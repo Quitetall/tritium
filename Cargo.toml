@@ -21,7 +21,7 @@ members = [
     # L2 runtime + functional
     # "crates/tritium-runtime",  # registry, dispatch, mem pools, autotune cache
     # "crates/tritium-quantize", # fp -> ternary (AbsMean/GPTQ/learned scales)
-    # "crates/tritium-nn",       # mixed-precision ops + model runner
+    "crates/tritium-nn",       # mixed-precision ops + model runner
     # "crates/tritium-train",    # [planned] QAT, STE autograd, optimizer
     # L3 frontends / bindings
     # "crates/tritium-ffi",      # C ABI cdylib + cbindgen

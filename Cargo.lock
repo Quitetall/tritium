@@ -686,6 +686,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tritium-nn"
+version = "0.0.1"
+dependencies = [
+ "half",
+ "proptest",
+ "tritium-core",
+ "tritium-format",
+ "tritium-runtime",
+ "tritium-spec",
+]
+
+[[package]]
 name = "tritium-runtime"
 version = "0.0.1"
 dependencies = [

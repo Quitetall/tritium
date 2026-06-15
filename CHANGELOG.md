@@ -33,10 +33,14 @@ reference on CPU, end to end through the backend contract, registry, and CLI.
   declared `n_dims` could otherwise drive a ~34 GB allocation and abort). Found by
   the commit-review policy; fixed with regression tests.
 
-### Deferred to a GPU/CI lane before `0.10.0` final
-- CUDA kernel vs reference and **CPU↔CUDA bit-parity (U2)** — need a GPU.
-- GGUF parser fuzz ≥1h (U5); `miri` (note: cannot execute AVX2 intrinsics) and
-  `compute-sanitizer` (U7).
+### Validated on GPU (RTX 4090, CUDA 13.3 / nvcc 13.3) — 2026-06-14
+- CUDA kernel vs reference and **CPU↔CUDA parity (U2)** ✓ — ported to cudarc 0.19;
+  both backends agree ≤1e-4 on the conformance set.
+- `compute-sanitizer` memcheck: **0 errors** (U7) ✓.
+
+### Still open before `0.10.0` final
+- GGUF parser fuzz ≥1h (U5) — scheduled CI lane (`cargo-fuzz` target exists);
+  `miri` is N/A (cannot execute AVX2 intrinsics).
 - Real llama.cpp `.gguf` fixture load + golden-dump comparison.
 
 [0.10.0-rc1]: https://github.com/Quitetall/tritium/releases/tag/v0.10.0-rc1
