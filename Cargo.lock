@@ -691,6 +691,8 @@ version = "0.0.1"
 dependencies = [
  "half",
  "proptest",
+ "serde",
+ "serde_json",
  "tritium-core",
  "tritium-format",
  "tritium-runtime",
