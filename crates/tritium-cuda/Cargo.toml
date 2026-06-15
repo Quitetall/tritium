@@ -17,30 +17,56 @@ tritium-runtime = { workspace = true }
 # `tritium-format` is only needed by the GPU host path (packed-row byte sizing),
 # so it is pulled in solely by the `cuda` feature to keep the default build lean.
 tritium-format = { workspace = true, optional = true }
-# cudarc: driver API only (no cublas/curand/cudnn). The driver feature pulls in
-# nvrtc transitively; we load pre-built PTX so nvrtc is unused at runtime.
-# `cuda-version-from-build-system` makes cudarc's build script auto-detect the
-# installed toolkit version from nvcc (so we don't hard-pin a CUDA minor); it
-# requires nvcc on the Wave D GPU lane — the same toolkit our own `build.rs` needs.
-# Declared directly (not via `workspace = true`) because the root pins
-# `cudarc = "0.13"` with default features and a member cannot turn those off when
-# inheriting; the version stays aligned with the workspace pin.
-cudarc = { version = "0.13", optional = true, default-features = false, features = [
+# cudarc 0.19: driver API only (no cublas/curand/cudnn).
+#
+# `fallback-dynamic-loading` makes cudarc dlopen the CUDA driver (`libcuda`) at
+# *runtime* instead of link-time, so its build script does NO link-time toolkit
+# probing. But cudarc's `sys` FFI bindings are still version-gated at *compile*
+# time and its build.rs demands exactly one `cuda-XXXXX` feature (or the
+# `nvcc`-probing `cuda-version-from-build-system`, which panics on toolkit 13.3 —
+# the very thing the 0.13 pin choked on). We therefore pin the *bindings* to the
+# newest cudarc supports, `cuda-13020` (CUDA 13.2). The CUDA **Driver API** is
+# forward-compatible within a major version, so 13.2 bindings call the same stable
+# symbols (`cuCtxCreate`, `cuMemAlloc`, `cuModuleLoadData`, `cuLaunchKernel`, …) on
+# the machine's 13.3 runtime driver — only the driver API subset this crate uses
+# (context/stream/memcpy/module/launch), all unchanged across 13.x. We still load
+# pre-built PTX from our own `build.rs` (nvcc), so cudarc's nvrtc path is unused.
+#
+# Declared directly (not via `workspace = true`) so this member can pin 0.19 and
+# turn default features off independently of the root manifest.
+#
+# Features: `driver` (the only CUDA library we touch), `nvrtc` (gates the `Ptx`
+# type and `CudaContext::load_module` — pure-Rust flag, no runtime `libnvrtc`
+# dlopen unless you call `compile_ptx`, which we don't), and `std` (gates
+# `DriverError`'s `Display`/`Error` impls). cublas/curand/runtime are left off.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
     "driver",
-    "cuda-version-from-build-system",
+    "nvrtc",
+    "std",
+    "fallback-dynamic-loading",
+    "cuda-13020",
 ] }
+# `linkme` backs the `BACKENDS` self-registration in the (cuda-only) host module —
+# same distributed-slice mechanism `tritium-cpu`/`tritium-runtime` use. Only pulled
+# in with the `cuda` feature, since the registration static is compiled only then.
+linkme = { workspace = true, optional = true }
 
 # All GPU code is gated behind `cuda`; the default build needs neither cudarc nor
 # a CUDA toolkit, so cpu-only CI stays green.
 [features]
 default = []
-cuda = ["dep:cudarc", "dep:tritium-format"]
+cuda = ["dep:cudarc", "dep:tritium-format", "dep:linkme"]
 
-# The conformance test only runs on the GPU lane (Wave D); these dev-deps are
-# referenced solely from `#[cfg(feature = "cuda")]` test code.
+# The conformance + parity tests only run on the GPU lane (Wave D); these dev-deps
+# are referenced solely from `#[cfg(feature = "cuda")]` test code. `tritium-cpu`
+# is the reference for the CPU↔CUDA parity gate (ADR 0002 U2).
 [dev-dependencies]
 tritium-testkit = { workspace = true }
 tritium-format = { workspace = true }
+tritium-cpu = { workspace = true }
+# `half::f16` is the block-scale type the TQ2_0 packer takes; used only by the
+# parity test's helper that packs trits the same way the testkit does.
+half = { workspace = true }
 
 [lints]
 workspace = true

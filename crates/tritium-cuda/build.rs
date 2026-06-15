@@ -11,17 +11,19 @@
 //
 // PTX is a *virtual* ISA, so a single `-ptx` build targets one `compute_XX` and
 // the driver JIT-recompiles it for the concrete device at load. We target the
-// lowest architecture Tritium supports (compute_70) because its PTX runs on every
-// newer device (Volta → Turing → Ampere → Hopper), which is what
+// lowest architecture Tritium supports (compute_75) because its PTX runs on every
+// newer device (Turing → Ampere → Ada → Hopper → Blackwell), which is what
 // `SUPPORTED_SM_ARCHS` documents and what the GPU CI lane (Wave D) exercises.
+// (CUDA 13 dropped Maxwell/Pascal/Volta, so compute_70 and below are gone.)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// SM architectures this kernel is validated to run on: Volta, Turing, Ampere,
+/// SM architectures this kernel is validated to run on: Turing, Ampere, Ada,
 /// Hopper. The emitted PTX is built for the *first* (lowest) of these; PTX is
 /// forward-compatible, so the driver JITs it up to whatever device is present.
-const SUPPORTED_SM_ARCHS: &[&str] = &["70", "75", "80", "90"];
+/// CUDA 13 removed Volta and earlier, so `compute_75` is the floor.
+const SUPPORTED_SM_ARCHS: &[&str] = &["75", "80", "89", "90"];
 
 fn main() {
     // Rebuild triggers regardless of feature state: cheap, and correct when the

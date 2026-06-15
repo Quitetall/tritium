@@ -1,20 +1,37 @@
 //! GPU host side for the CUDA backend. Compiled only with `--features cuda`.
 //!
-//! This module owns a [`cudarc`] device handle, loads the PTX emitted by
-//! `build.rs`, and drives the addition-only TQ2_0 mpGEMM kernel. It maps every
+//! This module owns a [`cudarc`] context + default stream, loads the PTX emitted
+//! by `build.rs`, and drives the addition-only TQ2_0 mpGEMM kernel. It maps every
 //! `cudarc` driver error to a [`BackendError`] so the backend never panics on a
 //! device failure, and reports allocation failures as
 //! [`BackendError::OutOfMemory`].
 //!
+//! ## cudarc 0.19 API
+//!
+//! Ported from the 0.13 device API to the 0.19 context/stream API:
+//! - [`cudarc::driver::CudaContext::new`] returns an `Arc<CudaContext>`; memory
+//!   and launches go through its [`default_stream`](cudarc::driver::CudaContext::default_stream).
+//! - PTX is loaded with [`CudaContext::load_module`] (taking a
+//!   [`cudarc::nvrtc::Ptx`] built from our pre-compiled string) and the kernel is
+//!   fetched with [`CudaModule::load_function`].
+//! - Host↔device copies use the stream's `clone_htod` / `clone_dtoh` /
+//!   `memcpy_dtoh`, and launches use the `launch_builder(...).arg(...).launch(cfg)`
+//!   builder. cudarc's `fallback-dynamic-loading` feature dlopen's `libcuda` at
+//!   runtime, so there is no build-time CUDA-toolkit-version pin (which is what
+//!   lets this crate build against CUDA 13.3).
+//!
 //! The crate-level `#![deny(unsafe_code)]` stands; the only `unsafe` here is the
-//! kernel launch (the driver's `launch` is an `unsafe fn`), behind a narrowly
-//! scoped `#[allow(unsafe_code)]` with a `SAFETY:` justification — exactly the
-//! pattern `tritium-runtime` uses for its `distributed_slice` statics.
+//! kernel launch (`launch_builder(...).launch` is an `unsafe fn`), behind a
+//! narrowly scoped `#[allow(unsafe_code)]` with a `SAFETY:` justification — exactly
+//! the pattern `tritium-runtime` uses for its `distributed_slice` statics.
 
 use core::any::Any;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConfig};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
+};
 use cudarc::nvrtc::Ptx;
 
 use tritium_core::{GemmShape, TernaryFormat};
@@ -22,9 +39,9 @@ use tritium_format::{TQ2_0_BLOCK_BYTES, num_blocks};
 use tritium_runtime::BackendEntry;
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
 
-/// Module name the PTX is registered under in the device.
-const MODULE_NAME: &str = "tq2_0_add";
 /// Kernel entry point — must match the `extern "C"` symbol in the `.cu` file.
+/// (cudarc 0.19 keys modules by the returned [`CudaModule`] handle, not by a
+/// registered module name, so only the function symbol is needed.)
 const KERNEL_NAME: &str = "tq2_0_add_mpgemm";
 /// CUDA threads per block for the 1-D launch grid.
 const THREADS_PER_BLOCK: u32 = 256;
@@ -45,8 +62,11 @@ fn driver_err(context: &str, err: &DriverError) -> BackendError {
 /// Wraps a [`CudaSlice<u8>`] (the htod copy of the host-packed bytes) plus the
 /// `[N, K]` geometry and the per-row packed byte stride, so `mpgemm` can validate
 /// and launch without re-deriving them.
+///
+/// Internal to the crate: it crosses the [`TernaryBackend`] boundary only as a
+/// `Box<dyn DeviceBuffer>`, downcast back here via [`core::any::Any`].
 #[derive(Debug)]
-pub struct CudaBuffer {
+pub(crate) struct CudaBuffer {
     /// Device allocation holding the packed TQ2_0 bytes, `[N * row_bytes]`.
     device: CudaSlice<u8>,
     /// Output channels (`N`).
@@ -71,13 +91,20 @@ impl DeviceBuffer for CudaBuffer {
 
 /// A CUDA execution backend bound to a single device ordinal.
 ///
-/// Construct with [`CudaBackend::new`]; it opens the device, loads the PTX module,
-/// and caches a friendly `device_id` like `"cuda:0"`. Cheap to clone the handle —
-/// the underlying [`CudaDevice`] is reference-counted by `cudarc`.
+/// Construct with [`CudaBackend::new`]; it opens the context, loads the PTX module,
+/// resolves the kernel, and caches a friendly `device_id` like `"cuda:0"`. The
+/// underlying [`CudaContext`], [`CudaStream`], and [`CudaModule`] are all
+/// reference-counted (`Arc`) by `cudarc`.
 #[derive(Debug)]
 pub struct CudaBackend {
-    /// Reference-counted device + loaded module handle.
-    device: Arc<CudaDevice>,
+    /// The context's default stream — all memory ops and launches go through it.
+    /// The stream holds its own `Arc<CudaContext>`, so the context stays alive for
+    /// as long as the backend does without a separate field.
+    stream: Arc<CudaStream>,
+    /// Loaded PTX module (kept alive so `func` stays valid).
+    _module: Arc<CudaModule>,
+    /// The resolved `tq2_0_add_mpgemm` kernel.
+    func: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -88,21 +115,28 @@ impl CudaBackend {
     /// Open CUDA device `ordinal`, load the TQ2_0 add kernel, and return a backend.
     ///
     /// # Errors
-    /// [`BackendError::Backend`] if the device cannot be opened or the PTX module
-    /// fails to load (no driver, no GPU, malformed PTX, …).
+    /// [`BackendError::Backend`] if the device cannot be opened, the PTX module
+    /// fails to load, or the kernel symbol is missing (no driver, no GPU, malformed
+    /// PTX, …).
     pub fn new(ordinal: usize) -> Result<Self, BackendError> {
-        let device = CudaDevice::new(ordinal).map_err(|e| driver_err("open cuda device", &e))?;
+        let ctx = CudaContext::new(ordinal).map_err(|e| driver_err("open cuda device", &e))?;
+        let stream = ctx.default_stream();
 
-        device
-            .load_ptx(Ptx::from_src(TQ2_0_ADD_PTX), MODULE_NAME, &[KERNEL_NAME])
+        let module = ctx
+            .load_module(Ptx::from_src(TQ2_0_ADD_PTX))
             .map_err(|e| driver_err("load tq2_0_add ptx", &e))?;
+        let func = module
+            .load_function(KERNEL_NAME)
+            .map_err(|e| driver_err("resolve tq2_0_add kernel", &e))?;
 
-        let device_name = device
+        let device_name = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_owned());
 
         Ok(Self {
-            device,
+            stream,
+            _module: module,
+            func,
             device_id: format!("cuda:{ordinal}"),
             device_name,
         })
@@ -120,8 +154,8 @@ impl TernaryBackend for CudaBackend {
     }
 
     fn capabilities(&self) -> DeviceCaps {
-        // total_memory is left at 0 (unknown): the cudarc safe API does not expose
-        // a portable free/total query here, and the contract permits 0.
+        // total_memory is left at its default (unknown): the contract permits 0 and
+        // the runtime does not rely on the figure here.
         DeviceCaps::new("cuda", self.device_name.clone()).with_features(vec!["tq2_0".to_owned()])
     }
 
@@ -145,7 +179,7 @@ impl TernaryBackend for CudaBackend {
         }
 
         // htod copy of the packed bytes. A driver OOM here is reported as such.
-        let device = self.device.htod_sync_copy(packed).map_err(|e| {
+        let device = self.stream.clone_htod(packed).map_err(|e| {
             if is_oom(&e) {
                 BackendError::OutOfMemory {
                     requested: expected,
@@ -213,22 +247,17 @@ impl TernaryBackend for CudaBackend {
             return Ok(());
         }
 
-        let func = self
-            .device
-            .get_func(MODULE_NAME, KERNEL_NAME)
-            .ok_or_else(|| BackendError::Backend(format!("kernel {KERNEL_NAME} not loaded")))?;
-
         // Upload activations + scales; allocate the output on device.
         let d_act = self
-            .device
-            .htod_sync_copy(act)
+            .stream
+            .clone_htod(act)
             .map_err(|e| alloc_or_backend("upload act (htod)", &e, act.len() * 4))?;
         let d_scales = self
-            .device
-            .htod_sync_copy(scales)
+            .stream
+            .clone_htod(scales)
             .map_err(|e| alloc_or_backend("upload scales (htod)", &e, scales.len() * 4))?;
         let mut d_out = self
-            .device
+            .stream
             .alloc_zeros::<f32>(m * n)
             .map_err(|e| alloc_or_backend("alloc out", &e, m * n * 4))?;
 
@@ -240,37 +269,45 @@ impl TernaryBackend for CudaBackend {
             shared_mem_bytes: 0,
         };
 
-        // Scalars are passed by value as i32 (matching the kernel signature).
-        let params = (
-            &d_act,
-            &buf.device,
-            &d_scales,
-            &mut d_out,
-            m as i32,
-            n as i32,
-            k as i32,
-            buf.row_bytes as i32,
-        );
+        // Scalars are passed by value as i32 (matching the kernel signature). They
+        // are bound to locals so they outlive the launch builder's borrows.
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let row_bytes_i = buf.row_bytes as i32;
 
-        // SAFETY: `LaunchAsync::launch` is `unsafe` because the kernel signature
-        // is not type-checked against `params` by the compiler. We uphold the
-        // contract manually: the param tuple's order and types exactly match the
-        // `extern "C"` kernel (`const float*`, `const unsigned char*`,
+        let mut launch = self.stream.launch_builder(&self.func);
+        launch
+            .arg(&d_act)
+            .arg(&buf.device)
+            .arg(&d_scales)
+            .arg(&mut d_out)
+            .arg(&m_i)
+            .arg(&n_i)
+            .arg(&k_i)
+            .arg(&row_bytes_i);
+
+        // SAFETY: `LaunchArgs::launch` is `unsafe` because the kernel signature is
+        // not type-checked against the pushed args by the compiler. We uphold the
+        // contract manually: the args were pushed in exactly the order and types of
+        // the `extern "C"` kernel (`const float*`, `const unsigned char*`,
         // `const float*`, `float*`, then four `int`s), the device buffers were all
         // allocated above (or in `upload_weights`) with sizes validated against
-        // `shape`, and the launch grid covers exactly `m*n` threads so no thread
-        // indexes past any buffer. No host memory aliased by the kernel is mutated
-        // concurrently.
+        // `shape`, only `d_out` is passed mutably (matching the kernel's single
+        // `float* out` output), and the launch grid covers exactly `m*n` threads so
+        // no thread indexes past any buffer. All host scalars outlive this call.
         #[allow(unsafe_code)]
         unsafe {
-            func.launch(cfg, params)
+            launch
+                .launch(cfg)
                 .map_err(|e| driver_err("launch tq2_0_add", &e))?;
         }
 
-        // dtoh copy of the result. `dtoh_sync_copy_into` synchronizes the stream,
-        // so the kernel has completed before we read back.
-        self.device
-            .dtoh_sync_copy_into(&d_out, out)
+        // dtoh copy of the result into the caller's buffer. `memcpy_dtoh` on the
+        // default stream is ordered after the launch and synchronizes the stream,
+        // so the kernel has completed before the bytes land in `out`.
+        self.stream
+            .memcpy_dtoh(&d_out, out)
             .map_err(|e| driver_err("download out (dtoh)", &e))?;
 
         Ok(())
@@ -318,10 +355,10 @@ static CUDA: BackendEntry = BackendEntry {
 
 #[cfg(test)]
 mod tests {
-    //! GPU conformance test. Runs only with `--features cuda` AND a working CUDA
-    //! device, so it is exercised on the Wave D GPU CI lane, never on cpu-only
-    //! lanes. When no device is present the test self-skips (constructing the
-    //! backend returns `Err`) rather than failing.
+    //! GPU conformance + CPU↔CUDA parity tests. Run only with `--features cuda` AND
+    //! a working CUDA device, so they are exercised on the Wave D GPU CI lane, never
+    //! on cpu-only lanes. When no device is present the tests self-skip
+    //! (constructing the backend returns `Err`) rather than failing.
     //!
     //! `run_conformance` itself packs each vector's trits to TQ2_0 (block scale
     //! 1.0), uploads via `upload_weights`, runs `mpgemm` with the per-channel
@@ -329,7 +366,19 @@ mod tests {
     //! supply the TQ2_0 vectors this kernel supports.
 
     use super::*;
-    use tritium_testkit::{Tolerance, generate_vectors, run_conformance};
+    use tritium_cpu::CpuBackend;
+    use tritium_testkit::{ConformanceVector, Tolerance, generate_vectors, run_conformance};
+
+    /// The full conformance set this kernel is responsible for: every TQ2_0 vector
+    /// from the committed generator (the kernel does not handle TQ1_0).
+    fn tq2_vectors() -> Vec<ConformanceVector> {
+        let v: Vec<_> = generate_vectors(0xC0FFEE, 16)
+            .into_iter()
+            .filter(|v| v.format == "tq2_0")
+            .collect();
+        assert!(!v.is_empty(), "expected some tq2_0 conformance vectors");
+        v
+    }
 
     #[test]
     fn cuda_matches_reference_within_tolerance() {
@@ -342,13 +391,7 @@ mod tests {
             }
         };
 
-        // This kernel only handles TQ2_0; the generator alternates formats.
-        let tq2: Vec<_> = generate_vectors(0xC0FFEE, 16)
-            .into_iter()
-            .filter(|v| v.format == "tq2_0")
-            .collect();
-        assert!(!tq2.is_empty(), "expected some tq2_0 conformance vectors");
-
+        let tq2 = tq2_vectors();
         let report = run_conformance(&backend, &tq2, Tolerance::default());
         assert!(
             report.is_ok(),
@@ -358,6 +401,104 @@ mod tests {
         );
     }
 
+    /// ADR 0002 U2: CPU↔CUDA parity. The *same* committed TQ2_0 vectors run through
+    /// both [`CpuBackend`] and [`CudaBackend`]; every output element must agree
+    /// within `1e-4` relative. This is the load-bearing cross-backend gate — it
+    /// catches a backend that is internally self-consistent (passes conformance)
+    /// but disagrees with the other backend on shared inputs.
+    #[test]
+    fn cuda_matches_cpu_within_tolerance() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping cpu<->cuda parity: no device ({e})");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+        let tol = Tolerance::default();
+
+        // Run both backends over the identical TQ2_0 vector set.
+        let cpu_report = run_conformance(&cpu, &tq2_vectors(), tol);
+        assert!(
+            cpu_report.is_ok(),
+            "cpu backend failed its own conformance, parity is moot: {:?}",
+            cpu_report.failed
+        );
+
+        // Replay each vector through both backends and compare outputs directly,
+        // rather than only against the shared reference, so any CPU/CUDA divergence
+        // surfaces even within the reference tolerance band.
+        for v in tq2_vectors() {
+            let shape = GemmShape::new(v.m, v.n, v.k);
+            let trits: Vec<_> = v
+                .weights
+                .iter()
+                .map(|&w| tritium_core::Trit::from_i8(w).expect("vector weight in {-1,0,1}"))
+                .collect();
+            let packed = pack_tq2_0(&trits, shape);
+
+            let cpu_out = run_backend(&cpu, &packed, &v.activation, &v.scales, shape);
+            let cuda_out = run_backend(&cuda, &packed, &v.activation, &v.scales, shape);
+
+            assert_eq!(
+                cpu_out.len(),
+                cuda_out.len(),
+                "{}: output len mismatch",
+                v.id
+            );
+            for (i, (&c, &g)) in cpu_out.iter().zip(&cuda_out).enumerate() {
+                assert!(
+                    tol.accepts(g, c),
+                    "{}: cpu/cuda disagree at [{i}]: cpu={c} cuda={g}",
+                    v.id
+                );
+            }
+        }
+    }
+
+    /// Pack an `[N, K]` trit matrix to TQ2_0 rows, block scale fixed to `1.0` (the
+    /// testkit convention), ready for `upload_weights`.
+    fn pack_tq2_0(trits: &[tritium_core::Trit], shape: GemmShape) -> Vec<u8> {
+        use tritium_format::pack_tq2_0_row;
+        let GemmShape { n, k, .. } = shape;
+        let nb = num_blocks(k);
+        let unit = vec![half::f16::ONE; nb];
+        let row_bytes = nb * TQ2_0_BLOCK_BYTES;
+        let mut packed = vec![0u8; n * row_bytes];
+        for ni in 0..n {
+            let row = &trits[ni * k..ni * k + k];
+            let out = &mut packed[ni * row_bytes..(ni + 1) * row_bytes];
+            pack_tq2_0_row(row, &unit, out).expect("pack tq2_0 row");
+        }
+        packed
+    }
+
+    /// Upload weights + run one TQ2_0 mpGEMM through any backend, returning `[M, N]`.
+    fn run_backend<B: TernaryBackend>(
+        backend: &B,
+        packed: &[u8],
+        act: &[f32],
+        scales: &[f32],
+        shape: GemmShape,
+    ) -> Vec<f32> {
+        let buf = backend
+            .upload_weights(packed, shape, TernaryFormat::Tq2_0)
+            .expect("upload weights");
+        let mut out = vec![0.0f32; shape.m * shape.n];
+        backend
+            .mpgemm(
+                act,
+                buf.as_ref(),
+                scales,
+                shape,
+                TernaryFormat::Tq2_0,
+                &mut out,
+            )
+            .expect("mpgemm");
+        out
+    }
+
     #[test]
     fn rejects_tq1_0_format() {
         let backend = match CudaBackend::new(0) {
@@ -365,9 +506,15 @@ mod tests {
             Err(_) => return, // no device: nothing to assert about format handling
         };
         let shape = GemmShape { m: 1, n: 1, k: 256 };
-        let err = backend
-            .upload_weights(&[0u8; 54], shape, TernaryFormat::Tq1_0)
-            .unwrap_err();
-        assert!(matches!(err, BackendError::UnsupportedFormat(_)));
+        // The format gate runs before any length check, so the bytes need not be a
+        // valid TQ1_0 length. `Box<dyn DeviceBuffer>` is not `Debug`, so `unwrap_err`
+        // is unavailable — match on the result instead (same idiom as tritium-cpu).
+        match backend.upload_weights(&[0u8; 66], shape, TernaryFormat::Tq1_0) {
+            Err(BackendError::UnsupportedFormat(_)) => {}
+            other => panic!(
+                "expected UnsupportedFormat, got {:?}",
+                other.map(|_| "ok-buffer")
+            ),
+        }
     }
 }
