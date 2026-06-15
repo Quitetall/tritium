@@ -2,7 +2,7 @@
 type: Crate
 title: tritium-core
 description: Foundation crate — ternary types, dtypes, scaling schemes, and reference math.
-resource: https://github.com/2BrianCells/tritium/tree/main/crates/tritium-core
+resource: https://github.com/Quitetall/tritium/tree/main/crates/tritium-core
 tags: [crate, foundation, no_std, l0]
 timestamp: 2026-06-14T00:00:00Z
 ---

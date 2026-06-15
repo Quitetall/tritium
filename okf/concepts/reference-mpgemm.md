@@ -2,7 +2,7 @@
 type: Contract
 title: Reference mpGEMM
 description: The slow, obviously-correct mixed-precision GEMM every backend must match.
-resource: https://github.com/2BrianCells/tritium/blob/main/crates/tritium-core/src/reference.rs
+resource: https://github.com/Quitetall/tritium/blob/main/crates/tritium-core/src/reference.rs
 tags: [tritium-core, conformance, ground-truth, mpgemm]
 timestamp: 2026-06-14T00:00:00Z
 ---

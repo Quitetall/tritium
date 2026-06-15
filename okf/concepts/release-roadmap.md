@@ -2,7 +2,7 @@
 type: Concept
 title: Release roadmap (v0.x0 → v1.0)
 description: Depth-first staircase of shippable milestones to a real, usable v1.0, each with airtight exit gates.
-resource: https://github.com/2BrianCells/tritium/blob/main/docs/adr/0002-release-roadmap.md
+resource: https://github.com/Quitetall/tritium/blob/main/docs/adr/0002-release-roadmap.md
 tags: [roadmap, milestones, validation, release]
 timestamp: 2026-06-14T00:00:00Z
 ---
@@ -13,7 +13,7 @@ v1.0 is the full vision — all backends, inference + [SALT](/concepts/salt-quan
 + distributed training, interop — **real and usable**. Reached via shippable
 `0.x0` milestones, **Approach A: capability depth-first, backend breadth second**,
 CPU+CUDA first. Full detail + per-milestone exit gates in
-[ADR 0002](https://github.com/2BrianCells/tritium/blob/main/docs/adr/0002-release-roadmap.md).
+[ADR 0002](https://github.com/Quitetall/tritium/blob/main/docs/adr/0002-release-roadmap.md).
 
 | Milestone | Theme |
 |---|---|

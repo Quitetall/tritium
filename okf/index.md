@@ -3,7 +3,7 @@ okf_version: "0.1"
 type: Knowledge Bundle
 title: Tritium
 description: Foundational ternary-model inference and training library — OKF knowledge bundle.
-resource: https://github.com/2BrianCells/tritium
+resource: https://github.com/Quitetall/tritium
 tags: [tritium, ternary, quantization, inference, cuda, bitnet]
 timestamp: 2026-06-14T00:00:00Z
 ---

@@ -39,4 +39,4 @@ reference on CPU, end to end through the backend contract, registry, and CLI.
   `compute-sanitizer` (U7).
 - Real llama.cpp `.gguf` fixture load + golden-dump comparison.
 
-[0.10.0-rc1]: https://github.com/2BrianCells/tritium/releases/tag/v0.10.0-rc1
+[0.10.0-rc1]: https://github.com/Quitetall/tritium/releases/tag/v0.10.0-rc1

@@ -2,7 +2,7 @@
 type: Concept
 title: SALT — Sensitivity-Allocated Layered Ternary
 description: Add ternary planes only where the model is sensitive; prune the rest. Stays multiply-free.
-resource: https://github.com/2BrianCells/tritium/blob/main/docs/adr/0001-salt-quantization.md
+resource: https://github.com/Quitetall/tritium/blob/main/docs/adr/0001-salt-quantization.md
 tags: [quantization, salt, residual, additive, mixed-precision]
 timestamp: 2026-06-14T00:00:00Z
 ---
@@ -10,7 +10,7 @@ timestamp: 2026-06-14T00:00:00Z
 # SALT — Sensitivity-Allocated Layered Ternary
 
 Tritium's quantization scheme. Full rationale in
-[ADR 0001](https://github.com/2BrianCells/tritium/blob/main/docs/adr/0001-salt-quantization.md);
+[ADR 0001](https://github.com/Quitetall/tritium/blob/main/docs/adr/0001-salt-quantization.md);
 this is the agent-facing summary.
 
 A weight group is approximated by a **sum of ternary planes**:

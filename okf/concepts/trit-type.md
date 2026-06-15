@@ -2,7 +2,7 @@
 type: Type
 title: Trit
 description: The ternary scalar — repr(transparent) over i8, invariant {-1, 0, +1}.
-resource: https://github.com/2BrianCells/tritium/blob/main/crates/tritium-core/src/trit.rs
+resource: https://github.com/Quitetall/tritium/blob/main/crates/tritium-core/src/trit.rs
 tags: [tritium-core, type, ternary]
 timestamp: 2026-06-14T00:00:00Z
 ---
