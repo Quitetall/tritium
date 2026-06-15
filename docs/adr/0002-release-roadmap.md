@@ -34,6 +34,25 @@ criteria. Revise if a hard date or team size changes milestone sizing.
 
 Adopt Approach A with the partition and gates below.
 
+**Convention (required):** every milestone has its own **status + testability ADR**
+before it is tagged. Each records the milestone's `Status` (planned / in-progress /
+done, with dependencies + blockers), its `Testability` (the exit gates from this
+roadmap, tagged with the taxonomy below and mapped to a test technique + CI lane),
+and a `Definition of done` checklist. Index:
+
+| Milestone | ADR | Status |
+|---|---|---|
+| v0.10 Foundation | [0003](./0003-v010-implementation.md) | **Done** (tagged `v0.10.0`) |
+| v0.20 Inference Spine | [0004](./0004-v020-inference-spine.md) | In progress |
+| v0.30 Performance | [0005](./0005-v030-performance.md) | Planned |
+| v0.40 SALT Quantization | [0006](./0006-v040-quantization.md) | Planned |
+| v0.50 Training Core | [0007](./0007-v050-training-core.md) | Planned |
+| v0.60 Pretraining + Distributed | [0008](./0008-v060-pretraining-distributed.md) | Planned |
+| v0.70 Backend Breadth | [0009](./0009-v070-backend-breadth.md) | Planned |
+| v0.80 Interop | [0010](./0010-v080-interop.md) | Planned |
+| v0.90 Hardening | [0011](./0011-v090-hardening.md) | Planned |
+| v1.0 Release | [0012](./0012-v100-release.md) | Planned |
+
 ---
 
 ## Validation taxonomy (applies to every milestone)
