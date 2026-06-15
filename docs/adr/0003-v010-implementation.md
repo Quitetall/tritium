@@ -13,12 +13,13 @@ repo rather than an ephemeral plan file.
 
 ## What shipped
 
-Seven crates, built in dependency waves (depth-first; backends parallel):
+Eight crates ship in rc1: `tritium-core` (foundation, built first inline) plus
+seven built in dependency waves (depth-first; backends parallel):
 
 - **Wave A (inline):** `tritium-spec` (object-safe `TernaryBackend`), `tritium-format`
-  (TQ1_0/TQ2_0 ggml port + GGUF reader).
-- **Wave B (workflow, 2∥→1):** `tritium-format` GGUF+rows, `tritium-runtime`
-  (linkme registry), `tritium-testkit` (conformance harness).
+  (TQ1_0/TQ2_0 pack/unpack, ggml port).
+- **Wave B (workflow, 2∥→1):** `tritium-format` extended with the GGUF reader + row
+  wrappers, `tritium-runtime` (linkme registry), `tritium-testkit` (conformance harness).
 - **Wave C (workflow, 2∥→1):** `tritium-cpu` (AVX2+scalar), `tritium-cuda`
   (feature-gated kernel), `tritium-cli` (inspect, list-backends).
 

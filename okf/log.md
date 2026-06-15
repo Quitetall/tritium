@@ -7,7 +7,7 @@ timestamp: 2026-06-14T00:00:00Z
 
 # Log
 
-- **2026-06-14** — Shipped **v0.10.0-rc1** Foundation: 7 crates (spec, format,
+- **2026-06-14** — Shipped **v0.10.0-rc1** Foundation: 8 crates (core, spec, format,
   testkit, runtime, cpu, cuda, cli). CPU ternary mpGEMM bit-exact vs reference;
   end-to-end backend registry + CLI. GPU/fuzz/sanitizer gates deferred to CI lanes
   (ADR 0003).

@@ -13,7 +13,7 @@ Cargo workspace. No CMake — `build.rs` + cargo features gate every backend.
 Status as of **v0.10.0-rc1**. See [release roadmap](/concepts/release-roadmap.md).
 
 ## L0 — foundation (pure, no_std-able)
-- `tritium-core` — types, dtypes, scaling, reference math. **Landed.** See [tritium-core](/crates/tritium-core.md).
+- `tritium-core` — types, dtypes, scaling, reference math. **Landed (v0.10).** See [tritium-core](/crates/tritium-core.md).
 - `tritium-format` — TQ1_0/TQ2_0 packing + GGUF reader + row wrappers. **Landed (v0.10).**
 - `tritium-spec` — object-safe backend trait, no impls. **Landed (v0.10).**
 - `tritium-testkit` — conformance vectors + harness. **Landed (v0.10).**
