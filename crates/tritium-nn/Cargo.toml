@@ -21,6 +21,10 @@ half = { workspace = true }
 proptest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# A concrete backend for the layer/forward integration tests (WF-3): the layers
+# speak the `tritium-spec` contract, so the tests drive them through the CPU
+# ternary mpGEMM. Not a runtime dependency of the crate.
+tritium-cpu = { workspace = true }
 
 [lints]
 workspace = true

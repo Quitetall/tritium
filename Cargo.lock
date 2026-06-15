@@ -694,6 +694,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tritium-core",
+ "tritium-cpu",
  "tritium-format",
  "tritium-runtime",
  "tritium-spec",
