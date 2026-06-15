@@ -1,0 +1,25 @@
+[package]
+name = "tritium-cpu"
+description = "CPU execution backend: AVX2 (and scalar fallback) ternary mpGEMM with runtime dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-spec = { workspace = true }
+tritium-runtime = { workspace = true }
+tritium-format = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+tritium-testkit = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

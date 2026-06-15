@@ -1,0 +1,29 @@
+[package]
+name = "tritium-cuda"
+description = "CUDA execution backend: cudarc host side + an addition-only ternary mpGEMM kernel (build.rs nvcc)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-spec = { workspace = true }
+tritium-runtime = { workspace = true }
+cudarc = { workspace = true, optional = true }
+
+# All GPU code is gated behind `cuda`; the default build needs neither cudarc nor
+# a CUDA toolkit, so cpu-only CI stays green.
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[build-dependencies]
+cc = { workspace = true }
+
+[lints]
+workspace = true

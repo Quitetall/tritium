@@ -1,0 +1,26 @@
+[package]
+name = "tritium-cli"
+description = "The `tritium` command-line tool: inspect GGUF files and list registered backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "tritium"
+path = "src/main.rs"
+
+[dependencies]
+tritium-format = { workspace = true }
+tritium-runtime = { workspace = true }
+# Linked so its backend self-registration is visible to `list-backends`.
+tritium-cpu = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true
