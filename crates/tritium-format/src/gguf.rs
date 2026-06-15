@@ -38,6 +38,15 @@ const MAX_STRING_LEN: u64 = 64 * 1024 * 1024;
 /// Upper bound on array / table element counts, to reject overflow-y inputs early.
 const MAX_COUNT: u64 = 1u64 << 32;
 
+/// Maximum tensor dimension count accepted. ggml's `GGML_MAX_DIMS` is 4; 8 leaves
+/// headroom. Bounding this keeps `n_dims` from driving a huge upfront allocation.
+const MAX_DIMS: u32 = 8;
+
+/// Cap on how many elements to *preallocate* from a file-declared count. The real
+/// container grows on demand as entries are read (and a short buffer truncates
+/// long before the declared count), so this only bounds the speculative reserve.
+const MAX_PREALLOC: usize = 4096;
+
 /// Errors raised while reading a GGUF container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -410,12 +419,15 @@ pub fn read_gguf(buf: &[u8]) -> Result<GgufFile, GgufError> {
         .unwrap_or(DEFAULT_ALIGNMENT);
 
     // Tensor-info table.
+    // `tensor_count` is attacker-controlled — cap the speculative reserve; the loop
+    // grows as real entries are read and a short buffer truncates first.
+    let tensor_count_usize = usize::try_from(tensor_count).map_err(|_| GgufError::DimsOverflow)?;
     let mut raw_tensors: Vec<(String, Vec<u64>, u32, u64)> =
-        Vec::with_capacity(usize::try_from(tensor_count).map_err(|_| GgufError::DimsOverflow)?);
+        Vec::with_capacity(tensor_count_usize.min(MAX_PREALLOC));
     for _ in 0..tensor_count {
         let name = cur.gguf_string()?;
         let n_dims = cur.u32()?;
-        if u64::from(n_dims) > MAX_COUNT {
+        if n_dims > MAX_DIMS {
             return Err(GgufError::DimsOverflow);
         }
         let mut dims = Vec::with_capacity(n_dims as usize);
@@ -562,6 +574,32 @@ mod tests {
         fn build(&self, alignment: u64) -> Vec<u8> {
             self.build_with_data(alignment, &[])
         }
+    }
+
+    #[test]
+    fn rejects_adversarial_n_dims_without_oom() {
+        // A tensor declaring n_dims = u32::MAX must error before any allocation,
+        // not attempt a ~34 GB Vec::with_capacity (which aborts the process).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC);
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&1u64.to_le_bytes()); // n_tensors
+        buf.extend_from_slice(&0u64.to_le_bytes()); // n_meta
+        push_str(&mut buf, "w"); // tensor name
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_dims = ~4.29e9
+        assert!(matches!(read_gguf(&buf), Err(GgufError::DimsOverflow)));
+    }
+
+    #[test]
+    fn huge_tensor_count_truncates_not_ooms() {
+        // A header claiming ~4.29e9 tensors with no bodies must truncate-error,
+        // not speculatively preallocate a giant Vec.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(u32::MAX as u64).to_le_bytes()); // n_tensors < MAX_COUNT
+        buf.extend_from_slice(&0u64.to_le_bytes()); // n_meta
+        assert!(read_gguf(&buf).is_err()); // truncates on first tensor read, no abort
     }
 
     #[test]
