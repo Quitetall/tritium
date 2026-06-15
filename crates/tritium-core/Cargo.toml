@@ -1,0 +1,26 @@
+[package]
+name = "tritium-core"
+description = "Foundational ternary types, dtypes, scaling schemes, and reference math for Tritium."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+# Foundation crate: zero external runtime deps by design. The only thing every
+# backend links is types + reference math — keep it minimal and no_std-able.
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

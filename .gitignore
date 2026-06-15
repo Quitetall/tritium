@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+Cargo.lock          # workspace of libs: keep unlocked; tritium-cli pins its own if needed
+
+# build artifacts from backends
+*.ptx
+*.cubin
+*.o
+*.so
+*.dylib
+*.dll
+
+# autotune + JIT cache (mirrors ~/.cache/tritium at runtime)
+/.tritium-cache
+
+# python / maturin
+*.whl
+__pycache__/
+.venv/
+
+# editor / os
+.DS_Store
+*.swp

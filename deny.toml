@@ -1,0 +1,18 @@
+# cargo-deny: license + advisory gate. Run in CI.
+# Tritium vendors MIT (T-MAC, BitBLAS, ggml, ExLlamaV2) and Apache-2.0 (Marlin);
+# every upstream license must stay allowed + attributed in NOTICE.
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Zlib"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

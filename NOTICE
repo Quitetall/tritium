@@ -1,0 +1,32 @@
+Tritium
+Copyright 2026 Brian Lam
+
+This product is dual-licensed under MIT OR Apache-2.0 (see LICENSE-MIT and
+LICENSE-APACHE — to be added before first public release).
+
+Tritium incorporates designs, algorithms, and/or code derived from the
+following upstream projects. Their license terms are preserved here and in
+the source files of the integrating crates.
+
+  - T-MAC — Microsoft Research (MIT)
+      LUT-based mpGEMM for low-bit LLM inference on CPU/NPU.
+      https://github.com/microsoft/T-MAC
+  - BitNet / bitnet.cpp — Microsoft (MIT)
+      Ternary (1.58-bit) inference framework + W1.58A8 CUDA kernel.
+      https://github.com/microsoft/BitNet
+  - BitBLAS — Microsoft (MIT)
+      Mixed-precision GEMM kernel codegen + autotuning.
+      https://github.com/microsoft/BitBLAS
+  - llama.cpp / ggml — (MIT)
+      TQ1_0 / TQ2_0 ternary block-quantization formats; GGUF.
+      https://github.com/ggml-org/llama.cpp
+  - GPTQ-Marlin — (Apache-2.0)
+      4-bit GPU kernel design.
+      https://github.com/IST-DASLab/marlin
+  - ExLlamaV2 — (MIT)
+      EXL2 quantization + 4-bit kernels.
+      https://github.com/turboderp-org/exllamav2
+
+Attribution requirement: any crate that vendors or directly ports upstream
+code MUST retain the upstream copyright header in the relevant source file
+and list the file under the corresponding project above.

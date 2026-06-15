@@ -1,0 +1,86 @@
+# Tritium — foundational ternary-model inference & training library.
+# Virtual workspace. Deps point inward: foundation → backends → runtime → frontends.
+# A frontend never depends on a concrete backend; a backend never depends on another backend.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/tritium-core",
+    # ── enabled as each lands (see docs/ROADMAP for the full crate graph) ──
+    # L0 foundation
+    # "crates/tritium-format",   # TQ1_0/TQ2_0 packing, GGUF + safetensors I/O
+    # "crates/tritium-spec",     # backend trait contract, no impls
+    # "crates/tritium-testkit",  # reference vectors + conformance harness
+    # L1 backends
+    # "crates/tritium-cpu",      # std::arch SIMD (x86 avx2/avx512/amx, arm neon/sve)
+    # "crates/tritium-cuda",     # cudarc host + .cu kernels + nvrtc JIT
+    # "crates/tritium-metal",    # [planned]
+    # "crates/tritium-rocm",     # [planned]
+    # "crates/tritium-wgpu",     # [planned]
+    # L2 runtime + functional
+    # "crates/tritium-runtime",  # registry, dispatch, mem pools, autotune cache
+    # "crates/tritium-quantize", # fp -> ternary (AbsMean/GPTQ/learned scales)
+    # "crates/tritium-nn",       # mixed-precision ops + model runner
+    # "crates/tritium-train",    # [planned] QAT, STE autograd, optimizer
+    # L3 frontends / bindings
+    # "crates/tritium-ffi",      # C ABI cdylib + cbindgen
+    # "crates/tritium-py",       # PyO3 + maturin
+    # "crates/tritium-onnx",     # ort custom op
+    # "crates/tritium-candle",   # candle backend
+    # "crates/tritium-burn",     # [planned]
+    # "crates/tritium-wasm",     # [planned]
+    # L4 apps
+    # "crates/tritium-cli",      # `tritium` binary
+    # "crates/tritium-serve",    # [planned] OpenAI-compatible server
+    # "xtask",                   # build orchestration / codegen / release
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.89"          # AVX-512 intrinsics stable floor (Rust 1.89, 2025-08-07)
+license = "MIT OR Apache-2.0"  # dual, Rust-ecosystem standard; vendored deps in NOTICE
+repository = "https://github.com/2BrianCells/tritium"
+authors = ["Brian Lam <briankhanglam@gmail.com>"]
+keywords = ["ternary", "bitnet", "quantization", "inference", "cuda"]
+categories = ["science", "hardware-support", "mathematics"]
+
+# Shared dependency versions — crates opt in with `dep.workspace = true`.
+[workspace.dependencies]
+# foundation
+bytemuck = "1"
+half = "2"
+# cpu
+rayon = "1"
+# cuda
+cudarc = "0.13"
+cc = "1"
+# bindings / frontends
+pyo3 = "0.23"
+ort = "2.0.0-rc.10"
+# dev / test / bench
+proptest = "1"
+divan = "0.1"
+
+# Lints applied workspace-wide; crates opt in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+# hot-path discipline: no hidden panics in kernels
+indexing_slicing = "allow"   # re-enable per-crate in backends once bounds are proven
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Fat LTO + max opt for shipped kernels; slow to build, used for wheels/benches.
+[profile.dist]
+inherits = "release"
+lto = "fat"
