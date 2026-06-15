@@ -1,6 +1,80 @@
 //! # tritium-cuda
 //!
-//! CUDA execution backend. Host side via `cudarc`; the addition-only ternary
-//! mpGEMM kernel is compiled from `.cu` to PTX by `build.rs` (nvcc) and loaded at
-//! runtime. All GPU code is gated behind the `cuda` feature so the default build
-//! requires no CUDA toolkit. Implementation in progress (v0.10 Wave C).
+//! CUDA execution backend for Tritium. The host side is built on
+//! [`cudarc`](https://docs.rs/cudarc); the addition-only ternary mpGEMM kernel is
+//! compiled from `kernels/tq2_0_add.cu` to PTX by `build.rs` (via `nvcc`) and
+//! loaded at runtime with [`include_str!`].
+//!
+//! ## Feature gating — `--features cuda`
+//!
+//! **All GPU code in this crate is behind the `cuda` cargo feature.** The default
+//! build (`cargo build -p tritium-cuda`) compiles a CUDA-free stub: it pulls in no
+//! `cudarc`, runs no `nvcc`, and registers no backend. This is what cpu-only CI
+//! lanes (and developer machines without a GPU) build.
+//!
+//! Building with `--features cuda` **requires a full CUDA toolkit** (so `build.rs`
+//! can find `nvcc` to emit PTX) and a working **NVIDIA GPU + driver** at runtime
+//! (so the backend's `init` can open device 0). Neither is present on cpu-only
+//! lanes, so the feature is validated on a **separate GPU CI lane (Wave D)**, never
+//! in the default build matrix.
+//!
+//! ## What it computes
+//!
+//! [`CudaBackend`] implements [`tritium_spec::TernaryBackend`]:
+//! [`upload_weights`](tritium_spec::TernaryBackend::upload_weights) copies the
+//! host-packed TQ2_0 bytes to device memory (host-to-device), and
+//! [`mpgemm`](tritium_spec::TernaryBackend::mpgemm) uploads activations + scales,
+//! launches the kernel (one output element per thread), synchronizes, and copies
+//! the result back. The result matches [`tritium_core::reference_mpgemm`] within
+//! the `1e-4` relative tolerance from ADR 0002.
+//!
+//! Only [`TernaryFormat::Tq2_0`](tritium_core::TernaryFormat::Tq2_0) is supported
+//! by the kernel; TQ1_0 returns
+//! [`BackendError::UnsupportedFormat`](tritium_spec::BackendError::UnsupportedFormat).
+#![deny(unsafe_code)]
+
+// The default (no-`cuda`) build is intentionally inert: it carries only docs and a
+// compile/type sanity test. Everything device-facing lives in the `cuda` module.
+#[cfg(feature = "cuda")]
+mod cuda;
+
+#[cfg(feature = "cuda")]
+pub use cuda::CudaBackend;
+
+#[cfg(test)]
+mod tests {
+    // Default-build sanity: the crate compiles, the spec types it is written
+    // against resolve, and (without the `cuda` feature) no backend is registered
+    // by this crate. The real conformance test is `cuda::tests`, gated on `cuda`
+    // and exercised only on the GPU lane.
+    use tritium_core::{GemmShape, TernaryFormat};
+    use tritium_spec::BackendError;
+
+    #[test]
+    fn spec_types_resolve_in_default_build() {
+        // These are the exact types the backend's signatures are written against;
+        // referencing them keeps the default build honest about the contract.
+        let shape = GemmShape { m: 2, n: 3, k: 256 };
+        assert_eq!(shape.m * shape.n, 6);
+        // TQ2_0 is 2 raw bits/trit plus the per-block f16 scale amortised over 256
+        // trits, so effective bpw is slightly above 2.0 — just assert the range.
+        let bpw = TernaryFormat::Tq2_0.bits_per_weight();
+        assert!((2.0..2.1).contains(&bpw), "tq2_0 bpw {bpw} out of range");
+        let err = BackendError::UnsupportedFormat(TernaryFormat::Tq1_0);
+        assert!(matches!(err, BackendError::UnsupportedFormat(_)));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn default_build_registers_no_cuda_backend() {
+        // Without the `cuda` feature this crate contributes nothing to the runtime
+        // registry, so a `"cuda"` lookup must miss. (Other crates in a workspace
+        // build may register their own backends; we only assert the negative for
+        // ours.)
+        let reg = tritium_runtime::Registry::init();
+        assert!(
+            reg.get("cuda").is_none(),
+            "default build must not register a cuda backend"
+        );
+    }
+}

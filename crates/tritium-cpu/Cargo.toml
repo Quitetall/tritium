@@ -16,6 +16,8 @@ tritium-spec = { workspace = true }
 tritium-runtime = { workspace = true }
 tritium-format = { workspace = true }
 rayon = { workspace = true }
+half = { workspace = true }
+linkme = { workspace = true }
 
 [dev-dependencies]
 tritium-testkit = { workspace = true }

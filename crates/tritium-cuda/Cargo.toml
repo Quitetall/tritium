@@ -14,16 +14,33 @@ categories.workspace = true
 tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-runtime = { workspace = true }
-cudarc = { workspace = true, optional = true }
+# `tritium-format` is only needed by the GPU host path (packed-row byte sizing),
+# so it is pulled in solely by the `cuda` feature to keep the default build lean.
+tritium-format = { workspace = true, optional = true }
+# cudarc: driver API only (no cublas/curand/cudnn). The driver feature pulls in
+# nvrtc transitively; we load pre-built PTX so nvrtc is unused at runtime.
+# `cuda-version-from-build-system` makes cudarc's build script auto-detect the
+# installed toolkit version from nvcc (so we don't hard-pin a CUDA minor); it
+# requires nvcc on the Wave D GPU lane — the same toolkit our own `build.rs` needs.
+# Declared directly (not via `workspace = true`) because the root pins
+# `cudarc = "0.13"` with default features and a member cannot turn those off when
+# inheriting; the version stays aligned with the workspace pin.
+cudarc = { version = "0.13", optional = true, default-features = false, features = [
+    "driver",
+    "cuda-version-from-build-system",
+] }
 
 # All GPU code is gated behind `cuda`; the default build needs neither cudarc nor
 # a CUDA toolkit, so cpu-only CI stays green.
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:tritium-format"]
 
-[build-dependencies]
-cc = { workspace = true }
+# The conformance test only runs on the GPU lane (Wave D); these dev-deps are
+# referenced solely from `#[cfg(feature = "cuda")]` test code.
+[dev-dependencies]
+tritium-testkit = { workspace = true }
+tritium-format = { workspace = true }
 
 [lints]
 workspace = true
