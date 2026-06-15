@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Required lane: must be green on every push. No GPU, default features only.
+  cpu-only-green:
+    name: test · clippy · fmt (cpu-only)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test --workspace --doc
+
+  # Scheduled fuzz lane (U5): GGUF parser, zero crashes.
+  fuzz:
+    name: fuzz gguf parser
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - run: cargo +nightly fuzz run gguf_parse -- -max_len=131072 -max_total_time=3600
+        working-directory: crates/tritium-format
+
+  # GPU lane (U2 parity + CUDA conformance + compute-sanitizer). Self-hosted,
+  # manual — runs only where a CUDA toolkit + NVIDIA GPU are present.
+  gpu:
+    name: cuda conformance + parity
+    runs-on: [self-hosted, gpu]
+    if: ${{ false }} # enable on a runner with nvcc + a GPU
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p tritium-cuda --features cuda
+      - run: compute-sanitizer --tool memcheck cargo test -p tritium-cuda --features cuda
