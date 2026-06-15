@@ -32,6 +32,12 @@ tritium-format = { workspace = true, optional = true }
 # (context/stream/memcpy/module/launch), all unchanged across 13.x. We still load
 # pre-built PTX from our own `build.rs` (nvcc), so cudarc's nvrtc path is unused.
 #
+# UPPER BOUND: this pin is valid for CUDA 13.x runtimes ONLY. On a CUDA 14.x host
+# the ABI may shift and the dlopen'd driver could fail at first launch with a
+# cryptic error. When cudarc ships a newer `cuda-130xx`/`cuda-14xxx` binding, bump
+# this one feature. (A runtime `cuDriverGetVersion` major-version guard in
+# `CudaBackend::new` is a deferred nicety to turn that into a clear diagnostic.)
+#
 # Declared directly (not via `workspace = true`) so this member can pin 0.19 and
 # turn default features off independently of the root manifest.
 #
