@@ -13,6 +13,8 @@ categories.workspace = true
 [dependencies]
 tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
+tritium-format = { workspace = true }
+half = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

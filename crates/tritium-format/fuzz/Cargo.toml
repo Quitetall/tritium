@@ -1,0 +1,29 @@
+# cargo-fuzz harness for the GGUF reader. This is a standalone crate (its own
+# [workspace] table below) so the main Tritium workspace never builds it and
+# crate-scoped `cargo` invocations ignore it. Run with:
+#   cargo +nightly fuzz run gguf_parse
+# (requires `cargo install cargo-fuzz`).
+[package]
+name = "tritium-format-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.tritium-format]
+path = ".."
+
+# Standalone: do not join the parent virtual workspace.
+[workspace]
+
+[[bin]]
+name = "gguf_parse"
+path = "fuzz_targets/gguf_parse.rs"
+test = false
+doc = false
+bench = false

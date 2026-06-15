@@ -464,6 +464,7 @@ name = "tritium-runtime"
 version = "0.0.1"
 dependencies = [
  "linkme",
+ "tritium-core",
  "tritium-spec",
 ]
 
@@ -478,10 +479,12 @@ dependencies = [
 name = "tritium-testkit"
 version = "0.0.1"
 dependencies = [
+ "half",
  "proptest",
  "serde",
  "serde_json",
  "tritium-core",
+ "tritium-format",
  "tritium-spec",
 ]
 

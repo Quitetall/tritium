@@ -14,5 +14,11 @@ categories.workspace = true
 tritium-spec = { workspace = true }
 linkme = { workspace = true }
 
+[dev-dependencies]
+# Used by the doctest example and the in-crate dummy backend tests to spell out
+# `GemmShape` / `TernaryFormat`. Not a runtime dependency: the registry itself
+# only speaks the `tritium-spec` contract.
+tritium-core = { workspace = true }
+
 [lints]
 workspace = true

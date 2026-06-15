@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
-Cargo.lock          # workspace of libs: keep unlocked; tritium-cli pins its own if needed
+# Cargo.lock is tracked — the workspace ships a binary (tritium-cli), so a locked
+# dependency graph keeps builds reproducible.
 
 # build artifacts from backends
 *.ptx

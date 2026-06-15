@@ -13,6 +13,16 @@
 //!
 //! The scale stored in a block is opaque to pack/unpack — the caller decides it
 //! (ggml uses `amax`, BitNet uses AbsMean). Roundtrip is trit-exact and scale-bit-exact.
+//!
+//! Beyond the per-block primitives, this crate provides:
+//!
+//! - **Row wrappers** ([`pack_tq2_0_row`] / [`unpack_tq2_0_row`] and the TQ1_0
+//!   pair) that quantize a run of `K` trits into `K.div_ceil(256)` blocks, each
+//!   with its own `f16` scale, zero-padding the final partial block.
+//! - A **GGUF v2/v3 container reader** ([`read_gguf`]) that parses the header,
+//!   metadata, and tensor table of an in-memory `.gguf` buffer. It is total: no
+//!   malformed input can panic or read out of bounds — every error is a typed
+//!   [`GgufError`].
 #![forbid(unsafe_code)]
 
 use core::fmt;
@@ -20,9 +30,16 @@ use core::fmt;
 use half::f16;
 use tritium_core::TritError;
 
+mod gguf;
+mod rows;
 mod tq1;
 mod tq2;
 
+pub use gguf::{
+    DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
+    TensorInfo, read_gguf,
+};
+pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};
 
