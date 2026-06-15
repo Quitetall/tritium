@@ -1,0 +1,18 @@
+[package]
+name = "tritium-runtime"
+description = "Backend registry and dispatch — backends self-register via linkme; no concrete backend deps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tritium-spec = { workspace = true }
+linkme = { workspace = true }
+
+[lints]
+workspace = true

@@ -8,9 +8,9 @@ members = [
     "crates/tritium-core",
     "crates/tritium-spec",     # backend trait contract, no impls
     "crates/tritium-format",   # TQ1_0/TQ2_0 packing, GGUF + safetensors I/O
+    "crates/tritium-testkit",  # reference vectors + conformance harness
+    "crates/tritium-runtime",  # registry, dispatch (linkme self-registration)
     # ── enabled as each lands (see docs/ROADMAP for the full crate graph) ──
-    # L0 foundation
-    # "crates/tritium-testkit",  # reference vectors + conformance harness
     # L1 backends
     # "crates/tritium-cpu",      # std::arch SIMD (x86 avx2/avx512/amx, arm neon/sve)
     # "crates/tritium-cuda",     # cudarc host + .cu kernels + nvrtc JIT

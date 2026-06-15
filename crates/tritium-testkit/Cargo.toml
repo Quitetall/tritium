@@ -1,0 +1,23 @@
+[package]
+name = "tritium-testkit"
+description = "Conformance vectors + a generic harness any TernaryBackend runs to prove it matches the reference."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-spec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
