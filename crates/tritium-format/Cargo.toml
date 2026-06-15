@@ -1,0 +1,22 @@
+[package]
+name = "tritium-format"
+description = "Ternary weight packing (TQ1_0/TQ2_0) and GGUF I/O — the single source of truth for on-disk layout."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Pack/unpack is a faithful port of ggml's TQ1_0/TQ2_0 reference (MIT, see NOTICE).
+[dependencies]
+tritium-core = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

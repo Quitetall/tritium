@@ -1,0 +1,19 @@
+[package]
+name = "tritium-spec"
+description = "The backend contract every Tritium execution backend implements (object-safe TernaryBackend trait)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# The contract crate: trait definitions only, zero backend implementations.
+# Depends on tritium-core (types) and nothing else.
+[dependencies]
+tritium-core = { workspace = true }
+
+[lints]
+workspace = true

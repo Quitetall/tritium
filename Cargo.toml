@@ -6,10 +6,10 @@
 resolver = "3"
 members = [
     "crates/tritium-core",
+    "crates/tritium-spec",     # backend trait contract, no impls
+    "crates/tritium-format",   # TQ1_0/TQ2_0 packing, GGUF + safetensors I/O
     # ── enabled as each lands (see docs/ROADMAP for the full crate graph) ──
     # L0 foundation
-    # "crates/tritium-format",   # TQ1_0/TQ2_0 packing, GGUF + safetensors I/O
-    # "crates/tritium-spec",     # backend trait contract, no impls
     # "crates/tritium-testkit",  # reference vectors + conformance harness
     # L1 backends
     # "crates/tritium-cpu",      # std::arch SIMD (x86 avx2/avx512/amx, arm neon/sve)
@@ -47,9 +47,16 @@ categories = ["science", "hardware-support", "mathematics"]
 
 # Shared dependency versions — crates opt in with `dep.workspace = true`.
 [workspace.dependencies]
+# internal crates (path deps; version omitted so pre-release bumps don't churn)
+tritium-core = { path = "crates/tritium-core" }
+tritium-spec = { path = "crates/tritium-spec" }
+tritium-format = { path = "crates/tritium-format" }
+tritium-runtime = { path = "crates/tritium-runtime" }
+tritium-testkit = { path = "crates/tritium-testkit" }
 # foundation
 bytemuck = "1"
 half = "2"
+linkme = "0.3"
 # cpu
 rayon = "1"
 # cuda
@@ -58,9 +65,14 @@ cc = "1"
 # bindings / frontends
 pyo3 = "0.23"
 ort = "2.0.0-rc.10"
+# cli
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
 # dev / test / bench
 proptest = "1"
 divan = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Lints applied workspace-wide; crates opt in with `[lints] workspace = true`.
 [workspace.lints.rust]

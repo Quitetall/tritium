@@ -28,14 +28,7 @@ impl GemmShape {
 
     /// Whether the operand/output buffer lengths are internally consistent.
     #[inline]
-    pub const fn buffers_fit(
-        &self,
-        act_len: usize,
-        weight_len: usize,
-        out_len: usize,
-    ) -> bool {
-        act_len == self.m * self.k
-            && weight_len == self.n * self.k
-            && out_len == self.m * self.n
+    pub const fn buffers_fit(&self, act_len: usize, weight_len: usize, out_len: usize) -> bool {
+        act_len == self.m * self.k && weight_len == self.n * self.k && out_len == self.m * self.n
     }
 }
