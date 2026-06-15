@@ -3,10 +3,11 @@
 All notable changes to Tritium. Format loosely follows Keep a Changelog; this is
 pre-1.0, so APIs may break between `0.x0` milestones.
 
-## [0.10.0-rc1] — 2026-06-14 — Foundation
+## [0.10.0] — 2026-06-15 — Foundation
 
 First milestone (ADR 0002 roadmap). A ternary mpGEMM runs bit-exact against the
-reference on CPU, end to end through the backend contract, registry, and CLI.
+reference on **CPU and CUDA**, end to end through the backend contract, registry,
+and CLI. All v0.10 exit gates (U1–U9) closed.
 
 ### Added
 - **tritium-core** — `Trit` (`{-1,0,+1}`, `repr(transparent)` i8), `DType`,
@@ -33,14 +34,14 @@ reference on CPU, end to end through the backend contract, registry, and CLI.
   declared `n_dims` could otherwise drive a ~34 GB allocation and abort). Found by
   the commit-review policy; fixed with regression tests.
 
-### Validated on GPU (RTX 4090, CUDA 13.3 / nvcc 13.3) — 2026-06-14
-- CUDA kernel vs reference and **CPU↔CUDA parity (U2)** ✓ — ported to cudarc 0.19;
-  both backends agree ≤1e-4 on the conformance set.
-- `compute-sanitizer` memcheck: **0 errors** (U7) ✓.
+### Gates closed for `0.10.0`
+- **GPU (RTX 4090, CUDA 13.3)** — CUDA kernel vs reference and **CPU↔CUDA parity
+  (U2)** ✓ (cudarc 0.19, both backends ≤1e-4); `compute-sanitizer` memcheck **0
+  errors** (U7) ✓.
+- **Fuzz (U5)** — GGUF parser, **550,816,129 runs / 1h, 0 crashes**, RSS flat.
+- **Real GGUF (0.10.5)** — reader pinned to the official `gguf` writer's output
+  (TQ2_0/TQ1_0/F16/F32 tensors + metadata), fixture committed.
+- `miri` is N/A (cannot execute AVX2 intrinsics); the unsafe AVX2 kernel is covered
+  by audit + reviewer sign-off + bit-exact scalar parity + `compute-sanitizer`.
 
-### Still open before `0.10.0` final
-- GGUF parser fuzz ≥1h (U5) — scheduled CI lane (`cargo-fuzz` target exists);
-  `miri` is N/A (cannot execute AVX2 intrinsics).
-- Real llama.cpp `.gguf` fixture load + golden-dump comparison.
-
-[0.10.0-rc1]: https://github.com/Quitetall/tritium/releases/tag/v0.10.0-rc1
+[0.10.0]: https://github.com/Quitetall/tritium/releases/tag/v0.10.0

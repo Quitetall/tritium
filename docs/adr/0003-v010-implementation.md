@@ -1,6 +1,6 @@
 # ADR 0003 — v0.10 Foundation: implementation record
 
-- **Status:** Accepted (rc1)
+- **Status:** Accepted (v0.10.0 — all U1–U9 gates closed, GPU-validated)
 - **Date:** 2026-06-14
 - **Relates:** executes the 0.10 milestone of [ADR 0002](./0002-release-roadmap.md)
 
@@ -44,15 +44,14 @@ Green locally (cpu-only, `clippy -D warnings`, fmt, ~95 tests + doctests):
 - **D** determinism; **Do** docs + doctests + `cli inspect`/`list-backends`.
 - End-to-end: `list-backends` discovers the linkme-registered CPU backend.
 
-Open — blocking `v0.10.0` final, tracked on dedicated CI lanes (`.github/workflows/ci.yml`):
-- **U2 / CUDA**: kernel vs reference and CPU↔CUDA parity — need a GPU + nvcc.
-- **U5**: GGUF fuzz ≥1h (target exists; `cargo-fuzz` not run here).
-- **U7**: `compute-sanitizer` (GPU); `miri` cannot execute AVX2 intrinsics, so the
-  unsafe kernel is covered by manual audit + reviewer sign-off + scalar bit-parity.
-- Real llama.cpp `.gguf` fixture + golden-dump comparison.
+Closed for `v0.10.0` (validated on an RTX 4090 + CUDA 13.3):
+- **U2 / CUDA** ✓: CUDA kernel vs reference and CPU↔CUDA parity (cudarc 0.19, ≤1e-4).
+- **U5** ✓: GGUF fuzz — 550,816,129 runs / 1h, 0 crashes, RSS flat.
+- **U7** ✓: `compute-sanitizer` memcheck 0 errors; `miri` N/A for AVX2 intrinsics, so
+  the unsafe kernel rests on audit + reviewer sign-off + bit-exact scalar parity.
+- Real GGUF ✓: reader pinned to the official `gguf` writer's output (`tests/real_gguf.rs`).
 
 ## Consequence
 
-`v0.10.0-rc1` is tagged: the CPU path is real, conformant, and reviewed; the GPU
-path compiles and is written against cudarc 0.13 but is unverified until a GPU lane
-runs. Promote to `v0.10.0` once the open gates pass.
+`v0.10.0` is tagged. Both the CPU and CUDA paths are real, conformant, reviewed, and
+GPU-validated; every U1–U9 gate is green. The foundation is ready for v0.20.

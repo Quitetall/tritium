@@ -22,3 +22,9 @@ __pycache__/
 # editor / os
 .DS_Store
 *.swp
+
+# cargo-fuzz generated
+crates/*/fuzz/corpus/
+crates/*/fuzz/artifacts/
+crates/*/fuzz/coverage/
+crates/*/fuzz/target/
