@@ -17,6 +17,18 @@ pub enum NnError {
     MissingMetadata(String),
     /// A backend call failed; the message is the stringified `BackendError`.
     Backend(String),
+    /// A tensor used a ggml type-id this layer cannot consume (the `u32` is the
+    /// offending ggml type-id, e.g. an unexpected quantization scheme).
+    UnsupportedTensorType(u32),
+    /// A weight tensor the model loader requires was not present in the GGUF
+    /// file; the `String` is the missing tensor name.
+    MissingTensor(String),
+    /// No execution backend satisfying the model's needs was available from the
+    /// runtime registry (e.g. ternary mpGEMM is unsupported on every device).
+    BackendUnavailable,
+    /// Tokenization or detokenization failed; the `String` is a human-readable
+    /// message from the tokenizer implementation.
+    Tokenizer(String),
 }
 
 impl fmt::Display for NnError {
@@ -29,6 +41,14 @@ impl fmt::Display for NnError {
                 write!(f, "missing or mistyped GGUF metadata: {key}")
             }
             NnError::Backend(msg) => write!(f, "backend error: {msg}"),
+            NnError::UnsupportedTensorType(t) => {
+                write!(f, "unsupported ggml tensor type-id: {t}")
+            }
+            NnError::MissingTensor(name) => write!(f, "missing tensor: {name}"),
+            NnError::BackendUnavailable => {
+                write!(f, "no execution backend available for this model")
+            }
+            NnError::Tokenizer(msg) => write!(f, "tokenizer error: {msg}"),
         }
     }
 }

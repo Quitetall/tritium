@@ -31,6 +31,7 @@ use half::f16;
 use tritium_core::TritError;
 
 mod gguf;
+mod i2s;
 mod rows;
 mod tq1;
 mod tq2;
@@ -39,6 +40,7 @@ pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
     TensorInfo, read_gguf,
 };
+pub use i2s::{GGML_TYPE_I2_S, I2S_BLOCK_BYTES, I2S_BLOCK_ELEMS, unpack_i2s_block};
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};

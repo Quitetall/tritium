@@ -2,6 +2,7 @@
 
 - **Status:** Accepted (scope + decisions approved 2026-06-14)
 - **Relates:** executes the 0.20 milestone of [ADR 0002](./0002-release-roadmap.md); builds on [ADR 0003](./0003-v010-implementation.md)
+- **Revised 2026-06-15:** research found the official BitNet 2B4T GGUF is **I2_S**, not TQ2_0 → v0.20 adds an I2_S reader to `tritium-format` (decodes to the exact trained trits + scale; per-row scale → existing `mpgemm` reused). BitNet is **W1.58A8** → the forward pass replicates int8 (per-token absmax) activation quant caller-side in `tritium-nn`. Reference oracle = HF `transformers BitNetForCausalLM` on the 4090. Full plan: `~/.claude/plans/eager-seeking-naur.md`.
 
 ## Context
 
@@ -43,9 +44,11 @@ as the exit gate.
 
 ### BitNet b1.58 2B4T target (from research)
 
-~2.4B params; **bias-free ternary** linear weights (TQ) with fp16 norms/embeddings/
-lm_head; **GQA** (K/V 8 heads, 4:1 group); RoPE; **ReLU² (squared ReLU) FFN**;
-sub-LN / RMSNorm; context 4096.
+~2.4B params; **bias-free ternary** weights loaded from an **I2_S** GGUF, with fp16
+norms / embeddings / lm_head; **GQA** 20 Q / **5 KV** heads (4:1 group), head_dim 128;
+RoPE θ=500000; **ReLU² (squared ReLU) FFN** (6912); sub-LN / RMSNorm; context 4096.
+**W1.58A8** — activations are int8-quantized per-token (absmax), replicated in the
+forward pass (without it greedy token-match fails).
 
 ### Parallelization waves
 

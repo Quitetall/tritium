@@ -1,7 +1,4 @@
-//! Neural-net ops. Foundation set (RMSNorm + greedy sampling); RoPE, GQA
-//! attention, softmax, and top-k/top-p sampling land in the per-op wave.
-
-use core::cmp::Ordering;
+//! RMSNorm — the only normalization BitNet (and the llama family) uses.
 
 use crate::error::NnError;
 
@@ -36,17 +33,6 @@ pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) -> Result<(), Nn
     Ok(())
 }
 
-/// Greedy sampling: the index of the maximum logit (NaN-tolerant; NaNs lose).
-/// Returns `None` for empty logits.
-#[must_use]
-pub fn sample_greedy(logits: &[f32]) -> Option<u32> {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Less))
-        .map(|(i, _)| i as u32)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,13 +56,5 @@ mod tests {
             rmsnorm(&[1.0, 2.0], &[1.0], 0.0, &mut out),
             Err(NnError::Shape { .. })
         ));
-    }
-
-    #[test]
-    fn greedy_picks_argmax() {
-        assert_eq!(sample_greedy(&[0.1, 0.9, 0.3, 0.2]), Some(1));
-        assert_eq!(sample_greedy(&[]), None);
-        // NaN must not win.
-        assert_eq!(sample_greedy(&[f32::NAN, 0.5]), Some(1));
     }
 }

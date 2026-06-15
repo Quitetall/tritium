@@ -15,8 +15,19 @@
 
 mod config;
 mod error;
+mod kv_cache;
+mod layers;
+mod model;
 mod ops;
+mod tensor;
 
 pub use config::ModelConfig;
 pub use error::NnError;
-pub use ops::{rmsnorm, sample_greedy};
+pub use kv_cache::KvCache;
+pub use layers::{Relu2Mlp, TernaryLinear, TransformerBlock};
+pub use model::{LayerWeights, ModelRunner, ModelWeights, Tokenizer};
+pub use ops::{
+    QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_greedy, sample_top_k,
+    sample_top_p, softmax_rows,
+};
+pub use tensor::f16_bytes_to_f32;
