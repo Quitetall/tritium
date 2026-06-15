@@ -3,6 +3,13 @@
 - **Status:** Accepted (scope + decisions approved 2026-06-14)
 - **Relates:** executes the 0.20 milestone of [ADR 0002](./0002-release-roadmap.md); builds on [ADR 0003](./0003-v010-implementation.md)
 - **Revised 2026-06-15:** research found the official BitNet 2B4T GGUF is **I2_S**, not TQ2_0 → v0.20 adds an I2_S reader to `tritium-format` (decodes to the exact trained trits + scale; per-row scale → existing `mpgemm` reused). BitNet is **W1.58A8** → the forward pass replicates int8 (per-token absmax) activation quant caller-side in `tritium-nn`. Reference oracle = HF `transformers BitNetForCausalLM` on the 4090. Full plan: `~/.claude/plans/eager-seeking-naur.md`.
+- **WF-1 confirmed (2026-06-15):** I2_S ggml type-id **36**; the scale is a single
+  **per-tensor** f32 trailer (used as a broadcast per-channel scale), decoded trits
+  bit-exact vs the HF checkpoint; an element interleaving (block groups → rows
+  `r, 160+r, 320+r, 480+r`) is applied at load. A8 uses **Qb=127** (`scale=127/absmax`,
+  range `[-128,127]`, round-half-to-even) per `transformers/integrations/bitnet.py`
+  `ActQuant`. `read_gguf` leaves `n_bytes==0` for type-36; the loader sizes I2_S as
+  `n_elements/4 + 32`.
 
 ## Context
 

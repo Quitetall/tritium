@@ -40,7 +40,10 @@ pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
     TensorInfo, read_gguf,
 };
-pub use i2s::{GGML_TYPE_I2_S, I2S_BLOCK_BYTES, I2S_BLOCK_ELEMS, unpack_i2s_block};
+pub use i2s::{
+    GGML_TYPE_I2_S, I2S_BLOCK_BYTES, I2S_BLOCK_ELEMS, I2S_SCALE_BYTES, unpack_i2s_block,
+    unpack_i2s_tensor,
+};
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};
@@ -74,6 +77,9 @@ pub enum FormatError {
     },
     /// A decoded value fell outside `{-1, 0, +1}` (corrupt input).
     DecodedOutOfRange(i32),
+    /// An I2_S 2-bit code was the reserved `0b11` (corrupt input). I2_S defines
+    /// only `0b00`=0, `0b01`=+1, `0b10`=-1; `0b11` never occurs in valid weights.
+    InvalidI2sCode(u8),
 }
 
 impl fmt::Display for FormatError {
@@ -90,6 +96,9 @@ impl fmt::Display for FormatError {
             }
             FormatError::DecodedOutOfRange(v) => {
                 write!(f, "decoded value {v} outside ternary range")
+            }
+            FormatError::InvalidI2sCode(c) => {
+                write!(f, "invalid I2_S 2-bit code 0b{c:02b} (reserved)")
             }
         }
     }
