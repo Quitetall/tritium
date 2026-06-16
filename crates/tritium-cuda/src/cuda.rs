@@ -67,6 +67,9 @@ const KERNEL_NAME_RMSNORM: &str = "rmsnorm_f32";
 /// The device-resident RoPE decode kernel (v0.3.1) — bit-matches the host
 /// `tritium_nn::ops::rope_apply` (precomputed f64→f32 trig, f32 rotation, no FMA).
 const KERNEL_NAME_ROPE: &str = "rope_apply_f32";
+/// The device-resident softmax decode kernel (v0.3.1) — matches
+/// `tritium_nn::ops::softmax_rows`; only `expf` may differ from host libm by ~1 ULP.
+const KERNEL_NAME_SOFTMAX: &str = "softmax_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -184,6 +187,10 @@ pub struct CudaBackend {
     /// The resolved `rope_apply_f32` decode kernel (bit-matches `ops::rope_apply`).
     #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
     func_rope: CudaFunction,
+    /// The resolved `softmax_f32` decode kernel (matches `ops::softmax_rows`; expf may
+    /// differ ~1 ULP).
+    #[allow(dead_code)] // wired into `forward_device` (attention) next; W1-in-progress.
+    func_softmax: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -255,6 +262,9 @@ impl CudaBackend {
         let func_rope = decode_module
             .load_function(KERNEL_NAME_ROPE)
             .map_err(|e| driver_err("resolve rope kernel", &e))?;
+        let func_softmax = decode_module
+            .load_function(KERNEL_NAME_SOFTMAX)
+            .map_err(|e| driver_err("resolve softmax kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -278,6 +288,7 @@ impl CudaBackend {
             _decode_module: decode_module,
             func_rmsnorm,
             func_rope,
+            func_softmax,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -436,6 +447,59 @@ impl CudaBackend {
         self.stream
             .memcpy_dtoh(&d_x, x)
             .map_err(|e| driver_err("rope dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device row-wise softmax on host slices, in-place on `x` (`[rows, row_len]`).
+    /// Matches `tritium_nn::ops::softmax_rows` except possibly `expf` (device libm vs
+    /// host glibc). A building block for the device-resident attention.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on a length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // wired into `forward_device` (attention) next; W1-in-progress.
+    pub(crate) fn softmax(
+        &self,
+        x: &mut [f32],
+        row_len: usize,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        if row_len == 0 || x.len() != rows * row_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * row_len,
+                got: x.len(),
+            });
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        let mut d_x = self
+            .stream
+            .clone_htod(x)
+            .map_err(|e| driver_err("softmax htod", &e))?;
+        let row_len_i = row_len as i32;
+        let rows_i = rows as i32;
+        let threads = 64u32;
+        let grid = (rows as u32).div_ceil(threads);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_softmax);
+        launch.arg(&mut d_x).arg(&row_len_i).arg(&rows_i);
+
+        // SAFETY: kernel signature `(float* x, int row_len, int rows)`; args pushed in
+        // that order/type. `d_x` is the `[rows*row_len]` in-place buffer; one thread
+        // per row, guarded by `row >= rows`, each touching only its own row.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch softmax", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_x, x)
+            .map_err(|e| driver_err("softmax dtoh", &e))?;
         Ok(())
     }
 
@@ -2336,5 +2400,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Measure device softmax vs host `softmax_rows`. The reductions are bit-matched;
+    /// the open question is `expf` (device CUDA libm vs host glibc). Reports the max
+    /// ULP difference + whether bit-exact, and asserts a tight relative tolerance so
+    /// the result is informative without spuriously failing on a ~1-ULP exp delta.
+    /// This is the gate-deciding measurement: bit-exact ⇒ strict greedy 256/256 is
+    /// reachable; otherwise the forward uses the perplexity+lockstep fallback.
+    #[test]
+    fn softmax_vs_host_exp_divergence() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping softmax divergence: no device ({e})");
+                return;
+            }
+        };
+        fn host_softmax(x: &mut [f32], row_len: usize) {
+            for row in x.chunks_mut(row_len) {
+                let mut m = f32::NEG_INFINITY;
+                for &v in row.iter() {
+                    if v > m {
+                        m = v;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for v in row.iter_mut() {
+                    let e = (*v - m).exp();
+                    *v = e;
+                    sum += e;
+                }
+                let inv = 1.0f32 / sum;
+                for v in row.iter_mut() {
+                    *v *= inv;
+                }
+            }
+        }
+        let (rows, row_len) = (20usize, 1024usize); // decode-ish: n_head × ctx
+        let mut s = 0x5151_5151_2727_2727u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f32 / (1u64 << 53) as f32) * 16.0 - 8.0
+        };
+        let x0: Vec<f32> = (0..rows * row_len).map(|_| next()).collect();
+        let mut want = x0.clone();
+        host_softmax(&mut want, row_len);
+        let mut got = x0.clone();
+        backend.softmax(&mut got, row_len, rows).expect("device softmax");
+
+        let (mut max_ulp, mut n_diff, mut max_rel) = (0i64, 0usize, 0.0f64);
+        for (&g, &h) in got.iter().zip(&want) {
+            let du = (i64::from(g.to_bits()) - i64::from(h.to_bits())).abs();
+            if du != 0 {
+                n_diff += 1;
+            }
+            max_ulp = max_ulp.max(du);
+            if h != 0.0 {
+                max_rel = max_rel.max((f64::from(g - h) / f64::from(h)).abs());
+            }
+        }
+        eprintln!(
+            "softmax device-vs-host: max_ulp={max_ulp} n_diff={n_diff}/{} max_rel={max_rel:.3e} bit_exact={}",
+            got.len(),
+            n_diff == 0
+        );
+        assert!(
+            max_rel < 1e-5,
+            "device softmax exp diverges too far from host: max_rel={max_rel:.3e}"
+        );
     }
 }

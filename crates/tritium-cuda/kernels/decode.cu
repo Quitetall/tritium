@@ -98,4 +98,32 @@ __global__ void rope_apply_f32(float* __restrict__ x,
   x[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
 }
 
+// softmax_f32 — row-wise softmax matching tritium_nn::ops::softmax_rows: one thread
+// per row, sequential max → exp(x-max) → sum → divide, in the host's order. The
+// reductions are sequential (bit-match), and `__fsub_rn`/`__fadd_rn`/`__fdiv_rn`/
+// `__fmul_rn` forbid FMA. The ONE op that may not bit-match host f32 is `expf`:
+// CUDA's libm differs from the host's glibc `expf` and can disagree by ~1 ULP. If so,
+// softmax (and attention) fall to the perplexity+lockstep gate; everything else stays
+// bit-exact. In-place on `x` (`[rows, row_len]`).
+__global__ void softmax_f32(float* __restrict__ x, const int row_len, const int rows) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  float* r = x + (long long)row * row_len;
+
+  float m = -INFINITY;  // host: NaN-ignoring max via `v > m`
+  for (int i = 0; i < row_len; ++i) {
+    if (r[i] > m) m = r[i];
+  }
+  float sum = 0.0f;
+  for (int i = 0; i < row_len; ++i) {
+    const float e = expf(__fsub_rn(r[i], m));  // host: (v - max).exp()
+    r[i] = e;
+    sum = __fadd_rn(sum, e);
+  }
+  const float inv = __fdiv_rn(1.0f, sum);
+  for (int i = 0; i < row_len; ++i) {
+    r[i] = __fmul_rn(r[i], inv);
+  }
+}
+
 }  // extern "C"
