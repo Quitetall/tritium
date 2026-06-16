@@ -62,4 +62,40 @@ __global__ void rmsnorm_f32(const float* __restrict__ x,
   }
 }
 
+// rope_apply_f32 — bit-exact match of tritium_nn::ops::rope_apply for ONE token
+// (the M=1 decode case). NeoX half-rotated: lane j in [0,half) pairs with j+half,
+//   out[j]      = a*cos - b*sin ;  out[j+half] = b*cos + a*sin   (a=x[j], b=x[j+half])
+//
+// The host computes (cos,sin) as the **f64** `sin_cos(pos * theta^(-2j/d))` cast to
+// f32 — data-independent of the activations — so they are PRECOMPUTED host-side
+// (identically) and passed in as `cos_t`/`sin_t` (`half` entries for this token's
+// position). The forward builds a `[ctx, half]` table once at load and indexes it by
+// position, so there is no per-token host work. The rotation itself is plain f32
+// mul/add/sub with no FMA (matching the host's three separate roundings).
+//
+// One thread per (head, j) pair; each pair is read+written by a single thread, so
+// the in-place update is race-free.
+__global__ void rope_apply_f32(float* __restrict__ x,
+                               const float* __restrict__ cos_t,  // [half], this pos
+                               const float* __restrict__ sin_t,  // [half], this pos
+                               const int n_head,
+                               const int head_dim) {
+  const int half = head_dim >> 1;
+  const int total = n_head * half;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+
+  const int head = idx / half;
+  const int j = idx - head * half;
+  const int base = head * head_dim;
+
+  const float c = cos_t[j];
+  const float s = sin_t[j];
+  const float a = x[base + j];
+  const float b = x[base + j + half];
+  // host: a*cos - b*sin  and  b*cos + a*sin (two muls then add/sub, no FMA).
+  x[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+  x[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+}
+
 }  // extern "C"

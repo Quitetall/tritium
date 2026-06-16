@@ -64,6 +64,9 @@ const KERNEL_NAME_ACT_QUANT: &str = "act_quant_int8_per_token";
 /// The device-resident RMSNorm decode kernel (v0.3.1) — bit-matches the host
 /// `tritium_nn::ops::rmsnorm` (sequential f32 sum-of-squares, no FMA).
 const KERNEL_NAME_RMSNORM: &str = "rmsnorm_f32";
+/// The device-resident RoPE decode kernel (v0.3.1) — bit-matches the host
+/// `tritium_nn::ops::rope_apply` (precomputed f64→f32 trig, f32 rotation, no FMA).
+const KERNEL_NAME_ROPE: &str = "rope_apply_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -178,6 +181,9 @@ pub struct CudaBackend {
     // the per-token decode next. W1-in-progress.
     #[allow(dead_code)]
     func_rmsnorm: CudaFunction,
+    /// The resolved `rope_apply_f32` decode kernel (bit-matches `ops::rope_apply`).
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    func_rope: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -246,6 +252,9 @@ impl CudaBackend {
         let func_rmsnorm = decode_module
             .load_function(KERNEL_NAME_RMSNORM)
             .map_err(|e| driver_err("resolve rmsnorm kernel", &e))?;
+        let func_rope = decode_module
+            .load_function(KERNEL_NAME_ROPE)
+            .map_err(|e| driver_err("resolve rope kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -268,6 +277,7 @@ impl CudaBackend {
             func_act_quant,
             _decode_module: decode_module,
             func_rmsnorm,
+            func_rope,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -351,6 +361,81 @@ impl CudaBackend {
         self.stream
             .memcpy_dtoh(&d_out, out)
             .map_err(|e| driver_err("rmsnorm dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device RoPE for one token (M=1 decode) on host slices, **bit-matching**
+    /// `tritium_nn::ops::rope_apply`. `cos_t`/`sin_t` are the `head_dim/2` precomputed
+    /// f32 trig values for the token's absolute position (built host-side identically
+    /// to the host op). In-place on `x` (`[n_head * head_dim]`). A building block for
+    /// the device-resident forward.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on a length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    pub(crate) fn rope(
+        &self,
+        x: &mut [f32],
+        cos_t: &[f32],
+        sin_t: &[f32],
+        n_head: usize,
+        head_dim: usize,
+    ) -> Result<(), BackendError> {
+        let half = head_dim / 2;
+        if x.len() != n_head * head_dim || cos_t.len() != half || sin_t.len() != half {
+            return Err(BackendError::ShapeMismatch {
+                expected: n_head * head_dim,
+                got: x.len(),
+            });
+        }
+        let total = n_head * half;
+        if total == 0 {
+            return Ok(());
+        }
+        let mut d_x = self
+            .stream
+            .clone_htod(x)
+            .map_err(|e| driver_err("rope htod x", &e))?;
+        let d_cos = self
+            .stream
+            .clone_htod(cos_t)
+            .map_err(|e| driver_err("rope htod cos", &e))?;
+        let d_sin = self
+            .stream
+            .clone_htod(sin_t)
+            .map_err(|e| driver_err("rope htod sin", &e))?;
+
+        let n_head_i = n_head as i32;
+        let head_dim_i = head_dim as i32;
+        let threads = 256u32;
+        let grid = (total as u32).div_ceil(threads);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_rope);
+        launch
+            .arg(&mut d_x)
+            .arg(&d_cos)
+            .arg(&d_sin)
+            .arg(&n_head_i)
+            .arg(&head_dim_i);
+
+        // SAFETY: kernel signature `(float* x, const float* cos, const float* sin,
+        // int n_head, int head_dim)`; args pushed in that order/type. `d_x` is the
+        // length-`n_head*head_dim` in-place buffer, `d_cos`/`d_sin` are length-`half`;
+        // the grid covers `n_head*half` threads each guarded by `idx >= total`, and
+        // every (head,j) pair is owned by exactly one thread (race-free in-place).
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch rope", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_x, x)
+            .map_err(|e| driver_err("rope dtoh", &e))?;
         Ok(())
     }
 
@@ -2182,6 +2267,73 @@ mod tests {
                     g.to_bits(),
                     h.to_bits()
                 );
+            }
+        }
+    }
+
+    /// The device `rope_apply_f32` kernel must reproduce `tritium_nn::ops::rope_apply`
+    /// **bit-for-bit** for one token (M=1 decode). The trig is computed exactly as the
+    /// host op (f64 `sin_cos` → f32, data-independent) and the f32 rotation has no FMA.
+    #[test]
+    fn rope_bit_matches_host() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping rope bit-match: no device ({e})");
+                return;
+            }
+        };
+        // BitNet 2B4T uses head_dim=128, n_head 20(Q)/5(KV), theta=500000.
+        for &(n_head, head_dim) in &[(20usize, 128usize), (5, 128), (1, 8), (3, 64)] {
+            let half = head_dim / 2;
+            let theta = 500_000.0f32;
+            for &pos in &[0usize, 1, 7, 255, 4095] {
+                // Trig tables, identical to the host op (f64 sin_cos cast to f32).
+                let theta_f64 = f64::from(theta);
+                let inv_hd = 1.0 / head_dim as f64;
+                let mut cos_t = vec![0.0f32; half];
+                let mut sin_t = vec![0.0f32; half];
+                for j in 0..half {
+                    let inv_freq = theta_f64.powf(-2.0 * j as f64 * inv_hd);
+                    let (s, c) = (pos as f64 * inv_freq).sin_cos();
+                    cos_t[j] = c as f32;
+                    sin_t[j] = s as f32;
+                }
+                // Deterministic input.
+                let mut st =
+                    0xDEAD_BEEF_CAFE_F00Du64 ^ ((pos as u64) * 131 + n_head as u64 * 17 + head_dim as u64);
+                let mut next = || {
+                    st ^= st << 13;
+                    st ^= st >> 7;
+                    st ^= st << 17;
+                    ((st >> 11) as f32 / (1u64 << 53) as f32) * 8.0 - 4.0
+                };
+                let x0: Vec<f32> = (0..n_head * head_dim).map(|_| next()).collect();
+
+                // Host rope (replicated; Rust does not auto-contract a*c - b*s to FMA).
+                let mut want = x0.clone();
+                for head in 0..n_head {
+                    let base = head * head_dim;
+                    for j in 0..half {
+                        let a = x0[base + j];
+                        let b = x0[base + j + half];
+                        want[base + j] = a * cos_t[j] - b * sin_t[j];
+                        want[base + j + half] = b * cos_t[j] + a * sin_t[j];
+                    }
+                }
+
+                let mut got = x0.clone();
+                backend
+                    .rope(&mut got, &cos_t, &sin_t, n_head, head_dim)
+                    .expect("device rope");
+
+                for (i, (&g, &h)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        h.to_bits(),
+                        "rope bit mismatch (n_head={n_head} head_dim={head_dim} pos={pos}) i={i}: got {g} want {h}"
+                    );
+                }
             }
         }
     }
