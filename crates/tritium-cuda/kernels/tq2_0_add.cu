@@ -118,6 +118,8 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled(
     const int lane = threadIdx.x % WARP_SIZE;
     const int mi = blockIdx.y;          // one block-row per output row
 
+    // Defensive only: the host launches grid.y == m, so mi < m always holds here.
+    // Kept so the kernel stays safe if a future launch ever over-dispatches Y.
     if (mi >= m) {
         return;
     }

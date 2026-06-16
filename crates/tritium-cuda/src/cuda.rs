@@ -263,6 +263,13 @@ impl CudaBackend {
                 )
             }
             AddKernel::Tiled => {
+                // `select_add_kernel` only routes K within the shared budget here;
+                // assert it for direct callers (the tests) so an oversized K fails
+                // loudly rather than as a cryptic CUDA shared-mem launch error.
+                debug_assert!(
+                    k <= TILED_K_MAX,
+                    "tiled kernel K={k} exceeds the {TILED_K_MAX} shared-mem cap"
+                );
                 // One warp per output column → a block covers WARPS_PER_BLOCK of N;
                 // one block-row per M. Shared memory stages this row's K acts.
                 let grid_n = (n as u32).div_ceil(WARPS_PER_BLOCK);
