@@ -32,6 +32,7 @@ use tritium_core::TritError;
 
 mod gguf;
 mod i2s;
+mod i2s_int8;
 mod rows;
 mod tq1;
 mod tq2;
@@ -44,6 +45,7 @@ pub use i2s::{
     GGML_TYPE_I2_S, I2S_BLOCK_BYTES, I2S_BLOCK_ELEMS, I2S_SCALE_BYTES, unpack_i2s_block,
     unpack_i2s_tensor,
 };
+pub use i2s_int8::{I2sInt8Weights, convert_i2s_to_int8, convert_i2s_to_tq2_0};
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};
@@ -77,8 +79,9 @@ pub enum FormatError {
     },
     /// A decoded value fell outside `{-1, 0, +1}` (corrupt input).
     DecodedOutOfRange(i32),
-    /// An I2_S 2-bit code was the reserved `0b11` (corrupt input). I2_S defines
-    /// only `0b00`=0, `0b01`=+1, `0b10`=-1; `0b11` never occurs in valid weights.
+    /// An I2_S 2-bit code was the reserved `0b11` (corrupt input). I2_S decodes
+    /// `trit = code - 1`, so only `0b00`=-1, `0b01`=0, `0b10`=+1 are valid; `0b11`
+    /// never occurs in valid weights (see [`i2s`] for the WF-4 verification).
     InvalidI2sCode(u8),
 }
 

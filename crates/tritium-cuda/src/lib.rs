@@ -41,6 +41,15 @@ mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::CudaBackend;
 
+// v0.30 (ADR 0005) skeletons. `autotune` is pure Rust (tile config + on-disk
+// cache keying) so it builds and tests on cpu-only lanes; `codegen` links
+// cudarc's nvrtc path, so it is gated behind `cuda`. WF-B implements both and the
+// IMMA kernel (WF-A) selects a tuned tile through them.
+mod autotune;
+
+#[cfg(feature = "cuda")]
+mod codegen;
+
 #[cfg(test)]
 mod tests {
     // Default-build sanity: the crate compiles, the spec types it is written

@@ -23,6 +23,7 @@ members = [
     # "crates/tritium-runtime",  # registry, dispatch, mem pools, autotune cache
     # "crates/tritium-quantize", # fp -> ternary (AbsMean/GPTQ/learned scales)
     "crates/tritium-nn",       # mixed-precision ops + model runner
+    "benches",                 # divan microbenches + perf harness (v0.30, ADR 0005)
     # "crates/tritium-train",    # [planned] QAT, STE autograd, optimizer
     # L3 frontends / bindings
     # "crates/tritium-ffi",      # C ABI cdylib + cbindgen

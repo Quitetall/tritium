@@ -1,0 +1,29 @@
+[package]
+name = "tritium-benches"
+description = "Divan microbenchmarks + end-to-end perf harness for Tritium (v0.30)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-spec = { workspace = true }
+tritium-cpu = { workspace = true }
+tritium-format = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+divan = { workspace = true }
+
+# WF-E extends this with the IMMA/add-only GPU benches, the end-to-end tokens/sec
+# bench on BitNet, and the roofline / regression harness.
+[[bench]]
+name = "mpgemm"
+harness = false

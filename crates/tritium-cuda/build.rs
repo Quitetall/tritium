@@ -29,6 +29,11 @@ fn main() {
     // Rebuild triggers regardless of feature state: cheap, and correct when the
     // feature is later toggled on.
     println!("cargo:rerun-if-changed=kernels/tq2_0_add.cu");
+    // WF-A (v0.30): the IMMA prefill kernel. Its `mma.m16n8k32` int8 shape needs
+    // sm_80+, so WF-A emits a SECOND PTX target (compute_80) for it here — it is
+    // NOT compiled yet (the placeholder .cu only declares the entry point). The
+    // rerun trigger is wired now so toggling it on later rebuilds correctly.
+    println!("cargo:rerun-if-changed=kernels/tq2_0_imma.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");

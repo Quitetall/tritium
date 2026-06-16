@@ -53,6 +53,12 @@ use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
 #[allow(unsafe_code)]
 mod kernel;
 
+// SIMD kernel variants for v0.30 (AVX-512 / VNNI, ARM NEON, T-MAC LUT). Skeleton
+// module tree (ADR 0005); WF-C implements them and wires the selection into
+// `kernel::dispatch_mpgemm` behind the existing `is_x86_feature_detected!` /
+// `target_arch` dispatch, gated by the cross-ISA conformance parity gate.
+mod simd;
+
 /// Owned host-memory buffer of packed weight bytes.
 ///
 /// [`CpuBackend::upload_weights`] copies the caller's packed bytes into one of
@@ -232,6 +238,9 @@ impl TernaryBackend for CpuBackend {
         // Unpack the [N, K] weights; this also validates the packed byte length.
         let trits = Self::unpack_weights(buf, shape, format)?;
 
+        // WF-C dispatch hook: `dispatch_mpgemm` picks AVX2-vs-scalar today; the
+        // v0.30 `simd::{avx512,neon,lut}` paths slot in here behind feature
+        // detection (results must stay bit-parity with the scalar reference).
         kernel::dispatch_mpgemm(act, &trits, scales, shape, out)
     }
 }
