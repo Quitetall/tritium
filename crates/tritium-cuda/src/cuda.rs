@@ -1124,7 +1124,10 @@ mod tests {
     /// all are: K ∈ {256, 512}).
     fn build_i2s_payload(trits: &[i8], scale: f32) -> Vec<u8> {
         let n_elements = trits.len();
-        assert!(n_elements % 128 == 0, "i2s payload needs 128-multiple elems");
+        assert!(
+            n_elements.is_multiple_of(128),
+            "i2s payload needs 128-multiple elems"
+        );
         let mut quants = vec![0u8; n_elements / 4];
         for (global, &t) in trits.iter().enumerate() {
             let block = global / 128;
