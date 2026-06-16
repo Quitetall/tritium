@@ -7,6 +7,16 @@ timestamp: 2026-06-14T00:00:00Z
 
 # Log
 
+- **2026-06-16** — Tagged **v0.3.0** (Performance). Versioning switched to SemVer
+  (the old `0.30` milestone is `0.3.0`). The performance tier on the v0.2.0 spine,
+  **zero numerics change**: a tiled add-only decode kernel + an IMMA `mma.m16n8k32`
+  int8 prefill kernel, an on-device fused W1.58A8 path (`mpgemm_with_act_quant` +
+  `TernaryFormat::I2sInt8`), nvrtc-JIT autotune with an on-disk tile cache (JIT==AOT
+  bit-identical), AVX-512/NEON CPU kernels + the T-MAC LUT, and a divan + roofline
+  bench harness. Verified on an RTX 4090: IMMA==reference, fused==host-A8, greedy
+  256/256 exact + perplexity 2.81e-3 preserved, sanitizer-clean. AVX-512/NEON
+  execution + the `≥1.2×` bitnet.cpp e2e target are lane-deferred / follow-on
+  (IMMA not yet wired into the model forward). ADR 0005.
 - **2026-06-15** — Tagged **v0.20.0** (Inference Spine). BitNet b1.58 2B4T loads from
   its I2_S GGUF and decodes tokens matching HF transformers on CPU + CUDA: CUDA greedy
   256/256 exact, perplexity 2.81e-3 (≤1%), CPU↔CUDA bit-identical. New: tritium-nn

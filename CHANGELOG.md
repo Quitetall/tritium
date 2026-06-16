@@ -1,7 +1,58 @@
 # Changelog
 
 All notable changes to Tritium. Format loosely follows Keep a Changelog; this is
-pre-1.0, so APIs may break between `0.x0` milestones.
+pre-1.0, so APIs may break between minor versions.
+
+> **Versioning:** SemVer (`MAJOR.MINOR.PATCH`) from **0.3.0** onward. The earlier
+> tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
+> correspond conceptually to 0.1.0 / 0.2.0.
+
+## [0.3.0] — 2026-06-16 — Performance
+
+The performance tier on the v0.2.0 spine — **fast kernels with zero numerics
+change** (ADR 0005). BitNet 2B4T greedy still matches transformers 256/256 exact,
+perplexity 2.81e-3, CPU↔CUDA bit-identical, with the new decode kernel as default.
+
+### Added
+- **tritium-cuda** — a **tiled add-only decode kernel** (`tq2_0_add_mpgemm_tiled`:
+  warp-per-output, shared-mem-staged activations, warp reduction, f64 accumulate;
+  auto-selected for decode) and an **IMMA int8 prefill kernel**
+  (`tq2_0_imma_mpgemm`: `mma.m16n8k32` `s32.s8.s8.s32` tensor cores, exact int32
+  accumulate, double-buffered shared unpack, `compute_80` second PTX). Fused
+  `CudaBackend::mpgemm_with_act_quant` — on-device per-token int8 absmax quant →
+  IMMA → scale fold. **WF-B autotune + nvrtc JIT**: `codegen::render_imma_source`
+  over a `TileConfig`, a budget-pruned tile sweep, an on-disk cache keyed by
+  arch+dtype+shape-bucket+CUDA-version; JIT == AOT bit-identical by construction.
+- **tritium-spec** — optional `TernaryBackend::mpgemm_with_act_quant` (default impl
+  = host W1.58A8); a GPU backend overrides it for the on-device fused path.
+- **tritium-format** — `TernaryFormat::I2sInt8` + `convert_i2s_to_int8` (the IMMA
+  tile interleave, byte-for-byte the kernel's B operand) and `convert_i2s_to_tq2_0`.
+- **tritium-cpu** — AVX-512 + ARM NEON ternary kernels (bit-exact with scalar via a
+  shared k-order fold) behind feature dispatch; the ISA-agnostic T-MAC LUT
+  (implemented + unit-tested, off the hot path until its SIMD gather lands).
+- **benches/** — divan CPU + GPU mpGEMM microbenches over 20 BitNet shapes, an
+  end-to-end tokens/sec bench coupled to a perplexity check, a roofline ceiling
+  (`peak_HBM / model_bytes` = 848.6 tok/s decode; 660.6 int8 TOPS prefill) + an
+  `ncu` %-of-SOL recipe, and a `>5%` regression CI lane.
+
+### Validated (RTX 4090, sm_89, nvcc 13.3; independently re-run)
+- IMMA == reference (exact int32 accumulate; fragment layout audited vs the PTX ISA
+  + CUTLASS); fused == host-A8 == caller quant; tail shapes on every kernel; JIT ==
+  AOT bit-identical; tiled decode within 1e-4 of the sequential reference.
+- **End-to-end greedy 256/256 exact, perplexity 2.81e-3** with the new kernels.
+- compute-sanitizer memcheck/racecheck/synccheck **0 errors**; build + clippy **0
+  warnings**; full cpu + `--features cuda` suites green.
+
+### Notes / not yet closed
+- **AVX-512 / NEON execution is lane-deferred** (the dev box is AVX2-only x86_64):
+  AVX-512 compile-checked, NEON aarch64 cross-compile-checked, LUT + AVX2 + scalar
+  parity gated here.
+- The **`≥1.2×` bitnet.cpp end-to-end tok/s target is not yet hit**: the IMMA kernel
+  is conformance-verified + microbenched but **not yet wired into the model forward**,
+  which still has the v0.20 per-matmul host round-trips. The competitor baseline is
+  **published** bitnet.cpp numbers (a same-HW build + a live `ncu` run are follow-on).
+  v0.3.0 ships the verified fast *kernels* + harness; the *end-to-end* speedup is the
+  next perf milestone.
 
 ## [0.20.0] — 2026-06-15 — Inference Spine
 
