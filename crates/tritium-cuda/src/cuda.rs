@@ -26,7 +26,8 @@
 //! the pattern `tritium-runtime` uses for its `distributed_slice` statics.
 
 use core::any::Any;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
@@ -40,6 +41,11 @@ use tritium_format::{
 };
 use tritium_runtime::BackendEntry;
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+
+use crate::autotune::{
+    CacheKey, CandidateResult, ShapeBucket, TileConfig, cache_dir, tune_or_load,
+};
+use crate::codegen::{JIT_KERNEL_NAME, compile_imma};
 
 /// Kernel entry point — must match the `extern "C"` symbol in the `.cu` file.
 /// (cudarc 0.19 keys modules by the returned [`CudaModule`] handle, not by a
@@ -162,6 +168,26 @@ pub struct CudaBackend {
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
     device_name: String,
+    /// The device's SM arch tag (`"sm_89"` on the 4090), part of the autotune
+    /// [`CacheKey`] so a tuned tile is never reused across architectures.
+    sm_arch: String,
+    /// The CUDA driver version (`cuDriverGetVersion`, e.g. `13030`), the cache
+    /// invalidation axis — a driver bump can change the JIT'd SASS, so a stale tuned
+    /// entry keyed under the old version is ignored.
+    cuda_version: u32,
+    /// Process-lifetime cache of JIT-compiled IMMA functions, keyed by the exact
+    /// [`TileConfig`] they were rendered for. Compiling a kernel via nvrtc is
+    /// expensive, so each distinct tile is compiled at most once per process; the
+    /// owning [`CudaModule`] is held alongside so the [`CudaFunction`] stays valid.
+    /// A `Mutex` makes the backend `Sync` (the spec trait does not require it, but
+    /// the runtime may share a backend across threads). Determinism is unaffected:
+    /// the same tile always renders the same source → the same SASS → the same
+    /// numerics, whether read from this cache or freshly compiled.
+    imma_jit: Mutex<HashMap<TileConfig, (Arc<CudaModule>, CudaFunction)>>,
+    /// Per-(arch,dtype,shape-bucket,version) resolved winning tile, memoised in
+    /// memory so a repeated shape does not re-hit the on-disk cache / re-tune. Seeded
+    /// from the on-disk cache via [`tune_or_load`] on first use of a bucket.
+    tuned_tiles: Mutex<HashMap<CacheKey, TileConfig>>,
 }
 
 impl CudaBackend {
@@ -203,6 +229,13 @@ impl CudaBackend {
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_owned());
 
+        // SM arch tag for the autotune cache key (e.g. "sm_89" on the 4090). Read the
+        // device's compute capability via the driver attributes; default to the IMMA
+        // floor `sm_80` if the query fails (the kernel requires sm_80+ anyway).
+        let sm_arch = query_sm_arch(&ctx);
+        // CUDA driver version for cache invalidation (e.g. 13030 for 13.3).
+        let cuda_version = query_driver_version();
+
         Ok(Self {
             stream,
             _module: module,
@@ -213,6 +246,10 @@ impl CudaBackend {
             func_act_quant,
             device_id: format!("cuda:{ordinal}"),
             device_name,
+            sm_arch,
+            cuda_version,
+            imma_jit: Mutex::new(HashMap::new()),
+            tuned_tiles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -497,42 +534,16 @@ impl CudaBackend {
         }
 
         // --- Step 2: IMMA int8 contraction, folding both scales into `out`. ---
-        {
-            let grid_n = (n as u32).div_ceil(IMMA_N as u32);
-            let grid_m = (m as u32).div_ceil(IMMA_M as u32);
-            let cfg = LaunchConfig {
-                grid_dim: (grid_n, grid_m, 1),
-                block_dim: (WARP_SIZE, 1, 1), // one warp per 16×8 output tile
-                shared_mem_bytes: 0,          // the kernel's staging is static __shared__
-            };
-            let mut launch = self.stream.launch_builder(&self.func_imma);
-            launch
-                .arg(&d_qact)
-                .arg(&buf.device)
-                .arg(&d_act_scale)
-                .arg(&d_wscale)
-                .arg(&mut d_out)
-                .arg(&m_i)
-                .arg(&n_i)
-                .arg(&k_i)
-                .arg(&num_ktiles_i);
-            // SAFETY: `launch` is `unsafe`. `tq2_0_imma_mpgemm(const signed char*,
-            // const unsigned char*, const float*, const float*, float*, int, int,
-            // int, int)` is fed in that exact order/type: `d_qact` (i8 [M,K]),
-            // `buf.device` (the I2sInt8 tile bytes, validated to the packed length in
-            // `upload_weights`), `d_act_scale` (f32 [M]), `d_wscale` (f32 [N]),
-            // `d_out` (f32 [M,N], the only mutable operand), then `m,n,k,num_ktiles`.
-            // The grid covers `ceil(M/16)·ceil(N/8)` tiles; the kernel bounds-checks
-            // every global (`gm<m`, `gn<n`, `gk<k`) and addresses the weight tiles
-            // with `num_ktiles`, the stride cached in the buffer. Host scalars
-            // outlive the launch.
-            #[allow(unsafe_code)]
-            unsafe {
-                launch
-                    .launch(cfg)
-                    .map_err(|e| driver_err("launch tq2_0_imma", &e))?;
-            }
-        }
+        // Resolve the tuned tile for this shape (on-disk autotune cache → JIT), and
+        // launch its kernel with the tile's geometry. The AOT-equivalent tile uses
+        // the embedded AOT cubin; every other tile is JIT-compiled (and cached). All
+        // tiles are numerically identical (exact int32 accumulate + one scale fold).
+        let tile = self.resolve_imma_tile(shape);
+        let func = self.imma_function_for_tile(tile)?;
+        self.launch_imma_tile(
+            &func, tile, &d_qact, &buf.device, &d_act_scale, &d_wscale, &mut d_out, m_i, n_i, k_i,
+            num_ktiles_i,
+        )?;
 
         self.stream
             .memcpy_dtoh(&d_out, out)
@@ -540,14 +551,318 @@ impl CudaBackend {
 
         Ok(())
     }
+
+    /// Launch the IMMA contraction kernel `func` (rendered/compiled for `tile`) with
+    /// the launch geometry `tile` dictates: a grid of `ceil(N/tile_n) ×
+    /// ceil(M/tile_m)` blocks of `tile.warps · 32` threads. The kernel's staging is
+    /// static `__shared__`, so `shared_mem_bytes` stays 0. Argument order/types are
+    /// identical for the AOT and every JIT tile (the codegen pins the signature).
+    ///
+    /// # Errors
+    /// The cudarc launch error, mapped to [`BackendError::Backend`].
+    #[allow(clippy::too_many_arguments)]
+    fn launch_imma_tile(
+        &self,
+        func: &CudaFunction,
+        tile: TileConfig,
+        d_qact: &CudaSlice<i8>,
+        d_weights: &CudaSlice<u8>,
+        d_act_scale: &CudaSlice<f32>,
+        d_wscale: &CudaSlice<f32>,
+        d_out: &mut CudaSlice<f32>,
+        m_i: i32,
+        n_i: i32,
+        k_i: i32,
+        num_ktiles_i: i32,
+    ) -> Result<(), BackendError> {
+        let grid_n = (n_i as u32).div_ceil(tile.tile_n as u32);
+        let grid_m = (m_i as u32).div_ceil(tile.tile_m as u32);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_n, grid_m, 1),
+            block_dim: (tile.block_threads(), 1, 1),
+            shared_mem_bytes: 0, // the kernel's staging is static __shared__
+        };
+        let mut launch = self.stream.launch_builder(func);
+        launch
+            .arg(d_qact)
+            .arg(d_weights)
+            .arg(d_act_scale)
+            .arg(d_wscale)
+            .arg(d_out)
+            .arg(&m_i)
+            .arg(&n_i)
+            .arg(&k_i)
+            .arg(&num_ktiles_i);
+        // SAFETY: `launch` is `unsafe`. Both the AOT `tq2_0_imma_mpgemm` and every
+        // JIT-rendered tile declare the identical signature `(const signed char*,
+        // const unsigned char*, const float*, const float*, float*, int, int, int,
+        // int)` (the codegen pins it), fed here in that exact order/type: `d_qact`
+        // (i8 [M,K]), `d_weights` (I2sInt8 tile bytes, validated to the packed length
+        // in `upload_weights`), `d_act_scale` (f32 [M]), `d_wscale` (f32 [N]),
+        // `d_out` (f32 [M,N], the only mutable operand), then `m,n,k,num_ktiles`. The
+        // grid covers `ceil(M/tile_m)·ceil(N/tile_n)` blocks; the kernel
+        // bounds-checks every global (`gm<m`, `gn<n`, `kt<num_ktiles`) and addresses
+        // the weight tiles with `num_ktiles`, the stride cached in the buffer. Host
+        // scalars outlive the launch.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch tq2_0_imma (tiled)", &e))?;
+        }
+        Ok(())
+    }
+
+    /// The autotune cache key for an IMMA launch of `shape` on this device.
+    fn imma_cache_key(&self, shape: GemmShape) -> CacheKey {
+        CacheKey {
+            arch: self.sm_arch.clone(),
+            dtype: IMMA_DTYPE_TAG,
+            bucket: ShapeBucket::from_shape(shape),
+            cuda_version: self.cuda_version,
+        }
+    }
+
+    /// Resolve the winning [`TileConfig`] for `shape`: memoised in memory, seeded from
+    /// the on-disk autotune cache (and a device tile search on a cold cache) via
+    /// [`tune_or_load`].
+    ///
+    /// On any device-side hiccup during the search the policy falls back to
+    /// [`TileConfig::AOT_EQUIVALENT`] (the guaranteed-correct anchor) without caching
+    /// it, so correctness is never at risk — only performance. Because every tile is
+    /// numerically identical, the resolved tile choice never affects the result.
+    fn resolve_imma_tile(&self, shape: GemmShape) -> TileConfig {
+        let key = self.imma_cache_key(shape);
+        if let Some(t) = self.tuned_tiles.lock().expect("tuned_tiles poisoned").get(&key) {
+            return *t;
+        }
+        let dir = cache_dir();
+        // The device-side evaluation half: JIT + launch each candidate on this shape,
+        // validate it against a host reference, and time it.
+        let tile = tune_or_load(
+            &dir,
+            &key,
+            |cand| self.evaluate_candidate(cand, shape),
+            |e| eprintln!("tritium-cuda: autotune cache write failed ({e}); continuing un-cached"),
+        );
+        self.tuned_tiles
+            .lock()
+            .expect("tuned_tiles poisoned")
+            .insert(key, tile);
+        tile
+    }
+
+    /// Evaluate one candidate `tile` on `shape`: JIT-compile it, run it on a small
+    /// deterministic problem of this shape, check the result against the host
+    /// reference (the same exact-int contraction the kernel computes), and time it.
+    /// A compile/launch failure or an out-of-tolerance result marks the candidate
+    /// incorrect (rejected), never aborting the search.
+    fn evaluate_candidate(&self, tile: TileConfig, shape: GemmShape) -> CandidateResult {
+        match self.try_evaluate_candidate(tile, shape) {
+            Ok(r) => r,
+            Err(_) => CandidateResult { correct: false, seconds: f64::INFINITY },
+        }
+    }
+
+    /// Fallible inner body of [`evaluate_candidate`]; any `Err` is folded to an
+    /// "incorrect" candidate by the caller.
+    fn try_evaluate_candidate(
+        &self,
+        tile: TileConfig,
+        shape: GemmShape,
+    ) -> Result<CandidateResult, BackendError> {
+        let GemmShape { m, n, k } = shape;
+        // Guard against degenerate buckets (M=0 etc.): use at least one row/col/tile.
+        let m = m.max(1);
+        let n = n.max(1);
+        let k = k.div_ceil(IMMA_K).max(1) * IMMA_K; // round K up to a whole k-tile
+
+        // Deterministic int8 activations, ternary weights, and scales for the probe.
+        let qact: Vec<i8> = (0..m * k).map(|i| ((i % 5) as i8) - 2).collect();
+        let act_scale: Vec<f32> = (0..m).map(|i| 0.5 + (i % 3) as f32 * 0.25).collect();
+        let wscale: Vec<f32> = (0..n).map(|j| 1.0 + (j % 4) as f32 * 0.5).collect();
+        let trits: Vec<i8> = (0..n * k).map(|i| ((i % 3) as i8) - 1).collect();
+
+        // Host reference: exact int32 contraction folded by the two scales — the same
+        // arithmetic the kernel performs, so a correct tile matches to the bit modulo
+        // the single f32 fold's rounding (within the IMMA tolerance).
+        let mut reference = vec![0.0f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut acc: i64 = 0;
+                for ki in 0..k {
+                    acc += qact[mi * k + ki] as i64 * trits[ni * k + ki] as i64;
+                }
+                reference[mi * n + ni] = act_scale[mi] * wscale[ni] * acc as f32;
+            }
+        }
+
+        // Pack the weights into the I2sInt8 tile layout the kernel expects.
+        let packed = pack_i2s_int8_tiles(&trits, n, k);
+
+        // Upload operands.
+        let d_qact = self
+            .stream
+            .clone_htod(&qact)
+            .map_err(|e| driver_err("autotune upload qact", &e))?;
+        let d_weights = self
+            .stream
+            .clone_htod(&packed)
+            .map_err(|e| driver_err("autotune upload weights", &e))?;
+        let d_act_scale = self
+            .stream
+            .clone_htod(&act_scale)
+            .map_err(|e| driver_err("autotune upload act_scale", &e))?;
+        let d_wscale = self
+            .stream
+            .clone_htod(&wscale)
+            .map_err(|e| driver_err("autotune upload wscale", &e))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .map_err(|e| driver_err("autotune alloc out", &e))?;
+
+        let num_ktiles_i = (k / IMMA_K) as i32;
+        let func = self.imma_function_for_tile(tile)?;
+
+        // One correctness launch + readback.
+        self.launch_imma_tile(
+            &func, tile, &d_qact, &d_weights, &d_act_scale, &d_wscale, &mut d_out, m as i32,
+            n as i32, k as i32, num_ktiles_i,
+        )?;
+        let mut got = vec![0.0f32; m * n];
+        self.stream
+            .memcpy_dtoh(&d_out, &mut got)
+            .map_err(|e| driver_err("autotune dtoh", &e))?;
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("autotune sync", &e))?;
+
+        let correct = got.iter().zip(&reference).all(|(&g, &r)| imma_close(g, r));
+        if !correct {
+            return Ok(CandidateResult { correct: false, seconds: f64::INFINITY });
+        }
+
+        // Time a few repetitions (median of the wall-clock per-launch time). This is a
+        // coarse but deterministic-enough metric for tile selection; the gate only
+        // requires that the *winner* be correct, not that timings be reproducible to
+        // the nanosecond.
+        const REPS: usize = 8;
+        let mut times = Vec::with_capacity(REPS);
+        for _ in 0..REPS {
+            let start = std::time::Instant::now();
+            self.launch_imma_tile(
+                &func, tile, &d_qact, &d_weights, &d_act_scale, &d_wscale, &mut d_out, m as i32,
+                n as i32, k as i32, num_ktiles_i,
+            )?;
+            self.stream
+                .synchronize()
+                .map_err(|e| driver_err("autotune timing sync", &e))?;
+            times.push(start.elapsed().as_secs_f64());
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let seconds = times[times.len() / 2];
+        Ok(CandidateResult { correct: true, seconds })
+    }
+
+    /// Resolve the IMMA kernel [`CudaFunction`] for `tile`.
+    ///
+    /// The [`TileConfig::AOT_EQUIVALENT`] tile is served by the **embedded AOT cubin**
+    /// (`func_imma`, built by `build.rs`) — the common-shape fast path that needs no
+    /// nvrtc at all. Every other tile is JIT-compiled via nvrtc on first use and
+    /// cached for the process lifetime. This is the cold-cache (JIT) == warm-cache
+    /// (AOT) contract made concrete: the AOT-equivalent tile's two realisations (the
+    /// embedded cubin here, and a fresh JIT compile via [`imma_jit_function`]) are
+    /// bit-identical, which the determinism test asserts explicitly.
+    ///
+    /// The returned [`CudaFunction`] is `Arc`-backed and holds its owning
+    /// [`CudaModule`] alive internally, so it stays valid after the cache lock is
+    /// dropped.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] for an invalid tile; [`BackendError::Backend`]
+    /// on an nvrtc compile or module-load failure.
+    fn imma_function_for_tile(&self, tile: TileConfig) -> Result<CudaFunction, BackendError> {
+        // Common-shape fast path: the AOT-equivalent tile is the embedded cubin.
+        if tile == TileConfig::AOT_EQUIVALENT {
+            return Ok(self.func_imma.clone());
+        }
+        if let Some((_, f)) = self.imma_jit.lock().expect("imma_jit poisoned").get(&tile) {
+            return Ok(f.clone());
+        }
+        let (module, func) = self.imma_jit_function(tile)?;
+        let mut guard = self.imma_jit.lock().expect("imma_jit poisoned");
+        // Another thread may have raced us between the unlock above and here; keep
+        // whichever entry is present (both are numerically identical), and return its
+        // function so every caller observes the same handle.
+        let (_, f) = guard.entry(tile).or_insert((module, func));
+        Ok(f.clone())
+    }
+
+    /// JIT-compile + load the IMMA kernel for `tile` (no process cache); returns the
+    /// owning module plus the freshly resolved [`CudaFunction`]. Used by
+    /// [`imma_function_for_tile`] and, directly, by the cold-vs-warm determinism test.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] / [`BackendError::Backend`] as
+    /// [`compile_imma`] / module load report.
+    fn imma_jit_function(
+        &self,
+        tile: TileConfig,
+    ) -> Result<(Arc<CudaModule>, CudaFunction), BackendError> {
+        let ptx = compile_imma(tile, IMMA_JIT_ARCH)?;
+        let module = self
+            .stream
+            .context()
+            .load_module(ptx)
+            .map_err(|e| driver_err("load JIT IMMA module", &e))?;
+        let func = module
+            .load_function(JIT_KERNEL_NAME)
+            .map_err(|e| driver_err("resolve JIT IMMA kernel", &e))?;
+        Ok((module, func))
+    }
 }
 
-/// Threads in a warp — the IMMA kernel launches exactly one warp per output tile.
-const WARP_SIZE: u32 = 32;
+/// The weight-dtype tag the IMMA path keys its autotune cache under (the I2sInt8
+/// packing). Distinct from the add-only `tq2_0` path so the two never share a tuned
+/// tile (they have different kernels entirely).
+const IMMA_DTYPE_TAG: &str = "i2sint8";
 
-/// The IMMA `mma.m16n8k32` output-tile M dimension (16 rows per warp tile). The N
-/// tile dimension is [`tritium_format::IMMA_N`] (8).
-const IMMA_M: usize = 16;
+/// The virtual arch the JIT path renders for: `compute_80`, matching the AOT IMMA
+/// PTX target (`build.rs`'s `IMMA_MIN_ARCH`). nvrtc emits forward-compatible PTX
+/// that the driver JITs to the present device, exactly as the AOT PTX is loaded —
+/// so a JIT'd tile and the AOT cubin for the *same* tile go through the identical
+/// driver back-end and produce bit-identical SASS/output (the cold==warm gate).
+const IMMA_JIT_ARCH: &str = "compute_80";
+
+/// Read the device compute capability and format it as an `sm_XY` tag for the
+/// autotune cache key. Falls back to the IMMA floor `sm_80` if the query fails (the
+/// kernel needs sm_80+ regardless, so this is the most conservative correct default).
+fn query_sm_arch(ctx: &Arc<CudaContext>) -> String {
+    match ctx.compute_capability() {
+        Ok((major, minor)) => format!("sm_{major}{minor}"),
+        Err(_) => "sm_80".to_owned(),
+    }
+}
+
+/// Query the CUDA driver version via `cuDriverGetVersion` (e.g. `13030` for 13.3),
+/// used as the autotune cache invalidation axis. Returns `0` if the query fails,
+/// which still keys a stable (if uninformative) cache slot.
+fn query_driver_version() -> u32 {
+    let mut version: core::ffi::c_int = 0;
+    // SAFETY: `cuDriverGetVersion` writes a single `int` through the supplied
+    // pointer and returns a `CUresult`; `version` is a live local `c_int` that
+    // outlives the call. cudarc's `fallback-dynamic-loading` resolves the symbol from
+    // the dlopen'd `libcuda` (the same driver the rest of the backend uses). The crate
+    // forbids unsafe by default; this scoped allow mirrors the kernel-launch sites.
+    #[allow(unsafe_code)]
+    let res = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut version) };
+    if res == cudarc::driver::sys::CUresult::CUDA_SUCCESS && version >= 0 {
+        version as u32
+    } else {
+        0
+    }
+}
 
 /// Which add-only kernel a launch should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,6 +1085,55 @@ fn quantize_act_int8_host(act: &[f32], m: usize, k: usize, q_out: &mut [f32], sc
         }
         scale_out[r] = gamma / A8_QB;
     }
+}
+
+/// The IMMA conformance tolerance the autotune correctness check uses (relative,
+/// matching ADR 0002's `1e-4`). A candidate tile whose output lands outside this band
+/// is a launch-geometry bug (the int contraction is exact), so it is rejected.
+const IMMA_AUTOTUNE_REL_TOL: f32 = 1e-4;
+
+/// Relative-or-absolute closeness check for the autotune correctness gate: accept if
+/// the absolute error is within `IMMA_AUTOTUNE_REL_TOL · max(1, |reference|)`. Mirrors
+/// the testkit's `Tolerance::accepts` shape so the in-tree probe matches the
+/// committed conformance gate.
+fn imma_close(got: f32, reference: f32) -> bool {
+    let diff = (got - reference).abs();
+    diff <= IMMA_AUTOTUNE_REL_TOL * reference.abs().max(1.0)
+}
+
+/// Pack an `[N, K]` ternary weight matrix (`i8` codes in `{-1,0,+1}`, row-major) into
+/// the IMMA `I2sInt8` tile layout the kernel reads (the same interleave
+/// `tritium_format::convert_i2s_to_int8` produces): `ceil(N/8) · ceil(K/32)` tiles of
+/// 64 bytes, tile `(nt, kt)` at flat byte offset `(nt·num_ktiles + kt)·64`, each tile
+/// 8×32 codes in `(n_in_tile, k_in_tile)` row-major, 4 codes/byte (low pair = first
+/// element), `code = trit + 1`. Padding rows/cols past `n`/`k` carry trit 0 (code 1),
+/// which contributes nothing to the int32 sum.
+///
+/// Used only by the autotune probe (it generates its own weights), so it packs the
+/// tile layout directly rather than round-tripping the block-striped I2_S payload.
+fn pack_i2s_int8_tiles(trits: &[i8], n: usize, k: usize) -> Vec<u8> {
+    let num_ntiles = n.div_ceil(IMMA_N);
+    let num_ktiles = k.div_ceil(IMMA_K);
+    let mut out = vec![0u8; num_ntiles * num_ktiles * IMMA_WTILE_BYTES];
+    for nt in 0..num_ntiles {
+        for kt in 0..num_ktiles {
+            let tile0 = (nt * num_ktiles + kt) * IMMA_WTILE_BYTES;
+            // 256 codes per tile in (n_in_tile, k_in_tile) row-major order.
+            for e in 0..(IMMA_N * IMMA_K) {
+                let n_in_tile = e / IMMA_K;
+                let k_in_tile = e % IMMA_K;
+                let gn = nt * IMMA_N + n_in_tile;
+                let gk = kt * IMMA_K + k_in_tile;
+                // In-range → real trit; padding → 0.
+                let trit = if gn < n && gk < k { trits[gn * k + gk] } else { 0 };
+                let code = (trit + 1) as u8; // {-1,0,1} -> {0,1,2}
+                let byte = tile0 + e / 4;
+                let shift = 2 * (e % 4);
+                out[byte] |= code << shift;
+            }
+        }
+    }
+    out
 }
 
 /// Heuristic: did this driver error come from an allocation running out of memory?
@@ -1400,6 +1764,278 @@ mod tests {
                     "shape {shape:?}: imma vs ref [{i}] imma={g} ref={c}"
                 );
             }
+        }
+    }
+
+    // ---- WF-B: autotune + nvrtc JIT determinism (ADR 0005) ---------------------
+    //
+    // These gate the WF-B contract: a JIT-compiled tile is BIT-IDENTICAL to the AOT
+    // cubin for the same tile (cold-cache == warm-cache), and any tuned tile matches
+    // the reference within the IMMA tolerance. Both are guaranteed by construction —
+    // every tile does the same exact int32 mma accumulate + one f32 scale fold — but
+    // these tests prove it on-device across tile shapes.
+
+    /// Deterministic int8 activations / ternary weights / scales for a WF-B probe.
+    fn jit_probe_inputs(m: usize, n: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<f32>, Vec<i8>) {
+        let qact: Vec<i8> = (0..m * k).map(|i| ((i % 7) as i8) - 3).collect();
+        let act_scale: Vec<f32> = (0..m).map(|i| 0.5 + (i % 3) as f32 * 0.25).collect();
+        let wscale: Vec<f32> = (0..n).map(|j| 1.0 + (j % 4) as f32 * 0.5).collect();
+        let trits: Vec<i8> = (0..n * k).map(|i| ((i % 3) as i8) - 1).collect();
+        (qact, act_scale, wscale, trits)
+    }
+
+    /// Run one IMMA contraction with an explicit `func`/`tile` (host-quantised int8
+    /// inputs already supplied), returning the `[M, N]` f32 output. Drives
+    /// `launch_imma_tile` directly so a test can force a specific tile + kernel image
+    /// (AOT cubin vs a freshly JIT-compiled module).
+    fn run_imma_tile(
+        cuda: &CudaBackend,
+        func: &CudaFunction,
+        tile: TileConfig,
+        qact: &[i8],
+        packed_weights: &[u8],
+        act_scale: &[f32],
+        wscale: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        let num_ktiles = k.div_ceil(IMMA_K);
+        let d_qact = cuda.stream.clone_htod(qact).expect("htod qact");
+        let d_weights = cuda.stream.clone_htod(packed_weights).expect("htod weights");
+        let d_act_scale = cuda.stream.clone_htod(act_scale).expect("htod act_scale");
+        let d_wscale = cuda.stream.clone_htod(wscale).expect("htod wscale");
+        let mut d_out = cuda.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
+        cuda.launch_imma_tile(
+            func,
+            tile,
+            &d_qact,
+            &d_weights,
+            &d_act_scale,
+            &d_wscale,
+            &mut d_out,
+            m as i32,
+            n as i32,
+            k as i32,
+            num_ktiles as i32,
+        )
+        .expect("launch imma tile");
+        let mut out = vec![0.0f32; m * n];
+        cuda.stream.memcpy_dtoh(&d_out, &mut out).expect("dtoh out");
+        cuda.stream.synchronize().expect("sync");
+        out
+    }
+
+    /// COLD-CACHE (JIT) == WARM-CACHE (AOT) BIT-IDENTICAL for a fixed tile.
+    ///
+    /// The AOT-equivalent tile has two realisations: the embedded AOT cubin
+    /// (`func_imma`, the warm/default path) and a fresh nvrtc JIT compile of the
+    /// rendered source (the cold path). For a range of shapes their outputs must be
+    /// **bit-for-bit equal** (`==` on the raw `f32`, not a tolerance) — the load-bearing
+    /// WF-B determinism gate. If they ever diverge, JIT and AOT are not interchangeable
+    /// and the autotune cache could change numerics, which ADR 0005 forbids.
+    #[test]
+    fn jit_aot_equivalent_is_bit_identical() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping JIT==AOT bit-identity: no device ({e})");
+                return;
+            }
+        };
+
+        // Freshly JIT-compile the AOT-equivalent tile (the cold path). The AOT side
+        // is the embedded cubin resolved by `imma_function_for_tile`.
+        let tile = TileConfig::AOT_EQUIVALENT;
+        let (_jit_mod, jit_func) = cuda
+            .imma_jit_function(tile)
+            .expect("JIT-compile AOT-equivalent tile");
+        let aot_func = cuda
+            .imma_function_for_tile(tile)
+            .expect("resolve AOT cubin");
+
+        // Tail + clean shapes; K a 32-multiple (one whole k-tile minimum).
+        let shapes = [
+            (1usize, 1usize, 32usize),
+            (3, 5, 64),
+            (16, 8, 256),
+            (17, 9, 96),
+            (33, 13, 512),
+            (64, 40, 2560 % 8192), // a realistic-ish K, still a 32-multiple below
+        ];
+        for (m, n, k) in shapes {
+            let k = k.max(IMMA_K); // never zero k-tiles
+            let k = k.div_ceil(IMMA_K) * IMMA_K; // snap to a whole k-tile
+            let (qact, act_scale, wscale, trits) = jit_probe_inputs(m, n, k);
+            let packed = pack_i2s_int8_tiles(&trits, n, k);
+
+            let aot = run_imma_tile(
+                &cuda, &aot_func, tile, &qact, &packed, &act_scale, &wscale, m, n, k,
+            );
+            let jit = run_imma_tile(
+                &cuda, &jit_func, tile, &qact, &packed, &act_scale, &wscale, m, n, k,
+            );
+
+            assert_eq!(aot.len(), jit.len(), "shape ({m},{n},{k}): len");
+            for (i, (&a, &j)) in aot.iter().zip(&jit).enumerate() {
+                // Bit-identical: compare the raw IEEE-754 bit patterns so even a
+                // signed-zero or NaN-payload difference would fail (none expected).
+                assert_eq!(
+                    a.to_bits(),
+                    j.to_bits(),
+                    "shape ({m},{n},{k}): JIT vs AOT diverge at [{i}] aot={a} jit={j}"
+                );
+            }
+        }
+    }
+
+    /// A NON-TRIVIAL JIT tile (wider M/N, deeper K, multi-warp) is ALSO bit-identical
+    /// to the AOT cubin. This proves the determinism guarantee holds across the tile
+    /// shapes the autotune search actually considers, not just the AOT-equivalent
+    /// anchor — the int32 accumulate is order-independent, so a 32×16/4-warp tile that
+    /// splits the work differently still lands on the same bits.
+    #[test]
+    fn jit_wide_tile_matches_aot_bit_identical() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping wide-tile JIT==AOT: no device ({e})");
+                return;
+            }
+        };
+        let aot_func = cuda
+            .imma_function_for_tile(TileConfig::AOT_EQUIVALENT)
+            .expect("AOT cubin");
+
+        // A representative spread of the search's candidate tiles.
+        let tiles = [
+            TileConfig { tile_m: 16, tile_n: 8, tile_k: 128, warps: 1, stages: 2 },
+            TileConfig { tile_m: 16, tile_n: 16, tile_k: 64, warps: 2, stages: 2 },
+            TileConfig { tile_m: 32, tile_n: 16, tile_k: 64, warps: 4, stages: 2 },
+            TileConfig { tile_m: 64, tile_n: 16, tile_k: 32, warps: 8, stages: 3 },
+        ];
+        let (m, n, k) = (40usize, 24usize, 256usize);
+        let (qact, act_scale, wscale, trits) = jit_probe_inputs(m, n, k);
+        let packed = pack_i2s_int8_tiles(&trits, n, k);
+
+        let aot = run_imma_tile(
+            &cuda,
+            &aot_func,
+            TileConfig::AOT_EQUIVALENT,
+            &qact,
+            &packed,
+            &act_scale,
+            &wscale,
+            m,
+            n,
+            k,
+        );
+
+        for tile in tiles {
+            assert!(tile.is_valid(), "test tile {tile:?} invalid");
+            let (_m, jit_func) = cuda
+                .imma_jit_function(tile)
+                .unwrap_or_else(|e| panic!("JIT-compile {tile:?}: {e:?}"));
+            let jit = run_imma_tile(
+                &cuda, &jit_func, tile, &qact, &packed, &act_scale, &wscale, m, n, k,
+            );
+            for (i, (&a, &j)) in aot.iter().zip(&jit).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    j.to_bits(),
+                    "tile {tile:?}: JIT vs AOT diverge at [{i}] aot={a} jit={j}"
+                );
+            }
+        }
+    }
+
+    /// The TUNED config (resolved through the on-disk autotune cache + tile search)
+    /// matches the reference within the IMMA tolerance. Drives the full public fused
+    /// path (`mpgemm_with_act_quant`), which now consults the cache via
+    /// `resolve_imma_tile`, on a prefill-shaped problem — so this exercises the tuner
+    /// end-to-end (cold cache → search → winner) and gates the winner vs the CPU
+    /// host-A8 reference. A second call (warm cache) must agree bit-for-bit with the
+    /// first, since a cached tile is numerically identical to the freshly-tuned one.
+    #[test]
+    fn tuned_config_matches_reference_and_is_stable() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping tuned-config gate: no device ({e})");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+        let tol = Tolerance::default();
+
+        // A prefill-shaped problem so the search has something to chew on. K is a
+        // 256-multiple (the I2_S converter the reference path uses needs a
+        // 128-multiple); N/M exercise partial tiles.
+        let (m, n, k) = (40usize, 24usize, 256usize);
+        let shape = GemmShape::new(m, n, k);
+        let raw: Vec<i8> = (0..n * k).map(|i| ((i % 3) as i8) - 1).collect();
+        let act: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32 - 5.0) * 0.3).collect();
+        let scales: Vec<f32> = (0..n).map(|j| 1.0 + (j % 4) as f32 * 0.5).collect();
+
+        // Reference: host-A8 default on the CPU backend (TQ2_0).
+        let trits: Vec<_> = raw
+            .iter()
+            .map(|&w| tritium_core::Trit::from_i8(w).unwrap())
+            .collect();
+        let cpu_buf = cpu
+            .upload_weights(&pack_tq2_0(&trits, shape), shape, TernaryFormat::Tq2_0)
+            .expect("cpu upload");
+        let mut ref_out = vec![0.0f32; m * n];
+        cpu.mpgemm_with_act_quant(
+            &act,
+            cpu_buf.as_ref(),
+            &scales,
+            shape,
+            TernaryFormat::Tq2_0,
+            &mut ref_out,
+        )
+        .expect("cpu host-A8 reference");
+
+        // Tuned path: upload I2sInt8, run the fused override (which resolves + tunes
+        // the tile). Run it twice; the second call hits the in-memory + on-disk cache.
+        let imma_buf = cuda
+            .upload_weights(&pack_i2s_int8(&raw, shape), shape, TernaryFormat::I2sInt8)
+            .expect("imma upload");
+        let mut tuned1 = vec![0.0f32; m * n];
+        cuda.mpgemm_with_act_quant(
+            &act,
+            imma_buf.as_ref(),
+            &scales,
+            shape,
+            TernaryFormat::I2sInt8,
+            &mut tuned1,
+        )
+        .expect("tuned fused (cold)");
+        let mut tuned2 = vec![0.0f32; m * n];
+        cuda.mpgemm_with_act_quant(
+            &act,
+            imma_buf.as_ref(),
+            &scales,
+            shape,
+            TernaryFormat::I2sInt8,
+            &mut tuned2,
+        )
+        .expect("tuned fused (warm)");
+
+        // Tuned == reference within tolerance.
+        for (i, (&g, &c)) in tuned1.iter().zip(&ref_out).enumerate() {
+            assert!(
+                tol.accepts(g, c),
+                "tuned vs ref [{i}] tuned={g} ref={c}"
+            );
+        }
+        // Cold vs warm cache: bit-for-bit identical (same tile → same numerics).
+        for (i, (&a, &b)) in tuned1.iter().zip(&tuned2).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "cold vs warm tuned output diverges at [{i}] cold={a} warm={b}"
+            );
         }
     }
 }

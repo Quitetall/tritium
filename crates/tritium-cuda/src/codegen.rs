@@ -1,17 +1,406 @@
-//! nvrtc JIT codegen for the IMMA kernel (v0.30, ADR 0005 / WF-B — skeleton).
+//! nvrtc JIT codegen for the IMMA kernel (v0.30, ADR 0005 / WF-B).
 //!
 //! The IMMA (`mma.m16n8k32`) kernel is templated over the [`TileConfig`]
-//! parameters from [`super::autotune`]; this module will render the CUDA source
-//! for a chosen tile and compile it to a cubin via cudarc's nvrtc binding at
-//! runtime (the `nvrtc` cargo feature is already enabled on `cudarc`). AOT
-//! default cubins cover the common BitNet shapes; JIT covers the long tail and
-//! the autotune search.
+//! parameters from [`super::autotune`]; this module renders the CUDA source for a
+//! chosen tile and compiles it to a loadable PTX image via cudarc's nvrtc binding
+//! at runtime (the `nvrtc` cargo feature is enabled on `cudarc`, and `libnvrtc` is
+//! dlopen'd on first use by the `fallback-dynamic-loading` path). AOT default PTX
+//! (built by `build.rs` for the common BitNet shapes) covers the hot path; JIT
+//! covers the long tail and the autotune search.
 //!
-//! Determinism is load-bearing: a JIT-compiled tile must produce **bit-identical**
-//! output to the AOT cubin for the same tile (the cold-cache == warm-cache gate),
-//! so codegen only varies the tile/launch parameters, never the arithmetic.
+//! ## Determinism is load-bearing
 //!
-//! Gated behind the `cuda` feature (it links cudarc's nvrtc path). No code yet —
-//! WF-B fills this in.
+//! A JIT-compiled tile must produce **bit-identical** output to the AOT cubin for
+//! the same tile (the cold-cache == warm-cache gate). This is guaranteed *by
+//! construction*, not by luck:
+//!
+//!   * The contraction is an **int32** `mma.m16n8k32` accumulate. Integer addition
+//!     is exact and associative, so reordering the K loop or splitting the work
+//!     across more warps/tiles never changes the accumulated value — every covered
+//!     output sees the identical `Σ_k qact·trit`.
+//!   * The only floating-point step is the single per-output
+//!     `act_scale[m] · weight_scale[n] · acc` fold (a `float` multiply chain in a
+//!     fixed left-to-right order). It is emitted identically for every tile, so the
+//!     rounding is identical.
+//!
+//! Codegen therefore only varies **launch geometry and shared-memory staging**
+//! (how many 16×8 `mma` sub-tiles a block covers, how many warps cooperate, how
+//! deep the prefetch pipeline is) — never the arithmetic. The rendered source is a
+//! generalisation of `kernels/tq2_0_imma.cu`: the [`TileConfig::AOT_EQUIVALENT`]
+//! config reproduces that committed kernel's launch shape exactly, which is what
+//! the cold-vs-warm test pins.
+//!
+//! Gated behind the `cuda` feature (it links cudarc's nvrtc path).
 //!
 //! [`TileConfig`]: super::autotune::TileConfig
+//! [`TileConfig::AOT_EQUIVALENT`]: super::autotune::TileConfig::AOT_EQUIVALENT
+
+use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
+
+use tritium_spec::BackendError;
+
+use super::autotune::TileConfig;
+
+/// `mma.m16n8k32` output-tile dimensions — the hardware shape the kernel is built
+/// on. A [`TileConfig`]'s `tile_m`/`tile_n`/`tile_k` are integer multiples of these
+/// (validated by [`TileConfig::is_valid`]); the block covers `tile_m/16 × tile_n/8`
+/// of these `mma` sub-tiles.
+const MMA_M: u16 = 16;
+const MMA_N: u16 = 8;
+const MMA_K: u16 = 32;
+/// Threads in a warp.
+const WARP: u16 = 32;
+
+/// The exported kernel symbol the host resolves after loading the JIT module. Must
+/// match the `extern "C"` name rendered by [`render_imma_source`] and the AOT
+/// kernel's `tq2_0_imma_mpgemm` so the same `load_function` call serves both paths.
+pub(crate) const JIT_KERNEL_NAME: &str = "tq2_0_imma_mpgemm";
+
+/// Render the IMMA kernel CUDA source specialised to `cfg`.
+///
+/// The output is a single translation unit exporting `tq2_0_imma_mpgemm` with the
+/// **exact** signature the host launches (`const signed char* qact, const unsigned
+/// char* weights, const float* act_scale, const float* weight_scale, float* out,
+/// int m, int n, int k, int num_ktiles`). Only the launch geometry varies with
+/// `cfg`; the per-output arithmetic (int32 `mma` accumulate + the single scale
+/// fold) is fixed, so every rendered config is bit-identical on shared inputs.
+///
+/// `cfg` must satisfy [`TileConfig::is_valid`]; callers funnel through
+/// [`compile_imma`], which checks it first.
+pub(crate) fn render_imma_source(cfg: TileConfig) -> String {
+    // Sub-tile counts the block covers, and the warp→sub-tile assignment. Each warp
+    // owns a contiguous slice of the `n_subtiles · m_subtiles` (mm, nn) grid and
+    // accumulates each owned 16×8 `mma` tile across the whole K dimension. Because
+    // the integer accumulate is exact, *which* warp computes a given sub-tile and
+    // *what order* the K-tiles are summed in are both numerically irrelevant.
+    let m_subtiles = (cfg.tile_m / MMA_M) as u32;
+    let n_subtiles = (cfg.tile_n / MMA_N) as u32;
+    let subtiles = m_subtiles * n_subtiles;
+    let warps = cfg.warps as u32;
+    let block_threads = warps * WARP as u32;
+    let stages = cfg.stages as u32;
+    // K-tiles consumed per main-loop step (tile_k / 32). The loop steps the packed
+    // k-tile index by this stride; the `mma` is still issued per 32-wide k-tile.
+    let ktiles_per_step = (cfg.tile_k / MMA_K) as u32;
+
+    // Shared staging: one A sub-tile region (16×32 int8) per m-subtile and one B
+    // sub-tile region (8×32 int8) per n-subtile, per pipeline stage. The K depth of
+    // a staged step is `tile_k`, so each stage holds `ktiles_per_step` k-tiles.
+    let a_stage_bytes = m_subtiles * (MMA_M as u32) * (cfg.tile_k as u32);
+    let b_stage_bytes = n_subtiles * (MMA_N as u32) * (cfg.tile_k as u32);
+
+    format!(
+        r#"// AUTO-GENERATED by tritium-cuda::codegen (WF-B nvrtc JIT). Do not edit.
+//
+// IMMA int8 ternary mpGEMM, specialised to tile_m={tile_m} tile_n={tile_n}
+// tile_k={tile_k} warps={warps} stages={stages}. Numerics are identical to the
+// AOT kernel (kernels/tq2_0_imma.cu): exact int32 mma accumulate + one f32 scale
+// fold per output. Only launch geometry / staging vary with the tile.
+
+#define IMMA_M {mma_m}
+#define IMMA_N {mma_n}
+#define IMMA_K {mma_k}
+#define IMMA_WTILE_BYTES (IMMA_N * IMMA_K / 4)
+
+#define TILE_M {tile_m}
+#define TILE_N {tile_n}
+#define TILE_K {tile_k}
+#define M_SUBTILES {m_subtiles}
+#define N_SUBTILES {n_subtiles}
+#define SUBTILES {subtiles}
+#define WARPS {warps}
+#define STAGES {stages}
+#define KTILES_PER_STEP {ktiles_per_step}
+#define A_STAGE {a_stage_bytes}
+#define B_STAGE {b_stage_bytes}
+
+extern "C" __global__ void __launch_bounds__({block_threads}) tq2_0_imma_mpgemm(
+    const signed char* __restrict__ qact,       // int8 [M, K] row-major
+    const unsigned char* __restrict__ weights,  // I2sInt8 packed
+    const float* __restrict__ act_scale,        // [M]
+    const float* __restrict__ weight_scale,     // [N]
+    float* __restrict__ out,                     // [M, N] row-major
+    const int m,
+    const int n,
+    const int k,
+    const int num_ktiles) {{
+    const int warp = threadIdx.x >> 5;           // 0..WARPS-1
+    const int lane = threadIdx.x & 31;           // 0..31
+    const int group = lane >> 2;                 // mma row/col group (0..7)
+    const int tig = lane & 3;                    // thread-in-group (0..3)
+
+    // Block tile origin. The block covers TILE_M rows x TILE_N cols of output,
+    // partitioned into M_SUBTILES x N_SUBTILES of the 16x8 mma shape.
+    const int block_m = blockIdx.y * TILE_M;
+    const int block_n = blockIdx.x * TILE_N;
+
+    // Double/multi-buffered shared staging (STAGES deep). Each stage holds the
+    // unpacked int8 A (TILE_M x TILE_K) and B (TILE_N x TILE_K) for one K step.
+    __shared__ signed char s_a[STAGES][A_STAGE];
+    __shared__ signed char s_b[STAGES][B_STAGE];
+
+    // Per-warp int32 accumulators: 4 C-fragment regs per owned 16x8 sub-tile.
+    // Warp `warp` owns sub-tiles {{warp, warp+WARPS, warp+2*WARPS, ...}} of the
+    // SUBTILES flat grid (mm-major). At most ceil(SUBTILES/WARPS) per warp.
+    int c0[ (SUBTILES + WARPS - 1) / WARPS ];
+    int c1[ (SUBTILES + WARPS - 1) / WARPS ];
+    int c2[ (SUBTILES + WARPS - 1) / WARPS ];
+    int c3[ (SUBTILES + WARPS - 1) / WARPS ];
+    #pragma unroll
+    for (int s = 0; s < (SUBTILES + WARPS - 1) / WARPS; ++s) {{
+        c0[s] = 0; c1[s] = 0; c2[s] = 0; c3[s] = 0;
+    }}
+
+    // num_steps = ceil(num_ktiles / KTILES_PER_STEP): how many TILE_K-wide K steps
+    // the main loop runs. Each step stages KTILES_PER_STEP k-tiles and issues that
+    // many mma instructions per owned sub-tile.
+    const int num_steps = (num_ktiles + KTILES_PER_STEP - 1) / KTILES_PER_STEP;
+
+    // Stage K-step `step` (KTILES_PER_STEP k-tiles starting at step*KTILES_PER_STEP)
+    // of A and B into shared buffer `buf`. All block threads cooperate. Tail
+    // rows/cols/k past m/n/k are written 0 so they contribute nothing.
+    auto stage = [&](int step, int buf) {{
+        const int kt0 = step * KTILES_PER_STEP;
+        // A: TILE_M x TILE_K int8, row-major within the staged block tile.
+        for (int idx = threadIdx.x; idx < TILE_M * TILE_K; idx += blockDim.x) {{
+            const int r = idx / TILE_K;          // 0..TILE_M-1
+            const int c = idx % TILE_K;          // 0..TILE_K-1
+            const int gm = block_m + r;
+            const int gk = kt0 * IMMA_K + c;
+            s_a[buf][idx] =
+                (gm < m && gk < k) ? qact[(long long)gm * k + gk] : (signed char)0;
+        }}
+        // B: TILE_N x TILE_K codes, unpacked from the I2sInt8 tiles. The packing is
+        // per (8x32) tile, 64 bytes each, tile (nt, kt) at flat byte offset
+        // (nt*num_ktiles + kt)*64. We unpack each owned (nn, kt) tile.
+        for (int idx = threadIdx.x; idx < N_SUBTILES * KTILES_PER_STEP * IMMA_WTILE_BYTES;
+             idx += blockDim.x) {{
+            const int byte_in_tile = idx % IMMA_WTILE_BYTES;
+            const int tile_idx = idx / IMMA_WTILE_BYTES;        // 0..N_SUBTILES*KTILES_PER_STEP-1
+            const int nn = tile_idx / KTILES_PER_STEP;          // n sub-tile (0..N_SUBTILES-1)
+            const int kk = tile_idx % KTILES_PER_STEP;          // k-tile within step
+            const int nt = blockIdx.x * N_SUBTILES + nn;        // global n-tile
+            const int kt = kt0 + kk;                            // global k-tile
+            signed char codes[4];
+            if (kt < num_ktiles) {{
+                const long long tile_byte0 =
+                    ((long long)nt * num_ktiles + kt) * IMMA_WTILE_BYTES;
+                const unsigned int packed = weights[tile_byte0 + byte_in_tile];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {{
+                    const unsigned int code = (packed >> (2 * j)) & 3u;
+                    codes[j] = (signed char)((int)code - 1);  // {{0,1,2}}->{{-1,0,+1}}
+                }}
+            }} else {{
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) codes[j] = 0;
+            }}
+            // Element e in the tile = byte_in_tile*4 + j; n_in_tile = e/32,
+            // k_in_tile = e%32. Write into the staged B region for this nn at the
+            // local K offset kk*IMMA_K.
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {{
+                const int e = byte_in_tile * 4 + j;
+                const int n_in_tile = e / IMMA_K;               // 0..7
+                const int k_in_tile = e % IMMA_K;               // 0..31
+                const int brow = nn * IMMA_N + n_in_tile;       // row within TILE_N
+                const int bcol = kk * IMMA_K + k_in_tile;       // col within TILE_K
+                s_b[buf][brow * TILE_K + bcol] = codes[j];
+            }}
+        }}
+    }};
+
+    // Prologue: stage step 0 into buffer 0.
+    if (num_steps > 0) {{
+        stage(0, 0);
+    }}
+
+    for (int step = 0; step < num_steps; ++step) {{
+        const int buf = step % STAGES;
+        const int nxt = (step + 1) % STAGES;
+        if (step + 1 < num_steps) {{
+            stage(step + 1, nxt);
+        }}
+        __syncthreads();
+
+        // Each warp processes its owned sub-tiles for this K step.
+        #pragma unroll 1
+        for (int st = warp; st < SUBTILES; st += WARPS) {{
+            const int slot = st / WARPS;            // dense index into c0..c3
+            const int mm = st % M_SUBTILES;         // m sub-tile (mm-major flat grid)
+            const int nn = st / M_SUBTILES;         // n sub-tile
+            const signed char* A = s_a[buf] + mm * (IMMA_M * TILE_K);
+            const signed char* B = s_b[buf] + nn * (IMMA_N * TILE_K);
+            // Issue one mma per k-tile staged in this step.
+            #pragma unroll 1
+            for (int kk = 0; kk < KTILES_PER_STEP; ++kk) {{
+                // The mma.m16n8k32.row.col operand distribution across the warp's 32
+                // lanes (see PTX ISA): each lane (group=lane/4, tig=lane%4) holds, for
+                // the A operand, 4 packed int8 at k = 4*tig + {{0..3}} and a second
+                // group at k = 16 + 4*tig + {{0..3}}, for rows `group` and `group+8`.
+                // The B operand mirrors this per col `group`. `kbase` is the k-tile's
+                // base within the staged TILE_K; `4*tig` is the per-lane k offset —
+                // dropping it makes every lane in a group read the same bytes (a bug).
+                const int kbase = kk * IMMA_K;
+                // A fragment (4 regs): the m16n8k32.row.col A operand layout.
+                unsigned int a0, a1, a2, a3;
+                {{
+                    auto pack = [&](int row, int kb) -> unsigned int {{
+                        unsigned int v = 0;
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            v |= ((unsigned int)(unsigned char)A[row * TILE_K + kbase + kb + j]) << (8 * j);
+                        return v;
+                    }};
+                    a0 = pack(group, 4 * tig);
+                    a1 = pack(group + 8, 4 * tig);
+                    a2 = pack(group, 16 + 4 * tig);
+                    a3 = pack(group + 8, 16 + 4 * tig);
+                }}
+                // B fragment (2 regs).
+                unsigned int b0, b1;
+                {{
+                    auto pack = [&](int col, int kb) -> unsigned int {{
+                        unsigned int v = 0;
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            v |= ((unsigned int)(unsigned char)B[col * TILE_K + kbase + kb + j]) << (8 * j);
+                        return v;
+                    }};
+                    b0 = pack(group, 4 * tig);
+                    b1 = pack(group, 16 + 4 * tig);
+                }}
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                    "{{%0,%1,%2,%3}}, {{%4,%5,%6,%7}}, {{%8,%9}}, {{%0,%1,%2,%3}};\n"
+                    : "+r"(c0[slot]), "+r"(c1[slot]), "+r"(c2[slot]), "+r"(c3[slot])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }}
+        }}
+        __syncthreads();
+    }}
+
+    // Store each owned sub-tile, folding scales (single f32 multiply chain, the
+    // same order as the AOT kernel: act_scale * weight_scale * acc).
+    #pragma unroll 1
+    for (int st = warp; st < SUBTILES; st += WARPS) {{
+        const int slot = st / WARPS;
+        const int mm = st % M_SUBTILES;
+        const int nn = st / M_SUBTILES;
+        const int tile_m0 = block_m + mm * IMMA_M;
+        const int tile_n0 = block_n + nn * IMMA_N;
+        auto store = [&](int acc, int row_in_tile, int col_in_tile) {{
+            const int gm = tile_m0 + row_in_tile;
+            const int gn = tile_n0 + col_in_tile;
+            if (gm < m && gn < n) {{
+                out[(long long)gm * n + gn] =
+                    act_scale[gm] * weight_scale[gn] * (float)acc;
+            }}
+        }};
+        store(c0[slot], group, 2 * tig);
+        store(c1[slot], group, 2 * tig + 1);
+        store(c2[slot], group + 8, 2 * tig);
+        store(c3[slot], group + 8, 2 * tig + 1);
+    }}
+}}
+"#,
+        mma_m = MMA_M,
+        mma_n = MMA_N,
+        mma_k = MMA_K,
+        tile_m = cfg.tile_m,
+        tile_n = cfg.tile_n,
+        tile_k = cfg.tile_k,
+        m_subtiles = m_subtiles,
+        n_subtiles = n_subtiles,
+        subtiles = subtiles,
+        warps = warps,
+        stages = stages,
+        ktiles_per_step = ktiles_per_step,
+        a_stage_bytes = a_stage_bytes,
+        b_stage_bytes = b_stage_bytes,
+        block_threads = block_threads,
+    )
+}
+
+/// JIT-compile the IMMA kernel for `cfg` to a loadable PTX image via nvrtc, built
+/// for `arch` (e.g. `"compute_80"` for forward-compatible PTX, or `"sm_89"` for a
+/// device-specific cubin). Returns the [`Ptx`] image ready for
+/// [`cudarc::driver::CudaContext::load_module`].
+///
+/// # Errors
+/// [`BackendError::InvalidInput`] if `cfg` is not [`TileConfig::is_valid`];
+/// [`BackendError::Backend`] (with the nvrtc compile log) on a compilation failure.
+pub(crate) fn compile_imma(cfg: TileConfig, arch: &'static str) -> Result<Ptx, BackendError> {
+    if !cfg.is_valid() {
+        return Err(BackendError::InvalidInput(format!(
+            "invalid IMMA tile config {cfg:?}: tile dims must be positive multiples of \
+             16x8x32 and warps/stages >= 1"
+        )));
+    }
+    let src = render_imma_source(cfg);
+    let opts = CompileOptions {
+        arch: Some(arch),
+        // Match the AOT build's numeric flags. The AOT path compiles with `nvcc -O3`
+        // and no `--fmad`/`--ftz` overrides, so the default FMA-contraction and
+        // denormal behaviour apply; nvrtc defaults to the same, so we leave these at
+        // None rather than forcing them and risking a divergence from the AOT cubin.
+        // (The single scale fold is a multiply chain, not an FMA candidate, so FMA
+        // contraction does not affect it regardless.)
+        ..Default::default()
+    };
+    compile_ptx_with_opts(&src, opts).map_err(|e| {
+        BackendError::Backend(format!("nvrtc compile IMMA tile {cfg:?} for {arch}: {e}"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_source_has_kernel_symbol() {
+        let src = render_imma_source(TileConfig::AOT_EQUIVALENT);
+        assert!(
+            src.contains(&format!("void __launch_bounds__")),
+            "expected launch-bounds qualifier in rendered source"
+        );
+        assert!(
+            src.contains(JIT_KERNEL_NAME),
+            "expected the kernel symbol {JIT_KERNEL_NAME} in rendered source"
+        );
+        // The mma instruction must survive templating verbatim (load-bearing for the
+        // exact-int32 accumulate).
+        assert!(
+            src.contains("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32"),
+            "expected the m16n8k32 mma instruction in rendered source"
+        );
+    }
+
+    #[test]
+    fn aot_equivalent_renders_single_warp_single_subtile() {
+        // The AOT-equivalent config must render exactly one 16x8 sub-tile and one
+        // warp per block, matching kernels/tq2_0_imma.cu's launch shape.
+        let src = render_imma_source(TileConfig::AOT_EQUIVALENT);
+        assert!(src.contains("#define SUBTILES 1"), "AOT-equiv must be 1 sub-tile");
+        assert!(src.contains("#define WARPS 1"), "AOT-equiv must be 1 warp");
+        assert!(src.contains("#define M_SUBTILES 1"));
+        assert!(src.contains("#define N_SUBTILES 1"));
+    }
+
+    #[test]
+    fn multi_warp_config_renders_consistent_geometry() {
+        let cfg = TileConfig {
+            tile_m: 32,
+            tile_n: 16,
+            tile_k: 64,
+            warps: 4,
+            stages: 2,
+        };
+        let src = render_imma_source(cfg);
+        assert!(src.contains("#define M_SUBTILES 2"));
+        assert!(src.contains("#define N_SUBTILES 2"));
+        assert!(src.contains("#define SUBTILES 4"));
+        assert!(src.contains("#define WARPS 4"));
+        assert!(src.contains("#define KTILES_PER_STEP 2"));
+    }
+}

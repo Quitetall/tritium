@@ -829,6 +829,8 @@ dependencies = [
  "cudarc",
  "half",
  "linkme",
+ "serde",
+ "serde_json",
  "tritium-core",
  "tritium-cpu",
  "tritium-format",
