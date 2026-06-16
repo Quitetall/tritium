@@ -43,7 +43,7 @@ and a `Definition of done` checklist. Index:
 | Milestone | ADR | Status |
 |---|---|---|
 | v0.10 Foundation | [0003](./0003-v010-implementation.md) | **Done** (tagged `v0.10.0`) |
-| v0.20 Inference Spine | [0004](./0004-v020-inference-spine.md) | In progress |
+| v0.20 Inference Spine | [0004](./0004-v020-inference-spine.md) | **Done** (tagged `v0.20.0`) |
 | v0.30 Performance | [0005](./0005-v030-performance.md) | Planned |
 | v0.40 SALT Quantization | [0006](./0006-v040-quantization.md) | Planned |
 | v0.50 Training Core | [0007](./0007-v050-training-core.md) | Planned |

@@ -3,6 +3,35 @@
 All notable changes to Tritium. Format loosely follows Keep a Changelog; this is
 pre-1.0, so APIs may break between `0.x0` milestones.
 
+## [0.20.0] — 2026-06-15 — Inference Spine
+
+End-to-end token generation: **BitNet b1.58 2B4T** loads from its I2_S GGUF and
+decodes tokens that match HF transformers, on CPU **and** CUDA (ADR 0004).
+
+### Added
+- **tritium-format** — I2_S decoder (`unpack_i2s_block`/`unpack_i2s_tensor`): ggml
+  type-36, per-tensor f32 scale, `trit = code-1`, plain `[N,K]`; bit-exact vs the HF
+  checkpoint on every layer-0 projection shape.
+- **tritium-nn** — ops (RoPE NeoX, GQA attention, softmax, top-k/p sampling) vs torch
+  goldens; W1.58**A8** int8 activation quant (Qb=127, round-half-to-even); paged KV
+  cache (incremental==full); `TernaryLinear`/`Relu2Mlp`/`TransformerBlock` with the
+  `attn_sub_norm`/`ffn_sub_norm` sub-LN; `ModelRunner::{load,forward,generate}` + a
+  fidelity-ladder debug hook; tied LM head.
+- **tritium-py** — PyO3 0.23 + maturin abi3 wheel: `Model.load/generate` (GIL released),
+  `ternary_matmul`; every error → a Python exception.
+- **tritium-cli** — `generate` subcommand.
+
+### Validated
+- **Forward fidelity** — vs transformers fp32: embedding bit-exact, per-op rungs ~1e-6,
+  final-logit **argmax exact**.
+- **Acceptance (RTX 4090)** — CUDA greedy **256/256 tokens exact**; **perplexity 2.81e-3**
+  (≤1%); **CPU↔CUDA parity** bit-identical over 32 steps.
+- **Python binding** — shape/dtype errors raise, GIL release proven, 6-thread no deadlock.
+
+### Notes
+- Tokenizer is Python-side (HF) for the acceptance harness; a native Rust tokenizer is
+  deferred to v0.80. Big-model tests are gated (model download + GPU), not on cpu-CI.
+
 ## [0.10.0] — 2026-06-15 — Foundation
 
 First milestone (ADR 0002 roadmap). A ternary mpGEMM runs bit-exact against the
