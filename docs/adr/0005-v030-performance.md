@@ -132,7 +132,16 @@ Correctness + infrastructure (**all met, verified on the RTX 4090 + independent 
 
 Partial / lane-deferred (**honestly not fully closed here**):
 
-- [~] **P** AVX2 == scalar == LUT verified here; **AVX-512 and NEON execution are lane-deferred** — the dev box is AVX2-only x86_64, so AVX-512 is compile-checked and NEON is aarch64 cross-compile-checked, with the bit-exact-fold parity argument documented. Closes when run on an AVX-512 host + an aarch64 host.
+- [~] **P** Cross-ISA parity: **AVX2 == scalar == LUT** verified natively, and **NEON
+  is now validated under emulation** — the full `tritium-cpu` suite (31/31, incl.
+  `simd::neon::tests::neon_matches_scalar` + the conformance set) passes on an emulated
+  aarch64 via `qemu-aarch64-static` (slow, real TCG), so the NEON kernel executes
+  bit-exact. **AVX-512 execution is still open**: QEMU-user's x86 path can't emulate
+  AVX-512 (its CPUID doesn't expose `avx512f`, so the kernel's runtime guard skips),
+  and cargo won't cross-execute a same-arch x86 target — so this needs **Intel SDE**
+  (`sde64 -spr -- <bin>`) or real AVX-512 silicon. The AVX-512 kernel is compile-checked
+  and shares the *exact* bit-exact-fold discipline of the AVX2 (validated) and NEON
+  (validated) kernels, plus passed code review — so the residual risk is low.
 - [~] **Pe** The bench harness, roofline ceiling (848.6 tok/s decode), `ncu` %-of-SOL recipe, and the `>5%`-drop regression CI lane are all in place; the **headline `≥1.2×` bitnet.cpp tok/s target is NOT yet hit** — the e2e pipeline is still the v0.20 correctness-first one (per-matmul H2D/D2H round-trips; the IMMA kernel is conformance-verified + microbenched but **not yet wired into the model forward**). The competitor baseline is committed as **published** bitnet.cpp numbers, not a same-HW build. A live `ncu` run is not recorded. **Tracked as the remaining e2e-performance work (follow-on 0.3.x / 0.4.0).**
 
 `v0.3.0` ships the **verified, zero-numerics-change performance kernels + autotune +
