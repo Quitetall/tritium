@@ -780,9 +780,14 @@ version = "0.0.1"
 dependencies = [
  "divan",
  "half",
+ "serde",
+ "serde_json",
  "tritium-core",
  "tritium-cpu",
+ "tritium-cuda",
  "tritium-format",
+ "tritium-nn",
+ "tritium-runtime",
  "tritium-spec",
 ]
 

@@ -55,3 +55,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p tritium-cuda --features cuda
       - run: compute-sanitizer --tool memcheck cargo test -p tritium-cuda --features cuda
+
+  # Perf-regression lane (ADR 0005 WF-E / Pe). Scheduled on the pinned GPU box: runs
+  # the end-to-end tokens/sec bench (which couples each perf number to an
+  # unchanged-perplexity assertion) and fails on a >5% tokens/sec drop vs the
+  # committed competitor baseline (`tritium_benches::BITNET_CPP_2B4T_DECODE`). Manual
+  # for now (`if: false`) — enable on the self-hosted 4090 runner with nvcc + the
+  # BitNet 2B4T GGUF present at the pinned cache path.
+  perf-regression:
+    name: perf regression (tok/s vs baseline)
+    runs-on: [self-hosted, gpu]
+    if: ${{ false }} # enable on the pinned 4090 runner with nvcc + the model
+    needs: gpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The bench fixtures + baseline/regression logic are unit-tested on every lane;
+      # this asserts they hold under -D warnings on the GPU toolchain too.
+      - run: cargo test -p tritium-benches --features cuda
+      # Compile the GPU + e2e benches (nvcc PTX build) and run the e2e tok/s bench.
+      # The bench asserts perplexity-within-1% before timing (panics on drift), then
+      # asserts the decode-only tok/s is not >5% below the recorded competitor baseline
+      # — both `assert!`s fail the bench process and thus this job. The published
+      # baseline is a conservative floor; tighten it to a `BuiltOnBox` number to make
+      # the gate bite on real kernel regressions.
+      - run: cargo bench -p tritium-benches --features cuda --bench e2e

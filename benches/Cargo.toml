@@ -21,9 +21,49 @@ half = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
+# The runtime registry is how the GPU + e2e benches obtain an owned backend trait
+# object (find the registered `init` by name), exactly as `tests/acceptance.rs` does.
+tritium-runtime = { workspace = true }
+# The end-to-end tokens/sec bench drives the v0.20 `ModelRunner` over the real GGUF.
+tritium-nn = { workspace = true }
+# The CUDA backend, linked ONLY for the GPU lane. It is a dev-dependency with its own
+# `cuda` feature off by default, so the standard cpu-only build/bench of this crate
+# pulls in no `cudarc` and runs no `nvcc`. The crate-level `cuda` feature below turns
+# it on so the backend self-registers as `"cuda"` into the runtime `BACKENDS` slice.
+tritium-cuda = { workspace = true }
+# Parse the committed `tools/reference/bitnet_accept.json` (token IDs + reference
+# perplexity) the end-to-end bench couples its tokens/sec to.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
-# WF-E extends this with the IMMA/add-only GPU benches, the end-to-end tokens/sec
-# bench on BitNet, and the roofline / regression harness.
+# `cargo bench -p tritium-benches --features cuda` enables the CUDA backend (and its
+# build.rs `nvcc` PTX compile) so the GPU mpGEMM microbenches and the end-to-end
+# tokens/sec bench can run on the `"cuda"` backend. Without the feature the GPU bench
+# bodies compile out entirely (`#[cfg(feature = "cuda")]`), keeping cpu-only lanes
+# (no GPU, no CUDA toolkit) building. The feature forwards to the CUDA backend's own
+# `cuda` feature via `tritium-nn`'s, plus its own `tritium-cuda/cuda` so the bench
+# crate can name `CudaBackend` directly.
+[features]
+default = []
+cuda = ["tritium-cuda/cuda", "tritium-nn/cuda"]
+
+# WF-E benches. `mpgemm` (CPU, always-on) is the v0.30 skeleton baseline. The GPU
+# mpGEMM microbenches + the end-to-end tokens/sec bench have `cuda`-gated bodies, so
+# they build everywhere but only do work with `--features cuda` (and, for e2e, the
+# model present). `roofline` is pure host arithmetic — it always runs, printing the
+# decode ceiling + the committed competitor baselines.
 [[bench]]
 name = "mpgemm"
+harness = false
+
+[[bench]]
+name = "gpu_mpgemm"
+harness = false
+
+[[bench]]
+name = "e2e"
+harness = false
+
+[[bench]]
+name = "roofline"
 harness = false
