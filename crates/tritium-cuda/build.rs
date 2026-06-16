@@ -25,6 +25,13 @@ use std::process::Command;
 /// CUDA 13 removed Volta and earlier, so `compute_75` is the floor.
 const SUPPORTED_SM_ARCHS: &[&str] = &["75", "80", "89", "90"];
 
+/// Virtual arch floor for the IMMA kernel. The `mma.m16n8k32` int8 shape it uses
+/// is an Ampere-and-later (sm_80+) instruction — it does not exist on the sm_75
+/// (Turing) floor the add-only kernel targets — so this kernel gets its OWN PTX
+/// target at `compute_80`. PTX is forward-compatible, so this one image JITs up to
+/// Ampere/Ada/Hopper/Blackwell (the rest of [`SUPPORTED_SM_ARCHS`]).
+const IMMA_MIN_ARCH: &str = "80";
+
 fn main() {
     // Rebuild triggers regardless of feature state: cheap, and correct when the
     // feature is later toggled on.
@@ -54,36 +61,53 @@ fn main() {
     let out_dir = PathBuf::from(
         std::env::var_os("OUT_DIR").expect("OUT_DIR is always set by cargo for build scripts"),
     );
-    let ptx_path = out_dir.join("tq2_0_add.ptx");
-    let src = Path::new("kernels/tq2_0_add.cu");
 
-    // PTX is generated for the lowest supported virtual arch; the driver JITs it
-    // up to the device's actual SM at load time (so one PTX covers sm_70..sm_90).
-    let min_arch = SUPPORTED_SM_ARCHS
+    // The add-only kernel: PTX for the lowest supported virtual arch; the driver
+    // JITs it up to the device's actual SM at load time (one PTX covers sm_75..90).
+    let add_min_arch = SUPPORTED_SM_ARCHS
         .first()
         .expect("SUPPORTED_SM_ARCHS is never empty");
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/tq2_0_add.cu"),
+        &out_dir.join("tq2_0_add.ptx"),
+        add_min_arch,
+    );
 
-    let mut cmd = Command::new(&nvcc);
+    // The IMMA prefill kernel: its `mma.m16n8k32` int8 shape needs sm_80+, so it
+    // gets a SECOND PTX target at compute_80 (the sm_75 floor cannot assemble it).
+    // PTX is forward-compatible, so this image still JITs up to Ada/Hopper/etc.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/tq2_0_imma.cu"),
+        &out_dir.join("tq2_0_imma.ptx"),
+        IMMA_MIN_ARCH,
+    );
+}
+
+/// Compile a single `.cu` source to virtual PTX (no SASS) for `arch`, emitting it
+/// at `ptx_path`. Panics with an actionable message if nvcc is missing the source,
+/// fails, or silently produces nothing.
+fn compile_ptx(nvcc: &Path, src: &Path, ptx_path: &Path, arch: &str) {
+    let mut cmd = Command::new(nvcc);
     cmd.arg("-ptx")
         .arg(src)
         .arg("-o")
-        .arg(&ptx_path)
+        .arg(ptx_path)
         // Virtual-only target: `arch=compute_XX,code=compute_XX` emits PTX (no
         // SASS), which the runtime driver recompiles for the present GPU.
         .arg("-gencode")
-        .arg(format!("arch=compute_{min_arch},code=compute_{min_arch}"))
-        // -O3 keeps the add-only loop tight; correctness is unaffected.
+        .arg(format!("arch=compute_{arch},code=compute_{arch}"))
+        // -O3 keeps the kernel tight; correctness is unaffected.
         .arg("-O3");
 
     let status = cmd.status().unwrap_or_else(|e| {
-        panic!(
-            "tritium-cuda: failed to invoke nvcc ({}): {e}",
-            nvcc.display()
-        )
+        panic!("tritium-cuda: failed to invoke nvcc ({}): {e}", nvcc.display())
     });
     assert!(
         status.success(),
-        "tritium-cuda: nvcc failed to compile kernels/tq2_0_add.cu (exit {status})"
+        "tritium-cuda: nvcc failed to compile {} (exit {status})",
+        src.display()
     );
     assert!(
         ptx_path.exists(),

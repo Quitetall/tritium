@@ -45,7 +45,9 @@ pub use i2s::{
     GGML_TYPE_I2_S, I2S_BLOCK_BYTES, I2S_BLOCK_ELEMS, I2S_SCALE_BYTES, unpack_i2s_block,
     unpack_i2s_tensor,
 };
-pub use i2s_int8::{I2sInt8Weights, convert_i2s_to_int8, convert_i2s_to_tq2_0};
+pub use i2s_int8::{
+    I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
+};
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};

@@ -35,7 +35,9 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 
 use tritium_core::{GemmShape, TernaryFormat};
-use tritium_format::{TQ2_0_BLOCK_BYTES, num_blocks};
+use tritium_format::{
+    IMMA_K, IMMA_N, IMMA_WTILE_BYTES, TQ2_0_BLOCK_BYTES, num_blocks,
+};
 use tritium_runtime::BackendEntry;
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
 
@@ -46,6 +48,16 @@ const KERNEL_NAME: &str = "tq2_0_add_mpgemm";
 /// The decode-oriented tiled add-only kernel (v0.30 WF-A): one warp per output,
 /// one block per row with the activation row staged in shared memory.
 const KERNEL_NAME_TILED: &str = "tq2_0_add_mpgemm_tiled";
+/// The IMMA int8 tensor-core prefill kernel (v0.30 WF-A part 2): one warp per
+/// 16×8 output tile, `mma.m16n8k32` int32 accumulate, ternary weights in the
+/// [`TernaryFormat::I2sInt8`] tile interleave.
+const KERNEL_NAME_IMMA: &str = "tq2_0_imma_mpgemm";
+/// On-device per-token int8 absmax activation quant (W1.58A8), the first step of
+/// the fused `mpgemm_with_act_quant` override.
+const KERNEL_NAME_ACT_QUANT: &str = "act_quant_int8_per_token";
+/// Threads per block for `act_quant_int8_per_token` — must match the kernel's
+/// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
+const ACT_QUANT_THREADS: u32 = 256;
 /// CUDA threads per block for the 1-D launch grid (simple kernel).
 const THREADS_PER_BLOCK: u32 = 256;
 /// Warps per block for the tiled kernel — each warp computes one output column,
@@ -63,6 +75,10 @@ const TILED_M_MAX: usize = 64;
 /// The PTX produced by `build.rs` (`nvcc -ptx`). Embedded at compile time so the
 /// backend needs no PTX file on disk at runtime.
 const TQ2_0_ADD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/tq2_0_add.ptx"));
+/// The IMMA prefill kernel + the on-device act-quant kernel, compiled by `build.rs`
+/// to a SECOND PTX target at `compute_80` (the `mma.m16n8k32` int8 shape needs
+/// sm_80+, above the add kernel's sm_75 floor). Embedded the same way.
+const TQ2_0_IMMA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/tq2_0_imma.ptx"));
 
 /// Map a `cudarc` driver error to a [`BackendError`]. Allocation failures surface
 /// as [`BackendError::OutOfMemory`]; everything else is stringified into
@@ -71,26 +87,39 @@ fn driver_err(context: &str, err: &DriverError) -> BackendError {
     BackendError::Backend(format!("{context}: {err}"))
 }
 
-/// Device-resident packed TQ2_0 weights for one matmul operand.
+/// Device-resident packed ternary weights for one matmul operand.
 ///
 /// Wraps a [`CudaSlice<u8>`] (the htod copy of the host-packed bytes) plus the
-/// `[N, K]` geometry and the per-row packed byte stride, so `mpgemm` can validate
-/// and launch without re-deriving them.
+/// `[N, K]` geometry, the packing [`TernaryFormat`], and a format-specific stride
+/// ([`Stride`]), so `mpgemm` / `mpgemm_with_act_quant` can validate and launch
+/// without re-deriving them.
 ///
 /// Internal to the crate: it crosses the [`TernaryBackend`] boundary only as a
 /// `Box<dyn DeviceBuffer>`, downcast back here via [`core::any::Any`].
 #[derive(Debug)]
 pub(crate) struct CudaBuffer {
-    /// Device allocation holding the packed TQ2_0 bytes, `[N * row_bytes]`.
+    /// Device allocation holding the packed bytes (TQ2_0 rows or the I2sInt8 tiles).
     device: CudaSlice<u8>,
-    /// Output channels (`N`).
+    /// Output channels (`N`), unpadded.
     n: usize,
-    /// Contraction dimension (`K`).
+    /// Contraction dimension (`K`), unpadded.
     k: usize,
-    /// Packed bytes per weight row (`num_blocks(k) * TQ2_0_BLOCK_BYTES`).
-    row_bytes: usize,
+    /// The packing this buffer holds — gates which kernel may consume it.
+    format: TernaryFormat,
+    /// Format-specific addressing stride (TQ2_0 per-row bytes vs IMMA k-tile count).
+    stride: Stride,
     /// Total bytes uploaded (`device.len()`), cached for [`DeviceBuffer::len_bytes`].
     bytes: usize,
+}
+
+/// Format-specific addressing metadata cached alongside a [`CudaBuffer`].
+#[derive(Debug, Clone, Copy)]
+enum Stride {
+    /// TQ2_0: packed bytes per weight row (`num_blocks(k) * TQ2_0_BLOCK_BYTES`).
+    Tq2_0 { row_bytes: usize },
+    /// I2sInt8: the packed K-tile count (`ceil(k / IMMA_K)`), the kernel's
+    /// `num_ktiles` launch argument and the per-n-tile k-tile stride.
+    I2sInt8 { num_ktiles: usize },
 }
 
 impl DeviceBuffer for CudaBuffer {
@@ -115,13 +144,20 @@ pub struct CudaBackend {
     /// The stream holds its own `Arc<CudaContext>`, so the context stays alive for
     /// as long as the backend does without a separate field.
     stream: Arc<CudaStream>,
-    /// Loaded PTX module (kept alive so `func`/`func_tiled` stay valid).
+    /// Loaded add-only PTX module (kept alive so `func`/`func_tiled` stay valid).
     _module: Arc<CudaModule>,
+    /// Loaded IMMA PTX module (kept alive so `func_imma`/`func_act_quant` stay
+    /// valid). A separate `compute_80` image, distinct from `_module`'s `compute_75`.
+    _imma_module: Arc<CudaModule>,
     /// The resolved `tq2_0_add_mpgemm` kernel (one thread per output).
     func: CudaFunction,
     /// The resolved `tq2_0_add_mpgemm_tiled` kernel (warp per output, shared-mem
     /// staged activations) — the decode path.
     func_tiled: CudaFunction,
+    /// The resolved `tq2_0_imma_mpgemm` kernel (IMMA int8 tensor-core prefill).
+    func_imma: CudaFunction,
+    /// The resolved `act_quant_int8_per_token` kernel (on-device W1.58A8 quant).
+    func_act_quant: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -149,6 +185,20 @@ impl CudaBackend {
             .load_function(KERNEL_NAME_TILED)
             .map_err(|e| driver_err("resolve tq2_0_add_tiled kernel", &e))?;
 
+        // The IMMA kernels live in their own compute_80 PTX (the add kernel's
+        // compute_75 PTX cannot assemble `mma.m16n8k32`). Loading it JITs to the
+        // present device, which the GPU lane guarantees is sm_80+ (the 4090 is
+        // sm_89). A pre-sm_80 device would fail here, which is the correct error.
+        let imma_module = ctx
+            .load_module(Ptx::from_src(TQ2_0_IMMA_PTX))
+            .map_err(|e| driver_err("load tq2_0_imma ptx", &e))?;
+        let func_imma = imma_module
+            .load_function(KERNEL_NAME_IMMA)
+            .map_err(|e| driver_err("resolve tq2_0_imma kernel", &e))?;
+        let func_act_quant = imma_module
+            .load_function(KERNEL_NAME_ACT_QUANT)
+            .map_err(|e| driver_err("resolve act_quant kernel", &e))?;
+
         let device_name = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_owned());
@@ -156,8 +206,11 @@ impl CudaBackend {
         Ok(Self {
             stream,
             _module: module,
+            _imma_module: imma_module,
             func,
             func_tiled,
+            func_imma,
+            func_act_quant,
             device_id: format!("cuda:{ordinal}"),
             device_name,
         })
@@ -204,6 +257,10 @@ impl CudaBackend {
             .as_any()
             .downcast_ref::<CudaBuffer>()
             .ok_or_else(|| BackendError::InvalidInput("buffer is not a CudaBuffer".into()))?;
+        // The add path consumes TQ2_0 rows; an I2sInt8 buffer would mis-address.
+        let Stride::Tq2_0 { row_bytes } = buf.stride else {
+            return Err(BackendError::UnsupportedFormat(buf.format));
+        };
 
         let GemmShape { m, n, k } = shape;
         if buf.n != n || buf.k != k {
@@ -287,7 +344,7 @@ impl CudaBackend {
         let m_i = m as i32;
         let n_i = n as i32;
         let k_i = k as i32;
-        let row_bytes_i = buf.row_bytes as i32;
+        let row_bytes_i = row_bytes as i32;
 
         let mut launch = self.stream.launch_builder(func);
         launch
@@ -324,7 +381,173 @@ impl CudaBackend {
 
         Ok(())
     }
+
+    /// The fused W1.58A8 path on the IMMA int8 tensor cores: quantize `act` to
+    /// per-token int8 **on device**, contract against the [`TernaryFormat::I2sInt8`]
+    /// weights with `mma.m16n8k32`, and fold both the per-token activation scale and
+    /// the per-channel `weight_scales` into the `f32` output — all without an extra
+    /// host pass or an H2D round-trip of the quantized activations.
+    ///
+    /// Validation mirrors the spec default's: `act`/`out`/`weight_scales` lengths vs
+    /// `shape`, the buffer's `[N, K]` geometry, and that the buffer is an I2sInt8
+    /// packing. Empty `M`/`N` is a no-op.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] / [`BackendError::UnsupportedFormat`] on bad
+    /// inputs; device failures via the cudarc error mapping.
+    fn imma_with_act_quant(
+        &self,
+        act: &[f32],
+        weights: &dyn DeviceBuffer,
+        weight_scales: &[f32],
+        shape: GemmShape,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let buf = weights
+            .as_any()
+            .downcast_ref::<CudaBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("buffer is not a CudaBuffer".into()))?;
+        let Stride::I2sInt8 { num_ktiles } = buf.stride else {
+            return Err(BackendError::UnsupportedFormat(buf.format));
+        };
+
+        let GemmShape { m, n, k } = shape;
+        if buf.n != n || buf.k != k {
+            return Err(BackendError::ShapeMismatch {
+                expected: buf.n * buf.k,
+                got: n * k,
+            });
+        }
+        if act.len() != m * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * k,
+                got: act.len(),
+            });
+        }
+        if weight_scales.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: weight_scales.len(),
+            });
+        }
+        if out.len() != m * n {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * n,
+                got: out.len(),
+            });
+        }
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+
+        // --- Upload activations; alloc the on-device int8 quant + per-token scale. ---
+        let d_act = self
+            .stream
+            .clone_htod(act)
+            .map_err(|e| alloc_or_backend("upload act (htod)", &e, act.len() * 4))?;
+        let mut d_qact = self
+            .stream
+            .alloc_zeros::<i8>(m * k)
+            .map_err(|e| alloc_or_backend("alloc qact", &e, m * k))?;
+        let mut d_act_scale = self
+            .stream
+            .alloc_zeros::<f32>(m)
+            .map_err(|e| alloc_or_backend("alloc act_scale", &e, m * 4))?;
+        let d_wscale = self
+            .stream
+            .clone_htod(weight_scales)
+            .map_err(|e| alloc_or_backend("upload weight_scales (htod)", &e, n * 4))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .map_err(|e| alloc_or_backend("alloc out", &e, m * n * 4))?;
+
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let num_ktiles_i = num_ktiles as i32;
+
+        // --- Step 1: per-token int8 absmax quant (one block per row). ---
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (m as u32, 1, 1),
+                block_dim: (ACT_QUANT_THREADS, 1, 1),
+                shared_mem_bytes: 0, // the kernel's reduction buffer is static __shared__
+            };
+            let mut launch = self.stream.launch_builder(&self.func_act_quant);
+            launch
+                .arg(&d_act)
+                .arg(&mut d_qact)
+                .arg(&mut d_act_scale)
+                .arg(&m_i)
+                .arg(&k_i);
+            // SAFETY: `launch` is `unsafe` — args are not type-checked against the
+            // kernel. `act_quant_int8_per_token(const float*, signed char*, float*,
+            // int, int)` is fed exactly: `d_act` (f32 [M,K], read), `d_qact` (i8
+            // [M,K], written), `d_act_scale` (f32 [M], written), then `m`, `k`. The
+            // grid is `M` blocks of `ACT_QUANT_THREADS` (matching the kernel's
+            // `ACT_QUANT_THREADS` static shared reduction). All buffers were sized
+            // against `shape`; host scalars outlive the launch.
+            #[allow(unsafe_code)]
+            unsafe {
+                launch
+                    .launch(cfg)
+                    .map_err(|e| driver_err("launch act_quant", &e))?;
+            }
+        }
+
+        // --- Step 2: IMMA int8 contraction, folding both scales into `out`. ---
+        {
+            let grid_n = (n as u32).div_ceil(IMMA_N as u32);
+            let grid_m = (m as u32).div_ceil(IMMA_M as u32);
+            let cfg = LaunchConfig {
+                grid_dim: (grid_n, grid_m, 1),
+                block_dim: (WARP_SIZE, 1, 1), // one warp per 16×8 output tile
+                shared_mem_bytes: 0,          // the kernel's staging is static __shared__
+            };
+            let mut launch = self.stream.launch_builder(&self.func_imma);
+            launch
+                .arg(&d_qact)
+                .arg(&buf.device)
+                .arg(&d_act_scale)
+                .arg(&d_wscale)
+                .arg(&mut d_out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(&num_ktiles_i);
+            // SAFETY: `launch` is `unsafe`. `tq2_0_imma_mpgemm(const signed char*,
+            // const unsigned char*, const float*, const float*, float*, int, int,
+            // int, int)` is fed in that exact order/type: `d_qact` (i8 [M,K]),
+            // `buf.device` (the I2sInt8 tile bytes, validated to the packed length in
+            // `upload_weights`), `d_act_scale` (f32 [M]), `d_wscale` (f32 [N]),
+            // `d_out` (f32 [M,N], the only mutable operand), then `m,n,k,num_ktiles`.
+            // The grid covers `ceil(M/16)·ceil(N/8)` tiles; the kernel bounds-checks
+            // every global (`gm<m`, `gn<n`, `gk<k`) and addresses the weight tiles
+            // with `num_ktiles`, the stride cached in the buffer. Host scalars
+            // outlive the launch.
+            #[allow(unsafe_code)]
+            unsafe {
+                launch
+                    .launch(cfg)
+                    .map_err(|e| driver_err("launch tq2_0_imma", &e))?;
+            }
+        }
+
+        self.stream
+            .memcpy_dtoh(&d_out, out)
+            .map_err(|e| driver_err("download out (dtoh)", &e))?;
+
+        Ok(())
+    }
 }
+
+/// Threads in a warp — the IMMA kernel launches exactly one warp per output tile.
+const WARP_SIZE: u32 = 32;
+
+/// The IMMA `mma.m16n8k32` output-tile M dimension (16 rows per warp tile). The N
+/// tile dimension is [`tritium_format::IMMA_N`] (8).
+const IMMA_M: usize = 16;
 
 /// Which add-only kernel a launch should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,8 +565,10 @@ impl TernaryBackend for CudaBackend {
 
     fn capabilities(&self) -> DeviceCaps {
         // total_memory is left at its default (unknown): the contract permits 0 and
-        // the runtime does not rely on the figure here.
-        DeviceCaps::new("cuda", self.device_name.clone()).with_features(vec!["tq2_0".to_owned()])
+        // the runtime does not rely on the figure here. Both packings this backend
+        // consumes are advertised so the runtime can route either kernel here.
+        DeviceCaps::new("cuda", self.device_name.clone())
+            .with_features(vec!["tq2_0".to_owned(), "i2s_int8".to_owned()])
     }
 
     fn upload_weights(
@@ -352,15 +577,31 @@ impl TernaryBackend for CudaBackend {
         shape: GemmShape,
         format: TernaryFormat,
     ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
-        if format != TernaryFormat::Tq2_0 {
-            return Err(BackendError::UnsupportedFormat(format));
-        }
         let GemmShape { n, k, .. } = shape;
-        let row_bytes = Self::row_bytes(k);
-        let expected = n * row_bytes;
+
+        // Each format has its own packed byte length and addressing stride; TQ1_0
+        // is not a GPU packing here.
+        let (expected, stride) = match format {
+            TernaryFormat::Tq2_0 => {
+                let row_bytes = Self::row_bytes(k);
+                (n * row_bytes, Stride::Tq2_0 { row_bytes })
+            }
+            TernaryFormat::I2sInt8 => {
+                // The IMMA tile interleave (see `tritium_format::convert_i2s_to_int8`):
+                // `ceil(N/IMMA_N) · ceil(K/IMMA_K) · IMMA_WTILE_BYTES` bytes.
+                let num_ntiles = n.div_ceil(IMMA_N);
+                let num_ktiles = k.div_ceil(IMMA_K);
+                (
+                    num_ntiles * num_ktiles * IMMA_WTILE_BYTES,
+                    Stride::I2sInt8 { num_ktiles },
+                )
+            }
+            other => return Err(BackendError::UnsupportedFormat(other)),
+        };
+
         if packed.len() != expected {
             return Err(BackendError::InvalidInput(format!(
-                "packed len {} != expected {expected} for shape {shape:?} (tq2_0)",
+                "packed len {} != expected {expected} for shape {shape:?} ({format:?})",
                 packed.len()
             )));
         }
@@ -380,7 +621,8 @@ impl TernaryBackend for CudaBackend {
             device,
             n,
             k,
-            row_bytes,
+            format,
+            stride,
             bytes: packed.len(),
         }))
     }
@@ -398,6 +640,135 @@ impl TernaryBackend for CudaBackend {
         // All validation + the launch live in `mpgemm_kernel`.
         let kernel = Self::select_add_kernel(shape.m, shape.k);
         self.mpgemm_kernel(act, weights, scales, shape, format, out, kernel)
+    }
+
+    /// CUDA override of the fused W1.58A8 path. For an [`TernaryFormat::I2sInt8`]
+    /// buffer this drives the on-device quant + IMMA int8 kernel
+    /// ([`imma_with_act_quant`](CudaBackend::imma_with_act_quant)), dropping the
+    /// host quant pass + the H2D round-trip the spec default would do. For a TQ2_0
+    /// buffer (no int8 tensor-core path) it defers to the spec default — host
+    /// per-token quant → [`mpgemm`](TernaryBackend::mpgemm) (add-only kernel) → fold
+    /// — so both packings are served and the override stays within the `mpgemm`
+    /// tolerance of that default (ADR 0005's "fused == host-A8" gate).
+    ///
+    /// # Errors
+    /// As [`imma_with_act_quant`](CudaBackend::imma_with_act_quant) /
+    /// [`mpgemm`](TernaryBackend::mpgemm) document, plus
+    /// [`BackendError::InvalidInput`] if the buffer is not a CUDA buffer.
+    fn mpgemm_with_act_quant(
+        &self,
+        act: &[f32],
+        weights: &dyn DeviceBuffer,
+        weight_scales: &[f32],
+        shape: GemmShape,
+        format: TernaryFormat,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let buf = weights
+            .as_any()
+            .downcast_ref::<CudaBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("buffer is not a CudaBuffer".into()))?;
+        match buf.format {
+            TernaryFormat::I2sInt8 => {
+                self.imma_with_act_quant(act, weights, weight_scales, shape, out)
+            }
+            // TQ2_0 (and anything else uploadable) → the host-quant default, which
+            // delegates to the add-only `mpgemm`. `format` must agree with the
+            // buffer; the default's `mpgemm` re-checks it.
+            _ => self.default_mpgemm_with_act_quant(act, weights, weight_scales, shape, format, out),
+        }
+    }
+}
+
+/// Free function holding the spec's default `mpgemm_with_act_quant` body, so the
+/// CUDA override can fall back to it for non-IMMA (TQ2_0) buffers without losing
+/// the on-device IMMA path for I2sInt8. It is the literal host-A8 reference:
+/// per-token int8 absmax quant on the host, then [`TernaryBackend::mpgemm`], then
+/// fold the per-token scale — identical to [`tritium_spec`]'s provided default and
+/// to the v0.20 caller-side quant.
+impl CudaBackend {
+    fn default_mpgemm_with_act_quant(
+        &self,
+        act: &[f32],
+        weights: &dyn DeviceBuffer,
+        weight_scales: &[f32],
+        shape: GemmShape,
+        format: TernaryFormat,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if act.len() != m * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * k,
+                got: act.len(),
+            });
+        }
+        if out.len() != m * n {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * n,
+                got: out.len(),
+            });
+        }
+        if weight_scales.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: weight_scales.len(),
+            });
+        }
+
+        // Per-token int8 absmax quant kept in f32 (the f32 `mpgemm` consumes it
+        // directly), plus the per-token dequant multiplier. Matches the spec default
+        // / `tritium-nn::ops::act_quant` (round-half-to-even, clamp [-128, 127]).
+        let mut q = vec![0.0_f32; m * k];
+        let mut act_scale = vec![0.0_f32; m];
+        quantize_act_int8_host(act, m, k, &mut q, &mut act_scale);
+
+        self.mpgemm(&q, weights, weight_scales, shape, format, out)?;
+
+        // Fold the per-token activation scale: out[m,n] *= act_scale[m].
+        for (row, &s) in out.chunks_exact_mut(n).zip(act_scale.iter()) {
+            for v in row {
+                *v *= s;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Symmetric int8 activation-quant positive cap (`Qp`). Matches
+/// `tritium_spec`'s `A8_QB` / `tritium-nn::ops::act_quant::QB` and the device
+/// `act_quant_int8_per_token` kernel.
+const A8_QB: f32 = 127.0;
+
+/// Host per-token int8 absmax quant — the fallback used by
+/// [`CudaBackend::default_mpgemm_with_act_quant`] for TQ2_0 buffers. A verbatim copy
+/// of `tritium_spec::quantize_act_int8` (which cannot be imported — it is private to
+/// that crate). The fused-vs-default gate keeps the two from drifting: the IMMA
+/// device quant, this host copy, and the spec copy all reproduce the same int8
+/// values, pinned by `act_quant` parity in the spec's own `act_quant_golden` test.
+fn quantize_act_int8_host(act: &[f32], m: usize, k: usize, q_out: &mut [f32], scale_out: &mut [f32]) {
+    for r in 0..m {
+        let row = &act[r * k..r * k + k];
+        let mut gamma = 0.0_f32;
+        for &v in row {
+            let a = v.abs();
+            if a > gamma {
+                gamma = a;
+            }
+        }
+        let out_row = &mut q_out[r * k..r * k + k];
+        if gamma == 0.0 {
+            for q in out_row.iter_mut() {
+                *q = 0.0;
+            }
+            scale_out[r] = 0.0;
+            continue;
+        }
+        let s = A8_QB / gamma;
+        for (q, &v) in out_row.iter_mut().zip(row) {
+            *q = (v * s).round_ties_even().clamp(-128.0, A8_QB);
+        }
+        scale_out[r] = gamma / A8_QB;
     }
 }
 
@@ -733,6 +1104,299 @@ mod tests {
                 "expected UnsupportedFormat, got {:?}",
                 other.map(|_| "ok-buffer")
             ),
+        }
+    }
+
+    // ---- IMMA int8 tensor-core path (v0.30 WF-A part 2) ------------------------
+    //
+    // Tolerance: the conformance default (`relative = 1e-4`, ADR 0002). The IMMA
+    // kernel contracts in **int32**, which is *exact* for int8×ternary (no overflow
+    // for any BitNet K — see `kernels/tq2_0_imma.cu`), so the only float rounding is
+    // the single per-output `act_scale·weight_scale·acc`. The 1e-4 band is therefore
+    // the *reference's* own f32-accumulate rounding, not a defect of this kernel —
+    // no widened reduction bar is needed (cf. the tiled add-only kernel, which sums
+    // in double to stay inside the band; the IMMA integer accumulate is exact).
+
+    /// Build an I2_S tensor payload (`N·K/4` quant bytes + one trailing `f32` scale)
+    /// from an `[N, K]` row-major trit matrix, inverting the 32-byte block striping
+    /// (`code = trit + 1`, element `pos` of a 128-block at byte `pos%32`, shift
+    /// `6 - 2*(pos/32)`). `n*k` must be a multiple of 128 (the conformance shapes
+    /// all are: K ∈ {256, 512}).
+    fn build_i2s_payload(trits: &[i8], scale: f32) -> Vec<u8> {
+        let n_elements = trits.len();
+        assert!(n_elements % 128 == 0, "i2s payload needs 128-multiple elems");
+        let mut quants = vec![0u8; n_elements / 4];
+        for (global, &t) in trits.iter().enumerate() {
+            let block = global / 128;
+            let pos = global % 128;
+            let group = pos / 32;
+            let gp = pos % 32;
+            let code = (t + 1) as u8; // {-1,0,1} -> {0,1,2}
+            quants[block * 32 + gp] |= code << (6 - 2 * group);
+        }
+        let mut payload = quants;
+        payload.extend_from_slice(&scale.to_le_bytes());
+        payload
+    }
+
+    /// Pack an `[N, K]` trit matrix into the IMMA `I2sInt8` layout by routing it
+    /// through the *real* converter (`build_i2s_payload` → `convert_i2s_to_int8`),
+    /// so the test exercises exactly the bytes the kernel will see in production.
+    /// Returns the packed bytes (block scale folded into the per-tensor `scale`,
+    /// which the test keeps separate as the per-channel scale, so pass `scale = 1`).
+    fn pack_i2s_int8(trits: &[i8], shape: GemmShape) -> Vec<u8> {
+        let GemmShape { n, k, .. } = shape;
+        let payload = build_i2s_payload(trits, 1.0);
+        let w = tritium_format::convert_i2s_to_int8(&payload, GemmShape { m: 0, n, k })
+            .expect("convert i2s -> int8");
+        w.bytes
+    }
+
+    /// IMMA == reference within tolerance over the conformance set. The vectors'
+    /// weights are converted to `I2sInt8`, uploaded, and run through the fused
+    /// `mpgemm_with_act_quant` (which routes I2sInt8 → on-device quant + IMMA). The
+    /// reference is `mpgemm_with_act_quant`'s contract on the *same f32 activations*:
+    /// `out[m,n] = act_scale[m]·weight_scale[n]·Σ q[m,k]·w[n,k]`, which the testkit
+    /// CPU path computes via the spec default — so this gates IMMA == host-A8 == ref
+    /// in one shot.
+    #[test]
+    fn imma_matches_reference_within_tolerance() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping imma conformance: no device ({e})");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+        let tol = Tolerance::default();
+
+        for v in tq2_vectors() {
+            let shape = GemmShape::new(v.m, v.n, v.k);
+
+            // Reference: the host-A8 default path on the CPU backend over the SAME
+            // f32 activations + per-channel weight scales.
+            let cpu_buf = {
+                let trits: Vec<_> = v
+                    .weights
+                    .iter()
+                    .map(|&w| tritium_core::Trit::from_i8(w).expect("weight in {-1,0,1}"))
+                    .collect();
+                let packed = pack_tq2_0(&trits, shape);
+                cpu.upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+                    .expect("cpu upload")
+            };
+            let mut ref_out = vec![0.0f32; shape.m * shape.n];
+            cpu.mpgemm_with_act_quant(
+                &v.activation,
+                cpu_buf.as_ref(),
+                &v.scales,
+                shape,
+                TernaryFormat::Tq2_0,
+                &mut ref_out,
+            )
+            .expect("cpu host-A8 reference");
+
+            // IMMA: upload the I2sInt8 weights, run the fused override (on-device
+            // quant + tensor-core contraction).
+            let imma_bytes = pack_i2s_int8(&v.weights, shape);
+            let imma_buf = cuda
+                .upload_weights(&imma_bytes, shape, TernaryFormat::I2sInt8)
+                .expect("imma upload");
+            let mut imma_out = vec![0.0f32; shape.m * shape.n];
+            cuda.mpgemm_with_act_quant(
+                &v.activation,
+                imma_buf.as_ref(),
+                &v.scales,
+                shape,
+                TernaryFormat::I2sInt8,
+                &mut imma_out,
+            )
+            .expect("imma fused mpgemm");
+
+            assert_eq!(imma_out.len(), ref_out.len(), "{}: len", v.id);
+            for (i, (&g, &c)) in imma_out.iter().zip(&ref_out).enumerate() {
+                assert!(
+                    tol.accepts(g, c),
+                    "{}: imma vs host-A8 ref [{i}] imma={g} ref={c}",
+                    v.id
+                );
+            }
+        }
+    }
+
+    /// The CUDA fused override (IMMA) == the spec host-A8 default == the v0.20
+    /// caller-side quant, all within tolerance — the "fused == host-A8" gate of ADR
+    /// 0005. Three independently-derived results over the same inputs:
+    ///   1. `cuda.mpgemm_with_act_quant` on an I2sInt8 buffer → on-device quant + IMMA.
+    ///   2. The spec *default* `mpgemm_with_act_quant` (host quant → `mpgemm`) run on
+    ///      the CPU backend (a TQ2_0 buffer).
+    ///   3. The v0.20 caller-side quant: quantize on the host, then call plain
+    ///      `mpgemm` and fold the per-token scale by hand.
+    #[test]
+    fn imma_fused_equals_host_a8_and_caller_quant() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping fused parity: no device ({e})");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+        let tol = Tolerance::default();
+
+        for v in tq2_vectors() {
+            let shape = GemmShape::new(v.m, v.n, v.k);
+            let GemmShape { m, n, k } = shape;
+            let trits: Vec<_> = v
+                .weights
+                .iter()
+                .map(|&w| tritium_core::Trit::from_i8(w).expect("weight in {-1,0,1}"))
+                .collect();
+            let tq2 = pack_tq2_0(&trits, shape);
+
+            // (1) CUDA fused override on I2sInt8.
+            let imma_bytes = pack_i2s_int8(&v.weights, shape);
+            let imma_buf = cuda
+                .upload_weights(&imma_bytes, shape, TernaryFormat::I2sInt8)
+                .expect("imma upload");
+            let mut fused = vec![0.0f32; m * n];
+            cuda.mpgemm_with_act_quant(
+                &v.activation,
+                imma_buf.as_ref(),
+                &v.scales,
+                shape,
+                TernaryFormat::I2sInt8,
+                &mut fused,
+            )
+            .expect("cuda fused");
+
+            // (2) Spec host-A8 default on the CPU backend (TQ2_0).
+            let cpu_buf = cpu
+                .upload_weights(&tq2, shape, TernaryFormat::Tq2_0)
+                .expect("cpu upload");
+            let mut host_a8 = vec![0.0f32; m * n];
+            cpu.mpgemm_with_act_quant(
+                &v.activation,
+                cpu_buf.as_ref(),
+                &v.scales,
+                shape,
+                TernaryFormat::Tq2_0,
+                &mut host_a8,
+            )
+            .expect("cpu host-A8");
+
+            // (3) v0.20 caller-side quant: host quant → plain `mpgemm` → fold.
+            let mut q = vec![0.0f32; m * k];
+            let mut act_scale = vec![0.0f32; m];
+            quantize_act_int8_host(&v.activation, m, k, &mut q, &mut act_scale);
+            let mut caller = vec![0.0f32; m * n];
+            cpu.mpgemm(
+                &q,
+                cpu_buf.as_ref(),
+                &v.scales,
+                shape,
+                TernaryFormat::Tq2_0,
+                &mut caller,
+            )
+            .expect("cpu plain mpgemm");
+            for (row, &s) in caller.chunks_exact_mut(n).zip(act_scale.iter()) {
+                for x in row {
+                    *x *= s;
+                }
+            }
+
+            for i in 0..m * n {
+                assert!(
+                    tol.accepts(fused[i], host_a8[i]),
+                    "{}: fused vs host-A8 [{i}] {} {}",
+                    v.id,
+                    fused[i],
+                    host_a8[i]
+                );
+                assert!(
+                    tol.accepts(fused[i], caller[i]),
+                    "{}: fused vs caller-quant [{i}] {} {}",
+                    v.id,
+                    fused[i],
+                    caller[i]
+                );
+            }
+        }
+    }
+
+    /// IMMA tail/boundary shapes: M not a multiple of 16, N not a multiple of 8, and
+    /// single rows/cols — the padding in the I2sInt8 tiles and the kernel's global
+    /// bounds checks must keep every covered output correct. K stays a 256-multiple
+    /// (the I2_S converter needs a 128-multiple element count); the M/N tails are the
+    /// interesting axes for the 16×8 tile.
+    #[test]
+    fn imma_handles_tail_shapes() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping imma tail shapes: no device ({e})");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+        let tol = Tolerance::default();
+
+        // (M, N, K): single row/col, partial 16-row tile, partial 8-col tile.
+        let shapes = [
+            (1usize, 1usize, 256usize),
+            (1, 8, 256),
+            (3, 5, 256),
+            (16, 8, 512),
+            (17, 9, 256),
+            (33, 13, 512),
+        ];
+        for (m, n, k) in shapes {
+            let shape = GemmShape::new(m, n, k);
+            // Deterministic ternary weights, activations, per-channel scales.
+            let raw: Vec<i8> = (0..n * k).map(|i| ((i % 3) as i8) - 1).collect();
+            let act: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32 - 5.0) * 0.3).collect();
+            let scales: Vec<f32> = (0..n).map(|j| 1.0 + (j % 4) as f32 * 0.5).collect();
+
+            // Reference: host-A8 default on the CPU backend.
+            let trits: Vec<_> = raw
+                .iter()
+                .map(|&w| tritium_core::Trit::from_i8(w).unwrap())
+                .collect();
+            let cpu_buf = cpu
+                .upload_weights(&pack_tq2_0(&trits, shape), shape, TernaryFormat::Tq2_0)
+                .expect("cpu upload");
+            let mut ref_out = vec![0.0f32; m * n];
+            cpu.mpgemm_with_act_quant(
+                &act,
+                cpu_buf.as_ref(),
+                &scales,
+                shape,
+                TernaryFormat::Tq2_0,
+                &mut ref_out,
+            )
+            .expect("cpu host-A8");
+
+            let imma_buf = cuda
+                .upload_weights(&pack_i2s_int8(&raw, shape), shape, TernaryFormat::I2sInt8)
+                .expect("imma upload");
+            let mut imma_out = vec![0.0f32; m * n];
+            cuda.mpgemm_with_act_quant(
+                &act,
+                imma_buf.as_ref(),
+                &scales,
+                shape,
+                TernaryFormat::I2sInt8,
+                &mut imma_out,
+            )
+            .expect("imma fused");
+
+            for (i, (&g, &c)) in imma_out.iter().zip(&ref_out).enumerate() {
+                assert!(
+                    tol.accepts(g, c),
+                    "shape {shape:?}: imma vs ref [{i}] imma={g} ref={c}"
+                );
+            }
         }
     }
 }

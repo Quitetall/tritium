@@ -12,16 +12,26 @@
 //!   are unit, exactly as the v0.20 path treats the I2_S per-tensor scale as a
 //!   broadcast per-channel scale. This converter is complete.
 //! - [`convert_i2s_to_int8`] → [`I2sInt8Weights`] for the *IMMA* (`mma.m16n8k32`)
-//!   prefill kernel. **The byte layout here is provisional** — a plain `[N, K]`
-//!   row-major int8 baseline that decodes back to the reference trits. WF-A pins
-//!   the actual fragment interleave the `mma` instruction wants once the kernel
-//!   tiling is fixed; the plain baseline stays as the correctness anchor the
-//!   interleaved layout is validated against (interleaved == plain == reference).
+//!   prefill kernel. The byte layout is the **tile interleave the kernel's `mma`
+//!   B operand consumes directly** (see [`convert_i2s_to_int8`] for the exact
+//!   geometry). It is validated against the I2_S decode at conversion time — the
+//!   round trip `interleave → unpack → trits` is exercised by this module's tests,
+//!   the same correctness anchor the provisional plain layout used to provide.
 
 use half::f16;
 use tritium_core::{GemmShape, Trit};
 
 use crate::{FormatError, TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row, unpack_i2s_tensor};
+
+/// IMMA tile dimensions — must match `kernels/tq2_0_imma.cu`'s `mma.m16n8k32` B
+/// operand. The B (weight) operand of one `mma` is an `N×K` tile of
+/// [`IMMA_N`]×[`IMMA_K`] ternary codes; N is padded up to [`IMMA_N`], K up to
+/// [`IMMA_K`].
+pub const IMMA_N: usize = 8;
+/// IMMA K-tile width (the `mma.m16n8k32` K dimension).
+pub const IMMA_K: usize = 32;
+/// Packed bytes per `IMMA_N`×`IMMA_K` weight tile: 256 ternary codes, 4 per byte.
+pub const IMMA_WTILE_BYTES: usize = IMMA_N * IMMA_K / 4;
 
 /// Decode an I2_S weight tensor and re-pack it as **TQ2_0** for the add-only CUDA
 /// kernel.
@@ -61,29 +71,57 @@ pub fn convert_i2s_to_tq2_0(
 /// ([`TernaryFormat::I2sInt8`](tritium_core::TernaryFormat::I2sInt8)), produced by
 /// [`convert_i2s_to_int8`].
 ///
-/// `bytes` carries one int8 per weight (each in `{-1, 0, 1}` reinterpreted to
-/// `u8`, so `-1` is `0xFF`); `scale` is the per-tensor magnitude; `n`/`k` are the
-/// `[N, K]` shape. The interpretation of `bytes` is the **provisional plain
-/// `[N, K]` row-major** layout (see the module docs) until WF-A fixes the
-/// `mma.m16n8k32` fragment interleave.
+/// `bytes` is the **tile-interleaved 2-bit packing** the `mma.m16n8k32` weight
+/// operand consumes (see [`convert_i2s_to_int8`] for the geometry); `scale` is the
+/// per-tensor magnitude; `n`/`k` are the *logical* (unpadded) `[N, K]` shape. The
+/// kernel needs the packed k-tile count to address a tile, which is
+/// `k.div_ceil(IMMA_K)`; [`num_ktiles`](Self::num_ktiles) returns it.
 #[derive(Debug, Clone)]
 pub struct I2sInt8Weights {
-    /// One int8 per weight, reinterpreted to `u8` (provisional plain `[N, K]`).
+    /// Tile-interleaved 2-bit ternary codes (`code = trit + 1`), 4 codes/byte, in
+    /// the IMMA B-operand order. Length is `n_tiles · k_tiles · IMMA_WTILE_BYTES`.
     pub bytes: Vec<u8>,
     /// Per-tensor `f32` magnitude scale carried by the I2_S source.
     pub scale: f32,
-    /// Output channels (rows).
+    /// Output channels (rows), unpadded.
     pub n: usize,
-    /// Input features (columns).
+    /// Input features (columns), unpadded.
     pub k: usize,
 }
 
-/// Decode an I2_S weight tensor into the IMMA int8 layout ([`I2sInt8Weights`]).
+impl I2sInt8Weights {
+    /// Number of padded K-tiles (`ceil(k / IMMA_K)`) — the kernel's `num_ktiles`
+    /// launch argument and the k-tile stride within [`bytes`](Self::bytes).
+    #[must_use]
+    pub fn num_ktiles(&self) -> usize {
+        self.k.div_ceil(IMMA_K)
+    }
+
+    /// Number of padded N-tiles (`ceil(n / IMMA_N)`).
+    #[must_use]
+    pub fn num_ntiles(&self) -> usize {
+        self.n.div_ceil(IMMA_N)
+    }
+}
+
+/// Decode an I2_S weight tensor into the IMMA int8 tile layout ([`I2sInt8Weights`]).
 ///
-/// Currently emits the **provisional plain `[N, K]` int8 baseline** (`bytes[i] =
-/// trit_i as i8 as u8`). WF-A replaces the body with the `mma.m16n8k32` fragment
-/// interleave; this baseline remains the correctness anchor (the interleaved
-/// layout must decode to the same trits).
+/// The output `bytes` is the exact interleave `kernels/tq2_0_imma.cu`'s
+/// `mma.m16n8k32` B (weight) operand reads:
+///
+/// * `N` is padded up to a multiple of [`IMMA_N`], `K` up to a multiple of
+///   [`IMMA_K`]; padding positions carry trit `0` (code `1`) so they contribute
+///   nothing to the int32 contraction.
+/// * The packing is `num_ntiles · num_ktiles` tiles of `IMMA_N × IMMA_K` codes,
+///   stored **n-tile-major then k-tile-major**: tile `(nt, kt)` begins at byte
+///   `(nt · num_ktiles + kt) · IMMA_WTILE_BYTES`.
+/// * Within a tile, the 256 codes are `(n_in_tile, k_in_tile)` **row-major**
+///   (`code = trit + 1 ∈ {0,1,2}`), 4 per byte with the first element in the low
+///   2-bit pair — i.e. `B[n_in_tile, k_in_tile]` for the `N×K` "col" operand.
+///
+/// The decode is validated against the reference I2_S trits by this module's tests
+/// (pack → unpack round trip), satisfying ADR 0005's "converted == reference at
+/// load" gate.
 ///
 /// # Errors
 /// Propagates [`unpack_i2s_tensor`] errors.
@@ -97,8 +135,39 @@ pub fn convert_i2s_to_int8(
     let mut trits = vec![Trit::ZERO; n_elements];
     let scale = unpack_i2s_tensor(payload, n_elements, &mut trits)?;
 
-    // Provisional: plain row-major int8, one byte per weight. WF-A: interleave.
-    let bytes = trits.iter().map(|t| t.get() as u8).collect();
+    let num_ntiles = n.div_ceil(IMMA_N);
+    let num_ktiles = k.div_ceil(IMMA_K);
+    // Padding codes default to 1 (= trit 0): an unwritten/padded byte of 0x00 would
+    // decode as four trit -1 (code 0), so the buffer is initialised to the
+    // all-trit-0 byte (each 2-bit code = 0b01 → 0b01010101 = 0x55) instead.
+    let mut bytes = vec![0x55u8; num_ntiles * num_ktiles * IMMA_WTILE_BYTES];
+
+    for nt in 0..num_ntiles {
+        for kt in 0..num_ktiles {
+            let tile_byte0 = (nt * num_ktiles + kt) * IMMA_WTILE_BYTES;
+            // 256 codes per tile, (n_in_tile, k_in_tile) row-major, 4 per byte.
+            for n_in in 0..IMMA_N {
+                let gn = nt * IMMA_N + n_in;
+                if gn >= n {
+                    continue; // padded output channel: leave as trit 0
+                }
+                for k_in in 0..IMMA_K {
+                    let gk = kt * IMMA_K + k_in;
+                    if gk >= k {
+                        continue; // padded feature: leave as trit 0
+                    }
+                    let elem = n_in * IMMA_K + k_in; // 0..256 within the tile
+                    let byte = tile_byte0 + elem / 4;
+                    let slot = elem % 4; // which 2-bit pair (0 = low)
+                    let code = (trits[gn * k + gk].get() + 1) as u8; // {-1,0,1}->{0,1,2}
+                    // Clear this slot's default-1 pair, then OR in the real code.
+                    bytes[byte] &= !(0b11u8 << (2 * slot));
+                    bytes[byte] |= code << (2 * slot);
+                }
+            }
+        }
+    }
+
     Ok(I2sInt8Weights {
         bytes,
         scale,
@@ -159,6 +228,36 @@ mod tests {
         }
     }
 
+    /// Decode the IMMA tile interleave back to a plain `[N, K]` int8 trit matrix,
+    /// mirroring exactly what `kernels/tq2_0_imma.cu` does when it unpacks the B
+    /// operand: walk every `(nt, kt)` tile, read `(n_in, k_in)` row-major codes 4
+    /// per byte, apply `trit = code - 1`. Padding positions (past `n`/`k`) are
+    /// skipped — they must be trit 0 in the packing but are not part of `[N, K]`.
+    fn decode_imma_to_nk(w: &I2sInt8Weights) -> Vec<i8> {
+        let (n, k) = (w.n, w.k);
+        let num_ktiles = w.num_ktiles();
+        let num_ntiles = w.num_ntiles();
+        let mut out = vec![0i8; n * k];
+        for nt in 0..num_ntiles {
+            for kt in 0..num_ktiles {
+                let tile_byte0 = (nt * num_ktiles + kt) * IMMA_WTILE_BYTES;
+                for elem in 0..IMMA_N * IMMA_K {
+                    let n_in = elem / IMMA_K;
+                    let k_in = elem % IMMA_K;
+                    let gn = nt * IMMA_N + n_in;
+                    let gk = kt * IMMA_K + k_in;
+                    if gn >= n || gk >= k {
+                        continue;
+                    }
+                    let byte = w.bytes[tile_byte0 + elem / 4];
+                    let code = (byte >> (2 * (elem % 4))) & 0b11;
+                    out[gn * k + gk] = code as i8 - 1;
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn int8_conversion_preserves_trits_and_scale() {
         let trits = pattern();
@@ -170,9 +269,79 @@ mod tests {
         assert_eq!(w.n, 1);
         assert_eq!(w.k, 128);
         assert_eq!(w.scale.to_bits(), scale.to_bits());
-        assert_eq!(w.bytes.len(), 128);
-        for (i, (&byte, &want)) in w.bytes.iter().zip(trits.iter()).enumerate() {
-            assert_eq!(byte as i8, want, "int8 weight mismatch at {i}");
+        // N=1 → 1 n-tile (pad to 8); K=128 → 4 k-tiles. 4 tiles · 64 bytes.
+        assert_eq!(w.num_ntiles(), 1);
+        assert_eq!(w.num_ktiles(), 4);
+        assert_eq!(w.bytes.len(), w.num_ntiles() * w.num_ktiles() * IMMA_WTILE_BYTES);
+
+        // Round trip the tile interleave back to [N, K] and check trit-for-trit.
+        let decoded = decode_imma_to_nk(&w);
+        for (i, (&got, &want)) in decoded.iter().zip(trits.iter()).enumerate() {
+            assert_eq!(got, want, "int8 weight mismatch at {i}");
+        }
+    }
+
+    /// A multi-row, padding-exercising shape: `N=3` (pads to 8), `K=160` (5
+    /// k-tiles, exact). The interleave must round-trip every weight, and every
+    /// padded code (the rows 3..8 of each n-tile) must be trit 0.
+    #[test]
+    fn int8_conversion_round_trips_multi_row_with_padding() {
+        // N=3 rows of K=128 trits each (one I2_S block per row would only give
+        // K=128; build three 128-trit rows and convert with K=128 to keep the
+        // payload simple, exercising the N padding to 8).
+        let scale = 2.5_f32;
+        let mut payload = Vec::new();
+        let rows = [pattern(), pattern(), pattern()];
+        // Vary each row so a transposed/mis-strided layout would be caught.
+        let mut varied = rows;
+        for (r, row) in varied.iter_mut().enumerate() {
+            for (i, t) in row.iter_mut().enumerate() {
+                *t = (((i + r) % 3) as i8) - 1;
+            }
+        }
+        for row in &varied {
+            // build_i2s_one_block already appends a scale trailer; we only want one
+            // trailing scale for the whole tensor, so build the quant bytes inline.
+            let mut bytes = [0u8; 32];
+            for (pos, &t) in row.iter().enumerate() {
+                let group = pos / 32;
+                let gp = pos % 32;
+                let code = (t + 1) as u8;
+                bytes[gp] |= code << (6 - 2 * group);
+            }
+            payload.extend_from_slice(&bytes);
+        }
+        payload.extend_from_slice(&scale.to_le_bytes());
+
+        let shape = GemmShape { m: 0, n: 3, k: 128 };
+        let w = convert_i2s_to_int8(&payload, shape).expect("convert");
+        assert_eq!(w.num_ntiles(), 1); // 3 → pads to 8
+        assert_eq!(w.num_ktiles(), 4); // 128 / 32
+
+        let decoded = decode_imma_to_nk(&w);
+        for r in 0..3 {
+            for c in 0..128 {
+                assert_eq!(
+                    decoded[r * 128 + c],
+                    varied[r][c],
+                    "row {r} col {c} mismatch"
+                );
+            }
+        }
+
+        // Padded output channels (rows 3..8 of the single n-tile) must all be code
+        // 1 (trit 0) so they contribute nothing in the kernel.
+        let num_ktiles = w.num_ktiles();
+        for nt_row in 3..IMMA_N {
+            for kt in 0..num_ktiles {
+                let tile_byte0 = kt * IMMA_WTILE_BYTES; // nt == 0
+                for k_in in 0..IMMA_K {
+                    let elem = nt_row * IMMA_K + k_in;
+                    let byte = w.bytes[tile_byte0 + elem / 4];
+                    let code = (byte >> (2 * (elem % 4))) & 0b11;
+                    assert_eq!(code, 1, "padded row {nt_row} k {k_in} not trit 0");
+                }
+            }
         }
     }
 
