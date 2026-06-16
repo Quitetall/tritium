@@ -214,6 +214,9 @@ fn quantize_act_int8(act: &[f32], m: usize, k: usize, q_out: &mut [f32], scale_o
             continue;
         }
         let s = A8_QB / gamma;
+        // Asymmetric int8 range: -128 is reachable but the positive cap is +127
+        // (Qp = A8_QB), so a value rounding to +128 saturates to +127 — matching
+        // transformers' `ActQuant` clamp.
         for (q, &v) in out_row.iter_mut().zip(row) {
             *q = (v * s).round_ties_even().clamp(-128.0, A8_QB);
         }
@@ -318,9 +321,7 @@ mod tests {
     /// `out[m,n] = scales[n] · Σ_k act[m,k] · w[n,k]`, used to check the
     /// `mpgemm_with_act_quant` default folds the per-token scale correctly.
     struct MockBuffer {
-        trits: Vec<i8>, // [N, K] row-major, values in {-1,0,1}
-        n: usize,
-        k: usize,
+        trits: Vec<i8>, // [N, K] row-major, values in {-1,0,1}; dims come from `shape`
     }
     impl DeviceBuffer for MockBuffer {
         fn len_bytes(&self) -> usize {
@@ -370,7 +371,6 @@ mod tests {
                     out[mi * n + ni] = scales[ni] * acc;
                 }
             }
-            let _ = buf.n;
             Ok(())
         }
     }
@@ -384,8 +384,6 @@ mod tests {
         let backend = MockBackend;
         let buf = MockBuffer {
             trits: vec![1, -1],
-            n: 1,
-            k: 2,
         };
         let act = [3.0_f32, -1.0];
         let weight_scales = [2.0_f32];
@@ -402,8 +400,10 @@ mod tests {
             )
             .expect("fused mpgemm");
         let expected = 338.0_f32 * 3.0 / 127.0;
+        // Tight bound: the only slack is the f32 fold-order difference between
+        // `(338*3)/127` and `338*(3/127)` (~1 ULP).
         assert!(
-            (out[0] - expected).abs() < 1e-4,
+            (out[0] - expected).abs() < 1e-5,
             "got {}, want {expected}",
             out[0]
         );
@@ -415,8 +415,6 @@ mod tests {
         let backend = MockBackend;
         let buf = MockBuffer {
             trits: vec![1, -1],
-            n: 1,
-            k: 2,
         };
         let shape = GemmShape { m: 1, n: 1, k: 2 };
         let mut out = [0.0_f32; 1];

@@ -66,6 +66,14 @@ impl ShapeBucket {
         let m = shape.m.max(1);
         // floor(log2): bit width minus one. usize::BITS - leading_zeros - 1.
         let m_log2 = (usize::BITS - 1 - m.leading_zeros()) as u8;
+        // N/K key the cache as u32; real weight dims are <<4B, but make the
+        // assumption explicit rather than silently truncating.
+        debug_assert!(
+            shape.n <= u32::MAX as usize && shape.k <= u32::MAX as usize,
+            "weight dims {}x{} exceed the u32 cache-key range",
+            shape.n,
+            shape.k
+        );
         ShapeBucket {
             m_log2,
             n: shape.n as u32,
@@ -132,9 +140,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_dir_prefers_xdg() {
-        // Don't mutate process env (test isolation); just assert the path shape is
-        // absolute-or-relative and ends in `tritium`.
+    fn cache_dir_ends_in_tritium() {
+        // Process env is global + shared across the test binary, so we don't mutate
+        // XDG_CACHE_HOME/HOME here (that would race other tests); just assert the
+        // resolved path ends in `tritium` for whichever branch the env selects.
         let dir = cache_dir();
         assert_eq!(dir.file_name().unwrap(), "tritium");
     }
