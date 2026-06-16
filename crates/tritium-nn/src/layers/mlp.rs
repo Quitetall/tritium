@@ -9,17 +9,17 @@
 //!
 //! The shipped model is `down_proj(ffn_sub_norm(act_fn(gate_proj(x)) *
 //! up_proj(x)))` with `act_fn = relu2` (i.e. `relu(z)²`). This struct implements
-//! the **gated body** `down(relu(gate(x))² ⊙ up(x))` exactly; the intermediate
-//! `ffn_sub_norm` (a `BitNetRMSNorm` over `n_ff`, unit-weight by default) lives in
-//! the BitLinear path and is wired in WF-4 with the rest of the sub-norm/quant
-//! placement, not here.
+//! that exactly: the gated body `relu(gate(x))² ⊙ up(x)`, then the intermediate
+//! `ffn_sub_norm` (a `BitNetRMSNorm` over `n_ff`) applied to that product, then
+//! `down`. The sub-norm is load-bearing for layer-0 numeric parity.
 
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
 use crate::layers::TernaryLinear;
+use crate::ops::rmsnorm;
 
-/// A gated squared-ReLU MLP block.
+/// A gated squared-ReLU MLP block with the BitNet intermediate sub-norm.
 #[allow(missing_debug_implementations)]
 pub struct Relu2Mlp {
     /// Gate projection `n_embd → n_ff` (the squared-ReLU branch).
@@ -28,10 +28,16 @@ pub struct Relu2Mlp {
     pub up: TernaryLinear,
     /// Down projection `n_ff → n_embd`.
     pub down: TernaryLinear,
+    /// `ffn_sub_norm` (`BitNetRMSNorm` over `n_ff`) applied to the gated product
+    /// before `down`; length `n_ff`.
+    pub ffn_sub_norm: Vec<f32>,
+    /// RMSNorm epsilon for `ffn_sub_norm`.
+    pub rms_eps: f32,
 }
 
 impl Relu2Mlp {
-    /// Forward over `m` tokens: `out = down(relu(gate(x))² ⊙ up(x))`.
+    /// Forward over `m` tokens:
+    /// `out = down(ffn_sub_norm(relu(gate(x))² ⊙ up(x)))`.
     ///
     /// `x` is `[m, n_embd]`; `out` is `[m, n_embd]`, overwritten.
     ///
@@ -71,6 +77,17 @@ impl Relu2Mlp {
         for (g, &u) in gate.iter_mut().zip(up.iter()) {
             let r = g.max(0.0);
             *g = r * r * u;
+        }
+
+        // BitNet `ffn_sub_norm` over the gated product, row by row, before `down`.
+        if self.ffn_sub_norm.len() == n_ff {
+            let mut normed = vec![0.0f32; m * n_ff];
+            for t in 0..m {
+                let src = &gate[t * n_ff..t * n_ff + n_ff];
+                let dst = &mut normed[t * n_ff..t * n_ff + n_ff];
+                rmsnorm(src, &self.ffn_sub_norm, self.rms_eps, dst)?;
+            }
+            return self.down.forward(backend, &normed, m, out);
         }
 
         // down(·): `[m, n_ff] → [m, n_embd]`.

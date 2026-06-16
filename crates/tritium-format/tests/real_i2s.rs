@@ -94,11 +94,19 @@ fn decodes_real_bitnet_i2s_tensor() {
     );
     assert_eq!(counts.iter().sum::<usize>(), n_elements);
 
-    // The first block matches the validated hand-extracted golden (also covered as a
-    // unit test on the block decoder); spot-check a few leading dequantized values.
-    let deq: Vec<f32> = trits[..8].iter().map(|t| t.to_f32() * scale).collect();
-    let want = [scale, scale, scale, 0.0, scale, 0.0, scale, scale];
-    for (i, (&g, &w)) in deq.iter().zip(want.iter()).enumerate() {
-        assert!((g - w).abs() < 1e-6, "dequant[{i}] {g} != {w}");
+    // The leading trits match `microsoft/bitnet-b1.58-2B-4T`'s unpacked
+    // `q_proj.weight` row 0 (validated bit-exactly against the HF checkpoint in
+    // WF-4), under the `trit = code - 1` mapping. Spot-check the first 16.
+    let want_trits = [0i8, 0, 0, -1, 0, -1, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0];
+    for (i, &w) in want_trits.iter().enumerate() {
+        assert_eq!(trits[i].get(), w, "trit[{i}] mismatch vs HF golden");
+    }
+    let deq: Vec<f32> = trits[..16].iter().map(|t| t.to_f32() * scale).collect();
+    for (i, (&g, &w)) in deq.iter().zip(want_trits.iter()).enumerate() {
+        assert!(
+            (g - w as f32 * scale).abs() < 1e-6,
+            "dequant[{i}] {g} != {}",
+            w as f32 * scale
+        );
     }
 }

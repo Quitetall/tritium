@@ -11,4 +11,4 @@ mod transformer_block;
 
 pub use linear::TernaryLinear;
 pub use mlp::Relu2Mlp;
-pub use transformer_block::TransformerBlock;
+pub use transformer_block::{BlockDump, TransformerBlock};

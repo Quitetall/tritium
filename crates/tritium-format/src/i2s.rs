@@ -1,21 +1,31 @@
 //! I2_S — the BitNet / bitnet.cpp ternary GGUF format. 128 ternary elements per
-//! 32-byte block: 2 bits each, `0b00`=0, `0b01`=+1, `0b10`=-1; byte `gp` (`0..32`)
-//! holds the elements at positions `[gp, 32+gp, 64+gp, 96+gp]` in bit-pairs
-//! `[7:6],[5:4],[3:2],[1:0]`.
+//! 32-byte block: 2 bits each, `code = trit + 1` (so `0b00`=-1, `0b01`=0,
+//! `0b10`=+1); byte `gp` (`0..32`) holds the elements at positions `[gp, 32+gp,
+//! 64+gp, 96+gp]` in bit-pairs `[7:6],[5:4],[3:2],[1:0]`.
+//!
+//! The `code = trit + 1` mapping (verified in WF-4) is the same `+1` offset
+//! `transformers`' `unpack_weights` uses (`value - 1` on decode), and it is what
+//! `ggml-bitnet`'s `quantize_i2_s` writes: `q8[i] = src[i]*scale > 0 ? 2 : 0`,
+//! with the near-zero case set to `1`. Decoding the 32-byte block striping and
+//! applying `trit = code - 1` reproduces the block-linear stream, which **is** the
+//! tensor in ggml memory order — i.e. plain `[N, K]` row-major. No further element
+//! reorder is needed.
 //!
 //! Unlike TQ1_0 / TQ2_0, the magnitude scale is **not** stored inside each block.
 //! An I2_S tensor lays out all of its 2-bit quants first (`n_elements / 4` bytes),
 //! immediately followed by a **single per-tensor `f32` scale**, the whole payload
-//! then padded up to the GGUF alignment (32 B). This was confirmed in WF-1 by
-//! reading the official `microsoft/bitnet-b1.58-2B-4T-gguf` `ggml-model-i2_s.gguf`:
-//! the GGUF `ggml_type` of the 210 ternary weight tensors is **36**, every tensor's
-//! payload is exactly `n_elements/4 + 32` bytes (quants + one `f32` + pad), and the
-//! `f32` matches the `weight_scale` (shape `[1]`) carried by the reference HF
-//! checkpoint (`microsoft/bitnet-b1.58-2B-4T`, `BitLinear` `autobitlinear`). The
-//! decoded trits match that checkpoint's unpacked ternary weights **bit-exactly**
-//! across the layer-0 projections (100% element match), so the v0.20 plan's
-//! per-tensor-scale assumption holds (the v0.10 per-channel `mpgemm` reuses it as a
-//! single broadcast scale, equivalently a per-row scale that is constant per tensor).
+//! then padded up to the GGUF alignment (32 B). This was confirmed by reading the
+//! official `microsoft/bitnet-b1.58-2B-4T-gguf` `ggml-model-i2_s.gguf`: the GGUF
+//! `ggml_type` of the 210 ternary weight tensors is **36**, every tensor's payload
+//! is exactly `n_elements/4 + 32` bytes (quants + one `f32` + pad), and the `f32`
+//! matches the `weight_scale` (shape `[1]`) carried by the reference HF checkpoint
+//! (`microsoft/bitnet-b1.58-2B-4T`, `BitLinear` `autobitlinear`). With the
+//! `trit = code - 1` mapping the decoded trits match that checkpoint's unpacked
+//! ternary weights **bit-exactly** across all seven layer-0 projections (100%
+//! element match, all shapes: 2560×2560, 640×2560, 2560×6912, 6912×2560), so the
+//! v0.20 plan's per-tensor-scale assumption holds (the v0.10 per-channel `mpgemm`
+//! reuses it as a single broadcast scale, equivalently a per-row scale that is
+//! constant per tensor).
 
 use tritium_core::Trit;
 
@@ -35,16 +45,19 @@ pub const I2S_BLOCK_BYTES: usize = I2S_BLOCK_ELEMS / 4;
 /// Bytes of the per-tensor scale trailer: a single little-endian `f32`.
 pub const I2S_SCALE_BYTES: usize = 4;
 
-/// Decode one 2-bit I2_S code into a [`Trit`].
+/// Decode one 2-bit I2_S code into a [`Trit`] via `trit = code - 1`.
 ///
-/// `0b00`→0, `0b01`→+1, `0b10`→-1; `0b11` is invalid and yields
-/// [`FormatError::InvalidI2sCode`].
+/// `0b00`→-1, `0b01`→0, `0b10`→+1; `0b11` (= trit `+2`) is invalid and yields
+/// [`FormatError::InvalidI2sCode`]. This is the `+1`-offset BitNet uses on both
+/// sides: `transformers` decodes with `value - 1`, and `ggml-bitnet`'s
+/// `quantize_i2_s` encodes a positive weight as `2`, a negative as `0`, and a
+/// near-zero as `1`.
 #[inline]
 fn code_to_trit(code: u8) -> Result<Trit, FormatError> {
     match code {
-        0b00 => Ok(Trit::ZERO),
-        0b01 => Ok(Trit::POS),
-        0b10 => Ok(Trit::NEG),
+        0b00 => Ok(Trit::NEG),
+        0b01 => Ok(Trit::ZERO),
+        0b10 => Ok(Trit::POS),
         // 0b11 is the only remaining value; reject it rather than silently mapping.
         other => Err(FormatError::InvalidI2sCode(other)),
     }
@@ -54,7 +67,8 @@ fn code_to_trit(code: u8) -> Result<Trit, FormatError> {
 ///
 /// Byte `gp` (`0..32`) supplies the elements at positions `[gp, 32+gp, 64+gp,
 /// 96+gp]`, taken from the bit-pairs `[7:6]`, `[5:4]`, `[3:2]`, `[1:0]`
-/// respectively. Codes decode as `0b00`=0, `0b01`=+1, `0b10`=-1.
+/// respectively. Codes decode as `trit = code - 1`: `0b00`=-1, `0b01`=0,
+/// `0b10`=+1.
 ///
 /// # Errors
 /// - [`FormatError::WrongBlockLen`] if `block` is not [`I2S_BLOCK_BYTES`] bytes.
@@ -155,12 +169,13 @@ mod tests {
 
     #[test]
     fn hand_golden_block_decodes() {
-        // byte gp=0 = 0b01_00_00_10 = 0x42 -> pos0=+1, pos32=0, pos64=0, pos96=-1.
-        // byte gp=1 = 0b00_01_10_00 = 0x18 -> pos1=0,  pos33=+1, pos65=-1, pos97=0.
-        // every other byte 0x00 -> all zero.
-        let mut block = [0u8; 32];
-        block[0] = 0b01_00_00_10;
-        block[1] = 0b00_01_10_00;
+        // `trit = code - 1` (0b00=-1, 0b01=0, 0b10=+1).
+        // byte gp=0 = 0b10_01_01_00 = 0x94 -> pos0=+1, pos32=0, pos64=0, pos96=-1.
+        // byte gp=1 = 0b01_10_00_01 = 0x61 -> pos1=0,  pos33=+1, pos65=-1, pos97=0.
+        // every other byte 0b01_01_01_01 = 0x55 -> all zero (code 1 = trit 0).
+        let mut block = [0b01_01_01_01u8; 32];
+        block[0] = 0b10_01_01_00;
+        block[1] = 0b01_10_00_01;
 
         let mut out = [Trit::ZERO; 128];
         unpack_i2s_block(&block, &mut out).expect("decode");
@@ -173,7 +188,7 @@ mod tests {
         assert_eq!(out[33], Trit::POS);
         assert_eq!(out[65], Trit::NEG);
         assert_eq!(out[97], Trit::ZERO);
-        // Everything else is zero.
+        // Everything else is zero (code 0b01).
         for (i, &t) in out.iter().enumerate() {
             if ![0, 1, 32, 33, 64, 65, 96, 97].contains(&i) {
                 assert_eq!(t, Trit::ZERO, "index {i}");
@@ -185,10 +200,11 @@ mod tests {
     fn all_three_codes_stripe_each_position() {
         // Drive each of the four sub-groups with a distinct code and confirm the
         // [gp, 32+gp, 64+gp, 96+gp] striping lands every element where expected.
-        let g0 = [0b01u8; 32]; // +1 across positions 0..32
-        let g1 = [0b10u8; 32]; // -1 across positions 32..64
-        let g2 = [0b00u8; 32]; //  0 across positions 64..96
-        let g3 = [0b01u8; 32]; // +1 across positions 96..128
+        // `trit = code - 1`.
+        let g0 = [0b10u8; 32]; // +1 across positions 0..32   (code 2)
+        let g1 = [0b00u8; 32]; // -1 across positions 32..64  (code 0)
+        let g2 = [0b01u8; 32]; //  0 across positions 64..96  (code 1)
+        let g3 = [0b10u8; 32]; // +1 across positions 96..128 (code 2)
         let block = pack_codes(&g0, &g1, &g2, &g3);
 
         let mut out = [Trit::ZERO; 128];
@@ -212,13 +228,16 @@ mod tests {
             0x65, 0x51, 0x15, 0x51, 0x19, 0x55, 0x60, 0x51, 0x41, 0x44, 0x56, 0x55, 0x55, 0x14,
             0x51, 0x06, 0x45, 0x45,
         ];
+        // Trits under the `trit = code - 1` mapping; these match
+        // `microsoft/bitnet-b1.58-2B-4T`'s unpacked `q_proj.weight` row 0 cols
+        // 0..128 (validated bit-exactly against the HF checkpoint in WF-4).
         #[rustfmt::skip]
         const EXPECT: [i8; 128] = [
-            1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, -1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0,
-            1, 0, 1, 1, 0, 0, -1, -1, 1, 1, 0, 1, 1, 1, 1, 0, -1, 1, -1, 1, 1, 1, 1, 1, -1, 1, 0,
-            0, 1, 1, 1, 1, 1, 0, 0, 0, 0, -1, 0, -1, 1, 0, 1, 1, 1, -1, 1, -1, 0, 1, 1, 0, 1, 0,
-            -1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, -1, 0, 1, 1, 1, -1, 0, 1, 1, 1, 0, -1, 1,
-            1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, -1, 1, 1, 0, 1, -1, 1, 1,
+            0, 0, 0, -1, 0, -1, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, -1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0,
+            -1, 0, -1, 0, 0, -1, -1, 1, 1, 0, 0, -1, 0, 0, 0, 0, -1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0,
+            -1, -1, 0, 0, 0, 0, 0, -1, -1, -1, -1, 1, -1, 1, 0, -1, 0, 0, 0, 1, 0, 1, -1, 0, 0, -1,
+            0, -1, 1, 0, -1, -1, -1, 0, 0, 0, 0, 0, -1, 0, 0, 0, 1, -1, 0, 0, 0, 1, -1, 0, 0, 0,
+            -1, 1, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, 1, 0, 0, -1, 0, 1, 0, 0,
         ];
 
         let mut out = [Trit::ZERO; 128];
@@ -266,11 +285,12 @@ mod tests {
 
     #[test]
     fn tensor_decode_reads_trailing_scale() {
-        // One block of quants (pos0..32 = +1 via code 0b01 in the top pair of every
-        // byte) followed by a known f32 scale; the helper must split them correctly.
+        // One block of quants (pos0..32 = +1 via code 0b10 in the top pair, the
+        // other three pairs 0b01 = trit 0) followed by a known f32 scale; the
+        // helper must split them correctly. `trit = code - 1`.
         let mut payload = vec![0u8; I2S_BLOCK_BYTES + I2S_SCALE_BYTES];
         for b in payload.iter_mut().take(I2S_BLOCK_BYTES) {
-            *b = 0b01_00_00_00;
+            *b = 0b10_01_01_01;
         }
         let scale: f32 = 1.218_854_8;
         payload[I2S_BLOCK_BYTES..].copy_from_slice(&scale.to_le_bytes());

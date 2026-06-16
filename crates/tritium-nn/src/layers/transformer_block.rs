@@ -4,10 +4,12 @@
 //! [`TernaryLinear`] q/k/v/o projections, RoPE on q/k, the KV cache, and
 //! [`crate::ops::gqa_attention`]; the MLP is [`Relu2Mlp`].
 //!
-//! BitNet also applies BitLinear sub-norms (`attn_sub_norm` before `o_proj`,
-//! `ffn_sub_norm` before `down_proj`); their exact placement is wired in WF-4
-//! against the real `transformers` layer. This block validates assembly + shape
-//! + residual wiring on a tiny random config; deep numeric fidelity is WF-4.
+//! BitNet applies BitLinear sub-norms: `attn_sub_norm` (a `BitNetRMSNorm` over
+//! `n_embd`) is applied to the attention output **before** `o_proj`, and
+//! `ffn_sub_norm` (over `n_ff`) is applied inside [`Relu2Mlp`] before `down`.
+//! Both are wired here against the real `transformers` `modeling_bitnet` layer
+//! (`BitNetAttention.forward`: `attn_output = self.attn_sub_norm(attn_output)`
+//! then `self.o_proj(...)`); they are load-bearing for layer-0 numeric parity.
 
 use tritium_spec::TernaryBackend;
 
@@ -20,7 +22,7 @@ use crate::ops::{gqa_attention, rmsnorm, rope_apply};
 /// A single transformer decoder block (attention + MLP, pre-norm, residual).
 #[allow(missing_debug_implementations)]
 pub struct TransformerBlock {
-    /// RMSNorm weight applied before attention; length `n_embd`.
+    /// RMSNorm weight applied before attention (`input_layernorm`); length `n_embd`.
     pub attn_norm: Vec<f32>,
     /// Query projection `n_embd → n_head · head_dim`.
     pub q_proj: TernaryLinear,
@@ -30,10 +32,27 @@ pub struct TransformerBlock {
     pub v_proj: TernaryLinear,
     /// Output projection `n_head · head_dim → n_embd`.
     pub o_proj: TernaryLinear,
-    /// RMSNorm weight applied before the MLP; length `n_embd`.
+    /// `attn_sub_norm` (`BitNetRMSNorm` over `n_embd`) applied to the attention
+    /// output before `o_proj`; length `n_embd` (empty to skip, for the WF-3 tests).
+    pub attn_sub_norm: Vec<f32>,
+    /// RMSNorm weight applied before the MLP (`post_attention_layernorm`); length
+    /// `n_embd`.
     pub ffn_norm: Vec<f32>,
     /// The gated ReLU² feed-forward.
     pub mlp: Relu2Mlp,
+}
+
+/// Per-stage activations captured during a block forward, for the fidelity
+/// ladder. Each is `[seq, n_embd]` (or `[seq, q_width]` for the pre-`o_proj`
+/// attention output) and is only populated when [`TransformerBlock::forward_dump`]
+/// is used.
+#[derive(Debug, Default, Clone)]
+pub struct BlockDump {
+    /// `input_layernorm(x)` — the pre-attention RMSNorm output.
+    pub attn_norm_out: Vec<f32>,
+    /// The attention output **after** `attn_sub_norm` and `o_proj`, before the
+    /// residual add (i.e. what `transformers` `BitNetAttention.forward` returns).
+    pub attn_out: Vec<f32>,
 }
 
 impl TransformerBlock {
@@ -58,6 +77,39 @@ impl TransformerBlock {
         kv: &mut KvCache,
         cfg: &ModelConfig,
         out: &mut [f32],
+    ) -> Result<(), NnError> {
+        self.forward_inner(backend, x, positions, kv, cfg, out, None)
+    }
+
+    /// Like [`forward`](Self::forward), but also captures per-stage activations
+    /// into `dump` for the fidelity ladder.
+    ///
+    /// # Errors
+    /// Same as [`forward`](Self::forward).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_dump(
+        &self,
+        backend: &dyn TernaryBackend,
+        x: &[f32],
+        positions: &[usize],
+        kv: &mut KvCache,
+        cfg: &ModelConfig,
+        out: &mut [f32],
+        dump: &mut BlockDump,
+    ) -> Result<(), NnError> {
+        self.forward_inner(backend, x, positions, kv, cfg, out, Some(dump))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_inner(
+        &self,
+        backend: &dyn TernaryBackend,
+        x: &[f32],
+        positions: &[usize],
+        kv: &mut KvCache,
+        cfg: &ModelConfig,
+        out: &mut [f32],
+        mut dump: Option<&mut BlockDump>,
     ) -> Result<(), NnError> {
         let n_embd = self.attn_norm.len();
         let n_head = cfg.n_head as usize;
@@ -93,6 +145,9 @@ impl TransformerBlock {
             let src = &x[t * n_embd..t * n_embd + n_embd];
             let dst = &mut normed[t * n_embd..t * n_embd + n_embd];
             rmsnorm(src, &self.attn_norm, cfg.rms_eps, dst)?;
+        }
+        if let Some(d) = dump.as_mut() {
+            d.attn_norm_out = normed.clone();
         }
 
         // q/k/v projections: q is [seq, q_width]; k/v are [seq, kv_width].
@@ -130,8 +185,24 @@ impl TransformerBlock {
             &mut attn,
         )?;
 
+        // BitNet `attn_sub_norm` over the attention output, row by row, BEFORE
+        // `o_proj` (the `# diff with Llama` line in `BitNetAttention.forward`).
+        // `q_width == n_embd` for BitNet, so the sub-norm is over `n_embd`.
+        if self.attn_sub_norm.len() == q_width {
+            let mut sn = vec![0.0f32; seq * q_width];
+            for t in 0..seq {
+                let src = &attn[t * q_width..t * q_width + q_width];
+                let dst = &mut sn[t * q_width..t * q_width + q_width];
+                rmsnorm(src, &self.attn_sub_norm, cfg.rms_eps, dst)?;
+            }
+            attn = sn;
+        }
+
         // o_proj: `[seq, q_width] → [seq, n_embd]`, then residual into `out`.
         self.o_proj.forward(backend, &attn, seq, out)?;
+        if let Some(d) = dump.as_mut() {
+            d.attn_out = out.to_vec();
+        }
         for (o, &xi) in out.iter_mut().zip(x.iter()) {
             *o += xi;
         }

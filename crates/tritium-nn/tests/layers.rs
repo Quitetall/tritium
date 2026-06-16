@@ -269,6 +269,9 @@ fn relu2_mlp_matches_torch() {
         gate: linear_from_i8(&backend, &gate_w, n_ff, n_embd, gate_s),
         up: linear_from_i8(&backend, &up_w, n_ff, n_embd, up_s),
         down: linear_from_i8(&backend, &down_w, n_embd, n_ff, down_s),
+        // Empty sub-norm => skipped, matching the no-sub-norm torch reference here.
+        ffn_sub_norm: Vec::new(),
+        rms_eps: 1e-5,
     };
 
     let mut got = vec![f32::NAN; m * n_embd];
@@ -317,11 +320,15 @@ fn build_block(backend: &CpuBackend, rng: &mut Rng, cfg: &ModelConfig) -> Transf
         k_proj: rand_linear(backend, rng, kv_width, n_embd),
         v_proj: rand_linear(backend, rng, kv_width, n_embd),
         o_proj: rand_linear(backend, rng, n_embd, q_width),
+        // Empty sub-norm => skipped, keeping the WF-3 assembly smoke test unchanged.
+        attn_sub_norm: Vec::new(),
         ffn_norm: (0..n_embd).map(|_| 1.0 + rng.next_f32(0.1)).collect(),
         mlp: Relu2Mlp {
             gate: rand_linear(backend, rng, n_ff, n_embd),
             up: rand_linear(backend, rng, n_ff, n_embd),
             down: rand_linear(backend, rng, n_embd, n_ff),
+            ffn_sub_norm: Vec::new(),
+            rms_eps: 1e-5,
         },
     }
 }

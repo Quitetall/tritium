@@ -4,12 +4,34 @@
 - **Relates:** executes the 0.20 milestone of [ADR 0002](./0002-release-roadmap.md); builds on [ADR 0003](./0003-v010-implementation.md)
 - **Revised 2026-06-15:** research found the official BitNet 2B4T GGUF is **I2_S**, not TQ2_0 → v0.20 adds an I2_S reader to `tritium-format` (decodes to the exact trained trits + scale; per-row scale → existing `mpgemm` reused). BitNet is **W1.58A8** → the forward pass replicates int8 (per-token absmax) activation quant caller-side in `tritium-nn`. Reference oracle = HF `transformers BitNetForCausalLM` on the 4090. Full plan: `~/.claude/plans/eager-seeking-naur.md`.
 - **WF-1 confirmed (2026-06-15):** I2_S ggml type-id **36**; the scale is a single
-  **per-tensor** f32 trailer (used as a broadcast per-channel scale), decoded trits
-  bit-exact vs the HF checkpoint; an element interleaving (block groups → rows
-  `r, 160+r, 320+r, 480+r`) is applied at load. A8 uses **Qb=127** (`scale=127/absmax`,
-  range `[-128,127]`, round-half-to-even) per `transformers/integrations/bitnet.py`
-  `ActQuant`. `read_gguf` leaves `n_bytes==0` for type-36; the loader sizes I2_S as
-  `n_elements/4 + 32`.
+  **per-tensor** f32 trailer (used as a broadcast per-channel scale). A8 uses
+  **Qb=127** (`scale=127/absmax`, range `[-128,127]`, round-half-to-even) per
+  `transformers/integrations/bitnet.py` `ActQuant`. `read_gguf` leaves
+  `n_bytes==0` for type-36; the loader sizes I2_S as `n_elements/4 + 32`.
+- **WF-4 corrected the I2_S decode (2026-06-15):** two things WF-1 got wrong are
+  now pinned bit-exactly against the HF checkpoint (100% element match on all
+  seven layer-0 projections, every shape: 2560×2560, 640×2560, 2560×6912,
+  6912×2560). (1) The value map is **`trit = code - 1`** (`0b00`=-1, `0b01`=0,
+  `0b10`=+1) — the same `+1` offset `transformers`' `unpack_weights` uses and
+  `ggml-bitnet`'s `quantize_i2_s` writes; the earlier `0b01`=+1/`0b10`=-1 map was
+  wrong. (2) There is **no element reorder**: decoding the 32-byte block striping
+  (`quantize_i2_s` writes element `i*128 + g*32 + gp` into byte `i*32+gp`, shift
+  `6-2g`) yields the block-linear stream, which *is* the tensor in ggml memory
+  order — i.e. plain `[N_out, K_in]` row-major with `N_out = dims[1]`,
+  `K_in = dims[0]`. The earlier `r,160+r,320+r,480+r` "interleave" was a
+  mis-derivation and is dropped.
+- **WF-4 sub-norms + tied head (2026-06-15):** `attn_sub_norm` (a `BitNetRMSNorm`
+  over `n_embd`) is applied to the attention output **before** `o_proj`, and
+  `ffn_sub_norm` (over `n_ff`) to the gated product **before** `down` — per
+  `modeling_bitnet` (`BitNetAttention.forward` / `BitNetMLP.forward`). The LM head
+  is **tied** to the token embedding (`tie_word_embeddings = true`, no
+  `output.weight` tensor); the runner unembeds with `token_embd`. The fidelity
+  ladder reaches **rung d on CPU**: last-position logits match the fp32
+  `transformers` oracle ≤2e-3 relative with an exact argmax, and a short greedy
+  decode matches token-for-token. Upstream rungs carry an irreducible bf16(HF)
+  -vs-F16/F32(GGUF) checkpoint-precision gap (the Tritium algorithm is verified
+  numerically identical to the oracle's at fp64), so they assert at a looser bar
+  while rung d stays strict.
 
 ## Context
 

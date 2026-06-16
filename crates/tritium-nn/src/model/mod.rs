@@ -8,6 +8,6 @@ mod runner;
 mod tokenizer;
 mod weights;
 
-pub use runner::ModelRunner;
+pub use runner::{ForwardDump, ModelRunner};
 pub use tokenizer::Tokenizer;
 pub use weights::{LayerWeights, ModelWeights};
