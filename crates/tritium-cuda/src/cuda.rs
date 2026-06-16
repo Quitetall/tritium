@@ -61,6 +61,9 @@ const KERNEL_NAME_IMMA: &str = "tq2_0_imma_mpgemm";
 /// On-device per-token int8 absmax activation quant (W1.58A8), the first step of
 /// the fused `mpgemm_with_act_quant` override.
 const KERNEL_NAME_ACT_QUANT: &str = "act_quant_int8_per_token";
+/// The device-resident RMSNorm decode kernel (v0.3.1) — bit-matches the host
+/// `tritium_nn::ops::rmsnorm` (sequential f32 sum-of-squares, no FMA).
+const KERNEL_NAME_RMSNORM: &str = "rmsnorm_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -85,6 +88,9 @@ const TQ2_0_ADD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/tq2_0_add.pt
 /// to a SECOND PTX target at `compute_80` (the `mma.m16n8k32` int8 shape needs
 /// sm_80+, above the add kernel's sm_75 floor). Embedded the same way.
 const TQ2_0_IMMA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/tq2_0_imma.ptx"));
+/// The device-resident decode kernels (v0.3.1), compiled `--fmad=false` so they
+/// reproduce the host f32 ops bit-for-bit. Embedded the same way as the others.
+const DECODE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/decode.ptx"));
 
 /// Map a `cudarc` driver error to a [`BackendError`]. Allocation failures surface
 /// as [`BackendError::OutOfMemory`]; everything else is stringified into
@@ -164,6 +170,14 @@ pub struct CudaBackend {
     func_imma: CudaFunction,
     /// The resolved `act_quant_int8_per_token` kernel (on-device W1.58A8 quant).
     func_act_quant: CudaFunction,
+    /// Loaded decode PTX module (v0.3.1 device-resident forward), kept alive so its
+    /// functions stay valid. Compiled `--fmad=false` to bit-match the host f32 ops.
+    _decode_module: Arc<CudaModule>,
+    /// The resolved `rmsnorm_f32` decode kernel (bit-matches `ops::rmsnorm`).
+    // Read only by `rmsnorm` (test-exercised today); `forward_device` wires it into
+    // the per-token decode next. W1-in-progress.
+    #[allow(dead_code)]
+    func_rmsnorm: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -225,6 +239,14 @@ impl CudaBackend {
             .load_function(KERNEL_NAME_ACT_QUANT)
             .map_err(|e| driver_err("resolve act_quant kernel", &e))?;
 
+        // The v0.3.1 device-resident decode kernels (their own `--fmad=false` PTX).
+        let decode_module = ctx
+            .load_module(Ptx::from_src(DECODE_PTX))
+            .map_err(|e| driver_err("load decode ptx", &e))?;
+        let func_rmsnorm = decode_module
+            .load_function(KERNEL_NAME_RMSNORM)
+            .map_err(|e| driver_err("resolve rmsnorm kernel", &e))?;
+
         let device_name = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_owned());
@@ -244,6 +266,8 @@ impl CudaBackend {
             func_tiled,
             func_imma,
             func_act_quant,
+            _decode_module: decode_module,
+            func_rmsnorm,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -256,6 +280,78 @@ impl CudaBackend {
     /// Packed bytes per weight row for `k` trits in TQ2_0.
     fn row_bytes(k: usize) -> usize {
         num_blocks(k) * TQ2_0_BLOCK_BYTES
+    }
+
+    /// Device RMSNorm on host slices (htod → launch → dtoh), **bit-matching**
+    /// `tritium_nn::ops::rmsnorm`. A building block for the v0.3.1 device-resident
+    /// forward (which calls the same kernel on already-resident buffers, no copies)
+    /// and the target of the bit-exact golden.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] if `x`/`w`/`out` lengths disagree; device
+    /// failures via the cudarc mapping.
+    // Test-exercised (the bit-match golden) until `forward_device` calls it on
+    // resident buffers; W1-in-progress.
+    #[allow(dead_code)]
+    pub(crate) fn rmsnorm(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        eps: f32,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let n = x.len();
+        if w.len() != n || out.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: w.len().min(out.len()),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let d_x = self
+            .stream
+            .clone_htod(x)
+            .map_err(|e| driver_err("rmsnorm htod x", &e))?;
+        let d_w = self
+            .stream
+            .clone_htod(w)
+            .map_err(|e| driver_err("rmsnorm htod w", &e))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(n)
+            .map_err(|e| driver_err("rmsnorm alloc out", &e))?;
+
+        let n_i = n as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_rmsnorm);
+        launch
+            .arg(&d_x)
+            .arg(&d_w)
+            .arg(&eps)
+            .arg(&n_i)
+            .arg(&mut d_out);
+
+        // SAFETY: kernel signature is `(const float* x, const float* w, const float
+        // eps, const int n, float* out)`; the args are pushed in that exact order and
+        // type. `d_x`/`d_w` are length-`n` device buffers, `d_out` the single length-`n`
+        // output, `eps`/`n_i` scalars by value. One block; the kernel bounds its loops
+        // by `n`, so no thread reads past any buffer.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch rmsnorm", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_out, out)
+            .map_err(|e| driver_err("rmsnorm dtoh", &e))?;
+        Ok(())
     }
 
     /// Pick the add-only kernel for this problem shape. The tiled (decode) kernel
@@ -2036,6 +2132,57 @@ mod tests {
                 b.to_bits(),
                 "cold vs warm tuned output diverges at [{i}] cold={a} warm={b}"
             );
+        }
+    }
+
+    /// v0.3.1 de-risk: the device `rmsnorm_f32` decode kernel must reproduce the host
+    /// `tritium_nn::ops::rmsnorm` **bit-for-bit** (`to_bits` equal), so the fully
+    /// device-resident forward keeps greedy 256/256. This is the proof that a
+    /// sequential-f32 + FMA-disabled device kernel can match host f32 exactly; the
+    /// rest of the decode kernels follow the same discipline.
+    #[test]
+    fn rmsnorm_bit_matches_host() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping rmsnorm bit-match: no device ({e})");
+                return;
+            }
+        };
+        // Host reference — identical to `tritium_nn::ops::rmsnorm` (this crate does
+        // not depend on tritium-nn, so the 4-line formula is replicated verbatim).
+        fn host_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+            let n = x.len();
+            let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            x.iter().zip(w).map(|(&xi, &wi)| xi * inv * wi).collect()
+        }
+        // BitNet hidden/ffn sizes + a few edge lengths; deterministic xorshift inputs.
+        for &n in &[2560usize, 6912, 1, 17, 256, 2559] {
+            let mut s = 0x1234_5678_9abc_def0u64 ^ (n as u64).wrapping_mul(0x9E37_79B9);
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f32 / (1u64 << 53) as f32) * 8.0 - 4.0
+            };
+            let x: Vec<f32> = (0..n).map(|_| next()).collect();
+            let w: Vec<f32> = (0..n).map(|_| next()).collect();
+            let eps = 1e-5f32;
+
+            let want = host_rmsnorm(&x, &w, eps);
+            let mut got = vec![0.0f32; n];
+            backend.rmsnorm(&x, &w, eps, &mut got).expect("device rmsnorm");
+
+            for (i, (&g, &h)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    h.to_bits(),
+                    "rmsnorm bit mismatch n={n} i={i}: got {g} ({:#010x}) want {h} ({:#010x})",
+                    g.to_bits(),
+                    h.to_bits()
+                );
+            }
         }
     }
 }

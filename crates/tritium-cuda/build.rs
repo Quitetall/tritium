@@ -41,6 +41,10 @@ fn main() {
     // NOT compiled yet (the placeholder .cu only declares the entry point). The
     // rerun trigger is wired now so toggling it on later rebuilds correctly.
     println!("cargo:rerun-if-changed=kernels/tq2_0_imma.cu");
+    // v0.3.1 (ADR 0013): the device-resident M=1 decode kernels (rmsnorm, rope,
+    // attention, …) — compiled with `--fmad=false` so they bit-match the host f32
+    // ops (multiply-then-add, not a fused `fma`).
+    println!("cargo:rerun-if-changed=kernels/decode.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -72,6 +76,7 @@ fn main() {
         Path::new("kernels/tq2_0_add.cu"),
         &out_dir.join("tq2_0_add.ptx"),
         add_min_arch,
+        &[],
     );
 
     // The IMMA prefill kernel: its `mma.m16n8k32` int8 shape needs sm_80+, so it
@@ -82,13 +87,26 @@ fn main() {
         Path::new("kernels/tq2_0_imma.cu"),
         &out_dir.join("tq2_0_imma.ptx"),
         IMMA_MIN_ARCH,
+        &[],
+    );
+
+    // The device-resident M=1 decode kernels (v0.3.1). `--fmad=false` forbids the
+    // compiler from fusing `a*b+c` into one rounded `fma`, so these reproduce the
+    // host f32 ops bit-for-bit (the kernels also use `__fmul_rn`/`__fadd_rn`
+    // explicitly; the flag is defence-in-depth for future kernels). compute_75 floor.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/decode.cu"),
+        &out_dir.join("decode.ptx"),
+        add_min_arch,
+        &["--fmad=false"],
     );
 }
 
 /// Compile a single `.cu` source to virtual PTX (no SASS) for `arch`, emitting it
 /// at `ptx_path`. Panics with an actionable message if nvcc is missing the source,
 /// fails, or silently produces nothing.
-fn compile_ptx(nvcc: &Path, src: &Path, ptx_path: &Path, arch: &str) {
+fn compile_ptx(nvcc: &Path, src: &Path, ptx_path: &Path, arch: &str, extra: &[&str]) {
     let mut cmd = Command::new(nvcc);
     cmd.arg("-ptx")
         .arg(src)
@@ -100,6 +118,10 @@ fn compile_ptx(nvcc: &Path, src: &Path, ptx_path: &Path, arch: &str) {
         .arg(format!("arch=compute_{arch},code=compute_{arch}"))
         // -O3 keeps the kernel tight; correctness is unaffected.
         .arg("-O3");
+    // Per-kernel extra flags (e.g. `--fmad=false` for the bit-matching decode kernels).
+    for flag in extra {
+        cmd.arg(flag);
+    }
 
     let status = cmd.status().unwrap_or_else(|e| {
         panic!("tritium-cuda: failed to invoke nvcc ({}): {e}", nvcc.display())
