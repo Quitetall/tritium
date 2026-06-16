@@ -5,6 +5,14 @@
 - **Deciders:** Brian Lam
 - **Supersedes / relates:** builds on [ADR 0001 — SALT](./0001-salt-quantization.md)
 
+> **Update (2026-06-16).** Versioning moved from the `0.x0` staircase to **SemVer**:
+> the milestones below are 0.1.0, 0.2.0, 0.3.0, … 1.0.0 (tags `v0.1.0`…; earlier tags
+> `v0.10.0`/`v0.20.0` are immutable, conceptually 0.1.0/0.2.0). A performance
+> point-release **v0.3.1 — the device-resident forward** ([ADR 0013](./0013-v031-device-resident-forward.md))
+> was inserted between v0.3.0 and v0.4.0 to close v0.3.0's slipped `≥1.2×` bitnet.cpp
+> Pe gate; it adds no new capability, so the capability staircase (0.4.0 SALT → …) is
+> unchanged.
+
 ## Context
 
 Tritium v1.0 is the **full vision, real and usable**: ternary inference and
