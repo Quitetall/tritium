@@ -22,13 +22,19 @@
 //!
 //! ## Kernels
 //!
-//! Two kernels back [`CpuBackend::mpgemm`], chosen at runtime: an AVX2 intrinsic
-//! kernel when the host advertises `avx2`, and the scalar reference otherwise. The
-//! AVX2 kernel folds its SIMD-decoded contributions sequentially in `f32`,
-//! reproducing the reference accumulation bit-for-bit — comfortably inside the
-//! `1e-4` relative tolerance of ADR 0002 (in fact exact). The independent `M` rows
-//! are spread across `rayon`'s thread pool without changing per-row arithmetic, so
-//! results are deterministic regardless of thread count.
+//! Several kernels back [`CpuBackend::mpgemm`], chosen at runtime by
+//! [`kernel::dispatch_mpgemm`]. On x86-64 it prefers the widest the host can
+//! execute — AVX-512 (`avx512f`+`bw`+`vl`), then AVX2 (`avx2`), else the scalar
+//! reference; on aarch64 the NEON kernel. The three **per-element** SIMD kernels
+//! (AVX2, AVX-512, NEON) fold their SIMD-decoded signed contributions
+//! sequentially in `f32` k-order, reproducing the scalar reference accumulation
+//! **bit-for-bit** — comfortably inside the `1e-4` relative tolerance of ADR
+//! 0002 (in fact exact). The scalar reference is kept as the terminal fallback
+//! so cross-host output stays byte-reproducible. A portable T-MAC lookup-table
+//! kernel ([`simd::lut`]) is implemented and unit-tested but not yet on the
+//! dispatch path — its production form is the per-ISA SIMD gather (deferred). The
+//! independent `M` rows are spread across `rayon`'s thread pool without changing
+//! per-row arithmetic, so results are deterministic regardless of thread count.
 //
 // `linkme`'s `distributed_slice` expands to a static with a custom
 // `#[link_section]`, and the AVX2 kernel needs hand-written `unsafe` for its
@@ -53,10 +59,15 @@ use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
 #[allow(unsafe_code)]
 mod kernel;
 
-// SIMD kernel variants for v0.30 (AVX-512 / VNNI, ARM NEON, T-MAC LUT). Skeleton
-// module tree (ADR 0005); WF-C implements them and wires the selection into
+// SIMD kernel variants for v0.30 (AVX-512 / VNNI, ARM NEON, T-MAC LUT). WF-C
+// implements them (ADR 0005) and wires the selection into
 // `kernel::dispatch_mpgemm` behind the existing `is_x86_feature_detected!` /
-// `target_arch` dispatch, gated by the cross-ISA conformance parity gate.
+// `target_arch` dispatch, gated by the cross-ISA conformance parity gate. The
+// `avx512`/`neon` submodules carry hand-written `unsafe` for their intrinsics
+// (each block with a `// SAFETY:` note), so — exactly like `mod kernel` — the
+// crate-level `deny(unsafe_code)` is relaxed for this module tree; the `lut`
+// submodule is pure safe arithmetic and uses no `unsafe`.
+#[allow(unsafe_code)]
 mod simd;
 
 /// Owned host-memory buffer of packed weight bytes.
@@ -168,16 +179,39 @@ impl TernaryBackend for CpuBackend {
     }
 
     fn capabilities(&self) -> DeviceCaps {
+        // `mut` is used on x86_64 and aarch64 (both push detected SIMD features);
+        // on any other architecture neither block compiles, leaving `features`
+        // empty and unmutated, so the `mut` is dead there only.
+        #[cfg_attr(
+            not(any(target_arch = "x86_64", target_arch = "aarch64")),
+            allow(unused_mut)
+        )]
         let mut features: Vec<String> = Vec::new();
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
                 features.push("avx2".to_owned());
             }
+            // AVX-512: the kernel needs the F + BW + VL subsets (BW for the
+            // byte-lane trit compares, VL to emit a mask from a 128-bit operand).
+            if is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+            {
+                features.push("avx512".to_owned());
+            }
             if is_x86_feature_detected!("fma") {
                 features.push("fma".to_owned());
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Baseline NEON (`Advanced SIMD`) is mandatory on aarch64, so the
+            // NEON kernel is always live there.
+            features.push("neon".to_owned());
+        }
+        // `features` is left empty on architectures with no SIMD kernel (the
+        // scalar / LUT fallback runs); `with_features` accepts an empty list.
         DeviceCaps::new("cpu", host_arch_name()).with_features(features)
     }
 

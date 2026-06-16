@@ -97,6 +97,26 @@ fn run_chunk(
 ) -> Result<(), BackendError> {
     #[cfg(target_arch = "x86_64")]
     {
+        // Prefer the widest kernel the host can execute. AVX-512 (with the BW +
+        // VL subsets, needed for the byte-lane trit compares that emit a mask from
+        // a 128-bit operand) is selected first where present; otherwise AVX2;
+        // otherwise scalar. The AVX-512 kernel compiles on every x86-64 target but
+        // only runs on an AVX-512 host, so on the AVX2 build box this branch is
+        // inert and the AVX2 path below runs. All three share the reference's
+        // k-order f32 fold, so the choice is bit-neutral.
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            // SAFETY: `avx512_mpgemm` requires the `avx512f` + `avx512bw` +
+            // `avx512vl` target features, all just confirmed present by the runtime
+            // checks above. All buffer lengths were validated by `dispatch_mpgemm`
+            // and are re-validated inside the call before any intrinsic touches
+            // memory.
+            return unsafe {
+                crate::simd::avx512::avx512_mpgemm(act, weights, scales, shape, out)
+            };
+        }
         if is_x86_feature_detected!("avx2") {
             // SAFETY: `avx2_mpgemm` requires the `avx2` target feature, which the
             // runtime check immediately above has just confirmed is present on
@@ -105,7 +125,32 @@ fn run_chunk(
             return unsafe { avx2_mpgemm(act, weights, scales, shape, out) };
         }
     }
-    scalar_mpgemm(act, weights, scales, shape, out)
+    // Baseline NEON is mandatory on aarch64; select it unconditionally there.
+    // NEON shares the x86 kernels' per-element k-order f32 fold, so its output is
+    // bit-identical to the scalar reference (and to the AVX2/AVX-512 paths on
+    // x86). Written as the function tail (not an early `return`) so the trailing
+    // scalar fallback is only compiled where no SIMD kernel applies — no
+    // unreachable-code warning.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `neon_mpgemm` requires the `neon` target feature. On aarch64,
+        // baseline NEON (`Advanced SIMD`) is part of the mandatory architecture —
+        // it is always present, so the precondition holds unconditionally on this
+        // `#[cfg(target_arch = "aarch64")]` path. All buffer lengths were
+        // validated by `dispatch_mpgemm` and are re-validated inside the call.
+        unsafe { crate::simd::neon::neon_mpgemm(act, weights, scales, shape, out) }
+    }
+    // Universal terminal fallback: the bit-exact scalar reference. Reached on
+    // x86-64 with neither AVX-512 nor AVX2 (very old CPUs / restricted CPUID), or
+    // any architecture with no SIMD kernel. Kept deliberately bit-exact (not the
+    // tolerance-only T-MAC LUT) so cross-host output stays byte-reproducible for
+    // golden-file / deterministic-checkpoint callers; the LUT
+    // (`crate::simd::lut::lut_mpgemm`) is implemented and tested but its
+    // production wiring is the per-ISA SIMD gather, deferred to a later step.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        scalar_mpgemm(act, weights, scales, shape, out)
+    }
 }
 
 /// The scalar ground-truth kernel: delegate to [`tritium_core::reference_mpgemm`].
