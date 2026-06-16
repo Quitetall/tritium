@@ -1,0 +1,33 @@
+[package]
+name = "tritium-py"
+description = "PyO3 bindings for Tritium: load a ternary GGUF model and generate tokens from Python."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+# The Python extension module: a C dynamic library named `tritium`.
+name = "tritium"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Loads the model and runs greedy generation; backend-generic via the registry.
+tritium-nn = { workspace = true }
+# The registry the helpers walk to pull a `cpu` backend out by name.
+tritium-runtime = { workspace = true }
+# The `TernaryBackend` trait the registry hands back.
+tritium-spec = { workspace = true }
+# Linked so the CPU backend self-registers into the runtime registry.
+tritium-cpu = { workspace = true }
+# Used by the low-level `ternary_matmul` helper to express problem geometry.
+tritium-core = { workspace = true }
+# `abi3-py39`: build one wheel that works on CPython 3.9+ (forward-compatible).
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py39"] }
+
+[lints]
+workspace = true

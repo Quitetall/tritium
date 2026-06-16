@@ -19,10 +19,15 @@ tritium-format = { workspace = true }
 tritium-runtime = { workspace = true }
 # Used directly to render `DeviceCaps` in `list-backends`.
 tritium-spec = { workspace = true }
-# Linked so its backend self-registration is visible to `list-backends`.
+# Linked so its backend self-registration is visible to `list-backends` and used by
+# `generate` (which loads a model on the CPU backend via the runtime registry).
 tritium-cpu = { workspace = true }
+# The `generate` subcommand loads a model and decodes tokens through `ModelRunner`.
+tritium-nn = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+# `generate` reads input token IDs from a reproducible JSON file.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -29,10 +29,15 @@ GGUF = os.path.expanduser(
     "~/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf"
 )
 OUT = os.path.join(os.path.dirname(__file__), "reference", "bitnet_ladder.json")
+# The WF-4b acceptance reference (CUDA greedy + perplexity + CPU↔CUDA parity).
+OUT_ACCEPT = os.path.join(os.path.dirname(__file__), "reference", "bitnet_accept.json")
 
 # A fixed short prompt. Kept tiny so one fp32 CPU prefill is tractable.
 PROMPT = "The capital of France is"
 GREEDY_NEW = 8
+# WF-4b acceptance: a long greedy continuation (the Rust GPU test asserts a prefix
+# of this) and the eval sequence perplexity is measured over.
+ACCEPT_GREEDY_NEW = 256
 
 
 def _read_gguf_tensors():
@@ -173,6 +178,89 @@ def inject_gguf_values(model):
                     [i2s_scale(gname)], dtype=torch.float32
                 )
     print("injected GGUF F16/F32 embedding, norms, and I2_S scales", file=sys.stderr)
+
+
+def emit_acceptance(model, tok, token_ids) -> None:
+    """Write the WF-4b acceptance reference (`bitnet_accept.json`).
+
+    Emits, for the same committed prompt the ladder uses:
+      - `token_ids`     : the prompt token IDs (the generation seed),
+      - `greedy_ids`    : the transformers GREEDY continuation, `ACCEPT_GREEDY_NEW`
+                          tokens (the Rust CUDA test asserts a prefix of this),
+      - `eval_ids`      : the fixed eval sequence perplexity is scored over
+                          (prompt + greedy continuation, truncated at EOS),
+      - `perplexity`    : the transformers teacher-forced perplexity over
+                          `eval_ids` (fp32 CPU oracle, identical numerics to the
+                          ladder forward — so the Rust runner can match it to 1%),
+      - `eos_token_id`  : so the Rust greedy/eval stop where the oracle does.
+
+    Perplexity is `exp(mean negative-log-likelihood)` of each true next token under
+    the model's full-vocab softmax, computed in one causal forward over `eval_ids`
+    with the shifted-logits convention (position t predicts token t+1).
+    """
+    import math
+
+    ids = torch.tensor([token_ids], dtype=torch.long)
+    eos = (
+        model.config.eos_token_id
+        if isinstance(model.config.eos_token_id, int)
+        else model.config.eos_token_id[0]
+    )
+
+    # Long greedy continuation (the GPU acceptance target). Greedy is deterministic,
+    # so this is a stable oracle for the Rust CUDA + CPU↔CUDA token-match.
+    with torch.no_grad():
+        gen = model.generate(
+            ids,
+            max_new_tokens=ACCEPT_GREEDY_NEW,
+            do_sample=False,
+            num_beams=1,
+            use_cache=True,
+        )
+    greedy_ids = gen[0].tolist()[len(token_ids):]
+    print(f"acceptance greedy continuation: {len(greedy_ids)} tokens", file=sys.stderr)
+
+    # Eval sequence = prompt + greedy continuation, truncated at the first EOS so
+    # perplexity is scored only over real (non-padding) targets the Rust runner
+    # will also stop at.
+    eval_ids = list(token_ids) + list(greedy_ids)
+    if eos in eval_ids[len(token_ids):]:
+        cut = eval_ids.index(eos, len(token_ids)) + 1
+        eval_ids = eval_ids[:cut]
+
+    # Teacher-forced perplexity over `eval_ids`: one causal forward, shift logits so
+    # position t scores the true token t+1, average the per-token NLL in fp32. This
+    # is the exact quantity the Rust `perplexity_over` recomputes step-by-step.
+    eval_t = torch.tensor([eval_ids], dtype=torch.long)
+    with torch.no_grad():
+        out = model(eval_t, use_cache=False)
+    logits = out.logits[0].float()  # [seq, vocab]
+    log_probs = torch.log_softmax(logits[:-1], dim=-1)  # predict t+1 from t
+    targets = eval_t[0, 1:]  # [seq-1]
+    nll = -log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)  # [seq-1]
+    mean_nll = float(nll.mean().item())
+    perplexity = math.exp(mean_nll)
+    print(
+        f"acceptance perplexity over {len(eval_ids)} eval tokens: {perplexity:.6f}",
+        file=sys.stderr,
+    )
+
+    data = {
+        "prompt": PROMPT,
+        "token_ids": list(token_ids),
+        "greedy_ids": greedy_ids,
+        "eval_ids": eval_ids,
+        "perplexity": perplexity,
+        "eos_token_id": eos,
+    }
+    os.makedirs(os.path.dirname(OUT_ACCEPT), exist_ok=True)
+    with open(OUT_ACCEPT, "w") as f:
+        json.dump(data, f)
+    print(
+        f"wrote {OUT_ACCEPT}  (greedy={len(greedy_ids)}, eval={len(eval_ids)}, "
+        f"ppl={perplexity:.4f})",
+        file=sys.stderr,
+    )
 
 
 def main() -> int:
@@ -324,6 +412,12 @@ def main() -> int:
     with open(OUT, "w") as f:
         json.dump(data, f)
     print(f"wrote {OUT}  (seq={len(token_ids)}, argmax_last={data['argmax_last']})", file=sys.stderr)
+
+    # WF-4b acceptance reference: long greedy continuation + eval-sequence
+    # perplexity for the CUDA acceptance + CPU↔CUDA parity gate. Reuses the same
+    # model (already injected with the GGUF's exact embedding/norms/scales) and the
+    # same committed prompt, so the Rust runner consumes byte-identical inputs.
+    emit_acceptance(model, tok, token_ids)
     return 0
 
 

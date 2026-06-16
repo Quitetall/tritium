@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tritium"
+description = "Ternary-model (BitNet) inference from Python, backed by the Rust Tritium engine."
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Brian Lam", email = "briankhanglam@gmail.com" }]
+keywords = ["ternary", "bitnet", "quantization", "inference"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/Quitetall/tritium"
+
+[tool.maturin]
+# The crate lives in the Cargo workspace; point maturin at its manifest and build
+# an abi3 wheel (one wheel for CPython 3.9+).
+manifest-path = "Cargo.toml"
+module-name = "tritium"
+features = ["pyo3/extension-module"]

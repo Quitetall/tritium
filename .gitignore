@@ -28,3 +28,9 @@ crates/*/fuzz/corpus/
 crates/*/fuzz/artifacts/
 crates/*/fuzz/coverage/
 crates/*/fuzz/target/
+
+# python test/build artifacts
+.pytest_cache/
+**/__pycache__/
+*.pyc
+/target/wheels/

@@ -25,6 +25,22 @@ serde_json = { workspace = true }
 # speak the `tritium-spec` contract, so the tests drive them through the CPU
 # ternary mpGEMM. Not a runtime dependency of the crate.
 tritium-cpu = { workspace = true }
+# The CUDA backend, linked ONLY for the GPU acceptance lane (WF-4b). It is a
+# dev-dependency with its own `cuda` feature off by default, so the standard
+# cpu-only build/test of this crate pulls in no `cudarc` and runs no `nvcc`. The
+# `cuda` feature below turns it on so the backend self-registers as `"cuda"` into
+# the runtime `BACKENDS` slice for `tests/acceptance.rs`.
+tritium-cuda = { workspace = true }
+
+# `cargo test -p tritium-nn --features cuda` enables the CUDA backend (and its
+# build.rs `nvcc` PTX compile) so the GPU acceptance + CPU↔CUDA parity tests in
+# `tests/acceptance.rs` can build a `ModelRunner` on the `"cuda"` backend. Without
+# the feature those `#[cfg(feature = "cuda")]` tests compile out entirely, keeping
+# cpu-only CI (no GPU, no CUDA toolkit) green. The feature forwards to the
+# dev-dependency's own `cuda` feature; it touches no runtime dependency.
+[features]
+default = []
+cuda = ["tritium-cuda/cuda"]
 
 [lints]
 workspace = true

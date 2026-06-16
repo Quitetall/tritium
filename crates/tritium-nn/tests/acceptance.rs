@@ -1,0 +1,404 @@
+//! WF-4b acceptance gate: the CUDA end-to-end + perplexity + CPU↔CUDA parity
+//! tests for the real BitNet b1.58 2B4T GGUF.
+//!
+//! This file is the GPU-lane counterpart to `fidelity_ladder.rs` (which proves the
+//! *CPU* forward stage-by-stage). It asserts three things, each gated so cpu-only
+//! CI (no GPU, no CUDA toolkit, possibly no model) skips cleanly:
+//!
+//!   1. **CUDA greedy acceptance** (`#[cfg(feature = "cuda")]`): build a
+//!      [`ModelRunner`] on the `"cuda"` backend, greedy-generate from the committed
+//!      prompt, and assert the generated token IDs equal the committed
+//!      `transformers` reference IDs.
+//!   2. **Perplexity** (`#[cfg(feature = "cuda")]`): run a forward over the fixed
+//!      eval sequence (prompt + reference continuation), compute perplexity from
+//!      the per-position next-token log-probs, and assert it is within 1% of the
+//!      committed `transformers` reference perplexity.
+//!   3. **CPU↔CUDA parity** (`#[cfg(feature = "cuda")]`): generate the same N tokens
+//!      on both backends and assert the token IDs are identical (greedy must match
+//!      bit-for-bit on the decision) and the per-position logits agree to a
+//!      ternary-path relative bound (exact on argmax, ≤2e-3 relative on the logit
+//!      vector — 1e-4 is unrealistic across the full 30-layer fp32 residual stream).
+//!
+//! A **cpu-only** longer-greedy match (no `cuda` feature, model-gated) is also
+//! included: it extends the 8-token `fidelity_ladder` check to a longer horizon on
+//! the CPU backend, valuable on machines with the model but no GPU.
+//!
+//! ## Gating
+//!
+//! Every test first checks the GGUF + reference JSON exist (`maybe_load`/`skip`);
+//! absent ⇒ early-return (a pass that prints why). The GPU tests additionally
+//! require `--features cuda` AND a working device: `cuda_backend()` returns `Err`
+//! when no CUDA device initialises, in which case the test skips rather than fails.
+//!
+//! Generate the reference with `python3 tools/gen_reference.py` (writes both
+//! `bitnet_ladder.json` and `bitnet_accept.json`).
+//!
+//! ## Decode horizons
+//!
+//! The CUDA greedy acceptance runs the **full 256-token** target
+//! ([`CUDA_GREEDY_LEN`]): the v0.10 add-only kernel
+//! (`kernels/tq2_0_add.cu`, ~7 ternary matmuls × 30 layers = ~210 synchronous
+//! launches per step) decodes at ~0.2 s/token on an RTX 4090, so 256 tokens
+//! finishes in well under a minute including load — comfortably inside a test
+//! budget. The asserted IDs are the entire committed continuation.
+//!
+//! The CPU↔CUDA parity test steps **both** backends in lockstep, and the scalar
+//! CPU forward is ~2 s/step, so its horizon is capped at [`PARITY_LEN`] (≥32) to
+//! stay tractable while still exercising a long multi-step decode where any
+//! per-step divergence would compound.
+
+use std::path::Path;
+
+use tritium_nn::ModelRunner;
+#[cfg(feature = "cuda")]
+use tritium_nn::sample_greedy;
+use tritium_runtime as _;
+
+// Linked so the CPU backend's `#[distributed_slice]` entry is included; the CUDA
+// entry is pulled in by the `cuda` feature's dev-dependency edge.
+use tritium_cpu as _;
+#[cfg(feature = "cuda")]
+use tritium_cuda as _;
+
+const GGUF_PATH: &str =
+    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+const REF_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/reference/bitnet_accept.json"
+);
+
+/// Decode horizon for the CUDA greedy acceptance test: the full committed
+/// 256-token continuation (the task's target). Measured ~0.2 s/token on an RTX
+/// 4090 with the add-only kernel, so the whole run (load + 256-step decode) is
+/// well under a minute. The asserted IDs are the entire reference, not a prefix.
+#[cfg(feature = "cuda")]
+const CUDA_GREEDY_LEN: usize = 256;
+
+/// Decode horizon for the CPU↔CUDA parity test. This test steps *both* backends in
+/// lockstep, and the scalar CPU forward is ~2 s/step in release, so the horizon is
+/// capped here (≥32, the task floor) to keep the run tractable while still
+/// exercising a long multi-step decode where any per-step divergence compounds.
+#[cfg(feature = "cuda")]
+const PARITY_LEN: usize = 32;
+
+/// Decode horizon for the cpu-only longer-greedy match. The CPU forward is a
+/// scalar reduction (~2 s/step in release), so we keep this modest but still well
+/// beyond the 8-token `fidelity_ladder` check — a 32-token horizon catches drift
+/// that only shows up several steps into autoregression.
+const CPU_GREEDY_LEN: usize = 32;
+
+/// The committed reference, emitted by `tools/gen_reference.py`.
+///
+/// `eval_ids` + `perplexity` are consumed only by the CUDA perplexity test; in a
+/// cpu-only build (no `cuda` feature) they are still deserialized — the JSON has
+/// them — but unread, so the non-cuda build silences dead-code for just those two.
+#[derive(serde::Deserialize)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct Reference {
+    /// Prompt token IDs (includes BOS), the generation seed.
+    token_ids: Vec<u32>,
+    /// transformers greedy continuation IDs (256 tokens; we may assert a prefix).
+    greedy_ids: Vec<u32>,
+    /// The fixed eval token sequence perplexity is measured over (prompt + cont).
+    eval_ids: Vec<u32>,
+    /// transformers reference perplexity over `eval_ids` (fp32 CPU oracle).
+    perplexity: f64,
+    /// EOS id, so greedy stops exactly where the oracle did.
+    eos_token_id: u32,
+}
+
+/// Load the reference + model bytes, or `None` (with a printed reason) if either
+/// is absent — the offline/cpu-only skip path shared by every test here.
+fn maybe_load() -> Option<(Reference, Vec<u8>)> {
+    if !Path::new(GGUF_PATH).exists() {
+        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+        return None;
+    }
+    if !Path::new(REF_PATH).exists() {
+        eprintln!("skipping: {REF_PATH} absent; run tools/gen_reference.py");
+        return None;
+    }
+    let reference: Reference =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference json");
+    let bytes = std::fs::read(GGUF_PATH).expect("read GGUF");
+    Some((reference, bytes))
+}
+
+/// Index of the maximum element (greedy argmax), ties broken by lowest index —
+/// matching `sample_greedy` and torch's `argmax`. Used only by the CUDA parity
+/// test.
+#[cfg(feature = "cuda")]
+fn argmax(v: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > bv {
+            bv = x;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Construct a `ModelRunner` on the named registry backend from already-read GGUF
+/// `bytes`. Returns `None` if the backend did not register / initialise (e.g. no
+/// CUDA device), so a GPU-less machine skips the GPU tests instead of failing.
+fn load_on(name: &str, bytes: &[u8]) -> Option<ModelRunner> {
+    // The runtime registry only hands out borrows; for an owned trait object we go
+    // through the linked backend's registered `init` by name — the same pattern
+    // `ModelRunner::load_cpu` uses internally for the CPU backend.
+    let init = tritium_runtime::BACKENDS
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| e.init)?;
+    let backend = match init() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: backend `{name}` failed to init ({e}); no device?");
+            return None;
+        }
+    };
+    let file = tritium_format::read_gguf(bytes).expect("parse gguf");
+    Some(ModelRunner::load(&file, bytes, backend).expect("load model"))
+}
+
+/// Numerically-stable log-softmax of `logits` at index `target`: returns
+/// `log P(target) = logits[target] - logsumexp(logits)`. CUDA perplexity only.
+#[cfg(feature = "cuda")]
+fn log_prob_of(logits: &[f32], target: usize) -> f64 {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x)) as f64;
+    let mut sum = 0.0f64;
+    for &l in logits {
+        sum += ((l as f64) - max).exp();
+    }
+    (logits[target] as f64) - max - sum.ln()
+}
+
+/// Teacher-forced perplexity of `runner` over `eval_ids`: for each position `t`
+/// read the next-token log-prob of the *true* token `eval_ids[t+1]` from that
+/// position's logits, where `log P(target) = logit[target] - logsumexp(logits)`.
+/// Perplexity is `exp(-mean log P)` over the `len-1` scored positions.
+///
+/// Computed the oracle-matching way: step token-by-token through the KV cache
+/// (each position attends only to its causal prefix), reading the next-token
+/// distribution at every step — exactly how the transformers oracle scores a
+/// sequence with `use_cache`. Costs `len-1` single-token forwards after the first.
+#[cfg(feature = "cuda")]
+fn perplexity_over(runner: &mut ModelRunner, eval_ids: &[u32]) -> f64 {
+    // One prefill of the whole sequence; we need *every* position's logits, not
+    // just the last, so we step token-by-token through the KV cache and collect the
+    // next-token log-prob at each step. This mirrors the transformers oracle's
+    // teacher-forced scoring exactly (each position attends only to its causal
+    // prefix), at the cost of `len-1` forwards.
+    runner.reset();
+    let n = eval_ids.len();
+    assert!(n >= 2, "perplexity needs at least 2 tokens");
+
+    let mut neg_log_sum = 0.0f64;
+    let mut count = 0usize;
+    // Position 0: prefill the first token alone, score token 1 from its logits.
+    let mut logits = runner
+        .forward(&eval_ids[..1], &[0])
+        .expect("perplexity prefill");
+    for t in 0..n - 1 {
+        let target = eval_ids[t + 1] as usize;
+        neg_log_sum -= log_prob_of(&logits, target);
+        count += 1;
+        // Advance: feed the *true* token t+1 at position t+1 (teacher forcing).
+        if t + 1 < n - 1 {
+            logits = runner
+                .forward(&[eval_ids[t + 1]], &[t + 1])
+                .expect("perplexity decode");
+        }
+    }
+    (neg_log_sum / count as f64).exp()
+}
+
+/// CPU-only longer-greedy match (model-gated, no `cuda` feature needed).
+///
+/// Extends the 8-token `fidelity_ladder` greedy check to [`CPU_GREEDY_LEN`] tokens
+/// on the CPU backend, asserting the IDs equal the committed transformers prefix.
+/// Valuable on machines that have the model but no GPU/CUDA toolkit.
+#[test]
+fn cpu_longer_greedy_matches_transformers() {
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cpu", &bytes) else {
+        eprintln!("skipping: no cpu backend registered");
+        return;
+    };
+
+    let want: Vec<u32> = reference
+        .greedy_ids
+        .iter()
+        .take(CPU_GREEDY_LEN)
+        .copied()
+        .collect();
+    let got = runner
+        .generate(&reference.token_ids, want.len(), reference.eos_token_id)
+        .expect("cpu greedy generate");
+    println!("cpu greedy ({} tok) ours={got:?}", got.len());
+    println!("cpu greedy ({} tok) ref ={want:?}", want.len());
+    assert_eq!(
+        got,
+        want,
+        "cpu greedy {}-token continuation must match transformers",
+        want.len()
+    );
+}
+
+// ───────────────────────── CUDA-gated GPU acceptance ─────────────────────────
+
+/// (a) CUDA greedy acceptance: generate the full 256-token continuation on the
+/// `"cuda"` backend, assert the IDs equal the committed transformers reference.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_greedy_matches_transformers() {
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return; // no GPU → skip (already printed)
+    };
+
+    let want: Vec<u32> = reference
+        .greedy_ids
+        .iter()
+        .take(CUDA_GREEDY_LEN)
+        .copied()
+        .collect();
+    let t0 = std::time::Instant::now();
+    let got = runner
+        .generate(&reference.token_ids, want.len(), reference.eos_token_id)
+        .expect("cuda greedy generate");
+    let dt = t0.elapsed();
+    println!("cuda greedy ({} tok in {:.1?}) ours={got:?}", got.len(), dt);
+    println!("cuda greedy ({} tok) ref ={want:?}", want.len());
+    assert_eq!(
+        got,
+        want,
+        "cuda greedy {}-token continuation must match transformers",
+        want.len()
+    );
+}
+
+/// (b) Perplexity: forward over the fixed eval sequence on CUDA, assert within 1%
+/// of the committed transformers reference perplexity.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_perplexity_within_1pct() {
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+
+    let ppl = perplexity_over(&mut runner, &reference.eval_ids);
+    let want = reference.perplexity;
+    let rel = (ppl - want).abs() / want;
+    println!("cuda perplexity ours={ppl:.6} ref={want:.6} rel={rel:.3e}");
+    assert!(
+        rel <= 0.01,
+        "cuda perplexity {ppl:.6} not within 1% of reference {want:.6} (rel {rel:.3e})"
+    );
+}
+
+/// (c) CPU↔CUDA parity: same N tokens on both backends. Token IDs must be
+/// identical (greedy decision is exact); per-position logits agree to ≤2e-3
+/// relative with an exact argmax at every step.
+#[cfg(feature = "cuda")]
+#[test]
+fn cpu_cuda_parity() {
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut cpu) = load_on("cpu", &bytes) else {
+        eprintln!("skipping: no cpu backend");
+        return;
+    };
+    let Some(mut cuda) = load_on("cuda", &bytes) else {
+        return; // no GPU → skip
+    };
+
+    // Reset both, prefill the prompt on each, then step in lockstep — at every
+    // position compare the full logit vectors and the greedy pick.
+    cpu.reset();
+    cuda.reset();
+    let n_steps = PARITY_LEN;
+
+    let positions: Vec<usize> = (0..reference.token_ids.len()).collect();
+    let mut cpu_logits = cpu
+        .forward(&reference.token_ids, &positions)
+        .expect("cpu prefill");
+    let mut cuda_logits = cuda
+        .forward(&reference.token_ids, &positions)
+        .expect("cuda prefill");
+
+    let mut worst_rel = 0.0f32;
+    let mut cpu_ids = Vec::with_capacity(n_steps);
+    let mut cuda_ids = Vec::with_capacity(n_steps);
+
+    for (step, pos) in (reference.token_ids.len()..).take(n_steps).enumerate() {
+        // Argmax must match exactly at every position (the greedy decision).
+        let am_cpu = argmax(&cpu_logits);
+        let am_cuda = argmax(&cuda_logits);
+        assert_eq!(
+            am_cpu, am_cuda,
+            "argmax mismatch at step {step}: cpu={am_cpu} cuda={am_cuda}"
+        );
+
+        // Per-position logit closeness, reference magnitude as the denominator.
+        let rel = max_rel_err(&cuda_logits, &cpu_logits);
+        if rel > worst_rel {
+            worst_rel = rel;
+        }
+        assert!(
+            rel <= 2e-3,
+            "step {step}: cpu↔cuda logits rel err {rel:.3e} > 2e-3"
+        );
+
+        let next_cpu = sample_greedy(&cpu_logits).expect("cpu greedy");
+        let next_cuda = sample_greedy(&cuda_logits).expect("cuda greedy");
+        assert_eq!(
+            next_cpu, next_cuda,
+            "greedy token mismatch at step {step}: cpu={next_cpu} cuda={next_cuda}"
+        );
+        cpu_ids.push(next_cpu);
+        cuda_ids.push(next_cuda);
+        if next_cpu == reference.eos_token_id {
+            break;
+        }
+
+        cpu_logits = cpu.forward(&[next_cpu], &[pos]).expect("cpu decode");
+        cuda_logits = cuda.forward(&[next_cuda], &[pos]).expect("cuda decode");
+    }
+
+    println!(
+        "cpu↔cuda parity over {} steps: identical IDs, worst logit rel = {worst_rel:.3e}",
+        cpu_ids.len()
+    );
+    assert_eq!(
+        cpu_ids, cuda_ids,
+        "cpu and cuda greedy IDs must be identical"
+    );
+}
+
+/// Max relative error between two equal-length vectors, using the larger-magnitude
+/// reference (`want`) as the denominator (with a small floor) — the ADR-0004
+/// convention also used by `fidelity_ladder.rs`.
+#[cfg(feature = "cuda")]
+fn max_rel_err(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len(), "logit length mismatch");
+    let scale = want.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-3);
+    let mut worst = 0.0f32;
+    for (&g, &w) in got.iter().zip(want) {
+        let e = (g - w).abs() / scale;
+        if e > worst {
+            worst = e;
+        }
+    }
+    worst
+}

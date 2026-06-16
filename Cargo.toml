@@ -12,7 +12,8 @@ members = [
     "crates/tritium-runtime",  # registry, dispatch (linkme self-registration)
     "crates/tritium-cpu",      # AVX2 + scalar ternary mpGEMM
     "crates/tritium-cuda",     # cudarc host + add-only .cu kernel (feature-gated)
-    "crates/tritium-cli",      # `tritium` binary: inspect, list-backends
+    "crates/tritium-cli",      # `tritium` binary: inspect, list-backends, generate
+    "crates/tritium-py",       # PyO3 + maturin Python bindings (cdylib wheel)
     # ── enabled as each lands (see docs/ROADMAP for the full crate graph) ──
     # L1 backends
     # "crates/tritium-metal",    # [planned]
@@ -56,6 +57,7 @@ tritium-runtime = { path = "crates/tritium-runtime" }
 tritium-testkit = { path = "crates/tritium-testkit" }
 tritium-cpu = { path = "crates/tritium-cpu" }
 tritium-cuda = { path = "crates/tritium-cuda" }
+tritium-nn = { path = "crates/tritium-nn" }
 # foundation
 bytemuck = "1"
 half = "2"
