@@ -80,3 +80,92 @@ extern "C" __global__ void tq2_0_add_mpgemm(
 
     out[(long long)mi * n + ni] = acc * scales[ni];
 }
+
+// tq2_0_add_mpgemm_tiled — the decode-oriented (memory-bound, small-M) sibling of
+// the kernel above (v0.30 WF-A, ADR 0005). Same add/sub/skip arithmetic and the
+// identical TQ2_0 decode, but parallelized for batch=1 decode where the floor is
+// reading the weight bytes:
+//
+//   * One CUDA block owns one activation row `mi` and stages its `K` floats into
+//     shared memory once (cooperatively), so every warp in the block reads the
+//     activations from shared instead of re-fetching them from global.
+//   * One *warp* computes one output `ni`: the 32 lanes split the K loop
+//     (lane `l` walks ki = l, l+32, …), decode + accumulate by sign, then a
+//     `__shfl_down_sync` tree-reduction sums the 32 partials. Lane 0 applies the
+//     per-channel scale and writes the result.
+//
+// The lane-split + tree-reduction sums K in a different order than the sequential
+// reference, so the result matches `reference_mpgemm` within the 1e-4 relative
+// tolerance (ADR 0002) rather than bit-exactly — exactly what the contract asks of
+// the float path. The host only routes shapes whose `K` activations fit the shared
+// budget here (`K <= 8192` floats = 32 KiB); larger K falls back to the kernel
+// above.
+#define WARP_SIZE 32
+
+extern "C" __global__ void tq2_0_add_mpgemm_tiled(
+    const float* __restrict__ act,      // [M, K]
+    const unsigned char* __restrict__ weights, // [N * row_bytes]
+    const float* __restrict__ scales,   // [N]
+    float* __restrict__ out,            // [M, N]
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    extern __shared__ float s_act[];    // K activations for this block's row `mi`
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;          // one block-row per output row
+
+    if (mi >= m) {
+        return;
+    }
+
+    // Stage this row's activations into shared memory (all threads cooperate).
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_act[i] = arow[i];
+    }
+    __syncthreads();
+
+    // This warp's output column. Warps past N have no work but must still have
+    // reached the barrier above, so the early-out comes after `__syncthreads`.
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    // Accumulate in double: the lane-split + tree-reduction sums K in a different
+    // order than the sequential reference, so an f32 accumulator drifts past the
+    // 1e-4 ternary tolerance on cancellation-heavy rows. A double accumulator keeps
+    // the tiled result within 1e-4 of the f32 reference (and near-bit-identical for
+    // the model forward, protecting v0.20 greedy parity).
+    double acc = 0.0;
+    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        const int e = ki - block * QK_K;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        const double a = (double)s_act[ki];
+        if (code == 2u) {
+            acc += a;
+        } else if (code == 0u) {
+            acc -= a;
+        }
+    }
+
+    // Tree-reduce the 32 lane partials in double. Full mask: every lane
+    // participates (a lane with no ki simply contributes 0).
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = (float)(acc * (double)scales[ni]);
+    }
+}
