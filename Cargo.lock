@@ -882,6 +882,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tritium-quantize"
+version = "0.3.7"
+dependencies = [
+ "proptest",
+ "tritium-core",
+]
+
+[[package]]
 name = "tritium-runtime"
 version = "0.3.7"
 dependencies = [

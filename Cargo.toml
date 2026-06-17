@@ -21,7 +21,7 @@ members = [
     # "crates/tritium-wgpu",     # [planned]
     # L2 runtime + functional
     # "crates/tritium-runtime",  # registry, dispatch, mem pools, autotune cache
-    # "crates/tritium-quantize", # fp -> ternary (AbsMean/GPTQ/learned scales)
+    "crates/tritium-quantize", # SALT: fp -> ternary plane stacks (ADR 0001/0006)
     "crates/tritium-nn",       # mixed-precision ops + model runner
     "benches",                 # divan microbenches + perf harness (v0.30, ADR 0005)
     # "crates/tritium-train",    # [planned] QAT, STE autograd, optimizer
@@ -58,6 +58,7 @@ tritium-runtime = { path = "crates/tritium-runtime" }
 tritium-testkit = { path = "crates/tritium-testkit" }
 tritium-cpu = { path = "crates/tritium-cpu" }
 tritium-cuda = { path = "crates/tritium-cuda" }
+tritium-quantize = { path = "crates/tritium-quantize" }
 tritium-nn = { path = "crates/tritium-nn" }
 # foundation
 bytemuck = "1"

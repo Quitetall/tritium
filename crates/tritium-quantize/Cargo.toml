@@ -1,0 +1,22 @@
+[package]
+name = "tritium-quantize"
+description = "SALT — sensitivity-allocated layered ternary quantization (residual planes + rate-distortion plane allocation)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Offline (host-side) quantizer: turns fp weights into SALT ternary plane stacks.
+# Depends only on the foundation crate (types + the AbsMean scaling contract).
+[dependencies]
+tritium-core = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
