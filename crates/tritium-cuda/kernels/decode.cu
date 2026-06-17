@@ -305,4 +305,132 @@ __global__ void relu2_gate_f32(float* __restrict__ gate, const float* __restrict
   }
 }
 
+// ===========================================================================
+// v0.3.2 (#29): CUDA-graph "_g" variants. A captured graph bakes by-value kernel
+// params, but the decode step's token id / RoPE position / KV write offset /
+// attention range change every token. These variants read those per-token values
+// from a small **device control block** `ctrl` (int[4] = {token, pos, cache_len, _})
+// instead of by-value args, so ONE captured graph replays across tokens (the host
+// just rewrites `ctrl` + the input between replays). The math is byte-identical to
+// the by-value kernels above given the same control values — the originals stay for
+// the eager path + the goldens; these are added alongside (not replacing).
+// ===========================================================================
+
+// embedding_gather_f32_g — like embedding_gather_f32 but tok = ctrl[0].
+__global__ void embedding_gather_f32_g(const float* __restrict__ table,
+                                       const int* __restrict__ ctrl,
+                                       const int n_embd, float* __restrict__ out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_embd) {
+    const int tok = ctrl[0];
+    out[i] = table[(long long)tok * n_embd + i];
+  }
+}
+
+// rope_apply_f32_g — like rope_apply_f32 but pos = ctrl[1], indexing the FULL
+// precomputed cos/sin table `[max_ctx, half]` itself (the eager kernel takes a
+// pre-sliced row; a captured graph cannot re-slice per token). Rotation math is
+// identical (two muls then sub/add, no FMA).
+__global__ void rope_apply_f32_g(float* __restrict__ x,
+                                 const float* __restrict__ cos_table,  // [max_ctx*half]
+                                 const float* __restrict__ sin_table,  // [max_ctx*half]
+                                 const int* __restrict__ ctrl,
+                                 const int n_head, const int head_dim) {
+  const int half = head_dim >> 1;
+  const int total = n_head * half;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+
+  const int head = idx / half;
+  const int j = idx - head * half;
+  const int base = head * head_dim;
+  const int pos = ctrl[1];
+  const float c = cos_table[(long long)pos * half + j];
+  const float s = sin_table[(long long)pos * half + j];
+  const float a = x[base + j];
+  const float b = x[base + j + half];
+  x[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+  x[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+}
+
+// kv_append_f32 — the device half of the KV append: copy this token's `src` row
+// (`[kv_width]`) into the layer's KV arena at offset `ctrl[2]*kv_width`. Replaces the
+// eager path's `memcpy_dtod` (whose offset would be baked into the graph). Pure copy.
+__global__ void kv_append_f32(const float* __restrict__ src,
+                              float* __restrict__ kv_base,   // [max_ctx*kv_width]
+                              const int* __restrict__ ctrl,
+                              const int kv_width) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < kv_width) {
+    const long long off = (long long)ctrl[2] * kv_width + i;
+    kv_base[off] = src[i];
+  }
+}
+
+// gqa_attention_decode_f32_g — like gqa_attention_decode_f32 but cache_len = ctrl[2]
+// (so ctx = cache_len+1, limit = cache_len), and `scores` is strided by the FIXED
+// `max_ctx` (not the per-token `ctx`), since the scratch layout must be constant
+// across replays. Same sequential dots / inline softmax (exp_f32) / weighted sum.
+__global__ void gqa_attention_decode_f32_g(const float* __restrict__ q,    // [n_head, head_dim]
+                                           const float* __restrict__ k,    // [max_ctx, n_head_kv, head_dim]
+                                           const float* __restrict__ v,    // [max_ctx, n_head_kv, head_dim]
+                                           float* __restrict__ out,        // [n_head, head_dim]
+                                           float* __restrict__ scores,     // [n_head, max_ctx] scratch
+                                           const int* __restrict__ ctrl,
+                                           const int max_ctx, const int n_head,
+                                           const int n_head_kv, const int head_dim,
+                                           const float scale) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= n_head) return;
+
+  const int cache_len = ctrl[2];
+  const int ctx = cache_len + 1;
+  const int limit = cache_len;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float* q_row = q + (long long)h * head_dim;
+  float* sc = scores + (long long)h * max_ctx;  // FIXED stride (constant across replays)
+
+  for (int j = 0; j < ctx; ++j) {
+    if (j > limit) {
+      sc[j] = -INFINITY;
+      continue;
+    }
+    const float* k_row = k + ((long long)j * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot = __fadd_rn(dot, __fmul_rn(q_row[d], k_row[d]));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+
+  float m = -INFINITY;
+  for (int j = 0; j < ctx; ++j) {
+    if (sc[j] > m) m = sc[j];
+  }
+  float sum = 0.0f;
+  for (int j = 0; j < ctx; ++j) {
+    const float e = exp_f32(__fsub_rn(sc[j], m));
+    sc[j] = e;
+    sum = __fadd_rn(sum, e);
+  }
+  const float inv = __fdiv_rn(1.0f, sum);
+  for (int j = 0; j < ctx; ++j) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+
+  float* o_row = out + (long long)h * head_dim;
+  for (int d = 0; d < head_dim; ++d) {
+    o_row[d] = 0.0f;
+  }
+  for (int j = 0; j < ctx; ++j) {
+    const float w = sc[j];
+    if (w == 0.0f) continue;
+    const float* v_row = v + ((long long)j * n_head_kv + kv) * head_dim;
+    for (int d = 0; d < head_dim; ++d) {
+      o_row[d] = __fadd_rn(o_row[d], __fmul_rn(w, v_row[d]));
+    }
+  }
+}
+
 }  // extern "C"

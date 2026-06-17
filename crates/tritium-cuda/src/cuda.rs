@@ -30,10 +30,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, DriverError,
-    LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, CudaView, DevicePtr,
+    DriverError, LaunchConfig, PushKernelArg, result, sys,
 };
 use cudarc::nvrtc::Ptx;
+use std::ffi::{CString, c_void};
 
 use tritium_core::{GemmShape, TernaryFormat};
 use tritium_format::{
@@ -88,6 +89,11 @@ const KERNEL_NAME_SCALE_MUL: &str = "scale_mul_f32";
 /// BitNet squared-ReLU FFN gate `g = relu(g)² ⊙ u` (v0.3.1) — bit-matches the host
 /// `mlp` gating loop (`r = g.max(0); g = r*r*u`).
 const KERNEL_NAME_RELU2_GATE: &str = "relu2_gate_f32";
+/// v0.3.2 graph variants reading the per-token control block (token/pos/cache_len).
+const KERNEL_NAME_EMBED_G: &str = "embedding_gather_f32_g";
+const KERNEL_NAME_ROPE_G: &str = "rope_apply_f32_g";
+const KERNEL_NAME_KV_APPEND: &str = "kv_append_f32";
+const KERNEL_NAME_ATTN_G: &str = "gqa_attention_decode_f32_g";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -1272,6 +1278,16 @@ impl CudaBackend {
             max_ctx,
             rms_eps,
             attn_scale: 1.0f32 / (head_dim as f32).sqrt(),
+            d_ctrl: s
+                .alloc_zeros::<i32>(4)
+                .map_err(|e| driver_err("decode d_ctrl", &e))?,
+            cap_stream: self
+                .stream
+                .context()
+                .new_stream()
+                .map_err(|e| driver_err("decode capture stream", &e))?,
+            graph: None,
+            raw: None,
         })
     }
 
@@ -2404,6 +2420,18 @@ pub struct CudaDecodeModel {
     max_ctx: usize,
     rms_eps: f32,
     attn_scale: f32,
+    // --- v0.3.2 CUDA-graph decode path ---
+    /// Device control block `[token, pos, cache_len, _]`, rewritten per token so one
+    /// captured graph replays across tokens (the `_g` kernels read it).
+    d_ctrl: CudaSlice<i32>,
+    /// Dedicated capture/replay stream (capturing the default stream is disallowed).
+    cap_stream: Arc<CudaStream>,
+    /// The captured decode graph, built lazily on first graph step. Declared **before**
+    /// `raw` so it drops (graph-exec destroyed) before the modules it references unload.
+    graph: Option<CudaGraph>,
+    /// Raw-loaded PTX modules + `CUfunction` handles for the captured raw launches
+    /// (the safe `CudaFunction` hides `cu_function`). `None` until the graph path is used.
+    raw: Option<RawGraphKernels>,
 }
 
 impl CudaDecodeModel {
@@ -2693,6 +2721,458 @@ impl CudaDecodeModel {
         #[allow(unsafe_code)]
         unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident lm_head", &e))?; }
         Ok(())
+    }
+
+    // ===================== v0.3.2 CUDA-graph decode path =====================
+
+    /// Run one decode step through the **captured CUDA graph** (built lazily on first
+    /// call): rewrite the device control block `[token, pos, cache_len]`, replay the
+    /// whole-forward graph with a single launch, and read back the logits. Crosses the
+    /// host boundary with two tiny transfers (ctrl H2D + logits D2H) and **one** graph
+    /// launch — replacing ~930 per-token kernel launches. Numerically identical to
+    /// [`step`](Self::step) (the `_g` kernels read the control block but do the same
+    /// math). `pos` must equal [`cache_len`](Self::cache_len).
+    ///
+    /// # Errors
+    /// [`BackendError`] on capacity overflow, a `pos`/token guard, or a device failure.
+    pub fn step_graph(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, BackendError> {
+        if self.cache_len >= self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "decode context overflow: cache_len={} max_ctx={}",
+                self.cache_len, self.max_ctx
+            )));
+        }
+        if pos != self.cache_len {
+            return Err(BackendError::InvalidInput(format!(
+                "decode pos={pos} must equal the KV watermark cache_len={}",
+                self.cache_len
+            )));
+        }
+        if token as usize >= self.vocab {
+            return Err(BackendError::InvalidInput(format!(
+                "decode token id {token} out of range (vocab={})",
+                self.vocab
+            )));
+        }
+        if self.graph.is_none() {
+            self.capture_graph()?;
+        }
+
+        // Rewrite the control block, then replay. Both are on `cap_stream`, so the H2D
+        // is ordered before the graph reads `d_ctrl`.
+        let ctrl = [token as i32, pos as i32, self.cache_len as i32, 0i32];
+        self.cap_stream
+            .memcpy_htod(&ctrl, &mut self.d_ctrl)
+            .map_err(|e| driver_err("decode ctrl htod", &e))?;
+        self.graph
+            .as_ref()
+            .expect("graph captured above")
+            .launch()
+            .map_err(|e| driver_err("decode graph launch", &e))?;
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("decode graph sync", &e))?;
+
+        let mut logits = vec![0.0f32; self.vocab];
+        self.cap_stream
+            .memcpy_dtoh(&self.d_logits, &mut logits)
+            .map_err(|e| driver_err("decode graph logits dtoh", &e))?;
+        self.cache_len += 1;
+        Ok(logits)
+    }
+
+    /// Load the raw kernels (once) and record + instantiate the decode graph.
+    fn capture_graph(&mut self) -> Result<(), BackendError> {
+        if self.raw.is_none() {
+            let ctx = self.cap_stream.context().clone();
+            self.raw = Some(RawGraphKernels::load(&ctx)?);
+        }
+        let graph = self.record_graph()?;
+        self.graph = Some(graph);
+        Ok(())
+    }
+
+    fn raw(&self) -> &RawGraphKernels {
+        self.raw.as_ref().expect("raw kernels loaded before record")
+    }
+
+    /// Extract every buffer's stable device pointer (guards dropped here, outside
+    /// capture), then capture the full forward via raw launches on `cap_stream`.
+    fn record_graph(&self) -> Result<CudaGraph, BackendError> {
+        let s = &self.cap_stream;
+        let lin = |l: &ResidentLinear| LinPtrs {
+            w: dptr(l.device.as_ref(), s),
+            sc: dptr(&l.scales, s),
+            n: l.n,
+            k: l.k,
+            rb: l.row_bytes,
+        };
+        let layers: Vec<LayerPtrs> = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(li, l)| LayerPtrs {
+                attn_norm: dptr(&l.attn_norm, s),
+                attn_sub_norm: l.attn_sub_norm.as_ref().map(|b| dptr(b, s)),
+                ffn_norm: dptr(&l.ffn_norm, s),
+                ffn_sub_norm: l.ffn_sub_norm.as_ref().map(|b| dptr(b, s)),
+                q: lin(&l.q),
+                k: lin(&l.k),
+                v: lin(&l.v),
+                o: lin(&l.o),
+                gate: lin(&l.gate),
+                up: lin(&l.up),
+                down: lin(&l.down),
+                kv_k: dptr(&self.kv_k[li], s),
+                kv_v: dptr(&self.kv_v[li], s),
+            })
+            .collect();
+        let p = GraphPtrs {
+            d_x: dptr(&self.d_x, s),
+            d_normed: dptr(&self.d_normed, s),
+            d_q: dptr(&self.d_q, s),
+            d_knew: dptr(&self.d_knew, s),
+            d_vnew: dptr(&self.d_vnew, s),
+            d_attn: dptr(&self.d_attn, s),
+            d_attn_sn: dptr(&self.d_attn_sn, s),
+            d_proj_out: dptr(&self.d_proj_out, s),
+            d_gate: dptr(&self.d_gate, s),
+            d_up: dptr(&self.d_up, s),
+            d_gate_sn: dptr(&self.d_gate_sn, s),
+            d_scores: dptr(&self.d_scores, s),
+            d_logits: dptr(&self.d_logits, s),
+            d_qact: dptr(&self.d_qact, s),
+            d_act_scale: dptr(&self.d_act_scale, s),
+            d_ctrl: dptr(&self.d_ctrl, s),
+            d_cos: dptr(&self.d_cos, s),
+            d_sin: dptr(&self.d_sin, s),
+            d_token_embd: dptr(&self.d_token_embd, s),
+            d_output_norm: dptr(&self.d_output_norm, s),
+        };
+        // Drain the events the device_ptr extraction recorded, so the capture (which
+        // uses only raw launches) carries no pre-capture dependency.
+        s.synchronize().map_err(|e| driver_err("pre-capture cap sync", &e))?;
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("pre-capture default sync", &e))?;
+
+        s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|e| driver_err("decode begin_capture", &e))?;
+
+        // The exact op order of `step` + `layer`, all raw-launched on `cap_stream`.
+        self.g_embed(p.d_token_embd, p.d_ctrl, p.d_x)?;
+        for lp in &layers {
+            self.g_layer(&p, lp)?;
+        }
+        self.g_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed)?;
+        self.g_lm_head(p.d_normed, p.d_token_embd, p.d_logits)?;
+
+        let graph = s
+            .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|e| driver_err("decode end_capture", &e))?
+            .ok_or_else(|| BackendError::Backend("decode graph capture produced no graph".into()))?;
+        Ok(graph)
+    }
+
+    /// One transformer block, raw-launched into the capture. Mirrors [`layer`](Self::layer).
+    fn g_layer(&self, p: &GraphPtrs, l: &LayerPtrs) -> Result<(), BackendError> {
+        let (n_embd, q_width, kv_width) = (self.n_embd, self.q_width, self.kv_width);
+        let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
+
+        // pre-norm attention
+        self.g_rmsnorm(p.d_x, l.attn_norm, n_embd, p.d_normed)?;
+        self.g_gemm(p.d_normed, &l.q, p.d_qact, p.d_act_scale, p.d_q)?;
+        self.g_gemm(p.d_normed, &l.k, p.d_qact, p.d_act_scale, p.d_knew)?;
+        self.g_gemm(p.d_normed, &l.v, p.d_qact, p.d_act_scale, p.d_vnew)?;
+        self.g_rope(p.d_q, p.d_cos, p.d_sin, p.d_ctrl, n_head, head_dim)?;
+        self.g_rope(p.d_knew, p.d_cos, p.d_sin, p.d_ctrl, n_head_kv, head_dim)?;
+        self.g_kv_append(p.d_knew, l.kv_k, p.d_ctrl, kv_width)?;
+        self.g_kv_append(p.d_vnew, l.kv_v, p.d_ctrl, kv_width)?;
+        self.g_attn(p.d_q, l.kv_k, l.kv_v, p.d_attn, p.d_scores, p.d_ctrl)?;
+        let attn_in = if let Some(sn) = l.attn_sub_norm {
+            self.g_rmsnorm(p.d_attn, sn, q_width, p.d_attn_sn)?;
+            p.d_attn_sn
+        } else {
+            p.d_attn
+        };
+        self.g_gemm(attn_in, &l.o, p.d_qact, p.d_act_scale, p.d_proj_out)?;
+        self.g_residual(p.d_x, p.d_proj_out, n_embd)?;
+
+        // pre-norm ReLU² MLP
+        self.g_rmsnorm(p.d_x, l.ffn_norm, n_embd, p.d_normed)?;
+        self.g_gemm(p.d_normed, &l.gate, p.d_qact, p.d_act_scale, p.d_gate)?;
+        self.g_gemm(p.d_normed, &l.up, p.d_qact, p.d_act_scale, p.d_up)?;
+        self.g_relu2(p.d_gate, p.d_up, self.n_ff)?;
+        let down_in = if let Some(sn) = l.ffn_sub_norm {
+            self.g_rmsnorm(p.d_gate, sn, self.n_ff, p.d_gate_sn)?;
+            p.d_gate_sn
+        } else {
+            p.d_gate
+        };
+        self.g_gemm(down_in, &l.down, p.d_qact, p.d_act_scale, p.d_proj_out)?;
+        self.g_residual(p.d_x, p.d_proj_out, n_embd)?;
+        Ok(())
+    }
+
+    // Raw-launch helpers (build the kernel_params array from pre-extracted device
+    // pointers + scalar locals; only `raw_launch` is unsafe). `cs` = capture stream.
+
+    fn g_rmsnorm(&self, x: sys::CUdeviceptr, w: sys::CUdeviceptr, n: usize, out: sys::CUdeviceptr) -> Result<(), BackendError> {
+        let eps = self.rms_eps;
+        let n_i = n as i32;
+        let mut params = [pp(&x), pp(&w), pp(&eps), pp(&n_i), pp(&out)];
+        raw_launch(self.raw().rmsnorm, (1, 1, 1), (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn g_gemm(&self, d_in: sys::CUdeviceptr, lin: &LinPtrs, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, d_out: sys::CUdeviceptr) -> Result<(), BackendError> {
+        let cs = self.cap_stream.cu_stream();
+        let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
+        // 1. act quant
+        {
+            let mut params = [pp(&d_in), pp(&k_i), pp(&d_qact), pp(&d_act_scale)];
+            raw_launch(self.raw().act_quant, (1, 1, 1), (256, 1, 1), 0, cs, &mut params)?;
+        }
+        // 2. tiled GEMM
+        {
+            let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
+            let smem = (lin.k * 4) as u32;
+            let mut params = [pp(&d_qact), pp(&lin.w), pp(&lin.sc), pp(&d_out), pp(&m_i), pp(&n_i), pp(&k_i), pp(&rb_i)];
+            raw_launch(self.raw().tiled, grid, (WARPS_PER_BLOCK * 32, 1, 1), smem, cs, &mut params)?;
+        }
+        // 3. scale fold
+        {
+            let grid = ((lin.n as u32).div_ceil(256), 1, 1);
+            let mut params = [pp(&d_out), pp(&d_act_scale), pp(&n_i)];
+            raw_launch(self.raw().scale, grid, (256, 1, 1), 0, cs, &mut params)?;
+        }
+        Ok(())
+    }
+
+    fn g_rope(&self, x: sys::CUdeviceptr, cos_t: sys::CUdeviceptr, sin_t: sys::CUdeviceptr, ctrl: sys::CUdeviceptr, n_head: usize, head_dim: usize) -> Result<(), BackendError> {
+        let (nh_i, hd_i) = (n_head as i32, head_dim as i32);
+        let total = (n_head * (head_dim / 2)) as u32;
+        let grid = (total.div_ceil(256), 1, 1);
+        let mut params = [pp(&x), pp(&cos_t), pp(&sin_t), pp(&ctrl), pp(&nh_i), pp(&hd_i)];
+        raw_launch(self.raw().rope_g, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn g_kv_append(&self, src: sys::CUdeviceptr, kv_base: sys::CUdeviceptr, ctrl: sys::CUdeviceptr, kv_width: usize) -> Result<(), BackendError> {
+        let kw_i = kv_width as i32;
+        let grid = ((kv_width as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&src), pp(&kv_base), pp(&ctrl), pp(&kw_i)];
+        raw_launch(self.raw().kv_append, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn g_attn(&self, q: sys::CUdeviceptr, k: sys::CUdeviceptr, v: sys::CUdeviceptr, out: sys::CUdeviceptr, scores: sys::CUdeviceptr, ctrl: sys::CUdeviceptr) -> Result<(), BackendError> {
+        let (mc_i, nh_i, nhkv_i, hd_i) = (self.max_ctx as i32, self.n_head as i32, self.n_head_kv as i32, self.head_dim as i32);
+        let scale = self.attn_scale;
+        let threads = 64u32;
+        let grid = ((self.n_head as u32).div_ceil(threads), 1, 1);
+        let mut params = [pp(&q), pp(&k), pp(&v), pp(&out), pp(&scores), pp(&ctrl), pp(&mc_i), pp(&nh_i), pp(&nhkv_i), pp(&hd_i), pp(&scale)];
+        raw_launch(self.raw().attn_g, grid, (threads, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn g_residual(&self, x: sys::CUdeviceptr, y: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let n_i = n as i32;
+        let grid = ((n as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&x), pp(&y), pp(&n_i)];
+        raw_launch(self.raw().residual, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn g_relu2(&self, gate: sys::CUdeviceptr, up: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let n_i = n as i32;
+        let grid = ((n as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&gate), pp(&up), pp(&n_i)];
+        raw_launch(self.raw().relu2, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn g_embed(&self, table: sys::CUdeviceptr, ctrl: sys::CUdeviceptr, out: sys::CUdeviceptr) -> Result<(), BackendError> {
+        let ne_i = self.n_embd as i32;
+        let grid = ((self.n_embd as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&table), pp(&ctrl), pp(&ne_i), pp(&out)];
+        raw_launch(self.raw().embed_g, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn g_lm_head(&self, h: sys::CUdeviceptr, embd: sys::CUdeviceptr, logits: sys::CUdeviceptr) -> Result<(), BackendError> {
+        let (ne_i, v_i) = (self.n_embd as i32, self.vocab as i32);
+        let grid = ((self.vocab as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&h), pp(&embd), pp(&ne_i), pp(&v_i), pp(&logits)];
+        raw_launch(self.raw().lm_head, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+}
+
+/// A kernel param: a pointer to the arg value `v`. For a pointer arg, `v` is the
+/// `CUdeviceptr`; for a by-value arg, `v` is the scalar. Casting a reference to a raw
+/// pointer is safe (the deref happens inside `cuLaunchKernel`); the caller keeps `v`
+/// alive across the launch (it is a local that outlives `raw_launch`, and graph capture
+/// snapshots the value into the kernel node).
+fn pp<T>(v: &T) -> *mut c_void {
+    (v as *const T) as *mut c_void
+}
+
+/// Extract a buffer's stable device address, dropping the `SyncOnDrop` guard
+/// immediately (outside any capture — its drop records an event, forbidden inside a
+/// capture). The `CUdeviceptr` is valid for the buffer's lifetime, so it is safe to
+/// bake into a captured graph that the buffer outlives.
+fn dptr<T>(buf: &CudaSlice<T>, stream: &CudaStream) -> sys::CUdeviceptr {
+    let (ptr, guard) = buf.device_ptr(stream);
+    drop(guard);
+    ptr
+}
+
+/// Launch a kernel via the RAW driver entry point, bypassing cudarc's safe launch
+/// (whose per-buffer event waits trip `STREAM_CAPTURE_ISOLATION` during capture).
+fn raw_launch(
+    func: sys::CUfunction,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    smem: u32,
+    stream: sys::CUstream,
+    params: &mut [*mut c_void],
+) -> Result<(), BackendError> {
+    // SAFETY: `func` is a valid `CUfunction` from a loaded `RawGraphKernels` module;
+    // `params` holds exactly one pointer per kernel arg in declaration order, each
+    // pointing to a live value (a `CUdeviceptr` for a pointer arg, the scalar for a
+    // by-value arg) that outlives this call. The kernel signatures are pinned by the
+    // `g_*` callers against `decode.cu`. Graph capture snapshots the arg values.
+    #[allow(unsafe_code)]
+    unsafe {
+        result::launch_kernel(func, grid, block, smem, stream, params)
+    }
+    .map_err(|e| driver_err("raw graph launch", &e))
+}
+
+/// Pre-extracted device pointers for one ternary projection.
+#[derive(Clone, Copy)]
+struct LinPtrs {
+    w: sys::CUdeviceptr,
+    sc: sys::CUdeviceptr,
+    n: usize,
+    k: usize,
+    rb: usize,
+}
+
+/// Pre-extracted device pointers for one transformer block.
+struct LayerPtrs {
+    attn_norm: sys::CUdeviceptr,
+    attn_sub_norm: Option<sys::CUdeviceptr>,
+    ffn_norm: sys::CUdeviceptr,
+    ffn_sub_norm: Option<sys::CUdeviceptr>,
+    q: LinPtrs,
+    k: LinPtrs,
+    v: LinPtrs,
+    o: LinPtrs,
+    gate: LinPtrs,
+    up: LinPtrs,
+    down: LinPtrs,
+    kv_k: sys::CUdeviceptr,
+    kv_v: sys::CUdeviceptr,
+}
+
+/// Pre-extracted device pointers for the shared dense weights + scratch buffers.
+struct GraphPtrs {
+    d_x: sys::CUdeviceptr,
+    d_normed: sys::CUdeviceptr,
+    d_q: sys::CUdeviceptr,
+    d_knew: sys::CUdeviceptr,
+    d_vnew: sys::CUdeviceptr,
+    d_attn: sys::CUdeviceptr,
+    d_attn_sn: sys::CUdeviceptr,
+    d_proj_out: sys::CUdeviceptr,
+    d_gate: sys::CUdeviceptr,
+    d_up: sys::CUdeviceptr,
+    d_gate_sn: sys::CUdeviceptr,
+    d_scores: sys::CUdeviceptr,
+    d_logits: sys::CUdeviceptr,
+    d_qact: sys::CUdeviceptr,
+    d_act_scale: sys::CUdeviceptr,
+    d_ctrl: sys::CUdeviceptr,
+    d_cos: sys::CUdeviceptr,
+    d_sin: sys::CUdeviceptr,
+    d_token_embd: sys::CUdeviceptr,
+    d_output_norm: sys::CUdeviceptr,
+}
+
+/// Raw-loaded PTX modules + `CUfunction` handles for the v0.3.2 graph-captured decode.
+/// Raw (not the safe `CudaModule`/`CudaFunction`) because the captured launch needs the
+/// `sys::CUfunction` handle, which the safe `CudaFunction` keeps `pub(crate)`. These are
+/// a SECOND JIT of the same PTX the backend already loaded (a few MB of extra SASS);
+/// the modules are unloaded on drop.
+struct RawGraphKernels {
+    modules: Vec<sys::CUmodule>,
+    embed_g: sys::CUfunction,
+    rope_g: sys::CUfunction,
+    kv_append: sys::CUfunction,
+    attn_g: sys::CUfunction,
+    rmsnorm: sys::CUfunction,
+    residual: sys::CUfunction,
+    relu2: sys::CUfunction,
+    lm_head: sys::CUfunction,
+    act_quant: sys::CUfunction,
+    scale: sys::CUfunction,
+    tiled: sys::CUfunction,
+}
+
+// SAFETY: the raw `CUmodule`/`CUfunction` are process-valid device handles, used only on
+// the owning `CudaDecodeModel`'s single capture stream (never concurrently across
+// threads — `CudaGraph` is itself documented not-thread-safe, so the whole graph path is
+// single-threaded by construction).
+#[allow(unsafe_code)]
+unsafe impl Send for RawGraphKernels {}
+
+impl RawGraphKernels {
+    fn load(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
+        ctx.bind_to_thread()
+            .map_err(|e| driver_err("raw kernels bind", &e))?;
+        let load_mod = |ptx: &str| -> Result<sys::CUmodule, BackendError> {
+            let c = CString::new(ptx)
+                .map_err(|_| BackendError::InvalidInput("PTX has an interior NUL".into()))?;
+            // SAFETY: `c` is a valid NUL-terminated PTX image; `load_data` JIT-compiles it.
+            #[allow(unsafe_code)]
+            unsafe { result::module::load_data(c.as_ptr() as *const c_void) }
+                .map_err(|e| driver_err("raw module load_data", &e))
+        };
+        let get = |m: sys::CUmodule, name: &str| -> Result<sys::CUfunction, BackendError> {
+            let c = CString::new(name)
+                .map_err(|_| BackendError::InvalidInput("kernel name has a NUL".into()))?;
+            // SAFETY: `m` is a loaded module; `name` is one of its `extern "C"` entry points.
+            #[allow(unsafe_code)]
+            unsafe { result::module::get_function(m, c) }
+                .map_err(|e| driver_err("raw get_function", &e))
+        };
+        let dm = load_mod(DECODE_PTX)?;
+        let am = load_mod(TQ2_0_ADD_PTX)?;
+        Ok(Self {
+            embed_g: get(dm, KERNEL_NAME_EMBED_G)?,
+            rope_g: get(dm, KERNEL_NAME_ROPE_G)?,
+            kv_append: get(dm, KERNEL_NAME_KV_APPEND)?,
+            attn_g: get(dm, KERNEL_NAME_ATTN_G)?,
+            rmsnorm: get(dm, KERNEL_NAME_RMSNORM)?,
+            residual: get(dm, KERNEL_NAME_RESIDUAL)?,
+            relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
+            lm_head: get(dm, KERNEL_NAME_LM_HEAD)?,
+            act_quant: get(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
+            scale: get(dm, KERNEL_NAME_SCALE_MUL)?,
+            tiled: get(am, KERNEL_NAME_TILED)?,
+            modules: vec![dm, am],
+        })
+    }
+}
+
+impl Drop for RawGraphKernels {
+    fn drop(&mut self) {
+        for &m in &self.modules {
+            if !m.is_null() {
+                // SAFETY: each module was loaded by `load` and is unloaded exactly once
+                // here; the owning model's `graph` field is declared before `raw`, so the
+                // graph-exec referencing these functions is destroyed first, and nothing
+                // launches the graph after this point.
+                #[allow(unsafe_code)]
+                unsafe {
+                    let _ = result::module::unload(m);
+                }
+            }
+        }
     }
 }
 

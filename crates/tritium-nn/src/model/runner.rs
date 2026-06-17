@@ -305,8 +305,11 @@ impl ModelRunner {
             .expect("ensure_resident returned true so resident is built");
         let mut logits = Vec::new();
         for (&tok, &pos) in tokens.iter().zip(positions.iter()) {
+            // v0.3.2: the CUDA-graph path (captured once, replayed per token). It is
+            // numerically identical to `step` (the `_g` kernels read the control block
+            // but do the same math), and collapses ~930 launches/token into one replay.
             logits = model
-                .step(tok, pos)
+                .step_graph(tok, pos)
                 .map_err(|e| NnError::Backend(e.to_string()))?;
         }
         Ok(Some(logits))
