@@ -96,15 +96,15 @@ const KERNEL_NAME_RELU2_GATE: &str = "relu2_gate_f32";
 const KERNEL_NAME_EMBED_G: &str = "embedding_gather_f32_g";
 const KERNEL_NAME_ROPE_G: &str = "rope_apply_f32_g";
 const KERNEL_NAME_KV_APPEND: &str = "kv_append_f32";
-/// Coalesced warp-per-row LM head (v0.3.2 perf) — NOT bit-exact (warp-reduce reorders
-/// the sum), gated by perplexity≤1% rather than greedy bit-match.
-const KERNEL_NAME_LM_HEAD_WARP: &str = "lm_head_warp_f32";
 /// Warp-per-head GQA attention for the graph (v0.3.3 perf) — bit-identical to the
 /// one-thread `_g` kernel (parallel across keys/output-dims, no reduction reorder).
 const KERNEL_NAME_ATTN_WARP: &str = "gqa_attention_decode_warp_g";
 /// Shared-staged rmsnorm for the graph (v0.3.4 perf) — bit-identical to rmsnorm_f32 (same
 /// sequential sum order, just from shared not global), ~8× faster (latency-bound → not).
 const KERNEL_NAME_RMSNORM_SHARED: &str = "rmsnorm_shared_f32";
+/// f16-`token_embd` warp LM head for the graph (v0.3.4 perf) — bit-identical to the f32
+/// warp head (f16 is the GGUF's native precision), halves the 1.3 GB/token table read.
+const KERNEL_NAME_LM_HEAD_WARP_F16: &str = "lm_head_warp_f16";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -1195,6 +1195,17 @@ impl CudaBackend {
         };
 
         let d_token_embd = upload(spec.token_embd, "decode token_embd htod")?;
+        // f16 copy for the graph LM head. `token_embd` is f16 in the GGUF (widened to f32
+        // losslessly on load), so `f16::from_f32` round-trips exactly — the LM head reads
+        // identical values from half the bytes.
+        let embd_f16: Vec<u16> = spec
+            .token_embd
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let d_token_embd_f16 = s
+            .clone_htod(&embd_f16)
+            .map_err(|e| driver_err("decode token_embd f16 htod", &e))?;
         let d_output_norm = upload(spec.output_norm, "decode output_norm htod")?;
         let d_cos = upload(&cos_t, "decode rope cos htod")?;
         let d_sin = upload(&sin_t, "decode rope sin htod")?;
@@ -1255,6 +1266,7 @@ impl CudaBackend {
             f_tiled: f(&self._module, KERNEL_NAME_TILED)?,
             f_scale: f(dm, KERNEL_NAME_SCALE_MUL)?,
             d_token_embd,
+            d_token_embd_f16,
             d_output_norm,
             d_cos,
             d_sin,
@@ -2394,6 +2406,9 @@ pub struct CudaDecodeModel {
     f_scale: CudaFunction,
     // Dense device weights (uploaded once).
     d_token_embd: CudaSlice<f32>,
+    /// f16 copy of `token_embd` (the GGUF's native precision) for the graph LM head — it
+    /// reads the whole table per token, so f16 halves that 1.3 GB read bit-identically.
+    d_token_embd_f16: CudaSlice<u16>,
     d_output_norm: CudaSlice<f32>,
     d_cos: CudaSlice<f32>,
     d_sin: CudaSlice<f32>,
@@ -2867,6 +2882,7 @@ impl CudaDecodeModel {
             d_cos: dptr(&self.d_cos, s),
             d_sin: dptr(&self.d_sin, s),
             d_token_embd: dptr(&self.d_token_embd, s),
+            d_token_embd_f16: dptr(&self.d_token_embd_f16, s),
             d_output_norm: dptr(&self.d_output_norm, s),
         };
         // Drain the events the device_ptr extraction recorded, so the capture (which
@@ -2885,7 +2901,7 @@ impl CudaDecodeModel {
             self.g_layer(&p, lp)?;
         }
         self.g_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed)?;
-        self.g_lm_head(p.d_normed, p.d_token_embd, p.d_logits)?;
+        self.g_lm_head(p.d_normed, p.d_token_embd_f16, p.d_logits)?;
 
         let graph = s
             .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
@@ -3113,6 +3129,7 @@ struct GraphPtrs {
     d_cos: sys::CUdeviceptr,
     d_sin: sys::CUdeviceptr,
     d_token_embd: sys::CUdeviceptr,
+    d_token_embd_f16: sys::CUdeviceptr,
     d_output_norm: sys::CUdeviceptr,
 }
 
@@ -3180,9 +3197,9 @@ impl RawGraphKernels {
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
             act_quant: get(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
             scale: get(dm, KERNEL_NAME_SCALE_MUL)?,
-            // The coalesced warp-per-row LM head (the decode memory bottleneck); not
-            // bit-exact, so the graph path is gated by perplexity≤1%, not greedy match.
-            lm_head: get(dm, KERNEL_NAME_LM_HEAD_WARP)?,
+            // Coalesced warp-per-row LM head reading the f16 token_embd (bit-identical to
+            // the f32 warp head — f16 is the GGUF's native precision — at half the read).
+            lm_head: get(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             // f32-accumulate GEMM (the f64 one is 1/64-rate on consumer GPUs).
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
             modules: vec![dm, am],

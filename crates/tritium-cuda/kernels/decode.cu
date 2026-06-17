@@ -23,6 +23,7 @@
 // per-element result is order-independent, so any thread assignment is bit-identical.
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 // exp_f32 — the softmax exponential, computed in **double** then rounded to float.
 // The host op is Rust `f32::exp`, which lowers to glibc `expf` (correctly rounded to
@@ -583,6 +584,28 @@ __global__ void lm_head_warp_f32(const float* __restrict__ h, const float* __res
     acc = __fadd_rn(acc, __fmul_rn(h[k], row[k]));  // coalesced across the warp
   }
   // Warp-shuffle tree reduction (reorders the sum vs the host's sequential fold).
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffff, acc, off);
+  }
+  if (lane == 0) logits[warp] = acc;
+}
+
+// lm_head_warp_f16 — like lm_head_warp_f32 but reads `token_embd` as **f16** (the GGUF's
+// native precision; the host widens it to f32 losslessly, so `(float)embd_f16[k]` is the
+// exact same value as the f32 buffer). This **bit-identically** halves the LM head's
+// dominant cost — the read of the whole `[vocab, n_embd]` table (1.3 GB f32 → 0.65 GB
+// f16) every token. `__half2float` is exact (f16 ⊂ f32). The warp-reduce reorders the sum
+// identically to the f32 warp kernel (so the same greedy 256/256 holds).
+__global__ void lm_head_warp_f16(const float* __restrict__ h, const __half* __restrict__ embd,
+                                 const int n_embd, const int vocab, float* __restrict__ logits) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= vocab) return;
+  const __half* row = embd + (long long)warp * n_embd;
+  float acc = 0.0f;
+  for (int k = lane; k < n_embd; k += 32) {
+    acc = __fadd_rn(acc, __fmul_rn(h[k], __half2float(row[k])));  // coalesced f16 read
+  }
   for (int off = 16; off > 0; off >>= 1) {
     acc += __shfl_down_sync(0xffffffff, acc, off);
   }

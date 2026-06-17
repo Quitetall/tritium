@@ -64,12 +64,16 @@ linkme = { workspace = true, optional = true }
 # but `serde` itself is a thin dep and these are workspace-pinned.
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# `half::f16` is the GGUF's native `token_embd` precision; the cuda-graph decode (v0.3.4)
+# uploads an f16 copy of the embedding table for the LM head (bit-identical, half the
+# read). Only the `cuda` feature uses it, so it is optional + pulled in by that feature.
+half = { workspace = true, optional = true }
 
 # All GPU code is gated behind `cuda`; the default build needs neither cudarc nor
 # a CUDA toolkit, so cpu-only CI stays green.
 [features]
 default = []
-cuda = ["dep:cudarc", "dep:tritium-format", "dep:linkme", "dep:serde", "dep:serde_json"]
+cuda = ["dep:cudarc", "dep:tritium-format", "dep:linkme", "dep:serde", "dep:serde_json", "dep:half"]
 
 # The conformance + parity tests only run on the GPU lane (Wave D); these dev-deps
 # are referenced solely from `#[cfg(feature = "cuda")]` test code. `tritium-cpu`
