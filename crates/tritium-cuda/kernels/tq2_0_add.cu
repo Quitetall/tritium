@@ -171,3 +171,64 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled(
         out[(long long)mi * n + ni] = (float)(acc * (double)scales[ni]);
     }
 }
+
+// f32-accumulate variant of `tq2_0_add_mpgemm_tiled` for the v0.3.2 CUDA-graph decode
+// (perf) path. The double accumulator above is correct but SLOW on consumer GPUs: the
+// RTX 4090 runs f64 at 1/64 the f32 rate, and the decode forward issues ~210 of these
+// per token — measured as the decode bottleneck. Accumulating + tree-reducing in f32
+// reorders the K sum past the 1e-4 bit-match tolerance on cancellation-heavy rows, so the
+// graph path is gated by **perplexity ≤ 1% + lockstep argmax**, not greedy bit-match (the
+// eager `step` keeps the double kernel and its 256/256 parity). Identical layout/decode;
+// only the accumulator type differs.
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32(
+    const float* __restrict__ act,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    extern __shared__ float s_act[];
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_act[i] = arow[i];
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    float acc = 0.0f;
+    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        const int e = ki - block * QK_K;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        const float a = s_act[ki];
+        if (code == 2u) {
+            acc += a;
+        } else if (code == 0u) {
+            acc -= a;
+        }
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = acc * scales[ni];
+    }
+}

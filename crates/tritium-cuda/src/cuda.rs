@@ -55,6 +55,9 @@ const KERNEL_NAME: &str = "tq2_0_add_mpgemm";
 /// The decode-oriented tiled add-only kernel (v0.30 WF-A): one warp per output,
 /// one block per row with the activation row staged in shared memory.
 const KERNEL_NAME_TILED: &str = "tq2_0_add_mpgemm_tiled";
+/// f32-accumulate tiled GEMM for the v0.3.2 graph (perf) path — f64 is 1/64-rate on the
+/// 4090, the decode bottleneck. Not bit-exact; perplexity-gated.
+const KERNEL_NAME_TILED_F32: &str = "tq2_0_add_mpgemm_tiled_f32";
 /// The IMMA int8 tensor-core prefill kernel (v0.30 WF-A part 2): one warp per
 /// 16×8 output tile, `mma.m16n8k32` int32 accumulate, ternary weights in the
 /// [`TernaryFormat::I2sInt8`] tile interleave.
@@ -94,6 +97,9 @@ const KERNEL_NAME_EMBED_G: &str = "embedding_gather_f32_g";
 const KERNEL_NAME_ROPE_G: &str = "rope_apply_f32_g";
 const KERNEL_NAME_KV_APPEND: &str = "kv_append_f32";
 const KERNEL_NAME_ATTN_G: &str = "gqa_attention_decode_f32_g";
+/// Coalesced warp-per-row LM head (v0.3.2 perf) — NOT bit-exact (warp-reduce reorders
+/// the sum), gated by perplexity≤1% rather than greedy bit-match.
+const KERNEL_NAME_LM_HEAD_WARP: &str = "lm_head_warp_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -2758,6 +2764,15 @@ impl CudaDecodeModel {
             self.capture_graph()?;
         }
 
+        // Drain any pending work on the default stream before the graph (on `cap_stream`)
+        // reads/writes the shared buffers. The graph-only runner path never leaves work
+        // there (so this is a no-op sync on an idle stream), but if a caller interleaves
+        // the eager `step` (which runs on `self.stream`) with `step_graph`, this closes the
+        // cross-stream race on the residual stream + KV arenas.
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("decode pre-graph default sync", &e))?;
+
         // Rewrite the control block, then replay. Both are on `cap_stream`, so the H2D
         // is ordered before the graph reads `d_ctrl`.
         let ctrl = [token as i32, pos as i32, self.cache_len as i32, 0i32];
@@ -2995,7 +3010,8 @@ impl CudaDecodeModel {
 
     fn g_lm_head(&self, h: sys::CUdeviceptr, embd: sys::CUdeviceptr, logits: sys::CUdeviceptr) -> Result<(), BackendError> {
         let (ne_i, v_i) = (self.n_embd as i32, self.vocab as i32);
-        let grid = ((self.vocab as u32).div_ceil(256), 1, 1);
+        // One WARP per vocab row: 256-thread block = 8 warps, so grid covers ceil(vocab/8).
+        let grid = ((self.vocab as u32).div_ceil(8), 1, 1);
         let mut params = [pp(&h), pp(&embd), pp(&ne_i), pp(&v_i), pp(&logits)];
         raw_launch(self.raw().lm_head, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
     }
@@ -3150,10 +3166,13 @@ impl RawGraphKernels {
             rmsnorm: get(dm, KERNEL_NAME_RMSNORM)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
-            lm_head: get(dm, KERNEL_NAME_LM_HEAD)?,
             act_quant: get(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
             scale: get(dm, KERNEL_NAME_SCALE_MUL)?,
-            tiled: get(am, KERNEL_NAME_TILED)?,
+            // The coalesced warp-per-row LM head (the decode memory bottleneck); not
+            // bit-exact, so the graph path is gated by perplexity≤1%, not greedy match.
+            lm_head: get(dm, KERNEL_NAME_LM_HEAD_WARP)?,
+            // f32-accumulate GEMM (the f64 one is 1/64-rate on consumer GPUs).
+            tiled: get(am, KERNEL_NAME_TILED_F32)?,
             modules: vec![dm, am],
         })
     }
@@ -4668,10 +4687,12 @@ mod tests {
         // Raw-load the decode PTX → a raw CUfunction (the safe CudaFunction hides
         // `cu_function`, so the captured launch needs this raw handle).
         let ptx_c = CString::new(DECODE_PTX).expect("ptx cstring");
+        // SAFETY: `ptx_c` is a valid NUL-terminated PTX image; `load_data` JIT-compiles it.
         #[allow(unsafe_code)]
         let cu_module =
             unsafe { result::module::load_data(ptx_c.as_ptr() as *const c_void).expect("load_data") };
         let fname = CString::new("residual_add_f32").expect("fn cstring");
+        // SAFETY: `cu_module` is a loaded module; `residual_add_f32` is one of its entry points.
         #[allow(unsafe_code)]
         let cu_func =
             unsafe { result::module::get_function(cu_module, fname).expect("get_function") };
@@ -4742,6 +4763,8 @@ mod tests {
         // The captured graph holds the raw CUfunction; unload only after a final sync.
         cap.synchronize().expect("final sync");
         drop(graph);
+        // SAFETY: `cu_module` was loaded above and is unloaded exactly once here, after the
+        // graph (which referenced its function) is dropped and the stream is synchronized.
         #[allow(unsafe_code)]
         unsafe {
             result::module::unload(cu_module).expect("unload");

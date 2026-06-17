@@ -433,4 +433,29 @@ __global__ void gqa_attention_decode_f32_g(const float* __restrict__ q,    // [n
   }
 }
 
+// lm_head_warp_f32 — the tied LM head, ONE WARP per vocab row (vs lm_head_f32's one
+// thread). Lanes stride the row by 32 so the `token_embd` reads COALESCE (the by-thread
+// kernel reads one 10 KB row per thread — adjacent threads 10 KB apart, fully
+// uncoalesced; the head reads the whole 1.3 GB `token_embd` per token, so this is the
+// decode memory bottleneck). The warp-shuffle reduction REORDERS the f32 sum, so this is
+// NOT bit-exact with the host (~1e-5 rel) — it trades the greedy 256/256 bit-match for
+// the sanctioned perplexity<=1% + lockstep gate. Partial sums use __fmul_rn/__fadd_rn (no
+// FMA); only the cross-lane combine reorders.
+__global__ void lm_head_warp_f32(const float* __restrict__ h, const float* __restrict__ embd,
+                                 const int n_embd, const int vocab, float* __restrict__ logits) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= vocab) return;
+  const float* row = embd + (long long)warp * n_embd;
+  float acc = 0.0f;
+  for (int k = lane; k < n_embd; k += 32) {
+    acc = __fadd_rn(acc, __fmul_rn(h[k], row[k]));  // coalesced across the warp
+  }
+  // Warp-shuffle tree reduction (reorders the sum vs the host's sequential fold).
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffff, acc, off);
+  }
+  if (lane == 0) logits[warp] = acc;
+}
+
 }  // extern "C"
