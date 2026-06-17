@@ -254,13 +254,28 @@ __global__ void gqa_attention_decode_f32(const float* __restrict__ q,    // [n_h
 __global__ void act_quant_tiled_f32(const float* __restrict__ act, const int k,
                                     float* __restrict__ q_out,
                                     float* __restrict__ act_scale) {
+  __shared__ float s_red[256];  // block reduction scratch (blockDim.x == 256)
   __shared__ float s_gamma;
-  if (threadIdx.x == 0) {
-    float gamma = 0.0f;
-    for (int i = 0; i < k; ++i) {
-      const float a = fabsf(act[i]);
-      if (a > gamma) gamma = a;  // host: sequential absmax via `a > gamma`
+  // Parallel absmax: each thread reduces its strided slice, then a shared-memory tree
+  // reduction combines them. `max` is associative+commutative, so the result is
+  // **bit-identical** to the sequential `a > gamma` fold (unlike a sum, no reordering
+  // error) — this stays an exact match of the host quant while using the whole block.
+  float local = 0.0f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float a = fabsf(act[i]);
+    if (a > local) local = a;
+  }
+  s_red[threadIdx.x] = local;
+  __syncthreads();
+  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      const float o = s_red[threadIdx.x + off];
+      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
     }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float gamma = s_red[0];
     s_gamma = gamma;
     *act_scale = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);  // host: gamma/127
   }
@@ -430,6 +445,86 @@ __global__ void gqa_attention_decode_f32_g(const float* __restrict__ q,    // [n
     for (int d = 0; d < head_dim; ++d) {
       o_row[d] = __fadd_rn(o_row[d], __fmul_rn(w, v_row[d]));
     }
+  }
+}
+
+// gqa_attention_decode_warp_g — ONE WARP per query head (vs the one-thread-per-head
+// `_g` kernel, which leaves 31/32 of a warp idle). **Bit-identical** to it (modulo the
+// shared `exp_f32`): the parallelism is across keys + output dims, not inside any
+// reduction, so no f32 sum is reordered.
+//   * scores: lane-per-key — each lane runs the FULL sequential `head_dim` dot for its
+//     keys (j = lane, lane+32, …), so each dot keeps the host's d-order.
+//   * softmax: lane 0 only, sequential over ctx (same max→exp→sum→divide order).
+//   * weighted sum: lane-per-output-dim — lane `d` sums `Σ_j w[j]·v[j][d]` in the host's
+//     j-order, so each output keeps its order.
+// `__syncwarp` separates the phases. ctrl[2] = cache_len (ctx = +1, limit = cache_len);
+// `scores` is strided by the fixed `max_ctx`.
+__global__ void gqa_attention_decode_warp_g(const float* __restrict__ q,
+                                            const float* __restrict__ k,
+                                            const float* __restrict__ v,
+                                            float* __restrict__ out,
+                                            float* __restrict__ scores,
+                                            const int* __restrict__ ctrl,
+                                            const int max_ctx, const int n_head,
+                                            const int n_head_kv, const int head_dim,
+                                            const float scale) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= n_head) return;
+  const int h = warp;
+  const int cache_len = ctrl[2];
+  const int ctx = cache_len + 1;
+  const int limit = cache_len;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float* q_row = q + (long long)h * head_dim;
+  float* sc = scores + (long long)h * max_ctx;
+
+  // scores: lane-per-key; each lane's dot is sequential over head_dim (bit-exact).
+  for (int j = lane; j < ctx; j += 32) {
+    if (j > limit) {
+      sc[j] = -INFINITY;
+      continue;
+    }
+    const float* k_row = k + ((long long)j * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot = __fadd_rn(dot, __fmul_rn(q_row[d], k_row[d]));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+  __syncwarp();
+
+  // softmax: lane 0 only, in the host's sequential order.
+  if (lane == 0) {
+    float m = -INFINITY;
+    for (int j = 0; j < ctx; ++j) {
+      if (sc[j] > m) m = sc[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float e = exp_f32(__fsub_rn(sc[j], m));
+      sc[j] = e;
+      sum = __fadd_rn(sum, e);
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+    for (int j = 0; j < ctx; ++j) {
+      sc[j] = __fmul_rn(sc[j], inv);
+    }
+  }
+  __syncwarp();
+
+  // weighted sum: lane-per-output-dim; each output sums over j in the host's order.
+  float* o_row = out + (long long)h * head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    float acc = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      if (w == 0.0f) continue;
+      const float* v_row = v + ((long long)j * n_head_kv + kv) * head_dim;
+      acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+    }
+    o_row[d] = acc;
   }
 }
 

@@ -96,10 +96,12 @@ const KERNEL_NAME_RELU2_GATE: &str = "relu2_gate_f32";
 const KERNEL_NAME_EMBED_G: &str = "embedding_gather_f32_g";
 const KERNEL_NAME_ROPE_G: &str = "rope_apply_f32_g";
 const KERNEL_NAME_KV_APPEND: &str = "kv_append_f32";
-const KERNEL_NAME_ATTN_G: &str = "gqa_attention_decode_f32_g";
 /// Coalesced warp-per-row LM head (v0.3.2 perf) — NOT bit-exact (warp-reduce reorders
 /// the sum), gated by perplexity≤1% rather than greedy bit-match.
 const KERNEL_NAME_LM_HEAD_WARP: &str = "lm_head_warp_f32";
+/// Warp-per-head GQA attention for the graph (v0.3.3 perf) — bit-identical to the
+/// one-thread `_g` kernel (parallel across keys/output-dims, no reduction reorder).
+const KERNEL_NAME_ATTN_WARP: &str = "gqa_attention_decode_warp_g";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -2981,10 +2983,10 @@ impl CudaDecodeModel {
     fn g_attn(&self, q: sys::CUdeviceptr, k: sys::CUdeviceptr, v: sys::CUdeviceptr, out: sys::CUdeviceptr, scores: sys::CUdeviceptr, ctrl: sys::CUdeviceptr) -> Result<(), BackendError> {
         let (mc_i, nh_i, nhkv_i, hd_i) = (self.max_ctx as i32, self.n_head as i32, self.n_head_kv as i32, self.head_dim as i32);
         let scale = self.attn_scale;
-        let threads = 64u32;
-        let grid = ((self.n_head as u32).div_ceil(threads), 1, 1);
+        // Warp-per-head: a 256-thread block holds 8 warps, so grid covers ceil(n_head/8).
+        let grid = ((self.n_head as u32).div_ceil(8), 1, 1);
         let mut params = [pp(&q), pp(&k), pp(&v), pp(&out), pp(&scores), pp(&ctrl), pp(&mc_i), pp(&nh_i), pp(&nhkv_i), pp(&hd_i), pp(&scale)];
-        raw_launch(self.raw().attn_g, grid, (threads, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(self.raw().attn_g, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
     }
 
     fn g_residual(&self, x: sys::CUdeviceptr, y: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
@@ -3162,7 +3164,13 @@ impl RawGraphKernels {
             embed_g: get(dm, KERNEL_NAME_EMBED_G)?,
             rope_g: get(dm, KERNEL_NAME_ROPE_G)?,
             kv_append: get(dm, KERNEL_NAME_KV_APPEND)?,
-            attn_g: get(dm, KERNEL_NAME_ATTN_G)?,
+            // Warp-per-head attention (bit-identical to the one-thread `_g`, just parallel).
+            attn_g: get(dm, KERNEL_NAME_ATTN_WARP)?,
+            // Sequential (bit-exact) rmsnorm: the block-parallel reorder of the
+            // sum-of-squares — though all-positive and ~1e-6 — still flips a greedy
+            // near-tie by token 109 AND fails the lockstep parity bar, so it is below the
+            // sanctioned perplexity+lockstep fallback and not used. The graph keeps the
+            // bit-exact rmsnorm; the rest of the decode is parallelised around it.
             rmsnorm: get(dm, KERNEL_NAME_RMSNORM)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
