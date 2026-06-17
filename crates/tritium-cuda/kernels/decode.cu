@@ -482,7 +482,7 @@ __global__ void gqa_attention_decode_warp_g(const float* __restrict__ q,
 
   // scores: lane-per-key; each lane's dot is sequential over head_dim (bit-exact).
   for (int j = lane; j < ctx; j += 32) {
-    if (j > limit) {
+    if (j > limit) {  // defensive — unreachable in decode (ctx == limit + 1), kept for parity
       sc[j] = -INFINITY;
       continue;
     }
