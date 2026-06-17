@@ -4097,4 +4097,67 @@ mod tests {
             assert_eq!(g.to_bits(), h.to_bits(), "mpgemm_device mismatch [{i}]: got {g} want {h}");
         }
     }
+
+    /// CUDA-graph capture spike (v0.3.1 W2) — documents a hard cudarc-0.19 limitation.
+    ///
+    /// Capturing the decode forward into a replayable graph would collapse the ~390
+    /// per-token kernel launches into one `graph.launch()`, the biggest remaining decode
+    /// win (the launch path is the wall at M=1). But cudarc 0.19's **safe** launch
+    /// (`LaunchArgs::launch`) waits on each buffer's read/write `CudaEvent` before the
+    /// kernel — and those events were recorded by the pre-capture uploads, so the very
+    /// first captured launch trips `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` ("dependency
+    /// created on uncaptured work"). RELAXED capture mode does not help (the dependency is
+    /// real, not a mode artifact). The raw escape — `result::launch_kernel`, which does no
+    /// event tracking — needs the `sys::CUfunction` handle, but cudarc keeps
+    /// `CudaFunction::cu_function` `pub(crate)`, so the only way through is a *parallel*
+    /// raw-FFI module/function/launch path (load the PTX via `result::module::load_data`,
+    /// `get_function`, hand-pack params), bypassing cudarc's safe layer entirely.
+    ///
+    /// That raw path is the deferred W2 work (it materially expands the `unsafe` surface
+    /// of this `#![deny(unsafe_code)]` crate, so it is its own gated change). This test is
+    /// `#[ignore]`d: it asserts the limitation still holds, so if a future cudarc makes the
+    /// safe launch capture-compatible, this starts passing and flags that the raw path is
+    /// no longer needed.
+    #[test]
+    #[ignore = "cudarc 0.19 safe launch is capture-incompatible; W2 needs the raw-FFI path"]
+    fn cuda_graph_capture_blocked_by_cudarc_safe_launch() {
+        use cudarc::driver::sys;
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping cuda graph spike: no device ({e})");
+                return;
+            }
+        };
+        let n = 256usize;
+        let x0 = vec![1.0f32; n];
+        let y = vec![2.0f32; n];
+        let cap = backend.stream.context().new_stream().expect("capture stream");
+        let mut d_x = cap.clone_htod(&x0).expect("htod x");
+        let d_y = cap.clone_htod(&y).expect("htod y");
+        cap.synchronize().expect("sync");
+
+        let n_i = n as i32;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cap.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .expect("begin_capture");
+        let mut l = cap.launch_builder(&backend.func_residual);
+        l.arg(&mut d_x).arg(&d_y).arg(&n_i);
+        // SAFETY: `residual_add_f32(float* x, const float* y, int n)`.
+        #[allow(unsafe_code)]
+        let launched = unsafe { l.launch(cfg) };
+        // The capture launch trips STREAM_CAPTURE_ISOLATION on cudarc 0.19. If this ever
+        // succeeds, the safe launch became capture-compatible — revisit the raw-FFI plan.
+        assert!(
+            launched.is_err(),
+            "cudarc safe launch unexpectedly captured cleanly — the raw-FFI W2 path may be unnecessary now"
+        );
+        let _ = cap.end_capture(
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+    }
 }
