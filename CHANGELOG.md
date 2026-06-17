@@ -7,6 +7,38 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.3.4] — 2026-06-17 — Decode toward the roofline (~120 tok/s, still 256/256)
+
+Continues the decode optimization, all **bit-match-preserving**: **~120 tok/s typical**
+(range ~114–131; 85.5 → ~120, **~4.4× over the v0.3.1 eager path**), ~14% of the memory
+roofline. Greedy 256/256 exact, perplexity 2.96e-3, cpu↔cuda parity identical all hold.
+
+### Performance
+- **Shared-staged rmsnorm** (`rmsnorm_shared_f32`) — rmsnorm was the #1 remaining cost
+  (thread-0 sum, latency-bound on serial global reads). The block now stages the row into
+  shared with a coalesced load, then thread 0 sums **from shared in the same order** — so
+  the f32 sum is byte-identical (greedy holds) but compute- not latency-bound. ~8× faster
+  rmsnorm; 83.8 → 113.7 tok/s. (The biggest single v0.3.4 win.)
+- **Branchless ternary decode** in the f32 graph GEMM — replaced the divergent
+  `if code==2/else if code==0` with `acc += a*(code-1)` (bit-identical for codes {0,1,2});
+  removes warp divergence. 116.1 → 131.5 tok/s.
+- **f16 `token_embd`** for the graph LM head (`lm_head_warp_f16`) — f16 is the GGUF's
+  native precision (widened to f32 losslessly), so the f16 read is bit-identical at half
+  the bytes. +2% (the LM head isn't the bottleneck).
+
+### Notes — occupancy-bound at M=1
+- During decode the 4090 sits at **~19% utilization / ~70 W of 450 W** (boost clock, not
+  throttling): a single-token forward is too small to fill the GPU. The wall is launch/
+  occupancy, not compute or bandwidth (14% of roofline). Further decode speedup is
+  **structural** — batched decode, kernel fusion — not more per-kernel tuning.
+- A *parallel* (tree-reduction) rmsnorm would reach ~132 tok/s but reorders the sum and
+  breaks the gate (greedy diverges at token 109, fails lockstep parity); kept the bit-exact
+  shared-staged version instead.
+
+### Deferred (→ v0.3.5 / v0.4.0)
+- Structural decode throughput (batched M>1 decode, GEMM fusion); batched device prefill;
+  IMMA prefill (#28); live `ncu`. Then v0.4.0 (SALT, ADR 0006).
+
 ## [0.3.3] — 2026-06-17 — Parallelized decode kernels (85.5 tok/s, still 256/256)
 
 A performance point-release continuing v0.3.2. **~1.86× more decode** (45.9 → 85.5 tok/s
