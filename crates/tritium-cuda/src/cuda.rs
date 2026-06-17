@@ -4162,4 +4162,109 @@ mod tests {
             sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
         );
     }
+
+    /// CUDA-graph **raw-FFI** capture spike (v0.3.2) — the path that works where the
+    /// safe launch trips isolation. Pre-extract each buffer's stable `CUdeviceptr`
+    /// *before* `begin_capture` (dropping the `SyncOnDrop` guard outside capture), raw-
+    /// load the decode PTX for a raw `CUfunction`, then capture two `residual_add_f32`
+    /// launches via `result::launch_kernel` (no cudarc event waits → no isolation), and
+    /// assert the single graph replay is **bit-identical** to the host reference. This
+    /// pins the v0.3.2 mechanic before the full decode forward is captured.
+    #[test]
+    fn cuda_graph_raw_launch_replay_bit_identical() {
+        use cudarc::driver::{DevicePtr, DevicePtrMut, result, sys};
+        use std::ffi::{CString, c_void};
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping raw-graph spike: no device ({e})");
+                return;
+            }
+        };
+        let ctx = backend.stream.context().clone();
+        ctx.bind_to_thread().expect("bind ctx");
+
+        // Raw-load the decode PTX → a raw CUfunction (the safe CudaFunction hides
+        // `cu_function`, so the captured launch needs this raw handle).
+        let ptx_c = CString::new(DECODE_PTX).expect("ptx cstring");
+        #[allow(unsafe_code)]
+        let cu_module =
+            unsafe { result::module::load_data(ptx_c.as_ptr() as *const c_void).expect("load_data") };
+        let fname = CString::new("residual_add_f32").expect("fn cstring");
+        #[allow(unsafe_code)]
+        let cu_func =
+            unsafe { result::module::get_function(cu_module, fname).expect("get_function") };
+
+        let n = 2560usize;
+        let x0 = vec![1.0f32; n];
+        let y = vec![2.0f32; n];
+        // residual_add applied twice: ((x0 + y) + y), the kernel's single-f32-add order.
+        let want: Vec<f32> = x0.iter().zip(&y).map(|(&a, &b)| (a + b) + b).collect();
+
+        let cap = ctx.new_stream().expect("capture stream");
+        let mut d_x = cap.clone_htod(&x0).expect("htod x");
+        let d_y = cap.clone_htod(&y).expect("htod y");
+        cap.synchronize().expect("pre-extract sync");
+
+        // Pre-extract stable device pointers; drop the SyncOnDrop guards OUTSIDE capture
+        // (their drop records an event, which is forbidden inside a capture).
+        let px: sys::CUdeviceptr = {
+            let (p, g) = d_x.device_ptr_mut(&cap);
+            drop(g);
+            p
+        };
+        let py: sys::CUdeviceptr = {
+            let (p, g) = d_y.device_ptr(&cap);
+            drop(g);
+            p
+        };
+        cap.synchronize().expect("post-extract sync");
+
+        let n_i = n as i32;
+        let grid = ((n as u32).div_ceil(256), 1u32, 1u32);
+        let block = (256u32, 1u32, 1u32);
+
+        cap.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .expect("begin_capture");
+        for _ in 0..2 {
+            // kernel_params: each entry points to the arg VALUE (a CUdeviceptr for a
+            // `float*`, the i32 for `int n`); these locals outlive the launch call, and
+            // graph capture snapshots the values into the kernel node.
+            let mut params: [*mut c_void; 3] = [
+                (&px) as *const sys::CUdeviceptr as *mut c_void,
+                (&py) as *const sys::CUdeviceptr as *mut c_void,
+                (&n_i) as *const i32 as *mut c_void,
+            ];
+            // SAFETY: raw `residual_add_f32(float* x, const float* y, int n)`; params in
+            // declaration order; `px`/`py` are valid device addresses (extracted above,
+            // `d_x`/`d_y` alive for the test), `n_i` matches the buffer length.
+            #[allow(unsafe_code)]
+            unsafe {
+                result::launch_kernel(cu_func, grid, block, 0, cap.cu_stream(), &mut params)
+                    .expect("raw capture launch");
+            }
+        }
+        let graph = cap
+            .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .expect("end_capture")
+            .expect("non-empty graph");
+
+        // d_x is still x0 (capture did not execute). One replay runs both adds.
+        graph.launch().expect("graph launch");
+        cap.synchronize().expect("post-replay sync");
+        let mut got = vec![0.0f32; n];
+        cap.memcpy_dtoh(&d_x, &mut got).expect("dtoh");
+        for (i, (&g, &h)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.to_bits(), h.to_bits(), "raw graph replay mismatch [{i}]: got {g} want {h}");
+        }
+
+        // The captured graph holds the raw CUfunction; unload only after a final sync.
+        cap.synchronize().expect("final sync");
+        drop(graph);
+        #[allow(unsafe_code)]
+        unsafe {
+            result::module::unload(cu_module).expect("unload");
+        }
+    }
 }
