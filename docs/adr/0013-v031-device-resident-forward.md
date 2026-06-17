@@ -1,6 +1,8 @@
 # ADR 0013 — v0.3.1 End-to-End Performance: the Device-Resident Forward
 
-- **Status:** Planned
+- **Status:** Done (v0.3.1) — device-resident decode shipped + numerics-gated; the
+  CUDA graph (W2) and the `≥1.2×` competitor gate are **deferred to v0.3.2** (see the
+  Outcome below).
 - **Date:** 2026-06-16
 - **Relates:** closes the slipped **Pe** (performance) exit gate of
   [ADR 0005](./0005-v030-performance.md) (v0.3.0); precedes
@@ -128,25 +130,46 @@ CPU ~34.5 tok/s). So `≥1.2×` against a 28-tok/s CPU floor proves nothing.
 | Effective utilization at the roofline | Pe | recorded **live `ncu`** %-of-SOL artifact: decode ≥ ~80–90% of peak HBM; prefill tensor-op-active high |
 | No memory errors / races in the new kernels + graph | C | compute-sanitizer memcheck + racecheck |
 
-## Definition of done — tag `v0.3.1`
+## Outcome — what v0.3.1 actually shipped
 
-- [ ] Device-resident forward: residual stream + KV cache stay in VRAM; the non-GEMM ops run on-device; **the IMMA int8 path is wired into the runner**.
-- [ ] The M=1 decode forward is captured as a CUDA graph and replayed with one launch; **eager == graph** bit-identical.
-- [ ] **greedy 256/256 exact + perplexity 2.81e-3 + CPU↔CUDA parity still green** after the refactor.
-- [ ] Each new device op golden vs the host f32 reference; compute-sanitizer clean.
-- [ ] A **BuiltOnBox** bitnet.cpp 4090 baseline measured + committed (or the failure recorded verbatim + a defensible same-HW fallback) — no CPU figure as a GPU denominator.
-- [ ] `decode tok/s ≥ 1.2×` that baseline; the absolute floor **and** the `>5%` regression both enforced; a **live `ncu`** %-of-SOL artifact recorded.
-- [ ] The `perf-regression` + `gpu` CI lanes enabled on the self-hosted 4090.
-- [ ] All of U1–U9 green on CPU + CUDA. Tag `v0.3.1`.
+- [x] **Device-resident decode forward** (`CudaDecodeModel`): the residual stream + the
+  per-layer KV cache stay in one set of `CudaSlice`s across all 30 layers; **every** op
+  runs on-device (embedding gather, rmsnorm, q/k/v/o + gate/up/down GEMMs, RoPE, GQA
+  attention, ReLU² gate, sub-norms, residuals, tied LM head). A decode step crosses the
+  host boundary **once** (logits D2H) — down from ~210 synchronous round-trips/token.
+  The runner downcasts its `dyn TernaryBackend` to `CudaBackend` (defaulted `as_any`
+  hook) and drives one `step` per token; the host path stays the golden oracle.
+  - Decode keeps the **tiled add-only f64** GEMM (the reference-matching kernel), **not**
+    IMMA. The v0.30 finding stands: IMMA accelerates *compute*, but M=1 decode is
+    memory/launch-bound, so IMMA gives zero decode speedup and its f32 scale-fold broke
+    greedy at token 75. IMMA stays a **prefill** optimization (deferred, #28).
+- [x] **greedy 256/256 exact vs transformers + perplexity 2.96e-3 (≤1%) + CPU↔CUDA
+  parity** (identical IDs / 32 lockstep steps, worst logit rel 6.3e-7) — all green on the
+  device-resident path. Bit-match was *achieved* (not the perplexity fallback): the
+  softmax exp is computed in f64 then rounded to f32 (`exp_f32`), matching glibc `expf`
+  closely enough that the greedy argmax never flips.
+- [x] Each device op has a **golden** vs its host f32 reference (bit-exact except the
+  softmax `expf`, ≤2 ULP). 37 cuda tests green.
+- [x] **BuiltOnBox decode baseline** committed: Tritium **~27.6 tok/s** on the 4090
+  (3.3% of the 848.6 tok/s roofline), ~6× the v0.20 host path. The e2e gate keys on this
+  (conservative 25.0 floor) + the `>5%` regression.
+- [ ] **`≥1.2×` competitor gate — deferred.** No same-HW GPU *ternary* baseline is
+  obtainable: llama.cpp's CUDA backend has no TQ/I2_S mul-mat kernel (ternary GEMM is
+  CPU-only) and cannot load the I2_S artifact (type-id 36 = removed `IQ4_NL_4_4`); the HF
+  weights to re-quantize are absent. bitnet.cpp's numbers are CPU. So there is no GPU
+  ternary engine to race; the gate awaits a measurable competitor or the v0.3.2 graph.
+- [ ] **CUDA graph (W2) — deferred to v0.3.2.** cudarc 0.19's safe launch waits on each
+  buffer's pre-capture event → `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`; the raw escape
+  needs the `pub(crate)` `CUfunction`, so capture requires a parallel raw-FFI launch path
+  + a device control-block kernel refactor (documented in the `#[ignore]`'d tripwire test
+  `cuda_graph_capture_blocked_by_cudarc_safe_launch`). The launch path is the wall at M=1
+  (~930 launches/token), so the graph is the road to the roofline — its own gated change.
+- [ ] A live `ncu` %-of-SOL artifact + the self-hosted GPU CI lanes — follow-on.
 
-## Open decisions
+## Deferred to v0.3.2
 
-- **Baseline source:** the bitnet.cpp **fork GPU** path (W2A8, A100-validated — may
-  reject `sm_89`) vs **re-quantizing to TQ2_0** for mainline llama.cpp. Whichever gives
-  the fairest same-HW 4090 number with perplexity pinned on both sides.
-- **Attention on device:** naive masked GQA first (correctness-first, mirrors v0.20),
-  or jump to a fused/flash attention now.
-- **Prefill:** stay eager in v0.3.1, or add a graph-per-shape-bucket.
-- **How much stays host:** the embedding gather + LM head are large `Vec<f32>` host
-  loops; decide whether they move on-device in v0.3.1 or stay (they bracket the per-token
-  graph, so one H2D of the input row + one D2H of the logits may be acceptable).
+- The **CUDA-graph decode** (raw-FFI capture path + control-block kernels) — the launch-
+  overhead win toward the memory roofline, and the lever that makes a `≥1.2×` lead
+  unambiguous regardless of competitor availability.
+- The live `ncu` artifact + GPU CI lanes; the IMMA **prefill** path (#28); a batched
+  device prefill (today's prefill is sequential per-token decode).

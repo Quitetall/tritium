@@ -7,6 +7,52 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.3.1] — 2026-06-16 — Device-Resident Decode Forward
+
+The end-to-end performance point-release (ADR 0013): make the v0.3.0 forward fast
+*end-to-end* with **zero numerics change**. BitNet 2B4T greedy still matches
+transformers **256/256 exact**, perplexity **2.96e-3**, CPU↔CUDA parity identical —
+now produced by a fully on-device decode that crosses the host boundary once per token
+instead of ~210 times.
+
+### Added
+- **tritium-cuda** — `CudaDecodeModel`, a **device-resident M=1 decode forward**. The
+  residual stream + per-layer KV cache live in VRAM across all 30 layers; every op runs
+  on-device via new bit-matching decode kernels (`rmsnorm_f32`, `rope_apply_f32`,
+  `gqa_attention_decode_f32`, `softmax_f32`, `residual_add_f32`, `embedding_gather_f32`,
+  `lm_head_f32`, `act_quant_tiled_f32`, `scale_mul_f32`, `relu2_gate_f32`), all compiled
+  `--fmad=false` and written sequential/no-FMA to reproduce the host f32 ops bit-for-bit.
+  `build_decode_model` uploads dense weights once, precomputes the RoPE table, and shares
+  the prefill path's ternary weights via `Arc` (no re-upload). **~6× decode speedup**
+  (~27.6 tok/s vs the v0.20 host path's ~4.5 tok/s on a 4090).
+- **tritium-spec** — defaulted `TernaryBackend::as_any()` downcast hook (returns `None`;
+  CUDA overrides) so the runner can reach the concrete backend without touching the
+  object-safe, host-slice-oriented trait.
+- **tritium-nn** — the runner lazily builds + drives `CudaDecodeModel` for non-dump
+  forwards on a CUDA backend (downcast dispatch); the host path stays the golden oracle.
+  `tritium-cuda` is now an optional `cuda`-gated dependency (was dev-only).
+- **tritium-benches** — `TRITIUM_2B4T_DECODE_4090`, the `BuiltOnBox` decode regression
+  baseline the e2e gate keys on (our own measured figure, not a CPU competitor number).
+
+### Numerics
+- Softmax/attention `exp` is computed in **f64 then rounded to f32** (`exp_f32`) so it
+  matches glibc `expf` (the host op) — the lever that holds greedy **bit-match** rather
+  than dropping to the perplexity fallback. The only non-bit-exact op is this exp
+  (≤2 ULP on ~0.05% of values); everything else is bit-exact vs the host.
+
+### Deferred (→ v0.3.2)
+- **CUDA-graph decode** — blocked by cudarc 0.19's safe launch (it waits on each
+  buffer's pre-capture event → `STREAM_CAPTURE_ISOLATION`; the raw escape needs the
+  `pub(crate)` `CUfunction`). Needs a parallel raw-FFI capture path + a device
+  control-block kernel refactor; documented in the `#[ignore]`'d tripwire test. This is
+  the launch-overhead win toward the memory roofline (decode is ~3.3% of SOL today).
+- **`≥1.2×` competitor gate** — no same-HW GPU *ternary* baseline is obtainable:
+  llama.cpp's CUDA backend has no TQ/I2_S mul-mat kernel and cannot load the I2_S
+  artifact; bitnet.cpp's numbers are CPU. Awaits a measurable GPU competitor or the
+  v0.3.2 graph (where a lead is unambiguous against the roofline).
+- IMMA **prefill** path (#28); batched device prefill (today's prefill is sequential
+  per-token decode); a live `ncu` artifact + the self-hosted GPU CI lanes.
+
 ## [0.3.0] — 2026-06-16 — Performance
 
 The performance tier on the v0.2.0 spine — **fast kernels with zero numerics

@@ -169,10 +169,10 @@ impl ModelRunner {
         // stream + KV stay in VRAM). The dump path keeps the host orchestration so the
         // fidelity ladder can still inspect each stage.
         #[cfg(feature = "cuda")]
-        if dump.is_none() {
-            if let Some(logits) = self.forward_resident(tokens, positions)? {
-                return Ok(logits);
-            }
+        if dump.is_none()
+            && let Some(logits) = self.forward_resident(tokens, positions)?
+        {
+            return Ok(logits);
         }
 
         // Embedding gather: hidden = token_embd[token] for each token.

@@ -1294,6 +1294,7 @@ impl CudaBackend {
     /// Validation [`BackendError::ShapeMismatch`] / [`BackendError::UnsupportedFormat`]
     /// as documented on [`TernaryBackend::mpgemm`]; device failures via the cudarc
     /// error mapping.
+    #[allow(clippy::too_many_arguments)] // act + weights + scales + shape + format + out + kernel
     fn mpgemm_kernel(
         &self,
         act: &[f32],
@@ -3308,6 +3309,7 @@ mod tests {
     /// inputs already supplied), returning the `[M, N]` f32 output. Drives
     /// `launch_imma_tile` directly so a test can force a specific tile + kernel image
     /// (AOT cubin vs a freshly JIT-compiled module).
+    #[allow(clippy::too_many_arguments)] // a test driver mirroring the kernel's operands
     fn run_imma_tile(
         cuda: &CudaBackend,
         func: &CudaFunction,
@@ -3381,7 +3383,7 @@ mod tests {
             (16, 8, 256),
             (17, 9, 96),
             (33, 13, 512),
-            (64, 40, 2560 % 8192), // a realistic-ish K, still a 32-multiple below
+            (64, 40, 2560), // a realistic-ish K (a 32-multiple, below the tiled cap)
         ];
         for (m, n, k) in shapes {
             let k = k.max(IMMA_K); // never zero k-tiles

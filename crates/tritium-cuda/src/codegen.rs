@@ -361,7 +361,7 @@ mod tests {
     fn rendered_source_has_kernel_symbol() {
         let src = render_imma_source(TileConfig::AOT_EQUIVALENT);
         assert!(
-            src.contains(&format!("void __launch_bounds__")),
+            src.contains("void __launch_bounds__"),
             "expected launch-bounds qualifier in rendered source"
         );
         assert!(
