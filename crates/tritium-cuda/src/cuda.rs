@@ -113,6 +113,9 @@ const KERNEL_NAME_ACT_QUANT_BATCH: &str = "act_quant_batch_f32";
 const KERNEL_NAME_SCALE_BATCH: &str = "scale_mul_batch_f32";
 const KERNEL_NAME_KV_APPEND_BATCH: &str = "kv_append_batch_f32";
 const KERNEL_NAME_ATTN_BATCH: &str = "gqa_attention_batch_f32";
+/// v0.3.7 batched M=N decode (N concurrent sequences, per-sequence KV).
+const KERNEL_NAME_KV_APPEND_MDECODE: &str = "kv_append_mdecode_f32";
+const KERNEL_NAME_ATTN_MDECODE: &str = "gqa_attention_mdecode_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -1283,6 +1286,8 @@ impl CudaBackend {
             f_kv_append_batch: f(dm, KERNEL_NAME_KV_APPEND_BATCH)?,
             f_attn_batch: f(dm, KERNEL_NAME_ATTN_BATCH)?,
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
+            f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
+            f_attn_mdecode: f(dm, KERNEL_NAME_ATTN_MDECODE)?,
             d_token_embd,
             d_token_embd_f16,
             d_output_norm,
@@ -2495,6 +2500,8 @@ pub struct CudaDecodeModel {
     f_kv_append_batch: CudaFunction,
     f_attn_batch: CudaFunction,
     f_lm_head_f16: CudaFunction,
+    f_kv_append_mdecode: CudaFunction,
+    f_attn_mdecode: CudaFunction,
     // Dense device weights (uploaded once).
     d_token_embd: CudaSlice<f32>,
     /// f16 copy of `token_embd` (the GGUF's native precision) for the graph LM head — it
@@ -3165,6 +3172,160 @@ impl CudaDecodeModel {
         Ok(())
     }
 
+    // ===================== v0.3.7 batched M=N decode =====================
+
+    /// Allocate batched-decode state for `n` concurrent sequences: a per-sequence KV arena
+    /// (`[n, max_ctx, kv_width]` per layer) + the M=N scratch, all starting empty.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a device allocation failure.
+    pub fn new_batch(&self, n: usize) -> Result<BatchKv, BackendError> {
+        let s = &self.stream;
+        let alloc = |k: usize, what: &str| s.alloc_zeros::<f32>(k).map_err(|e| driver_err(what, &e));
+        let mut kv_k = Vec::with_capacity(self.layers.len());
+        let mut kv_v = Vec::with_capacity(self.layers.len());
+        for _ in 0..self.layers.len() {
+            kv_k.push(alloc(n * self.max_ctx * self.kv_width, "batch kv_k")?);
+            kv_v.push(alloc(n * self.max_ctx * self.kv_width, "batch kv_v")?);
+        }
+        Ok(BatchKv {
+            n,
+            kv_k,
+            kv_v,
+            positions: vec![0; n],
+            d_tokens: s.alloc_zeros::<i32>(n).map_err(|e| driver_err("batch d_tokens", &e))?,
+            d_positions: s.alloc_zeros::<i32>(n).map_err(|e| driver_err("batch d_positions", &e))?,
+            d_x: alloc(n * self.n_embd, "batch d_x")?,
+            d_normed: alloc(n * self.n_embd, "batch d_normed")?,
+            d_q: alloc(n * self.q_width, "batch d_q")?,
+            d_k: alloc(n * self.kv_width, "batch d_k")?,
+            d_v: alloc(n * self.kv_width, "batch d_v")?,
+            d_attn: alloc(n * self.q_width, "batch d_attn")?,
+            d_attn_sn: alloc(n * self.q_width, "batch d_attn_sn")?,
+            d_proj: alloc(n * self.n_embd, "batch d_proj")?,
+            d_gate: alloc(n * self.n_ff, "batch d_gate")?,
+            d_up: alloc(n * self.n_ff, "batch d_up")?,
+            d_gate_sn: alloc(n * self.n_ff, "batch d_gate_sn")?,
+            d_qact: alloc(n * self.n_ff, "batch d_qact")?,
+            d_act_scale: alloc(n, "batch d_act_scale")?,
+            d_scores: alloc(n * self.n_head * self.max_ctx, "batch d_scores")?,
+            d_h: alloc(self.n_embd, "batch d_h")?,
+            d_logits: alloc(self.vocab, "batch d_logits")?,
+        })
+    }
+
+    /// One batched decode step: `tokens[r]` is sequence `r`'s next token (at its own
+    /// position `batch.positions[r]`). Runs the M=N forward — each row attends its OWN KV
+    /// slice — appends `n` k/v rows, advances every position by 1, and returns each
+    /// sequence's next-token logits `[vocab]`. Bit-identical per row to a single-sequence
+    /// `step_graph` (the batch kernels share the M=1 reduction order).
+    ///
+    /// # Errors
+    /// [`BackendError`] on a length/token guard, capacity overflow, or device failure.
+    pub fn decode_batch(&mut self, batch: &mut BatchKv, tokens: &[u32]) -> Result<Vec<Vec<f32>>, BackendError> {
+        let n = batch.n;
+        if tokens.len() != n {
+            return Err(BackendError::InvalidInput(format!("decode_batch expects {n} tokens, got {}", tokens.len())));
+        }
+        for (&t, &p) in tokens.iter().zip(&batch.positions) {
+            if t as usize >= self.vocab {
+                return Err(BackendError::InvalidInput(format!("decode_batch token {t} out of range")));
+            }
+            if p >= self.max_ctx {
+                return Err(BackendError::InvalidInput("decode_batch context overflow".into()));
+            }
+        }
+        let s = &self.stream;
+        let (n_embd, q_width, kv_width, n_ff) = (self.n_embd, self.q_width, self.kv_width, self.n_ff);
+        let (n_head, n_head_kv, head_dim, max_ctx) = (self.n_head, self.n_head_kv, self.head_dim, self.max_ctx);
+
+        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let pos_i: Vec<i32> = batch.positions.iter().map(|&p| p as i32).collect();
+        s.memcpy_htod(&tok_i, &mut batch.d_tokens).map_err(|e| driver_err("batch tokens htod", &e))?;
+        s.memcpy_htod(&pos_i, &mut batch.d_positions).map_err(|e| driver_err("batch pos htod", &e))?;
+
+        Self::bl_embed(s, &self.f_embed_batch, &self.d_token_embd, &batch.d_tokens, n_embd, n, &mut batch.d_x)?;
+
+        for li in 0..self.layers.len() {
+            Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_x, &self.layers[li].attn_norm, self.rms_eps, n_embd, n, &mut batch.d_normed)?;
+            Self::bl_quant(s, &self.f_quant_batch, &batch.d_normed, n_embd, n, &mut batch.d_qact, &mut batch.d_act_scale)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].q, &batch.d_act_scale, n, &mut batch.d_q)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].k, &batch.d_act_scale, n, &mut batch.d_k)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].v, &batch.d_act_scale, n, &mut batch.d_v)?;
+            Self::bl_rope(s, &self.f_rope_batch, &mut batch.d_q, &self.d_cos, &self.d_sin, &batch.d_positions, n_head, head_dim, n)?;
+            Self::bl_rope(s, &self.f_rope_batch, &mut batch.d_k, &self.d_cos, &self.d_sin, &batch.d_positions, n_head_kv, head_dim, n)?;
+            Self::md_kv_append(s, &self.f_kv_append_mdecode, &batch.d_k, &mut batch.kv_k[li], &batch.d_positions, max_ctx, kv_width, n)?;
+            Self::md_kv_append(s, &self.f_kv_append_mdecode, &batch.d_v, &mut batch.kv_v[li], &batch.d_positions, max_ctx, kv_width, n)?;
+            Self::md_attn(s, &self.f_attn_mdecode, &batch.d_q, &batch.kv_k[li], &batch.kv_v[li], &mut batch.d_attn, &mut batch.d_scores, &batch.d_positions, max_ctx, n_head, n_head_kv, head_dim, self.attn_scale, n)?;
+            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
+                Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_attn, sn, self.rms_eps, q_width, n, &mut batch.d_attn_sn)?;
+                &batch.d_attn_sn
+            } else {
+                &batch.d_attn
+            };
+            Self::bl_quant(s, &self.f_quant_batch, attn_in, q_width, n, &mut batch.d_qact, &mut batch.d_act_scale)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].o, &batch.d_act_scale, n, &mut batch.d_proj)?;
+            Self::bl_residual(s, &self.f_residual, &mut batch.d_x, &batch.d_proj, n * n_embd)?;
+
+            Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_x, &self.layers[li].ffn_norm, self.rms_eps, n_embd, n, &mut batch.d_normed)?;
+            Self::bl_quant(s, &self.f_quant_batch, &batch.d_normed, n_embd, n, &mut batch.d_qact, &mut batch.d_act_scale)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].gate, &batch.d_act_scale, n, &mut batch.d_gate)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].up, &batch.d_act_scale, n, &mut batch.d_up)?;
+            Self::bl_relu2(s, &self.f_relu2, &mut batch.d_gate, &batch.d_up, n * n_ff)?;
+            let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
+                Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_gate, sn, self.rms_eps, n_ff, n, &mut batch.d_gate_sn)?;
+                &batch.d_gate_sn
+            } else {
+                &batch.d_gate
+            };
+            Self::bl_quant(s, &self.f_quant_batch, down_in, n_ff, n, &mut batch.d_qact, &mut batch.d_act_scale)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].down, &batch.d_act_scale, n, &mut batch.d_proj)?;
+            Self::bl_residual(s, &self.f_residual, &mut batch.d_x, &batch.d_proj, n * n_embd)?;
+        }
+
+        // Final norm (all n rows) then per-row LM head.
+        Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_x, &self.d_output_norm, self.rms_eps, n_embd, n, &mut batch.d_normed)?;
+        let mut out = Vec::with_capacity(n);
+        for r in 0..n {
+            {
+                let row = batch.d_normed.slice(r * n_embd..(r + 1) * n_embd);
+                s.memcpy_dtod(&row, &mut batch.d_h).map_err(|e| driver_err("batch row copy", &e))?;
+            }
+            Self::bl_lm_head_f16(s, &self.f_lm_head_f16, &batch.d_h, &self.d_token_embd_f16, n_embd, self.vocab, &mut batch.d_logits)?;
+            let mut logits = vec![0.0f32; self.vocab];
+            s.memcpy_dtoh(&batch.d_logits, &mut logits).map_err(|e| driver_err("batch logits dtoh", &e))?;
+            out.push(logits);
+        }
+        for p in &mut batch.positions {
+            *p += 1;
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn md_kv_append(s: &Arc<CudaStream>, f: &CudaFunction, src: &CudaSlice<f32>, kv_base: &mut CudaSlice<f32>, positions: &CudaSlice<i32>, max_ctx: usize, kv_width: usize, n: usize) -> Result<(), BackendError> {
+        let (mc_i, kw_i, n_i) = (max_ctx as i32, kv_width as i32, n as i32);
+        let cfg = LaunchConfig { grid_dim: (((n * kv_width) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(src).arg(kv_base).arg(positions).arg(&mc_i).arg(&kw_i).arg(&n_i);
+        // SAFETY: `kv_append_mdecode_f32(const float* src, float* kv_base, const int* pos, int max_ctx, int kv_width, int n)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch mdecode kv_append", &e))?; }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn md_attn(s: &Arc<CudaStream>, f: &CudaFunction, q: &CudaSlice<f32>, k: &CudaSlice<f32>, v: &CudaSlice<f32>, out: &mut CudaSlice<f32>, scores: &mut CudaSlice<f32>, positions: &CudaSlice<i32>, max_ctx: usize, n_head: usize, n_head_kv: usize, head_dim: usize, scale: f32, n: usize) -> Result<(), BackendError> {
+        let (mc_i, nh_i, nhkv_i, hd_i, n_i) = (max_ctx as i32, n_head as i32, n_head_kv as i32, head_dim as i32, n as i32);
+        let cfg = LaunchConfig { grid_dim: (((n * n_head) as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(q).arg(k).arg(v).arg(out).arg(scores).arg(positions).arg(&mc_i).arg(&nh_i).arg(&nhkv_i).arg(&hd_i).arg(&scale).arg(&n_i);
+        // SAFETY: `gqa_attention_mdecode_f32(q, k, v, out, scores, positions, max_ctx, n_head, n_head_kv, head_dim, scale, n)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch mdecode attn", &e))?; }
+        Ok(())
+    }
+
     /// Load the raw kernels (once) and record + instantiate the decode graph.
     fn capture_graph(&mut self) -> Result<(), BackendError> {
         if self.raw.is_none() {
@@ -3570,6 +3731,57 @@ impl Drop for RawGraphKernels {
                 }
             }
         }
+    }
+}
+
+/// State for batched M=N decode of `n` concurrent sequences (v0.3.7): per-sequence KV
+/// arenas + the M=N forward scratch. Built by [`CudaDecodeModel::new_batch`] and advanced
+/// by [`CudaDecodeModel::decode_batch`]. Each sequence has its own KV slice
+/// (`kv_k[layer]` is `[n, max_ctx, kv_width]`) and its own [`positions`](Self::positions).
+#[allow(missing_debug_implementations)]
+pub struct BatchKv {
+    n: usize,
+    kv_k: Vec<CudaSlice<f32>>,
+    kv_v: Vec<CudaSlice<f32>>,
+    /// Per-sequence current position (next KV write slot); length `n`.
+    positions: Vec<usize>,
+    d_tokens: CudaSlice<i32>,
+    d_positions: CudaSlice<i32>,
+    d_x: CudaSlice<f32>,
+    d_normed: CudaSlice<f32>,
+    d_q: CudaSlice<f32>,
+    d_k: CudaSlice<f32>,
+    d_v: CudaSlice<f32>,
+    d_attn: CudaSlice<f32>,
+    d_attn_sn: CudaSlice<f32>,
+    d_proj: CudaSlice<f32>,
+    d_gate: CudaSlice<f32>,
+    d_up: CudaSlice<f32>,
+    d_gate_sn: CudaSlice<f32>,
+    d_qact: CudaSlice<f32>,
+    d_act_scale: CudaSlice<f32>,
+    d_scores: CudaSlice<f32>,
+    d_h: CudaSlice<f32>,
+    d_logits: CudaSlice<f32>,
+}
+
+impl BatchKv {
+    /// Number of concurrent sequences.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    /// True if the batch holds no sequences.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// Per-sequence positions (the number of tokens each sequence has decoded).
+    #[must_use]
+    pub fn positions(&self) -> &[usize] {
+        &self.positions
     }
 }
 

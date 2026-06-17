@@ -101,6 +101,21 @@ impl ModelRunner {
         })
     }
 
+    /// (cuda) Borrow the lazily-built device-resident decoder, building it first if
+    /// needed (returns `None` on a non-CUDA backend). Advanced/test access — it exposes
+    /// the M=1 graph decode + the batched (M=N) `decode_batch` path directly.
+    ///
+    /// # Errors
+    /// [`NnError::Backend`] if building the resident decoder fails.
+    #[cfg(feature = "cuda")]
+    #[doc(hidden)]
+    pub fn resident_cuda(&mut self) -> Result<Option<&mut tritium_cuda::CudaDecodeModel>, NnError> {
+        if !self.ensure_resident()? {
+            return Ok(None);
+        }
+        Ok(self.resident.as_mut())
+    }
+
     /// Convenience: load from a GGUF byte buffer using the runtime registry's
     /// `"cpu"` backend.
     ///

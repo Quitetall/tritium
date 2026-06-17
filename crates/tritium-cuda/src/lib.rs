@@ -46,7 +46,7 @@ pub use cuda::CudaBackend;
 // borrowed `DecodeModelSpec`, then drives it per token — keeping the residual stream
 // + KV cache in VRAM across all layers.
 #[cfg(feature = "cuda")]
-pub use cuda::{CudaDecodeModel, DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
+pub use cuda::{BatchKv, CudaDecodeModel, DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
 
 // v0.30 (ADR 0005) skeletons. `autotune` is pure Rust (tile config + on-disk
 // cache keying) so it builds and tests on cpu-only lanes; `codegen` links

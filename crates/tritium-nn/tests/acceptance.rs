@@ -284,6 +284,57 @@ fn cuda_greedy_matches_transformers() {
     );
 }
 
+/// Batched M=N decode (v0.3.7) must be **bit-identical** to a single-sequence M=1 decode:
+/// (1) two identical sequences in one batch produce identical logits (they are
+/// independent), and (2) each matches the `step_graph` reference for the same tokens. The
+/// batch kernels share the M=1 reduction order, so the per-sequence result is byte-for-byte.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_batch_decode_matches_single() {
+    let Some((_reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let model = match runner.resident_cuda() {
+        Ok(Some(m)) => m,
+        _ => {
+            eprintln!("skipping batch-decode parity: no cuda resident");
+            return;
+        }
+    };
+    // A few in-range tokens decoded in lockstep (content is irrelevant — we compare paths).
+    let toks: [u32; 4] = [128000, 791, 6864, 315];
+
+    // Single-sequence reference via the M=1 decode graph.
+    model.reset();
+    let mut single: Vec<Vec<f32>> = Vec::with_capacity(toks.len());
+    for (i, &t) in toks.iter().enumerate() {
+        single.push(model.step_graph(t, i).expect("single step_graph"));
+    }
+
+    // Batched N=2, both sequences fed the same tokens.
+    let mut batch = model.new_batch(2).expect("new_batch");
+    for (i, &t) in toks.iter().enumerate() {
+        let logits = model.decode_batch(&mut batch, &[t, t]).expect("decode_batch");
+        assert_eq!(logits.len(), 2);
+        for v in 0..logits[0].len() {
+            assert_eq!(
+                logits[0][v].to_bits(),
+                logits[1][v].to_bits(),
+                "batch seq0 != seq1 at step {i} vocab {v} (sequences must be independent)"
+            );
+            assert_eq!(
+                logits[0][v].to_bits(),
+                single[i][v].to_bits(),
+                "batch decode != single-sequence decode at step {i} vocab {v}"
+            );
+        }
+    }
+    println!("batch-decode parity: N=2 == single, bit-identical over {} steps", toks.len());
+}
+
 /// (b) Perplexity: forward over the fixed eval sequence on CUDA, assert within 1%
 /// of the committed transformers reference perplexity.
 #[cfg(feature = "cuda")]

@@ -812,4 +812,86 @@ __global__ void gqa_attention_batch_f32(const float* __restrict__ q, const float
   }
 }
 
+// ===========================================================================
+// v0.3.7: M=N batched DECODE kernels — N concurrent sequences, one token each per step.
+// Unlike prefill (one sequence, all rows share the growing KV), each row r is a distinct
+// sequence with its OWN KV slice and its OWN position. The per-sequence KV is laid out
+// `[n, max_ctx, n_head_kv, head_dim]` (seq r's KV is the contiguous `[max_ctx, kv_width]`
+// at offset r·max_ctx·kv_width). Per row math is bit-identical to the M=1 decode.
+// ===========================================================================
+
+// kv_append_mdecode_f32 — append `n` new k/v rows, row r → seq r's KV at positions[r].
+__global__ void kv_append_mdecode_f32(const float* __restrict__ src, float* __restrict__ kv_base,
+                                      const int* __restrict__ positions, const int max_ctx,
+                                      const int kv_width, const int n) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)n * kv_width) return;
+  const int row = idx / kv_width;
+  const int e = idx - (long long)row * kv_width;
+  const long long off = ((long long)row * max_ctx + positions[row]) * kv_width + e;
+  kv_base[off] = src[(long long)row * kv_width + e];
+}
+
+// gqa_attention_mdecode_f32 — M=N decode attention: row r (seq r) attends seq r's KV
+// `0..=positions[r]`. Warp per (row, head); same lane-per-key dots / lane-0 softmax /
+// lane-per-output-dim weighted sum as the M=1 warp kernel, but indexing seq r's KV slice.
+// `scores` is `[n, n_head, max_ctx]`.
+__global__ void gqa_attention_mdecode_f32(const float* __restrict__ q, const float* __restrict__ k,
+                                          const float* __restrict__ v, float* __restrict__ out,
+                                          float* __restrict__ scores, const int* __restrict__ positions,
+                                          const int max_ctx, const int n_head, const int n_head_kv,
+                                          const int head_dim, const float scale, const int n) {
+  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= (long long)n * n_head) return;
+  const int row = warp / n_head;
+  const int h = warp - (long long)row * n_head;
+  const int ctx = positions[row] + 1;  // keys 0..=positions[row]
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const long long kv_seq = (long long)row * max_ctx * n_head_kv * head_dim;
+  const float* k_seq = k + kv_seq;
+  const float* v_seq = v + kv_seq;
+  const float* q_row = q + ((long long)row * n_head + h) * head_dim;
+  float* sc = scores + ((long long)row * n_head + h) * max_ctx;
+
+  for (int j = lane; j < ctx; j += 32) {
+    const float* k_row = k_seq + ((long long)j * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot = __fadd_rn(dot, __fmul_rn(q_row[d], k_row[d]));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+  __syncwarp();
+  if (lane == 0) {
+    float mx = -INFINITY;
+    for (int j = 0; j < ctx; ++j) {
+      if (sc[j] > mx) mx = sc[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float e = exp_f32(__fsub_rn(sc[j], mx));
+      sc[j] = e;
+      sum = __fadd_rn(sum, e);
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+    for (int j = 0; j < ctx; ++j) {
+      sc[j] = __fmul_rn(sc[j], inv);
+    }
+  }
+  __syncwarp();
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    float acc = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      if (w == 0.0f) continue;
+      const float* v_row = v_seq + ((long long)j * n_head_kv + kv) * head_dim;
+      acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+    }
+    o_row[d] = acc;
+  }
+}
+
 }  // extern "C"
