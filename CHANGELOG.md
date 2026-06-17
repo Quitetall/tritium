@@ -7,6 +7,33 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.3.3] — 2026-06-17 — Parallelized decode kernels (85.5 tok/s, still 256/256)
+
+A performance point-release continuing v0.3.2. **~1.86× more decode** (45.9 → 85.5 tok/s
+on a 4090; **3.1× over the v0.3.1 eager path**), 10.1% of the memory roofline — and
+**without giving up the greedy 256/256 bit-match** (perplexity 2.96e-3, cpu↔cuda parity
+identical / worst logit rel 2.26e-6 all still green).
+
+### Performance
+- **Parallel `act_quant` absmax** — the per-token int8 absmax is now a block tree
+  reduction (was a thread-0 sequential fold). `max` is associative, so the result is
+  **bit-identical** to the sequential version; both the eager and graph paths use it.
+- **Warp-per-head GQA attention** (`gqa_attention_decode_warp_g`) — the graph path's
+  attention ran one thread per head (20/32 lanes idle); the warp version parallelizes
+  across keys (lane-per-key dots) and output dims (lane-per-d weighted sums) with a lane-0
+  softmax, so **no reduction is reordered** — bit-identical to the one-thread kernel.
+
+### Notes
+- A block-parallel rmsnorm (would have reached ~132 tok/s) was tried and **dropped**: its
+  sum-of-squares reorder — though all-positive, ~1e-6 — flips a greedy near-tie by token
+  109 and fails the lockstep parity, i.e. below the sanctioned perplexity+lockstep
+  fallback. The graph keeps the bit-exact sequential rmsnorm.
+
+### Deferred (→ v0.3.4)
+- More headroom toward the roofline: the GEMM efficiency at M=1, an f16 `token_embd` for
+  the LM-head read, a gate-holding parallel rmsnorm or a perplexity-fallback "fast mode".
+  Plus the still-open items: batched device prefill, IMMA prefill (#28), live `ncu`.
+
 ## [0.3.2] — 2026-06-17 — CUDA-Graph Decode + the f32-accumulate win
 
 A performance point-release on the v0.3.1 device-resident forward. **~1.66× decode**

@@ -313,16 +313,15 @@ pub const LLAMA_CPP_2B4T_DECODE: Baseline = Baseline {
 /// **regression denominator** the e2e gate keys on: a real, reproducible on-box
 /// figure, unlike the published competitor numbers above.
 ///
-/// **Measured.** The CUDA-graph decode (v0.3.2: one captured graph replayed per token,
-/// f32-accumulate GEMM + coalesced warp LM head — see `cuda.rs`) decodes the committed
-/// prompt at **~45.9 tok/s** (decode-only, prefill excluded) on the 4090 — ~1.66× the
-/// v0.3.1 eager device-resident path (~27.6 tok/s), itself ~6× the v0.20 host path
-/// (~4.5 tok/s). That is ~5.4% of the 848.6 tok/s memory roofline. **All numerics gates
-/// still hold on this fast path** (greedy 256/256 exact, perplexity 2.96e-3, cpu↔cuda
-/// parity identical / worst logit rel 2.26e-6): the f64 accumulate guarded a 1e-4
-/// worst-case the real activations never hit. The committed figure is a **conservative
-/// 42.0 tok/s floor** (~8% under measured) so run-to-run variance never trips the `>5%`
-/// gate; a real regression below the floor still fails CI.
+/// **Measured.** The CUDA-graph decode (one captured graph replayed per token) at
+/// **~85.5 tok/s** (decode-only, prefill excluded) on the 4090 — ~3.1× the v0.3.1 eager
+/// device-resident path (~27.6 tok/s), itself ~6× the v0.20 host path (~4.5 tok/s). That
+/// is ~10.1% of the 848.6 tok/s memory roofline. The speedups (v0.3.2 f32-accumulate
+/// GEMM + coalesced warp LM head; v0.3.3 parallel act_quant + warp-per-head attention)
+/// are all **bit-match-preserving** — **every numerics gate still holds**: greedy 256/256
+/// exact, perplexity 2.96e-3, cpu↔cuda parity identical (worst logit rel 2.26e-6). The
+/// committed figure is a **conservative 78.0 tok/s floor** (~9% under measured) so
+/// run-to-run variance never trips the `>5%` gate; a real regression still fails CI.
 ///
 /// **Why there is no `BuiltOnBox` GPU *competitor*.** A same-HW llama.cpp CUDA
 /// baseline for this artifact is **not obtainable**, confirmed on the local
@@ -337,11 +336,12 @@ pub const LLAMA_CPP_2B4T_DECODE: Baseline = Baseline {
 /// Tritium's I2_S decode runs on the GPU, which llama.cpp does not do. The ≥1.2×
 /// competitor gate stays deferred until a GPU ternary competitor is measurable; until
 /// then the gate is "don't regress vs our own measured decode" + the roofline %. (Our
-/// own rate keeps climbing — v0.3.2's f32 GEMM + warp LM head took it to ~45.9 tok/s,
-/// ~5.4% of the roofline; v0.3.3 parallelizes the remaining sequential kernels.)
+/// own rate keeps climbing, all bit-match-preserving: v0.3.2's f32 GEMM + warp LM head to
+/// ~45.9 tok/s, then v0.3.3's parallel act_quant + warp attention to ~85.5 tok/s, ~10.1%
+/// of the roofline.)
 pub const TRITIUM_2B4T_DECODE_4090: Baseline = Baseline {
     name: "tritium 2B4T decode (4090, cuda-graph)",
-    tokens_per_sec: 42.0,
+    tokens_per_sec: 78.0,
     source: BaselineSource::BuiltOnBox,
 };
 
