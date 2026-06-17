@@ -162,4 +162,72 @@ __global__ void lm_head_f32(const float* __restrict__ h, const float* __restrict
   logits[v] = acc;
 }
 
+// gqa_attention_decode_f32 — the M=1 (seq=1) decode case of tritium_nn::ops::
+// gqa_attention. One thread per query head: scaled sequential q·k dots → inline
+// row softmax → sequential weighted sum Σ w·v, all in the host's index order with
+// __fmul_rn/__fadd_rn (no FMA). Bit-matches the host EXCEPT the softmax `expf`
+// (<=3 ULP, the only non-bit-exact op in the forward). `limit` is the last visible
+// key index (causal_offset); keys j>limit are masked (-inf). `scores` is a
+// [n_head, ctx] scratch the caller provides (resident in the forward).
+__global__ void gqa_attention_decode_f32(const float* __restrict__ q,    // [n_head, head_dim]
+                                         const float* __restrict__ k,    // [ctx, n_head_kv, head_dim]
+                                         const float* __restrict__ v,    // [ctx, n_head_kv, head_dim]
+                                         float* __restrict__ out,        // [n_head, head_dim]
+                                         float* __restrict__ scores,     // [n_head, ctx] scratch
+                                         const int ctx, const int n_head,
+                                         const int n_head_kv, const int head_dim,
+                                         const float scale, const int limit) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= n_head) return;
+
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float* q_row = q + (long long)h * head_dim;
+  float* sc = scores + (long long)h * ctx;
+
+  // Scaled dot scores; masked keys (j > limit) -> -inf.
+  for (int j = 0; j < ctx; ++j) {
+    if (j > limit) {
+      sc[j] = -INFINITY;
+      continue;
+    }
+    const float* k_row = k + ((long long)j * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot = __fadd_rn(dot, __fmul_rn(q_row[d], k_row[d]));  // host: dot += q[d]*k[d]
+    }
+    sc[j] = __fmul_rn(dot, scale);  // host: dot * scale
+  }
+
+  // Inline row softmax (same sequential math as softmax_f32; expf is the <=3-ULP op).
+  float m = -INFINITY;
+  for (int j = 0; j < ctx; ++j) {
+    if (sc[j] > m) m = sc[j];
+  }
+  float sum = 0.0f;
+  for (int j = 0; j < ctx; ++j) {
+    const float e = expf(__fsub_rn(sc[j], m));
+    sc[j] = e;
+    sum = __fadd_rn(sum, e);
+  }
+  const float inv = __fdiv_rn(1.0f, sum);
+  for (int j = 0; j < ctx; ++j) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+
+  // Weighted sum of v rows, host order (j outer, d inner); skip w==0 like the host.
+  float* o_row = out + (long long)h * head_dim;
+  for (int d = 0; d < head_dim; ++d) {
+    o_row[d] = 0.0f;
+  }
+  for (int j = 0; j < ctx; ++j) {
+    const float w = sc[j];
+    if (w == 0.0f) continue;
+    const float* v_row = v + ((long long)j * n_head_kv + kv) * head_dim;
+    for (int d = 0; d < head_dim; ++d) {
+      o_row[d] = __fadd_rn(o_row[d], __fmul_rn(w, v_row[d]));  // host: o[d] += w*v[d]
+    }
+  }
+}
+
 }  // extern "C"

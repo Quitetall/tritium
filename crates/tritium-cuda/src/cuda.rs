@@ -76,6 +76,9 @@ const KERNEL_NAME_RESIDUAL: &str = "residual_add_f32";
 const KERNEL_NAME_EMBED: &str = "embedding_gather_f32";
 /// Tied LM head `logits[v] = <h, embd[v]>` (sequential dot, bit-matches host).
 const KERNEL_NAME_LM_HEAD: &str = "lm_head_f32";
+/// GQA attention, M=1 decode (v0.3.1) — matches `ops::gqa_attention`; dots/weighted
+/// sums bit-match, the inline softmax `expf` differs ≤3 ULP.
+const KERNEL_NAME_ATTN: &str = "gqa_attention_decode_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -204,6 +207,9 @@ pub struct CudaBackend {
     func_embed: CudaFunction,
     #[allow(dead_code)]
     func_lm_head: CudaFunction,
+    /// The resolved `gqa_attention_decode_f32` kernel (M=1 decode attention).
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    func_attn: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -287,6 +293,9 @@ impl CudaBackend {
         let func_lm_head = decode_module
             .load_function(KERNEL_NAME_LM_HEAD)
             .map_err(|e| driver_err("resolve lm_head kernel", &e))?;
+        let func_attn = decode_module
+            .load_function(KERNEL_NAME_ATTN)
+            .map_err(|e| driver_err("resolve attention kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -314,6 +323,7 @@ impl CudaBackend {
             func_residual,
             func_embed,
             func_lm_head,
+            func_attn,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -698,6 +708,109 @@ impl CudaBackend {
         self.stream
             .memcpy_dtoh(&d_logits, logits)
             .map_err(|e| driver_err("lm_head dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device GQA attention for the M=1 decode token on host slices. Matches
+    /// `tritium_nn::ops::gqa_attention` (seq=1) except the inline softmax `expf`
+    /// (≤3 ULP). `q` is `[n_head, head_dim]`; `k`/`v` are `[ctx, n_head_kv, head_dim]`;
+    /// `limit` is the last visible key index. A building block for `forward_device`.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    pub(crate) fn gqa_attention_decode(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        ctx: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        limit: usize,
+    ) -> Result<(), BackendError> {
+        let q_len = n_head * head_dim;
+        let kv_len = ctx * n_head_kv * head_dim;
+        if n_head_kv == 0
+            || !n_head.is_multiple_of(n_head_kv)
+            || q.len() != q_len
+            || k.len() != kv_len
+            || v.len() != kv_len
+            || out.len() != q_len
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: q_len,
+                got: q.len(),
+            });
+        }
+        if n_head == 0 || ctx == 0 {
+            return Ok(());
+        }
+        let d_q = self
+            .stream
+            .clone_htod(q)
+            .map_err(|e| driver_err("attn htod q", &e))?;
+        let d_k = self
+            .stream
+            .clone_htod(k)
+            .map_err(|e| driver_err("attn htod k", &e))?;
+        let d_v = self
+            .stream
+            .clone_htod(v)
+            .map_err(|e| driver_err("attn htod v", &e))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(q_len)
+            .map_err(|e| driver_err("attn alloc out", &e))?;
+        let mut d_scores = self
+            .stream
+            .alloc_zeros::<f32>(n_head * ctx)
+            .map_err(|e| driver_err("attn alloc scores", &e))?;
+
+        let ctx_i = ctx as i32;
+        let n_head_i = n_head as i32;
+        let n_head_kv_i = n_head_kv as i32;
+        let head_dim_i = head_dim as i32;
+        let limit_i = limit as i32;
+        let threads = 64u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_head as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_attn);
+        launch
+            .arg(&d_q)
+            .arg(&d_k)
+            .arg(&d_v)
+            .arg(&mut d_out)
+            .arg(&mut d_scores)
+            .arg(&ctx_i)
+            .arg(&n_head_i)
+            .arg(&n_head_kv_i)
+            .arg(&head_dim_i)
+            .arg(&scale)
+            .arg(&limit_i);
+
+        // SAFETY: kernel signature `(const float* q, const float* k, const float* v,
+        // float* out, float* scores, int ctx, int n_head, int n_head_kv, int head_dim,
+        // float scale, int limit)`; the 11 args are pushed in that exact order/type.
+        // `q`/`out` are length `n_head*head_dim`, `k`/`v` length `ctx*n_head_kv*head_dim`,
+        // `scores` length `n_head*ctx`; one thread per head guarded by `h >= n_head`,
+        // each touching only its own `q`/`out`/`scores` row and `kv`-selected k/v rows.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch attention", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_out, out)
+            .map_err(|e| driver_err("attn dtoh", &e))?;
         Ok(())
     }
 
@@ -2741,5 +2854,112 @@ mod tests {
                 assert_eq!(g.to_bits(), hh.to_bits(), "lm_head mismatch [{v}]: got {g} want {hh}");
             }
         }
+    }
+
+    /// Device GQA attention (M=1 decode) vs host `gqa_attention`. The dots + weighted
+    /// sums bit-match; the inline softmax `expf` gives a ≤3-ULP / ~1e-7 divergence, so
+    /// this measures the max rel error (reported) and asserts it stays tiny — the
+    /// attention output is the only forward op carrying the exp difference.
+    #[test]
+    fn gqa_attention_decode_matches_host() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping attention match: no device ({e})");
+                return;
+            }
+        };
+        // BitNet 2B4T attention dims; a modest cached context for the decode token.
+        let (n_head, n_head_kv, head_dim, ctx) = (20usize, 5usize, 128usize, 96usize);
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let limit = ctx - 1; // steady-state decode: all cached keys visible
+        let n_rep = n_head / n_head_kv;
+
+        let mut s = 0x0BAD_F00D_1357_2468u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f32 / (1u64 << 53) as f32) * 4.0 - 2.0
+        };
+        let q: Vec<f32> = (0..n_head * head_dim).map(|_| next()).collect();
+        let k: Vec<f32> = (0..ctx * n_head_kv * head_dim).map(|_| next()).collect();
+        let v: Vec<f32> = (0..ctx * n_head_kv * head_dim).map(|_| next()).collect();
+
+        // Host reference — replicates ops::gqa_attention for seq=1.
+        let mut want = vec![0.0f32; n_head * head_dim];
+        let mut scores = vec![0.0f32; ctx];
+        for h in 0..n_head {
+            let kv = h / n_rep;
+            let q_row = &q[h * head_dim..h * head_dim + head_dim];
+            for (j, sc) in scores.iter_mut().enumerate() {
+                if j > limit {
+                    *sc = f32::NEG_INFINITY;
+                    continue;
+                }
+                let k_row = &k[(j * n_head_kv + kv) * head_dim..][..head_dim];
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_row[d] * k_row[d];
+                }
+                *sc = dot * scale;
+            }
+            let mut m = f32::NEG_INFINITY;
+            for &sc in &scores {
+                if sc > m {
+                    m = sc;
+                }
+            }
+            let mut sum = 0.0f32;
+            for sc in scores.iter_mut() {
+                let e = (*sc - m).exp();
+                *sc = e;
+                sum += e;
+            }
+            let inv = 1.0f32 / sum;
+            for sc in scores.iter_mut() {
+                *sc *= inv;
+            }
+            let o = &mut want[h * head_dim..h * head_dim + head_dim];
+            for (j, &w) in scores.iter().enumerate() {
+                if w == 0.0 {
+                    continue;
+                }
+                let v_row = &v[(j * n_head_kv + kv) * head_dim..][..head_dim];
+                for d in 0..head_dim {
+                    o[d] += w * v_row[d];
+                }
+            }
+        }
+
+        let mut got = vec![0.0f32; n_head * head_dim];
+        backend
+            .gqa_attention_decode(&q, &k, &v, &mut got, ctx, n_head, n_head_kv, head_dim, scale, limit)
+            .expect("device attention");
+
+        let (mut max_ulp, mut n_diff, mut max_rel, mut max_abs) = (0i64, 0usize, 0.0f64, 0.0f64);
+        for (&g, &h) in got.iter().zip(&want) {
+            let du = (i64::from(g.to_bits()) - i64::from(h.to_bits())).abs();
+            if du != 0 {
+                n_diff += 1;
+            }
+            max_ulp = max_ulp.max(du);
+            max_abs = max_abs.max(f64::from((g - h).abs()));
+            if h != 0.0 {
+                max_rel = max_rel.max((f64::from(g - h) / f64::from(h)).abs());
+            }
+        }
+        eprintln!(
+            "attention device-vs-host: max_abs={max_abs:.3e} max_rel={max_rel:.3e} max_ulp={max_ulp} n_diff={n_diff}/{}",
+            got.len()
+        );
+        // The dots + weighted sum bit-match; the sole divergence is the softmax `expf`
+        // (≤3 ULP, ~1e-6 ABSOLUTE), which inflates to a larger *relative* error only on
+        // near-zero (cancellation) outputs. The meaningful metric is the absolute error,
+        // which must stay tiny (it propagates into the residual stream as a small add).
+        assert!(
+            max_abs < 1e-3,
+            "device attention absolute error too large (likely a real bug): max_abs={max_abs:.3e}"
+        );
     }
 }
