@@ -3039,6 +3039,7 @@ impl CudaDecodeModel {
 
     // --- batched (M>1) prefill launch helpers (safe launches; eager one-shot path) ---
 
+    #[allow(clippy::too_many_arguments)]
     fn bl_rmsnorm(s: &Arc<CudaStream>, f: &CudaFunction, x: &CudaSlice<f32>, w: &CudaSlice<f32>, eps: f32, n: usize, m: usize, out: &mut CudaSlice<f32>) -> Result<(), BackendError> {
         let (n_i, m_i) = (n as i32, m as i32);
         let cfg = LaunchConfig { grid_dim: (m as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (n * 4) as u32 };
