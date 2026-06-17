@@ -11,7 +11,12 @@
 > point-release **v0.3.1 — the device-resident forward** ([ADR 0013](./0013-v031-device-resident-forward.md))
 > was inserted between v0.3.0 and v0.4.0 to close v0.3.0's slipped `≥1.2×` bitnet.cpp
 > Pe gate; it adds no new capability, so the capability staircase (0.4.0 SALT → …) is
-> unchanged.
+> unchanged. **v0.3.1 shipped** the device-resident decode (greedy 256/256 exact, ~6×
+> decode, ~27.6 tok/s on a 4090); the CUDA-graph decode and the `≥1.2×` gate slipped to a
+> further point-release **v0.3.2** (the graph is blocked by cudarc 0.19's capture-
+> incompatible safe launch → needs a raw-FFI path; and no GPU *ternary* competitor is
+> measurable today, so a clear lead needs the graph's push toward the roofline). v0.3.2 is
+> likewise capability-neutral; the staircase is still unchanged.
 
 ## Context
 
