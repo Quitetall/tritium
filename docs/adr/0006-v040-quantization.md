@@ -6,8 +6,13 @@
 
 ## Status
 
-Planned — not started. No `tritium-quantize` crate, residual-sidecar format, or
-`cli quantize` code exists yet.
+In progress — the CPU-complete core has landed. `tritium-quantize` exists (residual
+expansion + rate-distortion allocator + end-to-end `quantize_tensor`) and the TQ2_0
+residual sidecar is in `tritium-format`; **all CPU-only exit gates below are green**
+(`T=1`==flat AbsMean, monotonic reconstruction error, budget + ordering invariants,
+determinism, sidecar roundtrip + back-compat + version). Still to land before tagging
+v0.4.0: the **GPU** multi-plane accumulate kernel + sparse==dense parity, the
+`cli quantize` subcommand, and the **model** accuracy-vs-bpw curve.
 
 **Must land first:** v0.30 (performance) tagged green — SALT's multi-plane
 accumulate (`Σ_p s_p·tmatmul`) rides the tuned mpGEMM kernels (add-only + IMMA,
@@ -44,10 +49,10 @@ weights alongside legacy plain-TQ2 for backward-compat) to `tritium-format`, and
 ## Definition of done — tag v0.40.0
 
 - [ ] Multi-plane accumulate kernel `Σ_p s_p·tmatmul` matches the SALT dequant→fp32 reference matmul within tolerance.
-- [ ] Residual reconstruction error decreases monotonically with plane count `T`; `T=1` reduces exactly to flat AbsMean (BitNet regression check).
-- [ ] Allocator respects the bpw budget exactly (`Σ|g|·1.585·T_g ≤ budget`); higher-sensitivity groups receive ≥ planes than lower (ordering invariant).
+- [x] Residual reconstruction error decreases monotonically with plane count `T`; `T=1` reduces exactly to flat AbsMean (BitNet regression check). *(tritium-quantize: `plane.rs` gates)*
+- [x] Allocator respects the bpw budget exactly (`Σ|g|·1.585·T_g ≤ budget`); higher-sensitivity groups receive ≥ planes than lower (ordering invariant). *(tritium-quantize: `allocate.rs` gates)*
 - [ ] Sparse residual plane and dense residual plane produce identical matmul output; the density-threshold switch is correct on both sides.
-- [ ] Format sidecar roundtrips multi-plane weights; reads legacy plain-TQ2 (no residual) for backward-compat; version field enforced; edge budgets, zero-variance group, and outlier-heavy group all handled.
-- [ ] Same model+seed+budget ⇒ byte-identical packed output.
+- [x] Format sidecar roundtrips multi-plane weights; reads legacy plain-TQ2 (no residual) for backward-compat; version field enforced; edge budgets, zero-variance group, and outlier-heavy group all handled. *(tritium-format: `salt.rs` gates)*
+- [x] Same model+seed+budget ⇒ byte-identical packed output. *(determinism gates in `plane.rs`/`allocate.rs`/`quantize.rs`)*
 - [ ] Accuracy-vs-bpw curve reported on the real model; at target bpw, within the stated gap of fp16.
 - [ ] Kernel matches dequant reference + sparse==dense + accuracy curve meets target — plus U1–U9. Tag `v0.40`.

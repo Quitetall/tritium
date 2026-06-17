@@ -7,6 +7,46 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [Unreleased] — v0.4.0 (SALT quantization, ADR 0001/0006) — in progress
+
+The CPU-complete core of SALT (Sensitivity-Allocated Layered Ternary) has landed in
+the new **`tritium-quantize`** crate plus a TQ2_0 residual sidecar in `tritium-format`.
+All CPU-only exit gates are green; the GPU multi-plane accumulate kernel, the sparse
+residual plane, the `cli quantize` subcommand, and the model accuracy-vs-bpw curve
+remain before v0.4.0 can tag.
+
+### Added
+- **tritium-quantize** (new crate) — the offline SALT quantizer:
+  - **Residual ternary expansion** (`residual_expand`, `Plane`, `PlaneStack`): a weight
+    group becomes `W ≈ Σ_p s_p·t_p`, fit greedily (each plane AbsMean-quantizes the prior
+    residual). Prefix-stable, so `T=1` is *exactly* flat BitNet b1.58 AbsMean.
+  - **Rate-distortion plane allocator** (`allocate`): greedy water-filling distributes a
+    bits-per-weight budget across groups by sensitivity — the next plane goes to whichever
+    group buys the most loss-drop-per-bit, `H_g·Δerr / (|g|·log2 3)`, capped at `T_max`.
+  - **End-to-end tensor quantizer** (`quantize_tensor`): 256-block groups → global
+    allocation → packed SALT rows; pluggable sensitivity (Uniform / Energy / Custom Hessian).
+- **tritium-format** — the **TQ2_0 residual sidecar** (`SaltRow`, `pack_salt_row`,
+  `unpack_salt_row`, `read_legacy_as_salt`, `dequant_salt_row`): `T` ternary planes, each a
+  standard TQ2_0 row, so a `T=1` row is byte-identical to legacy plain-TQ2 and pre-SALT
+  models load unchanged as flat AbsMean.
+
+### Validation (CPU exit gates, ADR 0006)
+- `T=1` reduces **exactly** to flat AbsMean (golden + proptest, bit-exact reconstruction).
+- Reconstruction error is **monotonic** non-increasing in plane count `T` (proptest; sound —
+  with round-clamp quantization per-element `residual² ≤ w²` whenever `scale ≥ 0`).
+- Allocator **never exceeds the budget**; **ordering invariant** (equal curve+size ⇒ higher
+  sensitivity gets ≥ planes); **determinism** (byte-identical output).
+- Sidecar **roundtrips** multi-plane weights, **reads legacy plain-TQ2**, **enforces
+  version + magic**, handles pruned / zero-variance / partial-block edges.
+- End-to-end `dequant_salt_row(quantize_tensor(..)) ==` independent re-expansion reference,
+  bit-exact; `budget == base` reproduces flat AbsMean through the whole pipeline.
+
+### Remaining for v0.4.0
+- GPU multi-plane accumulate kernel `Σ_p s_p·tmatmul` matches the dequant reference (GPU lane).
+- Sparse residual plane == dense; density-threshold switch (GPU lane).
+- `cli quantize` subcommand (fp source model → SALT sidecar).
+- Accuracy-vs-bpw curve within the stated fp16 gap on the real model (model-download lane).
+
 ## [0.3.7] — 2026-06-17 — Batched M=N decode (N concurrent sequences)
 
 Phase 2 of the M>1 work: decode N independent sequences in one device-resident M=N
