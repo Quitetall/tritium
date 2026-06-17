@@ -39,7 +39,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.6"               # SemVer (MAJOR.MINOR.PATCH); see CHANGELOG versioning note
+version = "0.3.7"               # SemVer (MAJOR.MINOR.PATCH); see CHANGELOG versioning note
 edition = "2024"
 rust-version = "1.89"          # AVX-512 intrinsics stable floor (Rust 1.89, 2025-08-07)
 license = "MIT OR Apache-2.0"  # dual, Rust-ecosystem standard; vendored deps in NOTICE

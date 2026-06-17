@@ -7,6 +7,31 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.3.7] — 2026-06-17 — Batched M=N decode (N concurrent sequences)
+
+Phase 2 of the M>1 work: decode N independent sequences in one device-resident M=N
+forward — the serving-throughput primitive (M=N fills the GPU that a single M=1 token
+can't, decode being occupancy-bound at ~19% util). Bit-match-preserving.
+
+### Added
+- **tritium-cuda** — `CudaDecodeModel::decode_batch` + `BatchKv`: each of N sequences has
+  its own KV slice (`[n, max_ctx, kv_width]` per layer) and position; row r attends seq r's
+  KV up to seq r's position. Two new per-sequence kernels — `kv_append_mdecode_f32` and
+  `gqa_attention_mdecode_f32` (per-seq KV base + per-row limit) — plus the reused v0.3.6
+  M>1 batch kernels. `new_batch(n)` allocates the per-seq KV + M=N scratch.
+- **tritium-nn** — `ModelRunner::resident_cuda()` accessor (advanced/test) for the
+  device-resident decoder (M=1 graph + batched M=N path).
+
+### Validation
+- `cuda_batch_decode_matches_single` — **bit-identical**: two identical sequences in one
+  batch produce byte-for-byte identical logits (they are independent), and each matches the
+  single-sequence `step_graph` reference (the batch kernels share the M=1 reduction order).
+
+### Deferred (→ v0.3.8 / v0.4.0)
+- A batched generate API / continuous batching (dynamic batch, paged KV) over `decode_batch`;
+  a batched LM head (read token_embd once for all N rows) + batched prefill into per-seq KV.
+  Then v0.4.0 (SALT, ADR 0006).
+
 ## [0.3.6] — 2026-06-17 — Batched M=P prefill (kills the sequential TTFT cliff)
 
 The first M>1 step: prefill the **whole prompt in one device-resident forward** instead of
