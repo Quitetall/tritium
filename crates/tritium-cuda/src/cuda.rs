@@ -82,6 +82,9 @@ const KERNEL_NAME_ATTN: &str = "gqa_attention_decode_f32";
 /// On-device int8 activation quant for the tiled (TQ2_0) decode GEMM (v0.3.1) —
 /// bit-matches `ops::quantize_activation_int8` (int8 kept as f32 + per-token scale).
 const KERNEL_NAME_ACT_QUANT_TILED: &str = "act_quant_tiled_f32";
+/// Per-token activation-scale fold `out *= act_scale` (v0.3.1) — the device half of
+/// the W1.58A8 dequant the host applies after the GEMM.
+const KERNEL_NAME_SCALE_MUL: &str = "scale_mul_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -216,6 +219,9 @@ pub struct CudaBackend {
     /// The resolved `act_quant_tiled_f32` kernel (on-device A8 quant for the tiled GEMM).
     #[allow(dead_code)] // wired into the device GEMM next; W1-in-progress.
     func_act_quant_tiled: CudaFunction,
+    /// The resolved `scale_mul_f32` kernel (per-token act-scale fold).
+    #[allow(dead_code)] // wired into the device GEMM next; W1-in-progress.
+    func_scale_mul: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -305,6 +311,9 @@ impl CudaBackend {
         let func_act_quant_tiled = decode_module
             .load_function(KERNEL_NAME_ACT_QUANT_TILED)
             .map_err(|e| driver_err("resolve act_quant_tiled kernel", &e))?;
+        let func_scale_mul = decode_module
+            .load_function(KERNEL_NAME_SCALE_MUL)
+            .map_err(|e| driver_err("resolve scale_mul kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -334,6 +343,7 @@ impl CudaBackend {
             func_lm_head,
             func_attn,
             func_act_quant_tiled,
+            func_scale_mul,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -884,6 +894,151 @@ impl CudaBackend {
             .memcpy_dtoh(&d_scale, &mut scale)
             .map_err(|e| driver_err("act_quant dtoh scale", &e))?;
         Ok(scale[0])
+    }
+
+    /// Device-resident TQ2_0 mpGEMM for the M=1 decode token (host-slice wrapper):
+    /// on-device A8 quant → tiled add-only **f64** GEMM (the reference-matching decode
+    /// kernel) → per-token scale fold, chained on device buffers. **Bit-matches** the
+    /// host `quantize_activation_int8` + tiled `mpgemm` + fold. `forward_device` keeps
+    /// `normed`/`out` resident; this wrapper htod's/dtoh's only for testing.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] if `m != 1`, `k` exceeds the tiled cap, or the
+    /// buffer is not a TQ2_0 `CudaBuffer`; [`BackendError::ShapeMismatch`] otherwise.
+    #[allow(dead_code)] // the resident chain feeds `forward_device` next; W1-in-progress.
+    pub(crate) fn mpgemm_device(
+        &self,
+        normed: &[f32],
+        weights: &dyn DeviceBuffer,
+        scales: &[f32],
+        shape: GemmShape,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if m != 1 {
+            return Err(BackendError::InvalidInput(
+                "mpgemm_device is M=1 decode only".into(),
+            ));
+        }
+        let buf = weights
+            .as_any()
+            .downcast_ref::<CudaBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("buffer is not a CudaBuffer".into()))?;
+        if buf.n != n || buf.k != k {
+            return Err(BackendError::ShapeMismatch {
+                expected: buf.n * buf.k,
+                got: n * k,
+            });
+        }
+        if normed.len() != k || scales.len() != n || out.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: k,
+                got: normed.len(),
+            });
+        }
+        if k > TILED_K_MAX {
+            return Err(BackendError::InvalidInput(format!(
+                "mpgemm_device k={k} exceeds the tiled cap {TILED_K_MAX}"
+            )));
+        }
+        let row_bytes = match buf.stride {
+            Stride::Tq2_0 { row_bytes } => row_bytes,
+            Stride::I2sInt8 { .. } => {
+                return Err(BackendError::UnsupportedFormat(TernaryFormat::I2sInt8));
+            }
+        };
+
+        let d_normed = self
+            .stream
+            .clone_htod(normed)
+            .map_err(|e| driver_err("gemm_dev htod normed", &e))?;
+        let d_scales = self
+            .stream
+            .clone_htod(scales)
+            .map_err(|e| driver_err("gemm_dev htod scales", &e))?;
+        let mut d_q = self
+            .stream
+            .alloc_zeros::<f32>(k)
+            .map_err(|e| driver_err("gemm_dev alloc q", &e))?;
+        let mut d_act_scale = self
+            .stream
+            .alloc_zeros::<f32>(1)
+            .map_err(|e| driver_err("gemm_dev alloc scale", &e))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(n)
+            .map_err(|e| driver_err("gemm_dev alloc out", &e))?;
+
+        let k_i = k as i32;
+        let n_i = n as i32;
+        let m_i = 1i32;
+        let rb_i = row_bytes as i32;
+
+        // 1. On-device A8 quant: normed -> int8-as-f32 q + per-token act_scale.
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut l = self.stream.launch_builder(&self.func_act_quant_tiled);
+            l.arg(&d_normed).arg(&k_i).arg(&mut d_q).arg(&mut d_act_scale);
+            // SAFETY: `act_quant_tiled_f32(const float* act, int k, float* q, float*
+            // scale)`; args in order; `d_normed`/`d_q` length `k`, `d_act_scale` 1.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch gemm_dev quant", &e))?;
+            }
+        }
+        // 2. Tiled add-only f64 GEMM (M=1): folds the per-channel weight scale.
+        {
+            let grid_n = (n as u32).div_ceil(WARPS_PER_BLOCK);
+            let cfg = LaunchConfig {
+                grid_dim: (grid_n, 1, 1),
+                block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+                shared_mem_bytes: (k * 4) as u32,
+            };
+            let mut l = self.stream.launch_builder(&self.func_tiled);
+            l.arg(&d_q)
+                .arg(&buf.device)
+                .arg(&d_scales)
+                .arg(&mut d_out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(&rb_i);
+            // SAFETY: `tq2_0_add_mpgemm_tiled(act, weights, scales, out, m, n, k,
+            // row_bytes)`; args in that order. `d_q` length `k`, `buf.device` the
+            // uploaded TQ2_0 weight, `d_scales` length `n`, `d_out` length `n` (M=1);
+            // grid covers `ceil(n/8)` warp-columns × 1 row; shared `k*4` ≤ 32 KiB.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch gemm_dev tiled", &e))?;
+            }
+        }
+        // 3. Per-token activation-scale fold: out *= act_scale.
+        {
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut l = self.stream.launch_builder(&self.func_scale_mul);
+            l.arg(&mut d_out).arg(&d_act_scale).arg(&n_i);
+            // SAFETY: `scale_mul_f32(float* out, const float* s, int n)`; args in
+            // order; `d_out` length `n`, `d_act_scale` the length-1 scalar.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch gemm_dev fold", &e))?;
+            }
+        }
+        self.stream
+            .memcpy_dtoh(&d_out, out)
+            .map_err(|e| driver_err("gemm_dev dtoh", &e))?;
+        Ok(())
     }
 
     /// Pick the add-only kernel for this problem shape. The tiled (decode) kernel
@@ -3088,5 +3243,82 @@ mod tests {
         let sc = backend.act_quant_tiled(&act, &mut q).expect("act_quant zero");
         assert_eq!(sc, 0.0);
         assert!(q.iter().all(|&x| x == 0.0), "zero row must quantize to zeros");
+    }
+
+    /// The device GEMM chain (`mpgemm_device`: on-device quant → tiled f64 GEMM →
+    /// scale fold) must reproduce the host path (`quantize_activation_int8` → tiled
+    /// `mpgemm` → `out *= act_scale`) **bit-for-bit** — same quant, same kernel, same
+    /// fold, just resident. This is the GEMM half of the device-resident decode.
+    #[test]
+    fn mpgemm_device_bit_matches_host_path() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping mpgemm_device match: no device ({e})");
+                return;
+            }
+        };
+        let (n, k) = (640usize, 2560usize); // BitNet attn_k projection shape
+        let shape = GemmShape::new(1, n, k);
+
+        let mut st = 0x1357_9BDF_2468_ACE0u64;
+        let trits: Vec<tritium_core::Trit> = (0..n * k)
+            .map(|_| {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                tritium_core::Trit::from_i8(((st >> 33) % 3) as i8 - 1).unwrap()
+            })
+            .collect();
+        let packed = pack_tq2_0(&trits, shape);
+        let weights = cuda
+            .upload_weights(&packed, shape, TernaryFormat::Tq2_0)
+            .expect("upload");
+
+        let mut sf = 0x2468_ACE0_1357_9BDFu64;
+        let mut nf = || {
+            sf ^= sf << 13;
+            sf ^= sf >> 7;
+            sf ^= sf << 17;
+            ((sf >> 11) as f32 / (1u64 << 53) as f32) * 4.0 - 2.0
+        };
+        let normed: Vec<f32> = (0..k).map(|_| nf()).collect();
+        let scales: Vec<f32> = (0..n).map(|_| 0.5 + nf().abs()).collect();
+
+        // Host path: quantize_activation_int8 + tiled mpgemm + per-token fold.
+        let (q_host, act_scale) = {
+            let mut gamma = 0.0f32;
+            for &v in &normed {
+                let a = v.abs();
+                if a > gamma {
+                    gamma = a;
+                }
+            }
+            if gamma == 0.0 {
+                (vec![0.0f32; k], 0.0f32)
+            } else {
+                let s = 127.0f32 / gamma;
+                (
+                    normed
+                        .iter()
+                        .map(|&v| (v * s).round_ties_even().clamp(-128.0, 127.0))
+                        .collect::<Vec<_>>(),
+                    gamma / 127.0,
+                )
+            }
+        };
+        let mut out_host = run_kernel(&cuda, &packed, &q_host, &scales, shape, AddKernel::Tiled);
+        for v in out_host.iter_mut() {
+            *v *= act_scale;
+        }
+
+        // Device chain.
+        let mut out_dev = vec![0.0f32; n];
+        cuda.mpgemm_device(&normed, weights.as_ref(), &scales, shape, &mut out_dev)
+            .expect("mpgemm_device");
+
+        for (i, (&g, &h)) in out_dev.iter().zip(&out_host).enumerate() {
+            assert_eq!(g.to_bits(), h.to_bits(), "mpgemm_device mismatch [{i}]: got {g} want {h}");
+        }
     }
 }

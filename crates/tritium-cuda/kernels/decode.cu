@@ -266,4 +266,15 @@ __global__ void act_quant_tiled_f32(const float* __restrict__ act, const int k,
   }
 }
 
+// scale_mul_f32 — out[i] *= *s. The per-token activation-dequant fold the host applies
+// after the GEMM (`*slot *= act_scale[r]`); a single f32 mul (no FMA), `s` a device
+// scalar. Embarrassingly parallel.
+__global__ void scale_mul_f32(float* __restrict__ out, const float* __restrict__ s,
+                              const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = __fmul_rn(out[i], *s);
+  }
+}
+
 }  // extern "C"
