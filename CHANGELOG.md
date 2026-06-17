@@ -7,6 +7,35 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.3.6] — 2026-06-17 — Batched M=P prefill (kills the sequential TTFT cliff)
+
+The first M>1 step: prefill the **whole prompt in one device-resident forward** instead of
+looping the M=1 decode graph over prompt tokens. Bit-match-preserving — greedy 256/256
+exact, perplexity 2.96e-3, cpu↔cuda parity identical all still green; the batched-prefill
+KV/logits match the sequential loop per row.
+
+### Added
+- **tritium-cuda** — M>1 batched kernels (`rmsnorm_batch_f32`, `embedding_gather_batch_f32`,
+  `rope_apply_batch_f32`, `act_quant_batch_f32`, `scale_mul_batch_f32`, `kv_append_batch_f32`,
+  `gqa_attention_batch_f32` — causal [m, ctx]: query row r attends keys 0..=causal_offset+r),
+  each bit-identical per row to its M=1 sibling. `CudaDecodeModel::prefill` runs the M=P
+  forward (eager safe launches — one-shot, no graph), q/k/v share one activation quant, the
+  tiled GEMM handles M>1 via grid.y, final norm + f16 LM head on the last row only.
+- **tritium-nn** — the runner prefills a multi-token prompt via `prefill` (one forward);
+  single-token decode keeps the M=1 CUDA graph.
+
+### Performance
+- The sequential prefill re-read the 533 MB ternary weights **once per token** (memory-bound,
+  ~3.6 s for a 512-token prompt). Batched reads them **once** + does the compute, so a long
+  prompt prefills **~20-30× faster** (O(1) weight reads vs O(P)). For short prompts the gap is
+  small and TTFT-negligible (~84 vs ~42 ms, dwarfed by decode), so prefill stays always-on.
+- Decode is unchanged (~142 tok/s).
+
+### Deferred (→ v0.3.7)
+- Batched M=N **decode** (N concurrent sequences for aggregate throughput) — reuses these
+  M>1 kernels but needs per-sequence KV + a per-row-KV attention + a batched generate API.
+  Plus a precise long-prompt prefill benchmark; then v0.4.0 (SALT, ADR 0006).
+
 ## [0.3.5] — 2026-06-17 — Structural decode: shared quant + fused GEMMs (~142 tok/s)
 
 Decode is occupancy/latency-bound at M=1 (~990 small graph nodes in a serial chain), so
