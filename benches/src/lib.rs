@@ -308,6 +308,39 @@ pub const LLAMA_CPP_2B4T_DECODE: Baseline = Baseline {
     ),
 };
 
+/// **Tritium's own** BitNet-2B4T decode rate on the pinned RTX 4090 — the
+/// `BuiltOnBox`, device-resident (v0.3.1, ADR 0013) decode forward. This is the
+/// **regression denominator** the e2e gate keys on: a real, reproducible on-box
+/// figure, unlike the published competitor numbers above.
+///
+/// **Measured.** The device-resident forward (residual stream + KV in VRAM across
+/// all 30 layers, ~1 D2H/token) decodes the committed prompt at **~27.6 tok/s**
+/// (decode-only, prefill excluded) — ~6× the v0.20 host-orchestrated path (~4.5
+/// tok/s, ~210 synchronous round-trips/token), and ~3.3% of the 848.6 tok/s memory
+/// roofline. The committed figure is a **conservative 25.0 tok/s floor** (~9% under
+/// the measured rate) so normal run-to-run variance never trips the `>5%` gate; a
+/// real regression below the floor still fails CI.
+///
+/// **Why there is no `BuiltOnBox` GPU *competitor*.** A same-HW llama.cpp CUDA
+/// baseline for this artifact is **not obtainable**, confirmed on the local
+/// CUDA-enabled llama.cpp fork (`/home/brianklam/llama.cpp`, `libggml-cuda.so`,
+/// 4090): (1) the `ggml-model-i2_s.gguf` will not load — GGUF quant type-id `36` is
+/// the removed `IQ4_NL_4_4` in current ggml, not BitNet `I2_S` (a fork-specific
+/// assignment), so the loader rejects it before any kernel runs; (2) even
+/// re-quantized, ggml's **CUDA backend has no ternary mul-mat kernel** (no
+/// `GGML_TYPE_TQ1_0`/`TQ2_0` dispatch in `ggml-cuda/`), so llama.cpp runs ternary
+/// GEMM on the CPU regardless of `-ngl`; and (3) the HF weights to re-convert are not
+/// present locally. In short, llama.cpp has **no GPU ternary decode path** to race —
+/// Tritium's I2_S decode runs on the GPU, which llama.cpp does not do. The ≥1.2×
+/// competitor gate is therefore deferred until either a GPU ternary competitor is
+/// measurable or the v0.3.2 CUDA-graph lands (which targets the roofline, where a
+/// clear lead is unambiguous regardless of competitor).
+pub const TRITIUM_2B4T_DECODE_4090: Baseline = Baseline {
+    name: "tritium 2B4T decode (4090, device-resident)",
+    tokens_per_sec: 25.0,
+    source: BaselineSource::BuiltOnBox,
+};
+
 /// The fractional tokens/sec drop that fails the perf-regression gate. ADR 0005:
 /// "Perf-regression job fails on a `>5%` tokens/sec drop vs the recorded baseline."
 pub const REGRESSION_DROP_THRESHOLD: f64 = 0.05;
@@ -440,7 +473,11 @@ mod tests {
 
     #[test]
     fn published_baselines_carry_a_citation() {
-        for b in [&BITNET_CPP_2B4T_DECODE, &LLAMA_CPP_2B4T_DECODE] {
+        for b in [
+            &BITNET_CPP_2B4T_DECODE,
+            &LLAMA_CPP_2B4T_DECODE,
+            &TRITIUM_2B4T_DECODE_4090,
+        ] {
             match b.source {
                 BaselineSource::Published(cite) => {
                     assert!(cite.contains("http"), "{} cite must be a URL", b.name);
@@ -449,5 +486,11 @@ mod tests {
             }
             assert!(b.tokens_per_sec > 0.0);
         }
+        // The regression denominator must be our own measured figure, not a competitor's.
+        assert_eq!(
+            TRITIUM_2B4T_DECODE_4090.source,
+            BaselineSource::BuiltOnBox,
+            "the e2e regression gate must key on a BuiltOnBox figure"
+        );
     }
 }

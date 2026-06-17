@@ -6,10 +6,11 @@
 //! unchanged-perplexity assertion** so no accuracy is silently traded for speed:
 //!
 //! - **decode tokens/sec** — single-token autoregressive steps through the KV cache
-//!   (the memory-bound batch-1 path the add-only tiled kernel targets). Reported
+//!   (the memory-bound batch-1 path the device-resident decode targets). Reported
 //!   against the [`bitnet_2b4t_decode_ceiling`] roofline (%-of-SOL denominator) and
-//!   checked for a `>5%` regression vs the committed [`BITNET_CPP_2B4T_DECODE`]
-//!   baseline.
+//!   checked for a `>5%` regression vs our own committed [`TRITIUM_2B4T_DECODE_4090`]
+//!   `BuiltOnBox` figure (the competitor numbers are CPU / have no GPU ternary path,
+//!   so they are printed as context, not used as the GPU gate denominator).
 //! - **prefill tokens/sec** — one forward over the whole prompt (the compute-bound
 //!   path the IMMA kernel targets at larger `M`).
 //!
@@ -40,8 +41,8 @@ mod cuda_e2e {
 
     use divan::{Bencher, counter::ItemsCount};
     use tritium_benches::{
-        BITNET_CPP_2B4T_DECODE, REGRESSION_DROP_THRESHOLD, bitnet_2b4t_decode_ceiling,
-        check_regression,
+        BITNET_CPP_2B4T_DECODE, REGRESSION_DROP_THRESHOLD, TRITIUM_2B4T_DECODE_4090,
+        bitnet_2b4t_decode_ceiling, check_regression,
     };
     use tritium_nn::ModelRunner;
 
@@ -187,11 +188,19 @@ mod cuda_e2e {
         assert_perplexity_unchanged(&mut runner, &reference);
 
         // Roofline + baseline context (printed once; uses the actual loaded bytes for
-        // the ceiling so it tracks the real model on disk).
+        // the ceiling so it tracks the real model on disk). The regression gate keys on
+        // our own `BuiltOnBox` figure (`TRITIUM_2B4T_DECODE_4090`): there is no
+        // obtainable GPU *ternary* competitor — llama.cpp's CUDA backend has no
+        // TQ/I2_S mul-mat kernel and cannot load this artifact (see the baseline's
+        // doc-comment), and bitnet.cpp's published numbers are CPU. Those are printed as
+        // context only; the gate is "don't regress vs our measured decode".
         let ceiling = bitnet_2b4t_decode_ceiling();
         println!(
             "decode roofline ceiling ≈ {ceiling:.1} tok/s (peak HBM BW / model bytes); \
-             baseline `{}` = {:.1} tok/s ({:?})",
+             regression gate `{}` = {:.1} tok/s ({:?}); competitor context: `{}` {:.1} tok/s (CPU, {:?})",
+            TRITIUM_2B4T_DECODE_4090.name,
+            TRITIUM_2B4T_DECODE_4090.tokens_per_sec,
+            TRITIUM_2B4T_DECODE_4090.source,
             BITNET_CPP_2B4T_DECODE.name,
             BITNET_CPP_2B4T_DECODE.tokens_per_sec,
             BITNET_CPP_2B4T_DECODE.source,
@@ -229,7 +238,7 @@ mod cuda_e2e {
         if decode_tokens > 0 && decode_secs > 0.0 {
             let decode_tps = decode_tokens as f64 / decode_secs;
             let pct = 100.0 * decode_tps / ceiling;
-            let report = check_regression(decode_tps, &BITNET_CPP_2B4T_DECODE);
+            let report = check_regression(decode_tps, &TRITIUM_2B4T_DECODE_4090);
             println!(
                 "decode ≈ {decode_tps:.1} tok/s (decode-only) — {pct:.1}% of roofline; \
                  vs baseline drop = {:.1}% ({})",
