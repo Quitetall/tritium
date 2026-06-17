@@ -34,6 +34,7 @@ mod gguf;
 mod i2s;
 mod i2s_int8;
 mod rows;
+mod salt;
 mod tq1;
 mod tq2;
 
@@ -49,6 +50,10 @@ pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
+pub use salt::{
+    SALT_HEADER_BYTES, SALT_MAGIC, SALT_VERSION, SaltRow, dequant_salt_row, pack_salt_row,
+    read_legacy_as_salt, unpack_salt_row,
+};
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};
 
@@ -85,6 +90,14 @@ pub enum FormatError {
     /// `trit = code - 1`, so only `0b00`=-1, `0b01`=0, `0b10`=+1 are valid; `0b11`
     /// never occurs in valid weights (see [`i2s`] for the WF-4 verification).
     InvalidI2sCode(u8),
+    /// A SALT sidecar buffer did not start with the [`SALT_MAGIC`] bytes.
+    SaltBadMagic,
+    /// A SALT sidecar declared a format version this build cannot read.
+    UnsupportedSaltVersion(u8),
+    /// A [`SaltRow`] had more planes than the sidecar's `u8` plane-count field.
+    SaltTooManyPlanes(usize),
+    /// A [`SaltRow`]'s `k` did not fit the sidecar's `u32` length field.
+    SaltRowTooLong(usize),
 }
 
 impl fmt::Display for FormatError {
@@ -104,6 +117,16 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidI2sCode(c) => {
                 write!(f, "invalid I2_S 2-bit code 0b{c:02b} (reserved)")
+            }
+            FormatError::SaltBadMagic => write!(f, "SALT sidecar: bad magic"),
+            FormatError::UnsupportedSaltVersion(v) => {
+                write!(f, "SALT sidecar: unsupported version {v}")
+            }
+            FormatError::SaltTooManyPlanes(t) => {
+                write!(f, "SALT sidecar: {t} planes exceed the u8 plane-count field")
+            }
+            FormatError::SaltRowTooLong(k) => {
+                write!(f, "SALT sidecar: row length {k} exceeds the u32 length field")
             }
         }
     }
