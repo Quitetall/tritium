@@ -41,6 +41,13 @@ mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::CudaBackend;
 
+// v0.3.1 (ADR 0013): the device-resident M=1 decode forward. The runner downcasts
+// its `dyn TernaryBackend` to `CudaBackend`, builds a `CudaDecodeModel` once from a
+// borrowed `DecodeModelSpec`, then drives it per token — keeping the residual stream
+// + KV cache in VRAM across all layers.
+#[cfg(feature = "cuda")]
+pub use cuda::{CudaDecodeModel, DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
+
 // v0.30 (ADR 0005) skeletons. `autotune` is pure Rust (tile config + on-disk
 // cache keying) so it builds and tests on cpu-only lanes; `codegen` links
 // cudarc's nvrtc path, so it is gated behind `cuda`. WF-B implements both and the

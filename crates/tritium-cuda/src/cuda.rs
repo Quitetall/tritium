@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, DriverError,
+    LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -135,7 +135,10 @@ fn driver_err(context: &str, err: &DriverError) -> BackendError {
 #[derive(Debug)]
 pub(crate) struct CudaBuffer {
     /// Device allocation holding the packed bytes (TQ2_0 rows or the I2sInt8 tiles).
-    device: CudaSlice<u8>,
+    /// `Arc` so the device-resident decode model ([`CudaDecodeModel`]) can share the
+    /// already-uploaded weight with the [`TernaryLinear`] that owns it — the resident
+    /// forward references the same VRAM as the prefill path, with no re-upload.
+    device: Arc<CudaSlice<u8>>,
     /// Output channels (`N`), unpadded.
     n: usize,
     /// Contraction dimension (`K`), unpadded.
@@ -165,6 +168,28 @@ impl DeviceBuffer for CudaBuffer {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl CudaBuffer {
+    /// Share the uploaded device allocation (cheap `Arc` clone). Used by
+    /// [`CudaDecodeModel`] to reference the prefill path's weights without re-upload.
+    pub(crate) fn device_arc(&self) -> Arc<CudaSlice<u8>> {
+        Arc::clone(&self.device)
+    }
+
+    /// `(N, K)` channel dims of the packed weight.
+    pub(crate) fn dims(&self) -> (usize, usize) {
+        (self.n, self.k)
+    }
+
+    /// The TQ2_0 per-row byte stride, or `None` if this buffer is not TQ2_0
+    /// (the resident decode path is TQ2_0-only; IMMA stays the prefill format).
+    pub(crate) fn tq2_0_row_bytes(&self) -> Option<usize> {
+        match self.stride {
+            Stride::Tq2_0 { row_bytes } => Some(row_bytes),
+            Stride::I2sInt8 { .. } => None,
+        }
     }
 }
 
@@ -1059,7 +1084,7 @@ impl CudaBackend {
             };
             let mut l = self.stream.launch_builder(&self.func_tiled);
             l.arg(&d_q)
-                .arg(&buf.device)
+                .arg(buf.device.as_ref())
                 .arg(&d_scales)
                 .arg(&mut d_out)
                 .arg(&m_i)
@@ -1097,6 +1122,158 @@ impl CudaBackend {
             .memcpy_dtoh(&d_out, out)
             .map_err(|e| driver_err("gemm_dev dtoh", &e))?;
         Ok(())
+    }
+
+    /// Build a fully device-resident decoder ([`CudaDecodeModel`]) from `spec`:
+    /// upload the dense fp32 weights + precompute the RoPE table once, share the
+    /// already-uploaded ternary weights (`Arc` clone, no re-upload), and allocate the
+    /// per-layer KV arenas + the reused scratch. The returned model owns all of this,
+    /// so it outlives the borrowed `spec` (the runner can drop its borrow afterwards).
+    ///
+    /// # Errors
+    /// [`BackendError`] if a ternary weight is not a TQ2_0 [`CudaBuffer`], a shape is
+    /// inconsistent, or a device allocation/upload fails.
+    pub fn build_decode_model(
+        &self,
+        spec: &DecodeModelSpec,
+    ) -> Result<CudaDecodeModel, BackendError> {
+        let s = &self.stream;
+        let DecodeModelSpec {
+            n_embd, n_head, n_head_kv, head_dim, n_ff, vocab, max_ctx, rope_theta, rms_eps, ..
+        } = *spec;
+        let q_width = n_head * head_dim;
+        let kv_width = n_head_kv * head_dim;
+        let half = head_dim / 2;
+
+        // Validate the dense shapes the kernels assume.
+        if spec.token_embd.len() != vocab * n_embd {
+            return Err(BackendError::ShapeMismatch { expected: vocab * n_embd, got: spec.token_embd.len() });
+        }
+        if spec.output_norm.len() != n_embd {
+            return Err(BackendError::ShapeMismatch { expected: n_embd, got: spec.output_norm.len() });
+        }
+
+        // RoPE table: cos/sin for every (pos, lane), computed exactly as the host
+        // `ops::rope_apply` (f64 inv_freq + sin_cos, cast to f32), so the device
+        // rotation bit-matches. `inv_freq[j] = theta^(-2j/head_dim)`.
+        let theta = f64::from(rope_theta);
+        let inv_head_dim = 1.0f64 / head_dim as f64;
+        let inv_freq: Vec<f64> = (0..half).map(|j| theta.powf(-2.0 * j as f64 * inv_head_dim)).collect();
+        let mut cos_t = vec![0.0f32; max_ctx * half];
+        let mut sin_t = vec![0.0f32; max_ctx * half];
+        for pos in 0..max_ctx {
+            let p = pos as f64;
+            for j in 0..half {
+                let (sin, cos) = (p * inv_freq[j]).sin_cos();
+                cos_t[pos * half + j] = cos as f32;
+                sin_t[pos * half + j] = sin as f32;
+            }
+        }
+
+        let upload = |v: &[f32], what: &str| -> Result<CudaSlice<f32>, BackendError> {
+            s.clone_htod(v).map_err(|e| driver_err(what, &e))
+        };
+        let alloc = |n: usize, what: &str| -> Result<CudaSlice<f32>, BackendError> {
+            s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e))
+        };
+
+        let d_token_embd = upload(spec.token_embd, "decode token_embd htod")?;
+        let d_output_norm = upload(spec.output_norm, "decode output_norm htod")?;
+        let d_cos = upload(&cos_t, "decode rope cos htod")?;
+        let d_sin = upload(&sin_t, "decode rope sin htod")?;
+
+        // Per-layer weights + KV arenas.
+        let mut layers = Vec::with_capacity(spec.layers.len());
+        let mut kv_k = Vec::with_capacity(spec.layers.len());
+        let mut kv_v = Vec::with_capacity(spec.layers.len());
+        for (li, ls) in spec.layers.iter().enumerate() {
+            let opt_norm = |w: &[f32], width: usize, what: &str| -> Result<Option<CudaSlice<f32>>, BackendError> {
+                if w.is_empty() {
+                    Ok(None)
+                } else if w.len() == width {
+                    Ok(Some(upload(w, what)?))
+                } else {
+                    Err(BackendError::ShapeMismatch { expected: width, got: w.len() })
+                }
+            };
+            if ls.attn_norm.len() != n_embd || ls.ffn_norm.len() != n_embd {
+                return Err(BackendError::ShapeMismatch {
+                    expected: n_embd,
+                    got: ls.attn_norm.len().min(ls.ffn_norm.len()),
+                });
+            }
+            layers.push(ResidentLayer {
+                attn_norm: upload(ls.attn_norm, "decode attn_norm htod")?,
+                attn_sub_norm: opt_norm(ls.attn_sub_norm, q_width, "decode attn_sub_norm htod")?,
+                ffn_norm: upload(ls.ffn_norm, "decode ffn_norm htod")?,
+                ffn_sub_norm: opt_norm(ls.ffn_sub_norm, n_ff, "decode ffn_sub_norm htod")?,
+                q: ResidentLinear::build(s, &ls.q)?,
+                k: ResidentLinear::build(s, &ls.k)?,
+                v: ResidentLinear::build(s, &ls.v)?,
+                o: ResidentLinear::build(s, &ls.o)?,
+                gate: ResidentLinear::build(s, &ls.gate)?,
+                up: ResidentLinear::build(s, &ls.up)?,
+                down: ResidentLinear::build(s, &ls.down)?,
+            });
+            kv_k.push(alloc(max_ctx * kv_width, "decode kv_k alloc")?);
+            kv_v.push(alloc(max_ctx * kv_width, "decode kv_v alloc")?);
+            let _ = li;
+        }
+
+        // Resolve the kernels from the resident modules (decode + the add module's tiled GEMM).
+        let f = |m: &Arc<CudaModule>, name: &str| -> Result<CudaFunction, BackendError> {
+            m.load_function(name).map_err(|e| driver_err("resolve decode kernel", &e))
+        };
+        let dm = &self._decode_module;
+
+        Ok(CudaDecodeModel {
+            stream: Arc::clone(&self.stream),
+            f_rmsnorm: f(dm, KERNEL_NAME_RMSNORM)?,
+            f_rope: f(dm, KERNEL_NAME_ROPE)?,
+            f_attn: f(dm, KERNEL_NAME_ATTN)?,
+            f_residual: f(dm, KERNEL_NAME_RESIDUAL)?,
+            f_embed: f(dm, KERNEL_NAME_EMBED)?,
+            f_lm_head: f(dm, KERNEL_NAME_LM_HEAD)?,
+            f_relu2: f(dm, KERNEL_NAME_RELU2_GATE)?,
+            f_quant: f(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
+            f_tiled: f(&self._module, KERNEL_NAME_TILED)?,
+            f_scale: f(dm, KERNEL_NAME_SCALE_MUL)?,
+            d_token_embd,
+            d_output_norm,
+            d_cos,
+            d_sin,
+            layers,
+            kv_k,
+            kv_v,
+            cache_len: 0,
+            d_x: alloc(n_embd, "decode d_x")?,
+            d_normed: alloc(n_embd, "decode d_normed")?,
+            d_q: alloc(q_width, "decode d_q")?,
+            d_knew: alloc(kv_width, "decode d_knew")?,
+            d_vnew: alloc(kv_width, "decode d_vnew")?,
+            d_attn: alloc(q_width, "decode d_attn")?,
+            d_attn_sn: alloc(q_width, "decode d_attn_sn")?,
+            d_proj_out: alloc(n_embd, "decode d_proj_out")?,
+            d_gate: alloc(n_ff, "decode d_gate")?,
+            d_up: alloc(n_ff, "decode d_up")?,
+            d_gate_sn: alloc(n_ff, "decode d_gate_sn")?,
+            d_scores: alloc(n_head * max_ctx, "decode d_scores")?,
+            d_logits: alloc(vocab, "decode d_logits")?,
+            d_qact: alloc(TILED_K_MAX.min(n_ff.max(q_width).max(n_embd)), "decode d_qact")?,
+            d_act_scale: alloc(1, "decode d_act_scale")?,
+            n_embd,
+            n_head,
+            n_head_kv,
+            head_dim,
+            half,
+            q_width,
+            kv_width,
+            n_ff,
+            vocab,
+            max_ctx,
+            rms_eps,
+            attn_scale: 1.0f32 / (head_dim as f32).sqrt(),
+        })
     }
 
     /// Pick the add-only kernel for this problem shape. The tiled (decode) kernel
@@ -1227,7 +1404,7 @@ impl CudaBackend {
         let mut launch = self.stream.launch_builder(func);
         launch
             .arg(&d_act)
-            .arg(&buf.device)
+            .arg(buf.device.as_ref())
             .arg(&d_scales)
             .arg(&mut d_out)
             .arg(&m_i)
@@ -1382,7 +1559,7 @@ impl CudaBackend {
         let tile = self.resolve_imma_tile(shape);
         let func = self.imma_function_for_tile(tile)?;
         self.launch_imma_tile(
-            &func, tile, &d_qact, &buf.device, &d_act_scale, &d_wscale, &mut d_out, m_i, n_i, k_i,
+            &func, tile, &d_qact, buf.device.as_ref(), &d_act_scale, &d_wscale, &mut d_out, m_i, n_i, k_i,
             num_ktiles_i,
         )?;
 
@@ -1774,7 +1951,7 @@ impl TernaryBackend for CudaBackend {
         })?;
 
         Ok(Box::new(CudaBuffer {
-            device,
+            device: Arc::new(device),
             n,
             k,
             format,
@@ -2015,6 +2192,481 @@ static CUDA: BackendEntry = BackendEntry {
     name: "cuda",
     init: init_cuda,
 };
+
+// ===========================================================================
+// v0.3.1 (ADR 0013): the device-resident M=1 decode forward.
+//
+// `CudaDecodeModel` keeps the residual stream, the KV cache, the RoPE table, and
+// every weight (dense + the shared ternary `Arc`s) in VRAM across all layers, so a
+// decode step crosses the host boundary exactly **twice**: one token-id H2D
+// (implicit in `embedding_gather`'s scalar arg) and one logits D2H. The old
+// host-orchestrated forward did ~210 synchronous round-trips/token; this does ~1.
+//
+// Every kernel it launches is the same bit-matching decode kernel the goldens pin
+// (`decode.cu`, `--fmad=false`), so moving the math onto the GPU does not change a
+// rounding — greedy parity with the host (hence transformers) is preserved, modulo
+// the softmax/attention `expf` (≤3 ULP, the documented fallback-gated op).
+// ===========================================================================
+
+/// Borrowed spec of one ternary projection for [`CudaBackend::build_decode_model`]:
+/// the already-uploaded device weight (shared, not re-uploaded) + its per-channel
+/// scales. The weight must be a TQ2_0 [`CudaBuffer`] (the decode GEMM is TQ2_0-only).
+#[allow(missing_debug_implementations)] // holds `&dyn DeviceBuffer` (no Debug)
+pub struct DecodeLinearSpec<'a> {
+    /// The uploaded ternary weight (downcast to [`CudaBuffer`] internally).
+    pub weights: &'a dyn DeviceBuffer,
+    /// Per-output-channel f32 weight scales, length `N`.
+    pub scales: &'a [f32],
+}
+
+/// Borrowed spec of one transformer block (dense norm weights + the 7 ternary
+/// projections). `attn_sub_norm`/`ffn_sub_norm` may be empty to skip the BitNet
+/// sub-norms (matches the host `if len == width` guard).
+#[allow(missing_debug_implementations)] // transitively holds `&dyn DeviceBuffer`
+pub struct DecodeLayerSpec<'a> {
+    /// `input_layernorm` weight, length `n_embd`.
+    pub attn_norm: &'a [f32],
+    /// `attn_sub_norm` weight (length `q_width`), or empty to skip.
+    pub attn_sub_norm: &'a [f32],
+    /// `post_attention_layernorm` weight, length `n_embd`.
+    pub ffn_norm: &'a [f32],
+    /// `ffn_sub_norm` weight (length `n_ff`), or empty to skip.
+    pub ffn_sub_norm: &'a [f32],
+    /// Attention q/k/v/o projections.
+    pub q: DecodeLinearSpec<'a>,
+    /// See [`q`](Self::q).
+    pub k: DecodeLinearSpec<'a>,
+    /// See [`q`](Self::q).
+    pub v: DecodeLinearSpec<'a>,
+    /// See [`q`](Self::q).
+    pub o: DecodeLinearSpec<'a>,
+    /// MLP gate/up/down projections.
+    pub gate: DecodeLinearSpec<'a>,
+    /// See [`gate`](Self::gate).
+    pub up: DecodeLinearSpec<'a>,
+    /// See [`gate`](Self::gate).
+    pub down: DecodeLinearSpec<'a>,
+}
+
+/// Borrowed spec of a whole model for [`CudaBackend::build_decode_model`]. Carries
+/// the dense fp32 weights (uploaded once) + per-layer specs + the head geometry.
+#[allow(missing_debug_implementations)] // transitively holds `&dyn DeviceBuffer`
+pub struct DecodeModelSpec<'a> {
+    /// Token embedding `[vocab, n_embd]` row-major (also the tied LM head).
+    pub token_embd: &'a [f32],
+    /// Final `output_norm` weight, length `n_embd`.
+    pub output_norm: &'a [f32],
+    /// Per-layer specs, length `n_layers`.
+    pub layers: Vec<DecodeLayerSpec<'a>>,
+    /// Hidden size.
+    pub n_embd: usize,
+    /// Query head count.
+    pub n_head: usize,
+    /// KV head count (GQA).
+    pub n_head_kv: usize,
+    /// Per-head width.
+    pub head_dim: usize,
+    /// FFN inner size.
+    pub n_ff: usize,
+    /// Vocabulary size.
+    pub vocab: usize,
+    /// Maximum context (KV arena rows).
+    pub max_ctx: usize,
+    /// RoPE base frequency.
+    pub rope_theta: f32,
+    /// RMSNorm epsilon.
+    pub rms_eps: f32,
+}
+
+/// One ternary projection, resident: the shared device weight + device scales.
+#[derive(Debug)]
+struct ResidentLinear {
+    device: Arc<CudaSlice<u8>>,
+    scales: CudaSlice<f32>,
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+}
+
+impl ResidentLinear {
+    /// Build from a borrowed spec: share the device weight (`Arc` clone, no
+    /// re-upload) and upload the per-channel scales once.
+    fn build(stream: &Arc<CudaStream>, spec: &DecodeLinearSpec) -> Result<Self, BackendError> {
+        let buf = spec
+            .weights
+            .as_any()
+            .downcast_ref::<CudaBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("decode weight is not a CudaBuffer".into()))?;
+        let row_bytes = buf.tq2_0_row_bytes().ok_or(BackendError::UnsupportedFormat(
+            TernaryFormat::I2sInt8,
+        ))?;
+        let (n, k) = buf.dims();
+        if spec.scales.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: spec.scales.len(),
+            });
+        }
+        if k > TILED_K_MAX {
+            return Err(BackendError::InvalidInput(format!(
+                "decode K={k} exceeds the tiled cap {TILED_K_MAX}"
+            )));
+        }
+        let scales = stream
+            .clone_htod(spec.scales)
+            .map_err(|e| driver_err("decode scales htod", &e))?;
+        Ok(Self {
+            device: buf.device_arc(),
+            scales,
+            n,
+            k,
+            row_bytes,
+        })
+    }
+}
+
+/// One resident transformer block: dense norms + the 7 projections (no KV — the KV
+/// arenas live model-side so a layer's weights and its KV can be borrowed disjointly).
+#[derive(Debug)]
+struct ResidentLayer {
+    attn_norm: CudaSlice<f32>,
+    attn_sub_norm: Option<CudaSlice<f32>>,
+    ffn_norm: CudaSlice<f32>,
+    ffn_sub_norm: Option<CudaSlice<f32>>,
+    q: ResidentLinear,
+    k: ResidentLinear,
+    v: ResidentLinear,
+    o: ResidentLinear,
+    gate: ResidentLinear,
+    up: ResidentLinear,
+    down: ResidentLinear,
+}
+
+/// A fully device-resident BitNet decoder. One [`step`](CudaDecodeModel::step) is a
+/// single-token (M=1) forward run entirely on the GPU. See the section banner above.
+#[allow(missing_debug_implementations)]
+pub struct CudaDecodeModel {
+    stream: Arc<CudaStream>,
+    // Decode kernels (loaded from the resident modules at build).
+    f_rmsnorm: CudaFunction,
+    f_rope: CudaFunction,
+    f_attn: CudaFunction,
+    f_residual: CudaFunction,
+    f_embed: CudaFunction,
+    f_lm_head: CudaFunction,
+    f_relu2: CudaFunction,
+    f_quant: CudaFunction,
+    f_tiled: CudaFunction,
+    f_scale: CudaFunction,
+    // Dense device weights (uploaded once).
+    d_token_embd: CudaSlice<f32>,
+    d_output_norm: CudaSlice<f32>,
+    d_cos: CudaSlice<f32>,
+    d_sin: CudaSlice<f32>,
+    layers: Vec<ResidentLayer>,
+    // Per-layer KV arenas `[max_ctx * kv_width]`, model-side for disjoint borrows.
+    kv_k: Vec<CudaSlice<f32>>,
+    kv_v: Vec<CudaSlice<f32>>,
+    cache_len: usize,
+    // Reused scratch (sized once).
+    d_x: CudaSlice<f32>,
+    d_normed: CudaSlice<f32>,
+    d_q: CudaSlice<f32>,
+    d_knew: CudaSlice<f32>,
+    d_vnew: CudaSlice<f32>,
+    d_attn: CudaSlice<f32>,
+    d_attn_sn: CudaSlice<f32>,
+    d_proj_out: CudaSlice<f32>,
+    d_gate: CudaSlice<f32>,
+    d_up: CudaSlice<f32>,
+    d_gate_sn: CudaSlice<f32>,
+    d_scores: CudaSlice<f32>,
+    d_logits: CudaSlice<f32>,
+    d_qact: CudaSlice<f32>,
+    d_act_scale: CudaSlice<f32>,
+    // Geometry.
+    n_embd: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    half: usize,
+    q_width: usize,
+    kv_width: usize,
+    n_ff: usize,
+    vocab: usize,
+    max_ctx: usize,
+    rms_eps: f32,
+    attn_scale: f32,
+}
+
+impl CudaDecodeModel {
+    /// Reset the KV cache (start a fresh sequence). The arena bytes are left as-is;
+    /// only the watermark moves, exactly like [`crate`]'s host `KvCache::reset`.
+    pub fn reset(&mut self) {
+        self.cache_len = 0;
+    }
+
+    /// Number of tokens currently cached (the decode position the next `step` writes).
+    #[must_use]
+    pub fn cache_len(&self) -> usize {
+        self.cache_len
+    }
+
+    /// Run one M=1 decode step for `token` at absolute position `pos`, returning the
+    /// next-token logits `[vocab]`. The whole forward stays on the device; only the
+    /// logits are copied back. `pos` must equal [`cache_len`](Self::cache_len).
+    ///
+    /// # Errors
+    /// [`BackendError`] on a device failure, capacity overflow, or shape mismatch.
+    pub fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, BackendError> {
+        debug_assert_eq!(pos, self.cache_len, "decode pos must track the KV watermark");
+        if self.cache_len >= self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "decode context overflow: cache_len={} max_ctx={}",
+                self.cache_len, self.max_ctx
+            )));
+        }
+        let n_embd = self.n_embd;
+        let eps = self.rms_eps;
+
+        // Embedding gather: d_x = token_embd[token].
+        Self::launch_embed(&self.stream, &self.f_embed, &self.d_token_embd, token, n_embd, &mut self.d_x)?;
+
+        for li in 0..self.layers.len() {
+            self.layer(li, pos)?;
+        }
+
+        // Final norm over the (single) last token, then the tied LM head.
+        Self::launch_rmsnorm(
+            &self.stream, &self.f_rmsnorm, &self.d_x, &self.d_output_norm, eps, n_embd, &mut self.d_normed,
+        )?;
+        Self::launch_lm_head(
+            &self.stream, &self.f_lm_head, &self.d_normed, &self.d_token_embd, n_embd, self.vocab, &mut self.d_logits,
+        )?;
+
+        let mut logits = vec![0.0f32; self.vocab];
+        self.stream
+            .memcpy_dtoh(&self.d_logits, &mut logits)
+            .map_err(|e| driver_err("decode logits dtoh", &e))?;
+        self.cache_len += 1;
+        Ok(logits)
+    }
+
+    /// One transformer block, fully on-device, into/out of the resident residual `d_x`.
+    fn layer(&mut self, li: usize, pos: usize) -> Result<(), BackendError> {
+        let eps = self.rms_eps;
+        let (n_embd, q_width, kv_width) = (self.n_embd, self.q_width, self.kv_width);
+        let (n_head, n_head_kv, head_dim, half) = (self.n_head, self.n_head_kv, self.head_dim, self.half);
+
+        // --- pre-norm attention ---
+        Self::launch_rmsnorm(&self.stream, &self.f_rmsnorm, &self.d_x, &self.layers[li].attn_norm, eps, n_embd, &mut self.d_normed)?;
+        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].q, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_q)?;
+        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].k, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_knew)?;
+        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].v, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_vnew)?;
+
+        // RoPE on q and the new k (this token's position row of the precomputed table).
+        let base = pos * half;
+        {
+            let cos_v = self.d_cos.slice(base..base + half);
+            let sin_v = self.d_sin.slice(base..base + half);
+            Self::launch_rope(&self.stream, &self.f_rope, &mut self.d_q, &cos_v, &sin_v, n_head, head_dim)?;
+        }
+        {
+            let cos_v = self.d_cos.slice(base..base + half);
+            let sin_v = self.d_sin.slice(base..base + half);
+            Self::launch_rope(&self.stream, &self.f_rope, &mut self.d_knew, &cos_v, &sin_v, n_head_kv, head_dim)?;
+        }
+
+        // Append the new k/v to this layer's KV arena at the watermark, dtod.
+        let off = self.cache_len * kv_width;
+        {
+            let mut dst = self.kv_k[li].slice_mut(off..off + kv_width);
+            self.stream.memcpy_dtod(&self.d_knew, &mut dst).map_err(|e| driver_err("kv append k", &e))?;
+        }
+        {
+            let mut dst = self.kv_v[li].slice_mut(off..off + kv_width);
+            self.stream.memcpy_dtod(&self.d_vnew, &mut dst).map_err(|e| driver_err("kv append v", &e))?;
+        }
+
+        // Attention over the cached prefix (ctx = watermark+1, last visible = watermark).
+        let ctx = self.cache_len + 1;
+        Self::launch_attention(
+            &self.stream, &self.f_attn, &self.d_q, &self.kv_k[li], &self.kv_v[li], &mut self.d_attn, &mut self.d_scores,
+            ctx, n_head, n_head_kv, head_dim, self.attn_scale, self.cache_len,
+        )?;
+
+        // BitNet attn_sub_norm before o_proj (over q_width == n_embd), then o_proj +
+        // the first residual into d_x.
+        let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
+            Self::launch_rmsnorm(&self.stream, &self.f_rmsnorm, &self.d_attn, sn, eps, q_width, &mut self.d_attn_sn)?;
+            &self.d_attn_sn
+        } else {
+            &self.d_attn
+        };
+        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, attn_in, &self.layers[li].o, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_proj_out)?;
+        Self::launch_residual(&self.stream, &self.f_residual, &mut self.d_x, &self.d_proj_out, n_embd)?;
+
+        // --- pre-norm ReLU² MLP ---
+        Self::launch_rmsnorm(&self.stream, &self.f_rmsnorm, &self.d_x, &self.layers[li].ffn_norm, eps, n_embd, &mut self.d_normed)?;
+        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].gate, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_gate)?;
+        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].up, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_up)?;
+        Self::launch_relu2(&self.stream, &self.f_relu2, &mut self.d_gate, &self.d_up, self.n_ff)?;
+        let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
+            Self::launch_rmsnorm(&self.stream, &self.f_rmsnorm, &self.d_gate, sn, eps, self.n_ff, &mut self.d_gate_sn)?;
+            &self.d_gate_sn
+        } else {
+            &self.d_gate
+        };
+        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, down_in, &self.layers[li].down, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_proj_out)?;
+        Self::launch_residual(&self.stream, &self.f_residual, &mut self.d_x, &self.d_proj_out, n_embd)?;
+        Ok(())
+    }
+
+    // --- launch helpers (associated fns so step()/layer() can pass disjoint field
+    //     borrows of `self` without going through a `&self`/`&mut self` method). ---
+
+    fn launch_rmsnorm(
+        stream: &Arc<CudaStream>, func: &CudaFunction, x: &CudaSlice<f32>, w: &CudaSlice<f32>,
+        eps: f32, n: usize, out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let n_i = n as i32;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = stream.launch_builder(func);
+        l.arg(x).arg(w).arg(&eps).arg(&n_i).arg(out);
+        // SAFETY: `rmsnorm_f32(const float* x, const float* w, float eps, int n, float* out)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident rmsnorm", &e))?; }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm(
+        stream: &Arc<CudaStream>, f_quant: &CudaFunction, f_tiled: &CudaFunction, f_scale: &CudaFunction,
+        d_in: &CudaSlice<f32>, lin: &ResidentLinear,
+        d_qact: &mut CudaSlice<f32>, d_act_scale: &mut CudaSlice<f32>, d_out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let (n, k) = (lin.n, lin.k);
+        let (n_i, k_i, m_i, rb_i) = (n as i32, k as i32, 1i32, lin.row_bytes as i32);
+        // 1. on-device A8 quant of the activation row. (Reborrow the `&mut` scratch so
+        //    the same bindings can be reused by the later launches.)
+        {
+            let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let mut l = stream.launch_builder(f_quant);
+            l.arg(d_in).arg(&k_i).arg(&mut *d_qact).arg(&mut *d_act_scale);
+            // SAFETY: `act_quant_tiled_f32(const float* act, int k, float* q, float* scale)`.
+            #[allow(unsafe_code)]
+            unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident gemm quant", &e))?; }
+        }
+        // 2. tiled add-only f64 GEMM (M=1), folds the per-channel weight scale.
+        {
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
+                block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+                shared_mem_bytes: (k * 4) as u32,
+            };
+            let mut l = stream.launch_builder(f_tiled);
+            l.arg(&*d_qact).arg(lin.device.as_ref()).arg(&lin.scales).arg(&mut *d_out).arg(&m_i).arg(&n_i).arg(&k_i).arg(&rb_i);
+            // SAFETY: `tq2_0_add_mpgemm_tiled(act, weights, scales, out, m, n, k, row_bytes)`.
+            #[allow(unsafe_code)]
+            unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident gemm tiled", &e))?; }
+        }
+        // 3. per-token activation-scale fold: out *= act_scale.
+        {
+            let cfg = LaunchConfig { grid_dim: ((n as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let mut l = stream.launch_builder(f_scale);
+            l.arg(&mut *d_out).arg(&*d_act_scale).arg(&n_i);
+            // SAFETY: `scale_mul_f32(float* out, const float* s, int n)`.
+            #[allow(unsafe_code)]
+            unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident gemm fold", &e))?; }
+        }
+        Ok(())
+    }
+
+    fn launch_rope(
+        stream: &Arc<CudaStream>, func: &CudaFunction, x: &mut CudaSlice<f32>,
+        cos_t: &CudaView<f32>, sin_t: &CudaView<f32>, n_head: usize, head_dim: usize,
+    ) -> Result<(), BackendError> {
+        let (nh_i, hd_i) = (n_head as i32, head_dim as i32);
+        let total = (n_head * (head_dim / 2)) as u32;
+        let cfg = LaunchConfig { grid_dim: (total.div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = stream.launch_builder(func);
+        l.arg(x).arg(cos_t).arg(sin_t).arg(&nh_i).arg(&hd_i);
+        // SAFETY: `rope_apply_f32(float* x, const float* cos_t, const float* sin_t, int n_head, int head_dim)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident rope", &e))?; }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_attention(
+        stream: &Arc<CudaStream>, func: &CudaFunction, q: &CudaSlice<f32>, k: &CudaSlice<f32>, v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>, scores: &mut CudaSlice<f32>,
+        ctx: usize, n_head: usize, n_head_kv: usize, head_dim: usize, scale: f32, limit: usize,
+    ) -> Result<(), BackendError> {
+        let (ctx_i, nh_i, nhkv_i, hd_i, lim_i) = (ctx as i32, n_head as i32, n_head_kv as i32, head_dim as i32, limit as i32);
+        let threads = 64u32;
+        let cfg = LaunchConfig { grid_dim: ((n_head as u32).div_ceil(threads), 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let mut l = stream.launch_builder(func);
+        l.arg(q).arg(k).arg(v).arg(out).arg(scores).arg(&ctx_i).arg(&nh_i).arg(&nhkv_i).arg(&hd_i).arg(&scale).arg(&lim_i);
+        // SAFETY: `gqa_attention_decode_f32(q, k, v, out, scores, ctx, n_head, n_head_kv, head_dim, scale, limit)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident attention", &e))?; }
+        Ok(())
+    }
+
+    fn launch_residual(
+        stream: &Arc<CudaStream>, func: &CudaFunction, x: &mut CudaSlice<f32>, y: &CudaSlice<f32>, n: usize,
+    ) -> Result<(), BackendError> {
+        let n_i = n as i32;
+        let cfg = LaunchConfig { grid_dim: ((n as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = stream.launch_builder(func);
+        l.arg(x).arg(y).arg(&n_i);
+        // SAFETY: `residual_add_f32(float* x, const float* y, int n)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident residual", &e))?; }
+        Ok(())
+    }
+
+    fn launch_relu2(
+        stream: &Arc<CudaStream>, func: &CudaFunction, gate: &mut CudaSlice<f32>, up: &CudaSlice<f32>, n: usize,
+    ) -> Result<(), BackendError> {
+        let n_i = n as i32;
+        let cfg = LaunchConfig { grid_dim: ((n as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = stream.launch_builder(func);
+        l.arg(gate).arg(up).arg(&n_i);
+        // SAFETY: `relu2_gate_f32(float* gate, const float* up, int n)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident relu2", &e))?; }
+        Ok(())
+    }
+
+    fn launch_embed(
+        stream: &Arc<CudaStream>, func: &CudaFunction, table: &CudaSlice<f32>, tok: u32, n_embd: usize, out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let (tok_i, ne_i) = (tok as i32, n_embd as i32);
+        let cfg = LaunchConfig { grid_dim: ((n_embd as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = stream.launch_builder(func);
+        l.arg(table).arg(&tok_i).arg(&ne_i).arg(out);
+        // SAFETY: `embedding_gather_f32(const float* table, int tok, int n_embd, float* out)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident embed", &e))?; }
+        Ok(())
+    }
+
+    fn launch_lm_head(
+        stream: &Arc<CudaStream>, func: &CudaFunction, h: &CudaSlice<f32>, embd: &CudaSlice<f32>,
+        n_embd: usize, vocab: usize, logits: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let (ne_i, v_i) = (n_embd as i32, vocab as i32);
+        let cfg = LaunchConfig { grid_dim: ((vocab as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = stream.launch_builder(func);
+        l.arg(h).arg(embd).arg(&ne_i).arg(&v_i).arg(logits);
+        // SAFETY: `lm_head_f32(const float* h, const float* embd, int n_embd, int vocab, float* logits)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident lm_head", &e))?; }
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
