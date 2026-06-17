@@ -277,4 +277,20 @@ __global__ void scale_mul_f32(float* __restrict__ out, const float* __restrict__
   }
 }
 
+// relu2_gate_f32 — BitNet squared-ReLU gating, bit-exact match of the host
+// tritium_nn::layers::mlp gating loop:
+//   r = gate[i].max(0.0) ;  gate[i] = (r * r) * up[i]
+// In place into `gate` (which holds gate_proj output); `up` holds up_proj output.
+// `fmaxf(g, 0)` matches Rust `f32::max(0.0)` (both return the non-NaN operand), and
+// the two muls are left-associated with no FMA contraction (host: `r * r * u`).
+// Elementwise → order-free, fully parallel.
+__global__ void relu2_gate_f32(float* __restrict__ gate, const float* __restrict__ up,
+                               const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    const float r = fmaxf(gate[i], 0.0f);                 // host: g.max(0.0)
+    gate[i] = __fmul_rn(__fmul_rn(r, r), up[i]);          // host: r * r * u (left-assoc, no FMA)
+  }
+}
+
 }  // extern "C"

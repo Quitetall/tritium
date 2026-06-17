@@ -85,6 +85,9 @@ const KERNEL_NAME_ACT_QUANT_TILED: &str = "act_quant_tiled_f32";
 /// Per-token activation-scale fold `out *= act_scale` (v0.3.1) — the device half of
 /// the W1.58A8 dequant the host applies after the GEMM.
 const KERNEL_NAME_SCALE_MUL: &str = "scale_mul_f32";
+/// BitNet squared-ReLU FFN gate `g = relu(g)² ⊙ u` (v0.3.1) — bit-matches the host
+/// `mlp` gating loop (`r = g.max(0); g = r*r*u`).
+const KERNEL_NAME_RELU2_GATE: &str = "relu2_gate_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -222,6 +225,9 @@ pub struct CudaBackend {
     /// The resolved `scale_mul_f32` kernel (per-token act-scale fold).
     #[allow(dead_code)] // wired into the device GEMM next; W1-in-progress.
     func_scale_mul: CudaFunction,
+    /// The resolved `relu2_gate_f32` kernel (BitNet squared-ReLU FFN gate).
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    func_relu2_gate: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -314,6 +320,9 @@ impl CudaBackend {
         let func_scale_mul = decode_module
             .load_function(KERNEL_NAME_SCALE_MUL)
             .map_err(|e| driver_err("resolve scale_mul kernel", &e))?;
+        let func_relu2_gate = decode_module
+            .load_function(KERNEL_NAME_RELU2_GATE)
+            .map_err(|e| driver_err("resolve relu2_gate kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -344,6 +353,7 @@ impl CudaBackend {
             func_attn,
             func_act_quant_tiled,
             func_scale_mul,
+            func_relu2_gate,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -602,6 +612,54 @@ impl CudaBackend {
         self.stream
             .memcpy_dtoh(&d_x, x)
             .map_err(|e| driver_err("residual dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device BitNet squared-ReLU FFN gate `gate = relu(gate)² ⊙ up` (in place into
+    /// `gate`), bit-matching the host `mlp` gating loop. Building block.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    pub(crate) fn relu2_gate(&self, gate: &mut [f32], up: &[f32]) -> Result<(), BackendError> {
+        let n = gate.len();
+        if up.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: up.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let mut d_gate = self
+            .stream
+            .clone_htod(gate)
+            .map_err(|e| driver_err("relu2_gate htod gate", &e))?;
+        let d_up = self
+            .stream
+            .clone_htod(up)
+            .map_err(|e| driver_err("relu2_gate htod up", &e))?;
+        let n_i = n as i32;
+        let threads = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_relu2_gate);
+        launch.arg(&mut d_gate).arg(&d_up).arg(&n_i);
+        // SAFETY: signature `(float* gate, const float* up, int n)`; pushed in that
+        // order; both buffers are length `n`, one thread per element guarded by `i < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch relu2_gate", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_gate, gate)
+            .map_err(|e| driver_err("relu2_gate dtoh", &e))?;
         Ok(())
     }
 
@@ -3080,6 +3138,45 @@ mod tests {
             for (v, (&g, &hh)) in got.iter().zip(&want).enumerate() {
                 assert_eq!(g.to_bits(), hh.to_bits(), "lm_head mismatch [{v}]: got {g} want {hh}");
             }
+        }
+    }
+
+    /// `relu2_gate` must reproduce the host BitNet squared-ReLU FFN gate `r =
+    /// g.max(0); g = r*r*u` **bit-for-bit**. The input deliberately straddles zero so
+    /// the `max(.,0)` clamp (and the gate's hard zero on negatives) is exercised.
+    #[test]
+    fn relu2_gate_bit_matches_host() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping relu2_gate bit-match: no device ({e})");
+                return;
+            }
+        };
+        let mut s = 0x51A7_3C9E_2D6B_8F40u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            // Range [-4, 4): ~half the gate values negative, hitting the ReLU clamp.
+            ((s >> 11) as f32 / (1u64 << 53) as f32) * 8.0 - 4.0
+        };
+        let n = 6912usize; // BitNet 2B4T n_ff
+        let gate0: Vec<f32> = (0..n).map(|_| next()).collect();
+        let up: Vec<f32> = (0..n).map(|_| next()).collect();
+        // Host reference: identical to layers::mlp's gating loop.
+        let want: Vec<f32> = gate0
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| {
+                let r = g.max(0.0);
+                r * r * u
+            })
+            .collect();
+        let mut got = gate0.clone();
+        backend.relu2_gate(&mut got, &up).expect("relu2_gate");
+        for (i, (&g, &h)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.to_bits(), h.to_bits(), "relu2_gate mismatch [{i}]: got {g} want {h}");
         }
     }
 
