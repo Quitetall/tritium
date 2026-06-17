@@ -13,8 +13,9 @@
 //!    [`PlaneStack`]. Greedy AbsMean per plane; `T = 1` is exactly flat BitNet
 //!    b1.58. Reconstruction + error: [`PlaneStack::reconstruct`], [`recon_error`].
 //! 2. Mode codebook — *(later v0.40 step)*.
-//! 3. Sensitivity rank + **4. rate-distortion plane allocation** — *(next: the
-//!    water-filling allocator over per-group error curves).*
+//! 3. Sensitivity rank + **4. rate-distortion plane allocation** —
+//!    [`allocate`], [`GroupInput`], [`AllocConfig`], [`Allocation`]. Greedy
+//!    water-filling over per-group error curves under a bits-per-weight budget.
 //! 5. Sparse residual planes / 6. heal — *(later; GPU + train).*
 //!
 //! The format sidecar (`tritium-format`) and the multi-plane accumulate kernel
@@ -30,6 +31,8 @@
 //! GPU gates (multi-plane accumulate matches dequant; sparse == dense) and the
 //! model-level accuracy-vs-bpw curve gate are validated in their own lanes.
 
+mod allocate;
 mod plane;
 
+pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
 pub use plane::{Plane, PlaneStack, absmean_ternary, recon_error, residual_expand};
