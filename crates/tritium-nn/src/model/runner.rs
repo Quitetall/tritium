@@ -284,6 +284,12 @@ impl ModelRunner {
     /// prefill is processed as a sequential causal decode — numerically identical to
     /// the batched host prefill, since each token's reductions are unchanged). Only
     /// the last token's logits are returned, matching [`forward`](Self::forward).
+    ///
+    /// Cost note: sequential prefill is O(seq) device forwards rather than one batched
+    /// pass, so a long prompt prefills more slowly than the host's batched GEMMs. v0.3.1
+    /// targets the *decode* gate (where this path is the win); a batched device prefill
+    /// is the deferred IMMA prefill work (ADR 0013, follow-up). For the short prompts the
+    /// decode gate uses this is immaterial.
     #[cfg(feature = "cuda")]
     fn forward_resident(
         &mut self,
