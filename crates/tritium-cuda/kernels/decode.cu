@@ -230,4 +230,40 @@ __global__ void gqa_attention_decode_f32(const float* __restrict__ q,    // [n_h
   }
 }
 
+// act_quant_tiled_f32 — bit-match of tritium_nn::ops::quantize_activation_int8 for
+// ONE row (M=1 decode), producing the int8 values kept as f32 that the tiled add-only
+// GEMM consumes, plus the per-token dequant scale. Per the host (Qp=127):
+//   gamma = max_k |act[k]|
+//   gamma==0 → q_out = 0, *act_scale = 0
+//   else  s = 127/gamma ; q_out[k] = clamp(round_ties_even(act[k]*s), -128, 127)
+//         *act_scale = gamma/127
+// `rintf` is IEEE round-to-nearest-even (== Rust f32::round_ties_even). Thread 0 does
+// the sequential absmax (bit-match); the per-element quant is parallel + order-free.
+__global__ void act_quant_tiled_f32(const float* __restrict__ act, const int k,
+                                    float* __restrict__ q_out,
+                                    float* __restrict__ act_scale) {
+  __shared__ float s_gamma;
+  if (threadIdx.x == 0) {
+    float gamma = 0.0f;
+    for (int i = 0; i < k; ++i) {
+      const float a = fabsf(act[i]);
+      if (a > gamma) gamma = a;  // host: sequential absmax via `a > gamma`
+    }
+    s_gamma = gamma;
+    *act_scale = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);  // host: gamma/127
+  }
+  __syncthreads();
+
+  const float gamma = s_gamma;
+  if (gamma == 0.0f) {
+    for (int i = threadIdx.x; i < k; i += blockDim.x) q_out[i] = 0.0f;
+    return;
+  }
+  const float s = __fdiv_rn(127.0f, gamma);  // host: 127/gamma
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float scaled = rintf(__fmul_rn(act[i], s));        // host: (act*s).round_ties_even()
+    q_out[i] = fminf(fmaxf(scaled, -128.0f), 127.0f);        // host: .clamp(-128, 127)
+  }
+}
+
 }  // extern "C"

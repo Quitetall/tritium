@@ -79,6 +79,9 @@ const KERNEL_NAME_LM_HEAD: &str = "lm_head_f32";
 /// GQA attention, M=1 decode (v0.3.1) — matches `ops::gqa_attention`; dots/weighted
 /// sums bit-match, the inline softmax `expf` differs ≤3 ULP.
 const KERNEL_NAME_ATTN: &str = "gqa_attention_decode_f32";
+/// On-device int8 activation quant for the tiled (TQ2_0) decode GEMM (v0.3.1) —
+/// bit-matches `ops::quantize_activation_int8` (int8 kept as f32 + per-token scale).
+const KERNEL_NAME_ACT_QUANT_TILED: &str = "act_quant_tiled_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -210,6 +213,9 @@ pub struct CudaBackend {
     /// The resolved `gqa_attention_decode_f32` kernel (M=1 decode attention).
     #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
     func_attn: CudaFunction,
+    /// The resolved `act_quant_tiled_f32` kernel (on-device A8 quant for the tiled GEMM).
+    #[allow(dead_code)] // wired into the device GEMM next; W1-in-progress.
+    func_act_quant_tiled: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -296,6 +302,9 @@ impl CudaBackend {
         let func_attn = decode_module
             .load_function(KERNEL_NAME_ATTN)
             .map_err(|e| driver_err("resolve attention kernel", &e))?;
+        let func_act_quant_tiled = decode_module
+            .load_function(KERNEL_NAME_ACT_QUANT_TILED)
+            .map_err(|e| driver_err("resolve act_quant_tiled kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -324,6 +333,7 @@ impl CudaBackend {
             func_embed,
             func_lm_head,
             func_attn,
+            func_act_quant_tiled,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -812,6 +822,68 @@ impl CudaBackend {
             .memcpy_dtoh(&d_out, out)
             .map_err(|e| driver_err("attn dtoh", &e))?;
         Ok(())
+    }
+
+    /// On-device int8 activation quant for the tiled GEMM (one row), on host slices,
+    /// **bit-matching** `tritium_nn::ops::quantize_activation_int8`. Writes the
+    /// int8-as-f32 values to `q_out` and returns the per-token dequant scale. A
+    /// building block for the device-resident decode GEMM.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] if `q_out.len() != act.len()`; device errors.
+    #[allow(dead_code)] // wired into the device GEMM next; W1-in-progress.
+    pub(crate) fn act_quant_tiled(
+        &self,
+        act: &[f32],
+        q_out: &mut [f32],
+    ) -> Result<f32, BackendError> {
+        let k = act.len();
+        if q_out.len() != k {
+            return Err(BackendError::ShapeMismatch {
+                expected: k,
+                got: q_out.len(),
+            });
+        }
+        if k == 0 {
+            return Ok(0.0);
+        }
+        let d_act = self
+            .stream
+            .clone_htod(act)
+            .map_err(|e| driver_err("act_quant htod", &e))?;
+        let mut d_q = self
+            .stream
+            .alloc_zeros::<f32>(k)
+            .map_err(|e| driver_err("act_quant alloc q", &e))?;
+        let mut d_scale = self
+            .stream
+            .alloc_zeros::<f32>(1)
+            .map_err(|e| driver_err("act_quant alloc scale", &e))?;
+        let k_i = k as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_act_quant_tiled);
+        launch.arg(&d_act).arg(&k_i).arg(&mut d_q).arg(&mut d_scale);
+        // SAFETY: kernel signature `(const float* act, int k, float* q_out, float*
+        // act_scale)`; args pushed in that order/type. `act`/`q_out` are length `k`,
+        // `act_scale` length 1; a single block, loops bounded by `k`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch act_quant_tiled", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_q, q_out)
+            .map_err(|e| driver_err("act_quant dtoh q", &e))?;
+        let mut scale = [0.0f32; 1];
+        self.stream
+            .memcpy_dtoh(&d_scale, &mut scale)
+            .map_err(|e| driver_err("act_quant dtoh scale", &e))?;
+        Ok(scale[0])
     }
 
     /// Pick the add-only kernel for this problem shape. The tiled (decode) kernel
@@ -2961,5 +3033,60 @@ mod tests {
             max_abs < 1e-3,
             "device attention absolute error too large (likely a real bug): max_abs={max_abs:.3e}"
         );
+    }
+
+    /// `act_quant_tiled` must reproduce `ops::quantize_activation_int8` **bit-for-bit**
+    /// (the int8-as-f32 values and the per-token scale), including the zero-row case.
+    #[test]
+    fn act_quant_tiled_bit_matches_host() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping act_quant bit-match: no device ({e})");
+                return;
+            }
+        };
+        fn host_quant(act: &[f32]) -> (Vec<f32>, f32) {
+            let mut gamma = 0.0f32;
+            for &v in act {
+                let a = v.abs();
+                if a > gamma {
+                    gamma = a;
+                }
+            }
+            if gamma == 0.0 {
+                return (vec![0.0; act.len()], 0.0);
+            }
+            let s = 127.0f32 / gamma;
+            (
+                act.iter()
+                    .map(|&v| (v * s).round_ties_even().clamp(-128.0, 127.0))
+                    .collect(),
+                gamma / 127.0,
+            )
+        }
+        for &k in &[2560usize, 6912, 17, 1] {
+            let mut s = 0x9999_AAAA_BBBB_CCCCu64 ^ k as u64;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f32 / (1u64 << 53) as f32) * 8.0 - 4.0
+            };
+            let act: Vec<f32> = (0..k).map(|_| next()).collect();
+            let (q_want, scale_want) = host_quant(&act);
+            let mut q_got = vec![f32::NAN; k];
+            let scale_got = backend.act_quant_tiled(&act, &mut q_got).expect("act_quant");
+            assert_eq!(scale_got.to_bits(), scale_want.to_bits(), "scale mismatch k={k}");
+            for (i, (&g, &h)) in q_got.iter().zip(&q_want).enumerate() {
+                assert_eq!(g.to_bits(), h.to_bits(), "act_quant q mismatch k={k} i={i}");
+            }
+        }
+        // Zero row → zeros + zero scale.
+        let act = vec![0.0f32; 64];
+        let mut q = vec![1.0f32; 64];
+        let sc = backend.act_quant_tiled(&act, &mut q).expect("act_quant zero");
+        assert_eq!(sc, 0.0);
+        assert!(q.iter().all(|&x| x == 0.0), "zero row must quantize to zeros");
     }
 }
