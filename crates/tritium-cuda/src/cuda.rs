@@ -1242,6 +1242,8 @@ impl CudaBackend {
                 gate: ResidentLinear::build(s, &ls.gate)?,
                 up: ResidentLinear::build(s, &ls.up)?,
                 down: ResidentLinear::build(s, &ls.down)?,
+                qkv: ResidentLinear::build_fused(s, &[&ls.q, &ls.k, &ls.v])?,
+                gateup: ResidentLinear::build_fused(s, &[&ls.gate, &ls.up])?,
             });
             kv_k.push(alloc(max_ctx * kv_width, "decode kv_k alloc")?);
             kv_v.push(alloc(max_ctx * kv_width, "decode kv_v alloc")?);
@@ -1277,6 +1279,8 @@ impl CudaBackend {
             d_x: alloc(n_embd, "decode d_x")?,
             d_normed: alloc(n_embd, "decode d_normed")?,
             d_q: alloc(q_width, "decode d_q")?,
+            d_qkv: alloc(q_width + 2 * kv_width, "decode d_qkv")?,
+            d_gateup: alloc(2 * n_ff, "decode d_gateup")?,
             d_knew: alloc(kv_width, "decode d_knew")?,
             d_vnew: alloc(kv_width, "decode d_vnew")?,
             d_attn: alloc(q_width, "decode d_attn")?,
@@ -2369,6 +2373,63 @@ impl ResidentLinear {
             row_bytes,
         })
     }
+
+    /// Build a **fused** projection by concatenating `parts` along the output dim `N`
+    /// (e.g. q‖k‖v, gate‖up). The parts must share `K` + `row_bytes` (they all project
+    /// the same input). The packed weight rows are copied (dtod) into one arena and the
+    /// scales concatenated, so one tiled GEMM produces all parts' outputs in one launch
+    /// (fewer graph nodes, better M=1 occupancy). Bit-identical: each output row's
+    /// warp-reduce is unchanged, only the grouping into one kernel differs. Owns a fresh
+    /// arena (not the shared prefill weight), so `+Σ row_bytes·n` VRAM.
+    fn build_fused(stream: &Arc<CudaStream>, parts: &[&DecodeLinearSpec]) -> Result<Self, BackendError> {
+        let bufs: Vec<&CudaBuffer> = parts
+            .iter()
+            .map(|p| {
+                p.weights
+                    .as_any()
+                    .downcast_ref::<CudaBuffer>()
+                    .ok_or_else(|| BackendError::InvalidInput("fused decode weight not a CudaBuffer".into()))
+            })
+            .collect::<Result<_, _>>()?;
+        let (_, k) = bufs[0].dims();
+        let row_bytes = bufs[0]
+            .tq2_0_row_bytes()
+            .ok_or(BackendError::UnsupportedFormat(TernaryFormat::I2sInt8))?;
+        let mut total_n = 0usize;
+        for (b, p) in bufs.iter().zip(parts) {
+            let (n, bk) = b.dims();
+            if bk != k || b.tq2_0_row_bytes() != Some(row_bytes) || p.scales.len() != n {
+                return Err(BackendError::InvalidInput("fused decode parts disagree on K/rb/scales".into()));
+            }
+            total_n += n;
+        }
+        let total_bytes = total_n * row_bytes;
+        let mut device = stream
+            .alloc_zeros::<u8>(total_bytes)
+            .map_err(|e| driver_err("fused decode weight alloc", &e))?;
+        let mut scales: Vec<f32> = Vec::with_capacity(total_n);
+        let mut off = 0usize;
+        for (b, p) in bufs.iter().zip(parts) {
+            let bytes = b.dims().0 * row_bytes;
+            let src = b.device_arc();
+            let mut dst = device.slice_mut(off..off + bytes);
+            stream
+                .memcpy_dtod(src.as_ref(), &mut dst)
+                .map_err(|e| driver_err("fused decode weight dtod", &e))?;
+            scales.extend_from_slice(p.scales);
+            off += bytes;
+        }
+        let d_scales = stream
+            .clone_htod(&scales)
+            .map_err(|e| driver_err("fused decode scales htod", &e))?;
+        Ok(Self {
+            device: Arc::new(device),
+            scales: d_scales,
+            n: total_n,
+            k,
+            row_bytes,
+        })
+    }
 }
 
 /// One resident transformer block: dense norms + the 7 projections (no KV — the KV
@@ -2386,6 +2447,11 @@ struct ResidentLayer {
     gate: ResidentLinear,
     up: ResidentLinear,
     down: ResidentLinear,
+    /// Fused q‖k‖v projection (one GEMM for all three) — the graph path uses this; the
+    /// eager `layer` keeps the separate q/k/v. Output `[q_width + 2·kv_width]`.
+    qkv: ResidentLinear,
+    /// Fused gate‖up projection. Output `[2·n_ff]`.
+    gateup: ResidentLinear,
 }
 
 /// A fully device-resident BitNet decoder. One [`step`](CudaDecodeModel::step) is a
@@ -2421,6 +2487,10 @@ pub struct CudaDecodeModel {
     d_x: CudaSlice<f32>,
     d_normed: CudaSlice<f32>,
     d_q: CudaSlice<f32>,
+    /// Fused q‖k‖v GEMM output `[q_width + 2·kv_width]` (q/k/v are offset slices of it).
+    d_qkv: CudaSlice<f32>,
+    /// Fused gate‖up GEMM output `[2·n_ff]`.
+    d_gateup: CudaSlice<f32>,
     d_knew: CudaSlice<f32>,
     d_vnew: CudaSlice<f32>,
     d_attn: CudaSlice<f32>,
@@ -2851,13 +2921,10 @@ impl CudaDecodeModel {
                 attn_sub_norm: l.attn_sub_norm.as_ref().map(|b| dptr(b, s)),
                 ffn_norm: dptr(&l.ffn_norm, s),
                 ffn_sub_norm: l.ffn_sub_norm.as_ref().map(|b| dptr(b, s)),
-                q: lin(&l.q),
-                k: lin(&l.k),
-                v: lin(&l.v),
                 o: lin(&l.o),
-                gate: lin(&l.gate),
-                up: lin(&l.up),
                 down: lin(&l.down),
+                qkv: lin(&l.qkv),
+                gateup: lin(&l.gateup),
                 kv_k: dptr(&self.kv_k[li], s),
                 kv_v: dptr(&self.kv_v[li], s),
             })
@@ -2865,14 +2932,11 @@ impl CudaDecodeModel {
         let p = GraphPtrs {
             d_x: dptr(&self.d_x, s),
             d_normed: dptr(&self.d_normed, s),
-            d_q: dptr(&self.d_q, s),
-            d_knew: dptr(&self.d_knew, s),
-            d_vnew: dptr(&self.d_vnew, s),
+            d_qkv: dptr(&self.d_qkv, s),
+            d_gateup: dptr(&self.d_gateup, s),
             d_attn: dptr(&self.d_attn, s),
             d_attn_sn: dptr(&self.d_attn_sn, s),
             d_proj_out: dptr(&self.d_proj_out, s),
-            d_gate: dptr(&self.d_gate, s),
-            d_up: dptr(&self.d_up, s),
             d_gate_sn: dptr(&self.d_gate_sn, s),
             d_scores: dptr(&self.d_scores, s),
             d_logits: dptr(&self.d_logits, s),
@@ -2915,37 +2979,45 @@ impl CudaDecodeModel {
         let (n_embd, q_width, kv_width) = (self.n_embd, self.q_width, self.kv_width);
         let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
 
-        // pre-norm attention
+        // pre-norm attention. q/k/v are FUSED into one GEMM over `d_normed`; q/k/v are then
+        // offset slices of the `[q_width + 2·kv_width]` output `d_qkv` (f32 → 4 bytes/elt).
         self.g_rmsnorm(p.d_x, l.attn_norm, n_embd, p.d_normed)?;
-        self.g_gemm(p.d_normed, &l.q, p.d_qact, p.d_act_scale, p.d_q)?;
-        self.g_gemm(p.d_normed, &l.k, p.d_qact, p.d_act_scale, p.d_knew)?;
-        self.g_gemm(p.d_normed, &l.v, p.d_qact, p.d_act_scale, p.d_vnew)?;
-        self.g_rope(p.d_q, p.d_cos, p.d_sin, p.d_ctrl, n_head, head_dim)?;
-        self.g_rope(p.d_knew, p.d_cos, p.d_sin, p.d_ctrl, n_head_kv, head_dim)?;
-        self.g_kv_append(p.d_knew, l.kv_k, p.d_ctrl, kv_width)?;
-        self.g_kv_append(p.d_vnew, l.kv_v, p.d_ctrl, kv_width)?;
-        self.g_attn(p.d_q, l.kv_k, l.kv_v, p.d_attn, p.d_scores, p.d_ctrl)?;
+        self.g_quant(p.d_normed, n_embd, p.d_qact, p.d_act_scale)?;
+        self.g_matmul(&l.qkv, p.d_qact, p.d_act_scale, p.d_qkv)?;
+        let q_ptr = p.d_qkv;
+        let knew_ptr = p.d_qkv + (q_width * 4) as sys::CUdeviceptr;
+        let vnew_ptr = p.d_qkv + ((q_width + kv_width) * 4) as sys::CUdeviceptr;
+        self.g_rope(q_ptr, p.d_cos, p.d_sin, p.d_ctrl, n_head, head_dim)?;
+        self.g_rope(knew_ptr, p.d_cos, p.d_sin, p.d_ctrl, n_head_kv, head_dim)?;
+        self.g_kv_append(knew_ptr, l.kv_k, p.d_ctrl, kv_width)?;
+        self.g_kv_append(vnew_ptr, l.kv_v, p.d_ctrl, kv_width)?;
+        self.g_attn(q_ptr, l.kv_k, l.kv_v, p.d_attn, p.d_scores, p.d_ctrl)?;
         let attn_in = if let Some(sn) = l.attn_sub_norm {
             self.g_rmsnorm(p.d_attn, sn, q_width, p.d_attn_sn)?;
             p.d_attn_sn
         } else {
             p.d_attn
         };
-        self.g_gemm(attn_in, &l.o, p.d_qact, p.d_act_scale, p.d_proj_out)?;
+        self.g_quant(attn_in, q_width, p.d_qact, p.d_act_scale)?;
+        self.g_matmul(&l.o, p.d_qact, p.d_act_scale, p.d_proj_out)?;
         self.g_residual(p.d_x, p.d_proj_out, n_embd)?;
 
-        // pre-norm ReLU² MLP
+        // pre-norm ReLU² MLP. gate/up are FUSED; gate/up are halves of `d_gateup` [2·n_ff].
+        let n_ff = self.n_ff;
         self.g_rmsnorm(p.d_x, l.ffn_norm, n_embd, p.d_normed)?;
-        self.g_gemm(p.d_normed, &l.gate, p.d_qact, p.d_act_scale, p.d_gate)?;
-        self.g_gemm(p.d_normed, &l.up, p.d_qact, p.d_act_scale, p.d_up)?;
-        self.g_relu2(p.d_gate, p.d_up, self.n_ff)?;
+        self.g_quant(p.d_normed, n_embd, p.d_qact, p.d_act_scale)?;
+        self.g_matmul(&l.gateup, p.d_qact, p.d_act_scale, p.d_gateup)?;
+        let gate_ptr = p.d_gateup;
+        let up_ptr = p.d_gateup + (n_ff * 4) as sys::CUdeviceptr;
+        self.g_relu2(gate_ptr, up_ptr, n_ff)?; // gate = relu(gate)² ⊙ up, in place
         let down_in = if let Some(sn) = l.ffn_sub_norm {
-            self.g_rmsnorm(p.d_gate, sn, self.n_ff, p.d_gate_sn)?;
+            self.g_rmsnorm(gate_ptr, sn, n_ff, p.d_gate_sn)?;
             p.d_gate_sn
         } else {
-            p.d_gate
+            gate_ptr
         };
-        self.g_gemm(down_in, &l.down, p.d_qact, p.d_act_scale, p.d_proj_out)?;
+        self.g_quant(down_in, n_ff, p.d_qact, p.d_act_scale)?;
+        self.g_matmul(&l.down, p.d_qact, p.d_act_scale, p.d_proj_out)?;
         self.g_residual(p.d_x, p.d_proj_out, n_embd)?;
         Ok(())
     }
@@ -2962,22 +3034,26 @@ impl CudaDecodeModel {
         raw_launch(self.raw().rmsnorm, (1, 1, 1), (256, 1, 1), smem, self.cap_stream.cu_stream(), &mut params)
     }
 
-    fn g_gemm(&self, d_in: sys::CUdeviceptr, lin: &LinPtrs, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, d_out: sys::CUdeviceptr) -> Result<(), BackendError> {
+    /// On-device A8 quant of an activation row (`k`-wide) → `d_qact` + `d_act_scale`. Split
+    /// out from the GEMM so projections sharing an input (q/k/v and gate/up both read
+    /// `d_normed`) quantize it **once** instead of per-GEMM — fewer graph nodes.
+    fn g_quant(&self, d_in: sys::CUdeviceptr, k: usize, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr) -> Result<(), BackendError> {
+        let k_i = k as i32;
+        let mut params = [pp(&d_in), pp(&k_i), pp(&d_qact), pp(&d_act_scale)];
+        raw_launch(self.raw().act_quant, (1, 1, 1), (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    /// Tiled add-only GEMM + the per-token scale fold, consuming a pre-quantized `d_qact`
+    /// (+ its `d_act_scale`). `g_quant` must have run on the matching input first.
+    fn g_matmul(&self, lin: &LinPtrs, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, d_out: sys::CUdeviceptr) -> Result<(), BackendError> {
         let cs = self.cap_stream.cu_stream();
         let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
-        // 1. act quant
-        {
-            let mut params = [pp(&d_in), pp(&k_i), pp(&d_qact), pp(&d_act_scale)];
-            raw_launch(self.raw().act_quant, (1, 1, 1), (256, 1, 1), 0, cs, &mut params)?;
-        }
-        // 2. tiled GEMM
         {
             let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
             let smem = (lin.k * 4) as u32;
             let mut params = [pp(&d_qact), pp(&lin.w), pp(&lin.sc), pp(&d_out), pp(&m_i), pp(&n_i), pp(&k_i), pp(&rb_i)];
             raw_launch(self.raw().tiled, grid, (WARPS_PER_BLOCK * 32, 1, 1), smem, cs, &mut params)?;
         }
-        // 3. scale fold
         {
             let grid = ((lin.n as u32).div_ceil(256), 1, 1);
             let mut params = [pp(&d_out), pp(&d_act_scale), pp(&n_i)];
@@ -3097,13 +3173,10 @@ struct LayerPtrs {
     attn_sub_norm: Option<sys::CUdeviceptr>,
     ffn_norm: sys::CUdeviceptr,
     ffn_sub_norm: Option<sys::CUdeviceptr>,
-    q: LinPtrs,
-    k: LinPtrs,
-    v: LinPtrs,
     o: LinPtrs,
-    gate: LinPtrs,
-    up: LinPtrs,
     down: LinPtrs,
+    qkv: LinPtrs,
+    gateup: LinPtrs,
     kv_k: sys::CUdeviceptr,
     kv_v: sys::CUdeviceptr,
 }
@@ -3112,14 +3185,11 @@ struct LayerPtrs {
 struct GraphPtrs {
     d_x: sys::CUdeviceptr,
     d_normed: sys::CUdeviceptr,
-    d_q: sys::CUdeviceptr,
-    d_knew: sys::CUdeviceptr,
-    d_vnew: sys::CUdeviceptr,
+    d_qkv: sys::CUdeviceptr,
+    d_gateup: sys::CUdeviceptr,
     d_attn: sys::CUdeviceptr,
     d_attn_sn: sys::CUdeviceptr,
     d_proj_out: sys::CUdeviceptr,
-    d_gate: sys::CUdeviceptr,
-    d_up: sys::CUdeviceptr,
     d_gate_sn: sys::CUdeviceptr,
     d_scores: sys::CUdeviceptr,
     d_logits: sys::CUdeviceptr,
