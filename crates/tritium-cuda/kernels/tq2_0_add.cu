@@ -219,11 +219,10 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32(
         const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
         const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
         const float a = s_act[ki];
-        if (code == 2u) {
-            acc += a;
-        } else if (code == 0u) {
-            acc -= a;
-        }
+        // Branchless decode: trit = code - 1 ∈ {-1, 0, +1} for the valid codes {0,1,2}, so
+        // `acc += a * trit` equals the add/sub/skip branch bit-for-bit (a*1=a, a*-1=-a,
+        // a*0=0 → a no-op add) — but with no warp divergence on the per-lane code.
+        acc += a * (float)((int)code - 1);
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
