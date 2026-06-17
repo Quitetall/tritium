@@ -24,6 +24,11 @@ use crate::{PlaneStack, recon_error, residual_expand};
 /// this `1.585`; we carry full precision so the budget accounting is exact.
 pub const TRIT_BITS: f64 = 1.584_962_500_721_156_2; // log2(3)
 
+/// Relative tolerance on the base-feasibility check, absorbing the float-rounding
+/// gap between a per-group `base` sum and a one-multiply bpw-derived budget so the
+/// exact floor (`budget == base`) stays feasible. Additions never use this slack.
+const BUDGET_FEASIBILITY_SLACK_REL: f64 = 1e-9;
+
 /// One weight group presented to the allocator.
 #[derive(Clone, Copy, Debug)]
 pub struct GroupInput<'a> {
@@ -186,7 +191,12 @@ pub fn allocate(groups: &[GroupInput], cfg: &AllocConfig) -> Result<Allocation, 
         .collect();
 
     let base_bits: f64 = bits_per_plane.iter().sum::<f64>() * cfg.t_min as f64;
-    if base_bits > cfg.budget_bits {
+    // The exact floor (budget == base) must stay feasible: `base` sums per group
+    // while a bpw-derived budget is one multiply, so they can disagree by float
+    // rounding. Tolerate that here; plane *additions* below stay strict, so the
+    // budget ceiling itself is never breached.
+    let feasibility_slack = BUDGET_FEASIBILITY_SLACK_REL * base_bits.max(1.0);
+    if base_bits > cfg.budget_bits + feasibility_slack {
         return Err(AllocError::BudgetTooSmall {
             base_bits,
             budget_bits: cfg.budget_bits,

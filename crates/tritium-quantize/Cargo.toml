@@ -10,10 +10,12 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# Offline (host-side) quantizer: turns fp weights into SALT ternary plane stacks.
-# Depends only on the foundation crate (types + the AbsMean scaling contract).
+# Offline (host-side) quantizer: turns fp weights into SALT ternary plane stacks
+# and packs them through the TQ2_0 residual sidecar (tritium-format).
 [dependencies]
 tritium-core = { workspace = true }
+tritium-format = { workspace = true }
+half = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -885,8 +885,10 @@ dependencies = [
 name = "tritium-quantize"
 version = "0.3.7"
 dependencies = [
+ "half",
  "proptest",
  "tritium-core",
+ "tritium-format",
 ]
 
 [[package]]

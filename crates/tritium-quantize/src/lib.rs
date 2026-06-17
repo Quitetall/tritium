@@ -33,6 +33,8 @@
 
 mod allocate;
 mod plane;
+mod quantize;
 
 pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
 pub use plane::{Plane, PlaneStack, absmean_ternary, recon_error, residual_expand};
+pub use quantize::{QuantConfig, QuantError, QuantizedTensor, Sensitivity, quantize_tensor};
