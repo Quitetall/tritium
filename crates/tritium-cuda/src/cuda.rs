@@ -1275,6 +1275,14 @@ impl CudaBackend {
             f_quant: f(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
             f_tiled: f(&self._module, KERNEL_NAME_TILED)?,
             f_scale: f(dm, KERNEL_NAME_SCALE_MUL)?,
+            f_rmsnorm_batch: f(dm, KERNEL_NAME_RMSNORM_BATCH)?,
+            f_embed_batch: f(dm, KERNEL_NAME_EMBED_BATCH)?,
+            f_rope_batch: f(dm, KERNEL_NAME_ROPE_BATCH)?,
+            f_quant_batch: f(dm, KERNEL_NAME_ACT_QUANT_BATCH)?,
+            f_scale_batch: f(dm, KERNEL_NAME_SCALE_BATCH)?,
+            f_kv_append_batch: f(dm, KERNEL_NAME_KV_APPEND_BATCH)?,
+            f_attn_batch: f(dm, KERNEL_NAME_ATTN_BATCH)?,
+            f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             d_token_embd,
             d_token_embd_f16,
             d_output_norm,
@@ -2478,6 +2486,15 @@ pub struct CudaDecodeModel {
     f_quant: CudaFunction,
     f_tiled: CudaFunction,
     f_scale: CudaFunction,
+    // v0.3.6 batched (M>1) prefill kernels.
+    f_rmsnorm_batch: CudaFunction,
+    f_embed_batch: CudaFunction,
+    f_rope_batch: CudaFunction,
+    f_quant_batch: CudaFunction,
+    f_scale_batch: CudaFunction,
+    f_kv_append_batch: CudaFunction,
+    f_attn_batch: CudaFunction,
+    f_lm_head_f16: CudaFunction,
     // Dense device weights (uploaded once).
     d_token_embd: CudaSlice<f32>,
     /// f16 copy of `token_embd` (the GGUF's native precision) for the graph LM head — it
@@ -2892,6 +2909,259 @@ impl CudaDecodeModel {
             .map_err(|e| driver_err("decode graph logits dtoh", &e))?;
         self.cache_len += 1;
         Ok(logits)
+    }
+
+    /// **Batched (M>1) prefill** — process all `tokens` (`positions[r]` absolute) in ONE
+    /// device-resident M=P forward, seeding the KV cache and advancing the watermark by P,
+    /// then return the last token's logits. Replaces the O(P) sequential `step_graph` loop
+    /// (the TTFT cliff). Bit-identical to that loop per row (the batch kernels share the
+    /// M=1 reduction order). Eager (safe) launches — prefill is one-shot, not replayed, so
+    /// it needs no graph. `positions[0]` must equal [`cache_len`](Self::cache_len) and the
+    /// positions must be contiguous.
+    ///
+    /// # Errors
+    /// [`BackendError`] on capacity overflow, a `pos` guard, an out-of-range token, or a
+    /// device failure.
+    pub fn prefill(&mut self, tokens: &[u32], positions: &[usize]) -> Result<Vec<f32>, BackendError> {
+        let m = tokens.len();
+        if m == 0 || positions.len() != m {
+            return Err(BackendError::InvalidInput("prefill: empty or mismatched positions".into()));
+        }
+        if positions[0] != self.cache_len {
+            return Err(BackendError::InvalidInput(format!(
+                "prefill pos[0]={} must equal cache_len={}",
+                positions[0], self.cache_len
+            )));
+        }
+        if self.cache_len + m > self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "prefill overflow: cache_len={} + {m} > max_ctx={}",
+                self.cache_len, self.max_ctx
+            )));
+        }
+        for (r, (&t, &p)) in tokens.iter().zip(positions).enumerate() {
+            if t as usize >= self.vocab {
+                return Err(BackendError::InvalidInput(format!("prefill token {t} out of range")));
+            }
+            if p != self.cache_len + r {
+                return Err(BackendError::InvalidInput("prefill positions not contiguous".into()));
+            }
+        }
+
+        let s = &self.stream;
+        let (n_embd, q_width, kv_width, n_ff) = (self.n_embd, self.q_width, self.kv_width, self.n_ff);
+        let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
+        let causal_offset = self.cache_len;
+        let ctx_max = self.cache_len + m;
+
+        // Upload token ids + positions as i32.
+        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let pos_i: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let d_tokens = s.clone_htod(&tok_i).map_err(|e| driver_err("prefill tokens htod", &e))?;
+        let d_positions = s.clone_htod(&pos_i).map_err(|e| driver_err("prefill positions htod", &e))?;
+
+        // M=P scratch (allocated for this prefill; freed on return).
+        let alloc = |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
+        let mut d_x = alloc(m * n_embd, "prefill d_x")?;
+        let mut d_normed = alloc(m * n_embd, "prefill d_normed")?;
+        let mut d_q = alloc(m * q_width, "prefill d_q")?;
+        let mut d_k = alloc(m * kv_width, "prefill d_k")?;
+        let mut d_v = alloc(m * kv_width, "prefill d_v")?;
+        let mut d_attn = alloc(m * q_width, "prefill d_attn")?;
+        let mut d_attn_sn = alloc(m * q_width, "prefill d_attn_sn")?;
+        let mut d_proj = alloc(m * n_embd, "prefill d_proj")?;
+        let mut d_gate = alloc(m * n_ff, "prefill d_gate")?;
+        let mut d_up = alloc(m * n_ff, "prefill d_up")?;
+        let mut d_gate_sn = alloc(m * n_ff, "prefill d_gate_sn")?;
+        let mut d_qact = alloc(m * n_ff, "prefill d_qact")?;
+        let mut d_act_scale = alloc(m, "prefill d_act_scale")?;
+        let mut d_scores = alloc(m * n_head * ctx_max, "prefill d_scores")?;
+        let mut d_logits = alloc(self.vocab, "prefill d_logits")?;
+
+        // Embedding gather (m rows).
+        Self::bl_embed(s, &self.f_embed_batch, &self.d_token_embd, &d_tokens, n_embd, m, &mut d_x)?;
+
+        for li in 0..self.layers.len() {
+            // --- attention ---
+            Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_x, &self.layers[li].attn_norm, self.rms_eps, n_embd, m, &mut d_normed)?;
+            // q/k/v share one quant of d_normed.
+            Self::bl_quant(s, &self.f_quant_batch, &d_normed, n_embd, m, &mut d_qact, &mut d_act_scale)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].q, &d_act_scale, m, &mut d_q)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].k, &d_act_scale, m, &mut d_k)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].v, &d_act_scale, m, &mut d_v)?;
+            Self::bl_rope(s, &self.f_rope_batch, &mut d_q, &self.d_cos, &self.d_sin, &d_positions, n_head, head_dim, m)?;
+            Self::bl_rope(s, &self.f_rope_batch, &mut d_k, &self.d_cos, &self.d_sin, &d_positions, n_head_kv, head_dim, m)?;
+            Self::bl_kv_append(s, &self.f_kv_append_batch, &d_k, &mut self.kv_k[li], causal_offset, kv_width, m)?;
+            Self::bl_kv_append(s, &self.f_kv_append_batch, &d_v, &mut self.kv_v[li], causal_offset, kv_width, m)?;
+            Self::bl_attn(s, &self.f_attn_batch, &d_q, &self.kv_k[li], &self.kv_v[li], &mut d_attn, &mut d_scores, ctx_max, n_head, n_head_kv, head_dim, self.attn_scale, causal_offset, m)?;
+            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
+                Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_attn, sn, self.rms_eps, q_width, m, &mut d_attn_sn)?;
+                &d_attn_sn
+            } else {
+                &d_attn
+            };
+            Self::bl_quant(s, &self.f_quant_batch, attn_in, q_width, m, &mut d_qact, &mut d_act_scale)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].o, &d_act_scale, m, &mut d_proj)?;
+            Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
+
+            // --- ReLU² MLP ---
+            Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_x, &self.layers[li].ffn_norm, self.rms_eps, n_embd, m, &mut d_normed)?;
+            Self::bl_quant(s, &self.f_quant_batch, &d_normed, n_embd, m, &mut d_qact, &mut d_act_scale)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].gate, &d_act_scale, m, &mut d_gate)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].up, &d_act_scale, m, &mut d_up)?;
+            Self::bl_relu2(s, &self.f_relu2, &mut d_gate, &d_up, m * n_ff)?;
+            let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
+                Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_gate, sn, self.rms_eps, n_ff, m, &mut d_gate_sn)?;
+                &d_gate_sn
+            } else {
+                &d_gate
+            };
+            Self::bl_quant(s, &self.f_quant_batch, down_in, n_ff, m, &mut d_qact, &mut d_act_scale)?;
+            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].down, &d_act_scale, m, &mut d_proj)?;
+            Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
+        }
+
+        // Final norm over the LAST token only, then the tied LM head (f16 table).
+        let mut d_last = alloc(n_embd, "prefill d_last")?;
+        {
+            let last_row = d_x.slice((m - 1) * n_embd..m * n_embd);
+            s.memcpy_dtod(&last_row, &mut d_last).map_err(|e| driver_err("prefill last row", &e))?;
+        }
+        let mut d_last_norm = alloc(n_embd, "prefill d_last_norm")?;
+        Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_last, &self.d_output_norm, self.rms_eps, n_embd, 1, &mut d_last_norm)?;
+        Self::bl_lm_head_f16(s, &self.f_lm_head_f16, &d_last_norm, &self.d_token_embd_f16, n_embd, self.vocab, &mut d_logits)?;
+
+        let mut logits = vec![0.0f32; self.vocab];
+        s.memcpy_dtoh(&d_logits, &mut logits).map_err(|e| driver_err("prefill logits dtoh", &e))?;
+        self.cache_len += m;
+        Ok(logits)
+    }
+
+    // --- batched (M>1) prefill launch helpers (safe launches; eager one-shot path) ---
+
+    fn bl_rmsnorm(s: &Arc<CudaStream>, f: &CudaFunction, x: &CudaSlice<f32>, w: &CudaSlice<f32>, eps: f32, n: usize, m: usize, out: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+        let (n_i, m_i) = (n as i32, m as i32);
+        let cfg = LaunchConfig { grid_dim: (m as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (n * 4) as u32 };
+        let mut l = s.launch_builder(f);
+        l.arg(x).arg(w).arg(&eps).arg(&n_i).arg(&m_i).arg(out);
+        // SAFETY: `rmsnorm_batch_f32(const float* x, const float* w, float eps, int n, int m, float* out)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill rmsnorm", &e))?; }
+        Ok(())
+    }
+
+    fn bl_embed(s: &Arc<CudaStream>, f: &CudaFunction, table: &CudaSlice<f32>, tokens: &CudaSlice<i32>, n_embd: usize, m: usize, out: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+        let (ne_i, m_i) = (n_embd as i32, m as i32);
+        let cfg = LaunchConfig { grid_dim: (((m * n_embd) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(table).arg(tokens).arg(&ne_i).arg(&m_i).arg(out);
+        // SAFETY: `embedding_gather_batch_f32(const float* table, const int* tokens, int n_embd, int m, float* out)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill embed", &e))?; }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bl_rope(s: &Arc<CudaStream>, f: &CudaFunction, x: &mut CudaSlice<f32>, cos_t: &CudaSlice<f32>, sin_t: &CudaSlice<f32>, positions: &CudaSlice<i32>, n_head: usize, head_dim: usize, m: usize) -> Result<(), BackendError> {
+        let (nh_i, hd_i, m_i) = (n_head as i32, head_dim as i32, m as i32);
+        let total = (m * n_head * (head_dim / 2)) as u32;
+        let cfg = LaunchConfig { grid_dim: (total.div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(x).arg(cos_t).arg(sin_t).arg(positions).arg(&nh_i).arg(&hd_i).arg(&m_i);
+        // SAFETY: `rope_apply_batch_f32(float* x, const float* cos, const float* sin, const int* pos, int n_head, int head_dim, int m)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill rope", &e))?; }
+        Ok(())
+    }
+
+    fn bl_quant(s: &Arc<CudaStream>, f: &CudaFunction, d_in: &CudaSlice<f32>, k: usize, m: usize, qact: &mut CudaSlice<f32>, scale: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+        let (k_i, m_i) = (k as i32, m as i32);
+        let cfg = LaunchConfig { grid_dim: (m as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(d_in).arg(&k_i).arg(&m_i).arg(qact).arg(scale);
+        // SAFETY: `act_quant_batch_f32(const float* act, int k, int m, float* q, float* scale)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill quant", &e))?; }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bl_matmul(s: &Arc<CudaStream>, f_tiled: &CudaFunction, f_scale: &CudaFunction, qact: &CudaSlice<f32>, lin: &ResidentLinear, scale: &CudaSlice<f32>, m: usize, out: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+        let (n, k, rb) = (lin.n, lin.k, lin.row_bytes);
+        let (m_i, n_i, k_i, rb_i) = (m as i32, n as i32, k as i32, rb as i32);
+        {
+            let cfg = LaunchConfig { grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), m as u32, 1), block_dim: (WARPS_PER_BLOCK * 32, 1, 1), shared_mem_bytes: (k * 4) as u32 };
+            let mut l = s.launch_builder(f_tiled);
+            l.arg(qact).arg(lin.device.as_ref()).arg(&lin.scales).arg(&mut *out).arg(&m_i).arg(&n_i).arg(&k_i).arg(&rb_i);
+            // SAFETY: `tq2_0_add_mpgemm_tiled(act, weights, scales, out, m, n, k, row_bytes)` (grid.y = m).
+            #[allow(unsafe_code)]
+            unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill tiled", &e))?; }
+        }
+        {
+            let cfg = LaunchConfig { grid_dim: (((m * n) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let mut l = s.launch_builder(f_scale);
+            l.arg(&mut *out).arg(scale).arg(&n_i).arg(&m_i);
+            // SAFETY: `scale_mul_batch_f32(float* out, const float* act_scale, int n, int m)`.
+            #[allow(unsafe_code)]
+            unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill scale", &e))?; }
+        }
+        Ok(())
+    }
+
+    fn bl_kv_append(s: &Arc<CudaStream>, f: &CudaFunction, src: &CudaSlice<f32>, kv_base: &mut CudaSlice<f32>, cache_len: usize, kv_width: usize, m: usize) -> Result<(), BackendError> {
+        let (cl_i, kw_i, m_i) = (cache_len as i32, kv_width as i32, m as i32);
+        let cfg = LaunchConfig { grid_dim: (((m * kv_width) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(src).arg(kv_base).arg(&cl_i).arg(&kw_i).arg(&m_i);
+        // SAFETY: `kv_append_batch_f32(const float* src, float* kv_base, int cache_len, int kv_width, int m)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill kv_append", &e))?; }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bl_attn(s: &Arc<CudaStream>, f: &CudaFunction, q: &CudaSlice<f32>, k: &CudaSlice<f32>, v: &CudaSlice<f32>, out: &mut CudaSlice<f32>, scores: &mut CudaSlice<f32>, ctx_max: usize, n_head: usize, n_head_kv: usize, head_dim: usize, scale: f32, causal_offset: usize, m: usize) -> Result<(), BackendError> {
+        let (cm_i, nh_i, nhkv_i, hd_i, co_i, m_i) = (ctx_max as i32, n_head as i32, n_head_kv as i32, head_dim as i32, causal_offset as i32, m as i32);
+        let cfg = LaunchConfig { grid_dim: (((m * n_head) as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(q).arg(k).arg(v).arg(out).arg(scores).arg(&cm_i).arg(&nh_i).arg(&nhkv_i).arg(&hd_i).arg(&scale).arg(&co_i).arg(&m_i);
+        // SAFETY: `gqa_attention_batch_f32(q, k, v, out, scores, ctx_max, n_head, n_head_kv, head_dim, scale, causal_offset, m)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill attn", &e))?; }
+        Ok(())
+    }
+
+    fn bl_residual(s: &Arc<CudaStream>, f: &CudaFunction, x: &mut CudaSlice<f32>, y: &CudaSlice<f32>, total: usize) -> Result<(), BackendError> {
+        let n_i = total as i32;
+        let cfg = LaunchConfig { grid_dim: ((total as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(x).arg(y).arg(&n_i);
+        // SAFETY: `residual_add_f32(float* x, const float* y, int n)` over m·n_embd elements.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill residual", &e))?; }
+        Ok(())
+    }
+
+    fn bl_relu2(s: &Arc<CudaStream>, f: &CudaFunction, gate: &mut CudaSlice<f32>, up: &CudaSlice<f32>, total: usize) -> Result<(), BackendError> {
+        let n_i = total as i32;
+        let cfg = LaunchConfig { grid_dim: ((total as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(gate).arg(up).arg(&n_i);
+        // SAFETY: `relu2_gate_f32(float* gate, const float* up, int n)` over m·n_ff elements.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill relu2", &e))?; }
+        Ok(())
+    }
+
+    fn bl_lm_head_f16(s: &Arc<CudaStream>, f: &CudaFunction, h: &CudaSlice<f32>, embd_f16: &CudaSlice<u16>, n_embd: usize, vocab: usize, logits: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+        let (ne_i, v_i) = (n_embd as i32, vocab as i32);
+        let cfg = LaunchConfig { grid_dim: ((vocab as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut l = s.launch_builder(f);
+        l.arg(h).arg(embd_f16).arg(&ne_i).arg(&v_i).arg(logits);
+        // SAFETY: `lm_head_warp_f16(const float* h, const __half* embd, int n_embd, int vocab, float* logits)`.
+        #[allow(unsafe_code)]
+        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill lm_head", &e))?; }
+        Ok(())
     }
 
     /// Load the raw kernels (once) and record + instantiate the decode graph.

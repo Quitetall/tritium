@@ -303,15 +303,19 @@ impl ModelRunner {
             .resident
             .as_mut()
             .expect("ensure_resident returned true so resident is built");
-        let mut logits = Vec::new();
-        for (&tok, &pos) in tokens.iter().zip(positions.iter()) {
-            // v0.3.2: the CUDA-graph path (captured once, replayed per token). It is
-            // numerically identical to `step` (the `_g` kernels read the control block
-            // but do the same math), and collapses ~930 launches/token into one replay.
-            logits = model
-                .step_graph(tok, pos)
-                .map_err(|e| NnError::Backend(e.to_string()))?;
-        }
+        // v0.3.6: a multi-token forward (the prompt) is a single **batched M=P prefill** —
+        // one device-resident forward over all tokens — instead of P sequential decode
+        // steps (the TTFT cliff). A single token (decode) replays the M=1 CUDA graph. Both
+        // are bit-identical to the per-token loop (the batch kernels share the M=1 order).
+        let logits = if tokens.len() > 1 {
+            model
+                .prefill(tokens, positions)
+                .map_err(|e| NnError::Backend(e.to_string()))?
+        } else {
+            model
+                .step_graph(tokens[0], positions[0])
+                .map_err(|e| NnError::Backend(e.to_string()))?
+        };
         Ok(Some(logits))
     }
 
