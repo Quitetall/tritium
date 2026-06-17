@@ -797,10 +797,13 @@ version = "0.3.7"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
  "serde_json",
  "tritium-cpu",
+ "tritium-cuda",
  "tritium-format",
  "tritium-nn",
+ "tritium-quantize",
  "tritium-runtime",
  "tritium-spec",
 ]

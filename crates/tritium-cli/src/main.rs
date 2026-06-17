@@ -14,14 +14,17 @@
 // linked so its `linkme` self-registration into `tritium_runtime::BACKENDS` is
 // present and `list-backends` can see the `cpu` backend.
 use tritium_cpu as _;
+#[cfg(feature = "cuda")]
+use tritium_cuda as _;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod backends;
 mod generate;
 mod inspect;
+mod report;
 
 /// BitNet 2B4T uses the LLaMA-3 tokenizer, whose end-of-text token is `128001`.
 /// Used as the default stop token for `generate` when `--eos` is not given.
@@ -69,6 +72,115 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_EOS)]
         eos: u32,
     },
+    /// Emit reproducible benchmark/validation reports.
+    Report {
+        /// The report to run.
+        #[command(subcommand)]
+        report: ReportCommand,
+    },
+}
+
+/// Benchmark/validation reports.
+#[derive(Subcommand, Debug)]
+enum ReportCommand {
+    /// Decode-only throughput after prefill.
+    Decode {
+        /// Path to the `.gguf` model file.
+        #[arg(long)]
+        model: PathBuf,
+        /// Path to a JSON file holding the input token IDs.
+        #[arg(long)]
+        tokens: PathBuf,
+        /// Backend name from the runtime registry.
+        #[arg(long, default_value = "cpu")]
+        backend: String,
+        /// Timed single-token decode steps.
+        #[arg(long, default_value_t = 8)]
+        decode_steps: usize,
+        /// Untimed decode warmup steps after prefill.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ReportFormat::Both)]
+        format: ReportFormat,
+    },
+    /// Time to first token / prefill latency.
+    Ttft {
+        /// Path to the `.gguf` model file.
+        #[arg(long)]
+        model: PathBuf,
+        /// Path to a JSON file holding the input token IDs.
+        #[arg(long)]
+        tokens: PathBuf,
+        /// Backend name from the runtime registry.
+        #[arg(long, default_value = "cpu")]
+        backend: String,
+        /// Number of full prefill runs.
+        #[arg(long, default_value_t = 1)]
+        runs: usize,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ReportFormat::Both)]
+        format: ReportFormat,
+    },
+    /// CPU-vs-CUDA greedy parity.
+    Parity {
+        /// Path to the `.gguf` model file.
+        #[arg(long)]
+        model: PathBuf,
+        /// Path to a JSON file holding the input token IDs.
+        #[arg(long)]
+        tokens: PathBuf,
+        /// Maximum generated tokens to compare.
+        #[arg(long, default_value_t = 16)]
+        max_new: usize,
+        /// End-of-sequence token ID.
+        #[arg(long, default_value_t = DEFAULT_EOS)]
+        eos: u32,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ReportFormat::Both)]
+        format: ReportFormat,
+    },
+    /// SALT bpw/error report for a flat JSON fp32 matrix.
+    Salt {
+        /// Path to a JSON array of row-major fp32 weights.
+        #[arg(long)]
+        input: PathBuf,
+        /// Number of matrix rows.
+        #[arg(long)]
+        rows: usize,
+        /// Input features per row.
+        #[arg(long)]
+        k: usize,
+        /// Comma-separated bpw budgets, e.g. `1.585,2.0,2.5`.
+        #[arg(long)]
+        budgets: String,
+        /// Sensitivity proxy.
+        #[arg(long, value_enum, default_value_t = SaltSensitivityArg::Uniform)]
+        sensitivity: SaltSensitivityArg,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ReportFormat::Both)]
+        format: ReportFormat,
+    },
+}
+
+/// Report output format.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum ReportFormat {
+    /// Human-readable table plus JSON.
+    Both,
+    /// JSON only.
+    Json,
+    /// Human-readable table only.
+    Table,
+}
+
+/// SALT report sensitivity proxy.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum SaltSensitivityArg {
+    /// Uniform group weighting.
+    Uniform,
+    /// Weight-energy proxy.
+    Energy,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -86,6 +198,47 @@ fn main() -> anyhow::Result<()> {
             let ids = generate::read_token_file(&tokens)?;
             generate::run(&model, &ids, max_new, greedy, eos)?;
         }
+        Command::Report { report: command } => match command {
+            ReportCommand::Decode {
+                model,
+                tokens,
+                backend,
+                decode_steps,
+                warmup,
+                format,
+            } => {
+                let ids = generate::read_token_file(&tokens)?;
+                report::decode(&model, &ids, &backend, decode_steps, warmup, format)?;
+            }
+            ReportCommand::Ttft {
+                model,
+                tokens,
+                backend,
+                runs,
+                format,
+            } => {
+                let ids = generate::read_token_file(&tokens)?;
+                report::ttft(&model, &ids, &backend, runs, format)?;
+            }
+            ReportCommand::Parity {
+                model,
+                tokens,
+                max_new,
+                eos,
+                format,
+            } => {
+                let ids = generate::read_token_file(&tokens)?;
+                report::parity(&model, &ids, max_new, eos, format)?;
+            }
+            ReportCommand::Salt {
+                input,
+                rows,
+                k,
+                budgets,
+                sensitivity,
+                format,
+            } => report::salt(&input, rows, k, &budgets, sensitivity, format)?,
+        },
     }
     Ok(())
 }

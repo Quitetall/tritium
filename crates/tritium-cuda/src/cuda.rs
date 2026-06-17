@@ -387,6 +387,7 @@ impl CudaBackend {
         let sm_arch = query_sm_arch(&ctx);
         // CUDA driver version for cache invalidation (e.g. 13030 for 13.3).
         let cuda_version = query_driver_version();
+        warn_if_cuda_driver_outside_bound_major(cuda_version);
 
         Ok(Self {
             stream,
@@ -1916,6 +1917,7 @@ const IMMA_DTYPE_TAG: &str = "i2sint8";
 /// so a JIT'd tile and the AOT cubin for the *same* tile go through the identical
 /// driver back-end and produce bit-identical SASS/output (the cold==warm gate).
 const IMMA_JIT_ARCH: &str = "compute_80";
+const CUDARC_BINDING_CUDA_MAJOR: u32 = 13;
 
 /// Read the device compute capability and format it as an `sm_XY` tag for the
 /// autotune cache key. Falls back to the IMMA floor `sm_80` if the query fails (the
@@ -1943,6 +1945,28 @@ fn query_driver_version() -> u32 {
         version as u32
     } else {
         0
+    }
+}
+
+fn cuda_driver_major(version: u32) -> Option<u32> {
+    if version == 0 {
+        None
+    } else {
+        Some(version / 1000)
+    }
+}
+
+fn warn_if_cuda_driver_outside_bound_major(version: u32) {
+    let Some(major) = cuda_driver_major(version) else {
+        eprintln!(
+            "tritium-cuda: warning: could not query CUDA driver version; cudarc is bound to cuda-13020"
+        );
+        return;
+    };
+    if major != CUDARC_BINDING_CUDA_MAJOR {
+        eprintln!(
+            "tritium-cuda: warning: CUDA driver version {version} is outside CUDA {CUDARC_BINDING_CUDA_MAJOR}.x; cudarc is bound to cuda-13020, so driver ABI drift may surface as launch/load errors"
+        );
     }
 }
 
@@ -3810,6 +3834,13 @@ mod tests {
             .collect();
         assert!(!v.is_empty(), "expected some tq2_0 conformance vectors");
         v
+    }
+
+    #[test]
+    fn cuda_driver_major_parses_driver_version() {
+        assert_eq!(cuda_driver_major(13_030), Some(13));
+        assert_eq!(cuda_driver_major(14_000), Some(14));
+        assert_eq!(cuda_driver_major(0), None);
     }
 
     #[test]

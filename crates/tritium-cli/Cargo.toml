@@ -24,10 +24,18 @@ tritium-spec = { workspace = true }
 tritium-cpu = { workspace = true }
 # The `generate` subcommand loads a model and decodes tokens through `ModelRunner`.
 tritium-nn = { workspace = true }
+# Optional CUDA backend linkage for `report --backend cuda` / parity reports.
+tritium-cuda = { workspace = true, optional = true }
+tritium-quantize = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 # `generate` reads input token IDs from a reproducible JSON file.
 serde_json = { workspace = true }
+
+[features]
+default = []
+cuda = ["dep:tritium-cuda", "tritium-nn/cuda"]
 
 [lints]
 workspace = true
