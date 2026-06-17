@@ -7,6 +7,33 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.3.5] — 2026-06-17 — Structural decode: shared quant + fused GEMMs (~142 tok/s)
+
+Decode is occupancy/latency-bound at M=1 (~990 small graph nodes in a serial chain), so
+v0.3.5 cuts the chain — bit-match-preserving as always: **~142 tok/s typical** (range
+~140–148; **5.1× over the v0.3.1 eager path**), ~17% of the roofline. Greedy 256/256 exact,
+perplexity 2.96e-3, cpu↔cuda parity identical all hold.
+
+### Performance
+- **Shared activation quant** — `g_gemm` split into `g_quant` + `g_matmul`, so q/k/v (and
+  gate/up), which all project the same `d_normed`, quantize it once instead of per-GEMM.
+- **Fused q‖k‖v and gate‖up GEMMs** (`ResidentLinear::build_fused`) — concatenate the
+  parts' TQ2_0 weight rows (dtod) + scales into one arena, so a single tiled GEMM emits all
+  parts' outputs (q/k/v are offset slices of `d_qkv`; gate/up halves of `d_gateup`). Three
+  serial GEMMs → one bigger, better-occupancy kernel; **bit-identical** (each output's
+  warp-reduce is unchanged, only the grouping). The bigger win (~+13%); costs ~340 MB of
+  fused-weight arenas (the eager path keeps the Arc-shared separate weights).
+
+### Notes — single-sequence near its M=1 ceiling
+- During decode the 4090 is at ~19% utilization / ~70 W of 450 W (boost, not throttling).
+  A single-token forward can't fill the GPU; per-kernel/fusion tuning is largely exhausted
+  at ~142 tok/s. The next real lever is **batched (M>1) decode** for aggregate throughput
+  (a separate, larger change), not more single-sequence tuning.
+
+### Deferred (→ v0.3.6 / v0.4.0)
+- Batched M>1 decode; batched device prefill; IMMA prefill (#28); live `ncu`. Then v0.4.0
+  (SALT, ADR 0006).
+
 ## [0.3.4] — 2026-06-17 — Decode toward the roofline (~120 tok/s, still 256/256)
 
 Continues the decode optimization, all **bit-match-preserving**: **~120 tok/s typical**
