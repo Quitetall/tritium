@@ -306,3 +306,41 @@ crates.io), perf-regression enforcement, security review.
 - **Acceptance model:** assumed BitNet b1.58 2B4T as the parity oracle — confirm,
   or pin an additional model.
 - **Per-platform CI availability** for Metal/ROCm at 0.70 (hosted runners vs self-hosted).
+
+## Beyond v1.0 — candidate future tracks
+
+### Edge / embedded ternary backend (bare-metal MCU deployment)
+
+A **bare-metal `no_std` backend** for running ternary models on microcontrollers —
+the deploy target for **LamQuant**-quantized models. This is a **distinct backend
+track**, not a variant of the existing CUDA/CPU (std) runtime: there is no
+bare-metal / `no_std` / RISC-V / Cortex-M path today, and one of the two flagship
+targets bypasses a generic CPU runtime entirely.
+
+**Targets.**
+- **RP2350** — Hazard3 core, **RISC-V `RV32IMAC`**, `no_std`, **520 KB SRAM**. A
+  generic-CPU ternary kernel (a `no_std` cousin of `tritium-cpu`'s scalar path),
+  but memory-bound by the tiny SRAM.
+- **STM32N6** — **Cortex-M55 + Helium/MVE** (SIMD) **and a Neural-ART NPU**. The NPU
+  is the fast path, and it does **not** run a generic CPU/CUDA runtime — inference
+  goes through **ST Edge AI / ONNX** (cf. ST tooling issue #243) to ST's Neural-ART
+  compiler. So the N6 path is an **ONNX export + ST Edge AI integration**, not a
+  Tritium kernel — closer to the 0.80 interop track than a backend crate.
+
+**The hard parts (what the current runtime does not cover).**
+- **Ternary weights in flash via XIP** — execute-in-place from flash, weights *never*
+  copied to SRAM (essential at 520 KB). The packing must be XIP-friendly (random
+  access from flash, no decompression pass into RAM). `tritium-format`'s packings
+  assume a RAM-resident buffer.
+- **Activations in SRAM** — the whole working set (residual stream + KV) must fit the
+  SRAM budget; the device-resident-forward thinking (v0.3.1) transfers, but the
+  budget is ~20 000× smaller than a 4090's VRAM.
+- **NPU via ST Edge AI / ONNX** for the N6 — ternary → an ONNX graph ST's Neural-ART
+  accepts, or a fallback to Helium/MVE on the M55.
+
+**Why it's a separate track.** `tritium-core` is already `no_std`-able (the
+foundation was built for this), but every layer above assumes `std` + a heap +ample
+memory. An embedded backend needs: a `no_std` backend crate (RV32IMAC + Cortex-M55
+Helium kernels), XIP-aware weight layouts, an SRAM-budgeted runtime, and the ONNX /
+ST-Edge-AI export for the N6 NPU. Sequenced **after v1.0** (or as a dedicated edge
+milestone once the std runtime + interop/ONNX 0.80 land), with its own ADR.
