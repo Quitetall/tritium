@@ -7,6 +7,45 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.3.2] — 2026-06-17 — CUDA-Graph Decode + the f32-accumulate win
+
+A performance point-release on the v0.3.1 device-resident forward. **~1.66× decode**
+(27.6 → 45.9 tok/s on a 4090) with **zero numerics regression** — greedy still 256/256
+exact vs transformers, perplexity 2.96e-3, cpu↔cuda parity identical.
+
+### Added
+- **tritium-cuda** — a **raw-FFI CUDA-graph decode path** (`CudaDecodeModel::step_graph`):
+  one captured graph replays the whole 30-layer forward per token. cudarc 0.19's safe
+  launch is capture-incompatible (its per-buffer event waits trip
+  `STREAM_CAPTURE_ISOLATION`) and hides the `CUfunction`, so the path raw-loads the PTX
+  (`result::module::load_data`) for raw `CUfunction`s and launches via
+  `result::launch_kernel` with pre-extracted stable `CUdeviceptr`s. New `_g` control-block
+  kernels (`embedding_gather_f32_g`, `rope_apply_f32_g`, `kv_append_f32`,
+  `gqa_attention_decode_f32_g`) read the per-token token/pos/cache_len from a device
+  `int[4]`, so one graph replays across tokens.
+- **tritium-cuda** — `tq2_0_add_mpgemm_tiled_f32` (f32-accumulate GEMM) and
+  `lm_head_warp_f32` (coalesced warp-per-row LM head), used by the graph path.
+
+### Performance
+- The CUDA graph alone gave **no speedup** (collapsing ~930 launches/token → 1 replay was
+  26.6 vs 27.6 tok/s) — which *proved* host launches were never the bottleneck. The real
+  cost was the **double-precision GEMM accumulate** (the 4090 runs f64 at 1/64 the f32
+  rate, × ~210 GEMMs/token) and the **uncoalesced 1.3 GB LM-head read**. The f32 GEMM
+  (+15.8 tok/s) + warp LM head (+3.5) deliver the 1.66×.
+- The eager `mpgemm`/`step` keep the double-accumulate kernel for the `1e-4` conformance
+  bar over adversarial inputs; only the model-decode graph path uses f32 (the real
+  activations stay ~2e-6 from the reference, far under the greedy tie margin).
+
+### Fixed
+- `step_graph` drains the default stream before replay, closing a latent cross-stream race
+  if the eager `step` and `step_graph` are interleaved on one model (found by the
+  adversarial review of the unsafe FFI, which otherwise verified the raw path sound).
+
+### Deferred (→ v0.3.3)
+- We are at ~5.4% of the memory roofline: parallelize the remaining sequential bit-match
+  kernels (rmsnorm thread-0 sum, one-thread-per-head attention), f16 `token_embd`. Plus a
+  live `ncu` artifact, batched device prefill, IMMA prefill (#28).
+
 ## [0.3.1] — 2026-06-16 — Device-Resident Decode Forward
 
 The end-to-end performance point-release (ADR 0013): make the v0.3.0 forward fast

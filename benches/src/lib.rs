@@ -313,13 +313,16 @@ pub const LLAMA_CPP_2B4T_DECODE: Baseline = Baseline {
 /// **regression denominator** the e2e gate keys on: a real, reproducible on-box
 /// figure, unlike the published competitor numbers above.
 ///
-/// **Measured.** The device-resident forward (residual stream + KV in VRAM across
-/// all 30 layers, ~1 D2H/token) decodes the committed prompt at **~27.6 tok/s**
-/// (decode-only, prefill excluded) — ~6× the v0.20 host-orchestrated path (~4.5
-/// tok/s, ~210 synchronous round-trips/token), and ~3.3% of the 848.6 tok/s memory
-/// roofline. The committed figure is a **conservative 25.0 tok/s floor** (~9% under
-/// the measured rate) so normal run-to-run variance never trips the `>5%` gate; a
-/// real regression below the floor still fails CI.
+/// **Measured.** The CUDA-graph decode (v0.3.2: one captured graph replayed per token,
+/// f32-accumulate GEMM + coalesced warp LM head — see `cuda.rs`) decodes the committed
+/// prompt at **~45.9 tok/s** (decode-only, prefill excluded) on the 4090 — ~1.66× the
+/// v0.3.1 eager device-resident path (~27.6 tok/s), itself ~6× the v0.20 host path
+/// (~4.5 tok/s). That is ~5.4% of the 848.6 tok/s memory roofline. **All numerics gates
+/// still hold on this fast path** (greedy 256/256 exact, perplexity 2.96e-3, cpu↔cuda
+/// parity identical / worst logit rel 2.26e-6): the f64 accumulate guarded a 1e-4
+/// worst-case the real activations never hit. The committed figure is a **conservative
+/// 42.0 tok/s floor** (~8% under measured) so run-to-run variance never trips the `>5%`
+/// gate; a real regression below the floor still fails CI.
 ///
 /// **Why there is no `BuiltOnBox` GPU *competitor*.** A same-HW llama.cpp CUDA
 /// baseline for this artifact is **not obtainable**, confirmed on the local
@@ -336,8 +339,8 @@ pub const LLAMA_CPP_2B4T_DECODE: Baseline = Baseline {
 /// measurable or the v0.3.2 CUDA-graph lands (which targets the roofline, where a
 /// clear lead is unambiguous regardless of competitor).
 pub const TRITIUM_2B4T_DECODE_4090: Baseline = Baseline {
-    name: "tritium 2B4T decode (4090, device-resident)",
-    tokens_per_sec: 25.0,
+    name: "tritium 2B4T decode (4090, cuda-graph)",
+    tokens_per_sec: 42.0,
     source: BaselineSource::BuiltOnBox,
 };
 

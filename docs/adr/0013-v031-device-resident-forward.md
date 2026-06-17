@@ -158,18 +158,32 @@ CPU ~34.5 tok/s). So `≥1.2×` against a 28-tok/s CPU floor proves nothing.
   CPU-only) and cannot load the I2_S artifact (type-id 36 = removed `IQ4_NL_4_4`); the HF
   weights to re-quantize are absent. bitnet.cpp's numbers are CPU. So there is no GPU
   ternary engine to race; the gate awaits a measurable competitor or the v0.3.2 graph.
-- [ ] **CUDA graph (W2) — deferred to v0.3.2.** cudarc 0.19's safe launch waits on each
-  buffer's pre-capture event → `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`; the raw escape
-  needs the `pub(crate)` `CUfunction`, so capture requires a parallel raw-FFI launch path
-  + a device control-block kernel refactor (documented in the `#[ignore]`'d tripwire test
-  `cuda_graph_capture_blocked_by_cudarc_safe_launch`). The launch path is the wall at M=1
-  (~930 launches/token), so the graph is the road to the roofline — its own gated change.
-- [ ] A live `ncu` %-of-SOL artifact + the self-hosted GPU CI lanes — follow-on.
+- [x] **CUDA graph (W2) — shipped in v0.3.2** (via the raw-FFI capture path cudarc 0.19's
+  safe launch couldn't do). But it was the WRONG lever: collapsing ~930 launches/token into
+  one replay gave **no speedup** (26.6 vs 27.6 tok/s) — proving launches were never the
+  wall. The graph is the experiment that found the real bottleneck (see v0.3.2 below).
+- [ ] A live `ncu` %-of-SOL artifact + the self-hosted GPU CI lanes — follow-on (no
+  `ncu`/`nsys` on the box; the graph-vs-eager equivalence served as the bottleneck probe).
 
-## Deferred to v0.3.2
+## v0.3.2 — what the graph actually unlocked
 
-- The **CUDA-graph decode** (raw-FFI capture path + control-block kernels) — the launch-
-  overhead win toward the memory roofline, and the lever that makes a `≥1.2×` lead
-  unambiguous regardless of competitor availability.
-- The live `ncu` artifact + GPU CI lanes; the IMMA **prefill** path (#28); a batched
-  device prefill (today's prefill is sequential per-token decode).
+The CUDA graph itself gave no speedup, but building it pinpointed the real decode
+bottleneck on the (perf) path:
+- **f32-accumulate GEMM** — the tiled kernel accumulates the K contraction in **double**
+  for the 1e-4 conformance bar; the 4090 runs f64 at **1/64 the f32 rate** and decode does
+  ~210 GEMMs/token, so the double reduction was dominant. The graph path swaps in an
+  f32-accumulate variant (the eager `mpgemm` keeps the double kernel for conformance).
+- **Coalesced warp-per-row LM head** — the by-thread head read the 1.3 GB `token_embd`
+  fully uncoalesced; a warp-per-row layout coalesces it.
+- Net **~1.66× decode (27.6 → 45.9 tok/s)** with **zero numerics regression** — greedy
+  256/256, perplexity 2.96e-3, parity identical all hold, because the real activations
+  never hit the cancellation-heavy worst case the f64 guarded.
+
+## Deferred (→ v0.3.3)
+
+- More decode headroom (we are at ~5.4% of the memory roofline): parallelize the remaining
+  sequential single-thread bit-match kernels (rmsnorm's thread-0 sum, the one-thread-per-
+  head GQA attention), and an f16 `token_embd` for the LM head read.
+- The IMMA **prefill** path (#28); a batched device prefill (today's prefill is sequential
+  per-token decode); a live `ncu` artifact + GPU CI lanes; the `≥1.2×` competitor gate
+  (still no GPU ternary competitor — see `benches/src/lib.rs`).
