@@ -51,6 +51,17 @@ pub struct ModelRunner {
     pub kv: Vec<KvCache>,
     /// The execution backend for ternary GEMMs.
     pub backend: Box<dyn TernaryBackend>,
+    /// (cuda) The device-resident decode fast path (v0.3.1, ADR 0013), built lazily
+    /// on the first non-dump forward when `backend` is a CUDA backend. Keeps the
+    /// residual stream + KV in VRAM across all layers, replacing ~210 round-trips per
+    /// token with ~1. The host path stays the golden oracle (used for `forward_dump`
+    /// and on non-CUDA backends).
+    #[cfg(feature = "cuda")]
+    resident: Option<tritium_cuda::CudaDecodeModel>,
+    /// (cuda) Whether we have already tried (and possibly failed) to build `resident`,
+    /// so a non-CUDA backend probes the downcast exactly once.
+    #[cfg(feature = "cuda")]
+    resident_probed: bool,
 }
 
 impl ModelRunner {
@@ -83,6 +94,10 @@ impl ModelRunner {
             weights,
             kv,
             backend,
+            #[cfg(feature = "cuda")]
+            resident: None,
+            #[cfg(feature = "cuda")]
+            resident_probed: false,
         })
     }
 
@@ -98,10 +113,15 @@ impl ModelRunner {
         Self::load(&file, bytes, backend)
     }
 
-    /// Reset every layer's KV cache (start a fresh sequence).
+    /// Reset every layer's KV cache (start a fresh sequence). Also resets the
+    /// device-resident decoder's KV watermark when present.
     pub fn reset(&mut self) {
         for c in &mut self.kv {
             c.reset();
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(r) = self.resident.as_mut() {
+            r.reset();
         }
     }
 
@@ -142,6 +162,17 @@ impl ModelRunner {
                 expected: seq,
                 got: positions.len(),
             });
+        }
+
+        // Device-resident fast path (v0.3.1): when the backend is CUDA and we are not
+        // capturing per-stage activations, run the whole forward on the GPU (residual
+        // stream + KV stay in VRAM). The dump path keeps the host orchestration so the
+        // fidelity ladder can still inspect each stage.
+        #[cfg(feature = "cuda")]
+        if dump.is_none() {
+            if let Some(logits) = self.forward_resident(tokens, positions)? {
+                return Ok(logits);
+            }
         }
 
         // Embedding gather: hidden = token_embd[token] for each token.
@@ -243,6 +274,117 @@ impl ModelRunner {
         }
 
         Ok(logits)
+    }
+
+    /// (cuda) Run the forward through the device-resident decoder if the backend is
+    /// CUDA, returning `Some(last-token logits)`; `None` means the backend has no
+    /// resident path and the caller should fall back to the host orchestration.
+    ///
+    /// Each of the `seq` tokens is driven through one device `step` (so a multi-token
+    /// prefill is processed as a sequential causal decode — numerically identical to
+    /// the batched host prefill, since each token's reductions are unchanged). Only
+    /// the last token's logits are returned, matching [`forward`](Self::forward).
+    #[cfg(feature = "cuda")]
+    fn forward_resident(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Option<Vec<f32>>, NnError> {
+        if !self.ensure_resident()? {
+            return Ok(None);
+        }
+        let model = self
+            .resident
+            .as_mut()
+            .expect("ensure_resident returned true so resident is built");
+        let mut logits = Vec::new();
+        for (&tok, &pos) in tokens.iter().zip(positions.iter()) {
+            logits = model
+                .step(tok, pos)
+                .map_err(|e| NnError::Backend(e.to_string()))?;
+        }
+        Ok(Some(logits))
+    }
+
+    /// (cuda) Build the device-resident decoder on first use. Returns `true` if a
+    /// resident decoder is available (already built or built now), `false` if the
+    /// backend is not a CUDA backend (probed once, then cached).
+    #[cfg(feature = "cuda")]
+    fn ensure_resident(&mut self) -> Result<bool, NnError> {
+        if self.resident.is_some() {
+            return Ok(true);
+        }
+        if self.resident_probed {
+            return Ok(false);
+        }
+        self.resident_probed = true;
+        // Recover the concrete `CudaBackend` from the `dyn TernaryBackend` (the
+        // defaulted `as_any` hook returns `None` for every non-CUDA backend).
+        let Some(cuda) = self
+            .backend
+            .as_any()
+            .and_then(|a| a.downcast_ref::<tritium_cuda::CudaBackend>())
+        else {
+            return Ok(false);
+        };
+        let spec = Self::build_decode_spec(&self.weights, &self.config);
+        let model = cuda
+            .build_decode_model(&spec)
+            .map_err(|e| NnError::Backend(e.to_string()))?;
+        self.resident = Some(model);
+        Ok(true)
+    }
+
+    /// (cuda) Assemble the borrowed [`tritium_cuda::DecodeModelSpec`] from the loaded
+    /// weights + config. The borrow is consumed inside `build_decode_model`; the
+    /// resident model owns shared (`Arc`) device handles afterwards.
+    #[cfg(feature = "cuda")]
+    fn build_decode_spec<'a>(
+        weights: &'a ModelWeights,
+        config: &ModelConfig,
+    ) -> tritium_cuda::DecodeModelSpec<'a> {
+        use crate::layers::TernaryLinear;
+        use tritium_cuda::{DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
+
+        fn lin(tl: &TernaryLinear) -> DecodeLinearSpec<'_> {
+            DecodeLinearSpec {
+                weights: &*tl.weights,
+                scales: &tl.scales,
+            }
+        }
+
+        let layers = weights
+            .layers
+            .iter()
+            .map(|b| DecodeLayerSpec {
+                attn_norm: &b.attn_norm,
+                attn_sub_norm: &b.attn_sub_norm,
+                ffn_norm: &b.ffn_norm,
+                ffn_sub_norm: &b.mlp.ffn_sub_norm,
+                q: lin(&b.q_proj),
+                k: lin(&b.k_proj),
+                v: lin(&b.v_proj),
+                o: lin(&b.o_proj),
+                gate: lin(&b.mlp.gate),
+                up: lin(&b.mlp.up),
+                down: lin(&b.mlp.down),
+            })
+            .collect();
+
+        DecodeModelSpec {
+            token_embd: &weights.token_embd,
+            output_norm: &weights.output_norm,
+            layers,
+            n_embd: config.n_embd as usize,
+            n_head: config.n_head as usize,
+            n_head_kv: config.n_head_kv as usize,
+            head_dim: config.head_dim() as usize,
+            n_ff: config.n_ff as usize,
+            vocab: weights.vocab,
+            max_ctx: config.n_ctx as usize,
+            rope_theta: config.rope_theta,
+            rms_eps: config.rms_eps,
+        }
     }
 
     /// Greedily generate up to `max_new` tokens continuing `prompt` (token IDs),

@@ -24,6 +24,18 @@
 
 #include <cuda_runtime.h>
 
+// exp_f32 — the softmax exponential, computed in **double** then rounded to float.
+// The host op is Rust `f32::exp`, which lowers to glibc `expf` (correctly rounded to
+// ≤0.5 ULP). CUDA's `expf` carries ~2 ULP of error, which is enough to flip a greedy
+// near-tie within a few dozen tokens. Computing `exp` in f64 (CUDA's `exp` is ≤1 ULP
+// of the true double value) and rounding once to f32 yields the correctly-rounded
+// float result — bit-identical to glibc `expf` for essentially every input — so the
+// device softmax/attention match the host instead of drifting. f64 exp is slower than
+// `expf`, but at M=1 decode the reduced lengths (n_embd, ctx) make it negligible.
+__device__ __forceinline__ float exp_f32(float x) {
+  return __double2float_rn(exp((double)x));
+}
+
 extern "C" {
 
 // rmsnorm_f32 — bit-exact match of tritium_nn::ops::rmsnorm:
@@ -101,10 +113,10 @@ __global__ void rope_apply_f32(float* __restrict__ x,
 // softmax_f32 — row-wise softmax matching tritium_nn::ops::softmax_rows: one thread
 // per row, sequential max → exp(x-max) → sum → divide, in the host's order. The
 // reductions are sequential (bit-match), and `__fsub_rn`/`__fadd_rn`/`__fdiv_rn`/
-// `__fmul_rn` forbid FMA. The ONE op that may not bit-match host f32 is `expf`:
-// CUDA's libm differs from the host's glibc `expf` and can disagree by ~1 ULP. If so,
-// softmax (and attention) fall to the perplexity+lockstep gate; everything else stays
-// bit-exact. In-place on `x` (`[rows, row_len]`).
+// `__fmul_rn` forbid FMA. The exponential uses `exp_f32` (f64 `exp` rounded once to
+// f32) so it matches glibc `expf` — the host op — bit-for-bit on essentially every
+// input, rather than drifting like CUDA's ~2-ULP `expf`. In-place on `x`
+// (`[rows, row_len]`).
 __global__ void softmax_f32(float* __restrict__ x, const int row_len, const int rows) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= rows) return;
@@ -116,7 +128,7 @@ __global__ void softmax_f32(float* __restrict__ x, const int row_len, const int 
   }
   float sum = 0.0f;
   for (int i = 0; i < row_len; ++i) {
-    const float e = expf(__fsub_rn(r[i], m));  // host: (v - max).exp()
+    const float e = exp_f32(__fsub_rn(r[i], m));  // host: (v - max).exp()
     r[i] = e;
     sum = __fadd_rn(sum, e);
   }
@@ -165,10 +177,10 @@ __global__ void lm_head_f32(const float* __restrict__ h, const float* __restrict
 // gqa_attention_decode_f32 — the M=1 (seq=1) decode case of tritium_nn::ops::
 // gqa_attention. One thread per query head: scaled sequential q·k dots → inline
 // row softmax → sequential weighted sum Σ w·v, all in the host's index order with
-// __fmul_rn/__fadd_rn (no FMA). Bit-matches the host EXCEPT the softmax `expf`
-// (<=3 ULP, the only non-bit-exact op in the forward). `limit` is the last visible
-// key index (causal_offset); keys j>limit are masked (-inf). `scores` is a
-// [n_head, ctx] scratch the caller provides (resident in the forward).
+// __fmul_rn/__fadd_rn (no FMA). The softmax exponential uses `exp_f32` (f64 exp →
+// f32), so it matches glibc `expf` and the whole op bit-matches the host. `limit` is
+// the last visible key index (causal_offset); keys j>limit are masked (-inf).
+// `scores` is a [n_head, ctx] scratch the caller provides (resident in the forward).
 __global__ void gqa_attention_decode_f32(const float* __restrict__ q,    // [n_head, head_dim]
                                          const float* __restrict__ k,    // [ctx, n_head_kv, head_dim]
                                          const float* __restrict__ v,    // [ctx, n_head_kv, head_dim]
@@ -199,14 +211,14 @@ __global__ void gqa_attention_decode_f32(const float* __restrict__ q,    // [n_h
     sc[j] = __fmul_rn(dot, scale);  // host: dot * scale
   }
 
-  // Inline row softmax (same sequential math as softmax_f32; expf is the <=3-ULP op).
+  // Inline row softmax (same sequential math as softmax_f32; exp_f32 matches glibc).
   float m = -INFINITY;
   for (int j = 0; j < ctx; ++j) {
     if (sc[j] > m) m = sc[j];
   }
   float sum = 0.0f;
   for (int j = 0; j < ctx; ++j) {
-    const float e = expf(__fsub_rn(sc[j], m));
+    const float e = exp_f32(__fsub_rn(sc[j], m));
     sc[j] = e;
     sum = __fadd_rn(sum, e);
   }

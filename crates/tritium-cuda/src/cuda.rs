@@ -1186,7 +1186,7 @@ impl CudaBackend {
         let mut layers = Vec::with_capacity(spec.layers.len());
         let mut kv_k = Vec::with_capacity(spec.layers.len());
         let mut kv_v = Vec::with_capacity(spec.layers.len());
-        for (li, ls) in spec.layers.iter().enumerate() {
+        for ls in &spec.layers {
             let opt_norm = |w: &[f32], width: usize, what: &str| -> Result<Option<CudaSlice<f32>>, BackendError> {
                 if w.is_empty() {
                     Ok(None)
@@ -1217,7 +1217,6 @@ impl CudaBackend {
             });
             kv_k.push(alloc(max_ctx * kv_width, "decode kv_k alloc")?);
             kv_v.push(alloc(max_ctx * kv_width, "decode kv_v alloc")?);
-            let _ = li;
         }
 
         // Resolve the kernels from the resident modules (decode + the add module's tiled GEMM).
@@ -1896,6 +1895,13 @@ impl TernaryBackend for CudaBackend {
         &self.device_id
     }
 
+    /// Opt into the downcast hook so the runner can recover `&CudaBackend` from its
+    /// `&dyn TernaryBackend` and build a [`CudaDecodeModel`] (the device-resident
+    /// decode fast path, v0.3.1).
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
+    }
+
     fn capabilities(&self) -> DeviceCaps {
         // total_memory is left at its default (unknown): the contract permits 0 and
         // the runtime does not rely on the figure here. Both packings this backend
@@ -2419,11 +2425,28 @@ impl CudaDecodeModel {
     /// # Errors
     /// [`BackendError`] on a device failure, capacity overflow, or shape mismatch.
     pub fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, BackendError> {
-        debug_assert_eq!(pos, self.cache_len, "decode pos must track the KV watermark");
         if self.cache_len >= self.max_ctx {
             return Err(BackendError::InvalidInput(format!(
                 "decode context overflow: cache_len={} max_ctx={}",
                 self.cache_len, self.max_ctx
+            )));
+        }
+        // `pos` must track the KV watermark: RoPE indexes the table by `pos` while KV
+        // append + the attention range use `cache_len`. A mismatch would silently apply
+        // the wrong rotation (and could index the RoPE table out of bounds), so this is
+        // a hard runtime guard, not a debug assert.
+        if pos != self.cache_len {
+            return Err(BackendError::InvalidInput(format!(
+                "decode pos={pos} must equal the KV watermark cache_len={}",
+                self.cache_len
+            )));
+        }
+        // The tied embedding/LM-head table has `vocab` rows; an out-of-range token id
+        // would make `embedding_gather` read past `d_token_embd`.
+        if token as usize >= self.vocab {
+            return Err(BackendError::InvalidInput(format!(
+                "decode token id {token} out of range (vocab={})",
+                self.vocab
             )));
         }
         let n_embd = self.n_embd;
@@ -2448,6 +2471,10 @@ impl CudaDecodeModel {
         self.stream
             .memcpy_dtoh(&self.d_logits, &mut logits)
             .map_err(|e| driver_err("decode logits dtoh", &e))?;
+        // Bump the watermark only after a fully successful step. A failure mid-step
+        // leaves this token's KV rows written at offset `cache_len` but the watermark
+        // unmoved; a retry at the same `pos` overwrites them in place (idempotent), so
+        // the cache is never left half-advanced.
         self.cache_len += 1;
         Ok(logits)
     }

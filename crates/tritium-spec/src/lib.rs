@@ -177,6 +177,17 @@ pub trait TernaryBackend: Send + Sync {
         }
         Ok(())
     }
+
+    /// Downcast hook for a backend-specific fast path. Returns `None` by default;
+    /// a backend that exposes a concrete accelerated forward (e.g. the CUDA
+    /// device-resident decode, [`tritium_cuda::CudaDecodeModel`]) overrides this to
+    /// return `Some(self)` so a caller holding a `&dyn TernaryBackend` can recover
+    /// the concrete type with `downcast_ref`. Keeping it defaulted means the generic
+    /// trait stays object-safe and host-slice-oriented; only the one backend that has
+    /// a device-resident path opts in.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
 }
 
 /// Symmetric int8 activation-quant positive cap (`Qp`): the int8 range is
