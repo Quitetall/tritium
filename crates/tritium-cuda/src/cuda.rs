@@ -102,6 +102,9 @@ const KERNEL_NAME_LM_HEAD_WARP: &str = "lm_head_warp_f32";
 /// Warp-per-head GQA attention for the graph (v0.3.3 perf) — bit-identical to the
 /// one-thread `_g` kernel (parallel across keys/output-dims, no reduction reorder).
 const KERNEL_NAME_ATTN_WARP: &str = "gqa_attention_decode_warp_g";
+/// Shared-staged rmsnorm for the graph (v0.3.4 perf) — bit-identical to rmsnorm_f32 (same
+/// sequential sum order, just from shared not global), ~8× faster (latency-bound → not).
+const KERNEL_NAME_RMSNORM_SHARED: &str = "rmsnorm_shared_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -2937,8 +2940,10 @@ impl CudaDecodeModel {
     fn g_rmsnorm(&self, x: sys::CUdeviceptr, w: sys::CUdeviceptr, n: usize, out: sys::CUdeviceptr) -> Result<(), BackendError> {
         let eps = self.rms_eps;
         let n_i = n as i32;
+        // `rmsnorm_shared_f32` stages the `n`-float input row into dynamic shared memory.
+        let smem = (n * 4) as u32;
         let mut params = [pp(&x), pp(&w), pp(&eps), pp(&n_i), pp(&out)];
-        raw_launch(self.raw().rmsnorm, (1, 1, 1), (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(self.raw().rmsnorm, (1, 1, 1), (256, 1, 1), smem, self.cap_stream.cu_stream(), &mut params)
     }
 
     fn g_gemm(&self, d_in: sys::CUdeviceptr, lin: &LinPtrs, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, d_out: sys::CUdeviceptr) -> Result<(), BackendError> {
@@ -3166,12 +3171,11 @@ impl RawGraphKernels {
             kv_append: get(dm, KERNEL_NAME_KV_APPEND)?,
             // Warp-per-head attention (bit-identical to the one-thread `_g`, just parallel).
             attn_g: get(dm, KERNEL_NAME_ATTN_WARP)?,
-            // Sequential (bit-exact) rmsnorm: the block-parallel reorder of the
-            // sum-of-squares — though all-positive and ~1e-6 — still flips a greedy
-            // near-tie by token 109 AND fails the lockstep parity bar, so it is below the
-            // sanctioned perplexity+lockstep fallback and not used. The graph keeps the
-            // bit-exact rmsnorm; the rest of the decode is parallelised around it.
-            rmsnorm: get(dm, KERNEL_NAME_RMSNORM)?,
+            // Shared-staged rmsnorm: BIT-IDENTICAL to the sequential rmsnorm_f32 (same sum
+            // order, from shared), just ~8× faster — so greedy 256/256 holds. (A *parallel*
+            // tree-reduction rmsnorm would reach ~132 tok/s but reorders the sum and breaks
+            // the gate; this gets most of the win while staying bit-exact.)
+            rmsnorm: get(dm, KERNEL_NAME_RMSNORM_SHARED)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
             act_quant: get(dm, KERNEL_NAME_ACT_QUANT_TILED)?,

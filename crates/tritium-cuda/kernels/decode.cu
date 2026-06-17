@@ -74,6 +74,42 @@ __global__ void rmsnorm_f32(const float* __restrict__ x,
   }
 }
 
+// rmsnorm_shared_f32 — **bit-identical** to rmsnorm_f32 but ~8× faster for the graph
+// (v0.3.3+ perf). rmsnorm_f32's thread-0 sum is latency-bound: one thread reads `n`
+// floats one-at-a-time from global, unable to hide ~400-cycle memory latency. Here the
+// whole block first stages `x` into shared memory with a COALESCED load, then thread 0
+// sums from shared **in the same i=0..n order** — so the f32 sum is byte-identical (no
+// reorder, unlike a tree reduction), keeping greedy 256/256, while the sum is now
+// compute-bound instead of memory-latency-bound. Dynamic shared = `n * 4` bytes (the
+// launch sets it); n_ff=6912 → 27 KiB < 48 KiB. The elementwise reads the staged `s_x`.
+__global__ void rmsnorm_shared_f32(const float* __restrict__ x,
+                                   const float* __restrict__ w,
+                                   const float eps,
+                                   const int n,
+                                   float* __restrict__ out) {
+  extern __shared__ float s_x[];
+  __shared__ float s_inv;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    s_x[i] = x[i];  // coalesced stage into shared
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; ++i) {
+      const float xi = s_x[i];
+      ss = __fadd_rn(ss, __fmul_rn(xi, xi));  // same i=0..n order as rmsnorm_f32
+    }
+    const float mean_sq = __fdiv_rn(ss, (float)n);
+    const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+    s_inv = __fdiv_rn(1.0f, denom);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    out[i] = __fmul_rn(__fmul_rn(s_x[i], inv), w[i]);
+  }
+}
+
 // rope_apply_f32 — bit-exact match of tritium_nn::ops::rope_apply for ONE token
 // (the M=1 decode case). NeoX half-rotated: lane j in [0,half) pairs with j+half,
 //   out[j]      = a*cos - b*sin ;  out[j+half] = b*cos + a*sin   (a=x[j], b=x[j+half])
