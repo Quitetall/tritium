@@ -126,4 +126,40 @@ __global__ void softmax_f32(float* __restrict__ x, const int row_len, const int 
   }
 }
 
+// residual_add_f32 — x[i] += y[i]. A single f32 add per element (no rounding choice,
+// no FMA), exact match of the host residual add. Embarrassingly parallel.
+__global__ void residual_add_f32(float* __restrict__ x, const float* __restrict__ y,
+                                 const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    x[i] = __fadd_rn(x[i], y[i]);
+  }
+}
+
+// embedding_gather_f32 — out[i] = table[tok*n_embd + i]. A pure copy of one row of
+// the embedding table (exact match of the host gather). One thread per element.
+__global__ void embedding_gather_f32(const float* __restrict__ table, const int tok,
+                                     const int n_embd, float* __restrict__ out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n_embd) {
+    out[i] = table[(long long)tok * n_embd + i];
+  }
+}
+
+// lm_head_f32 — tied LM head: logits[v] = Σ_k h[k] * embd[v*n_embd + k]. Bit-matches
+// the host's sequential `acc += h[k]*row[k]` (mul then add, no FMA) by accumulating
+// in the same k=0..n_embd order. One thread per vocab row; the reduction is sequential
+// within the thread (parallel across vocab).
+__global__ void lm_head_f32(const float* __restrict__ h, const float* __restrict__ embd,
+                            const int n_embd, const int vocab, float* __restrict__ logits) {
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if (v >= vocab) return;
+  const float* row = embd + (long long)v * n_embd;
+  float acc = 0.0f;
+  for (int k = 0; k < n_embd; ++k) {
+    acc = __fadd_rn(acc, __fmul_rn(h[k], row[k]));
+  }
+  logits[v] = acc;
+}
+
 }  // extern "C"

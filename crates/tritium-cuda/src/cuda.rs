@@ -70,6 +70,12 @@ const KERNEL_NAME_ROPE: &str = "rope_apply_f32";
 /// The device-resident softmax decode kernel (v0.3.1) — matches
 /// `tritium_nn::ops::softmax_rows`; only `expf` may differ from host libm by ~1 ULP.
 const KERNEL_NAME_SOFTMAX: &str = "softmax_f32";
+/// Residual add `x += y` (exact f32 add).
+const KERNEL_NAME_RESIDUAL: &str = "residual_add_f32";
+/// Embedding-table row gather (exact copy).
+const KERNEL_NAME_EMBED: &str = "embedding_gather_f32";
+/// Tied LM head `logits[v] = <h, embd[v]>` (sequential dot, bit-matches host).
+const KERNEL_NAME_LM_HEAD: &str = "lm_head_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -191,6 +197,13 @@ pub struct CudaBackend {
     /// differ ~1 ULP).
     #[allow(dead_code)] // wired into `forward_device` (attention) next; W1-in-progress.
     func_softmax: CudaFunction,
+    /// Resolved `residual_add_f32` / `embedding_gather_f32` / `lm_head_f32` kernels.
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    func_residual: CudaFunction,
+    #[allow(dead_code)]
+    func_embed: CudaFunction,
+    #[allow(dead_code)]
+    func_lm_head: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -265,6 +278,15 @@ impl CudaBackend {
         let func_softmax = decode_module
             .load_function(KERNEL_NAME_SOFTMAX)
             .map_err(|e| driver_err("resolve softmax kernel", &e))?;
+        let func_residual = decode_module
+            .load_function(KERNEL_NAME_RESIDUAL)
+            .map_err(|e| driver_err("resolve residual kernel", &e))?;
+        let func_embed = decode_module
+            .load_function(KERNEL_NAME_EMBED)
+            .map_err(|e| driver_err("resolve embed kernel", &e))?;
+        let func_lm_head = decode_module
+            .load_function(KERNEL_NAME_LM_HEAD)
+            .map_err(|e| driver_err("resolve lm_head kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -289,6 +311,9 @@ impl CudaBackend {
             func_rmsnorm,
             func_rope,
             func_softmax,
+            func_residual,
+            func_embed,
+            func_lm_head,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -500,6 +525,179 @@ impl CudaBackend {
         self.stream
             .memcpy_dtoh(&d_x, x)
             .map_err(|e| driver_err("softmax dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device residual add `x += y` (exact) on host slices. Building block.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    pub(crate) fn residual_add(&self, x: &mut [f32], y: &[f32]) -> Result<(), BackendError> {
+        let n = x.len();
+        if y.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: y.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let mut d_x = self
+            .stream
+            .clone_htod(x)
+            .map_err(|e| driver_err("residual htod x", &e))?;
+        let d_y = self
+            .stream
+            .clone_htod(y)
+            .map_err(|e| driver_err("residual htod y", &e))?;
+        let n_i = n as i32;
+        let threads = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_residual);
+        launch.arg(&mut d_x).arg(&d_y).arg(&n_i);
+        // SAFETY: signature `(float* x, const float* y, int n)`; pushed in that
+        // order; `d_x`/`d_y` are length `n`, one thread per element guarded by `i < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch residual", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_x, x)
+            .map_err(|e| driver_err("residual dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device embedding-row gather `out = table[tok]` (exact copy) on host slices.
+    /// (Test/building block — uploads `table`; the forward uses the resident table.)
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    pub(crate) fn embedding_gather(
+        &self,
+        table: &[f32],
+        tok: usize,
+        n_embd: usize,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        if out.len() != n_embd || table.len() < tok.saturating_add(1) * n_embd {
+            return Err(BackendError::ShapeMismatch {
+                expected: n_embd,
+                got: out.len(),
+            });
+        }
+        if n_embd == 0 {
+            return Ok(());
+        }
+        let d_table = self
+            .stream
+            .clone_htod(table)
+            .map_err(|e| driver_err("embed htod table", &e))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(n_embd)
+            .map_err(|e| driver_err("embed alloc out", &e))?;
+        let tok_i = tok as i32;
+        let n_embd_i = n_embd as i32;
+        let threads = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_embd as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_embed);
+        launch
+            .arg(&d_table)
+            .arg(&tok_i)
+            .arg(&n_embd_i)
+            .arg(&mut d_out);
+        // SAFETY: signature `(const float* table, int tok, int n_embd, float* out)`;
+        // pushed in order; `table` covers row `tok`, `out` is length `n_embd`, one
+        // thread per element guarded by `i < n_embd`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch embed", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_out, out)
+            .map_err(|e| driver_err("embed dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device tied LM head `logits[v] = <h, embd[v]>` on host slices, **bit-matching**
+    /// the host's sequential dot. (Test/building block — uploads `embd`; the forward
+    /// uses the resident embedding table.)
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
+    pub(crate) fn lm_head(
+        &self,
+        h: &[f32],
+        embd: &[f32],
+        n_embd: usize,
+        vocab: usize,
+        logits: &mut [f32],
+    ) -> Result<(), BackendError> {
+        if h.len() != n_embd || embd.len() != vocab * n_embd || logits.len() != vocab {
+            return Err(BackendError::ShapeMismatch {
+                expected: vocab,
+                got: logits.len(),
+            });
+        }
+        if vocab == 0 {
+            return Ok(());
+        }
+        let d_h = self
+            .stream
+            .clone_htod(h)
+            .map_err(|e| driver_err("lm_head htod h", &e))?;
+        let d_embd = self
+            .stream
+            .clone_htod(embd)
+            .map_err(|e| driver_err("lm_head htod embd", &e))?;
+        let mut d_logits = self
+            .stream
+            .alloc_zeros::<f32>(vocab)
+            .map_err(|e| driver_err("lm_head alloc logits", &e))?;
+        let n_embd_i = n_embd as i32;
+        let vocab_i = vocab as i32;
+        let threads = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((vocab as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_lm_head);
+        launch
+            .arg(&d_h)
+            .arg(&d_embd)
+            .arg(&n_embd_i)
+            .arg(&vocab_i)
+            .arg(&mut d_logits);
+        // SAFETY: signature `(const float* h, const float* embd, int n_embd, int vocab,
+        // float* logits)`; pushed in order; `h` length `n_embd`, `embd` length
+        // `vocab*n_embd`, `logits` length `vocab`; one thread per vocab row guarded by
+        // `v >= vocab`, each reading only its own `embd` row.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch lm_head", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_logits, logits)
+            .map_err(|e| driver_err("lm_head dtoh", &e))?;
         Ok(())
     }
 
@@ -2471,5 +2669,77 @@ mod tests {
             max_rel < 1e-5,
             "device softmax exp diverges too far from host: max_rel={max_rel:.3e}"
         );
+    }
+
+    /// `residual_add` / `embedding_gather` / `lm_head` must match host bit-for-bit:
+    /// the first two are exact (add / copy), the LM head reproduces the host's
+    /// sequential dot in k-order (no FMA).
+    #[test]
+    fn residual_embed_lmhead_bit_match_host() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping residual/embed/lm_head bit-match: no device ({e})");
+                return;
+            }
+        };
+        let mut s = 0xABCD_1234_5678_9876u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f32 / (1u64 << 53) as f32) * 8.0 - 4.0
+        };
+
+        // residual_add: x += y (exact).
+        {
+            let n = 2560usize;
+            let x0: Vec<f32> = (0..n).map(|_| next()).collect();
+            let y: Vec<f32> = (0..n).map(|_| next()).collect();
+            let want: Vec<f32> = x0.iter().zip(&y).map(|(&a, &b)| a + b).collect();
+            let mut got = x0.clone();
+            backend.residual_add(&mut got, &y).expect("residual");
+            for (i, (&g, &h)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), h.to_bits(), "residual_add mismatch [{i}]");
+            }
+        }
+
+        // embedding_gather: out = table[tok] (exact copy).
+        {
+            let (vocab, n_embd) = (64usize, 256usize);
+            let table: Vec<f32> = (0..vocab * n_embd).map(|_| next()).collect();
+            let tok = 37usize;
+            let want = &table[tok * n_embd..tok * n_embd + n_embd];
+            let mut got = vec![0.0f32; n_embd];
+            backend
+                .embedding_gather(&table, tok, n_embd, &mut got)
+                .expect("embed");
+            for (i, (&g, &h)) in got.iter().zip(want).enumerate() {
+                assert_eq!(g.to_bits(), h.to_bits(), "embedding_gather mismatch [{i}]");
+            }
+        }
+
+        // lm_head: sequential dot, bit-exact.
+        {
+            let (vocab, n_embd) = (128usize, 2560usize);
+            let h: Vec<f32> = (0..n_embd).map(|_| next()).collect();
+            let embd: Vec<f32> = (0..vocab * n_embd).map(|_| next()).collect();
+            let mut want = vec![0.0f32; vocab];
+            for (v, slot) in want.iter_mut().enumerate() {
+                let row = &embd[v * n_embd..v * n_embd + n_embd];
+                let mut acc = 0.0f32;
+                for k in 0..n_embd {
+                    acc += h[k] * row[k];
+                }
+                *slot = acc;
+            }
+            let mut got = vec![0.0f32; vocab];
+            backend
+                .lm_head(&h, &embd, n_embd, vocab, &mut got)
+                .expect("lm_head");
+            for (v, (&g, &hh)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), hh.to_bits(), "lm_head mismatch [{v}]: got {g} want {hh}");
+            }
+        }
     }
 }
