@@ -612,4 +612,204 @@ __global__ void lm_head_warp_f16(const float* __restrict__ h, const __half* __re
   if (lane == 0) logits[warp] = acc;
 }
 
+// ===========================================================================
+// v0.3.6: M>1 (batched) kernels for the **prefill** forward — process all P prompt
+// tokens in ONE device-resident forward instead of P sequential M=1 decode steps
+// (the O(seq) latency cliff). Same per-row math as the M=1 kernels (bit-identical),
+// just with a row dimension `m`. One block per row `mi = blockIdx.x` for the per-row
+// reductions; the tiled GEMM already handles M>1 via grid.y; residual/relu² are
+// elementwise so they reuse the M=1 kernels over `m*n` elements.
+// ===========================================================================
+
+// rmsnorm_batch_f32 — rmsnorm over `m` rows; block `mi` handles row `mi` (shared-staged
+// sum in the host's order). Bit-identical to rmsnorm_shared_f32 per row.
+__global__ void rmsnorm_batch_f32(const float* __restrict__ x, const float* __restrict__ w,
+                                  const float eps, const int n, const int m,
+                                  float* __restrict__ out) {
+  const int mi = blockIdx.x;
+  if (mi >= m) return;
+  extern __shared__ float s_x[];
+  __shared__ float s_inv;
+  const float* xr = x + (long long)mi * n;
+  float* outr = out + (long long)mi * n;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) s_x[i] = xr[i];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; ++i) {
+      const float xi = s_x[i];
+      ss = __fadd_rn(ss, __fmul_rn(xi, xi));
+    }
+    const float mean_sq = __fdiv_rn(ss, (float)n);
+    const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+    s_inv = __fdiv_rn(1.0f, denom);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    outr[i] = __fmul_rn(__fmul_rn(s_x[i], inv), w[i]);
+  }
+}
+
+// embedding_gather_batch_f32 — out[r] = table[tokens[r]] for r in 0..m. `tokens` is a
+// device int array (the prompt ids). One thread per (row, element).
+__global__ void embedding_gather_batch_f32(const float* __restrict__ table,
+                                           const int* __restrict__ tokens, const int n_embd,
+                                           const int m, float* __restrict__ out) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)m * n_embd) return;
+  const int row = idx / n_embd;
+  const int e = idx - (long long)row * n_embd;
+  out[idx] = table[(long long)tokens[row] * n_embd + e];
+}
+
+// rope_apply_batch_f32 — RoPE on `m` rows, row `r` at absolute position `positions[r]`
+// (so the full cos/sin table is indexed per row). Layout `[m, n_head, head_dim]`.
+__global__ void rope_apply_batch_f32(float* __restrict__ x, const float* __restrict__ cos_table,
+                                     const float* __restrict__ sin_table,
+                                     const int* __restrict__ positions, const int n_head,
+                                     const int head_dim, const int m) {
+  const int half = head_dim >> 1;
+  const int per_row = n_head * half;
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)m * per_row) return;
+  const int row = idx / per_row;
+  const int rem = idx - (long long)row * per_row;
+  const int head = rem / half;
+  const int j = rem - head * half;
+  const int pos = positions[row];
+  const long long base = ((long long)row * n_head + head) * head_dim;
+  const float c = cos_table[(long long)pos * half + j];
+  const float s = sin_table[(long long)pos * half + j];
+  const float a = x[base + j];
+  const float b = x[base + j + half];
+  x[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+  x[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+}
+
+// act_quant_batch_f32 — per-row int8 absmax quant of `[m, k]`; block `mi` does row `mi`,
+// writing q_out[mi] + act_scale[mi]. Bit-identical to act_quant_tiled_f32 per row.
+__global__ void act_quant_batch_f32(const float* __restrict__ act, const int k, const int m,
+                                    float* __restrict__ q_out, float* __restrict__ act_scale) {
+  const int mi = blockIdx.x;
+  if (mi >= m) return;
+  __shared__ float s_red[256];
+  __shared__ float s_gamma;
+  const float* ar = act + (long long)mi * k;
+  float* qr = q_out + (long long)mi * k;
+  float local = 0.0f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float a = fabsf(ar[i]);
+    if (a > local) local = a;
+  }
+  s_red[threadIdx.x] = local;
+  __syncthreads();
+  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      const float o = s_red[threadIdx.x + off];
+      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float gamma = s_red[0];
+    s_gamma = gamma;
+    act_scale[mi] = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);
+  }
+  __syncthreads();
+  const float gamma = s_gamma;
+  if (gamma == 0.0f) {
+    for (int i = threadIdx.x; i < k; i += blockDim.x) qr[i] = 0.0f;
+    return;
+  }
+  const float s = __fdiv_rn(127.0f, gamma);
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float scaled = rintf(__fmul_rn(ar[i], s));
+    qr[i] = fminf(fmaxf(scaled, -128.0f), 127.0f);
+  }
+}
+
+// scale_mul_batch_f32 — out[mi*n + ni] *= act_scale[mi] (per-row activation-dequant fold).
+__global__ void scale_mul_batch_f32(float* __restrict__ out, const float* __restrict__ act_scale,
+                                    const int n, const int m) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)m * n) return;
+  const int row = idx / n;
+  out[idx] = __fmul_rn(out[idx], act_scale[row]);
+}
+
+// kv_append_batch_f32 — append `m` new k/v rows at `cache_len` into the arena: copy
+// src[m, kv_width] → kv_base[(cache_len + r)*kv_width ...]. One thread per (row, element).
+__global__ void kv_append_batch_f32(const float* __restrict__ src, float* __restrict__ kv_base,
+                                    const int cache_len, const int kv_width, const int m) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)m * kv_width) return;
+  const int row = idx / kv_width;
+  const int e = idx - (long long)row * kv_width;
+  kv_base[((long long)(cache_len + row)) * kv_width + e] = src[(long long)row * kv_width + e];
+}
+
+// gqa_attention_batch_f32 — causal attention for `m` query rows (prefill). Query row `r`
+// is at absolute position `causal_offset + r` and attends keys `0..=causal_offset+r`. One
+// warp per (row, head): lane-per-key scaled dots → lane-0 softmax (exp_f32) → lane-per-
+// output-dim weighted sum. Bit-identical per (row, head) to gqa_attention_decode_warp_g.
+// `scores` is `[m, n_head, ctx_max]` scratch (strided by ctx_max). k/v are
+// `[ctx_max, n_head_kv, head_dim]`.
+__global__ void gqa_attention_batch_f32(const float* __restrict__ q, const float* __restrict__ k,
+                                        const float* __restrict__ v, float* __restrict__ out,
+                                        float* __restrict__ scores, const int ctx_max,
+                                        const int n_head, const int n_head_kv, const int head_dim,
+                                        const float scale, const int causal_offset, const int m) {
+  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const long long total = (long long)m * n_head;
+  if (warp >= total) return;
+  const int row = warp / n_head;
+  const int h = warp - (long long)row * n_head;
+  const int limit = causal_offset + row;
+  const int ctx = limit + 1;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float* q_row = q + ((long long)row * n_head + h) * head_dim;
+  float* sc = scores + ((long long)row * n_head + h) * ctx_max;
+
+  for (int j = lane; j < ctx; j += 32) {
+    const float* k_row = k + ((long long)j * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot = __fadd_rn(dot, __fmul_rn(q_row[d], k_row[d]));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+  __syncwarp();
+  if (lane == 0) {
+    float mx = -INFINITY;
+    for (int j = 0; j < ctx; ++j) {
+      if (sc[j] > mx) mx = sc[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float e = exp_f32(__fsub_rn(sc[j], mx));
+      sc[j] = e;
+      sum = __fadd_rn(sum, e);
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+    for (int j = 0; j < ctx; ++j) {
+      sc[j] = __fmul_rn(sc[j], inv);
+    }
+  }
+  __syncwarp();
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    float acc = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      if (w == 0.0f) continue;
+      const float* v_row = v + ((long long)j * n_head_kv + kv) * head_dim;
+      acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+    }
+    o_row[d] = acc;
+  }
+}
+
 }  // extern "C"

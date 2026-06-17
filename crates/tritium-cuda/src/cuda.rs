@@ -105,6 +105,14 @@ const KERNEL_NAME_RMSNORM_SHARED: &str = "rmsnorm_shared_f32";
 /// f16-`token_embd` warp LM head for the graph (v0.3.4 perf) — bit-identical to the f32
 /// warp head (f16 is the GGUF's native precision), halves the 1.3 GB/token table read.
 const KERNEL_NAME_LM_HEAD_WARP_F16: &str = "lm_head_warp_f16";
+/// v0.3.6 batched (M>1) prefill kernels — process the whole prompt in one forward.
+const KERNEL_NAME_RMSNORM_BATCH: &str = "rmsnorm_batch_f32";
+const KERNEL_NAME_EMBED_BATCH: &str = "embedding_gather_batch_f32";
+const KERNEL_NAME_ROPE_BATCH: &str = "rope_apply_batch_f32";
+const KERNEL_NAME_ACT_QUANT_BATCH: &str = "act_quant_batch_f32";
+const KERNEL_NAME_SCALE_BATCH: &str = "scale_mul_batch_f32";
+const KERNEL_NAME_KV_APPEND_BATCH: &str = "kv_append_batch_f32";
+const KERNEL_NAME_ATTN_BATCH: &str = "gqa_attention_batch_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
