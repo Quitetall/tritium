@@ -335,9 +335,10 @@ pub const LLAMA_CPP_2B4T_DECODE: Baseline = Baseline {
 /// GEMM on the CPU regardless of `-ngl`; and (3) the HF weights to re-convert are not
 /// present locally. In short, llama.cpp has **no GPU ternary decode path** to race —
 /// Tritium's I2_S decode runs on the GPU, which llama.cpp does not do. The ≥1.2×
-/// competitor gate is therefore deferred until either a GPU ternary competitor is
-/// measurable or the v0.3.2 CUDA-graph lands (which targets the roofline, where a
-/// clear lead is unambiguous regardless of competitor).
+/// competitor gate stays deferred until a GPU ternary competitor is measurable; until
+/// then the gate is "don't regress vs our own measured decode" + the roofline %. (Our
+/// own rate keeps climbing — v0.3.2's f32 GEMM + warp LM head took it to ~45.9 tok/s,
+/// ~5.4% of the roofline; v0.3.3 parallelizes the remaining sequential kernels.)
 pub const TRITIUM_2B4T_DECODE_4090: Baseline = Baseline {
     name: "tritium 2B4T decode (4090, cuda-graph)",
     tokens_per_sec: 42.0,
