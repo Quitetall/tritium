@@ -427,6 +427,63 @@ mod tests {
         }
     }
 
+    /// Independent reference for the per-tensor path: a single per-tensor base plane plus
+    /// per-block residual planes re-expanded from the residual (driven by `plane_counts`).
+    fn reference_dequant_tensor(weights: &[f32], rows: usize, k: usize, plane_counts: &[usize]) -> Vec<f32> {
+        let nb = num_blocks(k);
+        let base_scale = tritium_core::absmean(weights);
+        let base = crate::ternary_at_scale(weights, base_scale);
+        let mut residual = weights.to_vec();
+        for (rsd, t) in residual.iter_mut().zip(&base.trits) {
+            *rsd -= base_scale * t.to_f32();
+        }
+        let bs = f16::from_f32(base_scale).to_f32();
+        let mut out = vec![0.0f32; rows * k];
+        for r in 0..rows {
+            for b in 0..nb {
+                let start = b * QK_K;
+                let end = (start + QK_K).min(k);
+                // base plane (uniform per-tensor scale).
+                for i in start..end {
+                    out[r * k + i] += bs * base.trits[r * k + i].to_f32();
+                }
+                // residual planes: plane_counts[g] − 1 of them, re-expanded on the residual.
+                let extra = plane_counts[r * nb + b] - 1;
+                let stack = residual_expand(&residual[r * k + start..r * k + end], extra);
+                for plane in &stack.planes {
+                    let s = f16::from_f32(plane.scale).to_f32();
+                    for (i, t) in plane.trits.iter().enumerate() {
+                        out[r * k + start + i] += s * t.to_f32();
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // ── Gate: Tensor-mode dequant(quantized) == independent reference, ABOVE the floor.
+    // Closes the multi-plane (base + per-block residual) assembly path the floor gate misses.
+    #[test]
+    fn tensor_dequant_matches_reference() {
+        for &(rows, k) in &[(1usize, 256usize), (3, 700), (4, 256), (2, 257), (5, 1000)] {
+            let w = make_tensor(rows, k, 0x5A17 ^ (k as u64));
+            let cfg = QuantConfig { budget_bpw: 2.6, scale_group: ScaleGroup::Tensor, ..Default::default() };
+            let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
+            let reference = reference_dequant_tensor(&w, rows, k, &qt.plane_counts);
+            for (r, salt) in qt.salt_rows.iter().enumerate() {
+                let deq = dequant_salt_row(salt).unwrap();
+                for i in 0..k {
+                    assert_eq!(
+                        deq[i].to_bits(),
+                        reference[r * k + i].to_bits(),
+                        "rows={rows} k={k} row {r} elem {i}"
+                    );
+                }
+            }
+            assert!(qt.logical_bpw() <= 2.6 + 1e-9, "tensor logical bpw {} > budget", qt.logical_bpw());
+        }
+    }
+
     // ── Gate: ScaleGroup::Tensor floor == PER-TENSOR AbsMean (deployed BitNet I2_S).
     // The deployed b1.58 uses ONE absmean scale for the whole tensor; the per-256-block
     // default does not reproduce it (it reconstructs the heavy-tailed master far more
