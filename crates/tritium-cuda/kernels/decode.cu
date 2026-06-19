@@ -894,4 +894,70 @@ __global__ void gqa_attention_mdecode_f32(const float* __restrict__ q, const flo
   }
 }
 
+// ===========================================================================
+// v0.3.8 (Track-2): on-device sampling for the batched M=N decode graph — fold the
+// LM head + greedy argmax into the captured graph so a step returns N token ids
+// (N·4 bytes) instead of N·vocab·4 bytes of logits (the 33 MB/step readback at N=64).
+// ===========================================================================
+
+// lm_head_batch_f16 — batched LM head: [m, n_embd] · embd_f16[vocab, n_embd] -> [m, vocab].
+// One warp per (row mi, vocab row `warp`); grid.y = m. BIT-IDENTICAL per row to
+// lm_head_warp_f16 (same f16 read, same __fadd_rn/__fmul_rn, same warp tree-reduce order),
+// so the greedy decision matches the single-row path exactly.
+__global__ void lm_head_batch_f16(const float* __restrict__ h, const __half* __restrict__ embd,
+                                  const int n_embd, const int vocab, const int m,
+                                  float* __restrict__ logits) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const int mi = blockIdx.y;
+  if (mi >= m || warp >= vocab) return;
+  const float* hrow = h + (long long)mi * n_embd;
+  const __half* row = embd + (long long)warp * n_embd;
+  float acc = 0.0f;
+  for (int k = lane; k < n_embd; k += 32) {
+    acc = __fadd_rn(acc, __fmul_rn(hrow[k], __half2float(row[k])));
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffff, acc, off);
+  }
+  if (lane == 0) logits[(long long)mi * vocab + warp] = acc;
+}
+
+// argmax_rows_f32 — per-row greedy argmax: [m, vocab] -> [m] i32. One block (256 threads)
+// per row. Matches host `sample_greedy` (Iterator::max_by keeps the LATER element on
+// equality), so ties resolve to the HIGHEST index. The forward never emits NaN logits, so
+// no NaN special-case is needed.
+__global__ void argmax_rows_f32(const float* __restrict__ logits, const int vocab, const int m,
+                                int* __restrict__ out) {
+  const int mi = blockIdx.x;
+  if (mi >= m) return;
+  const float* row = logits + (long long)mi * vocab;
+  float best_val = -INFINITY;
+  int best_idx = -1;
+  for (int j = threadIdx.x; j < vocab; j += blockDim.x) {
+    const float v = row[j];
+    if (v > best_val || (v == best_val && j > best_idx)) {
+      best_val = v;
+      best_idx = j;
+    }
+  }
+  __shared__ float s_val[256];
+  __shared__ int s_idx[256];
+  s_val[threadIdx.x] = best_val;
+  s_idx[threadIdx.x] = best_idx;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const float ov = s_val[threadIdx.x + stride];
+      const int oi = s_idx[threadIdx.x + stride];
+      if (ov > s_val[threadIdx.x] || (ov == s_val[threadIdx.x] && oi > s_idx[threadIdx.x])) {
+        s_val[threadIdx.x] = ov;
+        s_idx[threadIdx.x] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[mi] = s_idx[0];
+}
+
 }  // extern "C"

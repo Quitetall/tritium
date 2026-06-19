@@ -389,6 +389,50 @@ fn cuda_batch_decode_graph_matches_eager() {
     println!("batch-graph parity: graph == eager, bit-identical over {} steps", toks.len());
 }
 
+/// The on-device-sampling M=N graph (`decode_batch_graph_argmax`) folds the LM head + a
+/// greedy argmax into the captured graph and returns N token ids (N·4 bytes) instead of N
+/// full logit vectors (the 33 MB/step readback). Its per-row token must equal the host
+/// `sample_greedy` of the eager `decode_batch` logits for the same state — i.e. the
+/// on-device argmax reproduces the reference greedy decision bit-for-bit (ties → highest
+/// index, matching `sample_greedy`'s `max_by`).
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_batch_decode_graph_argmax_matches_greedy() {
+    let Some((_reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let model = match runner.resident_cuda() {
+        Ok(Some(m)) => m,
+        _ => {
+            eprintln!("skipping batch-graph argmax parity: no cuda resident");
+            return;
+        }
+    };
+    const N: usize = 2;
+    let toks: [u32; 4] = [128000, 791, 6864, 315];
+
+    let mut eager = model.new_batch(N).expect("new_batch eager");
+    let mut argmax = model.new_batch(N).expect("new_batch argmax");
+    for (i, &t) in toks.iter().enumerate() {
+        let row_tokens = vec![t; N];
+        let logits = model.decode_batch(&mut eager, &row_tokens).expect("decode_batch eager");
+        let tokens = model
+            .decode_batch_graph_argmax(&mut argmax, &row_tokens)
+            .expect("decode_batch_graph_argmax");
+        assert_eq!(tokens.len(), N);
+        for r in 0..N {
+            let want = sample_greedy(&logits[r]).expect("greedy");
+            assert_eq!(tokens[r], want, "argmax != host greedy at step {i} row {r}");
+        }
+    }
+    drop(eager);
+    drop(argmax);
+    println!("batch-graph argmax parity: on-device argmax == host greedy over {} steps", toks.len());
+}
+
 /// (b) Perplexity: forward over the fixed eval sequence on CUDA, assert within 1%
 /// of the committed transformers reference perplexity.
 #[cfg(feature = "cuda")]

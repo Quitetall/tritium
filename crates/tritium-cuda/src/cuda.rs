@@ -120,6 +120,10 @@ const KERNEL_NAME_ATTN_BATCH: &str = "gqa_attention_batch_f32";
 /// v0.3.7 batched M=N decode (N concurrent sequences, per-sequence KV).
 const KERNEL_NAME_KV_APPEND_MDECODE: &str = "kv_append_mdecode_f32";
 const KERNEL_NAME_ATTN_MDECODE: &str = "gqa_attention_mdecode_f32";
+
+/// v0.3.8 on-device sampling for the batched decode graph.
+const KERNEL_NAME_LM_HEAD_BATCH_F16: &str = "lm_head_batch_f16";
+const KERNEL_NAME_ARGMAX_ROWS: &str = "argmax_rows_f32";
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -3331,7 +3335,10 @@ impl CudaDecodeModel {
             d_scores: alloc(n * self.n_head * self.max_ctx, "batch d_scores")?,
             d_h: alloc(self.n_embd, "batch d_h")?,
             d_logits: alloc(self.vocab, "batch d_logits")?,
+            d_logits_batch: alloc(n * self.vocab, "batch d_logits_batch")?,
+            d_argmax: s.alloc_zeros::<i32>(n).map_err(|e| driver_err("batch d_argmax", &e))?,
             graph: None,
+            graph_argmax: None,
             raw_keepalive: None,
         })
     }
@@ -3480,7 +3487,7 @@ impl CudaDecodeModel {
             self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx)?));
         }
         if batch.graph.is_none() {
-            let g = self.record_graph_batch(batch)?;
+            let g = self.record_graph_batch(batch, false)?;
             batch.graph = Some(g);
             // Keep the modules the captured graph references alive for as long as this
             // batch lives (see `BatchKv::raw_keepalive`).
@@ -3539,6 +3546,73 @@ impl CudaDecodeModel {
         Ok(out)
     }
 
+    /// **On-device-sampling batched decode** — the serving fast path. Same M=N forward as
+    /// [`decode_batch_graph`](Self::decode_batch_graph), but the captured graph also runs a
+    /// batched LM head + greedy argmax, so only `n` token ids (`n·4` bytes) come back instead
+    /// of `n·vocab·4` bytes of logits (the readback that caps the eager-tail path). Each
+    /// returned token equals the host `sample_greedy` of the logits the logits-path would
+    /// produce (the batched LM head is bit-identical per row to the single-row kernel; the
+    /// argmax tie rule matches `max_by`), gated by `cuda_batch_decode_graph_argmax_matches_greedy`.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a length/token guard, capacity overflow, or device failure.
+    pub fn decode_batch_graph_argmax(&mut self, batch: &mut BatchKv, tokens: &[u32]) -> Result<Vec<u32>, BackendError> {
+        let n = batch.n;
+        if tokens.len() != n {
+            return Err(BackendError::InvalidInput(format!("decode_batch_graph_argmax expects {n} tokens, got {}", tokens.len())));
+        }
+        for (&t, &p) in tokens.iter().zip(&batch.positions) {
+            if t as usize >= self.vocab {
+                return Err(BackendError::InvalidInput(format!("decode_batch_graph_argmax token {t} out of range")));
+            }
+            if p >= self.max_ctx {
+                return Err(BackendError::InvalidInput("decode_batch_graph_argmax context overflow".into()));
+            }
+        }
+
+        if self.batch_raw.is_none() {
+            let ctx = self.cap_stream.context().clone();
+            self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx)?));
+        }
+        if batch.graph_argmax.is_none() {
+            let g = self.record_graph_batch(batch, true)?;
+            batch.graph_argmax = Some(g);
+            batch.raw_keepalive = self.batch_raw.clone();
+        }
+
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("batch argmax pre default sync", &e))?;
+
+        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let pos_i: Vec<i32> = batch.positions.iter().map(|&p| p as i32).collect();
+        self.cap_stream
+            .memcpy_htod(&tok_i, &mut batch.d_tokens)
+            .map_err(|e| driver_err("batch argmax tokens htod", &e))?;
+        self.cap_stream
+            .memcpy_htod(&pos_i, &mut batch.d_positions)
+            .map_err(|e| driver_err("batch argmax pos htod", &e))?;
+        batch
+            .graph_argmax
+            .as_ref()
+            .expect("argmax graph captured above")
+            .launch()
+            .map_err(|e| driver_err("batch argmax graph launch", &e))?;
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("batch argmax graph sync", &e))?;
+
+        // The graph wrote the n greedy token ids into d_argmax; copy back just those.
+        let mut ids = vec![0i32; n];
+        self.cap_stream
+            .memcpy_dtoh(&batch.d_argmax, &mut ids)
+            .map_err(|e| driver_err("batch argmax dtoh", &e))?;
+        for p in &mut batch.positions {
+            *p += 1;
+        }
+        Ok(ids.into_iter().map(|t| t as u32).collect())
+    }
+
     fn batch_raw(&self) -> &BatchRawKernels {
         self.batch_raw.as_ref().expect("batch raw kernels loaded before record")
     }
@@ -3548,7 +3622,11 @@ impl CudaDecodeModel {
     /// `cap_stream`. Mirrors [`record_graph`](Self::record_graph) for the batched path,
     /// reading the **per-batch** KV arenas and the **unfused** q/k/v/gate/up projections
     /// (the eager `decode_batch` is unfused — fusing is the follow-on).
-    fn record_graph_batch(&self, batch: &BatchKv) -> Result<CudaGraph, BackendError> {
+    ///
+    /// `with_head`: when true, the capture also runs the batched LM head + greedy argmax
+    /// after the final RMSNorm (the on-device-sampling graph, ending at `d_argmax`); when
+    /// false it ends at `d_normed` and the LM head is the eager per-row tail.
+    fn record_graph_batch(&self, batch: &BatchKv, with_head: bool) -> Result<CudaGraph, BackendError> {
         let s = &self.cap_stream;
         let n = batch.n;
         let lin = |l: &ResidentLinear| LinPtrs {
@@ -3599,6 +3677,9 @@ impl CudaDecodeModel {
             d_sin: dptr(&self.d_sin, s),
             d_token_embd: dptr(&self.d_token_embd, s),
             d_output_norm: dptr(&self.d_output_norm, s),
+            d_token_embd_f16: dptr(&self.d_token_embd_f16, s),
+            d_logits_batch: dptr(&batch.d_logits_batch, s),
+            d_argmax: dptr(&batch.d_argmax, s),
         };
         // Drain the events the device_ptr extraction recorded, so the capture (raw
         // launches only) carries no pre-capture dependency.
@@ -3616,6 +3697,12 @@ impl CudaDecodeModel {
             self.gb_layer(&p, lp, n)?;
         }
         self.gb_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed, n)?;
+        if with_head {
+            // Batched LM head over all n rows → d_logits_batch, then per-row greedy argmax →
+            // d_argmax. Both raw-launched into the capture; only d_argmax is read back.
+            self.gb_lm_head_batch(p.d_normed, p.d_token_embd_f16, p.d_logits_batch, n)?;
+            self.gb_argmax(p.d_logits_batch, p.d_argmax, n)?;
+        }
 
         let graph = s
             .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
@@ -3749,6 +3836,24 @@ impl CudaDecodeModel {
         let grid = ((total as u32).div_ceil(256), 1, 1);
         let mut params = [pp(&gate), pp(&up), pp(&total_i)];
         raw_launch(self.batch_raw().relu2, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    /// Batched LM head over all `n` rows: `d_normed[n, n_embd] · token_embd_f16 → d_logits[n, vocab]`.
+    /// One warp per `(row, vocab)` output; `grid.y = n` (mirrors `bl_lm_head_f16`'s grid with the
+    /// batch dim added). Bit-identical per row to the single-row head.
+    fn gb_lm_head_batch(&self, h: sys::CUdeviceptr, embd: sys::CUdeviceptr, d_logits: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let (ne_i, v_i, n_i) = (self.n_embd as i32, self.vocab as i32, n as i32);
+        let grid = ((self.vocab as u32).div_ceil(8), n as u32, 1);
+        let mut params = [pp(&h), pp(&embd), pp(&ne_i), pp(&v_i), pp(&n_i), pp(&d_logits)];
+        raw_launch(self.batch_raw().lm_head_batch, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    /// Per-row greedy argmax `d_logits[n, vocab] → d_out[n]` (i32). One block per row.
+    fn gb_argmax(&self, d_logits: sys::CUdeviceptr, d_out: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let (v_i, n_i) = (self.vocab as i32, n as i32);
+        let grid = (n as u32, 1, 1);
+        let mut params = [pp(&d_logits), pp(&v_i), pp(&n_i), pp(&d_out)];
+        raw_launch(self.batch_raw().argmax, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
     }
 
     /// Load the raw kernels (once) and record + instantiate the decode graph.
@@ -4179,6 +4284,8 @@ struct BatchRawKernels {
     residual: sys::CUfunction,
     relu2: sys::CUfunction,
     tiled: sys::CUfunction,
+    lm_head_batch: sys::CUfunction,
+    argmax: sys::CUfunction,
 }
 
 // SAFETY: same contract as `RawGraphKernels` — the raw handles are process-valid device
@@ -4228,6 +4335,8 @@ impl BatchRawKernels {
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
+            lm_head_batch: get(dm, KERNEL_NAME_LM_HEAD_BATCH_F16)?,
+            argmax: get(dm, KERNEL_NAME_ARGMAX_ROWS)?,
             modules: vec![dm, am],
         })
     }
@@ -4290,6 +4399,10 @@ struct BatchPtrs {
     d_sin: sys::CUdeviceptr,
     d_token_embd: sys::CUdeviceptr,
     d_output_norm: sys::CUdeviceptr,
+    // On-device-sampling head (only used when the argmax graph is captured).
+    d_token_embd_f16: sys::CUdeviceptr,
+    d_logits_batch: sys::CUdeviceptr,
+    d_argmax: sys::CUdeviceptr,
 }
 
 /// State for batched M=N decode of `n` concurrent sequences (v0.3.7): per-sequence KV
@@ -4321,17 +4434,29 @@ pub struct BatchKv {
     d_scores: CudaSlice<f32>,
     d_h: CudaSlice<f32>,
     d_logits: CudaSlice<f32>,
+    /// `[n, vocab]` logits scratch for the on-device-sampling graph (the batched LM head
+    /// writes here, then the argmax reduces it). Separate from the per-row `d_logits` used
+    /// by the eager/logits tail.
+    d_logits_batch: CudaSlice<f32>,
+    /// `[n]` greedy token ids the on-device argmax writes; the only thing the argmax graph
+    /// copies back (N·4 bytes vs N·vocab·4).
+    d_argmax: CudaSlice<i32>,
     /// The captured M=N decode graph for this batch, built lazily on the first
     /// [`CudaDecodeModel::decode_batch_graph`]. Tied to *these* buffers (the capture bakes
-    /// their device pointers in), so it lives on the batch, not the model.
+    /// their device pointers in), so it lives on the batch, not the model. Ends at the final
+    /// RMSNorm (the LM head is the eager tail).
     ///
     /// Declared **before** `raw_keepalive` so the `CUgraphExec` is destroyed before the
     /// module ref it holds is released (the kernel nodes reference functions in those
     /// modules).
     graph: Option<CudaGraph>,
+    /// The captured on-device-sampling graph (built lazily on the first
+    /// [`CudaDecodeModel::decode_batch_graph_argmax`]): the same forward plus the batched LM
+    /// head + greedy argmax, ending at `d_argmax`. Also declared before `raw_keepalive`.
+    graph_argmax: Option<CudaGraph>,
     /// A clone of the model's [`batch_raw`](CudaDecodeModel::batch_raw) `Arc`, taken when
-    /// `graph` is captured. Keeps the `CUfunction` modules `graph` references loaded for
-    /// as long as this batch lives, regardless of whether the producing model is dropped
+    /// either graph is captured. Keeps the `CUfunction` modules the graphs reference loaded
+    /// for as long as this batch lives, regardless of whether the producing model is dropped
     /// first — closing the use-after-free the bare doc-convention couldn't enforce. Held,
     /// never read.
     raw_keepalive: Option<Arc<BatchRawKernels>>,

@@ -15,29 +15,37 @@
 //!     -- --ignored --nocapture
 //! ```
 //!
-//! ## Measured (RTX 4090, 64 steps, full-logits readback per step)
+//! ## Measured (RTX 4090, 64 steps)
 //!
 //! ```text
-//!    N   eager tok/s   graph tok/s     g/eager       g/142
-//!    1          48.7         107.3       2.20x       0.76x
-//!    2          61.5         171.7       2.79x       1.21x
-//!    4          70.2         240.8       3.43x       1.70x
-//!    8          74.5         298.5       4.01x       2.10x
-//!   16          76.8         337.5       4.39x       2.38x
-//!   32          74.9         333.3       4.45x       2.35x
-//!   64          73.2         355.8       4.86x       2.51x
+//!    N   eager tok/s   graph tok/s  argmax tok/s    amax/142
+//!    1          48.2         105.4         105.1       0.74x
+//!    2          60.8         169.1         168.7       1.19x
+//!    4          69.3         237.9         238.1       1.68x
+//!    8          73.8         292.9         294.2       2.07x
+//!   16          76.4         335.0         336.3       2.37x
+//!   32          77.4         357.0         359.1       2.53x
+//!   64          73.0         349.9         342.9       2.41x
 //! ```
 //!
-//! **Finding:** `decode_batch` is the *eager* (un-graph-captured) path — its aggregate
-//! saturates at ~75 tok/s by N≈8 and flatlines *below* the 142 tok/s M=1 `step_graph`,
-//! because per-kernel launch overhead dominates the M=N forward. Graph-capturing that
-//! forward ([`CudaDecodeModel::decode_batch_graph`], bit-identical to eager per the
-//! `cuda_batch_decode_graph_matches_eager` gate) is a **2.2×–4.9× win** that lifts the
-//! aggregate past the 142 single-stream line from N≥2 and to **2.5× (356 tok/s) at
-//! N=64**. The graph N=1 (107 tok/s) still trails the M=1 `step_graph` (142) because the
-//! batch graph keeps q/k/v and gate/up *unfused*; fusing them (the M=1 graph already
-//! does) is the next Track-2 step, alongside on-device sampling to drop the per-step
-//! full-logits dtoh (33 MB/step at N=64).
+//! **Graph capture is the win:** `decode_batch` (eager) saturates ~75 tok/s by N≈8 —
+//! below the 142 M=1 `step_graph` — because per-kernel launch overhead dominates the M=N
+//! forward. Graph-capturing it ([`CudaDecodeModel::decode_batch_graph`], bit-identical per
+//! the `cuda_batch_decode_graph_matches_eager` gate) is **2.2×–4.9×**, past 142 from N≥2 to
+//! ~350 (2.5×) at N=64.
+//!
+//! **On-device sampling is correctness, NOT throughput (measured negative result).**
+//! `decode_batch_graph_argmax` folds the LM head + greedy argmax into the graph and returns
+//! N token ids (N·4 B) instead of N·vocab·4 B of logits — yet it matches the logits path
+//! tok/s at every N. The per-step logits readback was **never the bottleneck**: at N=64,
+//! ~5.5 steps/s · 33 MB ≈ 180 MB/s, trivial vs PCIe's ~25 GB/s. It is the right *serving*
+//! primitive (gated by `cuda_batch_decode_graph_argmax_matches_greedy`), just not faster.
+//!
+//! **The real large-N cost is the LM head re-reading the embd table per row.** Both paths
+//! run a warp-per-vocab-row head that reads the whole 0.66 GB f16 `token_embd` table *once
+//! per row* → ~41 GB/step at N=64, dwarfing the ~0.6 GB ternary forward weights. A
+//! table-read-once / tiled LM head (reuse `embd` across the N-row tile) is the next large-N
+//! lever; fusing q/k/v / gate/up (the M=1 graph already does) lifts N=1 toward 142.
 
 #![cfg(feature = "cuda")]
 
@@ -100,8 +108,8 @@ fn batched_decode_throughput() {
     println!("\nBatched M=N decode throughput (RTX 4090, {STEPS} steps):");
     println!("  M=1 single-stream baseline ≈ 142 tok/s (occupancy-bound, ~19% util)\n");
     println!(
-        "  {:>4}  {:>12}  {:>12}  {:>10}  {:>10}",
-        "N", "eager tok/s", "graph tok/s", "g/eager", "g/142"
+        "  {:>4}  {:>12}  {:>12}  {:>12}  {:>10}",
+        "N", "eager tok/s", "graph tok/s", "argmax tok/s", "amax/142"
     );
 
     // Time `STEPS` decodes of a fresh `n`-sequence batch through `step_fn`, returning
@@ -138,8 +146,13 @@ fn batched_decode_throughput() {
             m.decode_batch_graph(b, t).expect("graph decode");
         });
         let Some(graph) = graph else { break };
-        let vs_eager = graph / eager;
-        let vs_142 = graph / 142.0;
-        println!("  {n:>4}  {eager:>12.1}  {graph:>12.1}  {vs_eager:>9.2}x  {vs_142:>9.2}x");
+        // On-device greedy: the whole step is one graph replay + an N·4-byte token readback
+        // (no per-step logits dtoh) — the serving fast path.
+        let argmax = bench(model, n, &|m, b, t| {
+            m.decode_batch_graph_argmax(b, t).expect("argmax decode");
+        });
+        let Some(argmax) = argmax else { break };
+        let amax_vs_142 = argmax / 142.0;
+        println!("  {n:>4}  {eager:>12.1}  {graph:>12.1}  {argmax:>12.1}  {amax_vs_142:>9.2}x");
     }
 }
