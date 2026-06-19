@@ -1348,6 +1348,7 @@ impl CudaBackend {
                 .map_err(|e| driver_err("decode capture stream", &e))?,
             graph: None,
             raw: None,
+            batch_raw: None,
         })
     }
 
@@ -2670,6 +2671,11 @@ pub struct CudaDecodeModel {
     /// Raw-loaded PTX modules + `CUfunction` handles for the captured raw launches
     /// (the safe `CudaFunction` hides `cu_function`). `None` until the graph path is used.
     raw: Option<RawGraphKernels>,
+    /// Raw batch (M=N) kernels for the graph-captured `decode_batch_graph`. A second JIT
+    /// of the batch entry points, loaded lazily on first batched-graph decode. The per-N
+    /// graph itself lives on the [`BatchKv`] (its buffers are N-specific), so this only
+    /// holds the `CUfunction` handles the capture references.
+    batch_raw: Option<BatchRawKernels>,
 }
 
 impl CudaDecodeModel {
@@ -3321,6 +3327,7 @@ impl CudaDecodeModel {
             d_scores: alloc(n * self.n_head * self.max_ctx, "batch d_scores")?,
             d_h: alloc(self.n_embd, "batch d_h")?,
             d_logits: alloc(self.vocab, "batch d_logits")?,
+            graph: None,
         })
     }
 
@@ -3434,6 +3441,302 @@ impl CudaDecodeModel {
         #[allow(unsafe_code)]
         unsafe { l.launch(cfg).map_err(|e| driver_err("launch mdecode attn", &e))?; }
         Ok(())
+    }
+
+    /// **Graph-captured batched (M=N) decode** — the Track-2 perf sibling of
+    /// [`decode_batch`](Self::decode_batch). The device-resident M=N body is recorded once
+    /// into a CUDA graph (per batch, since the capture bakes in *these* buffers' pointers)
+    /// and replayed per step, eliminating the per-kernel launch overhead that left the
+    /// eager M=N path slower than the M=1 [`step_graph`](Self::step_graph). Bit-identical
+    /// to `decode_batch` per row — the graph replays the exact same kernels in the same
+    /// order over the same buffers; only the launch mechanism differs — gated by
+    /// `cuda_batch_decode_graph_matches_eager`. The LM head stays eager (per-row), like
+    /// `decode_batch`.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a length/token guard, capacity overflow, or device failure.
+    pub fn decode_batch_graph(&mut self, batch: &mut BatchKv, tokens: &[u32]) -> Result<Vec<Vec<f32>>, BackendError> {
+        let n = batch.n;
+        if tokens.len() != n {
+            return Err(BackendError::InvalidInput(format!("decode_batch_graph expects {n} tokens, got {}", tokens.len())));
+        }
+        for (&t, &p) in tokens.iter().zip(&batch.positions) {
+            if t as usize >= self.vocab {
+                return Err(BackendError::InvalidInput(format!("decode_batch_graph token {t} out of range")));
+            }
+            if p >= self.max_ctx {
+                return Err(BackendError::InvalidInput("decode_batch_graph context overflow".into()));
+            }
+        }
+
+        // Lazily load the raw batch kernels, then capture this batch's graph (per-N).
+        if self.batch_raw.is_none() {
+            let ctx = self.cap_stream.context().clone();
+            self.batch_raw = Some(BatchRawKernels::load(&ctx)?);
+        }
+        if batch.graph.is_none() {
+            let g = self.record_graph_batch(batch)?;
+            batch.graph = Some(g);
+        }
+
+        // Drain any pending default-stream work before the graph (on `cap_stream`) touches
+        // the shared batch buffers, exactly as `step_graph` does for the M=1 path.
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("batch graph pre default sync", &e))?;
+
+        // Upload this step's tokens + positions on the capture stream, ordered before the
+        // replay (the captured embed/rope/kv/attn read them as stable pointers — the M=N
+        // analogue of the M=1 `d_ctrl`).
+        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let pos_i: Vec<i32> = batch.positions.iter().map(|&p| p as i32).collect();
+        self.cap_stream
+            .memcpy_htod(&tok_i, &mut batch.d_tokens)
+            .map_err(|e| driver_err("batch graph tokens htod", &e))?;
+        self.cap_stream
+            .memcpy_htod(&pos_i, &mut batch.d_positions)
+            .map_err(|e| driver_err("batch graph pos htod", &e))?;
+        batch
+            .graph
+            .as_ref()
+            .expect("graph captured above")
+            .launch()
+            .map_err(|e| driver_err("batch graph launch", &e))?;
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("batch graph sync", &e))?;
+
+        // Final norm landed in `d_normed`; run the per-row LM head eagerly (one warp head
+        // per row over the f16 token table), mirroring `decode_batch`'s tail bit-for-bit.
+        let s = &self.stream;
+        let n_embd = self.n_embd;
+        let mut out = Vec::with_capacity(n);
+        for r in 0..n {
+            {
+                let row = batch.d_normed.slice(r * n_embd..(r + 1) * n_embd);
+                s.memcpy_dtod(&row, &mut batch.d_h).map_err(|e| driver_err("batch graph row copy", &e))?;
+            }
+            Self::bl_lm_head_f16(s, &self.f_lm_head_f16, &batch.d_h, &self.d_token_embd_f16, n_embd, self.vocab, &mut batch.d_logits)?;
+            let mut logits = vec![0.0f32; self.vocab];
+            s.memcpy_dtoh(&batch.d_logits, &mut logits).map_err(|e| driver_err("batch graph logits dtoh", &e))?;
+            out.push(logits);
+        }
+        for p in &mut batch.positions {
+            *p += 1;
+        }
+        Ok(out)
+    }
+
+    fn batch_raw(&self) -> &BatchRawKernels {
+        self.batch_raw.as_ref().expect("batch raw kernels loaded before record")
+    }
+
+    /// Extract every batch + weight buffer's stable device pointer (guards dropped here,
+    /// outside capture), then capture the full M=N forward via raw launches on
+    /// `cap_stream`. Mirrors [`record_graph`](Self::record_graph) for the batched path,
+    /// reading the **per-batch** KV arenas and the **unfused** q/k/v/gate/up projections
+    /// (the eager `decode_batch` is unfused — fusing is the follow-on).
+    fn record_graph_batch(&self, batch: &BatchKv) -> Result<CudaGraph, BackendError> {
+        let s = &self.cap_stream;
+        let n = batch.n;
+        let lin = |l: &ResidentLinear| LinPtrs {
+            w: dptr(l.device.as_ref(), s),
+            sc: dptr(&l.scales, s),
+            n: l.n,
+            k: l.k,
+            rb: l.row_bytes,
+        };
+        let layers: Vec<BatchLayerPtrs> = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(li, l)| BatchLayerPtrs {
+                attn_norm: dptr(&l.attn_norm, s),
+                attn_sub_norm: l.attn_sub_norm.as_ref().map(|b| dptr(b, s)),
+                ffn_norm: dptr(&l.ffn_norm, s),
+                ffn_sub_norm: l.ffn_sub_norm.as_ref().map(|b| dptr(b, s)),
+                q: lin(&l.q),
+                k: lin(&l.k),
+                v: lin(&l.v),
+                o: lin(&l.o),
+                gate: lin(&l.gate),
+                up: lin(&l.up),
+                down: lin(&l.down),
+                kv_k: dptr(&batch.kv_k[li], s),
+                kv_v: dptr(&batch.kv_v[li], s),
+            })
+            .collect();
+        let p = BatchPtrs {
+            d_tokens: dptr(&batch.d_tokens, s),
+            d_positions: dptr(&batch.d_positions, s),
+            d_x: dptr(&batch.d_x, s),
+            d_normed: dptr(&batch.d_normed, s),
+            d_q: dptr(&batch.d_q, s),
+            d_k: dptr(&batch.d_k, s),
+            d_v: dptr(&batch.d_v, s),
+            d_attn: dptr(&batch.d_attn, s),
+            d_attn_sn: dptr(&batch.d_attn_sn, s),
+            d_proj: dptr(&batch.d_proj, s),
+            d_gate: dptr(&batch.d_gate, s),
+            d_up: dptr(&batch.d_up, s),
+            d_gate_sn: dptr(&batch.d_gate_sn, s),
+            d_qact: dptr(&batch.d_qact, s),
+            d_act_scale: dptr(&batch.d_act_scale, s),
+            d_scores: dptr(&batch.d_scores, s),
+            d_cos: dptr(&self.d_cos, s),
+            d_sin: dptr(&self.d_sin, s),
+            d_token_embd: dptr(&self.d_token_embd, s),
+            d_output_norm: dptr(&self.d_output_norm, s),
+        };
+        // Drain the events the device_ptr extraction recorded, so the capture (raw
+        // launches only) carries no pre-capture dependency.
+        s.synchronize().map_err(|e| driver_err("batch pre-capture cap sync", &e))?;
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("batch pre-capture default sync", &e))?;
+
+        s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|e| driver_err("batch begin_capture", &e))?;
+
+        // The exact op order of `decode_batch`, all raw-launched on `cap_stream`.
+        self.gb_embed(p.d_token_embd, p.d_tokens, p.d_x, n)?;
+        for lp in &layers {
+            self.gb_layer(&p, lp, n)?;
+        }
+        self.gb_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed, n)?;
+
+        let graph = s
+            .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|e| driver_err("batch end_capture", &e))?
+            .ok_or_else(|| BackendError::Backend("batch graph capture produced no graph".into()))?;
+        Ok(graph)
+    }
+
+    /// One transformer block of the M=N forward, raw-launched into the capture. Mirrors
+    /// the per-layer body of [`decode_batch`](Self::decode_batch) op-for-op.
+    fn gb_layer(&self, p: &BatchPtrs, l: &BatchLayerPtrs, n: usize) -> Result<(), BackendError> {
+        let (n_embd, q_width, kv_width, n_ff) = (self.n_embd, self.q_width, self.kv_width, self.n_ff);
+        let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
+
+        // pre-norm attention. q/k/v share ONE quant of d_normed, then three unfused GEMMs.
+        self.gb_rmsnorm(p.d_x, l.attn_norm, n_embd, p.d_normed, n)?;
+        self.gb_quant(p.d_normed, n_embd, p.d_qact, p.d_act_scale, n)?;
+        self.gb_matmul(&l.q, p.d_qact, p.d_act_scale, p.d_q, n)?;
+        self.gb_matmul(&l.k, p.d_qact, p.d_act_scale, p.d_k, n)?;
+        self.gb_matmul(&l.v, p.d_qact, p.d_act_scale, p.d_v, n)?;
+        self.gb_rope(p.d_q, p.d_cos, p.d_sin, p.d_positions, n_head, head_dim, n)?;
+        self.gb_rope(p.d_k, p.d_cos, p.d_sin, p.d_positions, n_head_kv, head_dim, n)?;
+        self.gb_kv_append(p.d_k, l.kv_k, p.d_positions, kv_width, n)?;
+        self.gb_kv_append(p.d_v, l.kv_v, p.d_positions, kv_width, n)?;
+        self.gb_attn(p.d_q, l.kv_k, l.kv_v, p.d_attn, p.d_scores, p.d_positions, n)?;
+        let attn_in = if let Some(sn) = l.attn_sub_norm {
+            self.gb_rmsnorm(p.d_attn, sn, q_width, p.d_attn_sn, n)?;
+            p.d_attn_sn
+        } else {
+            p.d_attn
+        };
+        self.gb_quant(attn_in, q_width, p.d_qact, p.d_act_scale, n)?;
+        self.gb_matmul(&l.o, p.d_qact, p.d_act_scale, p.d_proj, n)?;
+        self.gb_residual(p.d_x, p.d_proj, n * n_embd)?;
+
+        // pre-norm ReLU² MLP. gate/up unfused; relu2 writes gate = relu(gate)² ⊙ up.
+        self.gb_rmsnorm(p.d_x, l.ffn_norm, n_embd, p.d_normed, n)?;
+        self.gb_quant(p.d_normed, n_embd, p.d_qact, p.d_act_scale, n)?;
+        self.gb_matmul(&l.gate, p.d_qact, p.d_act_scale, p.d_gate, n)?;
+        self.gb_matmul(&l.up, p.d_qact, p.d_act_scale, p.d_up, n)?;
+        self.gb_relu2(p.d_gate, p.d_up, n * n_ff)?;
+        let down_in = if let Some(sn) = l.ffn_sub_norm {
+            self.gb_rmsnorm(p.d_gate, sn, n_ff, p.d_gate_sn, n)?;
+            p.d_gate_sn
+        } else {
+            p.d_gate
+        };
+        self.gb_quant(down_in, n_ff, p.d_qact, p.d_act_scale, n)?;
+        self.gb_matmul(&l.down, p.d_qact, p.d_act_scale, p.d_proj, n)?;
+        self.gb_residual(p.d_x, p.d_proj, n * n_embd)?;
+        Ok(())
+    }
+
+    // Raw-launch helpers for the batched capture (`gb_*`): each mirrors the matching safe
+    // `bl_*`/`md_*` helper 1:1 — same grid/block/smem and the same kernel-param order —
+    // but builds the params from pre-extracted device pointers and raw-launches on
+    // `cap_stream`. `n` is the batch (row) count.
+
+    fn gb_embed(&self, table: sys::CUdeviceptr, tokens: sys::CUdeviceptr, out: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let (ne_i, n_i) = (self.n_embd as i32, n as i32);
+        let grid = (((n * self.n_embd) as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&table), pp(&tokens), pp(&ne_i), pp(&n_i), pp(&out)];
+        raw_launch(self.batch_raw().embed, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn gb_rmsnorm(&self, x: sys::CUdeviceptr, w: sys::CUdeviceptr, dim: usize, out: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let eps = self.rms_eps;
+        let (dim_i, n_i) = (dim as i32, n as i32);
+        let smem = (dim * 4) as u32;
+        let mut params = [pp(&x), pp(&w), pp(&eps), pp(&dim_i), pp(&n_i), pp(&out)];
+        raw_launch(self.batch_raw().rmsnorm, (n as u32, 1, 1), (256, 1, 1), smem, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn gb_quant(&self, d_in: sys::CUdeviceptr, k: usize, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let (k_i, n_i) = (k as i32, n as i32);
+        let mut params = [pp(&d_in), pp(&k_i), pp(&n_i), pp(&d_qact), pp(&d_act_scale)];
+        raw_launch(self.batch_raw().quant, (n as u32, 1, 1), (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn gb_matmul(&self, lin: &LinPtrs, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, d_out: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let cs = self.cap_stream.cu_stream();
+        let (m_i, n_out_i, k_i, rb_i) = (n as i32, lin.n as i32, lin.k as i32, lin.rb as i32);
+        {
+            let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), n as u32, 1);
+            let smem = (lin.k * 4) as u32;
+            let mut params = [pp(&d_qact), pp(&lin.w), pp(&lin.sc), pp(&d_out), pp(&m_i), pp(&n_out_i), pp(&k_i), pp(&rb_i)];
+            raw_launch(self.batch_raw().tiled, grid, (WARPS_PER_BLOCK * 32, 1, 1), smem, cs, &mut params)?;
+        }
+        {
+            let grid = (((n * lin.n) as u32).div_ceil(256), 1, 1);
+            let mut params = [pp(&d_out), pp(&d_act_scale), pp(&n_out_i), pp(&m_i)];
+            raw_launch(self.batch_raw().scale, grid, (256, 1, 1), 0, cs, &mut params)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gb_rope(&self, x: sys::CUdeviceptr, cos_t: sys::CUdeviceptr, sin_t: sys::CUdeviceptr, positions: sys::CUdeviceptr, n_head: usize, head_dim: usize, n: usize) -> Result<(), BackendError> {
+        let (nh_i, hd_i, n_i) = (n_head as i32, head_dim as i32, n as i32);
+        let total = (n * n_head * (head_dim / 2)) as u32;
+        let grid = (total.div_ceil(256), 1, 1);
+        let mut params = [pp(&x), pp(&cos_t), pp(&sin_t), pp(&positions), pp(&nh_i), pp(&hd_i), pp(&n_i)];
+        raw_launch(self.batch_raw().rope, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn gb_kv_append(&self, src: sys::CUdeviceptr, kv_base: sys::CUdeviceptr, positions: sys::CUdeviceptr, kv_width: usize, n: usize) -> Result<(), BackendError> {
+        let (mc_i, kw_i, n_i) = (self.max_ctx as i32, kv_width as i32, n as i32);
+        let grid = (((n * kv_width) as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&src), pp(&kv_base), pp(&positions), pp(&mc_i), pp(&kw_i), pp(&n_i)];
+        raw_launch(self.batch_raw().kv_append, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gb_attn(&self, q: sys::CUdeviceptr, k: sys::CUdeviceptr, v: sys::CUdeviceptr, out: sys::CUdeviceptr, scores: sys::CUdeviceptr, positions: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+        let (mc_i, nh_i, nhkv_i, hd_i, n_i) = (self.max_ctx as i32, self.n_head as i32, self.n_head_kv as i32, self.head_dim as i32, n as i32);
+        let scale = self.attn_scale;
+        let grid = (((n * self.n_head) as u32).div_ceil(8), 1, 1);
+        let mut params = [pp(&q), pp(&k), pp(&v), pp(&out), pp(&scores), pp(&positions), pp(&mc_i), pp(&nh_i), pp(&nhkv_i), pp(&hd_i), pp(&scale), pp(&n_i)];
+        raw_launch(self.batch_raw().attn, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn gb_residual(&self, x: sys::CUdeviceptr, y: sys::CUdeviceptr, total: usize) -> Result<(), BackendError> {
+        let total_i = total as i32;
+        let grid = ((total as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&x), pp(&y), pp(&total_i)];
+        raw_launch(self.batch_raw().residual, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+    }
+
+    fn gb_relu2(&self, gate: sys::CUdeviceptr, up: sys::CUdeviceptr, total: usize) -> Result<(), BackendError> {
+        let total_i = total as i32;
+        let grid = ((total as u32).div_ceil(256), 1, 1);
+        let mut params = [pp(&gate), pp(&up), pp(&total_i)];
+        raw_launch(self.batch_raw().relu2, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
     }
 
     /// Load the raw kernels (once) and record + instantiate the decode graph.
@@ -3844,6 +4147,131 @@ impl Drop for RawGraphKernels {
     }
 }
 
+/// Raw-loaded PTX modules + `CUfunction` handles for the graph-captured **batched** (M=N)
+/// decode ([`CudaDecodeModel::decode_batch_graph`]). The batched analogue of
+/// [`RawGraphKernels`]: a second JIT of the same `DECODE_PTX` / `TQ2_0_ADD_PTX` the backend
+/// already loaded, exposing the raw `sys::CUfunction` handles the captured launches need.
+/// The `tiled` GEMM is the f32-accumulate variant — bit-identical to the eager batch path's
+/// double-accumulate GEMM here because the activations are int8 and the weights ternary, so
+/// each partial product is an exact integer and the running sum never leaves f32's exact
+/// integer range (the same equivalence the M=1 graph relies on).
+struct BatchRawKernels {
+    modules: Vec<sys::CUmodule>,
+    embed: sys::CUfunction,
+    rmsnorm: sys::CUfunction,
+    quant: sys::CUfunction,
+    scale: sys::CUfunction,
+    rope: sys::CUfunction,
+    kv_append: sys::CUfunction,
+    attn: sys::CUfunction,
+    residual: sys::CUfunction,
+    relu2: sys::CUfunction,
+    tiled: sys::CUfunction,
+}
+
+// SAFETY: same contract as `RawGraphKernels` — the raw handles are process-valid device
+// handles used only on the owning model's single capture stream, never concurrently across
+// threads (the graph path is single-threaded by construction).
+#[allow(unsafe_code)]
+unsafe impl Send for BatchRawKernels {}
+
+impl BatchRawKernels {
+    fn load(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
+        ctx.bind_to_thread()
+            .map_err(|e| driver_err("batch raw kernels bind", &e))?;
+        let load_mod = |ptx: &str| -> Result<sys::CUmodule, BackendError> {
+            let c = CString::new(ptx)
+                .map_err(|_| BackendError::InvalidInput("PTX has an interior NUL".into()))?;
+            // SAFETY: `c` is a valid NUL-terminated PTX image; `load_data` JIT-compiles it.
+            #[allow(unsafe_code)]
+            unsafe { result::module::load_data(c.as_ptr() as *const c_void) }
+                .map_err(|e| driver_err("batch raw module load_data", &e))
+        };
+        let get = |m: sys::CUmodule, name: &str| -> Result<sys::CUfunction, BackendError> {
+            let c = CString::new(name)
+                .map_err(|_| BackendError::InvalidInput("kernel name has a NUL".into()))?;
+            // SAFETY: `m` is a loaded module; `name` is one of its `extern "C"` entry points.
+            #[allow(unsafe_code)]
+            unsafe { result::module::get_function(m, c) }
+                .map_err(|e| driver_err("batch raw get_function", &e))
+        };
+        let dm = load_mod(DECODE_PTX)?;
+        let am = load_mod(TQ2_0_ADD_PTX)?;
+        Ok(Self {
+            embed: get(dm, KERNEL_NAME_EMBED_BATCH)?,
+            rmsnorm: get(dm, KERNEL_NAME_RMSNORM_BATCH)?,
+            quant: get(dm, KERNEL_NAME_ACT_QUANT_BATCH)?,
+            scale: get(dm, KERNEL_NAME_SCALE_BATCH)?,
+            rope: get(dm, KERNEL_NAME_ROPE_BATCH)?,
+            kv_append: get(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
+            attn: get(dm, KERNEL_NAME_ATTN_MDECODE)?,
+            residual: get(dm, KERNEL_NAME_RESIDUAL)?,
+            relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
+            tiled: get(am, KERNEL_NAME_TILED_F32)?,
+            modules: vec![dm, am],
+        })
+    }
+}
+
+impl Drop for BatchRawKernels {
+    fn drop(&mut self) {
+        for &m in &self.modules {
+            if !m.is_null() {
+                // SAFETY: each module was loaded by `load` and is unloaded exactly once
+                // here; a `BatchKv`'s captured graph must be dropped before the model whose
+                // `batch_raw` these are, so nothing launches that graph after this point.
+                #[allow(unsafe_code)]
+                unsafe {
+                    let _ = result::module::unload(m);
+                }
+            }
+        }
+    }
+}
+
+/// Pre-extracted device pointers for one transformer block of the batched capture. Like
+/// [`LayerPtrs`] but the projections are **unfused** (separate q/k/v and gate/up, matching
+/// the eager `decode_batch`) and the KV arenas are the **per-batch** ones.
+struct BatchLayerPtrs {
+    attn_norm: sys::CUdeviceptr,
+    attn_sub_norm: Option<sys::CUdeviceptr>,
+    ffn_norm: sys::CUdeviceptr,
+    ffn_sub_norm: Option<sys::CUdeviceptr>,
+    q: LinPtrs,
+    k: LinPtrs,
+    v: LinPtrs,
+    o: LinPtrs,
+    gate: LinPtrs,
+    up: LinPtrs,
+    down: LinPtrs,
+    kv_k: sys::CUdeviceptr,
+    kv_v: sys::CUdeviceptr,
+}
+
+/// Pre-extracted device pointers for the batched capture's scratch + shared dense weights.
+struct BatchPtrs {
+    d_tokens: sys::CUdeviceptr,
+    d_positions: sys::CUdeviceptr,
+    d_x: sys::CUdeviceptr,
+    d_normed: sys::CUdeviceptr,
+    d_q: sys::CUdeviceptr,
+    d_k: sys::CUdeviceptr,
+    d_v: sys::CUdeviceptr,
+    d_attn: sys::CUdeviceptr,
+    d_attn_sn: sys::CUdeviceptr,
+    d_proj: sys::CUdeviceptr,
+    d_gate: sys::CUdeviceptr,
+    d_up: sys::CUdeviceptr,
+    d_gate_sn: sys::CUdeviceptr,
+    d_qact: sys::CUdeviceptr,
+    d_act_scale: sys::CUdeviceptr,
+    d_scores: sys::CUdeviceptr,
+    d_cos: sys::CUdeviceptr,
+    d_sin: sys::CUdeviceptr,
+    d_token_embd: sys::CUdeviceptr,
+    d_output_norm: sys::CUdeviceptr,
+}
+
 /// State for batched M=N decode of `n` concurrent sequences (v0.3.7): per-sequence KV
 /// arenas + the M=N forward scratch. Built by [`CudaDecodeModel::new_batch`] and advanced
 /// by [`CudaDecodeModel::decode_batch`]. Each sequence has its own KV slice
@@ -3873,6 +4301,12 @@ pub struct BatchKv {
     d_scores: CudaSlice<f32>,
     d_h: CudaSlice<f32>,
     d_logits: CudaSlice<f32>,
+    /// The captured M=N decode graph for this batch, built lazily on the first
+    /// [`CudaDecodeModel::decode_batch_graph`]. Tied to *these* buffers (the capture bakes
+    /// their device pointers in), so it lives on the batch, not the model. The model's
+    /// [`CudaDecodeModel::batch_raw`] modules must outlive it, so a `BatchKv` must be
+    /// dropped before the model that produced it.
+    graph: Option<CudaGraph>,
 }
 
 impl BatchKv {

@@ -15,33 +15,36 @@
 //!     -- --ignored --nocapture
 //! ```
 //!
-//! ## Measured baseline (RTX 4090, 64 steps, full-logits readback per step)
+//! ## Measured (RTX 4090, 64 steps, full-logits readback per step)
 //!
 //! ```text
-//!   N    agg tok/s   per-stream   vs N=1
-//!   1       43.9        43.9       1.00x
-//!   2       54.4        27.2       1.24x
-//!   4       64.2        16.1       1.46x
-//!   8       73.3         9.2       1.67x
-//!  16       75.5         4.7       1.72x
-//!  32       74.3         2.3       1.69x
-//!  64       75.6         1.2       1.72x
+//!    N   eager tok/s   graph tok/s     g/eager       g/142
+//!    1          48.7         107.3       2.20x       0.76x
+//!    2          61.5         171.7       2.79x       1.21x
+//!    4          70.2         240.8       3.43x       1.70x
+//!    8          74.5         298.5       4.01x       2.10x
+//!   16          76.8         337.5       4.39x       2.38x
+//!   32          74.9         333.3       4.45x       2.35x
+//!   64          73.2         355.8       4.86x       2.51x
 //! ```
 //!
-//! **Honest finding (refutes the "batching fills the GPU" assertion):**
-//! `decode_batch` is the *eager* (un-graph-captured) path — N=1 here is 43.9 tok/s
-//! vs **142 tok/s** for the M=1 `step_graph` (the CUDA graph is a ~3.2× win that the
-//! batched path discards). Aggregate **saturates at ~75 tok/s by N≈8 and goes flat**,
-//! i.e. *below* the 142 single-stream graph path. The M=N decode is bit-exact (the
-//! v0.3.7 gate) but **not a throughput win as built** — it needs the same CUDA-graph
-//! capture the M=1 path got (+ on-device sampling to avoid the per-step logits dtoh,
-//! 33 MB/step at N=64). Tracked as Track-2 perf work.
+//! **Finding:** `decode_batch` is the *eager* (un-graph-captured) path — its aggregate
+//! saturates at ~75 tok/s by N≈8 and flatlines *below* the 142 tok/s M=1 `step_graph`,
+//! because per-kernel launch overhead dominates the M=N forward. Graph-capturing that
+//! forward ([`CudaDecodeModel::decode_batch_graph`], bit-identical to eager per the
+//! `cuda_batch_decode_graph_matches_eager` gate) is a **2.2×–4.9× win** that lifts the
+//! aggregate past the 142 single-stream line from N≥2 and to **2.5× (356 tok/s) at
+//! N=64**. The graph N=1 (107 tok/s) still trails the M=1 `step_graph` (142) because the
+//! batch graph keeps q/k/v and gate/up *unfused*; fusing them (the M=1 graph already
+//! does) is the next Track-2 step, alongside on-device sampling to drop the per-step
+//! full-logits dtoh (33 MB/step at N=64).
 
 #![cfg(feature = "cuda")]
 
 use std::path::Path;
 use std::time::Instant;
 
+use tritium_cuda::{BatchKv, CudaDecodeModel};
 use tritium_nn::ModelRunner;
 
 const GGUF_PATH: &str = "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
@@ -96,32 +99,47 @@ fn batched_decode_throughput() {
     let tok = 791u32; // an arbitrary valid token id; values don't affect timing
     println!("\nBatched M=N decode throughput (RTX 4090, {STEPS} steps):");
     println!("  M=1 single-stream baseline ≈ 142 tok/s (occupancy-bound, ~19% util)\n");
-    println!("  {:>4}  {:>14}  {:>14}  {:>8}", "N", "agg tok/s", "per-stream", "vs N=1");
+    println!(
+        "  {:>4}  {:>12}  {:>12}  {:>10}  {:>10}",
+        "N", "eager tok/s", "graph tok/s", "g/eager", "g/142"
+    );
 
-    let mut base_per_stream = f64::NAN;
-    for &n in NS {
+    // Time `STEPS` decodes of a fresh `n`-sequence batch through `step_fn`, returning
+    // aggregate tokens/sec (n·STEPS / elapsed). `None` if the batch can't be allocated.
+    let bench = |model: &mut CudaDecodeModel,
+                 n: usize,
+                 step: &dyn Fn(&mut CudaDecodeModel, &mut BatchKv, &[u32])|
+     -> Option<f64> {
         let mut batch = match model.new_batch(n) {
             Ok(b) => b,
             Err(e) => {
                 println!("  N={n}: new_batch failed ({e}) — likely VRAM cap, stopping");
-                break;
+                return None;
             }
         };
         let tokens = vec![tok; n];
         for _ in 0..WARM {
-            model.decode_batch(&mut batch, &tokens).expect("warmup");
+            step(model, &mut batch, &tokens);
         }
         let start = Instant::now();
         for _ in 0..STEPS {
-            model.decode_batch(&mut batch, &tokens).expect("decode");
+            step(model, &mut batch, &tokens);
         }
         let secs = start.elapsed().as_secs_f64();
-        let agg = (n * STEPS) as f64 / secs;
-        let per_stream = agg / n as f64;
-        if n == 1 {
-            base_per_stream = per_stream;
-        }
-        let speedup = agg / (base_per_stream * 1.0); // agg vs the N=1 aggregate
-        println!("  {n:>4}  {agg:>14.1}  {per_stream:>14.1}  {speedup:>7.2}x");
+        Some((n * STEPS) as f64 / secs)
+    };
+
+    for &n in NS {
+        let eager = bench(model, n, &|m, b, t| {
+            m.decode_batch(b, t).expect("eager decode");
+        });
+        let Some(eager) = eager else { break };
+        let graph = bench(model, n, &|m, b, t| {
+            m.decode_batch_graph(b, t).expect("graph decode");
+        });
+        let Some(graph) = graph else { break };
+        let vs_eager = graph / eager;
+        let vs_142 = graph / 142.0;
+        println!("  {n:>4}  {eager:>12.1}  {graph:>12.1}  {vs_eager:>9.2}x  {vs_142:>9.2}x");
     }
 }
