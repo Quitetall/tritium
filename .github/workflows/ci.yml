@@ -41,7 +41,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz
-      - run: cargo +nightly fuzz run gguf_parse -- -max_len=131072 -max_total_time=3600
+      # One hour split across the three tritium-format parsers (U5: every parser
+      # introduced has a target — GGUF reader, SALT-in-GGUF, sparse plane).
+      - run: cargo +nightly fuzz run gguf_parse -- -max_len=131072 -max_total_time=1200
+        working-directory: crates/tritium-format
+      - run: cargo +nightly fuzz run salt_gguf_parse -- -max_len=131072 -max_total_time=1200
+        working-directory: crates/tritium-format
+      - run: cargo +nightly fuzz run sparse_plane_parse -- -max_len=131072 -max_total_time=1200
         working-directory: crates/tritium-format
 
   # GPU lane (U2 parity + CUDA conformance + compute-sanitizer). Self-hosted,

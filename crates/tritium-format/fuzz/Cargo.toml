@@ -27,3 +27,17 @@ path = "fuzz_targets/gguf_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "salt_gguf_parse"
+path = "fuzz_targets/salt_gguf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sparse_plane_parse"
+path = "fuzz_targets/sparse_plane_parse.rs"
+test = false
+doc = false
+bench = false
