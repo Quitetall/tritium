@@ -122,8 +122,10 @@ const KERNEL_NAME_KV_APPEND_MDECODE: &str = "kv_append_mdecode_f32";
 const KERNEL_NAME_ATTN_MDECODE: &str = "gqa_attention_mdecode_f32";
 
 /// v0.3.8 on-device sampling for the batched decode graph.
-const KERNEL_NAME_LM_HEAD_BATCH_F16: &str = "lm_head_batch_f16";
+const KERNEL_NAME_LM_HEAD_TILED_F16: &str = "lm_head_tiled_f16";
 const KERNEL_NAME_ARGMAX_ROWS: &str = "argmax_rows_f32";
+/// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
+const LMHEAD_ROW_TILE: u32 = 8;
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
 /// `ACT_QUANT_THREADS` (its shared reduction is sized for this, a power of two).
 const ACT_QUANT_THREADS: u32 = 256;
@@ -3839,13 +3841,14 @@ impl CudaDecodeModel {
     }
 
     /// Batched LM head over all `n` rows: `d_normed[n, n_embd] · token_embd_f16 → d_logits[n, vocab]`.
-    /// One warp per `(row, vocab)` output; `grid.y = n` (mirrors `bl_lm_head_f16`'s grid with the
-    /// batch dim added). Bit-identical per row to the single-row head.
+    /// One warp per vocab row, computing `LMHEAD_ROW_TILE` output rows per launch so the embd
+    /// table is read once per row-tile (not once per row); `grid.y = ceil(n / TILE)`.
+    /// Bit-identical per row to the single-row head.
     fn gb_lm_head_batch(&self, h: sys::CUdeviceptr, embd: sys::CUdeviceptr, d_logits: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
         let (ne_i, v_i, n_i) = (self.n_embd as i32, self.vocab as i32, n as i32);
-        let grid = ((self.vocab as u32).div_ceil(8), n as u32, 1);
+        let grid = ((self.vocab as u32).div_ceil(8), (n as u32).div_ceil(LMHEAD_ROW_TILE), 1);
         let mut params = [pp(&h), pp(&embd), pp(&ne_i), pp(&v_i), pp(&n_i), pp(&d_logits)];
-        raw_launch(self.batch_raw().lm_head_batch, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(self.batch_raw().lm_head_tiled, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
     }
 
     /// Per-row greedy argmax `d_logits[n, vocab] → d_out[n]` (i32). One block per row.
@@ -4284,7 +4287,7 @@ struct BatchRawKernels {
     residual: sys::CUfunction,
     relu2: sys::CUfunction,
     tiled: sys::CUfunction,
-    lm_head_batch: sys::CUfunction,
+    lm_head_tiled: sys::CUfunction,
     argmax: sys::CUfunction,
 }
 
@@ -4335,7 +4338,7 @@ impl BatchRawKernels {
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
-            lm_head_batch: get(dm, KERNEL_NAME_LM_HEAD_BATCH_F16)?,
+            lm_head_tiled: get(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             argmax: get(dm, KERNEL_NAME_ARGMAX_ROWS)?,
             modules: vec![dm, am],
         })

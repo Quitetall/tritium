@@ -15,37 +15,37 @@
 //!     -- --ignored --nocapture
 //! ```
 //!
-//! ## Measured (RTX 4090, 64 steps)
+//! ## Measured (RTX 4090, 64 steps; `argmax` = tiled LM head)
 //!
 //! ```text
 //!    N   eager tok/s   graph tok/s  argmax tok/s    amax/142
-//!    1          48.2         105.4         105.1       0.74x
-//!    2          60.8         169.1         168.7       1.19x
-//!    4          69.3         237.9         238.1       1.68x
-//!    8          73.8         292.9         294.2       2.07x
-//!   16          76.4         335.0         336.3       2.37x
-//!   32          77.4         357.0         359.1       2.53x
-//!   64          73.0         349.9         342.9       2.41x
+//!    1          52.4         114.9         113.9       0.80x
+//!    2          66.2         183.2         195.7       1.38x
+//!    4          75.8         260.4         303.9       2.14x
+//!    8          81.0         323.0         410.7       2.89x
+//!   16          83.5         365.2         483.2       3.40x
+//!   32          80.8         337.5         457.5       3.22x
+//!   64          75.1         366.0         474.3       3.34x
 //! ```
 //!
-//! **Graph capture is the win:** `decode_batch` (eager) saturates ~75 tok/s by N≈8 —
-//! below the 142 M=1 `step_graph` — because per-kernel launch overhead dominates the M=N
-//! forward. Graph-capturing it ([`CudaDecodeModel::decode_batch_graph`], bit-identical per
-//! the `cuda_batch_decode_graph_matches_eager` gate) is **2.2×–4.9×**, past 142 from N≥2 to
-//! ~350 (2.5×) at N=64.
+//! **Graph capture is the foundation win:** `decode_batch` (eager) saturates ~80 tok/s by
+//! N≈8 — below the 142 M=1 `step_graph` — because per-kernel launch overhead dominates the
+//! M=N forward. Graph-capturing it ([`CudaDecodeModel::decode_batch_graph`], bit-identical
+//! per `cuda_batch_decode_graph_matches_eager`) clears that, reaching ~366 at N=64.
 //!
-//! **On-device sampling is correctness, NOT throughput (measured negative result).**
-//! `decode_batch_graph_argmax` folds the LM head + greedy argmax into the graph and returns
-//! N token ids (N·4 B) instead of N·vocab·4 B of logits — yet it matches the logits path
-//! tok/s at every N. The per-step logits readback was **never the bottleneck**: at N=64,
-//! ~5.5 steps/s · 33 MB ≈ 180 MB/s, trivial vs PCIe's ~25 GB/s. It is the right *serving*
-//! primitive (gated by `cuda_batch_decode_graph_argmax_matches_greedy`), just not faster.
+//! **On-device sampling + a tiled LM head is the serving path.**
+//! [`CudaDecodeModel::decode_batch_graph_argmax`] folds the LM head + greedy argmax into the
+//! graph (returns N token ids, gated by `cuda_batch_decode_graph_argmax_matches_greedy`).
+//! The readback itself was never the bottleneck (~180 MB/s at N=64 vs PCIe ~25 GB/s); the
+//! win is the **tiled LM head**. An `nsys` trace at N=64 showed the per-row head
+//! (`lm_head_warp_f16`) was **29% of GPU time**, reading the 0.66 GB f16 `token_embd` table
+//! *once per row* at ~930 GB/s (≈ the 4090's bandwidth). The tiled head reads each embd row
+//! once per 8-row tile (`LMHEAD_ROW_TILE`), cutting that ~8×: **474 tok/s at N=64 = 3.34×
+//! the M=1 142**, +38% over the per-row head.
 //!
-//! **The real large-N cost is the LM head re-reading the embd table per row.** Both paths
-//! run a warp-per-vocab-row head that reads the whole 0.66 GB f16 `token_embd` table *once
-//! per row* → ~41 GB/step at N=64, dwarfing the ~0.6 GB ternary forward weights. A
-//! table-read-once / tiled LM head (reuse `embd` across the N-row tile) is the next large-N
-//! lever; fusing q/k/v / gate/up (the M=1 graph already does) lifts N=1 toward 142.
+//! **The floor is now the ternary GEMM** (`tq2_0_add_mpgemm_tiled_f32`, 68% of GPU time at
+//! N=64, compute-bound). Fusing q/k/v / gate/up trims launches/staging; the big GEMM lever
+//! is the deferred IMMA (int8 tensor-core) path.
 
 #![cfg(feature = "cuda")]
 
@@ -155,4 +155,40 @@ fn batched_decode_throughput() {
         let amax_vs_142 = argmax / 142.0;
         println!("  {n:>4}  {eager:>12.1}  {graph:>12.1}  {argmax:>12.1}  {amax_vs_142:>9.2}x");
     }
+}
+
+/// Minimal profiling driver for `nsys`/`ncu`: load the model, build one `N`-sequence batch
+/// (`TRITIUM_PROFILE_N`, default 32), warm the graph, then run `TRITIUM_PROFILE_STEPS`
+/// (default 8) `decode_batch_graph` steps — nothing else — so the profiler sees only the
+/// decode kernels, not the 7×3 sweep. Run under the profiler, e.g.:
+/// ```text
+/// nsys profile -o /tmp/decode \
+///   ./target/release/deps/batched_throughput-<hash> profile_decode_burst --ignored --exact
+/// ```
+#[test]
+#[ignore = "profiling driver for ncu/nsys; run the test binary under the profiler"]
+fn profile_decode_burst() {
+    let mut runner = match load_cuda() {
+        Some(r) => r,
+        None => return,
+    };
+    runner.config.n_ctx = CTX;
+    let model = match runner.resident_cuda().expect("resident build") {
+        Some(m) => m,
+        None => {
+            eprintln!("skipping: not a cuda resident");
+            return;
+        }
+    };
+    let n: usize = std::env::var("TRITIUM_PROFILE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+    let steps: usize = std::env::var("TRITIUM_PROFILE_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let mut batch = model.new_batch(n).expect("new_batch");
+    let tokens = vec![791u32; n];
+    for _ in 0..4 {
+        model.decode_batch_graph(&mut batch, &tokens).expect("warmup");
+    }
+    for _ in 0..steps {
+        model.decode_batch_graph(&mut batch, &tokens).expect("step");
+    }
+    println!("profiled {steps} decode_batch_graph steps at N={n}");
 }

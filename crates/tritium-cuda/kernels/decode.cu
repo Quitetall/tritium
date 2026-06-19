@@ -900,27 +900,40 @@ __global__ void gqa_attention_mdecode_f32(const float* __restrict__ q, const flo
 // (N·4 bytes) instead of N·vocab·4 bytes of logits (the 33 MB/step readback at N=64).
 // ===========================================================================
 
-// lm_head_batch_f16 — batched LM head: [m, n_embd] · embd_f16[vocab, n_embd] -> [m, vocab].
-// One warp per (row mi, vocab row `warp`); grid.y = m. BIT-IDENTICAL per row to
-// lm_head_warp_f16 (same f16 read, same __fadd_rn/__fmul_rn, same warp tree-reduce order),
-// so the greedy decision matches the single-row path exactly.
-__global__ void lm_head_batch_f16(const float* __restrict__ h, const __half* __restrict__ embd,
+// lm_head_tiled_f16 — batched LM head: [m, n_embd] · embd_f16[vocab, n_embd] -> [m, vocab].
+// One warp per vocab row, computing LMHEAD_ROW_TILE output rows at once: each warp reads its
+// `embd` row from the 0.66 GB f16 table ONCE and reuses it across the row-tile, so the table
+// is streamed ceil(m / LMHEAD_ROW_TILE) times per step instead of once per row — the embd
+// read is the dominant cost at large N (~930 GB/s, ~the 4090's bandwidth). `h` (m·n_embd, a
+// few hundred KB) stays hot in L2. BIT-IDENTICAL per row to lm_head_warp_f16 (same f16 read,
+// same __fadd_rn/__fmul_rn per k, same warp tree-reduce order).
+#define LMHEAD_ROW_TILE 8
+__global__ void lm_head_tiled_f16(const float* __restrict__ h, const __half* __restrict__ embd,
                                   const int n_embd, const int vocab, const int m,
                                   float* __restrict__ logits) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
-  const int mi = blockIdx.y;
-  if (mi >= m || warp >= vocab) return;
-  const float* hrow = h + (long long)mi * n_embd;
-  const __half* row = embd + (long long)warp * n_embd;
-  float acc = 0.0f;
+  if (warp >= vocab) return;
+  const int row0 = blockIdx.y * LMHEAD_ROW_TILE;
+  const __half* erow = embd + (long long)warp * n_embd;
+  float acc[LMHEAD_ROW_TILE];
+#pragma unroll
+  for (int r = 0; r < LMHEAD_ROW_TILE; ++r) acc[r] = 0.0f;
   for (int k = lane; k < n_embd; k += 32) {
-    acc = __fadd_rn(acc, __fmul_rn(hrow[k], __half2float(row[k])));
+    const float e = __half2float(erow[k]);
+#pragma unroll
+    for (int r = 0; r < LMHEAD_ROW_TILE; ++r) {
+      const int mi = row0 + r;
+      if (mi < m) acc[r] = __fadd_rn(acc[r], __fmul_rn(h[(long long)mi * n_embd + k], e));
+    }
   }
-  for (int off = 16; off > 0; off >>= 1) {
-    acc += __shfl_down_sync(0xffffffff, acc, off);
+#pragma unroll
+  for (int r = 0; r < LMHEAD_ROW_TILE; ++r) {
+    float a = acc[r];
+    for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
+    const int mi = row0 + r;
+    if (lane == 0 && mi < m) logits[(long long)mi * vocab + warp] = a;
   }
-  if (lane == 0) logits[(long long)mi * vocab + warp] = acc;
 }
 
 // argmax_rows_f32 — per-row greedy argmax: [m, vocab] -> [m] i32. One block (256 threads)
