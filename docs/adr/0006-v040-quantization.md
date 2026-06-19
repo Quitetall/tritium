@@ -6,20 +6,31 @@
 
 ## Status
 
-In progress — nearly tag-ready. `tritium-quantize` (residual expansion + rate-distortion
-allocator + `quantize_tensor`, with a per-tensor `ScaleGroup::Tensor` base for QAT-ternary
-masters), the TQ2_0 residual sidecar + whole-model SALT bundle in `tritium-format`, the
-**GPU** multi-plane accumulate kernel (`salt_mpgemm_tiled_f32`, matches the dequant
-reference within 1e-4), and the `tritium quantize` CLI (sidecar output) have all landed.
-**All CPU exit gates green**; the accuracy gate is **reframed** (see below); SALT is
-validated both ways — `salt@1.585 == deployed I2_S` on b1.58 and a monotone
-recon-error-vs-bpw curve on a normal fp model.
+Tag-ready. `tritium-quantize` (residual expansion + rate-distortion allocator +
+`quantize_tensor`, with a per-tensor `ScaleGroup::Tensor` base for QAT-ternary masters), the
+TQ2_0 residual sidecar + whole-model SALT bundle in `tritium-format`, the **GPU** multi-plane
+accumulate kernel (`salt_mpgemm_tiled_f32`, matches the dequant reference within 1e-4), and
+the `tritium quantize` CLI have all landed. **All CPU exit gates green**; the accuracy gate
+is **reframed** (see below); SALT is validated both ways — `salt@1.585 == deployed I2_S` on
+b1.58 and a monotone recon-error-vs-bpw curve on a normal fp model.
 
-Still to land before tagging v0.4.0 (all **storage/IO/wiring**, not core correctness):
-the **sparse residual plane** (== dense parity + density switch), the **modified-GGUF
-writer** for `quantize --format gguf` (sidecar bundle works), and wiring SALT weights into
-the **resident GPU decode** path (`TernaryFormat::Salt` + plane-major upload) so the kernel
-runs end-to-end. These are scoping decisions for the tag (defer to v0.4.1 vs block the tag).
+The three items previously scoped as deferrable have **all landed** (storage/IO/wiring, not
+core correctness):
+
+- **GGUF writer** (`tritium-format::write_gguf`, the reader's inverse) + a **SALT-in-GGUF
+  container** (`write_salt_gguf`/`read_salt_gguf`), wired to `quantize --format gguf`. The
+  sidecar bundle remains the canonical artifact; the GGUF is the single-container option.
+- **Resident-GPU SALT decode** (`CudaBackend::upload_salt` + `salt_forward`,
+  `SaltResidentLinear`): the `salt_mpgemm_tiled_f32` kernel now runs against a VRAM-resident,
+  plane-major weight uploaded once — the building block a full SALT decode forward composes
+  per projection (gated vs the host dequant reference + resident reuse).
+- **Sparse residual plane** (`tritium-format::sparse`): the ADR 0001 §5 storage form +
+  density switch (`choose_plane_repr`), round-tripping byte-identically to dense and gated
+  for matmul-output equivalence (`sparse_dot` bit-exact vs the dense dot).
+
+Remaining as explicit **v0.5+ follow-ons** (not v0.4.0 gates): a full SALT decode *forward*
+composing the resident primitive across every projection, a Qwen-arch perplexity curve, and
+the per-arch GPU **sparse-matmul** kernel (the compute win on top of the sparse storage form).
 
 **Accuracy gate reframe (load-bearing).** The original "accuracy-vs-bpw within the stated
 fp16 gap" gate is ill-defined for the only real model, BitNet b1.58: its bf16 "master" is
@@ -68,9 +79,11 @@ weights alongside legacy plain-TQ2 for backward-compat) to `tritium-format`, and
 - [x] Multi-plane accumulate kernel `Σ_p s_p·tmatmul` matches the SALT dequant→fp32 reference matmul within tolerance. *(tritium-cuda: `salt_mpgemm_tiled_f32` + `salt_mpgemm_matches_dequant_reference`, 1e-4)*
 - [x] Residual reconstruction error decreases monotonically with plane count `T`; `T=1` reduces exactly to flat AbsMean (BitNet regression check). *(tritium-quantize: `plane.rs` gates)*
 - [x] Allocator respects the bpw budget exactly (`Σ|g|·1.585·T_g ≤ budget`); higher-sensitivity groups receive ≥ planes than lower (ordering invariant). *(tritium-quantize: `allocate.rs` gates)*
-- [ ] **(deferred → v0.4.1)** Sparse residual plane and dense residual plane produce identical matmul output; the density-threshold switch is correct on both sides. *Storage optimization (ADR 0001 §5): the dense path is correct; on-disk bytes just exceed the logical bpw until this lands. Not core correctness — deferred out of the tag.*
+- [x] Sparse residual plane and dense residual plane produce identical matmul output; the density-threshold switch is correct on both sides. *(tritium-format: `sparse.rs` — `sparse_from_tq2_0`/`sparse_to_tq2_0` byte-identical round-trip, `sparse_dot` bit-exact vs the dense dot, `choose_plane_repr` sparse@2.5%/dense@50%, malicious-input hardening. The per-arch GPU sparse-matmul kernel is the v0.5+ compute follow-on; the storage form + equivalence gate land here.)*
 - [x] Format sidecar roundtrips multi-plane weights; reads legacy plain-TQ2 (no residual) for backward-compat; version field enforced; edge budgets, zero-variance group, and outlier-heavy group all handled. *(tritium-format: `salt.rs` + `salt_bundle.rs` gates, incl. malicious-input hardening)*
 - [x] Same model+seed+budget ⇒ byte-identical packed output. *(determinism gates in `plane.rs`/`allocate.rs`/`quantize.rs`/`salt_bundle.rs`)*
 - [x] **(reframed)** Accuracy validated: `salt@1.585 == deployed I2_S` on b1.58 *(tritium-nn `salt_accuracy` / `gguf_eval_perplexity`)* **and** a monotone recon-error-vs-bpw curve on a normal fp model *(tritium-quantize `recon_curve`, gpt2 0.540→0.387)*. The literal "within the fp16 gap" gate is dropped for a QAT-ternary master (no valid fp16 upper bound); a full Qwen-arch perplexity curve is the deferred follow-on.
-- [x] `tritium quantize` CLI (fp safetensors → SALT bundle). *(tritium-cli `quantize.rs`; `--format gguf` deferred with the GGUF writer.)*
-- [ ] **Tag `v0.40`** once the deferred items above are scoped (sparse plane, modified-GGUF writer, resident-GPU SALT decode wiring) — plus U1–U9.
+- [x] `tritium quantize` CLI (fp safetensors → SALT bundle **or** GGUF container). *(tritium-cli `quantize.rs`; `--format gguf` now emits a SALT-in-GGUF container via `tritium-format::write_salt_gguf`, atop the new general `write_gguf`.)*
+- [x] **GGUF writer** (`tritium-format::write_gguf`, inverse of the reader) + SALT-in-GGUF container (`write_salt_gguf`/`read_salt_gguf`). *Round-trips through `read_gguf`; gates for every value type, alignment, and malicious input.*
+- [x] **Resident-GPU SALT decode** primitive (`CudaBackend::upload_salt` + `salt_forward`, `SaltResidentLinear`): the kernel runs against a VRAM-resident plane-major weight uploaded once. *(tritium-cuda: `salt_resident_forward_matches_dequant` — T=1/2/3 incl. ragged, vs host dequant + resident reuse.)*
+- [ ] **Tag `v0.40`** — all DoD gates above green; pending U1–U9 + the final tag action.

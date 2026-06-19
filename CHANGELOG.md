@@ -7,16 +7,17 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
-## [Unreleased] — v0.4.0 (SALT quantization, ADR 0001/0006) — in progress
+## [Unreleased] — v0.4.0 (SALT quantization, ADR 0001/0006) — tag-ready
 
 SALT (Sensitivity-Allocated Layered Ternary) — the **`tritium-quantize`** crate, a TQ2_0
 residual sidecar + whole-model bundle in `tritium-format`, the GPU multi-plane accumulate
 kernel, and the `tritium quantize` CLI. All CPU exit gates green; the GPU kernel matches the
 dequant reference; SALT is validated both ways — `salt@1.585 == deployed I2_S` on BitNet
-b1.58, and a smooth monotone recon-error-vs-bpw curve on a normal fp model (gpt2). Remaining
-before tag: the **sparse residual plane** (storage optimization), the **modified-GGUF
-writer** (sidecar bundle output works), and wiring SALT weights into the **resident GPU
-decode** path. (This cycle also shipped Track-2 decode perf — see below — orthogonal to SALT.)
+b1.58, and a smooth monotone recon-error-vs-bpw curve on a normal fp model (gpt2). The three
+items previously scoped as deferrable all landed this cycle: a **GGUF writer** + SALT-in-GGUF
+container (`--format gguf`), a **resident-GPU SALT decode** primitive, and the **sparse
+residual plane** + density switch. (This cycle also shipped Track-2 decode perf — see below
+— orthogonal to SALT.)
 
 ### Added
 - **tritium-quantize** (new crate) — the offline SALT quantizer:
@@ -42,9 +43,25 @@ decode** path. (This cycle also shipped Track-2 decode perf — see below — or
 - **tritium-cuda** — the **SALT multi-plane GPU GEMM** `salt_mpgemm_tiled_f32`
   (`Σ_p scale_p·trit_p`, per-block f16 scales read from the weight bytes), matching the
   `dequant_salt_row` → fp32 reference within 1e-4 (`salt_mpgemm_matches_dequant_reference`).
-- **tritium-cli** — `tritium quantize --input <safetensors> --output <.tslb> --bpw <f>
-  --scale-group {block|tensor}`: SALT-quantize every 2D weight of an fp model to a SALT
-  bundle (validated end-to-end on gpt2). `--format gguf` is reserved (no GGUF writer yet).
+- **tritium-cli** — `tritium quantize --input <safetensors> --output <out> --bpw <f>
+  --scale-group {block|tensor} --format {sidecar|gguf}`: SALT-quantize every 2D weight of an
+  fp model to a SALT bundle **or** a GGUF container (validated end-to-end on gpt2).
+- **tritium-format GGUF writer** — `write_gguf` (+ `TensorOut`), the exact inverse of
+  `read_gguf`: serializes a metadata table + tensor payloads so `read_gguf(write_gguf(..)) ==`
+  input. Plus the **SALT-in-GGUF container** (`write_salt_gguf`/`read_salt_gguf`): a whole SALT
+  model in a GGUF envelope, one tensor per SALT tensor under the tritium-private type id 169,
+  payload = the per-tensor `pack_salt_row` blobs; reader walks rows self-describingly and is
+  hardened against malicious input. Backs `quantize --format gguf`.
+- **tritium-cuda resident-GPU SALT decode** — `CudaBackend::upload_salt` + `salt_forward`
+  (`SaltResidentLinear`): the `salt_mpgemm_tiled_f32` kernel now runs against a VRAM-resident,
+  plane-major weight uploaded once (ragged plane counts zero-padded), feeding the raw f32
+  activation + per-block scales — the building block a full SALT decode forward composes per
+  projection. (Previously the kernel was reachable only via a test that re-uploaded per call.)
+- **tritium-format sparse residual plane** (`sparse.rs`, ADR 0001 §5) — `SparsePlane` stores a
+  pruned plane as nonzeros only (ascending `(column, sign)` + per-block scales),
+  `sparse_from_tq2_0`/`sparse_to_tq2_0` round-trip **byte-identically** to dense TQ2_0, and
+  `choose_plane_repr` is the density switch (sparse below ~10% nonzero, else dense). The
+  GPU sparse-matmul kernel (the per-arch compute win) is the v0.5+ follow-on.
 
 ### Validation (CPU exit gates, ADR 0006)
 - `T=1` reduces **exactly** to flat AbsMean (golden + proptest, bit-exact reconstruction).
@@ -66,12 +83,24 @@ decode** path. (This cycle also shipped Track-2 decode perf — see below — or
   0.540→0.387 over 1.585→3.0 bpw; `tritium-quantize` `recon_curve`). A full Qwen-arch
   perplexity curve is the deferred "real accuracy" follow-on.
 
-### Remaining for v0.4.0
-- **Sparse residual plane** == dense; density-threshold switch (ADR 0001 §5; storage opt — the
-  dense path is correct, on-disk bytes just exceed the logical bpw until this lands).
-- **Modified-GGUF writer** for `tritium quantize --format gguf` (the sidecar bundle works).
-- Wiring SALT weights into the **resident GPU decode** (a `TernaryFormat::Salt` + plane-major
-  upload) so the multi-plane kernel runs end-to-end on device.
+### Validation — the three landed items
+- **GGUF**: `write_gguf` round-trips through `read_gguf` for every value type, custom
+  alignment, empty/nested arrays, version rejection; `write_salt_gguf`/`read_salt_gguf`
+  round-trips exactly (incl. ragged plane counts + non-256-multiple `k`), parses as a valid
+  GGUF, dequant-equal after round-trip, rejects non-SALT GGUF, fuzz-safe on truncation.
+- **Resident SALT**: `salt_resident_forward_matches_dequant` — T=1/2/3 incl. ragged, each row
+  vs host `dequant_salt_row → fp32 matmul` within 1e-4, two forwards on the same resident
+  buffer agree.
+- **Sparse plane**: byte-identical dense round-trip; `sparse_dot` **bit-exact** vs the dense
+  dot; density switch picks sparse@2.5% / dense@50% and both expand identically; pruned plane
+  packs smaller; pack/unpack round-trip; corrupt/truncated/oversized-`k` input errors, never
+  panics. (Test load-bearingness confirmed by mutation.)
+
+### v0.5+ follow-ons (not v0.4.0 gates)
+- A full SALT decode **forward** composing the resident primitive across every projection.
+- The per-arch GPU **sparse-matmul** kernel (the compute win atop the sparse storage form).
+- A full **Qwen-arch perplexity** curve (the "real accuracy" validation b1.58's latent master
+  cannot give).
 
 ### Track-2 decode performance (this cycle; orthogonal to SALT)
 - **CUDA-graph batched M=N decode** (`decode_batch_graph`) — graph-captures the M=N forward;
