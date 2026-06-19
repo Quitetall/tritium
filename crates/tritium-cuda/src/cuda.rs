@@ -2673,9 +2673,13 @@ pub struct CudaDecodeModel {
     raw: Option<RawGraphKernels>,
     /// Raw batch (M=N) kernels for the graph-captured `decode_batch_graph`. A second JIT
     /// of the batch entry points, loaded lazily on first batched-graph decode. The per-N
-    /// graph itself lives on the [`BatchKv`] (its buffers are N-specific), so this only
-    /// holds the `CUfunction` handles the capture references.
-    batch_raw: Option<BatchRawKernels>,
+    /// graph itself lives on the [`BatchKv`] (its buffers are N-specific). Held behind an
+    /// `Arc` that each `BatchKv` clones when it captures a graph, so the modules these
+    /// `CUfunction` handles come from stay loaded as long as *any* captured graph still
+    /// references them — even if this model is dropped before the batch (the structural
+    /// drop-order guarantee the M=1 `graph`/`raw` fields rely on does not exist for the
+    /// caller-owned `BatchKv`).
+    batch_raw: Option<Arc<BatchRawKernels>>,
 }
 
 impl CudaDecodeModel {
@@ -3328,6 +3332,7 @@ impl CudaDecodeModel {
             d_h: alloc(self.n_embd, "batch d_h")?,
             d_logits: alloc(self.vocab, "batch d_logits")?,
             graph: None,
+            raw_keepalive: None,
         })
     }
 
@@ -3472,11 +3477,14 @@ impl CudaDecodeModel {
         // Lazily load the raw batch kernels, then capture this batch's graph (per-N).
         if self.batch_raw.is_none() {
             let ctx = self.cap_stream.context().clone();
-            self.batch_raw = Some(BatchRawKernels::load(&ctx)?);
+            self.batch_raw = Some(Arc::new(BatchRawKernels::load(&ctx)?));
         }
         if batch.graph.is_none() {
             let g = self.record_graph_batch(batch)?;
             batch.graph = Some(g);
+            // Keep the modules the captured graph references alive for as long as this
+            // batch lives (see `BatchKv::raw_keepalive`).
+            batch.raw_keepalive = self.batch_raw.clone();
         }
 
         // Drain any pending default-stream work before the graph (on `cap_stream`) touches
@@ -3508,7 +3516,11 @@ impl CudaDecodeModel {
 
         // Final norm landed in `d_normed`; run the per-row LM head eagerly (one warp head
         // per row over the f16 token table), mirroring `decode_batch`'s tail bit-for-bit.
-        let s = &self.stream;
+        // The tail stays on `cap_stream` — the same stream the graph ran on — so the read
+        // of `d_normed` is plain stream-ordered after the graph's write, with no
+        // cross-stream handoff (the M=1 `step_graph` keeps its post-graph dtoh on
+        // `cap_stream` for the same reason).
+        let s = &self.cap_stream;
         let n_embd = self.n_embd;
         let mut out = Vec::with_capacity(n);
         for r in 0..n {
@@ -4171,9 +4183,17 @@ struct BatchRawKernels {
 
 // SAFETY: same contract as `RawGraphKernels` — the raw handles are process-valid device
 // handles used only on the owning model's single capture stream, never concurrently across
-// threads (the graph path is single-threaded by construction).
+// threads (the graph path is single-threaded by construction). `Sync` (which `RawGraphKernels`
+// does not need, being owned directly) is additionally required here because the model holds
+// these behind an `Arc` (shared with each `BatchKv`), and `Arc<T>: Send` needs `T: Send + Sync`;
+// it is sound for the same reason — the handles are immutable after `load` and never touched
+// off the single capture stream.
 #[allow(unsafe_code)]
 unsafe impl Send for BatchRawKernels {}
+// SAFETY: as above — the handles are immutable after `load` and only ever used on the single
+// capture stream, so concurrent shared (`&`) access across threads observes nothing mutable.
+#[allow(unsafe_code)]
+unsafe impl Sync for BatchRawKernels {}
 
 impl BatchRawKernels {
     fn load(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
@@ -4303,10 +4323,18 @@ pub struct BatchKv {
     d_logits: CudaSlice<f32>,
     /// The captured M=N decode graph for this batch, built lazily on the first
     /// [`CudaDecodeModel::decode_batch_graph`]. Tied to *these* buffers (the capture bakes
-    /// their device pointers in), so it lives on the batch, not the model. The model's
-    /// [`CudaDecodeModel::batch_raw`] modules must outlive it, so a `BatchKv` must be
-    /// dropped before the model that produced it.
+    /// their device pointers in), so it lives on the batch, not the model.
+    ///
+    /// Declared **before** `raw_keepalive` so the `CUgraphExec` is destroyed before the
+    /// module ref it holds is released (the kernel nodes reference functions in those
+    /// modules).
     graph: Option<CudaGraph>,
+    /// A clone of the model's [`batch_raw`](CudaDecodeModel::batch_raw) `Arc`, taken when
+    /// `graph` is captured. Keeps the `CUfunction` modules `graph` references loaded for
+    /// as long as this batch lives, regardless of whether the producing model is dropped
+    /// first — closing the use-after-free the bare doc-convention couldn't enforce. Held,
+    /// never read.
+    raw_keepalive: Option<Arc<BatchRawKernels>>,
 }
 
 impl BatchKv {
