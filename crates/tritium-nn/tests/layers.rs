@@ -18,7 +18,7 @@
 
 use tritium_core::Trit;
 use tritium_cpu::CpuBackend;
-use tritium_nn::{ModelConfig, Relu2Mlp, TernaryLinear, TransformerBlock};
+use tritium_nn::{ModelConfig, Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
 
 /// Deterministic xorshift64 PRNG so the "random" weights/activations are
 /// reproducible without a dependency.
@@ -266,9 +266,9 @@ fn relu2_mlp_matches_torch() {
     ];
 
     let mlp = Relu2Mlp {
-        gate: linear_from_i8(&backend, &gate_w, n_ff, n_embd, gate_s),
-        up: linear_from_i8(&backend, &up_w, n_ff, n_embd, up_s),
-        down: linear_from_i8(&backend, &down_w, n_embd, n_ff, down_s),
+        gate: Projection::Ternary(linear_from_i8(&backend, &gate_w, n_ff, n_embd, gate_s)),
+        up: Projection::Ternary(linear_from_i8(&backend, &up_w, n_ff, n_embd, up_s)),
+        down: Projection::Ternary(linear_from_i8(&backend, &down_w, n_embd, n_ff, down_s)),
         // Empty sub-norm => skipped, matching the no-sub-norm torch reference here.
         ffn_sub_norm: Vec::new(),
         rms_eps: 1e-5,
@@ -286,10 +286,12 @@ fn relu2_mlp_matches_torch() {
 // 3. TransformerBlock assembly / smoke.
 // --------------------------------------------------------------------------- //
 
-fn rand_linear(backend: &CpuBackend, rng: &mut Rng, n_out: usize, k_in: usize) -> TernaryLinear {
+fn rand_linear(backend: &CpuBackend, rng: &mut Rng, n_out: usize, k_in: usize) -> Projection {
     let trits: Vec<Trit> = (0..n_out * k_in).map(|_| rng.next_trit()).collect();
     // Small positive scale keeps activations in a sane range across the block.
-    TernaryLinear::new(backend, &trits, n_out, k_in, 0.05).expect("construct linear")
+    Projection::Ternary(
+        TernaryLinear::new(backend, &trits, n_out, k_in, 0.05).expect("construct linear"),
+    )
 }
 
 fn tiny_cfg() -> ModelConfig {

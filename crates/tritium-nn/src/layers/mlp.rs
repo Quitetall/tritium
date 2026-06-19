@@ -16,18 +16,18 @@
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
-use crate::layers::TernaryLinear;
+use crate::layers::Projection;
 use crate::ops::rmsnorm;
 
 /// A gated squared-ReLU MLP block with the BitNet intermediate sub-norm.
 #[allow(missing_debug_implementations)]
 pub struct Relu2Mlp {
     /// Gate projection `n_embd → n_ff` (the squared-ReLU branch).
-    pub gate: TernaryLinear,
+    pub gate: Projection,
     /// Up projection `n_embd → n_ff` (the linear branch).
-    pub up: TernaryLinear,
+    pub up: Projection,
     /// Down projection `n_ff → n_embd`.
-    pub down: TernaryLinear,
+    pub down: Projection,
     /// `ffn_sub_norm` (`BitNetRMSNorm` over `n_ff`) applied to the gated product
     /// before `down`; length `n_ff`.
     pub ffn_sub_norm: Vec<f32>,
@@ -51,8 +51,8 @@ impl Relu2Mlp {
         m: usize,
         out: &mut [f32],
     ) -> Result<(), NnError> {
-        let n_embd = self.gate.k_in;
-        let n_ff = self.gate.n_out;
+        let n_embd = self.gate.k_in();
+        let n_ff = self.gate.n_out();
         // Shape contract: gate/up share `[n_embd → n_ff]`; down is `[n_ff → n_embd]`.
         if x.len() != m * n_embd {
             return Err(NnError::Shape {

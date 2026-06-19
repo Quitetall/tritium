@@ -101,6 +101,35 @@ impl ModelRunner {
         })
     }
 
+    /// Build a runner from already-constructed [`ModelWeights`] — e.g. an in-memory
+    /// SALT / fp quantization for the accuracy harness — allocating one [`KvCache`]
+    /// per layer. The model starts on the host forward path; the device-resident
+    /// decoder is built lazily and is skipped for any model carrying a dense
+    /// ([`Projection::Dense`](crate::layers::Projection)) projection.
+    #[must_use]
+    pub fn from_weights(
+        config: ModelConfig,
+        weights: ModelWeights,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Self {
+        let head_dim = config.head_dim() as usize;
+        let n_head_kv = config.n_head_kv as usize;
+        let max_ctx = config.n_ctx as usize;
+        let kv = (0..config.n_layers)
+            .map(|_| KvCache::new(max_ctx, n_head_kv, head_dim))
+            .collect();
+        Self {
+            config,
+            weights,
+            kv,
+            backend,
+            #[cfg(feature = "cuda")]
+            resident: None,
+            #[cfg(feature = "cuda")]
+            resident_probed: false,
+        }
+    }
+
     /// (cuda) Borrow the lazily-built device-resident decoder, building it first if
     /// needed (returns `None` on a non-CUDA backend). Advanced/test access — it exposes
     /// the M=1 graph decode + the batched (M=N) `decode_batch` path directly.
@@ -355,7 +384,11 @@ impl ModelRunner {
         else {
             return Ok(false);
         };
-        let spec = Self::build_decode_spec(&self.weights, &self.config);
+        // A model with any dense (SALT / fp) projection cannot use the TQ2_0-only
+        // resident decoder; it runs the host forward instead.
+        let Some(spec) = Self::build_decode_spec(&self.weights, &self.config) else {
+            return Ok(false);
+        };
         let model = cuda
             .build_decode_model(&spec)
             .map_err(|e| NnError::Backend(e.to_string()))?;
@@ -370,36 +403,42 @@ impl ModelRunner {
     fn build_decode_spec<'a>(
         weights: &'a ModelWeights,
         config: &ModelConfig,
-    ) -> tritium_cuda::DecodeModelSpec<'a> {
-        use crate::layers::TernaryLinear;
+    ) -> Option<tritium_cuda::DecodeModelSpec<'a>> {
+        use crate::layers::Projection;
         use tritium_cuda::{DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
 
-        fn lin(tl: &TernaryLinear) -> DecodeLinearSpec<'_> {
-            DecodeLinearSpec {
+        // The device-resident decoder is TQ2_0-only: every projection must be
+        // ternary. A model carrying any dense (SALT / fp) projection returns `None`
+        // here and runs the host-orchestrated forward instead.
+        fn lin(p: &Projection) -> Option<DecodeLinearSpec<'_>> {
+            let tl = p.as_ternary()?;
+            Some(DecodeLinearSpec {
                 weights: &*tl.weights,
                 scales: &tl.scales,
-            }
+            })
         }
 
         let layers = weights
             .layers
             .iter()
-            .map(|b| DecodeLayerSpec {
-                attn_norm: &b.attn_norm,
-                attn_sub_norm: &b.attn_sub_norm,
-                ffn_norm: &b.ffn_norm,
-                ffn_sub_norm: &b.mlp.ffn_sub_norm,
-                q: lin(&b.q_proj),
-                k: lin(&b.k_proj),
-                v: lin(&b.v_proj),
-                o: lin(&b.o_proj),
-                gate: lin(&b.mlp.gate),
-                up: lin(&b.mlp.up),
-                down: lin(&b.mlp.down),
+            .map(|b| {
+                Some(DecodeLayerSpec {
+                    attn_norm: &b.attn_norm,
+                    attn_sub_norm: &b.attn_sub_norm,
+                    ffn_norm: &b.ffn_norm,
+                    ffn_sub_norm: &b.mlp.ffn_sub_norm,
+                    q: lin(&b.q_proj)?,
+                    k: lin(&b.k_proj)?,
+                    v: lin(&b.v_proj)?,
+                    o: lin(&b.o_proj)?,
+                    gate: lin(&b.mlp.gate)?,
+                    up: lin(&b.mlp.up)?,
+                    down: lin(&b.mlp.down)?,
+                })
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
 
-        DecodeModelSpec {
+        Some(DecodeModelSpec {
             token_embd: &weights.token_embd,
             output_norm: &weights.output_norm,
             layers,
@@ -412,7 +451,7 @@ impl ModelRunner {
             max_ctx: config.n_ctx as usize,
             rope_theta: config.rope_theta,
             rms_eps: config.rms_eps,
-        }
+        })
     }
 
     /// Greedily generate up to `max_new` tokens continuing `prompt` (token IDs),

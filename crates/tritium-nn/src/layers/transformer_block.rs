@@ -16,7 +16,7 @@ use tritium_spec::TernaryBackend;
 use crate::config::ModelConfig;
 use crate::error::NnError;
 use crate::kv_cache::KvCache;
-use crate::layers::{Relu2Mlp, TernaryLinear};
+use crate::layers::{Projection, Relu2Mlp};
 use crate::ops::{gqa_attention, rmsnorm, rope_apply};
 
 /// A single transformer decoder block (attention + MLP, pre-norm, residual).
@@ -25,13 +25,13 @@ pub struct TransformerBlock {
     /// RMSNorm weight applied before attention (`input_layernorm`); length `n_embd`.
     pub attn_norm: Vec<f32>,
     /// Query projection `n_embd → n_head · head_dim`.
-    pub q_proj: TernaryLinear,
+    pub q_proj: Projection,
     /// Key projection `n_embd → n_head_kv · head_dim`.
-    pub k_proj: TernaryLinear,
+    pub k_proj: Projection,
     /// Value projection `n_embd → n_head_kv · head_dim`.
-    pub v_proj: TernaryLinear,
+    pub v_proj: Projection,
     /// Output projection `n_head · head_dim → n_embd`.
-    pub o_proj: TernaryLinear,
+    pub o_proj: Projection,
     /// `attn_sub_norm` (`BitNetRMSNorm` over `n_embd`) applied to the attention
     /// output before `o_proj`; length `n_embd` (empty to skip, for the WF-3 tests).
     pub attn_sub_norm: Vec<f32>,

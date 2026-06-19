@@ -8,9 +8,11 @@
 mod dense;
 mod linear;
 mod mlp;
+mod projection;
 mod transformer_block;
 
 pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::Relu2Mlp;
+pub use projection::Projection;
 pub use transformer_block::{BlockDump, TransformerBlock};

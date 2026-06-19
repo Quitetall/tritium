@@ -26,7 +26,7 @@ use tritium_spec::TernaryBackend;
 
 use crate::config::ModelConfig;
 use crate::error::NnError;
-use crate::layers::{Relu2Mlp, TernaryLinear, TransformerBlock};
+use crate::layers::{Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
 use crate::tensor::f16_bytes_to_f32;
 
 /// The weights for one decoder layer, ready to run.
@@ -205,16 +205,16 @@ fn load_layer(
 
     Ok(TransformerBlock {
         attn_norm,
-        q_proj,
-        k_proj,
-        v_proj,
-        o_proj,
+        q_proj: Projection::Ternary(q_proj),
+        k_proj: Projection::Ternary(k_proj),
+        v_proj: Projection::Ternary(v_proj),
+        o_proj: Projection::Ternary(o_proj),
         attn_sub_norm,
         ffn_norm,
         mlp: Relu2Mlp {
-            gate,
-            up,
-            down,
+            gate: Projection::Ternary(gate),
+            up: Projection::Ternary(up),
+            down: Projection::Ternary(down),
             ffn_sub_norm,
             rms_eps: config.rms_eps,
         },
