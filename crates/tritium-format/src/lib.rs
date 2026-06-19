@@ -23,6 +23,9 @@
 //!   metadata, and tensor table of an in-memory `.gguf` buffer. It is total: no
 //!   malformed input can panic or read out of bounds — every error is a typed
 //!   [`GgufError`].
+//! - A **GGUF writer** ([`write_gguf`]), the reader's inverse: it serializes a
+//!   metadata table and tensor payloads into a buffer `read_gguf` parses back
+//!   identically (`read_gguf(write_gguf(..)) == input`).
 #![forbid(unsafe_code)]
 
 use core::fmt;
@@ -31,6 +34,7 @@ use half::f16;
 use tritium_core::TritError;
 
 mod gguf;
+mod gguf_write;
 mod i2s;
 mod i2s_int8;
 mod rows;
@@ -44,6 +48,7 @@ pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
     TensorInfo, read_gguf,
 };
+pub use gguf_write::{TensorOut, write_gguf};
 pub use i2s::{
     GGML_TYPE_I2_S, I2S_BLOCK_BYTES, I2S_BLOCK_ELEMS, I2S_SCALE_BYTES, unpack_i2s_block,
     unpack_i2s_tensor,
