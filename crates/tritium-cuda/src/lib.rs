@@ -48,6 +48,12 @@ pub use cuda::CudaBackend;
 #[cfg(feature = "cuda")]
 pub use cuda::{BatchKv, CudaDecodeModel, DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
 
+// v0.4.0: the resident SALT projection primitive — upload multi-plane TQ2_0 weights
+// plane-major once, then run the `salt_mpgemm_tiled_f32` kernel against them. The
+// building block a SALT decode forward composes per projection.
+#[cfg(feature = "cuda")]
+pub use cuda::SaltResidentLinear;
+
 // v0.30 (ADR 0005) skeletons. `autotune` is pure Rust (tile config + on-disk
 // cache keying) so it builds and tests on cpu-only lanes; `codegen` links
 // cudarc's nvrtc path, so it is gated behind `cuda`. WF-B implements both and the

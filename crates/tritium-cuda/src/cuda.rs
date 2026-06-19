@@ -231,6 +231,30 @@ impl CudaBuffer {
     }
 }
 
+/// A SALT multi-plane projection, resident in VRAM: the plane-major TQ2_0 planes
+/// uploaded once, plus the geometry the `salt_mpgemm_tiled_f32` kernel needs.
+///
+/// Unlike [`ResidentLinear`] (the W1.58A8 path: int8-quantized activation + a
+/// per-channel scale), a SALT linear feeds the kernel the **raw f32 activation**
+/// and the per-block scales packed in the planes — the contract
+/// [`tritium_format::dequant_salt_row`] defines. Built by [`CudaBackend::upload_salt`]
+/// and run by [`CudaBackend::salt_forward`]; the kernel itself is gated bit-for-bit
+/// against the dequant reference by `salt_mpgemm_matches_dequant_reference`.
+#[derive(Debug)]
+pub struct SaltResidentLinear {
+    /// Plane-major packed weight `[T, N, row_bytes]`: plane `p`, row `ni` at
+    /// `p*N*row_bytes + ni*row_bytes`. Uploaded once; reused across decode steps.
+    device: Arc<CudaSlice<u8>>,
+    /// Output channels (`N`).
+    n: usize,
+    /// Contraction dimension (`K`).
+    k: usize,
+    /// TQ2_0 bytes per plane-row (`num_blocks(k) * TQ2_0_BLOCK_BYTES`).
+    row_bytes: usize,
+    /// Realized plane count `T` (max over rows; ragged rows zero-padded on upload).
+    t_planes: usize,
+}
+
 /// A CUDA execution backend bound to a single device ordinal.
 ///
 /// Construct with [`CudaBackend::new`]; it opens the context, loads the PTX module,
@@ -253,8 +277,8 @@ pub struct CudaBackend {
     /// The resolved `tq2_0_add_mpgemm_tiled` kernel (warp per output, shared-mem
     /// staged activations) — the decode path.
     func_tiled: CudaFunction,
-    /// The resolved `salt_mpgemm_tiled_f32` kernel (v0.4.0 SALT multi-plane GEMM).
-    #[allow(dead_code)] // used by the P1 spike (`salt_mpgemm_dense`); P2 wires it into the resident decode path.
+    /// The resolved `salt_mpgemm_tiled_f32` kernel (v0.4.0 SALT multi-plane GEMM),
+    /// driven by the resident [`CudaBackend::salt_forward`] path.
     func_salt: CudaFunction,
     /// The resolved `tq2_0_imma_mpgemm` kernel (IMMA int8 tensor-core prefill).
     func_imma: CudaFunction,
@@ -1520,12 +1544,143 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Upload a SALT tensor's rows into VRAM as one plane-major buffer, ready for
+    /// [`Self::salt_forward`]. Each [`SaltRow`] contributes its `T` planes; a row
+    /// with fewer planes than the tensor max is zero-padded (a zeroed TQ2_0 plane
+    /// dequantizes to 0, so it is a no-op in the accumulate). The weight is uploaded
+    /// once and reused across decode steps — this is the resident-decode wiring of
+    /// the SALT kernel, vs the test-only [`Self::salt_mpgemm_dense`] which re-uploads.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] if `rows.len() != n` or a row's `k` disagrees;
+    /// [`BackendError::WrongBlockLen`]-style [`BackendError::InvalidInput`] if a plane
+    /// is the wrong byte length or `k` exceeds the tiled shared-memory cap.
+    pub fn upload_salt(
+        &self,
+        rows: &[tritium_format::SaltRow],
+        n: usize,
+        k: usize,
+    ) -> Result<SaltResidentLinear, BackendError> {
+        if rows.len() != n {
+            return Err(BackendError::ShapeMismatch { expected: n, got: rows.len() });
+        }
+        if k > TILED_K_MAX {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT decode K={k} exceeds the tiled cap {TILED_K_MAX}"
+            )));
+        }
+        let row_bytes = num_blocks(k) * TQ2_0_BLOCK_BYTES;
+        let t_planes = rows.iter().map(|r| r.planes.len()).max().unwrap_or(0);
+        for r in rows {
+            if r.k != k {
+                return Err(BackendError::ShapeMismatch { expected: k, got: r.k });
+            }
+            for plane in &r.planes {
+                if plane.len() != row_bytes {
+                    return Err(BackendError::InvalidInput(format!(
+                        "SALT plane is {} bytes, expected {row_bytes}",
+                        plane.len()
+                    )));
+                }
+            }
+        }
+
+        // Plane-major assembly: plane p, then row ni; ragged rows zero-padded.
+        let zero_plane = vec![0u8; row_bytes];
+        let mut weights = Vec::with_capacity(t_planes * n * row_bytes);
+        for p in 0..t_planes {
+            for r in rows {
+                match r.planes.get(p) {
+                    Some(plane) => weights.extend_from_slice(plane),
+                    None => weights.extend_from_slice(&zero_plane),
+                }
+            }
+        }
+        let device = self
+            .stream
+            .clone_htod(&weights)
+            .map_err(|e| driver_err("htod salt resident weights", &e))?;
+        Ok(SaltResidentLinear { device: Arc::new(device), n, k, row_bytes, t_planes })
+    }
+
+    /// Run a resident SALT projection: contract `act` `[M, K]` against the
+    /// VRAM-resident plane-major planes of `lin`, returning `[M, N]` row-major.
+    /// Same launch as [`Self::salt_mpgemm_dense`] but against the pre-uploaded
+    /// weight — no per-call H2D of the planes.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] if `act.len() != m * lin.k`; a driver error
+    /// from the allocation, launch, or readback otherwise.
+    pub fn salt_forward(
+        &self,
+        lin: &SaltResidentLinear,
+        act: &[f32],
+        m: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        if act.len() != m * lin.k {
+            return Err(BackendError::ShapeMismatch { expected: m * lin.k, got: act.len() });
+        }
+        let (n, k) = (lin.n, lin.k);
+        if m == 0 || n == 0 {
+            return Ok(vec![0.0f32; m * n]);
+        }
+        let d_act = self
+            .stream
+            .clone_htod(act)
+            .map_err(|e| driver_err("htod salt act", &e))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .map_err(|e| driver_err("alloc salt out", &e))?;
+
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), m as u32, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: (k * 4) as u32,
+        };
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let rb_i = lin.row_bytes as i32;
+        let tp_i = lin.t_planes as i32;
+        let plane_stride = (n * lin.row_bytes) as i64;
+
+        let mut launch = self.stream.launch_builder(&self.func_salt);
+        launch
+            .arg(&d_act)
+            .arg(lin.device.as_ref())
+            .arg(&mut d_out)
+            .arg(&m_i)
+            .arg(&n_i)
+            .arg(&k_i)
+            .arg(&rb_i)
+            .arg(&tp_i)
+            .arg(&plane_stride);
+        // SAFETY: `salt_mpgemm_tiled_f32(const float*, const unsigned char*, float*, int,
+        // int, int, int, int, long long)` — args pushed in that order/type; only `d_out`
+        // is mutable. `d_act` is `M*K`, the resident weight is `T*N*row_bytes` (built by
+        // `upload_salt`), `d_out` is `M*N`; the grid covers `M` rows × `ceil(N/WARPS_PER_BLOCK)`
+        // warp-columns with in-kernel `mi>=m`/`ni>=n` guards, and `K*4` shared matches the
+        // kernel's `extern __shared__ float[K]`. Host scalars outlive the launch.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch salt resident", &e))?;
+        }
+        let mut out = vec![0.0f32; m * n];
+        self.stream
+            .memcpy_dtoh(&d_out, &mut out)
+            .map_err(|e| driver_err("dtoh salt resident out", &e))?;
+        Ok(out)
+    }
+
     /// SALT multi-plane dense GEMM (v0.4.0 P1): contract `act` `[M, K]` against
     /// `t_planes` stacked TQ2_0 planes (`weights`, **plane-major** — plane `p`, row
     /// `ni` at `p*N*row_bytes + ni*row_bytes`), reading each block's f16 scale and
     /// summing `Σ_p scale_p·tmatmul(t_p)`. Matches [`tritium_format::dequant_salt_row`]
-    /// → fp32 matmul within 1e-4. This is the kernel-correctness entry point; P2
-    /// wires the same launch into the resident decode path.
+    /// → fp32 matmul within 1e-4. This is the kernel-correctness entry point;
+    /// [`Self::salt_forward`] wires the same launch into the resident decode path.
     #[cfg(test)]
     fn salt_mpgemm_dense(
         &self,
@@ -4640,6 +4795,93 @@ mod tests {
                         gpu[i],
                     );
                 }
+            }
+        }
+    }
+
+    /// v0.4.0: the **resident** SALT path — upload a SALT tensor's rows once via
+    /// [`CudaBackend::upload_salt`], then [`CudaBackend::salt_forward`] — must match
+    /// the host `dequant_salt_row → fp32 matmul` reference, for T=1/2/3 (incl. ragged
+    /// plane counts) and survive reuse (two forwards on the same resident buffer).
+    /// This gates the resident decode wiring, distinct from `salt_mpgemm_dense` which
+    /// re-uploads per call.
+    #[test]
+    fn salt_resident_forward_matches_dequant() {
+        use half::f16;
+        use tritium_core::Trit;
+        use tritium_format::{SaltRow, dequant_salt_row, pack_tq2_0_row};
+
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping salt resident: no device ({e})");
+                return;
+            }
+        };
+
+        let k = 512usize;
+        let n = 6usize;
+        let nb = num_blocks(k);
+        let row_bytes = nb * TQ2_0_BLOCK_BYTES;
+        let mut s: u64 = 0x5A17_F00D;
+        let mut next = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s
+        };
+
+        // Build n rows; row ni gets `t_of(ni)` planes (ragged: not all rows equal T).
+        for max_t in [1usize, 2, 3] {
+            let rows: Vec<SaltRow> = (0..n)
+                .map(|ni| {
+                    let t_row = 1 + (ni % max_t); // 1..=max_t, ragged across rows
+                    let planes = (0..t_row)
+                        .map(|p| {
+                            let trits: Vec<Trit> = (0..k)
+                                .map(|_| Trit::from_i8(((next() >> 40) % 3) as i8 - 1).unwrap())
+                                .collect();
+                            let scales: Vec<f16> = (0..nb)
+                                .map(|_| f16::from_f32((0.05 + ((next() >> 40) % 8) as f32 * 0.3) / (p as f32 + 1.0)))
+                                .collect();
+                            let mut bytes = vec![0u8; row_bytes];
+                            pack_tq2_0_row(&trits, &scales, &mut bytes).unwrap();
+                            bytes
+                        })
+                        .collect();
+                    SaltRow { k, planes }
+                })
+                .collect();
+
+            // Host reference: dequant each row, fp64 matmul.
+            let m = 2usize;
+            let act: Vec<f32> = (0..m * k)
+                .map(|_| (next() >> 40) as f32 / (1u64 << 23) as f32 - 0.5)
+                .collect();
+            let mut reference = vec![0f64; m * n];
+            for (ni, row) in rows.iter().enumerate() {
+                let w = dequant_salt_row(row).unwrap();
+                for mi in 0..m {
+                    let mut acc = 0f64;
+                    for kk in 0..k {
+                        acc += act[mi * k + kk] as f64 * w[kk] as f64;
+                    }
+                    reference[mi * n + ni] = acc;
+                }
+            }
+
+            let lin = cuda.upload_salt(&rows, n, k).expect("upload_salt");
+            // Two forwards on the same resident buffer must agree (reuse).
+            let gpu = cuda.salt_forward(&lin, &act, m).expect("salt_forward");
+            let gpu2 = cuda.salt_forward(&lin, &act, m).expect("salt_forward reuse");
+            assert_eq!(gpu, gpu2, "resident reuse must be deterministic (max_t={max_t})");
+
+            for i in 0..m * n {
+                let r = reference[i];
+                let tol = 1e-4 * r.abs().max(1.0);
+                assert!(
+                    (gpu[i] as f64 - r).abs() <= tol,
+                    "salt resident max_t={max_t} idx={i}: gpu={} ref={r} (tol {tol})",
+                    gpu[i],
+                );
             }
         }
     }
