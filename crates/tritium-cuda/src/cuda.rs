@@ -85,6 +85,9 @@ const KERNEL_NAME_LM_HEAD: &str = "lm_head_f32";
 /// GQA attention, M=1 decode (v0.3.1) — matches `ops::gqa_attention`; dots/weighted
 /// sums bit-match, the inline softmax `expf` differs ≤3 ULP.
 const KERNEL_NAME_ATTN: &str = "gqa_attention_decode_f32";
+/// Flash-decoding (split-KV) attention pair — the low-N occupancy fix.
+const KERNEL_NAME_ATTN_SPLIT_PARTIAL: &str = "gqa_attention_split_partial_f32";
+const KERNEL_NAME_ATTN_COMBINE: &str = "gqa_attention_combine_f32";
 /// On-device int8 activation quant for the tiled (TQ2_0) decode GEMM (v0.3.1) —
 /// bit-matches `ops::quantize_activation_int8` (int8 kept as f32 + per-token scale).
 const KERNEL_NAME_ACT_QUANT_TILED: &str = "act_quant_tiled_f32";
@@ -307,6 +310,14 @@ pub struct CudaBackend {
     /// The resolved `gqa_attention_decode_f32` kernel (M=1 decode attention).
     #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
     func_attn: CudaFunction,
+    /// `gqa_attention_split_partial_f32` + `gqa_attention_combine_f32` — the
+    /// flash-decoding (split-KV) attention pair (low-N occupancy fix). Resolved here
+    /// and exercised by the `attn_split_kv_matches_direct_attention` equivalence gate;
+    /// the resident decode wiring (`md_attn`/`gb_attn`) lands next and makes them load-bearing.
+    #[allow(dead_code)]
+    func_attn_split_partial: CudaFunction,
+    #[allow(dead_code)]
+    func_attn_combine: CudaFunction,
     /// The resolved `act_quant_tiled_f32` kernel (on-device A8 quant for the tiled GEMM).
     #[allow(dead_code)] // wired into the device GEMM next; W1-in-progress.
     func_act_quant_tiled: CudaFunction,
@@ -405,6 +416,12 @@ impl CudaBackend {
         let func_attn = decode_module
             .load_function(KERNEL_NAME_ATTN)
             .map_err(|e| driver_err("resolve attention kernel", &e))?;
+        let func_attn_split_partial = decode_module
+            .load_function(KERNEL_NAME_ATTN_SPLIT_PARTIAL)
+            .map_err(|e| driver_err("resolve attn split-partial kernel", &e))?;
+        let func_attn_combine = decode_module
+            .load_function(KERNEL_NAME_ATTN_COMBINE)
+            .map_err(|e| driver_err("resolve attn combine kernel", &e))?;
         let func_act_quant_tiled = decode_module
             .load_function(KERNEL_NAME_ACT_QUANT_TILED)
             .map_err(|e| driver_err("resolve act_quant_tiled kernel", &e))?;
@@ -444,6 +461,8 @@ impl CudaBackend {
             func_embed,
             func_lm_head,
             func_attn,
+            func_attn_split_partial,
+            func_attn_combine,
             func_act_quant_tiled,
             func_scale_mul,
             func_relu2_gate,
@@ -983,6 +1002,116 @@ impl CudaBackend {
             .memcpy_dtoh(&d_out, out)
             .map_err(|e| driver_err("attn dtoh", &e))?;
         Ok(())
+    }
+
+    /// Flash-decoding (split-KV) attention over ONE sequence (`n=1`), for the
+    /// equivalence gate: contract `q [n_head*head_dim]` against `k`/`v`
+    /// `[ctx, n_head_kv, head_dim]` via the `gqa_attention_split_partial_f32` +
+    /// `gqa_attention_combine_f32` pair (`n_split` chunks of `chunk` keys), returning
+    /// `out [n_head*head_dim]`. Must match [`Self::gqa_attention_decode`] within tol.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn attn_split_dense(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        ctx: usize,
+        n_split: usize,
+        chunk: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let q_len = n_head * head_dim;
+        let d_q = self
+            .stream
+            .clone_htod(q)
+            .map_err(|e| driver_err("split htod q", &e))?;
+        let d_k = self
+            .stream
+            .clone_htod(k)
+            .map_err(|e| driver_err("split htod k", &e))?;
+        let d_v = self
+            .stream
+            .clone_htod(v)
+            .map_err(|e| driver_err("split htod v", &e))?;
+        let positions = vec![(ctx - 1) as i32];
+        let d_pos = self
+            .stream
+            .clone_htod(&positions)
+            .map_err(|e| driver_err("split htod pos", &e))?;
+        let mut d_part = self
+            .stream
+            .alloc_zeros::<f32>(n_head * n_split * (head_dim + 2))
+            .map_err(|e| driver_err("split alloc partials", &e))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(q_len)
+            .map_err(|e| driver_err("split alloc out", &e))?;
+
+        let (max_ctx_i, nh_i, nhkv_i, hd_i) =
+            (ctx as i32, n_head as i32, n_head_kv as i32, head_dim as i32);
+        let (n_i, ns_i, chunk_i) = (1i32, n_split as i32, chunk as i32);
+
+        // Partial: one warp (32 threads) per (row, head, split).
+        let cfg_p = LaunchConfig {
+            grid_dim: ((n_head * n_split) as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lp = self.stream.launch_builder(&self.func_attn_split_partial);
+        lp.arg(&d_q)
+            .arg(&d_k)
+            .arg(&d_v)
+            .arg(&mut d_part)
+            .arg(&d_pos)
+            .arg(&max_ctx_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&scale)
+            .arg(&n_i)
+            .arg(&ns_i)
+            .arg(&chunk_i);
+        // SAFETY: matches `gqa_attention_split_partial_f32(q, k, v, partials, positions,
+        // max_ctx, n_head, n_head_kv, head_dim, scale, n, n_split, chunk)` — order/types
+        // exact; only `partials` mutable. q is n_head*head_dim, k/v are ctx*n_head_kv*head_dim
+        // (max_ctx=ctx), partials is n_head*n_split*(head_dim+2); grid covers n_head*n_split
+        // warps with the in-kernel `warp >= n*n_head*n_split` guard.
+        #[allow(unsafe_code)]
+        unsafe {
+            lp.launch(cfg_p)
+                .map_err(|e| driver_err("launch split partial", &e))?;
+        }
+
+        // Combine: one warp per (row, head).
+        let cfg_c = LaunchConfig {
+            grid_dim: (n_head as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lc = self.stream.launch_builder(&self.func_attn_combine);
+        lc.arg(&d_part)
+            .arg(&mut d_out)
+            .arg(&nh_i)
+            .arg(&hd_i)
+            .arg(&n_i)
+            .arg(&ns_i);
+        // SAFETY: matches `gqa_attention_combine_f32(partials, out, n_head, head_dim, n,
+        // n_split)`; only `out` mutable; out is n_head*head_dim; grid covers n_head warps.
+        #[allow(unsafe_code)]
+        unsafe {
+            lc.launch(cfg_c)
+                .map_err(|e| driver_err("launch split combine", &e))?;
+        }
+
+        let mut out = vec![0.0f32; q_len];
+        self.stream
+            .memcpy_dtoh(&d_out, &mut out)
+            .map_err(|e| driver_err("split dtoh out", &e))?;
+        Ok(out)
     }
 
     /// On-device int8 activation quant for the tiled GEMM (one row), on host slices,
@@ -6373,6 +6502,67 @@ mod tests {
                         gpu[i],
                     );
                 }
+            }
+        }
+    }
+
+    /// v0.4.1: flash-decoding (split-KV) attention must match the direct decode
+    /// attention (`gqa_attention_decode`) within tolerance — for several `n_split`
+    /// (chunk counts), including `n_split=1` (single chunk) and a split that leaves a
+    /// ragged final chunk. The online-softmax merge reorders sums, so this is a
+    /// tolerance gate (1e-4), not bit-exact.
+    #[test]
+    fn attn_split_kv_matches_direct_attention() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping split-kv attn: no device ({e})");
+                return;
+            }
+        };
+        let (n_head, n_head_kv, head_dim, ctx) = (8usize, 2usize, 128usize, 200usize);
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut s: u64 = 0x5F11_7A11_u64; // seed
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 40) as f32 / (1u64 << 23) as f32 - 0.5
+        };
+        let q: Vec<f32> = (0..n_head * head_dim).map(|_| next()).collect();
+        let k: Vec<f32> = (0..ctx * n_head_kv * head_dim).map(|_| next()).collect();
+        let v: Vec<f32> = (0..ctx * n_head_kv * head_dim).map(|_| next()).collect();
+
+        let mut reference = vec![0.0f32; n_head * head_dim];
+        cuda.gqa_attention_decode(
+            &q,
+            &k,
+            &v,
+            &mut reference,
+            ctx,
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale,
+            ctx,
+        )
+        .expect("reference attention");
+
+        for n_split in [1usize, 4, 7, 16] {
+            let chunk = ctx.div_ceil(n_split);
+            let got = cuda
+                .attn_split_dense(
+                    &q, &k, &v, n_head, n_head_kv, head_dim, scale, ctx, n_split, chunk,
+                )
+                .expect("split attention");
+            for i in 0..n_head * head_dim {
+                let r = reference[i];
+                let tol = 1e-4 * r.abs().max(1.0);
+                assert!(
+                    (got[i] as f64 - r as f64).abs() <= tol as f64,
+                    "split-kv n_split={n_split} idx={i}: got={} ref={r} (tol {tol})",
+                    got[i],
+                );
             }
         }
     }

@@ -973,4 +973,125 @@ __global__ void argmax_rows_f32(const float* __restrict__ logits, const int voca
   if (threadIdx.x == 0) out[mi] = s_idx[0];
 }
 
+// ===========================================================================
+// Flash-decoding (split-KV) attention — the low-N occupancy fix. The decode
+// attention `gqa_attention_mdecode_f32` runs warp-per-(row,head): at N=1 that is
+// ~n_head warps = a few blocks, leaving a 128-SM GPU ~idle (ncu: SM 0.2% / DRAM
+// 0.4% busy), latency-bound on the KV read whose cost grows with ctx. These two
+// kernels split each (row,head)'s key range into `n_split` chunks across `n_split`
+// blocks, so a single decode row fills the GPU. Numerically equal to the direct
+// softmax within fp tolerance (the online-softmax merge reorders the sums) — NOT
+// bit-exact, so the gates that consume it are tolerance-based (vs the transformers
+// reference / parity), and eager + graph share these kernels to stay mutually exact.
+// ===========================================================================
+
+// Per-lane register budget for one warp's accumulator: head_dim / 32, capped at 8
+// (head_dim ≤ 256). The Rust launch asserts head_dim ≤ 256.
+#define SPLIT_MAX_HD_PER_LANE 8
+
+// gqa_attention_split_partial_f32 — warp per (row, head, split). Online-softmax over
+// this warp's key chunk `[s*chunk, min((s+1)*chunk, ctx))` → a partial
+// {acc[head_dim] relative to the chunk max, m = chunk max, l = chunk sumexp}, written
+// to `partials[warp][head_dim+2]` (warp index = (row*n_head+h)*n_split + s).
+__global__ void gqa_attention_split_partial_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ partials, const int* __restrict__ positions, const int max_ctx,
+    const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
+    const int n_split, const int chunk) {
+  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= (long long)n * n_head * n_split) return;
+  const int s = warp % n_split;
+  const long long rh = warp / n_split;  // row*n_head + h
+  const int row = rh / n_head;
+  const int h = rh - (long long)row * n_head;
+  const int ctx = positions[row] + 1;  // keys 0..=positions[row]
+  const int start = s * chunk;
+  const int end = min(start + chunk, ctx);
+  float* part = partials + warp * (long long)(head_dim + 2);
+
+  // Split beyond this row's ctx → identity partial (m = -inf contributes 0 in combine).
+  if (start >= ctx) {
+    for (int d = lane; d < head_dim; d += 32) part[d] = 0.0f;
+    if (lane == 0) {
+      part[head_dim] = -INFINITY;
+      part[head_dim + 1] = 0.0f;
+    }
+    return;
+  }
+
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const long long kv_seq = (long long)row * max_ctx * n_head_kv * head_dim;
+  const float* k_seq = k + kv_seq;
+  const float* v_seq = v + kv_seq;
+  const float* q_row = q + rh * (long long)head_dim;
+
+  float acc[SPLIT_MAX_HD_PER_LANE];
+  const int per_lane = (head_dim + 31) / 32;
+  for (int i = 0; i < per_lane; ++i) acc[i] = 0.0f;
+  float m = -INFINITY, l = 0.0f;
+
+  for (int j = start; j < end; ++j) {
+    const float* k_row = k_seq + ((long long)j * n_head_kv + kv) * head_dim;
+    // Lane-strided partial dot, then a warp tree-reduce to the full q·k.
+    float pd = 0.0f;
+    for (int d = lane; d < head_dim; d += 32) pd = __fadd_rn(pd, __fmul_rn(q_row[d], k_row[d]));
+    for (int off = 16; off > 0; off >>= 1) pd += __shfl_down_sync(0xffffffff, pd, off);
+    float sj = __shfl_sync(0xffffffff, pd, 0);  // broadcast the reduced dot to all lanes
+    sj = __fmul_rn(sj, scale);
+    const float m_new = fmaxf(m, sj);
+    const float corr = exp_f32(__fsub_rn(m, m_new));  // 0 on the first key (m = -inf)
+    const float p = exp_f32(__fsub_rn(sj, m_new));
+    l = __fadd_rn(__fmul_rn(l, corr), p);
+    const float* v_row = v_seq + ((long long)j * n_head_kv + kv) * head_dim;
+    for (int i = 0, d = lane; d < head_dim; d += 32, ++i)
+      acc[i] = __fadd_rn(__fmul_rn(acc[i], corr), __fmul_rn(p, v_row[d]));
+    m = m_new;
+  }
+  for (int i = 0, d = lane; d < head_dim; d += 32, ++i) part[d] = acc[i];
+  if (lane == 0) {
+    part[head_dim] = m;
+    part[head_dim + 1] = l;
+  }
+}
+
+// gqa_attention_combine_f32 — warp per (row, head). Flash-merge the `n_split` partials
+// into out[head_dim]: global max M over splits, L = Σ_s l_s·exp(m_s−M), and
+// out[d] = (Σ_s exp(m_s−M)·acc_s[d]) / L.
+__global__ void gqa_attention_combine_f32(const float* __restrict__ partials,
+                                          float* __restrict__ out, const int n_head,
+                                          const int head_dim, const int n, const int n_split) {
+  const long long rh = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;  // row*n_head+h
+  const int lane = threadIdx.x & 31;
+  if (rh >= (long long)n * n_head) return;
+  const float* base = partials + rh * (long long)n_split * (head_dim + 2);
+
+  float M = -INFINITY;
+  for (int s = 0; s < n_split; ++s) {
+    const float ms = base[(long long)s * (head_dim + 2) + head_dim];
+    if (ms > M) M = ms;
+  }
+  float L = 0.0f;
+  for (int s = 0; s < n_split; ++s) {
+    const float ms = base[(long long)s * (head_dim + 2) + head_dim];
+    if (ms != -INFINITY) {
+      const float ls = base[(long long)s * (head_dim + 2) + head_dim + 1];
+      L = __fadd_rn(L, __fmul_rn(ls, exp_f32(__fsub_rn(ms, M))));
+    }
+  }
+  const float inv = __fdiv_rn(1.0f, L);
+  float* o_row = out + rh * (long long)head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    float a = 0.0f;
+    for (int s = 0; s < n_split; ++s) {
+      const float ms = base[(long long)s * (head_dim + 2) + head_dim];
+      if (ms == -INFINITY) continue;
+      const float w = exp_f32(__fsub_rn(ms, M));
+      a = __fadd_rn(a, __fmul_rn(w, base[(long long)s * (head_dim + 2) + d]));
+    }
+    o_row[d] = __fmul_rn(a, inv);
+  }
+}
+
 }  // extern "C"
