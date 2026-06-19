@@ -130,7 +130,10 @@ pub fn read_salt_bundle(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
         k: usize,
         data_len: usize,
     }
-    let mut index = Vec::with_capacity(tensor_count);
+    // Cap the reservation by what the buffer could actually hold (each index entry is
+    // ≥18 bytes: name_len 2 + rows 4 + k 4 + data_len 8). A crafted `tensor_count` of
+    // u32::MAX on a tiny file must not reserve gigabytes before the per-entry `take` errors.
+    let mut index = Vec::with_capacity(tensor_count.min(bytes.len() / 18));
     for _ in 0..tensor_count {
         let name_len = c.u16()?;
         let name = core::str::from_utf8(c.take(name_len)?)
@@ -142,19 +145,27 @@ pub fn read_salt_bundle(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
         index.push(Entry { name, rows, k, data_len });
     }
 
-    let mut out = Vec::with_capacity(tensor_count);
+    let mut out = Vec::with_capacity(tensor_count.min(bytes.len() / 18));
     for e in index {
         let blob = c.take(e.data_len)?;
         // Walk the blob's `rows` self-describing packed rows.
         let plane_bytes = num_blocks(e.k) * TQ2_0_BLOCK_BYTES;
         let mut off = 0usize;
-        let mut salt_rows = Vec::with_capacity(e.rows);
+        // Cap by the blob (each row is ≥SALT_HEADER_BYTES) so a huge `e.rows` can't reserve
+        // unboundedly before the per-row bounds check below errors.
+        let mut salt_rows = Vec::with_capacity(e.rows.min(blob.len() / SALT_HEADER_BYTES + 1));
         for _ in 0..e.rows {
             if off + SALT_HEADER_BYTES > blob.len() {
                 return Err(FormatError::WrongBlockLen { expected: off + SALT_HEADER_BYTES, got: blob.len() });
             }
             let t = blob[off + 5] as usize;
-            let row_len = SALT_HEADER_BYTES + t * plane_bytes;
+            // Checked: on 64-bit the downstream bounds check already covers this, but a
+            // 32-bit `usize` could wrap (t ≤ 255, plane_bytes up to ~1.1 GB) — `read_salt_bundle`
+            // promises never to panic, so compute the length without overflow.
+            let row_len = t
+                .checked_mul(plane_bytes)
+                .and_then(|p| p.checked_add(SALT_HEADER_BYTES))
+                .ok_or(FormatError::WrongBlockLen { expected: usize::MAX, got: blob.len() })?;
             if off + row_len > blob.len() {
                 return Err(FormatError::WrongBlockLen { expected: off + row_len, got: blob.len() });
             }
@@ -231,5 +242,31 @@ mod tests {
         // truncated mid-data
         packed.truncate(packed.len() - 10);
         assert!(matches!(read_salt_bundle(&packed), Err(FormatError::WrongBlockLen { .. })));
+    }
+
+    #[test]
+    fn huge_counts_error_without_unbounded_alloc() {
+        // A tiny buffer claiming u32::MAX tensors must error from the bounds check, not
+        // reserve gigabytes via with_capacity. (If the cap regressed this would OOM the test.)
+        let mut b = Vec::new();
+        b.extend_from_slice(&SALT_BUNDLE_MAGIC);
+        b.push(SALT_BUNDLE_VERSION);
+        b.push(0);
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // tensor_count = 4 billion
+        assert!(matches!(read_salt_bundle(&b), Err(FormatError::WrongBlockLen { .. })));
+
+        // One tensor claiming u32::MAX rows but a tiny data blob → per-row bounds check errors.
+        let mut b2 = Vec::new();
+        b2.extend_from_slice(&SALT_BUNDLE_MAGIC);
+        b2.push(SALT_BUNDLE_VERSION);
+        b2.push(0);
+        b2.extend_from_slice(&1u32.to_le_bytes()); // 1 tensor
+        b2.extend_from_slice(&1u16.to_le_bytes()); // name_len 1
+        b2.push(b'w'); // name
+        b2.extend_from_slice(&u32::MAX.to_le_bytes()); // rows = 4 billion
+        b2.extend_from_slice(&256u32.to_le_bytes()); // k
+        b2.extend_from_slice(&4u64.to_le_bytes()); // data_len = 4 bytes (too small for any row)
+        b2.extend_from_slice(&[0u8; 4]); // the 4 data bytes
+        assert!(matches!(read_salt_bundle(&b2), Err(FormatError::WrongBlockLen { .. })));
     }
 }
