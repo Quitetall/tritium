@@ -5,10 +5,12 @@
 //! [`crate::model::weights`]. Real forward math lands in WF-3; today they are
 //! documented stubs so the per-op waves can fill them in disjoint files.
 
+mod dense;
 mod linear;
 mod mlp;
 mod transformer_block;
 
+pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::Relu2Mlp;
 pub use transformer_block::{BlockDump, TransformerBlock};
