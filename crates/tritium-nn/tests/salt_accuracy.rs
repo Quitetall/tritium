@@ -22,9 +22,10 @@ use std::path::PathBuf;
 
 use tritium_format::{SafeTensors, dequant_salt_row};
 use tritium_nn::{
-    DenseLinear, ModelConfig, ModelRunner, ModelWeights, Projection, Relu2Mlp, TransformerBlock,
+    DenseLinear, ForwardDump, ModelConfig, ModelRunner, ModelWeights, Projection, Relu2Mlp,
+    TransformerBlock,
 };
-use tritium_quantize::{QuantConfig, Sensitivity, quantize_tensor};
+use tritium_quantize::{QuantConfig, ScaleGroup, Sensitivity, quantize_tensor};
 
 /// Eval tokens to score. The reference set is 262; the CPU host forward over a
 /// 2.4B-param fp model is memory-bandwidth-bound (~11 GB streamed/token), so a
@@ -81,6 +82,10 @@ fn proj(st: &SafeTensors, name: &str, n_out: usize, k_in: usize, mode: Mode) -> 
                 t_min: 1,
                 t_max: 3,
                 sensitivity: Sensitivity::Uniform,
+                // BitNet b1.58 is QAT-trained against a single per-tensor absmean ternary, so
+                // the SALT base plane must match that granularity (per-256-block reconstructs
+                // the latent master too faithfully → garbage). T=1 ⇒ the deployed I2_S.
+                scale_group: ScaleGroup::Tensor,
             };
             let qt = quantize_tensor(&w, n_out, k_in, &cfg).expect("quantize_tensor");
             let mut dq = vec![0.0f32; n_out * k_in];
@@ -196,10 +201,12 @@ fn salt_accuracy_curve() {
     ];
 
     println!("\nSALT accuracy-vs-bpw curve ({} eval tokens):", eval_ids.len());
-    println!("  reference: deployed ternary I2_S = 1.4028 perplexity\n");
+    println!("  reference: deployed ternary I2_S = 1.4028 (full 262-tok set); see");
+    println!("  `gguf_eval_perplexity` for the deployed score on THIS prefix.\n");
     println!("  {:<16} {:>10}", "mode", "perplexity");
 
     let mut fp_ppl = f64::NAN;
+    let mut salt_floor = f64::NAN;
     for mode in modes {
         let weights = build_weights(&st, &cfg, mode);
         let backend = Box::new(tritium_cpu::CpuBackend::new());
@@ -210,12 +217,197 @@ fn salt_accuracy_curve() {
             Mode::Salt { bpw } => format!("salt {bpw:.3}bpw"),
         };
         println!("  {label:<16} {ppl:>10.4}");
-        if let Mode::Fp = mode {
-            fp_ppl = ppl;
+        match mode {
+            Mode::Fp => fp_ppl = ppl,
+            Mode::Salt { bpw } if (bpw - tritium_quantize::TRIT_BITS).abs() < 1e-3 => salt_floor = ppl,
+            Mode::Salt { .. } => {}
         }
         // `runner` (and its ~11 GB of weights) drops here before the next build.
     }
 
-    // Sanity: the fp upper bound is a finite, reasonable perplexity.
-    assert!(fp_ppl.is_finite() && fp_ppl > 1.0 && fp_ppl < 100.0, "fp perplexity {fp_ppl}");
+    // For a QAT-ternary master (BitNet b1.58) the curve INVERTS the usual shape: the bf16
+    // `fp` row is the *latent* weight, not a usable forward, so it scores garbage; the
+    // per-tensor SALT floor (`budget = log2 3`, `ScaleGroup::Tensor`) is the deployed I2_S
+    // ternary and the curve's optimum, and residual planes (higher bpw) regress back toward
+    // the unusable master. So the gate is: the floor is a *working* model that crushes the
+    // raw-master fp. (Per-tensor base reproduces the GGUF weights to f16; `gguf_eval_perplexity`
+    // is the deployed score on this same prefix.)
+    assert!(fp_ppl.is_finite(), "fp perplexity {fp_ppl} not finite");
+    assert!(
+        salt_floor.is_finite() && salt_floor < 50.0,
+        "per-tensor SALT floor {salt_floor} — expected a working model (deployed I2_S ≈ 5 on this prefix), not the ~8000 a per-block base produces"
+    );
+    assert!(
+        salt_floor * 100.0 < fp_ppl,
+        "per-tensor SALT floor {salt_floor} must crush the raw latent master fp {fp_ppl}"
+    );
+}
+
+const GGUF_PATH: &str =
+    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+
+/// Reference: the deployed GGUF I2_S perplexity on the SAME `EVAL_LEN` tokens the curve
+/// uses (the committed 1.4028 is over the full 262-token set; a short prefix scores
+/// higher). `salt@1.585` with [`ScaleGroup::Tensor`] must match this — that's the gate
+/// that the per-tensor SALT base reproduces the deployed ternary. Cheap (one model, one
+/// forward), unlike the full curve.
+#[test]
+#[ignore = "loads the GGUF + one CPU forward; run explicitly"]
+fn gguf_eval_perplexity() {
+    if !std::path::Path::new(GGUF_PATH).exists() {
+        eprintln!("skipping: {GGUF_PATH} absent");
+        return;
+    }
+    let ref_raw = match std::fs::read(reference_path()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: reference json: {e}");
+            return;
+        }
+    };
+    let ref_json: serde_json::Value = serde_json::from_slice(&ref_raw).expect("parse reference");
+    let all_ids: Vec<u32> = ref_json["eval_ids"]
+        .as_array()
+        .expect("eval_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let eval_ids = &all_ids[..EVAL_LEN.min(all_ids.len())];
+
+    let gbytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let mut gg = ModelRunner::load_cpu(&gbytes).expect("load gguf cpu");
+    let ppl = perplexity(&mut gg, eval_ids);
+    println!("\nGGUF I2_S perplexity on {} eval tokens = {ppl:.4}", eval_ids.len());
+}
+
+/// L2 norm + max-abs of a stage tensor.
+fn stats(v: &[f32]) -> (f64, f32) {
+    let l2 = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
+    let maxabs = v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    (l2, maxabs)
+}
+
+/// DIAGNOSTIC (curve debug, a04dfa7): the fp curve produces garbage perplexity. Run the
+/// HF-fp model and the known-good GGUF-ternary model through the **same** CPU host forward
+/// on one token, dumping each stage's L2/max so the first divergence localizes the bug.
+/// They use different weights (fp vs ternary) so small per-stage drift is expected; an
+/// order-of-magnitude gap (or a NaN/explosion) marks the broken stage.
+#[test]
+#[ignore = "diagnostic: HF-fp vs GGUF-ternary per-stage dump on one token"]
+fn salt_fp_vs_gguf_stage_dump() {
+    let path = bf16_path();
+    if !path.exists() {
+        eprintln!("skipping: {} absent", path.display());
+        return;
+    }
+    if !std::path::Path::new(GGUF_PATH).exists() {
+        eprintln!("skipping: {GGUF_PATH} absent");
+        return;
+    }
+    let cfg = config();
+    let tok = 128000u32; // BOS; probed at position 0
+
+    let bytes = std::fs::read(&path).expect("read bf16");
+    let st = SafeTensors::parse(&bytes).expect("parse safetensors");
+    let weights = build_weights(&st, &cfg, Mode::Fp);
+    let mut hf =
+        ModelRunner::from_weights(cfg.clone(), weights, Box::new(tritium_cpu::CpuBackend::new()));
+
+    let gbytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let mut gg = ModelRunner::load_cpu(&gbytes).expect("load gguf cpu");
+
+    let mut dh = ForwardDump::default();
+    hf.reset();
+    hf.forward_dump(&[tok], &[0], &mut dh).expect("hf dump");
+    let mut dg = ForwardDump::default();
+    gg.reset();
+    gg.forward_dump(&[tok], &[0], &mut dg).expect("gguf dump");
+
+    let pr = |name: &str, a: &[f32], b: &[f32]| {
+        let (la, ma) = stats(a);
+        let (lb, mb) = stats(b);
+        println!("  {name:<20} hf[l2={la:>11.3} max={ma:>9.3}]  gguf[l2={lb:>11.3} max={mb:>9.3}]");
+    };
+    println!("\nstage dump (token {tok}, pos 0) — HF-fp vs GGUF-ternary:");
+    pr("embedding", &dh.embedding, &dg.embedding);
+    pr("layer0_attn_norm", &dh.layer0_attn_norm, &dg.layer0_attn_norm);
+    pr("layer0_attn_out", &dh.layer0_attn_out, &dg.layer0_attn_out);
+    let nl = dh.hidden_states.len();
+    for (i, (a, b)) in dh.hidden_states.iter().zip(&dg.hidden_states).enumerate() {
+        if i < 3 || i + 1 == nl {
+            pr(&format!("hidden[{i}]"), a, b);
+        }
+    }
+    pr("final_norm", &dh.final_norm, &dg.final_norm);
+    let amax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::MIN), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) })
+    };
+    println!("  hf logits argmax={:?}   gguf logits argmax={:?}", amax(&dh.logits), amax(&dg.logits));
+
+    // --- decompose layer-0 attention (the first divergence) --- //
+    // At pos 0 attention is trivial (attn_out == v expanded), so the q_width-3× gap is in
+    // v_proj / attn_sub_norm / o_proj. Compare the norm WEIGHTS (input-independent) and the
+    // v_proj output on the shared (matching) normed input.
+    let hb = &hf.weights.layers[0];
+    let gb = &gg.weights.layers[0];
+    println!("\nlayer-0 norm weights (hf vs gguf):");
+    pr("attn_norm.w", &hb.attn_norm, &gb.attn_norm);
+    pr("attn_sub_norm.w", &hb.attn_sub_norm, &gb.attn_sub_norm);
+    pr("ffn_norm.w", &hb.ffn_norm, &gb.ffn_norm);
+    pr("ffn_sub_norm.w", &hb.mlp.ffn_sub_norm, &gb.mlp.ffn_sub_norm);
+    pr("output_norm.w", &hf.weights.output_norm, &gg.weights.output_norm);
+
+    // v_proj on the shared matching input.
+    let backend = tritium_cpu::CpuBackend::new();
+    let n_embd = cfg.n_embd as usize;
+    let kv_width = cfg.n_head_kv as usize * cfg.head_dim() as usize;
+    let inp = &dg.layer0_attn_norm[..n_embd]; // identical for both (matched above)
+    let mut vh = vec![0.0f32; kv_width];
+    let mut vg = vec![0.0f32; kv_width];
+    hb.v_proj.forward(&backend, inp, 1, &mut vh).expect("hf v");
+    gb.v_proj.forward(&backend, inp, 1, &mut vg).expect("gg v");
+    pr("v_proj(shared inp)", &vh, &vg);
+
+    // Compare HF master absmean (the implied weight_scale) vs the GGUF I2_S per-tensor
+    // scale, per projection. If the ratio is ~constant across tensors → a global scale
+    // convention bug; if it tracks absmean → the fp path is just missing the ×scale.
+    let absmean = |w: &[f32]| w.iter().map(|x| f64::from(x.abs())).sum::<f64>() / w.len() as f64;
+    let hf_w = |p: &Projection| match p {
+        Projection::Dense(d) => d.weights.clone(),
+        Projection::Ternary(_) => unreachable!("hf is dense"),
+    };
+    let gg_scale = |p: &Projection| f64::from(p.as_ternary().expect("gguf ternary").scales[0]);
+    println!("\nlayer-0 weight scales (hf absmean vs gguf I2_S scale):");
+    for (name, hp, gp) in [
+        ("q_proj", &hb.q_proj, &gb.q_proj),
+        ("k_proj", &hb.k_proj, &gb.k_proj),
+        ("v_proj", &hb.v_proj, &gb.v_proj),
+        ("o_proj", &hb.o_proj, &gb.o_proj),
+        ("gate", &hb.mlp.gate, &gb.mlp.gate),
+        ("down", &hb.mlp.down, &gb.mlp.down),
+    ] {
+        let am = absmean(&hf_w(hp));
+        let sc = gg_scale(gp);
+        println!("  {name:<8} hf_absmean={am:>12.6}  gguf_scale={sc:>12.6}  ratio={:>8.3}", am / sc);
+    }
+
+    // Decisive: does SALT@1.585 (all-T=1 == flat absmean == BitNet ternary) reproduce the
+    // GGUF v_proj? If yes, the forward is fine and only raw-master "fp" is ill-defined; if
+    // it also blows up, SALT T=1 != the BitNet ternary the GGUF uses.
+    let salt_v = proj(&st, "model.layers.0.self_attn.v_proj.weight", kv_width, n_embd, Mode::Salt { bpw: 1.585 });
+    let mut vs = vec![0.0f32; kv_width];
+    salt_v.forward(&backend, inp, 1, &mut vs).expect("salt v");
+    pr("v_proj salt@1.585", &vs, &vg); // vg is the GGUF v_proj output (reference)
+
+    // Confirm the fix direction: a PER-TENSOR absmean ternary of the raw master (one scale
+    // for the whole tensor, round-clamp to {-1,0,1}) should reproduce the GGUF I2_S output.
+    let w_v = hf_w(&hb.v_proj);
+    let am_v = absmean(&w_v) as f32;
+    let w_pt: Vec<f32> = w_v.iter().map(|&x| am_v * (x / am_v).round().clamp(-1.0, 1.0)).collect();
+    let pt = Projection::Dense(DenseLinear::new(w_pt, kv_width, n_embd).unwrap());
+    let mut vp = vec![0.0f32; kv_width];
+    pt.forward(&backend, inp, 1, &mut vp).expect("per-tensor v");
+    pr("v_proj per-tensor", &vp, &vg); // should match gguf (~105)
 }

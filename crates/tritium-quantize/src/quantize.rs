@@ -18,10 +18,13 @@
 //! bytes match that figure is the later GPU-gated step (ADR 0001 §5).
 
 use half::f16;
-use tritium_core::Trit;
+use tritium_core::{Trit, absmean};
 use tritium_format::{FormatError, QK_K, SaltRow, TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row};
 
-use crate::{AllocConfig, AllocError, GroupInput, allocate, residual_expand};
+use crate::{
+    AllocConfig, AllocError, GroupInput, Plane, PlaneStack, TRIT_BITS, allocate, residual_expand,
+    ternary_at_scale,
+};
 
 /// How to score each group's loss sensitivity `H_g` for the allocator.
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,6 +40,21 @@ pub enum Sensitivity<'a> {
     Custom(&'a [f64]),
 }
 
+/// Granularity of the **base** (T=1) plane's AbsMean scale.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScaleGroup {
+    /// Per-256-block: every block fits its own AbsMean (the SALT/TQ2_0 default). Best for a
+    /// normally-trained fp master — it reconstructs the weights most faithfully.
+    #[default]
+    Block,
+    /// Per-tensor: ONE AbsMean over the whole matrix for the base plane (residual planes stay
+    /// per-block). This reproduces deployed **BitNet b1.58 I2_S**, which is QAT-trained against
+    /// a single per-tensor ternary scale — the per-block fit reconstructs the heavy-tailed
+    /// *latent* master too faithfully and yields weights the model was never trained for. Use
+    /// for b1.58 masters so SALT's floor (`budget = log2 3`) matches the deployed checkpoint.
+    Tensor,
+}
+
 /// Knobs for [`quantize_tensor`].
 #[derive(Clone, Copy, Debug)]
 pub struct QuantConfig<'a> {
@@ -48,6 +66,8 @@ pub struct QuantConfig<'a> {
     pub t_max: usize,
     /// Sensitivity scoring.
     pub sensitivity: Sensitivity<'a>,
+    /// Base-plane scale granularity (default [`ScaleGroup::Block`]).
+    pub scale_group: ScaleGroup,
 }
 
 impl Default for QuantConfig<'_> {
@@ -57,6 +77,7 @@ impl Default for QuantConfig<'_> {
             t_min: 1,
             t_max: 3,
             sensitivity: Sensitivity::Uniform,
+            scale_group: ScaleGroup::Block,
         }
     }
 }
@@ -176,65 +197,172 @@ pub fn quantize_tensor(
         });
     }
 
-    // Build group slices + sensitivities (row-major over blocks).
-    let mut groups: Vec<GroupInput> = Vec::with_capacity(n_groups);
-    for r in 0..rows {
-        let row = &weights[r * k..r * k + k];
-        for b in 0..nb {
-            let start = b * QK_K;
-            let end = (start + QK_K).min(k);
-            let gw = &row[start..end];
-            let sensitivity = match cfg.sensitivity {
-                Sensitivity::Uniform => 1.0,
-                Sensitivity::Energy => gw.iter().map(|&x| x as f64 * x as f64).sum(),
-                Sensitivity::Custom(s) => s[r * nb + b],
-            };
-            groups.push(GroupInput { weights: gw, sensitivity });
-        }
-    }
+    // Each path yields, per row, the `nb` block plane-stacks plus the realized plane count
+    // per group; the assembly below is shared.
+    let (row_stacks, plane_counts) = match cfg.scale_group {
+        ScaleGroup::Block => expand_per_block(weights, rows, k, nb, cfg)?,
+        ScaleGroup::Tensor => expand_per_tensor(weights, rows, k, nb, cfg)?,
+    };
 
-    let total_w = rows * k;
-    let acfg = AllocConfig::from_bpw(cfg.budget_bpw, total_w, cfg.t_min, cfg.t_max);
-    let alloc = allocate(&groups, &acfg)?;
-
-    // Assemble each row's dense planes.
     let mut salt_rows = Vec::with_capacity(rows);
-    for r in 0..rows {
-        let row = &weights[r * k..r * k + k];
-        let stacks: Vec<_> = (0..nb)
-            .map(|b| {
-                let start = b * QK_K;
-                let end = (start + QK_K).min(k);
-                residual_expand(&row[start..end], alloc.plane_counts[r * nb + b])
-            })
-            .collect();
-        let t_row = stacks.iter().map(|s| s.plane_count()).max().unwrap_or(0);
-
-        let mut planes = Vec::with_capacity(t_row);
-        for p in 0..t_row {
-            let mut row_trits = vec![Trit::ZERO; k];
-            let mut row_scales = vec![f16::ZERO; nb];
-            for (b, st) in stacks.iter().enumerate() {
-                if p < st.plane_count() {
-                    let plane = &st.planes[p];
-                    let start = b * QK_K;
-                    row_scales[b] = f16::from_f32(plane.scale);
-                    row_trits[start..start + plane.trits.len()].copy_from_slice(&plane.trits);
-                }
-            }
-            let mut bytes = vec![0u8; nb * TQ2_0_BLOCK_BYTES];
-            pack_tq2_0_row(&row_trits, &row_scales, &mut bytes)?;
-            planes.push(bytes);
-        }
-        salt_rows.push(SaltRow { k, planes });
+    for stacks in &row_stacks {
+        salt_rows.push(assemble_salt_row(k, nb, stacks)?);
     }
 
     Ok(QuantizedTensor {
         rows,
         k,
         salt_rows,
-        plane_counts: alloc.plane_counts,
+        plane_counts,
     })
+}
+
+/// `[start, end)` of block `b` in a `k`-wide row (the last block is short when `k % 256 != 0`).
+#[inline]
+fn block_range(b: usize, k: usize) -> (usize, usize) {
+    let start = b * QK_K;
+    (start, (start + QK_K).min(k))
+}
+
+/// One group's loss sensitivity `H_g` for the allocator. `idx` is the row-major group index
+/// `r·nb + b` (for [`Sensitivity::Custom`]).
+fn group_sensitivity(sensitivity: Sensitivity, gw: &[f32], idx: usize) -> f64 {
+    match sensitivity {
+        Sensitivity::Uniform => 1.0,
+        Sensitivity::Energy => gw.iter().map(|&x| x as f64 * x as f64).sum(),
+        Sensitivity::Custom(s) => s[idx],
+    }
+}
+
+/// Per-256-block SALT (the default): every group fits its own AbsMean base + greedy residual
+/// planes, allocated under the budget. Returns the per-row block stacks + per-group counts.
+type RowStacks = (Vec<Vec<PlaneStack>>, Vec<usize>);
+
+fn expand_per_block(
+    weights: &[f32],
+    rows: usize,
+    k: usize,
+    nb: usize,
+    cfg: &QuantConfig,
+) -> Result<RowStacks, QuantError> {
+    let n_groups = rows * nb;
+    let mut groups: Vec<GroupInput> = Vec::with_capacity(n_groups);
+    for r in 0..rows {
+        let row = &weights[r * k..r * k + k];
+        for b in 0..nb {
+            let (start, end) = block_range(b, k);
+            let gw = &row[start..end];
+            groups.push(GroupInput { weights: gw, sensitivity: group_sensitivity(cfg.sensitivity, gw, r * nb + b) });
+        }
+    }
+    let total_w = rows * k;
+    let acfg = AllocConfig::from_bpw(cfg.budget_bpw, total_w, cfg.t_min, cfg.t_max);
+    let alloc = allocate(&groups, &acfg)?;
+
+    let mut row_stacks = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let row = &weights[r * k..r * k + k];
+        let stacks = (0..nb)
+            .map(|b| {
+                let (start, end) = block_range(b, k);
+                residual_expand(&row[start..end], alloc.plane_counts[r * nb + b])
+            })
+            .collect();
+        row_stacks.push(stacks);
+    }
+    Ok((row_stacks, alloc.plane_counts))
+}
+
+/// Per-tensor base SALT (BitNet b1.58): the T=1 base plane uses ONE AbsMean over the whole
+/// matrix (so `budget = log2 3` reproduces the deployed I2_S ternary); extra planes are then
+/// allocated per-256-block on the *residual* left by the base, via the same machinery.
+fn expand_per_tensor(
+    weights: &[f32],
+    rows: usize,
+    k: usize,
+    nb: usize,
+    cfg: &QuantConfig,
+) -> Result<RowStacks, QuantError> {
+    let total_w = rows * k;
+    // The per-tensor base costs one plane on every group; below that floor nothing fits.
+    if cfg.budget_bpw + 1e-9 < TRIT_BITS {
+        return Err(QuantError::Alloc(AllocError::BudgetTooSmall {
+            base_bits: total_w as f64 * TRIT_BITS,
+            budget_bits: cfg.budget_bpw * total_w as f64,
+        }));
+    }
+
+    // One per-tensor AbsMean scale; the base plane forces it on every element of the matrix.
+    let base_scale = absmean(weights);
+    let base = ternary_at_scale(weights, base_scale);
+    let mut residual = weights.to_vec();
+    for (r, t) in residual.iter_mut().zip(&base.trits) {
+        *r -= base_scale * t.to_f32();
+    }
+
+    // Allocate the EXTRA planes (beyond the base) on the residual, per block.
+    let n_groups = rows * nb;
+    let mut groups: Vec<GroupInput> = Vec::with_capacity(n_groups);
+    for r in 0..rows {
+        let rrow = &residual[r * k..r * k + k];
+        for b in 0..nb {
+            let (start, end) = block_range(b, k);
+            let gw = &rrow[start..end];
+            groups.push(GroupInput { weights: gw, sensitivity: group_sensitivity(cfg.sensitivity, gw, r * nb + b) });
+        }
+    }
+    let extra_bpw = (cfg.budget_bpw - TRIT_BITS).max(0.0);
+    let acfg = AllocConfig::from_bpw(extra_bpw, total_w, cfg.t_min.saturating_sub(1), cfg.t_max.saturating_sub(1));
+    let extra = allocate(&groups, &acfg)?;
+
+    let mut row_stacks = Vec::with_capacity(rows);
+    let mut plane_counts = vec![0usize; n_groups];
+    for r in 0..rows {
+        let rrow = &residual[r * k..r * k + k];
+        let stacks = (0..nb)
+            .map(|b| {
+                let (start, end) = block_range(b, k);
+                let g = r * nb + b;
+                let base_block = Plane {
+                    scale: base_scale,
+                    trits: base.trits[r * k + start..r * k + end].to_vec(),
+                };
+                let resid = residual_expand(&rrow[start..end], extra.plane_counts[g]);
+                // Plane count = the always-present base + the extra planes the allocator gave
+                // (mirrors the per-block path, which reports requested counts).
+                plane_counts[g] = 1 + extra.plane_counts[g];
+                let mut planes = Vec::with_capacity(1 + resid.planes.len());
+                planes.push(base_block);
+                planes.extend(resid.planes);
+                PlaneStack { planes }
+            })
+            .collect();
+        row_stacks.push(stacks);
+    }
+    Ok((row_stacks, plane_counts))
+}
+
+/// Assemble one row's `nb` block plane-stacks into a packed [`SaltRow`] of dense TQ2_0
+/// planes (plane `p` gathers block `b`'s `p`-th plane, padding shorter blocks with zeros).
+fn assemble_salt_row(k: usize, nb: usize, stacks: &[PlaneStack]) -> Result<SaltRow, QuantError> {
+    let t_row = stacks.iter().map(|s| s.plane_count()).max().unwrap_or(0);
+    let mut planes = Vec::with_capacity(t_row);
+    for p in 0..t_row {
+        let mut row_trits = vec![Trit::ZERO; k];
+        let mut row_scales = vec![f16::ZERO; nb];
+        for (b, st) in stacks.iter().enumerate() {
+            if p < st.plane_count() {
+                let plane = &st.planes[p];
+                let start = b * QK_K;
+                row_scales[b] = f16::from_f32(plane.scale);
+                row_trits[start..start + plane.trits.len()].copy_from_slice(&plane.trits);
+            }
+        }
+        let mut bytes = vec![0u8; nb * TQ2_0_BLOCK_BYTES];
+        pack_tq2_0_row(&row_trits, &row_scales, &mut bytes)?;
+        planes.push(bytes);
+    }
+    Ok(SaltRow { k, planes })
 }
 
 #[cfg(test)]
@@ -299,13 +427,45 @@ mod tests {
         }
     }
 
+    // ── Gate: ScaleGroup::Tensor floor == PER-TENSOR AbsMean (deployed BitNet I2_S).
+    // The deployed b1.58 uses ONE absmean scale for the whole tensor; the per-256-block
+    // default does not reproduce it (it reconstructs the heavy-tailed master far more
+    // faithfully → weights the QAT model was never trained for). At the floor budget every
+    // group must be a single per-tensor base plane.
+    #[test]
+    fn tensor_group_floor_is_per_tensor_absmean() {
+        let (rows, k) = (3usize, 512usize);
+        let w = make_tensor(rows, k, 0xBEEF);
+        let cfg = QuantConfig {
+            budget_bpw: crate::TRIT_BITS,
+            t_min: 1,
+            t_max: 3,
+            sensitivity: Sensitivity::Uniform,
+            scale_group: ScaleGroup::Tensor,
+        };
+        let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
+        assert!(qt.plane_counts.iter().all(|&t| t == 1), "floor ⇒ base plane only");
+
+        let tensor_absmean = tritium_core::absmean(&w);
+        let s = f16::from_f32(tensor_absmean).to_f32();
+        for r in 0..rows {
+            let deq = dequant_salt_row(&qt.salt_rows[r]).unwrap();
+            for i in 0..k {
+                // Mirror `quantize_one`'s `as i8` cast (collapses -0.0 → 0) so the reference
+                // doesn't carry a negative-zero the integer trit can't represent.
+                let trit = ((w[r * k + i] / tensor_absmean).round().clamp(-1.0, 1.0) as i8) as f32;
+                assert_eq!(deq[i].to_bits(), (s * trit).to_bits(), "r={r} i={i}");
+            }
+        }
+    }
+
     // ── Gate: budget == base ⇒ T=1 everywhere == flat AbsMean (BitNet floor). ─
     #[test]
     fn budget_floor_is_flat_absmean() {
         let (rows, k) = (3usize, 512usize);
         let w = make_tensor(rows, k, 0xABBA);
         // budget_bpw exactly the base (t_min=1 ⇒ log2 3 bpw)
-        let cfg = QuantConfig { budget_bpw: crate::TRIT_BITS, t_min: 1, t_max: 3, sensitivity: Sensitivity::Uniform };
+        let cfg = QuantConfig { budget_bpw: crate::TRIT_BITS, t_min: 1, t_max: 3, sensitivity: Sensitivity::Uniform, scale_group: ScaleGroup::Block };
         let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
         assert!(qt.plane_counts.iter().all(|&t| t == 1), "all groups at base");
 
