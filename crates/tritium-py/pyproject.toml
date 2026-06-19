@@ -6,13 +6,13 @@ build-backend = "maturin"
 name = "tritium"
 description = "Ternary-model (BitNet) inference from Python, backed by the Rust Tritium engine."
 requires-python = ">=3.9"
-license = { text = "MIT OR Apache-2.0" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Brian Lam", email = "briankhanglam@gmail.com" }]
 keywords = ["ternary", "bitnet", "quantization", "inference"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]

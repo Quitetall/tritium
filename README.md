@@ -41,4 +41,4 @@ cargo test  -p tritium-core     # reference math + roundtrip
 
 ## License
 
-`MIT OR Apache-2.0`. Vendored upstreams attributed in [NOTICE](./NOTICE).
+[Apache-2.0](./LICENSE). Free and open source. Vendored upstreams attributed in [NOTICE](./NOTICE).

@@ -1,11 +1,11 @@
 Tritium
 Copyright 2026 Brian Lam
 
-This product is dual-licensed under MIT OR Apache-2.0 (see LICENSE-MIT and
-LICENSE-APACHE — to be added before first public release).
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Tritium incorporates designs, algorithms, and/or code derived from the
-following upstream projects. Their license terms are preserved here and in
+following upstream projects. Their license terms (MIT and Apache-2.0, both
+compatible with redistribution under Apache-2.0) are preserved here and in
 the source files of the integrating crates.
 
   - T-MAC — Microsoft Research (MIT)
