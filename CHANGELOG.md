@@ -7,7 +7,7 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
-## [Unreleased] — v0.4.0 (SALT quantization, ADR 0001/0006) — tag-ready
+## [0.4.0] — 2026-06-19 — SALT quantization (ADR 0001/0006)
 
 SALT (Sensitivity-Allocated Layered Ternary) — the **`tritium-quantize`** crate, a TQ2_0
 residual sidecar + whole-model bundle in `tritium-format`, the GPU multi-plane accumulate
