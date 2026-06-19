@@ -49,7 +49,10 @@ pub fn write_salt_gguf(tensors: &[(&str, &[SaltRow])]) -> Result<Vec<u8>, Format
         let k = rows
             .first()
             .map(|r| r.k)
-            .ok_or(FormatError::WrongBlockLen { expected: 1, got: 0 })?;
+            .ok_or(FormatError::WrongBlockLen {
+                expected: 1,
+                got: 0,
+            })?;
         let mut blob = Vec::new();
         for row in *rows {
             blob.extend_from_slice(&pack_salt_row_checked(row, k)?);
@@ -81,7 +84,10 @@ pub fn write_salt_gguf(tensors: &[(&str, &[SaltRow])]) -> Result<Vec<u8>, Format
 /// Pack one row, ensuring its `k` matches the tensor's declared `k`.
 fn pack_salt_row_checked(row: &SaltRow, k: usize) -> Result<Vec<u8>, FormatError> {
     if row.k != k {
-        return Err(FormatError::WrongBlockLen { expected: k, got: row.k });
+        return Err(FormatError::WrongBlockLen {
+            expected: k,
+            got: row.k,
+        });
     }
     crate::pack_salt_row(row)
 }
@@ -99,7 +105,8 @@ fn pack_salt_row_checked(row: &SaltRow, k: usize) -> Result<Vec<u8>, FormatError
 /// [`FormatError::WrongBlockLen`] on a truncated payload, or any [`unpack_salt_row`] error.
 pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
     let f = read_gguf(bytes)?;
-    if f.get_metadata(SALT_GGUF_FORMAT_KEY).and_then(GgufValue::as_str)
+    if f.get_metadata(SALT_GGUF_FORMAT_KEY)
+        .and_then(GgufValue::as_str)
         != Some(SALT_GGUF_FORMAT_VALUE)
     {
         return Err(FormatError::SaltGgufBadFormat);
@@ -150,7 +157,10 @@ pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
             let row_len = t_planes
                 .checked_mul(plane_bytes)
                 .and_then(|p| p.checked_add(SALT_HEADER_BYTES))
-                .ok_or(FormatError::WrongBlockLen { expected: usize::MAX, got: blob.len() })?;
+                .ok_or(FormatError::WrongBlockLen {
+                    expected: usize::MAX,
+                    got: blob.len(),
+                })?;
             if off + row_len > blob.len() {
                 return Err(FormatError::WrongBlockLen {
                     expected: off + row_len,
@@ -160,7 +170,12 @@ pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
             salt_rows.push(unpack_salt_row(&blob[off..off + row_len])?);
             off += row_len;
         }
-        out.push(SaltTensor { name: t.name.clone(), rows, k, salt_rows });
+        out.push(SaltTensor {
+            name: t.name.clone(),
+            rows,
+            k,
+            salt_rows,
+        });
     }
     Ok(out)
 }
@@ -219,7 +234,8 @@ mod tests {
         // It's a real GGUF: the generic reader parses it and sees the marker + tensor.
         let f = read_gguf(&bytes).expect("generic gguf parse");
         assert_eq!(
-            f.get_metadata(SALT_GGUF_FORMAT_KEY).and_then(GgufValue::as_str),
+            f.get_metadata(SALT_GGUF_FORMAT_KEY)
+                .and_then(GgufValue::as_str),
             Some(SALT_GGUF_FORMAT_VALUE)
         );
         let t = f.tensor("w").expect("tensor present");
@@ -245,7 +261,10 @@ mod tests {
         // A valid GGUF without the marker is rejected as not-a-SALT-container.
         let meta = BTreeMap::new();
         let plain = write_gguf(3, &meta, &[]).expect("write plain gguf");
-        assert_eq!(read_salt_gguf(&plain).unwrap_err(), FormatError::SaltGgufBadFormat);
+        assert_eq!(
+            read_salt_gguf(&plain).unwrap_err(),
+            FormatError::SaltGgufBadFormat
+        );
     }
 
     #[test]

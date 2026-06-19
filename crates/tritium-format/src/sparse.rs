@@ -91,7 +91,12 @@ pub fn sparse_from_tq2_0(packed: &[u8], k: usize) -> Result<SparsePlane, FormatE
             sign.push(v);
         }
     }
-    Ok(SparsePlane { k, scales, idx, sign })
+    Ok(SparsePlane {
+        k,
+        scales,
+        idx,
+        sign,
+    })
 }
 
 /// Reconstruct the dense TQ2_0 plane bytes from a [`SparsePlane`] — the exact
@@ -104,16 +109,25 @@ pub fn sparse_from_tq2_0(packed: &[u8], k: usize) -> Result<SparsePlane, FormatE
 pub fn sparse_to_tq2_0(plane: &SparsePlane) -> Result<Vec<u8>, FormatError> {
     let nb = num_blocks(plane.k);
     if plane.scales.len() != nb {
-        return Err(FormatError::WrongBlockLen { expected: nb, got: plane.scales.len() });
+        return Err(FormatError::WrongBlockLen {
+            expected: nb,
+            got: plane.scales.len(),
+        });
     }
     if plane.idx.len() != plane.sign.len() {
-        return Err(FormatError::WrongBlockLen { expected: plane.idx.len(), got: plane.sign.len() });
+        return Err(FormatError::WrongBlockLen {
+            expected: plane.idx.len(),
+            got: plane.sign.len(),
+        });
     }
     let mut trits = vec![Trit::ZERO; plane.k];
     for (&c, &s) in plane.idx.iter().zip(&plane.sign) {
         let c = c as usize;
         if c >= plane.k {
-            return Err(FormatError::WrongBlockLen { expected: plane.k, got: c });
+            return Err(FormatError::WrongBlockLen {
+                expected: plane.k,
+                got: c,
+            });
         }
         trits[c] = Trit::from_i8(s)?;
     }
@@ -147,7 +161,10 @@ pub fn dequant_sparse_plane(plane: &SparsePlane) -> Vec<f32> {
 /// [`FormatError::WrongBlockLen`] if `act` is shorter than `k`.
 pub fn sparse_dot(act: &[f32], plane: &SparsePlane) -> Result<f32, FormatError> {
     if act.len() < plane.k {
-        return Err(FormatError::WrongBlockLen { expected: plane.k, got: act.len() });
+        return Err(FormatError::WrongBlockLen {
+            expected: plane.k,
+            got: act.len(),
+        });
     }
     let mut acc = 0.0f32;
     for (&c, &s) in plane.idx.iter().zip(&plane.sign) {
@@ -155,7 +172,10 @@ pub fn sparse_dot(act: &[f32], plane: &SparsePlane) -> Result<f32, FormatError> 
         // Guard out-of-range columns (a manually-built plane could carry one),
         // matching dequant_sparse_plane — never index act/scales out of bounds.
         if c >= plane.k {
-            return Err(FormatError::WrongBlockLen { expected: plane.k, got: c });
+            return Err(FormatError::WrongBlockLen {
+                expected: plane.k,
+                got: c,
+            });
         }
         acc += act[c] * plane.scales[c / QK_K].to_f32() * f32::from(s);
     }
@@ -219,10 +239,16 @@ pub fn pack_sparse_plane(plane: &SparsePlane) -> Result<Vec<u8>, FormatError> {
     }
     let nb = num_blocks(plane.k);
     if plane.scales.len() != nb {
-        return Err(FormatError::WrongBlockLen { expected: nb, got: plane.scales.len() });
+        return Err(FormatError::WrongBlockLen {
+            expected: nb,
+            got: plane.scales.len(),
+        });
     }
     if plane.idx.len() != plane.sign.len() {
-        return Err(FormatError::WrongBlockLen { expected: plane.idx.len(), got: plane.sign.len() });
+        return Err(FormatError::WrongBlockLen {
+            expected: plane.idx.len(),
+            got: plane.sign.len(),
+        });
     }
     let mut out = Vec::with_capacity(SPARSE_HEADER_BYTES + nb * 2 + plane.idx.len() * 4);
     out.extend_from_slice(&SPARSE_MAGIC);
@@ -256,7 +282,10 @@ pub fn pack_sparse_plane(plane: &SparsePlane) -> Result<Vec<u8>, FormatError> {
 /// disagreement; [`FormatError::DecodedOutOfRange`] if an entry's column is `≥ k`.
 pub fn unpack_sparse_plane(bytes: &[u8]) -> Result<SparsePlane, FormatError> {
     if bytes.len() < SPARSE_HEADER_BYTES {
-        return Err(FormatError::WrongBlockLen { expected: SPARSE_HEADER_BYTES, got: bytes.len() });
+        return Err(FormatError::WrongBlockLen {
+            expected: SPARSE_HEADER_BYTES,
+            got: bytes.len(),
+        });
     }
     if bytes[0..4] != SPARSE_MAGIC {
         return Err(FormatError::SaltBadMagic);
@@ -277,14 +306,26 @@ pub fn unpack_sparse_plane(bytes: &[u8]) -> Result<SparsePlane, FormatError> {
 
     // Required length is exact: header + scales + entries. Compute it overflow-safe
     // (k/nnz are attacker-controlled u32; on 32-bit usize the product could wrap).
-    let scales_bytes = nb.checked_mul(2).ok_or(FormatError::WrongBlockLen { expected: usize::MAX, got: bytes.len() })?;
-    let entries_bytes = nnz.checked_mul(4).ok_or(FormatError::WrongBlockLen { expected: usize::MAX, got: bytes.len() })?;
+    let scales_bytes = nb.checked_mul(2).ok_or(FormatError::WrongBlockLen {
+        expected: usize::MAX,
+        got: bytes.len(),
+    })?;
+    let entries_bytes = nnz.checked_mul(4).ok_or(FormatError::WrongBlockLen {
+        expected: usize::MAX,
+        got: bytes.len(),
+    })?;
     let need = SPARSE_HEADER_BYTES
         .checked_add(scales_bytes)
         .and_then(|s| s.checked_add(entries_bytes))
-        .ok_or(FormatError::WrongBlockLen { expected: usize::MAX, got: bytes.len() })?;
+        .ok_or(FormatError::WrongBlockLen {
+            expected: usize::MAX,
+            got: bytes.len(),
+        })?;
     if bytes.len() != need {
-        return Err(FormatError::WrongBlockLen { expected: need, got: bytes.len() });
+        return Err(FormatError::WrongBlockLen {
+            expected: need,
+            got: bytes.len(),
+        });
     }
 
     let mut scales = Vec::with_capacity(nb);
@@ -308,7 +349,12 @@ pub fn unpack_sparse_plane(bytes: &[u8]) -> Result<SparsePlane, FormatError> {
         idx.push(c);
         sign.push(if enc & SIGN_BIT != 0 { -1 } else { 1 });
     }
-    Ok(SparsePlane { k, scales, idx, sign })
+    Ok(SparsePlane {
+        k,
+        scales,
+        idx,
+        sign,
+    })
 }
 
 #[cfg(test)]
@@ -321,7 +367,9 @@ mod tests {
         let nb = num_blocks(k);
         let mut s = seed;
         let mut next = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             s
         };
         let trits: Vec<Trit> = (0..k)
@@ -333,7 +381,9 @@ mod tests {
                 }
             })
             .collect();
-        let scales: Vec<f16> = (0..nb).map(|b| f16::from_f32(0.1 + b as f32 * 0.05)).collect();
+        let scales: Vec<f16> = (0..nb)
+            .map(|b| f16::from_f32(0.1 + b as f32 * 0.05))
+            .collect();
         let mut out = vec![0u8; nb * TQ2_0_BLOCK_BYTES];
         pack_tq2_0_row(&trits, &scales, &mut out).unwrap();
         out
@@ -345,7 +395,10 @@ mod tests {
             let dense = dense_plane(k, stride, 0xABCD ^ k as u64);
             let sparse = sparse_from_tq2_0(&dense, k).unwrap();
             let back = sparse_to_tq2_0(&sparse).unwrap();
-            assert_eq!(back, dense, "k={k} stride={stride}: sparse must rebuild exact dense bytes");
+            assert_eq!(
+                back, dense,
+                "k={k} stride={stride}: sparse must rebuild exact dense bytes"
+            );
         }
     }
 
@@ -360,7 +413,9 @@ mod tests {
         let mut trits = vec![Trit::ZERO; k];
         let mut scales = vec![f16::ZERO; nb];
         unpack_tq2_0_row(&dense, &mut trits, &mut scales).unwrap();
-        let dense_w: Vec<f32> = (0..k).map(|i| scales[i / QK_K].to_f32() * trits[i].to_f32()).collect();
+        let dense_w: Vec<f32> = (0..k)
+            .map(|i| scales[i / QK_K].to_f32() * trits[i].to_f32())
+            .collect();
 
         assert_eq!(dequant_sparse_plane(&sparse), dense_w);
     }
@@ -381,7 +436,11 @@ mod tests {
             .collect();
 
         let dense_dot: f32 = (0..k).map(|i| act[i] * dense_w[i]).sum();
-        assert_eq!(sparse_dot(&act, &sparse).unwrap(), dense_dot, "ascending-index skip of zeros is exact");
+        assert_eq!(
+            sparse_dot(&act, &sparse).unwrap(),
+            dense_dot,
+            "ascending-index skip of zeros is exact"
+        );
     }
 
     #[test]
@@ -394,8 +453,14 @@ mod tests {
 
         let lr = choose_plane_repr(&low, k, thresh).unwrap();
         let hr = choose_plane_repr(&high, k, thresh).unwrap();
-        assert!(matches!(lr, PlaneRepr::Sparse(_)), "2.5% density must go sparse");
-        assert!(matches!(hr, PlaneRepr::Dense(_)), "50% density must stay dense");
+        assert!(
+            matches!(lr, PlaneRepr::Sparse(_)),
+            "2.5% density must go sparse"
+        );
+        assert!(
+            matches!(hr, PlaneRepr::Dense(_)),
+            "50% density must stay dense"
+        );
 
         // Either side expands to the original dense bytes -> identical matmul.
         assert_eq!(expand_plane_repr(&lr).unwrap(), low);
@@ -437,12 +502,18 @@ mod tests {
         // Bad magic.
         let mut bad = packed.clone();
         bad[0] = b'X';
-        assert_eq!(unpack_sparse_plane(&bad).unwrap_err(), FormatError::SaltBadMagic);
+        assert_eq!(
+            unpack_sparse_plane(&bad).unwrap_err(),
+            FormatError::SaltBadMagic
+        );
 
         // Bad version.
         let mut badv = packed.clone();
         badv[4] = 99;
-        assert!(matches!(unpack_sparse_plane(&badv), Err(FormatError::UnsupportedSaltVersion(99))));
+        assert!(matches!(
+            unpack_sparse_plane(&badv),
+            Err(FormatError::UnsupportedSaltVersion(99))
+        ));
 
         // Every truncation errors cleanly.
         for len in 0..packed.len() {
@@ -460,7 +531,10 @@ mod tests {
         // Rewrite the single entry's index to k (out of range).
         let entry_off = SPARSE_HEADER_BYTES + num_blocks(k) * 2;
         oob[entry_off..entry_off + 4].copy_from_slice(&(k as u32).to_le_bytes());
-        assert!(matches!(unpack_sparse_plane(&oob), Err(FormatError::DecodedOutOfRange(_))));
+        assert!(matches!(
+            unpack_sparse_plane(&oob),
+            Err(FormatError::DecodedOutOfRange(_))
+        ));
     }
 
     #[test]

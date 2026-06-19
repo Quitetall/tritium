@@ -20,9 +20,7 @@
 use half::f16;
 use tritium_core::Trit;
 
-use crate::{
-    FormatError, QK_K, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq2_0_row,
-};
+use crate::{FormatError, QK_K, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq2_0_row};
 
 /// Sidecar magic: `b"TSLT"` (Tritium SALT).
 pub const SALT_MAGIC: [u8; 4] = *b"TSLT";
@@ -298,7 +296,10 @@ mod tests {
     #[test]
     fn edge_pruned_and_zero_variance() {
         // T=0: fully pruned row → empty stack, dequantizes to all-zero.
-        let pruned = SaltRow { k: 256, planes: vec![] };
+        let pruned = SaltRow {
+            k: 256,
+            planes: vec![],
+        };
         let packed = pack_salt_row(&pruned).unwrap();
         assert_eq!(packed.len(), SALT_HEADER_BYTES);
         let back = unpack_salt_row(&packed).unwrap();
@@ -309,7 +310,10 @@ mod tests {
         let nb = num_blocks(256);
         let mut zero_plane = vec![0u8; nb * TQ2_0_BLOCK_BYTES];
         pack_tq2_0_row(&vec![Trit::ZERO; 256], &[f16::ZERO; 1], &mut zero_plane).unwrap();
-        let zrow = SaltRow { k: 256, planes: vec![zero_plane] };
+        let zrow = SaltRow {
+            k: 256,
+            planes: vec![zero_plane],
+        };
         assert!(dequant_salt_row(&zrow).unwrap().iter().all(|&x| x == 0.0));
     }
 
@@ -319,8 +323,16 @@ mod tests {
         let k = 256;
         let row = make_salt_row(k, 2);
         let full = dequant_salt_row(&row).unwrap();
-        let p0 = dequant_salt_row(&SaltRow { k, planes: vec![row.planes[0].clone()] }).unwrap();
-        let p1 = dequant_salt_row(&SaltRow { k, planes: vec![row.planes[1].clone()] }).unwrap();
+        let p0 = dequant_salt_row(&SaltRow {
+            k,
+            planes: vec![row.planes[0].clone()],
+        })
+        .unwrap();
+        let p1 = dequant_salt_row(&SaltRow {
+            k,
+            planes: vec![row.planes[1].clone()],
+        })
+        .unwrap();
         for i in 0..k {
             assert_eq!(full[i].to_bits(), (p0[i] + p1[i]).to_bits(), "elem {i}");
         }

@@ -34,9 +34,9 @@
 //! through every helper.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
 #[cfg(feature = "cuda")]
 use std::path::Path;
+use std::path::PathBuf;
 
 use tritium_core::GemmShape;
 
@@ -110,7 +110,8 @@ impl TileConfig {
     /// holding the int8 A (`tile_m·tile_k`) and B (`tile_n·tile_k`) staging regions.
     /// Used to prune candidates that would exceed the per-block shared budget.
     pub(crate) const fn shared_bytes(&self) -> u32 {
-        let per_stage = self.tile_m as u32 * self.tile_k as u32 + self.tile_n as u32 * self.tile_k as u32;
+        let per_stage =
+            self.tile_m as u32 * self.tile_k as u32 + self.tile_n as u32 * self.tile_k as u32;
         per_stage * self.stages as u32
     }
 }
@@ -135,19 +136,73 @@ pub(crate) fn candidate_tiles() -> Vec<TileConfig> {
         // The guaranteed-correct anchor (== AOT kernel).
         TileConfig::AOT_EQUIVALENT,
         // Single warp, deeper K step (more mma per sync).
-        TileConfig { tile_m: 16, tile_n: 8, tile_k: 64, warps: 1, stages: 2 },
-        TileConfig { tile_m: 16, tile_n: 8, tile_k: 128, warps: 1, stages: 2 },
+        TileConfig {
+            tile_m: 16,
+            tile_n: 8,
+            tile_k: 64,
+            warps: 1,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 16,
+            tile_n: 8,
+            tile_k: 128,
+            warps: 1,
+            stages: 2,
+        },
         // Wider N (more output cols per block), 2 warps.
-        TileConfig { tile_m: 16, tile_n: 16, tile_k: 32, warps: 2, stages: 2 },
-        TileConfig { tile_m: 16, tile_n: 16, tile_k: 64, warps: 2, stages: 2 },
+        TileConfig {
+            tile_m: 16,
+            tile_n: 16,
+            tile_k: 32,
+            warps: 2,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 16,
+            tile_n: 16,
+            tile_k: 64,
+            warps: 2,
+            stages: 2,
+        },
         // Wider M (more output rows per block), 2 warps.
-        TileConfig { tile_m: 32, tile_n: 8, tile_k: 32, warps: 2, stages: 2 },
-        TileConfig { tile_m: 32, tile_n: 8, tile_k: 64, warps: 2, stages: 2 },
+        TileConfig {
+            tile_m: 32,
+            tile_n: 8,
+            tile_k: 32,
+            warps: 2,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 32,
+            tile_n: 8,
+            tile_k: 64,
+            warps: 2,
+            stages: 2,
+        },
         // Square-ish 32x16, 4 warps — prefill workhorse.
-        TileConfig { tile_m: 32, tile_n: 16, tile_k: 32, warps: 4, stages: 2 },
-        TileConfig { tile_m: 32, tile_n: 16, tile_k: 64, warps: 4, stages: 2 },
+        TileConfig {
+            tile_m: 32,
+            tile_n: 16,
+            tile_k: 32,
+            warps: 4,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 32,
+            tile_n: 16,
+            tile_k: 64,
+            warps: 4,
+            stages: 2,
+        },
         // Larger 64x16, 8 warps, triple-buffered.
-        TileConfig { tile_m: 64, tile_n: 16, tile_k: 32, warps: 8, stages: 3 },
+        TileConfig {
+            tile_m: 64,
+            tile_n: 16,
+            tile_k: 32,
+            warps: 8,
+            stages: 3,
+        },
     ];
     RAW.iter()
         .copied()
@@ -213,7 +268,12 @@ impl CacheKey {
     pub(crate) fn to_key_string(&self) -> String {
         format!(
             "{}-{}-m{}-n{}-k{}-cuda{}",
-            self.arch, self.dtype, self.bucket.m_log2, self.bucket.n, self.bucket.k, self.cuda_version
+            self.arch,
+            self.dtype,
+            self.bucket.m_log2,
+            self.bucket.n,
+            self.bucket.k,
+            self.cuda_version
         )
     }
 }
@@ -411,12 +471,35 @@ mod tests {
 
     #[test]
     fn m_buckets_by_floor_log2() {
-        assert_eq!(ShapeBucket::from_shape(GemmShape { m: 0, n: 1, k: 1 }).m_log2, 0);
-        assert_eq!(ShapeBucket::from_shape(GemmShape { m: 1, n: 1, k: 1 }).m_log2, 0);
-        assert_eq!(ShapeBucket::from_shape(GemmShape { m: 2, n: 1, k: 1 }).m_log2, 1);
-        assert_eq!(ShapeBucket::from_shape(GemmShape { m: 31, n: 1, k: 1 }).m_log2, 4);
-        assert_eq!(ShapeBucket::from_shape(GemmShape { m: 32, n: 1, k: 1 }).m_log2, 5);
-        assert_eq!(ShapeBucket::from_shape(GemmShape { m: 4096, n: 1, k: 1 }).m_log2, 12);
+        assert_eq!(
+            ShapeBucket::from_shape(GemmShape { m: 0, n: 1, k: 1 }).m_log2,
+            0
+        );
+        assert_eq!(
+            ShapeBucket::from_shape(GemmShape { m: 1, n: 1, k: 1 }).m_log2,
+            0
+        );
+        assert_eq!(
+            ShapeBucket::from_shape(GemmShape { m: 2, n: 1, k: 1 }).m_log2,
+            1
+        );
+        assert_eq!(
+            ShapeBucket::from_shape(GemmShape { m: 31, n: 1, k: 1 }).m_log2,
+            4
+        );
+        assert_eq!(
+            ShapeBucket::from_shape(GemmShape { m: 32, n: 1, k: 1 }).m_log2,
+            5
+        );
+        assert_eq!(
+            ShapeBucket::from_shape(GemmShape {
+                m: 4096,
+                n: 1,
+                k: 1
+            })
+            .m_log2,
+            12
+        );
     }
 
     /// A representative key for the cache tests.
@@ -424,7 +507,11 @@ mod tests {
         CacheKey {
             arch: "sm_89".to_owned(),
             dtype: "i2sint8",
-            bucket: ShapeBucket::from_shape(GemmShape { m: 40, n: 2560, k: 2560 }),
+            bucket: ShapeBucket::from_shape(GemmShape {
+                m: 40,
+                n: 2560,
+                k: 2560,
+            }),
             cuda_version: 13030,
         }
     }
@@ -586,16 +673,28 @@ mod tests {
             &key,
             |c| {
                 if c == bad {
-                    CandidateResult { correct: false, seconds: 0.0 }
+                    CandidateResult {
+                        correct: false,
+                        seconds: 0.0,
+                    }
                 } else if c == fast {
-                    CandidateResult { correct: true, seconds: 0.1 }
+                    CandidateResult {
+                        correct: true,
+                        seconds: 0.1,
+                    }
                 } else {
-                    CandidateResult { correct: true, seconds: 1.0 }
+                    CandidateResult {
+                        correct: true,
+                        seconds: 1.0,
+                    }
                 }
             },
             |e| panic!("unexpected store error: {e}"),
         );
-        assert_eq!(winner, fast, "tuner must pick the fastest correct candidate");
+        assert_eq!(
+            winner, fast,
+            "tuner must pick the fastest correct candidate"
+        );
         // It must have been persisted, so a second call reads it back without
         // evaluating anything (the closure would panic if called).
         let again = tune_or_load(
@@ -623,7 +722,10 @@ mod tests {
         let winner = tune_or_load(
             &dir,
             &key,
-            |_| CandidateResult { correct: true, seconds: 0.5 },
+            |_| CandidateResult {
+                correct: true,
+                seconds: 0.5,
+            },
             |_| {},
         );
         assert_eq!(winner, candidate_tiles()[0]);
@@ -644,7 +746,10 @@ mod tests {
         let winner = tune_or_load(
             &dir,
             &key,
-            |_| CandidateResult { correct: false, seconds: 0.0 },
+            |_| CandidateResult {
+                correct: false,
+                seconds: 0.0,
+            },
             |_| {},
         );
         // No candidate validated → the guaranteed-correct anchor, and nothing cached.

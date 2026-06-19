@@ -37,9 +37,7 @@ use cudarc::nvrtc::Ptx;
 use std::ffi::{CString, c_void};
 
 use tritium_core::{GemmShape, TernaryFormat};
-use tritium_format::{
-    IMMA_K, IMMA_N, IMMA_WTILE_BYTES, TQ2_0_BLOCK_BYTES, num_blocks,
-};
+use tritium_format::{IMMA_K, IMMA_N, IMMA_WTILE_BYTES, TQ2_0_BLOCK_BYTES, num_blocks};
 use tritium_runtime::BackendEntry;
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
 
@@ -1135,7 +1133,10 @@ impl CudaBackend {
                 shared_mem_bytes: 0,
             };
             let mut l = self.stream.launch_builder(&self.func_act_quant_tiled);
-            l.arg(&d_normed).arg(&k_i).arg(&mut d_q).arg(&mut d_act_scale);
+            l.arg(&d_normed)
+                .arg(&k_i)
+                .arg(&mut d_q)
+                .arg(&mut d_act_scale);
             // SAFETY: `act_quant_tiled_f32(const float* act, int k, float* q, float*
             // scale)`; args in order; `d_normed`/`d_q` length `k`, `d_act_scale` 1.
             #[allow(unsafe_code)]
@@ -1209,7 +1210,16 @@ impl CudaBackend {
     ) -> Result<CudaDecodeModel, BackendError> {
         let s = &self.stream;
         let DecodeModelSpec {
-            n_embd, n_head, n_head_kv, head_dim, n_ff, vocab, max_ctx, rope_theta, rms_eps, ..
+            n_embd,
+            n_head,
+            n_head_kv,
+            head_dim,
+            n_ff,
+            vocab,
+            max_ctx,
+            rope_theta,
+            rms_eps,
+            ..
         } = *spec;
         let q_width = n_head * head_dim;
         let kv_width = n_head_kv * head_dim;
@@ -1217,10 +1227,16 @@ impl CudaBackend {
 
         // Validate the dense shapes the kernels assume.
         if spec.token_embd.len() != vocab * n_embd {
-            return Err(BackendError::ShapeMismatch { expected: vocab * n_embd, got: spec.token_embd.len() });
+            return Err(BackendError::ShapeMismatch {
+                expected: vocab * n_embd,
+                got: spec.token_embd.len(),
+            });
         }
         if spec.output_norm.len() != n_embd {
-            return Err(BackendError::ShapeMismatch { expected: n_embd, got: spec.output_norm.len() });
+            return Err(BackendError::ShapeMismatch {
+                expected: n_embd,
+                got: spec.output_norm.len(),
+            });
         }
 
         // RoPE table: cos/sin for every (pos, lane), computed exactly as the host
@@ -1228,7 +1244,9 @@ impl CudaBackend {
         // rotation bit-matches. `inv_freq[j] = theta^(-2j/head_dim)`.
         let theta = f64::from(rope_theta);
         let inv_head_dim = 1.0f64 / head_dim as f64;
-        let inv_freq: Vec<f64> = (0..half).map(|j| theta.powf(-2.0 * j as f64 * inv_head_dim)).collect();
+        let inv_freq: Vec<f64> = (0..half)
+            .map(|j| theta.powf(-2.0 * j as f64 * inv_head_dim))
+            .collect();
         let mut cos_t = vec![0.0f32; max_ctx * half];
         let mut sin_t = vec![0.0f32; max_ctx * half];
         for pos in 0..max_ctx {
@@ -1268,13 +1286,19 @@ impl CudaBackend {
         let mut kv_k = Vec::with_capacity(spec.layers.len());
         let mut kv_v = Vec::with_capacity(spec.layers.len());
         for ls in &spec.layers {
-            let opt_norm = |w: &[f32], width: usize, what: &str| -> Result<Option<CudaSlice<f32>>, BackendError> {
+            let opt_norm = |w: &[f32],
+                            width: usize,
+                            what: &str|
+             -> Result<Option<CudaSlice<f32>>, BackendError> {
                 if w.is_empty() {
                     Ok(None)
                 } else if w.len() == width {
                     Ok(Some(upload(w, what)?))
                 } else {
-                    Err(BackendError::ShapeMismatch { expected: width, got: w.len() })
+                    Err(BackendError::ShapeMismatch {
+                        expected: width,
+                        got: w.len(),
+                    })
                 }
             };
             if ls.attn_norm.len() != n_embd || ls.ffn_norm.len() != n_embd {
@@ -1304,7 +1328,8 @@ impl CudaBackend {
 
         // Resolve the kernels from the resident modules (decode + the add module's tiled GEMM).
         let f = |m: &Arc<CudaModule>, name: &str| -> Result<CudaFunction, BackendError> {
-            m.load_function(name).map_err(|e| driver_err("resolve decode kernel", &e))
+            m.load_function(name)
+                .map_err(|e| driver_err("resolve decode kernel", &e))
         };
         let dm = &self._decode_module;
 
@@ -1354,7 +1379,10 @@ impl CudaBackend {
             d_gate_sn: alloc(n_ff, "decode d_gate_sn")?,
             d_scores: alloc(n_head * max_ctx, "decode d_scores")?,
             d_logits: alloc(vocab, "decode d_logits")?,
-            d_qact: alloc(TILED_K_MAX.min(n_ff.max(q_width).max(n_embd)), "decode d_qact")?,
+            d_qact: alloc(
+                TILED_K_MAX.min(n_ff.max(q_width).max(n_embd)),
+                "decode d_qact",
+            )?,
             d_act_scale: alloc(1, "decode d_act_scale")?,
             n_embd,
             n_head,
@@ -1562,7 +1590,10 @@ impl CudaBackend {
         k: usize,
     ) -> Result<SaltResidentLinear, BackendError> {
         if rows.len() != n {
-            return Err(BackendError::ShapeMismatch { expected: n, got: rows.len() });
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: rows.len(),
+            });
         }
         if k > TILED_K_MAX {
             return Err(BackendError::InvalidInput(format!(
@@ -1573,7 +1604,10 @@ impl CudaBackend {
         let t_planes = rows.iter().map(|r| r.planes.len()).max().unwrap_or(0);
         for r in rows {
             if r.k != k {
-                return Err(BackendError::ShapeMismatch { expected: k, got: r.k });
+                return Err(BackendError::ShapeMismatch {
+                    expected: k,
+                    got: r.k,
+                });
             }
             for plane in &r.planes {
                 if plane.len() != row_bytes {
@@ -1600,7 +1634,13 @@ impl CudaBackend {
             .stream
             .clone_htod(&weights)
             .map_err(|e| driver_err("htod salt resident weights", &e))?;
-        Ok(SaltResidentLinear { device: Arc::new(device), n, k, row_bytes, t_planes })
+        Ok(SaltResidentLinear {
+            device: Arc::new(device),
+            n,
+            k,
+            row_bytes,
+            t_planes,
+        })
     }
 
     /// Run a resident SALT projection: contract `act` `[M, K]` against the
@@ -1618,7 +1658,10 @@ impl CudaBackend {
         m: usize,
     ) -> Result<Vec<f32>, BackendError> {
         if act.len() != m * lin.k {
-            return Err(BackendError::ShapeMismatch { expected: m * lin.k, got: act.len() });
+            return Err(BackendError::ShapeMismatch {
+                expected: m * lin.k,
+                got: act.len(),
+            });
         }
         let (n, k) = (lin.n, lin.k);
         if m == 0 || n == 0 {
@@ -1692,7 +1735,11 @@ impl CudaBackend {
         t_planes: usize,
     ) -> Result<Vec<f32>, BackendError> {
         let row_bytes = num_blocks(k) * TQ2_0_BLOCK_BYTES;
-        assert_eq!(weights.len(), t_planes * n * row_bytes, "weights len mismatch");
+        assert_eq!(
+            weights.len(),
+            t_planes * n * row_bytes,
+            "weights len mismatch"
+        );
         assert_eq!(act.len(), m * k, "act len mismatch");
 
         let d_act = self
@@ -1872,7 +1919,16 @@ impl CudaBackend {
         let tile = self.resolve_imma_tile(shape);
         let func = self.imma_function_for_tile(tile)?;
         self.launch_imma_tile(
-            &func, tile, &d_qact, buf.device.as_ref(), &d_act_scale, &d_wscale, &mut d_out, m_i, n_i, k_i,
+            &func,
+            tile,
+            &d_qact,
+            buf.device.as_ref(),
+            &d_act_scale,
+            &d_wscale,
+            &mut d_out,
+            m_i,
+            n_i,
+            k_i,
             num_ktiles_i,
         )?;
 
@@ -1964,7 +2020,12 @@ impl CudaBackend {
     /// numerically identical, the resolved tile choice never affects the result.
     fn resolve_imma_tile(&self, shape: GemmShape) -> TileConfig {
         let key = self.imma_cache_key(shape);
-        if let Some(t) = self.tuned_tiles.lock().expect("tuned_tiles poisoned").get(&key) {
+        if let Some(t) = self
+            .tuned_tiles
+            .lock()
+            .expect("tuned_tiles poisoned")
+            .get(&key)
+        {
             return *t;
         }
         let dir = cache_dir();
@@ -1991,7 +2052,10 @@ impl CudaBackend {
     fn evaluate_candidate(&self, tile: TileConfig, shape: GemmShape) -> CandidateResult {
         match self.try_evaluate_candidate(tile, shape) {
             Ok(r) => r,
-            Err(_) => CandidateResult { correct: false, seconds: f64::INFINITY },
+            Err(_) => CandidateResult {
+                correct: false,
+                seconds: f64::INFINITY,
+            },
         }
     }
 
@@ -2058,8 +2122,17 @@ impl CudaBackend {
 
         // One correctness launch + readback.
         self.launch_imma_tile(
-            &func, tile, &d_qact, &d_weights, &d_act_scale, &d_wscale, &mut d_out, m as i32,
-            n as i32, k as i32, num_ktiles_i,
+            &func,
+            tile,
+            &d_qact,
+            &d_weights,
+            &d_act_scale,
+            &d_wscale,
+            &mut d_out,
+            m as i32,
+            n as i32,
+            k as i32,
+            num_ktiles_i,
         )?;
         let mut got = vec![0.0f32; m * n];
         self.stream
@@ -2071,7 +2144,10 @@ impl CudaBackend {
 
         let correct = got.iter().zip(&reference).all(|(&g, &r)| imma_close(g, r));
         if !correct {
-            return Ok(CandidateResult { correct: false, seconds: f64::INFINITY });
+            return Ok(CandidateResult {
+                correct: false,
+                seconds: f64::INFINITY,
+            });
         }
 
         // Time a few repetitions (median of the wall-clock per-launch time). This is a
@@ -2083,8 +2159,17 @@ impl CudaBackend {
         for _ in 0..REPS {
             let start = std::time::Instant::now();
             self.launch_imma_tile(
-                &func, tile, &d_qact, &d_weights, &d_act_scale, &d_wscale, &mut d_out, m as i32,
-                n as i32, k as i32, num_ktiles_i,
+                &func,
+                tile,
+                &d_qact,
+                &d_weights,
+                &d_act_scale,
+                &d_wscale,
+                &mut d_out,
+                m as i32,
+                n as i32,
+                k as i32,
+                num_ktiles_i,
             )?;
             self.stream
                 .synchronize()
@@ -2093,7 +2178,10 @@ impl CudaBackend {
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let seconds = times[times.len() / 2];
-        Ok(CandidateResult { correct: true, seconds })
+        Ok(CandidateResult {
+            correct: true,
+            seconds,
+        })
     }
 
     /// Resolve the IMMA kernel [`CudaFunction`] for `tile`.
@@ -2351,7 +2439,9 @@ impl TernaryBackend for CudaBackend {
             // TQ2_0 (and anything else uploadable) → the host-quant default, which
             // delegates to the add-only `mpgemm`. `format` must agree with the
             // buffer; the default's `mpgemm` re-checks it.
-            _ => self.default_mpgemm_with_act_quant(act, weights, weight_scales, shape, format, out),
+            _ => {
+                self.default_mpgemm_with_act_quant(act, weights, weight_scales, shape, format, out)
+            }
         }
     }
 }
@@ -2422,7 +2512,13 @@ const A8_QB: f32 = 127.0;
 /// that crate). The fused-vs-default gate keeps the two from drifting: the IMMA
 /// device quant, this host copy, and the spec copy all reproduce the same int8
 /// values, pinned by `act_quant` parity in the spec's own `act_quant_golden` test.
-fn quantize_act_int8_host(act: &[f32], m: usize, k: usize, q_out: &mut [f32], scale_out: &mut [f32]) {
+fn quantize_act_int8_host(
+    act: &[f32],
+    m: usize,
+    k: usize,
+    q_out: &mut [f32],
+    scale_out: &mut [f32],
+) {
     for r in 0..m {
         let row = &act[r * k..r * k + k];
         let mut gamma = 0.0_f32;
@@ -2486,7 +2582,11 @@ fn pack_i2s_int8_tiles(trits: &[i8], n: usize, k: usize) -> Vec<u8> {
                 let gn = nt * IMMA_N + n_in_tile;
                 let gk = kt * IMMA_K + k_in_tile;
                 // In-range → real trit; padding → 0.
-                let trit = if gn < n && gk < k { trits[gn * k + gk] } else { 0 };
+                let trit = if gn < n && gk < k {
+                    trits[gn * k + gk]
+                } else {
+                    0
+                };
                 let code = (trit + 1) as u8; // {-1,0,1} -> {0,1,2}
                 let byte = tile0 + e / 4;
                 let shift = 2 * (e % 4);
@@ -2639,10 +2739,12 @@ impl ResidentLinear {
             .weights
             .as_any()
             .downcast_ref::<CudaBuffer>()
-            .ok_or_else(|| BackendError::InvalidInput("decode weight is not a CudaBuffer".into()))?;
-        let row_bytes = buf.tq2_0_row_bytes().ok_or(BackendError::UnsupportedFormat(
-            TernaryFormat::I2sInt8,
-        ))?;
+            .ok_or_else(|| {
+                BackendError::InvalidInput("decode weight is not a CudaBuffer".into())
+            })?;
+        let row_bytes = buf
+            .tq2_0_row_bytes()
+            .ok_or(BackendError::UnsupportedFormat(TernaryFormat::I2sInt8))?;
         let (n, k) = buf.dims();
         if spec.scales.len() != n {
             return Err(BackendError::ShapeMismatch {
@@ -2674,14 +2776,19 @@ impl ResidentLinear {
     /// (fewer graph nodes, better M=1 occupancy). Bit-identical: each output row's
     /// warp-reduce is unchanged, only the grouping into one kernel differs. Owns a fresh
     /// arena (not the shared prefill weight), so `+Σ row_bytes·n` VRAM.
-    fn build_fused(stream: &Arc<CudaStream>, parts: &[&DecodeLinearSpec]) -> Result<Self, BackendError> {
+    fn build_fused(
+        stream: &Arc<CudaStream>,
+        parts: &[&DecodeLinearSpec],
+    ) -> Result<Self, BackendError> {
         let bufs: Vec<&CudaBuffer> = parts
             .iter()
             .map(|p| {
                 p.weights
                     .as_any()
                     .downcast_ref::<CudaBuffer>()
-                    .ok_or_else(|| BackendError::InvalidInput("fused decode weight not a CudaBuffer".into()))
+                    .ok_or_else(|| {
+                        BackendError::InvalidInput("fused decode weight not a CudaBuffer".into())
+                    })
             })
             .collect::<Result<_, _>>()?;
         let (_, k) = bufs[0].dims();
@@ -2692,7 +2799,9 @@ impl ResidentLinear {
         for (b, p) in bufs.iter().zip(parts) {
             let (n, bk) = b.dims();
             if bk != k || b.tq2_0_row_bytes() != Some(row_bytes) || p.scales.len() != n {
-                return Err(BackendError::InvalidInput("fused decode parts disagree on K/rb/scales".into()));
+                return Err(BackendError::InvalidInput(
+                    "fused decode parts disagree on K/rb/scales".into(),
+                ));
             }
             total_n += n;
         }
@@ -2891,7 +3000,14 @@ impl CudaDecodeModel {
         let eps = self.rms_eps;
 
         // Embedding gather: d_x = token_embd[token].
-        Self::launch_embed(&self.stream, &self.f_embed, &self.d_token_embd, token, n_embd, &mut self.d_x)?;
+        Self::launch_embed(
+            &self.stream,
+            &self.f_embed,
+            &self.d_token_embd,
+            token,
+            n_embd,
+            &mut self.d_x,
+        )?;
 
         for li in 0..self.layers.len() {
             self.layer(li, pos)?;
@@ -2899,10 +3015,22 @@ impl CudaDecodeModel {
 
         // Final norm over the (single) last token, then the tied LM head.
         Self::launch_rmsnorm(
-            &self.stream, &self.f_rmsnorm, &self.d_x, &self.d_output_norm, eps, n_embd, &mut self.d_normed,
+            &self.stream,
+            &self.f_rmsnorm,
+            &self.d_x,
+            &self.d_output_norm,
+            eps,
+            n_embd,
+            &mut self.d_normed,
         )?;
         Self::launch_lm_head(
-            &self.stream, &self.f_lm_head, &self.d_normed, &self.d_token_embd, n_embd, self.vocab, &mut self.d_logits,
+            &self.stream,
+            &self.f_lm_head,
+            &self.d_normed,
+            &self.d_token_embd,
+            n_embd,
+            self.vocab,
+            &mut self.d_logits,
         )?;
 
         let mut logits = vec![0.0f32; self.vocab];
@@ -2921,69 +3049,221 @@ impl CudaDecodeModel {
     fn layer(&mut self, li: usize, pos: usize) -> Result<(), BackendError> {
         let eps = self.rms_eps;
         let (n_embd, q_width, kv_width) = (self.n_embd, self.q_width, self.kv_width);
-        let (n_head, n_head_kv, head_dim, half) = (self.n_head, self.n_head_kv, self.head_dim, self.half);
+        let (n_head, n_head_kv, head_dim, half) =
+            (self.n_head, self.n_head_kv, self.head_dim, self.half);
 
         // --- pre-norm attention ---
-        Self::launch_rmsnorm(&self.stream, &self.f_rmsnorm, &self.d_x, &self.layers[li].attn_norm, eps, n_embd, &mut self.d_normed)?;
-        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].q, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_q)?;
-        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].k, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_knew)?;
-        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].v, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_vnew)?;
+        Self::launch_rmsnorm(
+            &self.stream,
+            &self.f_rmsnorm,
+            &self.d_x,
+            &self.layers[li].attn_norm,
+            eps,
+            n_embd,
+            &mut self.d_normed,
+        )?;
+        Self::gemm(
+            &self.stream,
+            &self.f_quant,
+            &self.f_tiled,
+            &self.f_scale,
+            &self.d_normed,
+            &self.layers[li].q,
+            &mut self.d_qact,
+            &mut self.d_act_scale,
+            &mut self.d_q,
+        )?;
+        Self::gemm(
+            &self.stream,
+            &self.f_quant,
+            &self.f_tiled,
+            &self.f_scale,
+            &self.d_normed,
+            &self.layers[li].k,
+            &mut self.d_qact,
+            &mut self.d_act_scale,
+            &mut self.d_knew,
+        )?;
+        Self::gemm(
+            &self.stream,
+            &self.f_quant,
+            &self.f_tiled,
+            &self.f_scale,
+            &self.d_normed,
+            &self.layers[li].v,
+            &mut self.d_qact,
+            &mut self.d_act_scale,
+            &mut self.d_vnew,
+        )?;
 
         // RoPE on q and the new k (this token's position row of the precomputed table).
         let base = pos * half;
         {
             let cos_v = self.d_cos.slice(base..base + half);
             let sin_v = self.d_sin.slice(base..base + half);
-            Self::launch_rope(&self.stream, &self.f_rope, &mut self.d_q, &cos_v, &sin_v, n_head, head_dim)?;
+            Self::launch_rope(
+                &self.stream,
+                &self.f_rope,
+                &mut self.d_q,
+                &cos_v,
+                &sin_v,
+                n_head,
+                head_dim,
+            )?;
         }
         {
             let cos_v = self.d_cos.slice(base..base + half);
             let sin_v = self.d_sin.slice(base..base + half);
-            Self::launch_rope(&self.stream, &self.f_rope, &mut self.d_knew, &cos_v, &sin_v, n_head_kv, head_dim)?;
+            Self::launch_rope(
+                &self.stream,
+                &self.f_rope,
+                &mut self.d_knew,
+                &cos_v,
+                &sin_v,
+                n_head_kv,
+                head_dim,
+            )?;
         }
 
         // Append the new k/v to this layer's KV arena at the watermark, dtod.
         let off = self.cache_len * kv_width;
         {
             let mut dst = self.kv_k[li].slice_mut(off..off + kv_width);
-            self.stream.memcpy_dtod(&self.d_knew, &mut dst).map_err(|e| driver_err("kv append k", &e))?;
+            self.stream
+                .memcpy_dtod(&self.d_knew, &mut dst)
+                .map_err(|e| driver_err("kv append k", &e))?;
         }
         {
             let mut dst = self.kv_v[li].slice_mut(off..off + kv_width);
-            self.stream.memcpy_dtod(&self.d_vnew, &mut dst).map_err(|e| driver_err("kv append v", &e))?;
+            self.stream
+                .memcpy_dtod(&self.d_vnew, &mut dst)
+                .map_err(|e| driver_err("kv append v", &e))?;
         }
 
         // Attention over the cached prefix (ctx = watermark+1, last visible = watermark).
         let ctx = self.cache_len + 1;
         Self::launch_attention(
-            &self.stream, &self.f_attn, &self.d_q, &self.kv_k[li], &self.kv_v[li], &mut self.d_attn, &mut self.d_scores,
-            ctx, n_head, n_head_kv, head_dim, self.attn_scale, self.cache_len,
+            &self.stream,
+            &self.f_attn,
+            &self.d_q,
+            &self.kv_k[li],
+            &self.kv_v[li],
+            &mut self.d_attn,
+            &mut self.d_scores,
+            ctx,
+            n_head,
+            n_head_kv,
+            head_dim,
+            self.attn_scale,
+            self.cache_len,
         )?;
 
         // BitNet attn_sub_norm before o_proj (over q_width == n_embd), then o_proj +
         // the first residual into d_x.
         let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
-            Self::launch_rmsnorm(&self.stream, &self.f_rmsnorm, &self.d_attn, sn, eps, q_width, &mut self.d_attn_sn)?;
+            Self::launch_rmsnorm(
+                &self.stream,
+                &self.f_rmsnorm,
+                &self.d_attn,
+                sn,
+                eps,
+                q_width,
+                &mut self.d_attn_sn,
+            )?;
             &self.d_attn_sn
         } else {
             &self.d_attn
         };
-        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, attn_in, &self.layers[li].o, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_proj_out)?;
-        Self::launch_residual(&self.stream, &self.f_residual, &mut self.d_x, &self.d_proj_out, n_embd)?;
+        Self::gemm(
+            &self.stream,
+            &self.f_quant,
+            &self.f_tiled,
+            &self.f_scale,
+            attn_in,
+            &self.layers[li].o,
+            &mut self.d_qact,
+            &mut self.d_act_scale,
+            &mut self.d_proj_out,
+        )?;
+        Self::launch_residual(
+            &self.stream,
+            &self.f_residual,
+            &mut self.d_x,
+            &self.d_proj_out,
+            n_embd,
+        )?;
 
         // --- pre-norm ReLU² MLP ---
-        Self::launch_rmsnorm(&self.stream, &self.f_rmsnorm, &self.d_x, &self.layers[li].ffn_norm, eps, n_embd, &mut self.d_normed)?;
-        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].gate, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_gate)?;
-        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, &self.d_normed, &self.layers[li].up, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_up)?;
-        Self::launch_relu2(&self.stream, &self.f_relu2, &mut self.d_gate, &self.d_up, self.n_ff)?;
+        Self::launch_rmsnorm(
+            &self.stream,
+            &self.f_rmsnorm,
+            &self.d_x,
+            &self.layers[li].ffn_norm,
+            eps,
+            n_embd,
+            &mut self.d_normed,
+        )?;
+        Self::gemm(
+            &self.stream,
+            &self.f_quant,
+            &self.f_tiled,
+            &self.f_scale,
+            &self.d_normed,
+            &self.layers[li].gate,
+            &mut self.d_qact,
+            &mut self.d_act_scale,
+            &mut self.d_gate,
+        )?;
+        Self::gemm(
+            &self.stream,
+            &self.f_quant,
+            &self.f_tiled,
+            &self.f_scale,
+            &self.d_normed,
+            &self.layers[li].up,
+            &mut self.d_qact,
+            &mut self.d_act_scale,
+            &mut self.d_up,
+        )?;
+        Self::launch_relu2(
+            &self.stream,
+            &self.f_relu2,
+            &mut self.d_gate,
+            &self.d_up,
+            self.n_ff,
+        )?;
         let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
-            Self::launch_rmsnorm(&self.stream, &self.f_rmsnorm, &self.d_gate, sn, eps, self.n_ff, &mut self.d_gate_sn)?;
+            Self::launch_rmsnorm(
+                &self.stream,
+                &self.f_rmsnorm,
+                &self.d_gate,
+                sn,
+                eps,
+                self.n_ff,
+                &mut self.d_gate_sn,
+            )?;
             &self.d_gate_sn
         } else {
             &self.d_gate
         };
-        Self::gemm(&self.stream, &self.f_quant, &self.f_tiled, &self.f_scale, down_in, &self.layers[li].down, &mut self.d_qact, &mut self.d_act_scale, &mut self.d_proj_out)?;
-        Self::launch_residual(&self.stream, &self.f_residual, &mut self.d_x, &self.d_proj_out, n_embd)?;
+        Self::gemm(
+            &self.stream,
+            &self.f_quant,
+            &self.f_tiled,
+            &self.f_scale,
+            down_in,
+            &self.layers[li].down,
+            &mut self.d_qact,
+            &mut self.d_act_scale,
+            &mut self.d_proj_out,
+        )?;
+        Self::launch_residual(
+            &self.stream,
+            &self.f_residual,
+            &mut self.d_x,
+            &self.d_proj_out,
+            n_embd,
+        )?;
         Ok(())
     }
 
@@ -2991,36 +3271,64 @@ impl CudaDecodeModel {
     //     borrows of `self` without going through a `&self`/`&mut self` method). ---
 
     fn launch_rmsnorm(
-        stream: &Arc<CudaStream>, func: &CudaFunction, x: &CudaSlice<f32>, w: &CudaSlice<f32>,
-        eps: f32, n: usize, out: &mut CudaSlice<f32>,
+        stream: &Arc<CudaStream>,
+        func: &CudaFunction,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        eps: f32,
+        n: usize,
+        out: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         let n_i = n as i32;
-        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = stream.launch_builder(func);
         l.arg(x).arg(w).arg(&eps).arg(&n_i).arg(out);
         // SAFETY: `rmsnorm_f32(const float* x, const float* w, float eps, int n, float* out)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident rmsnorm", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident rmsnorm", &e))?;
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn gemm(
-        stream: &Arc<CudaStream>, f_quant: &CudaFunction, f_tiled: &CudaFunction, f_scale: &CudaFunction,
-        d_in: &CudaSlice<f32>, lin: &ResidentLinear,
-        d_qact: &mut CudaSlice<f32>, d_act_scale: &mut CudaSlice<f32>, d_out: &mut CudaSlice<f32>,
+        stream: &Arc<CudaStream>,
+        f_quant: &CudaFunction,
+        f_tiled: &CudaFunction,
+        f_scale: &CudaFunction,
+        d_in: &CudaSlice<f32>,
+        lin: &ResidentLinear,
+        d_qact: &mut CudaSlice<f32>,
+        d_act_scale: &mut CudaSlice<f32>,
+        d_out: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         let (n, k) = (lin.n, lin.k);
         let (n_i, k_i, m_i, rb_i) = (n as i32, k as i32, 1i32, lin.row_bytes as i32);
         // 1. on-device A8 quant of the activation row. (Reborrow the `&mut` scratch so
         //    the same bindings can be reused by the later launches.)
         {
-            let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
             let mut l = stream.launch_builder(f_quant);
-            l.arg(d_in).arg(&k_i).arg(&mut *d_qact).arg(&mut *d_act_scale);
+            l.arg(d_in)
+                .arg(&k_i)
+                .arg(&mut *d_qact)
+                .arg(&mut *d_act_scale);
             // SAFETY: `act_quant_tiled_f32(const float* act, int k, float* q, float* scale)`.
             #[allow(unsafe_code)]
-            unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident gemm quant", &e))?; }
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch resident gemm quant", &e))?;
+            }
         }
         // 2. tiled add-only f64 GEMM (M=1), folds the per-channel weight scale.
         {
@@ -3030,105 +3338,213 @@ impl CudaDecodeModel {
                 shared_mem_bytes: (k * 4) as u32,
             };
             let mut l = stream.launch_builder(f_tiled);
-            l.arg(&*d_qact).arg(lin.device.as_ref()).arg(&lin.scales).arg(&mut *d_out).arg(&m_i).arg(&n_i).arg(&k_i).arg(&rb_i);
+            l.arg(&*d_qact)
+                .arg(lin.device.as_ref())
+                .arg(&lin.scales)
+                .arg(&mut *d_out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(&rb_i);
             // SAFETY: `tq2_0_add_mpgemm_tiled(act, weights, scales, out, m, n, k, row_bytes)`.
             #[allow(unsafe_code)]
-            unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident gemm tiled", &e))?; }
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch resident gemm tiled", &e))?;
+            }
         }
         // 3. per-token activation-scale fold: out *= act_scale.
         {
-            let cfg = LaunchConfig { grid_dim: ((n as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
             let mut l = stream.launch_builder(f_scale);
             l.arg(&mut *d_out).arg(&*d_act_scale).arg(&n_i);
             // SAFETY: `scale_mul_f32(float* out, const float* s, int n)`.
             #[allow(unsafe_code)]
-            unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident gemm fold", &e))?; }
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch resident gemm fold", &e))?;
+            }
         }
         Ok(())
     }
 
     fn launch_rope(
-        stream: &Arc<CudaStream>, func: &CudaFunction, x: &mut CudaSlice<f32>,
-        cos_t: &CudaView<f32>, sin_t: &CudaView<f32>, n_head: usize, head_dim: usize,
+        stream: &Arc<CudaStream>,
+        func: &CudaFunction,
+        x: &mut CudaSlice<f32>,
+        cos_t: &CudaView<f32>,
+        sin_t: &CudaView<f32>,
+        n_head: usize,
+        head_dim: usize,
     ) -> Result<(), BackendError> {
         let (nh_i, hd_i) = (n_head as i32, head_dim as i32);
         let total = (n_head * (head_dim / 2)) as u32;
-        let cfg = LaunchConfig { grid_dim: (total.div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = stream.launch_builder(func);
         l.arg(x).arg(cos_t).arg(sin_t).arg(&nh_i).arg(&hd_i);
         // SAFETY: `rope_apply_f32(float* x, const float* cos_t, const float* sin_t, int n_head, int head_dim)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident rope", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident rope", &e))?;
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn launch_attention(
-        stream: &Arc<CudaStream>, func: &CudaFunction, q: &CudaSlice<f32>, k: &CudaSlice<f32>, v: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>, scores: &mut CudaSlice<f32>,
-        ctx: usize, n_head: usize, n_head_kv: usize, head_dim: usize, scale: f32, limit: usize,
+        stream: &Arc<CudaStream>,
+        func: &CudaFunction,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        scores: &mut CudaSlice<f32>,
+        ctx: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        limit: usize,
     ) -> Result<(), BackendError> {
-        let (ctx_i, nh_i, nhkv_i, hd_i, lim_i) = (ctx as i32, n_head as i32, n_head_kv as i32, head_dim as i32, limit as i32);
+        let (ctx_i, nh_i, nhkv_i, hd_i, lim_i) = (
+            ctx as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+            limit as i32,
+        );
         let threads = 64u32;
-        let cfg = LaunchConfig { grid_dim: ((n_head as u32).div_ceil(threads), 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((n_head as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = stream.launch_builder(func);
-        l.arg(q).arg(k).arg(v).arg(out).arg(scores).arg(&ctx_i).arg(&nh_i).arg(&nhkv_i).arg(&hd_i).arg(&scale).arg(&lim_i);
+        l.arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(out)
+            .arg(scores)
+            .arg(&ctx_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&scale)
+            .arg(&lim_i);
         // SAFETY: `gqa_attention_decode_f32(q, k, v, out, scores, ctx, n_head, n_head_kv, head_dim, scale, limit)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident attention", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident attention", &e))?;
+        }
         Ok(())
     }
 
     fn launch_residual(
-        stream: &Arc<CudaStream>, func: &CudaFunction, x: &mut CudaSlice<f32>, y: &CudaSlice<f32>, n: usize,
+        stream: &Arc<CudaStream>,
+        func: &CudaFunction,
+        x: &mut CudaSlice<f32>,
+        y: &CudaSlice<f32>,
+        n: usize,
     ) -> Result<(), BackendError> {
         let n_i = n as i32;
-        let cfg = LaunchConfig { grid_dim: ((n as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = stream.launch_builder(func);
         l.arg(x).arg(y).arg(&n_i);
         // SAFETY: `residual_add_f32(float* x, const float* y, int n)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident residual", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident residual", &e))?;
+        }
         Ok(())
     }
 
     fn launch_relu2(
-        stream: &Arc<CudaStream>, func: &CudaFunction, gate: &mut CudaSlice<f32>, up: &CudaSlice<f32>, n: usize,
+        stream: &Arc<CudaStream>,
+        func: &CudaFunction,
+        gate: &mut CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        n: usize,
     ) -> Result<(), BackendError> {
         let n_i = n as i32;
-        let cfg = LaunchConfig { grid_dim: ((n as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = stream.launch_builder(func);
         l.arg(gate).arg(up).arg(&n_i);
         // SAFETY: `relu2_gate_f32(float* gate, const float* up, int n)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident relu2", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident relu2", &e))?;
+        }
         Ok(())
     }
 
     fn launch_embed(
-        stream: &Arc<CudaStream>, func: &CudaFunction, table: &CudaSlice<f32>, tok: u32, n_embd: usize, out: &mut CudaSlice<f32>,
+        stream: &Arc<CudaStream>,
+        func: &CudaFunction,
+        table: &CudaSlice<f32>,
+        tok: u32,
+        n_embd: usize,
+        out: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         let (tok_i, ne_i) = (tok as i32, n_embd as i32);
-        let cfg = LaunchConfig { grid_dim: ((n_embd as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((n_embd as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = stream.launch_builder(func);
         l.arg(table).arg(&tok_i).arg(&ne_i).arg(out);
         // SAFETY: `embedding_gather_f32(const float* table, int tok, int n_embd, float* out)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident embed", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident embed", &e))?;
+        }
         Ok(())
     }
 
     fn launch_lm_head(
-        stream: &Arc<CudaStream>, func: &CudaFunction, h: &CudaSlice<f32>, embd: &CudaSlice<f32>,
-        n_embd: usize, vocab: usize, logits: &mut CudaSlice<f32>,
+        stream: &Arc<CudaStream>,
+        func: &CudaFunction,
+        h: &CudaSlice<f32>,
+        embd: &CudaSlice<f32>,
+        n_embd: usize,
+        vocab: usize,
+        logits: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         let (ne_i, v_i) = (n_embd as i32, vocab as i32);
-        let cfg = LaunchConfig { grid_dim: ((vocab as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((vocab as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = stream.launch_builder(func);
         l.arg(h).arg(embd).arg(&ne_i).arg(&v_i).arg(logits);
         // SAFETY: `lm_head_f32(const float* h, const float* embd, int n_embd, int vocab, float* logits)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch resident lm_head", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident lm_head", &e))?;
+        }
         Ok(())
     }
 
@@ -3210,10 +3626,16 @@ impl CudaDecodeModel {
     /// # Errors
     /// [`BackendError`] on capacity overflow, a `pos` guard, an out-of-range token, or a
     /// device failure.
-    pub fn prefill(&mut self, tokens: &[u32], positions: &[usize]) -> Result<Vec<f32>, BackendError> {
+    pub fn prefill(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<f32>, BackendError> {
         let m = tokens.len();
         if m == 0 || positions.len() != m {
-            return Err(BackendError::InvalidInput("prefill: empty or mismatched positions".into()));
+            return Err(BackendError::InvalidInput(
+                "prefill: empty or mismatched positions".into(),
+            ));
         }
         if positions[0] != self.cache_len {
             return Err(BackendError::InvalidInput(format!(
@@ -3229,15 +3651,20 @@ impl CudaDecodeModel {
         }
         for (r, (&t, &p)) in tokens.iter().zip(positions).enumerate() {
             if t as usize >= self.vocab {
-                return Err(BackendError::InvalidInput(format!("prefill token {t} out of range")));
+                return Err(BackendError::InvalidInput(format!(
+                    "prefill token {t} out of range"
+                )));
             }
             if p != self.cache_len + r {
-                return Err(BackendError::InvalidInput("prefill positions not contiguous".into()));
+                return Err(BackendError::InvalidInput(
+                    "prefill positions not contiguous".into(),
+                ));
             }
         }
 
         let s = &self.stream;
-        let (n_embd, q_width, kv_width, n_ff) = (self.n_embd, self.q_width, self.kv_width, self.n_ff);
+        let (n_embd, q_width, kv_width, n_ff) =
+            (self.n_embd, self.q_width, self.kv_width, self.n_ff);
         let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
         let causal_offset = self.cache_len;
         let ctx_max = self.cache_len + m;
@@ -3245,11 +3672,16 @@ impl CudaDecodeModel {
         // Upload token ids + positions as i32.
         let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let pos_i: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
-        let d_tokens = s.clone_htod(&tok_i).map_err(|e| driver_err("prefill tokens htod", &e))?;
-        let d_positions = s.clone_htod(&pos_i).map_err(|e| driver_err("prefill positions htod", &e))?;
+        let d_tokens = s
+            .clone_htod(&tok_i)
+            .map_err(|e| driver_err("prefill tokens htod", &e))?;
+        let d_positions = s
+            .clone_htod(&pos_i)
+            .map_err(|e| driver_err("prefill positions htod", &e))?;
 
         // M=P scratch (allocated for this prefill; freed on return).
-        let alloc = |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
+        let alloc =
+            |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
         let mut d_x = alloc(m * n_embd, "prefill d_x")?;
         let mut d_normed = alloc(m * n_embd, "prefill d_normed")?;
         let mut d_q = alloc(m * q_width, "prefill d_q")?;
@@ -3267,45 +3699,236 @@ impl CudaDecodeModel {
         let mut d_logits = alloc(self.vocab, "prefill d_logits")?;
 
         // Embedding gather (m rows).
-        Self::bl_embed(s, &self.f_embed_batch, &self.d_token_embd, &d_tokens, n_embd, m, &mut d_x)?;
+        Self::bl_embed(
+            s,
+            &self.f_embed_batch,
+            &self.d_token_embd,
+            &d_tokens,
+            n_embd,
+            m,
+            &mut d_x,
+        )?;
 
         for li in 0..self.layers.len() {
             // --- attention ---
-            Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_x, &self.layers[li].attn_norm, self.rms_eps, n_embd, m, &mut d_normed)?;
+            Self::bl_rmsnorm(
+                s,
+                &self.f_rmsnorm_batch,
+                &d_x,
+                &self.layers[li].attn_norm,
+                self.rms_eps,
+                n_embd,
+                m,
+                &mut d_normed,
+            )?;
             // q/k/v share one quant of d_normed.
-            Self::bl_quant(s, &self.f_quant_batch, &d_normed, n_embd, m, &mut d_qact, &mut d_act_scale)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].q, &d_act_scale, m, &mut d_q)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].k, &d_act_scale, m, &mut d_k)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].v, &d_act_scale, m, &mut d_v)?;
-            Self::bl_rope(s, &self.f_rope_batch, &mut d_q, &self.d_cos, &self.d_sin, &d_positions, n_head, head_dim, m)?;
-            Self::bl_rope(s, &self.f_rope_batch, &mut d_k, &self.d_cos, &self.d_sin, &d_positions, n_head_kv, head_dim, m)?;
-            Self::bl_kv_append(s, &self.f_kv_append_batch, &d_k, &mut self.kv_k[li], causal_offset, kv_width, m)?;
-            Self::bl_kv_append(s, &self.f_kv_append_batch, &d_v, &mut self.kv_v[li], causal_offset, kv_width, m)?;
-            Self::bl_attn(s, &self.f_attn_batch, &d_q, &self.kv_k[li], &self.kv_v[li], &mut d_attn, &mut d_scores, ctx_max, n_head, n_head_kv, head_dim, self.attn_scale, causal_offset, m)?;
-            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
-                Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_attn, sn, self.rms_eps, q_width, m, &mut d_attn_sn)?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                &d_normed,
+                n_embd,
+                m,
+                &mut d_qact,
+                &mut d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &d_qact,
+                &self.layers[li].q,
+                &d_act_scale,
+                m,
+                &mut d_q,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &d_qact,
+                &self.layers[li].k,
+                &d_act_scale,
+                m,
+                &mut d_k,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &d_qact,
+                &self.layers[li].v,
+                &d_act_scale,
+                m,
+                &mut d_v,
+            )?;
+            Self::bl_rope(
+                s,
+                &self.f_rope_batch,
+                &mut d_q,
+                &self.d_cos,
+                &self.d_sin,
+                &d_positions,
+                n_head,
+                head_dim,
+                m,
+            )?;
+            Self::bl_rope(
+                s,
+                &self.f_rope_batch,
+                &mut d_k,
+                &self.d_cos,
+                &self.d_sin,
+                &d_positions,
+                n_head_kv,
+                head_dim,
+                m,
+            )?;
+            Self::bl_kv_append(
+                s,
+                &self.f_kv_append_batch,
+                &d_k,
+                &mut self.kv_k[li],
+                causal_offset,
+                kv_width,
+                m,
+            )?;
+            Self::bl_kv_append(
+                s,
+                &self.f_kv_append_batch,
+                &d_v,
+                &mut self.kv_v[li],
+                causal_offset,
+                kv_width,
+                m,
+            )?;
+            Self::bl_attn(
+                s,
+                &self.f_attn_batch,
+                &d_q,
+                &self.kv_k[li],
+                &self.kv_v[li],
+                &mut d_attn,
+                &mut d_scores,
+                ctx_max,
+                n_head,
+                n_head_kv,
+                head_dim,
+                self.attn_scale,
+                causal_offset,
+                m,
+            )?;
+            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref()
+            {
+                Self::bl_rmsnorm(
+                    s,
+                    &self.f_rmsnorm_batch,
+                    &d_attn,
+                    sn,
+                    self.rms_eps,
+                    q_width,
+                    m,
+                    &mut d_attn_sn,
+                )?;
                 &d_attn_sn
             } else {
                 &d_attn
             };
-            Self::bl_quant(s, &self.f_quant_batch, attn_in, q_width, m, &mut d_qact, &mut d_act_scale)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].o, &d_act_scale, m, &mut d_proj)?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                attn_in,
+                q_width,
+                m,
+                &mut d_qact,
+                &mut d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &d_qact,
+                &self.layers[li].o,
+                &d_act_scale,
+                m,
+                &mut d_proj,
+            )?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
 
             // --- ReLU² MLP ---
-            Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_x, &self.layers[li].ffn_norm, self.rms_eps, n_embd, m, &mut d_normed)?;
-            Self::bl_quant(s, &self.f_quant_batch, &d_normed, n_embd, m, &mut d_qact, &mut d_act_scale)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].gate, &d_act_scale, m, &mut d_gate)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].up, &d_act_scale, m, &mut d_up)?;
+            Self::bl_rmsnorm(
+                s,
+                &self.f_rmsnorm_batch,
+                &d_x,
+                &self.layers[li].ffn_norm,
+                self.rms_eps,
+                n_embd,
+                m,
+                &mut d_normed,
+            )?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                &d_normed,
+                n_embd,
+                m,
+                &mut d_qact,
+                &mut d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &d_qact,
+                &self.layers[li].gate,
+                &d_act_scale,
+                m,
+                &mut d_gate,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &d_qact,
+                &self.layers[li].up,
+                &d_act_scale,
+                m,
+                &mut d_up,
+            )?;
             Self::bl_relu2(s, &self.f_relu2, &mut d_gate, &d_up, m * n_ff)?;
             let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
-                Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_gate, sn, self.rms_eps, n_ff, m, &mut d_gate_sn)?;
+                Self::bl_rmsnorm(
+                    s,
+                    &self.f_rmsnorm_batch,
+                    &d_gate,
+                    sn,
+                    self.rms_eps,
+                    n_ff,
+                    m,
+                    &mut d_gate_sn,
+                )?;
                 &d_gate_sn
             } else {
                 &d_gate
             };
-            Self::bl_quant(s, &self.f_quant_batch, down_in, n_ff, m, &mut d_qact, &mut d_act_scale)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &d_qact, &self.layers[li].down, &d_act_scale, m, &mut d_proj)?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                down_in,
+                n_ff,
+                m,
+                &mut d_qact,
+                &mut d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &d_qact,
+                &self.layers[li].down,
+                &d_act_scale,
+                m,
+                &mut d_proj,
+            )?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
         }
 
@@ -3313,14 +3936,33 @@ impl CudaDecodeModel {
         let mut d_last = alloc(n_embd, "prefill d_last")?;
         {
             let last_row = d_x.slice((m - 1) * n_embd..m * n_embd);
-            s.memcpy_dtod(&last_row, &mut d_last).map_err(|e| driver_err("prefill last row", &e))?;
+            s.memcpy_dtod(&last_row, &mut d_last)
+                .map_err(|e| driver_err("prefill last row", &e))?;
         }
         let mut d_last_norm = alloc(n_embd, "prefill d_last_norm")?;
-        Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &d_last, &self.d_output_norm, self.rms_eps, n_embd, 1, &mut d_last_norm)?;
-        Self::bl_lm_head_f16(s, &self.f_lm_head_f16, &d_last_norm, &self.d_token_embd_f16, n_embd, self.vocab, &mut d_logits)?;
+        Self::bl_rmsnorm(
+            s,
+            &self.f_rmsnorm_batch,
+            &d_last,
+            &self.d_output_norm,
+            self.rms_eps,
+            n_embd,
+            1,
+            &mut d_last_norm,
+        )?;
+        Self::bl_lm_head_f16(
+            s,
+            &self.f_lm_head_f16,
+            &d_last_norm,
+            &self.d_token_embd_f16,
+            n_embd,
+            self.vocab,
+            &mut d_logits,
+        )?;
 
         let mut logits = vec![0.0f32; self.vocab];
-        s.memcpy_dtoh(&d_logits, &mut logits).map_err(|e| driver_err("prefill logits dtoh", &e))?;
+        s.memcpy_dtoh(&d_logits, &mut logits)
+            .map_err(|e| driver_err("prefill logits dtoh", &e))?;
         self.cache_len += m;
         Ok(logits)
     }
@@ -3328,128 +3970,323 @@ impl CudaDecodeModel {
     // --- batched (M>1) prefill launch helpers (safe launches; eager one-shot path) ---
 
     #[allow(clippy::too_many_arguments)]
-    fn bl_rmsnorm(s: &Arc<CudaStream>, f: &CudaFunction, x: &CudaSlice<f32>, w: &CudaSlice<f32>, eps: f32, n: usize, m: usize, out: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+    fn bl_rmsnorm(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        eps: f32,
+        n: usize,
+        m: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
         let (n_i, m_i) = (n as i32, m as i32);
-        let cfg = LaunchConfig { grid_dim: (m as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (n * 4) as u32 };
+        let cfg = LaunchConfig {
+            grid_dim: (m as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (n * 4) as u32,
+        };
         let mut l = s.launch_builder(f);
         l.arg(x).arg(w).arg(&eps).arg(&n_i).arg(&m_i).arg(out);
         // SAFETY: `rmsnorm_batch_f32(const float* x, const float* w, float eps, int n, int m, float* out)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill rmsnorm", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill rmsnorm", &e))?;
+        }
         Ok(())
     }
 
-    fn bl_embed(s: &Arc<CudaStream>, f: &CudaFunction, table: &CudaSlice<f32>, tokens: &CudaSlice<i32>, n_embd: usize, m: usize, out: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+    fn bl_embed(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        table: &CudaSlice<f32>,
+        tokens: &CudaSlice<i32>,
+        n_embd: usize,
+        m: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
         let (ne_i, m_i) = (n_embd as i32, m as i32);
-        let cfg = LaunchConfig { grid_dim: (((m * n_embd) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (((m * n_embd) as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
         l.arg(table).arg(tokens).arg(&ne_i).arg(&m_i).arg(out);
         // SAFETY: `embedding_gather_batch_f32(const float* table, const int* tokens, int n_embd, int m, float* out)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill embed", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill embed", &e))?;
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bl_rope(s: &Arc<CudaStream>, f: &CudaFunction, x: &mut CudaSlice<f32>, cos_t: &CudaSlice<f32>, sin_t: &CudaSlice<f32>, positions: &CudaSlice<i32>, n_head: usize, head_dim: usize, m: usize) -> Result<(), BackendError> {
+    fn bl_rope(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        x: &mut CudaSlice<f32>,
+        cos_t: &CudaSlice<f32>,
+        sin_t: &CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
+        n_head: usize,
+        head_dim: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
         let (nh_i, hd_i, m_i) = (n_head as i32, head_dim as i32, m as i32);
         let total = (m * n_head * (head_dim / 2)) as u32;
-        let cfg = LaunchConfig { grid_dim: (total.div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
-        l.arg(x).arg(cos_t).arg(sin_t).arg(positions).arg(&nh_i).arg(&hd_i).arg(&m_i);
+        l.arg(x)
+            .arg(cos_t)
+            .arg(sin_t)
+            .arg(positions)
+            .arg(&nh_i)
+            .arg(&hd_i)
+            .arg(&m_i);
         // SAFETY: `rope_apply_batch_f32(float* x, const float* cos, const float* sin, const int* pos, int n_head, int head_dim, int m)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill rope", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill rope", &e))?;
+        }
         Ok(())
     }
 
-    fn bl_quant(s: &Arc<CudaStream>, f: &CudaFunction, d_in: &CudaSlice<f32>, k: usize, m: usize, qact: &mut CudaSlice<f32>, scale: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+    fn bl_quant(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        d_in: &CudaSlice<f32>,
+        k: usize,
+        m: usize,
+        qact: &mut CudaSlice<f32>,
+        scale: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
         let (k_i, m_i) = (k as i32, m as i32);
-        let cfg = LaunchConfig { grid_dim: (m as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (m as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
         l.arg(d_in).arg(&k_i).arg(&m_i).arg(qact).arg(scale);
         // SAFETY: `act_quant_batch_f32(const float* act, int k, int m, float* q, float* scale)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill quant", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill quant", &e))?;
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bl_matmul(s: &Arc<CudaStream>, f_tiled: &CudaFunction, f_scale: &CudaFunction, qact: &CudaSlice<f32>, lin: &ResidentLinear, scale: &CudaSlice<f32>, m: usize, out: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+    fn bl_matmul(
+        s: &Arc<CudaStream>,
+        f_tiled: &CudaFunction,
+        f_scale: &CudaFunction,
+        qact: &CudaSlice<f32>,
+        lin: &ResidentLinear,
+        scale: &CudaSlice<f32>,
+        m: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
         let (n, k, rb) = (lin.n, lin.k, lin.row_bytes);
         let (m_i, n_i, k_i, rb_i) = (m as i32, n as i32, k as i32, rb as i32);
         {
-            let cfg = LaunchConfig { grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), m as u32, 1), block_dim: (WARPS_PER_BLOCK * 32, 1, 1), shared_mem_bytes: (k * 4) as u32 };
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), m as u32, 1),
+                block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+                shared_mem_bytes: (k * 4) as u32,
+            };
             let mut l = s.launch_builder(f_tiled);
-            l.arg(qact).arg(lin.device.as_ref()).arg(&lin.scales).arg(&mut *out).arg(&m_i).arg(&n_i).arg(&k_i).arg(&rb_i);
+            l.arg(qact)
+                .arg(lin.device.as_ref())
+                .arg(&lin.scales)
+                .arg(&mut *out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(&rb_i);
             // SAFETY: `tq2_0_add_mpgemm_tiled(act, weights, scales, out, m, n, k, row_bytes)` (grid.y = m).
             #[allow(unsafe_code)]
-            unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill tiled", &e))?; }
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch prefill tiled", &e))?;
+            }
         }
         {
-            let cfg = LaunchConfig { grid_dim: (((m * n) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let cfg = LaunchConfig {
+                grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
             let mut l = s.launch_builder(f_scale);
             l.arg(&mut *out).arg(scale).arg(&n_i).arg(&m_i);
             // SAFETY: `scale_mul_batch_f32(float* out, const float* act_scale, int n, int m)`.
             #[allow(unsafe_code)]
-            unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill scale", &e))?; }
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch prefill scale", &e))?;
+            }
         }
         Ok(())
     }
 
-    fn bl_kv_append(s: &Arc<CudaStream>, f: &CudaFunction, src: &CudaSlice<f32>, kv_base: &mut CudaSlice<f32>, cache_len: usize, kv_width: usize, m: usize) -> Result<(), BackendError> {
+    fn bl_kv_append(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        src: &CudaSlice<f32>,
+        kv_base: &mut CudaSlice<f32>,
+        cache_len: usize,
+        kv_width: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
         let (cl_i, kw_i, m_i) = (cache_len as i32, kv_width as i32, m as i32);
-        let cfg = LaunchConfig { grid_dim: (((m * kv_width) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (((m * kv_width) as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
         l.arg(src).arg(kv_base).arg(&cl_i).arg(&kw_i).arg(&m_i);
         // SAFETY: `kv_append_batch_f32(const float* src, float* kv_base, int cache_len, int kv_width, int m)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill kv_append", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill kv_append", &e))?;
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bl_attn(s: &Arc<CudaStream>, f: &CudaFunction, q: &CudaSlice<f32>, k: &CudaSlice<f32>, v: &CudaSlice<f32>, out: &mut CudaSlice<f32>, scores: &mut CudaSlice<f32>, ctx_max: usize, n_head: usize, n_head_kv: usize, head_dim: usize, scale: f32, causal_offset: usize, m: usize) -> Result<(), BackendError> {
-        let (cm_i, nh_i, nhkv_i, hd_i, co_i, m_i) = (ctx_max as i32, n_head as i32, n_head_kv as i32, head_dim as i32, causal_offset as i32, m as i32);
-        let cfg = LaunchConfig { grid_dim: (((m * n_head) as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    fn bl_attn(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        scores: &mut CudaSlice<f32>,
+        ctx_max: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        causal_offset: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
+        let (cm_i, nh_i, nhkv_i, hd_i, co_i, m_i) = (
+            ctx_max as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+            causal_offset as i32,
+            m as i32,
+        );
+        let cfg = LaunchConfig {
+            grid_dim: (((m * n_head) as u32).div_ceil(8), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
-        l.arg(q).arg(k).arg(v).arg(out).arg(scores).arg(&cm_i).arg(&nh_i).arg(&nhkv_i).arg(&hd_i).arg(&scale).arg(&co_i).arg(&m_i);
+        l.arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(out)
+            .arg(scores)
+            .arg(&cm_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&scale)
+            .arg(&co_i)
+            .arg(&m_i);
         // SAFETY: `gqa_attention_batch_f32(q, k, v, out, scores, ctx_max, n_head, n_head_kv, head_dim, scale, causal_offset, m)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill attn", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill attn", &e))?;
+        }
         Ok(())
     }
 
-    fn bl_residual(s: &Arc<CudaStream>, f: &CudaFunction, x: &mut CudaSlice<f32>, y: &CudaSlice<f32>, total: usize) -> Result<(), BackendError> {
+    fn bl_residual(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        x: &mut CudaSlice<f32>,
+        y: &CudaSlice<f32>,
+        total: usize,
+    ) -> Result<(), BackendError> {
         let n_i = total as i32;
-        let cfg = LaunchConfig { grid_dim: ((total as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((total as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
         l.arg(x).arg(y).arg(&n_i);
         // SAFETY: `residual_add_f32(float* x, const float* y, int n)` over m·n_embd elements.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill residual", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill residual", &e))?;
+        }
         Ok(())
     }
 
-    fn bl_relu2(s: &Arc<CudaStream>, f: &CudaFunction, gate: &mut CudaSlice<f32>, up: &CudaSlice<f32>, total: usize) -> Result<(), BackendError> {
+    fn bl_relu2(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        gate: &mut CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        total: usize,
+    ) -> Result<(), BackendError> {
         let n_i = total as i32;
-        let cfg = LaunchConfig { grid_dim: ((total as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((total as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
         l.arg(gate).arg(up).arg(&n_i);
         // SAFETY: `relu2_gate_f32(float* gate, const float* up, int n)` over m·n_ff elements.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill relu2", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill relu2", &e))?;
+        }
         Ok(())
     }
 
-    fn bl_lm_head_f16(s: &Arc<CudaStream>, f: &CudaFunction, h: &CudaSlice<f32>, embd_f16: &CudaSlice<u16>, n_embd: usize, vocab: usize, logits: &mut CudaSlice<f32>) -> Result<(), BackendError> {
+    fn bl_lm_head_f16(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        h: &CudaSlice<f32>,
+        embd_f16: &CudaSlice<u16>,
+        n_embd: usize,
+        vocab: usize,
+        logits: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
         let (ne_i, v_i) = (n_embd as i32, vocab as i32);
-        let cfg = LaunchConfig { grid_dim: ((vocab as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((vocab as u32).div_ceil(8), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
         l.arg(h).arg(embd_f16).arg(&ne_i).arg(&v_i).arg(logits);
         // SAFETY: `lm_head_warp_f16(const float* h, const __half* embd, int n_embd, int vocab, float* logits)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch prefill lm_head", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill lm_head", &e))?;
+        }
         Ok(())
     }
 
@@ -3462,7 +4299,8 @@ impl CudaDecodeModel {
     /// [`BackendError`] on a device allocation failure.
     pub fn new_batch(&self, n: usize) -> Result<BatchKv, BackendError> {
         let s = &self.stream;
-        let alloc = |k: usize, what: &str| s.alloc_zeros::<f32>(k).map_err(|e| driver_err(what, &e));
+        let alloc =
+            |k: usize, what: &str| s.alloc_zeros::<f32>(k).map_err(|e| driver_err(what, &e));
         let mut kv_k = Vec::with_capacity(self.layers.len());
         let mut kv_v = Vec::with_capacity(self.layers.len());
         for _ in 0..self.layers.len() {
@@ -3474,8 +4312,12 @@ impl CudaDecodeModel {
             kv_k,
             kv_v,
             positions: vec![0; n],
-            d_tokens: s.alloc_zeros::<i32>(n).map_err(|e| driver_err("batch d_tokens", &e))?,
-            d_positions: s.alloc_zeros::<i32>(n).map_err(|e| driver_err("batch d_positions", &e))?,
+            d_tokens: s
+                .alloc_zeros::<i32>(n)
+                .map_err(|e| driver_err("batch d_tokens", &e))?,
+            d_positions: s
+                .alloc_zeros::<i32>(n)
+                .map_err(|e| driver_err("batch d_positions", &e))?,
             d_x: alloc(n * self.n_embd, "batch d_x")?,
             d_normed: alloc(n * self.n_embd, "batch d_normed")?,
             d_q: alloc(n * self.q_width, "batch d_q")?,
@@ -3493,7 +4335,9 @@ impl CudaDecodeModel {
             d_h: alloc(self.n_embd, "batch d_h")?,
             d_logits: alloc(self.vocab, "batch d_logits")?,
             d_logits_batch: alloc(n * self.vocab, "batch d_logits_batch")?,
-            d_argmax: s.alloc_zeros::<i32>(n).map_err(|e| driver_err("batch d_argmax", &e))?,
+            d_argmax: s
+                .alloc_zeros::<i32>(n)
+                .map_err(|e| driver_err("batch d_argmax", &e))?,
             graph: None,
             graph_argmax: None,
             raw_keepalive: None,
@@ -3508,78 +4352,317 @@ impl CudaDecodeModel {
     ///
     /// # Errors
     /// [`BackendError`] on a length/token guard, capacity overflow, or device failure.
-    pub fn decode_batch(&mut self, batch: &mut BatchKv, tokens: &[u32]) -> Result<Vec<Vec<f32>>, BackendError> {
+    pub fn decode_batch(
+        &mut self,
+        batch: &mut BatchKv,
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>, BackendError> {
         let n = batch.n;
         if tokens.len() != n {
-            return Err(BackendError::InvalidInput(format!("decode_batch expects {n} tokens, got {}", tokens.len())));
+            return Err(BackendError::InvalidInput(format!(
+                "decode_batch expects {n} tokens, got {}",
+                tokens.len()
+            )));
         }
         for (&t, &p) in tokens.iter().zip(&batch.positions) {
             if t as usize >= self.vocab {
-                return Err(BackendError::InvalidInput(format!("decode_batch token {t} out of range")));
+                return Err(BackendError::InvalidInput(format!(
+                    "decode_batch token {t} out of range"
+                )));
             }
             if p >= self.max_ctx {
-                return Err(BackendError::InvalidInput("decode_batch context overflow".into()));
+                return Err(BackendError::InvalidInput(
+                    "decode_batch context overflow".into(),
+                ));
             }
         }
         let s = &self.stream;
-        let (n_embd, q_width, kv_width, n_ff) = (self.n_embd, self.q_width, self.kv_width, self.n_ff);
-        let (n_head, n_head_kv, head_dim, max_ctx) = (self.n_head, self.n_head_kv, self.head_dim, self.max_ctx);
+        let (n_embd, q_width, kv_width, n_ff) =
+            (self.n_embd, self.q_width, self.kv_width, self.n_ff);
+        let (n_head, n_head_kv, head_dim, max_ctx) =
+            (self.n_head, self.n_head_kv, self.head_dim, self.max_ctx);
 
         let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let pos_i: Vec<i32> = batch.positions.iter().map(|&p| p as i32).collect();
-        s.memcpy_htod(&tok_i, &mut batch.d_tokens).map_err(|e| driver_err("batch tokens htod", &e))?;
-        s.memcpy_htod(&pos_i, &mut batch.d_positions).map_err(|e| driver_err("batch pos htod", &e))?;
+        s.memcpy_htod(&tok_i, &mut batch.d_tokens)
+            .map_err(|e| driver_err("batch tokens htod", &e))?;
+        s.memcpy_htod(&pos_i, &mut batch.d_positions)
+            .map_err(|e| driver_err("batch pos htod", &e))?;
 
-        Self::bl_embed(s, &self.f_embed_batch, &self.d_token_embd, &batch.d_tokens, n_embd, n, &mut batch.d_x)?;
+        Self::bl_embed(
+            s,
+            &self.f_embed_batch,
+            &self.d_token_embd,
+            &batch.d_tokens,
+            n_embd,
+            n,
+            &mut batch.d_x,
+        )?;
 
         for li in 0..self.layers.len() {
-            Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_x, &self.layers[li].attn_norm, self.rms_eps, n_embd, n, &mut batch.d_normed)?;
-            Self::bl_quant(s, &self.f_quant_batch, &batch.d_normed, n_embd, n, &mut batch.d_qact, &mut batch.d_act_scale)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].q, &batch.d_act_scale, n, &mut batch.d_q)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].k, &batch.d_act_scale, n, &mut batch.d_k)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].v, &batch.d_act_scale, n, &mut batch.d_v)?;
-            Self::bl_rope(s, &self.f_rope_batch, &mut batch.d_q, &self.d_cos, &self.d_sin, &batch.d_positions, n_head, head_dim, n)?;
-            Self::bl_rope(s, &self.f_rope_batch, &mut batch.d_k, &self.d_cos, &self.d_sin, &batch.d_positions, n_head_kv, head_dim, n)?;
-            Self::md_kv_append(s, &self.f_kv_append_mdecode, &batch.d_k, &mut batch.kv_k[li], &batch.d_positions, max_ctx, kv_width, n)?;
-            Self::md_kv_append(s, &self.f_kv_append_mdecode, &batch.d_v, &mut batch.kv_v[li], &batch.d_positions, max_ctx, kv_width, n)?;
-            Self::md_attn(s, &self.f_attn_mdecode, &batch.d_q, &batch.kv_k[li], &batch.kv_v[li], &mut batch.d_attn, &mut batch.d_scores, &batch.d_positions, max_ctx, n_head, n_head_kv, head_dim, self.attn_scale, n)?;
-            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref() {
-                Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_attn, sn, self.rms_eps, q_width, n, &mut batch.d_attn_sn)?;
+            Self::bl_rmsnorm(
+                s,
+                &self.f_rmsnorm_batch,
+                &batch.d_x,
+                &self.layers[li].attn_norm,
+                self.rms_eps,
+                n_embd,
+                n,
+                &mut batch.d_normed,
+            )?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                &batch.d_normed,
+                n_embd,
+                n,
+                &mut batch.d_qact,
+                &mut batch.d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &batch.d_qact,
+                &self.layers[li].q,
+                &batch.d_act_scale,
+                n,
+                &mut batch.d_q,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &batch.d_qact,
+                &self.layers[li].k,
+                &batch.d_act_scale,
+                n,
+                &mut batch.d_k,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &batch.d_qact,
+                &self.layers[li].v,
+                &batch.d_act_scale,
+                n,
+                &mut batch.d_v,
+            )?;
+            Self::bl_rope(
+                s,
+                &self.f_rope_batch,
+                &mut batch.d_q,
+                &self.d_cos,
+                &self.d_sin,
+                &batch.d_positions,
+                n_head,
+                head_dim,
+                n,
+            )?;
+            Self::bl_rope(
+                s,
+                &self.f_rope_batch,
+                &mut batch.d_k,
+                &self.d_cos,
+                &self.d_sin,
+                &batch.d_positions,
+                n_head_kv,
+                head_dim,
+                n,
+            )?;
+            Self::md_kv_append(
+                s,
+                &self.f_kv_append_mdecode,
+                &batch.d_k,
+                &mut batch.kv_k[li],
+                &batch.d_positions,
+                max_ctx,
+                kv_width,
+                n,
+            )?;
+            Self::md_kv_append(
+                s,
+                &self.f_kv_append_mdecode,
+                &batch.d_v,
+                &mut batch.kv_v[li],
+                &batch.d_positions,
+                max_ctx,
+                kv_width,
+                n,
+            )?;
+            Self::md_attn(
+                s,
+                &self.f_attn_mdecode,
+                &batch.d_q,
+                &batch.kv_k[li],
+                &batch.kv_v[li],
+                &mut batch.d_attn,
+                &mut batch.d_scores,
+                &batch.d_positions,
+                max_ctx,
+                n_head,
+                n_head_kv,
+                head_dim,
+                self.attn_scale,
+                n,
+            )?;
+            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref()
+            {
+                Self::bl_rmsnorm(
+                    s,
+                    &self.f_rmsnorm_batch,
+                    &batch.d_attn,
+                    sn,
+                    self.rms_eps,
+                    q_width,
+                    n,
+                    &mut batch.d_attn_sn,
+                )?;
                 &batch.d_attn_sn
             } else {
                 &batch.d_attn
             };
-            Self::bl_quant(s, &self.f_quant_batch, attn_in, q_width, n, &mut batch.d_qact, &mut batch.d_act_scale)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].o, &batch.d_act_scale, n, &mut batch.d_proj)?;
-            Self::bl_residual(s, &self.f_residual, &mut batch.d_x, &batch.d_proj, n * n_embd)?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                attn_in,
+                q_width,
+                n,
+                &mut batch.d_qact,
+                &mut batch.d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &batch.d_qact,
+                &self.layers[li].o,
+                &batch.d_act_scale,
+                n,
+                &mut batch.d_proj,
+            )?;
+            Self::bl_residual(
+                s,
+                &self.f_residual,
+                &mut batch.d_x,
+                &batch.d_proj,
+                n * n_embd,
+            )?;
 
-            Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_x, &self.layers[li].ffn_norm, self.rms_eps, n_embd, n, &mut batch.d_normed)?;
-            Self::bl_quant(s, &self.f_quant_batch, &batch.d_normed, n_embd, n, &mut batch.d_qact, &mut batch.d_act_scale)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].gate, &batch.d_act_scale, n, &mut batch.d_gate)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].up, &batch.d_act_scale, n, &mut batch.d_up)?;
+            Self::bl_rmsnorm(
+                s,
+                &self.f_rmsnorm_batch,
+                &batch.d_x,
+                &self.layers[li].ffn_norm,
+                self.rms_eps,
+                n_embd,
+                n,
+                &mut batch.d_normed,
+            )?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                &batch.d_normed,
+                n_embd,
+                n,
+                &mut batch.d_qact,
+                &mut batch.d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &batch.d_qact,
+                &self.layers[li].gate,
+                &batch.d_act_scale,
+                n,
+                &mut batch.d_gate,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &batch.d_qact,
+                &self.layers[li].up,
+                &batch.d_act_scale,
+                n,
+                &mut batch.d_up,
+            )?;
             Self::bl_relu2(s, &self.f_relu2, &mut batch.d_gate, &batch.d_up, n * n_ff)?;
             let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
-                Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_gate, sn, self.rms_eps, n_ff, n, &mut batch.d_gate_sn)?;
+                Self::bl_rmsnorm(
+                    s,
+                    &self.f_rmsnorm_batch,
+                    &batch.d_gate,
+                    sn,
+                    self.rms_eps,
+                    n_ff,
+                    n,
+                    &mut batch.d_gate_sn,
+                )?;
                 &batch.d_gate_sn
             } else {
                 &batch.d_gate
             };
-            Self::bl_quant(s, &self.f_quant_batch, down_in, n_ff, n, &mut batch.d_qact, &mut batch.d_act_scale)?;
-            Self::bl_matmul(s, &self.f_tiled, &self.f_scale_batch, &batch.d_qact, &self.layers[li].down, &batch.d_act_scale, n, &mut batch.d_proj)?;
-            Self::bl_residual(s, &self.f_residual, &mut batch.d_x, &batch.d_proj, n * n_embd)?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                down_in,
+                n_ff,
+                n,
+                &mut batch.d_qact,
+                &mut batch.d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled,
+                &self.f_scale_batch,
+                &batch.d_qact,
+                &self.layers[li].down,
+                &batch.d_act_scale,
+                n,
+                &mut batch.d_proj,
+            )?;
+            Self::bl_residual(
+                s,
+                &self.f_residual,
+                &mut batch.d_x,
+                &batch.d_proj,
+                n * n_embd,
+            )?;
         }
 
         // Final norm (all n rows) then per-row LM head.
-        Self::bl_rmsnorm(s, &self.f_rmsnorm_batch, &batch.d_x, &self.d_output_norm, self.rms_eps, n_embd, n, &mut batch.d_normed)?;
+        Self::bl_rmsnorm(
+            s,
+            &self.f_rmsnorm_batch,
+            &batch.d_x,
+            &self.d_output_norm,
+            self.rms_eps,
+            n_embd,
+            n,
+            &mut batch.d_normed,
+        )?;
         let mut out = Vec::with_capacity(n);
         for r in 0..n {
             {
                 let row = batch.d_normed.slice(r * n_embd..(r + 1) * n_embd);
-                s.memcpy_dtod(&row, &mut batch.d_h).map_err(|e| driver_err("batch row copy", &e))?;
+                s.memcpy_dtod(&row, &mut batch.d_h)
+                    .map_err(|e| driver_err("batch row copy", &e))?;
             }
-            Self::bl_lm_head_f16(s, &self.f_lm_head_f16, &batch.d_h, &self.d_token_embd_f16, n_embd, self.vocab, &mut batch.d_logits)?;
+            Self::bl_lm_head_f16(
+                s,
+                &self.f_lm_head_f16,
+                &batch.d_h,
+                &self.d_token_embd_f16,
+                n_embd,
+                self.vocab,
+                &mut batch.d_logits,
+            )?;
             let mut logits = vec![0.0f32; self.vocab];
-            s.memcpy_dtoh(&batch.d_logits, &mut logits).map_err(|e| driver_err("batch logits dtoh", &e))?;
+            s.memcpy_dtoh(&batch.d_logits, &mut logits)
+                .map_err(|e| driver_err("batch logits dtoh", &e))?;
             out.push(logits);
         }
         for p in &mut batch.positions {
@@ -3589,26 +4672,86 @@ impl CudaDecodeModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn md_kv_append(s: &Arc<CudaStream>, f: &CudaFunction, src: &CudaSlice<f32>, kv_base: &mut CudaSlice<f32>, positions: &CudaSlice<i32>, max_ctx: usize, kv_width: usize, n: usize) -> Result<(), BackendError> {
+    fn md_kv_append(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        src: &CudaSlice<f32>,
+        kv_base: &mut CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
+        max_ctx: usize,
+        kv_width: usize,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let (mc_i, kw_i, n_i) = (max_ctx as i32, kv_width as i32, n as i32);
-        let cfg = LaunchConfig { grid_dim: (((n * kv_width) as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (((n * kv_width) as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
-        l.arg(src).arg(kv_base).arg(positions).arg(&mc_i).arg(&kw_i).arg(&n_i);
+        l.arg(src)
+            .arg(kv_base)
+            .arg(positions)
+            .arg(&mc_i)
+            .arg(&kw_i)
+            .arg(&n_i);
         // SAFETY: `kv_append_mdecode_f32(const float* src, float* kv_base, const int* pos, int max_ctx, int kv_width, int n)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch mdecode kv_append", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch mdecode kv_append", &e))?;
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn md_attn(s: &Arc<CudaStream>, f: &CudaFunction, q: &CudaSlice<f32>, k: &CudaSlice<f32>, v: &CudaSlice<f32>, out: &mut CudaSlice<f32>, scores: &mut CudaSlice<f32>, positions: &CudaSlice<i32>, max_ctx: usize, n_head: usize, n_head_kv: usize, head_dim: usize, scale: f32, n: usize) -> Result<(), BackendError> {
-        let (mc_i, nh_i, nhkv_i, hd_i, n_i) = (max_ctx as i32, n_head as i32, n_head_kv as i32, head_dim as i32, n as i32);
-        let cfg = LaunchConfig { grid_dim: (((n * n_head) as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    fn md_attn(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        scores: &mut CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
+        max_ctx: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        let (mc_i, nh_i, nhkv_i, hd_i, n_i) = (
+            max_ctx as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+            n as i32,
+        );
+        let cfg = LaunchConfig {
+            grid_dim: (((n * n_head) as u32).div_ceil(8), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut l = s.launch_builder(f);
-        l.arg(q).arg(k).arg(v).arg(out).arg(scores).arg(positions).arg(&mc_i).arg(&nh_i).arg(&nhkv_i).arg(&hd_i).arg(&scale).arg(&n_i);
+        l.arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(out)
+            .arg(scores)
+            .arg(positions)
+            .arg(&mc_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&scale)
+            .arg(&n_i);
         // SAFETY: `gqa_attention_mdecode_f32(q, k, v, out, scores, positions, max_ctx, n_head, n_head_kv, head_dim, scale, n)`.
         #[allow(unsafe_code)]
-        unsafe { l.launch(cfg).map_err(|e| driver_err("launch mdecode attn", &e))?; }
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch mdecode attn", &e))?;
+        }
         Ok(())
     }
 
@@ -3624,17 +4767,28 @@ impl CudaDecodeModel {
     ///
     /// # Errors
     /// [`BackendError`] on a length/token guard, capacity overflow, or device failure.
-    pub fn decode_batch_graph(&mut self, batch: &mut BatchKv, tokens: &[u32]) -> Result<Vec<Vec<f32>>, BackendError> {
+    pub fn decode_batch_graph(
+        &mut self,
+        batch: &mut BatchKv,
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>, BackendError> {
         let n = batch.n;
         if tokens.len() != n {
-            return Err(BackendError::InvalidInput(format!("decode_batch_graph expects {n} tokens, got {}", tokens.len())));
+            return Err(BackendError::InvalidInput(format!(
+                "decode_batch_graph expects {n} tokens, got {}",
+                tokens.len()
+            )));
         }
         for (&t, &p) in tokens.iter().zip(&batch.positions) {
             if t as usize >= self.vocab {
-                return Err(BackendError::InvalidInput(format!("decode_batch_graph token {t} out of range")));
+                return Err(BackendError::InvalidInput(format!(
+                    "decode_batch_graph token {t} out of range"
+                )));
             }
             if p >= self.max_ctx {
-                return Err(BackendError::InvalidInput("decode_batch_graph context overflow".into()));
+                return Err(BackendError::InvalidInput(
+                    "decode_batch_graph context overflow".into(),
+                ));
             }
         }
 
@@ -3690,11 +4844,21 @@ impl CudaDecodeModel {
         for r in 0..n {
             {
                 let row = batch.d_normed.slice(r * n_embd..(r + 1) * n_embd);
-                s.memcpy_dtod(&row, &mut batch.d_h).map_err(|e| driver_err("batch graph row copy", &e))?;
+                s.memcpy_dtod(&row, &mut batch.d_h)
+                    .map_err(|e| driver_err("batch graph row copy", &e))?;
             }
-            Self::bl_lm_head_f16(s, &self.f_lm_head_f16, &batch.d_h, &self.d_token_embd_f16, n_embd, self.vocab, &mut batch.d_logits)?;
+            Self::bl_lm_head_f16(
+                s,
+                &self.f_lm_head_f16,
+                &batch.d_h,
+                &self.d_token_embd_f16,
+                n_embd,
+                self.vocab,
+                &mut batch.d_logits,
+            )?;
             let mut logits = vec![0.0f32; self.vocab];
-            s.memcpy_dtoh(&batch.d_logits, &mut logits).map_err(|e| driver_err("batch graph logits dtoh", &e))?;
+            s.memcpy_dtoh(&batch.d_logits, &mut logits)
+                .map_err(|e| driver_err("batch graph logits dtoh", &e))?;
             out.push(logits);
         }
         for p in &mut batch.positions {
@@ -3713,17 +4877,28 @@ impl CudaDecodeModel {
     ///
     /// # Errors
     /// [`BackendError`] on a length/token guard, capacity overflow, or device failure.
-    pub fn decode_batch_graph_argmax(&mut self, batch: &mut BatchKv, tokens: &[u32]) -> Result<Vec<u32>, BackendError> {
+    pub fn decode_batch_graph_argmax(
+        &mut self,
+        batch: &mut BatchKv,
+        tokens: &[u32],
+    ) -> Result<Vec<u32>, BackendError> {
         let n = batch.n;
         if tokens.len() != n {
-            return Err(BackendError::InvalidInput(format!("decode_batch_graph_argmax expects {n} tokens, got {}", tokens.len())));
+            return Err(BackendError::InvalidInput(format!(
+                "decode_batch_graph_argmax expects {n} tokens, got {}",
+                tokens.len()
+            )));
         }
         for (&t, &p) in tokens.iter().zip(&batch.positions) {
             if t as usize >= self.vocab {
-                return Err(BackendError::InvalidInput(format!("decode_batch_graph_argmax token {t} out of range")));
+                return Err(BackendError::InvalidInput(format!(
+                    "decode_batch_graph_argmax token {t} out of range"
+                )));
             }
             if p >= self.max_ctx {
-                return Err(BackendError::InvalidInput("decode_batch_graph_argmax context overflow".into()));
+                return Err(BackendError::InvalidInput(
+                    "decode_batch_graph_argmax context overflow".into(),
+                ));
             }
         }
 
@@ -3771,7 +4946,9 @@ impl CudaDecodeModel {
     }
 
     fn batch_raw(&self) -> &BatchRawKernels {
-        self.batch_raw.as_ref().expect("batch raw kernels loaded before record")
+        self.batch_raw
+            .as_ref()
+            .expect("batch raw kernels loaded before record")
     }
 
     /// Extract every batch + weight buffer's stable device pointer (guards dropped here,
@@ -3783,7 +4960,11 @@ impl CudaDecodeModel {
     /// `with_head`: when true, the capture also runs the batched LM head + greedy argmax
     /// after the final RMSNorm (the on-device-sampling graph, ending at `d_argmax`); when
     /// false it ends at `d_normed` and the LM head is the eager per-row tail.
-    fn record_graph_batch(&self, batch: &BatchKv, with_head: bool) -> Result<CudaGraph, BackendError> {
+    fn record_graph_batch(
+        &self,
+        batch: &BatchKv,
+        with_head: bool,
+    ) -> Result<CudaGraph, BackendError> {
         let s = &self.cap_stream;
         let n = batch.n;
         let lin = |l: &ResidentLinear| LinPtrs {
@@ -3840,7 +5021,8 @@ impl CudaDecodeModel {
         };
         // Drain the events the device_ptr extraction recorded, so the capture (raw
         // launches only) carries no pre-capture dependency.
-        s.synchronize().map_err(|e| driver_err("batch pre-capture cap sync", &e))?;
+        s.synchronize()
+            .map_err(|e| driver_err("batch pre-capture cap sync", &e))?;
         self.stream
             .synchronize()
             .map_err(|e| driver_err("batch pre-capture default sync", &e))?;
@@ -3862,7 +5044,9 @@ impl CudaDecodeModel {
         }
 
         let graph = s
-            .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            )
             .map_err(|e| driver_err("batch end_capture", &e))?
             .ok_or_else(|| BackendError::Backend("batch graph capture produced no graph".into()))?;
         Ok(graph)
@@ -3871,7 +5055,8 @@ impl CudaDecodeModel {
     /// One transformer block of the M=N forward, raw-launched into the capture. Mirrors
     /// the per-layer body of [`decode_batch`](Self::decode_batch) op-for-op.
     fn gb_layer(&self, p: &BatchPtrs, l: &BatchLayerPtrs, n: usize) -> Result<(), BackendError> {
-        let (n_embd, q_width, kv_width, n_ff) = (self.n_embd, self.q_width, self.kv_width, self.n_ff);
+        let (n_embd, q_width, kv_width, n_ff) =
+            (self.n_embd, self.q_width, self.kv_width, self.n_ff);
         let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
 
         // pre-norm attention. q/k/v share ONE quant of d_normed, then three unfused GEMMs.
@@ -3881,10 +5066,26 @@ impl CudaDecodeModel {
         self.gb_matmul(&l.k, p.d_qact, p.d_act_scale, p.d_k, n)?;
         self.gb_matmul(&l.v, p.d_qact, p.d_act_scale, p.d_v, n)?;
         self.gb_rope(p.d_q, p.d_cos, p.d_sin, p.d_positions, n_head, head_dim, n)?;
-        self.gb_rope(p.d_k, p.d_cos, p.d_sin, p.d_positions, n_head_kv, head_dim, n)?;
+        self.gb_rope(
+            p.d_k,
+            p.d_cos,
+            p.d_sin,
+            p.d_positions,
+            n_head_kv,
+            head_dim,
+            n,
+        )?;
         self.gb_kv_append(p.d_k, l.kv_k, p.d_positions, kv_width, n)?;
         self.gb_kv_append(p.d_v, l.kv_v, p.d_positions, kv_width, n)?;
-        self.gb_attn(p.d_q, l.kv_k, l.kv_v, p.d_attn, p.d_scores, p.d_positions, n)?;
+        self.gb_attn(
+            p.d_q,
+            l.kv_k,
+            l.kv_v,
+            p.d_attn,
+            p.d_scores,
+            p.d_positions,
+            n,
+        )?;
         let attn_in = if let Some(sn) = l.attn_sub_norm {
             self.gb_rmsnorm(p.d_attn, sn, q_width, p.d_attn_sn, n)?;
             p.d_attn_sn
@@ -3918,100 +5119,311 @@ impl CudaDecodeModel {
     // but builds the params from pre-extracted device pointers and raw-launches on
     // `cap_stream`. `n` is the batch (row) count.
 
-    fn gb_embed(&self, table: sys::CUdeviceptr, tokens: sys::CUdeviceptr, out: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+    fn gb_embed(
+        &self,
+        table: sys::CUdeviceptr,
+        tokens: sys::CUdeviceptr,
+        out: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let (ne_i, n_i) = (self.n_embd as i32, n as i32);
         let grid = (((n * self.n_embd) as u32).div_ceil(256), 1, 1);
         let mut params = [pp(&table), pp(&tokens), pp(&ne_i), pp(&n_i), pp(&out)];
-        raw_launch(self.batch_raw().embed, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.batch_raw().embed,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn gb_rmsnorm(&self, x: sys::CUdeviceptr, w: sys::CUdeviceptr, dim: usize, out: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+    fn gb_rmsnorm(
+        &self,
+        x: sys::CUdeviceptr,
+        w: sys::CUdeviceptr,
+        dim: usize,
+        out: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let eps = self.rms_eps;
         let (dim_i, n_i) = (dim as i32, n as i32);
         let smem = (dim * 4) as u32;
         let mut params = [pp(&x), pp(&w), pp(&eps), pp(&dim_i), pp(&n_i), pp(&out)];
-        raw_launch(self.batch_raw().rmsnorm, (n as u32, 1, 1), (256, 1, 1), smem, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.batch_raw().rmsnorm,
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            smem,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn gb_quant(&self, d_in: sys::CUdeviceptr, k: usize, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+    fn gb_quant(
+        &self,
+        d_in: sys::CUdeviceptr,
+        k: usize,
+        d_qact: sys::CUdeviceptr,
+        d_act_scale: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let (k_i, n_i) = (k as i32, n as i32);
         let mut params = [pp(&d_in), pp(&k_i), pp(&n_i), pp(&d_qact), pp(&d_act_scale)];
-        raw_launch(self.batch_raw().quant, (n as u32, 1, 1), (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.batch_raw().quant,
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn gb_matmul(&self, lin: &LinPtrs, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, d_out: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+    fn gb_matmul(
+        &self,
+        lin: &LinPtrs,
+        d_qact: sys::CUdeviceptr,
+        d_act_scale: sys::CUdeviceptr,
+        d_out: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let cs = self.cap_stream.cu_stream();
         let (m_i, n_out_i, k_i, rb_i) = (n as i32, lin.n as i32, lin.k as i32, lin.rb as i32);
         {
             let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), n as u32, 1);
             let smem = (lin.k * 4) as u32;
-            let mut params = [pp(&d_qact), pp(&lin.w), pp(&lin.sc), pp(&d_out), pp(&m_i), pp(&n_out_i), pp(&k_i), pp(&rb_i)];
-            raw_launch(self.batch_raw().tiled, grid, (WARPS_PER_BLOCK * 32, 1, 1), smem, cs, &mut params)?;
+            let mut params = [
+                pp(&d_qact),
+                pp(&lin.w),
+                pp(&lin.sc),
+                pp(&d_out),
+                pp(&m_i),
+                pp(&n_out_i),
+                pp(&k_i),
+                pp(&rb_i),
+            ];
+            raw_launch(
+                self.batch_raw().tiled,
+                grid,
+                (WARPS_PER_BLOCK * 32, 1, 1),
+                smem,
+                cs,
+                &mut params,
+            )?;
         }
         {
             let grid = (((n * lin.n) as u32).div_ceil(256), 1, 1);
             let mut params = [pp(&d_out), pp(&d_act_scale), pp(&n_out_i), pp(&m_i)];
-            raw_launch(self.batch_raw().scale, grid, (256, 1, 1), 0, cs, &mut params)?;
+            raw_launch(
+                self.batch_raw().scale,
+                grid,
+                (256, 1, 1),
+                0,
+                cs,
+                &mut params,
+            )?;
         }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gb_rope(&self, x: sys::CUdeviceptr, cos_t: sys::CUdeviceptr, sin_t: sys::CUdeviceptr, positions: sys::CUdeviceptr, n_head: usize, head_dim: usize, n: usize) -> Result<(), BackendError> {
+    fn gb_rope(
+        &self,
+        x: sys::CUdeviceptr,
+        cos_t: sys::CUdeviceptr,
+        sin_t: sys::CUdeviceptr,
+        positions: sys::CUdeviceptr,
+        n_head: usize,
+        head_dim: usize,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let (nh_i, hd_i, n_i) = (n_head as i32, head_dim as i32, n as i32);
         let total = (n * n_head * (head_dim / 2)) as u32;
         let grid = (total.div_ceil(256), 1, 1);
-        let mut params = [pp(&x), pp(&cos_t), pp(&sin_t), pp(&positions), pp(&nh_i), pp(&hd_i), pp(&n_i)];
-        raw_launch(self.batch_raw().rope, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        let mut params = [
+            pp(&x),
+            pp(&cos_t),
+            pp(&sin_t),
+            pp(&positions),
+            pp(&nh_i),
+            pp(&hd_i),
+            pp(&n_i),
+        ];
+        raw_launch(
+            self.batch_raw().rope,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn gb_kv_append(&self, src: sys::CUdeviceptr, kv_base: sys::CUdeviceptr, positions: sys::CUdeviceptr, kv_width: usize, n: usize) -> Result<(), BackendError> {
+    fn gb_kv_append(
+        &self,
+        src: sys::CUdeviceptr,
+        kv_base: sys::CUdeviceptr,
+        positions: sys::CUdeviceptr,
+        kv_width: usize,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let (mc_i, kw_i, n_i) = (self.max_ctx as i32, kv_width as i32, n as i32);
         let grid = (((n * kv_width) as u32).div_ceil(256), 1, 1);
-        let mut params = [pp(&src), pp(&kv_base), pp(&positions), pp(&mc_i), pp(&kw_i), pp(&n_i)];
-        raw_launch(self.batch_raw().kv_append, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        let mut params = [
+            pp(&src),
+            pp(&kv_base),
+            pp(&positions),
+            pp(&mc_i),
+            pp(&kw_i),
+            pp(&n_i),
+        ];
+        raw_launch(
+            self.batch_raw().kv_append,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gb_attn(&self, q: sys::CUdeviceptr, k: sys::CUdeviceptr, v: sys::CUdeviceptr, out: sys::CUdeviceptr, scores: sys::CUdeviceptr, positions: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
-        let (mc_i, nh_i, nhkv_i, hd_i, n_i) = (self.max_ctx as i32, self.n_head as i32, self.n_head_kv as i32, self.head_dim as i32, n as i32);
+    fn gb_attn(
+        &self,
+        q: sys::CUdeviceptr,
+        k: sys::CUdeviceptr,
+        v: sys::CUdeviceptr,
+        out: sys::CUdeviceptr,
+        scores: sys::CUdeviceptr,
+        positions: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        let (mc_i, nh_i, nhkv_i, hd_i, n_i) = (
+            self.max_ctx as i32,
+            self.n_head as i32,
+            self.n_head_kv as i32,
+            self.head_dim as i32,
+            n as i32,
+        );
         let scale = self.attn_scale;
         let grid = (((n * self.n_head) as u32).div_ceil(8), 1, 1);
-        let mut params = [pp(&q), pp(&k), pp(&v), pp(&out), pp(&scores), pp(&positions), pp(&mc_i), pp(&nh_i), pp(&nhkv_i), pp(&hd_i), pp(&scale), pp(&n_i)];
-        raw_launch(self.batch_raw().attn, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        let mut params = [
+            pp(&q),
+            pp(&k),
+            pp(&v),
+            pp(&out),
+            pp(&scores),
+            pp(&positions),
+            pp(&mc_i),
+            pp(&nh_i),
+            pp(&nhkv_i),
+            pp(&hd_i),
+            pp(&scale),
+            pp(&n_i),
+        ];
+        raw_launch(
+            self.batch_raw().attn,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn gb_residual(&self, x: sys::CUdeviceptr, y: sys::CUdeviceptr, total: usize) -> Result<(), BackendError> {
+    fn gb_residual(
+        &self,
+        x: sys::CUdeviceptr,
+        y: sys::CUdeviceptr,
+        total: usize,
+    ) -> Result<(), BackendError> {
         let total_i = total as i32;
         let grid = ((total as u32).div_ceil(256), 1, 1);
         let mut params = [pp(&x), pp(&y), pp(&total_i)];
-        raw_launch(self.batch_raw().residual, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.batch_raw().residual,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn gb_relu2(&self, gate: sys::CUdeviceptr, up: sys::CUdeviceptr, total: usize) -> Result<(), BackendError> {
+    fn gb_relu2(
+        &self,
+        gate: sys::CUdeviceptr,
+        up: sys::CUdeviceptr,
+        total: usize,
+    ) -> Result<(), BackendError> {
         let total_i = total as i32;
         let grid = ((total as u32).div_ceil(256), 1, 1);
         let mut params = [pp(&gate), pp(&up), pp(&total_i)];
-        raw_launch(self.batch_raw().relu2, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.batch_raw().relu2,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
     /// Batched LM head over all `n` rows: `d_normed[n, n_embd] · token_embd_f16 → d_logits[n, vocab]`.
     /// One warp per vocab row, computing `LMHEAD_ROW_TILE` output rows per launch so the embd
     /// table is read once per row-tile (not once per row); `grid.y = ceil(n / TILE)`.
     /// Bit-identical per row to the single-row head.
-    fn gb_lm_head_batch(&self, h: sys::CUdeviceptr, embd: sys::CUdeviceptr, d_logits: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+    fn gb_lm_head_batch(
+        &self,
+        h: sys::CUdeviceptr,
+        embd: sys::CUdeviceptr,
+        d_logits: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let (ne_i, v_i, n_i) = (self.n_embd as i32, self.vocab as i32, n as i32);
-        let grid = ((self.vocab as u32).div_ceil(8), (n as u32).div_ceil(LMHEAD_ROW_TILE), 1);
-        let mut params = [pp(&h), pp(&embd), pp(&ne_i), pp(&v_i), pp(&n_i), pp(&d_logits)];
-        raw_launch(self.batch_raw().lm_head_tiled, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        let grid = (
+            (self.vocab as u32).div_ceil(8),
+            (n as u32).div_ceil(LMHEAD_ROW_TILE),
+            1,
+        );
+        let mut params = [
+            pp(&h),
+            pp(&embd),
+            pp(&ne_i),
+            pp(&v_i),
+            pp(&n_i),
+            pp(&d_logits),
+        ];
+        raw_launch(
+            self.batch_raw().lm_head_tiled,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
     /// Per-row greedy argmax `d_logits[n, vocab] → d_out[n]` (i32). One block per row.
-    fn gb_argmax(&self, d_logits: sys::CUdeviceptr, d_out: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+    fn gb_argmax(
+        &self,
+        d_logits: sys::CUdeviceptr,
+        d_out: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let (v_i, n_i) = (self.vocab as i32, n as i32);
         let grid = (n as u32, 1, 1);
         let mut params = [pp(&d_logits), pp(&v_i), pp(&n_i), pp(&d_out)];
-        raw_launch(self.batch_raw().argmax, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.batch_raw().argmax,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
     /// Load the raw kernels (once) and record + instantiate the decode graph.
@@ -4079,7 +5491,8 @@ impl CudaDecodeModel {
         };
         // Drain the events the device_ptr extraction recorded, so the capture (which
         // uses only raw launches) carries no pre-capture dependency.
-        s.synchronize().map_err(|e| driver_err("pre-capture cap sync", &e))?;
+        s.synchronize()
+            .map_err(|e| driver_err("pre-capture cap sync", &e))?;
         self.stream
             .synchronize()
             .map_err(|e| driver_err("pre-capture default sync", &e))?;
@@ -4096,9 +5509,13 @@ impl CudaDecodeModel {
         self.g_lm_head(p.d_normed, p.d_token_embd_f16, p.d_logits)?;
 
         let graph = s
-            .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            )
             .map_err(|e| driver_err("decode end_capture", &e))?
-            .ok_or_else(|| BackendError::Backend("decode graph capture produced no graph".into()))?;
+            .ok_or_else(|| {
+                BackendError::Backend("decode graph capture produced no graph".into())
+            })?;
         Ok(graph)
     }
 
@@ -4153,34 +5570,82 @@ impl CudaDecodeModel {
     // Raw-launch helpers (build the kernel_params array from pre-extracted device
     // pointers + scalar locals; only `raw_launch` is unsafe). `cs` = capture stream.
 
-    fn g_rmsnorm(&self, x: sys::CUdeviceptr, w: sys::CUdeviceptr, n: usize, out: sys::CUdeviceptr) -> Result<(), BackendError> {
+    fn g_rmsnorm(
+        &self,
+        x: sys::CUdeviceptr,
+        w: sys::CUdeviceptr,
+        n: usize,
+        out: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
         let eps = self.rms_eps;
         let n_i = n as i32;
         // `rmsnorm_shared_f32` stages the `n`-float input row into dynamic shared memory.
         let smem = (n * 4) as u32;
         let mut params = [pp(&x), pp(&w), pp(&eps), pp(&n_i), pp(&out)];
-        raw_launch(self.raw().rmsnorm, (1, 1, 1), (256, 1, 1), smem, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.raw().rmsnorm,
+            (1, 1, 1),
+            (256, 1, 1),
+            smem,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
     /// On-device A8 quant of an activation row (`k`-wide) → `d_qact` + `d_act_scale`. Split
     /// out from the GEMM so projections sharing an input (q/k/v and gate/up both read
     /// `d_normed`) quantize it **once** instead of per-GEMM — fewer graph nodes.
-    fn g_quant(&self, d_in: sys::CUdeviceptr, k: usize, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr) -> Result<(), BackendError> {
+    fn g_quant(
+        &self,
+        d_in: sys::CUdeviceptr,
+        k: usize,
+        d_qact: sys::CUdeviceptr,
+        d_act_scale: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
         let k_i = k as i32;
         let mut params = [pp(&d_in), pp(&k_i), pp(&d_qact), pp(&d_act_scale)];
-        raw_launch(self.raw().act_quant, (1, 1, 1), (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.raw().act_quant,
+            (1, 1, 1),
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
     /// Tiled add-only GEMM + the per-token scale fold, consuming a pre-quantized `d_qact`
     /// (+ its `d_act_scale`). `g_quant` must have run on the matching input first.
-    fn g_matmul(&self, lin: &LinPtrs, d_qact: sys::CUdeviceptr, d_act_scale: sys::CUdeviceptr, d_out: sys::CUdeviceptr) -> Result<(), BackendError> {
+    fn g_matmul(
+        &self,
+        lin: &LinPtrs,
+        d_qact: sys::CUdeviceptr,
+        d_act_scale: sys::CUdeviceptr,
+        d_out: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
         let cs = self.cap_stream.cu_stream();
         let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
         {
             let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
             let smem = (lin.k * 4) as u32;
-            let mut params = [pp(&d_qact), pp(&lin.w), pp(&lin.sc), pp(&d_out), pp(&m_i), pp(&n_i), pp(&k_i), pp(&rb_i)];
-            raw_launch(self.raw().tiled, grid, (WARPS_PER_BLOCK * 32, 1, 1), smem, cs, &mut params)?;
+            let mut params = [
+                pp(&d_qact),
+                pp(&lin.w),
+                pp(&lin.sc),
+                pp(&d_out),
+                pp(&m_i),
+                pp(&n_i),
+                pp(&k_i),
+                pp(&rb_i),
+            ];
+            raw_launch(
+                self.raw().tiled,
+                grid,
+                (WARPS_PER_BLOCK * 32, 1, 1),
+                smem,
+                cs,
+                &mut params,
+            )?;
         }
         {
             let grid = ((lin.n as u32).div_ceil(256), 1, 1);
@@ -4190,57 +5655,172 @@ impl CudaDecodeModel {
         Ok(())
     }
 
-    fn g_rope(&self, x: sys::CUdeviceptr, cos_t: sys::CUdeviceptr, sin_t: sys::CUdeviceptr, ctrl: sys::CUdeviceptr, n_head: usize, head_dim: usize) -> Result<(), BackendError> {
+    fn g_rope(
+        &self,
+        x: sys::CUdeviceptr,
+        cos_t: sys::CUdeviceptr,
+        sin_t: sys::CUdeviceptr,
+        ctrl: sys::CUdeviceptr,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Result<(), BackendError> {
         let (nh_i, hd_i) = (n_head as i32, head_dim as i32);
         let total = (n_head * (head_dim / 2)) as u32;
         let grid = (total.div_ceil(256), 1, 1);
-        let mut params = [pp(&x), pp(&cos_t), pp(&sin_t), pp(&ctrl), pp(&nh_i), pp(&hd_i)];
-        raw_launch(self.raw().rope_g, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        let mut params = [
+            pp(&x),
+            pp(&cos_t),
+            pp(&sin_t),
+            pp(&ctrl),
+            pp(&nh_i),
+            pp(&hd_i),
+        ];
+        raw_launch(
+            self.raw().rope_g,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn g_kv_append(&self, src: sys::CUdeviceptr, kv_base: sys::CUdeviceptr, ctrl: sys::CUdeviceptr, kv_width: usize) -> Result<(), BackendError> {
+    fn g_kv_append(
+        &self,
+        src: sys::CUdeviceptr,
+        kv_base: sys::CUdeviceptr,
+        ctrl: sys::CUdeviceptr,
+        kv_width: usize,
+    ) -> Result<(), BackendError> {
         let kw_i = kv_width as i32;
         let grid = ((kv_width as u32).div_ceil(256), 1, 1);
         let mut params = [pp(&src), pp(&kv_base), pp(&ctrl), pp(&kw_i)];
-        raw_launch(self.raw().kv_append, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.raw().kv_append,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn g_attn(&self, q: sys::CUdeviceptr, k: sys::CUdeviceptr, v: sys::CUdeviceptr, out: sys::CUdeviceptr, scores: sys::CUdeviceptr, ctrl: sys::CUdeviceptr) -> Result<(), BackendError> {
-        let (mc_i, nh_i, nhkv_i, hd_i) = (self.max_ctx as i32, self.n_head as i32, self.n_head_kv as i32, self.head_dim as i32);
+    fn g_attn(
+        &self,
+        q: sys::CUdeviceptr,
+        k: sys::CUdeviceptr,
+        v: sys::CUdeviceptr,
+        out: sys::CUdeviceptr,
+        scores: sys::CUdeviceptr,
+        ctrl: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
+        let (mc_i, nh_i, nhkv_i, hd_i) = (
+            self.max_ctx as i32,
+            self.n_head as i32,
+            self.n_head_kv as i32,
+            self.head_dim as i32,
+        );
         let scale = self.attn_scale;
         // Warp-per-head: a 256-thread block holds 8 warps, so grid covers ceil(n_head/8).
         let grid = ((self.n_head as u32).div_ceil(8), 1, 1);
-        let mut params = [pp(&q), pp(&k), pp(&v), pp(&out), pp(&scores), pp(&ctrl), pp(&mc_i), pp(&nh_i), pp(&nhkv_i), pp(&hd_i), pp(&scale)];
-        raw_launch(self.raw().attn_g, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        let mut params = [
+            pp(&q),
+            pp(&k),
+            pp(&v),
+            pp(&out),
+            pp(&scores),
+            pp(&ctrl),
+            pp(&mc_i),
+            pp(&nh_i),
+            pp(&nhkv_i),
+            pp(&hd_i),
+            pp(&scale),
+        ];
+        raw_launch(
+            self.raw().attn_g,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn g_residual(&self, x: sys::CUdeviceptr, y: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+    fn g_residual(
+        &self,
+        x: sys::CUdeviceptr,
+        y: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let n_i = n as i32;
         let grid = ((n as u32).div_ceil(256), 1, 1);
         let mut params = [pp(&x), pp(&y), pp(&n_i)];
-        raw_launch(self.raw().residual, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.raw().residual,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn g_relu2(&self, gate: sys::CUdeviceptr, up: sys::CUdeviceptr, n: usize) -> Result<(), BackendError> {
+    fn g_relu2(
+        &self,
+        gate: sys::CUdeviceptr,
+        up: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let n_i = n as i32;
         let grid = ((n as u32).div_ceil(256), 1, 1);
         let mut params = [pp(&gate), pp(&up), pp(&n_i)];
-        raw_launch(self.raw().relu2, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.raw().relu2,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn g_embed(&self, table: sys::CUdeviceptr, ctrl: sys::CUdeviceptr, out: sys::CUdeviceptr) -> Result<(), BackendError> {
+    fn g_embed(
+        &self,
+        table: sys::CUdeviceptr,
+        ctrl: sys::CUdeviceptr,
+        out: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
         let ne_i = self.n_embd as i32;
         let grid = ((self.n_embd as u32).div_ceil(256), 1, 1);
         let mut params = [pp(&table), pp(&ctrl), pp(&ne_i), pp(&out)];
-        raw_launch(self.raw().embed_g, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.raw().embed_g,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 
-    fn g_lm_head(&self, h: sys::CUdeviceptr, embd: sys::CUdeviceptr, logits: sys::CUdeviceptr) -> Result<(), BackendError> {
+    fn g_lm_head(
+        &self,
+        h: sys::CUdeviceptr,
+        embd: sys::CUdeviceptr,
+        logits: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
         let (ne_i, v_i) = (self.n_embd as i32, self.vocab as i32);
         // One WARP per vocab row: 256-thread block = 8 warps, so grid covers ceil(vocab/8).
         let grid = ((self.vocab as u32).div_ceil(8), 1, 1);
         let mut params = [pp(&h), pp(&embd), pp(&ne_i), pp(&v_i), pp(&logits)];
-        raw_launch(self.raw().lm_head, grid, (256, 1, 1), 0, self.cap_stream.cu_stream(), &mut params)
+        raw_launch(
+            self.raw().lm_head,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
     }
 }
 
@@ -4279,10 +5859,8 @@ fn raw_launch(
     // by-value arg) that outlives this call. The kernel signatures are pinned by the
     // `g_*` callers against `decode.cu`. Graph capture snapshots the arg values.
     #[allow(unsafe_code)]
-    unsafe {
-        result::launch_kernel(func, grid, block, smem, stream, params)
-    }
-    .map_err(|e| driver_err("raw graph launch", &e))
+    unsafe { result::launch_kernel(func, grid, block, smem, stream, params) }
+        .map_err(|e| driver_err("raw graph launch", &e))
 }
 
 /// Pre-extracted device pointers for one ternary projection.
@@ -4746,8 +6324,8 @@ mod tests {
                             .map(|_| {
                                 let pick = (next() >> 40) % 8;
                                 let v = match pick {
-                                    0 => 0.0,                       // zero-variance block
-                                    1 => 12.5,                      // outlier-heavy block
+                                    0 => 0.0,  // zero-variance block
+                                    1 => 12.5, // outlier-heavy block
                                     other => 0.05 + other as f32 * 0.3,
                                 };
                                 f16::from_f32(v / (p as f32 + 1.0))
@@ -4825,7 +6403,9 @@ mod tests {
         let row_bytes = nb * TQ2_0_BLOCK_BYTES;
         let mut s: u64 = 0x5A17_F00D;
         let mut next = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             s
         };
 
@@ -4840,7 +6420,12 @@ mod tests {
                                 .map(|_| Trit::from_i8(((next() >> 40) % 3) as i8 - 1).unwrap())
                                 .collect();
                             let scales: Vec<f16> = (0..nb)
-                                .map(|_| f16::from_f32((0.05 + ((next() >> 40) % 8) as f32 * 0.3) / (p as f32 + 1.0)))
+                                .map(|_| {
+                                    f16::from_f32(
+                                        (0.05 + ((next() >> 40) % 8) as f32 * 0.3)
+                                            / (p as f32 + 1.0),
+                                    )
+                                })
                                 .collect();
                             let mut bytes = vec![0u8; row_bytes];
                             pack_tq2_0_row(&trits, &scales, &mut bytes).unwrap();
@@ -4871,8 +6456,13 @@ mod tests {
             let lin = cuda.upload_salt(&rows, n, k).expect("upload_salt");
             // Two forwards on the same resident buffer must agree (reuse).
             let gpu = cuda.salt_forward(&lin, &act, m).expect("salt_forward");
-            let gpu2 = cuda.salt_forward(&lin, &act, m).expect("salt_forward reuse");
-            assert_eq!(gpu, gpu2, "resident reuse must be deterministic (max_t={max_t})");
+            let gpu2 = cuda
+                .salt_forward(&lin, &act, m)
+                .expect("salt_forward reuse");
+            assert_eq!(
+                gpu, gpu2,
+                "resident reuse must be deterministic (max_t={max_t})"
+            );
 
             for i in 0..m * n {
                 let r = reference[i];
@@ -5466,7 +7056,10 @@ mod tests {
     ) -> Vec<f32> {
         let num_ktiles = k.div_ceil(IMMA_K);
         let d_qact = cuda.stream.clone_htod(qact).expect("htod qact");
-        let d_weights = cuda.stream.clone_htod(packed_weights).expect("htod weights");
+        let d_weights = cuda
+            .stream
+            .clone_htod(packed_weights)
+            .expect("htod weights");
         let d_act_scale = cuda.stream.clone_htod(act_scale).expect("htod act_scale");
         let d_wscale = cuda.stream.clone_htod(wscale).expect("htod wscale");
         let mut d_out = cuda.stream.alloc_zeros::<f32>(m * n).expect("alloc out");
@@ -5573,10 +7166,34 @@ mod tests {
 
         // A representative spread of the search's candidate tiles.
         let tiles = [
-            TileConfig { tile_m: 16, tile_n: 8, tile_k: 128, warps: 1, stages: 2 },
-            TileConfig { tile_m: 16, tile_n: 16, tile_k: 64, warps: 2, stages: 2 },
-            TileConfig { tile_m: 32, tile_n: 16, tile_k: 64, warps: 4, stages: 2 },
-            TileConfig { tile_m: 64, tile_n: 16, tile_k: 32, warps: 8, stages: 3 },
+            TileConfig {
+                tile_m: 16,
+                tile_n: 8,
+                tile_k: 128,
+                warps: 1,
+                stages: 2,
+            },
+            TileConfig {
+                tile_m: 16,
+                tile_n: 16,
+                tile_k: 64,
+                warps: 2,
+                stages: 2,
+            },
+            TileConfig {
+                tile_m: 32,
+                tile_n: 16,
+                tile_k: 64,
+                warps: 4,
+                stages: 2,
+            },
+            TileConfig {
+                tile_m: 64,
+                tile_n: 16,
+                tile_k: 32,
+                warps: 8,
+                stages: 3,
+            },
         ];
         let (m, n, k) = (40usize, 24usize, 256usize);
         let (qact, act_scale, wscale, trits) = jit_probe_inputs(m, n, k);
@@ -5688,10 +7305,7 @@ mod tests {
 
         // Tuned == reference within tolerance.
         for (i, (&g, &c)) in tuned1.iter().zip(&ref_out).enumerate() {
-            assert!(
-                tol.accepts(g, c),
-                "tuned vs ref [{i}] tuned={g} ref={c}"
-            );
+            assert!(tol.accepts(g, c), "tuned vs ref [{i}] tuned={g} ref={c}");
         }
         // Cold vs warm cache: bit-for-bit identical (same tile → same numerics).
         for (i, (&a, &b)) in tuned1.iter().zip(&tuned2).enumerate() {
@@ -5740,7 +7354,9 @@ mod tests {
 
             let want = host_rmsnorm(&x, &w, eps);
             let mut got = vec![0.0f32; n];
-            backend.rmsnorm(&x, &w, eps, &mut got).expect("device rmsnorm");
+            backend
+                .rmsnorm(&x, &w, eps, &mut got)
+                .expect("device rmsnorm");
 
             for (i, (&g, &h)) in got.iter().zip(&want).enumerate() {
                 assert_eq!(
@@ -5783,8 +7399,8 @@ mod tests {
                     sin_t[j] = s as f32;
                 }
                 // Deterministic input.
-                let mut st =
-                    0xDEAD_BEEF_CAFE_F00Du64 ^ ((pos as u64) * 131 + n_head as u64 * 17 + head_dim as u64);
+                let mut st = 0xDEAD_BEEF_CAFE_F00Du64
+                    ^ ((pos as u64) * 131 + n_head as u64 * 17 + head_dim as u64);
                 let mut next = || {
                     st ^= st << 13;
                     st ^= st >> 7;
@@ -5868,7 +7484,9 @@ mod tests {
         let mut want = x0.clone();
         host_softmax(&mut want, row_len);
         let mut got = x0.clone();
-        backend.softmax(&mut got, row_len, rows).expect("device softmax");
+        backend
+            .softmax(&mut got, row_len, rows)
+            .expect("device softmax");
 
         let (mut max_ulp, mut n_diff, mut max_rel) = (0i64, 0usize, 0.0f64);
         for (&g, &h) in got.iter().zip(&want) {
@@ -5959,7 +7577,11 @@ mod tests {
                 .lm_head(&h, &embd, n_embd, vocab, &mut got)
                 .expect("lm_head");
             for (v, (&g, &hh)) in got.iter().zip(&want).enumerate() {
-                assert_eq!(g.to_bits(), hh.to_bits(), "lm_head mismatch [{v}]: got {g} want {hh}");
+                assert_eq!(
+                    g.to_bits(),
+                    hh.to_bits(),
+                    "lm_head mismatch [{v}]: got {g} want {hh}"
+                );
             }
         }
     }
@@ -5999,7 +7621,11 @@ mod tests {
         let mut got = gate0.clone();
         backend.relu2_gate(&mut got, &up).expect("relu2_gate");
         for (i, (&g, &h)) in got.iter().zip(&want).enumerate() {
-            assert_eq!(g.to_bits(), h.to_bits(), "relu2_gate mismatch [{i}]: got {g} want {h}");
+            assert_eq!(
+                g.to_bits(),
+                h.to_bits(),
+                "relu2_gate mismatch [{i}]: got {g} want {h}"
+            );
         }
     }
 
@@ -6081,7 +7707,9 @@ mod tests {
 
         let mut got = vec![0.0f32; n_head * head_dim];
         backend
-            .gqa_attention_decode(&q, &k, &v, &mut got, ctx, n_head, n_head_kv, head_dim, scale, limit)
+            .gqa_attention_decode(
+                &q, &k, &v, &mut got, ctx, n_head, n_head_kv, head_dim, scale, limit,
+            )
             .expect("device attention");
 
         let (mut max_ulp, mut n_diff, mut max_rel, mut max_abs) = (0i64, 0usize, 0.0f64, 0.0f64);
@@ -6151,8 +7779,14 @@ mod tests {
             let act: Vec<f32> = (0..k).map(|_| next()).collect();
             let (q_want, scale_want) = host_quant(&act);
             let mut q_got = vec![f32::NAN; k];
-            let scale_got = backend.act_quant_tiled(&act, &mut q_got).expect("act_quant");
-            assert_eq!(scale_got.to_bits(), scale_want.to_bits(), "scale mismatch k={k}");
+            let scale_got = backend
+                .act_quant_tiled(&act, &mut q_got)
+                .expect("act_quant");
+            assert_eq!(
+                scale_got.to_bits(),
+                scale_want.to_bits(),
+                "scale mismatch k={k}"
+            );
             for (i, (&g, &h)) in q_got.iter().zip(&q_want).enumerate() {
                 assert_eq!(g.to_bits(), h.to_bits(), "act_quant q mismatch k={k} i={i}");
             }
@@ -6160,9 +7794,14 @@ mod tests {
         // Zero row → zeros + zero scale.
         let act = vec![0.0f32; 64];
         let mut q = vec![1.0f32; 64];
-        let sc = backend.act_quant_tiled(&act, &mut q).expect("act_quant zero");
+        let sc = backend
+            .act_quant_tiled(&act, &mut q)
+            .expect("act_quant zero");
         assert_eq!(sc, 0.0);
-        assert!(q.iter().all(|&x| x == 0.0), "zero row must quantize to zeros");
+        assert!(
+            q.iter().all(|&x| x == 0.0),
+            "zero row must quantize to zeros"
+        );
     }
 
     /// The device GEMM chain (`mpgemm_device`: on-device quant → tiled f64 GEMM →
@@ -6238,7 +7877,11 @@ mod tests {
             .expect("mpgemm_device");
 
         for (i, (&g, &h)) in out_dev.iter().zip(&out_host).enumerate() {
-            assert_eq!(g.to_bits(), h.to_bits(), "mpgemm_device mismatch [{i}]: got {g} want {h}");
+            assert_eq!(
+                g.to_bits(),
+                h.to_bits(),
+                "mpgemm_device mismatch [{i}]: got {g} want {h}"
+            );
         }
     }
 
@@ -6276,7 +7919,11 @@ mod tests {
         let n = 256usize;
         let x0 = vec![1.0f32; n];
         let y = vec![2.0f32; n];
-        let cap = backend.stream.context().new_stream().expect("capture stream");
+        let cap = backend
+            .stream
+            .context()
+            .new_stream()
+            .expect("capture stream");
         let mut d_x = cap.clone_htod(&x0).expect("htod x");
         let d_y = cap.clone_htod(&y).expect("htod y");
         cap.synchronize().expect("sync");
@@ -6332,8 +7979,9 @@ mod tests {
         let ptx_c = CString::new(DECODE_PTX).expect("ptx cstring");
         // SAFETY: `ptx_c` is a valid NUL-terminated PTX image; `load_data` JIT-compiles it.
         #[allow(unsafe_code)]
-        let cu_module =
-            unsafe { result::module::load_data(ptx_c.as_ptr() as *const c_void).expect("load_data") };
+        let cu_module = unsafe {
+            result::module::load_data(ptx_c.as_ptr() as *const c_void).expect("load_data")
+        };
         let fname = CString::new("residual_add_f32").expect("fn cstring");
         // SAFETY: `cu_module` is a loaded module; `residual_add_f32` is one of its entry points.
         #[allow(unsafe_code)]
@@ -6390,7 +8038,9 @@ mod tests {
             }
         }
         let graph = cap
-            .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            )
             .expect("end_capture")
             .expect("non-empty graph");
 
@@ -6400,7 +8050,11 @@ mod tests {
         let mut got = vec![0.0f32; n];
         cap.memcpy_dtoh(&d_x, &mut got).expect("dtoh");
         for (i, (&g, &h)) in got.iter().zip(&want).enumerate() {
-            assert_eq!(g.to_bits(), h.to_bits(), "raw graph replay mismatch [{i}]: got {g} want {h}");
+            assert_eq!(
+                g.to_bits(),
+                h.to_bits(),
+                "raw graph replay mismatch [{i}]: got {g} want {h}"
+            );
         }
 
         // The captured graph holds the raw CUfunction; unload only after a final sync.

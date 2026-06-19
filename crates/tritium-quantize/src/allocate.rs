@@ -102,7 +102,10 @@ impl fmt::Display for AllocError {
                 "base allocation needs {base_bits:.1} bits but budget is {budget_bits:.1}"
             ),
             AllocError::InvalidSensitivity { group, value } => {
-                write!(f, "group {group} has invalid sensitivity {value} (want finite, ≥ 0)")
+                write!(
+                    f,
+                    "group {group} has invalid sensitivity {value} (want finite, ≥ 0)"
+                )
             }
         }
     }
@@ -257,12 +260,26 @@ mod tests {
         let a = [1.0f32, -0.5, 0.25, 2.0];
         let b = [3.0f32, 0.1, -1.5];
         let groups = [
-            GroupInput { weights: &a, sensitivity: 5.0 },
-            GroupInput { weights: &b, sensitivity: 1.0 },
+            GroupInput {
+                weights: &a,
+                sensitivity: 5.0,
+            },
+            GroupInput {
+                weights: &b,
+                sensitivity: 1.0,
+            },
         ];
         let sizes = sizes_of(&groups);
         let base = (sizes.iter().sum::<usize>() as f64) * TRIT_BITS;
-        let alloc = allocate(&groups, &AllocConfig { t_min: 1, t_max: 3, budget_bits: base }).unwrap();
+        let alloc = allocate(
+            &groups,
+            &AllocConfig {
+                t_min: 1,
+                t_max: 3,
+                budget_bits: base,
+            },
+        )
+        .unwrap();
         assert_eq!(alloc.plane_counts, vec![1, 1]);
         assert!(alloc.total_bits(&sizes) <= base + 1e-9);
     }
@@ -270,9 +287,19 @@ mod tests {
     #[test]
     fn budget_below_base_errors() {
         let a = [1.0f32, 2.0, 3.0];
-        let groups = [GroupInput { weights: &a, sensitivity: 1.0 }];
+        let groups = [GroupInput {
+            weights: &a,
+            sensitivity: 1.0,
+        }];
         let base = 3.0 * TRIT_BITS;
-        let err = allocate(&groups, &AllocConfig { t_min: 1, t_max: 3, budget_bits: base - 0.5 });
+        let err = allocate(
+            &groups,
+            &AllocConfig {
+                t_min: 1,
+                t_max: 3,
+                budget_bits: base - 0.5,
+            },
+        );
         assert!(matches!(err, Err(AllocError::BudgetTooSmall { .. })));
     }
 
@@ -280,13 +307,19 @@ mod tests {
     fn invalid_sensitivity_errors() {
         let a = [1.0f32, 2.0];
         // negative H would spend budget worsening the objective
-        let neg = [GroupInput { weights: &a, sensitivity: -1.0 }];
+        let neg = [GroupInput {
+            weights: &a,
+            sensitivity: -1.0,
+        }];
         assert!(matches!(
             allocate(&neg, &AllocConfig::default()),
             Err(AllocError::InvalidSensitivity { group: 0, .. })
         ));
         // NaN H would poison the greedy max-selection
-        let nan = [GroupInput { weights: &a, sensitivity: f64::NAN }];
+        let nan = [GroupInput {
+            weights: &a,
+            sensitivity: f64::NAN,
+        }];
         assert!(matches!(
             allocate(&nan, &AllocConfig::default()),
             Err(AllocError::InvalidSensitivity { group: 0, .. })
@@ -296,8 +329,18 @@ mod tests {
     #[test]
     fn bad_range_errors() {
         let a = [1.0f32];
-        let groups = [GroupInput { weights: &a, sensitivity: 1.0 }];
-        let err = allocate(&groups, &AllocConfig { t_min: 3, t_max: 2, budget_bits: 100.0 });
+        let groups = [GroupInput {
+            weights: &a,
+            sensitivity: 1.0,
+        }];
+        let err = allocate(
+            &groups,
+            &AllocConfig {
+                t_min: 3,
+                t_max: 2,
+                budget_bits: 100.0,
+            },
+        );
         assert!(matches!(err, Err(AllocError::BadRange { .. })));
     }
 
@@ -307,15 +350,29 @@ mod tests {
         // plane. It must go to the higher-sensitivity group.
         let w = [1.0f32, 0.6, 0.31, 0.14, -0.8, 0.45];
         let groups = [
-            GroupInput { weights: &w, sensitivity: 1.0 },   // low
-            GroupInput { weights: &w, sensitivity: 9.0 },   // high
+            GroupInput {
+                weights: &w,
+                sensitivity: 1.0,
+            }, // low
+            GroupInput {
+                weights: &w,
+                sensitivity: 9.0,
+            }, // high
         ];
         let sizes = sizes_of(&groups);
         let base = (sizes.iter().sum::<usize>() as f64) * TRIT_BITS;
         let one_plane = w.len() as f64 * TRIT_BITS;
-        let cfg = AllocConfig { t_min: 1, t_max: 3, budget_bits: base + one_plane };
+        let cfg = AllocConfig {
+            t_min: 1,
+            t_max: 3,
+            budget_bits: base + one_plane,
+        };
         let alloc = allocate(&groups, &cfg).unwrap();
-        assert_eq!(alloc.plane_counts, vec![1, 2], "extra plane → higher-H group");
+        assert_eq!(
+            alloc.plane_counts,
+            vec![1, 2],
+            "extra plane → higher-H group"
+        );
         assert!(alloc.total_bits(&sizes) <= cfg.budget_bits + 1e-9);
     }
 

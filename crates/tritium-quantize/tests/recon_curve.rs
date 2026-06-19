@@ -25,7 +25,11 @@ use tritium_quantize::{QuantConfig, ScaleGroup, Sensitivity, quantize_tensor};
 fn gpt2_safetensors() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let snaps = PathBuf::from(home).join(".cache/huggingface/hub/models--gpt2/snapshots");
-    let snap = std::fs::read_dir(&snaps).ok()?.flatten().map(|e| e.path()).find(|p| p.is_dir())?;
+    let snap = std::fs::read_dir(&snaps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())?;
     let st = snap.join("model.safetensors");
     st.exists().then_some(st)
 }
@@ -72,13 +76,19 @@ fn salt_recon_error_decreases_with_bpw() {
     // Every 2D weight tensor (the Linear/embedding matrices); skip 1D norms/biases.
     let names: Vec<String> = st
         .names()
-        .filter(|n| st.shape(n).is_some_and(|s| s.len() == 2 && s[0] >= 2 && s[1] >= 2))
+        .filter(|n| {
+            st.shape(n)
+                .is_some_and(|s| s.len() == 2 && s[0] >= 2 && s[1] >= 2)
+        })
         .map(str::to_owned)
         .collect();
     assert!(!names.is_empty(), "no 2D weight tensors found");
 
     let bpws = [tritium_quantize::TRIT_BITS, 2.0, 2.6, 3.0];
-    println!("\nSALT recon-error vs bpw (gpt2, {} weight tensors):", names.len());
+    println!(
+        "\nSALT recon-error vs bpw (gpt2, {} weight tensors):",
+        names.len()
+    );
     println!("  {:>8}  {:>14}", "bpw", "rel recon err");
     let mut prev = f64::INFINITY;
     for &bpw in &bpws {
@@ -96,6 +106,12 @@ fn salt_recon_error_decreases_with_bpw() {
     // beat it meaningfully — i.e. residual planes actually buy fidelity on a normal model.
     let floor = recon_error_at(&st, &names, tritium_quantize::TRIT_BITS);
     let top = recon_error_at(&st, &names, 3.0);
-    assert!(floor > 0.05, "T=1 ternary should be visibly lossy, got {floor}");
-    assert!(top < floor * 0.8, "3 bpw should cut recon error >20% vs the floor ({top} vs {floor})");
+    assert!(
+        floor > 0.05,
+        "T=1 ternary should be visibly lossy, got {floor}"
+    );
+    assert!(
+        top < floor * 0.8,
+        "3 bpw should cut recon error >20% vs the floor ({top} vs {floor})"
+    );
 }

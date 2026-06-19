@@ -317,7 +317,9 @@ fn cuda_batch_decode_matches_single() {
     // Batched N=2, both sequences fed the same tokens.
     let mut batch = model.new_batch(2).expect("new_batch");
     for (i, &t) in toks.iter().enumerate() {
-        let logits = model.decode_batch(&mut batch, &[t, t]).expect("decode_batch");
+        let logits = model
+            .decode_batch(&mut batch, &[t, t])
+            .expect("decode_batch");
         assert_eq!(logits.len(), 2);
         for v in 0..logits[0].len() {
             assert_eq!(
@@ -332,7 +334,10 @@ fn cuda_batch_decode_matches_single() {
             );
         }
     }
-    println!("batch-decode parity: N=2 == single, bit-identical over {} steps", toks.len());
+    println!(
+        "batch-decode parity: N=2 == single, bit-identical over {} steps",
+        toks.len()
+    );
 }
 
 /// CUDA-graph batched decode (Track-2 perf) must be **bit-identical** to the eager
@@ -368,7 +373,9 @@ fn cuda_batch_decode_graph_matches_eager() {
     let mut graph = model.new_batch(N).expect("new_batch graph");
     for (i, &t) in toks.iter().enumerate() {
         let row_tokens = vec![t; N];
-        let want = model.decode_batch(&mut eager, &row_tokens).expect("decode_batch eager");
+        let want = model
+            .decode_batch(&mut eager, &row_tokens)
+            .expect("decode_batch eager");
         let got = model
             .decode_batch_graph(&mut graph, &row_tokens)
             .expect("decode_batch_graph");
@@ -386,7 +393,10 @@ fn cuda_batch_decode_graph_matches_eager() {
     }
     drop(eager);
     drop(graph);
-    println!("batch-graph parity: graph == eager, bit-identical over {} steps", toks.len());
+    println!(
+        "batch-graph parity: graph == eager, bit-identical over {} steps",
+        toks.len()
+    );
 }
 
 /// The on-device-sampling M=N graph (`decode_batch_graph_argmax`) folds the LM head + a
@@ -418,7 +428,9 @@ fn cuda_batch_decode_graph_argmax_matches_greedy() {
     let mut argmax = model.new_batch(N).expect("new_batch argmax");
     for (i, &t) in toks.iter().enumerate() {
         let row_tokens = vec![t; N];
-        let logits = model.decode_batch(&mut eager, &row_tokens).expect("decode_batch eager");
+        let logits = model
+            .decode_batch(&mut eager, &row_tokens)
+            .expect("decode_batch eager");
         let tokens = model
             .decode_batch_graph_argmax(&mut argmax, &row_tokens)
             .expect("decode_batch_graph_argmax");
@@ -430,7 +442,10 @@ fn cuda_batch_decode_graph_argmax_matches_greedy() {
     }
     drop(eager);
     drop(argmax);
-    println!("batch-graph argmax parity: on-device argmax == host greedy over {} steps", toks.len());
+    println!(
+        "batch-graph argmax parity: on-device argmax == host greedy over {} steps",
+        toks.len()
+    );
 }
 
 /// (b) Perplexity: forward over the fixed eval sequence on CUDA, assert within 1%

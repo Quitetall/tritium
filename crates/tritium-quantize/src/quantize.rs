@@ -123,16 +123,9 @@ impl QuantizedTensor {
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuantError {
     /// `weights.len()` ≠ `rows · k`.
-    ShapeMismatch {
-        rows: usize,
-        k: usize,
-        got: usize,
-    },
+    ShapeMismatch { rows: usize, k: usize, got: usize },
     /// [`Sensitivity::Custom`] had the wrong number of entries.
-    SensitivityLen {
-        expected: usize,
-        got: usize,
-    },
+    SensitivityLen { expected: usize, got: usize },
     /// The plane allocator rejected the inputs.
     Alloc(AllocError),
     /// A plane failed to pack.
@@ -143,10 +136,17 @@ impl core::fmt::Display for QuantError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             QuantError::ShapeMismatch { rows, k, got } => {
-                write!(f, "shape mismatch: {rows}×{k} needs {} weights, got {got}", rows * k)
+                write!(
+                    f,
+                    "shape mismatch: {rows}×{k} needs {} weights, got {got}",
+                    rows * k
+                )
             }
             QuantError::SensitivityLen { expected, got } => {
-                write!(f, "custom sensitivity: expected {expected} entries, got {got}")
+                write!(
+                    f,
+                    "custom sensitivity: expected {expected} entries, got {got}"
+                )
             }
             QuantError::Alloc(e) => write!(f, "allocation: {e}"),
             QuantError::Format(e) => write!(f, "format: {e}"),
@@ -252,7 +252,10 @@ fn expand_per_block(
         for b in 0..nb {
             let (start, end) = block_range(b, k);
             let gw = &row[start..end];
-            groups.push(GroupInput { weights: gw, sensitivity: group_sensitivity(cfg.sensitivity, gw, r * nb + b) });
+            groups.push(GroupInput {
+                weights: gw,
+                sensitivity: group_sensitivity(cfg.sensitivity, gw, r * nb + b),
+            });
         }
     }
     let total_w = rows * k;
@@ -308,11 +311,19 @@ fn expand_per_tensor(
         for b in 0..nb {
             let (start, end) = block_range(b, k);
             let gw = &rrow[start..end];
-            groups.push(GroupInput { weights: gw, sensitivity: group_sensitivity(cfg.sensitivity, gw, r * nb + b) });
+            groups.push(GroupInput {
+                weights: gw,
+                sensitivity: group_sensitivity(cfg.sensitivity, gw, r * nb + b),
+            });
         }
     }
     let extra_bpw = (cfg.budget_bpw - TRIT_BITS).max(0.0);
-    let acfg = AllocConfig::from_bpw(extra_bpw, total_w, cfg.t_min.saturating_sub(1), cfg.t_max.saturating_sub(1));
+    let acfg = AllocConfig::from_bpw(
+        extra_bpw,
+        total_w,
+        cfg.t_min.saturating_sub(1),
+        cfg.t_max.saturating_sub(1),
+    );
     let extra = allocate(&groups, &acfg)?;
 
     let mut row_stacks = Vec::with_capacity(rows);
@@ -385,7 +396,12 @@ mod tests {
     }
 
     /// Independent reference: dequant by re-expanding each group with f16 scales.
-    fn reference_dequant(weights: &[f32], rows: usize, k: usize, plane_counts: &[usize]) -> Vec<f32> {
+    fn reference_dequant(
+        weights: &[f32],
+        rows: usize,
+        k: usize,
+        plane_counts: &[usize],
+    ) -> Vec<f32> {
         let nb = num_blocks(k);
         let mut out = vec![0.0f32; rows * k];
         for r in 0..rows {
@@ -411,7 +427,10 @@ mod tests {
     fn dequant_matches_reference() {
         for &(rows, k) in &[(1usize, 256usize), (3, 700), (4, 256), (2, 257), (5, 1000)] {
             let w = make_tensor(rows, k, 0xC0FFEE ^ (k as u64));
-            let cfg = QuantConfig { budget_bpw: 2.6, ..Default::default() };
+            let cfg = QuantConfig {
+                budget_bpw: 2.6,
+                ..Default::default()
+            };
             let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
             let reference = reference_dequant(&w, rows, k, &qt.plane_counts);
             for (r, salt) in qt.salt_rows.iter().enumerate() {
@@ -429,7 +448,12 @@ mod tests {
 
     /// Independent reference for the per-tensor path: a single per-tensor base plane plus
     /// per-block residual planes re-expanded from the residual (driven by `plane_counts`).
-    fn reference_dequant_tensor(weights: &[f32], rows: usize, k: usize, plane_counts: &[usize]) -> Vec<f32> {
+    fn reference_dequant_tensor(
+        weights: &[f32],
+        rows: usize,
+        k: usize,
+        plane_counts: &[usize],
+    ) -> Vec<f32> {
         let nb = num_blocks(k);
         let base_scale = tritium_core::absmean(weights);
         let base = crate::ternary_at_scale(weights, base_scale);
@@ -467,7 +491,11 @@ mod tests {
     fn tensor_dequant_matches_reference() {
         for &(rows, k) in &[(1usize, 256usize), (3, 700), (4, 256), (2, 257), (5, 1000)] {
             let w = make_tensor(rows, k, 0x5A17 ^ (k as u64));
-            let cfg = QuantConfig { budget_bpw: 2.6, scale_group: ScaleGroup::Tensor, ..Default::default() };
+            let cfg = QuantConfig {
+                budget_bpw: 2.6,
+                scale_group: ScaleGroup::Tensor,
+                ..Default::default()
+            };
             let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
             let reference = reference_dequant_tensor(&w, rows, k, &qt.plane_counts);
             for (r, salt) in qt.salt_rows.iter().enumerate() {
@@ -480,7 +508,11 @@ mod tests {
                     );
                 }
             }
-            assert!(qt.logical_bpw() <= 2.6 + 1e-9, "tensor logical bpw {} > budget", qt.logical_bpw());
+            assert!(
+                qt.logical_bpw() <= 2.6 + 1e-9,
+                "tensor logical bpw {} > budget",
+                qt.logical_bpw()
+            );
         }
     }
 
@@ -501,7 +533,10 @@ mod tests {
             scale_group: ScaleGroup::Tensor,
         };
         let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
-        assert!(qt.plane_counts.iter().all(|&t| t == 1), "floor ⇒ base plane only");
+        assert!(
+            qt.plane_counts.iter().all(|&t| t == 1),
+            "floor ⇒ base plane only"
+        );
 
         let tensor_absmean = tritium_core::absmean(&w);
         let s = f16::from_f32(tensor_absmean).to_f32();
@@ -522,9 +557,18 @@ mod tests {
         let (rows, k) = (3usize, 512usize);
         let w = make_tensor(rows, k, 0xABBA);
         // budget_bpw exactly the base (t_min=1 ⇒ log2 3 bpw)
-        let cfg = QuantConfig { budget_bpw: crate::TRIT_BITS, t_min: 1, t_max: 3, sensitivity: Sensitivity::Uniform, scale_group: ScaleGroup::Block };
+        let cfg = QuantConfig {
+            budget_bpw: crate::TRIT_BITS,
+            t_min: 1,
+            t_max: 3,
+            sensitivity: Sensitivity::Uniform,
+            scale_group: ScaleGroup::Block,
+        };
         let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
-        assert!(qt.plane_counts.iter().all(|&t| t == 1), "all groups at base");
+        assert!(
+            qt.plane_counts.iter().all(|&t| t == 1),
+            "all groups at base"
+        );
 
         // Every group dequantizes to flat AbsMean with the f16-rounded scale.
         let nb = num_blocks(k);
@@ -548,7 +592,10 @@ mod tests {
     fn logical_bpw_within_budget() {
         for &bpw in &[crate::TRIT_BITS, 2.0, 2.5, 3.0, 4.0] {
             let w = make_tensor(4, 800, 0xD00D ^ bpw.to_bits());
-            let cfg = QuantConfig { budget_bpw: bpw, ..Default::default() };
+            let cfg = QuantConfig {
+                budget_bpw: bpw,
+                ..Default::default()
+            };
             let qt = quantize_tensor(&w, 4, 800, &cfg).unwrap();
             assert!(
                 qt.logical_bpw() <= bpw + 1e-9,
@@ -562,7 +609,10 @@ mod tests {
     #[test]
     fn quantize_is_deterministic() {
         let w = make_tensor(3, 600, 0x1357);
-        let cfg = QuantConfig { budget_bpw: 2.4, ..Default::default() };
+        let cfg = QuantConfig {
+            budget_bpw: 2.4,
+            ..Default::default()
+        };
         let a = quantize_tensor(&w, 3, 600, &cfg).unwrap();
         let b = quantize_tensor(&w, 3, 600, &cfg).unwrap();
         assert_eq!(a, b);
@@ -595,10 +645,16 @@ mod tests {
     fn custom_sensitivity_wrong_len_errors() {
         let w = make_tensor(2, 256, 1);
         let bad = [1.0f64; 3]; // need 2 groups, gave 3
-        let cfg = QuantConfig { sensitivity: Sensitivity::Custom(&bad), ..Default::default() };
+        let cfg = QuantConfig {
+            sensitivity: Sensitivity::Custom(&bad),
+            ..Default::default()
+        };
         assert!(matches!(
             quantize_tensor(&w, 2, 256, &cfg),
-            Err(QuantError::SensitivityLen { expected: 2, got: 3 })
+            Err(QuantError::SensitivityLen {
+                expected: 2,
+                got: 3
+            })
         ));
     }
 
@@ -606,8 +662,26 @@ mod tests {
     #[test]
     fn higher_budget_never_reduces_planes() {
         let w = make_tensor(3, 512, 0x9999);
-        let lo = quantize_tensor(&w, 3, 512, &QuantConfig { budget_bpw: 2.0, ..Default::default() }).unwrap();
-        let hi = quantize_tensor(&w, 3, 512, &QuantConfig { budget_bpw: 3.5, ..Default::default() }).unwrap();
+        let lo = quantize_tensor(
+            &w,
+            3,
+            512,
+            &QuantConfig {
+                budget_bpw: 2.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let hi = quantize_tensor(
+            &w,
+            3,
+            512,
+            &QuantConfig {
+                budget_bpw: 3.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for (l, h) in lo.plane_counts.iter().zip(&hi.plane_counts) {
             assert!(h >= l, "more budget reduced a plane count");
         }

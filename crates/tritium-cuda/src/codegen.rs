@@ -381,7 +381,10 @@ mod tests {
         // The AOT-equivalent config must render exactly one 16x8 sub-tile and one
         // warp per block, matching kernels/tq2_0_imma.cu's launch shape.
         let src = render_imma_source(TileConfig::AOT_EQUIVALENT);
-        assert!(src.contains("#define SUBTILES 1"), "AOT-equiv must be 1 sub-tile");
+        assert!(
+            src.contains("#define SUBTILES 1"),
+            "AOT-equiv must be 1 sub-tile"
+        );
         assert!(src.contains("#define WARPS 1"), "AOT-equiv must be 1 warp");
         assert!(src.contains("#define M_SUBTILES 1"));
         assert!(src.contains("#define N_SUBTILES 1"));

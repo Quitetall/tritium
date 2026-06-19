@@ -113,9 +113,7 @@ fn run_chunk(
             // checks above. All buffer lengths were validated by `dispatch_mpgemm`
             // and are re-validated inside the call before any intrinsic touches
             // memory.
-            return unsafe {
-                crate::simd::avx512::avx512_mpgemm(act, weights, scales, shape, out)
-            };
+            return unsafe { crate::simd::avx512::avx512_mpgemm(act, weights, scales, shape, out) };
         }
         if is_x86_feature_detected!("avx2") {
             // SAFETY: `avx2_mpgemm` requires the `avx2` target feature, which the

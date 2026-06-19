@@ -49,7 +49,13 @@ pub fn write_salt_bundle(tensors: &[(&str, &[SaltRow])]) -> Result<Vec<u8>, Form
     // Pack each tensor's rows into one contiguous blob first (so we know its data_len).
     let mut blobs: Vec<(usize, Vec<u8>)> = Vec::with_capacity(tensors.len());
     for (_, rows) in tensors {
-        let k = rows.first().map(|r| r.k).ok_or(FormatError::WrongBlockLen { expected: 1, got: 0 })?;
+        let k = rows
+            .first()
+            .map(|r| r.k)
+            .ok_or(FormatError::WrongBlockLen {
+                expected: 1,
+                got: 0,
+            })?;
         let mut blob = Vec::new();
         for row in *rows {
             blob.extend_from_slice(&pack_salt_row(row)?);
@@ -82,9 +88,15 @@ struct Cursor<'a> {
 }
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
-        let end = self.o.checked_add(n).ok_or(FormatError::WrongBlockLen { expected: n, got: 0 })?;
+        let end = self.o.checked_add(n).ok_or(FormatError::WrongBlockLen {
+            expected: n,
+            got: 0,
+        })?;
         if end > self.b.len() {
-            return Err(FormatError::WrongBlockLen { expected: end, got: self.b.len() });
+            return Err(FormatError::WrongBlockLen {
+                expected: end,
+                got: self.b.len(),
+            });
         }
         let s = &self.b[self.o..end];
         self.o = end;
@@ -142,7 +154,12 @@ pub fn read_salt_bundle(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
         let rows = c.u32()?;
         let k = c.u32()?;
         let data_len = c.u64()?;
-        index.push(Entry { name, rows, k, data_len });
+        index.push(Entry {
+            name,
+            rows,
+            k,
+            data_len,
+        });
     }
 
     let mut out = Vec::with_capacity(tensor_count.min(bytes.len() / 18));
@@ -156,7 +173,10 @@ pub fn read_salt_bundle(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
         let mut salt_rows = Vec::with_capacity(e.rows.min(blob.len() / SALT_HEADER_BYTES + 1));
         for _ in 0..e.rows {
             if off + SALT_HEADER_BYTES > blob.len() {
-                return Err(FormatError::WrongBlockLen { expected: off + SALT_HEADER_BYTES, got: blob.len() });
+                return Err(FormatError::WrongBlockLen {
+                    expected: off + SALT_HEADER_BYTES,
+                    got: blob.len(),
+                });
             }
             let t = blob[off + 5] as usize;
             // Checked: on 64-bit the downstream bounds check already covers this, but a
@@ -165,14 +185,25 @@ pub fn read_salt_bundle(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
             let row_len = t
                 .checked_mul(plane_bytes)
                 .and_then(|p| p.checked_add(SALT_HEADER_BYTES))
-                .ok_or(FormatError::WrongBlockLen { expected: usize::MAX, got: blob.len() })?;
+                .ok_or(FormatError::WrongBlockLen {
+                    expected: usize::MAX,
+                    got: blob.len(),
+                })?;
             if off + row_len > blob.len() {
-                return Err(FormatError::WrongBlockLen { expected: off + row_len, got: blob.len() });
+                return Err(FormatError::WrongBlockLen {
+                    expected: off + row_len,
+                    got: blob.len(),
+                });
             }
             salt_rows.push(unpack_salt_row(&blob[off..off + row_len])?);
             off += row_len;
         }
-        out.push(SaltTensor { name: e.name, rows: e.rows, k: e.k, salt_rows });
+        out.push(SaltTensor {
+            name: e.name,
+            rows: e.rows,
+            k: e.k,
+            salt_rows,
+        });
     }
     Ok(out)
 }
@@ -190,7 +221,9 @@ mod tests {
         let planes = (0..t)
             .map(|p| {
                 let trits: Vec<Trit> = (0..k)
-                    .map(|i| Trit::from_i8(((i as i32 + p as i32 + seed as i32) % 3 - 1) as i8).unwrap())
+                    .map(|i| {
+                        Trit::from_i8(((i as i32 + p as i32 + seed as i32) % 3 - 1) as i8).unwrap()
+                    })
                     .collect();
                 let scales = vec![f16::from_f32(0.5 + p as f32); nb];
                 let mut bytes = vec![0u8; nb * TQ2_0_BLOCK_BYTES];
@@ -227,7 +260,10 @@ mod tests {
     fn bundle_is_deterministic() {
         let t_a = vec![row(256, 2, 7)];
         let tensors: Vec<(&str, &[SaltRow])> = vec![("w", &t_a)];
-        assert_eq!(write_salt_bundle(&tensors).unwrap(), write_salt_bundle(&tensors).unwrap());
+        assert_eq!(
+            write_salt_bundle(&tensors).unwrap(),
+            write_salt_bundle(&tensors).unwrap()
+        );
     }
 
     #[test]
@@ -238,10 +274,16 @@ mod tests {
         // bad magic
         let mut bad = packed.clone();
         bad[0] = b'X';
-        assert!(matches!(read_salt_bundle(&bad), Err(FormatError::SaltBadMagic)));
+        assert!(matches!(
+            read_salt_bundle(&bad),
+            Err(FormatError::SaltBadMagic)
+        ));
         // truncated mid-data
         packed.truncate(packed.len() - 10);
-        assert!(matches!(read_salt_bundle(&packed), Err(FormatError::WrongBlockLen { .. })));
+        assert!(matches!(
+            read_salt_bundle(&packed),
+            Err(FormatError::WrongBlockLen { .. })
+        ));
     }
 
     #[test]
@@ -253,7 +295,10 @@ mod tests {
         b.push(SALT_BUNDLE_VERSION);
         b.push(0);
         b.extend_from_slice(&u32::MAX.to_le_bytes()); // tensor_count = 4 billion
-        assert!(matches!(read_salt_bundle(&b), Err(FormatError::WrongBlockLen { .. })));
+        assert!(matches!(
+            read_salt_bundle(&b),
+            Err(FormatError::WrongBlockLen { .. })
+        ));
 
         // One tensor claiming u32::MAX rows but a tiny data blob → per-row bounds check errors.
         let mut b2 = Vec::new();
@@ -267,6 +312,9 @@ mod tests {
         b2.extend_from_slice(&256u32.to_le_bytes()); // k
         b2.extend_from_slice(&4u64.to_le_bytes()); // data_len = 4 bytes (too small for any row)
         b2.extend_from_slice(&[0u8; 4]); // the 4 data bytes
-        assert!(matches!(read_salt_bundle(&b2), Err(FormatError::WrongBlockLen { .. })));
+        assert!(matches!(
+            read_salt_bundle(&b2),
+            Err(FormatError::WrongBlockLen { .. })
+        ));
     }
 }

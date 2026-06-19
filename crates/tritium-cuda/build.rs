@@ -124,7 +124,10 @@ fn compile_ptx(nvcc: &Path, src: &Path, ptx_path: &Path, arch: &str, extra: &[&s
     }
 
     let status = cmd.status().unwrap_or_else(|e| {
-        panic!("tritium-cuda: failed to invoke nvcc ({}): {e}", nvcc.display())
+        panic!(
+            "tritium-cuda: failed to invoke nvcc ({}): {e}",
+            nvcc.display()
+        )
     });
     assert!(
         status.success(),

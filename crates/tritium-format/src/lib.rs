@@ -156,10 +156,16 @@ impl fmt::Display for FormatError {
                 write!(f, "SALT sidecar: unsupported version {v}")
             }
             FormatError::SaltTooManyPlanes(t) => {
-                write!(f, "SALT sidecar: {t} planes exceed the u8 plane-count field")
+                write!(
+                    f,
+                    "SALT sidecar: {t} planes exceed the u8 plane-count field"
+                )
             }
             FormatError::SaltRowTooLong(k) => {
-                write!(f, "SALT sidecar: row length {k} exceeds the u32 length field")
+                write!(
+                    f,
+                    "SALT sidecar: row length {k} exceeds the u32 length field"
+                )
             }
             FormatError::Gguf(e) => write!(f, "GGUF container: {e}"),
             FormatError::SaltGgufBadFormat => {

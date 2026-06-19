@@ -53,7 +53,10 @@ pub(crate) fn run(
     // Quantize every 2D weight matrix; skip 1D tensors (norms/biases) and degenerate shapes.
     let names: Vec<String> = st
         .names()
-        .filter(|n| st.shape(n).is_some_and(|s| s.len() == 2 && s[0] >= 2 && s[1] >= 2))
+        .filter(|n| {
+            st.shape(n)
+                .is_some_and(|s| s.len() == 2 && s[0] >= 2 && s[1] >= 2)
+        })
         .map(str::to_owned)
         .collect();
     if names.is_empty() {
@@ -66,7 +69,9 @@ pub(crate) fn run(
     for name in &names {
         let shape = st.shape(name).expect("filtered to Some");
         let (rows, k) = (shape[0], shape[1]);
-        let w = st.tensor_f32(name).with_context(|| format!("read tensor {name}"))?;
+        let w = st
+            .tensor_f32(name)
+            .with_context(|| format!("read tensor {name}"))?;
         let cfg = QuantConfig {
             budget_bpw: bpw,
             t_min: 1,
@@ -80,19 +85,27 @@ pub(crate) fn run(
         quantized.push((name.clone(), qt.salt_rows));
     }
 
-    let refs: Vec<(&str, &[SaltRow])> =
-        quantized.iter().map(|(n, r)| (n.as_str(), r.as_slice())).collect();
+    let refs: Vec<(&str, &[SaltRow])> = quantized
+        .iter()
+        .map(|(n, r)| (n.as_str(), r.as_slice()))
+        .collect();
     let (out_bytes, container) = match format {
-        OutputFormat::Sidecar => {
-            (write_salt_bundle(&refs).context("serialize SALT bundle")?, "SALT bundle")
-        }
-        OutputFormat::Gguf => {
-            (write_salt_gguf(&refs).context("serialize SALT GGUF")?, "SALT GGUF")
-        }
+        OutputFormat::Sidecar => (
+            write_salt_bundle(&refs).context("serialize SALT bundle")?,
+            "SALT bundle",
+        ),
+        OutputFormat::Gguf => (
+            write_salt_gguf(&refs).context("serialize SALT GGUF")?,
+            "SALT GGUF",
+        ),
     };
     std::fs::write(output, &out_bytes).with_context(|| format!("write {}", output.display()))?;
 
-    let avg_bpw = if total_params > 0 { total_bits / total_params as f64 } else { 0.0 };
+    let avg_bpw = if total_params > 0 {
+        total_bits / total_params as f64
+    } else {
+        0.0
+    };
     println!(
         "quantized {} tensors ({:.2}M params) at {:.3} bpw target, {:?} scale → {} {} ({:.1} MiB, {:.3} avg bpw)",
         names.len(),

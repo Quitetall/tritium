@@ -72,7 +72,9 @@ fn config() -> ModelConfig {
 /// Build one projection: read the bf16 weight, optionally SALT-quantize-then-dequant,
 /// and wrap as a dense fp32 projection.
 fn proj(st: &SafeTensors, name: &str, n_out: usize, k_in: usize, mode: Mode) -> Projection {
-    let w = st.tensor_f32(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let w = st
+        .tensor_f32(name)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
     assert_eq!(w.len(), n_out * k_in, "{name} shape");
     let dense = match mode {
         Mode::Fp => w,
@@ -107,7 +109,9 @@ fn build_weights(st: &SafeTensors, cfg: &ModelConfig, mode: Mode) -> ModelWeight
     let kv_width = cfg.n_head_kv as usize * head_dim;
     let n_ff = cfg.n_ff as usize;
 
-    let token_embd = st.tensor_f32("model.embed_tokens.weight").expect("embed_tokens");
+    let token_embd = st
+        .tensor_f32("model.embed_tokens.weight")
+        .expect("embed_tokens");
     let vocab = st.shape("model.embed_tokens.weight").expect("embed shape")[0];
     let output_norm = st.tensor_f32("model.norm.weight").expect("norm");
 
@@ -120,8 +124,12 @@ fn build_weights(st: &SafeTensors, cfg: &ModelConfig, mode: Mode) -> ModelWeight
                 k_proj: proj(st, &nm("self_attn.k_proj.weight"), kv_width, n_embd, mode),
                 v_proj: proj(st, &nm("self_attn.v_proj.weight"), kv_width, n_embd, mode),
                 o_proj: proj(st, &nm("self_attn.o_proj.weight"), n_embd, q_width, mode),
-                attn_sub_norm: st.tensor_f32(&nm("self_attn.attn_sub_norm.weight")).unwrap(),
-                ffn_norm: st.tensor_f32(&nm("post_attention_layernorm.weight")).unwrap(),
+                attn_sub_norm: st
+                    .tensor_f32(&nm("self_attn.attn_sub_norm.weight"))
+                    .unwrap(),
+                ffn_norm: st
+                    .tensor_f32(&nm("post_attention_layernorm.weight"))
+                    .unwrap(),
                 mlp: Relu2Mlp {
                     gate: proj(st, &nm("mlp.gate_proj.weight"), n_ff, n_embd, mode),
                     up: proj(st, &nm("mlp.up_proj.weight"), n_ff, n_embd, mode),
@@ -145,7 +153,11 @@ fn build_weights(st: &SafeTensors, cfg: &ModelConfig, mode: Mode) -> ModelWeight
 /// Log-softmax of `logits` at `target` (numerically stable).
 fn log_prob(logits: &[f32], target: usize) -> f64 {
     let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-    let lse = m + logits.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln();
+    let lse = m + logits
+        .iter()
+        .map(|&x| (x as f64 - m).exp())
+        .sum::<f64>()
+        .ln();
     logits[target] as f64 - lse
 }
 
@@ -159,7 +171,9 @@ fn perplexity(runner: &mut ModelRunner, eval_ids: &[u32]) -> f64 {
     for t in 0..n - 1 {
         let target = eval_ids[t + 1] as usize;
         nll += -log_prob(&logits, target);
-        logits = runner.forward(&[eval_ids[t + 1]], &[t + 1]).expect("decode");
+        logits = runner
+            .forward(&[eval_ids[t + 1]], &[t + 1])
+            .expect("decode");
     }
     (nll / (n - 1) as f64).exp()
 }
@@ -200,7 +214,10 @@ fn salt_accuracy_curve() {
         Mode::Salt { bpw: 3.0 },
     ];
 
-    println!("\nSALT accuracy-vs-bpw curve ({} eval tokens):", eval_ids.len());
+    println!(
+        "\nSALT accuracy-vs-bpw curve ({} eval tokens):",
+        eval_ids.len()
+    );
     println!("  reference: deployed ternary I2_S = 1.4028 (full 262-tok set); see");
     println!("  `gguf_eval_perplexity` for the deployed score on THIS prefix.\n");
     println!("  {:<16} {:>10}", "mode", "perplexity");
@@ -219,7 +236,9 @@ fn salt_accuracy_curve() {
         println!("  {label:<16} {ppl:>10.4}");
         match mode {
             Mode::Fp => fp_ppl = ppl,
-            Mode::Salt { bpw } if (bpw - tritium_quantize::TRIT_BITS).abs() < 1e-3 => salt_floor = ppl,
+            Mode::Salt { bpw } if (bpw - tritium_quantize::TRIT_BITS).abs() < 1e-3 => {
+                salt_floor = ppl
+            }
             Mode::Salt { .. } => {}
         }
         // `runner` (and its ~11 GB of weights) drops here before the next build.
@@ -277,12 +296,19 @@ fn gguf_eval_perplexity() {
     let gbytes = std::fs::read(GGUF_PATH).expect("read gguf");
     let mut gg = ModelRunner::load_cpu(&gbytes).expect("load gguf cpu");
     let ppl = perplexity(&mut gg, eval_ids);
-    println!("\nGGUF I2_S perplexity on {} eval tokens = {ppl:.4}", eval_ids.len());
+    println!(
+        "\nGGUF I2_S perplexity on {} eval tokens = {ppl:.4}",
+        eval_ids.len()
+    );
 }
 
 /// L2 norm + max-abs of a stage tensor.
 fn stats(v: &[f32]) -> (f64, f32) {
-    let l2 = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
+    let l2 = v
+        .iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum::<f64>()
+        .sqrt();
     let maxabs = v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     (l2, maxabs)
 }
@@ -310,8 +336,11 @@ fn salt_fp_vs_gguf_stage_dump() {
     let bytes = std::fs::read(&path).expect("read bf16");
     let st = SafeTensors::parse(&bytes).expect("parse safetensors");
     let weights = build_weights(&st, &cfg, Mode::Fp);
-    let mut hf =
-        ModelRunner::from_weights(cfg.clone(), weights, Box::new(tritium_cpu::CpuBackend::new()));
+    let mut hf = ModelRunner::from_weights(
+        cfg.clone(),
+        weights,
+        Box::new(tritium_cpu::CpuBackend::new()),
+    );
 
     let gbytes = std::fs::read(GGUF_PATH).expect("read gguf");
     let mut gg = ModelRunner::load_cpu(&gbytes).expect("load gguf cpu");
@@ -330,7 +359,11 @@ fn salt_fp_vs_gguf_stage_dump() {
     };
     println!("\nstage dump (token {tok}, pos 0) — HF-fp vs GGUF-ternary:");
     pr("embedding", &dh.embedding, &dg.embedding);
-    pr("layer0_attn_norm", &dh.layer0_attn_norm, &dg.layer0_attn_norm);
+    pr(
+        "layer0_attn_norm",
+        &dh.layer0_attn_norm,
+        &dg.layer0_attn_norm,
+    );
     pr("layer0_attn_out", &dh.layer0_attn_out, &dg.layer0_attn_out);
     let nl = dh.hidden_states.len();
     for (i, (a, b)) in dh.hidden_states.iter().zip(&dg.hidden_states).enumerate() {
@@ -340,11 +373,16 @@ fn salt_fp_vs_gguf_stage_dump() {
     }
     pr("final_norm", &dh.final_norm, &dg.final_norm);
     let amax = |v: &[f32]| {
-        v.iter()
-            .enumerate()
-            .fold((0usize, f32::MIN), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) })
+        v.iter().enumerate().fold(
+            (0usize, f32::MIN),
+            |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) },
+        )
     };
-    println!("  hf logits argmax={:?}   gguf logits argmax={:?}", amax(&dh.logits), amax(&dg.logits));
+    println!(
+        "  hf logits argmax={:?}   gguf logits argmax={:?}",
+        amax(&dh.logits),
+        amax(&dg.logits)
+    );
 
     // --- decompose layer-0 attention (the first divergence) --- //
     // At pos 0 attention is trivial (attn_out == v expanded), so the q_width-3× gap is in
@@ -357,7 +395,11 @@ fn salt_fp_vs_gguf_stage_dump() {
     pr("attn_sub_norm.w", &hb.attn_sub_norm, &gb.attn_sub_norm);
     pr("ffn_norm.w", &hb.ffn_norm, &gb.ffn_norm);
     pr("ffn_sub_norm.w", &hb.mlp.ffn_sub_norm, &gb.mlp.ffn_sub_norm);
-    pr("output_norm.w", &hf.weights.output_norm, &gg.weights.output_norm);
+    pr(
+        "output_norm.w",
+        &hf.weights.output_norm,
+        &gg.weights.output_norm,
+    );
 
     // v_proj on the shared matching input.
     let backend = tritium_cpu::CpuBackend::new();
@@ -390,13 +432,22 @@ fn salt_fp_vs_gguf_stage_dump() {
     ] {
         let am = absmean(&hf_w(hp));
         let sc = gg_scale(gp);
-        println!("  {name:<8} hf_absmean={am:>12.6}  gguf_scale={sc:>12.6}  ratio={:>8.3}", am / sc);
+        println!(
+            "  {name:<8} hf_absmean={am:>12.6}  gguf_scale={sc:>12.6}  ratio={:>8.3}",
+            am / sc
+        );
     }
 
     // Decisive: does SALT@1.585 (all-T=1 == flat absmean == BitNet ternary) reproduce the
     // GGUF v_proj? If yes, the forward is fine and only raw-master "fp" is ill-defined; if
     // it also blows up, SALT T=1 != the BitNet ternary the GGUF uses.
-    let salt_v = proj(&st, "model.layers.0.self_attn.v_proj.weight", kv_width, n_embd, Mode::Salt { bpw: 1.585 });
+    let salt_v = proj(
+        &st,
+        "model.layers.0.self_attn.v_proj.weight",
+        kv_width,
+        n_embd,
+        Mode::Salt { bpw: 1.585 },
+    );
     let mut vs = vec![0.0f32; kv_width];
     salt_v.forward(&backend, inp, 1, &mut vs).expect("salt v");
     pr("v_proj salt@1.585", &vs, &vg); // vg is the GGUF v_proj output (reference)
@@ -405,7 +456,10 @@ fn salt_fp_vs_gguf_stage_dump() {
     // for the whole tensor, round-clamp to {-1,0,1}) should reproduce the GGUF I2_S output.
     let w_v = hf_w(&hb.v_proj);
     let am_v = absmean(&w_v) as f32;
-    let w_pt: Vec<f32> = w_v.iter().map(|&x| am_v * (x / am_v).round().clamp(-1.0, 1.0)).collect();
+    let w_pt: Vec<f32> = w_v
+        .iter()
+        .map(|&x| am_v * (x / am_v).round().clamp(-1.0, 1.0))
+        .collect();
     let pt = Projection::Dense(DenseLinear::new(w_pt, kv_width, n_embd).unwrap());
     let mut vp = vec![0.0f32; kv_width];
     pt.forward(&backend, inp, 1, &mut vp).expect("per-tensor v");

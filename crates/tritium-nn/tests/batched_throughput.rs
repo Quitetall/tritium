@@ -55,7 +55,8 @@ use std::time::Instant;
 use tritium_cuda::{BatchKv, CudaDecodeModel};
 use tritium_nn::ModelRunner;
 
-const GGUF_PATH: &str = "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
+const GGUF_PATH: &str =
+    "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
 
 /// Small KV window: we decode `WARM + STEPS` (~72) positions, so 512 is ample and
 /// keeps `N × max_ctx` arenas inside 24 GB for large `N`.
@@ -180,12 +181,20 @@ fn profile_decode_burst() {
             return;
         }
     };
-    let n: usize = std::env::var("TRITIUM_PROFILE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
-    let steps: usize = std::env::var("TRITIUM_PROFILE_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let n: usize = std::env::var("TRITIUM_PROFILE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let steps: usize = std::env::var("TRITIUM_PROFILE_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     let mut batch = model.new_batch(n).expect("new_batch");
     let tokens = vec![791u32; n];
     for _ in 0..4 {
-        model.decode_batch_graph(&mut batch, &tokens).expect("warmup");
+        model
+            .decode_batch_graph(&mut batch, &tokens)
+            .expect("warmup");
     }
     for _ in 0..steps {
         model.decode_batch_graph(&mut batch, &tokens).expect("step");

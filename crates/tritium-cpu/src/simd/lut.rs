@@ -498,14 +498,21 @@ mod tests {
             s ^= s << 17;
             s
         };
-        for &(m, n, k) in &[(3usize, 5usize, 19usize), (2, 4, 256), (1, 1, 11), (4, 2, 512)] {
+        for &(m, n, k) in &[
+            (3usize, 5usize, 19usize),
+            (2, 4, 256),
+            (1, 1, 11),
+            (4, 2, 512),
+        ] {
             let act: Vec<f32> = (0..m * k)
                 .map(|_| (next() % 20000) as f32 / 100.0 - 100.0)
                 .collect();
             let w: Vec<Trit> = (0..n * k)
                 .map(|_| Trit::from_sign((next() % 3) as i8 - 1))
                 .collect();
-            let scales: Vec<f32> = (0..n).map(|_| (next() % 200) as f32 / 100.0 + 0.1).collect();
+            let scales: Vec<f32> = (0..n)
+                .map(|_| (next() % 200) as f32 / 100.0 + 0.1)
+                .collect();
             let shape = GemmShape::new(m, n, k);
 
             let mut want = vec![0.0f32; m * n];

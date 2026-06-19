@@ -168,12 +168,7 @@ pub fn convert_i2s_to_int8(
         }
     }
 
-    Ok(I2sInt8Weights {
-        bytes,
-        scale,
-        n,
-        k,
-    })
+    Ok(I2sInt8Weights { bytes, scale, n, k })
 }
 
 #[cfg(test)]
@@ -272,7 +267,10 @@ mod tests {
         // N=1 → 1 n-tile (pad to 8); K=128 → 4 k-tiles. 4 tiles · 64 bytes.
         assert_eq!(w.num_ntiles(), 1);
         assert_eq!(w.num_ktiles(), 4);
-        assert_eq!(w.bytes.len(), w.num_ntiles() * w.num_ktiles() * IMMA_WTILE_BYTES);
+        assert_eq!(
+            w.bytes.len(),
+            w.num_ntiles() * w.num_ktiles() * IMMA_WTILE_BYTES
+        );
 
         // Round trip the tile interleave back to [N, K] and check trit-for-trit.
         let decoded = decode_imma_to_nk(&w);

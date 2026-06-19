@@ -35,8 +35,8 @@
 //! `f32`-activation contraction that the parity gate covers.
 
 use core::arch::x86_64::{
-    _mm512_loadu_ps, _mm512_mask_sub_ps, _mm512_maskz_mov_ps, _mm512_setzero_ps, _mm512_storeu_ps,
-    _mm_cmpgt_epi8_mask, _mm_loadu_si128, _mm_set1_epi8,
+    _mm_cmpgt_epi8_mask, _mm_loadu_si128, _mm_set1_epi8, _mm512_loadu_ps, _mm512_mask_sub_ps,
+    _mm512_maskz_mov_ps, _mm512_setzero_ps, _mm512_storeu_ps,
 };
 
 use tritium_core::{GemmShape, Trit};

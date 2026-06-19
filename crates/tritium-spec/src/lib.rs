@@ -393,9 +393,7 @@ mod tests {
     #[test]
     fn fused_folds_per_token_scale() {
         let backend = MockBackend;
-        let buf = MockBuffer {
-            trits: vec![1, -1],
-        };
+        let buf = MockBuffer { trits: vec![1, -1] };
         let act = [3.0_f32, -1.0];
         let weight_scales = [2.0_f32];
         let shape = GemmShape { m: 1, n: 1, k: 2 };
@@ -424,9 +422,7 @@ mod tests {
     #[test]
     fn fused_rejects_bad_shapes() {
         let backend = MockBackend;
-        let buf = MockBuffer {
-            trits: vec![1, -1],
-        };
+        let buf = MockBuffer { trits: vec![1, -1] };
         let shape = GemmShape { m: 1, n: 1, k: 2 };
         let mut out = [0.0_f32; 1];
         // act too short

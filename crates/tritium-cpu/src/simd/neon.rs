@@ -34,7 +34,7 @@
 
 use core::arch::aarch64::{
     float32x4_t, vbslq_f32, vcgtq_s32, vcltq_s32, vdupq_n_f32, vdupq_n_s32, vget_low_s16,
-    vld1q_f32, vmovl_s16, vmovl_s8, vnegq_f32, vst1q_f32,
+    vld1q_f32, vmovl_s8, vmovl_s16, vnegq_f32, vst1q_f32,
 };
 
 use tritium_core::{GemmShape, Trit};

@@ -56,19 +56,36 @@ pub enum SafeTensorsError {
 impl fmt::Display for SafeTensorsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SafeTensorsError::TooShort => write!(f, "safetensors: buffer shorter than 8-byte prefix"),
-            SafeTensorsError::BadHeaderLen { declared, available } => {
-                write!(f, "safetensors: header len {declared} exceeds buffer ({available} bytes)")
+            SafeTensorsError::TooShort => {
+                write!(f, "safetensors: buffer shorter than 8-byte prefix")
+            }
+            SafeTensorsError::BadHeaderLen {
+                declared,
+                available,
+            } => {
+                write!(
+                    f,
+                    "safetensors: header len {declared} exceeds buffer ({available} bytes)"
+                )
             }
             SafeTensorsError::Json(e) => write!(f, "safetensors: header JSON: {e}"),
             SafeTensorsError::NotFound(n) => write!(f, "safetensors: tensor `{n}` not found"),
-            SafeTensorsError::OutOfBounds(n) => write!(f, "safetensors: tensor `{n}` offsets out of bounds"),
-            SafeTensorsError::LengthMismatch { name, expected, got } => write!(
+            SafeTensorsError::OutOfBounds(n) => {
+                write!(f, "safetensors: tensor `{n}` offsets out of bounds")
+            }
+            SafeTensorsError::LengthMismatch {
+                name,
+                expected,
+                got,
+            } => write!(
                 f,
                 "safetensors: tensor `{name}` spans {got} bytes, shape+dtype implies {expected}"
             ),
             SafeTensorsError::UnsupportedDtype { name, dtype } => {
-                write!(f, "safetensors: tensor `{name}` has unsupported dtype `{dtype}`")
+                write!(
+                    f,
+                    "safetensors: tensor `{name}` has unsupported dtype `{dtype}`"
+                )
             }
             SafeTensorsError::ShapeOverflow { name } => {
                 write!(f, "safetensors: tensor `{name}` shape overflows usize")
@@ -105,18 +122,18 @@ impl<'a> SafeTensors<'a> {
             return Err(SafeTensorsError::TooShort);
         }
         let n = u64::from_le_bytes(buf[0..8].try_into().unwrap()) as usize;
-        let header_end = 8usize
-            .checked_add(n)
-            .filter(|&e| e <= buf.len())
-            .ok_or(SafeTensorsError::BadHeaderLen {
+        let header_end = 8usize.checked_add(n).filter(|&e| e <= buf.len()).ok_or(
+            SafeTensorsError::BadHeaderLen {
                 declared: n,
                 available: buf.len().saturating_sub(8),
-            })?;
+            },
+        )?;
 
         // Parse as a generic map so the optional `__metadata__` string-map entry
         // (which is not a tensor) can be dropped before typed deserialization.
         let mut raw: BTreeMap<String, serde_json::Value> =
-            serde_json::from_slice(&buf[8..header_end]).map_err(|e| SafeTensorsError::Json(e.to_string()))?;
+            serde_json::from_slice(&buf[8..header_end])
+                .map_err(|e| SafeTensorsError::Json(e.to_string()))?;
         raw.remove("__metadata__");
 
         let mut tensors = BTreeMap::new();
@@ -258,14 +275,20 @@ mod tests {
         assert_eq!(st.dtype("a_bf16"), Some("BF16"));
 
         // bf16 widening is exact for these values.
-        assert_eq!(st.tensor_f32("a_bf16").unwrap(), vec![1.0, -2.0, 0.5, -0.25]);
+        assert_eq!(
+            st.tensor_f32("a_bf16").unwrap(),
+            vec![1.0, -2.0, 0.5, -0.25]
+        );
         assert_eq!(st.tensor_f32("b_f16").unwrap(), vec![9.0, -8.0]);
         assert_eq!(st.tensor_f32("c_f32").unwrap(), vec![3.0, -4.0, 0.125]);
     }
 
     #[test]
     fn errors_are_typed() {
-        assert_eq!(SafeTensors::parse(&[0u8; 4]).unwrap_err(), SafeTensorsError::TooShort);
+        assert_eq!(
+            SafeTensors::parse(&[0u8; 4]).unwrap_err(),
+            SafeTensorsError::TooShort
+        );
 
         // header len past the buffer
         let mut bad = 9999u64.to_le_bytes().to_vec();
@@ -278,7 +301,10 @@ mod tests {
         let header = r#"{"x":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#;
         let st_buf = build(header, &[0u8; 4]);
         let st = SafeTensors::parse(&st_buf).unwrap();
-        assert!(matches!(st.tensor_f32("missing"), Err(SafeTensorsError::NotFound(_))));
+        assert!(matches!(
+            st.tensor_f32("missing"),
+            Err(SafeTensorsError::NotFound(_))
+        ));
 
         // unsupported dtype
         let h2 = r#"{"x":{"dtype":"I64","shape":[1],"data_offsets":[0,8]}}"#;
