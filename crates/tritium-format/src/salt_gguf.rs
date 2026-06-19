@@ -126,7 +126,14 @@ pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
             .ok_or(FormatError::SaltGgufBadFormat)?;
         let blob = bytes.get(start..).ok_or(FormatError::SaltGgufBadFormat)?;
 
-        let plane_bytes = num_blocks(k) * TQ2_0_BLOCK_BYTES;
+        // `k` comes from a u64 GGUF dim (uncapped on 64-bit, unlike the bundle's
+        // u32 `k`). `num_blocks(k) = ⌈k/256⌉ ≤ k/256`, so `·66` cannot wrap usize
+        // for any u64 `k` — but check it anyway so the guard stays sound if the
+        // block constant or `k` source ever changes (the bundle relies on its u32
+        // cap for the same invariant).
+        let plane_bytes = num_blocks(k)
+            .checked_mul(TQ2_0_BLOCK_BYTES)
+            .ok_or(FormatError::SaltGgufBadFormat)?;
         let mut off = 0usize;
         // Each row is ≥ SALT_HEADER_BYTES; cap the reserve so a crafted `rows` cannot
         // preallocate unboundedly before the per-row bounds check below errors.
