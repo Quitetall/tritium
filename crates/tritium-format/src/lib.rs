@@ -34,6 +34,7 @@ mod gguf;
 mod i2s;
 mod i2s_int8;
 mod rows;
+mod safetensors;
 mod salt;
 mod tq1;
 mod tq2;
@@ -50,6 +51,7 @@ pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
+pub use safetensors::{SafeTensors, SafeTensorsError};
 pub use salt::{
     SALT_HEADER_BYTES, SALT_MAGIC, SALT_VERSION, SaltRow, dequant_salt_row, pack_salt_row,
     read_legacy_as_salt, unpack_salt_row,

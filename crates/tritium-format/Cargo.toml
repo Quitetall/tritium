@@ -14,6 +14,9 @@ categories.workspace = true
 [dependencies]
 tritium-core = { workspace = true }
 half = { workspace = true }
+# safetensors header is JSON; serde_json parses it (the fp source reader for SALT).
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

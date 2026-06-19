@@ -853,6 +853,8 @@ version = "0.3.7"
 dependencies = [
  "half",
  "proptest",
+ "serde",
+ "serde_json",
  "tritium-core",
 ]
 
