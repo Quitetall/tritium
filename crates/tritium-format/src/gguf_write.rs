@@ -186,7 +186,9 @@ pub fn write_gguf(
 
     // Data section: each payload at `tensor_data_offset + offset`, zero-padding gaps.
     for (t, &off) in tensors.iter().zip(&offsets) {
-        let abs = (tensor_data_offset + off) as usize;
+        let abs = tensor_data_offset
+            .checked_add(off)
+            .ok_or(GgufError::DimsOverflow)? as usize;
         if out.len() < abs {
             out.resize(abs, 0);
         }
