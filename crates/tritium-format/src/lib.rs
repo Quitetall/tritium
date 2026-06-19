@@ -41,6 +41,7 @@ mod rows;
 mod safetensors;
 mod salt;
 mod salt_bundle;
+mod salt_gguf;
 mod tq1;
 mod tq2;
 
@@ -64,6 +65,10 @@ pub use salt::{
 };
 pub use salt_bundle::{
     SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltTensor, read_salt_bundle, write_salt_bundle,
+};
+pub use salt_gguf::{
+    GGML_TYPE_TRITIUM_SALT, SALT_GGUF_FORMAT_KEY, SALT_GGUF_FORMAT_VALUE, read_salt_gguf,
+    write_salt_gguf,
 };
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};
@@ -109,6 +114,17 @@ pub enum FormatError {
     SaltTooManyPlanes(usize),
     /// A [`SaltRow`]'s `k` did not fit the sidecar's `u32` length field.
     SaltRowTooLong(usize),
+    /// A GGUF container operation (read/write) failed; carries the [`GgufError`].
+    Gguf(GgufError),
+    /// A GGUF buffer was not a tritium SALT-in-GGUF container (missing or wrong
+    /// `tritium.salt.format` marker, or a SALT tensor with malformed dims).
+    SaltGgufBadFormat,
+}
+
+impl From<GgufError> for FormatError {
+    fn from(e: GgufError) -> Self {
+        FormatError::Gguf(e)
+    }
 }
 
 impl fmt::Display for FormatError {
@@ -138,6 +154,10 @@ impl fmt::Display for FormatError {
             }
             FormatError::SaltRowTooLong(k) => {
                 write!(f, "SALT sidecar: row length {k} exceeds the u32 length field")
+            }
+            FormatError::Gguf(e) => write!(f, "GGUF container: {e}"),
+            FormatError::SaltGgufBadFormat => {
+                write!(f, "GGUF buffer is not a tritium SALT-in-GGUF container")
             }
         }
     }

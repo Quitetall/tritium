@@ -94,7 +94,8 @@ enum Command {
         /// for a BitNet b1.58 master).
         #[arg(long, value_enum, default_value_t = quantize::ScaleGroupArg::Block)]
         scale_group: quantize::ScaleGroupArg,
-        /// Output container: `sidecar` (single-file bundle) or `gguf` (not yet implemented).
+        /// Output container: `sidecar` (single-file `.tslb` bundle) or `gguf`
+        /// (GGUF container holding the SALT rows).
         #[arg(long, value_enum, default_value_t = quantize::OutputFormat::Sidecar)]
         format: quantize::OutputFormat,
     },

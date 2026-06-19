@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use tritium_format::{SafeTensors, SaltRow, write_salt_bundle};
+use tritium_format::{SafeTensors, SaltRow, write_salt_bundle, write_salt_gguf};
 use tritium_quantize::{QuantConfig, ScaleGroup, Sensitivity, quantize_tensor};
 
 /// Base-plane scale granularity (CLI mirror of [`ScaleGroup`]).
@@ -30,7 +30,7 @@ pub(crate) enum ScaleGroupArg {
 pub(crate) enum OutputFormat {
     /// Single-file SALT bundle (`.tslb`).
     Sidecar,
-    /// A GGUF with the SALT rows in place of plain-TQ2 (not yet implemented).
+    /// A GGUF container holding the SALT rows (tritium-private tensor type).
     Gguf,
 }
 
@@ -42,12 +42,6 @@ pub(crate) fn run(
     scale_group: ScaleGroupArg,
     format: OutputFormat,
 ) -> Result<()> {
-    if let OutputFormat::Gguf = format {
-        anyhow::bail!(
-            "modified-GGUF output is not implemented yet (tritium-format has no GGUF writer); \
-             use --format sidecar for now"
-        );
-    }
     let sg = match scale_group {
         ScaleGroupArg::Block => ScaleGroup::Block,
         ScaleGroupArg::Tensor => ScaleGroup::Tensor,
@@ -88,18 +82,26 @@ pub(crate) fn run(
 
     let refs: Vec<(&str, &[SaltRow])> =
         quantized.iter().map(|(n, r)| (n.as_str(), r.as_slice())).collect();
-    let bundle = write_salt_bundle(&refs).context("serialize SALT bundle")?;
-    std::fs::write(output, &bundle).with_context(|| format!("write {}", output.display()))?;
+    let (out_bytes, container) = match format {
+        OutputFormat::Sidecar => {
+            (write_salt_bundle(&refs).context("serialize SALT bundle")?, "SALT bundle")
+        }
+        OutputFormat::Gguf => {
+            (write_salt_gguf(&refs).context("serialize SALT GGUF")?, "SALT GGUF")
+        }
+    };
+    std::fs::write(output, &out_bytes).with_context(|| format!("write {}", output.display()))?;
 
     let avg_bpw = if total_params > 0 { total_bits / total_params as f64 } else { 0.0 };
     println!(
-        "quantized {} tensors ({:.2}M params) at {:.3} bpw target, {:?} scale → {} ({:.1} MiB, {:.3} avg bpw)",
+        "quantized {} tensors ({:.2}M params) at {:.3} bpw target, {:?} scale → {} {} ({:.1} MiB, {:.3} avg bpw)",
         names.len(),
         total_params as f64 / 1e6,
         bpw,
         scale_group,
+        container,
         output.display(),
-        bundle.len() as f64 / (1024.0 * 1024.0),
+        out_bytes.len() as f64 / (1024.0 * 1024.0),
         avg_bpw,
     );
     Ok(())
