@@ -42,6 +42,7 @@ mod safetensors;
 mod salt;
 mod salt_bundle;
 mod salt_gguf;
+mod sparse;
 mod tq1;
 mod tq2;
 
@@ -69,6 +70,11 @@ pub use salt_bundle::{
 pub use salt_gguf::{
     GGML_TYPE_TRITIUM_SALT, SALT_GGUF_FORMAT_KEY, SALT_GGUF_FORMAT_VALUE, read_salt_gguf,
     write_salt_gguf,
+};
+pub use sparse::{
+    PlaneRepr, SPARSE_HEADER_BYTES, SPARSE_MAGIC, SPARSE_VERSION, SparsePlane, choose_plane_repr,
+    dequant_sparse_plane, expand_plane_repr, pack_sparse_plane, sparse_dot, sparse_from_tq2_0,
+    sparse_to_tq2_0, unpack_sparse_plane,
 };
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};
