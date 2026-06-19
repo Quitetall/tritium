@@ -1024,6 +1024,11 @@ impl CudaBackend {
         n_split: usize,
         chunk: usize,
     ) -> Result<Vec<f32>, BackendError> {
+        // head_dim/32 must fit the kernel's per-lane acc[SPLIT_MAX_HD_PER_LANE=8].
+        assert!(
+            head_dim <= 256,
+            "split-KV attention: head_dim={head_dim} > 256 overflows acc[8] in the partial kernel"
+        );
         let q_len = n_head * head_dim;
         let d_q = self
             .stream
