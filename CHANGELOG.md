@@ -9,11 +9,14 @@ pre-1.0, so APIs may break between minor versions.
 
 ## [Unreleased] — v0.4.0 (SALT quantization, ADR 0001/0006) — in progress
 
-The CPU-complete core of SALT (Sensitivity-Allocated Layered Ternary) has landed in
-the new **`tritium-quantize`** crate plus a TQ2_0 residual sidecar in `tritium-format`.
-All CPU-only exit gates are green; the GPU multi-plane accumulate kernel, the sparse
-residual plane, the `cli quantize` subcommand, and the model accuracy-vs-bpw curve
-remain before v0.4.0 can tag.
+SALT (Sensitivity-Allocated Layered Ternary) — the **`tritium-quantize`** crate, a TQ2_0
+residual sidecar + whole-model bundle in `tritium-format`, the GPU multi-plane accumulate
+kernel, and the `tritium quantize` CLI. All CPU exit gates green; the GPU kernel matches the
+dequant reference; SALT is validated both ways — `salt@1.585 == deployed I2_S` on BitNet
+b1.58, and a smooth monotone recon-error-vs-bpw curve on a normal fp model (gpt2). Remaining
+before tag: the **sparse residual plane** (storage optimization), the **modified-GGUF
+writer** (sidecar bundle output works), and wiring SALT weights into the **resident GPU
+decode** path. (This cycle also shipped Track-2 decode perf — see below — orthogonal to SALT.)
 
 ### Added
 - **tritium-quantize** (new crate) — the offline SALT quantizer:
@@ -25,10 +28,23 @@ remain before v0.4.0 can tag.
     group buys the most loss-drop-per-bit, `H_g·Δerr / (|g|·log2 3)`, capped at `T_max`.
   - **End-to-end tensor quantizer** (`quantize_tensor`): 256-block groups → global
     allocation → packed SALT rows; pluggable sensitivity (Uniform / Energy / Custom Hessian).
+  - **Per-tensor base plane** (`ScaleGroup::Tensor`): the T=1 base uses one per-tensor
+    AbsMean (residual planes stay per-block), reproducing the deployed BitNet b1.58 I2_S
+    ternary — a QAT-trained master only works through its exact per-tensor clip, so the
+    per-256-block default reconstructs the *latent* weights too faithfully and yields a
+    non-working model. `Block` stays the default for normally-trained masters.
 - **tritium-format** — the **TQ2_0 residual sidecar** (`SaltRow`, `pack_salt_row`,
   `unpack_salt_row`, `read_legacy_as_salt`, `dequant_salt_row`): `T` ternary planes, each a
   standard TQ2_0 row, so a `T=1` row is byte-identical to legacy plain-TQ2 and pre-SALT
-  models load unchanged as flat AbsMean.
+  models load unchanged as flat AbsMean. Plus the whole-model **SALT bundle**
+  (`write_salt_bundle`/`read_salt_bundle`, magic `b"TSLB"`) — a single-file container with a
+  per-tensor index; the reader is hardened against malicious input (no OOB/overflow/OOM).
+- **tritium-cuda** — the **SALT multi-plane GPU GEMM** `salt_mpgemm_tiled_f32`
+  (`Σ_p scale_p·trit_p`, per-block f16 scales read from the weight bytes), matching the
+  `dequant_salt_row` → fp32 reference within 1e-4 (`salt_mpgemm_matches_dequant_reference`).
+- **tritium-cli** — `tritium quantize --input <safetensors> --output <.tslb> --bpw <f>
+  --scale-group {block|tensor}`: SALT-quantize every 2D weight of an fp model to a SALT
+  bundle (validated end-to-end on gpt2). `--format gguf` is reserved (no GGUF writer yet).
 
 ### Validation (CPU exit gates, ADR 0006)
 - `T=1` reduces **exactly** to flat AbsMean (golden + proptest, bit-exact reconstruction).
@@ -40,12 +56,30 @@ remain before v0.4.0 can tag.
   version + magic**, handles pruned / zero-variance / partial-block edges.
 - End-to-end `dequant_salt_row(quantize_tensor(..)) ==` independent re-expansion reference,
   bit-exact; `budget == base` reproduces flat AbsMean through the whole pipeline.
+- **GPU multi-plane accumulate** matches the dequant→fp32 reference within 1e-4.
+- **Accuracy (reframed for a QAT-ternary master, ADR 0006):** the original "within the fp16
+  gap" gate is ill-defined for BitNet b1.58 — its bf16 "master" is *latent* QAT weights, not a
+  usable forward (raw-master perplexity is garbage; the SALT curve *inverts*, higher bpw →
+  worse). Reframed to (a) `salt@1.585 == deployed I2_S` on b1.58 (the per-tensor base
+  reproduces the GGUF weights to f16; `tritium-nn` `salt_accuracy` + `gguf_eval_perplexity`),
+  and (b) a **smooth monotone recon-error-vs-bpw curve on a normal fp model** (gpt2:
+  0.540→0.387 over 1.585→3.0 bpw; `tritium-quantize` `recon_curve`). A full Qwen-arch
+  perplexity curve is the deferred "real accuracy" follow-on.
 
 ### Remaining for v0.4.0
-- GPU multi-plane accumulate kernel `Σ_p s_p·tmatmul` matches the dequant reference (GPU lane).
-- Sparse residual plane == dense; density-threshold switch (GPU lane).
-- `cli quantize` subcommand (fp source model → SALT sidecar).
-- Accuracy-vs-bpw curve within the stated fp16 gap on the real model (model-download lane).
+- **Sparse residual plane** == dense; density-threshold switch (ADR 0001 §5; storage opt — the
+  dense path is correct, on-disk bytes just exceed the logical bpw until this lands).
+- **Modified-GGUF writer** for `tritium quantize --format gguf` (the sidecar bundle works).
+- Wiring SALT weights into the **resident GPU decode** (a `TernaryFormat::Salt` + plane-major
+  upload) so the multi-plane kernel runs end-to-end on device.
+
+### Track-2 decode performance (this cycle; orthogonal to SALT)
+- **CUDA-graph batched M=N decode** (`decode_batch_graph`) — graph-captures the M=N forward;
+  2.2–4.9× over the eager path, bit-identical (`cuda_batch_decode_graph_matches_eager`).
+- **On-device greedy sampling + tiled LM head** (`decode_batch_graph_argmax`) — folds the LM
+  head + argmax into the graph (returns N token ids, not N·vocab logits); an nsys-guided tiled
+  LM head reads the f16 embd table once per 8-row tile. **474 tok/s at N=64 = 3.34× the M=1
+  142** (`cuda_batch_decode_graph_argmax_matches_greedy`).
 
 ## [0.3.7] — 2026-06-17 — Batched M=N decode (N concurrent sequences)
 
