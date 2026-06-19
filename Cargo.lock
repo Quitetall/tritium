@@ -864,12 +864,14 @@ version = "0.3.7"
 dependencies = [
  "half",
  "proptest",
+ "rayon",
  "serde",
  "serde_json",
  "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
  "tritium-format",
+ "tritium-quantize",
  "tritium-runtime",
  "tritium-spec",
 ]

@@ -15,6 +15,8 @@
 //! weights (the upper-bound reference) or a SALT plane-stack dequantized via
 //! [`tritium_format::dequant_salt_row`] (the SALT point at a given bpw).
 
+use rayon::prelude::*;
+
 use crate::error::NnError;
 use crate::ops::quantize_activation_int8;
 
@@ -82,17 +84,26 @@ impl DenseLinear {
         let mut act_scale = vec![0.0f32; m];
         quantize_activation_int8(act, m, k, &mut q_act, &mut act_scale)?;
 
+        // Parallelize over output channels: each `out[r,n]` is an independent dot,
+        // and the per-dot sum order is unchanged, so the result is bit-identical to
+        // the scalar loop — only the channels are distributed across threads. This is
+        // an eval-only projection (the deployed ternary model uses TernaryLinear), so
+        // there is no greedy-gated path to disturb.
+        let weights = &self.weights;
         for r in 0..m {
             let qrow = &q_act[r * k..r * k + k];
             let s = act_scale[r];
-            for n in 0..self.n_out {
-                let wn = &self.weights[n * k..n * k + k];
-                let mut acc = 0.0f32;
-                for kk in 0..k {
-                    acc += qrow[kk] * wn[kk];
-                }
-                out[r * self.n_out + n] = acc * s;
-            }
+            out[r * self.n_out..r * self.n_out + self.n_out]
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(n, slot)| {
+                    let wn = &weights[n * k..n * k + k];
+                    let mut acc = 0.0f32;
+                    for kk in 0..k {
+                        acc += qrow[kk] * wn[kk];
+                    }
+                    *slot = acc * s;
+                });
         }
         Ok(())
     }
