@@ -33,6 +33,8 @@
 //     row_bytes = nb * 66. Trailing trits past K in the final block are padding
 //     and are never read because the K loop stops at K.
 
+#include <cuda_fp16.h>
+
 #define QK_K 256
 #define TQ2_0_BLOCK_BYTES 66
 #define TQ2_0_QS_BYTES 64
@@ -229,5 +231,87 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32(
     }
     if (lane == 0) {
         out[(long long)mi * n + ni] = acc * scales[ni];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SALT multi-plane accumulate (v0.4.0, ADR 0001/0006).
+//
+// A SALT-quantized weight row is a sum of T ternary planes, each a standard TQ2_0
+// row whose per-256-block f16 scale carries that plane's per-group AbsMean scale:
+//
+//     W[ni, k] = Σ_p scale_p[ni, block(k)] · trit_p[ni, k]
+//
+// so the GEMM is
+//
+//     out[mi, ni] = Σ_k act[mi, k] · W[ni, k]
+//                 = Σ_p Σ_k act[mi, k] · scale_p[block(k)] · trit_p[ni, k].
+//
+// This MUST match `tritium_format::dequant_salt_row` → fp32 reference matmul within
+// 1e-4 (the lane-split + warp tree-reduce reorders the K-sum, exactly like the f32
+// tiled kernel above is within 1e-4 of the sequential reference). Unlike the plain
+// decode GEMM, the per-block f16 scale is **read from the weight bytes** and applied
+// per term — the decode path instead fixes the block scale to 1.0 and folds a single
+// per-channel scale at the end.
+//
+// Planes are laid out plane-major: plane p of row ni starts at
+//   weights + p*plane_stride + ni*row_bytes,   with plane_stride = N * row_bytes.
+extern "C" __global__ void salt_mpgemm_tiled_f32(
+    const float* __restrict__ act,             // [M, K]
+    const unsigned char* __restrict__ weights, // [T, N, row_bytes] plane-major
+    float* __restrict__ out,                   // [M, N]
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes,                       // nb * 66
+    const int t_planes,
+    const long long plane_stride) {            // N * row_bytes
+    extern __shared__ float s_act[];
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_act[i] = arow[i];
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+
+    float acc = 0.0f;
+    for (int p = 0; p < t_planes; ++p) {
+        const unsigned char* wrow =
+            weights + (long long)p * plane_stride + (long long)ni * row_bytes;
+        for (int ki = lane; ki < k; ki += WARP_SIZE) {
+            const int block = ki / QK_K;
+            const int e = ki - block * QK_K;
+            const int c = e >> 7;
+            const int mm = e & 31;
+            const int l = (e & 127) >> 5;
+            const int blk = block * TQ2_0_BLOCK_BYTES;
+            const unsigned int code = ((unsigned int)wrow[blk + c * 32 + mm] >> (2 * l)) & 3u;
+            // Per-block f16 scale = the block's last 2 bytes, little-endian, exactly
+            // as `tritium_format::read_scale` reads it. __half2float is exact (f16 ⊂ f32).
+            const unsigned short sbits =
+                (unsigned short)wrow[blk + TQ2_0_QS_BYTES] |
+                ((unsigned short)wrow[blk + TQ2_0_QS_BYTES + 1] << 8);
+            const float s = __half2float(__ushort_as_half(sbits));
+            acc += s_act[ki] * (float)((int)code - 1) * s;
+        }
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = acc;
     }
 }

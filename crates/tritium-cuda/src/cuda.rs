@@ -58,6 +58,10 @@ const KERNEL_NAME_TILED: &str = "tq2_0_add_mpgemm_tiled";
 /// f32-accumulate tiled GEMM for the v0.3.2 graph (perf) path — f64 is 1/64-rate on the
 /// 4090, the decode bottleneck. Not bit-exact; perplexity-gated.
 const KERNEL_NAME_TILED_F32: &str = "tq2_0_add_mpgemm_tiled_f32";
+/// SALT multi-plane accumulate (v0.4.0): sums `Σ_p scale_p·tmatmul(t_p)` over `T`
+/// stacked TQ2_0 planes, reading each block's f16 scale. Matches
+/// [`tritium_format::dequant_salt_row`] → fp32 matmul within 1e-4.
+const KERNEL_NAME_SALT: &str = "salt_mpgemm_tiled_f32";
 /// The IMMA int8 tensor-core prefill kernel (v0.30 WF-A part 2): one warp per
 /// 16×8 output tile, `mma.m16n8k32` int32 accumulate, ternary weights in the
 /// [`TernaryFormat::I2sInt8`] tile interleave.
@@ -243,6 +247,9 @@ pub struct CudaBackend {
     /// The resolved `tq2_0_add_mpgemm_tiled` kernel (warp per output, shared-mem
     /// staged activations) — the decode path.
     func_tiled: CudaFunction,
+    /// The resolved `salt_mpgemm_tiled_f32` kernel (v0.4.0 SALT multi-plane GEMM).
+    #[allow(dead_code)] // used by the P1 spike (`salt_mpgemm_dense`); P2 wires it into the resident decode path.
+    func_salt: CudaFunction,
     /// The resolved `tq2_0_imma_mpgemm` kernel (IMMA int8 tensor-core prefill).
     func_imma: CudaFunction,
     /// The resolved `act_quant_int8_per_token` kernel (on-device W1.58A8 quant).
@@ -327,6 +334,9 @@ impl CudaBackend {
         let func_tiled = module
             .load_function(KERNEL_NAME_TILED)
             .map_err(|e| driver_err("resolve tq2_0_add_tiled kernel", &e))?;
+        let func_salt = module
+            .load_function(KERNEL_NAME_SALT)
+            .map_err(|e| driver_err("resolve salt_mpgemm kernel", &e))?;
 
         // The IMMA kernels live in their own compute_80 PTX (the add kernel's
         // compute_75 PTX cannot assemble `mma.m16n8k32`). Loading it JITs to the
@@ -395,6 +405,7 @@ impl CudaBackend {
             _imma_module: imma_module,
             func,
             func_tiled,
+            func_salt,
             func_imma,
             func_act_quant,
             _decode_module: decode_module,
@@ -1500,6 +1511,81 @@ impl CudaBackend {
             .map_err(|e| driver_err("download out (dtoh)", &e))?;
 
         Ok(())
+    }
+
+    /// SALT multi-plane dense GEMM (v0.4.0 P1): contract `act` `[M, K]` against
+    /// `t_planes` stacked TQ2_0 planes (`weights`, **plane-major** — plane `p`, row
+    /// `ni` at `p*N*row_bytes + ni*row_bytes`), reading each block's f16 scale and
+    /// summing `Σ_p scale_p·tmatmul(t_p)`. Matches [`tritium_format::dequant_salt_row`]
+    /// → fp32 matmul within 1e-4. This is the kernel-correctness entry point; P2
+    /// wires the same launch into the resident decode path.
+    #[cfg(test)]
+    fn salt_mpgemm_dense(
+        &self,
+        act: &[f32],
+        weights: &[u8],
+        m: usize,
+        n: usize,
+        k: usize,
+        t_planes: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let row_bytes = num_blocks(k) * TQ2_0_BLOCK_BYTES;
+        assert_eq!(weights.len(), t_planes * n * row_bytes, "weights len mismatch");
+        assert_eq!(act.len(), m * k, "act len mismatch");
+
+        let d_act = self
+            .stream
+            .clone_htod(act)
+            .map_err(|e| driver_err("htod act", &e))?;
+        let d_w = self
+            .stream
+            .clone_htod(weights)
+            .map_err(|e| driver_err("htod salt weights", &e))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .map_err(|e| driver_err("alloc salt out", &e))?;
+
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), m as u32, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: (k * 4) as u32,
+        };
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let rb_i = row_bytes as i32;
+        let tp_i = t_planes as i32;
+        let plane_stride = (n * row_bytes) as i64;
+
+        let mut launch = self.stream.launch_builder(&self.func_salt);
+        launch
+            .arg(&d_act)
+            .arg(&d_w)
+            .arg(&mut d_out)
+            .arg(&m_i)
+            .arg(&n_i)
+            .arg(&k_i)
+            .arg(&rb_i)
+            .arg(&tp_i)
+            .arg(&plane_stride);
+        // SAFETY: `salt_mpgemm_tiled_f32` declares (const float*, const unsigned char*,
+        // float*, int, int, int, int, int, long long) — pushed here in that exact order
+        // and type. Only `d_out` is mutable. Buffers are sized `M*K` / `T*N*row_bytes` /
+        // `M*N` above; the grid covers `M` rows × `ceil(N/WARPS_PER_BLOCK)` warp-columns
+        // with in-kernel `mi>=m`/`ni>=n` guards, and the `K*4` shared request matches the
+        // kernel's `extern __shared__ float[K]`. All host scalars outlive the launch.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch salt_mpgemm", &e))?;
+        }
+        let mut out = vec![0.0f32; m * n];
+        self.stream
+            .memcpy_dtoh(&d_out, &mut out)
+            .map_err(|e| driver_err("dtoh salt out", &e))?;
+        Ok(out)
     }
 
     /// The fused W1.58A8 path on the IMMA int8 tensor cores: quantize `act` to
@@ -3862,6 +3948,110 @@ mod tests {
             report.failed.len(),
             report.failed
         );
+    }
+
+    // v0.4.0 P1: the SALT multi-plane GPU GEMM must match `dequant_salt_row` → fp32
+    // reference matmul within 1e-4, across T∈{1,2,3}, M∈{1,2}, with each plane's
+    // per-block f16 scales including a zero-variance (scale 0) block and an
+    // outlier-heavy (large scale) block.
+    #[test]
+    fn salt_mpgemm_matches_dequant_reference() {
+        use half::f16;
+        use tritium_core::Trit;
+        use tritium_format::{
+            SaltRow, TQ2_0_BLOCK_BYTES, dequant_salt_row, num_blocks, pack_tq2_0_row,
+        };
+
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping salt mpgemm: no device ({e})");
+                return;
+            }
+        };
+
+        let k = 512usize; // 2 blocks
+        let n = 6usize;
+        let nb = num_blocks(k);
+        let row_bytes = nb * TQ2_0_BLOCK_BYTES;
+
+        let mut s: u64 = 0x5A17_C0DE;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s
+        };
+
+        for m in [1usize, 2] {
+            for t in [1usize, 2, 3] {
+                let act: Vec<f32> = (0..m * k)
+                    .map(|_| (next() >> 40) as f32 / (1u64 << 23) as f32 - 0.5)
+                    .collect();
+
+                // planes[p][ni] = packed TQ2_0 bytes for row ni, plane p.
+                let mut planes: Vec<Vec<Vec<u8>>> = Vec::with_capacity(t);
+                for p in 0..t {
+                    let mut prows = Vec::with_capacity(n);
+                    for _ni in 0..n {
+                        let trits: Vec<Trit> = (0..k)
+                            .map(|_| Trit::from_i8(((next() >> 40) % 3) as i8 - 1).unwrap())
+                            .collect();
+                        let scales: Vec<f16> = (0..nb)
+                            .map(|_| {
+                                let pick = (next() >> 40) % 8;
+                                let v = match pick {
+                                    0 => 0.0,                       // zero-variance block
+                                    1 => 12.5,                      // outlier-heavy block
+                                    other => 0.05 + other as f32 * 0.3,
+                                };
+                                f16::from_f32(v / (p as f32 + 1.0))
+                            })
+                            .collect();
+                        let mut bytes = vec![0u8; row_bytes];
+                        pack_tq2_0_row(&trits, &scales, &mut bytes).unwrap();
+                        prows.push(bytes);
+                    }
+                    planes.push(prows);
+                }
+
+                // Plane-major concatenation: plane p, then row ni.
+                let mut weights = Vec::with_capacity(t * n * row_bytes);
+                for prows in &planes {
+                    for row in prows {
+                        weights.extend_from_slice(row);
+                    }
+                }
+
+                // Reference: dequant each row to fp32 weights, then fp64 matmul.
+                let mut reference = vec![0f64; m * n];
+                for ni in 0..n {
+                    let row = SaltRow {
+                        k,
+                        planes: (0..t).map(|p| planes[p][ni].clone()).collect(),
+                    };
+                    let w = dequant_salt_row(&row).unwrap();
+                    for mi in 0..m {
+                        let mut acc = 0f64;
+                        for kk in 0..k {
+                            acc += act[mi * k + kk] as f64 * w[kk] as f64;
+                        }
+                        reference[mi * n + ni] = acc;
+                    }
+                }
+
+                let gpu = cuda.salt_mpgemm_dense(&act, &weights, m, n, k, t).unwrap();
+                for i in 0..m * n {
+                    let r = reference[i];
+                    let tol = 1e-4 * r.abs().max(1.0);
+                    assert!(
+                        (gpu[i] as f64 - r).abs() <= tol,
+                        "salt mpgemm m={m} t={t} idx={i}: gpu={} ref={r} (tol {tol})",
+                        gpu[i],
+                    );
+                }
+            }
+        }
     }
 
     /// ADR 0002 U2: CPU↔CUDA parity. The *same* committed TQ2_0 vectors run through
