@@ -152,6 +152,11 @@ pub fn sparse_dot(act: &[f32], plane: &SparsePlane) -> Result<f32, FormatError> 
     let mut acc = 0.0f32;
     for (&c, &s) in plane.idx.iter().zip(&plane.sign) {
         let c = c as usize;
+        // Guard out-of-range columns (a manually-built plane could carry one),
+        // matching dequant_sparse_plane — never index act/scales out of bounds.
+        if c >= plane.k {
+            return Err(FormatError::WrongBlockLen { expected: plane.k, got: c });
+        }
         acc += act[c] * plane.scales[c / QK_K].to_f32() * f32::from(s);
     }
     Ok(acc)
@@ -261,6 +266,12 @@ pub fn unpack_sparse_plane(bytes: &[u8]) -> Result<SparsePlane, FormatError> {
         return Err(FormatError::UnsupportedSaltVersion(version));
     }
     let k = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+    // Reject k ≥ 2^31 up front (both write paths enforce it): such a plane is
+    // unserializable by pack_sparse_plane and would amplify this 14-byte header
+    // into a multi-MB allocation via num_blocks(k) below.
+    if k >= SIGN_BIT as usize {
+        return Err(FormatError::SaltRowTooLong(k));
+    }
     let nnz = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
     let nb = num_blocks(k);
 
@@ -450,5 +461,39 @@ mod tests {
         let entry_off = SPARSE_HEADER_BYTES + num_blocks(k) * 2;
         oob[entry_off..entry_off + 4].copy_from_slice(&(k as u32).to_le_bytes());
         assert!(matches!(unpack_sparse_plane(&oob), Err(FormatError::DecodedOutOfRange(_))));
+    }
+
+    #[test]
+    fn sparse_dot_rejects_out_of_range_index_without_panic() {
+        // A manually-built plane with an index == k must error, not panic on act[c].
+        let k = 256;
+        let plane = SparsePlane {
+            k,
+            scales: vec![f16::ONE; num_blocks(k)],
+            idx: vec![k as u32], // out of range
+            sign: vec![1],
+        };
+        let act = vec![0.0f32; k];
+        assert!(matches!(
+            sparse_dot(&act, &plane),
+            Err(FormatError::WrongBlockLen { .. })
+        ));
+    }
+
+    #[test]
+    fn unpack_rejects_oversized_k_before_allocating() {
+        // A 14-byte header declaring k = 2^31 must error up front, not allocate
+        // ~16 MB of scales from num_blocks(2^31).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&SPARSE_MAGIC);
+        buf.push(SPARSE_VERSION);
+        buf.push(0); // pad
+        buf.extend_from_slice(&SIGN_BIT.to_le_bytes()); // k = 2^31
+        buf.extend_from_slice(&0u32.to_le_bytes()); // nnz = 0
+        assert_eq!(buf.len(), SPARSE_HEADER_BYTES);
+        assert!(matches!(
+            unpack_sparse_plane(&buf),
+            Err(FormatError::SaltRowTooLong(_))
+        ));
     }
 }
