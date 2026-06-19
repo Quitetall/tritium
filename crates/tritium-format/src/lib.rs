@@ -36,6 +36,7 @@ mod i2s_int8;
 mod rows;
 mod safetensors;
 mod salt;
+mod salt_bundle;
 mod tq1;
 mod tq2;
 
@@ -55,6 +56,9 @@ pub use safetensors::{SafeTensors, SafeTensorsError};
 pub use salt::{
     SALT_HEADER_BYTES, SALT_MAGIC, SALT_VERSION, SaltRow, dequant_salt_row, pack_salt_row,
     read_legacy_as_salt, unpack_salt_row,
+};
+pub use salt_bundle::{
+    SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltTensor, read_salt_bundle, write_salt_bundle,
 };
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};

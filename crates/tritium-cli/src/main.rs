@@ -24,6 +24,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod backends;
 mod generate;
 mod inspect;
+mod quantize;
 mod report;
 
 /// BitNet 2B4T uses the LLaMA-3 tokenizer, whose end-of-text token is `128001`.
@@ -77,6 +78,25 @@ enum Command {
         /// The report to run.
         #[command(subcommand)]
         report: ReportCommand,
+    },
+    /// SALT-quantize an fp safetensors model to a SALT bundle.
+    Quantize {
+        /// Path to the fp16/bf16/f32 `.safetensors` source model.
+        #[arg(long)]
+        input: PathBuf,
+        /// Path to write the SALT bundle (`.tslb`).
+        #[arg(long)]
+        output: PathBuf,
+        /// Target average bits-per-weight (`1.585` = all base ternary … `~4.75` at T=3).
+        #[arg(long, default_value_t = 2.0)]
+        bpw: f64,
+        /// Base-plane scale granularity: `block` (per-256-block) or `tensor` (per-tensor,
+        /// for a BitNet b1.58 master).
+        #[arg(long, value_enum, default_value_t = quantize::ScaleGroupArg::Block)]
+        scale_group: quantize::ScaleGroupArg,
+        /// Output container: `sidecar` (single-file bundle) or `gguf` (not yet implemented).
+        #[arg(long, value_enum, default_value_t = quantize::OutputFormat::Sidecar)]
+        format: quantize::OutputFormat,
     },
 }
 
@@ -239,6 +259,13 @@ fn main() -> anyhow::Result<()> {
                 format,
             } => report::salt(&input, rows, k, &budgets, sensitivity, format)?,
         },
+        Command::Quantize {
+            input,
+            output,
+            bpw,
+            scale_group,
+            format,
+        } => quantize::run(&input, &output, bpw, scale_group, format)?,
     }
     Ok(())
 }
