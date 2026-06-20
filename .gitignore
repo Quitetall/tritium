@@ -14,6 +14,9 @@
 # autotune + JIT cache (mirrors ~/.cache/tritium at runtime)
 /.tritium-cache
 
+# mimocode executor scratch (node tooling + ephemeral plans; durable plans live in docs/)
+/.mimocode
+
 # python / maturin
 *.whl
 __pycache__/
