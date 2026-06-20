@@ -182,7 +182,7 @@ extern "C" __global__ void __launch_bounds__({block_threads}) tq2_0_imma_mpgemm(
             const int nt = blockIdx.x * N_SUBTILES + nn;        // global n-tile
             const int kt = kt0 + kk;                            // global k-tile
             signed char codes[4];
-            if (kt < num_ktiles) {{
+            if (nt * IMMA_N < n && kt < num_ktiles) {{
                 const long long tile_byte0 =
                     ((long long)nt * num_ktiles + kt) * IMMA_WTILE_BYTES;
                 const unsigned int packed = weights[tile_byte0 + byte_in_tile];
