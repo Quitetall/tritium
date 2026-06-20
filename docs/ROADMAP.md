@@ -54,11 +54,22 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 
 | # | Plan | Scope | Serves | Status |
 |---|------|-------|--------|--------|
-| 0001 | `plans/0001-v0.4.1-split-kv-wiring.md` | Wire the split-KV attention kernels into the resident decode (`md_attn`/`gb_attn`, eager+graph) + re-bench N=1 | v0.4.1 / ADR 0013 | **in-progress** |
-| 0002 | `plans/0002-v0.4.1-imma-oob-fix.md` (to write) | Fix the IMMA tail-shape OOB read (U7); compute-sanitizer clean | v0.4.1 / U7 | todo |
+| 0001 | `plans/0001-v0.4.1-split-kv-wiring.md` | Wire the split-KV attention kernels into the resident decode (`md_attn`/`gb_attn`, eager+graph) | v0.4.1 / ADR 0013 | **done** (`79f4939`+`899b162`) — see Outcome in the plan |
+| 0002 | `plans/0002-v0.4.1-imma-oob-fix.md` (to write) | Fix the IMMA tail-shape OOB read (U7); compute-sanitizer clean | v0.4.1 / U7 | **next** |
 | 0003 | `plans/0003-v0.4.1-tag.md` (to write) | v0.4.1 CHANGELOG + version bump + tag; push v0.4.0+v0.4.1 | v0.4.1 | todo |
 | 0004 | ADR 0014 — BASTION spec-decode design | spec-decode tree-verify scope (no code) | new milestone | todo |
 | … | (mapped as milestones approach) | v0.50→v1.0 tactical breakdown | per ADR | todo |
+
+> **0001 outcome (planner review):** split-KV is correct (graph==eager bit-exact; greedy/parity
+> gates hold) and a real kernel win — nsys shows attention **57.6% → 26.6%** of N=1 GPU time
+> (~2.2× faster), neutral-to-better throughput across N (no high-N regression on clean re-bench).
+> But end-to-end **N=1 throughput stayed ~flat (108→111)** because N=1 is occupancy-bound across
+> the *whole* pipeline (GEMM 35% / rmsnorm 21% / eager lm_head 8% now dominate). The plan's
+> `>120 N=1` criterion was an over-optimistic Amdahl estimate — **corrected**: the success metric
+> for an attention fix is the *attention* share, not N=1 wall-clock. Further N=1 gains are
+> diminishing-returns (whole-pipeline occupancy); the regimes that matter (N≥2, long-ctx, the
+> argmax path) already perform well. **Lesson for future plans:** gate perf work on the *profiled
+> bottleneck's* metric, not a derived end-to-end target.
 
 > Already shipped on `main` above `v0.4.0` (this session, pre-system): rustfmt-1.9.0 reformat
 > (CI fmt gate), U5 fuzz targets + `fuzz/target` untrack, split-KV attention **kernels +
