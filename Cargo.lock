@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-benches"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "divan",
  "half",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cli"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -810,14 +810,14 @@ dependencies = [
 
 [[package]]
 name = "tritium-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "tritium-cpu"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "half",
  "linkme",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cuda"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "cudarc",
  "half",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-format"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "half",
  "proptest",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-nn"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "half",
  "proptest",
@@ -875,11 +875,12 @@ dependencies = [
  "tritium-quantize",
  "tritium-runtime",
  "tritium-spec",
+ "tritium-train",
 ]
 
 [[package]]
 name = "tritium-py"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "pyo3",
  "tritium-core",
@@ -891,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-quantize"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "half",
  "proptest",
@@ -901,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-runtime"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "linkme",
  "tritium-core",
@@ -910,14 +911,14 @@ dependencies = [
 
 [[package]]
 name = "tritium-spec"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "tritium-core",
 ]
 
 [[package]]
 name = "tritium-testkit"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "half",
  "proptest",
@@ -930,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-train"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "tritium-core",

@@ -23,7 +23,7 @@ Planned — **not started**. No `tritium-train` crate exists yet; this milestone
 | No NaN/Inf over ≥1k steps; bf16-master mixed-precision path matches; same seed ⇒ same loss curve | E/D | conformance harness | GPU |
 | Real ternary fine-tune recovers `≥90%` of the lost accuracy gap vs fp16 baseline; loss decreases (convergence smoke) | Pe | vs-reference | model-download |
 
-## Definition of done — tag v0.50.0
+## Definition of done — tag v0.5.0
 
 - [ ] Gradient check: STE backward matches finite-difference numerical gradient within tolerance for **every** trainable op.
 - [ ] Autograd graph reproduces analytic gradients on toy problems.

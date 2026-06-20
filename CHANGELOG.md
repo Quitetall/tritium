@@ -7,6 +7,50 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.0] — 2026-06-20 — Training Core (STE autograd + QAT + optimizer + LoRA + CUDA backward)
+
+The v0.50 milestone (ADR 0007): a single-node training core for ternary BitNet models. New crate
+`tritium-train` — reverse-mode autograd over a flat tape of hand-written `forward`+`vjp` ops,
+validated by finite-difference gradient checks (Gate C) — plus the optimizer, checkpoint, LoRA, the
+CUDA backward kernels, and a heal bridge that drives the training core end-to-end on the real model.
+
+### Added
+- **`tritium-train` crate** (`#![forbid(unsafe_code)]`): a reverse-mode autograd `Tape` over an f32
+  value arena, with hand-written `forward`+`vjp` for STE-quantize (straight-through estimator),
+  ternary matmul, plain dense matmul, bias, squared-ReLU, MSE / softmax-cross-entropy, element-wise
+  add/mul, `detach` (stop-gradient), and `scale_const`. A `gradcheck` harness finite-differences
+  every trainable op — **Gate C green on CPU** (the STE vjp is the exact gradient of the
+  differentiable surrogate `clamp(Wf/s_q)`, not the rounded forward).
+- **AdamW optimizer** (decoupled weight decay, eps-outside-sqrt, bias-corrected) behind a minimal
+  `Optimizer` trait, with a versioned, never-panic **`TOPT` training checkpoint** — optimizer state
+  save/restore is **bit-exact** and a resumed run equals the uninterrupted run; no NaN/Inf over ≥1k
+  steps. (Muon/Lion/Adafactor/… surveyed; AdamW is the baseline, the rest deferred with rationale in
+  `docs/plans/0008`.)
+- **LoRA adapters on a frozen ternary base**, composed from reusable primitives (`dense`/`detach`/
+  `scale_const`): the frozen base receives **exactly zero** gradient, adapter A/B gradients match
+  finite difference, the merge folds into a dense weight correctly, and rank edges `r=1` / `r=full`
+  pass — all proptested.
+- **CUDA f32 backward kernels** (`tritium-cuda`): `ternary_matmul_grad_a/_w/_s`, gradient-checked
+  against the CPU `vjp` oracle (parity ≤1e-4 across shapes incl. tails + multi-block) and
+  `compute-sanitizer memcheck`-clean — **Gate C green on CUDA** (deterministic: one thread per
+  output, no atomics, `--fmad=false` for host bit-parity).
+- **QAT heal bridge**: `TernaryLinear::replace_weights` (re-pack TQ2_0 + upload a re-trained ternary
+  weight in place), `Projection::as_ternary_mut`, and `ModelRunner::invalidate_resident` (drop the
+  cached device-resident decoder so a post-swap forward rebuilds from current weights).
+- **Capstone convergence gate** (`tritium-nn`, GPU+model-gated): the QAT machinery (AdamW + STE +
+  tape) drives a real BitNet-2b4t attention slice's ternary **distillation loss down ≥90%** on real
+  model activations, end-to-end through the bridge (measured ~94.6%), loss-decreases, no-NaN.
+
+### Notes
+- **Scope honesty (ADR 0007 recovery gate):** a *full-model ≥90% perplexity-recovery* gate is not
+  meaningful on BitNet-2b4t — its bf16 "master" is the QAT *latent* weight (garbage when run densely;
+  `salt_accuracy.rs` documents this), it is already per-tensor-QAT-optimal (naive ternary ≈ deployed,
+  so no gap to heal), and layerwise distillation from a short eval slice is underdetermined for
+  2560-wide layers. The capstone therefore certifies **distillation-loss convergence** of the
+  training core on the real model; a true model-wide PPL-recovery gate needs full-model backprop and
+  a non-QAT-latent checkpoint — deferred to v0.60. Full reasoning in `docs/plans/0010`.
+- **Multi-GPU is out of scope** (v0.60): this milestone is single-node.
+
 ## [0.4.1] — 2026-06-20 — Split-KV decode attention + IMMA OOB fix (perf/correctness point-release)
 
 A capability-neutral point-release: it adds no new public API (the SALT staircase is unchanged),
