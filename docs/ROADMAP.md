@@ -11,14 +11,15 @@ and a reviewer can course-correct from the outputs alone.
 |-------|-------|------|----------|
 | **Strategic** | `docs/adr/` | ADRs — the 0.1.0→1.0.0 arc, each milestone's scope + exit gates | permanent (append/amend) |
 | **Index** | `docs/ROADMAP.md` (this file) | the ordered set of tactical plans from *now* → done, with status | living |
-| **Tactical** | `plans/NNNN-*.md` | one detailed, verbatim, gated executable plan per point-release / coherent feature (1–few commits) | per chunk; kept for the audit trail |
+| **Tactical** | `docs/plans/NNNN-*.md` | one detailed, verbatim, gated executable plan per point-release / coherent feature (1–few commits) | per chunk; kept for the audit trail |
 
-`~/.claude/plans/` is the ephemeral session scratch (plan mode); the **durable** plans live in
-`plans/` (version-controlled, diffable, reviewable).
+Everything the executor needs is under **`docs/`** — point the model there. **`docs/EXECUTOR.md`** is the
+single entry point (protocol + which plans to run next + how to report back). `~/.claude/plans/` is
+ephemeral session scratch; the durable plans live in `docs/plans/` (version-controlled, diffable).
 
 ## The per-turn loop
 
-1. **Plan** — the strong model writes the next `plans/NNNN-*.md` (see template below) and flips its
+1. **Plan** — the strong model writes the next `docs/plans/NNNN-*.md` (see template below) and flips its
    row here to `in-progress`.
 2. **Execute** — the weaker model runs the plan step-by-step, pasting the full output of each
    command and the review verdict.
@@ -54,11 +55,19 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 
 | # | Plan | Scope | Serves | Status |
 |---|------|-------|--------|--------|
-| 0001 | `plans/0001-v0.4.1-split-kv-wiring.md` | Wire the split-KV attention kernels into the resident decode (`md_attn`/`gb_attn`, eager+graph) | v0.4.1 / ADR 0013 | **done** (`79f4939`+`899b162`) — see Outcome in the plan |
-| 0002 | `plans/0002-v0.4.1-imma-oob-fix.md` (to write) | Fix the IMMA tail-shape OOB read (U7); compute-sanitizer clean | v0.4.1 / U7 | **next** |
-| 0003 | `plans/0003-v0.4.1-tag.md` (to write) | v0.4.1 CHANGELOG + version bump + tag; push v0.4.0+v0.4.1 | v0.4.1 | todo |
-| 0004 | ADR 0014 — BASTION spec-decode design | spec-decode tree-verify scope (no code) | new milestone | todo |
-| … | (mapped as milestones approach) | v0.50→v1.0 tactical breakdown | per ADR | todo |
+| # | Plan | Scope | Serves | Status | Parallel? |
+|---|------|-------|--------|--------|-----------|
+| 0001 | `docs/plans/0001-v0.4.1-split-kv-wiring.md` | Split-KV attention into the resident decode | v0.4.1 / ADR 0013 | **done** (`79f4939`+`899b162`) | — |
+| 0002 | `docs/plans/0002-v0.4.0-doctests-example.md` | Doctests for the v0.4.0 public API + a runnable SALT example (U9) | v0.4.0 / U9 | **ready** | **A** — CPU, `tritium-format`/`-quantize` + `examples/` only |
+| 0003 | `docs/plans/0003-v0.4.1-imma-oob-fix.md` | Fix the JIT IMMA tail-shape OOB read (U7); compute-sanitizer clean | v0.4.1 / U7 | **ready** | **B** — CUDA, `codegen.rs` only |
+| 0004 | `docs/plans/0004-v0.4.1-release.md` (to write) | v0.4.1 CHANGELOG + version bump; STOP before tag (release = planner/user) | v0.4.1 | blocked-by 0002+0003 | sequential |
+| ADR 0014 | (planner writes) | BASTION spec-decode design | new milestone | todo | — |
+| … | (mapped as milestones approach) | v0.50→v1.0 breakdown | per ADR | todo | — |
+
+> **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
+> JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**
+> (`git worktree add ../tritium-0003 main`) so two executors don't fight one index; otherwise run
+> them sequentially (either order). 0004 runs only after both land + are green.
 
 > **0001 outcome (planner review):** split-KV is correct (graph==eager bit-exact; greedy/parity
 > gates hold) and a real kernel win — nsys shows attention **57.6% → 26.6%** of N=1 GPU time
