@@ -4,13 +4,16 @@
 //! flat tape of explicit ops; each op is a hand-written forward + vector-Jacobian
 //! product (`vjp`), validated by a finite-difference gradient check (Gate C).
 //!
-//! v0.50 skeleton: the [`gradcheck`] harness, the STE-quantize op, and the
-//! ternary-matmul backward (grads w.r.t. activations and per-output scale, with
-//! the trit-grad straight-through-estimated back to the latent f32 weight).
+//! v0.50: the [`gradcheck`] harness, the STE-quantize and ternary-matmul ops, the
+//! CPU op set (bias, squared-ReLU, MSE / softmax-cross-entropy, element-wise
+//! add/mul), and the reverse-mode [`tape`] that composes them into a differentiable
+//! QAT graph (grads w.r.t. activations, weights, scale, and bias).
 #![forbid(unsafe_code)]
 
 pub mod gradcheck;
 pub mod ops;
+pub mod tape;
 pub mod value;
 
+pub use tape::{Tape, ValueId};
 pub use value::Shape;
