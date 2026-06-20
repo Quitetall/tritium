@@ -41,8 +41,8 @@ proceed from outputs alone, "no matter what happens."
 | v0.20 Inference Spine | 0004 | **Done** (tagged) |
 | v0.30 Performance (+ v0.3.1 device-resident, 0013) | 0005 / 0013 | **Done** |
 | v0.40 SALT Quantization | 0006 | **Done** (tagged `v0.4.0`, pushed) |
-| v0.4.1 perf/correctness point-release (split-KV + IMMA fix) | 0013 / — | **In-progress** — plans 0001–0003 done; 0004 (release) ready, untagged |
-| v0.50 Training Core | 0007 | Planned — *optional BLUT cookbook integration (external, AGPL boundary)* |
+| v0.4.1 perf/correctness point-release (split-KV + IMMA fix) | 0013 / — | **Done** (tagged `v0.4.1` @ `202bec1`, pushed; CUDA decode + IMMA gates re-verified on GPU) |
+| v0.50 Training Core | 0007 | **In-progress** — STE+matmul backward (0005) + CPU op set & autograd tape (0006) **done**, Gate C green on CPU; CUDA backward (0007) next |
 | v0.60 Pretraining + Distributed | 0008 | Planned |
 | v0.70 Backend Breadth | 0009 | Planned |
 | v0.80 Interop (`tritium-serve`) | 0010 | Planned — *OpenAI-HTTP server doubles as the LAMU `backend_kind` interface* |
@@ -61,9 +61,12 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0001 | `docs/plans/0001-v0.4.1-split-kv-wiring.md` | Split-KV attention into the resident decode | v0.4.1 / ADR 0013 | **done** (`79f4939`+`899b162`) | — |
 | 0002 | `docs/plans/0002-v0.4.0-doctests-example.md` | Runnable SALT example (U9) | v0.4.0 / U9 | **done** (`a71c48e`) | — |
 | 0003 | `docs/plans/0003-v0.4.1-imma-oob-fix.md` | Fix the JIT IMMA tail-shape OOB read (U7); compute-sanitizer clean | v0.4.1 / U7 | **done** (`13438a4`; memcheck 0 errors) | — |
-| 0004 | `docs/plans/0004-v0.4.1-release.md` | v0.4.1 CHANGELOG + version bump; STOP before tag (release = planner/user) | v0.4.1 | **ready** (unblocked by 0002+0003) | sequential |
+| 0004 | `docs/plans/0004-v0.4.1-release.md` | v0.4.1 CHANGELOG + version bump | v0.4.1 | **done** (`202bec1`, tagged `v0.4.1` + pushed) | sequential |
 | ADR 0014 | `docs/adr/0014-spec-decode-bastion.md` | BASTION spec-decode design (Tritium = verifier) | new capability | **done** (proposed) | — |
-| 0005+ | (planner writes just-in-time) | v0.50→v1.0 breakdown — see **Forward decomposition** below | per ADR | todo | per milestone |
+| 0005 | `docs/plans/0005-v0.50-train-skeleton-ste.md` | tritium-train skeleton: STE + ternary-matmul backward, gradient-checked | v0.50 / ADR 0007 Gate C | **done** (`5030fa3`; CPU) | — |
+| 0006 | `docs/plans/0006-v0.50-cpu-ops-tape.md` | CPU op set (bias/relu²/mse/xent/elementwise) + reverse-mode tape + composed QAT gradient | v0.50 / ADR 0007 Gate C | **done** (`2be9332`; Gate C green on CPU) | — |
+| 0007 | (planner writes just-in-time) | CUDA backward kernels gradient-checked vs CPU vjp + compute-sanitizer | v0.50 / ADR 0007 | **in-progress** (single-GPU) | — |
+| 0008+ | (planner writes just-in-time) | AdamW+checkpoint (0008), LoRA (0009), QAT heal+gate (0010) — see **Forward decomposition** | per ADR | todo | per milestone |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**
