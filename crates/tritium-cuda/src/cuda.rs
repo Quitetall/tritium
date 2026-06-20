@@ -129,6 +129,10 @@ const KERNEL_NAME_ATTN_MDECODE: &str = "gqa_attention_mdecode_f32";
 /// v0.3.8 on-device sampling for the batched decode graph.
 const KERNEL_NAME_LM_HEAD_TILED_F16: &str = "lm_head_tiled_f16";
 const KERNEL_NAME_ARGMAX_ROWS: &str = "argmax_rows_f32";
+/// v0.50 (ADR 0007) f32 training backward kernels for the ternary matmul.
+const KERNEL_NAME_GRAD_A: &str = "ternary_matmul_grad_a";
+const KERNEL_NAME_GRAD_W: &str = "ternary_matmul_grad_w";
+const KERNEL_NAME_GRAD_S: &str = "ternary_matmul_grad_s";
 /// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
 const LMHEAD_ROW_TILE: u32 = 8;
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
@@ -158,6 +162,9 @@ const TQ2_0_IMMA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/tq2_0_imma.
 /// The device-resident decode kernels (v0.3.1), compiled `--fmad=false` so they
 /// reproduce the host f32 ops bit-for-bit. Embedded the same way as the others.
 const DECODE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/decode.ptx"));
+/// The v0.50 training backward kernels (gA/gW/gs), compiled `--fmad=false` so they
+/// match the host CPU vjp oracle bit-for-bit. Embedded the same way as the others.
+const TRAIN_GRAD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/train_grad.ptx"));
 
 /// Map a `cudarc` driver error to a [`BackendError`]. Allocation failures surface
 /// as [`BackendError::OutOfMemory`]; everything else is stringified into
@@ -331,6 +338,18 @@ pub struct CudaBackend {
     /// The resolved `relu2_gate_f32` kernel (BitNet squared-ReLU FFN gate).
     #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
     func_relu2_gate: CudaFunction,
+    /// Loaded v0.50 training backward PTX module (`--fmad=false`), kept alive so its
+    /// gradient functions stay valid.
+    _grad_module: Arc<CudaModule>,
+    /// The resolved `ternary_matmul_grad_a/_w/_s` kernels (f32 backward, ADR 0007).
+    /// Gradient-checked against the `tritium-train` CPU vjp oracle; the QAT training
+    /// path (v0.50) wires them onto resident buffers next.
+    #[allow(dead_code)]
+    func_grad_a: CudaFunction,
+    #[allow(dead_code)]
+    func_grad_w: CudaFunction,
+    #[allow(dead_code)]
+    func_grad_s: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -436,6 +455,20 @@ impl CudaBackend {
             .load_function(KERNEL_NAME_RELU2_GATE)
             .map_err(|e| driver_err("resolve relu2_gate kernel", &e))?;
 
+        // The v0.50 training backward kernels (their own `--fmad=false` PTX, compute_75).
+        let grad_module = ctx
+            .load_module(Ptx::from_src(TRAIN_GRAD_PTX))
+            .map_err(|e| driver_err("load train_grad ptx", &e))?;
+        let func_grad_a = grad_module
+            .load_function(KERNEL_NAME_GRAD_A)
+            .map_err(|e| driver_err("resolve grad_a kernel", &e))?;
+        let func_grad_w = grad_module
+            .load_function(KERNEL_NAME_GRAD_W)
+            .map_err(|e| driver_err("resolve grad_w kernel", &e))?;
+        let func_grad_s = grad_module
+            .load_function(KERNEL_NAME_GRAD_S)
+            .map_err(|e| driver_err("resolve grad_s kernel", &e))?;
+
         let device_name = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_owned());
@@ -470,6 +503,10 @@ impl CudaBackend {
             func_act_quant_tiled,
             func_scale_mul,
             func_relu2_gate,
+            _grad_module: grad_module,
+            func_grad_a,
+            func_grad_w,
+            func_grad_s,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -482,6 +519,241 @@ impl CudaBackend {
     /// Packed bytes per weight row for `k` trits in TQ2_0.
     fn row_bytes(k: usize) -> usize {
         num_blocks(k) * TQ2_0_BLOCK_BYTES
+    }
+
+    /// Reject training-backward shapes whose flat-index products would overflow the
+    /// device's `int` index arithmetic (the kernels form `m*n`, `n*k`, `m*k` as int32),
+    /// which also bounds the `u32` launch grid. A silent `as` truncation would otherwise
+    /// give a wrong answer; BitNet shapes are orders of magnitude below this limit.
+    fn check_grad_launch_bounds(m: usize, n: usize, k: usize) -> Result<(), BackendError> {
+        let lim = i32::MAX as usize;
+        if m.checked_mul(n).is_none_or(|v| v > lim)
+            || n.checked_mul(k).is_none_or(|v| v > lim)
+            || m.checked_mul(k).is_none_or(|v| v > lim)
+        {
+            return Err(BackendError::InvalidInput(format!(
+                "grad shape {m}x{n}x{k}: a flat-index product exceeds i32::MAX (device index overflow)"
+            )));
+        }
+        Ok(())
+    }
+
+    // ── v0.50 training: f32 ternary-matmul backward (ADR 0007, Gate C) ──────────
+    // Each mirrors `tritium_train::ops::matmul::vjp` and is gradient-checked against
+    // it on the GPU lane. htod → launch (one thread per output, sequential reduction,
+    // no atomics) → dtoh. The QAT training path wires these onto resident buffers next.
+
+    /// Device `gA[m,k] = Σ_n gy[m,n]·s[n]·W[n,k]`. `gy`:[M,N], `w`:[N,K], `s`:[N], `ga`:[M,K].
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // gradient-checked today; resident QAT wiring lands next.
+    pub(crate) fn grad_a(
+        &self,
+        gy: &[f32],
+        w: &[f32],
+        s: &[f32],
+        shape: GemmShape,
+        ga: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if gy.len() != m * n || w.len() != n * k || s.len() != n || ga.len() != m * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * k,
+                got: ga.len(),
+            });
+        }
+        Self::check_grad_launch_bounds(m, n, k)?;
+        if m * k == 0 {
+            return Ok(());
+        }
+        let d_gy = self
+            .stream
+            .clone_htod(gy)
+            .map_err(|e| driver_err("grad_a htod gy", &e))?;
+        let d_w = self
+            .stream
+            .clone_htod(w)
+            .map_err(|e| driver_err("grad_a htod w", &e))?;
+        let d_s = self
+            .stream
+            .clone_htod(s)
+            .map_err(|e| driver_err("grad_a htod s", &e))?;
+        let mut d_ga = self
+            .stream
+            .alloc_zeros::<f32>(m * k)
+            .map_err(|e| driver_err("grad_a alloc", &e))?;
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        let threads = THREADS_PER_BLOCK;
+        let cfg = LaunchConfig {
+            grid_dim: (((m * k) as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_grad_a);
+        launch
+            .arg(&d_gy)
+            .arg(&d_w)
+            .arg(&d_s)
+            .arg(&mut d_ga)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        // SAFETY: signature `(const float* gy[M,N], const float* w[N,K], const float*
+        // s[N], float* ga[M,K], int m, int n, int k)`; args pushed in that order; one
+        // thread per gA element, guarded by `idx < m*k`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch grad_a", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_ga, ga)
+            .map_err(|e| driver_err("grad_a dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device `gW[n,k] = Σ_m gy[m,n]·s[n]·A[m,k]`. `gy`:[M,N], `a`:[M,K], `s`:[N], `gw`:[N,K].
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // gradient-checked today; resident QAT wiring lands next.
+    pub(crate) fn grad_w(
+        &self,
+        gy: &[f32],
+        a: &[f32],
+        s: &[f32],
+        shape: GemmShape,
+        gw: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if gy.len() != m * n || a.len() != m * k || s.len() != n || gw.len() != n * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: n * k,
+                got: gw.len(),
+            });
+        }
+        Self::check_grad_launch_bounds(m, n, k)?;
+        if n * k == 0 {
+            return Ok(());
+        }
+        let d_gy = self
+            .stream
+            .clone_htod(gy)
+            .map_err(|e| driver_err("grad_w htod gy", &e))?;
+        let d_a = self
+            .stream
+            .clone_htod(a)
+            .map_err(|e| driver_err("grad_w htod a", &e))?;
+        let d_s = self
+            .stream
+            .clone_htod(s)
+            .map_err(|e| driver_err("grad_w htod s", &e))?;
+        let mut d_gw = self
+            .stream
+            .alloc_zeros::<f32>(n * k)
+            .map_err(|e| driver_err("grad_w alloc", &e))?;
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        let threads = THREADS_PER_BLOCK;
+        let cfg = LaunchConfig {
+            grid_dim: (((n * k) as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_grad_w);
+        launch
+            .arg(&d_gy)
+            .arg(&d_a)
+            .arg(&d_s)
+            .arg(&mut d_gw)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        // SAFETY: signature `(const float* gy[M,N], const float* a[M,K], const float*
+        // s[N], float* gw[N,K], int m, int n, int k)`; args pushed in that order; one
+        // thread per gW element, guarded by `idx < n*k`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch grad_w", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_gw, gw)
+            .map_err(|e| driver_err("grad_w dtoh", &e))?;
+        Ok(())
+    }
+
+    /// Device `gs[n] = Σ_m gy[m,n]·(Σ_k A[m,k]·W[n,k])`. `gy`:[M,N], `a`:[M,K], `w`:[N,K], `gs`:[N].
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // gradient-checked today; resident QAT wiring lands next.
+    pub(crate) fn grad_s(
+        &self,
+        gy: &[f32],
+        a: &[f32],
+        w: &[f32],
+        shape: GemmShape,
+        gs: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if gy.len() != m * n || a.len() != m * k || w.len() != n * k || gs.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: gs.len(),
+            });
+        }
+        Self::check_grad_launch_bounds(m, n, k)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let d_gy = self
+            .stream
+            .clone_htod(gy)
+            .map_err(|e| driver_err("grad_s htod gy", &e))?;
+        let d_a = self
+            .stream
+            .clone_htod(a)
+            .map_err(|e| driver_err("grad_s htod a", &e))?;
+        let d_w = self
+            .stream
+            .clone_htod(w)
+            .map_err(|e| driver_err("grad_s htod w", &e))?;
+        let mut d_gs = self
+            .stream
+            .alloc_zeros::<f32>(n)
+            .map_err(|e| driver_err("grad_s alloc", &e))?;
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        let threads = THREADS_PER_BLOCK;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_grad_s);
+        launch
+            .arg(&d_gy)
+            .arg(&d_a)
+            .arg(&d_w)
+            .arg(&mut d_gs)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        // SAFETY: signature `(const float* gy[M,N], const float* a[M,K], const float*
+        // w[N,K], float* gs[N], int m, int n, int k)`; args pushed in that order; one
+        // thread per gs element, guarded by `ni < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch grad_s", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_gs, gs)
+            .map_err(|e| driver_err("grad_s dtoh", &e))?;
+        Ok(())
     }
 
     /// Device RMSNorm on host slices (htod → launch → dtoh), **bit-matching**
@@ -6467,6 +6739,86 @@ mod tests {
         assert_eq!(cuda_driver_major(13_030), Some(13));
         assert_eq!(cuda_driver_major(14_000), Some(14));
         assert_eq!(cuda_driver_major(0), None);
+    }
+
+    /// Deterministic xorshift f32 fill in `[lo, hi)` — no `rand` dep.
+    fn seeded_f32(seed: u64, len: usize, lo: f32, hi: f32) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..len)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                lo + (s % 1000) as f32 / 1000.0 * (hi - lo)
+            })
+            .collect()
+    }
+
+    /// Gate C on CUDA (ADR 0007): the f32 ternary-matmul backward kernels match the
+    /// `tritium-train` CPU `vjp` oracle within the IMMA `1e-4` bar, across square and
+    /// tail shapes. Self-skips when no GPU is present.
+    #[test]
+    fn train_backward_matches_cpu_vjp() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping train backward parity: no device ({e})");
+                return;
+            }
+        };
+        let tol = Tolerance {
+            relative: 1e-4,
+            bit_exact: false,
+        };
+        // square + tail shapes (non-multiples of the 256-thread block). The (2,300,3)
+        // case pushes N past 256 so grad_s's own grid spans >1 block (blockIdx.x>0).
+        let shapes = [
+            (3, 4, 5),
+            (1, 1, 7),
+            (2, 3, 4),
+            (8, 16, 32),
+            (16, 8, 33),
+            (5, 7, 1),
+            (2, 300, 3),
+        ];
+        for (m, n, k) in shapes {
+            let act = seeded_f32(1, m * k, -2.0, 2.0);
+            // Real-valued (fractional) weights exercise the general contraction the
+            // autograd surrogate path uses; ternary is the special case it subsumes.
+            let w = seeded_f32(2, n * k, -1.0, 1.0);
+            let s = seeded_f32(3, n, 0.1, 2.0);
+            let gy = seeded_f32(4, m * n, -1.5, 1.5);
+
+            // CPU oracle: vjp -> [gA, gW, gs].
+            let cpu = tritium_train::ops::matmul::vjp(&act, &w, &s, m, n, k, &gy);
+            let shape = GemmShape::new(m, n, k);
+
+            let mut ga = vec![0.0f32; m * k];
+            cuda.grad_a(&gy, &w, &s, shape, &mut ga).expect("grad_a");
+            let mut gw = vec![0.0f32; n * k];
+            cuda.grad_w(&gy, &act, &s, shape, &mut gw).expect("grad_w");
+            let mut gs = vec![0.0f32; n];
+            cuda.grad_s(&gy, &act, &w, shape, &mut gs).expect("grad_s");
+
+            for (i, (&g, &c)) in ga.iter().zip(&cpu[0]).enumerate() {
+                assert!(
+                    tol.accepts(g, c),
+                    "grad_a[{i}] {m}x{n}x{k}: gpu {g} vs cpu {c}"
+                );
+            }
+            for (i, (&g, &c)) in gw.iter().zip(&cpu[1]).enumerate() {
+                assert!(
+                    tol.accepts(g, c),
+                    "grad_w[{i}] {m}x{n}x{k}: gpu {g} vs cpu {c}"
+                );
+            }
+            for (i, (&g, &c)) in gs.iter().zip(&cpu[2]).enumerate() {
+                assert!(
+                    tol.accepts(g, c),
+                    "grad_s[{i}] {m}x{n}x{k}: gpu {g} vs cpu {c}"
+                );
+            }
+        }
     }
 
     #[test]

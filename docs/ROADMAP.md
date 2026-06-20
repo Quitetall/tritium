@@ -65,7 +65,7 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | ADR 0014 | `docs/adr/0014-spec-decode-bastion.md` | BASTION spec-decode design (Tritium = verifier) | new capability | **done** (proposed) | — |
 | 0005 | `docs/plans/0005-v0.50-train-skeleton-ste.md` | tritium-train skeleton: STE + ternary-matmul backward, gradient-checked | v0.50 / ADR 0007 Gate C | **done** (`5030fa3`; CPU) | — |
 | 0006 | `docs/plans/0006-v0.50-cpu-ops-tape.md` | CPU op set (bias/relu²/mse/xent/elementwise) + reverse-mode tape + composed QAT gradient | v0.50 / ADR 0007 Gate C | **done** (`2be9332`; Gate C green on CPU) | — |
-| 0007 | (planner writes just-in-time) | CUDA backward kernels gradient-checked vs CPU vjp + compute-sanitizer | v0.50 / ADR 0007 | **in-progress** (single-GPU) | — |
+| 0007 | `docs/plans/0007-v0.50-cuda-backward.md` | CUDA backward kernels (gA/gW/gs) gradient-checked vs CPU vjp + compute-sanitizer | v0.50 / ADR 0007 | **done** (single-GPU; parity 1e-4 + memcheck 0 errors) | — |
 | 0008+ | (planner writes just-in-time) | AdamW+checkpoint (0008), LoRA (0009), QAT heal+gate (0010) — see **Forward decomposition** | per ADR | todo | per milestone |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA

@@ -82,6 +82,9 @@ cuda = ["dep:cudarc", "dep:tritium-format", "dep:linkme", "dep:serde", "dep:serd
 tritium-testkit = { workspace = true }
 tritium-format = { workspace = true }
 tritium-cpu = { workspace = true }
+# The v0.50 training-backward parity gate (ADR 0007 Gate C on CUDA) compares the GPU
+# gradient kernels against this crate's CPU `vjp` oracle. Test-only.
+tritium-train = { workspace = true }
 # `half::f16` is the block-scale type the TQ2_0 packer takes; used only by the
 # parity test's helper that packs trits the same way the testkit does.
 half = { workspace = true }

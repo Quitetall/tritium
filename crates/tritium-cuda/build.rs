@@ -45,6 +45,9 @@ fn main() {
     // attention, …) — compiled with `--fmad=false` so they bit-match the host f32
     // ops (multiply-then-add, not a fused `fma`).
     println!("cargo:rerun-if-changed=kernels/decode.cu");
+    // v0.50 (ADR 0007): f32 training backward kernels (gA/gW/gs for the ternary
+    // matmul). Same `--fmad=false` host-bit-match discipline as the decode kernels.
+    println!("cargo:rerun-if-changed=kernels/train_grad.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -98,6 +101,17 @@ fn main() {
         &nvcc,
         Path::new("kernels/decode.cu"),
         &out_dir.join("decode.ptx"),
+        add_min_arch,
+        &["--fmad=false"],
+    );
+
+    // The v0.50 training backward kernels (f32, ADR 0007). `--fmad=false` so the
+    // multiply/add rounding matches the host CPU vjp oracle bit-for-bit; compute_75
+    // floor (plain f32, no tensor cores).
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/train_grad.cu"),
+        &out_dir.join("train_grad.ptx"),
         add_min_arch,
         &["--fmad=false"],
     );
