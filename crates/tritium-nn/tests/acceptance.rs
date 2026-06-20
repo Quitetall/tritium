@@ -329,27 +329,18 @@ fn cuda_batch_decode_matches_single() {
                 "batch seq0 != seq1 at step {i} vocab {v} (sequences must be independent)"
             );
         }
-        // Split-KV (M=N) vs warp kernel (M=1): different reduction order
-        // (online-softmax warp-shuffle reorders the f32 sum) so logit-level
-        // bit-exactness is not achievable.  Compare argmax tokens instead —
-        // the graph-vs-eager and argmax-vs-greedy gates above already prove
-        // the split-KV path is internally consistent and correct.
-        // MODIFIED BY: mimo 2.5 pro — argmax-level comparison for split-KV
-        let batch_tok = logits[0]
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
-            .0;
-        let single_tok = single[i]
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
-            .0;
+        // Split-KV (M=N) vs warp kernel (M=1): the online-softmax warp-shuffle reorders
+        // the f32 sum, so logit-level bit-exactness is not achievable. Compare the GREEDY
+        // TOKEN instead — the decode-meaningful invariant — via the system's own
+        // `sample_greedy` (NaN-safe, with the exact tie-rule the caller uses) rather than a
+        // reimplemented argmax, so it matches what greedy decode actually emits. Numeric
+        // correctness is already covered by the kernel-level 1e-4 equivalence gate
+        // (attn_split_kv_matches_direct_attention) + the graph==eager bit-exact gate.
+        let batch_tok = tritium_nn::sample_greedy(&logits[0]).expect("non-empty logits");
+        let single_tok = tritium_nn::sample_greedy(&single[i]).expect("non-empty logits");
         assert_eq!(
             batch_tok, single_tok,
-            "batch decode argmax != single-sequence argmax at step {i}: batch={batch_tok} single={single_tok}"
+            "batch decode greedy token != single greedy token at step {i}: batch={batch_tok} single={single_tok}"
         );
     }
     println!(
