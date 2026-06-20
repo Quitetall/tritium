@@ -40,14 +40,15 @@ proceed from outputs alone, "no matter what happens."
 | v0.10 Foundation | 0003 | **Done** (tagged) |
 | v0.20 Inference Spine | 0004 | **Done** (tagged) |
 | v0.30 Performance (+ v0.3.1 device-resident, 0013) | 0005 / 0013 | **Done** |
-| v0.40 SALT Quantization | 0006 | **Done** (tagged `v0.4.0`, local; push pending) |
+| v0.40 SALT Quantization | 0006 | **Done** (tagged `v0.4.0`, pushed) |
+| v0.4.1 perf/correctness point-release (split-KV + IMMA fix) | 0013 / — | **In-progress** — plans 0001–0003 done; 0004 (release) ready, untagged |
 | v0.50 Training Core | 0007 | Planned — *optional BLUT cookbook integration (external, AGPL boundary)* |
 | v0.60 Pretraining + Distributed | 0008 | Planned |
 | v0.70 Backend Breadth | 0009 | Planned |
 | v0.80 Interop (`tritium-serve`) | 0010 | Planned — *OpenAI-HTTP server doubles as the LAMU `backend_kind` interface* |
 | v0.90 Hardening | 0011 | Planned |
 | v1.0 Release | 0012 | Planned |
-| **Spec-decode (BASTION-style tree verify)** | **0014 (to write)** | Planned — *post-v0.4.1; Tritium = verifier, LAMU orchestrates, drafter external* |
+| **Spec-decode (BASTION-style tree verify)** | **0014** | **Proposed (ADR written)** — *post-v0.4.1 point-release; Tritium = verifier, LAMU orchestrates, drafter external* |
 
 ## Tactical plan index (now → done)
 
@@ -58,11 +59,11 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | # | Plan | Scope | Serves | Status | Parallel? |
 |---|------|-------|--------|--------|-----------|
 | 0001 | `docs/plans/0001-v0.4.1-split-kv-wiring.md` | Split-KV attention into the resident decode | v0.4.1 / ADR 0013 | **done** (`79f4939`+`899b162`) | — |
-| 0002 | `docs/plans/0002-v0.4.0-doctests-example.md` | Doctests for the v0.4.0 public API + a runnable SALT example (U9) | v0.4.0 / U9 | **ready** | **A** — CPU, `tritium-format`/`-quantize` + `examples/` only |
-| 0003 | `docs/plans/0003-v0.4.1-imma-oob-fix.md` | Fix the JIT IMMA tail-shape OOB read (U7); compute-sanitizer clean | v0.4.1 / U7 | **ready** | **B** — CUDA, `codegen.rs` only |
-| 0004 | `docs/plans/0004-v0.4.1-release.md` (to write) | v0.4.1 CHANGELOG + version bump; STOP before tag (release = planner/user) | v0.4.1 | blocked-by 0002+0003 | sequential |
-| ADR 0014 | (planner writes) | BASTION spec-decode design | new milestone | todo | — |
-| … | (mapped as milestones approach) | v0.50→v1.0 breakdown | per ADR | todo | — |
+| 0002 | `docs/plans/0002-v0.4.0-doctests-example.md` | Runnable SALT example (U9) | v0.4.0 / U9 | **done** (`a71c48e`) | — |
+| 0003 | `docs/plans/0003-v0.4.1-imma-oob-fix.md` | Fix the JIT IMMA tail-shape OOB read (U7); compute-sanitizer clean | v0.4.1 / U7 | **done** (`13438a4`; memcheck 0 errors) | — |
+| 0004 | `docs/plans/0004-v0.4.1-release.md` | v0.4.1 CHANGELOG + version bump; STOP before tag (release = planner/user) | v0.4.1 | **ready** (unblocked by 0002+0003) | sequential |
+| ADR 0014 | `docs/adr/0014-spec-decode-bastion.md` | BASTION spec-decode design (Tritium = verifier) | new capability | **done** (proposed) | — |
+| 0005+ | (planner writes just-in-time) | v0.50→v1.0 breakdown — see **Forward decomposition** below | per ADR | todo | per milestone |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**
@@ -84,6 +85,64 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 > (CI fmt gate), U5 fuzz targets + `fuzz/target` untrack, split-KV attention **kernels +
 > equivalence gate** (`b5173e9`) + head_dim guard (`9e70354`). Plan 0001 is the *wiring* of those
 > kernels into production.
+
+---
+
+## Forward decomposition (v0.50 → v1.0)
+
+The strategic ADRs **0007–0012** already define each milestone's exit gates + Definition of Done.
+Tactical plans are written **just-in-time** (verbatim against the code as it exists when the
+milestone starts) — writing them all now would be fiction against crates that don't exist yet. So
+this section is the **map**: per milestone, the ordered *entry* tactical plans an executor should
+write/run first, and the hard blocker that gates the milestone. A planner turns each `→` arrow into
+one `docs/plans/NNNN-*.md` when its turn comes.
+
+- **v0.50 Training Core — ADR 0007** *(blocker: GPU + a real fp16 source model + a known-recoverable
+  fine-tune task)*
+  `tritium-train` skeleton + STE autograd for the ternary matmul (finite-difference gradient-check,
+  TDD) → backward kernels for the remaining ternary ops (CPU first, then CUDA; each gradient-checked)
+  → optimizer + bit-exact save/restore (resume==uninterrupted golden) → LoRA on a frozen ternary
+  base (zero-grad-on-base proptest; `r=1` and `r=full` edges) → QAT heal loop + the GPU
+  ≥90%-gap-recovery convergence gate. *(Optional external: a BLUT training cookbook over
+  `tritium-train` — AGPL boundary, cookbook→Tritium only.)*
+- **v0.60 Pretraining + Distributed — ADR 0008** *(blocker: ≥2-GPU cluster; multi-node interconnect
+  for the multi-node path)*
+  Data pipeline (deterministic sharded shuffle, resumable mid-epoch — CPU-testable) → FSDP/DDP
+  gradient/param sharding (N-GPU loss-parity vs 1-GPU) → distributed checkpoint + resharding J≠K →
+  multi-node orchestration + rank-kill fault injection → scaling bench (≥80% efficiency) +
+  from-scratch pretrain smoke.
+- **v0.70 Backend Breadth — ADR 0009** *(blocker: per-platform hardware — Metal box, ROCm GPU,
+  WebGPU/WASM target)*
+  **Freeze + version the conformance vector set first** (the one CPU/CUDA pass) → then one backend
+  crate per plan: `tritium-metal` → `tritium-rocm` → `tritium-wgpu`/`tritium-wasm`, each passing the
+  full conformance set + cross-backend parity + acceptance-model greedy match.
+- **v0.80 Interop — ADR 0010** *(blocker: acceptance model for native-parity gates; ONNX Runtime in
+  CI)*
+  `tritium-serve` (OpenAI-compatible HTTP — **this is also the LAMU `backend_kind` interface**;
+  contract + streaming + concurrency gates) → `tritium-ffi` (C ABI + generated header; C/C++ compile
+  + round-trip + null-arg fuzz + sanitizer) → `tritium-candle` / `tritium-burn` ops → `tritium-onnx`
+  custom op then ORT EP.
+- **v0.90 Hardening — ADR 0011** *(blocker: full per-platform CI matrix + GPU/multi-GPU lanes +
+  model download)*
+  **Full doctest sweep** (the ~27 v0.4.0 public items still lacking `/// # Examples`, the rest of U9
+  — *startable now, good standalone agent task*) → 24h-cumulative fuzz breadth across every parser →
+  full CI build/test matrix → packaging (wheels for manylinux/macOS/Windows + `cargo publish
+  --dry-run`) → mdbook + dead-link check → perf-regression gate enforced on `main` → security review
+  + threat model + `cargo-deny`/SBOM.
+- **v1.0 Release — ADR 0012** *(blocker: real model end-to-end in a fresh env; GPU)*
+  `cargo-semver-checks` baseline + public API/C-ABI freeze → re-run every prior gate on the release
+  commit → third-party-reproducible quickstart + model zoo + benchmark report → capstone fresh-env
+  e2e (install → infer → SALT-quantize → fine-tune).
+- **Spec-decode (BASTION) — ADR 0014** *(post-v0.4.1 point-release; blocker for the speedup gate: an
+  external block-diffusion drafter; correctness gates need only a mock drafter)*
+  Tree-masked verify attention (sibling of split-KV) → shared-prefix KV + provisional
+  commit/rollback → accept logic + losslessness gates (greedy + sampling, mock drafter) → memcheck →
+  *(with a real external drafter)* end-to-end speedup bench at the roofline knee.
+
+**Convention reminder:** milestone work is gate-blocked, not date-blocked — no work on milestone N+1
+merges until N's gate is green and tagged (ADR 0002). A milestone whose hard blocker (GPU count,
+per-platform HW, model download) is unavailable runs its load-bearing gate as a **documented manual
+gate** on borrowed hardware before tagging.
 
 ---
 
