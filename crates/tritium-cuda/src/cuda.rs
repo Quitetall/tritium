@@ -88,6 +88,10 @@ const KERNEL_NAME_ATTN: &str = "gqa_attention_decode_f32";
 /// Flash-decoding (split-KV) attention pair — the low-N occupancy fix.
 const KERNEL_NAME_ATTN_SPLIT_PARTIAL: &str = "gqa_attention_split_partial_f32";
 const KERNEL_NAME_ATTN_COMBINE: &str = "gqa_attention_combine_f32";
+/// Keys per split-KV attention chunk. Fixed (not ctx-dependent) so the captured
+/// graph's grid `n·n_head·ceil(max_ctx/CHUNK)` is valid for every decode step.
+// WIRED BY: mimo 2.5 pro — split-KV attention into M=N decode (plans/0001)
+const ATTN_SPLIT_CHUNK: usize = 64;
 /// On-device int8 activation quant for the tiled (TQ2_0) decode GEMM (v0.3.1) —
 /// bit-matches `ops::quantize_activation_int8` (int8 kept as f32 + per-token scale).
 const KERNEL_NAME_ACT_QUANT_TILED: &str = "act_quant_tiled_f32";
@@ -1489,6 +1493,8 @@ impl CudaBackend {
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
             f_attn_mdecode: f(dm, KERNEL_NAME_ATTN_MDECODE)?,
+            f_attn_split_partial: f(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
+            f_attn_combine: f(dm, KERNEL_NAME_ATTN_COMBINE)?,
             d_token_embd,
             d_token_embd_f16,
             d_output_norm,
@@ -3016,7 +3022,10 @@ pub struct CudaDecodeModel {
     f_attn_batch: CudaFunction,
     f_lm_head_f16: CudaFunction,
     f_kv_append_mdecode: CudaFunction,
+    #[allow(dead_code)] // kept for fallback; split-KV replaced it in the M=N path
     f_attn_mdecode: CudaFunction,
+    f_attn_split_partial: CudaFunction,
+    f_attn_combine: CudaFunction,
     // Dense device weights (uploaded once).
     d_token_embd: CudaSlice<f32>,
     /// f16 copy of `token_embd` (the GGUF's native precision) for the graph LM head — it
@@ -4466,6 +4475,10 @@ impl CudaDecodeModel {
             d_qact: alloc(n * self.n_ff, "batch d_qact")?,
             d_act_scale: alloc(n, "batch d_act_scale")?,
             d_scores: alloc(n * self.n_head * self.max_ctx, "batch d_scores")?,
+            d_attn_partials: alloc(
+                n * self.n_head * self.max_ctx.div_ceil(ATTN_SPLIT_CHUNK) * (self.head_dim + 2),
+                "batch d_attn_partials",
+            )?,
             d_h: alloc(self.n_embd, "batch d_h")?,
             d_logits: alloc(self.vocab, "batch d_logits")?,
             d_logits_batch: alloc(n * self.vocab, "batch d_logits_batch")?,
@@ -4627,12 +4640,13 @@ impl CudaDecodeModel {
             )?;
             Self::md_attn(
                 s,
-                &self.f_attn_mdecode,
+                &self.f_attn_split_partial,
+                &self.f_attn_combine,
                 &batch.d_q,
                 &batch.kv_k[li],
                 &batch.kv_v[li],
                 &mut batch.d_attn,
-                &mut batch.d_scores,
+                &mut batch.d_attn_partials,
                 &batch.d_positions,
                 max_ctx,
                 n_head,
@@ -4841,12 +4855,13 @@ impl CudaDecodeModel {
     #[allow(clippy::too_many_arguments)]
     fn md_attn(
         s: &Arc<CudaStream>,
-        f: &CudaFunction,
+        f_partial: &CudaFunction,
+        f_combine: &CudaFunction,
         q: &CudaSlice<f32>,
         k: &CudaSlice<f32>,
         v: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
-        scores: &mut CudaSlice<f32>,
+        partials: &mut CudaSlice<f32>,
         positions: &CudaSlice<i32>,
         max_ctx: usize,
         n_head: usize,
@@ -4855,36 +4870,67 @@ impl CudaDecodeModel {
         scale: f32,
         n: usize,
     ) -> Result<(), BackendError> {
-        let (mc_i, nh_i, nhkv_i, hd_i, n_i) = (
+        let n_split = max_ctx.div_ceil(ATTN_SPLIT_CHUNK);
+        let (mc_i, nh_i, nhkv_i, hd_i, n_i, ns_i, ck_i) = (
             max_ctx as i32,
             n_head as i32,
             n_head_kv as i32,
             head_dim as i32,
             n as i32,
+            n_split as i32,
+            ATTN_SPLIT_CHUNK as i32,
         );
-        let cfg = LaunchConfig {
-            grid_dim: (((n * n_head) as u32).div_ceil(8), 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut l = s.launch_builder(f);
-        l.arg(q)
-            .arg(k)
-            .arg(v)
-            .arg(out)
-            .arg(scores)
-            .arg(positions)
-            .arg(&mc_i)
-            .arg(&nh_i)
-            .arg(&nhkv_i)
-            .arg(&hd_i)
-            .arg(&scale)
-            .arg(&n_i);
-        // SAFETY: `gqa_attention_mdecode_f32(q, k, v, out, scores, positions, max_ctx, n_head, n_head_kv, head_dim, scale, n)`.
-        #[allow(unsafe_code)]
-        unsafe {
-            l.launch(cfg)
-                .map_err(|e| driver_err("launch mdecode attn", &e))?;
+        // Partial: one warp (32 threads) per (row, head, split).
+        {
+            let cfg = LaunchConfig {
+                grid_dim: ((n * n_head * n_split) as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut l = s.launch_builder(f_partial);
+            l.arg(q)
+                .arg(k)
+                .arg(v)
+                .arg(&mut *partials)
+                .arg(positions)
+                .arg(&mc_i)
+                .arg(&nh_i)
+                .arg(&nhkv_i)
+                .arg(&hd_i)
+                .arg(&scale)
+                .arg(&n_i)
+                .arg(&ns_i)
+                .arg(&ck_i);
+            // SAFETY: matches `gqa_attention_split_partial_f32(q, k, v, partials, positions,
+            // max_ctx, n_head, n_head_kv, head_dim, scale, n, n_split, chunk)`; only `partials`
+            // mutable; partials is `n·n_head·n_split·(head_dim+2)`; grid covers n·n_head·n_split warps.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch md split partial", &e))?;
+            }
+        }
+        // Combine: one warp per (row, head).
+        {
+            let cfg = LaunchConfig {
+                grid_dim: ((n * n_head) as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut l = s.launch_builder(f_combine);
+            l.arg(&*partials)
+                .arg(out)
+                .arg(&nh_i)
+                .arg(&hd_i)
+                .arg(&n_i)
+                .arg(&ns_i);
+            // SAFETY: matches `gqa_attention_combine_f32(partials, out, n_head, head_dim, n, n_split)`;
+            // only `out` mutable; out is `n·n_head·head_dim`; grid covers n·n_head warps.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg)
+                    .map_err(|e| driver_err("launch md split combine", &e))?;
+            }
         }
         Ok(())
     }
@@ -5145,6 +5191,7 @@ impl CudaDecodeModel {
             d_qact: dptr(&batch.d_qact, s),
             d_act_scale: dptr(&batch.d_act_scale, s),
             d_scores: dptr(&batch.d_scores, s),
+            d_attn_partials: dptr(&batch.d_attn_partials, s),
             d_cos: dptr(&self.d_cos, s),
             d_sin: dptr(&self.d_sin, s),
             d_token_embd: dptr(&self.d_token_embd, s),
@@ -5216,7 +5263,7 @@ impl CudaDecodeModel {
             l.kv_k,
             l.kv_v,
             p.d_attn,
-            p.d_scores,
+            p.d_attn_partials,
             p.d_positions,
             n,
         )?;
@@ -5430,41 +5477,68 @@ impl CudaDecodeModel {
         k: sys::CUdeviceptr,
         v: sys::CUdeviceptr,
         out: sys::CUdeviceptr,
-        scores: sys::CUdeviceptr,
+        partials: sys::CUdeviceptr,
         positions: sys::CUdeviceptr,
         n: usize,
     ) -> Result<(), BackendError> {
-        let (mc_i, nh_i, nhkv_i, hd_i, n_i) = (
+        let n_split = self.max_ctx.div_ceil(ATTN_SPLIT_CHUNK);
+        let (mc_i, nh_i, nhkv_i, hd_i, n_i, ns_i, ck_i) = (
             self.max_ctx as i32,
             self.n_head as i32,
             self.n_head_kv as i32,
             self.head_dim as i32,
             n as i32,
+            n_split as i32,
+            ATTN_SPLIT_CHUNK as i32,
         );
         let scale = self.attn_scale;
-        let grid = (((n * self.n_head) as u32).div_ceil(8), 1, 1);
-        let mut params = [
-            pp(&q),
-            pp(&k),
-            pp(&v),
-            pp(&out),
-            pp(&scores),
-            pp(&positions),
-            pp(&mc_i),
-            pp(&nh_i),
-            pp(&nhkv_i),
-            pp(&hd_i),
-            pp(&scale),
-            pp(&n_i),
-        ];
-        raw_launch(
-            self.batch_raw().attn,
-            grid,
-            (256, 1, 1),
-            0,
-            self.cap_stream.cu_stream(),
-            &mut params,
-        )
+        let cs = self.cap_stream.cu_stream();
+        {
+            let grid = ((n * self.n_head * n_split) as u32, 1, 1);
+            let mut params = [
+                pp(&q),
+                pp(&k),
+                pp(&v),
+                pp(&partials),
+                pp(&positions),
+                pp(&mc_i),
+                pp(&nh_i),
+                pp(&nhkv_i),
+                pp(&hd_i),
+                pp(&scale),
+                pp(&n_i),
+                pp(&ns_i),
+                pp(&ck_i),
+            ];
+            raw_launch(
+                self.batch_raw().attn_split_partial,
+                grid,
+                (32, 1, 1),
+                0,
+                cs,
+                &mut params,
+            )?;
+        }
+        {
+            let grid = ((n * self.n_head) as u32, 1, 1);
+            let mut params = [
+                pp(&partials),
+                pp(&out),
+                pp(&nh_i),
+                pp(&hd_i),
+                pp(&n_i),
+                pp(&ns_i),
+            ];
+            raw_launch(
+                self.batch_raw().attn_combine,
+                grid,
+                (32, 1, 1),
+                0,
+                cs,
+                &mut params,
+            )?;
+        }
+        Ok(())
     }
 
     fn gb_residual(
@@ -6150,7 +6224,10 @@ struct BatchRawKernels {
     scale: sys::CUfunction,
     rope: sys::CUfunction,
     kv_append: sys::CUfunction,
+    #[allow(dead_code)] // kept for fallback; split-KV replaced it
     attn: sys::CUfunction,
+    attn_split_partial: sys::CUfunction,
+    attn_combine: sys::CUfunction,
     residual: sys::CUfunction,
     relu2: sys::CUfunction,
     tiled: sys::CUfunction,
@@ -6202,6 +6279,8 @@ impl BatchRawKernels {
             rope: get(dm, KERNEL_NAME_ROPE_BATCH)?,
             kv_append: get(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
             attn: get(dm, KERNEL_NAME_ATTN_MDECODE)?,
+            attn_split_partial: get(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
+            attn_combine: get(dm, KERNEL_NAME_ATTN_COMBINE)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
@@ -6264,7 +6343,9 @@ struct BatchPtrs {
     d_gate_sn: sys::CUdeviceptr,
     d_qact: sys::CUdeviceptr,
     d_act_scale: sys::CUdeviceptr,
+    #[allow(dead_code)] // kept for fallback; split-KV partials replaced it
     d_scores: sys::CUdeviceptr,
+    d_attn_partials: sys::CUdeviceptr,
     d_cos: sys::CUdeviceptr,
     d_sin: sys::CUdeviceptr,
     d_token_embd: sys::CUdeviceptr,
@@ -6302,6 +6383,8 @@ pub struct BatchKv {
     d_qact: CudaSlice<f32>,
     d_act_scale: CudaSlice<f32>,
     d_scores: CudaSlice<f32>,
+    /// Split-KV attention partials `[n · n_head · S · (head_dim+2)]`, `S = ceil(max_ctx/ATTN_SPLIT_CHUNK)`.
+    d_attn_partials: CudaSlice<f32>,
     d_h: CudaSlice<f32>,
     d_logits: CudaSlice<f32>,
     /// `[n, vocab]` logits scratch for the on-device-sampling graph (the batched LM head
