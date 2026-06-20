@@ -169,6 +169,21 @@ impl ModelRunner {
         }
     }
 
+    /// Drop the device-resident decoder (if built) so the next forward rebuilds it from
+    /// the *current* weights. Call after mutating a layer's weights in place (e.g. a QAT
+    /// [`replace_weights`](crate::layers::TernaryLinear::replace_weights) swap, plan
+    /// 0010) — the resident decoder holds its own device copies and would otherwise serve
+    /// stale weights. Without the `cuda` feature this is a no-op; with it on, it clears the
+    /// resident slot + re-probe flag (on a non-CUDA backend that slot was never built, so
+    /// the next forward just re-probes once — harmless).
+    pub fn invalidate_resident(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            self.resident = None;
+            self.resident_probed = false;
+        }
+    }
+
     /// Run one prefill / decode step over `tokens` at absolute positions
     /// `positions`, returning the next-token logits `[vocab]` for the last token.
     ///

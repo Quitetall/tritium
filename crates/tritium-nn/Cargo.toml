@@ -38,6 +38,9 @@ tritium-cpu = { workspace = true }
 # SALT accuracy harness (tests/salt_accuracy.rs): quantize the bf16 master and run
 # perplexity through the host forward. Test-only, not a runtime dependency.
 tritium-quantize = { workspace = true }
+# v0.50 QAT heal gate (tests/qat_heal_gate.rs): STE + AdamW + LoRA to heal a layer's
+# induced perplexity gap. Test-only (the train crate is single-node, no runtime tie-in).
+tritium-train = { workspace = true }
 
 # `cargo test -p tritium-nn --features cuda` enables the CUDA backend (and its
 # build.rs `nvcc` PTX compile) so the GPU acceptance + CPU↔CUDA parity tests in

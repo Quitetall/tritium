@@ -66,4 +66,13 @@ impl Projection {
             Projection::Dense(_) => None,
         }
     }
+
+    /// Mutable access to the ternary projection, or `None` if dense. Used by QAT
+    /// healing to swap a re-trained ternary weight back in (plan 0010).
+    pub fn as_ternary_mut(&mut self) -> Option<&mut TernaryLinear> {
+        match self {
+            Projection::Ternary(l) => Some(l),
+            Projection::Dense(_) => None,
+        }
+    }
 }

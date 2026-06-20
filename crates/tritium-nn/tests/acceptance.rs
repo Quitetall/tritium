@@ -322,10 +322,15 @@ fn cuda_batch_decode_matches_single() {
             .expect("decode_batch");
         assert_eq!(logits.len(), 2);
         // Sequences in the same batch must be independent (bit-exact).
-        for v in 0..logits[0].len() {
+        assert_eq!(
+            logits[0].len(),
+            logits[1].len(),
+            "per-sequence logit length mismatch"
+        );
+        for (v, (a, b)) in logits[0].iter().zip(&logits[1]).enumerate() {
             assert_eq!(
-                logits[0][v].to_bits(),
-                logits[1][v].to_bits(),
+                a.to_bits(),
+                b.to_bits(),
                 "batch seq0 != seq1 at step {i} vocab {v} (sequences must be independent)"
             );
         }

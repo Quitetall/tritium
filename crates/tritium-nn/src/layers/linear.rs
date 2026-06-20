@@ -66,6 +66,21 @@ impl TernaryLinear {
         k_in: usize,
         weight_scale: f32,
     ) -> Result<Self, NnError> {
+        let packed = Self::pack_rows(trits, n_out, k_in)?;
+        let shape = GemmShape::new(0, n_out, k_in);
+        let weights = backend.upload_weights(&packed, shape, TernaryFormat::Tq2_0)?;
+
+        Ok(Self {
+            n_out,
+            k_in,
+            scales: vec![weight_scale; n_out],
+            weights,
+        })
+    }
+
+    /// Re-pack `[n_out, k_in]` ternary `trits` to TQ2_0 (one `1.0` f16 block scale per
+    /// 256-trit block, so the unpacked values are the raw trits) and validate the shape.
+    fn pack_rows(trits: &[Trit], n_out: usize, k_in: usize) -> Result<Vec<u8>, NnError> {
         let expected = n_out.checked_mul(k_in).ok_or(NnError::Shape {
             expected: usize::MAX,
             got: trits.len(),
@@ -76,39 +91,50 @@ impl TernaryLinear {
                 got: trits.len(),
             });
         }
-
-        // Per-row TQ2_0: one f16 block scale per 256-trit block, all 1.0 so the
-        // unpacked trits are the raw weights (the per-channel scale is applied by
-        // the backend from `scales`, never from the block scale).
+        // `k_in == 0` would make the per-row `chunks_exact` ill-defined.
+        if k_in == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: 0,
+            });
+        }
         let nb = num_blocks(k_in);
         let row_bytes = nb * TQ2_0_BLOCK_BYTES;
         let block_scales = vec![f16::ONE; nb];
         let mut packed = vec![0u8; n_out * row_bytes];
-        for (row, out_row) in trits
-            .chunks_exact(k_in.max(1))
-            .zip(packed.chunks_mut(row_bytes))
-        {
-            // `k_in == 0` would make `chunks_exact` ill-defined; reject it as a
-            // shape error rather than packing an empty layer.
-            if k_in == 0 {
-                return Err(NnError::Shape {
-                    expected: 1,
-                    got: 0,
-                });
-            }
+        for (row, out_row) in trits.chunks_exact(k_in).zip(packed.chunks_mut(row_bytes)) {
             pack_tq2_0_row(row, &block_scales, out_row)
                 .map_err(|e| NnError::Backend(e.to_string()))?;
         }
+        Ok(packed)
+    }
 
-        let shape = GemmShape::new(0, n_out, k_in);
-        let weights = backend.upload_weights(&packed, shape, TernaryFormat::Tq2_0)?;
-
-        Ok(Self {
-            n_out,
-            k_in,
-            scales: vec![weight_scale; n_out],
-            weights,
-        })
+    /// Re-pack `trits` (`[n_out, k_in]`) and upload, replacing this layer's weight and
+    /// per-output-channel `scales` in place. The QAT heal (plan 0010) uses this to swap
+    /// a re-trained ternary weight back into a loaded model; `scales` is the per-row
+    /// quantization scale `s_q` (length `n_out`), applied by the backend GEMM as
+    /// `scales[n] · Σ_k q_act · trit[n,k]`.
+    ///
+    /// # Errors
+    /// [`NnError::Shape`] if `trits.len() != n_out*k_in` or `scales.len() != n_out`, or
+    /// [`NnError::Backend`] if packing or the upload fails.
+    pub fn replace_weights(
+        &mut self,
+        backend: &dyn TernaryBackend,
+        trits: &[Trit],
+        scales: Vec<f32>,
+    ) -> Result<(), NnError> {
+        if scales.len() != self.n_out {
+            return Err(NnError::Shape {
+                expected: self.n_out,
+                got: scales.len(),
+            });
+        }
+        let packed = Self::pack_rows(trits, self.n_out, self.k_in)?;
+        let shape = GemmShape::new(0, self.n_out, self.k_in);
+        self.weights = backend.upload_weights(&packed, shape, TernaryFormat::Tq2_0)?;
+        self.scales = scales;
+        Ok(())
     }
 
     /// GEMM shape for an `m`-row activation batch through this layer.
