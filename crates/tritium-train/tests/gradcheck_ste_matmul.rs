@@ -1,7 +1,7 @@
 //! Gate C (ADR 0007): STE + ternary-matmul backward vs central finite difference.
 
 use tritium_train::gradcheck::{GradCheckCfg, check_op};
-use tritium_train::ops::{matmul, ste};
+use tritium_train::ops::{dense, matmul, ste};
 
 // Canonical fixture: M=3, N=4, K=5. Weights straddle the clamp band so the STE
 // mask (pass-through vs saturated) is exercised in both states.
@@ -86,4 +86,21 @@ fn ternary_matmul_grad_wrt_act_and_scale() {
         GradCheckCfg::default(),
     )
     .expect("ternary matmul wrt act and scale must match finite difference");
+}
+
+#[test]
+fn dense_matmul_grad_wrt_x_and_w() {
+    // The plain dense matmul (the LoRA building block): Y[m,n] = Σ_k X[m,k]·W[n,k].
+    // Differentiable in both inputs, so check both against central finite difference.
+    let x = seeded(5, M * K, -2.0, 2.0);
+    let w = seeded(6, N * K, -2.0, 2.0);
+    let inputs = vec![x, w];
+    check_op(
+        |ins| dense::forward(ins[0], ins[1], M, N, K),
+        |ins, g| dense::vjp(ins[0], ins[1], M, N, K, g),
+        &inputs,
+        &[0, 1],
+        GradCheckCfg::default(),
+    )
+    .expect("dense matmul wrt X and W must match finite difference");
 }

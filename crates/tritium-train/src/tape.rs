@@ -12,7 +12,7 @@
 //! the `ste` module). The graph this tape differentiates is therefore the smooth
 //! surrogate model; `round` is a forward-only QAT detail layered on later (ADR 0007).
 
-use crate::ops::{act, bias, elementwise, loss, matmul, ste};
+use crate::ops::{act, bias, dense, elementwise, loss, matmul, ste};
 
 /// Index of a value buffer in a [`Tape`]'s arena.
 pub type ValueId = usize;
@@ -120,6 +120,45 @@ impl Tape {
             vec![wf, s_q],
             out,
             Box::new(move |ins, g| ste::quantize_vjp(ins[0], ins[1], rows, cols, g)),
+        )
+    }
+
+    /// Plain dense matmul `Y[m,n] = Σ_k X[m,k]·W[n,k]` (no scale, real `f32`).
+    pub fn dense_matmul(
+        &mut self,
+        x: ValueId,
+        w: ValueId,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> ValueId {
+        let out = dense::forward(&self.values[x], &self.values[w], m, n, k);
+        self.record(
+            vec![x, w],
+            out,
+            Box::new(move |ins, g| dense::vjp(ins[0], ins[1], m, n, k, g)),
+        )
+    }
+
+    /// Stop-gradient: forwards `x` unchanged, but blocks the backward pass (its input
+    /// receives zero gradient). This is how a frozen base is held constant — the leaves
+    /// behind a `detach` train nothing.
+    pub fn detach(&mut self, x: ValueId) -> ValueId {
+        let out = self.values[x].clone();
+        self.record(
+            vec![x],
+            out,
+            Box::new(|ins, _g| vec![vec![0.0; ins[0].len()]]),
+        )
+    }
+
+    /// Multiply by a compile-time-constant scalar `c`: `Y = c·X`, `vjp = c·g`.
+    pub fn scale_const(&mut self, x: ValueId, c: f32) -> ValueId {
+        let out: Vec<f32> = self.values[x].iter().map(|&v| v * c).collect();
+        self.record(
+            vec![x],
+            out,
+            Box::new(move |_ins, g| vec![g.iter().map(|&gv| gv * c).collect()]),
         )
     }
 

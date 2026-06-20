@@ -42,7 +42,7 @@ proceed from outputs alone, "no matter what happens."
 | v0.30 Performance (+ v0.3.1 device-resident, 0013) | 0005 / 0013 | **Done** |
 | v0.40 SALT Quantization | 0006 | **Done** (tagged `v0.4.0`, pushed) |
 | v0.4.1 perf/correctness point-release (split-KV + IMMA fix) | 0013 / — | **Done** (tagged `v0.4.1` @ `202bec1`, pushed; CUDA decode + IMMA gates re-verified on GPU) |
-| v0.50 Training Core | 0007 | **In-progress** — STE+matmul backward (0005), CPU op set & tape (0006), CUDA backward (0007), AdamW + bit-exact checkpoint (0008) **done** (Gate C green CPU+CUDA; resume==uninterrupted, no-NaN ≥1k); LoRA (0009) next |
+| v0.50 Training Core | 0007 | **In-progress** — STE+matmul backward (0005), CPU op set & tape (0006), CUDA backward (0007), AdamW + bit-exact checkpoint (0008), LoRA on frozen base (0009) **done** (Gate C green CPU+CUDA; resume==uninterrupted; frozen-base zero-grad + merge + rank edges proptested); QAT heal + recovery gate + tag (0010) next |
 | v0.60 Pretraining + Distributed | 0008 | Planned |
 | v0.70 Backend Breadth | 0009 | Planned |
 | v0.80 Interop (`tritium-serve`) | 0010 | Planned — *OpenAI-HTTP server doubles as the LAMU `backend_kind` interface* |
@@ -67,7 +67,8 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0006 | `docs/plans/0006-v0.50-cpu-ops-tape.md` | CPU op set (bias/relu²/mse/xent/elementwise) + reverse-mode tape + composed QAT gradient | v0.50 / ADR 0007 Gate C | **done** (`2be9332`; Gate C green on CPU) | — |
 | 0007 | `docs/plans/0007-v0.50-cuda-backward.md` | CUDA backward kernels (gA/gW/gs) gradient-checked vs CPU vjp + compute-sanitizer | v0.50 / ADR 0007 | **done** (single-GPU; parity 1e-4 + memcheck 0 errors) | — |
 | 0008 | `docs/plans/0008-v0.50-optimizer-checkpoint.md` | AdamW + minimal Optimizer trait + bit-exact TOPT checkpoint (resume==uninterrupted, no-NaN ≥1k) | v0.50 / ADR 0007 | **done** (`05e45d2`; CPU) | — |
-| 0009+ | (planner writes just-in-time) | LoRA (0009), QAT heal+gate+tag v0.50.0 (0010) — see **Forward decomposition** | per ADR | todo | per milestone |
+| 0009 | `docs/plans/0009-v0.50-lora-frozen-base.md` | LoRA on a frozen ternary base (dense/detach/scale_const primitives); frozen-base zero-grad + merge + rank edges proptested | v0.50 / ADR 0007 | **done** (CPU) | — |
+| 0010 | (planner writes just-in-time) | QAT heal loop + ≥90%-gap-recovery gate + tag v0.50.0 — see **Forward decomposition** | v0.50 / ADR 0007 | todo (needs GPU + fine-tune task/dataset) | per milestone |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**

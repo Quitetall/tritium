@@ -2,6 +2,7 @@
 
 pub mod act;
 pub mod bias;
+pub mod dense;
 pub mod elementwise;
 pub mod loss;
 pub mod matmul;

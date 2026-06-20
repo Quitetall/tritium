@@ -932,6 +932,7 @@ dependencies = [
 name = "tritium-train"
 version = "0.4.1"
 dependencies = [
+ "proptest",
  "tritium-core",
  "tritium-testkit",
 ]
