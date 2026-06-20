@@ -7,6 +7,44 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.4.1] — 2026-06-20 — Split-KV decode attention + IMMA OOB fix (perf/correctness point-release)
+
+A capability-neutral point-release: it adds no new public API (the SALT staircase is unchanged),
+only performance and correctness depth on the v0.4.0 surface. Headline: flash-decoding (split-KV)
+attention wired into the resident M=N decode, and a fixed out-of-bounds read in the JIT IMMA
+kernel on tail shapes.
+
+### Added
+- **Flash-decoding (split-KV) attention** (`tritium-cuda`): two new kernels —
+  `gqa_attention_split_partial_f32` (warp per `(row, head, key-chunk)`; online-softmax over its
+  key chunk → partial `{acc, m, l}`) and `gqa_attention_combine_f32` (flash-merge the `S` partials)
+  — with a fixed chunk size so the captured CUDA-graph grid is valid for every decode step. Wired
+  into **both** M=N launch sites (eager `decode_batch` + graph `decode_batch_graph`), so graph and
+  eager stay bit-identical. An equivalence gate (`attn_split_kv_matches_direct_attention`) pins the
+  split-KV output to the direct attention reference within tolerance.
+- **U5 fuzz targets** (`cargo-fuzz`) for the two v0.4.0 parsers (SALT bundle + SALT-in-GGUF).
+- **Runnable SALT example** (`crates/tritium-quantize/examples/salt_roundtrip.rs`): fp32 matrix →
+  `quantize_tensor` → both containers → read back → identical-dequant assert (ADR 0002 U9).
+
+### Fixed
+- **JIT IMMA tail-shape OOB read** (U7): the JIT `tq2_0_imma_mpgemm` kernel read 1–2 bytes past
+  the packed weight buffer when an autotuned `tile_n > IMMA_N` and `N` was not a tile multiple (the
+  high sub-tile index exceeded `ceil(N/IMMA_N)` n-tiles). Added an `nt` bound to the weight-stage
+  read guard; the padding tile was already zeroed and masked on output, so results are unchanged.
+  `compute-sanitizer memcheck` is now clean on the CUDA suite.
+- `cuda_batch_decode_matches_single` uses `sample_greedy` (deterministic tie-break, NaN-safe)
+  instead of a panicking argmax.
+
+### Performance
+- Split-KV cuts the decode attention kernel from **57.6% → 26.6%** of N=1 GPU time (~2.2× on the
+  attention kernel; nsys per-kernel breakdown). End-to-end N=1 throughput is ~flat (N=1 is
+  occupancy-bound across the whole pipeline — GEMM/rmsnorm/lm_head now dominate); no regression at
+  N≥2 (clean re-bench: N=64 graph ≈ baseline). See `docs/plans/0001` outcome + `docs/ROADMAP.md`.
+
+### Internal
+- `rustfmt` 1.9.0 across the workspace (greens the CI fmt gate); `.mimocode/` executor scratch
+  gitignored.
+
 ## [0.4.0] — 2026-06-19 — SALT quantization (ADR 0001/0006)
 
 SALT (Sensitivity-Allocated Layered Ternary) — the **`tritium-quantize`** crate, a TQ2_0
