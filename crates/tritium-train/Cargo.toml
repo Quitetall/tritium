@@ -1,0 +1,18 @@
+[package]
+name = "tritium-train"
+description = "STE autograd, QAT, optimizer, and LoRA for ternary BitNet models (single-node)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-testkit = { workspace = true }
+
+[lints]
+workspace = true

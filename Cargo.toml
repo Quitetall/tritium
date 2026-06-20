@@ -24,7 +24,7 @@ members = [
     "crates/tritium-quantize", # SALT: fp -> ternary plane stacks (ADR 0001/0006)
     "crates/tritium-nn",       # mixed-precision ops + model runner
     "benches",                 # divan microbenches + perf harness (v0.30, ADR 0005)
-    # "crates/tritium-train",    # [planned] QAT, STE autograd, optimizer
+    "crates/tritium-train",     # QAT, STE autograd, optimizer (ADR 0007)
     # L3 frontends / bindings
     # "crates/tritium-ffi",      # C ABI cdylib + cbindgen
     # "crates/tritium-py",       # PyO3 + maturin
@@ -60,6 +60,7 @@ tritium-cpu = { path = "crates/tritium-cpu" }
 tritium-cuda = { path = "crates/tritium-cuda" }
 tritium-quantize = { path = "crates/tritium-quantize" }
 tritium-nn = { path = "crates/tritium-nn" }
+tritium-train = { path = "crates/tritium-train" }
 # foundation
 bytemuck = "1"
 half = "2"

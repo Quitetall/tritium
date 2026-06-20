@@ -928,6 +928,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tritium-train"
+version = "0.4.1"
+dependencies = [
+ "tritium-core",
+ "tritium-testkit",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
