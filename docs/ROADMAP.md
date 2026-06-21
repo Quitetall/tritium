@@ -75,7 +75,8 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0014 | `docs/plans/0014-v0.60-process-group.md` | `ProcessGroup` trait + deterministic thread-simulated collective backend (all_reduce / reduce_scatter / all_gather / broadcast); all-reduced grads == single-process summed reference | v0.60 / ADR 0008 | **done** (tagged `v0.5.4`; CPU sim) — uniform publish-first/2-barrier protocol + op-tag desync guard, adversarial-review-hardened | — |
 | 0015 | `docs/plans/0015-v0.60-fsdp-zero3.md` | ZeRO-3/FSDP over the sim PG: `FlatShardPlan` + all_gather/reduce_scatter sharded training; reduced-gradient == full-batch gradient (teeth) + replicated bit-exact (world∈{2,4}) + partition loss-curve tracking | v0.60 / ADR 0008 | **done** (tagged `v0.5.5`; CPU sim) — review-hardened: added gradient-level teeth after the loss-only gate was found blind to a wrong reduce op (AdamW scale-invariance) | — |
 | 0016 | `docs/plans/0016-v0.60-distributed-checkpoint.md` | Distributed checkpoint (`dcp`): per-rank shard files + manifest, crash-atomic temp→fsync→rename, save-K/reshard-J identical-forward + bit-exact resume + fault injection | v0.60 / ADR 0008 | **done** (tagged `v0.5.6`; CPU sim) — review-hardened: never-panic load path (`try_new` + `n_planes` bound), monotonic-step contract, real disk-reshard + uncommitted-shard gates | — |
-| 0017–0018 WALL | (planner writes just-in-time) | real NCCL backend (`cudarc::nccl` behind `ProcessGroup`) + HW loss-parity / ≥80% scaling bench → tag `v0.60.0` | v0.60 / ADR 0008 | todo (rented ≥2×GPU) | — |
+| 0017–0018 WALL | `docs/plans/0017-v0.60-nccl-wall.md` | real NCCL backend (`cudarc::nccl` behind `ProcessGroup`) + HW loss-parity / ≥80% scaling bench → tag `v0.60.0` | v0.60 / ADR 0008 | todo (rented ≥2×GPU; backend + gates + `scripts/gpu_session.sh` built/reviewed/world=1-verified) | — |
+| 0019 | `docs/plans/0019-v070-freeze-conformance-set.md` | Freeze + version the conformance vector set: committed `vectors/v070.jsonl` + `frozen_vectors()` + drift gate; CPU gate repointed | v0.70 / ADR 0009 | **done** (tagged `v0.5.7`; CPU) — first **build-ahead** item (see note) | — |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**
@@ -155,6 +156,18 @@ one `docs/plans/NNNN-*.md` when its turn comes.
 merges until N's gate is green and tagged (ADR 0002). A milestone whose hard blocker (GPU count,
 per-platform HW, model download) is unavailable runs its load-bearing gate as a **documented manual
 gate** on borrowed hardware before tagging.
+
+**Build-ahead strategy (from `v0.5.7`):** ADR 0002 sequences the milestone *tags*, not the *build*.
+With `v0.60.0` dammed behind the rented ≥2-GPU session, the software-reachable slices of v0.70/v0.80/
+v0.90/v1.0 are landed *now* on the continuing `0.5.x` point-release line — each fully gated + reviewed,
+none claiming a milestone tag. A code-grounded survey put this at **~21 reachable-now items vs ~9 true
+HW-wall items** (the wall: Apple-Metal + AMD-ROCm parity, the multi-GPU NCCL/FSDP re-runs, and the
+macOS/Windows CI matrix). The payoff: once the rented session tags `v0.60.0`, the downstream milestone
+tags fall as a short **verify-and-tag cascade** instead of a per-milestone build-then-tag crawl.
+Reachable-now order (by value/effort + dependency): **0019 freeze (done)** → capability-fallback test →
+`tritium-wgpu` (Vulkan on the 4090) / `tritium-wasm` (wasmtime) → `tritium-serve` + `tritium-ffi`
+(v0.80, pure-CPU wrappers over the shipped runner) → doctest sweep / fuzz breadth / `cargo-deny` /
+semver baseline (v0.90/v1.0 tooling).
 
 ---
 

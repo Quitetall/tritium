@@ -7,6 +7,39 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.7] — 2026-06-21 — Freeze + version the conformance vector set (first v0.70 build-ahead)
+
+The conformance suite is now a **committed, versioned, immutable artifact** instead of a set
+regenerated from a seed at test time. This is the prerequisite ADR 0009 names for v0.70 backend
+breadth: every future backend (`tritium-wgpu`/`tritium-wasm`/`tritium-metal`/`tritium-rocm`), every
+v0.80 "matches the native reference" interop gate, and every v1.0 release re-run grades against one
+reference that must not drift underneath them.
+
+> **Build-ahead note.** v0.60.0 is gate-blocked behind the rented ≥2-GPU session (0017/0018). Per
+> ADR 0002 the milestone *tags* stay sequential, but the *build* order does not: this and subsequent
+> `0.5.x` point releases land software-reachable slices of v0.70+ now, so the rented session becomes a
+> short verify-and-tag cascade rather than a per-milestone build-then-tag crawl.
+
+### Added
+- **`tritium-testkit::frozen`** — `frozen_vectors()` loads the committed `vectors/v070.jsonl`
+  (`= generate_vectors(0xC0FFEE, 64)`, 89 vectors: 64 random + the 25-case boundary set, both packing
+  formats). The path is resolved from the testkit crate's `CARGO_MANIFEST_DIR`, so any consuming crate
+  finds the one canonical set regardless of its own test cwd. `VECTOR_SET_VERSION` + `FROZEN_SEED` +
+  `FROZEN_COUNT` are public pins.
+- **`freeze_vectors` example** — the single sanctioned, reproducible way to (re)generate the artifact:
+  `cargo run -p tritium-testkit --example freeze_vectors`.
+
+### Gates
+- **`frozen_set_matches_pinned_generator`** (the teeth): the committed file must equal
+  `generate_vectors(FROZEN_SEED, FROZEN_COUNT)`. Any drift — a changed generator, a changed reference
+  kernel, a hand-edited file — is a hard failure, so a re-freeze must be deliberate (regenerate +
+  bump `VECTOR_SET_VERSION`).
+- **CPU conformance** repointed to `frozen_vectors()`. The frozen set *is* the historical
+  `(0xC0FFEE, 64)` set, so this changed nothing about what CPU validates — only locked it. `cuda.rs`
+  left untouched (active perf-optimization WIP); a count-monotone subset gate
+  (`smaller_count_is_a_value_subset_of_the_frozen_set`) proves its seed-generated set is contained in
+  the frozen set, so the freeze holds for the GPU path too.
+
 ## [0.5.6] — 2026-06-21 — Distributed checkpoint: resharding + crash-atomic writes
 
 The sixth v0.60 increment (single-GPU-reachable; `0.5.x` line). The ADR-0008 "checkpoint resharding

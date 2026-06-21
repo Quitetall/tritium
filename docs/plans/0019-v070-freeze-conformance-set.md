@@ -82,8 +82,8 @@ deliberate (regenerate via the freeze_vectors example + bump VECTOR_SET_VERSION)
 The prerequisite ADR 0009 names for all v0.70 backend breadth: every new backend
 (wgpu/wasm/metal/rocm) and every later interop/release re-run now grades against
 this committed set. CPU gate repointed to frozen_vectors() (identical set, just
-locked). cuda.rs left untouched (active WIP); the drift gate proves its
-seed-generated set equals the frozen prefix.
+locked). cuda.rs left untouched (active WIP); a count-monotone subset gate proves
+its seed-generated set is contained in the frozen set.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ```
