@@ -38,15 +38,19 @@ pub struct FlatShardPlan {
     total: usize,
     /// Number of ranks the flat buffer is split across.
     world: usize,
-    /// Per-rank shard length `ceil(total / world)`; `chunk * world == padded_len`.
+    /// Per-rank shard length `ceil(total / world)`; `chunk * world == padded`.
     chunk: usize,
+    /// Padded flat-buffer length `chunk * world` (a multiple of `world`, `>= total`). Stored so the
+    /// `chunk * world` multiply is overflow-checked exactly once, in [`new`](Self::new).
+    padded: usize,
 }
 
 impl FlatShardPlan {
     /// Build a plan for leaves of the given lengths (in order), sharded across `world` ranks.
     ///
     /// # Panics
-    /// If `world == 0`, or if the concatenated length overflows `usize`.
+    /// If `world == 0`, if the concatenated length (`Σ len`) overflows `usize`, or if the padded
+    /// length (`chunk * world`) overflows `usize` (only reachable at ~`usize::MAX` total elements).
     #[must_use]
     pub fn new(leaf_lens: &[usize], world: usize) -> Self {
         assert!(world > 0, "world size must be > 0");
@@ -60,21 +64,20 @@ impl FlatShardPlan {
         }
         let total = off;
         // `chunk * world` is the smallest multiple of `world` that is >= total, so the flat buffer
-        // divides evenly into `world` shards for reduce_scatter / all_gather. `div_ceil` is exact and
-        // never overflows here (total already fits usize; chunk <= total).
+        // divides evenly into `world` shards for reduce_scatter / all_gather. `div_ceil` itself is
+        // exact (total fits usize; chunk <= total), but `chunk * world` can in principle overflow at
+        // ~usize::MAX total — guard it here once, mirroring dist.rs's `LengthOverflow` discipline.
         let chunk = total.div_ceil(world);
+        let padded = chunk
+            .checked_mul(world)
+            .expect("padded flat length (chunk * world) overflows usize");
         Self {
             segments,
             total,
             world,
             chunk,
+            padded,
         }
-    }
-
-    /// The number of ranks this plan shards across.
-    #[must_use]
-    pub fn world(&self) -> usize {
-        self.world
     }
 
     /// The per-rank shard length (`ceil(total / world)`).
@@ -92,7 +95,7 @@ impl FlatShardPlan {
     /// The padded flat-buffer length (`chunk * world`), a multiple of `world` and `>= total`.
     #[must_use]
     pub fn padded_len(&self) -> usize {
-        self.chunk * self.world
+        self.padded
     }
 
     /// Rank `r`'s shard slice `[r*chunk, (r+1)*chunk)` within the padded flat buffer.

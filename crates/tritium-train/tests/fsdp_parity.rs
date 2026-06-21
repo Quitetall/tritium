@@ -1,13 +1,19 @@
 //! ZeRO-3 / FSDP loss-parity gate (ADR 0008 / plan 0015): a tiny model sharded across `world`
 //! simulated ranks — params [`all_gather`](tritium_train::ProcessGroup::all_gather)ed before the
 //! forward, grads [`reduce_scatter`](tritium_train::ProcessGroup::reduce_scatter)ed after the backward,
-//! optimizer state sharded — produces a loss curve that tracks a single-process full-batch reference.
+//! optimizer state sharded — verified against an independent single-process full-batch reference.
 //!
 //! The reference [`baseline`] is an *independent* single-threaded loop (no sharding, no collectives),
 //! so a coherent bug copied into both paths cannot pass the gate (the 0013 verification-gap lesson).
-//! Parity is **bit-exact** where the float arithmetic permits (world=1; world=2 with replicated data,
-//! where `(G+G)/2 == G` exactly) and **within a measured tolerance** for data-parallel partitioning,
-//! where per-rank partial sums fold the examples in a different order than the single-process reference.
+//! The gate is layered, because what each layer can catch differs:
+//! - **Bit-exact**: world=1, and replicated-data world∈{2,4} (where `ΣG/world == G` exactly — the
+//!   accumulated running-sum rounding cancels under /2 and /4; it does *not* under /8).
+//! - **Gradient teeth**: the FSDP-reduced gradient must equal the full-batch gradient. This is the
+//!   teeth against gradient-magnitude / wrong-reduce-op errors — and it is *load-bearing* because
+//!   AdamW's update is scale-invariant in the gradient, so a loss/param-curve compare alone is BLIND
+//!   to a `world`-times gradient scaling (a wrong `ReduceOp`).
+//! - **Convergence tracking**: the data-parallel loss/param curve tracks the reference within a
+//!   measured tolerance over the budget (an end-to-end check, not the wrong-reduce-op gate).
 
 use std::thread;
 use tritium_train::optim::{AdamState, AdamW, Optimizer};
@@ -92,6 +98,35 @@ fn baseline(steps: u64) -> (Vec<f32>, Vec<Vec<f32>>) {
     (curve, leaves)
 }
 
+/// This rank's local data + example count: the full batch (replicated) or an equal contiguous slice
+/// of the global batch (partitioned). The equal-slice assumption is load-bearing — the data-parallel
+/// `Avg` reduction equals the full-batch mean only for equal, complete slices — so partitioning
+/// asserts `B % world == 0` rather than silently truncating the tail.
+fn local_slice(
+    rank: usize,
+    world: usize,
+    replicated: bool,
+    x_full: &[f32],
+    y_full: &[f32],
+) -> (Vec<f32>, Vec<f32>, usize) {
+    if replicated {
+        return (x_full.to_vec(), y_full.to_vec(), B);
+    }
+    assert_eq!(
+        B % world,
+        0,
+        "global batch B={B} must be divisible by world={world} for equal partitioned slices"
+    );
+    let bl = B / world;
+    let xs = rank * bl * D_IN;
+    let ys = rank * bl * D_OUT;
+    (
+        x_full[xs..xs + bl * D_IN].to_vec(),
+        y_full[ys..ys + bl * D_OUT].to_vec(),
+        bl,
+    )
+}
+
 /// One rank's FSDP training loop. Owns its param shard + sharded AdamW state; each step gathers the
 /// full params, runs forward/backward on its local data slice, reduce_scatters the grad, steps its
 /// shard, and all_reduces the loss. Returns `(loss_curve, final_param_shard)`.
@@ -108,20 +143,7 @@ fn rank_loop(
     let world = pg.world_size();
     let (lo, hi) = plan.shard_range(rank);
     let mut shard = init_flat[lo..hi].to_vec();
-
-    // Local data: the full batch (replicated) or this rank's equal contiguous slice (partitioned).
-    let (x_local, y_local, b_local) = if replicated {
-        (x_full.to_vec(), y_full.to_vec(), B)
-    } else {
-        let bl = B / world;
-        let xs = rank * bl * D_IN;
-        let ys = rank * bl * D_OUT;
-        (
-            x_full[xs..xs + bl * D_IN].to_vec(),
-            y_full[ys..ys + bl * D_OUT].to_vec(),
-            bl,
-        )
-    };
+    let (x_local, y_local, b_local) = local_slice(rank, world, replicated, x_full, y_full);
 
     let opt = AdamW::new(LR);
     let mut state = AdamState {
@@ -186,6 +208,61 @@ fn run_fsdp(world: usize, steps: u64, replicated: bool) -> (Vec<f32>, Vec<Vec<f3
     (per_rank[0].0.clone(), plan.unflatten(&full))
 }
 
+/// The single-process full-batch gradient at the initial params, flattened in leaf order — the
+/// reference the FSDP-reduced gradient must reproduce. Unlike the loss/param curve this is NOT
+/// scale-invariant, so it is the gate's teeth against gradient-magnitude / wrong-reduce-op errors.
+fn full_batch_grad() -> Vec<f32> {
+    let (x, y) = data();
+    let (_loss, grads) = forward_backward(&init_leaves(), &x, &y, B);
+    grads.concat()
+}
+
+/// Run ONE FSDP gradient reduction at the initial params across `world` ranks and reassemble the full
+/// reduced gradient (length `total`, padding dropped). Same gather → fwd/bwd → reduce_scatter(Avg)
+/// path as the training loop, stopped before the optimizer step.
+fn fsdp_reduced_grad(world: usize, replicated: bool) -> Vec<f32> {
+    let plan = FlatShardPlan::new(&leaf_lens(), world);
+    let init_flat = plan.flatten(&init_leaves());
+    let (x_full, y_full) = data();
+    let pgs = SimProcessGroup::world(world);
+
+    let plan_ref = &plan;
+    let init_ref = &init_flat;
+    let x_ref = &x_full;
+    let y_ref = &y_full;
+    let shards: Vec<Vec<f32>> = thread::scope(|s| {
+        let handles: Vec<_> = pgs
+            .into_iter()
+            .map(|pg| {
+                s.spawn(move || {
+                    let rank = pg.rank();
+                    let world = pg.world_size();
+                    let (lo, hi) = plan_ref.shard_range(rank);
+                    let shard = init_ref[lo..hi].to_vec();
+                    let (xl, yl, bl) = local_slice(rank, world, replicated, x_ref, y_ref);
+                    let mut full = vec![0.0f32; plan_ref.padded_len()];
+                    pg.all_gather(&shard, &mut full).expect("all_gather");
+                    let leaves = plan_ref.unflatten(&full);
+                    let (_loss, grads) = forward_backward(&leaves, &xl, &yl, bl);
+                    let grad_flat = plan_ref.flatten(&grads);
+                    let mut grad_shard = vec![0.0f32; plan_ref.chunk()];
+                    pg.reduce_scatter(&grad_flat, &mut grad_shard, ReduceOp::Avg)
+                        .expect("reduce_scatter");
+                    grad_shard
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut full = vec![0.0f32; plan.padded_len()];
+    for (rank, shard) in shards.iter().enumerate() {
+        let (lo, hi) = plan.shard_range(rank);
+        full[lo..hi].copy_from_slice(shard);
+    }
+    full[..plan.total()].to_vec()
+}
+
 fn assert_finite(curve: &[f32], label: &str) {
     assert!(
         curve.iter().all(|x| x.is_finite()),
@@ -217,30 +294,66 @@ fn world1_fsdp_is_bit_exact_to_baseline() {
 }
 
 #[test]
-fn world2_replicated_fsdp_is_bit_exact_to_baseline() {
+fn replicated_fsdp_is_bit_exact_to_baseline() {
     let (base_curve, base_leaves) = baseline(STEPS);
-    // Replicated data + world=2: each rank computes the identical full grad G; reduce_scatter(Avg)
-    // yields (G+G)/2 == G exactly (power-of-two scaling never rounds), and AdamW is element-wise —
-    // so the sharded run is bit-exact to the full-buffer baseline. Isolates the sharding mechanics.
-    let (curve, leaves) = run_fsdp(2, STEPS, true);
-    assert_eq!(
-        curve, base_curve,
-        "world=2 replicated loss curve not bit-exact"
-    );
-    assert_eq!(
-        leaves, base_leaves,
-        "world=2 replicated final params not bit-exact"
-    );
+    // Replicated data: every rank computes the identical full grad G; reduce_scatter(Avg) yields
+    // Σ G / world == G *bit-exactly* for world∈{2,4} — the accumulated running-sum rounding cancels
+    // under /2 and /4 (empirically verified; it does NOT under /8) — and AdamW is element-wise, so the
+    // sharded run is bit-exact to the full-buffer baseline. Isolates the sharding mechanics (gather +
+    // reduce_scatter + sharded optimizer/state) from data-parallel float reordering. (world=8 would be
+    // within-tolerance, not bit-exact, so it is deliberately not asserted here.)
+    for world in [2usize, 4] {
+        let (curve, leaves) = run_fsdp(world, STEPS, true);
+        assert_eq!(
+            curve, base_curve,
+            "world={world} replicated loss curve not bit-exact"
+        );
+        assert_eq!(
+            leaves, base_leaves,
+            "world={world} replicated final params not bit-exact"
+        );
+    }
 }
 
 #[test]
-fn data_parallel_partition_parity_within_tolerance() {
+fn fsdp_reduced_gradient_equals_full_batch_reference() {
+    // THE teeth against gradient-magnitude / wrong-reduce-op errors. AdamW's update m̂/(√v̂+ε) is
+    // scale-invariant in the gradient, so a world-times gradient scaling (e.g. reduce_scatter Avg→Sum)
+    // cancels in the loss/param curve — the partition loss-curve test below is BLIND to it. Asserting
+    // the reduced *gradient* directly is not scale-invariant: Avg→Sum is off by exactly `world`, a
+    // dropped reduction or wrong slice off by ≥2× — all far outside this tolerance.
+    let reference = full_batch_grad();
+    for world in [2usize, 4] {
+        // Partitioned: Avg over equal per-rank slices reproduces the full-batch grad within the float
+        // reorder (~1e-7 rel).
+        let reduced = fsdp_reduced_grad(world, false);
+        assert_eq!(reduced.len(), reference.len());
+        for (i, (&g, &r)) in reduced.iter().zip(&reference).enumerate() {
+            let abs = (g - r).abs();
+            let rel = abs / r.abs().max(1e-6);
+            assert!(
+                abs <= 1e-5 || rel <= 1e-4,
+                "world={world} grad[{i}]: reduced {g} vs full-batch {r} (abs {abs}, rel {rel})"
+            );
+        }
+        // Replicated: every rank's grad is the full-batch grad; Avg is bit-exact for world∈{2,4}.
+        assert_eq!(
+            fsdp_reduced_grad(world, true),
+            reference,
+            "world={world} replicated reduced grad not bit-exact to the full-batch grad"
+        );
+    }
+}
+
+#[test]
+fn data_parallel_partition_loss_curve_tracks_baseline() {
     let (base_curve, base_leaves) = baseline(STEPS);
-    // Data-parallel: partition the global batch into equal per-rank slices, Avg-reduce. Mathematically
-    // equal to the full-batch grad, but the per-rank partial sums reorder the float adds, so parity is
-    // within a measured tolerance, not bit-exact. Measured max |Δloss| over STEPS steps is ~4.5e-8
-    // (≈1 ULP at this loss magnitude) for both world=2 and world=4 — gate at 1e-4 absolute / 1e-3
-    // relative leaves a ~2000× margin (tight enough to catch a wrong reduce op, loose enough for f32).
+    // Data-parallel END-TO-END check: partition the global batch into equal per-rank slices, Avg-reduce,
+    // and confirm the FSDP loss/param curve TRACKS the single-process full-batch reference over the
+    // budget. This is convergence-tracking, NOT the wrong-reduce-op gate: AdamW's update is
+    // scale-invariant in the gradient, so a world-times gradient error is invisible to a loss/param
+    // compare — the gradient-magnitude teeth live in `fsdp_reduced_gradient_equals_full_batch_reference`.
+    // Measured max |Δloss| over STEPS steps is ~4.5e-8 (≈1 ULP) for world∈{2,4}; gate at 1e-4 abs / 1e-3 rel.
     const ABS_TOL: f32 = 1e-4;
     const REL_TOL: f32 = 1e-3;
     for world in [2usize, 4] {
@@ -257,7 +370,8 @@ fn data_parallel_partition_parity_within_tolerance() {
                 "world={world} step {t}: loss {got} vs baseline {want} (abs {abs}, rel {rel})"
             );
         }
-        // Final params also track within tolerance (looser: accumulated drift over the curve).
+        // Final params track within a coarse bound (accumulated float-reorder drift). Gradient
+        // correctness itself is gated by the reduced-gradient test, not this scale-invariant compare.
         for (li, (lf, lb)) in leaves.iter().zip(&base_leaves).enumerate() {
             for (i, (&g, &w)) in lf.iter().zip(lb).enumerate() {
                 let abs = (g - w).abs();
