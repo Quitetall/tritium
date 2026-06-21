@@ -77,6 +77,7 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0016 | `docs/plans/0016-v0.60-distributed-checkpoint.md` | Distributed checkpoint (`dcp`): per-rank shard files + manifest, crash-atomic temp→fsync→rename, save-K/reshard-J identical-forward + bit-exact resume + fault injection | v0.60 / ADR 0008 | **done** (tagged `v0.5.6`; CPU sim) — review-hardened: never-panic load path (`try_new` + `n_planes` bound), monotonic-step contract, real disk-reshard + uncommitted-shard gates | — |
 | 0017–0018 WALL | `docs/plans/0017-v0.60-nccl-wall.md` | real NCCL backend (`cudarc::nccl` behind `ProcessGroup`) + HW loss-parity / ≥80% scaling bench → tag `v0.60.0` | v0.60 / ADR 0008 | todo (rented ≥2×GPU; backend + gates + `scripts/gpu_session.sh` built/reviewed/world=1-verified) | — |
 | 0019 | `docs/plans/0019-v070-freeze-conformance-set.md` | Freeze + version the conformance vector set: committed `vectors/v070.jsonl` + `frozen_vectors()` + drift gate; CPU gate repointed | v0.70 / ADR 0009 | **done** (tagged `v0.5.7`; CPU) — first **build-ahead** item (see note) | — |
+| 0021 | `docs/plans/0021-v090-cargo-deny-gate.md` | Supply-chain gate: `cargo deny check` green (Unicode-3.0 allow; internal deps version-pinned) + cargo-deny CI lane | v0.90 / ADR 0011 | **done** (tagged `v0.5.8`; CPU) — build-ahead; also unblocks v1.0 `cargo publish` | — |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**

@@ -7,6 +7,27 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.8] — 2026-06-21 — Supply-chain gate (cargo-deny) + publishable internal dep pins
+
+v0.90-hardening build-ahead (ADR 0011, supply-chain). `cargo deny check` now passes and runs as a CI
+lane on every push/PR.
+
+### Added
+- **cargo-deny CI lane** (`EmbarkStudios/cargo-deny-action@v2`): checks licenses, RustSec advisories,
+  bans, and sources. The action pins a recent cargo-deny that parses CVSS-4.0 advisories (the locally
+  installed 0.16.x cannot), so CI is the authoritative advisory gate.
+
+### Changed
+- **`deny.toml`**: allow `Unicode-3.0` (the `unicode-ident` transitive dep's license; a permissive
+  Unicode license — a normal Cargo dependency, not a vendored code port, so not in NOTICE; bundling
+  dependency license texts is deferred to the v1.0 packaging work).
+- **Internal workspace deps are version-pinned** (`{ path = "...", version = "0.5.7" }`) instead of
+  bare path deps. The caret requirement resolves across the entire `0.5.x` build-ahead line with zero
+  churn (only a `0.60.0`-style minor bump updates it, as part of that release commit); it keeps
+  `wildcards = "deny"` meaningful for *external* deps (cargo-deny refuses `allow-wildcard-paths` for
+  publishable crates), and is required for the v1.0 `cargo publish` gate (crates.io forbids bare path
+  deps).
+
 ## [0.5.7] — 2026-06-21 — Freeze + version the conformance vector set (first v0.70 build-ahead)
 
 The conformance suite is now a **committed, versioned, immutable artifact** instead of a set
