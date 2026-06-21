@@ -63,6 +63,11 @@ mod autotune;
 #[cfg(feature = "cuda")]
 mod codegen;
 
+// v0.60 / plan 0013: the GPU QAT training step + tiny-model pretrain smoke — the first real
+// consumer of the `train_grad.cu` forward + gradient kernels.
+#[cfg(feature = "cuda")]
+pub mod train;
+
 #[cfg(test)]
 mod tests {
     // Default-build sanity: the crate compiles, the spec types it is written

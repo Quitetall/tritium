@@ -10,6 +10,28 @@
 //
 // All buffers row-major. gy = grad_out [M,N].
 
+// Y[m,n] = s[n] * sum_k A[m,k] * W[n,k]      (A:[M,K], W:[N,K], s:[N], Y:[M,N])
+// The forward companion to the grad kernels above: same f32 layout, same sequential
+// reduction order, same --fmad=false rounding, so it reproduces tritium_train::ops::matmul::forward
+// element for element (W is the STE-quantized {-1,0,+1} weight, passed as f32).
+extern "C" __global__ void ternary_matmul_forward(
+    const float* __restrict__ a,    // [M, K]
+    const float* __restrict__ w,    // [N, K]
+    const float* __restrict__ s,    // [N]
+    float* __restrict__ y,          // [M, N]
+    int m, int n, int k)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; // over M*N
+    if (idx >= (long)m * n) return;
+    int mi = idx / n;
+    int ni = idx % n;
+    float acc = 0.0f;
+    for (int ki = 0; ki < k; ++ki) {
+        acc += a[mi * k + ki] * w[ni * k + ki];
+    }
+    y[idx] = s[ni] * acc;
+}
+
 // gA[m,k] = sum_n gy[m,n] * s[n] * W[n,k]      (shape [M,K])
 extern "C" __global__ void ternary_matmul_grad_a(
     const float* __restrict__ gy,   // [M, N]

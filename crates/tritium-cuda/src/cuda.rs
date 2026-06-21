@@ -130,6 +130,7 @@ const KERNEL_NAME_ATTN_MDECODE: &str = "gqa_attention_mdecode_f32";
 const KERNEL_NAME_LM_HEAD_TILED_F16: &str = "lm_head_tiled_f16";
 const KERNEL_NAME_ARGMAX_ROWS: &str = "argmax_rows_f32";
 /// v0.50 (ADR 0007) f32 training backward kernels for the ternary matmul.
+const KERNEL_NAME_TRAIN_FWD: &str = "ternary_matmul_forward";
 const KERNEL_NAME_GRAD_A: &str = "ternary_matmul_grad_a";
 const KERNEL_NAME_GRAD_W: &str = "ternary_matmul_grad_w";
 const KERNEL_NAME_GRAD_S: &str = "ternary_matmul_grad_s";
@@ -342,13 +343,13 @@ pub struct CudaBackend {
     /// gradient functions stay valid.
     _grad_module: Arc<CudaModule>,
     /// The resolved `ternary_matmul_grad_a/_w/_s` kernels (f32 backward, ADR 0007).
-    /// Gradient-checked against the `tritium-train` CPU vjp oracle; the QAT training
-    /// path (v0.50) wires them onto resident buffers next.
-    #[allow(dead_code)]
+    /// The f32 forward companion to the grad kernels (`Y = s·(A·Wᵀ)`), used by the QAT training
+    /// step ([`super::train`]).
+    func_train_forward: CudaFunction,
+    /// Gradient-checked against the `tritium-train` CPU vjp oracle; wired into the QAT training
+    /// step ([`super::train`]).
     func_grad_a: CudaFunction,
-    #[allow(dead_code)]
     func_grad_w: CudaFunction,
-    #[allow(dead_code)]
     func_grad_s: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     device_id: String,
@@ -459,6 +460,9 @@ impl CudaBackend {
         let grad_module = ctx
             .load_module(Ptx::from_src(TRAIN_GRAD_PTX))
             .map_err(|e| driver_err("load train_grad ptx", &e))?;
+        let func_train_forward = grad_module
+            .load_function(KERNEL_NAME_TRAIN_FWD)
+            .map_err(|e| driver_err("resolve train_forward kernel", &e))?;
         let func_grad_a = grad_module
             .load_function(KERNEL_NAME_GRAD_A)
             .map_err(|e| driver_err("resolve grad_a kernel", &e))?;
@@ -504,6 +508,7 @@ impl CudaBackend {
             func_scale_mul,
             func_relu2_gate,
             _grad_module: grad_module,
+            func_train_forward,
             func_grad_a,
             func_grad_w,
             func_grad_s,
@@ -538,16 +543,93 @@ impl CudaBackend {
         Ok(())
     }
 
-    // ── v0.50 training: f32 ternary-matmul backward (ADR 0007, Gate C) ──────────
-    // Each mirrors `tritium_train::ops::matmul::vjp` and is gradient-checked against
-    // it on the GPU lane. htod → launch (one thread per output, sequential reduction,
-    // no atomics) → dtoh. The QAT training path wires these onto resident buffers next.
+    // ── v0.50 training: f32 ternary-matmul forward + backward (ADR 0007 Gate C) ──
+    // The backward kernels mirror `tritium_train::ops::matmul::vjp` and the forward mirrors
+    // `::forward`, gradient-checked against them on the GPU lane. htod → launch (one thread per
+    // output, sequential reduction, no atomics) → dtoh. Wired into the QAT training step
+    // (`super::train`, plan 0013); a future resident engine keeps these buffers on-device.
+
+    /// Device `Y[m,n] = s[n]·Σ_k A[m,k]·W[n,k]`. `a`:[M,K], `w`:[N,K] (STE-quantized weight as f32),
+    /// `s`:[N], `y`:[M,N]. Reproduces [`tritium_train::ops::matmul::forward`] (same reduction order +
+    /// `--fmad=false`).
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
+    pub(crate) fn train_forward(
+        &self,
+        a: &[f32],
+        w: &[f32],
+        s: &[f32],
+        shape: GemmShape,
+        y: &mut [f32],
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if a.len() != m * k || w.len() != n * k || s.len() != n || y.len() != m * n {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * n,
+                got: y.len(),
+            });
+        }
+        Self::check_grad_launch_bounds(m, n, k)?;
+        if m * n == 0 {
+            return Ok(());
+        }
+        if k == 0 {
+            // Empty contraction: Y[m,n] = s[n]·0 = 0. Avoid a zero-length htod and launch.
+            y.fill(0.0);
+            return Ok(());
+        }
+        let d_a = self
+            .stream
+            .clone_htod(a)
+            .map_err(|e| driver_err("train_forward htod a", &e))?;
+        let d_w = self
+            .stream
+            .clone_htod(w)
+            .map_err(|e| driver_err("train_forward htod w", &e))?;
+        let d_s = self
+            .stream
+            .clone_htod(s)
+            .map_err(|e| driver_err("train_forward htod s", &e))?;
+        let mut d_y = self
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .map_err(|e| driver_err("train_forward alloc", &e))?;
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        let threads = THREADS_PER_BLOCK;
+        let cfg = LaunchConfig {
+            grid_dim: (((m * n) as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_train_forward);
+        launch
+            .arg(&d_a)
+            .arg(&d_w)
+            .arg(&d_s)
+            .arg(&mut d_y)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        // SAFETY: signature `(const float* a[M,K], const float* w[N,K], const float* s[N],
+        // float* y[M,N], int m, int n, int k)`; args pushed in that order; one thread per Y
+        // element, guarded by `idx < m*n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch train_forward", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_y, y)
+            .map_err(|e| driver_err("train_forward dtoh", &e))?;
+        Ok(())
+    }
 
     /// Device `gA[m,k] = Σ_n gy[m,n]·s[n]·W[n,k]`. `gy`:[M,N], `w`:[N,K], `s`:[N], `ga`:[M,K].
     ///
     /// # Errors
     /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
-    #[allow(dead_code)] // gradient-checked today; resident QAT wiring lands next.
     pub(crate) fn grad_a(
         &self,
         gy: &[f32],
@@ -618,7 +700,6 @@ impl CudaBackend {
     ///
     /// # Errors
     /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
-    #[allow(dead_code)] // gradient-checked today; resident QAT wiring lands next.
     pub(crate) fn grad_w(
         &self,
         gy: &[f32],
@@ -689,7 +770,6 @@ impl CudaBackend {
     ///
     /// # Errors
     /// [`BackendError::ShapeMismatch`] on length mismatch; device errors via cudarc.
-    #[allow(dead_code)] // gradient-checked today; resident QAT wiring lands next.
     pub(crate) fn grad_s(
         &self,
         gy: &[f32],

@@ -17,6 +17,9 @@ tritium-runtime = { workspace = true }
 # `tritium-format` is only needed by the GPU host path (packed-row byte sizing),
 # so it is pulled in solely by the `cuda` feature to keep the default build lean.
 tritium-format = { workspace = true, optional = true }
+# `tritium-train` provides AdamW + the LR schedule + the CPU matmul vjp oracle for the QAT
+# training step (the grad kernels' first real consumer, plan 0013). Pulled in by `cuda` only.
+tritium-train = { workspace = true, optional = true }
 # cudarc 0.19: driver API only (no cublas/curand/cudnn).
 #
 # `fallback-dynamic-loading` makes cudarc dlopen the CUDA driver (`libcuda`) at
@@ -73,7 +76,7 @@ half = { workspace = true, optional = true }
 # a CUDA toolkit, so cpu-only CI stays green.
 [features]
 default = []
-cuda = ["dep:cudarc", "dep:tritium-format", "dep:linkme", "dep:serde", "dep:serde_json", "dep:half"]
+cuda = ["dep:cudarc", "dep:tritium-format", "dep:tritium-train", "dep:linkme", "dep:serde", "dep:serde_json", "dep:half"]
 
 # The conformance + parity tests only run on the GPU lane (Wave D); these dev-deps
 # are referenced solely from `#[cfg(feature = "cuda")]` test code. `tritium-cpu`
@@ -82,12 +85,11 @@ cuda = ["dep:cudarc", "dep:tritium-format", "dep:linkme", "dep:serde", "dep:serd
 tritium-testkit = { workspace = true }
 tritium-format = { workspace = true }
 tritium-cpu = { workspace = true }
-# The v0.50 training-backward parity gate (ADR 0007 Gate C on CUDA) compares the GPU
-# gradient kernels against this crate's CPU `vjp` oracle. Test-only.
-tritium-train = { workspace = true }
 # `half::f16` is the block-scale type the TQ2_0 packer takes; used only by the
 # parity test's helper that packs trits the same way the testkit does.
 half = { workspace = true }
+# NOTE: `tritium-train` is a `cuda`-gated normal dependency (above), not a dev-dep — the GPU
+# parity + QAT tests reach it through that, and it is the grad kernels' real consumer (0013).
 
 [lints]
 workspace = true
