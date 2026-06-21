@@ -206,12 +206,27 @@ since the LM head is the dominant cost after the transformer layers.
 
 ---
 
+### #18 — Per-layer scratch arena ✅
+
+**Files:** `crates/tritium-nn/src/layers/transformer_block.rs`, `crates/tritium-nn/src/model/runner.rs`
+
+**Change:** Added `BlockScratch` struct with pre-allocated buffers (normed, q, k,
+v, attn, sn, mlp_out). Sized once at model init, then passed mutably to each
+layer via `forward_with_scratch()`. Eliminates ~7 heap allocs per layer × 26
+layers ≈ 182 allocs per forward pass.
+
+**Impact:** Reduces allocation overhead in the CPU forward path. The dump path
+(`forward_dump`) still allocates fresh buffers for the fidelity ladder.
+
+**Verification:** 11/11 NN tests pass. Build clean.
+
+---
+
 ## Still open (from the full optimization scan)
 
 See the conversation for the complete list of 29 findings across CUDA, CPU, and
 training paths. Highest-impact remaining:
 
-1. **Per-layer scratch arena** (CPU, ~300 allocs/token eliminated)
-2. **M=N batch fusion** (CUDA, Q/K/V + gate/up in single GEMM)
-3. **AVX2 GEMM SIMD accumulator** (4-8× CPU GEMM win)
-4. **Fuse residual add into GEMM epilogue** (CUDA, 2 launches/layer saved)
+1. **M=N batch fusion** (CUDA, Q/K/V + gate/up in single GEMM)
+2. **AVX2 GEMM SIMD accumulator** (4-8× CPU GEMM win)
+3. **Fuse residual add into GEMM epilogue** (CUDA, 2 launches/layer saved)
