@@ -7,6 +7,59 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.5] — 2026-06-21 — ZeRO-3 / FSDP over the simulated `ProcessGroup`: gradient + loss parity
+
+The fifth v0.60 increment (single-GPU-reachable; `0.5.x` line). The ADR-0008 "N-GPU vs 1-GPU loss
+parity" gate, reachable on one machine: shard a tiny model's params/grads/optimizer state across `world`
+simulated ranks (ZeRO-3 / FSDP) over the 0014 `SimProcessGroup` — `all_gather` params before the
+forward, `reduce_scatter(Avg)` grads after the backward, sharded AdamW step — and prove the result
+matches an independent single-process full-batch reference.
+
+### Added
+- **`fsdp::FlatShardPlan`** (re-exported at the crate root): the FSDP "FlatParameter" descriptor.
+  Concatenates the trainable leaves into one flat buffer, pads to a multiple of `world`, splits into
+  `world` equal contiguous shards; `flatten`/`unflatten` between the leaf and padded-flat views,
+  `shard_range` per rank. The `chunk * world` length is overflow-checked once in `new()`. This is the
+  seed of 0016's distributed-checkpoint manifest `(global_shape, local_offset, shard_spec)`.
+- The FSDP training orchestration (gather → fwd/bwd → reduce_scatter → sharded step) lives in the gate
+  test, parameterized by the model's fwd/bwd closure — not a premature `fsdp_step` helper (single
+  consumer today; cheap retrofit). Whole-model single-unit gather; per-layer gather/free is the deferred
+  memory optimization (does not change the curve).
+
+### Gates (12 tests, green; in-scope `clippy -D warnings` + `fmt` clean)
+- **`FlatShardPlan`** (6 unit): flatten/unflatten roundtrip identity; `shard_range` partitions the
+  padded buffer; padding zeroed; no-padding + `world=4` padding cases; `world=0` panics.
+- **world=1 FSDP == baseline**, bit-exact (the orchestration is a faithful refactor of the plain loop —
+  *different code*, so a real teeth check).
+- **replicated-data FSDP == baseline**, bit-exact for **world∈{2,4}** (`ΣG/world == G` exactly — the
+  running-sum rounding cancels under /2 and /4; verified over 20 M random gradients, and that it does
+  *not* cancel under /8). Isolates the sharding mechanics from data-parallel reordering.
+- **reduced gradient == full-batch gradient (the teeth)**, world∈{2,4}: the reassembled FSDP-reduced
+  gradient matches the single-process full-batch gradient directly (partitioned ~1e-7; replicated
+  bit-exact). Not scale-invariant — catches a wrong `ReduceOp` / dropped reduction / wrong slice.
+- **partition loss-curve tracking**, world∈{2,4}: end-to-end curve within ≈1 ULP (~4.5e-8, measured) of
+  the baseline — a convergence-tracking check, not the reduce-op gate.
+- **determinism**: the FSDP loss curve is bit-identical across thread reschedulings (the fixed-order
+  collective fold through a real training loop).
+
+### Hardened by adversarial review (load-bearing)
+- The review caught that the loss/param-curve parity gate was **blind to a wrong reduce op**: AdamW's
+  update `m̂/(√v̂+ε)` is **scale-invariant in the gradient**, so an `Avg→Sum` (gradients `world`× too
+  large) cancels in the adaptive normalizer — only the `ε` floor leaks (~5e-7, under the 1e-4 gate).
+  Reproduced at HEAD, then fixed by adding the **gradient-level** assertion above (mutation-verified:
+  `Avg→Sum` now fails it). The loss-curve gate was reframed as convergence-tracking, not the reduce-op
+  gate.
+- The review also corrected the plan's IEEE-754 rationale (it claimed "only world=2 replicated is
+  bit-exact" and implied powers of two are safe — both wrong); the verified statement is world∈{2,4}
+  bit-exact, world=8 not.
+
+### Notes
+- Model is a dense 2-layer MLP on the gradient-checked tape ops (0011) — FSDP shards flat f32 master
+  weights identically whether or not the forward quantizes; ternary/QAT is gated separately (0013), and
+  parity (not convergence) is what 0015 proves. CPU sim. Next on the `0.5.x` line: distributed
+  checkpoint + resharding + fault injection (0016), then the rented-2×GPU wall (0017–0018 → `v0.60.0`).
+  See `docs/plans/0015`.
+
 ## [0.5.4] — 2026-06-21 — Distributed collectives: `ProcessGroup` trait + thread-simulated backend
 
 The fourth v0.60 increment (single-GPU-reachable; `0.5.x` line). The ADR-0008 collective-correctness
