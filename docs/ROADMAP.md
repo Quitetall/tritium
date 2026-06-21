@@ -79,6 +79,7 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0019 | `docs/plans/0019-v070-freeze-conformance-set.md` | Freeze + version the conformance vector set: committed `vectors/v070.jsonl` + `frozen_vectors()` + drift gate; CPU gate repointed | v0.70 / ADR 0009 | **done** (tagged `v0.5.7`; CPU) — first **build-ahead** item (see note) | — |
 | 0021 | `docs/plans/0021-v090-cargo-deny-gate.md` | Supply-chain gate: `cargo deny check` green (Unicode-3.0 allow; internal deps version-pinned) + cargo-deny CI lane | v0.90 / ADR 0011 | **done** (tagged `v0.5.8`; CPU) — build-ahead; also unblocks v1.0 `cargo publish` | — |
 | 0022 | `docs/plans/0022-v090-fuzz-breadth.md` | Fuzz breadth: cargo-fuzz targets for every untrusted-byte parser (tqbin/tqidx/salt_bundle/safetensors/legacy) + 8-target CI sweep | v0.90 / ADR 0011 | **done** (tagged `v0.5.9`; CPU) — build-ahead (U5) | — |
+| 0023 | `docs/plans/0023-v090-hardening-gates.md` | v0.90 hardening gates: `#![deny(missing_docs)]` on 6 foundation crates + `cargo-semver-checks` API-stability gate (`scripts/check-semver.sh` + CI lane) | v0.90/v1.0 / ADR 0011 | **done** (tagged `v0.5.10`; CPU) — build-ahead | — |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**

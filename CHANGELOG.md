@@ -7,6 +7,25 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.10] — 2026-06-21 — v0.90 hardening gates: doc-coverage + API-stability
+
+Two reachable-now release-readiness gates (ADR 0011 → ADR 0012), both CPU-only and clear of the
+active GPU/training WIP. Scope: the stable, GPU-free, non-binary library crates.
+
+### Added
+- **`#![deny(missing_docs)]`** on `tritium-core`, `tritium-spec`, `tritium-format`,
+  `tritium-runtime`, `tritium-testkit`, `tritium-quantize` — every public item must now be documented
+  (enforced by the existing build/clippy lane). spec/runtime/testkit were already complete; documented
+  the 17 remaining gaps in core/format/quantize (enum-variant struct fields + one constructor).
+- **`scripts/check-semver.sh`** + a **`semver` CI lane** (`cargo-semver-checks` via
+  `taiki-e/install-action`, baseline = latest `v0.5.*` tag): asserts no *unintentional* breaking API
+  change to the 7 stable public-API crates. Verified locally — current API is non-breaking vs `v0.5.6`
+  ("no semver update required" on all 7).
+
+### Scope note
+`tritium-cuda` (GPU build), binaries (`cli`/`benches`), `tritium-py` (cdylib ABI), and the in-flux
+`tritium-nn`/`tritium-train` are excluded from both gates for now; widen as they stabilize toward v1.0.
+
 ## [0.5.9] — 2026-06-21 — Fuzz breadth: a target for every untrusted-byte parser
 
 v0.90-hardening build-ahead (ADR 0011, U5). Completes the "every parser has a cargo-fuzz target"
