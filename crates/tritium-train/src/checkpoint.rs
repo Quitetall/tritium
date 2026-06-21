@@ -207,7 +207,7 @@ pub fn read_checkpoint<O: Optimizer>(
     bytes: &[u8],
 ) -> Result<Checkpoint<O::State>, CheckpointError> {
     let mut c = Cursor::new(bytes);
-    if c.take(4)? != CHECKPOINT_MAGIC {
+    if c.take_magic()? != CHECKPOINT_MAGIC {
         return Err(CheckpointError::BadMagic);
     }
     let version = c.u8()?;

@@ -28,7 +28,7 @@ pub use checkpoint::{Checkpoint, CheckpointError, LeafCheckpoint};
 pub use data::{Cursor, DataSampler};
 pub use dcp::{DcpError, DistCheckpoint};
 pub use dist::{DistError, ProcessGroup, ReduceOp, SimProcessGroup};
-pub use fsdp::FlatShardPlan;
+pub use fsdp::{FlatShardError, FlatShardPlan};
 pub use lora::Lora;
 pub use lr::LrSchedule;
 pub use optim::{AdamState, AdamW, Optimizer};

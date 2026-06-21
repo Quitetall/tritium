@@ -275,32 +275,27 @@ fn save_load_round_trips_global_state_for_any_world() {
 
 #[test]
 fn save_k_reshard_j_gives_identical_forward() {
-    // Save with K shards, load (world-agnostic), reshard to J ranks and reassemble, then run the
-    // forward — identical loss for every (K, J), because the reconstructed global param is identical.
+    // Save with K shards, load, then RE-SAVE with J shards into a fresh dir and reload — a real K→J
+    // reshard through J-sharded files on disk (param AND optimizer planes). The round-tripped global is
+    // identical for every (K, J), and the forward matches — so no J≠K slicing/padding/plane-drop bug
+    // can hide (each is materialized as real shard files and read back).
     let g = synthetic_global(9);
     let reference = mlp_loss(&g.param);
     for k in [1usize, 2, 4] {
-        let dir = TmpDir::new(&format!("rf_k{k}"));
-        dcp::save(dir.path(), &to_dist(&g), k).unwrap();
-        let loaded = dcp::load(dir.path()).unwrap();
-        assert_eq!(
-            loaded.param, g.param,
-            "load (save world={k}) changed the param"
-        );
+        let dir_k = TmpDir::new(&format!("rf_k{k}"));
+        dcp::save(dir_k.path(), &to_dist(&g), k).unwrap();
+        let loaded = from_dist(dcp::load(dir_k.path()).unwrap());
+        assert_eq!(loaded, g, "load (save world={k}) changed the global state");
         for j in [1usize, 2, 4] {
-            // Reshard to J: pad → split into J contiguous shards → reassemble → drop padding.
-            let plan_j = FlatShardPlan::new(&loaded.leaf_lens, j);
-            let mut padded = loaded.param.clone();
-            padded.resize(plan_j.padded_len(), 0.0);
-            let mut reassembled = vec![0.0f32; plan_j.padded_len()];
-            for r in 0..j {
-                let (lo, hi) = plan_j.shard_range(r);
-                reassembled[lo..hi].copy_from_slice(&padded[lo..hi]);
-            }
-            reassembled.truncate(loaded.total());
-            assert_eq!(reassembled, g.param, "K={k} J={j}: resharded param differs");
+            let dir_j = TmpDir::new(&format!("rf_k{k}_j{j}"));
+            dcp::save(dir_j.path(), &to_dist(&loaded), j).unwrap();
+            let resharded = from_dist(dcp::load(dir_j.path()).unwrap());
             assert_eq!(
-                mlp_loss(&reassembled),
+                resharded, g,
+                "K={k} J={j}: resharded global differs (param/m/v/step)"
+            );
+            assert_eq!(
+                mlp_loss(&resharded.param),
                 reference,
                 "K={k} J={j}: forward differs"
             );
@@ -340,29 +335,123 @@ fn distributed_resume_continues_the_curve_bit_exact() {
     }
 }
 
+/// Overwrite `len` bytes of `path` starting at `offset` with `repl`.
+fn patch_file(path: &Path, offset: usize, repl: &[u8]) {
+    let mut b = std::fs::read(path).unwrap();
+    b[offset..offset + repl.len()].copy_from_slice(repl);
+    std::fs::write(path, b).unwrap();
+}
+
 #[test]
-fn interrupted_save_leaves_committed_checkpoint_intact() {
-    // A committed checkpoint, then a CRASHED save of a newer step: some shard bytes written, but the
-    // manifest never committed (only a .tmp). load() reads only what the live manifest names, so the
-    // previous checkpoint survives untouched — "old or new, never torn".
-    let dir = TmpDir::new("fault_interrupt");
+fn uncommitted_newer_shards_do_not_shadow_committed_checkpoint() {
+    // The crux of "the manifest is the single commit point": a committed checkpoint, then a fully
+    // written but UNCOMMITTED newer save (real, valid step-20 shard files copied in; manifest NOT
+    // updated). load() must still return the committed step-10 checkpoint — complete new shards are
+    // inert until their manifest commits. This is the real rank-killed-mid-save scenario (shards
+    // landed, manifest not yet committed), not a garbage-bytes stand-in.
+    let dir = TmpDir::new("fault_uncommitted");
     let g1 = synthetic_global(10);
     dcp::save(dir.path(), &to_dist(&g1), 2).unwrap();
-    // Orphans from an interrupted save of step 20: a partial shard and an uncommitted manifest .tmp.
-    std::fs::write(
-        dir.path().join("step_20_shard_0000.tdcp"),
-        b"partially written shard",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("manifest.tdcp.tmp"),
-        b"half-written manifest",
-    )
-    .unwrap();
+
+    // Stage a genuine, different step-20 checkpoint elsewhere, then copy ONLY its shards into `dir`.
+    let staging = TmpDir::new("fault_staging");
+    let g2 = GlobalState {
+        step: 20,
+        param: seeded(99, TOTAL, -1.0, 1.0),
+        m: seeded(98, TOTAL, -1.0, 1.0),
+        v: seeded(97, TOTAL, 0.0, 1.0),
+    };
+    dcp::save(staging.path(), &to_dist(&g2), 2).unwrap();
+    for rank in [0usize, 1] {
+        let name = format!("step_20_shard_{rank:04}.tdcp");
+        std::fs::copy(staging.path().join(&name), dir.path().join(&name)).unwrap();
+    }
+    // Plus a half-written manifest .tmp from the interrupted commit, to confirm load ignores it.
+    std::fs::write(dir.path().join("manifest.tdcp.tmp"), b"half-written").unwrap();
+
     let loaded = from_dist(dcp::load(dir.path()).unwrap());
     assert_eq!(
         loaded, g1,
-        "interrupted save corrupted the committed checkpoint"
+        "uncommitted newer shards shadowed the committed checkpoint"
+    );
+}
+
+#[test]
+fn save_rejects_non_monotonic_step() {
+    // Re-saving an already-committed step would overwrite live shard files in place (tearing risk);
+    // save() rejects it before writing anything. A strictly-greater step is accepted.
+    let dir = TmpDir::new("monotonic");
+    dcp::save(dir.path(), &to_dist(&synthetic_global(10)), 2).unwrap();
+    assert_eq!(
+        dcp::save(dir.path(), &to_dist(&synthetic_global(10)), 2),
+        Err(DcpError::NonMonotonicSave {
+            committed: 10,
+            attempted: 10
+        })
+    );
+    assert_eq!(
+        dcp::save(dir.path(), &to_dist(&synthetic_global(5)), 2),
+        Err(DcpError::NonMonotonicSave {
+            committed: 10,
+            attempted: 5
+        })
+    );
+    // A greater step is fine, and load() returns the newest committed step.
+    dcp::save(dir.path(), &to_dist(&synthetic_global(11)), 2).unwrap();
+    assert_eq!(dcp::load(dir.path()).unwrap().step, 11);
+}
+
+#[test]
+fn load_never_panics_on_corrupt_manifest_fields() {
+    // The never-panic-on-untrusted-bytes contract for the structural manifest fields: a corrupt
+    // world / n_planes / version must return a clean DcpError, never panic FlatShardPlan or an alloc.
+    // Manifest layout: magic[0..4] ver[4] step[5..13] world[13..21] n_planes[21..29] ...
+    let make = |tag: &str| {
+        let dir = TmpDir::new(tag);
+        dcp::save(dir.path(), &to_dist(&synthetic_global(2)), 2).unwrap();
+        dir
+    };
+    // world = 0 → InvalidManifest (would otherwise assert in FlatShardPlan::new).
+    let d = make("corrupt_world");
+    patch_file(&d.path().join("manifest.tdcp"), 13, &0u64.to_le_bytes());
+    assert_eq!(
+        dcp::load(d.path()),
+        Err(DcpError::InvalidManifest("world size is zero"))
+    );
+    // n_planes = u64::MAX → TooManyPlanes (would otherwise drive an unbounded Vec allocation).
+    let d = make("corrupt_planes");
+    patch_file(&d.path().join("manifest.tdcp"), 21, &u64::MAX.to_le_bytes());
+    assert_eq!(
+        dcp::load(d.path()),
+        Err(DcpError::TooManyPlanes {
+            got: usize::MAX,
+            max: tritium_train::dcp::MAX_STATE_PLANES
+        })
+    );
+    // version byte → UnsupportedVersion.
+    let d = make("corrupt_version");
+    patch_file(&d.path().join("manifest.tdcp"), 4, &[99u8]);
+    assert_eq!(dcp::load(d.path()), Err(DcpError::UnsupportedVersion(99)));
+}
+
+#[test]
+fn swapped_shards_are_detected() {
+    // Swap two shard files' contents on disk: the file load() reads for rank 0 now carries rank=1 in
+    // its header → ShardMismatch{rank}, not a silently-permuted global.
+    let dir = TmpDir::new("swap");
+    dcp::save(dir.path(), &to_dist(&synthetic_global(7)), 2).unwrap();
+    let p0 = dir.path().join("step_7_shard_0000.tdcp");
+    let p1 = dir.path().join("step_7_shard_0001.tdcp");
+    let b0 = std::fs::read(&p0).unwrap();
+    let b1 = std::fs::read(&p1).unwrap();
+    std::fs::write(&p0, &b1).unwrap();
+    std::fs::write(&p1, &b0).unwrap();
+    assert!(
+        matches!(
+            dcp::load(dir.path()),
+            Err(DcpError::ShardMismatch { field: "rank", .. })
+        ),
+        "swapped shards not detected"
     );
 }
 

@@ -45,39 +45,68 @@ pub struct FlatShardPlan {
     padded: usize,
 }
 
+/// Why building a [`FlatShardPlan`] from *untrusted* inputs failed (e.g. a checkpoint manifest loaded
+/// from disk). Trusted callers use [`FlatShardPlan::new`], which panics on these instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlatShardError {
+    /// `world == 0`.
+    ZeroWorld,
+    /// The concatenated length (`Σ len`) or the padded length (`chunk * world`) overflows `usize`.
+    Overflow,
+}
+
+impl core::fmt::Display for FlatShardError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FlatShardError::ZeroWorld => write!(f, "world size must be > 0"),
+            FlatShardError::Overflow => write!(f, "flat / padded parameter length overflows usize"),
+        }
+    }
+}
+
+impl std::error::Error for FlatShardError {}
+
 impl FlatShardPlan {
-    /// Build a plan for leaves of the given lengths (in order), sharded across `world` ranks.
+    /// Build a plan for leaves of the given lengths (in order), sharded across `world` ranks, from
+    /// **untrusted** inputs (e.g. a manifest parsed from disk): returns an error rather than panicking.
     ///
-    /// # Panics
-    /// If `world == 0`, if the concatenated length (`Σ len`) overflows `usize`, or if the padded
-    /// length (`chunk * world`) overflows `usize` (only reachable at ~`usize::MAX` total elements).
-    #[must_use]
-    pub fn new(leaf_lens: &[usize], world: usize) -> Self {
-        assert!(world > 0, "world size must be > 0");
+    /// # Errors
+    /// [`FlatShardError::ZeroWorld`] if `world == 0`; [`FlatShardError::Overflow`] if the concatenated
+    /// length (`Σ len`) or the padded length (`chunk * world`) overflows `usize`.
+    pub fn try_new(leaf_lens: &[usize], world: usize) -> Result<Self, FlatShardError> {
+        if world == 0 {
+            return Err(FlatShardError::ZeroWorld);
+        }
         let mut segments = Vec::with_capacity(leaf_lens.len());
         let mut off = 0usize;
         for &len in leaf_lens {
             segments.push((off, len));
-            off = off
-                .checked_add(len)
-                .expect("flat parameter length overflows usize");
+            off = off.checked_add(len).ok_or(FlatShardError::Overflow)?;
         }
         let total = off;
         // `chunk * world` is the smallest multiple of `world` that is >= total, so the flat buffer
         // divides evenly into `world` shards for reduce_scatter / all_gather. `div_ceil` itself is
-        // exact (total fits usize; chunk <= total), but `chunk * world` can in principle overflow at
-        // ~usize::MAX total — guard it here once, mirroring dist.rs's `LengthOverflow` discipline.
+        // exact (total fits usize; chunk <= total), but `chunk * world` can overflow at ~usize::MAX —
+        // guarded here, mirroring dist.rs's `LengthOverflow` discipline.
         let chunk = total.div_ceil(world);
-        let padded = chunk
-            .checked_mul(world)
-            .expect("padded flat length (chunk * world) overflows usize");
-        Self {
+        let padded = chunk.checked_mul(world).ok_or(FlatShardError::Overflow)?;
+        Ok(Self {
             segments,
             total,
             world,
             chunk,
             padded,
-        }
+        })
+    }
+
+    /// Build a plan for **trusted** leaf lengths (model parameter sizes).
+    ///
+    /// # Panics
+    /// If `world == 0`, or if the concatenated / padded length overflows `usize` — a programmer error
+    /// for trusted callers. Use [`try_new`](Self::try_new) for inputs parsed from untrusted bytes.
+    #[must_use]
+    pub fn new(leaf_lens: &[usize], world: usize) -> Self {
+        Self::try_new(leaf_lens, world).unwrap_or_else(|e| panic!("invalid FlatShardPlan: {e}"))
     }
 
     /// The per-rank shard length (`ceil(total / world)`).
@@ -240,5 +269,38 @@ mod tests {
     #[should_panic(expected = "world size must be > 0")]
     fn world_zero_panics() {
         let _ = FlatShardPlan::new(&[1, 2], 0);
+    }
+
+    #[test]
+    fn try_new_rejects_zero_world() {
+        assert_eq!(
+            FlatShardPlan::try_new(&[1, 2], 0),
+            Err(FlatShardError::ZeroWorld)
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_length_overflow() {
+        // Σ len overflows usize.
+        assert_eq!(
+            FlatShardPlan::try_new(&[usize::MAX, usize::MAX], 2),
+            Err(FlatShardError::Overflow)
+        );
+        // chunk * world overflows usize (chunk = ceil(usize::MAX / 2), * 2 wraps).
+        assert_eq!(
+            FlatShardPlan::try_new(&[usize::MAX], 2),
+            Err(FlatShardError::Overflow)
+        );
+    }
+
+    #[test]
+    fn try_new_matches_new_on_valid_input() {
+        let lens = [6usize, 1, 2];
+        for world in [1usize, 2, 4] {
+            assert_eq!(
+                FlatShardPlan::try_new(&lens, world).unwrap(),
+                FlatShardPlan::new(&lens, world)
+            );
+        }
     }
 }

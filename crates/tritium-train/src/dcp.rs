@@ -26,8 +26,9 @@
 //! the same element range. Byte framing reuses the never-panic [`Cursor`] from [`crate::checkpoint`].
 
 use crate::checkpoint::{CheckpointError, Cursor};
-use crate::fsdp::FlatShardPlan;
+use crate::fsdp::{FlatShardError, FlatShardPlan};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-rank shard file magic: `b"TDCP"` (Tritium Distributed-Checkpoint, Per-rank).
 pub const DCP_SHARD_MAGIC: [u8; 4] = *b"TDCP";
@@ -35,6 +36,15 @@ pub const DCP_SHARD_MAGIC: [u8; 4] = *b"TDCP";
 pub const DCP_MANIFEST_MAGIC: [u8; 4] = *b"TDCM";
 /// Current DCP format version.
 pub const DCP_VERSION: u8 = 1;
+
+/// Upper bound on optimizer-state planes a manifest may declare. AdamW uses 2; any real first-order
+/// optimizer uses a small handful. A larger value in a (corrupt) manifest is rejected rather than used
+/// to size an allocation — the never-panic guard against an unbounded `Vec` from untrusted bytes.
+pub const MAX_STATE_PLANES: usize = 16;
+
+/// Process-unique counter for atomic-write temp filenames (so concurrent saves to one dir cannot
+/// collide on the same `.tmp` source).
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Why a distributed-checkpoint operation failed. Parsing/loading never panics: a corrupt, truncated,
 /// stale, or missing piece always yields one of these.
@@ -76,6 +86,33 @@ pub enum DcpError {
         /// The value the manifest carried.
         got: usize,
     },
+    /// The manifest's layout was structurally invalid (`world == 0`, or a length that overflows
+    /// `usize`) — caught on the untrusted load path before it could panic [`FlatShardPlan`].
+    InvalidManifest(&'static str),
+    /// A length field exceeded `usize` (e.g. a 64-bit checkpoint read on a 32-bit target, or a
+    /// corrupt field). Carries the offending field name + value.
+    ValueTooLarge {
+        /// The field that was too large.
+        field: &'static str,
+        /// The value read.
+        value: u64,
+    },
+    /// The manifest declared more optimizer-state planes than [`MAX_STATE_PLANES`] — rejected rather
+    /// than used to size an allocation.
+    TooManyPlanes {
+        /// The plane count the manifest declared.
+        got: usize,
+        /// The maximum allowed ([`MAX_STATE_PLANES`]).
+        max: usize,
+    },
+    /// `save` would overwrite a committed checkpoint with a non-greater step (a non-monotonic save,
+    /// which could tear the live checkpoint). The previously-committed step and the attempted step.
+    NonMonotonicSave {
+        /// The step the committed manifest already holds.
+        committed: u64,
+        /// The step the rejected save attempted.
+        attempted: u64,
+    },
 }
 
 impl core::fmt::Display for DcpError {
@@ -104,6 +141,20 @@ impl core::fmt::Display for DcpError {
             } => write!(
                 f,
                 "DCP manifest {field} inconsistent: recomputed {expected}, manifest {got}"
+            ),
+            DcpError::InvalidManifest(why) => write!(f, "invalid DCP manifest: {why}"),
+            DcpError::ValueTooLarge { field, value } => {
+                write!(f, "DCP {field} value {value} exceeds usize")
+            }
+            DcpError::TooManyPlanes { got, max } => {
+                write!(f, "DCP manifest declares {got} state planes (max {max})")
+            }
+            DcpError::NonMonotonicSave {
+                committed,
+                attempted,
+            } => write!(
+                f,
+                "non-monotonic DCP save: committed step {committed}, attempted {attempted}"
             ),
         }
     }
@@ -182,14 +233,24 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, DcpError> {
         return Err(DcpError::UnsupportedVersion(version));
     }
     let step = c.u64()?;
-    let world = u64_to_usize(c.u64()?)?;
-    let n_planes = u64_to_usize(c.u64()?)?;
-    let total = u64_to_usize(c.u64()?)?;
-    let chunk = u64_to_usize(c.u64()?)?;
-    let leaf_count = u64_to_usize(c.u64()?)?;
-    let mut leaf_lens = Vec::with_capacity(leaf_count.min(c.remaining() / 8 + 1));
+    let world = u64_to_usize("world", c.u64()?)?;
+    let n_planes = u64_to_usize("n_planes", c.u64()?)?;
+    // Bound n_planes BEFORE it is ever used to size an allocation (here, in load(), or in
+    // parse_shard) — an unbounded value from a corrupt manifest must not drive a giant `Vec`.
+    if n_planes > MAX_STATE_PLANES {
+        return Err(DcpError::TooManyPlanes {
+            got: n_planes,
+            max: MAX_STATE_PLANES,
+        });
+    }
+    let total = u64_to_usize("total", c.u64()?)?;
+    let chunk = u64_to_usize("chunk", c.u64()?)?;
+    let leaf_count = u64_to_usize("leaf_count", c.u64()?)?;
+    // Each leaf_len is a fixed 8-byte u64, so the remaining bytes cap the count exactly — clamp the
+    // pre-allocation to what the buffer can actually hold (a crafted huge leaf_count can't pre-alloc).
+    let mut leaf_lens = Vec::with_capacity(leaf_count.min(c.remaining() / 8));
     for _ in 0..leaf_count {
-        leaf_lens.push(u64_to_usize(c.u64()?)?);
+        leaf_lens.push(u64_to_usize("leaf_len", c.u64()?)?);
     }
     if c.remaining() != 0 {
         return Err(DcpError::TrailingBytes(c.remaining()));
@@ -259,7 +320,7 @@ fn parse_shard(
     check_field("n_planes", m.n_planes as u64, n_planes)?;
     let shard_len = c.u64()?;
     check_field("shard_len", m.chunk as u64, shard_len)?;
-    let shard_len = u64_to_usize(shard_len)?;
+    let shard_len = u64_to_usize("shard_len", shard_len)?;
     let param = c.f32_vec(shard_len)?;
     let mut planes = Vec::with_capacity(m.n_planes);
     for _ in 0..m.n_planes {
@@ -283,11 +344,8 @@ fn check_field(field: &'static str, expected: u64, got: u64) -> Result<(), DcpEr
     }
 }
 
-fn u64_to_usize(v: u64) -> Result<usize, DcpError> {
-    usize::try_from(v).map_err(|_| DcpError::Truncated {
-        needed: usize::MAX,
-        had: 0,
-    })
+fn u64_to_usize(field: &'static str, v: u64) -> Result<usize, DcpError> {
+    usize::try_from(v).map_err(|_| DcpError::ValueTooLarge { field, value: v })
 }
 
 fn shard_path(dir: &Path, step: u64, rank: usize) -> PathBuf {
@@ -298,12 +356,18 @@ fn manifest_path(dir: &Path) -> PathBuf {
     dir.join("manifest.tdcp")
 }
 
-/// Write `bytes` to `path` crash-atomically: write a `.tmp` sibling, `fsync` it, `rename` it into
-/// place, then `fsync` the parent directory so the rename is durable.
+/// Write `bytes` to `path` crash-atomically: write a process-unique `.tmp` sibling, `fsync` it,
+/// `rename` it into place, then `fsync` the parent directory so the rename is durable.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), DcpError> {
     use std::io::Write;
+    // A process-unique temp suffix (pid + atomic counter) so concurrent saves into one directory can
+    // never collide on the same `.tmp` source and truncate each other.
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let tmp = PathBuf::from(tmp);
     {
         let mut f = std::fs::File::create(&tmp).map_err(io)?;
@@ -312,10 +376,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), DcpError> {
     }
     std::fs::rename(&tmp, path).map_err(io)?;
     if let Some(parent) = path.parent() {
-        // Directory fsync makes the rename durable across a crash (POSIX). Best-effort: a platform
-        // that refuses to open a dir as a file should not fail the whole save.
+        // Directory fsync makes the rename durable across a crash (POSIX). Opening a dir as a file is
+        // best-effort (some platforms refuse it), but if it DID open, a sync_all error is a real
+        // durability failure and is surfaced rather than swallowed.
         if let Ok(d) = std::fs::File::open(parent) {
-            let _ = d.sync_all();
+            d.sync_all().map_err(io)?;
         }
     }
     Ok(())
@@ -326,10 +391,18 @@ fn io(e: std::io::Error) -> DcpError {
 }
 
 /// Save `ckpt` as a `world`-rank distributed checkpoint under `dir` (created if absent). Writes one
-/// shard per rank (each atomically), then commits the manifest (atomically) — so an interrupted save
-/// never replaces the previously-committed checkpoint.
+/// shard per rank (each atomically), then commits the manifest (atomically) — the manifest is the
+/// single commit point, so a crash before it commits leaves the previously-committed checkpoint intact.
+///
+/// **Monotonic-step contract.** Saves must advance the step: each new step writes its own shard files
+/// (named by step), so it never overwrites the files the live manifest references. A save whose step
+/// is `<=` the committed step is rejected with [`DcpError::NonMonotonicSave`] *before any file is
+/// written* — re-saving an already-committed step would overwrite live shards in place, which (under a
+/// mid-write crash) could tear the checkpoint. Within this contract, the "old-or-new, never-torn"
+/// guarantee holds unconditionally.
 ///
 /// # Errors
+/// [`DcpError::NonMonotonicSave`] if `ckpt.step` is not greater than the committed step;
 /// [`DcpError::Io`] on any filesystem failure.
 ///
 /// # Panics
@@ -350,6 +423,17 @@ pub fn save(dir: &Path, ckpt: &DistCheckpoint, world: usize) -> Result<(), DcpEr
             "plane {i} length {} != Σ leaf_lens {total}",
             p.len()
         );
+    }
+    // Monotonic-step guard: refuse to overwrite a committed checkpoint with a non-greater step (which
+    // would mutate live-manifest-referenced shard files in place). Checked before writing anything.
+    if let Ok(prev_bytes) = std::fs::read(manifest_path(dir))
+        && let Ok(prev) = parse_manifest(&prev_bytes)
+        && ckpt.step <= prev.step
+    {
+        return Err(DcpError::NonMonotonicSave {
+            committed: prev.step,
+            attempted: ckpt.step,
+        });
     }
     let plan = FlatShardPlan::new(&ckpt.leaf_lens, world);
     let padded = plan.padded_len();
@@ -397,8 +481,13 @@ pub fn save(dir: &Path, ckpt: &DistCheckpoint, world: usize) -> Result<(), DcpEr
 pub fn load(dir: &Path) -> Result<DistCheckpoint, DcpError> {
     let manifest_bytes = std::fs::read(manifest_path(dir)).map_err(io)?;
     let m = parse_manifest(&manifest_bytes)?;
-    // Recompute the layout from leaf_lens + world and check the manifest agrees (corrupt-manifest guard).
-    let plan = FlatShardPlan::new(&m.leaf_lens, m.world);
+    // Recompute the layout from the (untrusted) leaf_lens + world via the non-panicking constructor: a
+    // corrupt manifest (world == 0, overflowing lengths) returns an error instead of panicking the
+    // loader. Then check the manifest's own total/chunk agree with the recomputed plan.
+    let plan = FlatShardPlan::try_new(&m.leaf_lens, m.world).map_err(|e| match e {
+        FlatShardError::ZeroWorld => DcpError::InvalidManifest("world size is zero"),
+        FlatShardError::Overflow => DcpError::InvalidManifest("layout length overflows usize"),
+    })?;
     if plan.total() != m.total {
         return Err(DcpError::LayoutMismatch {
             field: "total",
