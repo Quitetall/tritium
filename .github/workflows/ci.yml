@@ -32,6 +32,20 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace # runs unit, integration, and doc tests
 
+  # Supply-chain gate (ADR 0011 hardening): licenses (allow-list + NOTICE
+  # attribution), RustSec advisories, bans (no external wildcard versions /
+  # disallowed crates), and source registries. Fast + CPU-only, on every push +
+  # PR. The action pins a recent cargo-deny that parses CVSS-4.0 advisories (the
+  # locally-installed 0.16.x cannot), so this is the authoritative advisory gate.
+  cargo-deny:
+    name: supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources advisories
+
   # Scheduled fuzz lane (U5): GGUF parser, zero crashes.
   fuzz:
     name: fuzz gguf parser

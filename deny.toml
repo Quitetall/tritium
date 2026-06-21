@@ -6,12 +6,28 @@
 yanked = "deny"
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Zlib"]
+# Unicode-3.0 is the license of `unicode-ident` (a transitive dep of serde/syn etc.),
+# a permissive Unicode license. It is a normal Cargo dependency (not a vendored code
+# port like T-MAC/BitNet/ggml/Marlin), so it is NOT listed in NOTICE — bundling
+# dependency license texts is deferred to the v1.0 packaging work.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
 confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
+# Deny external wildcard version requirements, but allow them for in-workspace
+# `path`/`workspace = true` deps — every internal Tritium crate is pinned by path,
+# so its version requirement is a (harmless) wildcard.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

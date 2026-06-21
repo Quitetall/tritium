@@ -50,17 +50,21 @@ categories = ["science", "hardware-support", "mathematics"]
 
 # Shared dependency versions — crates opt in with `dep.workspace = true`.
 [workspace.dependencies]
-# internal crates (path deps; version omitted so pre-release bumps don't churn)
-tritium-core = { path = "crates/tritium-core" }
-tritium-spec = { path = "crates/tritium-spec" }
-tritium-format = { path = "crates/tritium-format" }
-tritium-runtime = { path = "crates/tritium-runtime" }
-tritium-testkit = { path = "crates/tritium-testkit" }
-tritium-cpu = { path = "crates/tritium-cpu" }
-tritium-cuda = { path = "crates/tritium-cuda" }
-tritium-quantize = { path = "crates/tritium-quantize" }
-tritium-nn = { path = "crates/tritium-nn" }
-tritium-train = { path = "crates/tritium-train" }
+# internal crates (path + caret version). The caret req resolves across the whole
+# 0.5.x build-ahead line with zero churn (only a minor bump like 0.60.0 updates it,
+# as part of that release commit); the explicit version is also required for
+# `cargo publish` (crates.io forbids bare path deps) and lets cargo-deny keep
+# `wildcards = "deny"` meaningful for *external* deps.
+tritium-core = { path = "crates/tritium-core", version = "0.5.7" }
+tritium-spec = { path = "crates/tritium-spec", version = "0.5.7" }
+tritium-format = { path = "crates/tritium-format", version = "0.5.7" }
+tritium-runtime = { path = "crates/tritium-runtime", version = "0.5.7" }
+tritium-testkit = { path = "crates/tritium-testkit", version = "0.5.7" }
+tritium-cpu = { path = "crates/tritium-cpu", version = "0.5.7" }
+tritium-cuda = { path = "crates/tritium-cuda", version = "0.5.7" }
+tritium-quantize = { path = "crates/tritium-quantize", version = "0.5.7" }
+tritium-nn = { path = "crates/tritium-nn", version = "0.5.7" }
+tritium-train = { path = "crates/tritium-train", version = "0.5.7" }
 # foundation
 bytemuck = "1"
 half = "2"
