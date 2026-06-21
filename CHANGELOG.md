@@ -7,6 +7,23 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.9] — 2026-06-21 — Fuzz breadth: a target for every untrusted-byte parser
+
+v0.90-hardening build-ahead (ADR 0011, U5). Completes the "every parser has a cargo-fuzz target"
+invariant across the model-file trust boundary — additive (no library change).
+
+### Added
+- **5 new `tritium-format` fuzz targets**: `tqbin_parse`, `tqidx_parse`, `salt_bundle_parse`,
+  `safetensors_parse`, `salt_legacy_parse` — covering `read_tqbin` / `read_tqidx` /
+  `read_salt_bundle` / `SafeTensors::parse` / `read_legacy_as_salt` (the previously-unfuzzed
+  untrusted-byte parsers). With the existing 3, every `tritium-format` parser now has a target.
+  Verified locally (nightly + cargo-fuzz): each builds, links libFuzzer, and runs clean with no
+  crashes/leaks (millions of execs, RSS ~0.5 GB).
+
+### Changed
+- **CI fuzz lane** now loops over all 8 targets (~450 s each, ~1 h total) instead of three hard-coded
+  runs; adding a parser is a one-line edit.
+
 ## [0.5.8] — 2026-06-21 — Supply-chain gate (cargo-deny) + publishable internal dep pins
 
 v0.90-hardening build-ahead (ADR 0011, supply-chain). `cargo deny check` now passes and runs as a CI
