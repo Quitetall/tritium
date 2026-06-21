@@ -320,7 +320,7 @@ mod tests {
     use super::*;
     use half::f16;
     use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
-    use tritium_testkit::{Tolerance, generate_vectors, run_conformance};
+    use tritium_testkit::{Tolerance, frozen_vectors, generate_vectors, run_conformance};
 
     /// Pack an `[N, K]` trit matrix into the format's row layout, block scale
     /// fixed to `1.0` (the testkit convention), ready for `upload_weights`.
@@ -371,9 +371,15 @@ mod tests {
 
     // ---- the conformance gate ------------------------------------------------
 
+    /// The CPU backend reproduces the committed, frozen conformance set
+    /// (`tritium-testkit`'s `vectors/v070.jsonl`) with zero failures. Grades
+    /// against the immutable artifact rather than a regenerated seed, so this is
+    /// the exact same reference every other backend runs (ADR 0009 freeze). The
+    /// frozen set is `generate_vectors(0xC0FFEE, 64)`, so this changed nothing
+    /// about what CPU validates — only locked it.
     #[test]
     fn conformance_zero_failures() {
-        let vectors = generate_vectors(0xC0FFEE, 64);
+        let vectors = frozen_vectors();
         let report = run_conformance(&CpuBackend::new(), &vectors, Tolerance::default());
         assert!(
             report.is_ok(),

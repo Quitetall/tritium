@@ -32,12 +32,16 @@
 //! ```
 #![forbid(unsafe_code)]
 
+mod frozen;
 mod generate;
 mod jsonl;
 mod reference_backend;
 mod runner;
 mod vector;
 
+pub use frozen::{
+    FROZEN_COUNT, FROZEN_SEED, VECTOR_SET_VERSION, frozen_vectors, frozen_vectors_path,
+};
 pub use generate::generate_vectors;
 pub use jsonl::{JsonlError, load_vectors, save_vectors};
 pub use runner::{FailedCase, FailureReason, Report, run_conformance};
