@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod checkpoint;
+pub mod data;
 pub mod gradcheck;
 pub mod lora;
 pub mod ops;
@@ -20,6 +21,7 @@ pub mod tape;
 pub mod value;
 
 pub use checkpoint::{Checkpoint, CheckpointError, LeafCheckpoint};
+pub use data::{Cursor, DataSampler};
 pub use lora::Lora;
 pub use optim::{AdamState, AdamW, Optimizer};
 pub use tape::{Tape, ValueId};

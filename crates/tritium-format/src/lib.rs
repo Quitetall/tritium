@@ -37,6 +37,7 @@ mod gguf;
 mod gguf_write;
 mod i2s;
 mod i2s_int8;
+mod le_cursor;
 mod rows;
 mod safetensors;
 mod salt;
@@ -45,6 +46,8 @@ mod salt_gguf;
 mod sparse;
 mod tq1;
 mod tq2;
+mod tqbin;
+mod tqidx;
 
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
@@ -78,6 +81,8 @@ pub use sparse::{
 };
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};
+pub use tqbin::{TQBIN_HEADER_BYTES, TQBIN_MAGIC, TQBIN_VERSION, read_tqbin, write_tqbin};
+pub use tqidx::{ShardEntry, TQIDX_MAGIC, TQIDX_VERSION, TqIndex, read_tqidx, write_tqidx};
 
 /// Weights per quantization block (ggml `QK_K`).
 pub const QK_K: usize = 256;
@@ -110,7 +115,7 @@ pub enum FormatError {
     DecodedOutOfRange(i32),
     /// An I2_S 2-bit code was the reserved `0b11` (corrupt input). I2_S decodes
     /// `trit = code - 1`, so only `0b00`=-1, `0b01`=0, `0b10`=+1 are valid; `0b11`
-    /// never occurs in valid weights (see [`i2s`] for the WF-4 verification).
+    /// never occurs in valid weights (see the `i2s` module for the WF-4 verification).
     InvalidI2sCode(u8),
     /// A SALT sidecar buffer did not start with the [`SALT_MAGIC`] bytes.
     SaltBadMagic,
@@ -125,6 +130,16 @@ pub enum FormatError {
     /// A GGUF buffer was not a tritium SALT-in-GGUF container (missing or wrong
     /// `tritium.salt.format` marker, or a SALT tensor with malformed dims).
     SaltGgufBadFormat,
+    /// A `.tqbin`/`.tqidx` buffer did not start with its expected magic bytes.
+    TqBadMagic,
+    /// A `.tqbin`/`.tqidx` buffer declared a format version this build cannot read.
+    UnsupportedTqVersion(u8),
+    /// A `.tqidx` manifest declared `seq_len == 0` (it is the divisor for the sample count).
+    TqZeroSeqLen,
+    /// A `.tqidx` shard name exceeded the `u16` name-length field.
+    TqNameTooLong(usize),
+    /// A `.tqidx` shard name was not valid UTF-8.
+    TqBadName,
 }
 
 impl From<GgufError> for FormatError {
@@ -171,6 +186,18 @@ impl fmt::Display for FormatError {
             FormatError::SaltGgufBadFormat => {
                 write!(f, "GGUF buffer is not a tritium SALT-in-GGUF container")
             }
+            FormatError::TqBadMagic => write!(f, "tq corpus: bad magic"),
+            FormatError::UnsupportedTqVersion(v) => {
+                write!(f, "tq corpus: unsupported version {v}")
+            }
+            FormatError::TqZeroSeqLen => write!(f, "tq manifest: seq_len must be non-zero"),
+            FormatError::TqNameTooLong(n) => {
+                write!(
+                    f,
+                    "tq manifest: shard name length {n} exceeds the u16 field"
+                )
+            }
+            FormatError::TqBadName => write!(f, "tq manifest: shard name is not valid UTF-8"),
         }
     }
 }
