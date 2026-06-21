@@ -1,10 +1,11 @@
 //! Reverse-mode autograd tape: a flat list of ops over an `f32` value arena.
 //!
 //! Each op runs its forward eagerly (storing the output in the arena) and records a
-//! backward closure `(input_values, grad_output) -> grad_per_input`. [`Tape::backward`]
-//! seeds the scalar loss with cotangent `1`, walks the recorded ops in reverse, and
-//! **accumulates** each input's grad — so a value feeding more than one consumer sums
-//! its incoming grads, exactly as the chain rule requires.
+//! backward closure that accumulates gradients directly into the per-value grad
+//! buffers. [`Tape::backward`] seeds the scalar loss with cotangent `1`, walks the
+//! recorded ops in reverse, and each closure adds its contribution to the input
+//! grads — so a value feeding more than one consumer sums its incoming grads,
+//! exactly as the chain rule requires.
 //!
 //! The quantizer slot uses the STE *surrogate* ([`crate::ops::ste::quantize_surrogate`]),
 //! not the rounded QAT forward: `round` is piecewise-constant and not finite-difference-
@@ -17,7 +18,10 @@ use crate::ops::{act, bias, dense, elementwise, loss, matmul, norm, rope, softma
 /// Index of a value buffer in a [`Tape`]'s arena.
 pub type ValueId = usize;
 
-type Backward = Box<dyn Fn(&[&[f32]], &[f32]) -> Vec<Vec<f32>>>;
+/// Backward closure: receives (input_slices, grad_output, grads_array, input_ids)
+/// and accumulates gradients directly into `grads[input_id]` for each input.
+/// No return value — zero intermediate allocations.
+type Backward = Box<dyn Fn(&[&[f32]], &[f32], &mut [Vec<f32>], &[ValueId])>;
 
 struct Node {
     inputs: Vec<ValueId>,
@@ -88,19 +92,17 @@ impl Tape {
         for g in &mut grads[loss] {
             *g = 1.0;
         }
+        // Reusable buffer for input slice references (avoids 270 allocs).
+        let mut input_buf: Vec<&[f32]> = Vec::new();
         for node in self.nodes.iter().rev() {
-            let input_vals: Vec<&[f32]> = node
-                .inputs
-                .iter()
-                .map(|&i| self.values[i].as_slice())
-                .collect();
-            let g_out = grads[node.output].clone();
-            let g_ins = (node.backward)(&input_vals, &g_out);
-            for (k, &in_id) in node.inputs.iter().enumerate() {
-                for (j, &gv) in g_ins[k].iter().enumerate() {
-                    grads[in_id][j] += gv;
-                }
-            }
+            input_buf.clear();
+            input_buf.extend(node.inputs.iter().map(|&i| self.values[i].as_slice()));
+            // Split grads at node.output so we can immutably borrow g_out while
+            // mutably borrowing the rest. Since inputs are always < output (ops
+            // append to the arena), grads_lo contains all input grad slots.
+            let (grads_lo, grads_hi) = grads.split_at_mut(node.output);
+            let g_out = &grads_hi[0]; // grads[node.output]
+            (node.backward)(&input_buf, g_out, grads_lo, &node.inputs);
         }
         grads
     }
@@ -119,7 +121,14 @@ impl Tape {
         self.record(
             vec![wf, s_q],
             out,
-            Box::new(move |ins, g| ste::quantize_vjp(ins[0], ins[1], rows, cols, g)),
+            Box::new(move |ins, g, grads, ids| {
+                let gs = ste::quantize_vjp(ins[0], ins[1], rows, cols, g);
+                for (k, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k]][j] += v;
+                    }
+                }
+            }),
         )
     }
 
@@ -136,7 +145,14 @@ impl Tape {
         self.record(
             vec![x, w],
             out,
-            Box::new(move |ins, g| dense::vjp(ins[0], ins[1], m, n, k, g)),
+            Box::new(move |ins, g, grads, ids| {
+                let gs = dense::vjp(ins[0], ins[1], m, n, k, g);
+                for (k_idx, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k_idx]][j] += v;
+                    }
+                }
+            }),
         )
     }
 
@@ -146,7 +162,12 @@ impl Tape {
         self.record(
             vec![x],
             out,
-            Box::new(move |_ins, g| dense::transpose_vjp(rows, cols, g)),
+            Box::new(move |_ins, g, grads, ids| {
+                let gs = dense::transpose_vjp(rows, cols, g);
+                for (j, &v) in gs[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
         )
     }
 
@@ -158,7 +179,9 @@ impl Tape {
         self.record(
             vec![x],
             out,
-            Box::new(|ins, _g| vec![vec![0.0; ins[0].len()]]),
+            Box::new(|_ins, _g, _grads, _ids| {
+                // Zero gradient — nothing to accumulate.
+            }),
         )
     }
 
@@ -168,7 +191,11 @@ impl Tape {
         self.record(
             vec![x],
             out,
-            Box::new(move |_ins, g| vec![g.iter().map(|&gv| gv * c).collect()]),
+            Box::new(move |_ins, g, grads, ids| {
+                for (j, &gv) in g.iter().enumerate() {
+                    grads[ids[0]][j] += gv * c;
+                }
+            }),
         )
     }
 
@@ -193,7 +220,14 @@ impl Tape {
         self.record(
             vec![act_, trits, scale],
             out,
-            Box::new(move |ins, g| matmul::vjp(ins[0], ins[1], ins[2], m, n, k, g)),
+            Box::new(move |ins, g, grads, ids| {
+                let gs = matmul::vjp(ins[0], ins[1], ins[2], m, n, k, g);
+                for (k_idx, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k_idx]][j] += v;
+                    }
+                }
+            }),
         )
     }
 
@@ -203,14 +237,30 @@ impl Tape {
         self.record(
             vec![x, b],
             out,
-            Box::new(move |ins, g| bias::vjp(ins[0], ins[1], rows, cols, g)),
+            Box::new(move |ins, g, grads, ids| {
+                let gs = bias::vjp(ins[0], ins[1], rows, cols, g);
+                for (k_idx, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k_idx]][j] += v;
+                    }
+                }
+            }),
         )
     }
 
     /// Squared-ReLU activation.
     pub fn relu2(&mut self, x: ValueId) -> ValueId {
         let out = act::relu2_forward(&self.values[x]);
-        self.record(vec![x], out, Box::new(|ins, g| act::relu2_vjp(ins[0], g)))
+        self.record(
+            vec![x],
+            out,
+            Box::new(|ins, g, grads, ids| {
+                let gs = act::relu2_vjp(ins[0], g);
+                for (j, &v) in gs[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
+        )
     }
 
     /// Element-wise add `Y = A + B`.
@@ -219,7 +269,14 @@ impl Tape {
         self.record(
             vec![a, b],
             out,
-            Box::new(|ins, g| elementwise::add_vjp(ins[0], ins[1], g)),
+            Box::new(|ins, g, grads, ids| {
+                let gs = elementwise::add_vjp(ins[0], ins[1], g);
+                for (k_idx, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k_idx]][j] += v;
+                    }
+                }
+            }),
         )
     }
 
@@ -229,7 +286,14 @@ impl Tape {
         self.record(
             vec![a, b],
             out,
-            Box::new(|ins, g| elementwise::mul_vjp(ins[0], ins[1], g)),
+            Box::new(|ins, g, grads, ids| {
+                let gs = elementwise::mul_vjp(ins[0], ins[1], g);
+                for (k_idx, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k_idx]][j] += v;
+                    }
+                }
+            }),
         )
     }
 
@@ -246,7 +310,14 @@ impl Tape {
         self.record(
             vec![x, w],
             out,
-            Box::new(move |ins, g| norm::vjp(ins[0], ins[1], rows, cols, eps, g)),
+            Box::new(move |ins, g, grads, ids| {
+                let gs = norm::vjp(ins[0], ins[1], rows, cols, eps, g);
+                for (k_idx, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k_idx]][j] += v;
+                    }
+                }
+            }),
         )
     }
 
@@ -256,7 +327,12 @@ impl Tape {
         self.record(
             vec![x],
             out,
-            Box::new(move |ins, g| softmax::vjp(ins[0], rows, cols, g)),
+            Box::new(move |ins, g, grads, ids| {
+                let gs = softmax::vjp(ins[0], rows, cols, g);
+                for (j, &v) in gs[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
         )
     }
 
@@ -266,7 +342,12 @@ impl Tape {
         self.record(
             vec![x],
             out,
-            Box::new(move |_ins, g| softmax::causal_mask_vjp(rows, cols, g)),
+            Box::new(move |_ins, g, grads, ids| {
+                let gs = softmax::causal_mask_vjp(rows, cols, g);
+                for (j, &v) in gs[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
         )
     }
 
@@ -284,7 +365,12 @@ impl Tape {
         self.record(
             vec![x],
             out,
-            Box::new(move |_ins, g| rope::vjp(&positions, n_head, head_dim, theta, g)),
+            Box::new(move |_ins, g, grads, ids| {
+                let gs = rope::vjp(&positions, n_head, head_dim, theta, g);
+                for (j, &v) in gs[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
         )
     }
 
@@ -294,13 +380,39 @@ impl Tape {
         self.record(
             vec![pred, target],
             out,
-            Box::new(|ins, g| {
+            Box::new(|ins, g, grads, ids| {
                 let gp = loss::mse_vjp(ins[0], ins[1], g);
-                // target is data: its grad slot stays zero.
-                vec![
-                    gp.into_iter().next().unwrap_or_default(),
-                    vec![0.0; ins[1].len()],
-                ]
+                // Accumulate pred gradient; target is data (zero grad).
+                for (j, &v) in gp[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
+        )
+    }
+
+    /// Softmax cross-entropy loss (scalar output).
+    pub fn softmax_xent(
+        &mut self,
+        logits: ValueId,
+        target: ValueId,
+        rows: usize,
+        cols: usize,
+    ) -> ValueId {
+        let out = loss::softmax_xent_forward(
+            &self.values[logits],
+            &self.values[target],
+            rows,
+            cols,
+        );
+        self.record(
+            vec![logits, target],
+            out,
+            Box::new(move |ins, g, grads, ids| {
+                let gp = loss::softmax_xent_vjp(ins[0], ins[1], rows, cols, g);
+                // Accumulate logits gradient; target is data (zero grad).
+                for (j, &v) in gp[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
             }),
         )
     }

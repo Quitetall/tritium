@@ -73,21 +73,36 @@ pub fn rope_apply(
         .map(|j| theta.powf(-2.0 * j as f64 * inv_head_dim))
         .collect();
 
+    // Precompute cos/sin table: [positions.len() × half]. For a given position
+    // and lane j, the (cos, sin) pair is identical across all heads — only the
+    // data being rotated differs. Precomputing eliminates (n_head-1) × half
+    // sin_cos calls per position.
+    let n_pos = positions.len();
+    let mut cos_table = vec![0.0f32; n_pos * half];
+    let mut sin_table = vec![0.0f32; n_pos * half];
     for (token, &pos) in positions.iter().enumerate() {
         let pos = pos as f64;
-        // Precompute (cos, sin) per lane for this token; shared across all heads.
+        let ct = &mut cos_table[token * half..token * half + half];
+        let st = &mut sin_table[token * half..token * half + half];
+        for j in 0..half {
+            let angle = pos * inv_freq[j];
+            let (s, c) = angle.sin_cos();
+            ct[j] = c as f32;
+            st[j] = s as f32;
+        }
+    }
+
+    for (token, _) in positions.iter().enumerate() {
         let token_base = token * n_head * head_dim;
+        let ct = &cos_table[token * half..token * half + half];
+        let st = &sin_table[token * half..token * half + half];
         for head in 0..n_head {
             let head_base = token_base + head * head_dim;
             for j in 0..half {
-                let angle = pos * inv_freq[j];
-                let (sin, cos) = angle.sin_cos();
-                let cos = cos as f32;
-                let sin = sin as f32;
                 let a = x[head_base + j];
                 let b = x[head_base + j + half];
-                x[head_base + j] = a * cos - b * sin;
-                x[head_base + j + half] = b * cos + a * sin;
+                x[head_base + j] = a * ct[j] - b * st[j];
+                x[head_base + j + half] = b * ct[j] + a * st[j];
             }
         }
     }

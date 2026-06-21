@@ -288,32 +288,22 @@ impl ModelRunner {
             }
         }
 
-        // Final RMSNorm over the last token only (we only need its logits), but
-        // dump the full sequence when capturing.
+        // Final RMSNorm: compute only the last token's norm (we only need its
+        // logits for the LM head). The dump path computes the full sequence.
         let last = seq - 1;
-        let mut final_full = if dump.is_some() {
-            vec![0.0f32; seq * n_embd]
-        } else {
-            Vec::new()
-        };
         let mut last_norm = vec![0.0f32; n_embd];
-        for t in 0..seq {
-            let src = &hidden[t * n_embd..t * n_embd + n_embd];
-            if t == last {
-                rmsnorm(
-                    src,
-                    &self.weights.output_norm,
-                    self.config.rms_eps,
-                    &mut last_norm,
-                )?;
-            }
-            if dump.is_some() {
+        if let Some(d) = dump.as_deref_mut() {
+            let mut final_full = vec![0.0f32; seq * n_embd];
+            for t in 0..seq {
+                let src = &hidden[t * n_embd..t * n_embd + n_embd];
                 let dst = &mut final_full[t * n_embd..t * n_embd + n_embd];
                 rmsnorm(src, &self.weights.output_norm, self.config.rms_eps, dst)?;
             }
-        }
-        if let Some(d) = dump.as_deref_mut() {
+            last_norm.copy_from_slice(&final_full[last * n_embd..last * n_embd + n_embd]);
             d.final_norm = final_full;
+        } else {
+            let src = &hidden[last * n_embd..last * n_embd + n_embd];
+            rmsnorm(src, &self.weights.output_norm, self.config.rms_eps, &mut last_norm)?;
         }
 
         // Tied LM head: logits[v] = <last_norm, token_embd[v]>.
