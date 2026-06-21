@@ -4285,8 +4285,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
-                &self.f_scale_batch,
+                &self.f_tiled_scaled,
                 &d_qact,
                 &self.layers[li].q,
                 &d_act_scale,
@@ -4295,8 +4294,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
-                &self.f_scale_batch,
+                &self.f_tiled_scaled,
                 &d_qact,
                 &self.layers[li].k,
                 &d_act_scale,
@@ -4305,8 +4303,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
-                &self.f_scale_batch,
+                &self.f_tiled_scaled,
                 &d_qact,
                 &self.layers[li].v,
                 &d_act_scale,
@@ -4396,8 +4393,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
-                &self.f_scale_batch,
+                &self.f_tiled_scaled,
                 &d_qact,
                 &self.layers[li].o,
                 &d_act_scale,
@@ -4428,8 +4424,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
-                &self.f_scale_batch,
+                &self.f_tiled_scaled,
                 &d_qact,
                 &self.layers[li].gate,
                 &d_act_scale,
@@ -4438,8 +4433,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
-                &self.f_scale_batch,
+                &self.f_tiled_scaled,
                 &d_qact,
                 &self.layers[li].up,
                 &d_act_scale,
@@ -4473,8 +4467,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
-                &self.f_scale_batch,
+                &self.f_tiled_scaled,
                 &d_qact,
                 &self.layers[li].down,
                 &d_act_scale,
@@ -4640,8 +4633,7 @@ impl CudaDecodeModel {
     #[allow(clippy::too_many_arguments)]
     fn bl_matmul(
         s: &Arc<CudaStream>,
-        f_tiled: &CudaFunction,
-        f_scale: &CudaFunction,
+        f_tiled_scaled: &CudaFunction,
         qact: &CudaSlice<f32>,
         lin: &ResidentLinear,
         scale: &CudaSlice<f32>,
@@ -4650,41 +4642,31 @@ impl CudaDecodeModel {
     ) -> Result<(), BackendError> {
         let (n, k, rb) = (lin.n, lin.k, lin.row_bytes);
         let (m_i, n_i, k_i, rb_i) = (m as i32, n as i32, k as i32, rb as i32);
+        // Fused tiled GEMM + per-token act_scale fold (v0.6.0 opt #15).
+        // grid.y = m dispatches one block-row per output row; the kernel reads
+        // act_scale[mi] per row in the epilogue.
         {
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), m as u32, 1),
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
                 shared_mem_bytes: (k * 4) as u32,
             };
-            let mut l = s.launch_builder(f_tiled);
+            let mut l = s.launch_builder(f_tiled_scaled);
             l.arg(qact)
                 .arg(lin.device.as_ref())
                 .arg(&lin.scales)
+                .arg(scale)
                 .arg(&mut *out)
                 .arg(&m_i)
                 .arg(&n_i)
                 .arg(&k_i)
                 .arg(&rb_i);
-            // SAFETY: `tq2_0_add_mpgemm_tiled(act, weights, scales, out, m, n, k, row_bytes)` (grid.y = m).
+            // SAFETY: `tq2_0_add_mpgemm_tiled_scaled(act, weights, scales,
+            // act_scale, out, m, n, k, row_bytes)` (grid.y = m).
             #[allow(unsafe_code)]
             unsafe {
                 l.launch(cfg)
-                    .map_err(|e| driver_err("launch prefill tiled", &e))?;
-            }
-        }
-        {
-            let cfg = LaunchConfig {
-                grid_dim: (((m * n) as u32).div_ceil(256), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut l = s.launch_builder(f_scale);
-            l.arg(&mut *out).arg(scale).arg(&n_i).arg(&m_i);
-            // SAFETY: `scale_mul_batch_f32(float* out, const float* act_scale, int n, int m)`.
-            #[allow(unsafe_code)]
-            unsafe {
-                l.launch(cfg)
-                    .map_err(|e| driver_err("launch prefill scale", &e))?;
+                    .map_err(|e| driver_err("launch prefill tiled scaled", &e))?;
             }
         }
         Ok(())
