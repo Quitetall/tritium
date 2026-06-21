@@ -58,6 +58,7 @@ const KERNEL_NAME_TILED: &str = "tq2_0_add_mpgemm_tiled";
 const KERNEL_NAME_TILED_F32: &str = "tq2_0_add_mpgemm_tiled_f32";
 const KERNEL_NAME_TILED_SCALED: &str = "tq2_0_add_mpgemm_tiled_scaled";
 const KERNEL_NAME_TILED_F32_SCALED: &str = "tq2_0_add_mpgemm_tiled_f32_scaled";
+const KERNEL_NAME_TILED_F32_SCALED_RESIDUAL: &str = "tq2_0_add_mpgemm_tiled_f32_scaled_residual";
 /// SALT multi-plane accumulate (v0.4.0): sums `Σ_p scale_p·tmatmul(t_p)` over `T`
 /// stacked TQ2_0 planes, reading each block's f16 scale. Matches
 /// [`tritium_format::dequant_salt_row`] → fp32 matmul within 1e-4.
@@ -97,6 +98,7 @@ const ATTN_SPLIT_CHUNK: usize = 64;
 /// On-device int8 activation quant for the tiled (TQ2_0) decode GEMM (v0.3.1) —
 /// bit-matches `ops::quantize_activation_int8` (int8 kept as f32 + per-token scale).
 const KERNEL_NAME_ACT_QUANT_TILED: &str = "act_quant_tiled_f32";
+const KERNEL_NAME_RMSNORM_QUANT: &str = "rmsnorm_quant_f32";
 /// Per-token activation-scale fold `out *= act_scale` (v0.3.1) — the device half of
 /// the W1.58A8 dequant the host applies after the GEMM.
 const KERNEL_NAME_SCALE_MUL: &str = "scale_mul_f32";
@@ -1828,12 +1830,14 @@ impl CudaBackend {
             f_lm_head: f(dm, KERNEL_NAME_LM_HEAD)?,
             f_relu2: f(dm, KERNEL_NAME_RELU2_GATE)?,
             f_quant: f(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
+            f_rmsnorm_quant: f(dm, KERNEL_NAME_RMSNORM_QUANT)?,
             // v0.50 opt: f32-accumulate tiled GEMM (same kernel the graph path uses).
             // f64 is 1/64-rate on the 4090 — the original decode bottleneck. The f32
             // variant stays within the 1e-4 conformance bar (graph path already gated).
             f_tiled: f(&self._module, KERNEL_NAME_TILED_F32)?,
             f_scale: f(dm, KERNEL_NAME_SCALE_MUL)?,
             f_tiled_scaled: f(&self._module, KERNEL_NAME_TILED_F32_SCALED)?,
+            f_tiled_scaled_residual: f(&self._module, KERNEL_NAME_TILED_F32_SCALED_RESIDUAL)?,
             f_rmsnorm_batch: f(dm, KERNEL_NAME_RMSNORM_BATCH)?,
             f_embed_batch: f(dm, KERNEL_NAME_EMBED_BATCH)?,
             f_rope_batch: f(dm, KERNEL_NAME_ROPE_BATCH)?,
@@ -3361,9 +3365,11 @@ pub struct CudaDecodeModel {
     f_lm_head: CudaFunction,
     f_relu2: CudaFunction,
     f_quant: CudaFunction,
+    f_rmsnorm_quant: CudaFunction,
     f_tiled: CudaFunction,
     f_scale: CudaFunction,
     f_tiled_scaled: CudaFunction,
+    f_tiled_scaled_residual: CudaFunction,
     // v0.3.6 batched (M>1) prefill kernels.
     f_rmsnorm_batch: CudaFunction,
     f_embed_batch: CudaFunction,
@@ -3548,20 +3554,13 @@ impl CudaDecodeModel {
             (self.n_head, self.n_head_kv, self.head_dim, self.half);
 
         // --- pre-norm attention ---
-        Self::launch_rmsnorm(
+        // Fused rmsnorm + quant (v0.7.0): skips intermediate d_normed + 1 launch.
+        Self::launch_rmsnorm_quant(
             &self.stream,
-            &self.f_rmsnorm,
+            &self.f_rmsnorm_quant,
             &self.d_x,
             &self.layers[li].attn_norm,
             eps,
-            n_embd,
-            &mut self.d_normed,
-        )?;
-        // Quantize once, reuse for q/k/v (saves 2 quant launches per layer).
-        Self::launch_quant(
-            &self.stream,
-            &self.f_quant,
-            &self.d_normed,
             n_embd,
             &mut self.d_qact,
             &mut self.d_act_scale,
@@ -3688,20 +3687,13 @@ impl CudaDecodeModel {
         )?;
 
         // --- pre-norm ReLU² MLP ---
-        Self::launch_rmsnorm(
+        // Fused rmsnorm + quant (v0.7.0).
+        Self::launch_rmsnorm_quant(
             &self.stream,
-            &self.f_rmsnorm,
+            &self.f_rmsnorm_quant,
             &self.d_x,
             &self.layers[li].ffn_norm,
             eps,
-            n_embd,
-            &mut self.d_normed,
-        )?;
-        // Quantize once, reuse for gate/up (saves 1 quant launch per layer).
-        Self::launch_quant(
-            &self.stream,
-            &self.f_quant,
-            &self.d_normed,
             n_embd,
             &mut self.d_qact,
             &mut self.d_act_scale,
@@ -3788,6 +3780,41 @@ impl CudaDecodeModel {
         unsafe {
             l.launch(cfg)
                 .map_err(|e| driver_err("launch resident rmsnorm", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Fused RMSNorm + A8 quant (v0.7.0): reads `x`, writes `d_qact` + `d_act_scale`
+    /// directly. Eliminates the intermediate `d_normed` buffer and one kernel launch.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_rmsnorm_quant(
+        stream: &Arc<CudaStream>,
+        func: &CudaFunction,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        eps: f32,
+        n: usize,
+        d_qact: &mut CudaSlice<f32>,
+        d_act_scale: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let n_i = n as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (n * 4) as u32,
+        };
+        let mut l = stream.launch_builder(func);
+        l.arg(x)
+            .arg(w)
+            .arg(&eps)
+            .arg(&n_i)
+            .arg(&mut *d_qact)
+            .arg(&mut *d_act_scale);
+        // SAFETY: `rmsnorm_quant_f32(x, w, eps, n, q_out, act_scale)`.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident rmsnorm_quant", &e))?;
         }
         Ok(())
     }
@@ -6125,8 +6152,8 @@ impl CudaDecodeModel {
 
         // pre-norm attention. q/k/v are FUSED into one GEMM over `d_normed`; q/k/v are then
         // offset slices of the `[q_width + 2·kv_width]` output `d_qkv` (f32 → 4 bytes/elt).
-        self.g_rmsnorm(p.d_x, l.attn_norm, n_embd, p.d_normed)?;
-        self.g_quant(p.d_normed, n_embd, p.d_qact, p.d_act_scale)?;
+        // Fused rmsnorm+quant (v0.7.0): eliminates intermediate d_normed + 1 launch.
+        self.g_rmsnorm_quant(p.d_x, l.attn_norm, n_embd, p.d_qact, p.d_act_scale)?;
         self.g_matmul(&l.qkv, p.d_qact, p.d_act_scale, p.d_qkv)?;
         let q_ptr = p.d_qkv;
         let knew_ptr = p.d_qkv + (q_width * 4) as sys::CUdeviceptr;
@@ -6136,33 +6163,33 @@ impl CudaDecodeModel {
         self.g_kv_append(knew_ptr, l.kv_k, p.d_ctrl, kv_width)?;
         self.g_kv_append(vnew_ptr, l.kv_v, p.d_ctrl, kv_width)?;
         self.g_attn(q_ptr, l.kv_k, l.kv_v, p.d_attn, p.d_scores, p.d_ctrl)?;
-        let attn_in = if let Some(sn) = l.attn_sub_norm {
-            self.g_rmsnorm(p.d_attn, sn, q_width, p.d_attn_sn)?;
-            p.d_attn_sn
+        if let Some(sn) = l.attn_sub_norm {
+            // Fused sub-norm + quant: skips intermediate attn_sn buffer.
+            self.g_rmsnorm_quant(p.d_attn, sn, q_width, p.d_qact, p.d_act_scale)?;
         } else {
-            p.d_attn
-        };
-        self.g_quant(attn_in, q_width, p.d_qact, p.d_act_scale)?;
-        self.g_matmul(&l.o, p.d_qact, p.d_act_scale, p.d_proj_out)?;
-        self.g_residual(p.d_x, p.d_proj_out, n_embd)?;
+            self.g_quant(p.d_attn, q_width, p.d_qact, p.d_act_scale)?;
+        }
+        // Fused O proj GEMM + residual add (v0.7.0 Phase 2).
+        // Pass d_x as both residual and output → in-place: d_x += GEMM.
+        self.g_matmul_residual(&l.o, p.d_qact, p.d_act_scale, p.d_x, p.d_x)?;
 
         // pre-norm ReLU² MLP. gate/up are FUSED; gate/up are halves of `d_gateup` [2·n_ff].
         let n_ff = self.n_ff;
-        self.g_rmsnorm(p.d_x, l.ffn_norm, n_embd, p.d_normed)?;
-        self.g_quant(p.d_normed, n_embd, p.d_qact, p.d_act_scale)?;
+        // Fused rmsnorm+quant (v0.7.0).
+        self.g_rmsnorm_quant(p.d_x, l.ffn_norm, n_embd, p.d_qact, p.d_act_scale)?;
         self.g_matmul(&l.gateup, p.d_qact, p.d_act_scale, p.d_gateup)?;
         let gate_ptr = p.d_gateup;
         let up_ptr = p.d_gateup + (n_ff * 4) as sys::CUdeviceptr;
         self.g_relu2(gate_ptr, up_ptr, n_ff)?; // gate = relu(gate)² ⊙ up, in place
-        let down_in = if let Some(sn) = l.ffn_sub_norm {
-            self.g_rmsnorm(gate_ptr, sn, n_ff, p.d_gate_sn)?;
-            p.d_gate_sn
+        if let Some(sn) = l.ffn_sub_norm {
+            // Fused sub-norm + quant.
+            self.g_rmsnorm_quant(gate_ptr, sn, n_ff, p.d_qact, p.d_act_scale)?;
         } else {
-            gate_ptr
-        };
-        self.g_quant(down_in, n_ff, p.d_qact, p.d_act_scale)?;
-        self.g_matmul(&l.down, p.d_qact, p.d_act_scale, p.d_proj_out)?;
-        self.g_residual(p.d_x, p.d_proj_out, n_embd)?;
+            self.g_quant(gate_ptr, n_ff, p.d_qact, p.d_act_scale)?;
+        }
+        // Fused down proj GEMM + residual add (v0.7.0 Phase 2).
+        // Pass d_x as both residual and output → in-place: d_x += GEMM.
+        self.g_matmul_residual(&l.down, p.d_qact, p.d_act_scale, p.d_x, p.d_x)?;
         Ok(())
     }
 
@@ -6213,6 +6240,31 @@ impl CudaDecodeModel {
         )
     }
 
+    /// Fused RMSNorm + A8 quant (v0.7.0): reads `x`, writes `d_qact` + `d_act_scale`
+    /// directly. Eliminates the intermediate `d_normed` buffer and one kernel launch.
+    /// Dynamic shared memory = n * 4 bytes.
+    fn g_rmsnorm_quant(
+        &self,
+        x: sys::CUdeviceptr,
+        w: sys::CUdeviceptr,
+        n: usize,
+        d_qact: sys::CUdeviceptr,
+        d_act_scale: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
+        let eps = self.rms_eps;
+        let n_i = n as i32;
+        let smem = (n * 4) as u32;
+        let mut params = [pp(&x), pp(&w), pp(&eps), pp(&n_i), pp(&d_qact), pp(&d_act_scale)];
+        raw_launch(
+            self.raw().rmsnorm_quant,
+            (1, 1, 1),
+            (256, 1, 1),
+            smem,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
+    }
+
     /// Tiled add-only GEMM + the per-token scale fold, consuming a pre-quantized `d_qact`
     /// (+ its `d_act_scale`). `g_quant` must have run on the matching input first.
     fn g_matmul(
@@ -6250,6 +6302,43 @@ impl CudaDecodeModel {
             )?;
         }
         Ok(())
+    }
+
+    /// Fused tiled GEMM + act_scale fold + residual add (v0.7.0 Phase 2).
+    /// Epilogue: `out[mi,ni] = residual[mi,ni] + acc * scales[ni] * act_scale[mi]`.
+    /// Eliminates the separate `residual_add_f32` launch + its memory pass.
+    fn g_matmul_residual(
+        &self,
+        lin: &LinPtrs,
+        d_qact: sys::CUdeviceptr,
+        d_act_scale: sys::CUdeviceptr,
+        d_residual: sys::CUdeviceptr,
+        d_out: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
+        let cs = self.cap_stream.cu_stream();
+        let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
+        let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
+        let smem = (lin.k * 4) as u32;
+        let mut params = [
+            pp(&d_qact),
+            pp(&lin.w),
+            pp(&lin.sc),
+            pp(&d_act_scale),
+            pp(&d_residual),
+            pp(&d_out),
+            pp(&m_i),
+            pp(&n_i),
+            pp(&k_i),
+            pp(&rb_i),
+        ];
+        raw_launch(
+            self.raw().tiled_scaled_residual,
+            grid,
+            (WARPS_PER_BLOCK * 32, 1, 1),
+            smem,
+            cs,
+            &mut params,
+        )
     }
 
     fn g_rope(
@@ -6518,6 +6607,7 @@ struct RawGraphKernels {
     kv_append: sys::CUfunction,
     attn_g: sys::CUfunction,
     rmsnorm: sys::CUfunction,
+    rmsnorm_quant: sys::CUfunction,
     residual: sys::CUfunction,
     relu2: sys::CUfunction,
     lm_head: sys::CUfunction,
@@ -6525,6 +6615,7 @@ struct RawGraphKernels {
     scale: sys::CUfunction,
     tiled: sys::CUfunction,
     tiled_scaled: sys::CUfunction,
+    tiled_scaled_residual: sys::CUfunction,
 }
 
 // SAFETY: the raw `CUmodule`/`CUfunction` are process-valid device handles, used only on
@@ -6567,6 +6658,8 @@ impl RawGraphKernels {
             // tree-reduction rmsnorm would reach ~132 tok/s but reorders the sum and breaks
             // the gate; this gets most of the win while staying bit-exact.)
             rmsnorm: get(dm, KERNEL_NAME_RMSNORM_SHARED)?,
+            // Fused rmsnorm + quant: eliminates one global read+write per norm (v0.7.0).
+            rmsnorm_quant: get(dm, KERNEL_NAME_RMSNORM_QUANT)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
             act_quant: get(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
@@ -6578,6 +6671,8 @@ impl RawGraphKernels {
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
             // Fused-scaled variant: folds act_scale into the epilogue (v0.6.0 opt #15).
             tiled_scaled: get(am, KERNEL_NAME_TILED_F32_SCALED)?,
+            // Fused-scaled + residual: GEMM epilogue adds to residual (v0.7.0 Phase 2).
+            tiled_scaled_residual: get(am, KERNEL_NAME_TILED_F32_SCALED_RESIDUAL)?,
             modules: vec![dm, am],
         })
     }

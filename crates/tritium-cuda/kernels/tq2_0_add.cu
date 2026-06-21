@@ -349,6 +349,61 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
     }
 }
 
+// Fused-scaled + residual-add f32 variant (v0.7.0 opt Phase 2).
+// Epilogue: out[mi,ni] = residual[mi,ni] + acc * scales[ni] * act_scale[mi]
+// Eliminates the separate residual_add_f32 kernel launch + its memory pass.
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
+    const float* __restrict__ act,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const float* __restrict__ act_scale,
+    const float* __restrict__ residual,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    extern __shared__ float s_act[];
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_act[i] = arow[i];
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    float acc = 0.0f;
+    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        const int e = ki - block * QK_K;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        const float a = s_act[ki];
+        acc += a * (float)((int)code - 1);
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        const long long idx = (long long)mi * n + ni;
+        out[idx] = __fadd_rn(residual[idx], acc * scales[ni] * act_scale[mi]);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SALT multi-plane accumulate (v0.4.0, ADR 0001/0006).
 //
