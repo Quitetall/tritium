@@ -7,6 +7,52 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.4] — 2026-06-21 — Distributed collectives: `ProcessGroup` trait + thread-simulated backend
+
+The fourth v0.60 increment (single-GPU-reachable; `0.5.x` line). The ADR-0008 collective-correctness
+substrate, fully reachable on one machine: an object-safe `ProcessGroup` trait (the abstraction the
+real `cudarc::nccl` backend implements at the 0017 wall) plus a **deterministic** thread-simulated
+backend — N logical ranks in N threads over a shared host buffer — so the load-bearing gate,
+*all-reduced grads == a single-process summed reference*, goes CI-green with no second GPU.
+
+### Added
+- **`ProcessGroup`** (object-safe) in `tritium-train::dist`: `all_reduce` / `reduce_scatter` /
+  `all_gather` / `broadcast`, each `-> Result<(), DistError>`; `ReduceOp::{Sum, Avg}`. Re-exported at
+  the crate root.
+- **`SimProcessGroup`** — the "gloo-for-CI" backend. `SimProcessGroup::world(n)` hands back `n` handles
+  sharing one `Arc<SimShared>` (per-rank staging slots behind a `Mutex` + a `std::sync::Barrier(n)`).
+  Every reduction folds the slots in **fixed rank order `0..world`**, so the result is independent of
+  thread scheduling and bit-identical to a single-process reference (f32 add is non-associative — the
+  bridge to 0015's loss-parity and 0017's wire-correctness gates).
+- **`DistError`**: `LengthMismatch` / `LengthOverflow` / `InvalidRoot` / `CollectiveMismatch` /
+  `Backend` — every collective misuse returns rather than panics.
+
+### Gates (14 tests, green)
+- **all_reduce == single-process summed reference**, bit-exact, `world∈{1,2,4,8}` + a proptest over
+  `world∈[1,8]`, `n∈[1,40)`; reduce_scatter / all_gather / broadcast match their references; `Avg` =
+  `Sum/world` for all_reduce **and** reduce_scatter.
+- **determinism** under thread scheduling for all four collectives (40–50× rerun bit-identity).
+- mis-sized buffers → `Err`, never a panic; in-scope `clippy -D warnings` + `fmt` clean.
+
+### Barrier protocol — hardened by a 10-lens adversarial review (load-bearing)
+- The review caught a real **deadlock**: `reduce_scatter`/`all_gather`/`broadcast` did a local
+  size/root pre-check and `return Err` *before* `publish()`/barrier #1, so a size-disagreeing rank did
+  **zero** `barrier.wait()` calls while peers blocked at barrier #1 forever (a CI hang). Fixed by
+  making every collective uniform — **"publish first → validate after barrier #1 → ALWAYS reach
+  barrier #2"**: exactly two `barrier.wait()` on every Ok/Err path. A timeout-guarded multi-rank
+  regression test provably **hangs→fails against the old code** and passes in 0.04 s against the fix.
+- Review-driven additions: a per-collective **op-tag** turns a cross-collective desync into a clean
+  symmetric `CollectiveMismatch` (no hang); `LengthOverflow` replaces the dishonest `usize::MAX`
+  overflow sentinel.
+
+### Notes
+- CPU sim. **Documented limitations:** `std::sync::Barrier` has no break/poison (a rank that *panics*
+  inside a collective strands its peers); a *different-count-of-collectives* desync is uncatchable
+  (the op-tag guard only catches same-step type/order divergence) — the real NCCL backend (0017)
+  brings its own timeout/abort. Next on the `0.5.x` line: ZeRO-3/FSDP over this `ProcessGroup` (0015),
+  distributed checkpoint/resharding/fault-inject (0016), then the rented-2×GPU wall (0017–0018 →
+  `v0.60.0`). See `docs/plans/0014`.
+
 ## [0.5.3] — 2026-06-20 — GPU pretrain smoke: training step wires the grad kernels + LR schedule
 
 The third v0.60 increment (single-GPU-reachable; `0.5.x` line). The formerly dead-code CUDA gradient

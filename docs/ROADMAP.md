@@ -43,7 +43,7 @@ proceed from outputs alone, "no matter what happens."
 | v0.40 SALT Quantization | 0006 | **Done** (tagged `v0.4.0`, pushed) |
 | v0.4.1 perf/correctness point-release (split-KV + IMMA fix) | 0013 / — | **Done** (tagged `v0.4.1` @ `202bec1`, pushed; CUDA decode + IMMA gates re-verified on GPU) |
 | v0.50 Training Core | 0007 | **Done** (tagged `v0.5.0`) — STE autograd + Gate C green CPU+CUDA (0005–0007), AdamW + bit-exact checkpoint (0008), LoRA on frozen base (0009), QAT heal bridge + distillation-convergence capstone on the real model (0010). Full-model ≥90% PPL-recovery deferred to v0.60 (needs full-model backprop + a non-QAT-latent checkpoint — see 0010). |
-| v0.60 Pretraining + Distributed | 0008 | **In-progress** — full-model CPU backward (0011, `v0.5.1`) + data pipeline (0012, `v0.5.2`) + GPU pretrain smoke (0013, `v0.5.3`) **done**; shipping the single-GPU-reachable foundation as the `0.5.x` line (next: distributed correctness via a simulated ProcessGroup), with the real ≥2-GPU wall (NCCL + ≥80% scaling) deferred to a rented session → `v0.60.0` |
+| v0.60 Pretraining + Distributed | 0008 | **In-progress** — full-model CPU backward (0011, `v0.5.1`) + data pipeline (0012, `v0.5.2`) + GPU pretrain smoke (0013, `v0.5.3`) + ProcessGroup trait & simulated collective backend (0014, `v0.5.4`) **done**; shipping the single-GPU-reachable foundation as the `0.5.x` line (next: ZeRO-3/FSDP over the sim PG, 0015), with the real ≥2-GPU wall (NCCL + ≥80% scaling) deferred to a rented session → `v0.60.0` |
 | v0.70 Backend Breadth | 0009 | Planned |
 | v0.80 Interop (`tritium-serve`) | 0010 | Planned — *OpenAI-HTTP server doubles as the LAMU `backend_kind` interface* |
 | v0.90 Hardening | 0011 | Planned |
@@ -72,7 +72,8 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0011 | `docs/plans/0011-v0.60-full-model-backward.md` | Full-model CPU backward: rmsnorm/softmax/rope/transpose tape vjps + tiny-transformer end-to-end gradient gate | v0.60 / ADR 0008 | **done** (`b6620cf`, tagged `v0.5.1`; CPU) | — |
 | 0012 | `docs/plans/0012-v0.60-data-pipeline.md` | Data pipeline: deterministic resumable dup/loss-free sharded `DataSampler` + the `.tqbin`/`.tqidx` corpus formats (total never-panic parsers) | v0.60 / ADR 0008 | **done** (tagged `v0.5.2`; CPU) | — |
 | 0013 | `docs/plans/0013-v0.60-gpu-pretrain-smoke.md` | GPU QAT training step (wires the `train_grad` forward+grad kernels) + LR schedule + from-scratch tiny-model pretrain smoke; device==CPU + finite-difference composition gradcheck | v0.60 / ADR 0008 | **done** (tagged `v0.5.3`; 1 GPU) — full-2B resident training engine deferred | — |
-| 0014+ | (planner writes just-in-time) | ProcessGroup + simulated backend (0014), ZeRO-3 sim + resharding (0015–0016), then the ≥2-GPU wall (0017–0018) | v0.60 / ADR 0008 | todo | per chunk |
+| 0014 | `docs/plans/0014-v0.60-process-group.md` | `ProcessGroup` trait + deterministic thread-simulated collective backend (all_reduce / reduce_scatter / all_gather / broadcast); all-reduced grads == single-process summed reference | v0.60 / ADR 0008 | **done** (tagged `v0.5.4`; CPU sim) — uniform publish-first/2-barrier protocol + op-tag desync guard, adversarial-review-hardened | — |
+| 0015+ | (planner writes just-in-time) | ZeRO-3/FSDP over the sim PG (0015), distributed checkpoint + resharding + fault-inject (0016), then the ≥2-GPU wall (0017–0018) | v0.60 / ADR 0008 | todo | per chunk |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**
