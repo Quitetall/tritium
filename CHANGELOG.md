@@ -7,6 +7,27 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.1] — 2026-06-20 — Full-model autograd backward (v0.60 foundation)
+
+The first v0.60 increment (single-GPU-reachable; the v0.60 milestone proper is gated on ≥2 GPUs).
+The eager reverse-mode tape now backprops a **whole transformer end-to-end** — the foundation a
+pretraining loop needs, and the wall the v0.50 capstone explicitly deferred.
+
+### Added
+- New gradient-checked `tritium-train` tape ops (forward + vjp, each central-FD-checked at
+  Gate-C 2e-3): **RMSNorm**, **row-wise softmax** + **causal mask**, **NeoX RoPE** (matching the
+  inference `rope_apply` convention; vjp = the inverse rotation), and a **dense transpose** (for
+  attention's `P·V`). The gated squared-ReLU MLP + residuals compose from existing ops.
+- A composed **single-head tiny-transformer end-to-end gradient check** — rmsnorm → q/k/v → RoPE →
+  scaled causal-masked softmax attention → o_proj → residual → gated-relu²-MLP + sub-norm →
+  residual → output-norm → LM head → MSE — with every trainable leaf's analytic gradient matched
+  to a per-element central finite difference. The v0.50-deferred full-model-backprop wall, now green.
+
+### Notes
+- CPU only. The rest of v0.60 follows as the `0.5.x` line: the GPU-resident training loop +
+  pretrain smoke (0013), distributed correctness via a thread-simulated `ProcessGroup` (0014–0016),
+  then the rented-2×GPU wall (0017–0018 → `v0.60.0`). See `docs/plans/0011`.
+
 ## [0.5.0] — 2026-06-20 — Training Core (STE autograd + QAT + optimizer + LoRA + CUDA backward)
 
 The v0.50 milestone (ADR 0007): a single-node training core for ternary BitNet models. New crate
