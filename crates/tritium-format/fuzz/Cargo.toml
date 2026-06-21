@@ -41,3 +41,38 @@ path = "fuzz_targets/sparse_plane_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tqbin_parse"
+path = "fuzz_targets/tqbin_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tqidx_parse"
+path = "fuzz_targets/tqidx_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "salt_bundle_parse"
+path = "fuzz_targets/salt_bundle_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safetensors_parse"
+path = "fuzz_targets/safetensors_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "salt_legacy_parse"
+path = "fuzz_targets/salt_legacy_parse.rs"
+test = false
+doc = false
+bench = false

@@ -46,23 +46,28 @@ jobs:
         with:
           command: check licenses bans sources advisories
 
-  # Scheduled fuzz lane (U5): GGUF parser, zero crashes.
+  # Scheduled fuzz lane (U5): every tritium-format parser, zero crashes.
   fuzz:
-    name: fuzz gguf parser
+    name: fuzz parsers
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz
-      # One hour split across the three tritium-format parsers (U5: every parser
-      # introduced has a target — GGUF reader, SALT-in-GGUF, sparse plane).
-      - run: cargo +nightly fuzz run gguf_parse -- -max_len=131072 -max_total_time=1200
+      # ~1 hour split across EVERY tritium-format untrusted-byte parser (U5:
+      # every parser introduced has a target). Looped so adding a parser is a
+      # one-line change here + a new fuzz_targets/*.rs + a [[bin]] block.
+      - name: fuzz all parsers
         working-directory: crates/tritium-format
-      - run: cargo +nightly fuzz run salt_gguf_parse -- -max_len=131072 -max_total_time=1200
-        working-directory: crates/tritium-format
-      - run: cargo +nightly fuzz run sparse_plane_parse -- -max_len=131072 -max_total_time=1200
-        working-directory: crates/tritium-format
+        run: |
+          for t in gguf_parse salt_gguf_parse sparse_plane_parse \
+                   tqbin_parse tqidx_parse salt_bundle_parse \
+                   safetensors_parse salt_legacy_parse; do
+            echo "::group::fuzz $t"
+            cargo +nightly fuzz run "$t" -- -max_len=131072 -max_total_time=450
+            echo "::endgroup::"
+          done
 
   # GPU lane (U2 parity + CUDA conformance + compute-sanitizer). Self-hosted,
   # manual — runs only where a CUDA toolkit + NVIDIA GPU are present.
