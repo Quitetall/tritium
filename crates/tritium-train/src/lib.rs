@@ -13,6 +13,7 @@
 
 pub mod checkpoint;
 pub mod data;
+pub mod dcp;
 pub mod dist;
 pub mod fsdp;
 pub mod gradcheck;
@@ -25,6 +26,7 @@ pub mod value;
 
 pub use checkpoint::{Checkpoint, CheckpointError, LeafCheckpoint};
 pub use data::{Cursor, DataSampler};
+pub use dcp::{DcpError, DistCheckpoint};
 pub use dist::{DistError, ProcessGroup, ReduceOp, SimProcessGroup};
 pub use fsdp::FlatShardPlan;
 pub use lora::Lora;

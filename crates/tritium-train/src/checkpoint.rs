@@ -102,6 +102,15 @@ impl<'a> Cursor<'a> {
         Ok(s)
     }
 
+    /// Read a 4-byte magic tag.
+    ///
+    /// # Errors
+    /// [`CheckpointError::Truncated`] if fewer than 4 bytes remain.
+    pub fn take_magic(&mut self) -> Result<[u8; 4], CheckpointError> {
+        let s = self.take(4)?;
+        Ok([s[0], s[1], s[2], s[3]])
+    }
+
     /// Read a `u8`.
     pub fn u8(&mut self) -> Result<u8, CheckpointError> {
         Ok(self.take(1)?[0])
