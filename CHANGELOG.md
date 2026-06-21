@@ -7,6 +7,37 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.3] — 2026-06-20 — GPU pretrain smoke: training step wires the grad kernels + LR schedule
+
+The third v0.60 increment (single-GPU-reachable; `0.5.x` line). The formerly dead-code CUDA gradient
+kernels are now wired into a converging GPU QAT training step, with a learning-rate schedule and a
+from-scratch tiny-model pretrain smoke — the ADR-0008 "tiny model reaches target loss" gate on one GPU.
+
+### Added
+- **`LrSchedule`** (`tritium-train`): pure-CPU linear-warmup → cosine-decay, `lr(step) -> f32`.
+- **`ternary_matmul_forward`** CUDA kernel (the f32 forward companion to `grad_a/grad_w/grad_s`,
+  same `--fmad=false` reduction order) + a `train_forward` host binding.
+- **GPU QAT training step** (`tritium-cuda::train`, behind `cuda`): a 2-layer ternary MLP
+  (`x →[Wq₁,s₁] → relu² → [Wq₂,s₂] → MSE`) with f32 master weights (off-grid init), a **learned**
+  per-row output scale (quantizer-scale stop-gradiented), STE master updates
+  (`ste::quantize_vjp`), and per-leaf `AdamW` driven by the schedule. `pretrain_smoke` runs it from a
+  seeded init. `tritium-train` becomes a `cuda`-gated dependency (the grad kernels' first real consumer).
+
+### Gates
+- **device step == CPU tape** within 1e-4 (the composed 2-layer step's gradients vs `tritium-train`'s
+  matmul vjp) **plus** a CPU **finite-difference gradcheck** of the composition's weight-master
+  gradients against the smooth STE-surrogate loss — which (unlike the parity gate) catches a coherent
+  miswiring shared by both engines (mutation-verified).
+- **pretrain smoke**: loss `0.261 → 0.025` (90.5% drop, gated `<0.30`), no NaN, ~0.98 ms/step.
+- LR-schedule property tests; `clippy -D warnings` + `fmt` clean; **`compute-sanitizer` memcheck:
+  0 errors**; full 45-test cuda suite green; default no-CUDA build inert.
+
+### Notes
+- CPU + 1 GPU. The full-2B **resident** training engine (training-mode resident decoder, activation
+  retention/checkpointing) is deferred — measured immaterial at smoke scale. Next on the `0.5.x` line:
+  distributed correctness via a thread-simulated `ProcessGroup` (0014–0016), then the rented-2×GPU wall
+  (0017–0018 → `v0.60.0`). See `docs/plans/0013`.
+
 ## [0.5.2] — 2026-06-20 — Data pipeline: deterministic resumable sharded sampler + `.tqbin`/`.tqidx`
 
 The second v0.60 increment (single-GPU-reachable; still on the `0.5.x` line). The data substrate a
