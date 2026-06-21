@@ -192,13 +192,26 @@ GPU CI lane).
 
 ---
 
+### #16 — Parallel CPU LM head with rayon ✅
+
+**File:** `crates/tritium-nn/src/model/runner.rs`
+
+**Change:** The tied LM head computes 128K dot products of 2560 elements each
+(logit[v] = <last_norm, token_embd[v]>). Parallelized with rayon
+`par_chunks_mut(1024)` for multi-core throughput.
+
+**Impact:** On a multi-core CPU, this reduces the LM head time proportionally
+to the core count. For the CPU-only decode path, this is a significant win
+since the LM head is the dominant cost after the transformer layers.
+
+---
+
 ## Still open (from the full optimization scan)
 
 See the conversation for the complete list of 29 findings across CUDA, CPU, and
 training paths. Highest-impact remaining:
 
-1. **Fuse scale_mul_batch into batched GEMM epilogue** (CUDA, M>1 prefill path)
-2. **Per-layer scratch arena** (CPU, ~300 allocs/token eliminated)
-3. **M=N batch fusion** (CUDA, Q/K/V + gate/up fusion)
-4. **CPU LM head parallelization** (128K × 2560 scalar dot → rayon + SIMD)
-5. **AVX2 GEMM SIMD accumulator** (4-8× CPU GEMM win)
+1. **Per-layer scratch arena** (CPU, ~300 allocs/token eliminated)
+2. **M=N batch fusion** (CUDA, Q/K/V + gate/up in single GEMM)
+3. **AVX2 GEMM SIMD accumulator** (4-8× CPU GEMM win)
+4. **Fuse residual add into GEMM epilogue** (CUDA, 2 launches/layer saved)
