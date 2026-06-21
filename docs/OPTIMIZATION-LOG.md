@@ -222,6 +222,39 @@ layers ≈ 182 allocs per forward pass.
 
 ---
 
+### Phase 1 — Fused RMSNorm + Quantize ✅
+
+**File:** `crates/tritium-cuda/kernels/decode.cu`
+
+**Change:** New `rmsnorm_quant_f32` kernel combines `rmsnorm_shared_f32` +
+`act_quant_tiled_f32` into one pass. The rmsnorm output stays in shared memory;
+the absmax reduction and quantization read from shared, not global.
+
+**Saves:** 1 global read + 1 global write per call. 4 calls per layer × 26
+layers = **104 launches eliminated** from the graph path.
+
+---
+
+### Phase 2 — Fused GEMM + Residual Add ✅
+
+**File:** `crates/tritium-cuda/kernels/tq2_0_add.cu`
+
+**Change:** New `tq2_0_add_mpgemm_tiled_f32_scaled_residual` kernel folds the
+residual add into the GEMM epilogue:
+```c
+out[idx] = residual[idx] + acc * scales[ni] * act_scale[mi]
+```
+When residual and out are the same pointer, this becomes in-place `d_x += GEMM`.
+
+**Saves:** 2 residual adds per layer × 26 layers = **52 launches eliminated**
+from the graph path. Each also saves a full read+write pass over the hidden
+state.
+
+**Combined Phase 1+2:** 156 launches eliminated from the graph path (from ~400
+to ~244).
+
+---
+
 ## Still open (from the full optimization scan)
 
 See the conversation for the complete list of 29 findings across CUDA, CPU, and
