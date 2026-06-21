@@ -56,6 +56,8 @@ const KERNEL_NAME_TILED: &str = "tq2_0_add_mpgemm_tiled";
 /// f32-accumulate tiled GEMM for the v0.3.2 graph (perf) path — f64 is 1/64-rate on the
 /// 4090, the decode bottleneck. Not bit-exact; perplexity-gated.
 const KERNEL_NAME_TILED_F32: &str = "tq2_0_add_mpgemm_tiled_f32";
+const KERNEL_NAME_TILED_SCALED: &str = "tq2_0_add_mpgemm_tiled_scaled";
+const KERNEL_NAME_TILED_F32_SCALED: &str = "tq2_0_add_mpgemm_tiled_f32_scaled";
 /// SALT multi-plane accumulate (v0.4.0): sums `Σ_p scale_p·tmatmul(t_p)` over `T`
 /// stacked TQ2_0 planes, reading each block's f16 scale. Matches
 /// [`tritium_format::dequant_salt_row`] → fp32 matmul within 1e-4.
@@ -290,6 +292,9 @@ pub struct CudaBackend {
     /// The resolved `tq2_0_add_mpgemm_tiled` kernel (warp per output, shared-mem
     /// staged activations) — the decode path.
     func_tiled: CudaFunction,
+    /// Fused-scaled variant: folds `act_scale` into the epilogue, eliminating the
+    /// separate `scale_mul_f32` launch (v0.6.0 opt #15).
+    func_tiled_scaled: CudaFunction,
     /// The resolved `salt_mpgemm_tiled_f32` kernel (v0.4.0 SALT multi-plane GEMM),
     /// driven by the resident [`CudaBackend::salt_forward`] path.
     func_salt: CudaFunction,
@@ -397,6 +402,9 @@ impl CudaBackend {
         let func_tiled = module
             .load_function(KERNEL_NAME_TILED)
             .map_err(|e| driver_err("resolve tq2_0_add_tiled kernel", &e))?;
+        let func_tiled_scaled = module
+            .load_function(KERNEL_NAME_TILED_SCALED)
+            .map_err(|e| driver_err("resolve tq2_0_add_tiled_scaled kernel", &e))?;
         let func_salt = module
             .load_function(KERNEL_NAME_SALT)
             .map_err(|e| driver_err("resolve salt_mpgemm kernel", &e))?;
@@ -491,6 +499,7 @@ impl CudaBackend {
             _imma_module: imma_module,
             func,
             func_tiled,
+            func_tiled_scaled,
             func_salt,
             func_imma,
             func_act_quant,
@@ -1635,7 +1644,9 @@ impl CudaBackend {
                     .map_err(|e| driver_err("launch gemm_dev quant", &e))?;
             }
         }
-        // 2. Tiled add-only f64 GEMM (M=1): folds the per-channel weight scale.
+        // 2. Tiled add-only f64 GEMM (M=1) with fused act_scale fold.
+        //    Epilogue: out[mi,ni] = acc * scales[ni] * act_scale[mi].
+        //    Eliminates the separate scale_mul_f32 launch + its memory pass.
         {
             let grid_n = (n as u32).div_ceil(WARPS_PER_BLOCK);
             let cfg = LaunchConfig {
@@ -1643,40 +1654,22 @@ impl CudaBackend {
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
                 shared_mem_bytes: (k * 4) as u32,
             };
-            let mut l = self.stream.launch_builder(&self.func_tiled);
+            let mut l = self.stream.launch_builder(&self.func_tiled_scaled);
             l.arg(&d_q)
                 .arg(buf.device.as_ref())
                 .arg(&d_scales)
+                .arg(&d_act_scale)
                 .arg(&mut d_out)
                 .arg(&m_i)
                 .arg(&n_i)
                 .arg(&k_i)
                 .arg(&rb_i);
-            // SAFETY: `tq2_0_add_mpgemm_tiled(act, weights, scales, out, m, n, k,
-            // row_bytes)`; args in that order. `d_q` length `k`, `buf.device` the
-            // uploaded TQ2_0 weight, `d_scales` length `n`, `d_out` length `n` (M=1);
-            // grid covers `ceil(n/8)` warp-columns × 1 row; shared `k*4` ≤ 32 KiB.
+            // SAFETY: `tq2_0_add_mpgemm_tiled_scaled(act, weights, scales, act_scale,
+            // out, m, n, k, row_bytes)`; args in that order.
             #[allow(unsafe_code)]
             unsafe {
                 l.launch(cfg)
-                    .map_err(|e| driver_err("launch gemm_dev tiled", &e))?;
-            }
-        }
-        // 3. Per-token activation-scale fold: out *= act_scale.
-        {
-            let cfg = LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut l = self.stream.launch_builder(&self.func_scale_mul);
-            l.arg(&mut d_out).arg(&d_act_scale).arg(&n_i);
-            // SAFETY: `scale_mul_f32(float* out, const float* s, int n)`; args in
-            // order; `d_out` length `n`, `d_act_scale` the length-1 scalar.
-            #[allow(unsafe_code)]
-            unsafe {
-                l.launch(cfg)
-                    .map_err(|e| driver_err("launch gemm_dev fold", &e))?;
+                    .map_err(|e| driver_err("launch gemm_dev tiled scaled", &e))?;
             }
         }
         self.stream
@@ -1827,14 +1820,20 @@ impl CudaBackend {
             stream: Arc::clone(&self.stream),
             f_rmsnorm: f(dm, KERNEL_NAME_RMSNORM)?,
             f_rope: f(dm, KERNEL_NAME_ROPE)?,
-            f_attn: f(dm, KERNEL_NAME_ATTN)?,
+            // v0.50 opt: warp-parallel attention (1 warp/head, 32 threads) instead of
+            // single-thread-per-head. The warp kernel is already loaded by the graph path.
+            f_attn: f(dm, KERNEL_NAME_ATTN_WARP)?,
             f_residual: f(dm, KERNEL_NAME_RESIDUAL)?,
             f_embed: f(dm, KERNEL_NAME_EMBED)?,
             f_lm_head: f(dm, KERNEL_NAME_LM_HEAD)?,
             f_relu2: f(dm, KERNEL_NAME_RELU2_GATE)?,
             f_quant: f(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
-            f_tiled: f(&self._module, KERNEL_NAME_TILED)?,
+            // v0.50 opt: f32-accumulate tiled GEMM (same kernel the graph path uses).
+            // f64 is 1/64-rate on the 4090 — the original decode bottleneck. The f32
+            // variant stays within the 1e-4 conformance bar (graph path already gated).
+            f_tiled: f(&self._module, KERNEL_NAME_TILED_F32)?,
             f_scale: f(dm, KERNEL_NAME_SCALE_MUL)?,
+            f_tiled_scaled: f(&self._module, KERNEL_NAME_TILED_F32_SCALED)?,
             f_rmsnorm_batch: f(dm, KERNEL_NAME_RMSNORM_BATCH)?,
             f_embed_batch: f(dm, KERNEL_NAME_EMBED_BATCH)?,
             f_rope_batch: f(dm, KERNEL_NAME_ROPE_BATCH)?,
@@ -3364,6 +3363,7 @@ pub struct CudaDecodeModel {
     f_quant: CudaFunction,
     f_tiled: CudaFunction,
     f_scale: CudaFunction,
+    f_tiled_scaled: CudaFunction,
     // v0.3.6 batched (M>1) prefill kernels.
     f_rmsnorm_batch: CudaFunction,
     f_embed_batch: CudaFunction,
@@ -3557,37 +3557,37 @@ impl CudaDecodeModel {
             n_embd,
             &mut self.d_normed,
         )?;
-        Self::gemm(
+        // Quantize once, reuse for q/k/v (saves 2 quant launches per layer).
+        Self::launch_quant(
             &self.stream,
             &self.f_quant,
-            &self.f_tiled,
-            &self.f_scale,
             &self.d_normed,
-            &self.layers[li].q,
+            n_embd,
             &mut self.d_qact,
             &mut self.d_act_scale,
+        )?;
+        Self::gemm_prequantized(
+            &self.stream,
+            &self.f_tiled_scaled,
+            &self.layers[li].q,
+            &self.d_qact,
+            &self.d_act_scale,
             &mut self.d_q,
         )?;
-        Self::gemm(
+        Self::gemm_prequantized(
             &self.stream,
-            &self.f_quant,
-            &self.f_tiled,
-            &self.f_scale,
-            &self.d_normed,
+            &self.f_tiled_scaled,
             &self.layers[li].k,
-            &mut self.d_qact,
-            &mut self.d_act_scale,
+            &self.d_qact,
+            &self.d_act_scale,
             &mut self.d_knew,
         )?;
-        Self::gemm(
+        Self::gemm_prequantized(
             &self.stream,
-            &self.f_quant,
-            &self.f_tiled,
-            &self.f_scale,
-            &self.d_normed,
+            &self.f_tiled_scaled,
             &self.layers[li].v,
-            &mut self.d_qact,
-            &mut self.d_act_scale,
+            &self.d_qact,
+            &self.d_act_scale,
             &mut self.d_vnew,
         )?;
 
@@ -3636,7 +3636,7 @@ impl CudaDecodeModel {
         }
 
         // Attention over the cached prefix (ctx = watermark+1, last visible = watermark).
-        let ctx = self.cache_len + 1;
+        // The warp kernel reads cache_len from d_ctrl[2] (already populated by step()).
         Self::launch_attention(
             &self.stream,
             &self.f_attn,
@@ -3645,12 +3645,12 @@ impl CudaDecodeModel {
             &self.kv_v[li],
             &mut self.d_attn,
             &mut self.d_scores,
-            ctx,
+            &self.d_ctrl,
+            self.max_ctx,
             n_head,
             n_head_kv,
             head_dim,
             self.attn_scale,
-            self.cache_len,
         )?;
 
         // BitNet attn_sub_norm before o_proj (over q_width == n_embd), then o_proj +
@@ -3672,8 +3672,7 @@ impl CudaDecodeModel {
         Self::gemm(
             &self.stream,
             &self.f_quant,
-            &self.f_tiled,
-            &self.f_scale,
+            &self.f_tiled_scaled,
             attn_in,
             &self.layers[li].o,
             &mut self.d_qact,
@@ -3698,26 +3697,29 @@ impl CudaDecodeModel {
             n_embd,
             &mut self.d_normed,
         )?;
-        Self::gemm(
+        // Quantize once, reuse for gate/up (saves 1 quant launch per layer).
+        Self::launch_quant(
             &self.stream,
             &self.f_quant,
-            &self.f_tiled,
-            &self.f_scale,
             &self.d_normed,
-            &self.layers[li].gate,
+            n_embd,
             &mut self.d_qact,
             &mut self.d_act_scale,
+        )?;
+        Self::gemm_prequantized(
+            &self.stream,
+            &self.f_tiled_scaled,
+            &self.layers[li].gate,
+            &self.d_qact,
+            &self.d_act_scale,
             &mut self.d_gate,
         )?;
-        Self::gemm(
+        Self::gemm_prequantized(
             &self.stream,
-            &self.f_quant,
-            &self.f_tiled,
-            &self.f_scale,
-            &self.d_normed,
+            &self.f_tiled_scaled,
             &self.layers[li].up,
-            &mut self.d_qact,
-            &mut self.d_act_scale,
+            &self.d_qact,
+            &self.d_act_scale,
             &mut self.d_up,
         )?;
         Self::launch_relu2(
@@ -3744,8 +3746,7 @@ impl CudaDecodeModel {
         Self::gemm(
             &self.stream,
             &self.f_quant,
-            &self.f_tiled,
-            &self.f_scale,
+            &self.f_tiled_scaled,
             down_in,
             &self.layers[li].down,
             &mut self.d_qact,
@@ -3795,8 +3796,7 @@ impl CudaDecodeModel {
     fn gemm(
         stream: &Arc<CudaStream>,
         f_quant: &CudaFunction,
-        f_tiled: &CudaFunction,
-        f_scale: &CudaFunction,
+        f_tiled_scaled: &CudaFunction,
         d_in: &CudaSlice<f32>,
         lin: &ResidentLinear,
         d_qact: &mut CudaSlice<f32>,
@@ -3805,8 +3805,7 @@ impl CudaDecodeModel {
     ) -> Result<(), BackendError> {
         let (n, k) = (lin.n, lin.k);
         let (n_i, k_i, m_i, rb_i) = (n as i32, k as i32, 1i32, lin.row_bytes as i32);
-        // 1. on-device A8 quant of the activation row. (Reborrow the `&mut` scratch so
-        //    the same bindings can be reused by the later launches.)
+        // 1. on-device A8 quant of the activation row.
         {
             let cfg = LaunchConfig {
                 grid_dim: (1, 1, 1),
@@ -3825,43 +3824,101 @@ impl CudaDecodeModel {
                     .map_err(|e| driver_err("launch resident gemm quant", &e))?;
             }
         }
-        // 2. tiled add-only f64 GEMM (M=1), folds the per-channel weight scale.
+        // 2. Tiled GEMM with fused act_scale fold (v0.6.0 opt #15).
+        //    Epilogue: out[mi,ni] = acc * scales[ni] * act_scale[mi].
+        //    Single launch replaces the former GEMM + scale_mul_f32 pair.
         {
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
                 shared_mem_bytes: (k * 4) as u32,
             };
-            let mut l = stream.launch_builder(f_tiled);
+            let mut l = stream.launch_builder(f_tiled_scaled);
             l.arg(&*d_qact)
                 .arg(lin.device.as_ref())
                 .arg(&lin.scales)
+                .arg(&*d_act_scale)
                 .arg(&mut *d_out)
                 .arg(&m_i)
                 .arg(&n_i)
                 .arg(&k_i)
                 .arg(&rb_i);
-            // SAFETY: `tq2_0_add_mpgemm_tiled(act, weights, scales, out, m, n, k, row_bytes)`.
+            // SAFETY: `tq2_0_add_mpgemm_tiled_scaled(act, weights, scales, act_scale,
+            // out, m, n, k, row_bytes)`.
             #[allow(unsafe_code)]
             unsafe {
                 l.launch(cfg)
-                    .map_err(|e| driver_err("launch resident gemm tiled", &e))?;
+                    .map_err(|e| driver_err("launch resident gemm tiled scaled", &e))?;
             }
         }
-        // 3. per-token activation-scale fold: out *= act_scale.
+        Ok(())
+    }
+
+    /// Run just the A8 quantization step (act → q_act + act_scale).
+    fn launch_quant(
+        stream: &Arc<CudaStream>,
+        f_quant: &CudaFunction,
+        d_in: &CudaSlice<f32>,
+        k: usize,
+        d_qact: &mut CudaSlice<f32>,
+        d_act_scale: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let k_i = k as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = stream.launch_builder(f_quant);
+        l.arg(d_in)
+            .arg(&k_i)
+            .arg(&mut *d_qact)
+            .arg(&mut *d_act_scale);
+        // SAFETY: `act_quant_tiled_f32(const float* act, int k, float* q, float* scale)`.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch resident quant", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Run a tiled GEMM + scale fold on already-quantized activations.
+    /// Skips the quant step — use when multiple projections share the same input.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_prequantized(
+        stream: &Arc<CudaStream>,
+        f_tiled_scaled: &CudaFunction,
+        lin: &ResidentLinear,
+        d_qact: &CudaSlice<f32>,
+        d_act_scale: &CudaSlice<f32>,
+        d_out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let (n, k) = (lin.n, lin.k);
+        let (n_i, k_i, m_i, rb_i) = (n as i32, k as i32, 1i32, lin.row_bytes as i32);
+        // Fused tiled GEMM (M=1) with act_scale fold in the epilogue.
         {
             let cfg = LaunchConfig {
-                grid_dim: ((n as u32).div_ceil(256), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
+                grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
+                block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+                shared_mem_bytes: (k * 4) as u32,
             };
-            let mut l = stream.launch_builder(f_scale);
-            l.arg(&mut *d_out).arg(&*d_act_scale).arg(&n_i);
-            // SAFETY: `scale_mul_f32(float* out, const float* s, int n)`.
+            let mut l = stream.launch_builder(f_tiled_scaled);
+            l.arg(d_qact)
+                .arg(lin.device.as_ref())
+                .arg(&lin.scales)
+                .arg(d_act_scale)
+                .arg(&mut *d_out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(&rb_i);
+            // SAFETY: `tq2_0_add_mpgemm_tiled_f32_scaled(act, weights, scales,
+            // act_scale, out, m, n, k, row_bytes)`.
             #[allow(unsafe_code)]
             unsafe {
                 l.launch(cfg)
-                    .map_err(|e| driver_err("launch resident gemm fold", &e))?;
+                    .map_err(|e| driver_err("launch resident gemm tiled scaled", &e))?;
             }
         }
         Ok(())
@@ -3903,24 +3960,24 @@ impl CudaDecodeModel {
         v: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         scores: &mut CudaSlice<f32>,
-        ctx: usize,
+        ctrl: &CudaSlice<i32>,
+        max_ctx: usize,
         n_head: usize,
         n_head_kv: usize,
         head_dim: usize,
         scale: f32,
-        limit: usize,
     ) -> Result<(), BackendError> {
-        let (ctx_i, nh_i, nhkv_i, hd_i, lim_i) = (
-            ctx as i32,
+        let (mc_i, nh_i, nhkv_i, hd_i) = (
+            max_ctx as i32,
             n_head as i32,
             n_head_kv as i32,
             head_dim as i32,
-            limit as i32,
         );
-        let threads = 64u32;
+        // Warp-per-head: 256-thread block = 8 warps, grid = ceil(n_head/8).
+        let grid = ((n_head as u32).div_ceil(8), 1, 1);
         let cfg = LaunchConfig {
-            grid_dim: ((n_head as u32).div_ceil(threads), 1, 1),
-            block_dim: (threads, 1, 1),
+            grid_dim: grid,
+            block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut l = stream.launch_builder(func);
@@ -3929,13 +3986,13 @@ impl CudaDecodeModel {
             .arg(v)
             .arg(out)
             .arg(scores)
-            .arg(&ctx_i)
+            .arg(ctrl)
+            .arg(&mc_i)
             .arg(&nh_i)
             .arg(&nhkv_i)
             .arg(&hd_i)
-            .arg(&scale)
-            .arg(&lim_i);
-        // SAFETY: `gqa_attention_decode_f32(q, k, v, out, scores, ctx, n_head, n_head_kv, head_dim, scale, limit)`.
+            .arg(&scale);
+        // SAFETY: `gqa_attention_decode_warp_g(q, k, v, out, scores, ctrl, max_ctx, n_head, n_head_kv, head_dim, scale)`.
         #[allow(unsafe_code)]
         unsafe {
             l.launch(cfg)
@@ -6185,6 +6242,8 @@ impl CudaDecodeModel {
     ) -> Result<(), BackendError> {
         let cs = self.cap_stream.cu_stream();
         let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
+        // Fused tiled GEMM + act_scale fold (v0.6.0 opt #15).
+        // Single launch replaces the former tiled + scale_mul pair.
         {
             let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
             let smem = (lin.k * 4) as u32;
@@ -6192,6 +6251,7 @@ impl CudaDecodeModel {
                 pp(&d_qact),
                 pp(&lin.w),
                 pp(&lin.sc),
+                pp(&d_act_scale),
                 pp(&d_out),
                 pp(&m_i),
                 pp(&n_i),
@@ -6199,18 +6259,13 @@ impl CudaDecodeModel {
                 pp(&rb_i),
             ];
             raw_launch(
-                self.raw().tiled,
+                self.raw().tiled_scaled,
                 grid,
                 (WARPS_PER_BLOCK * 32, 1, 1),
                 smem,
                 cs,
                 &mut params,
             )?;
-        }
-        {
-            let grid = ((lin.n as u32).div_ceil(256), 1, 1);
-            let mut params = [pp(&d_out), pp(&d_act_scale), pp(&n_i)];
-            raw_launch(self.raw().scale, grid, (256, 1, 1), 0, cs, &mut params)?;
         }
         Ok(())
     }
@@ -6487,6 +6542,7 @@ struct RawGraphKernels {
     act_quant: sys::CUfunction,
     scale: sys::CUfunction,
     tiled: sys::CUfunction,
+    tiled_scaled: sys::CUfunction,
 }
 
 // SAFETY: the raw `CUmodule`/`CUfunction` are process-valid device handles, used only on
@@ -6538,6 +6594,8 @@ impl RawGraphKernels {
             lm_head: get(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             // f32-accumulate GEMM (the f64 one is 1/64-rate on consumer GPUs).
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
+            // Fused-scaled variant: folds act_scale into the epilogue (v0.6.0 opt #15).
+            tiled_scaled: get(am, KERNEL_NAME_TILED_F32_SCALED)?,
             modules: vec![dm, am],
         })
     }

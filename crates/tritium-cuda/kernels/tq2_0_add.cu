@@ -174,6 +174,69 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled(
     }
 }
 
+// ─── Fused-scaled variants (v0.6.0 opt #15) ─────────────────────────────────
+// Identical to the two kernels above, but the epilogue multiplies by both the
+// per-channel weight scale AND the per-token activation scale in one write:
+//     out[mi, ni] = acc * scales[ni] * act_scale[mi]
+// This eliminates the separate `scale_mul_f32` kernel launch + its full
+// read-write pass over the output buffer (~182 launches/token saved).
+
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_scaled(
+    const float* __restrict__ act,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const float* __restrict__ act_scale,  // [M] per-token activation scale
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    extern __shared__ float s_act[];
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_act[i] = arow[i];
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    double acc = 0.0;
+    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        const int e = ki - block * QK_K;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        const double a = (double)s_act[ki];
+        if (code == 2u) {
+            acc += a;
+        } else if (code == 0u) {
+            acc -= a;
+        }
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = (float)(acc * (double)scales[ni]) * act_scale[mi];
+    }
+}
+
 // f32-accumulate variant of `tq2_0_add_mpgemm_tiled` for the v0.3.2 CUDA-graph decode
 // (perf) path. The double accumulator above is correct but SLOW on consumer GPUs: the
 // RTX 4090 runs f64 at 1/64 the f32 rate, and the decode forward issues ~210 of these
@@ -231,6 +294,58 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32(
     }
     if (lane == 0) {
         out[(long long)mi * n + ni] = acc * scales[ni];
+    }
+}
+
+// Fused-scaled f32-accumulate variant (v0.6.0 opt #15). Same as above but
+// epilogue folds both weight scale and per-token activation scale in one write.
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
+    const float* __restrict__ act,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const float* __restrict__ act_scale,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    extern __shared__ float s_act[];
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_act[i] = arow[i];
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    float acc = 0.0f;
+    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        const int e = ki - block * QK_K;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        const float a = s_act[ki];
+        acc += a * (float)((int)code - 1);
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = acc * scales[ni] * act_scale[mi];
     }
 }
 
