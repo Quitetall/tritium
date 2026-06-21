@@ -68,6 +68,15 @@ mod codegen;
 #[cfg(feature = "cuda")]
 pub mod train;
 
+// v0.60 / plan 0017 (the ≥2-GPU wall): the real NCCL collective backend — a
+// `tritium_train::dist::ProcessGroup` over `cudarc::nccl`, validated against the simulated reference.
+// Behind the `nccl` feature (implies `cuda`); needs `libnccl >= 2.30`.
+#[cfg(feature = "nccl")]
+pub mod nccl;
+
+#[cfg(feature = "nccl")]
+pub use nccl::{NcclId, NcclProcessGroup};
+
 #[cfg(test)]
 mod tests {
     // Default-build sanity: the crate compiles, the spec types it is written
