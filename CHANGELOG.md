@@ -7,6 +7,54 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.6] — 2026-06-21 — Distributed checkpoint: resharding + crash-atomic writes
+
+The sixth v0.60 increment (single-GPU-reachable; `0.5.x` line). The ADR-0008 "checkpoint resharding
+`J≠K` ⇒ identical forward; resume continues" and "kill rank mid-run ⇒ clean error / no corrupt
+checkpoint" gates, reachable on one machine: a sharded distributed checkpoint (DCP) over the 0015
+`FlatShardPlan` layout, with crash-atomic writes.
+
+### Added
+- **`dcp` module** (`DistCheckpoint` + `save`/`load`, re-exported with `DcpError`): a checkpoint is a
+  directory of one shard file per rank plus a `manifest.tdcp` committed **last** (the single commit
+  point), each written `temp → fsync → rename → fsync-parent`. The global state is **world-agnostic** (a
+  shard is a contiguous slice of the flattened/padded buffers), so `load` reassembles the same global
+  `(param, planes, step)` regardless of save-time world `K`, and resharding to `J` is just
+  `FlatShardPlan::new(leaf_lens, J)`. Optimizer state rides as parallel f32 planes (AdamW → `[m, v]`).
+- **`FlatShardPlan::try_new`** (+ `FlatShardError`): the non-panicking constructor for untrusted inputs
+  (a manifest parsed from disk). `new` delegates to it (panics only for trusted model code).
+
+### Gates (28 tests green; in-scope `clippy -D warnings` + `fmt` clean)
+- **byte framing** (7 inline): manifest/shard round-trip; bad-magic, trailing-bytes, truncation,
+  stale-step, wrong-rank all detected.
+- **save-K / reshard-J**: the loaded global is bit-identical for every `K∈{1,2,4}`; re-saved with every
+  `J∈{1,2,4}` into fresh shard files and reloaded, the round-tripped global (param **and** planes **and**
+  step) is identical and the forward matches — a real disk reshard.
+- **distributed resume (bit-exact)**: train `HALF` steps on world `W∈{1,2,4}`, DCP-save mid-run, restore,
+  continue — the resumed loss curve equals the uninterrupted curve bit-for-bit. Proves `m`/`v` + step
+  survive the round-trip, not just params.
+- **fault injection / crash atomicity**: a fully-written-but-uncommitted newer save does not shadow the
+  committed checkpoint; non-monotonic re-save → `NonMonotonicSave`; swapped shards → `ShardMismatch`;
+  truncated → `Truncated`; missing → `MissingShard`; corrupt manifest (`world==0` → `InvalidManifest`,
+  huge `n_planes` → `TooManyPlanes`, bad version/magic) — never a panic, never a silent corrupt load.
+
+### Hardened by adversarial review (load-bearing)
+- The review caught that `load` (the untrusted-bytes entry point) **violated its never-panic contract**
+  four ways — a corrupt manifest with `world==0`, overflowing `Σleaf_lens`, overflowing `chunk*world`, or
+  a huge `n_planes` would panic/abort the loader. Fixed: `FlatShardPlan::try_new` for the structural
+  fields, an `n_planes` bound (`MAX_STATE_PLANES`) before any allocation, and `ValueTooLarge` for
+  oversized lengths — now all clean `DcpError`s (re-verified inline: removing the `n_planes` bound makes
+  the gate panic with "capacity overflow").
+- Also: a same-step re-save could tear the checkpoint (shard filenames key on step) → `save` now enforces
+  a **monotonic-step** contract (`NonMonotonicSave`); and two gates lacked teeth (the reshard gate was a
+  vacuous in-memory identity; the fault test used garbage orphans) → both rebuilt to round-trip real
+  shard files through disk (re-verified inline: reversing shard reassembly now fails the reshard gate).
+
+### Notes
+- CPU sim, single-writer-per-directory. **Deferred (documented):** keep-last-N GC of superseded shards;
+  a distributed commit barrier (0017's NCCL job). Next: the rented-2×GPU wall (0017–0018 → `v0.60.0`).
+  See `docs/plans/0016`.
+
 ## [0.5.5] — 2026-06-21 — ZeRO-3 / FSDP over the simulated `ProcessGroup`: gradient + loss parity
 
 The fifth v0.60 increment (single-GPU-reachable; `0.5.x` line). The ADR-0008 "N-GPU vs 1-GPU loss
