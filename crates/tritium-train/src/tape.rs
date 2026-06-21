@@ -12,7 +12,7 @@
 //! the `ste` module). The graph this tape differentiates is therefore the smooth
 //! surrogate model; `round` is a forward-only QAT detail layered on later (ADR 0007).
 
-use crate::ops::{act, bias, dense, elementwise, loss, matmul, ste};
+use crate::ops::{act, bias, dense, elementwise, loss, matmul, norm, rope, softmax, ste};
 
 /// Index of a value buffer in a [`Tape`]'s arena.
 pub type ValueId = usize;
@@ -140,6 +140,16 @@ impl Tape {
         )
     }
 
+    /// Transpose `[rows, cols] → [cols, rows]` (for attention's `P·V`).
+    pub fn transpose(&mut self, x: ValueId, rows: usize, cols: usize) -> ValueId {
+        let out = dense::transpose_forward(&self.values[x], rows, cols);
+        self.record(
+            vec![x],
+            out,
+            Box::new(move |_ins, g| dense::transpose_vjp(rows, cols, g)),
+        )
+    }
+
     /// Stop-gradient: forwards `x` unchanged, but blocks the backward pass (its input
     /// receives zero gradient). This is how a frozen base is held constant — the leaves
     /// behind a `detach` train nothing.
@@ -220,6 +230,61 @@ impl Tape {
             vec![a, b],
             out,
             Box::new(|ins, g| elementwise::mul_vjp(ins[0], ins[1], g)),
+        )
+    }
+
+    /// RMSNorm `y[r,i] = x[r,i]·inv_r·w[i]` (per-row, weight shared across rows).
+    pub fn rmsnorm(
+        &mut self,
+        x: ValueId,
+        w: ValueId,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> ValueId {
+        let out = norm::forward(&self.values[x], &self.values[w], rows, cols, eps);
+        self.record(
+            vec![x, w],
+            out,
+            Box::new(move |ins, g| norm::vjp(ins[0], ins[1], rows, cols, eps, g)),
+        )
+    }
+
+    /// Row-wise softmax `[rows, cols] → [rows, cols]` (attention probabilities).
+    pub fn softmax(&mut self, x: ValueId, rows: usize, cols: usize) -> ValueId {
+        let out = softmax::forward(&self.values[x], rows, cols);
+        self.record(
+            vec![x],
+            out,
+            Box::new(move |ins, g| softmax::vjp(ins[0], rows, cols, g)),
+        )
+    }
+
+    /// Additive causal mask over `[rows=queries, cols=keys]` scores (`j <= i` visible).
+    pub fn causal_mask(&mut self, x: ValueId, rows: usize, cols: usize) -> ValueId {
+        let out = softmax::causal_mask_forward(&self.values[x], rows, cols);
+        self.record(
+            vec![x],
+            out,
+            Box::new(move |_ins, g| softmax::causal_mask_vjp(rows, cols, g)),
+        )
+    }
+
+    /// RoPE over a `[n_token, n_head, head_dim]` flat buffer (orthogonal rotation;
+    /// `positions`/`theta` are data, only `x` is differentiated).
+    pub fn rope(
+        &mut self,
+        x: ValueId,
+        positions: Vec<usize>,
+        n_head: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> ValueId {
+        let out = rope::forward(&self.values[x], &positions, n_head, head_dim, theta);
+        self.record(
+            vec![x],
+            out,
+            Box::new(move |_ins, g| rope::vjp(&positions, n_head, head_dim, theta, g)),
         )
     }
 

@@ -26,6 +26,33 @@ pub fn forward(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     out
 }
 
+/// Transpose `[rows, cols] → [cols, rows]`. Needed for attention's `P·V` (which contracts
+/// the key dim, unlike `dense`'s last-dim contraction): `attn = dense(P, transpose(V))`.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn transpose_forward(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = x[r * cols + c];
+        }
+    }
+    out
+}
+
+/// vjp of transpose: `gx[r,c] = g[c,r]` (transpose the cotangent back).
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn transpose_vjp(rows: usize, cols: usize, grad_out: &[f32]) -> Vec<Vec<f32>> {
+    let mut gx = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            gx[r * cols + c] = grad_out[c * rows + r];
+        }
+    }
+    vec![gx]
+}
+
 /// vjp returning `[gX, gW]` (same shapes as `x`, `w`).
 #[must_use]
 #[allow(clippy::needless_range_loop)]
