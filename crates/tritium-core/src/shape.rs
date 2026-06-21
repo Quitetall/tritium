@@ -8,12 +8,16 @@
 /// - `k` — contraction / input features (weight + activation columns).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct GemmShape {
+    /// Activation rows (batch × sequence).
     pub m: usize,
+    /// Output features (weight rows).
     pub n: usize,
+    /// Contraction / input features (weight + activation columns).
     pub k: usize,
 }
 
 impl GemmShape {
+    /// Construct a shape from its `m`, `n`, `k` dimensions.
     #[inline]
     pub const fn new(m: usize, n: usize, k: usize) -> Self {
         Self { m, n, k }

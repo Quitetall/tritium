@@ -27,6 +27,8 @@
 //!   metadata table and tensor payloads into a buffer `read_gguf` parses back
 //!   identically (`read_gguf(write_gguf(..)) == input`).
 #![forbid(unsafe_code)]
+// v0.90 hardening: every public item must carry a doc comment.
+#![deny(missing_docs)]
 
 use core::fmt;
 

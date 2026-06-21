@@ -123,9 +123,21 @@ impl QuantizedTensor {
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuantError {
     /// `weights.len()` ≠ `rows · k`.
-    ShapeMismatch { rows: usize, k: usize, got: usize },
+    ShapeMismatch {
+        /// Expected number of weight rows.
+        rows: usize,
+        /// Expected contraction dimension.
+        k: usize,
+        /// Actual `weights.len()`.
+        got: usize,
+    },
     /// [`Sensitivity::Custom`] had the wrong number of entries.
-    SensitivityLen { expected: usize, got: usize },
+    SensitivityLen {
+        /// Number of groups expected.
+        expected: usize,
+        /// Number of custom sensitivity entries provided.
+        got: usize,
+    },
     /// The plane allocator rejected the inputs.
     Alloc(AllocError),
     /// A plane failed to pack.

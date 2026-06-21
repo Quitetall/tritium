@@ -17,6 +17,8 @@
 //! is on). Backends depend on this crate; this crate depends on nothing.
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
+// v0.90 hardening: every public item must carry a doc comment.
+#![deny(missing_docs)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;

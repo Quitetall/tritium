@@ -54,6 +54,8 @@
 // `#[allow(unsafe_code)]` on exactly the `distributed_slice` declarations below —
 // no hand-written `unsafe` exists in this crate.
 #![deny(unsafe_code)]
+// v0.90 hardening: every public item must carry a doc comment.
+#![deny(missing_docs)]
 
 use std::sync::OnceLock;
 

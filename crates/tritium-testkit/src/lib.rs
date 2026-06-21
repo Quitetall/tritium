@@ -31,6 +31,8 @@
 //! assert!(report.is_ok(), "{} cases failed", report.failed.len());
 //! ```
 #![forbid(unsafe_code)]
+// v0.90 hardening: every public item must carry a doc comment.
+#![deny(missing_docs)]
 
 mod frozen;
 mod generate;

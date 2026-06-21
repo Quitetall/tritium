@@ -19,6 +19,8 @@
 //! in `tritium-format`, the single source of truth. A backend receives
 //! already-packed bytes through [`TernaryBackend::upload_weights`].
 #![forbid(unsafe_code)]
+// v0.90 hardening: every public item must carry a doc comment.
+#![deny(missing_docs)]
 
 use core::any::Any;
 use core::fmt;

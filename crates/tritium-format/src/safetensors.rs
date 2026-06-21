@@ -22,7 +22,12 @@ pub enum SafeTensorsError {
     /// Buffer is shorter than the 8-byte length prefix.
     TooShort,
     /// The declared header length runs past the end of the buffer.
-    BadHeaderLen { declared: usize, available: usize },
+    BadHeaderLen {
+        /// Header length declared by the 8-byte little-endian prefix.
+        declared: usize,
+        /// Bytes actually available in the buffer after the prefix.
+        available: usize,
+    },
     /// The JSON header failed to parse.
     Json(String),
     /// A tensor name was not present in the header.

@@ -78,14 +78,29 @@ impl Default for AllocConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AllocError {
     /// `t_min > t_max` — empty feasible range.
-    BadRange { t_min: usize, t_max: usize },
+    BadRange {
+        /// Requested minimum planes per group.
+        t_min: usize,
+        /// Requested maximum planes per group.
+        t_max: usize,
+    },
     /// The base allocation (`t_min` planes on every group) already exceeds the
     /// budget, so no feasible allocation exists.
-    BudgetTooSmall { base_bits: f64, budget_bits: f64 },
+    BudgetTooSmall {
+        /// Bits used by the base allocation (`t_min` planes on every group).
+        base_bits: f64,
+        /// The bit budget that the base allocation already exceeds.
+        budget_bits: f64,
+    },
     /// Group `group`'s `sensitivity` is not finite-and-nonnegative — it would
     /// corrupt the greedy objective (a negative `H_g` spends budget to *raise*
     /// the weighted loss; `NaN` poisons the max-selection so no group is chosen).
-    InvalidSensitivity { group: usize, value: f64 },
+    InvalidSensitivity {
+        /// Index of the offending group.
+        group: usize,
+        /// The non-finite-or-negative sensitivity value that was rejected.
+        value: f64,
+    },
 }
 
 impl fmt::Display for AllocError {

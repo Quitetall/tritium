@@ -30,6 +30,8 @@
 //!
 //! GPU gates (multi-plane accumulate matches dequant; sparse == dense) and the
 //! model-level accuracy-vs-bpw curve gate are validated in their own lanes.
+// v0.90 hardening: every public item must carry a doc comment.
+#![deny(missing_docs)]
 
 mod allocate;
 mod plane;

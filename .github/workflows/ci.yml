@@ -46,6 +46,23 @@ jobs:
         with:
           command: check licenses bans sources advisories
 
+  # API-stability gate (ADR 0011/0012): no UNINTENTIONAL breaking change to the
+  # stable public-API crates vs the last v0.5.* release tag. Pre-1.0 breaks are
+  # allowed but must be deliberate; this surfaces them. fetch-depth: 0 so the
+  # baseline tag + history are available to `git describe` in the script.
+  semver:
+    name: API stability (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - run: ./scripts/check-semver.sh
+
   # Scheduled fuzz lane (U5): every tritium-format parser, zero crashes.
   fuzz:
     name: fuzz parsers
