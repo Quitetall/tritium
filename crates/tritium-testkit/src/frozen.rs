@@ -121,4 +121,39 @@ mod tests {
             "frozen set must exercise tq1_0"
         );
     }
+
+    /// Guards the count-monotone subset invariant the freeze relies on for any
+    /// consumer that grades a *smaller* count than the frozen set. The CUDA
+    /// conformance test (`cuda.rs`) is intentionally left ungrafted and grades
+    /// `generate_vectors(0xC0FFEE, 16)`; its cross-backend-parity value depends on
+    /// that set being contained in the frozen set. The drift gate only pins
+    /// `generate_vectors(SEED, FROZEN_COUNT) == file`, so without this every
+    /// vector `generate_vectors(SEED, n<FROZEN_COUNT)` produces must still appear,
+    /// **by value (`id` included)**, in the frozen set.
+    ///
+    /// The property holds because each random vector is a pure function of
+    /// accumulated prefix RNG state and the boundary set is regenerated from an
+    /// independent fixed seed regardless of `count` (see `generate.rs`). It is not
+    /// otherwise guarded — a future generator change that made the random stream
+    /// `count`-dependent would keep the `FROZEN_COUNT` drift gate green while
+    /// silently making a smaller-count consumer grade off-reference. This fails
+    /// loudly if that ever happens.
+    #[test]
+    fn smaller_count_is_a_value_subset_of_the_frozen_set() {
+        let frozen = frozen_vectors(); // == generate_vectors(FROZEN_SEED, FROZEN_COUNT)
+        for smaller in [8usize, 16, 32] {
+            assert!(smaller <= FROZEN_COUNT);
+            for v in &generate_vectors(FROZEN_SEED, smaller) {
+                assert!(
+                    frozen.contains(v),
+                    "generate_vectors(0x{FROZEN_SEED:X}, {smaller}) produced vector {} that is \
+                     not in the frozen set: the count-monotone subset invariant broke, so a \
+                     smaller-count conformance consumer (e.g. the CUDA gate) would grade \
+                     off-reference. Repoint that consumer at frozen_vectors() or restore the \
+                     invariant.",
+                    v.id
+                );
+            }
+        }
+    }
 }

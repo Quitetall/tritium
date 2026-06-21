@@ -20,10 +20,11 @@ the caller's cwd, and a gate that fails if the committed set ever drifts from th
   **same `(0xC0FFEE, 64)`** means the CPU gate grades against a *provably identical* set — zero
   behavioral change, just locked to a committed file.
 - The CUDA conformance test (`cuda.rs:6849`, `generate_vectors(0xC0FFEE, 16)`) is in the user's active
-  perf-optimization file. It is **left untouched**: the freeze gate (`frozen == generate_vectors(SEED,
-  COUNT)`) proves the generator still reproduces the artifact bit-for-bit, so CUDA's seed-generated
-  16-vector set is provably the frozen set's prefix. Repoint it opportunistically when `cuda.rs` is
-  next edited — not now, to avoid conflicting with WIP.
+  perf-optimization file. It is **left untouched**: the drift gate (`frozen == generate_vectors(SEED,
+  COUNT)`) plus the count-monotone subset gate (`smaller_count_is_a_value_subset_of_the_frozen_set`)
+  prove CUDA's seed-generated 16-vector set is a **value-subset** of the frozen set (it is *not* a
+  contiguous prefix — the boundary set is appended after the random count). Repoint it opportunistically
+  when `cuda.rs` is next edited — not now, to avoid conflicting with WIP.
 
 ## Steps
 
