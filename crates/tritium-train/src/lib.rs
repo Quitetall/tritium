@@ -13,6 +13,7 @@
 
 pub mod checkpoint;
 pub mod data;
+pub mod dist;
 pub mod gradcheck;
 pub mod lora;
 pub mod lr;
@@ -23,6 +24,7 @@ pub mod value;
 
 pub use checkpoint::{Checkpoint, CheckpointError, LeafCheckpoint};
 pub use data::{Cursor, DataSampler};
+pub use dist::{DistError, ProcessGroup, ReduceOp, SimProcessGroup};
 pub use lora::Lora;
 pub use lr::LrSchedule;
 pub use optim::{AdamState, AdamW, Optimizer};
