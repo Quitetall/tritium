@@ -3,7 +3,8 @@
 //! [`NcclProcessGroup`] implements the **same** [`ProcessGroup`](tritium_train::dist::ProcessGroup)
 //! trait as the thread-simulated backend (0014), backed by `cudarc::nccl`. The FSDP loop (0015) and
 //! distributed checkpoint (0016) therefore run unchanged over either backend — the sim is the CI
-//! oracle, this is the real one validated against it on a multi-GPU box.
+//! oracle on CPU; this backend is validated on a multi-GPU box against **single-process references**
+//! (the same targets the sim proves), not against a live `SimProcessGroup` instance.
 //!
 //! **One rank per GPU.** Each rank opens its own [`CudaContext`] + stream, then joins the group's NCCL
 //! communicator via the shared [`NcclId`] (rank 0 creates it; the others reconstruct it from its bytes,
@@ -14,12 +15,14 @@
 //! correctness gate; a device-resident path is the perf concern of the deferred 2B engine).
 //!
 //! **Contract.** As with the sim and with MPI/NCCL generally, all ranks must invoke the same collective
-//! sequence with consistent sizes; the size-relation checks here mirror the sim's exactly
+//! sequence with consistent sizes. The *intra-rank* size-relation checks here mirror the sim's
 //! ([`DistError::LengthMismatch`] / [`LengthOverflow`](DistError::LengthOverflow) /
-//! [`InvalidRoot`](DistError::InvalidRoot)) so a mis-sized call fails identically on both backends.
-//! NCCL ring/tree reductions are **not** bit-identical to the sim's fixed-order CPU fold (float adds
-//! reorder), so the wire-correctness gate compares within a tolerance, exactly like the 0015
-//! data-parallel parity gate.
+//! [`InvalidRoot`](DistError::InvalidRoot)) so a locally-mis-sized call fails identically on both
+//! backends. NCCL does **not**, however, enforce the *cross-rank* length agreement the sim additionally
+//! checks: if ranks pass different-length buffers, the sim returns a clean `LengthMismatch` while NCCL
+//! hangs/aborts (an unguardable NCCL contract violation). NCCL ring/tree reductions are also not
+//! bit-identical to the sim's fixed-order CPU fold (float adds reorder), so the wire-correctness gate
+//! compares within a tolerance, exactly like the 0015 data-parallel parity gate.
 
 use std::sync::Arc;
 
@@ -349,6 +352,12 @@ mod tests {
             .collect()
     }
 
+    /// The largest divisor of `b` that is `<= cap` (and `>= 1`). For B=8: cap 1→1, 2→2, 3→2, 4→4,
+    /// 5..7→4, ≥8→8 — so each rank always gets an equal, complete batch slice.
+    fn largest_divisor_le(b: usize, cap: usize) -> usize {
+        (1..=cap.min(b)).rev().find(|d| b % d == 0).unwrap_or(1)
+    }
+
     #[test]
     fn nccl_all_reduce_matches_sum_reference_multi_gpu() {
         let world = device_count();
@@ -414,18 +423,21 @@ mod tests {
             return;
         }
         let n = 9;
-        let root = 1.min(world - 1);
-        let results = nccl_world(world, move |pg| {
-            let mut buf = vec_for(pg.rank(), n);
-            pg.broadcast(&mut buf, root).unwrap();
-            buf
-        });
-        let reference = vec_for(root, n); // broadcast is exact — every rank ends with root's buffer.
-        for (r, got) in results.iter().enumerate() {
-            assert_eq!(
-                got, &reference,
-                "rank {r} broadcast != root {root}'s buffer"
-            );
+        // Cover both the rank-0 root and a non-zero root (the in-place path is the same; this guards a
+        // regression that only manifests at one root).
+        for root in [0usize, world - 1] {
+            let results = nccl_world(world, move |pg| {
+                let mut buf = vec_for(pg.rank(), n);
+                pg.broadcast(&mut buf, root).unwrap();
+                buf
+            });
+            let reference = vec_for(root, n); // exact — every rank ends with root's buffer.
+            for (r, got) in results.iter().enumerate() {
+                assert_eq!(
+                    got, &reference,
+                    "rank {r} broadcast != root {root}'s buffer"
+                );
+            }
         }
     }
 
@@ -579,7 +591,12 @@ mod tests {
             return;
         }
         let reference = reference_curve();
-        let world = world.min(B);
+        // Use the largest divisor of B that is <= the GPU count, so every rank gets an EQUAL, complete
+        // slice of the batch. `Avg`-reduced grads equal the full-batch grad only for equal shards — a
+        // non-divisor world (e.g. 3 or 6 GPUs, common rental SKUs) would silently drop the tail rows
+        // and diverge from the full-batch reference for a NON-NCCL reason (a phantom failure that burns
+        // GPU hours). world∈{1,2,4,8} are the divisors of 8 that run.
+        let world = largest_divisor_le(B, world);
         if world == 1 {
             // Single GPU: collectives are identities → bit-exact to the reference (harness teeth check).
             assert_eq!(
@@ -590,9 +607,14 @@ mod tests {
             eprintln!("nccl_fsdp_loss_parity world=1: bit-exact");
             return;
         }
-        // >=2 GPUs (the box): within tolerance (NCCL reductions reorder); tighten from observed.
+        // >=2 GPUs (the box): within tolerance. NOTE this is an end-to-end *convergence* check, not the
+        // wrong-reduce-op gate — AdamW's update is scale-invariant in the gradient (the 0015 lesson), so
+        // a loss curve cannot reliably catch a `world`×-scaled reduction. The reduce-op TEETH live in
+        // `nccl_all_reduce_matches_sum_reference_multi_gpu` (compares reduced *values* directly). This
+        // bound is a placeholder; on the box, read the printed `max |Δloss|` and tighten ABS/REL to ~10×
+        // it (and AND them) before tagging v0.60.0 — do not tag on the first loose-band green.
         const ABS_TOL: f32 = 1e-3;
-        const REL_TOL: f32 = 1e-2;
+        const REL_TOL: f32 = 1e-3;
         let curve = nccl_fsdp_curve(world);
         assert_eq!(curve.len(), reference.len());
         let mut max_abs = 0.0f32;
