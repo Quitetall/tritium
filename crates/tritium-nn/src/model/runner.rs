@@ -307,17 +307,26 @@ impl ModelRunner {
         }
 
         // Tied LM head: logits[v] = <last_norm, token_embd[v]>.
+        // Parallelized with rayon: 128K × 2560 dot products.
+        use rayon::prelude::*;
         let vocab = self.weights.vocab;
         let mut logits = vec![0.0f32; vocab];
         let embd = &self.weights.token_embd;
-        for (v, slot) in logits.iter_mut().enumerate() {
-            let row = &embd[v * n_embd..v * n_embd + n_embd];
-            let mut acc = 0.0f32;
-            for k in 0..n_embd {
-                acc += last_norm[k] * row[k];
-            }
-            *slot = acc;
-        }
+        logits
+            .par_chunks_mut(1024)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base = chunk_idx * 1024;
+                for (i, slot) in chunk.iter_mut().enumerate() {
+                    let v = base + i;
+                    let row = &embd[v * n_embd..v * n_embd + n_embd];
+                    let mut acc = 0.0f32;
+                    for k in 0..n_embd {
+                        acc += last_norm[k] * row[k];
+                    }
+                    *slot = acc;
+                }
+            });
         if let Some(d) = dump {
             d.logits = logits.clone();
         }
