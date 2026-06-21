@@ -15,7 +15,7 @@ use tritium_spec::TernaryBackend;
 use crate::config::ModelConfig;
 use crate::error::NnError;
 use crate::kv_cache::KvCache;
-use crate::layers::BlockDump;
+use crate::layers::{BlockDump, BlockScratch};
 use crate::model::weights::ModelWeights;
 use crate::ops::{rmsnorm, sample_greedy};
 use tritium_format::GgufFile;
@@ -250,8 +250,14 @@ impl ModelRunner {
             d.hidden_states.clear();
         }
 
-        // Per-layer block forward.
+        // Per-layer block forward. Pre-allocate scratch once, reuse across layers.
         let mut next = vec![0.0f32; seq * n_embd];
+        let n_head = self.config.n_head as usize;
+        let n_head_kv = self.config.n_head_kv as usize;
+        let head_dim = self.config.head_dim() as usize;
+        let q_width = n_head * head_dim;
+        let kv_width = n_head_kv * head_dim;
+        let mut scratch = BlockScratch::new(seq, n_embd, q_width, kv_width);
         let n_layers = self.weights.layers.len();
         for li in 0..n_layers {
             // Borrow the block and its KV cache disjointly.
@@ -273,13 +279,14 @@ impl ModelRunner {
                     d.layer0_attn_out = bd.attn_out;
                 }
             } else {
-                block.forward(
+                block.forward_with_scratch(
                     self.backend.as_ref(),
                     &hidden,
                     positions,
                     kv,
                     &self.config,
                     &mut next,
+                    &mut scratch,
                 )?;
             }
             std::mem::swap(&mut hidden, &mut next);

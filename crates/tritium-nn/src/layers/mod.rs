@@ -15,4 +15,4 @@ pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::Relu2Mlp;
 pub use projection::Projection;
-pub use transformer_block::{BlockDump, TransformerBlock};
+pub use transformer_block::{BlockDump, BlockScratch, TransformerBlock};
