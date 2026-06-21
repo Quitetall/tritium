@@ -7,6 +7,39 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.5.2] — 2026-06-20 — Data pipeline: deterministic resumable sharded sampler + `.tqbin`/`.tqidx`
+
+The second v0.60 increment (single-GPU-reachable; still on the `0.5.x` line). The data substrate a
+pretraining loop consumes: a deterministic, resumable, dup/loss-free sharded sampler plus the two
+little-endian corpus formats.
+
+### Added
+- **`DataSampler`** (`tritium-train`): per-epoch Fisher–Yates shuffle of `0..N` driven by a
+  `splitmix64`-seeded `xorshift64` stream (integer-only — reproducible across machines), with a
+  **strided** rank partition (rank `r` takes `perm[r], perm[r+n_ranks], …`) so the union over ranks
+  is exactly `0..N` with no duplication or loss, and a resumable `(seed, epoch, consumed)` cursor
+  that restores the exact remaining order across epoch boundaries. `drop_last` gives every rank
+  `floor(N/n_ranks)` samples; the per-epoch permutation is memoized so streaming an epoch is O(N).
+- **`.tqbin`** (`tritium-format`): a tokenized-corpus shard — LE `magic | version | n_tokens | u32
+  tokens`. **`.tqidx`**: the manifest — `seq_len`, ordered shard list, per-shard token counts; the
+  global sample count is `Σ_shard floor(n_tokens / seq_len)` (`TqIndex::n_samples`). Both parsers
+  are *total*: magic/version enforced, every length bounds-checked against the buffer before
+  allocating (the `checkpoint.rs::f32_vec` discipline) — arbitrary bytes error, never panic/OOB/OOM.
+  A shared never-panic `LeCursor` backs both.
+
+### Gates
+- Sampler property tests (proptest): deterministic permutation, exact coverage (no dup/loss), equal
+  drop-last counts, exact mid-epoch resume across an epoch boundary (both `drop_last` modes).
+- Parser fuzz (proptest): `read_tqbin`/`read_tqidx` total on arbitrary + crafted-header bytes.
+- `clippy -D warnings` + `fmt --check` clean. An adversarial multi-lens review (23 agents) confirmed
+  + fixed two majors — the `drop_last` zero-data guard and O(N) permutation memoization — plus a
+  `TqBadName` UTF-8 error and determinism/resume doc accuracy.
+
+### Notes
+- CPU only. Next on the `0.5.x` line: the GPU-resident training loop + pretrain smoke (0013), then
+  distributed correctness via a thread-simulated `ProcessGroup` (0014–0016), then the rented-2×GPU
+  wall (0017–0018 → `v0.60.0`). See `docs/plans/0012`.
+
 ## [0.5.1] — 2026-06-20 — Full-model autograd backward (v0.60 foundation)
 
 The first v0.60 increment (single-GPU-reachable; the v0.60 milestone proper is gated on ≥2 GPUs).
