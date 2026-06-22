@@ -399,12 +399,21 @@ mod tests {
             }
 
             let got = lut_row_dot(&act, &w);
-            // ADR 0002: relative tolerance 1e-4 with a unit-magnitude floor.
-            let tol = 1e-4 * want.abs().max(1.0);
-            prop_assert!(
-                (got - want).abs() <= tol,
-                "lut {got} vs reference {want} (k={k}, tol={tol})"
-            );
+            // The LUT sums group-partials; the reference sums term-by-term. Both are valid f32
+            // accumulations of the SAME terms, so they agree only up to the re-association gap,
+            // bounded by (k-1)·u·Σ|act| (Higham §4). For cancellation-heavy rows (|want| ≪ Σ|act|)
+            // that far exceeds a result-relative 1e-4, so the tolerance must scale with the
+            // accumulation L1-norm, not the result. (Each group entry is bit-exact — see
+            // table_is_bit_exact_vs_direct_for_every_pattern; this row test bounds the re-association.)
+            let sum_abs: f32 = act
+                .iter()
+                .zip(&w)
+                .filter(|(_, t)| t.get() != 0)
+                .map(|(a, _)| a.abs())
+                .sum();
+            let tol = (k as f32) * f32::EPSILON * sum_abs.max(1.0);
+            let d = (got - want).abs();
+            prop_assert!(d <= tol, "lut {got} vs reference {want} (k={k}, diff={d}, tol={tol})");
         }
 
         /// Determinism: the LUT contraction is byte-identical run-to-run for the

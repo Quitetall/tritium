@@ -24,7 +24,9 @@ mod tensor;
 pub use config::ModelConfig;
 pub use error::NnError;
 pub use kv_cache::KvCache;
-pub use layers::{BlockDump, BlockScratch, DenseLinear, Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
+pub use layers::{
+    BlockDump, BlockScratch, DenseLinear, Projection, Relu2Mlp, TernaryLinear, TransformerBlock,
+};
 pub use model::{ForwardDump, LayerWeights, ModelRunner, ModelWeights, Tokenizer};
 pub use ops::{
     QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_greedy, sample_top_k,

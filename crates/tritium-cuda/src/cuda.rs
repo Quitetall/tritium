@@ -3375,6 +3375,7 @@ pub struct CudaDecodeModel {
     f_embed_batch: CudaFunction,
     f_rope_batch: CudaFunction,
     f_quant_batch: CudaFunction,
+    #[allow(dead_code)]
     f_scale_batch: CudaFunction,
     f_kv_append_batch: CudaFunction,
     f_attn_batch: CudaFunction,
@@ -4987,7 +4988,6 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled,
-                &self.f_scale_batch,
                 &batch.d_qact,
                 &self.layers[li].q,
                 &batch.d_act_scale,
@@ -4997,7 +4997,6 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled,
-                &self.f_scale_batch,
                 &batch.d_qact,
                 &self.layers[li].k,
                 &batch.d_act_scale,
@@ -5007,7 +5006,6 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled,
-                &self.f_scale_batch,
                 &batch.d_qact,
                 &self.layers[li].v,
                 &batch.d_act_scale,
@@ -5101,7 +5099,6 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled,
-                &self.f_scale_batch,
                 &batch.d_qact,
                 &self.layers[li].o,
                 &batch.d_act_scale,
@@ -5138,7 +5135,6 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled,
-                &self.f_scale_batch,
                 &batch.d_qact,
                 &self.layers[li].gate,
                 &batch.d_act_scale,
@@ -5148,7 +5144,6 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled,
-                &self.f_scale_batch,
                 &batch.d_qact,
                 &self.layers[li].up,
                 &batch.d_act_scale,
@@ -5183,7 +5178,6 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled,
-                &self.f_scale_batch,
                 &batch.d_qact,
                 &self.layers[li].down,
                 &batch.d_act_scale,
@@ -6254,7 +6248,14 @@ impl CudaDecodeModel {
         let eps = self.rms_eps;
         let n_i = n as i32;
         let smem = (n * 4) as u32;
-        let mut params = [pp(&x), pp(&w), pp(&eps), pp(&n_i), pp(&d_qact), pp(&d_act_scale)];
+        let mut params = [
+            pp(&x),
+            pp(&w),
+            pp(&eps),
+            pp(&n_i),
+            pp(&d_qact),
+            pp(&d_act_scale),
+        ];
         raw_launch(
             self.raw().rmsnorm_quant,
             (1, 1, 1),

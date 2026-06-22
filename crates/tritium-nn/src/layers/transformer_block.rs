@@ -197,7 +197,15 @@ impl TransformerBlock {
         // Destructure scratch once to get disjoint mutable borrows, or allocate fresh.
         let (mut normed_a, mut q_a, mut k_a, mut v_a, mut attn_a, mut sn_a, mut mlp_a);
         let (normed, q, k, v, attn, sn_buf, mlp_out) = if let Some(s) = scratch {
-            (&mut s.normed, &mut s.q, &mut s.k, &mut s.v, &mut s.attn, &mut s.sn, &mut s.mlp_out)
+            (
+                &mut s.normed,
+                &mut s.q,
+                &mut s.k,
+                &mut s.v,
+                &mut s.attn,
+                &mut s.sn,
+                &mut s.mlp_out,
+            )
         } else {
             normed_a = vec![0.0f32; seq * n_embd];
             q_a = vec![0.0f32; seq * q_width];
@@ -206,7 +214,15 @@ impl TransformerBlock {
             attn_a = vec![0.0f32; seq * q_width];
             sn_a = vec![0.0f32; seq * q_width];
             mlp_a = vec![0.0f32; seq * n_embd];
-            (&mut normed_a, &mut q_a, &mut k_a, &mut v_a, &mut attn_a, &mut sn_a, &mut mlp_a)
+            (
+                &mut normed_a,
+                &mut q_a,
+                &mut k_a,
+                &mut v_a,
+                &mut attn_a,
+                &mut sn_a,
+                &mut mlp_a,
+            )
         };
 
         // --- Pre-norm attention -------------------------------------------- //

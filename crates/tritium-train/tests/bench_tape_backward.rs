@@ -1,6 +1,6 @@
 //! Microbenchmark for tape backward pass. Regression gate for the VJP refactor.
 
-use tritium_train::ops::{bias, elementwise, loss, matmul, ste};
+use tritium_train::ops::ste;
 use tritium_train::tape::Tape;
 
 fn build_tape(n_layers: usize, m: usize, n: usize, k: usize) -> (Tape, usize) {
@@ -10,7 +10,9 @@ fn build_tape(n_layers: usize, m: usize, n: usize, k: usize) -> (Tape, usize) {
     let act_: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.07).cos()).collect();
     let s: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32) * 0.01).collect();
     let b: Vec<f32> = vec![0.01; n];
-    let target: Vec<f32> = (0..m * n).map(|i| ((i as f32) * 0.03).sin() * 0.5).collect();
+    let target: Vec<f32> = (0..m * n)
+        .map(|i| ((i as f32) * 0.03).sin() * 0.5)
+        .collect();
     let wf_id = tape.leaf(wf);
     let sq_id = tape.leaf(sq);
     let act_id = tape.leaf(act_);
@@ -38,7 +40,10 @@ fn bench_tape_backward() {
     let n_layers = 30;
     let (m, n, k) = (1, 20, 128);
     let iters = 200;
-    { let (tape, loss_id) = build_tape(n_layers, m, n, k); let _ = tape.backward(loss_id); }
+    {
+        let (tape, loss_id) = build_tape(n_layers, m, n, k);
+        let _ = tape.backward(loss_id);
+    }
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let (tape, loss_id) = build_tape(n_layers, m, n, k);

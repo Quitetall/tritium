@@ -398,12 +398,8 @@ impl Tape {
         rows: usize,
         cols: usize,
     ) -> ValueId {
-        let out = loss::softmax_xent_forward(
-            &self.values[logits],
-            &self.values[target],
-            rows,
-            cols,
-        );
+        let out =
+            loss::softmax_xent_forward(&self.values[logits], &self.values[target], rows, cols);
         self.record(
             vec![logits, target],
             out,

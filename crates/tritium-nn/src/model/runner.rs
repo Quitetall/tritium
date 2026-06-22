@@ -310,7 +310,12 @@ impl ModelRunner {
             d.final_norm = final_full;
         } else {
             let src = &hidden[last * n_embd..last * n_embd + n_embd];
-            rmsnorm(src, &self.weights.output_norm, self.config.rms_eps, &mut last_norm)?;
+            rmsnorm(
+                src,
+                &self.weights.output_norm,
+                self.config.rms_eps,
+                &mut last_norm,
+            )?;
         }
 
         // Tied LM head: logits[v] = <last_norm, token_embd[v]>.

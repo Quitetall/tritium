@@ -150,6 +150,7 @@ fn bench_rope() {
 // ── softmax_rows ──────────────────────────────────────────────────────────
 
 /// Current: 3 passes (max, exp+sum, normalize).
+#[allow(dead_code)]
 fn softmax_3pass(x: &mut [f32], row_len: usize) {
     for row in x.chunks_mut(row_len) {
         let mut max = f32::NEG_INFINITY;
