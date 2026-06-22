@@ -46,7 +46,7 @@ pub use frozen::{
 };
 pub use generate::generate_vectors;
 pub use jsonl::{JsonlError, load_vectors, save_vectors};
-pub use runner::{FailedCase, FailureReason, Report, run_conformance};
+pub use runner::{FailedCase, FailureReason, Report, run_conformance, run_fused_fallback_contract};
 pub use vector::{ConformanceVector, Tolerance};
 
 // The reference backend is part of the public surface only so this crate's own

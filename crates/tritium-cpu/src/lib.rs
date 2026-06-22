@@ -320,7 +320,9 @@ mod tests {
     use super::*;
     use half::f16;
     use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
-    use tritium_testkit::{Tolerance, frozen_vectors, generate_vectors, run_conformance};
+    use tritium_testkit::{
+        Tolerance, frozen_vectors, generate_vectors, run_conformance, run_fused_fallback_contract,
+    };
 
     /// Pack an `[N, K]` trit matrix into the format's row layout, block scale
     /// fixed to `1.0` (the testkit convention), ready for `upload_weights`.
@@ -402,6 +404,36 @@ mod tests {
                 report.failed
             );
         }
+    }
+
+    /// Capability fallback: the CPU backend advertises **no fp8 / IMMA** yet must
+    /// still serve the fused `mpgemm_with_act_quant` path — degrading to the host
+    /// quant and matching the host-A8 reference, never erroring. This pins the
+    /// no-panic-degrade contract that every backend (wasm, wgpu, …) is held to.
+    #[test]
+    fn fused_path_degrades_without_fp8() {
+        let caps = CpuBackend::new().capabilities();
+        assert!(!caps.supports_fp8, "precondition: CPU advertises no fp8");
+        assert!(!caps.supports_imma, "precondition: CPU advertises no IMMA");
+        assert!(
+            !caps.has_feature("i2s_int8"),
+            "precondition: CPU advertises no on-device int8"
+        );
+
+        let vectors = frozen_vectors();
+        let report =
+            run_fused_fallback_contract(&CpuBackend::new(), &vectors, Tolerance::default());
+        assert!(
+            report.is_ok(),
+            "{} fused-fallback failures: {:?}",
+            report.failed.len(),
+            report.failed
+        );
+        assert_eq!(
+            report.passed,
+            vectors.len(),
+            "all vectors must degrade cleanly"
+        );
     }
 
     // ---- device_id / capabilities -------------------------------------------

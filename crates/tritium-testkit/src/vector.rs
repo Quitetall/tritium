@@ -74,6 +74,23 @@ impl Tolerance {
     /// near-zero references from demanding impossible absolute precision.
     #[must_use]
     pub fn accepts(&self, got: f32, want: f32) -> bool {
+        self.accepts_with_floor(got, want, 1.0)
+    }
+
+    /// Like [`accepts`](Self::accepts) but with an explicit near-zero `floor`
+    /// replacing the default `1.0`: the finite-value bound is
+    /// `|got - want| <= relative * max(floor, |want|)`.
+    ///
+    /// This exists for graded outputs that carry a per-row multiplier. The plain
+    /// mpGEMM tolerance floors at `max(1, |P|)` on the *unscaled* product `P`; if
+    /// the output is then scaled by a per-token factor `s` (as the fused
+    /// W1.58A8 path scales by `act_scale = γ/127`), the sound floor is `s`, not
+    /// `1` — because `s · max(1, |P|) = max(s, |s·P|) = max(s, |want|)`. Passing
+    /// `floor = s` keeps the tolerance equivalent to the mpGEMM contract for any
+    /// `s`, where the fixed `1.0` floor would falsely reject a conformant backend
+    /// once `s ≥ 1` (γ > 127, routine in real activations).
+    #[must_use]
+    pub fn accepts_with_floor(&self, got: f32, want: f32, floor: f32) -> bool {
         if self.bit_exact {
             return got == want;
         }
@@ -83,7 +100,7 @@ impl Tolerance {
         if want.is_infinite() || got.is_infinite() {
             return got == want;
         }
-        let denom = want.abs().max(1.0);
+        let denom = want.abs().max(floor);
         (got - want).abs() <= self.relative * denom
     }
 }
@@ -120,6 +137,20 @@ mod tests {
         assert!(t.accepts(f32::INFINITY, f32::INFINITY));
         assert!(!t.accepts(f32::INFINITY, f32::NEG_INFINITY));
         assert!(!t.accepts(f32::INFINITY, 1.0));
+    }
+
+    #[test]
+    fn floor_lifts_tolerance_through_a_per_row_scale() {
+        let t = Tolerance::default();
+        // Unscaled products P_ref=1.25, P_sub differing by 2e-4 are within the
+        // mpGEMM 1e-4 tolerance once floored at the row's act_scale. Here the
+        // output is scaled by s=2.5 (γ>127): want=1.25, got=1.2502, |Δ|=2e-4.
+        let (s, want, got) = (2.5_f32, 1.25_f32, 1.2502_f32);
+        // The fixed 1.0 floor falsely rejects this conformant backend
+        // (bound = 1e-4·max(1.25,1) = 1.25e-4 < 2e-4)...
+        assert!(!t.accepts(got, want));
+        // ...the scale-aware floor accepts it (bound = 1e-4·max(1.25,2.5) = 2.5e-4).
+        assert!(t.accepts_with_floor(got, want, s));
     }
 
     #[test]
