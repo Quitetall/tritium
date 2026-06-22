@@ -7,6 +7,44 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.0] — 2026-06-22 — v0.60 Pretraining + Distributed (ADR 0008): real-NCCL wall cleared on 2×A100
+
+The **v0.60 milestone**. The from-scratch distributed-training stack — built single-GPU-reachable
+across 0011–0016 and proven in simulation — is now **validated on real multi-GPU hardware**: the real
+`cudarc::nccl` backend agrees with the deterministic simulated reference, closing ADR-0008's
+distributed-correctness story.
+
+### Hardware validation (2× A100-SXM4-80GB, production mode)
+- **0017 NCCL wire-correctness:** all_reduce == summed reference, all_gather == ordered concat,
+  broadcast == root — green at world=2 on real NCCL (2.28.9).
+- **0018 FSDP loss-parity:** the tiny-MLP FSDP loop over the real `NcclProcessGroup` tracks the
+  single-process reference to **`max |Δloss| = 4.5e-8`** (float-epsilon) at world=2.
+- **First datacenter-arch run:** full CUDA suite **51/51 on Ampere/sm_80** (every hand-written PTX
+  kernel + the JIT/autotuned IMMA codegen bit-clean); `compute-sanitizer memcheck` clean over the
+  single-GPU kernels.
+- The **≥80% throughput-scaling** gate stays explicitly deferred — the gate models are tiny seeded
+  MLPs where comms are negligible, so a scaling figure proves nothing; it needs the separately-fenced
+  real-scale resident engine. `v0.6.0` is tagged on correctness.
+
+### Distributed stack (shipped 0011–0016 on the 0.5.x line, now milestone-tagged)
+full-model CPU backward (0011) · resumable sharded data pipeline (0012) · GPU pretrain smoke (0013) ·
+`ProcessGroup` trait + simulated collective backend (0014) · ZeRO-3/FSDP with gradient + loss parity
+(0015) · distributed checkpoint with resharding + crash-atomic writes (0016) · real `cudarc::nccl`
+backend (0017) + the 2×A100 wall (0018).
+
+### Fixed / hardened
+- **`--features cuda` now compiles** — reverted an incomplete in-flight `bl_matmul` change (the M>1
+  batched-scale fusion) that left the call sites inconsistent with the definition. It slipped in
+  because the GPU CI lane is `if: false`; enabling a cuda-feature build is the ROADMAP follow-up so
+  this can't recur.
+- **`scripts/gpu_session.sh` hardened for *any* multi-GPU box**: auto-shims the unversioned
+  `libnccl.so`/`libnvrtc.so` that cudarc dlopens (images ship only `*.so.N`); tolerates any NCCL 2.x
+  (the 2.30 bindings are ABI-stable — 2.28 validated); optional toolchain auto-install for bare base
+  images; requires/notes production mode for multi-GPU; robust positive-evidence verdict.
+
+### Build
+- Internal workspace dep pins bumped to `0.6.0`.
+
 ## [0.5.10] — 2026-06-21 — v0.90 hardening gates: doc-coverage + API-stability
 
 Two reachable-now release-readiness gates (ADR 0011 → ADR 0012), both CPU-only and clear of the
