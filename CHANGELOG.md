@@ -7,6 +7,30 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.4] — 2026-06-23 — v0.80 interop: tritium-candle (ternary mpGEMM as a candle op)
+
+The third **v0.80 Interop** slice (ADR 0010): expose Tritium's ternary mpGEMM as a candle-native
+op, so a candle model graph can use BitNet ternary weights. On the 0.6.x line.
+
+### Added
+- **`tritium-candle`** — [`ternary_mpgemm`], a [`candle_core::CustomOp1`] (applied via
+  `apply_op1_no_bwd`) that runs Tritium's ternary (BitNet b1.58) mpGEMM on a candle `Tensor`: an
+  `[M, K]` f32 activation tensor times `[N, K]` packed ternary weights (TQ2_0 / TQ1_0) with `[N]`
+  per-output-channel scales, producing `[M, N]` f32. `N` is taken from `scales.len()`. The kernel is
+  `tritium_core::reference_mpgemm` itself, so a candle BitNet layer is **bit-exact** with the
+  reference every Tritium backend is graded against. Validates dtype/contiguity/K/packed-length and
+  errors (never panics) on mismatch; the op borrows its weight bytes (call once per forward).
+- **Gate:** a candle-`Tensor` conformance test reproduces the full frozen vector set
+  (64 random + boundary) **bit-exactly**, proving the Tensor↔slice plumbing (layout, shape,
+  readback); plus negative tests for K / packed-length / non-contiguous-activation. New
+  `candle-conformance` CI lane (clippy + `cargo test --features candle`, every push).
+
+### Build
+- New workspace member `tritium-candle`; the heavy `candle-core` dep (CPU-only — no
+  cuda/mkl/accelerate) + the op live behind the **`candle`** feature, off by default, so the default
+  workspace build and `cargo test --workspace` stay candle-free (mirrors `tritium-serve`'s `serve`).
+  candle-core 0.9.2's tree is cargo-deny clean. Internal dep pins bumped to `0.6.4`.
+
 ## [0.6.3] — 2026-06-23 — v0.80 interop: tritium-ffi (C ABI cdylib + staticlib)
 
 The second **v0.80 Interop** slice (ADR 0010): a stable C ABI so any language can drive Tritium
