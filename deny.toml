@@ -4,6 +4,12 @@
 
 [advisories]
 yanked = "deny"
+# RUSTSEC-2024-0436: `paste` is unmaintained (not a vulnerability). It enters the
+# graph only on Apple targets, as a build-time proc-macro transitive of
+# `wgpu` → `wgpu-hal` → `metal` (the macOS/iOS HAL); it is never compiled on the
+# Linux/CUDA path. No maintained drop-in replacement exists upstream yet. Revisit
+# when a future wgpu drops it. Low risk: proc-macro, compile-time only.
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 # Unicode-3.0 is the license of `unicode-ident` (a transitive dep of serde/syn etc.),
