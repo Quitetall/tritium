@@ -7,6 +7,41 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.5] — 2026-06-23 — v0.80 interop COMPLETE: tritium-burn + tritium-onnx (framework backends)
+
+The final **v0.80 Interop** slice (ADR 0010): burn and ONNX Runtime. With serve + ffi + candle, all
+four framework backends are now landed. On the 0.6.x line.
+
+### Added
+- **`tritium-burn`** (feature `burn`) — [`ternary_mpgemm`]`<B: Backend>`, a backend-generic op that
+  runs Tritium's ternary (BitNet b1.58) mpGEMM on a burn `Tensor`: `[M, K]` f32 activations × `[N, K]`
+  packed ternary weights (TQ2_0 / TQ1_0) × `[N]` scales → `[M, N]` f32, **bit-exact** with the
+  reference. A host round-trip (read → `reference_mpgemm` → rebuild) that works on any burn backend
+  (NdArray, wgpu, cuda) in f32; a deferred-execution read failure on a lazy backend is returned as a
+  `BurnTernaryError`, not a panic; the result is pinned to `DType::F32`. Conformance test reproduces
+  the frozen vector set bit-exactly on the NdArray CPU backend + negative tests. `burn-tensor` /
+  `burn-ndarray` 0.21, optional behind the feature (lean default). New `burn-conformance` CI lane.
+- **`tritium-onnx`** — two layers so the always-on CI needs no native library:
+  - **Layer 1** (default, zero external deps): `ternary_mpgemm_kernel`, a plain bit-exact kernel
+    whose conformance test is the default-feature gate (no `ort`, no `onnxruntime`).
+  - **Layer 2** (feature `onnx`): an `ort` 2.x custom operator exposing the kernel as the ONNX node
+    `TritiumTernaryMpGemm` (the `Operator` / `Kernel` traits). `ort = 2.0.0-rc.12` (default-features
+    off + `download-binaries` + `tls-rustls`) fetches a prebuilt onnxruntime at build, so a networked
+    CI lane builds + tests `--features onnx` with no system library. The `run` kernel logic is tested
+    bit-exact + the operator registers; the full native session dispatch is the `#[ignore]`d e2e. New
+    `onnx-op` CI lane.
+
+### Supply-chain
+- `deny.toml` allow-lists **MPL-2.0** (`colored`, via `burn-tensor`'s `std`) and
+  **CDLA-Permissive-2.0** (`webpki-roots`, via `ort`'s `tls-rustls`), both scoped + justified;
+  cargo-deny `--all-features` licenses + bans clean. `ort` pin bumped from the unused `2.0.0-rc.10`
+  to `=2.0.0-rc.12`.
+
+### Build
+- New workspace members `tritium-burn`, `tritium-onnx`; all framework deps optional behind their
+  features so the default workspace build + `cargo test --workspace` stay free of burn/ort/onnxruntime.
+  Internal dep pins bumped to `0.6.5`.
+
 ## [0.6.4] — 2026-06-23 — v0.80 interop: tritium-candle (ternary mpGEMM as a candle op)
 
 The third **v0.80 Interop** slice (ADR 0010): expose Tritium's ternary mpGEMM as a candle-native
