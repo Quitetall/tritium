@@ -16,10 +16,16 @@
 //! - `format` — the packing scheme: `0` = TQ2_0, `1` = TQ1_0 (see
 //!   [`format_from_attr`]).
 //!
-//! `M` is read from `act`'s shape, `N` from `scales`' length. The kernel calls
-//! [`crate::ternary_mpgemm_kernel`] — the same bit-exact reference path the
-//! always-on conformance gate covers — so the ONNX node produces exactly the
-//! reference output.
+//! `M` is read from `act`'s shape, `N` from `scales`' length. The kernel's
+//! compute logic (`run`) calls [`crate::ternary_mpgemm_kernel`] — the same
+//! bit-exact reference path the always-on Layer-1 conformance gate covers — and
+//! `run` is itself tested bit-exact against the frozen vectors
+//! (`kernel_run_matches_reference_on_frozen_set`). CI thus verifies the kernel
+//! logic and that the operator registers into a domain
+//! (`operator_domain_registers`); the full graph dispatch (onnxruntime
+//! extracting a node's tensors and invoking `compute`) is exercised only by the
+//! `#[ignore]`d `end_to_end_session_matches_reference`, which needs the native
+//! runtime and is not run in CI.
 
 use ort::error::Error as OrtError;
 use ort::operator::{

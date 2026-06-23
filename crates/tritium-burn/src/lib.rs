@@ -7,16 +7,22 @@
 //! [`tritium_core::reference_mpgemm`] itself, so a burn BitNet layer is
 //! **bit-exact** with the reference every Tritium backend is graded against.
 //!
-//! ## Host round-trip — works for any [`Backend`]
+//! ## Host round-trip — works on any [`Backend`], in f32
 //!
 //! burn has no stable custom-kernel ABI that is portable across its backends, so
 //! the op is a host round-trip rather than a backend-native kernel: read the
 //! `[M, K]` f32 data out of the burn tensor, unpack the ternary weights exactly
-//! like the candle / wasm backends, run `reference_mpgemm` into a `Vec<f32>`,
-//! and build the `[M, N]` result with [`Tensor::from_data`] on `act`'s device.
-//! This is correct (and bit-exact) for every burn backend — CPU NdArray, wgpu,
-//! cuda — at the cost of a device→host→device copy. It mirrors candle's
-//! `CustomOp1::cpu_fwd`, which is also a host computation.
+//! like the candle / wasm backends, run `reference_mpgemm` into a `Vec<f32>`, and
+//! build the `[M, N]` result (pinned to `DType::F32`) with [`Tensor::from_data`]
+//! on `act`'s device. This works on any burn backend — CPU NdArray, wgpu, cuda —
+//! at the cost of a device→host→device copy, and is **bit-exact** with the
+//! reference. It mirrors candle's `CustomOp1::cpu_fwd`, which is also a host
+//! computation.
+//!
+//! The op computes in **f32**: the activation tensor must have `DType::F32` (the
+//! default float dtype for these backends); a half-precision (`f16`/`bf16`)
+//! activation returns [`BurnTernaryError::TensorRead`] rather than running at a
+//! lower precision. The `[M, N]` result is always `f32`.
 //!
 //! ## Feature gate
 //!
@@ -36,7 +42,7 @@ pub use burn_op::{BurnTernaryError, ternary_mpgemm};
 mod burn_op {
     use core::fmt;
 
-    use burn_tensor::{Tensor, TensorData, backend::Backend};
+    use burn_tensor::{DType, Tensor, TensorData, backend::Backend};
     use half::f16;
     use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
     use tritium_format::{
@@ -144,21 +150,23 @@ mod burn_op {
         Ok(trits)
     }
 
-    /// Run Tritium's ternary mpGEMM on `act` (an `[M, K]` f32 [`Tensor`] on any
+    /// Run Tritium's ternary mpGEMM on `act` (an `[M, K]` **f32** [`Tensor`] on any
     /// burn [`Backend`]) against `[N, K]` `packed` ternary weights in `format`
     /// with `[N]` `scales`, returning the `[M, N]` f32 result on the same device
     /// as `act`. `N` (the output-channel count) is taken from `scales.len()`.
     ///
     /// The implementation is a host round-trip (read `act` to host, unpack
-    /// weights, run [`reference_mpgemm`], rebuild the result tensor), so it is
-    /// correct for every burn backend without a backend-native kernel — see the
-    /// crate docs.
+    /// weights, run [`reference_mpgemm`], rebuild the result tensor pinned to
+    /// `DType::F32`), so it is correct on any burn backend without a
+    /// backend-native kernel — see the crate docs.
     ///
     /// # Errors
-    /// [`BurnTernaryError`] if reading `act` fails, `act`'s `K` disagrees with
-    /// `k`, the packed length is wrong for `[N = scales.len(), K]` in `format`,
-    /// the format is unsupported, or the kernel rejects the assembled buffers.
-    /// Never panics.
+    /// [`BurnTernaryError`] if reading `act` fails (including a deferred kernel
+    /// error surfaced by a lazy backend, or a non-`f32` activation dtype), `act`'s
+    /// `K` disagrees with `k`, the packed length is wrong for `[N = scales.len(),
+    /// K]` in `format`, the format is unsupported, or the kernel rejects the
+    /// assembled buffers. Does not panic on a native backend (a read failure is
+    /// returned as [`BurnTernaryError::TensorRead`]).
     pub fn ternary_mpgemm<B: Backend>(
         act: Tensor<B, 2>,
         packed: &[u8],
@@ -181,7 +189,14 @@ mod burn_op {
         let trits = unpack(packed, n, k, format)?;
 
         let device = act.device();
-        let data: TensorData = act.into_data();
+        // Fallible read: on a lazy backend (wgpu/cuda) a deferred kernel error
+        // surfaces here; `try_into_data` returns it instead of `into_data`'s
+        // panic, so the documented "read fails -> TensorRead" path holds.
+        let data: TensorData = act
+            .try_into_data()
+            .map_err(|e| BurnTernaryError::TensorRead(format!("{e:?}")))?;
+        // f32-only: a non-f32 (e.g. f16/bf16) tensor returns TensorRead here
+        // rather than running at reduced precision.
         let acts: Vec<f32> = data
             .to_vec::<f32>()
             .map_err(|e| BurnTernaryError::TensorRead(format!("{e:?}")))?;
@@ -192,9 +207,11 @@ mod burn_op {
         reference_mpgemm(&acts, &trits, scales, GemmShape { m, n, k }, &mut out)
             .map_err(|e| BurnTernaryError::Kernel(format!("{e}")))?;
 
+        // Pin the result to f32 (via the (&device, DType) creation options) so it
+        // is not silently downcast on a backend whose default float dtype is half.
         Ok(Tensor::<B, 2>::from_data(
             TensorData::new(out, [m, n]),
-            &device,
+            (&device, DType::F32),
         ))
     }
 
