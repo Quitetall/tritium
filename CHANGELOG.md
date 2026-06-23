@@ -7,6 +7,35 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.7] — 2026-06-23 — v1.0 capstone prep: freeze audit + model-zoo/benchmark docs + CPU fresh-env e2e
+
+The reachable **v1.0 Release** preparation (ADR 0012), on the 0.6.x line. The v1.0.0 **tag** itself
+stays gated on fenced hardware (Metal/ROCm parity + the GPU CI matrix + the real-model/GPU capstone),
+per ADR 0002/0012 — none of that is claimed here.
+
+### Added
+- **`docs/v1.0-api-freeze-audit.md`** — a report-only freeze-readiness audit of the whole public
+  surface: a per-crate readiness table, the **C ABI confirmed frozen at v1** (via the cbindgen drift +
+  C11/C++17 compile gates), the `cargo-semver-checks` enforcement process, and a prioritized
+  `[breaking]`/`[additive]` list of pre-freeze API changes to consider. **Mutates no public API.**
+  Measured (not assumed): `tritium-cpu`/`-nn`/`-train`/`-py` already have full doc coverage despite
+  lacking `#![deny(missing_docs)]`; the semver gate is green (253 checks/crate vs the `v0.5.10`
+  baseline). P0 flag: `tritium-train` exposes 12 `pub mod`s to curate before the freeze.
+- **mdbook Model Zoo + Benchmarks chapters** — the real model-load path (BitNet b1.58 2B4T loads via
+  the GGUF **I2_S** type-id 36, re-packed to TQ2_0; EOS `128001`) and the perf **methodology** (the
+  divan microbenches, the e2e tok/s bench coupled to a perplexity gate, the `tritium report`
+  subcommands) — with **zero fabricated numbers** and CPU-measurable vs GPU-required signals clearly
+  separated. Wired into `SUMMARY.md`.
+- **`scripts/capstone.sh` + `capstone` CI lane** — a CPU fresh-env end-to-end smoke exercising the
+  **install → infer → SALT → fine-tune** pipeline on real code paths (workspace build; `list-backends`;
+  a real GGUF parse + a clean runner-load-fail on the partial fixture; a real SALT quantize → `.tslb`
+  bundle; the `tritium-train` STE/AdamW CPU gates). Honest DEFERRED markers mark the GPU/real-model
+  capstone (the v1.0.0 tag gate).
+
+### Build
+- No workspace code or dependencies changed (docs + a shell script + a CI lane). Internal dep pins
+  bumped to `0.6.7`.
+
 ## [0.6.6] — 2026-06-23 — v0.90 hardening polish: mdbook + sanitizers + wheels + CPU bench smoke
 
 The reachable **v0.90 Hardening** tooling (ADR 0011), on the 0.6.x line. (The fenced-hardware
