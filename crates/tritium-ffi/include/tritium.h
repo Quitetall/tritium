@@ -27,7 +27,9 @@ typedef enum TritiumStatus {
     TritiumStatus_Generate = 3,
     // The output buffer was too small; `*out_len` holds the required length.
     TritiumStatus_BufferTooSmall = 4,
-    // An internal panic was caught at the boundary (should not happen).
+    // An internal panic was caught at the boundary. Only reachable when the
+    // crate is built with `panic = "unwind"`; under `panic = "abort"` (the
+    // default release/dist profile) a panic aborts the process instead.
     TritiumStatus_Panic = 5,
 } TritiumStatus;
 
@@ -55,11 +57,21 @@ const char *tritium_version(void);
 // null or a valid writable `TritiumStatus*`.
 struct TritiumModel *tritium_model_load_file(const char *path, enum TritiumStatus *out_status);
 
-// Greedily generate up to `max_new` tokens from `prompt` (`prompt_len` token
-// IDs), stopping early at `eos`. Writes up to `out_cap` token IDs into `out` and
-// sets `*out_len` to the number generated. If the generated count exceeds
-// `out_cap`, returns [`TritiumStatus::BufferTooSmall`] with `*out_len` set to the
-// required length (nothing is written).
+// Greedily generate up to `max_new` tokens continuing `prompt` (`prompt_len`
+// token IDs), stopping early at `eos`. The generated count never exceeds
+// `max_new`, so the simplest correct use is to size `out` to `max_new` and call
+// once, reading the count from `*out_len`.
+//
+// Writes up to `out_cap` token IDs into `out` and sets `*out_len` to the number
+// generated. If the count exceeds `out_cap`, returns
+// [`TritiumStatus::BufferTooSmall`] with `*out_len` set to the required length
+// (nothing is written). When `out_len` is non-null it is *always* written: `0`
+// on the `NullArg`/`Generate` paths, the count on `Ok`/`BufferTooSmall`.
+//
+// Each call re-runs generation from scratch (the KV cache is reset), so a "size
+// with `out_cap = 0`, then fill" pattern costs two full generations and is only
+// length-stable because greedy decoding is deterministic. Prefer the single
+// `max_new`-sized pass above.
 //
 // # Safety
 // `model` must be a live handle from [`tritium_model_load_file`]; `prompt` must

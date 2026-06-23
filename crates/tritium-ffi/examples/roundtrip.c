@@ -38,30 +38,25 @@ int main(int argc, char **argv) {
 
     /* A toy prompt of token IDs. A real caller tokenizes text first. */
     const uint32_t prompt[] = {1, 2, 3};
-    const uint32_t max_new = 16;
+#define MAX_NEW 16
     const uint32_t eos = 128001; /* TRITIUM default EOS */
 
-    /* Pass 1: discover how many tokens will be produced (out_cap = 0). */
-    size_t needed = 0;
+    /* The generated count never exceeds max_new, so size the buffer to max_new
+     * and generate in a single pass — no separate sizing call (which would
+     * re-run generation). Read the actual count from `produced`. */
+    uint32_t out[MAX_NEW];
+    size_t produced = 0;
     status = tritium_generate(model, prompt, sizeof(prompt) / sizeof(prompt[0]),
-                              max_new, eos, NULL, 0, &needed);
-    if (status != TritiumStatus_BufferTooSmall && status != TritiumStatus_Ok) {
-        fprintf(stderr, "generate (sizing) failed: status=%d\n", (int)status);
+                              MAX_NEW, eos, out, MAX_NEW, &produced);
+    if (status != TritiumStatus_Ok) {
+        fprintf(stderr, "generate failed: status=%d\n", (int)status);
         tritium_model_free(model);
         return 1;
     }
 
-    /* Pass 2: allocate and fill. */
-    uint32_t *out = (uint32_t *)calloc(needed ? needed : 1, sizeof(uint32_t));
-    size_t produced = 0;
-    status = tritium_generate(model, prompt, sizeof(prompt) / sizeof(prompt[0]),
-                              max_new, eos, out, needed, &produced);
-    if (status != TritiumStatus_Ok) {
-        fprintf(stderr, "generate failed: status=%d\n", (int)status);
-        free(out);
-        tritium_model_free(model);
-        return 1;
-    }
+    /* (If you must learn the length without a buffer, pass out=NULL, out_cap=0:
+     * the call returns TritiumStatus_BufferTooSmall with *out_len set to the
+     * required count — but it re-runs generation, so prefer the pass above.) */
 
     printf("generated %zu tokens:", produced);
     for (size_t i = 0; i < produced; i++) {
@@ -69,7 +64,6 @@ int main(int argc, char **argv) {
     }
     printf("\n");
 
-    free(out);
     tritium_model_free(model);
     return 0;
 }

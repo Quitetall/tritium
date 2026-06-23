@@ -7,9 +7,14 @@
 //!
 //! ## Safety contract (the FFI boundary)
 //!
-//! - **Never panics across the boundary.** Every entry point wraps its body in
-//!   `catch_unwind`; a panic becomes [`TritiumStatus::Panic`], never undefined
-//!   behavior.
+//! - **Panics never unwind across the boundary** (unwinding out of `extern "C"`
+//!   is undefined behavior). Under the workspace's default `release`/`dist`
+//!   profile (`panic = "abort"`) an internal panic aborts the process — the safe,
+//!   defined outcome. The `catch_unwind` guards additionally turn a panic into
+//!   [`TritiumStatus::Panic`] *when the crate is built with* `panic = "unwind"`
+//!   (the default for `dev`/`test`); build that way if you need the host to
+//!   survive an internal panic with an error code instead of an abort. (`panic`
+//!   is a whole-artifact profile setting — Cargo forbids overriding it per crate.)
 //! - **Null-checked.** Every pointer argument is checked; a null where one is
 //!   required returns [`TritiumStatus::NullArg`] instead of dereferencing.
 //! - **Ownership.** [`tritium_model_load_file`] returns an owned handle the caller
@@ -47,7 +52,9 @@ pub enum TritiumStatus {
     Generate = 3,
     /// The output buffer was too small; `*out_len` holds the required length.
     BufferTooSmall = 4,
-    /// An internal panic was caught at the boundary (should not happen).
+    /// An internal panic was caught at the boundary. Only reachable when the
+    /// crate is built with `panic = "unwind"`; under `panic = "abort"` (the
+    /// default release/dist profile) a panic aborts the process instead.
     Panic = 5,
 }
 
@@ -123,11 +130,21 @@ pub unsafe extern "C" fn tritium_model_load_file(
     }
 }
 
-/// Greedily generate up to `max_new` tokens from `prompt` (`prompt_len` token
-/// IDs), stopping early at `eos`. Writes up to `out_cap` token IDs into `out` and
-/// sets `*out_len` to the number generated. If the generated count exceeds
-/// `out_cap`, returns [`TritiumStatus::BufferTooSmall`] with `*out_len` set to the
-/// required length (nothing is written).
+/// Greedily generate up to `max_new` tokens continuing `prompt` (`prompt_len`
+/// token IDs), stopping early at `eos`. The generated count never exceeds
+/// `max_new`, so the simplest correct use is to size `out` to `max_new` and call
+/// once, reading the count from `*out_len`.
+///
+/// Writes up to `out_cap` token IDs into `out` and sets `*out_len` to the number
+/// generated. If the count exceeds `out_cap`, returns
+/// [`TritiumStatus::BufferTooSmall`] with `*out_len` set to the required length
+/// (nothing is written). When `out_len` is non-null it is *always* written: `0`
+/// on the `NullArg`/`Generate` paths, the count on `Ok`/`BufferTooSmall`.
+///
+/// Each call re-runs generation from scratch (the KV cache is reset), so a "size
+/// with `out_cap = 0`, then fill" pattern costs two full generations and is only
+/// length-stable because greedy decoding is deterministic. Prefer the single
+/// `max_new`-sized pass above.
 ///
 /// # Safety
 /// `model` must be a live handle from [`tritium_model_load_file`]; `prompt` must
@@ -146,8 +163,14 @@ pub unsafe extern "C" fn tritium_generate(
     out_len: *mut usize,
 ) -> TritiumStatus {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null() {
+            return TritiumStatus::NullArg;
+        }
+        // out_len is valid from here: define it (0) so every non-NullArg return
+        // leaves it in a known state; the count overwrites it on success below.
+        // SAFETY: out_len checked non-null; caller guarantees it is writable.
+        unsafe { *out_len = 0 };
         if model.is_null()
-            || out_len.is_null()
             || (prompt.is_null() && prompt_len != 0)
             || (out.is_null() && out_cap != 0)
         {
