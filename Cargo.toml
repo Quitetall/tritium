@@ -18,7 +18,7 @@ members = [
     # L1 backends
     # "crates/tritium-metal",    # [planned]
     # "crates/tritium-rocm",     # [planned]
-    # "crates/tritium-wgpu",     # [planned]
+    "crates/tritium-wgpu",     # WGSL mpGEMM over wgpu (Vulkan)
     # L2 runtime + functional
     # "crates/tritium-runtime",  # registry, dispatch, mem pools, autotune cache
     "crates/tritium-quantize", # SALT: fp -> ternary plane stacks (ADR 0001/0006)
@@ -31,7 +31,7 @@ members = [
     # "crates/tritium-onnx",     # ort custom op
     # "crates/tritium-candle",   # candle backend
     # "crates/tritium-burn",     # [planned]
-    # "crates/tritium-wasm",     # [planned]
+    "crates/tritium-wasm",     # scalar TernaryBackend for wasm32-wasip1
     # L4 apps
     # "crates/tritium-cli",      # `tritium` binary
     # "crates/tritium-serve",    # [planned] OpenAI-compatible server
@@ -39,7 +39,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"              # SemVer (MAJOR.MINOR.PATCH); see CHANGELOG versioning note
+version = "0.6.1"              # SemVer (MAJOR.MINOR.PATCH); see CHANGELOG versioning note
 edition = "2024"
 rust-version = "1.89"          # AVX-512 intrinsics stable floor (Rust 1.89, 2025-08-07)
 license = "Apache-2.0"         # FOSS; see LICENSE. Vendored deps attributed in NOTICE.
@@ -53,16 +53,16 @@ categories = ["science", "hardware-support", "mathematics"]
 # internal crates (path + caret version, bumped in lockstep with the workspace version at each
 # minor release). The explicit version is required for `cargo publish` (crates.io forbids bare path
 # deps) and lets cargo-deny keep `wildcards = "deny"` meaningful for *external* deps.
-tritium-core = { path = "crates/tritium-core", version = "0.6.0" }
-tritium-spec = { path = "crates/tritium-spec", version = "0.6.0" }
-tritium-format = { path = "crates/tritium-format", version = "0.6.0" }
-tritium-runtime = { path = "crates/tritium-runtime", version = "0.6.0" }
-tritium-testkit = { path = "crates/tritium-testkit", version = "0.6.0" }
-tritium-cpu = { path = "crates/tritium-cpu", version = "0.6.0" }
-tritium-cuda = { path = "crates/tritium-cuda", version = "0.6.0" }
-tritium-quantize = { path = "crates/tritium-quantize", version = "0.6.0" }
-tritium-nn = { path = "crates/tritium-nn", version = "0.6.0" }
-tritium-train = { path = "crates/tritium-train", version = "0.6.0" }
+tritium-core = { path = "crates/tritium-core", version = "0.6.1" }
+tritium-spec = { path = "crates/tritium-spec", version = "0.6.1" }
+tritium-format = { path = "crates/tritium-format", version = "0.6.1" }
+tritium-runtime = { path = "crates/tritium-runtime", version = "0.6.1" }
+tritium-testkit = { path = "crates/tritium-testkit", version = "0.6.1" }
+tritium-cpu = { path = "crates/tritium-cpu", version = "0.6.1" }
+tritium-cuda = { path = "crates/tritium-cuda", version = "0.6.1" }
+tritium-quantize = { path = "crates/tritium-quantize", version = "0.6.1" }
+tritium-nn = { path = "crates/tritium-nn", version = "0.6.1" }
+tritium-train = { path = "crates/tritium-train", version = "0.6.1" }
 # foundation
 bytemuck = "1"
 half = "2"
@@ -72,6 +72,9 @@ rayon = "1"
 # cuda
 cudarc = "0.13"
 cc = "1"
+# wgpu backend (WGSL mpGEMM over Vulkan); exact pin keeps cargo-deny wildcards=deny meaningful
+wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl"] }
+pollster = "0.4"
 # bindings / frontends
 pyo3 = "0.23"
 ort = "2.0.0-rc.10"

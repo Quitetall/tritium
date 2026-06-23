@@ -1,0 +1,6 @@
+# wasm32-wasip1 conformance gate runs the test harness inside wasmtime (whose
+# default codegen engine is Cranelift). `--dir=.` preopens the working directory
+# so the frozen-vector JSONL (resolved via CARGO_MANIFEST_DIR) is readable in the
+# WASI sandbox. Only affects builds that explicitly --target wasm32-wasip1.
+[target.wasm32-wasip1]
+runner = "wasmtime --dir=."

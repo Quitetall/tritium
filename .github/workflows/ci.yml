@@ -122,3 +122,40 @@ jobs:
       # baseline is a conservative floor; tighten it to a `BuiltOnBox` number to make
       # the gate bite on real kernel regressions.
       - run: cargo bench -p tritium-benches --features cuda --bench e2e
+
+  # wasm lane (v0.70 backend breadth). Hosted ubuntu, no GPU, no sudo: adds the
+  # wasm32-wasip1 target, installs the wasmtime CLI (Cranelift), and runs the
+  # tritium-wasm conformance + fused-fallback gates INSIDE the wasm guest. The
+  # .cargo/config.toml `runner = "wasmtime --dir=."` makes `cargo test --target`
+  # transparently execute the test harness under wasmtime. Green on every push.
+  wasm:
+    name: wasm conformance (wasm32-wasip1)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasmtime
+      - run: cargo test --target wasm32-wasip1 -p tritium-wasm
+
+  # wgpu lane (v0.70 backend breadth). Self-hosted, manual — runs only where a
+  # Vulkan adapter + driver are present (the 4090 box). Mirrors the disabled `gpu`
+  # (CUDA) lane: the same frozen-conformance + fused-fallback gates; the wgpu
+  # backend self-skips with no adapter, so this is the only place it actually
+  # bites. `register` exercises both the explicit ctor and the linkme self-
+  # registration on a target where linkme is available.
+  wgpu:
+    name: wgpu conformance (vulkan)
+    runs-on: [self-hosted, gpu]
+    if: ${{ false }} # enable on a runner with a Vulkan adapter + driver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: vulkan runtime
+        run: sudo apt-get update && sudo apt-get install -y libvulkan1 vulkan-tools
+      - run: cargo test -p tritium-wgpu --features register

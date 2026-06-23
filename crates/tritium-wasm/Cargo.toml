@@ -1,0 +1,23 @@
+[package]
+name = "tritium-wasm"
+description = "Scalar WebAssembly execution backend for wasm32-wasip1: the reference ternary mpGEMM, no host-only deps (no rayon, no linkme, no SIMD intrinsics)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-spec = { workspace = true }
+tritium-format = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+tritium-testkit = { workspace = true }
+
+[lints]
+workspace = true

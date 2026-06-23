@@ -80,6 +80,9 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0021 | `docs/plans/0021-v090-cargo-deny-gate.md` | Supply-chain gate: `cargo deny check` green (Unicode-3.0 allow; internal deps version-pinned) + cargo-deny CI lane | v0.90 / ADR 0011 | **done** (tagged `v0.5.8`; CPU) — build-ahead; also unblocks v1.0 `cargo publish` | — |
 | 0022 | `docs/plans/0022-v090-fuzz-breadth.md` | Fuzz breadth: cargo-fuzz targets for every untrusted-byte parser (tqbin/tqidx/salt_bundle/safetensors/legacy) + 8-target CI sweep | v0.90 / ADR 0011 | **done** (tagged `v0.5.9`; CPU) — build-ahead (U5) | — |
 | 0023 | `docs/plans/0023-v090-hardening-gates.md` | v0.90 hardening gates: `#![deny(missing_docs)]` on 6 foundation crates + `cargo-semver-checks` API-stability gate (`scripts/check-semver.sh` + CI lane) | v0.90/v1.0 / ADR 0011 | **done** (tagged `v0.5.10`; CPU) — build-ahead | — |
+| 0024 | _(v0.6.1; workflow-designed)_ | Capability-fallback contract: `run_fused_fallback_contract` pins the no-panic fused-path (`mpgemm_with_act_quant`) degrade for no-fp8 backends, scale-aware tolerance floor; CPU + wgpu + wasm subjects | v0.70 / ADR 0009 | **done** (tagged `v0.6.1`; CPU) — build-ahead | — |
+| 0025 | _(v0.6.1; workflow-designed)_ | `tritium-wgpu`: WGSL ternary mpGEMM over wgpu (Vulkan); 89-vector conformance + fused-fallback **on the 4090**; add/sub/skip shader form; 2-D dispatch beyond the 65535/dim cap; error-scoped (no-panic); adapter-select + real limits | v0.70 / ADR 0009 | **done** (tagged `v0.6.1`; 4090 Vulkan) — build-ahead | — |
+| 0026 | _(v0.6.1; workflow-designed)_ | `tritium-wasm`: scalar `TernaryBackend` on `wasm32-wasip1` (`reference_mpgemm`, spec/core/format only — no rayon/linkme); conformance **inside wasmtime** (Cranelift) | v0.70 / ADR 0009 | **done** (tagged `v0.6.1`; wasm/wasmtime) — build-ahead | — |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**
@@ -167,10 +170,12 @@ none claiming a milestone tag. A code-grounded survey put this at **~21 reachabl
 HW-wall items** (the wall: Apple-Metal + AMD-ROCm parity, the multi-GPU NCCL/FSDP re-runs, and the
 macOS/Windows CI matrix). The payoff: once the rented session tags `v0.60.0`, the downstream milestone
 tags fall as a short **verify-and-tag cascade** instead of a per-milestone build-then-tag crawl.
-Reachable-now order (by value/effort + dependency): **0019 freeze (done)** → capability-fallback test →
-`tritium-wgpu` (Vulkan on the 4090) / `tritium-wasm` (wasmtime) → `tritium-serve` + `tritium-ffi`
-(v0.80, pure-CPU wrappers over the shipped runner) → doctest sweep / fuzz breadth / `cargo-deny` /
-semver baseline (v0.90/v1.0 tooling).
+Reachable-now order (by value/effort + dependency): **0019 freeze (done `v0.5.7`)** →
+**capability-fallback contract (done `v0.6.1`)** → **`tritium-wgpu` (Vulkan on the 4090, done `v0.6.1`)
+/ `tritium-wasm` (wasmtime, done `v0.6.1`)** → `tritium-serve` + `tritium-ffi` (v0.80, pure-CPU wrappers
+over the shipped runner) → doctest sweep / fuzz breadth (done) / `cargo-deny` (done) / semver baseline
+(done) (v0.90/v1.0 tooling). Remaining v0.70 = the **Metal + ROCm** platform backends (fenced HW) +
+the macOS/Windows CI matrix → then the v0.70 milestone tag.
 
 ---
 

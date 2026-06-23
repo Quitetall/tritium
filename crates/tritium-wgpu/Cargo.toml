@@ -1,0 +1,39 @@
+[package]
+name = "tritium-wgpu"
+description = "Cross-platform GPU execution backend: WGSL ternary mpGEMM over wgpu (Vulkan), validated on the 4090 Vulkan adapter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-spec = { workspace = true }
+tritium-runtime = { workspace = true }
+tritium-format = { workspace = true }
+half = { workspace = true }
+
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true, features = ["derive"] }
+linkme = { workspace = true, optional = true }
+
+[features]
+default = []
+# GPU code (and its heavy deps) live behind `wgpu`, mirroring tritium-cuda's `cuda`
+# gate: the default build is an inert stub the cpu-only CI matrix compiles with no
+# GPU deps.
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# `register` adds linkme self-registration into the runtime BACKENDS slice.
+register = ["wgpu", "dep:linkme"]
+
+[dev-dependencies]
+tritium-testkit = { workspace = true }
+pollster = { workspace = true }
+
+[lints]
+workspace = true

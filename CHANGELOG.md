@@ -7,6 +7,40 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.1] — 2026-06-22 — v0.70 backend breadth (reachable): wgpu + wasm backends + capability-fallback contract
+
+Three software-reachable slices of **v0.70 Backend Breadth** (ADR 0009), shipped on the 0.6.x line
+ahead of the platform-GPU milestone gate. Both new backends pass the frozen v0.70 conformance set on
+real targets (the 4090 Vulkan adapter; wasmtime). The v0.70 **milestone** tag still waits on Metal +
+ROCm hardware parity — these are the reachable-now backends.
+
+### Added
+- **`tritium-wgpu`** — cross-platform GPU backend: a WGSL ternary mpGEMM compute shader over wgpu
+  (Vulkan), validated on the **RTX 4090 Vulkan adapter** against all 89 frozen conformance vectors
+  (≤1e-4) + the fused-fallback contract. Host-unpacks weights (TQ2_0/TQ1_0) to an `i32` storage
+  buffer; the shader uses the reference's **add/sub/skip** accumulation form (not `act·f32(trit)`) so
+  f32 round-off stays inside the 1e-4 bar on high-cancellation vectors. A **2-D workgroup dispatch**
+  handles `M·N` beyond the 65535-per-dimension Vulkan limit (validated at `M·N = 4.19M`). Device-side
+  validation errors are **error-scoped → `BackendError`, never a panic**; adapter selection prefers
+  the discrete NVIDIA GPU and requests the adapter's real limits. All GPU code behind `--features
+  wgpu`; `--features register` adds linkme self-registration.
+- **`tritium-wasm`** — scalar `TernaryBackend` for `wasm32-wasip1`: the portable
+  `tritium_core::reference_mpgemm` over `tritium-format`-unpacked weights, depending only on the
+  wasm-clean spec/core/format crates (no rayon, no linkme — neither compiles on wasm32). Conformance
+  runs **inside wasmtime** (Cranelift) on every push; bit-exact with the reference.
+- **`run_fused_fallback_contract`** (tritium-testkit) — pins the no-panic-degrade contract for the
+  fused W1.58A8 path: a backend advertising no fp8/IMMA must serve `mpgemm_with_act_quant` via the
+  host-default fallback, graded against the host-A8 reference with a per-token scale-aware tolerance
+  floor (`Tolerance::accepts_with_floor`). Exercised by CPU + wgpu + wasm.
+- **CI:** a `wasm` lane (wasm32-wasip1 under wasmtime, every push) + a `wgpu` lane (self-hosted Vulkan,
+  manual, like the `gpu` lane). The new crates also build/test in `cpu-only-green` via their default
+  (no-GPU) builds.
+
+### Build
+- New workspace members `tritium-wgpu` / `tritium-wasm`; `wgpu = "=23.0.1"` (exact pin, satisfies
+  cargo-deny `wildcards=deny`) + `pollster` workspace deps; new `.cargo/config.toml` wasmtime runner.
+  Internal dep pins bumped to `0.6.1`.
+
 ## [0.6.0] — 2026-06-22 — v0.60 Pretraining + Distributed (ADR 0008): real-NCCL wall cleared on 2×A100
 
 The **v0.60 milestone**. The from-scratch distributed-training stack — built single-GPU-reachable
