@@ -37,3 +37,6 @@ crates/*/fuzz/target/
 **/__pycache__/
 *.pyc
 /target/wheels/
+
+# CycloneDX SBOMs (generated in CI, uploaded as an artifact)
+*.cdx.json

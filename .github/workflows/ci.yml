@@ -190,3 +190,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p tritium-serve --features e2e -- --ignored serve_e2e_token_id_roundtrip
+
+  # Publish-readiness gate (ADR 0011 / v0.90): every workspace crate packages into a
+  # valid .crate (manifest + files + version-pinned internal deps). See
+  # scripts/check-publish.sh for why this is `cargo package --workspace` rather than
+  # per-crate `cargo publish --dry-run`.
+  publish-check:
+    name: publish readiness (cargo package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/check-publish.sh
+
+  # SBOM (ADR 0011 / v0.90): generate a CycloneDX software bill of materials for the
+  # whole workspace and upload it as a build artifact.
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-cyclonedx --locked
+      - run: cargo cyclonedx --all --format json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: "**/*.cdx.json"
+          if-no-files-found: error
