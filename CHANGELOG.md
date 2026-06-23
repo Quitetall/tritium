@@ -7,6 +7,36 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.3] — 2026-06-23 — v0.80 interop: tritium-ffi (C ABI cdylib + staticlib)
+
+The second **v0.80 Interop** slice (ADR 0010): a stable C ABI so any language can drive Tritium
+inference. On the 0.6.x line; unblocks the **v1.0 C-ABI freeze**.
+
+### Added
+- **`tritium-ffi`** — a `cdylib` + `staticlib` exposing a small, stable, panic-safe C API: load a GGUF
+  model on the CPU backend and greedily generate token IDs from C/C++/any language. Surface (the
+  cbindgen-generated `include/tritium.h`): `tritium_abi_version()` (ABI v1), `tritium_version()`,
+  `tritium_model_load_file()`, `tritium_generate()` (single `max_new`-sized pass, or `out_cap=0`
+  size-then-fill), `tritium_model_free()` (null-safe). Boundary discipline: every entry point
+  null-checks its pointer args (→ `NullArg`, never a deref) and wraps its body in `catch_unwind`; the
+  three pointer-taking functions are `unsafe extern "C"`; `*out_len` is always written when non-null.
+  The cpu backend's `linkme` registration is **verified to survive linker GC into the linked
+  cdylib/staticlib** (so `load_cpu` resolves). A documented `examples/roundtrip.c` shows the consumer flow.
+- **Header discipline:** `include/tritium.h` is committed; a dev-only drift test regenerates it with
+  cbindgen and fails on mismatch, then compiles it as **C11 + C++17** under `-Wall -Wextra` on Linux.
+  No `build.rs` source write (keeps the publish clean-tree check honest).
+- **Tests:** 10 ABI null/error/version tests + 2 header gates; a gated real-model round-trip
+  (`TRITIUM_FFI_MODEL=<gguf>`).
+
+### Notes
+- **`panic = "abort"`:** under the default `release`/`dist` profile a panic aborts the process (the
+  safe, defined FFI outcome); the `catch_unwind` → `TritiumStatus::Panic` path is reachable only when
+  built with `panic = "unwind"` (the `dev`/`test` default). `panic` is a whole-artifact profile setting
+  — Cargo forbids overriding it per crate.
+
+### Build
+- New workspace member `tritium-ffi`; `cbindgen` workspace dev-dependency. Internal dep pins bumped to `0.6.3`.
+
 ## [0.6.2] — 2026-06-23 — v0.80 interop: tritium-serve (OpenAI HTTP/SSE) + pyo3 security bump
 
 The first **v0.80 Interop** slice (ADR 0010) plus a supply-chain hardening pass, on the 0.6.x line.

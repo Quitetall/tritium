@@ -1661,7 +1661,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tritium-benches"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "divan",
  "half",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cli"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1695,14 +1695,14 @@ dependencies = [
 
 [[package]]
 name = "tritium-core"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "tritium-cpu"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "half",
  "linkme",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cuda"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "cudarc",
  "half",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-ffi"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "cbindgen",
  "tritium-core",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-format"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "half",
  "proptest",
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-nn"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "half",
  "proptest",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-py"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "pyo3",
  "tritium-core",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-quantize"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "half",
  "proptest",
@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-runtime"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "linkme",
  "tritium-core",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-serve"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -1822,14 +1822,14 @@ dependencies = [
 
 [[package]]
 name = "tritium-spec"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "tritium-core",
 ]
 
 [[package]]
 name = "tritium-testkit"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "half",
  "proptest",
@@ -1842,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-train"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "proptest",
  "tritium-core",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-wasm"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "half",
  "tritium-core",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-wgpu"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "bytemuck",
  "half",

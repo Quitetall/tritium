@@ -45,7 +45,7 @@ proceed from outputs alone, "no matter what happens."
 | v0.50 Training Core | 0007 | **Done** (tagged `v0.5.0`) — STE autograd + Gate C green CPU+CUDA (0005–0007), AdamW + bit-exact checkpoint (0008), LoRA on frozen base (0009), QAT heal bridge + distillation-convergence capstone on the real model (0010). Full-model ≥90% PPL-recovery deferred to v0.60 (needs full-model backprop + a non-QAT-latent checkpoint — see 0010). |
 | v0.60 Pretraining + Distributed | 0008 | **Done** (tagged `v0.6.0`) — distributed stack 0011–0016 (shipped on the `0.5.x` line: full-model CPU backward, data pipeline, GPU pretrain smoke, ProcessGroup+sim backend, ZeRO-3/FSDP, distributed checkpoint) + real `cudarc::nccl` backend (0017) + the ≥2-GPU wall (0018) **validated on 2×A100 (production)**: 0017 wire-correctness + 0018 FSDP loss-parity (world=2, `max\|Δloss\|=4.5e-8`); full CUDA suite **51/51 on Ampere** + single-GPU memcheck-clean. **≥80% scaling deferred** (tiny gate models; needs the real-scale resident engine). |
 | v0.70 Backend Breadth | 0009 | Planned |
-| v0.80 Interop (`tritium-serve`) | 0010 | In progress — **`tritium-serve` done** (OpenAI HTTP/SSE, contract gate, shipped `v0.6.2`; doubles as the LAMU `backend_kind`); `tritium-ffi`/`candle`/`burn`/`onnx` remain |
+| v0.80 Interop | 0010 | In progress — **`tritium-serve` done** (OpenAI HTTP/SSE, contract gate, `v0.6.2`; doubles as the LAMU `backend_kind`); **`tritium-ffi` done** (C ABI cdylib + staticlib, panic-safe, cbindgen header w/ drift + C11/C++17 compile gate, `v0.6.3` — unblocks the v1.0 C-ABI freeze); `candle`/`burn`/`onnx` remain |
 | v0.90 Hardening | 0011 | Planned |
 | v1.0 Release | 0012 | Planned |
 | **Spec-decode (BASTION-style tree verify)** | **0014** | **Proposed (ADR written)** — *post-v0.4.1 point-release; Tritium = verifier, LAMU orchestrates, drafter external* |
@@ -84,6 +84,7 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0025 | _(v0.6.1; workflow-designed)_ | `tritium-wgpu`: WGSL ternary mpGEMM over wgpu (Vulkan); 89-vector conformance + fused-fallback **on the 4090**; add/sub/skip shader form; 2-D dispatch beyond the 65535/dim cap; error-scoped (no-panic); adapter-select + real limits | v0.70 / ADR 0009 | **done** (tagged `v0.6.1`; 4090 Vulkan) — build-ahead | — |
 | 0026 | _(v0.6.1; workflow-designed)_ | `tritium-wasm`: scalar `TernaryBackend` on `wasm32-wasip1` (`reference_mpgemm`, spec/core/format only — no rayon/linkme); conformance **inside wasmtime** (Cranelift) | v0.70 / ADR 0009 | **done** (tagged `v0.6.1`; wasm/wasmtime) — build-ahead | — |
 | 0027 | _(v0.6.2; workflow-designed)_ | `tritium-serve`: OpenAI HTTP/SSE server (axum, feature-gated); `Generator` seam (RunnerGenerator + MockGenerator); one decode thread + bounded queue (concurrency, backpressure, graceful shutdown); 11 model-free contract tests = the ADR-0010 serve gate. Also the LAMU `backend_kind`. + pyo3 0.23→0.25.1 (RUSTSEC-2025-0020) + deny paste-ignore | v0.80 / ADR 0010 | **done** (tagged `v0.6.2`; CPU) — build-ahead | — |
+| 0028 | _(v0.6.3; workflow-reviewed)_ | `tritium-ffi`: C ABI `cdylib`+`staticlib`; panic-safe (`catch_unwind`) + null-checked `unsafe extern "C"`; cbindgen `include/tritium.h` with a drift gate + C11/C++17 compile check; single-pass / size-then-fill `tritium_generate`; `*out_len` always defined; linkme cpu-registration survival verified in the linked artifact; 10 ABI + 2 header tests. Unblocks the **v1.0 C-ABI freeze** | v0.80 / ADR 0010 | **done** (tagged `v0.6.3`; CPU) — build-ahead | — |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**
@@ -173,8 +174,8 @@ macOS/Windows CI matrix). The payoff: once the rented session tags `v0.60.0`, th
 tags fall as a short **verify-and-tag cascade** instead of a per-milestone build-then-tag crawl.
 Reachable-now order (by value/effort + dependency): **0019 freeze (done `v0.5.7`)** →
 **capability-fallback contract (done `v0.6.1`)** → **`tritium-wgpu` (Vulkan on the 4090, done `v0.6.1`)
-/ `tritium-wasm` (wasmtime, done `v0.6.1`)** → **`tritium-serve` (OpenAI HTTP/SSE, done `v0.6.2`)** +
-`tritium-ffi` / candle / burn / onnx (rest of v0.80, pure-CPU wrappers over the shipped runner) →
+/ `tritium-wasm` (wasmtime, done `v0.6.1`)** → **`tritium-serve` (OpenAI HTTP/SSE, done `v0.6.2`)**
+→ **`tritium-ffi` (C ABI, done `v0.6.3`)** + candle / burn / onnx (rest of v0.80, pure-CPU wrappers over the shipped runner) →
 doctest sweep / fuzz breadth (done) / `cargo-deny` (done) / semver baseline (done) (v0.90/v1.0
 tooling). Remaining v0.70 = the **Metal + ROCm** platform backends (fenced HW) +
 the macOS/Windows CI matrix → then the v0.70 milestone tag.
