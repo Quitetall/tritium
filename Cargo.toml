@@ -26,7 +26,7 @@ members = [
     "benches",                 # divan microbenches + perf harness (v0.30, ADR 0005)
     "crates/tritium-train",     # QAT, STE autograd, optimizer (ADR 0007)
     # L3 frontends / bindings
-    # "crates/tritium-ffi",      # C ABI cdylib + cbindgen
+    "crates/tritium-ffi",      # C ABI cdylib + staticlib + cbindgen header
     # "crates/tritium-py",       # PyO3 + maturin
     # "crates/tritium-onnx",     # ort custom op
     # "crates/tritium-candle",   # candle backend
@@ -72,6 +72,8 @@ rayon = "1"
 # cuda
 cudarc = "0.13"
 cc = "1"
+# ffi (C ABI): cbindgen regenerates include/tritium.h in a dev-only drift test
+cbindgen = "0.29"
 # wgpu backend (WGSL mpGEMM over Vulkan); exact pin keeps cargo-deny wildcards=deny meaningful
 wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl"] }
 pollster = "0.4"

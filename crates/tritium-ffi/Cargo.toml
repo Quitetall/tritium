@@ -1,0 +1,29 @@
+[package]
+name = "tritium-ffi"
+description = "C ABI (cdylib + staticlib) for Tritium ternary-model inference: load a GGUF model and greedily generate token IDs from C/C++/any language."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+# cdylib + staticlib for C/C++ consumers; rlib so the crate's own Rust tests can
+# call the extern "C" functions directly.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-nn = { workspace = true }
+# A backend must be linked so ModelRunner::load_cpu finds a "cpu" entry.
+tritium-cpu = { workspace = true }
+
+[dev-dependencies]
+# header drift gate (regenerate + compare) — not a build-time source write
+cbindgen = { workspace = true }
+
+[lints]
+workspace = true
