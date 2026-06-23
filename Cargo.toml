@@ -29,7 +29,7 @@ members = [
     "crates/tritium-ffi",      # C ABI cdylib + staticlib + cbindgen header
     # "crates/tritium-py",       # PyO3 + maturin
     # "crates/tritium-onnx",     # ort custom op
-    # "crates/tritium-candle",   # candle backend
+    "crates/tritium-candle",   # candle CustomOp wrapping the ternary mpGEMM (feature-gated)
     # "crates/tritium-burn",     # [planned]
     "crates/tritium-wasm",     # scalar TernaryBackend for wasm32-wasip1
     # L4 apps
@@ -82,6 +82,8 @@ pollster = "0.4"
 # the missing-Sync PyCFunction advisory. tritium-py uses the modern Bound API (stable here).
 pyo3 = "0.29"
 ort = "2.0.0-rc.10"
+# candle interop (tritium-candle, behind its `candle` feature; CPU-only — no cuda/mkl/accelerate)
+candle-core = { version = "0.9", default-features = false }
 # cli
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

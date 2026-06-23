@@ -1,0 +1,269 @@
+//! # tritium-candle — Tritium's ternary mpGEMM as a candle op.
+//!
+//! Exposes [`ternary_mpgemm`], a [`candle_core::CustomOp1`] that runs Tritium's
+//! ternary (BitNet b1.58) matrix multiply on a candle [`Tensor`]: an `[M, K]`
+//! f32 activation tensor times `[N, K]` packed ternary weights (TQ2_0 / TQ1_0)
+//! with `[N]` per-output-channel scales, producing `[M, N]` f32. The kernel is
+//! [`tritium_core::reference_mpgemm`] itself, so a candle BitNet layer is
+//! **bit-exact** with the reference every Tritium backend is graded against.
+//!
+//! This lets a candle model graph use Tritium ternary weights as a drop-in
+//! `CustomOp1` while the rest of the network stays in candle.
+//!
+//! ## Feature gate
+//!
+//! The op (and the heavy `candle-core` dependency) live behind the **`candle`**
+//! feature, off by default — so the default workspace build and
+//! `cargo test --workspace` stay candle-free. Enable it to build the op:
+//!
+//! ```text
+//! cargo test -p tritium-candle --features candle
+//! ```
+#![deny(missing_docs)]
+
+#[cfg(feature = "candle")]
+pub use candle_op::{TernaryMpGemm, ternary_mpgemm};
+
+#[cfg(feature = "candle")]
+mod candle_op {
+    use candle_core::{CpuStorage, CustomOp1, Error as CandleError, Layout, Result, Shape, Tensor};
+    use half::f16;
+    use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
+    use tritium_format::{
+        TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
+    };
+
+    /// Packed bytes per block for a supported ternary format.
+    fn block_bytes(format: TernaryFormat) -> Result<usize> {
+        match format {
+            TernaryFormat::Tq2_0 => Ok(TQ2_0_BLOCK_BYTES),
+            TernaryFormat::Tq1_0 => Ok(TQ1_0_BLOCK_BYTES),
+            other => Err(CandleError::Msg(format!(
+                "tritium-candle: unsupported ternary format {other:?}"
+            ))),
+        }
+    }
+
+    /// A candle [`CustomOp1`] computing `out[M,N] = scale[n] * Σ_k act[m,k] * w[n,k]`
+    /// for packed ternary weights. Captures the `[N, K]` packed weights, the `[N]`
+    /// scales, the weight shape, and the packing format; the single tensor
+    /// argument is the `[M, K]` activations.
+    #[derive(Debug)]
+    pub struct TernaryMpGemm<'a> {
+        packed: &'a [u8],
+        scales: &'a [f32],
+        n: usize,
+        k: usize,
+        format: TernaryFormat,
+    }
+
+    impl TernaryMpGemm<'_> {
+        /// Unpack the `[N, K]` packed weights into a flat `Vec<Trit>`, validating
+        /// the byte length against the captured shape + format.
+        fn unpack(&self) -> Result<Vec<Trit>> {
+            let nb = num_blocks(self.k);
+            let row_bytes = nb * block_bytes(self.format)?;
+            let expected = self.n * row_bytes;
+            if self.packed.len() != expected {
+                return Err(CandleError::Msg(format!(
+                    "tritium-candle: packed weights len {} != expected {expected} for [N={}, K={}] {:?}",
+                    self.packed.len(),
+                    self.n,
+                    self.k,
+                    self.format
+                )));
+            }
+            let mut trits = vec![Trit::ZERO; self.n * self.k];
+            // Per-block scale scratch: the packer fixed these to 1.0; the
+            // per-channel scales are applied in the contraction.
+            let mut scratch = vec![f16::ONE; nb];
+            for ni in 0..self.n {
+                let row = &self.packed[ni * row_bytes..(ni + 1) * row_bytes];
+                let trow = &mut trits[ni * self.k..ni * self.k + self.k];
+                let res = match self.format {
+                    TernaryFormat::Tq2_0 => unpack_tq2_0_row(row, trow, &mut scratch),
+                    TernaryFormat::Tq1_0 => unpack_tq1_0_row(row, trow, &mut scratch),
+                    other => {
+                        return Err(CandleError::Msg(format!(
+                            "tritium-candle: unsupported format {other:?}"
+                        )));
+                    }
+                };
+                res.map_err(|e| CandleError::Msg(format!("tritium-candle: unpack row {ni}: {e}")))?;
+            }
+            Ok(trits)
+        }
+    }
+
+    impl CustomOp1 for TernaryMpGemm<'_> {
+        fn name(&self) -> &'static str {
+            "tritium-ternary-mpgemm"
+        }
+
+        fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+            let (m, k) = layout.shape().dims2()?;
+            if k != self.k {
+                return Err(CandleError::Msg(format!(
+                    "tritium-candle: activation K={k} != weight K={}",
+                    self.k
+                )));
+            }
+            let all = storage.as_slice::<f32>()?;
+            // The reference kernel reads a contiguous [M, K] row-major slice.
+            let acts = match layout.contiguous_offsets() {
+                Some((start, end)) => &all[start..end],
+                None => {
+                    return Err(CandleError::Msg(
+                        "tritium-candle: activations must be contiguous (call .contiguous() first)"
+                            .to_string(),
+                    ));
+                }
+            };
+            let trits = self.unpack()?;
+            let mut out = vec![0f32; m * self.n];
+            reference_mpgemm(
+                acts,
+                &trits,
+                self.scales,
+                GemmShape { m, n: self.n, k },
+                &mut out,
+            )
+            .map_err(|e| CandleError::Msg(format!("tritium-candle: mpgemm: {e}")))?;
+            Ok((CpuStorage::F32(out), Shape::from((m, self.n))))
+        }
+    }
+
+    /// Run Tritium's ternary mpGEMM on `act` (an `[M, K]` f32 [`Tensor`]) against
+    /// `[N, K]` `packed` ternary weights in `format` with `[N]` `scales`, returning
+    /// the `[M, N]` f32 result tensor (on the same device as `act`).
+    ///
+    /// # Errors
+    /// A [`candle_core::Error`] if `act` is not 2-D f32, its `K` disagrees with the
+    /// weights, `scales.len() != n`, the packed length is wrong for `[N, K]`/`format`,
+    /// or the format is unsupported.
+    pub fn ternary_mpgemm(
+        act: &Tensor,
+        packed: &[u8],
+        scales: &[f32],
+        n: usize,
+        k: usize,
+        format: TernaryFormat,
+    ) -> Result<Tensor> {
+        if scales.len() != n {
+            return Err(CandleError::Msg(format!(
+                "tritium-candle: scales len {} != N {n}",
+                scales.len()
+            )));
+        }
+        let op = TernaryMpGemm {
+            packed,
+            scales,
+            n,
+            k,
+            format,
+        };
+        act.apply_op1_no_bwd(&op)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use candle_core::{Device, Tensor};
+        use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
+        use tritium_testkit::{
+            ConformanceVector, FROZEN_COUNT, FROZEN_SEED, Tolerance, generate_vectors,
+        };
+
+        fn parse_format(tag: &str) -> TernaryFormat {
+            match tag {
+                "tq2_0" => TernaryFormat::Tq2_0,
+                "tq1_0" => TernaryFormat::Tq1_0,
+                other => panic!("unexpected format tag {other}"),
+            }
+        }
+
+        /// Pack a vector's `[N, K]` `i8` weights exactly as the conformance harness
+        /// does: per row, unit (1.0) block scales, concatenated output-major.
+        fn pack(v: &ConformanceVector, format: TernaryFormat) -> Vec<u8> {
+            let nb = num_blocks(v.k);
+            let unit = vec![f16::ONE; nb];
+            let row_bytes = nb * block_bytes(format).unwrap();
+            let mut packed = vec![0u8; v.n * row_bytes];
+            for ni in 0..v.n {
+                let trits: Vec<Trit> = v.weights[ni * v.k..ni * v.k + v.k]
+                    .iter()
+                    .map(|&w| Trit::from_i8(w).unwrap())
+                    .collect();
+                let out = &mut packed[ni * row_bytes..(ni + 1) * row_bytes];
+                match format {
+                    TernaryFormat::Tq2_0 => pack_tq2_0_row(&trits, &unit, out).unwrap(),
+                    TernaryFormat::Tq1_0 => pack_tq1_0_row(&trits, &unit, out).unwrap(),
+                    other => panic!("cannot pack {other:?}"),
+                };
+            }
+            packed
+        }
+
+        fn vectors() -> Vec<ConformanceVector> {
+            generate_vectors(FROZEN_SEED, FROZEN_COUNT)
+        }
+
+        /// The candle op reproduces the frozen conformance set. Because it runs the
+        /// same `reference_mpgemm` over pack→unpack-round-tripped trits, it is
+        /// bit-exact; the gate proves the candle Tensor <-> slice plumbing (layout,
+        /// shape, readback) is correct.
+        #[test]
+        fn candle_op_matches_reference_on_frozen_set() {
+            let tol = Tolerance::default();
+            // generate_vectors appends the fixed boundary set on top of the
+            // FROZEN_COUNT random vectors, so the total exceeds FROZEN_COUNT.
+            let vs = vectors();
+            let total = vs.len();
+            assert!(total > FROZEN_COUNT, "boundary vectors must be included");
+            let mut checked = 0usize;
+            for v in vs {
+                let format = parse_format(&v.format);
+                let packed = pack(&v, format);
+                let act = Tensor::from_vec(v.activation.clone(), (v.m, v.k), &Device::Cpu).unwrap();
+                let out = ternary_mpgemm(&act, &packed, &v.scales, v.n, v.k, format).unwrap();
+                assert_eq!(out.dims(), [v.m, v.n], "vector {}: output shape", v.id);
+                let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                assert_eq!(got.len(), v.expected.len(), "vector {}: len", v.id);
+                for (i, (g, w)) in got.iter().zip(&v.expected).enumerate() {
+                    let rel = (g - w).abs() / w.abs().max(1.0);
+                    assert!(
+                        rel <= tol.relative,
+                        "vector {} idx {i}: got {g} want {w} (rel {rel})",
+                        v.id
+                    );
+                }
+                checked += 1;
+            }
+            assert_eq!(checked, total, "every frozen vector exercised");
+        }
+
+        #[test]
+        fn rejects_k_mismatch() {
+            let act = Tensor::from_vec(vec![1.0f32; 2 * 4], (2, 4), &Device::Cpu).unwrap();
+            // weight K=8 != activation K=4
+            let r = ternary_mpgemm(&act, &[0u8; 64], &[1.0, 1.0], 2, 8, TernaryFormat::Tq2_0);
+            assert!(r.is_err(), "K mismatch must error");
+        }
+
+        #[test]
+        fn rejects_scales_len_mismatch() {
+            let act = Tensor::from_vec(vec![1.0f32; 2 * 4], (2, 4), &Device::Cpu).unwrap();
+            // scales len 1 != N 2
+            let r = ternary_mpgemm(&act, &[], &[1.0], 2, 4, TernaryFormat::Tq2_0);
+            assert!(r.is_err(), "scales length mismatch must error");
+        }
+
+        #[test]
+        fn rejects_packed_len_mismatch() {
+            let act = Tensor::from_vec(vec![1.0f32; 2 * 32], (2, 32), &Device::Cpu).unwrap();
+            // empty packed buffer for a real [N=2, K=32] shape
+            let r = ternary_mpgemm(&act, &[], &[1.0, 1.0], 2, 32, TernaryFormat::Tq2_0);
+            assert!(r.is_err(), "packed length mismatch must error");
+        }
+    }
+}
