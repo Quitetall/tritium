@@ -34,12 +34,12 @@ members = [
     "crates/tritium-wasm",     # scalar TernaryBackend for wasm32-wasip1
     # L4 apps
     # "crates/tritium-cli",      # `tritium` binary
-    # "crates/tritium-serve",    # [planned] OpenAI-compatible server
+    "crates/tritium-serve",    # OpenAI-compatible HTTP/SSE server (feature-gated)
     # "xtask",                   # build orchestration / codegen / release
 ]
 
 [workspace.package]
-version = "0.6.1"              # SemVer (MAJOR.MINOR.PATCH); see CHANGELOG versioning note
+version = "0.6.2"              # SemVer (MAJOR.MINOR.PATCH); see CHANGELOG versioning note
 edition = "2024"
 rust-version = "1.89"          # AVX-512 intrinsics stable floor (Rust 1.89, 2025-08-07)
 license = "Apache-2.0"         # FOSS; see LICENSE. Vendored deps attributed in NOTICE.
@@ -53,16 +53,16 @@ categories = ["science", "hardware-support", "mathematics"]
 # internal crates (path + caret version, bumped in lockstep with the workspace version at each
 # minor release). The explicit version is required for `cargo publish` (crates.io forbids bare path
 # deps) and lets cargo-deny keep `wildcards = "deny"` meaningful for *external* deps.
-tritium-core = { path = "crates/tritium-core", version = "0.6.1" }
-tritium-spec = { path = "crates/tritium-spec", version = "0.6.1" }
-tritium-format = { path = "crates/tritium-format", version = "0.6.1" }
-tritium-runtime = { path = "crates/tritium-runtime", version = "0.6.1" }
-tritium-testkit = { path = "crates/tritium-testkit", version = "0.6.1" }
-tritium-cpu = { path = "crates/tritium-cpu", version = "0.6.1" }
-tritium-cuda = { path = "crates/tritium-cuda", version = "0.6.1" }
-tritium-quantize = { path = "crates/tritium-quantize", version = "0.6.1" }
-tritium-nn = { path = "crates/tritium-nn", version = "0.6.1" }
-tritium-train = { path = "crates/tritium-train", version = "0.6.1" }
+tritium-core = { path = "crates/tritium-core", version = "0.6.2" }
+tritium-spec = { path = "crates/tritium-spec", version = "0.6.2" }
+tritium-format = { path = "crates/tritium-format", version = "0.6.2" }
+tritium-runtime = { path = "crates/tritium-runtime", version = "0.6.2" }
+tritium-testkit = { path = "crates/tritium-testkit", version = "0.6.2" }
+tritium-cpu = { path = "crates/tritium-cpu", version = "0.6.2" }
+tritium-cuda = { path = "crates/tritium-cuda", version = "0.6.2" }
+tritium-quantize = { path = "crates/tritium-quantize", version = "0.6.2" }
+tritium-nn = { path = "crates/tritium-nn", version = "0.6.2" }
+tritium-train = { path = "crates/tritium-train", version = "0.6.2" }
 # foundation
 bytemuck = "1"
 half = "2"
@@ -83,6 +83,13 @@ ort = "2.0.0-rc.10"
 # cli
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# serve (OpenAI HTTP/SSE server; all behind tritium-serve's `serve` feature)
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+async-stream = "0.3"
+futures-core = "0.3"
+http-body-util = "0.1"
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # dev / test / bench
 proptest = "1"
 divan = "0.1"

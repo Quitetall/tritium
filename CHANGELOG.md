@@ -7,6 +7,37 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.2] — 2026-06-23 — v0.80 interop: tritium-serve (OpenAI HTTP/SSE) + pyo3 security bump
+
+The first **v0.80 Interop** slice (ADR 0010) plus a supply-chain hardening pass, on the 0.6.x line.
+
+### Added
+- **`tritium-serve`** — an OpenAI-compatible HTTP inference server (axum, behind a `serve` feature; the
+  default workspace build stays free of tokio/axum). Endpoints: `/v1/chat/completions` (non-streaming
+  **and SSE** streaming), `/v1/models`, `/healthz`. A `Generator` seam isolates HTTP from inference:
+  `RunnerGenerator` wraps the real `ModelRunner` (re-implementing the prefill + per-step `forward`
+  decode loop with per-step sampling + seed-advance + a context guard), and `MockGenerator` drives the
+  **model-free contract lane**. One dedicated decode thread owns the (`&mut`-exclusive) runner behind a
+  bounded queue: concurrent connections, **backpressure** (429 when full), and **graceful shutdown**
+  (drain flag → in-flight SSE streams close with a well-formed terminal chunk + `[DONE]`). Per-token
+  incremental detokenization (stream-concat == buffered output) + OpenAI `stop`-string matching.
+  **LAMU-compatible** by OpenAI-wire fidelity (point a `local-llm` OpenAI backend at `/v1`). The ADR
+  0010 gate is proven by **11 model-free contract tests**; a gated `e2e` feature runs a real-model
+  round-trip. Ships the **id-passthrough tokenizer** (integer token IDs) — real LLaMA-3 BPE is the
+  separate tokenizer-seam task.
+- **CI:** a `serve-contract` lane (cpu, mock, every push) + a manual `serve-e2e` lane.
+
+### Security / supply-chain
+- **pyo3 `0.23 → 0.25.1`** — clears **RUSTSEC-2025-0020** (buffer overflow in `PyString::from_object`)
+  and the macOS/Windows abi3 link failure on the hosted CI runners. No `tritium-py` API migration was
+  needed (already on the modern Bound API; verified end-to-end via a maturin wheel + 13/13 pytest).
+- **cargo-deny:** ignore **RUSTSEC-2024-0436** (`paste` unmaintained — an Apple-only, build-time
+  `wgpu-hal → metal` transitive; not a vulnerability). With the pyo3 bump, the supply-chain lane is green.
+
+### Build
+- New workspace member `tritium-serve`; tokio/axum/async-stream/futures-core/http-body-util/tower
+  workspace deps (all behind serve's feature or dev-only). Internal dep pins bumped to `0.6.2`.
+
 ## [0.6.1] — 2026-06-22 — v0.70 backend breadth (reachable): wgpu + wasm backends + capability-fallback contract
 
 Three software-reachable slices of **v0.70 Backend Breadth** (ADR 0009), shipped on the 0.6.x line

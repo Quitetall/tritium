@@ -1,0 +1,386 @@
+//! The seam between the HTTP layer and inference.
+//!
+//! This module is **always compiled** and **runtime-free** (no tokio/axum), so the
+//! default workspace build pulls in no async deps. The `serve`-gated worker drives
+//! a [`Generator`] on a dedicated thread; contract tests drive [`MockGenerator`]
+//! directly with no model.
+
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// One generation request: a tokenized prompt + decode controls.
+#[derive(Debug, Clone)]
+pub struct GenRequest {
+    /// Prompt token IDs (already tokenized — serve does not own a BPE; see crate docs).
+    pub prompt_tokens: Vec<u32>,
+    /// Max new tokens to decode (clamped to the model's remaining context).
+    pub max_new: usize,
+    /// Sampling strategy.
+    pub sampling: Sampling,
+    /// Honor the model EOS token (always true except for adversarial tests).
+    pub stop_eos: bool,
+}
+
+/// Sampling strategy, lowered from the OpenAI request fields.
+#[derive(Debug, Clone, Copy)]
+pub enum Sampling {
+    /// Deterministic argmax (OpenAI `temperature == 0`).
+    Greedy,
+    /// Top-k with temperature (no native OpenAI field; available for completeness).
+    TopK {
+        /// Candidate cutoff (`0` = unrestricted).
+        k: usize,
+        /// Softmax temperature.
+        temp: f32,
+        /// Base PRNG seed (advanced per step inside the generator).
+        seed: u64,
+    },
+    /// Nucleus (top-p) with temperature (OpenAI `top_p`).
+    TopP {
+        /// Cumulative-probability cutoff in `(0, 1]`.
+        p: f32,
+        /// Softmax temperature.
+        temp: f32,
+        /// Base PRNG seed (advanced per step inside the generator).
+        seed: u64,
+    },
+}
+
+/// One decoded step handed to the `on_step` callback.
+#[derive(Debug, Clone, Copy)]
+pub struct Step {
+    /// The decoded token ID (special tokens like EOS are dropped by the HTTP detok).
+    pub token: u32,
+    /// True on the terminal step (EOS hit or budget reached).
+    pub finished: bool,
+    /// Set on the terminal step.
+    pub finish_reason: Option<FinishReason>,
+}
+
+/// Why generation stopped (maps to the OpenAI `finish_reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// EOS token or a stop string was hit.
+    Stop,
+    /// The `max_tokens` / context budget was reached.
+    Length,
+}
+
+impl FinishReason {
+    /// The OpenAI wire string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+        }
+    }
+}
+
+/// A generation failure surfaced to the HTTP layer.
+#[derive(Debug, Clone)]
+pub enum GenError {
+    /// The execution backend failed (stringified device/runner error).
+    Backend(String),
+    /// The prompt is longer than the model context window.
+    ContextOverflow,
+}
+
+impl fmt::Display for GenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GenError::Backend(m) => write!(f, "backend error: {m}"),
+            GenError::ContextOverflow => write!(f, "prompt exceeds the model context window"),
+        }
+    }
+}
+
+impl std::error::Error for GenError {}
+
+/// The inference seam: prefill a prompt and stream decode steps.
+///
+/// Synchronous and runtime-free by design — the serve-gated worker drives it on a
+/// dedicated thread (the runner is `Send` but `&mut`-exclusive). `on_step`
+/// returning `false` cancels generation (client disconnect / shutdown).
+pub trait Generator: Send {
+    /// Prefill `req.prompt_tokens` then decode up to `req.max_new` tokens, calling
+    /// `on_step` once per decoded token. Stops early when `on_step` returns `false`.
+    ///
+    /// # Errors
+    /// [`GenError::ContextOverflow`] if the prompt exceeds the context window;
+    /// [`GenError::Backend`] on a device/runner failure.
+    fn generate(
+        &mut self,
+        req: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError>;
+
+    /// Model context length (for prompt-length validation).
+    fn n_ctx(&self) -> usize;
+    /// Vocabulary size (for logit-shape sanity).
+    fn vocab(&self) -> usize;
+}
+
+/// A model-free generator that emits a fixed script of token IDs — the contract
+/// suite's reason to exist (drives the HTTP/SSE machinery with no weights).
+pub struct MockGenerator {
+    /// Tokens to emit (truncated to `max_new`).
+    pub script: Vec<u32>,
+    /// The `finish_reason` reported when the whole script is emitted within budget.
+    pub end_reason: FinishReason,
+    /// Reported [`Generator::n_ctx`].
+    pub n_ctx: usize,
+    /// Reported [`Generator::vocab`].
+    pub vocab: usize,
+    /// Optional per-step sleep, to simulate a slow decode (shutdown/backpressure tests).
+    pub step_delay_ms: u64,
+    /// Optional counter incremented per emitted step (client-disconnect test).
+    pub emitted: Option<Arc<AtomicUsize>>,
+}
+
+impl fmt::Debug for MockGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockGenerator")
+            .field("script_len", &self.script.len())
+            .field("end_reason", &self.end_reason)
+            .finish()
+    }
+}
+
+impl MockGenerator {
+    /// A mock that emits `script` and reports `Length` when the budget truncates it,
+    /// else `end_reason`.
+    #[must_use]
+    pub fn new(script: Vec<u32>) -> Self {
+        Self {
+            script,
+            end_reason: FinishReason::Length,
+            n_ctx: 4096,
+            vocab: 128_256,
+            step_delay_ms: 0,
+            emitted: None,
+        }
+    }
+}
+
+impl Generator for MockGenerator {
+    fn generate(
+        &mut self,
+        req: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        let n = self.script.len().min(req.max_new);
+        let truncated = req.max_new < self.script.len();
+        for i in 0..n {
+            if self.step_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.step_delay_ms));
+            }
+            let last = i + 1 == n;
+            let finish_reason = if last {
+                Some(if truncated {
+                    FinishReason::Length
+                } else {
+                    self.end_reason
+                })
+            } else {
+                None
+            };
+            if let Some(c) = &self.emitted {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+            let cont = on_step(Step {
+                token: self.script[i],
+                finished: last,
+                finish_reason,
+            });
+            if last || !cont {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn n_ctx(&self) -> usize {
+        self.n_ctx
+    }
+    fn vocab(&self) -> usize {
+        self.vocab
+    }
+}
+
+/// A [`Generator`] wrapping the real [`tritium_nn::ModelRunner`]: re-implements the
+/// prefill + per-step `forward` decode loop (the runner's `generate` returns all
+/// tokens at once and is greedy-only, so serve owns this) with per-step sampling,
+/// a per-step seed advance, and a context guard.
+pub struct RunnerGenerator {
+    runner: tritium_nn::ModelRunner,
+    eos: u32,
+}
+
+impl fmt::Debug for RunnerGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunnerGenerator")
+            .field("eos", &self.eos)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunnerGenerator {
+    /// Wrap a loaded runner, using `eos` as the stop token.
+    #[must_use]
+    pub fn new(runner: tritium_nn::ModelRunner, eos: u32) -> Self {
+        Self { runner, eos }
+    }
+
+    fn sample(logits: &[f32], s: &Sampling, step: u64) -> Option<u32> {
+        match *s {
+            Sampling::Greedy => tritium_nn::sample_greedy(logits),
+            // Advance the seed per step so a stochastic decode actually varies (the
+            // samplers take the seed per call and would otherwise repeat).
+            Sampling::TopK { k, temp, seed } => {
+                tritium_nn::sample_top_k(logits, k, temp, seed.wrapping_add(step))
+            }
+            Sampling::TopP { p, temp, seed } => {
+                tritium_nn::sample_top_p(logits, p, temp, seed.wrapping_add(step))
+            }
+        }
+    }
+}
+
+impl Generator for RunnerGenerator {
+    fn generate(
+        &mut self,
+        req: &GenRequest,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        let n_ctx = self.runner.config.n_ctx as usize;
+        let prompt_len = req.prompt_tokens.len();
+        if prompt_len == 0 || prompt_len > n_ctx {
+            return Err(GenError::ContextOverflow);
+        }
+        let max_new = req.max_new.min(n_ctx.saturating_sub(prompt_len));
+
+        self.runner.reset();
+        let positions: Vec<usize> = (0..prompt_len).collect();
+        let mut logits = self
+            .runner
+            .forward(&req.prompt_tokens, &positions)
+            .map_err(|e| GenError::Backend(e.to_string()))?;
+
+        for i in 0..max_new {
+            let next = Self::sample(&logits, &req.sampling, i as u64)
+                .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+            let is_eos = req.stop_eos && next == self.eos;
+            let last = is_eos || i + 1 == max_new;
+            let finish_reason = if is_eos {
+                Some(FinishReason::Stop)
+            } else if last {
+                Some(FinishReason::Length)
+            } else {
+                None
+            };
+            let cont = on_step(Step {
+                token: next,
+                finished: last,
+                finish_reason,
+            });
+            if last || !cont {
+                break;
+            }
+            let pos = prompt_len + i;
+            logits = self
+                .runner
+                .forward(&[next], &[pos])
+                .map_err(|e| GenError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn n_ctx(&self) -> usize {
+        self.runner.config.n_ctx as usize
+    }
+    fn vocab(&self) -> usize {
+        self.runner.weights.vocab
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mock drives `on_step` for each scripted token and reports the right
+    /// finish_reason (Length when truncated by budget, else end_reason).
+    #[test]
+    fn mock_emits_script_and_finish_reason() {
+        let mut g = MockGenerator {
+            end_reason: FinishReason::Stop,
+            ..MockGenerator::new(vec![10, 11, 12])
+        };
+        let mut seen = Vec::new();
+        let mut last_reason = None;
+        g.generate(
+            &GenRequest {
+                prompt_tokens: vec![1],
+                max_new: 8,
+                sampling: Sampling::Greedy,
+                stop_eos: true,
+            },
+            &mut |s| {
+                seen.push(s.token);
+                if let Some(r) = s.finish_reason {
+                    last_reason = Some(r);
+                }
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![10, 11, 12]);
+        assert_eq!(last_reason, Some(FinishReason::Stop));
+    }
+
+    /// A budget shorter than the script truncates and reports Length.
+    #[test]
+    fn mock_truncates_to_max_new_with_length() {
+        let mut g = MockGenerator::new(vec![1, 2, 3, 4, 5]);
+        let mut count = 0usize;
+        let mut last_reason = None;
+        g.generate(
+            &GenRequest {
+                prompt_tokens: vec![1],
+                max_new: 2,
+                sampling: Sampling::Greedy,
+                stop_eos: true,
+            },
+            &mut |s| {
+                count += 1;
+                last_reason = s.finish_reason.or(last_reason);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(last_reason, Some(FinishReason::Length));
+    }
+
+    /// `on_step` returning false cancels early.
+    #[test]
+    fn mock_cancels_when_on_step_false() {
+        let mut g = MockGenerator::new(vec![1, 2, 3, 4, 5]);
+        let mut count = 0usize;
+        g.generate(
+            &GenRequest {
+                prompt_tokens: vec![1],
+                max_new: 5,
+                sampling: Sampling::Greedy,
+                stop_eos: true,
+            },
+            &mut |_s| {
+                count += 1;
+                count < 2 // stop after the 2nd
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+}

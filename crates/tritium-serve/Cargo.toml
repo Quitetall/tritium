@@ -1,0 +1,44 @@
+[package]
+name = "tritium-serve"
+description = "OpenAI-compatible HTTP/SSE inference server for Tritium ternary models (axum, feature-gated). LAMU-compatible by virtue of OpenAI-wire fidelity."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Always compiled (the Generator seam + DTOs are runtime-free, so cpu-only-green
+# builds tritium-serve with no async deps). Only tritium-nn is used directly (it
+# pulls core/spec/runtime transitively); the Tokenizer trait + NnError come from it.
+tritium-nn = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# The HTTP/SSE server, behind the `serve` feature (mirrors tritium-cuda/wgpu's gate).
+tokio = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
+# A backend must be linked for the binary to actually serve a model.
+tritium-cpu = { workspace = true, optional = true }
+
+[features]
+default = []
+serve = ["dep:tokio", "dep:axum", "dep:async-stream", "dep:futures-core", "dep:tritium-cpu"]
+# Gated real-model end-to-end test (needs TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH).
+e2e = ["serve"]
+
+[[bin]]
+name = "tritium-serve"
+required-features = ["serve"]
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = { workspace = true }
+
+[lints]
+workspace = true

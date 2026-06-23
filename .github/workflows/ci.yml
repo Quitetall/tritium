@@ -159,3 +159,30 @@ jobs:
       - name: vulkan runtime
         run: sudo apt-get update && sudo apt-get install -y libvulkan1 vulkan-tools
       - run: cargo test -p tritium-wgpu --features register
+
+  # serve contract lane (v0.80 interop). Hosted ubuntu, every push: the OpenAI
+  # wire contract (schema, SSE framing, stream==buffered, finish_reason, stop
+  # strings, concurrency, backpressure, graceful shutdown) is proven model-free
+  # via MockGenerator. No GPU, no model.
+  serve-contract:
+    name: serve contract (cpu, mock)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p tritium-serve --features serve --all-targets -- -D warnings
+      - run: cargo test -p tritium-serve --features serve
+
+  # serve real-model e2e (v0.80). Manual — needs a GGUF + the e2e feature.
+  serve-e2e:
+    name: serve e2e (real model)
+    runs-on: [self-hosted, gpu]
+    if: ${{ false }} # enable with TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH set
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p tritium-serve --features e2e -- --ignored serve_e2e_token_id_roundtrip
