@@ -1,0 +1,94 @@
+# Python wheels (ADR 0011 / v0.90 hardening): build distributable wheels + an
+# sdist for the PyO3 extension crate `tritium-py` (crates/tritium-py), whose lib
+# is a `cdylib` named `tritium` (excluded from `cargo test --workspace` — it is
+# exercised via maturin + pytest, not cargo test).
+#
+# The crate builds ONE abi3 wheel per platform (pyo3 `abi3-py39`: forward-
+# compatible with CPython 3.9+), so the matrix is over OS/arch, not Python
+# version. Built with maturin via the official PyO3 `maturin-action`, mirroring
+# what `maturin generate-ci github` emits for an abi3 project.
+#
+# Triggers: git tags (release builds), manual dispatch, and a build-only smoke on
+# pull_request so the packaging path stays green without gating every push.
+#
+# IMPORTANT: this workflow does NOT publish to PyPI. There is no token, no
+# `twine upload`, no `maturin publish`, no trusted-publishing step. Every wheel
+# and the sdist are uploaded as build artifacts only (actions/upload-artifact).
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    # Build-only smoke: a tag/dispatch builds the full matrix; on PRs we keep the
+    # packaging path honest without running it on every commit to main.
+    paths:
+      - "crates/tritium-py/**"
+      - ".github/workflows/wheels.yml"
+  workflow_dispatch:
+
+# A new push to a PR cancels the previous wheel build for that PR.
+concurrency:
+  group: wheels-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # One abi3 wheel per (os, target). `maturin-action` runs manylinux builds in a
+  # container by default, so the linux wheels are manylinux-tagged and portable.
+  wheels:
+    name: wheel · ${{ matrix.platform.os }} · ${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # Linux (manylinux, built in the maturin container).
+          - { os: linux, runner: ubuntu-latest, target: x86_64 }
+          - { os: linux, runner: ubuntu-latest, target: aarch64 }
+          # macOS (universal2 covers both Apple Silicon + Intel in one wheel).
+          - { os: macos, runner: macos-latest, target: universal2 }
+          # Windows.
+          - { os: windows, runner: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          # The crate lives in the workspace; point maturin at its manifest.
+          # --release for distributable artifacts; the abi3 feature comes from
+          # the crate's Cargo.toml + pyproject.toml [tool.maturin].
+          command: build
+          args: --release --manifest-path crates/tritium-py/Cargo.toml --out dist
+          target: ${{ matrix.platform.target }}
+          # Container manylinux build for linux; `auto` is a no-op off-linux.
+          manylinux: ${{ matrix.platform.os == 'linux' && 'auto' || 'off' }}
+          sccache: "true"
+      - name: upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # Platform-independent source distribution (built once on linux). Lets `pip
+  # install` fall back to a from-source build where no wheel matches.
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --manifest-path crates/tritium-py/Cargo.toml --out dist
+      - name: upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error

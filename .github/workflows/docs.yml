@@ -1,0 +1,37 @@
+# mdbook user guide + dead-link gate (v0.90 hardening, ADR 0011).
+#
+# Builds the book under docs/book/ and FAILS on any dead internal link. The
+# link check runs as the `mdbook-linkcheck` backend (wired in docs/book/book.toml
+# with `warning-policy = "error"`), so `mdbook build` is the single gate — it
+# behaves identically here and on a contributor's machine. `follow-web-links` is
+# off in book.toml, so the gate is deterministic and offline: it never flakes on a
+# third-party 5xx, and only the links Tritium owns (relative links to chapters and
+# to the ADRs under docs/adr/) are checked. CPU-only, on every push + PR.
+name: docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  mdbook:
+    name: mdbook build + dead-link check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Prebuilt binaries via taiki-e/install-action (matches ci.yml's lane style).
+      # Pinned versions keep the gate reproducible; mdbook-linkcheck is the backend
+      # mdbook invokes during `build`.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.4.43,mdbook-linkcheck@0.7.7
+      - name: build the book + check links
+        run: mdbook build docs/book
+      - name: upload built book
+        uses: actions/upload-artifact@v4
+        with:
+          name: tritium-book
+          path: docs/book/book/html
+          if-no-files-found: error

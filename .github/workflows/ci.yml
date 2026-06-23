@@ -127,6 +127,23 @@ jobs:
       # the gate bite on real kernel regressions.
       - run: cargo bench -p tritium-benches --features cuda --bench e2e
 
+  # CPU bench smoke (v0.90 hardening). Hosted ubuntu, every push: compiles ALL
+  # benches (catches bench bit-rot, incl. the cuda-gated gpu_mpgemm/e2e shells)
+  # and runs the CPU `mpgemm` divan microbench end to end. This is the hosted half
+  # of the perf gate — it keeps the bench harness runnable on every push without a
+  # GPU; the tok/s *regression* assertion (vs the competitor baseline) stays in the
+  # self-hosted `perf-regression` lane above, which needs the 4090 + the model.
+  cpu-bench-smoke:
+    name: cpu bench smoke (divan mpgemm)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p tritium-benches --benches
+      - run: cargo bench -p tritium-benches --bench mpgemm
+
   # wasm lane (v0.70 backend breadth). Hosted ubuntu, no GPU, no sudo: adds the
   # wasm32-wasip1 target, installs the wasmtime CLI (Cranelift), and runs the
   # tritium-wasm conformance + fused-fallback gates INSIDE the wasm guest. The

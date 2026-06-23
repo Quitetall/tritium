@@ -1,0 +1,227 @@
+# CPU sanitizers (v0.90 hardening, ADR 0011). Memory-safety + UB coverage of the
+# crates that carry hand-written `unsafe` or parse untrusted bytes:
+#
+#   - tritium-cpu     — SIMD intrinsics (AVX2/AVX-512/NEON) + raw pointer
+#                       loads/stores in `mod kernel` / `mod simd`, and the rows
+#                       are fanned out across a rayon thread pool. The only
+#                       crate with hot-path `unsafe` on the dispatch path.
+#   - tritium-ffi     — the C ABI: `unsafe extern "C"` entry points that take
+#                       raw pointers/lengths from a foreign caller (null checks,
+#                       buffer-cap math, `CStr::from_ptr`, `&mut *model`).
+#   - tritium-format  — GGUF / safetensors / TQ* parsing of *untrusted* bytes.
+#                       It is `#![forbid(unsafe_code)]`, so it has no UB of its
+#                       own to find; the sanitizers here are a belt-and-braces
+#                       check that the fuzz-adjacent length/offset arithmetic in
+#                       the parsers never produces an out-of-bounds slice index
+#                       under real instrumented codegen.
+#
+# ADR 0011's v0.90 exit criterion is "ASan/UBSan/TSan/`miri`/`compute-sanitizer`
+# clean across the whole suite". This workflow is the CPU half of that line;
+# `compute-sanitizer` is the GPU half and lives in the (self-hosted) `gpu` lane
+# in ci.yml. The honest mapping onto the Rust toolchain:
+#
+# Two complementary classes of tool:
+#   (1) LLVM sanitizers via `-Zsanitizer` + `-Zbuild-std` — real machine code,
+#       so they exercise the actual SIMD intrinsics and the real FFI ABI:
+#         · AddressSanitizer (ASan)  — OOB, use-after-free, double-free.
+#         · MemorySanitizer (MSan)   — reads of uninitialised memory (the SIMD
+#                                       decode buffers + the FFI out-buffers are
+#                                       exactly the surfaces where this bites).
+#         · ThreadSanitizer (TSan)   — data races (tritium-cpu fans rows across
+#                                       a rayon thread pool).
+#       `-Zbuild-std` rebuilds core+std *with the same sanitizer* so the runtime
+#       is instrumented end to end (MSan in particular false-positives without
+#       an instrumented std).
+#
+#       NOTE on UBSan: the Rust toolchain does NOT expose a standalone
+#       UndefinedBehaviorSanitizer, so the ADR's "UBSan" line has no direct
+#       `-Zsanitizer` equivalent. `rustc -Zsanitizer=` accepts only
+#       {address, cfi, dataflow, hwaddress, kcfi, kernel-address,
+#        kernel-hwaddress, leak, memory, memtag, safestack,
+#        shadow-call-stack, thread, realtime} — there is no `undefined`. The
+#       UB classes a C-toolchain UBSan would flag (OOB, misaligned/uninit
+#       access) are covered here by ASan + MSan; aliasing / strict-provenance /
+#       uninit-on-the-abstract-machine UB is covered by the miri lane below.
+#       This substitution is intentional, not an omission.
+#
+#   (2) miri — the abstract-machine interpreter. Catches Stacked/Tree-Borrows
+#       aliasing, strict-provenance, and uninitialised-read UB that the LLVM
+#       sanitizers miss, but CANNOT execute platform SIMD intrinsics or real
+#       FFI into C, so it is pointed only at the `unsafe`-free, pure-Rust
+#       crates (core + the format parsers). See the miri lane for the exact
+#       exclusions and why.
+#
+# Mirrors the nightly setup of the `fuzz` lane in ci.yml (dtolnay/rust-toolchain
+# @nightly). Scheduled weekly + manual; NOT a required per-push gate (build-std
+# rebuilds std under instrumentation and miri's interpreter are both slow).
+name: sanitizers
+
+on:
+  # Weekly, alongside the fuzz lane (ci.yml uses the same Monday cron family).
+  schedule:
+    - cron: "0 5 * * 1"
+  # Allow on-demand runs from the Actions tab.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── (1a) AddressSanitizer ────────────────────────────────────────────────
+  # Real codegen with ASan-instrumented std (`-Zbuild-std`). Runs the actual
+  # SIMD intrinsics (tritium-cpu) and the real C ABI (tritium-ffi) plus the
+  # untrusted-byte parsers (tritium-format).
+  #
+  # `--lib --tests`: covers unit + integration tests but NOT doc-tests —
+  # doc-tests fail to link the sanitizer runtime under `-Zbuild-std`
+  # (`undefined symbol: __asan_register_elf_globals`), a known toolchain
+  # limitation, and they add no `unsafe` coverage the lib/integration tests
+  # don't already have.
+  #
+  # detect_leaks=0: we are hunting spatial/temporal memory errors (OOB, UAF),
+  # not leaks — the FFI surface deliberately hands ownership to a C caller, so
+  # "leaks" there are by design and would be noise.
+  asan:
+    name: AddressSanitizer (build-std)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-Zsanitizer=address"
+      ASAN_OPTIONS: "detect_leaks=0"
+      # build-std needs an explicit target; the host triple on ubuntu-latest.
+      TARGET: x86_64-unknown-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [tritium-cpu, tritium-ffi, tritium-format]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: cargo test (ASan)
+        run: |
+          cargo +nightly test -Zbuild-std \
+            --target "$TARGET" \
+            -p ${{ matrix.crate }} --lib --tests
+
+  # ── (1b) MemorySanitizer ─────────────────────────────────────────────────
+  # Same build-std machinery, MSan instead of ASan: reads of uninitialised
+  # memory. This is the in-tree stand-in for the "find UB" half of the task —
+  # the SIMD decode path materialises trits into scratch buffers and the FFI
+  # path writes token IDs into a caller buffer, both classic uninit-read sites.
+  # `-Zsanitizer-memory-track-origins` reports WHERE the uninit value was born.
+  #
+  # tritium-format is intentionally NOT in this matrix: it is
+  # `#![forbid(unsafe_code)]` pure Rust whose only job is parsing — it cannot
+  # construct an uninitialised read that safe Rust + an MSan-instrumented std
+  # wouldn't already forbid, so MSan there is pure cost. ASan + miri already
+  # cover its parsers. MSan is reserved for the two crates that actually touch
+  # raw/uninit memory (SIMD + FFI).
+  msan:
+    name: MemorySanitizer (build-std)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-Zsanitizer=memory -Zsanitizer-memory-track-origins"
+      TARGET: x86_64-unknown-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [tritium-cpu, tritium-ffi]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: cargo test (MSan)
+        run: |
+          cargo +nightly test -Zbuild-std \
+            --target "$TARGET" \
+            -p ${{ matrix.crate }} --lib --tests
+
+  # ── (1c) ThreadSanitizer ─────────────────────────────────────────────────
+  # Same build-std machinery, TSan: data races. tritium-cpu fans the kernel's
+  # independent `M` rows across a rayon thread pool; the crate documents the
+  # per-row arithmetic as race-free (each task owns a disjoint chunk of output
+  # rows). TSan proves that claim under real threads. tritium-ffi documents the
+  # handle as `Send` but not `Sync`; its in-process tests are single-threaded,
+  # so TSan there is a cheap regression guard on that boundary.
+  #
+  # tritium-format is single-threaded pure parsing — no threads to race — so it
+  # is intentionally not in this matrix.
+  tsan:
+    name: ThreadSanitizer (build-std)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-Zsanitizer=thread"
+      TARGET: x86_64-unknown-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [tritium-cpu, tritium-ffi]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: cargo test (TSan)
+        run: |
+          cargo +nightly test -Zbuild-std \
+            --target "$TARGET" \
+            -p ${{ matrix.crate }} --lib --tests
+
+  # ── (2) miri ─────────────────────────────────────────────────────────────
+  # The abstract-machine interpreter: Stacked/Tree-Borrows aliasing, strict
+  # provenance, uninitialised reads, OOB on the abstract machine. Pointed ONLY
+  # at the pure-Rust, `#![forbid(unsafe_code)]` crates:
+  #
+  #   - tritium-core    — pure, dependency-free, no_std-able. The correctness
+  #                       ground truth (reference_mpgemm, Trit, scale). No
+  #                       unsafe, no threads, no FFI: a clean miri target.
+  #   - tritium-format  — the untrusted-byte parsers (GGUF/safetensors/TQ*).
+  #                       `#![forbid(unsafe_code)]`, pure Rust + serde_json, so
+  #                       miri runs every parser end to end and proves the
+  #                       length/offset arithmetic stays in bounds on the
+  #                       abstract machine.
+  #
+  #     Scope is `--lib` + the `tqidx_fuzz` parser-fuzz integration test only.
+  #     The other format integration tests are real-GGUF round-trips
+  #     (`real_gguf`, `real_i2s`) — `real_i2s` reads a multi-GB model file and
+  #     parsing that through the interpreter is pathologically slow / memory
+  #     hungry, so it is deliberately left off the miri matrix (it is covered by
+  #     ASan above, on real codegen). The capped PROPTEST_CASES keeps the
+  #     `tqidx_fuzz` proptests tractable under interpretation.
+  #
+  # EXCLUDED from miri, and why (miri cannot model these — it would error, not
+  # find a real bug):
+  #   - tritium-cpu     — calls platform SIMD intrinsics (`_mm256_*` / NEON via
+  #                       `is_x86_feature_detected!`) and runs the kernel rows
+  #                       across a rayon thread pool. miri has no codegen for
+  #                       target intrinsics and cannot execute the AVX2/AVX-512
+  #                       paths. (Covered by ASan/MSan above, which run the real
+  #                       intrinsics.)
+  #   - tritium-ffi     — its rlib tests call `unsafe extern "C"` fns, and the
+  #                       crate force-links tritium-cpu (the SIMD backend) for
+  #                       ModelRunner::load_cpu. The intrinsic-bearing dep makes
+  #                       it a non-miri target; the FFI ABI itself is real
+  #                       machine code, which is exactly what ASan/MSan cover.
+  #   - doc-tests       — `cargo miri test` does not run doc-tests; the lib +
+  #                       integration tests carry the parser/logic coverage.
+  miri:
+    name: miri (core + format parsers)
+    runs-on: ubuntu-latest
+    env:
+      # Cap the parser proptests so the interpreter stays within a sane
+      # wall-clock without dropping any parser path. (No -Zmiri-disable-
+      # isolation: the scoped tests do no real I/O, so the sandbox stays on,
+      # and Miri's default aliasing model — Tree Borrows — is left in place.)
+      PROPTEST_CASES: "32"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      # core: every test (it is tiny + pure).
+      - run: cargo +nightly miri test -p tritium-core
+      # format: the parser unit tests + the parser-fuzz integration test only
+      # (see the comment above for why the real-GGUF round-trips are excluded).
+      - run: cargo +nightly miri test -p tritium-format --lib --test tqidx_fuzz

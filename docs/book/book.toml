@@ -1,0 +1,28 @@
+[book]
+title = "Tritium — ternary-model inference & training"
+description = "User guide for Tritium, a from-scratch ternary (BitNet b1.58) inference and training library in Rust."
+authors = ["Brian Lam <briankhanglam@gmail.com>"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/Quitetall/tritium"
+edit-url-template = "https://github.com/Quitetall/tritium/edit/main/docs/book/{path}"
+
+# Dead-link gate (v0.90 hardening, ADR 0011). The mdbook-linkcheck backend runs as
+# part of `mdbook build`, so the gate fires identically in CI and locally.
+#
+# - `follow-web-links = false`: do NOT fetch http(s) URLs. The build stays
+#   deterministic and offline — CI does not flake on a third-party 5xx, and an
+#   external link rotting is not a Tritium regression. Internal/relative links
+#   (the ones we own) are always checked.
+# - `traverse-parent-directories = true`: the chapters link to the ADRs at
+#   `../../adr/*.md` (relative to `docs/book/src/`, i.e. `docs/adr/`). This lets
+#   the checker resolve and verify those real on-disk files instead of refusing
+#   to look outside the book root. A broken ADR link is therefore a build failure.
+# - `warning-policy = "error"`: any dead link is a hard error, not a warning.
+[output.linkcheck]
+follow-web-links = false
+traverse-parent-directories = true
+warning-policy = "error"
