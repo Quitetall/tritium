@@ -135,30 +135,29 @@ mod candle_op {
 
     /// Run Tritium's ternary mpGEMM on `act` (an `[M, K]` f32 [`Tensor`]) against
     /// `[N, K]` `packed` ternary weights in `format` with `[N]` `scales`, returning
-    /// the `[M, N]` f32 result tensor (on the same device as `act`).
+    /// the `[M, N]` f32 result on the same device as `act`. `N` (the output-channel
+    /// count) is taken from `scales.len()`.
+    ///
+    /// The op borrows `packed`/`scales`, so a candle module that owns its weight
+    /// bytes calls this once per forward rather than storing the op.
     ///
     /// # Errors
-    /// A [`candle_core::Error`] if `act` is not 2-D f32, its `K` disagrees with the
-    /// weights, `scales.len() != n`, the packed length is wrong for `[N, K]`/`format`,
-    /// or the format is unsupported.
+    /// A [`candle_core::Error`] if `act` is not a 2-D f32 tensor, is non-contiguous,
+    /// its `K` disagrees with `k`, the packed length is wrong for
+    /// `[N = scales.len(), K]` in `format`, or the format is unsupported.
     pub fn ternary_mpgemm(
         act: &Tensor,
         packed: &[u8],
         scales: &[f32],
-        n: usize,
         k: usize,
         format: TernaryFormat,
     ) -> Result<Tensor> {
-        if scales.len() != n {
-            return Err(CandleError::Msg(format!(
-                "tritium-candle: scales len {} != N {n}",
-                scales.len()
-            )));
-        }
+        // N (output channels) is exactly the number of per-channel scales — derive
+        // it rather than taking a second loose `usize` the caller could swap with k.
         let op = TernaryMpGemm {
             packed,
             scales,
-            n,
+            n: scales.len(),
             k,
             format,
         };
@@ -170,9 +169,7 @@ mod candle_op {
         use super::*;
         use candle_core::{Device, Tensor};
         use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
-        use tritium_testkit::{
-            ConformanceVector, FROZEN_COUNT, FROZEN_SEED, Tolerance, generate_vectors,
-        };
+        use tritium_testkit::{ConformanceVector, FROZEN_COUNT, FROZEN_SEED, generate_vectors};
 
         fn parse_format(tag: &str) -> TernaryFormat {
             match tag {
@@ -214,7 +211,6 @@ mod candle_op {
         /// shape, readback) is correct.
         #[test]
         fn candle_op_matches_reference_on_frozen_set() {
-            let tol = Tolerance::default();
             // generate_vectors appends the fixed boundary set on top of the
             // FROZEN_COUNT random vectors, so the total exceeds FROZEN_COUNT.
             let vs = vectors();
@@ -225,18 +221,18 @@ mod candle_op {
                 let format = parse_format(&v.format);
                 let packed = pack(&v, format);
                 let act = Tensor::from_vec(v.activation.clone(), (v.m, v.k), &Device::Cpu).unwrap();
-                let out = ternary_mpgemm(&act, &packed, &v.scales, v.n, v.k, format).unwrap();
+                let out = ternary_mpgemm(&act, &packed, &v.scales, v.k, format).unwrap();
                 assert_eq!(out.dims(), [v.m, v.n], "vector {}: output shape", v.id);
                 let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                assert_eq!(got.len(), v.expected.len(), "vector {}: len", v.id);
-                for (i, (g, w)) in got.iter().zip(&v.expected).enumerate() {
-                    let rel = (g - w).abs() / w.abs().max(1.0);
-                    assert!(
-                        rel <= tol.relative,
-                        "vector {} idx {i}: got {g} want {w} (rel {rel})",
-                        v.id
-                    );
-                }
+                // The op runs the SAME reference_mpgemm over pack->unpack
+                // round-tripped trits in the same order, so it is bit-exact with
+                // the frozen `expected`; grade it exactly (a tolerance here would
+                // mask a real Tensor<->slice plumbing regression).
+                assert_eq!(
+                    got, v.expected,
+                    "vector {}: candle op must be bit-exact with the reference",
+                    v.id
+                );
                 checked += 1;
             }
             assert_eq!(checked, total, "every frozen vector exercised");
@@ -245,25 +241,31 @@ mod candle_op {
         #[test]
         fn rejects_k_mismatch() {
             let act = Tensor::from_vec(vec![1.0f32; 2 * 4], (2, 4), &Device::Cpu).unwrap();
-            // weight K=8 != activation K=4
-            let r = ternary_mpgemm(&act, &[0u8; 64], &[1.0, 1.0], 2, 8, TernaryFormat::Tq2_0);
+            // N=2 (scales), weight K=8 != activation K=4
+            let r = ternary_mpgemm(&act, &[0u8; 64], &[1.0, 1.0], 8, TernaryFormat::Tq2_0);
             assert!(r.is_err(), "K mismatch must error");
-        }
-
-        #[test]
-        fn rejects_scales_len_mismatch() {
-            let act = Tensor::from_vec(vec![1.0f32; 2 * 4], (2, 4), &Device::Cpu).unwrap();
-            // scales len 1 != N 2
-            let r = ternary_mpgemm(&act, &[], &[1.0], 2, 4, TernaryFormat::Tq2_0);
-            assert!(r.is_err(), "scales length mismatch must error");
         }
 
         #[test]
         fn rejects_packed_len_mismatch() {
             let act = Tensor::from_vec(vec![1.0f32; 2 * 32], (2, 32), &Device::Cpu).unwrap();
-            // empty packed buffer for a real [N=2, K=32] shape
-            let r = ternary_mpgemm(&act, &[], &[1.0, 1.0], 2, 32, TernaryFormat::Tq2_0);
+            // N=2 (scales), empty packed buffer for a real [N=2, K=32] shape
+            let r = ternary_mpgemm(&act, &[], &[1.0, 1.0], 32, TernaryFormat::Tq2_0);
             assert!(r.is_err(), "packed length mismatch must error");
+        }
+
+        #[test]
+        fn rejects_non_contiguous_activation() {
+            // A transposed view is non-contiguous; the op must reject it (the
+            // reference kernel reads a contiguous [M, K] slice) rather than
+            // silently mis-reading strided data.
+            let base = Tensor::from_vec(vec![1.0f32; 4 * 32], (32, 4), &Device::Cpu).unwrap();
+            let act = base.t().unwrap(); // [4, 32], non-contiguous
+            assert!(!act.is_contiguous());
+            let nb = num_blocks(32);
+            let packed = vec![0u8; 2 * nb * block_bytes(TernaryFormat::Tq2_0).unwrap()];
+            let r = ternary_mpgemm(&act, &packed, &[1.0, 1.0], 32, TernaryFormat::Tq2_0);
+            assert!(r.is_err(), "non-contiguous activation must error");
         }
     }
 }
