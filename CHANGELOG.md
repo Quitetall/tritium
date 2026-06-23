@@ -7,6 +7,39 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.6] — 2026-06-23 — v0.90 hardening polish: mdbook + sanitizers + wheels + CPU bench smoke
+
+The reachable **v0.90 Hardening** tooling (ADR 0011), on the 0.6.x line. (The fenced-hardware
+v0.90 items — Metal/ROCm platform-GPU lanes — remain deferred.)
+
+### Added
+- **mdbook user guide** (`docs/book/`): 9 chapters — introduction, architecture, quickstart,
+  backends, quantization (SALT), training, interop, conformance, contributing — sourced from the
+  real code + ADRs. A new **`docs` CI lane** builds the book and **fails on any dead internal link**
+  (the `mdbook-linkcheck` backend with `warning-policy = "error"`).
+- **`sanitizers` CI lane** (nightly; weekly + manual): AddressSanitizer + MemorySanitizer +
+  ThreadSanitizer (via `-Zsanitizer` + `-Zbuild-std`) over the crates with hand-written `unsafe` or
+  untrusted-byte parsing (`tritium-cpu`, `tritium-ffi`, `tritium-format`), plus **miri** over the
+  pure-Rust crates (`tritium-core`, `tritium-format` parsers). All four run clean. (The Rust
+  toolchain has no `-Zsanitizer=undefined`; MSan/TSan/miri cover the UB classes a C UBSan would —
+  documented in the lane.)
+- **`wheels` CI lane** (tags + PR smoke + dispatch): abi3 Python wheels via maturin for
+  linux (manylinux) / macOS (universal2) / windows + an sdist, uploaded as **build artifacts only**
+  (no PyPI publish). A real `cp39-abi3` manylinux wheel was built + inspected locally.
+- **`cpu-bench-smoke` CI lane** (every push): compiles all benches + runs the CPU divan `mpgemm`
+  microbench — the hosted half of the perf gate (the tok/s regression assertion stays in the
+  self-hosted `perf-regression` lane).
+
+### Docs accuracy (adversarial review)
+- Corrected three confirmed doc-accuracy issues the review caught: distributed training is **shipped**
+  (v0.60; re-exported from `tritium-train`), not "the next milestone"; the SALT pipeline now flags
+  steps 2/5/6 as planned-not-yet-wired (only 1/3/4 drive the quantizer); and `tritium-cpu` dispatches
+  **AVX-512 → AVX2 → NEON → scalar**, not just AVX2.
+
+### Build
+- No workspace code or dependencies changed (mdbook / maturin are CI tools). Internal dep pins bumped
+  to `0.6.6`.
+
 ## [0.6.5] — 2026-06-23 — v0.80 interop COMPLETE: tritium-burn + tritium-onnx (framework backends)
 
 The final **v0.80 Interop** slice (ADR 0010): burn and ONNX Runtime. With serve + ffi + candle, all
