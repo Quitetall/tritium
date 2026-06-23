@@ -28,9 +28,9 @@ members = [
     # L3 frontends / bindings
     "crates/tritium-ffi",      # C ABI cdylib + staticlib + cbindgen header
     # "crates/tritium-py",       # PyO3 + maturin
-    # "crates/tritium-onnx",     # ort custom op
+    "crates/tritium-onnx",     # ort 2.x custom op (feature-gated; always-on bit-exact kernel)
     "crates/tritium-candle",   # candle CustomOp wrapping the ternary mpGEMM (feature-gated)
-    # "crates/tritium-burn",     # [planned]
+    "crates/tritium-burn",     # burn op wrapping the ternary mpGEMM (feature-gated)
     "crates/tritium-wasm",     # scalar TernaryBackend for wasm32-wasip1
     # L4 apps
     # "crates/tritium-cli",      # `tritium` binary
@@ -81,9 +81,17 @@ pollster = "0.4"
 # pyo3 0.29.x: clears RUSTSEC-2025-0020 + RUSTSEC-2026-0176 (PyList/PyTuple nth OOB) +
 # the missing-Sync PyCFunction advisory. tritium-py uses the modern Bound API (stable here).
 pyo3 = "0.29"
-ort = "2.0.0-rc.10"
+# onnx interop (tritium-onnx, behind its `onnx` feature). default-features off so the crate opts
+# into exactly download-binaries + tls-rustls (fetch a prebuilt onnxruntime at build — no system
+# lib). Exact pin keeps cargo-deny wildcards=deny meaningful. rc.12 wraps ONNX Runtime 1.24.
+ort = { version = "=2.0.0-rc.12", default-features = false }
 # candle interop (tritium-candle, behind its `candle` feature; CPU-only — no cuda/mkl/accelerate)
 candle-core = { version = "0.9", default-features = false }
+# burn interop (tritium-burn, behind its `burn` feature; CPU-only NdArray backend in the test).
+# burn-tensor gives Tensor/Backend/TensorData; burn-ndarray is the concrete CPU backend. `std`
+# (needed for NdArray + TensorData::to_vec) pulls the MPL-2.0 `colored` crate (allow-listed in deny.toml).
+burn-tensor = { version = "0.21", default-features = false, features = ["std"] }
+burn-ndarray = { version = "0.21", default-features = false, features = ["std"] }
 # cli
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

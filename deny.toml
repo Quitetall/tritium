@@ -28,6 +28,16 @@ allow = [
     # license of `hexf-parse`, a hex-float parser transitive of `naga` (wgpu's
     # shader compiler) ← `tritium-wgpu`. Surfaced once the pyo3 advisory cleared.
     "CC0-1.0",
+    # MPL-2.0: file-level weak copyleft (OSI-approved, FSF Free/Libre) — license of
+    # `colored`, a terminal-color crate pulled by `burn-tensor`'s mandatory `std`
+    # feature ← `tritium-burn` (only under `--features burn`). MPL-2.0 requires only
+    # that modified MPL-covered FILES stay MPL; it does not infect the Apache-2.0
+    # work that merely links `colored` (which we do not modify).
+    "MPL-2.0",
+    # CDLA-Permissive-2.0: permissive data license — license of `webpki-roots` (the
+    # Mozilla CA root-store data bundle) pulled by `ort`'s `tls-rustls` download path
+    # ← `tritium-onnx` (only under `--features onnx`). A data bundle, not code.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

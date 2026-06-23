@@ -210,6 +210,46 @@ jobs:
       - run: cargo clippy -p tritium-candle --features candle --all-targets -- -D warnings
       - run: cargo test -p tritium-candle --features candle
 
+  # burn interop lane (v0.80). Hosted ubuntu, every push: the burn host-round-trip
+  # op conformance gate proves the op reproduces the frozen vector set at the burn
+  # Tensor level (bit-exact — same reference kernel) on burn's CPU NdArray backend.
+  # No GPU, no model. Built with `--features burn` (off by default so the lean
+  # workspace build + `cargo test --workspace` stay burn-free), mirroring
+  # candle-conformance.
+  burn-conformance:
+    name: burn interop (cpu)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p tritium-burn --features burn --all-targets -- -D warnings
+      - run: cargo test -p tritium-burn --features burn
+
+  # onnx custom-op lane (v0.80). Hosted ubuntu, every push: builds + tests the `ort`
+  # 2.x custom operator (Layer 2). The always-on Layer-1 kernel conformance gate
+  # already runs in cpu-only-green with NO feature (zero ort). `ort`'s
+  # `download-binaries` (+ `tls-rustls`) fetches a prebuilt onnxruntime at build —
+  # network is available during the CI build, so no system lib is required. The op
+  # (and the heavy `ort` dep) live behind the `onnx` feature, off by default so the
+  # lean workspace build stays ort-free. The full end-to-end native session test is
+  # `#[ignore]`d; the registration + bit-exact kernel tests run here.
+  onnx-op:
+    name: onnx custom op (cpu)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p tritium-onnx --features onnx --all-targets -- -D warnings
+      - run: cargo test -p tritium-onnx --features onnx
+
   # Publish-readiness gate (ADR 0011 / v0.90): every workspace crate packages into a
   # valid .crate (manifest + files + version-pinned internal deps). See
   # scripts/check-publish.sh for why this is `cargo package --workspace` rather than

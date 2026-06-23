@@ -1,0 +1,37 @@
+[package]
+name = "tritium-burn"
+description = "burn interop for Tritium: a host round-trip op that runs Tritium's ternary (BitNet b1.58) mpGEMM on a burn `Tensor` for any `Backend`, bit-exact with the reference kernel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Lean by default: the heavy burn-tensor / burn-ndarray deps + the op are only
+# pulled in with the `burn` feature (mirrors tritium-candle's `candle`). The
+# default workspace build and `cargo test --workspace` stay burn-free; a
+# dedicated CI lane (burn-conformance) runs the gate with `--features burn`.
+default = []
+burn = ["dep:burn-tensor", "dep:burn-ndarray"]
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-format = { workspace = true }
+half = { workspace = true }
+# Optional NORMAL deps (NOT dev-deps) so the lean default really pulls zero of
+# them: burn-tensor supplies Tensor/Backend/TensorData/Shape for the op;
+# burn-ndarray is the concrete CPU backend the conformance test runs on (used
+# only under #[cfg(test)], but kept a normal optional dep so `cargo build
+# --features burn` exercises the same dep tree the lane gates).
+burn-tensor = { workspace = true, optional = true }
+burn-ndarray = { workspace = true, optional = true }
+
+[dev-dependencies]
+tritium-testkit = { workspace = true }
+
+[lints]
+workspace = true
