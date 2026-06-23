@@ -16,7 +16,7 @@
 //! into a Python exception ([`PyValueError`] / [`PyRuntimeError`]) rather than
 //! unwinding. A wrong dtype, a wrong shape, or a malformed model therefore raises a
 //! catchable Python exception — never a segfault or an abort. The crate carries no
-//! hand-written `unsafe`; the GIL release uses the safe [`Python::allow_threads`].
+//! hand-written `unsafe`; the GIL release uses the safe [`Python::detach`].
 //!
 //! ## Threading
 //!
@@ -64,7 +64,7 @@ impl Model {
         let path = gguf_path.to_owned();
         // Reading the file and building the runner is pure Rust compute + I/O; let
         // other Python threads run while it happens.
-        let runner = py.allow_threads(move || -> Result<ModelRunner, String> {
+        let runner = py.detach(move || -> Result<ModelRunner, String> {
             let bytes = std::fs::read(&path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
             ModelRunner::load_cpu(&bytes).map_err(|e| format!("cannot load `{path}`: {e}"))
         });
@@ -82,7 +82,7 @@ impl Model {
     /// Greedily generate up to `max_new_tokens` continuing `token_ids`, returning
     /// the newly generated token IDs (the prompt is not included).
     ///
-    /// The Rust compute runs with the GIL **released** ([`Python::allow_threads`]),
+    /// The Rust compute runs with the GIL **released** ([`Python::detach`]),
     /// so other Python threads execute concurrently. `greedy` is accepted for API
     /// stability; v0.20 only implements greedy decoding, so `greedy=False` decodes
     /// greedily as well.
@@ -114,7 +114,7 @@ impl Model {
         // Release the GIL for the compute. Lock the runner inside the closure so the
         // borrow does not cross the FFI boundary. A poisoned lock (a prior panic in
         // another thread) becomes a clean RuntimeError instead of a re-panic.
-        let result = py.allow_threads(move || -> Result<Vec<u32>, String> {
+        let result = py.detach(move || -> Result<Vec<u32>, String> {
             let mut runner = self
                 .runner
                 .lock()
@@ -205,7 +205,7 @@ fn ternary_matmul(
 
     // Compute with the GIL released. The CPU backend comes from the registry; the
     // `TernaryLinear` path packs, uploads, and runs the same mpGEMM the model uses.
-    let flat = py.allow_threads(move || -> Result<Vec<f32>, String> {
+    let flat = py.detach(move || -> Result<Vec<f32>, String> {
         let backend = cpu_backend()?;
         let linear =
             TernaryLinear::new(backend.as_ref(), &trits, n, k, scale).map_err(|e| e.to_string())?;

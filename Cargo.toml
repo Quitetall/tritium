@@ -76,9 +76,9 @@ cc = "1"
 wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl"] }
 pollster = "0.4"
 # bindings / frontends
-# pyo3 0.25.x: clears RUSTSEC-2025-0020 (PyString::from_object buffer overflow, fixed
-# in 0.24.1). Also fixes the macOS/Windows abi3 link failure on hosted runners.
-pyo3 = "0.25"
+# pyo3 0.29.x: clears RUSTSEC-2025-0020 + RUSTSEC-2026-0176 (PyList/PyTuple nth OOB) +
+# the missing-Sync PyCFunction advisory. tritium-py uses the modern Bound API (stable here).
+pyo3 = "0.29"
 ort = "2.0.0-rc.10"
 # cli
 clap = { version = "4", features = ["derive"] }

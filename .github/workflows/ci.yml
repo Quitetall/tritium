@@ -30,7 +30,11 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace # runs unit, integration, and doc tests
+      # tritium-py is a PyO3 extension module (cdylib) with no cargo tests — it is
+      # exercised via maturin + pytest, not `cargo test`. Excluded here so its
+      # cdylib doesn't link libpython into a cargo-test binary, which fails to link
+      # on the hosted macOS/Windows runners.
+      - run: cargo test --workspace --exclude tritium-py # unit, integration, and doc tests
 
   # Supply-chain gate (ADR 0011 hardening): licenses (allow-list + NOTICE
   # attribution), RustSec advisories, bans (no external wildcard versions /

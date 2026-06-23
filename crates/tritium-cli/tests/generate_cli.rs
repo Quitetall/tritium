@@ -117,10 +117,15 @@ fn generate_on_real_model_runs() {
         eprintln!("skipping real-model generate; set TRITIUM_RUN_SLOW=1 to enable");
         return;
     }
-    let model = PathBuf::from(concat!(
-        env!("HOME"),
-        "/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf"
-    ));
+    // Resolve the home dir at runtime (cross-platform: HOME on unix, USERPROFILE
+    // on Windows) — `env!("HOME")` is a compile-time lookup that is undefined on
+    // the Windows CI runner and breaks the build there.
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        eprintln!("skipping: no HOME/USERPROFILE in the environment");
+        return;
+    };
+    let model =
+        PathBuf::from(home).join(".cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf");
     if !model.exists() {
         eprintln!("skipping: real model not present at {}", model.display());
         return;
