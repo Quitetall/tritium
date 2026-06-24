@@ -15,7 +15,11 @@
 //! build time on the ROCm lane (the toolkit is present there); on the default Linux
 //! build this whole module is `#[cfg]`-compiled out, so the linker never sees it.
 
-#![allow(non_camel_case_types)]
+// Every item below is `pub` inside this crate-private `mod ffi`, so each trips the
+// workspace `unreachable_pub` lint. That is intentional — these are the HIP runtime
+// entry points the crate's GPU host path (`rocm.rs`) calls — so allow it module-wide
+// rather than peppering `pub(crate)` across two dozen FFI declarations.
+#![allow(non_camel_case_types, unreachable_pub)]
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 

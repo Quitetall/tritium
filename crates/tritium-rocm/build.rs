@@ -60,6 +60,15 @@ fn main() {
         Path::new("kernels/tq2_0_add.hip"),
         &out_dir.join("tq2_0_add.co"),
     );
+
+    // Point the linker at the HIP runtime so the `#[link(name = "amdhip64")]` in
+    // src/ffi.rs resolves: `libamdhip64.so` ships in `<rocm>/lib`, which cargo does
+    // not add to the linker search path by default (this is the first-compile
+    // `unable to find library -lamdhip64` otherwise). The rpath embed lets the test
+    // /bin load it at run time even on a box whose ld.so cache lacks the ROCm path.
+    let rocm_lib = rocm_root().join("lib");
+    println!("cargo:rustc-link-search=native={}", rocm_lib.display());
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", rocm_lib.display());
 }
 
 /// Compile a single `.hip` source to a relocatable AMD GPU code object covering
@@ -95,6 +104,18 @@ fn compile_code_object(hipcc: &Path, src: &Path, co_path: &Path) {
         "tritium-rocm: hipcc reported success but {} was not produced",
         co_path.display()
     );
+}
+
+/// Resolve the ROCm install prefix for locating `libamdhip64.so`: `$ROCM_PATH`,
+/// then `$HIP_PATH`, then the conventional `/opt/rocm`. `libamdhip64` ships in
+/// `<prefix>/lib` on ROCm 5.x/6.x.
+fn rocm_root() -> PathBuf {
+    for var in ["ROCM_PATH", "HIP_PATH"] {
+        if let Some(root) = std::env::var_os(var) {
+            return PathBuf::from(root);
+        }
+    }
+    PathBuf::from("/opt/rocm")
 }
 
 /// Locate the `hipcc` binary: prefer the toolkit pointed at by `ROCM_PATH` /
