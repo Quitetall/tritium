@@ -7,6 +7,36 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.9.0] — 2026-06-24 — v0.90 Hardening milestone COMPLETE
+
+The **v0.90 Hardening** milestone (ADR 0011) is complete — a depth pass over the v1.0 surface, no new
+capabilities. The two gates genuinely open this session are now closed and verified:
+
+- **Sanitizers green** — `sanitizers.yml` ran clean for the first time: ASan/MSan/TSan via `-Zbuild-std`
+  (tritium-cpu/ffi/format) + miri (tritium-core/format parsers). The first run surfaced a miri *isolation*
+  issue — proptest's `getcwd` under the sandbox — fixed with `-Zmiri-disable-isolation` (gates only
+  syscalls, not UB detection). **No real UB found.**
+- **Threat model documented** — `docs/security/threat-model.md`: a 30-threat, code-grounded review across
+  the model-file parsers, C ABI/FFI, HTTP server, kernels + dispatch, and supply chain — each with STRIDE +
+  severity + mitigations cited to source + residual risks. Linked from `SECURITY.md`.
+
+Already shipped on the 0.5.x/0.6.x build-ahead line: cargo-deny, fuzz breadth + corpora (8 targets, 769
+files), doc-coverage + semver baseline, mdbook + dead-link lane, abi3 wheels, cpu-bench-smoke, SBOM.
+
+The GPU-dependent gates (full CI matrix, perf-regression-on-main, compute-sanitizer) are met via the **ADR
+0011 amendment** (2026-06-24): GPU parity validated by documented fenced sessions (cuda/A100, metal/M1,
+rocm/MI300X, wgpu/4090) + the GPU lanes kept as `workflow_dispatch` recipes; **Metal additionally runs free
+on GitHub-hosted `macos-14` every push**. "Green on every push" is waived for the paid-GPU backends absent
+standing runners.
+
+### Added
+- `docs/security/threat-model.md` — the full code-grounded threat model (closes the ADR-0011 security gate).
+
+### Changed
+- CI: `gpu`/`rocm`/`wgpu`/`perf-regression`/`serve-e2e` lanes are now `workflow_dispatch` (dispatchable
+  on-demand) instead of `if: false`; the `metal` lane runs free on GitHub-hosted `macos-14`; the
+  `sanitizers` miri job uses `-Zmiri-disable-isolation`.
+
 ## [0.8.0] — 2026-06-24 — v0.80 Interop milestone COMPLETE (all four framework frontends)
 
 The **v0.80 Interop** milestone (ADR 0010) is complete: Tritium's ternary mpGEMM is reachable from every

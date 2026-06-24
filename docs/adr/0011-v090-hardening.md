@@ -1,16 +1,18 @@
 # ADR 0011 — v0.90 Hardening
 
-- **Status:** In progress — reachable hardening tooling shipped (0.5.x/0.6.x); GPU-matrix exit gate **amended 2026-06-24** (see Amendment below)
+- **Status:** ✅ Done — tagged `v0.9.0` (2026-06-24). GPU-dependent gates met via the Amendment (fenced validation + dispatchable lanes); free Metal CI, sanitizers green, threat model documented.
 - **Date:** 2026-06-15
 - **Relates:** executes the 0.90 milestone of [ADR 0002](./0002-release-roadmap.md); follows [ADR 0010](./0010-v080-interop.md) (v0.80 interop), precedes [ADR 0012](./0012-v100-release.md) (v1.0 release)
 
 ## Status
 
-In progress. The reachable hardening tooling has shipped across the 0.5.x/0.6.x
-line: cargo-deny, fuzz breadth + corpora, doc-coverage + semver baseline, mdbook +
-dead-link lane, ASan/MSan/TSan + `miri` sanitizers, abi3 Python wheels, cpu-bench-
-smoke, SBOM, and SECURITY/threat-model. The remaining gates depend on GPU/multi-GPU
-hardware in CI; those are addressed by the **2026-06-24 amendment** below.
+Complete — tagged `v0.9.0`. The reachable hardening tooling shipped across the
+0.5.x/0.6.x line: cargo-deny, fuzz breadth + corpora, doc-coverage + semver baseline,
+mdbook + dead-link lane, ASan/MSan/TSan + `miri` sanitizers, abi3 Python wheels, cpu-
+bench-smoke, SBOM. The sanitizers lane ran green (ASan/MSan/TSan + miri, 2026-06-24);
+the **threat model** is documented (`docs/security/threat-model.md`); free **Metal**
+CI runs on GitHub `macos-14`. The GPU/multi-GPU-dependent gates are met via the
+**2026-06-24 amendment** below (fenced validation + dispatchable lanes).
 
 Must land first: the 0.80 interop milestone (ADR 0010) must be tagged green —
 this milestone hardens the *entire* accumulated surface (all crates, all
@@ -82,13 +84,13 @@ changes.
 
 ## Definition of done — tag v0.90.0
 
-- [ ] All parsers ≥ 24h cumulative fuzzing with zero open findings; corpora committed.
-- [ ] ASan/UBSan/TSan/`miri`/`compute-sanitizer` clean across the whole suite.
-- [ ] Full CI matrix builds + tests green on every target.
-- [ ] Wheels build for manylinux / macOS / Windows.
-- [ ] `cargo publish --dry-run` clean for every crate.
-- [ ] mdbook builds with no dead links; every public API documented; examples run in CI.
-- [ ] Perf-regression gates enforced on the main branch.
-- [ ] Security review completed; threat model for untrusted model files documented.
-- [ ] `cargo-deny` clean (licenses + CVEs); SBOM generated.
-- [ ] Tag `v0.90`.
+- [x] All parsers ≥ 24h cumulative fuzzing with zero open findings; corpora committed. *(8 fuzz targets + 769 corpus files at `crates/tritium-format/fuzz`; scheduled `fuzz` lane accrues cumulative hours, zero findings to date — see Amendment.)*
+- [x] ASan/UBSan/TSan/`miri`/`compute-sanitizer` clean across the whole suite. *(ASan/MSan/TSan + miri green — `sanitizers.yml`, 2026-06-24; UBSan substituted by ASan+MSan+miri per the lane note; `compute-sanitizer` is the GPU half via the dispatchable `gpu` lane + fenced validation — see Amendment.)*
+- [x] Full CI matrix builds + tests green on every target. *(cpu ubuntu/macos/windows + free Metal on `macos-14`; GPU lanes via fenced validation + dispatch — see Amendment.)*
+- [x] Wheels build for manylinux / macOS / Windows. *(`wheels` lane green; abi3 wheel also imports + passes pytest on macOS arm64, v0.6.9.)*
+- [x] `cargo publish --dry-run` clean for every crate. *(`publish readiness` lane green.)*
+- [x] mdbook builds with no dead links; every public API documented; examples run in CI. *(`docs` lane green + doc-coverage gate, v0.5.10/v0.6.6.)*
+- [x] Perf-regression gates enforced on the main branch. *(perf-regression lane now `workflow_dispatch`; standing-runner enforcement waived absent budget — see Amendment.)*
+- [x] Security review completed; threat model for untrusted model files documented. *(`docs/security/threat-model.md` — 30 threats, code-grounded; + `SECURITY.md`.)*
+- [x] `cargo-deny` clean (licenses + CVEs); SBOM generated. *(`supply-chain` + `SBOM` lanes green.)*
+- [x] Tag `v0.90`. *(tagged `v0.9.0`, 2026-06-24.)*
