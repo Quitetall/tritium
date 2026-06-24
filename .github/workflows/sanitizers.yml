@@ -211,10 +211,17 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Cap the parser proptests so the interpreter stays within a sane
-      # wall-clock without dropping any parser path. (No -Zmiri-disable-
-      # isolation: the scoped tests do no real I/O, so the sandbox stays on,
-      # and Miri's default aliasing model — Tree Borrows — is left in place.)
+      # wall-clock without dropping any parser path.
       PROPTEST_CASES: "32"
+      # proptest's failure-persistence machinery calls `getcwd` during harness
+      # setup (to locate its regression file), which Miri's isolation sandbox
+      # rejects ("unsupported operation: `getcwd` not available when isolation is
+      # enabled"). `-Zmiri-disable-isolation` lets those syscalls through; it does
+      # NOT weaken Miri's UB detection — isolation only gates host syscalls, while
+      # the aliasing (Tree Borrows, left in place) / strict-provenance / uninit-read
+      # checks are unaffected. (The earlier "tests do no real I/O" assumption was
+      # wrong: proptest touches the FS even on success.)
+      MIRIFLAGS: "-Zmiri-disable-isolation"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
