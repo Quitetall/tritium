@@ -102,6 +102,36 @@ jobs:
       - run: cargo test -p tritium-cuda --features cuda
       - run: compute-sanitizer --tool memcheck cargo test -p tritium-cuda --features cuda
 
+  # metal lane (Apple-Silicon backend breadth). Self-hosted, manual — runs only on
+  # an Apple-Silicon runner with a Metal device. Mirrors the disabled `wgpu`/`gpu`
+  # lanes: the same frozen-conformance + fused-fallback gates; the metal backend
+  # self-skips when MTLCreateSystemDefaultDevice() is nil, so this is the only place
+  # it bites. `register` exercises both the explicit ctor and the linkme self-
+  # registration. The MSL kernel + metal-rs host side compile only here (no Metal
+  # framework on the Linux CI matrix), so this lane is where they are first built.
+  metal:
+    name: metal conformance (apple silicon)
+    runs-on: [self-hosted, macos] # or `macos-14` (Apple-Silicon GitHub-hosted)
+    if: ${{ false }} # enable on an Apple-Silicon runner with a Metal device
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p tritium-metal --features register
+
+  # ROCm lane (AMD HIP conformance). Self-hosted, manual — mirrors the `gpu` (CUDA)
+  # lane: runs only where a ROCm toolkit (hipcc) + an AMD GPU are present. The
+  # add-only HIP kernel + raw HIP-runtime FFI are behind the `rocm` feature; the
+  # conformance test self-skips when `hipInit` finds no device, so this is the only
+  # place the backend bites. Enable on an AMD-GPU runner with ROCm installed.
+  rocm:
+    name: rocm conformance (hip)
+    runs-on: [self-hosted, rocm]
+    if: ${{ false }} # enable on an AMD-GPU runner with the ROCm toolkit (hipcc)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p tritium-rocm --features rocm
+
   # Perf-regression lane (ADR 0005 WF-E / Pe). Scheduled on the pinned GPU box: runs
   # the end-to-end tokens/sec bench (which couples each perf number to an
   # unchanged-perplexity assertion) and fails on a >5% tokens/sec drop vs the

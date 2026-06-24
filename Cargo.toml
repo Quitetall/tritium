@@ -16,8 +16,8 @@ members = [
     "crates/tritium-py",       # PyO3 + maturin Python bindings (cdylib wheel)
     # ── enabled as each lands (see docs/ROADMAP for the full crate graph) ──
     # L1 backends
-    # "crates/tritium-metal",    # [planned]
-    # "crates/tritium-rocm",     # [planned]
+    "crates/tritium-metal",    # MSL mpGEMM over Apple Metal (macOS-gated; empty lib off macOS)
+    "crates/tritium-rocm",     # AMD ROCm/HIP host (raw FFI) + add-only .hip kernel (rocm-feature-gated)
     "crates/tritium-wgpu",     # WGSL mpGEMM over wgpu (Vulkan)
     # L2 runtime + functional
     # "crates/tritium-runtime",  # registry, dispatch, mem pools, autotune cache
@@ -77,6 +77,11 @@ cbindgen = "0.29"
 # wgpu backend (WGSL mpGEMM over Vulkan); exact pin keeps cargo-deny wildcards=deny meaningful
 wgpu = { version = "=23.0.1", default-features = false, features = ["wgsl"] }
 pollster = "0.4"
+# metal backend (MSL mpGEMM over Apple Metal, tritium-metal). metal-rs is declared under
+# tritium-metal's [target.'cfg(target_os = "macos")'] table, so it is NEVER resolved on a
+# non-macOS host. Exact pin keeps cargo-deny wildcards=deny meaningful. (tritium-rocm needs no
+# external dep — it uses raw extern "C" FFI to the HIP runtime, compiled via hipcc in build.rs.)
+metal = "=0.33.0"
 # bindings / frontends
 # pyo3 0.29.x: clears RUSTSEC-2025-0020 + RUSTSEC-2026-0176 (PyList/PyTuple nth OOB) +
 # the missing-Sync PyCFunction advisory. tritium-py uses the modern Bound API (stable here).

@@ -1,0 +1,53 @@
+[package]
+name = "tritium-metal"
+description = "Apple-Silicon execution backend: metal-rs host side + an add/sub/skip ternary mpGEMM compute kernel in Metal Shading Language (compiled at runtime)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tritium-core = { workspace = true }
+tritium-spec = { workspace = true }
+tritium-runtime = { workspace = true }
+tritium-format = { workspace = true }
+half = { workspace = true }
+
+# `linkme` backs the `BACKENDS` self-registration (same distributed-slice
+# mechanism tritium-cpu/tritium-wgpu use). Only pulled in with the `register`
+# feature, and only ever compiled on macOS (the registration static is
+# `cfg(target_os = "macos")`), so a Linux build never links it.
+linkme = { workspace = true, optional = true }
+
+# The Metal binding (metal-rs, the gfx-rs Apple binding) lives ONLY on macOS:
+# placing it under a target-specific table means a Linux `cargo build` /
+# `cargo tree` never resolves or pulls it. All `metal`-using code in this crate is
+# additionally `cfg(target_os = "macos")`-gated, so the macOS-only dep and the
+# code that needs it appear and disappear together. `metal` 0.33 wraps the modern
+# Metal API surface this kernel uses (newLibraryWithSource, compute pipeline,
+# shared-storage MTLBuffers); pinned in the workspace deps so cargo-deny's
+# `wildcards = "deny"` stays meaningful.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { workspace = true, optional = true }
+
+[features]
+default = []
+# `metal` gates ALL device code + the metal-rs binding. The default build (and
+# every Linux build, where the dep does not even exist) is an inert stub: no
+# metal-rs, no device, no backend registration — exactly like tritium-wgpu's
+# `wgpu` gate and tritium-cuda's `cuda` gate. On a non-macOS target the feature
+# is a no-op because the gated code is also `cfg(target_os = "macos")`.
+metal = ["dep:metal"]
+# `register` adds linkme self-registration into the runtime BACKENDS slice
+# (macOS only). Implies `metal`.
+register = ["metal", "dep:linkme"]
+
+[dev-dependencies]
+tritium-testkit = { workspace = true }
+
+[lints]
+workspace = true
