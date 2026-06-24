@@ -7,6 +7,27 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.8.0] — 2026-06-24 — v0.80 Interop milestone COMPLETE (all four framework frontends)
+
+The **v0.80 Interop** milestone (ADR 0010) is complete: Tritium's ternary mpGEMM is reachable from every
+target frontend, each validated green in CI on CPU:
+
+- **`tritium-serve`** — OpenAI-compatible HTTP/SSE server: contract + streaming + concurrency (CI lane
+  *serve contract, cpu mock*). (`v0.6.2`)
+- **`tritium-ffi`** — C ABI cdylib + staticlib, panic-safe, cbindgen header with a drift gate + C11/C++17
+  compile check; round-trips through the C ABI. Unblocks the v1.0 C-ABI freeze. (`v0.6.3`)
+- **`tritium-candle`** — candle `CustomOp1`, bit-exact vs `reference_mpgemm` (CI lane *candle interop*). (`v0.6.4`)
+- **`tritium-burn`** — backend-generic burn op, bit-exact (CI lane *burn interop*). (`v0.6.5`)
+- **`tritium-onnx`** — always-on bit-exact kernel + `ort` 2.x custom op == native (CI lane *onnx custom op*). (`v0.6.5`)
+
+No new code in this release — the frontends shipped across the 0.6.x line; this tag marks the milestone now
+that v0.70 (its predecessor) is complete (per ADR 0002, milestones tag in order). The abi3 Python wheel
+additionally builds + imports + passes pytest on macOS arm64 (validated on the M1, `v0.6.9`).
+
+### Validated (CI, CPU)
+- *serve contract (mock)* · *candle interop* · *burn interop* · *onnx custom op* · *wasm conformance* ·
+  *cpu-only test/clippy/fmt* on ubuntu + macos + windows — all green.
+
 ## [0.7.0] — 2026-06-24 — v0.70 Backend Breadth milestone COMPLETE (full backend matrix hardware-validated)
 
 The **v0.70 Backend Breadth** milestone (ADR 0009) is complete: every backend in the matrix —

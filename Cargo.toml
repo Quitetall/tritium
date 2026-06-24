@@ -39,7 +39,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"              # SemVer (MAJOR.MINOR.PATCH); see CHANGELOG versioning note
+version = "0.8.0"              # SemVer (MAJOR.MINOR.PATCH); see CHANGELOG versioning note
 edition = "2024"
 rust-version = "1.89"          # AVX-512 intrinsics stable floor (Rust 1.89, 2025-08-07)
 license = "Apache-2.0"         # FOSS; see LICENSE. Vendored deps attributed in NOTICE.
@@ -53,16 +53,16 @@ categories = ["science", "hardware-support", "mathematics"]
 # internal crates (path + caret version, bumped in lockstep with the workspace version at each
 # minor release). The explicit version is required for `cargo publish` (crates.io forbids bare path
 # deps) and lets cargo-deny keep `wildcards = "deny"` meaningful for *external* deps.
-tritium-core = { path = "crates/tritium-core", version = "0.7.0" }
-tritium-spec = { path = "crates/tritium-spec", version = "0.7.0" }
-tritium-format = { path = "crates/tritium-format", version = "0.7.0" }
-tritium-runtime = { path = "crates/tritium-runtime", version = "0.7.0" }
-tritium-testkit = { path = "crates/tritium-testkit", version = "0.7.0" }
-tritium-cpu = { path = "crates/tritium-cpu", version = "0.7.0" }
-tritium-cuda = { path = "crates/tritium-cuda", version = "0.7.0" }
-tritium-quantize = { path = "crates/tritium-quantize", version = "0.7.0" }
-tritium-nn = { path = "crates/tritium-nn", version = "0.7.0" }
-tritium-train = { path = "crates/tritium-train", version = "0.7.0" }
+tritium-core = { path = "crates/tritium-core", version = "0.8.0" }
+tritium-spec = { path = "crates/tritium-spec", version = "0.8.0" }
+tritium-format = { path = "crates/tritium-format", version = "0.8.0" }
+tritium-runtime = { path = "crates/tritium-runtime", version = "0.8.0" }
+tritium-testkit = { path = "crates/tritium-testkit", version = "0.8.0" }
+tritium-cpu = { path = "crates/tritium-cpu", version = "0.8.0" }
+tritium-cuda = { path = "crates/tritium-cuda", version = "0.8.0" }
+tritium-quantize = { path = "crates/tritium-quantize", version = "0.8.0" }
+tritium-nn = { path = "crates/tritium-nn", version = "0.8.0" }
+tritium-train = { path = "crates/tritium-train", version = "0.8.0" }
 # foundation
 bytemuck = "1"
 half = "2"
