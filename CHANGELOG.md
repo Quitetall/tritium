@@ -7,6 +7,33 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.9] — 2026-06-24 — Metal parity validated on Apple Silicon + Metal memory-parity (in-kernel TQ2_0 decode) + macOS-portable capstone
+
+First hardware validation of a fenced-HW backend. **Metal parity is green on a real Apple M1** (Scaleway
+M1-M, macOS 26.3.2, Rust 1.96): the blind-written MSL backend compiled and passed the frozen-vector
+conformance + fused-fallback + 2-D-grid + zero-dim tests on the first compile, **zero glue fixes** — exactly
+as the pre-compile audit (zero real findings) predicted. As a bonus on the same lease, the **wgpu** backend
+validated on the Apple GPU via wgpu's Metal HAL (4 tests), the whole Rust workspace passed on **macOS arm64**
+(407 tests / 77 binaries), and the **abi3 Python wheel** built via maturin + imported + passed its pytest
+suite (FFI safety, GIL release) — coverage the wheels CI lane (artifacts-only) does not exercise.
+
+### Changed
+- **`tritium-metal` — device-memory parity with cuda/rocm.** `mpgemm.metal` gains an `mpgemm_tq2_0` kernel
+  that decodes the 2-bit TQ2_0 codes **in-kernel** (a direct port of the verified cuda/hip add-only kernel),
+  so TQ2_0 weights now stay **packed on device** (~2.06 bit/trit) instead of being host-widened to one `i32`
+  per trit (32 bit/trit — a 16× blow-up). This removes the limitation that a multi-billion-parameter model
+  could not fit Apple unified memory; the Metal backend is now memory-equivalent to cuda/rocm. TQ1_0 (the
+  small/rare format) keeps the host-unpack + widen path. Validated bit-exact (≤1e-4) on a real M1 GPU
+  across all 47 TQ2_0 frozen vectors plus the random large-shape and zero-dim cases.
+  Kernel row/element indices use 64-bit (`ulong`) arithmetic so large shapes cannot
+  overflow the index math (matching the cuda/hip reference's `long long` casts).
+
+### Fixed
+- **`scripts/capstone.sh` is now macOS-portable.** STEP 1's workspace build now `--exclude tritium-py`
+  (a PyO3 `extension-module` cdylib that deliberately does not link libpython — building its cdylib under
+  plain `cargo build` fails to link on macOS with undefined `_Py*` symbols), mirroring `ci.yml`. The
+  capstone now runs green end-to-end (build → infer → SALT → fine-tune) on macOS arm64, not just Linux.
+
 ## [0.6.8] — 2026-06-23 — full backend matrix: tritium-metal + tritium-rocm + third-party license bundle
 
 Lands the last two backends (ADR 0009 full scope) and the dependency-license tracking for v1.0

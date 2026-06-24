@@ -116,6 +116,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Lint the macOS-only backend here — the Linux clippy lane cannot compile the
+      # `cfg(target_os = "macos")` device code, so this is the only clippy coverage.
+      - run: cargo clippy -p tritium-metal --features register --all-targets -- -D warnings
       - run: cargo test -p tritium-metal --features register
 
   # ROCm lane (AMD HIP conformance). Self-hosted, manual — mirrors the `gpu` (CUDA)
@@ -130,6 +135,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Lint the rocm-feature-gated backend here — the Linux clippy lane cannot
+      # compile it (no hipcc / HIP runtime), so this is the only clippy coverage.
+      - run: cargo clippy -p tritium-rocm --features rocm --all-targets -- -D warnings
       - run: cargo test -p tritium-rocm --features rocm
 
   # Perf-regression lane (ADR 0005 WF-E / Pe). Scheduled on the pinned GPU box: runs

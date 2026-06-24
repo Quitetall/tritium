@@ -18,9 +18,11 @@
 //! `out[m,n] = scales[n] · Σ_k act[m,k] (±) w[n,k]` per thread, in the exact
 //! add/subtract/skip form of [`tritium_core::reference_mpgemm`] (a direct port of
 //! the tritium-wgpu WGSL kernel), so f32 round-off stays within the 1e-4
-//! conformance bar. Weights are host-unpacked to one `i32` per trit and uploaded
-//! into a shared-storage `MTLBuffer` (unified memory on Apple Silicon — no
-//! discrete copy). The MSL source is compiled at runtime with
+//! conformance bar. TQ2_0 weights stay packed on device and are decoded in-kernel
+//! (device-memory parity with the cuda/rocm backends — ~2.06 bit/trit, so large
+//! models fit unified memory); TQ1_0 is host-unpacked and widened to one `i32` per
+//! trit. Either way the weights live in a shared-storage `MTLBuffer` (unified memory
+//! on Apple Silicon — no discrete copy). The MSL source is compiled at runtime with
 //! `newLibraryWithSource:`.
 //!
 //! ## Unsafe

@@ -3708,7 +3708,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-benches"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "divan",
  "half",
@@ -3725,7 +3725,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-burn"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "burn-ndarray",
  "burn-tensor",
@@ -3737,7 +3737,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-candle"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "candle-core",
  "half",
@@ -3748,7 +3748,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cli"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -3765,14 +3765,14 @@ dependencies = [
 
 [[package]]
 name = "tritium-core"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "tritium-cpu"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "linkme",
@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-cuda"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "cudarc",
  "half",
@@ -3805,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-ffi"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "cbindgen",
  "tritium-core",
@@ -3815,7 +3815,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-format"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "proptest",
@@ -3826,7 +3826,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-metal"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "linkme",
@@ -3840,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-nn"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "proptest",
@@ -3859,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-onnx"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "ort",
@@ -3870,7 +3870,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-py"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "pyo3",
  "tritium-core",
@@ -3882,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-quantize"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "proptest",
@@ -3892,7 +3892,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-rocm"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "linkme",
@@ -3905,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-runtime"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "linkme",
  "tritium-core",
@@ -3914,7 +3914,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-serve"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "async-stream",
  "axum",
@@ -3930,14 +3930,14 @@ dependencies = [
 
 [[package]]
 name = "tritium-spec"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "tritium-core",
 ]
 
 [[package]]
 name = "tritium-testkit"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "proptest",
@@ -3950,7 +3950,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-train"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "proptest",
  "tritium-core",
@@ -3959,7 +3959,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-wasm"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "half",
  "tritium-core",
@@ -3970,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "tritium-wgpu"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "bytemuck",
  "half",

@@ -1,6 +1,8 @@
-//! The Apple Metal ternary mpGEMM backend: host-unpack weights, upload to a
-//! shared-storage `MTLBuffer` (unified memory on Apple Silicon), run the MSL
-//! compute kernel (`mpgemm.metal`), read back.
+//! The Apple Metal ternary mpGEMM backend. TQ2_0 weights stay PACKED on device and
+//! are decoded in-kernel (`mpgemm_tq2_0` — ~2.06 bit/trit, device-memory parity with
+//! the cuda/rocm backends); TQ1_0 weights are host-unpacked and widened to one `i32`
+//! per trit (`mpgemm`). Both live in a shared-storage `MTLBuffer` (unified memory on
+//! Apple Silicon); the MSL kernel runs and the result is read back.
 //!
 //! Compiled only on macOS with `--features metal` (see the crate docs).
 
@@ -11,9 +13,7 @@ use metal::{
 };
 
 use tritium_core::{GemmShape, TernaryFormat, Trit};
-use tritium_format::{
-    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
-};
+use tritium_format::{TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row};
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
 
 /// Threadgroup width for the 2-D dispatch (must match the threadgroup size the
@@ -33,16 +33,21 @@ struct Dims {
     /// linear output index as `gid.y * lane_stride + gid.x`, so M*N can exceed any
     /// single grid dimension's ceiling.
     lane_stride: u32,
+    /// Packed bytes per weight row — read only by the `mpgemm_tq2_0` (packed-decode)
+    /// kernel to stride into the on-device TQ2_0 bytes. 0 for the widened `mpgemm`
+    /// (i32) kernel, which ignores it.
+    row_bytes: u32,
 }
 
 // Pin the size + field offsets so a field reorder (which preserves size) cannot
-// silently land `n` where the kernel reads `k`. MSL packs this as 4×u32 = 16
+// silently land `n` where the kernel reads `k`. MSL packs this as 5×u32 = 20
 // bytes with natural alignment, matching `repr(C)`.
-const _: () = assert!(core::mem::size_of::<Dims>() == 16);
+const _: () = assert!(core::mem::size_of::<Dims>() == 20);
 const _: () = assert!(core::mem::offset_of!(Dims, m) == 0);
 const _: () = assert!(core::mem::offset_of!(Dims, n) == 4);
 const _: () = assert!(core::mem::offset_of!(Dims, k) == 8);
 const _: () = assert!(core::mem::offset_of!(Dims, lane_stride) == 12);
+const _: () = assert!(core::mem::offset_of!(Dims, row_bytes) == 16);
 
 /// Send+Sync wrapper around the non-`Send` metal-rs handles.
 ///
@@ -53,7 +58,10 @@ const _: () = assert!(core::mem::offset_of!(Dims, lane_stride) == 12);
 struct Handles {
     device: Device,
     queue: CommandQueue,
+    /// `mpgemm` — widened-i32 path (TQ1_0).
     pipeline: ComputePipelineState,
+    /// `mpgemm_tq2_0` — packed in-kernel-decode path (TQ2_0).
+    pipeline_tq2: ComputePipelineState,
 }
 
 // SAFETY: the wrapped handles are `MTLDevice` / `MTLCommandQueue` /
@@ -69,15 +77,25 @@ unsafe impl Send for Handles {}
 #[allow(unsafe_code)]
 unsafe impl Sync for Handles {}
 
-/// Device buffer: weights host-unpacked + widened to `i32`, resident in a
-/// shared-storage `MTLBuffer`, plus the `[N, K]` dims and the original packed
-/// byte count.
-///
-/// On Apple Silicon, `StorageModeShared` is unified memory — the CPU write that
-/// fills the buffer and the GPU read in the kernel hit the same physical pages,
-/// with no discrete host→device copy.
+/// How the ternary weights are laid out in the device `MTLBuffer`.
+#[derive(Clone, Copy, Debug)]
+enum WeightRepr {
+    /// TQ2_0 packed bytes, decoded in-kernel by `mpgemm_tq2_0`. `row_bytes` is the
+    /// packed stride per weight row. Device memory == packed size (~2.06 bit/trit),
+    /// matching the cuda/rocm backends so large models fit unified memory.
+    PackedTq2_0 { row_bytes: usize },
+    /// One `i32` per trit (host-unpacked + widened), consumed by the `mpgemm`
+    /// kernel. Used for TQ1_0 — 32 bit/trit on device, so for small weights only.
+    WidenedI32,
+}
+
+/// Device buffer: ternary weights resident in a shared-storage `MTLBuffer` (unified
+/// memory on Apple Silicon — the CPU fill and the GPU read share physical pages,
+/// with no discrete host→device copy), plus the `[N, K]` dims, the original packed
+/// byte count, and how the bytes are laid out ([`WeightRepr`]).
 pub struct MetalBuffer {
     weights: WeightBuf,
+    repr: WeightRepr,
     n: usize,
     k: usize,
     bytes: usize, // original packed byte count, for len_bytes()
@@ -98,6 +116,7 @@ unsafe impl Sync for WeightBuf {}
 impl core::fmt::Debug for MetalBuffer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MetalBuffer")
+            .field("repr", &self.repr)
             .field("n", &self.n)
             .field("k", &self.k)
             .field("bytes", &self.bytes)
@@ -165,18 +184,29 @@ impl MetalBackend {
         let library = device
             .new_library_with_source(include_str!("mpgemm.metal"), &options)
             .map_err(|e| BackendError::Backend(format!("MSL compile: {e}")))?;
-        let function = library
+        // Both kernels compile from the one embedded MSL source: `mpgemm` (widened
+        // i32, for TQ1_0) and `mpgemm_tq2_0` (packed in-kernel decode, for TQ2_0).
+        let f_i32 = library
             .get_function("mpgemm", None)
             .map_err(|e| BackendError::Backend(format!("missing `mpgemm` function: {e}")))?;
         let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| BackendError::Backend(format!("pipeline state: {e}")))?;
+            .new_compute_pipeline_state_with_function(&f_i32)
+            .map_err(|e| BackendError::Backend(format!("pipeline state for `mpgemm`: {e}")))?;
+        let f_tq2 = library
+            .get_function("mpgemm_tq2_0", None)
+            .map_err(|e| BackendError::Backend(format!("missing `mpgemm_tq2_0` function: {e}")))?;
+        let pipeline_tq2 = device
+            .new_compute_pipeline_state_with_function(&f_tq2)
+            .map_err(|e| {
+                BackendError::Backend(format!("pipeline state for `mpgemm_tq2_0`: {e}"))
+            })?;
 
         Ok(MetalBackend {
             handles: Handles {
                 device,
                 queue,
                 pipeline,
+                pipeline_tq2,
             },
             device_name,
         })
@@ -246,36 +276,47 @@ impl TernaryBackend for MetalBackend {
             )));
         }
 
-        // Host-unpack both formats to a flat trit buffer (block scale fixed to
-        // 1.0 by the packer → discarded), then widen to i32 — one i32 per trit,
-        // exactly the layout the kernel's `device const int* weights` expects.
-        let mut trits = vec![Trit::ZERO; n * k];
-        let mut scratch = vec![half::f16::ONE; nb];
-        for ni in 0..n {
-            let row = &packed[ni * row_bytes..(ni + 1) * row_bytes];
-            let trits_row = &mut trits[ni * k..ni * k + k];
-            let res = match format {
-                TernaryFormat::Tq2_0 => unpack_tq2_0_row(row, trits_row, &mut scratch),
-                TernaryFormat::Tq1_0 => unpack_tq1_0_row(row, trits_row, &mut scratch),
-                other => return Err(BackendError::UnsupportedFormat(other)),
-            };
-            res.map_err(|e| BackendError::Backend(format!("unpack row {ni}: {e}")))?;
-        }
-        let widened: Vec<i32> = trits.iter().map(|t| i32::from(t.get())).collect();
-
-        // A zero-element weight buffer (N==0 or K==0) would be an invalid Metal
-        // allocation; keep a non-allocating handle for those degenerate shapes
-        // (mpgemm short-circuits zero-dim cases before ever touching the buffer).
-        let weights = if widened.is_empty() {
-            self.handles
-                .device
-                .new_buffer(1, MTLResourceOptions::StorageModeShared)
-        } else {
-            shared_buffer(&self.handles.device, &widened)
+        // TQ2_0 keeps the PACKED bytes on device (decoded in-kernel by
+        // `mpgemm_tq2_0`) so device memory stays at the packed ~2.06 bit/trit —
+        // 16× less than widening to i32 — matching the cuda/rocm backends so large
+        // models fit unified memory. TQ1_0 (the small/rare format) is host-unpacked
+        // and widened to one i32 per trit for the `mpgemm` kernel. A zero-element
+        // buffer would be an invalid Metal allocation, so degenerate shapes get a
+        // 1-byte placeholder (mpgemm short-circuits zero-dim cases before touching
+        // the buffer).
+        let dev = &self.handles.device;
+        let (weights, repr) = match format {
+            TernaryFormat::Tq2_0 => {
+                let buf = if packed.is_empty() {
+                    dev.new_buffer(1, MTLResourceOptions::StorageModeShared)
+                } else {
+                    shared_buffer(dev, packed)
+                };
+                (buf, WeightRepr::PackedTq2_0 { row_bytes })
+            }
+            TernaryFormat::Tq1_0 => {
+                let mut trits = vec![Trit::ZERO; n * k];
+                let mut scratch = vec![half::f16::ONE; nb];
+                for ni in 0..n {
+                    let row = &packed[ni * row_bytes..(ni + 1) * row_bytes];
+                    let trits_row = &mut trits[ni * k..ni * k + k];
+                    unpack_tq1_0_row(row, trits_row, &mut scratch)
+                        .map_err(|e| BackendError::Backend(format!("unpack row {ni}: {e}")))?;
+                }
+                let widened: Vec<i32> = trits.iter().map(|t| i32::from(t.get())).collect();
+                let buf = if widened.is_empty() {
+                    dev.new_buffer(1, MTLResourceOptions::StorageModeShared)
+                } else {
+                    shared_buffer(dev, &widened)
+                };
+                (buf, WeightRepr::WidenedI32)
+            }
+            other => return Err(BackendError::UnsupportedFormat(other)),
         };
 
         Ok(Box::new(MetalBuffer {
             weights: WeightBuf(weights),
+            repr,
             n,
             k,
             bytes: packed.len(),
@@ -358,11 +399,18 @@ impl TernaryBackend for MetalBackend {
             (MAX_DIM, total_groups.div_ceil(MAX_DIM))
         };
         let lane_stride = gx * TG_SIZE;
+        // Select the kernel + per-row stride from how the weights are laid out:
+        // packed TQ2_0 (decoded in-kernel) vs widened-i32 (TQ1_0).
+        let (pipeline, row_bytes) = match buf.repr {
+            WeightRepr::PackedTq2_0 { row_bytes } => (&self.handles.pipeline_tq2, row_bytes as u32),
+            WeightRepr::WidenedI32 => (&self.handles.pipeline, 0u32),
+        };
         let dims = Dims {
             m: m as u32,
             n: n as u32,
             k: k as u32,
             lane_stride: lane_stride as u32,
+            row_bytes,
         };
 
         // Shared-storage input buffers (unified memory — filled by the CPU, read
@@ -377,7 +425,7 @@ impl TernaryBackend for MetalBackend {
 
         let cmd = self.handles.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&self.handles.pipeline);
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(&act_buf), 0);
         encoder.set_buffer(1, Some(&buf.weights.0), 0);
         encoder.set_buffer(2, Some(&scales_buf), 0);

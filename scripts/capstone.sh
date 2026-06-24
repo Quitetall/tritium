@@ -123,7 +123,14 @@ printf '########################################################################
 # (1) BUILD  — the "install" stage from a clean checkout.
 # ----------------------------------------------------------------------------
 step 1 "BUILD (cargo build --workspace + the tritium binary)"
-cargo build --workspace
+# Exclude tritium-py: it is a PyO3 `extension-module` cdylib that deliberately does
+# not link libpython (symbols resolve at load via the host interpreter), so building
+# its cdylib under plain `cargo build` fails to link on macOS (undefined `_Py*`).
+# It is built+tested via maturin, not cargo — mirror ci.yml's `--exclude tritium-py`.
+# (On Linux the cdylib linked fine under plain `cargo build` — ELF allows unresolved
+# symbols in a `.so` — so excluding it there is a harmless no-op; only macOS's linker
+# errors.) Keeps this capstone portable across Linux and macOS.
+cargo build --workspace --exclude tritium-py
 cargo build -p tritium-cli
 TRITIUM="$REPO_ROOT/target/debug/tritium"
 [ -x "$TRITIUM" ] || fail BUILD "tritium binary not found at $TRITIUM after build"
