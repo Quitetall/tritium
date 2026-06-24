@@ -7,6 +7,44 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.6.8] — 2026-06-23 — full backend matrix: tritium-metal + tritium-rocm + third-party license bundle
+
+Lands the last two backends (ADR 0009 full scope) and the dependency-license tracking for v1.0
+packaging. With cpu/cuda/wgpu/wasm, the backend matrix is now **code-complete**; the Metal/ROCm GPU
+code is written but gets its first compile + parity validation on the target hardware (the new
+self-hosted CI lanes) — the fenced-HW step.
+
+### Added
+- **`tritium-metal`** (Apple Metal; `metal` + `register` features) — an MSL compute kernel porting the
+  wgpu WGSL add/sub/skip ternary mpGEMM (runtime-compiled; shared-storage `MTLBuffer` / unified
+  memory) + a `TernaryBackend` impl + linkme `"metal"` registration + a conformance test that
+  self-skips when no Metal device is present. `metal-rs` (`= 0.33.0`) is declared under
+  `[target.'cfg(target_os = "macos")']`, so a Linux/CI build never resolves it; all device code is
+  `cfg(target_os = "macos")`. The crate is an inert empty lib off macOS.
+- **`tritium-rocm`** (AMD ROCm/HIP; `rocm` feature, off by default) — raw `extern "C"` FFI to the HIP
+  runtime (zero external deps); a `build.rs` that shells `hipcc` (a **no-op** unless
+  `CARGO_FEATURE_ROCM` is set) to compile `kernels/tq2_0_add.hip` (a port of the cuda add-only kernel)
+  + a `TernaryBackend` impl + linkme `"rocm"` registration + a self-skipping conformance test. Inert
+  empty lib without the feature.
+- Two manual self-hosted CI lanes (`metal`: Apple-Silicon; `rocm`: AMD + ROCm), `if: ${{ false }}`,
+  mirroring the `gpu`/`wgpu` lanes — where the GPU code first compiles + validates parity.
+- **`THIRD-PARTY-LICENSES.md`** — the bundled license texts of all 369 third-party crates (via
+  `cargo-about`; config `about.toml` + `about.hbs` committed for reproducibility), the v1.0-packaging
+  dependency-tracking step. Covers 9 licenses incl. the newly allow-listed MPL-2.0 (`colored` ← burn)
+  and CDLA-Permissive-2.0 (`webpki-roots` ← ort).
+
+### Honesty
+- The Metal/ROCm GPU code was authored **blind** (no Metal framework / no ROCm toolkit on the dev box).
+  Verified here: the Linux workspace stays green (`cargo build`/`clippy`/`test --workspace`), each
+  crate gated to an inert lib (`cargo tree` confirms neither the metal binding nor any hip dep is
+  pulled by default; negative-registration tests pass). Adversarial port-fidelity review vs the
+  verified wgpu/cuda kernels: zero findings. The kernels' first real compile + numeric parity is the
+  hardware lane.
+
+### Build
+- New workspace members `tritium-metal`, `tritium-rocm`; `metal = "=0.33.0"` added to
+  `[workspace.dependencies]` (macOS-target-only). Internal dep pins bumped to `0.6.8`.
+
 ## [0.6.7] — 2026-06-23 — v1.0 capstone prep: freeze audit + model-zoo/benchmark docs + CPU fresh-env e2e
 
 The reachable **v1.0 Release** preparation (ADR 0012), on the 0.6.x line. The v1.0.0 **tag** itself
