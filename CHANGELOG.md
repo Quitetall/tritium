@@ -7,6 +7,27 @@ pre-1.0, so APIs may break between minor versions.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [0.7.0] — 2026-06-24 — v0.70 Backend Breadth milestone COMPLETE (full backend matrix hardware-validated)
+
+The **v0.70 Backend Breadth** milestone (ADR 0009) is complete: every backend in the matrix —
+cpu · cuda · wgpu · wasm · **metal · rocm** — now passes the frozen conformance suite on its own
+hardware. The two fenced-HW backends are validated on real silicon:
+
+- **Metal** ✅ — bit-exact 89-vector conformance on a real Apple M1 (Scaleway M1-M, macOS 26.3.2),
+  shipped `v0.6.9`, plus an in-kernel TQ2_0 decode for device-memory parity with cuda/rocm.
+- **ROCm** ✅ — the frozen-vector conformance **ran on a real AMD Instinct MI300X** (gfx942, ROCm 7.2.4,
+  Hot Aisle) — confirmed executed on the GPU, not self-skipped — matching `reference_mpgemm` within 1e-4.
+  The HIP kernel fat-compiles for gfx900..gfx1100; the `build.rs` `libamdhip64` link-search fix (`5397781`)
+  makes it link on a stock ROCm install.
+
+No new code in this release — the backend code shipped across the 0.6.x line (wgpu/wasm `v0.6.1`,
+metal/rocm `v0.6.8`, metal memory-parity `v0.6.9`, rocm link fix `5397781`). This tag marks the milestone
+now that both fenced-HW parity runs have landed (per ADR 0002: no milestone tag before its HW gate clears).
+
+### Validated
+- Full backend matrix hardware-conformant: cpu (SIMD), cuda (Ampere, `v0.6.0`), wgpu (4090 Vulkan +
+  Apple Metal HAL), wasm (wasmtime), **metal (Apple M1)**, **rocm (AMD MI300X)**.
+
 ## [0.6.9] — 2026-06-24 — Metal parity validated on Apple Silicon + Metal memory-parity (in-kernel TQ2_0 decode) + macOS-portable capstone
 
 First hardware validation of a fenced-HW backend. **Metal parity is green on a real Apple M1** (Scaleway
