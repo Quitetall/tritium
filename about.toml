@@ -1,0 +1,15 @@
+# cargo-about config — generates THIRD-PARTY-LICENSES.md (v0.90/v1.0 packaging).
+# The accepted set mirrors deny.toml's [licenses].allow, so a license that passes
+# the supply-chain gate is also bundleable here (and vice versa).
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
