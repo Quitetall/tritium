@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch: # manual "Run workflow" — drives the self-hosted GPU lanes (gpu/rocm/wgpu/perf/serve-e2e) once a matching runner is registered
   schedule:
     - cron: "0 4 * * 1" # weekly Monday 04:00 UTC — drives the fuzz lane
 
@@ -95,7 +96,7 @@ jobs:
   gpu:
     name: cuda conformance + parity
     runs-on: [self-hosted, gpu]
-    if: ${{ false }} # enable on a runner with nvcc + a GPU
+    if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually once a self-hosted nvcc+GPU runner is registered
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -111,8 +112,8 @@ jobs:
   # framework on the Linux CI matrix), so this lane is where they are first built.
   metal:
     name: metal conformance (apple silicon)
-    runs-on: [self-hosted, macos] # or `macos-14` (Apple-Silicon GitHub-hosted)
-    if: ${{ false }} # enable on an Apple-Silicon runner with a Metal device
+    runs-on: macos-14 # GitHub-hosted Apple-Silicon (free) — Metal device may be paravirtual; the conformance test self-skips if MTLCreateSystemDefaultDevice() is nil, so the lane stays green either way
+    if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }} # free Metal CI on main pushes + on-demand
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -131,7 +132,7 @@ jobs:
   rocm:
     name: rocm conformance (hip)
     runs-on: [self-hosted, rocm]
-    if: ${{ false }} # enable on an AMD-GPU runner with the ROCm toolkit (hipcc)
+    if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually once a self-hosted AMD-GPU + ROCm (hipcc) runner is registered
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -151,7 +152,7 @@ jobs:
   perf-regression:
     name: perf regression (tok/s vs baseline)
     runs-on: [self-hosted, gpu]
-    if: ${{ false }} # enable on the pinned 4090 runner with nvcc + the model
+    if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually on the pinned 4090 runner (nvcc + the model)
     needs: gpu
     steps:
       - uses: actions/checkout@v4
@@ -213,7 +214,7 @@ jobs:
   wgpu:
     name: wgpu conformance (vulkan)
     runs-on: [self-hosted, gpu]
-    if: ${{ false }} # enable on a runner with a Vulkan adapter + driver
+    if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually once a self-hosted Vulkan-adapter runner is registered
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -242,7 +243,7 @@ jobs:
   serve-e2e:
     name: serve e2e (real model)
     runs-on: [self-hosted, gpu]
-    if: ${{ false }} # enable with TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH set
+    if: ${{ github.event_name == 'workflow_dispatch' }} # dispatch manually with TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH set
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

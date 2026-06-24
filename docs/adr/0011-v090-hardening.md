@@ -1,12 +1,16 @@
 # ADR 0011 — v0.90 Hardening
 
-- **Status:** Planned
+- **Status:** In progress — reachable hardening tooling shipped (0.5.x/0.6.x); GPU-matrix exit gate **amended 2026-06-24** (see Amendment below)
 - **Date:** 2026-06-15
 - **Relates:** executes the 0.90 milestone of [ADR 0002](./0002-release-roadmap.md); follows [ADR 0010](./0010-v080-interop.md) (v0.80 interop), precedes [ADR 0012](./0012-v100-release.md) (v1.0 release)
 
 ## Status
 
-Planned — not started. No code yet.
+In progress. The reachable hardening tooling has shipped across the 0.5.x/0.6.x
+line: cargo-deny, fuzz breadth + corpora, doc-coverage + semver baseline, mdbook +
+dead-link lane, ASan/MSan/TSan + `miri` sanitizers, abi3 Python wheels, cpu-bench-
+smoke, SBOM, and SECURITY/threat-model. The remaining gates depend on GPU/multi-GPU
+hardware in CI; those are addressed by the **2026-06-24 amendment** below.
 
 Must land first: the 0.80 interop milestone (ADR 0010) must be tagged green —
 this milestone hardens the *entire* accumulated surface (all crates, all
@@ -21,6 +25,36 @@ Hard blockers:
   paths need the **≥2-GPU** lane from 0.60.
 - Acceptance-model parity examples in docs need the **external model download**
   (BitNet b1.58 2B4T) available in CI.
+
+## Amendment (2026-06-24) — GPU-matrix exit gate
+
+The "full CI matrix green on every push" gate assumed standing per-platform + GPU
+runners. Continuous GPU runners cost $700–6000/mo per GPU; a research project has no
+such budget, and parking the GPU lanes at `if: false` indefinitely is not a real
+gate. The gate is therefore amended as follows:
+
+1. **GPU-backend parity is validated by fenced manual sessions, with logged evidence**,
+   rather than a per-push CI matrix:
+   - **cuda** — Ampere / 2×A100 (51/51 + memcheck-clean, `v0.6.0`).
+   - **wgpu** — 4090 Vulkan adapter (`v0.6.1`) + the Apple **Metal HAL** (`v0.6.9`).
+   - **wasm** — wasmtime (`v0.6.1`).
+   - **metal** — real Apple M1, bit-exact 89-vector conformance (`v0.6.9`).
+   - **rocm** — real AMD Instinct MI300X (gfx942, ROCm 7.2.4), frozen-vector
+     conformance ran on-GPU, 1e-4 (`v0.7.0`).
+   Each is recorded in `CHANGELOG.md` and `docs/ROADMAP.md`.
+2. **The GPU CI lanes are kept as reproducible, dispatchable recipes, not dead code.**
+   `gpu` / `rocm` / `wgpu` / `perf-regression` / `serve-e2e` are gated on
+   `workflow_dispatch` (`runs-on: [self-hosted, …]`): register a matching GPU runner,
+   click *Run workflow*, and the exact validation re-runs on demand. The **`metal`**
+   lane runs for free on the GitHub-hosted `macos-14` (Apple-Silicon) runner on every
+   `main` push, self-skipping cleanly if that VM's Metal device is unavailable.
+3. **"Green on every push" is waived for the paid-GPU backends** (cuda/rocm/wgpu)
+   absent standing runners; the matrix gate is considered met by (1) + (2). If a
+   continuous GPU-runner budget ever exists, flipping the `workflow_dispatch` guards
+   back to `push` restores the always-on matrix with no other change.
+
+This keeps the gate honest (the validation is real and reproducible) without
+pretending a hobby-scale project can fund 24/7 GPU CI.
 
 ## Scope
 
