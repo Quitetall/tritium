@@ -5,6 +5,13 @@ states the trust model, the threat boundary for **untrusted model files**, the
 hardening that defends it, and how to report a vulnerability. It is the v0.90
 security gate (ADR 0011).
 
+> **Full threat model:** the complete surface-by-surface analysis — 30 threats
+> across the model-file parsers, the C ABI / FFI, the HTTP server, the compute
+> kernels + backend dispatch, and the supply-chain + build pipeline, each with
+> mitigations cited to source (file/line or CI lane) and residual risks — is in
+> [`docs/security/threat-model.md`](docs/security/threat-model.md). This page is
+> the policy + trust-model summary; that document is the detailed review.
+
 ## Trust model
 
 The primary untrusted input is a **model file**: weights, config metadata, and

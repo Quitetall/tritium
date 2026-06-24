@@ -1,0 +1,195 @@
+# Tritium Threat Model
+
+**Date:** 2026-06-24
+**Status:** Committed security document — satisfies the **ADR-0011 v0.90 security gate**.
+
+This document is the consolidated threat model for Tritium, synthesized from five code-grounded surface audits (model-file parsers, the C ABI / FFI boundary, the OpenAI-compatible HTTP server, the compute kernels + backend dispatch, and the supply-chain + build pipeline). Its purpose is to state plainly what Tritium protects, against whom, where the trust boundaries lie, and — surface by surface — which threats exist, which mitigations are present **in committed code** (cited to file/line or CI lane), and which residual risks remain. Mitigations are reported only where they exist in the source; gaps are stated honestly as "no mitigation yet; tracked" rather than fabricated.
+
+---
+
+## 1. Scope & deployment model
+
+Tritium is a **Rust library plus a local / trusted-deployment inference server**. It is not a multi-tenant, internet-facing service. The assumed deployment is one of:
+
+- An embedding application linking the library directly (Rust or via the C ABI / Python ctypes).
+- A local OpenAI-compatible HTTP server (`tritium-serve`) that **binds loopback only** (`127.0.0.1`) and is **off by default** (feature-gated behind `serve`).
+
+The trusted parties are: the **local operator** who chooses what to run, the **embedding application** that links the library, and the **build/CI host**. The principal untrusted inputs are: **model files downloaded from third parties**, **network request bytes** to the local server, **raw pointers/lengths from foreign FFI callers**, and the **third-party crate graph** pulled at build time.
+
+Because the entire host-side parsing/compute path that touches untrusted bytes is **safe Rust** (`#![forbid(unsafe_code)]` in `tritium-format`) or carefully-bounded `unsafe` (the SIMD/GPU kernels), the **realistic worst case is denial of service (panic/abort/OOM) or a logic-level mis-load — not remote code execution**. Severities throughout are calibrated to this trusted/local model; several would rise to high/critical under public network exposure (called out where relevant).
+
+---
+
+## 2. Assets
+
+| Asset | What we protect |
+|---|---|
+| **Host process integrity / memory safety** | No untrusted input may corrupt memory, alias mutable state, or escalate to code execution in the host process or embedding application. |
+| **Availability** | A malformed model file, hostile request, or pathological shape should not crash, hang, or OOM the process beyond a contained, recoverable error. |
+| **The user's machine when loading third-party models** | Loading an attacker-controlled model file must not escape structural-parse safety: no OOB, no type confusion, no arbitrary file/path access beyond the operator's own choice. |
+| **Build host integrity** | The developer/CI build machine must not execute attacker-controlled code beyond the inherent (and gated) Rust build-time exposure. |
+
+---
+
+## 3. Trust boundaries
+
+```
+        UNTRUSTED INPUTS                         TRUSTED CORE
+  ┌──────────────────────────┐
+  │ Third-party model files   │  parse →  ┌────────────────────────────────┐
+  │ (.gguf/.safetensors/SALT) │──────────▶│ tritium-format                  │
+  └──────────────────────────┘           │  #![forbid(unsafe_code)]         │
+                                          │  bounds-checked LeCursor/Cursor  │
+  ┌──────────────────────────┐           └──────────────┬─────────────────┘
+  │ Network req bytes (JSON,   │  HTTP →                  │ post-parse: shapes,
+  │ prompts, sampling params)  │──────┐                   │ weights, TensorInfo
+  │ → loopback 127.0.0.1 only  │      │                   ▼  (trusted relative
+  └──────────────────────────┘      │            ┌──────────────────────┐    to the parser)
+                                     ├───────────▶│ tritium-nn / runtime  │
+  ┌──────────────────────────┐      │            │ tritium-cpu / -cuda    │
+  │ FFI raw ptr+len, model     │ C ABI│            │ -rocm / -metal kernels │
+  │ path (foreign C/ctypes)    │──────┘            └──────────────────────┘
+  └──────────────────────────┘
+                                          ┌────────────────────────────────┐
+  ┌──────────────────────────┐  resolve  │ Build host (dev/CI)             │
+  │ crates.io graph, build.rs, │──────────▶│ cargo-deny, Cargo.lock, SBOM,   │
+  │ proc-macros, nvcc/hipcc    │           │ CARGO_FEATURE_* gates           │
+  └──────────────────────────┘           └────────────────────────────────┘
+
+  Trusted: the local operator, the embedding application, shapes/weights AFTER
+  the format parser has validated them, the build/CI host itself.
+```
+
+The boundary is the **function/handler/trait-call entry**: from there inward, all header counts, lengths, offsets, dims, type tags, pointers, JSON fields, and request params are treated as hostile. Once data has crossed the `tritium-format` parser, it is *relatively* trusted by the downstream kernels — the residual kernel-side attacker model is a buggy/malicious in-process caller passing inconsistent shapes, plus pathological dimensions.
+
+---
+
+## 4. Threats by surface
+
+### 4.1 Model-file parsers (`tritium-format`)
+
+The whole crate is `#![forbid(unsafe_code)]` (`crates/tritium-format/src/lib.rs:29`), so the worst outcome is a clean panic, never memory corruption.
+
+| Threat | STRIDE | Severity | Mitigation (cited) | Residual risk |
+|---|---|---|---|---|
+| Integer overflow / OOB slice in GGUF offset+length & dim arithmetic | Tampering | low | `forbid(unsafe_code)` (lib.rs:29); `Cursor::take` checked_add + `slice::get` (gguf.rs:106-111); `checked_mul` dim product (gguf.rs:273-279, 452-455); `div_ceil`+`checked_mul` for n_bytes (gguf.rs:312-315); span check `checked_add` vs `data_section_len` via `saturating_sub` (gguf.rs:447,458-465); `MAX_COUNT`/`MAX_DIMS` caps (gguf.rs:401,430); tests for dims_overflow/offset_oob/truncation/2000 arbitrary inputs | None in `read_gguf` itself. Unknown ggml types get `n_bytes=0`; only their offset is bounds-checked (gguf.rs:463) — payload sizing is pushed to the consumer (see I2_S threat). |
+| Unbounded allocation / OOM from attacker-declared counts | DoS | low | `MAX_PREALLOC=4096` speculative reserve, grow-on-demand (gguf.rs:48,426); array reserve `.min(1024)` (gguf.rs:240); tqbin validates `n_tokens*4 <= remaining` (tqbin.rs:60-73); tqidx caps reserve by `remaining/10` (tqidx.rs:117); salt_bundle caps by `len/18` & per-row by `blob.len()/HEADER` (salt_bundle.rs:148,173); sparse rejects `k>=2^31` + exact-length check (sparse.rs:301,324); `unpack_salt_row` exact `== bytes.len()` (salt.rs:120-126); safetensors `header_end <= buf.len()` (safetensors.rs:130). Tests for adversarial n_dims/tensor_count/n_tokens/shard_count. | No hard cap on total metadata/tensor memory beyond input length; a multi-GB array needs a multi-GB file. OOM bounded by file size — acceptable for local/trusted load. |
+| `compute_zero_bitmap` / `compute_zero_bitmaps` panic on under-length input | DoS | low | `forbid(unsafe_code)` guarantees clean panic; sole in-tree callers (cuda.rs:9135,9176,9211,9246,9285) compute `k/n/row_bytes` self-consistently from the same packed buffer. | **Real gap.** These two are the only public byte-consuming functions lacking the length-check-returns-Error discipline used everywhere else (tq2.rs:93-124), and they have **no fuzz target**. A future caller passing a model-derived `k/n` with a mismatched packed length panics. Tracked: add a length precondition returning `FormatError` + `debug_assert`. |
+| Type confusion / unvalidated enum & tag fields | Tampering | info | `read_value` rejects unknown `value_type` (gguf.rs:249) and forbids nested arrays via depth guard (gguf.rs:229-232); version whitelist `{2,3}` (gguf.rs:395); magic check (gguf.rs:390); unknown ggml_type sized 0 not misread (gguf.rs:299); I2_S reserved code `0b11` rejected (i2s.rs:56-63); safetensors rejects unsupported dtype (safetensors.rs:202); every sidecar enforces magic+version; UTF-8 validated for all strings. | None material. `as_u64` widening returns None for negative ints; zero alignment falls back to `DEFAULT_ALIGNMENT`. No silent coercion found. |
+| Truncated / overlapping / mis-sized tensor data regions | Tampering | info | safetensors `data.get(a..b)` (safetensors.rs:194-197), `checked_mul` shape product + `LengthMismatch` (safetensors.rs:212-226); GGUF validates every `[offset, offset+n_bytes)` vs `data_section_len` (gguf.rs:458-465); salt_gguf walks self-describing rows bounds-checked (salt_gguf.rs:149-169). | safetensors does **not** detect overlapping tensor regions — harmless because the reader only ever reads (never writes), each read independently bounds-checked. No security impact. |
+| No authenticity/integrity verification of model files | Spoofing | info | None at this layer, **by design** — `tritium-format` is a structural parser, not a trust anchor. `forbid(unsafe_code)` + total parsers ensure a malicious file cannot escalate beyond mis-load or DoS. | Model-content trust is out of scope and unsolvable here (no signature scheme in GGUF/safetensors). Mitigation is operational: obtain models from trusted sources / verify hashes out of band. |
+
+**Downstream consequence (just outside the crate boundary, reachable from the same untrusted file):** the `tritium-nn` loader re-sizes I2_S payloads and recomputes `n_out*k_in` with unchecked arithmetic — `(file.tensor_data_offset + info.offset) as usize` (weights.rs:124), `start + len` (weights.rs:134), `n_out * k_in` (weights.rs:174). `bytes.get(start..start+len)` keeps the slice safe (returns None, not OOB), so impact is at most a debug-build panic (DoS) on a hostile file; on 64-bit with realistic file sizes these cannot wrap to an in-bounds slice. **Tracked:** loader should reuse `info.element_count()` and checked adds.
+
+---
+
+### 4.2 C ABI / FFI boundary (`tritium-ffi`)
+
+The boundary is trusted Rust ↔ a foreign caller supplying raw pointers, lengths, and a model path. All memory-safety obligations on inbound pointers (validity, alignment, capacity, exclusivity, liveness) are **contractual**; Tritium can only null-check.
+
+| Threat | STRIDE | Severity | Mitigation (cited) | Residual risk |
+|---|---|---|---|---|
+| `catch_unwind` is a no-op under shipped `panic=abort` — `TritiumStatus::Panic` unreachable in release/dist | DoS | low | This is the **safe** outcome for a no-unwind FFI contract (unwinding across `extern "C"` would be UB). Behavior documented honestly (lib.rs:11-17,55-58); `catch_unwind` still protects dev/test (`panic="unwind"`). | Any reachable internal panic aborts the host process in release/dist; `Panic` status can never be returned there. Availability-only; acceptable for trusted/local. Documentation/expectation issue, not a code fix. |
+| Inbound pointer validity/alignment/true-capacity unverifiable beyond null | Tampering | **medium** | Every pointer null-checked (lib.rs:106,166,173-178); out-buffer write gated — `*out_len=tokens.len()`, `BufferTooSmall` with nothing written when `> out_cap` (lib.rs:192-195), copy uses `tokens.len() <= out_cap` so Tritium never writes past declared capacity (lib.rs:196-199); null-iff-zero-length invariants enforced; per-fn safety contracts documented. | Inherent to any C ABI: validity/alignment/true capacity of non-null pointers cannot be checked in-language. Residual write-overflow risk = a caller who **lies** about `out_cap`. Acceptable for trusted/local; real risk for any embedder forwarding untrusted length/pointer values. |
+| Handle documented Send-not-Sync, but type auto-derives Sync; concurrency enforced only by docs | Tampering | **medium** | Single-writer/not-concurrent contract documented (lib.rs:23-26,153); `&mut *model` borrow (lib.rs:180) makes exclusive access explicit in impl. | No explicit `impl !Sync`; `TritiumModel` wraps `ModelRunner` whose fields are all `Send+Sync` (`TernaryBackend: Send+Sync`, tritium-spec/src/lib.rs:57), so it almost certainly auto-derives **both**. Two concurrent `tritium_generate` calls on one handle race the mutable KV cache = UB. **No runtime guard.** Tracked: cheap `AtomicBool` "busy" guard returning a distinct status on re-entry. |
+| Use-after-free / double-free of the model handle | Tampering | **medium** | `tritium_model_free` is null-safe (lib.rs:212); ownership documented (free exactly once, no use-after-free, lib.rs:20-22,206-209); drop wrapped in `catch_unwind`. | No defense against UAF/double-free: a stale non-null pointer is indistinguishable from a live one (raw `Box::into_raw`, no generation counter/freed-flag). Inherent to opaque-handle C ABIs. Tracked: magic sentinel zeroed on free, or a live-handle registry, to fail fast. |
+| Out-parameter state on every path of `tritium_generate` | Info Disclosure | info | `*out_len=0` written before any fallible work (lib.rs:169-172) so output state defined on every path where `out_len` is non-null; real count overwrites on Ok/BufferTooSmall (lib.rs:192); `out_status` only written when non-null (lib.rs:100); out-of-vocab token IDs bounds-checked in embedding gather → `MissingTensor`→`Generate` not OOB (runner.rs:241-245). | Defined-output behavior is genuinely correct; this entry documents the mitigation. Residual = the usual "caller ignores status code." No code fix needed. |
+| Model file read from caller-controlled path with host privileges | Info Disclosure | low | Invalid-UTF-8 paths rejected (lib.rs:111-112); I/O failure → `TritiumStatus::Load` without leaking errno (lib.rs:113); runs with caller's own privileges (no escalation); parse failures contained to `Load`. | No path sandboxing/allowlisting; whole file read into memory before parse (memory-pressure DoS on a huge file). Acceptable where the caller chooses the path with its own rights; a concern only if an embedder forwards untrusted paths (embedder's responsibility). Worth a doc note. |
+
+---
+
+### 4.3 Network server (`tritium-serve`, OpenAI-compatible HTTP/SSE)
+
+Binds **loopback only** (`main.rs:68`, `SocketAddr([127,0,0,1], port)`, no flag to bind `0.0.0.0`) and is **off by default** (`serve` not in default features; bin `required-features=["serve"]`). Severities are calibrated to this localhost/trusted posture; they rise to high/critical under public exposure.
+
+| Threat | STRIDE | Severity | Mitigation (cited) | Residual risk |
+|---|---|---|---|---|
+| No authentication or authorization on any endpoint | Elevation of Privilege | medium | Loopback-only bind (main.rs:68); off-by-default feature gate; localhost/trusted + reverse-proxy-for-exposure intent documented. | **No defense-in-depth if exposed**: no optional bearer-token gate to opt into. On shared hosts loopback isn't a real trust boundary (any local user qualifies). Acceptable for documented single-user-trusted; a residual the moment that assumption breaks. |
+| No request timeout — slowloris / slow-send | DoS | low | axum default 2 MB body limit (axum-core 0.4.5 `DEFAULT_LIMIT=2_097_152`) bounds total bytes; loopback-only bind; generation decoupled onto a bounded queue so request-read stalls don't block decode. | No explicit per-request timeout (no tower `TimeoutLayer`, no `tower-http` dep) and no concurrent-connection cap on the accept loop; many half-open connections could exhaust FDs. Low under loopback-trust; medium/high if exposed. Tracked: `TimeoutLayer` + connection cap. |
+| Unbounded prompt length & `max_tokens` value (compute exhaustion within 2MB body) | DoS | low | 2MB body limit caps prompt bytes; `RunnerGenerator` clamps `max_new = req.max_new.min(n_ctx - prompt_len)`, rejects `prompt_len==0 \|\| > n_ctx` with `ContextOverflow` (generator.rs:259-262); bounded job queue (cap 32) → 429 when full (router.rs:243-255); slow clients self-cancel via per-token `try_send` (worker.rs:89). | No explicit max-prompt-tokens / max-messages limit in the handler; only ceiling is the context window, applied *after* tokenization. `max_tokens` value silently clamped, not rejected. Single decode thread ⇒ inherent head-of-line blocking. A configurable max-prompt-length + per-request decode budget would close it. |
+| Streaming (SSE) connection exhaustion via many concurrent streams | DoS | low | Bounded job queue (cap 32) → 429 + Retry-After (router.rs:245-254); per-token `try_send` cancels stalled readers (worker.rs:9-13,86-90); loopback bind; graceful-drain flag closes in-flight streams on shutdown (router.rs:134, main.rs:79-99). | No separate global HTTP concurrency limit (no `ConcurrencyLimitLayer`); only throttle is decode queue depth. 64-token-per-job buffer × active streams is small/bounded. Fine under loopback-trust. |
+| Handler panic taking down the server | DoS | low | Generation under `catch_unwind` per job → `GenEvent::Error`, worker continues (worker.rs:80-105); `AliveGuard` + `/healthz` reports 503 when worker dead (worker.rs:54-59, router.rs:405-412); sampler `None` handled as Backend error (generator.rs:272-273); `unwrap_or_default` on decode/serialize paths. | **Under `panic=abort` release/dist builds `catch_unwind` is a no-op** (FFI panic-abort contract) — a panic-inducing request kills the whole process (process-kill DoS). Mitigation holds only for unwind dev/test builds. Residual depends on build profile. |
+| Worker death (closed job channel) | DoS | info | `try_send` `Closed` → 503 (router.rs:256-263); `/healthz` reports unhealthy when `worker_alive` false (router.rs:405-412); draining flag → 503 during shutdown (router.rs:134-141). | No automatic worker restart — needs external process supervision to recover. Detection exists; self-healing does not. Reasonable for a CLI binary expecting a supervisor. |
+| Unknown JSON fields silently ignored (no `deny_unknown_fields`) | Tampering | info | Intentional OpenAI-compatibility (dto.rs:5-6,45-69); security-relevant fields individually validated: temperature `[0,2]` (router.rs:150), top_p `(0,1]` & finite (router.rs:187-196), stop count `<=4` non-empty (router.rs:171-186), `max_tokens != 0` (router.rs:197), empty messages rejected (router.rs:142), model id 404-matched (router.rs:158-165). | Footgun (typo'd field silently dropped), no security impact. Not a real vulnerability. |
+
+---
+
+### 4.4 Kernels & backend dispatch (`tritium-cpu` SIMD/LUT, `tritium-spec` trait, CUDA/ROCm/Metal)
+
+The boundary is the `TernaryBackend` trait call; callers are in-process Rust passing host slices + a `GemmShape`. Weights are **post-parse** (already crossed the `tritium-format` boundary). The UB-bearing code is the hand-written `unsafe` SIMD and the GPU device kernels (no memory protection).
+
+| Threat | STRIDE | Severity | Mitigation (cited) | Residual risk |
+|---|---|---|---|---|
+| Shape-mismatch OOB in CPU SIMD kernels | Tampering | low | **4-deep defense:** (1) `CpuBackend::mpgemm` validates `act.len()==m*k`, `scales.len()==n`, `out.len()==m*n` → `ShapeMismatch` (lib.rs:251-270); (2) `unpack_weights` allocates `trits = vec![…; n*k]` exactly (lib.rs:146-173); (3) `kernel::dispatch_mpgemm` re-validates all four lengths (kernel.rs:55-61); (4) each SIMD kernel re-validates at entry, defers to scalar on mismatch (kernel.rs:208-212; avx512.rs:82-85; neon.rs:80-83); every raw load/store carries a proven `// SAFETY:` note. Tests `mpgemm_rejects_bad_operand_lengths` (lib.rs:535), ASan/MSan/TSan build-std lane (sanitizers.yml:84-170). | None material. Only residual is that the sanitizer lane is **weekly/manual, not a required per-push gate** — a newly-introduced OOB could merge and sit until the next scheduled run. |
+| CUDA *inference* `mpgemm_kernel` lacks the i32/u32 overflow guard the training/ROCm/Metal paths have | DoS | low | Partial backstop: up-front length checks `act.len()==m*k`/`out.len()==m*n`/`scales.len()==n` (cuda.rs:1977-1994) run before the cast. Sibling paths prove the correct guard exists: training `check_grad_launch_bounds` checked_mul vs `i32::MAX` (cuda.rs:564-575), ROCm (rocm.rs:417-424), Metal rejects `>u32::MAX` (backend.rs:375-383). | **Real inconsistency.** The CUDA inference path is the one mpgemm entry missing the `checked_mul`/`i32::MAX` guard — it does `(m*n) as u32` (cuda.rs:2016) and `i32` casts (cuda.rs:2049-2051) and `alloc_zeros::<f32>(m*n)` (cuda.rs:2009) without the product check. Debug ⇒ panic (no-panic contract violation); release ⇒ truncated grid → device-side OOB if the length backstop is defeated. GPU OOB invisible to host ASan/MSan. Tracked: lift `check_grad_launch_bounds` to cover the inference kernel. |
+| Index-arithmetic overflow in GPU device kernels | Tampering | info | Per-row bases widened to 64-bit: metal `ulong` (mpgemm.metal:57-60,93-97), hip/cuda `long long` (tq2_0_add.hip:58-59,66-67,89); host guards real (Metal backend.rs:375-383, ROCm rocm.rs:417-424); tail-thread `idx >= total` guard before any load (mpgemm.metal:51,88; tq2_0_add.hip:60); `row_bytes = nb*66` validated host-side at upload (backend.rs:270-277; rocm.rs:347-350). | The CUDA inference missing-guard (above) is the one hole that could feed a truncated dimension into the otherwise-correct 64-bit bases — widening doesn't save you if `m/n/k` were already truncated to i32 on the host. GPU memory has **no sanitizer coverage** in default (non-self-hosted) CI. |
+| rayon row fan-out data race | Tampering | info | `out.par_chunks_mut(...).zip(act.par_chunks(...))` yields provably non-overlapping `&mut` slices (rayon/std guarantee); per-task `chunk_shape` derived from actual chunk length (kernel.rs:69-77); weights/scales shared immutable `&[]`; output bit-identical regardless of thread count (determinism tests lib.rs:746,765); verified under TSan (sanitizers.yml:151-170); `CpuBackend` stateless `Send+Sync`. | None identified. Residual: TSan is weekly/on-demand, not per-push — a future chunking-math change could introduce a race uncaught until the scheduled run. |
+| Backend no-panic contract not enforced against arithmetic overflow | DoS | low | Contract real & tested for bad-shape case: `fused_rejects_bad_shapes` (lib.rs:425), `mpgemm_rejects_bad_operand_lengths` (lib.rs:535); `GemmShape::macs()` widens to u64 (shape.rs:29-31); ROCm/Metal/CUDA-training use `checked_mul`/`u32::MAX` guards. | `m*k`/`m*n`/`n*k` use bare `*` (not `checked_mul`) in the length comparisons across spec/cpu (lib.rs:146, kernel.rs:58, etc.). Overflowing-usize shape ⇒ debug panic (which under `panic=abort` dist aborts the process — DoS) / release wrap. Realistic impact low (petabyte-scale tensors never arise from a real parsed model). Tracked: documented precondition or uniform `checked_mul`. |
+
+---
+
+### 4.5 Supply chain & build (workspace pins, `deny.toml`, build scripts, CI lanes)
+
+The boundary is the developer/CI build machine. Realistic attacker = a compromised upstream/typosquat/malicious transitive dep, or a poisoned local toolchain — not a remote network attacker.
+
+| Threat | STRIDE | Severity | Mitigation (cited) | Residual risk |
+|---|---|---|---|---|
+| CI builds/tests do not use `--locked` — committed `Cargo.lock` not enforced | Tampering | medium | `Cargo.lock` IS committed (repo root + `crates/tritium-format/fuzz/Cargo.lock`); cargo-deny advisories lane (ci.yml:45-52, deny.toml:5-12, `yanked="deny"`) retroactively flags known-advisory deps; caret ranges bounded to compatible majors; `unknown-registry="deny"`/`unknown-git="deny"` (deny.toml:52-54). | **No `--locked`/`--frozen` on any cargo invocation in `ci.yml`** (e.g. lines 33,38,103), so the lockfile is advisory — a fresh semver-compatible malicious patch can be pulled and its build.rs/proc-macro executed, with the lockfile silently rewritten. cargo-deny only catches *published* advisories. Cheap fix tracked: add `--locked` + a step failing if `cargo update --locked` would change anything. |
+| Build scripts trust whatever `nvcc`/`hipcc` is on the local machine | Elevation of Privilege | low | Both scripts hard-gated behind `CARGO_FEATURE_CUDA`/`CARGO_FEATURE_ROCM` early-return (cuda build.rs:55-58, rocm build.rs:41-44) — default cpu-only build never touches a compiler; env-prefixed paths preferred over bare PATH; compiler invoked with only fixed, non-interpolated args (no shell). | PATH fallback (build.rs:178 / 142) trusts the ambient environment; no checksum/signature of the located compiler. Low given trusted-build model (a PATH-poisonable host is already compromised) + the default build is unaffected. Worth a comment acknowledging toolchain-trust. |
+| Arbitrary code execution via dependency build scripts & proc-macros | Elevation of Privilege | medium | cargo-deny `sources` denies unknown registries/git (deny.toml:52-54); `wildcards="deny"` (deny.toml:49); network/native deps exact-pinned (wgpu `=23.0.1`, metal `=0.33.0`, ort `=2.0.0-rc.12`, Cargo.toml:78,84,92) and feature-gated **off by default**; advisories lane + `yanked="deny"`; `multiple-versions="warn"`. | cargo-deny does not detect a novel no-advisory-yet malicious crate and does not sandbox build scripts (no cargo-vet, no `-Zsandbox`). The `ort` `download-binaries` path fetches a native binary at build time (integrity outside Cargo's checksum model) — but only under `--features onnx`. Standard Rust build-time-RCE exposure, partially contained by feature gates. |
+| Floating toolchain (`rust-toolchain@stable`) and unpinned tool installs in CI | Tampering | low | GitHub Actions pinned to major tags (`checkout@v4`, `cargo-deny-action@v2`, `upload-artifact@v4`); `rust-version="1.89"` floor declared (Cargo.toml:44); SBOM generated + uploaded as artifact (ci.yml:325-337); cargo-deny-action pins a recent cargo-deny deliberately. | No exact toolchain pin (no `rust-toolchain.toml`), no SHA-pinned Actions — trusted inputs drift silently. SBOM is only an uploaded artifact, **not diffed/gated** against a baseline. Low impact for a library; weakens reproducibility/audit trail. |
+| Advisory ignore + broad license allow-list widen the trusted set | Repudiation | info | Every ignore/allow documented with rationale/scope/revisit condition (RUSTSEC-2024-0436 `paste`, deny.toml:7-12; licenses 14-41); `yanked="deny"` + advisories lane still run for everything else; licenses are a default-deny **allow-list** (fails closed); NOTICE attribution tracked. | The `paste` ignore is by RUSTSEC id, so a hypothetical future *vulnerability* filed under the reused id would be suppressed (minor — RustSec generally issues new ids). License allow-list growth to review at v1.0 packaging. Well-documented, fails closed on the default path. |
+
+---
+
+## 5. Cross-cutting mitigations
+
+- **`#![forbid(unsafe_code)]` where it holds.** `tritium-format` (lib.rs:29) is the **only** crate-level `forbid(unsafe_code)` — confirmed — so no malformed model byte can corrupt memory; the worst realistic outcome is a contained panic or logic-level mis-load. (The SIMD/GPU kernels are necessarily `unsafe` and are covered by layered shape validation + sanitizers instead.)
+- **Fuzzing.** Committed cargo-fuzz harness with **8 targets** (`gguf`, `safetensors`, `salt_bundle`, `salt_gguf`, `salt_legacy`, `sparse_plane`, `tqbin`, `tqidx`) and **769 corpus files** checked into git. Gap: no `tq2` zero-bitmap target (see 4.1).
+- **Sanitizers + miri.** `.github/workflows/sanitizers.yml` runs ASan/MSan/TSan via `-Zbuild-std` over `tritium-cpu` (and a miri lane over `tritium-core` + `tritium-format --lib`), targeting exactly the unsafe/parse surfaces. **Caveat:** weekly + `workflow_dispatch`, **not a required per-push gate** — regressions in unsafe paths could merge unnoticed until the scheduled run. GPU device-side OOB is observable only via compute-sanitizer on the self-hosted GPU lane.
+- **`panic=abort`.** `[profile.release]` sets `panic="abort"` and `[profile.dist]` inherits it (Cargo.toml:132,136). This makes unwinding across `extern "C"` impossible (the safe FFI choice) but means `catch_unwind` is a **no-op in shipped artifacts** — an internal panic aborts the process (availability loss, not UB/RCE). This applies to both the FFI boundary and the server worker.
+- **Backend no-panic contract.** `BackendError` ("backends never panic on bad input", tritium-spec/src/lib.rs:240-241); enforced & tested for bad shapes, but **not** against unchecked `usize` product overflow (see 4.4).
+- **Supply chain.** Committed `Cargo.lock`; cargo-deny `check licenses bans sources advisories` with `yanked="deny"`, `wildcards="deny"`, `unknown-registry`/`unknown-git="deny"`, default-deny license allow-list; CycloneDX SBOM lane; `CARGO_FEATURE_*` gates keep GPU build scripts inert on the default cpu-only build (the single strongest build-surface mitigation). Gap: no `--locked` enforcement (see 4.5).
+- **Bounds-checked cursors & caps.** `gguf.rs Cursor` / `le_cursor.rs LeCursor`; `MAX_COUNT`/`MAX_DIMS`/`MAX_PREALLOC`/`MAX_STRING_LEN` (gguf.rs:36-48); typed error enums (`GgufError`/`SafeTensorsError`/`FormatError`/`BackendError`/`TritiumStatus`) instead of panics throughout.
+
+---
+
+## 6. Explicitly out of scope
+
+- **TLS / HTTPS termination** for the server — none implemented; expected behind a reverse proxy if ever exposed. Operator's responsibility.
+- **Authentication / authorization** for the server — none implemented; loopback-trust is the design. Operator's responsibility.
+- **A malicious *operator*** — the local operator who chooses what to load and run is trusted by definition.
+- **Model-output content safety / prompt injection / harmful generations** — a model is trusted to be the model the user intended; content-level trust is unsolvable at the parser layer (no signature scheme in GGUF/safetensors).
+- **Model-content provenance / backdoored weights** — structural parse safety is guaranteed; provenance is not. Mitigation is operational (trusted sources, out-of-band hash verification).
+- **Side-channel attacks** (timing, cache, power) — not modeled.
+- **Tokenizer correctness** — the server's id-passthrough MVP is not a security surface here.
+- **Embedder-forwarded untrusted input** — if an embedding application forwards untrusted file paths or untrusted pointer/length values across the FFI, that is the embedder's responsibility (Tritium bounds its own writes to declared capacity but cannot validate a lying caller).
+
+---
+
+## 7. Residual risks & follow-ups
+
+Honest list of gaps the audits flagged, ordered by actionability. None are critical under the documented trusted/local model; several rise under public exposure.
+
+**Cheap, recommended:**
+1. **Add `--locked` to all CI cargo invocations** (ci.yml) + a step that fails on lockfile drift. *(supply chain, medium)* — closes the silent-malicious-patch window the committed lockfile is supposed to prevent.
+2. **Lift `check_grad_launch_bounds` (cuda.rs:564) into the CUDA inference `mpgemm_kernel`** before the `(m*n) as u32` grid math and i32 casts. *(kernels, low)* — the one mpgemm path missing the guard every sibling has.
+3. **Length-check discipline + fuzz target for `tq2.rs compute_zero_bitmap`/`compute_zero_bitmaps`.** *(parser, low)* — the only public byte-consuming functions without the return-Error-on-short-input pattern; no fuzz coverage today.
+4. **Defensive FFI hardening (optional):** an `AtomicBool` in-use guard on `TritiumModel` to reject concurrent `tritium_generate` (medium — concurrency UB); a magic sentinel zeroed on free to fail fast on UAF/double-free (medium).
+5. **Loader hardening:** make `weights.rs` (124,134,174) reuse `info.element_count()` and checked adds instead of unchecked `+`/`*`. *(low)*
+
+**Server hardening (only needed if the loopback/off-by-default assumption is ever relaxed):**
+6. **No auth gate** — add an optional bearer-token check before considering any non-loopback bind. *(medium, →high if exposed)*
+7. **No request timeout / connection cap** — add a tower `TimeoutLayer` + connection cap. *(low, →medium/high if exposed)*
+8. **No explicit max-prompt-tokens / per-request decode budget** — context-window clamp happens only after tokenization; single decode thread ⇒ head-of-line blocking. *(low)*
+
+**Assurance / process:**
+9. **Sanitizer + miri lanes are weekly/manual, not required per-push gates** — a regression in an unsafe/parse path could merge and sit until the next scheduled run. Consider promoting at least a fast subset to a required gate.
+10. **No exact toolchain pin, no SHA-pinned Actions, SBOM not diff-gated** — trusted build inputs can drift silently; the SBOM is an artifact, not a baseline check.
+
+**Accepted / inherent (documented, no fix planned):**
+11. `catch_unwind` is a no-op under `panic=abort` in release/dist — internal panics abort the process (availability, not UB). Applies to both FFI and the server worker. Understood and documented.
+12. Non-null pointer validity/alignment/true-capacity is uncheckable at any C ABI — caller obligation.
+13. No model-file authenticity/integrity verification — out of scope for a structural parser; operational mitigation only.
+14. No build-script sandboxing / cargo-vet / crev trust review — standard Rust build-time exposure, partially contained by feature gates and `cargo-deny sources`.
+15. Backend no-panic contract does not cover unchecked `usize` product overflow — realistic impact requires petabyte-scale shapes that never arise from a real parsed model.
