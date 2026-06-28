@@ -1,11 +1,60 @@
 # Changelog
 
-All notable changes to Tritium. Format loosely follows Keep a Changelog; this is
-pre-1.0, so APIs may break between minor versions.
+All notable changes to Tritium. Format loosely follows Keep a Changelog. From
+**1.0**, the frozen **core** crates + the C ABI follow semver; the **evolving** tier
+(`tritium-nn`/`-train`/`-cuda` + interop + `-serve`) may break in minor releases —
+see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 > **Versioning:** SemVer (`MAJOR.MINOR.PATCH`) from **0.3.0** onward. The earlier
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
+
+## [1.0.0] — 2026-06-28 — v1.0 Release 🎉
+
+First stable release. The v1.0 Definition of Done (ADR 0012) is met: the public API and C ABI are frozen
+(tiered — see below), the **real-model GPU capstone is proven on real hardware**, and every prior milestone
+gate (v0.10→v0.90) re-runs green on this commit.
+
+### Real-model GPU capstone — PROVEN (RTX 4090, sm_89)
+
+Real `microsoft/bitnet-b1.58-2B-4T` runs correctly end-to-end on the GPU. All five acceptance gates pass:
+
+- `cuda_perplexity_within_1pct` — ours **1.3987** vs transformers ref 1.4028 (rel 2.96e-3)
+- `cuda_greedy_matches_transformers` — **256/256** tokens token-exact
+- `cpu_cuda_parity` — identical token IDs over 32 steps, worst logit rel **2.26e-6**
+- `cuda_batch_decode_matches_single` — N=2 batch == single, argmax-identical
+- `qat_heal_gate` — layerwise distillation **94.6%** convergence (PPL 1.40)
+
+Getting here required fixing two latent CUDA resident-decode bugs (`302d059`): a shared-memory aliasing bug
+in the fused `rmsnorm_quant_f32` kernel (the block-wide absmax reduction reused the RMSNorm-output shared
+buffer `s_x` as scratch → clobbered activations → garbage logits, PPL ~10⁵–10⁶) and an **unscaled** tiled
+mpgemm (`f_tiled` instead of `f_tiled_scaled`) in the per-layer decode forward. A teeth-proven conformance
+gate `rmsnorm_quant_bit_matches_host` was added (`51b041d`) so the kernel can't silently regress again.
+
+### API / C-ABI freeze (tiered)
+
+v1.0 freezes a **stable core** under semver; other crates are an **evolving tier** that may take breaking
+changes in 1.x minor releases (rationale + per-crate detail in `docs/v1.0-api-freeze-audit.md`, ADR 0012):
+
+- **Frozen (semver-gated):** `tritium-core`, `-spec`, `-format`, `-runtime`, `-cpu`, `-quantize`, `-testkit`,
+  and the **C ABI** (`TRITIUM_ABI_VERSION = 1`, cbindgen-drift + C11/C++17 gated).
+- **Evolving (not semver-gated; may break in 1.x minors):** `tritium-nn`, `-train`, `-cuda`, the interop
+  crates (`-candle`, `-burn`, `-onnx`), and `-serve` — these track fast-moving upstreams and ongoing
+  perf/training work.
+
+### Gates green on the release commit
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, the full CPU workspace test
+suite, `cargo-semver-checks` (vs `v0.5.10` baseline), and the CPU fresh-env `capstone` — all green. GPU
+validation is **fenced** (ADR-0011 amendment): CUDA conformance + the real-model capstone above on the
+local 4090; Metal (M1) / ROCm (MI300X) / wgpu (4090) parity from prior fenced sessions; the GPU CI lanes
+remain dispatchable `workflow_dispatch` recipes.
+
+### Docs
+
+Reproducible quickstart, model zoo (the BitNet 2B4T I2_S→TQ2_0 load path + loader type-id contract), and
+benchmark methodology (roofline ceilings + divan microbench + e2e tok/s, with honest fenced-measurement
+boundaries) — `docs/book/`.
 
 ## [0.9.0] — 2026-06-24 — v0.90 Hardening milestone COMPLETE
 
