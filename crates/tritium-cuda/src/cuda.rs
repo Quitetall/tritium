@@ -312,6 +312,11 @@ pub struct CudaBackend {
     // the per-token decode next. W1-in-progress.
     #[allow(dead_code)]
     func_rmsnorm: CudaFunction,
+    /// The resolved `rmsnorm_quant_f32` decode kernel (fused RMSNorm + int8 act-quant).
+    /// Exercised by `rmsnorm_quant_bit_matches_host`; the resident decode path launches
+    /// it via its own `f_rmsnorm_quant` handle.
+    #[allow(dead_code)]
+    func_rmsnorm_quant: CudaFunction,
     /// The resolved `rope_apply_f32` decode kernel (bit-matches `ops::rope_apply`).
     #[allow(dead_code)] // wired into `forward_device` next; W1-in-progress.
     func_rope: CudaFunction,
@@ -432,6 +437,9 @@ impl CudaBackend {
         let func_rmsnorm = decode_module
             .load_function(KERNEL_NAME_RMSNORM)
             .map_err(|e| driver_err("resolve rmsnorm kernel", &e))?;
+        let func_rmsnorm_quant = decode_module
+            .load_function(KERNEL_NAME_RMSNORM_QUANT)
+            .map_err(|e| driver_err("resolve rmsnorm_quant kernel", &e))?;
         let func_rope = decode_module
             .load_function(KERNEL_NAME_ROPE)
             .map_err(|e| driver_err("resolve rope kernel", &e))?;
@@ -507,6 +515,7 @@ impl CudaBackend {
             func_act_quant,
             _decode_module: decode_module,
             func_rmsnorm,
+            func_rmsnorm_quant,
             func_rope,
             func_softmax,
             func_residual,
@@ -917,6 +926,87 @@ impl CudaBackend {
             .memcpy_dtoh(&d_out, out)
             .map_err(|e| driver_err("rmsnorm dtoh", &e))?;
         Ok(())
+    }
+
+    /// Device fused RMSNorm + int8 activation-quant (`rmsnorm_quant_f32`) on host
+    /// slices. `q_out` receives the int8 values stored as f32 (matching
+    /// `act_quant_tiled`); returns the per-tensor activation scale. One block of 256
+    /// (a power of two, as the absmax tree reduction requires) with `n*4` dynamic shared
+    /// bytes. A standalone regression guard for the fused decode kernel.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on a length mismatch; device errors via cudarc.
+    #[allow(dead_code)] // the resident decode path uses its own `f_rmsnorm_quant`; this
+    // host-slice wrapper exists for the conformance gate.
+    pub(crate) fn rmsnorm_quant(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        eps: f32,
+        q_out: &mut [f32],
+    ) -> Result<f32, BackendError> {
+        let n = x.len();
+        if w.len() != n || q_out.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: w.len().min(q_out.len()),
+            });
+        }
+        if n == 0 {
+            return Ok(0.0);
+        }
+        let d_x = self
+            .stream
+            .clone_htod(x)
+            .map_err(|e| driver_err("rmsnorm_quant htod x", &e))?;
+        let d_w = self
+            .stream
+            .clone_htod(w)
+            .map_err(|e| driver_err("rmsnorm_quant htod w", &e))?;
+        let mut d_q = self
+            .stream
+            .alloc_zeros::<f32>(n)
+            .map_err(|e| driver_err("rmsnorm_quant alloc q", &e))?;
+        let mut d_scale = self
+            .stream
+            .alloc_zeros::<f32>(1)
+            .map_err(|e| driver_err("rmsnorm_quant alloc scale", &e))?;
+
+        let n_i = n as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (n * 4) as u32,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_rmsnorm_quant);
+        launch
+            .arg(&d_x)
+            .arg(&d_w)
+            .arg(&eps)
+            .arg(&n_i)
+            .arg(&mut d_q)
+            .arg(&mut d_scale);
+
+        // SAFETY: kernel signature is `(const float* x, const float* w, const float eps,
+        // const int n, float* q_out, float* act_scale)`; args are pushed in that exact
+        // order and type. `d_x`/`d_w`/`d_q` are length-`n` device buffers, `d_scale` a
+        // single f32, `eps`/`n_i` scalars by value. One block of 256; `n*4` dynamic shared
+        // bytes hold `s_x`; the kernel bounds its loops by `n`, so no thread reads past
+        // any buffer.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch rmsnorm_quant", &e))?;
+        }
+        self.stream
+            .memcpy_dtoh(&d_q, q_out)
+            .map_err(|e| driver_err("rmsnorm_quant dtoh q", &e))?;
+        let mut scale = [0.0f32; 1];
+        self.stream
+            .memcpy_dtoh(&d_scale, &mut scale)
+            .map_err(|e| driver_err("rmsnorm_quant dtoh scale", &e))?;
+        Ok(scale[0])
     }
 
     /// Device RoPE for one token (M=1 decode) on host slices, **bit-matching**
@@ -8647,6 +8737,92 @@ mod tests {
         assert!(
             q.iter().all(|&x| x == 0.0),
             "zero row must quantize to zeros"
+        );
+    }
+
+    /// The fused `rmsnorm_quant_f32` decode kernel must reproduce host RMSNorm followed
+    /// by the host int8 activation-quant, **bit-for-bit** — it composes the same two ops
+    /// `rmsnorm_bit_matches_host` and `act_quant_tiled_bit_matches_host` already pin.
+    /// This is the standalone regression guard for the shared-memory aliasing bug: the
+    /// absmax reduction once reused `s_x` as scratch, clobbering the RMSNorm output before
+    /// the quant step → garbage activations that only surfaced in the end-to-end forward.
+    #[test]
+    fn rmsnorm_quant_bit_matches_host() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping rmsnorm_quant bit-match: no device ({e})");
+                return;
+            }
+        };
+        // Host reference = ops::rmsnorm (replicated, as elsewhere) then the host int8
+        // activation-quant (absmax → 127/gamma scale → round-ties-even → clamp).
+        fn host_rmsnorm_quant(x: &[f32], w: &[f32], eps: f32) -> (Vec<f32>, f32) {
+            let n = x.len();
+            let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            let y: Vec<f32> = x.iter().zip(w).map(|(&xi, &wi)| xi * inv * wi).collect();
+            let mut gamma = 0.0f32;
+            for &v in &y {
+                let a = v.abs();
+                if a > gamma {
+                    gamma = a;
+                }
+            }
+            if gamma == 0.0 {
+                return (vec![0.0; n], 0.0);
+            }
+            let s = 127.0f32 / gamma;
+            (
+                y.iter()
+                    .map(|&v| (v * s).round_ties_even().clamp(-128.0, 127.0))
+                    .collect(),
+                gamma / 127.0,
+            )
+        }
+        // BitNet hidden/ffn widths + edge lengths; deterministic xorshift inputs.
+        for &n in &[2560usize, 6912, 1, 17, 256, 2559] {
+            let mut s = 0x0FED_CBA9_8765_4321u64 ^ (n as u64).wrapping_mul(0x9E37_79B9);
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f32 / (1u64 << 53) as f32) * 8.0 - 4.0
+            };
+            let x: Vec<f32> = (0..n).map(|_| next()).collect();
+            let w: Vec<f32> = (0..n).map(|_| next()).collect();
+            let eps = 1e-5f32;
+
+            let (q_want, scale_want) = host_rmsnorm_quant(&x, &w, eps);
+            let mut q_got = vec![f32::NAN; n];
+            let scale_got = backend
+                .rmsnorm_quant(&x, &w, eps, &mut q_got)
+                .expect("device rmsnorm_quant");
+
+            assert_eq!(
+                scale_got.to_bits(),
+                scale_want.to_bits(),
+                "rmsnorm_quant scale mismatch n={n}: got {scale_got} want {scale_want}"
+            );
+            for (i, (&g, &h)) in q_got.iter().zip(&q_want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    h.to_bits(),
+                    "rmsnorm_quant q mismatch n={n} i={i}: got {g} want {h}"
+                );
+            }
+        }
+        // All-zero input → zeros + zero scale (the gamma==0 branch).
+        let x = vec![0.0f32; 128];
+        let w = vec![1.0f32; 128];
+        let mut q = vec![1.0f32; 128];
+        let sc = backend
+            .rmsnorm_quant(&x, &w, 1e-5, &mut q)
+            .expect("rmsnorm_quant zero");
+        assert_eq!(sc, 0.0, "all-zero input must give zero scale");
+        assert!(
+            q.iter().all(|&v| v == 0.0),
+            "all-zero input must quantize to zeros"
         );
     }
 
