@@ -111,6 +111,99 @@ __global__ void rmsnorm_shared_f32(const float* __restrict__ x,
   }
 }
 
+// rmsnorm_quant_f32 — fused RMSNorm + int8 activation quant (v0.7.0 opt).
+// Combines rmsnorm_shared_f32 + act_quant_tiled_f32 into one kernel:
+//   1. Stage x into shared memory (coalesced load)
+//   2. Thread 0: sequential sum-of-squares → inv = 1/sqrt(mean_sq + eps)
+//   3. All threads: compute y[i] = x[i] * inv * w[i] (in shared), track absmax
+//   4. Block-wide absmax reduction → gamma
+//   5. All threads: q_out[i] = clamp(round(y[i] * 127/gamma), -128, 127)
+//
+// Eliminates one global read + one global write per norm (the rmsnorm output
+// stays in shared memory). Saves 1 kernel launch per call (4 per layer).
+// Dynamic shared = n * 4 bytes (the launch must set it).
+//
+// Bit-match contract: the rmsnorm output y[i] is computed identically to
+// rmsnorm_shared_f32 (same sum order, same FMA discipline). The absmax uses
+// a tree reduction (associative+commutative for max) → same gamma. The quant
+// uses rintf + clamp → same as act_quant_tiled_f32.
+__global__ void rmsnorm_quant_f32(const float* __restrict__ x,
+                                   const float* __restrict__ w,
+                                   const float eps,
+                                   const int n,
+                                   float* __restrict__ q_out,
+                                   float* __restrict__ act_scale) {
+  extern __shared__ float s_x[];
+  __shared__ float s_inv;
+  __shared__ float s_gamma;
+
+  // 1. Stage x into shared memory (coalesced).
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    s_x[i] = x[i];
+  }
+  __syncthreads();
+
+  // 2. Thread 0: sequential sum-of-squares (bit-match with host).
+  if (threadIdx.x == 0) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; ++i) {
+      const float xi = s_x[i];
+      ss = __fadd_rn(ss, __fmul_rn(xi, xi));
+    }
+    const float mean_sq = __fdiv_rn(ss, (float)n);
+    const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+    s_inv = __fdiv_rn(1.0f, denom);
+  }
+  __syncthreads();
+
+  // 3. Compute rmsnorm output y[i] = x[i] * inv * w[i] in shared memory,
+  //    and track per-thread absmax for the quant step.
+  const float inv = s_inv;
+  float local_max = 0.0f;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float yi = __fmul_rn(__fmul_rn(s_x[i], inv), w[i]);
+    s_x[i] = yi;  // overwrite x with rmsnorm output (reuses shared mem)
+    const float a = fabsf(yi);
+    if (a > local_max) local_max = a;
+  }
+  __syncthreads();
+
+  // 4. Block-wide absmax reduction. Reduce in a SEPARATE static shared buffer
+  //    (`s_red`), NOT in `s_x`: s_x[0..n) holds the rmsnorm output y[i] that step 5
+  //    must quantize. The previous version reused `s_x[threadIdx.x]` as reduction
+  //    scratch, which clobbered the first `blockDim.x` outputs before they were
+  //    quantized → garbage activations. `blockDim.x` ≤ 1024 (CUDA max) and is a power
+  //    of two (matches act_quant_tiled_f32's reduction).
+  __shared__ float s_red[1024];
+  s_red[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      const float o = s_red[threadIdx.x + off];
+      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float gamma = s_red[0];
+    s_gamma = gamma;
+    *act_scale = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);
+  }
+  __syncthreads();
+
+  // 5. Quantize: q_out[i] = clamp(round(y[i] * 127/gamma), -128, 127).
+  const float gamma = s_gamma;
+  if (gamma == 0.0f) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) q_out[i] = 0.0f;
+    return;
+  }
+  const float s = __fdiv_rn(127.0f, gamma);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float scaled = rintf(__fmul_rn(s_x[i], s));
+    q_out[i] = fminf(fmaxf(scaled, -128.0f), 127.0f);
+  }
+}
+
 // rope_apply_f32 — bit-exact match of tritium_nn::ops::rope_apply for ONE token
 // (the M=1 decode case). NeoX half-rotated: lane j in [0,half) pairs with j+half,
 //   out[j]      = a*cos - b*sin ;  out[j+half] = b*cos + a*sin   (a=x[j], b=x[j+half])

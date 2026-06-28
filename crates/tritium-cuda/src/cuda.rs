@@ -4987,7 +4987,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
+                &self.f_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].q,
                 &batch.d_act_scale,
@@ -4996,7 +4996,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
+                &self.f_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].k,
                 &batch.d_act_scale,
@@ -5005,7 +5005,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
+                &self.f_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].v,
                 &batch.d_act_scale,
@@ -5098,7 +5098,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
+                &self.f_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].o,
                 &batch.d_act_scale,
@@ -5134,7 +5134,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
+                &self.f_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].gate,
                 &batch.d_act_scale,
@@ -5143,7 +5143,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
+                &self.f_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].up,
                 &batch.d_act_scale,
@@ -5177,7 +5177,7 @@ impl CudaDecodeModel {
             )?;
             Self::bl_matmul(
                 s,
-                &self.f_tiled,
+                &self.f_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].down,
                 &batch.d_act_scale,
