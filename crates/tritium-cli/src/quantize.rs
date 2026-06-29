@@ -14,9 +14,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use tritium_format::{SafeTensors, SaltRow, write_salt_bundle, write_salt_gguf};
-use tritium_quantize::{QuantConfig, ScaleGroup, Sensitivity, quantize_tensor};
+use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
 
-/// Base-plane scale granularity (CLI mirror of [`ScaleGroup`]).
+/// Base-plane scale granularity (CLI mirror of [`BaseScaleScope`]).
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum ScaleGroupArg {
     /// Per-256-block AbsMean (default; best for a normally-trained fp master).
@@ -43,8 +43,8 @@ pub(crate) fn run(
     format: OutputFormat,
 ) -> Result<()> {
     let sg = match scale_group {
-        ScaleGroupArg::Block => ScaleGroup::Block,
-        ScaleGroupArg::Tensor => ScaleGroup::Tensor,
+        ScaleGroupArg::Block => BaseScaleScope::Block,
+        ScaleGroupArg::Tensor => BaseScaleScope::Tensor,
     };
 
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;

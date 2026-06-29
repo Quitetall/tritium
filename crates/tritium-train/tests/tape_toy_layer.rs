@@ -7,10 +7,7 @@ use tritium_train::ops::{act, bias, elementwise, loss, matmul, ste};
 use tritium_train::tape::Tape;
 
 fn gate_c_tol() -> Tolerance {
-    Tolerance {
-        relative: 2e-3,
-        bit_exact: false,
-    }
+    Tolerance::relative(2e-3)
 }
 
 #[test]

@@ -25,7 +25,7 @@ use tritium_nn::{
     DenseLinear, ForwardDump, ModelConfig, ModelRunner, ModelWeights, Projection, Relu2Mlp,
     TransformerBlock,
 };
-use tritium_quantize::{QuantConfig, ScaleGroup, Sensitivity, quantize_tensor};
+use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
 
 /// Eval tokens to score. The reference set is 262; the CPU host forward over a
 /// 2.4B-param fp model is memory-bandwidth-bound (~11 GB streamed/token), so a
@@ -87,7 +87,7 @@ fn proj(st: &SafeTensors, name: &str, n_out: usize, k_in: usize, mode: Mode) -> 
                 // BitNet b1.58 is QAT-trained against a single per-tensor absmean ternary, so
                 // the SALT base plane must match that granularity (per-256-block reconstructs
                 // the latent master too faithfully → garbage). T=1 ⇒ the deployed I2_S.
-                scale_group: ScaleGroup::Tensor,
+                scale_group: BaseScaleScope::Tensor,
             };
             let qt = quantize_tensor(&w, n_out, k_in, &cfg).expect("quantize_tensor");
             let mut dq = vec![0.0f32; n_out * k_in];
@@ -246,7 +246,7 @@ fn salt_accuracy_curve() {
 
     // For a QAT-ternary master (BitNet b1.58) the curve INVERTS the usual shape: the bf16
     // `fp` row is the *latent* weight, not a usable forward, so it scores garbage; the
-    // per-tensor SALT floor (`budget = log2 3`, `ScaleGroup::Tensor`) is the deployed I2_S
+    // per-tensor SALT floor (`budget = log2 3`, `BaseScaleScope::Tensor`) is the deployed I2_S
     // ternary and the curve's optimum, and residual planes (higher bpw) regress back toward
     // the unusable master. So the gate is: the floor is a *working* model that crushes the
     // raw-master fp. (Per-tensor base reproduces the GGUF weights to f16; `gguf_eval_perplexity`
@@ -267,7 +267,7 @@ const GGUF_PATH: &str =
 
 /// Reference: the deployed GGUF I2_S perplexity on the SAME `EVAL_LEN` tokens the curve
 /// uses (the committed 1.4028 is over the full 262-token set; a short prefix scores
-/// higher). `salt@1.585` with [`ScaleGroup::Tensor`] must match this — that's the gate
+/// higher). `salt@1.585` with [`BaseScaleScope::Tensor`] must match this — that's the gate
 /// that the per-tensor SALT base reproduces the deployed ternary. Cheap (one model, one
 /// forward), unlike the full curve.
 #[test]

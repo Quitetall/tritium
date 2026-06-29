@@ -32,7 +32,7 @@ mod cuda_benches {
         BITNET_SHAPES, gemm_macs, packed_i2s_int8_weights, packed_tq2_0_weights,
     };
     use tritium_core::{GemmShape, TernaryFormat};
-    use tritium_spec::{DeviceBuffer, TernaryBackend};
+    use tritium_spec::{DeviceBuffer, MpGemm, TernaryBackend};
 
     // Linked so the CUDA backend's `#[distributed_slice]` registration is included in
     // the bench binary (the same edge `tests/acceptance.rs` relies on).
@@ -95,14 +95,14 @@ mod cuda_benches {
             .counter(ItemsCount::new(gemm_macs(m, n, k)))
             .bench_local(|| {
                 backend
-                    .mpgemm(
-                        &act,
-                        weights.as_ref(),
-                        &scales,
+                    .mpgemm(MpGemm {
+                        act: &act,
+                        weights: weights.as_ref(),
+                        scales: &scales,
                         shape,
-                        TernaryFormat::Tq2_0,
-                        &mut out,
-                    )
+                        format: TernaryFormat::Tq2_0,
+                        out: &mut out,
+                    })
                     .expect("add-only mpgemm");
             });
     }
@@ -132,14 +132,14 @@ mod cuda_benches {
         // the tuned tile so compilation does not land inside the timed region, and it
         // lets the bench skip cleanly on *any* warm-up failure (unsupported IMMA path,
         // a device hiccup, …) rather than panicking inside `bench_local`.
-        if let Err(e) = backend.mpgemm_with_act_quant(
-            &act,
-            weights.as_ref(),
-            &weight_scales,
+        if let Err(e) = backend.mpgemm_with_act_quant(MpGemm {
+            act: &act,
+            weights: weights.as_ref(),
+            scales: &weight_scales,
             shape,
-            TernaryFormat::I2sInt8,
-            &mut out,
-        ) {
+            format: TernaryFormat::I2sInt8,
+            out: &mut out,
+        }) {
             eprintln!("skipping shape {shape:?}: IMMA warm-up failed ({e})");
             return;
         }
@@ -148,14 +148,14 @@ mod cuda_benches {
             .counter(ItemsCount::new(gemm_macs(m, n, k)))
             .bench_local(|| {
                 backend
-                    .mpgemm_with_act_quant(
-                        &act,
-                        weights.as_ref(),
-                        &weight_scales,
+                    .mpgemm_with_act_quant(MpGemm {
+                        act: &act,
+                        weights: weights.as_ref(),
+                        scales: &weight_scales,
                         shape,
-                        TernaryFormat::I2sInt8,
-                        &mut out,
-                    )
+                        format: TernaryFormat::I2sInt8,
+                        out: &mut out,
+                    })
                     .expect("imma mpgemm_with_act_quant");
             });
     }

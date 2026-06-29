@@ -49,6 +49,12 @@ pub use jsonl::{JsonlError, load_vectors, save_vectors};
 pub use runner::{FailedCase, FailureReason, Report, run_conformance, run_fused_fallback_contract};
 pub use vector::{ConformanceVector, Tolerance};
 
+// Re-export the backend contract + core vocabulary so a downstream backend
+// author needs only depend on `tritium-testkit` to both implement and conform a
+// backend.
+pub use tritium_core::{GemmShape, TernaryFormat, Trit};
+pub use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
+
 // The reference backend is part of the public surface only so this crate's own
 // doctests have a known-good backend to run against; it is hidden from docs.
 #[doc(hidden)]

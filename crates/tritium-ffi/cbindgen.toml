@@ -6,6 +6,9 @@ cpp_compat = true
 tab_width = 4
 documentation = true
 documentation_style = "c99"
+# Emit `usize`/`isize` as `size_t`/`ptrdiff_t` rather than `uintptr_t`/`intptr_t`,
+# so buffer lengths read naturally in the generated header.
+usize_is_size_t = true
 
 [export]
 prefix = ""

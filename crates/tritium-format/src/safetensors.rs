@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 /// Errors from parsing or reading a safetensors buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SafeTensorsError {
     /// Buffer is shorter than the 8-byte length prefix.
     TooShort,
@@ -242,6 +243,17 @@ impl<'a> SafeTensors<'a> {
         };
         Ok(out)
     }
+}
+
+/// Parse a safetensors buffer's header (no tensor data is copied), returning a
+/// [`SafeTensors`] view borrowing `bytes`. Free-function entry point mirroring
+/// [`crate::read_gguf`]; equivalent to [`SafeTensors::parse`].
+///
+/// # Errors
+/// [`SafeTensorsError::TooShort`] / [`SafeTensorsError::BadHeaderLen`] on a
+/// malformed prefix; [`SafeTensorsError::Json`] on an unparseable header.
+pub fn read_safetensors(bytes: &[u8]) -> Result<SafeTensors<'_>, SafeTensorsError> {
+    SafeTensors::parse(bytes)
 }
 
 #[cfg(test)]

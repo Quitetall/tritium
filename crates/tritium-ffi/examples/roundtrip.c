@@ -46,8 +46,9 @@ int main(int argc, char **argv) {
      * re-run generation). Read the actual count from `produced`. */
     uint32_t out[MAX_NEW];
     size_t produced = 0;
+    /* opts = NULL selects the default greedy behavior. */
     status = tritium_generate(model, prompt, sizeof(prompt) / sizeof(prompt[0]),
-                              MAX_NEW, eos, out, MAX_NEW, &produced);
+                              MAX_NEW, eos, out, MAX_NEW, &produced, NULL);
     if (status != TritiumStatus_Ok) {
         fprintf(stderr, "generate failed: status=%d\n", (int)status);
         tritium_model_free(model);

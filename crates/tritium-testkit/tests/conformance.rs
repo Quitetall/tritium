@@ -13,7 +13,7 @@ use tritium_core::{GemmShape, TernaryFormat, Trit};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 use tritium_testkit::{
     ReferenceBackend, Tolerance, generate_vectors, load_vectors, run_conformance, save_vectors,
 };
@@ -37,8 +37,8 @@ fn reference_backend_passes_all_vectors() {
 fn reference_backend_passes_both_formats() {
     // Spot-check that both tq2_0 and tq1_0 vectors are present and pass.
     let vectors = generate_vectors(7, 20);
-    assert!(vectors.iter().any(|v| v.format == "tq2_0"));
-    assert!(vectors.iter().any(|v| v.format == "tq1_0"));
+    assert!(vectors.iter().any(|v| v.format == TernaryFormat::Tq2_0));
+    assert!(vectors.iter().any(|v| v.format == TernaryFormat::Tq1_0));
     let report = run_conformance(&ReferenceBackend::new(), &vectors, Tolerance::default());
     assert!(report.is_ok());
 }
@@ -104,15 +104,15 @@ impl TernaryBackend for WrongBackend {
             bytes: packed.len(),
         }))
     }
-    fn mpgemm(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        scales: &[f32],
-        shape: GemmShape,
-        _format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales,
+            shape,
+            format: _format,
+            out,
+        } = p;
         let buf = weights
             .as_any()
             .downcast_ref::<WrongBuffer>()

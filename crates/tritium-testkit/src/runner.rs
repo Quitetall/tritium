@@ -3,7 +3,7 @@
 use half::f16;
 use tritium_core::{GemmShape, TernaryFormat, Trit};
 use tritium_format::{num_blocks, pack_tq1_0_row, pack_tq2_0_row};
-use tritium_spec::TernaryBackend;
+use tritium_spec::{MpGemm, TernaryBackend};
 
 use crate::reference_backend::ReferenceBackend;
 use crate::vector::{ConformanceVector, Tolerance};
@@ -75,14 +75,30 @@ impl Report {
     pub fn total(&self) -> usize {
         self.passed + self.failed.len()
     }
+
+    /// Panic with the failing ids and reasons unless every vector passed.
+    ///
+    /// The assertion-style companion to [`is_ok`](Self::is_ok): use it in a test
+    /// to turn a non-conformant [`Report`] into a readable failure.
+    ///
+    /// # Panics
+    /// Panics if [`failed`](Self::failed) is non-empty.
+    pub fn assert_conformant(&self) {
+        assert!(self.is_ok(), "{self}");
+    }
 }
 
-/// Parse the format tag a [`ConformanceVector`] carries.
-fn parse_format(tag: &str) -> Option<TernaryFormat> {
-    match tag {
-        "tq2_0" => Some(TernaryFormat::Tq2_0),
-        "tq1_0" => Some(TernaryFormat::Tq1_0),
-        _ => None,
+impl std::fmt::Display for Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "conformance: {}/{} passed", self.passed, self.total())?;
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        write!(f, "; {} failed:", self.failed.len())?;
+        for case in &self.failed {
+            write!(f, "\n  - {}: {}", case.id, case.reason)?;
+        }
+        Ok(())
     }
 }
 
@@ -157,8 +173,7 @@ fn run_one<B: TernaryBackend>(
     v: &ConformanceVector,
     tol: Tolerance,
 ) -> Result<(), FailureReason> {
-    let format =
-        parse_format(&v.format).ok_or_else(|| FailureReason::UnknownFormat(v.format.clone()))?;
+    let format = v.format;
     let shape = GemmShape::new(v.m, v.n, v.k);
 
     // Validate the vector's own internal consistency before touching the backend.
@@ -190,14 +205,14 @@ fn run_one<B: TernaryBackend>(
 
     let mut out = vec![0.0f32; v.m * v.n];
     backend
-        .mpgemm(
-            &v.activation,
-            buffer.as_ref(),
-            &v.scales,
+        .mpgemm(MpGemm {
+            act: &v.activation,
+            weights: buffer.as_ref(),
+            scales: &v.scales,
             shape,
             format,
-            &mut out,
-        )
+            out: &mut out,
+        })
         .map_err(|e| FailureReason::BackendError(e.to_string()))?;
 
     for (i, (&got, &want)) in out.iter().zip(&v.expected).enumerate() {
@@ -276,8 +291,7 @@ fn run_one_fused<B: TernaryBackend>(
     v: &ConformanceVector,
     tol: Tolerance,
 ) -> Result<(), FailureReason> {
-    let format =
-        parse_format(&v.format).ok_or_else(|| FailureReason::UnknownFormat(v.format.clone()))?;
+    let format = v.format;
     let shape = GemmShape::new(v.m, v.n, v.k);
 
     // Same internal-consistency checks as the plain runner.
@@ -312,14 +326,14 @@ fn run_one_fused<B: TernaryBackend>(
         .map_err(|e| FailureReason::BackendError(format!("reference upload: {e}")))?;
     let mut want = vec![0.0f32; v.m * v.n];
     reference
-        .mpgemm_with_act_quant(
-            &v.activation,
-            ref_buf.as_ref(),
-            &v.scales,
+        .mpgemm_with_act_quant(MpGemm {
+            act: &v.activation,
+            weights: ref_buf.as_ref(),
+            scales: &v.scales,
             shape,
             format,
-            &mut want,
-        )
+            out: &mut want,
+        })
         .map_err(|e| FailureReason::BackendError(format!("reference fused: {e}")))?;
 
     // Subject backend fused output. An error here is itself a contract failure:
@@ -330,14 +344,14 @@ fn run_one_fused<B: TernaryBackend>(
         .map_err(|e| FailureReason::BackendError(e.to_string()))?;
     let mut got = vec![0.0f32; v.m * v.n];
     backend
-        .mpgemm_with_act_quant(
-            &v.activation,
-            buffer.as_ref(),
-            &v.scales,
+        .mpgemm_with_act_quant(MpGemm {
+            act: &v.activation,
+            weights: buffer.as_ref(),
+            scales: &v.scales,
             shape,
             format,
-            &mut got,
-        )
+            out: &mut got,
+        })
         .map_err(|e| FailureReason::BackendError(e.to_string()))?;
 
     // Grade with a per-row floor of `act_scale[m]` rather than the fixed 1.0:
@@ -410,7 +424,7 @@ mod fallback_tests {
     use core::any::Any;
 
     use tritium_core::{GemmShape, TernaryFormat};
-    use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+    use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
     use super::{FailureReason, run_fused_fallback_contract};
     use crate::generate_vectors;
@@ -461,26 +475,10 @@ mod fallback_tests {
         ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
             Ok(Box::new(NoopBuf))
         }
-        fn mpgemm(
-            &self,
-            _act: &[f32],
-            _weights: &dyn DeviceBuffer,
-            _scales: &[f32],
-            _shape: GemmShape,
-            _format: TernaryFormat,
-            _out: &mut [f32],
-        ) -> Result<(), BackendError> {
+        fn mpgemm(&self, _p: MpGemm<'_>) -> Result<(), BackendError> {
             Err(BackendError::Backend("no mpgemm".into()))
         }
-        fn mpgemm_with_act_quant(
-            &self,
-            _act: &[f32],
-            _weights: &dyn DeviceBuffer,
-            _weight_scales: &[f32],
-            _shape: GemmShape,
-            _format: TernaryFormat,
-            _out: &mut [f32],
-        ) -> Result<(), BackendError> {
+        fn mpgemm_with_act_quant(&self, _p: MpGemm<'_>) -> Result<(), BackendError> {
             Err(BackendError::Backend(
                 "refuses fused; does not degrade".into(),
             ))
@@ -522,28 +520,12 @@ mod fallback_tests {
         ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
             Ok(Box::new(NoopBuf))
         }
-        fn mpgemm(
-            &self,
-            _act: &[f32],
-            _weights: &dyn DeviceBuffer,
-            _scales: &[f32],
-            _shape: GemmShape,
-            _format: TernaryFormat,
-            out: &mut [f32],
-        ) -> Result<(), BackendError> {
-            out.fill(1.0e30);
+        fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+            p.out.fill(1.0e30);
             Ok(())
         }
-        fn mpgemm_with_act_quant(
-            &self,
-            _act: &[f32],
-            _weights: &dyn DeviceBuffer,
-            _weight_scales: &[f32],
-            _shape: GemmShape,
-            _format: TernaryFormat,
-            out: &mut [f32],
-        ) -> Result<(), BackendError> {
-            out.fill(1.0e30);
+        fn mpgemm_with_act_quant(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+            p.out.fill(1.0e30);
             Ok(())
         }
     }

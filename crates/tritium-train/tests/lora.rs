@@ -78,10 +78,7 @@ fn lora_loss(
 }
 
 fn gate_c_tol() -> Tolerance {
-    Tolerance {
-        relative: 2e-3,
-        bit_exact: false,
-    }
+    Tolerance::relative(2e-3)
 }
 
 /// Tape analytic grads for A and B vs per-element central finite difference of
@@ -289,7 +286,7 @@ proptest! {
             .map(|(&p, &q)| p + s * q)
             .collect();
 
-        let tol = Tolerance { relative: 1e-4, bit_exact: false };
+        let tol = Tolerance::relative(1e-4);
         for i in 0..m * n {
             prop_assert!(
                 tol.accepts(y_merged[i], y_composed[i]),

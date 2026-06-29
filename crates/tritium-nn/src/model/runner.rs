@@ -402,10 +402,10 @@ impl ModelRunner {
         }
         self.resident_probed = true;
         // Recover the concrete `CudaBackend` from the `dyn TernaryBackend` (the
-        // defaulted `as_any` hook returns `None` for every non-CUDA backend).
+        // defaulted `as_concrete` hook returns `None` for every non-CUDA backend).
         let Some(cuda) = self
             .backend
-            .as_any()
+            .as_concrete()
             .and_then(|a| a.downcast_ref::<tritium_cuda::CudaBackend>())
         else {
             return Ok(false);

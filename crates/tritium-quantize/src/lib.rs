@@ -42,5 +42,5 @@ pub use plane::{
     Plane, PlaneStack, absmean_ternary, recon_error, residual_expand, ternary_at_scale,
 };
 pub use quantize::{
-    QuantConfig, QuantError, QuantizedTensor, ScaleGroup, Sensitivity, quantize_tensor,
+    BaseScaleScope, QuantConfig, QuantError, QuantizedTensor, Sensitivity, quantize_tensor,
 };

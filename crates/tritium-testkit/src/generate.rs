@@ -7,7 +7,7 @@
 //! [`tritium_core::reference_mpgemm`], so the suite is by construction the
 //! reference's own output.
 
-use tritium_core::{GemmShape, Trit, reference_mpgemm};
+use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
 
 use crate::vector::ConformanceVector;
 
@@ -68,7 +68,7 @@ fn build(
     activation: Vec<f32>,
     weights: Vec<Trit>,
     scales: Vec<f32>,
-    format: &str,
+    format: TernaryFormat,
 ) -> ConformanceVector {
     let mut expected = vec![0.0f32; shape.m * shape.n];
     // Lengths are constructed to match `shape`, so this never errors. We still
@@ -84,7 +84,7 @@ fn build(
         activation,
         weights: weights.iter().map(|t| t.get()).collect(),
         scales,
-        format: format.to_string(),
+        format,
         expected,
     }
 }
@@ -94,7 +94,7 @@ fn random_vector(
     rng: &mut XorShift64,
     id: String,
     shape: GemmShape,
-    format: &str,
+    format: TernaryFormat,
 ) -> ConformanceVector {
     let activation = (0..shape.m * shape.k).map(|_| rng.activation()).collect();
     let weights = (0..shape.n * shape.k).map(|_| rng.trit()).collect();
@@ -133,7 +133,7 @@ fn boundary_vectors() -> Vec<ConformanceVector> {
             activation.clone(),
             zeros,
             scales.clone(),
-            "tq2_0",
+            TernaryFormat::Tq2_0,
         ));
 
         // All-+1 weights.
@@ -144,7 +144,7 @@ fn boundary_vectors() -> Vec<ConformanceVector> {
             activation.clone(),
             allpos,
             scales.clone(),
-            "tq2_0",
+            TernaryFormat::Tq2_0,
         ));
 
         // All--1 weights.
@@ -155,7 +155,7 @@ fn boundary_vectors() -> Vec<ConformanceVector> {
             activation.clone(),
             allneg,
             scales.clone(),
-            "tq1_0",
+            TernaryFormat::Tq1_0,
         ));
 
         // Mixed random weights at this boundary shape, one per format.
@@ -166,7 +166,7 @@ fn boundary_vectors() -> Vec<ConformanceVector> {
             activation.clone(),
             mixed.clone(),
             scales.clone(),
-            "tq2_0",
+            TernaryFormat::Tq2_0,
         ));
         out.push(build(
             format!("boundary-{si}-mixed-tq1"),
@@ -174,7 +174,7 @@ fn boundary_vectors() -> Vec<ConformanceVector> {
             activation,
             mixed,
             scales,
-            "tq1_0",
+            TernaryFormat::Tq1_0,
         ));
     }
 
@@ -214,7 +214,11 @@ pub fn generate_vectors(seed: u64, count: usize) -> Vec<ConformanceVector> {
         let m = 1 + rng.below(64) as usize;
         let n = 1 + rng.below(32) as usize;
         let k = 256 * (1 + rng.below(2) as usize);
-        let format = if i % 2 == 0 { "tq2_0" } else { "tq1_0" };
+        let format = if i % 2 == 0 {
+            TernaryFormat::Tq2_0
+        } else {
+            TernaryFormat::Tq1_0
+        };
 
         out.push(random_vector(
             &mut rng,

@@ -48,6 +48,7 @@ fn generate_null_model_is_nullarg() {
             out.as_mut_ptr(),
             out.len(),
             &mut out_len,
+            ptr::null(),
         )
     };
     assert_eq!(st, TritiumStatus::NullArg);
@@ -67,6 +68,7 @@ fn generate_null_out_len_is_nullarg() {
             ptr::null_mut(),
             0,
             ptr::null_mut(),
+            ptr::null(),
         )
     };
     assert_eq!(st, TritiumStatus::NullArg);
@@ -86,6 +88,7 @@ fn generate_null_prompt_with_nonzero_len_is_nullarg() {
             ptr::null_mut(),
             0,
             &mut out_len,
+            ptr::null(),
         )
     };
     assert_eq!(st, TritiumStatus::NullArg);
@@ -106,6 +109,7 @@ fn generate_null_out_with_nonzero_cap_is_nullarg() {
             ptr::null_mut(),
             4,
             &mut out_len,
+            ptr::null(),
         )
     };
     assert_eq!(st, TritiumStatus::NullArg);
@@ -173,6 +177,7 @@ fn model_roundtrip() {
             tiny.as_mut_ptr(),
             tiny.len(),
             &mut need,
+            ptr::null(),
         )
     };
     assert_eq!(st, TritiumStatus::BufferTooSmall);
@@ -192,6 +197,7 @@ fn model_roundtrip() {
             out.as_mut_ptr(),
             out.len(),
             &mut got,
+            ptr::null(),
         )
     };
     assert_eq!(st, TritiumStatus::Ok);

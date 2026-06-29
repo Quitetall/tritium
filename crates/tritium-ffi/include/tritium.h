@@ -9,6 +9,7 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -16,7 +17,15 @@
 #define TRITIUM_ABI_VERSION 1
 
 // Result code returned by the C API. `Ok` is 0; all errors are non-zero.
-typedef enum TritiumStatus {
+//
+// `#[non_exhaustive]` (Rust side): future ABI revisions may add status codes, so
+// Rust callers must include a wildcard arm. C callers should treat any unknown
+// non-zero code as a generic error.
+enum TritiumStatus
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
     // Success.
     TritiumStatus_Ok = 0,
     // A required pointer argument was null.
@@ -31,15 +40,48 @@ typedef enum TritiumStatus {
     // crate is built with `panic = "unwind"`; under `panic = "abort"` (the
     // default release/dist profile) a panic aborts the process instead.
     TritiumStatus_Panic = 5,
-} TritiumStatus;
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum TritiumStatus TritiumStatus;
+#else
+typedef int32_t TritiumStatus;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 // Opaque handle to a loaded model (a `ModelRunner`). Created by
 // [`tritium_model_load_file`], released by [`tritium_model_free`].
 typedef struct TritiumModel TritiumModel;
 
+// Versioned options for [`tritium_generate`]. Pass `NULL` for the default
+// (greedy) behavior — all existing behavior is preserved when no options are
+// given.
+//
+// To use it: zero the whole struct, set `struct_size = sizeof(TritiumGenerateOptions)`,
+// then set the fields your build knows about. Tritium reads only the fields that
+// fit within the caller-provided `struct_size`, so growing this struct in a later
+// ABI revision stays forward- and backward-compatible. All currently-defined
+// fields beyond `struct_size` are reserved and must be zeroed.
+typedef struct TritiumGenerateOptions {
+    // `sizeof(TritiumGenerateOptions)` as seen by the caller. Tritium reads
+    // option fields only up to this many bytes. Must be `>= sizeof(usize)`.
+    size_t struct_size;
+    // Reserved for future options (e.g. sampling temperature / top-k). Must be
+    // zeroed; ignored by this ABI revision.
+    uint8_t reserved[32];
+} TritiumGenerateOptions;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+// Return a pointer to the calling thread's last error message as a
+// NUL-terminated C string, or null if there is none.
+//
+// The pointer is valid until the next `tritium_*` call **on the same thread**
+// (which may overwrite or clear it); copy the string if you need it longer. The
+// storage is thread-local, so each thread has its own last error.
+const char *tritium_last_error(void);
 
 // Returns the C ABI version ([`TRITIUM_ABI_VERSION`]).
 uint32_t tritium_abi_version(void);
@@ -55,12 +97,33 @@ const char *tritium_version(void);
 // # Safety
 // `path` must be a valid NUL-terminated C string (or null); `out_status` must be
 // null or a valid writable `TritiumStatus*`.
-struct TritiumModel *tritium_model_load_file(const char *path, enum TritiumStatus *out_status);
+struct TritiumModel *tritium_model_load_file(const char *path, TritiumStatus *out_status);
+
+// Load a GGUF model from an in-memory buffer (`data`, `len` bytes) on the CPU
+// backend. Mirrors [`tritium_model_load_file`] but reads from memory rather than
+// a path — useful when the model is embedded or fetched by the host. Returns an
+// owned handle, or null on failure; if `out_status` is non-null it receives the
+// [`TritiumStatus`]. Free the handle with [`tritium_model_free`]. On error, see
+// [`tritium_last_error`].
+//
+// # Safety
+// `data` must point to `len` readable bytes (or be null iff `len == 0`);
+// `out_status` must be null or a valid writable `TritiumStatus*`. Tritium copies
+// what it needs and does not retain `data`.
+struct TritiumModel *tritium_model_load_bytes(const uint8_t *data,
+                                              size_t len,
+                                              TritiumStatus *out_status);
 
 // Greedily generate up to `max_new` tokens continuing `prompt` (`prompt_len`
 // token IDs), stopping early at `eos`. The generated count never exceeds
 // `max_new`, so the simplest correct use is to size `out` to `max_new` and call
 // once, reading the count from `*out_len`.
+//
+// `opts` is an optional [`TritiumGenerateOptions`] pointer for forward-compatible
+// tuning: pass `NULL` for the current greedy default (unchanged behavior). When
+// non-null, Tritium reads its fields defensively up to the caller's `struct_size`;
+// this ABI revision defines only reserved fields, so a non-null zeroed `opts`
+// behaves identically to `NULL`.
 //
 // Writes up to `out_cap` token IDs into `out` and sets `*out_len` to the number
 // generated. If the count exceeds `out_cap`, returns
@@ -77,15 +140,18 @@ struct TritiumModel *tritium_model_load_file(const char *path, enum TritiumStatu
 // `model` must be a live handle from [`tritium_model_load_file`]; `prompt` must
 // point to `prompt_len` `u32`s (or be null iff `prompt_len == 0`); `out` must
 // point to `out_cap` writable `u32`s (or be null iff `out_cap == 0`); `out_len`
-// must be a valid writable `usize*`. Do not call concurrently on one `model`.
-enum TritiumStatus tritium_generate(struct TritiumModel *model,
-                                    const uint32_t *prompt,
-                                    uintptr_t prompt_len,
-                                    uint32_t max_new,
-                                    uint32_t eos,
-                                    uint32_t *out,
-                                    uintptr_t out_cap,
-                                    uintptr_t *out_len);
+// must be a valid writable `usize*`; `opts` must be null or point to a valid
+// [`TritiumGenerateOptions`] of at least `opts->struct_size` bytes. Do not call
+// concurrently on one `model`.
+TritiumStatus tritium_generate(struct TritiumModel *model,
+                               const uint32_t *prompt,
+                               size_t prompt_len,
+                               uint32_t max_new,
+                               uint32_t eos,
+                               uint32_t *out,
+                               size_t out_cap,
+                               size_t *out_len,
+                               const struct TritiumGenerateOptions *opts);
 
 // Free a model handle returned by [`tritium_model_load_file`]. Null-safe;
 // double-free is the caller's responsibility (do not call twice on one handle).

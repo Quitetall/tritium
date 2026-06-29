@@ -50,7 +50,7 @@ use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
 use tritium_runtime::BackendEntry;
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
 // The kernel module holds the only hand-written `unsafe` in the crate: the AVX2
 // intrinsic kernel (its `unsafe fn` plus the raw-pointer loads/stores). The
@@ -234,15 +234,15 @@ impl TernaryBackend for CpuBackend {
         Ok(Box::new(CpuBuffer::new(packed.to_vec())))
     }
 
-    fn mpgemm(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        scales: &[f32],
-        shape: GemmShape,
-        format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    fn mpgemm(&self, p: tritium_spec::MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales,
+            shape,
+            format,
+            out,
+        } = p;
         let buf = weights
             .as_any()
             .downcast_ref::<CpuBuffer>()
@@ -357,7 +357,14 @@ mod tests {
         let buf = backend.upload_weights(&packed, shape, format).unwrap();
         let mut out = vec![0.0f32; shape.m * shape.n];
         backend
-            .mpgemm(act, buf.as_ref(), scales, shape, format, &mut out)
+            .mpgemm(MpGemm {
+                act,
+                weights: buf.as_ref(),
+                scales,
+                shape,
+                format,
+                out: &mut out,
+            })
             .unwrap();
         out
     }
@@ -519,14 +526,14 @@ mod tests {
         let scales = vec![1.0f32; 1];
         let mut out = vec![0.0f32; 1];
         let err = backend
-            .mpgemm(
-                &act,
-                &Foreign,
-                &scales,
+            .mpgemm(MpGemm {
+                act: &act,
+                weights: &Foreign,
+                scales: &scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            })
             .unwrap_err();
         assert!(matches!(err, BackendError::InvalidInput(_)), "{err:?}");
     }
@@ -545,14 +552,14 @@ mod tests {
         let scales = vec![1.0f32; 1];
         let mut out = vec![0.0f32; 2];
         let err = backend
-            .mpgemm(
-                &act,
-                buf.as_ref(),
-                &scales,
+            .mpgemm(MpGemm {
+                act: &act,
+                weights: buf.as_ref(),
+                scales: &scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            })
             .unwrap_err();
         assert!(matches!(err, BackendError::ShapeMismatch { .. }), "{err:?}");
     }

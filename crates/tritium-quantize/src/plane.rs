@@ -69,7 +69,7 @@ pub fn absmean_ternary(w: &[f32]) -> Plane {
 /// Quantize `w` to a single ternary plane at a **given** `scale` instead of the group's
 /// own AbsMean: `trit = round(w / scale)` clamped to `{-1, 0, +1}`, `Plane::scale = scale`.
 ///
-/// The per-tensor base plane ([`ScaleGroup::Tensor`](crate::ScaleGroup)) uses this so every
+/// The per-tensor base plane ([`BaseScaleScope::Tensor`](crate::BaseScaleScope)) uses this so every
 /// 256-block of the base shares ONE scale — the deployed BitNet b1.58 per-tensor AbsMean,
 /// which a per-block fit (each block its own AbsMean) does not reproduce. `scale == 0`
 /// prunes to all-[`Trit::ZERO`], matching [`absmean_ternary`].

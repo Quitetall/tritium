@@ -113,11 +113,13 @@ mod tests {
             "frozen set must include the degenerate boundary cases"
         );
         assert!(
-            v.iter().any(|x| x.format == "tq2_0"),
+            v.iter()
+                .any(|x| x.format == tritium_core::TernaryFormat::Tq2_0),
             "frozen set must exercise tq2_0"
         );
         assert!(
-            v.iter().any(|x| x.format == "tq1_0"),
+            v.iter()
+                .any(|x| x.format == tritium_core::TernaryFormat::Tq1_0),
             "frozen set must exercise tq1_0"
         );
     }

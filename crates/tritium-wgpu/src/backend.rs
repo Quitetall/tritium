@@ -10,7 +10,7 @@ use tritium_core::{GemmShape, TernaryFormat, Trit};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
 /// Workgroup size for the 1-D flattened-output dispatch (must match the WGSL
 /// `@workgroup_size`).
@@ -266,15 +266,15 @@ impl TernaryBackend for WgpuBackend {
         }))
     }
 
-    fn mpgemm(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        scales: &[f32],
-        shape: GemmShape,
-        _format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales,
+            shape,
+            format: _format,
+            out,
+        } = p;
         let buf = weights
             .as_any()
             .downcast_ref::<WgpuBuffer>()

@@ -27,8 +27,9 @@ use crate::{
 };
 
 /// How to score each group's loss sensitivity `H_g` for the allocator.
-#[derive(Clone, Copy, Debug, Default)]
-pub enum Sensitivity<'a> {
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub enum Sensitivity {
     /// All groups equally sensitive — allocate purely by reconstruction-error
     /// reduction (minimize total MSE under the budget). The default.
     #[default]
@@ -37,12 +38,19 @@ pub enum Sensitivity<'a> {
     Energy,
     /// Caller-supplied per-group sensitivities (e.g. a GPTQ Hessian diagonal),
     /// row-major `r·nb + b`. Must have exactly one entry per group.
-    Custom(&'a [f64]),
+    Custom(Vec<f64>),
 }
 
 /// Granularity of the **base** (T=1) plane's AbsMean scale.
+///
+/// Distinct from [`tritium_core::ScaleGranularity`]: that type names the general
+/// per-tensor/-channel/-group scale-sharing scheme a weight tensor can use, while
+/// this enum names only the two scopes SALT's base plane supports
+/// (`Block` ≈ per-256-block, `Tensor` ≈ per-tensor). Kept separate so the SALT
+/// base-plane choice stays a clean 2-state knob with its own `Default`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ScaleGroup {
+#[non_exhaustive]
+pub enum BaseScaleScope {
     /// Per-256-block: every block fits its own AbsMean (the SALT/TQ2_0 default). Best for a
     /// normally-trained fp master — it reconstructs the weights most faithfully.
     #[default]
@@ -56,8 +64,8 @@ pub enum ScaleGroup {
 }
 
 /// Knobs for [`quantize_tensor`].
-#[derive(Clone, Copy, Debug)]
-pub struct QuantConfig<'a> {
+#[derive(Clone, Debug)]
+pub struct QuantConfig {
     /// Target **average bits-per-weight** (`≥ t_min·log2 3`; `1.585` = all base).
     pub budget_bpw: f64,
     /// Dense base planes every group gets (default `1`).
@@ -65,19 +73,19 @@ pub struct QuantConfig<'a> {
     /// Plane cap per group (default `3`, tile-uniform `{1,2,3}`).
     pub t_max: usize,
     /// Sensitivity scoring.
-    pub sensitivity: Sensitivity<'a>,
-    /// Base-plane scale granularity (default [`ScaleGroup::Block`]).
-    pub scale_group: ScaleGroup,
+    pub sensitivity: Sensitivity,
+    /// Base-plane scale granularity (default [`BaseScaleScope::Block`]).
+    pub scale_group: BaseScaleScope,
 }
 
-impl Default for QuantConfig<'_> {
+impl Default for QuantConfig {
     fn default() -> Self {
         Self {
             budget_bpw: 2.0,
             t_min: 1,
             t_max: 3,
             sensitivity: Sensitivity::Uniform,
-            scale_group: ScaleGroup::Block,
+            scale_group: BaseScaleScope::Block,
         }
     }
 }
@@ -121,6 +129,7 @@ impl QuantizedTensor {
 
 /// Why a tensor could not be quantized.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum QuantError {
     /// `weights.len()` ≠ `rows · k`.
     ShapeMismatch {
@@ -200,7 +209,7 @@ pub fn quantize_tensor(
     }
     let nb = num_blocks(k);
     let n_groups = rows * nb;
-    if let Sensitivity::Custom(s) = cfg.sensitivity
+    if let Sensitivity::Custom(s) = &cfg.sensitivity
         && s.len() != n_groups
     {
         return Err(QuantError::SensitivityLen {
@@ -212,8 +221,8 @@ pub fn quantize_tensor(
     // Each path yields, per row, the `nb` block plane-stacks plus the realized plane count
     // per group; the assembly below is shared.
     let (row_stacks, plane_counts) = match cfg.scale_group {
-        ScaleGroup::Block => expand_per_block(weights, rows, k, nb, cfg)?,
-        ScaleGroup::Tensor => expand_per_tensor(weights, rows, k, nb, cfg)?,
+        BaseScaleScope::Block => expand_per_block(weights, rows, k, nb, cfg)?,
+        BaseScaleScope::Tensor => expand_per_tensor(weights, rows, k, nb, cfg)?,
     };
 
     let mut salt_rows = Vec::with_capacity(rows);
@@ -238,7 +247,7 @@ fn block_range(b: usize, k: usize) -> (usize, usize) {
 
 /// One group's loss sensitivity `H_g` for the allocator. `idx` is the row-major group index
 /// `r·nb + b` (for [`Sensitivity::Custom`]).
-fn group_sensitivity(sensitivity: Sensitivity, gw: &[f32], idx: usize) -> f64 {
+fn group_sensitivity(sensitivity: &Sensitivity, gw: &[f32], idx: usize) -> f64 {
     match sensitivity {
         Sensitivity::Uniform => 1.0,
         Sensitivity::Energy => gw.iter().map(|&x| x as f64 * x as f64).sum(),
@@ -266,7 +275,7 @@ fn expand_per_block(
             let gw = &row[start..end];
             groups.push(GroupInput {
                 weights: gw,
-                sensitivity: group_sensitivity(cfg.sensitivity, gw, r * nb + b),
+                sensitivity: group_sensitivity(&cfg.sensitivity, gw, r * nb + b),
             });
         }
     }
@@ -325,7 +334,7 @@ fn expand_per_tensor(
             let gw = &rrow[start..end];
             groups.push(GroupInput {
                 weights: gw,
-                sensitivity: group_sensitivity(cfg.sensitivity, gw, r * nb + b),
+                sensitivity: group_sensitivity(&cfg.sensitivity, gw, r * nb + b),
             });
         }
     }
@@ -505,7 +514,7 @@ mod tests {
             let w = make_tensor(rows, k, 0x5A17 ^ (k as u64));
             let cfg = QuantConfig {
                 budget_bpw: 2.6,
-                scale_group: ScaleGroup::Tensor,
+                scale_group: BaseScaleScope::Tensor,
                 ..Default::default()
             };
             let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
@@ -528,7 +537,7 @@ mod tests {
         }
     }
 
-    // ── Gate: ScaleGroup::Tensor floor == PER-TENSOR AbsMean (deployed BitNet I2_S).
+    // ── Gate: BaseScaleScope::Tensor floor == PER-TENSOR AbsMean (deployed BitNet I2_S).
     // The deployed b1.58 uses ONE absmean scale for the whole tensor; the per-256-block
     // default does not reproduce it (it reconstructs the heavy-tailed master far more
     // faithfully → weights the QAT model was never trained for). At the floor budget every
@@ -542,7 +551,7 @@ mod tests {
             t_min: 1,
             t_max: 3,
             sensitivity: Sensitivity::Uniform,
-            scale_group: ScaleGroup::Tensor,
+            scale_group: BaseScaleScope::Tensor,
         };
         let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
         assert!(
@@ -574,7 +583,7 @@ mod tests {
             t_min: 1,
             t_max: 3,
             sensitivity: Sensitivity::Uniform,
-            scale_group: ScaleGroup::Block,
+            scale_group: BaseScaleScope::Block,
         };
         let qt = quantize_tensor(&w, rows, k, &cfg).unwrap();
         assert!(
@@ -658,7 +667,7 @@ mod tests {
         let w = make_tensor(2, 256, 1);
         let bad = [1.0f64; 3]; // need 2 groups, gave 3
         let cfg = QuantConfig {
-            sensitivity: Sensitivity::Custom(&bad),
+            sensitivity: Sensitivity::Custom(bad.to_vec()),
             ..Default::default()
         };
         assert!(matches!(

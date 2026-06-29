@@ -39,7 +39,7 @@ use std::ffi::{CString, c_void};
 use tritium_core::{GemmShape, TernaryFormat};
 use tritium_format::{IMMA_K, IMMA_N, IMMA_WTILE_BYTES, TQ2_0_BLOCK_BYTES, num_blocks};
 use tritium_runtime::BackendEntry;
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
 use crate::autotune::{
     CacheKey, CandidateResult, ShapeBucket, TileConfig, cache_dir, tune_or_load,
@@ -2908,7 +2908,7 @@ impl TernaryBackend for CudaBackend {
     /// Opt into the downcast hook so the runner can recover `&CudaBackend` from its
     /// `&dyn TernaryBackend` and build a [`CudaDecodeModel`] (the device-resident
     /// decode fast path, v0.3.1).
-    fn as_any(&self) -> Option<&dyn Any> {
+    fn as_concrete(&self) -> Option<&dyn Any> {
         Some(self)
     }
 
@@ -2976,15 +2976,15 @@ impl TernaryBackend for CudaBackend {
         }))
     }
 
-    fn mpgemm(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        scales: &[f32],
-        shape: GemmShape,
-        format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales,
+            shape,
+            format,
+            out,
+        } = p;
         // Auto-select the add-only kernel by shape (decode → tiled), then run it.
         // All validation + the launch live in `mpgemm_kernel`.
         let kernel = Self::select_add_kernel(shape.m, shape.k);
@@ -3004,15 +3004,15 @@ impl TernaryBackend for CudaBackend {
     /// As [`imma_with_act_quant`](CudaBackend::imma_with_act_quant) /
     /// [`mpgemm`](TernaryBackend::mpgemm) document, plus
     /// [`BackendError::InvalidInput`] if the buffer is not a CUDA buffer.
-    fn mpgemm_with_act_quant(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        weight_scales: &[f32],
-        shape: GemmShape,
-        format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    fn mpgemm_with_act_quant(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales: weight_scales,
+            shape,
+            format,
+            out,
+        } = p;
         let buf = weights
             .as_any()
             .downcast_ref::<CudaBuffer>()
@@ -3074,7 +3074,14 @@ impl CudaBackend {
         let mut act_scale = vec![0.0_f32; m];
         quantize_act_int8_host(act, m, k, &mut q, &mut act_scale);
 
-        self.mpgemm(&q, weights, weight_scales, shape, format, out)?;
+        self.mpgemm(MpGemm {
+            act: &q,
+            weights,
+            scales: weight_scales,
+            shape,
+            format,
+            out,
+        })?;
 
         // Fold the per-token activation scale: out[m,n] *= act_scale[m].
         for (row, &s) in out.chunks_exact_mut(n).zip(act_scale.iter()) {
@@ -7034,7 +7041,7 @@ mod tests {
     fn tq2_vectors() -> Vec<ConformanceVector> {
         let v: Vec<_> = generate_vectors(0xC0FFEE, 16)
             .into_iter()
-            .filter(|v| v.format == "tq2_0")
+            .filter(|v| v.format == TernaryFormat::Tq2_0)
             .collect();
         assert!(!v.is_empty(), "expected some tq2_0 conformance vectors");
         v
@@ -7072,10 +7079,7 @@ mod tests {
                 return;
             }
         };
-        let tol = Tolerance {
-            relative: 1e-4,
-            bit_exact: false,
-        };
+        let tol = Tolerance::relative(1e-4);
         // square + tail shapes (non-multiples of the 256-thread block). The (2,300,3)
         // case pushes N past 256 so grad_s's own grid spans >1 block (blockIdx.x>0).
         let shapes = [
@@ -7498,14 +7502,14 @@ mod tests {
             .expect("upload weights");
         let mut out = vec![0.0f32; shape.m * shape.n];
         backend
-            .mpgemm(
+            .mpgemm(tritium_spec::MpGemm {
                 act,
-                buf.as_ref(),
+                weights: buf.as_ref(),
                 scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            })
             .expect("mpgemm");
         out
     }
@@ -7743,14 +7747,14 @@ mod tests {
                     .expect("cpu upload")
             };
             let mut ref_out = vec![0.0f32; shape.m * shape.n];
-            cpu.mpgemm_with_act_quant(
-                &v.activation,
-                cpu_buf.as_ref(),
-                &v.scales,
+            cpu.mpgemm_with_act_quant(tritium_spec::MpGemm {
+                act: &v.activation,
+                weights: cpu_buf.as_ref(),
+                scales: &v.scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut ref_out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut ref_out,
+            })
             .expect("cpu host-A8 reference");
 
             // IMMA: upload the I2sInt8 weights, run the fused override (on-device
@@ -7760,14 +7764,14 @@ mod tests {
                 .upload_weights(&imma_bytes, shape, TernaryFormat::I2sInt8)
                 .expect("imma upload");
             let mut imma_out = vec![0.0f32; shape.m * shape.n];
-            cuda.mpgemm_with_act_quant(
-                &v.activation,
-                imma_buf.as_ref(),
-                &v.scales,
+            cuda.mpgemm_with_act_quant(tritium_spec::MpGemm {
+                act: &v.activation,
+                weights: imma_buf.as_ref(),
+                scales: &v.scales,
                 shape,
-                TernaryFormat::I2sInt8,
-                &mut imma_out,
-            )
+                format: TernaryFormat::I2sInt8,
+                out: &mut imma_out,
+            })
             .expect("imma fused mpgemm");
 
             assert_eq!(imma_out.len(), ref_out.len(), "{}: len", v.id);
@@ -7817,14 +7821,14 @@ mod tests {
                 .upload_weights(&imma_bytes, shape, TernaryFormat::I2sInt8)
                 .expect("imma upload");
             let mut fused = vec![0.0f32; m * n];
-            cuda.mpgemm_with_act_quant(
-                &v.activation,
-                imma_buf.as_ref(),
-                &v.scales,
+            cuda.mpgemm_with_act_quant(tritium_spec::MpGemm {
+                act: &v.activation,
+                weights: imma_buf.as_ref(),
+                scales: &v.scales,
                 shape,
-                TernaryFormat::I2sInt8,
-                &mut fused,
-            )
+                format: TernaryFormat::I2sInt8,
+                out: &mut fused,
+            })
             .expect("cuda fused");
 
             // (2) Spec host-A8 default on the CPU backend (TQ2_0).
@@ -7832,14 +7836,14 @@ mod tests {
                 .upload_weights(&tq2, shape, TernaryFormat::Tq2_0)
                 .expect("cpu upload");
             let mut host_a8 = vec![0.0f32; m * n];
-            cpu.mpgemm_with_act_quant(
-                &v.activation,
-                cpu_buf.as_ref(),
-                &v.scales,
+            cpu.mpgemm_with_act_quant(tritium_spec::MpGemm {
+                act: &v.activation,
+                weights: cpu_buf.as_ref(),
+                scales: &v.scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut host_a8,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut host_a8,
+            })
             .expect("cpu host-A8");
 
             // (3) v0.20 caller-side quant: host quant → plain `mpgemm` → fold.
@@ -7847,14 +7851,14 @@ mod tests {
             let mut act_scale = vec![0.0f32; m];
             quantize_act_int8_host(&v.activation, m, k, &mut q, &mut act_scale);
             let mut caller = vec![0.0f32; m * n];
-            cpu.mpgemm(
-                &q,
-                cpu_buf.as_ref(),
-                &v.scales,
+            cpu.mpgemm(tritium_spec::MpGemm {
+                act: &q,
+                weights: cpu_buf.as_ref(),
+                scales: &v.scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut caller,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut caller,
+            })
             .expect("cpu plain mpgemm");
             for (row, &s) in caller.chunks_exact_mut(n).zip(act_scale.iter()) {
                 for x in row {
@@ -7923,28 +7927,28 @@ mod tests {
                 .upload_weights(&pack_tq2_0(&trits, shape), shape, TernaryFormat::Tq2_0)
                 .expect("cpu upload");
             let mut ref_out = vec![0.0f32; m * n];
-            cpu.mpgemm_with_act_quant(
-                &act,
-                cpu_buf.as_ref(),
-                &scales,
+            cpu.mpgemm_with_act_quant(tritium_spec::MpGemm {
+                act: &act,
+                weights: cpu_buf.as_ref(),
+                scales: &scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut ref_out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut ref_out,
+            })
             .expect("cpu host-A8");
 
             let imma_buf = cuda
                 .upload_weights(&pack_i2s_int8(&raw, shape), shape, TernaryFormat::I2sInt8)
                 .expect("imma upload");
             let mut imma_out = vec![0.0f32; m * n];
-            cuda.mpgemm_with_act_quant(
-                &act,
-                imma_buf.as_ref(),
-                &scales,
+            cuda.mpgemm_with_act_quant(tritium_spec::MpGemm {
+                act: &act,
+                weights: imma_buf.as_ref(),
+                scales: &scales,
                 shape,
-                TernaryFormat::I2sInt8,
-                &mut imma_out,
-            )
+                format: TernaryFormat::I2sInt8,
+                out: &mut imma_out,
+            })
             .expect("imma fused");
 
             for (i, (&g, &c)) in imma_out.iter().zip(&ref_out).enumerate() {
@@ -8203,14 +8207,14 @@ mod tests {
             .upload_weights(&pack_tq2_0(&trits, shape), shape, TernaryFormat::Tq2_0)
             .expect("cpu upload");
         let mut ref_out = vec![0.0f32; m * n];
-        cpu.mpgemm_with_act_quant(
-            &act,
-            cpu_buf.as_ref(),
-            &scales,
+        cpu.mpgemm_with_act_quant(tritium_spec::MpGemm {
+            act: &act,
+            weights: cpu_buf.as_ref(),
+            scales: &scales,
             shape,
-            TernaryFormat::Tq2_0,
-            &mut ref_out,
-        )
+            format: TernaryFormat::Tq2_0,
+            out: &mut ref_out,
+        })
         .expect("cpu host-A8 reference");
 
         // Tuned path: upload I2sInt8, run the fused override (which resolves + tunes
@@ -8219,24 +8223,24 @@ mod tests {
             .upload_weights(&pack_i2s_int8(&raw, shape), shape, TernaryFormat::I2sInt8)
             .expect("imma upload");
         let mut tuned1 = vec![0.0f32; m * n];
-        cuda.mpgemm_with_act_quant(
-            &act,
-            imma_buf.as_ref(),
-            &scales,
+        cuda.mpgemm_with_act_quant(tritium_spec::MpGemm {
+            act: &act,
+            weights: imma_buf.as_ref(),
+            scales: &scales,
             shape,
-            TernaryFormat::I2sInt8,
-            &mut tuned1,
-        )
+            format: TernaryFormat::I2sInt8,
+            out: &mut tuned1,
+        })
         .expect("tuned fused (cold)");
         let mut tuned2 = vec![0.0f32; m * n];
-        cuda.mpgemm_with_act_quant(
-            &act,
-            imma_buf.as_ref(),
-            &scales,
+        cuda.mpgemm_with_act_quant(tritium_spec::MpGemm {
+            act: &act,
+            weights: imma_buf.as_ref(),
+            scales: &scales,
             shape,
-            TernaryFormat::I2sInt8,
-            &mut tuned2,
-        )
+            format: TernaryFormat::I2sInt8,
+            out: &mut tuned2,
+        })
         .expect("tuned fused (warm)");
 
         // Tuned == reference within tolerance.

@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use tritium_core::{GemmShape, TernaryFormat};
 use tritium_format::{TQ2_0_BLOCK_BYTES, num_blocks};
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
 use crate::ffi;
 
@@ -365,15 +365,15 @@ impl TernaryBackend for RocmBackend {
         }))
     }
 
-    fn mpgemm(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        scales: &[f32],
-        shape: GemmShape,
-        format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales,
+            shape,
+            format,
+            out,
+        } = p;
         if format != TernaryFormat::Tq2_0 {
             return Err(BackendError::UnsupportedFormat(format));
         }

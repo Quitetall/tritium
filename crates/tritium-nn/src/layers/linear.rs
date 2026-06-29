@@ -180,14 +180,14 @@ impl TernaryLinear {
 
         // Ternary GEMM: out[r, n] = scales[n] · Σ_k q_act[r, k] · trit[n, k].
         // `scales` already carries the per-tensor weight scale.
-        backend.mpgemm(
-            &q_act,
-            &*self.weights,
-            &self.scales,
-            self.shape(m),
-            TernaryFormat::Tq2_0,
+        backend.mpgemm(tritium_spec::MpGemm {
+            act: &q_act,
+            weights: &*self.weights,
+            scales: &self.scales,
+            shape: self.shape(m),
+            format: TernaryFormat::Tq2_0,
             out,
-        )?;
+        })?;
 
         // Fold the per-token activation dequant scale: y · act_scale · weight_scale
         // (weight_scale already applied by the GEMM).

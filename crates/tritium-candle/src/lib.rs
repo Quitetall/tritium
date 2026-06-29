@@ -171,14 +171,6 @@ mod candle_op {
         use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
         use tritium_testkit::{ConformanceVector, FROZEN_COUNT, FROZEN_SEED, generate_vectors};
 
-        fn parse_format(tag: &str) -> TernaryFormat {
-            match tag {
-                "tq2_0" => TernaryFormat::Tq2_0,
-                "tq1_0" => TernaryFormat::Tq1_0,
-                other => panic!("unexpected format tag {other}"),
-            }
-        }
-
         /// Pack a vector's `[N, K]` `i8` weights exactly as the conformance harness
         /// does: per row, unit (1.0) block scales, concatenated output-major.
         fn pack(v: &ConformanceVector, format: TernaryFormat) -> Vec<u8> {
@@ -218,7 +210,7 @@ mod candle_op {
             assert!(total > FROZEN_COUNT, "boundary vectors must be included");
             let mut checked = 0usize;
             for v in vs {
-                let format = parse_format(&v.format);
+                let format = v.format;
                 let packed = pack(&v, format);
                 let act = Tensor::from_vec(v.activation.clone(), (v.m, v.k), &Device::Cpu).unwrap();
                 let out = ternary_mpgemm(&act, &packed, &v.scales, v.k, format).unwrap();

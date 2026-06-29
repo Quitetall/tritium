@@ -208,6 +208,61 @@ impl GgufValue {
             _ => None,
         }
     }
+
+    /// Interpret this value as a signed integer, widening any integer width.
+    /// Returns `None` for non-integer kinds or a `U64` that does not fit `i64`.
+    #[must_use]
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            GgufValue::U8(v) => Some(i64::from(*v)),
+            GgufValue::I8(v) => Some(i64::from(*v)),
+            GgufValue::U16(v) => Some(i64::from(*v)),
+            GgufValue::I16(v) => Some(i64::from(*v)),
+            GgufValue::U32(v) => Some(i64::from(*v)),
+            GgufValue::I32(v) => Some(i64::from(*v)),
+            GgufValue::I64(v) => Some(*v),
+            GgufValue::U64(v) => i64::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    /// Interpret this value as `f64`. `F64` is returned directly; `F32` widens
+    /// losslessly. Returns `None` for non-float kinds.
+    #[must_use]
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            GgufValue::F64(v) => Some(*v),
+            GgufValue::F32(v) => Some(f64::from(*v)),
+            _ => None,
+        }
+    }
+
+    /// Interpret this value as `f32`, or `None` if it is not an `F32`.
+    #[must_use]
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            GgufValue::F32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// This value as a `bool`, or `None` if it is not a `Bool`.
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            GgufValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Borrow this value's elements as a slice, or `None` if it is not an `Array`.
+    #[must_use]
+    pub fn as_array(&self) -> Option<&[GgufValue]> {
+        match self {
+            GgufValue::Array(items) => Some(items),
+            _ => None,
+        }
+    }
 }
 
 /// Read one metadata value of the given `value_type` from the cursor.
@@ -251,7 +306,8 @@ fn read_value(cur: &mut Cursor<'_>, value_type: u32, depth: u32) -> Result<GgufV
 }
 
 /// Description of one tensor's container entry (its payload is not parsed here).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct TensorInfo {
     /// Tensor name (a GGUF string).
     pub name: String,
@@ -266,6 +322,20 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
+    /// Construct a tensor-table entry. Primarily for tests and tools that build a
+    /// container description by hand; [`read_gguf`] fills these from a parsed
+    /// buffer.
+    #[must_use]
+    pub fn new(name: String, dims: Vec<u64>, ggml_type: u32, offset: u64, n_bytes: u64) -> Self {
+        TensorInfo {
+            name,
+            dims,
+            ggml_type,
+            offset,
+            n_bytes,
+        }
+    }
+
     /// Number of elements = product of `dims` (1 for a 0-dimensional tensor).
     ///
     /// # Errors
@@ -319,7 +389,8 @@ fn tensor_n_bytes(ggml_type: u32, n_elements: u64) -> Result<u64, GgufError> {
 ///
 /// The original byte buffer is *not* retained; payloads are located via
 /// [`Self::tensor_data_offset`] plus each [`TensorInfo`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct GgufFile {
     /// File-format version (2 or 3).
     pub version: u32,
@@ -332,6 +403,23 @@ pub struct GgufFile {
 }
 
 impl GgufFile {
+    /// Construct a container description. Primarily for tests and tools that build
+    /// one by hand; [`read_gguf`] fills these from a parsed buffer.
+    #[must_use]
+    pub fn new(
+        version: u32,
+        metadata: BTreeMap<String, GgufValue>,
+        tensors: Vec<TensorInfo>,
+        tensor_data_offset: u64,
+    ) -> Self {
+        GgufFile {
+            version,
+            metadata,
+            tensors,
+            tensor_data_offset,
+        }
+    }
+
     /// Look up a metadata value by its full dotted key.
     #[must_use]
     pub fn get_metadata(&self, key: &str) -> Option<&GgufValue> {

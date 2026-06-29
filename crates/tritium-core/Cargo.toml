@@ -14,10 +14,17 @@ categories.workspace = true
 default = ["std"]
 std = ["alloc"]
 alloc = []
+# Opt-in Serialize/Deserialize for the shared vocabulary enums (e.g.
+# `TernaryFormat`). Used by `tritium-testkit`'s on-disk conformance vectors so
+# the format tag serializes to its canonical lowercase token. Off by default to
+# keep the foundation crate dependency-free / no_std-able.
+serde = ["dep:serde"]
 
 # Foundation crate: zero external runtime deps by design. The only thing every
 # backend links is types + reference math — keep it minimal and no_std-able.
 [dependencies]
+# Optional: only pulled in under the `serde` feature (derive-only, no_std-compatible).
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -25,10 +25,49 @@
 use core::any::Any;
 use core::fmt;
 
-use tritium_core::{GemmShape, TernaryFormat, TritError};
+// Re-export the core vocabulary types the contract speaks so a backend author
+// needs only depend on `tritium-spec` to implement [`TernaryBackend`].
+pub use tritium_core::{DType, GemmShape, TernaryFormat, TritError};
 
 mod caps;
 pub use caps::DeviceCaps;
+
+/// Parameters for a ternary mixed-precision GEMM call.
+///
+/// Groups the operands of [`TernaryBackend::mpgemm`] (and
+/// [`TernaryBackend::mpgemm_with_act_quant`]) into one value so the call site is
+/// a single struct rather than six positional arguments. All slices are
+/// row-major and follow the [`GemmShape`] convention: `act` is `[M, K]`, the
+/// `weights` buffer is `[N, K]` (output-major) packed in `format`, `scales` is
+/// `[N]` per-output-channel, and `out` is `[M, N]` and is overwritten.
+pub struct MpGemm<'a> {
+    /// `[M, K]` row-major activations.
+    pub act: &'a [f32],
+    /// Device handle for the packed `[N, K]` ternary weights (from
+    /// [`TernaryBackend::upload_weights`]).
+    pub weights: &'a dyn DeviceBuffer,
+    /// `[N]` per-output-channel scales.
+    pub scales: &'a [f32],
+    /// Problem geometry `(M, N, K)`.
+    pub shape: GemmShape,
+    /// Packing scheme of `weights`.
+    pub format: TernaryFormat,
+    /// `[M, N]` output, overwritten by the call.
+    pub out: &'a mut [f32],
+}
+
+impl fmt::Debug for MpGemm<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MpGemm")
+            .field("act_len", &self.act.len())
+            .field("weights_bytes", &self.weights.len_bytes())
+            .field("scales_len", &self.scales.len())
+            .field("shape", &self.shape)
+            .field("format", &self.format)
+            .field("out_len", &self.out.len())
+            .finish()
+    }
+}
 
 /// Opaque handle to device-resident memory owned by a backend.
 ///
@@ -77,9 +116,9 @@ pub trait TernaryBackend: Send + Sync {
 
     /// Compute `out[M,N] = scale[n] · Σ_k act[m,k] · w[n,k]` for ternary `w`.
     ///
-    /// `act` is `[M, K]` row-major, `weights` is the handle from
-    /// [`upload_weights`](TernaryBackend::upload_weights), `scales` is `[N]`
-    /// per-output-channel, `out` is `[M, N]` and is overwritten.
+    /// Operands are carried in [`MpGemm`]: `act` is `[M, K]` row-major, `weights`
+    /// is the handle from [`upload_weights`](TernaryBackend::upload_weights),
+    /// `scales` is `[N]` per-output-channel, `out` is `[M, N]` and is overwritten.
     ///
     /// Result must match [`tritium_core::reference_mpgemm`] with relative error
     /// `≤ 1e-4` (fp32 accumulation reorders across backends; bit-exactness is not
@@ -88,15 +127,7 @@ pub trait TernaryBackend: Send + Sync {
     /// # Errors
     /// [`BackendError::ShapeMismatch`] if buffer lengths disagree with `shape`;
     /// [`BackendError::Backend`] for device-specific failures.
-    fn mpgemm(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        scales: &[f32],
-        shape: GemmShape,
-        format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError>;
+    fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError>;
 
     /// Ternary mpGEMM with **W1.58A8** activation quantization fused in: quantize
     /// `act` to per-token int8 (absmax, `Qp = 127`), contract against the ternary
@@ -130,18 +161,21 @@ pub trait TernaryBackend: Send + Sync {
     // value the nn copy asserts, so they cannot silently diverge.
     ///
     /// # Errors
-    /// [`BackendError::ShapeMismatch`] if `act`/`out`/`weight_scales` lengths
+    /// [`BackendError::ShapeMismatch`] if `act`/`out`/`scales` lengths
     /// disagree with `shape`; otherwise whatever
     /// [`mpgemm`](TernaryBackend::mpgemm) returns.
-    fn mpgemm_with_act_quant(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        weight_scales: &[f32],
-        shape: GemmShape,
-        format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    ///
+    /// In the [`MpGemm`], `scales` is the `[N]` per-output-channel **weight**
+    /// scale; the per-token activation scale is computed internally.
+    fn mpgemm_with_act_quant(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales: weight_scales,
+            shape,
+            format,
+            out,
+        } = p;
         let GemmShape { m, n, k } = shape;
         if act.len() != m * k {
             return Err(BackendError::ShapeMismatch {
@@ -169,7 +203,14 @@ pub trait TernaryBackend: Send + Sync {
         quantize_act_int8(act, m, k, &mut q, &mut act_scale);
 
         // out[m,n] = weight_scale[n] · Σ_k q[m,k] · w[n,k]
-        self.mpgemm(&q, weights, weight_scales, shape, format, out)?;
+        self.mpgemm(MpGemm {
+            act: &q,
+            weights,
+            scales: weight_scales,
+            shape,
+            format,
+            out: &mut *out,
+        })?;
 
         // Fold the per-token activation scale: out[m,n] *= act_scale[m].
         for (row, &s) in out.chunks_exact_mut(n).zip(act_scale.iter()) {
@@ -187,7 +228,10 @@ pub trait TernaryBackend: Send + Sync {
     /// the concrete type with `downcast_ref`. Keeping it defaulted means the generic
     /// trait stays object-safe and host-slice-oriented; only the one backend that has
     /// a device-resident path opts in.
-    fn as_any(&self) -> Option<&dyn core::any::Any> {
+    ///
+    /// Named `as_concrete` (not `as_any`) to avoid clashing with
+    /// [`DeviceBuffer::as_any`].
+    fn as_concrete(&self) -> Option<&dyn core::any::Any> {
         None
     }
 }
@@ -283,7 +327,14 @@ impl fmt::Display for BackendError {
     }
 }
 
-impl std::error::Error for BackendError {}
+impl std::error::Error for BackendError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            BackendError::Core(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<TritError> for BackendError {
     fn from(e: TritError) -> Self {
@@ -361,15 +412,15 @@ mod tests {
         ) -> Result<Box<dyn DeviceBuffer>, BackendError> {
             Err(BackendError::InvalidInput("mock: unused".into()))
         }
-        fn mpgemm(
-            &self,
-            act: &[f32],
-            weights: &dyn DeviceBuffer,
-            scales: &[f32],
-            shape: GemmShape,
-            _format: TernaryFormat,
-            out: &mut [f32],
-        ) -> Result<(), BackendError> {
+        fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+            let MpGemm {
+                act,
+                weights,
+                scales,
+                shape,
+                format: _format,
+                out,
+            } = p;
             let buf = weights
                 .as_any()
                 .downcast_ref::<MockBuffer>()
@@ -401,14 +452,14 @@ mod tests {
         let shape = GemmShape { m: 1, n: 1, k: 2 };
         let mut out = [f32::NAN; 1];
         backend
-            .mpgemm_with_act_quant(
-                &act,
-                &buf,
-                &weight_scales,
+            .mpgemm_with_act_quant(MpGemm {
+                act: &act,
+                weights: &buf,
+                scales: &weight_scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            })
             .expect("fused mpgemm");
         let expected = 338.0_f32 * 3.0 / 127.0;
         // Tight bound: the only slack is the f32 fold-order difference between
@@ -429,14 +480,14 @@ mod tests {
         let mut out = [0.0_f32; 1];
         // act too short
         assert!(matches!(
-            backend.mpgemm_with_act_quant(
-                &[3.0],
-                &buf,
-                &[2.0],
+            backend.mpgemm_with_act_quant(MpGemm {
+                act: &[3.0],
+                weights: &buf,
+                scales: &[2.0],
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out
-            ),
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            }),
             Err(BackendError::ShapeMismatch { .. })
         ));
     }

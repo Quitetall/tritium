@@ -47,6 +47,20 @@ impl DeviceCaps {
         self
     }
 
+    /// Set whether an int8 tensor-core (IMMA) path is available.
+    #[must_use]
+    pub fn with_imma(mut self, supported: bool) -> Self {
+        self.supports_imma = supported;
+        self
+    }
+
+    /// Set whether an fp8 path is available.
+    #[must_use]
+    pub fn with_fp8(mut self, supported: bool) -> Self {
+        self.supports_fp8 = supported;
+        self
+    }
+
     /// True if the named feature flag is present.
     pub fn has_feature(&self, name: &str) -> bool {
         self.features.iter().any(|f| f == name)

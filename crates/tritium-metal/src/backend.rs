@@ -14,7 +14,7 @@ use metal::{
 
 use tritium_core::{GemmShape, TernaryFormat, Trit};
 use tritium_format::{TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row};
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
 /// Threadgroup width for the 2-D dispatch (must match the threadgroup size the
 /// kernel is launched with; the MSL kernel itself is agnostic to the value).
@@ -323,15 +323,15 @@ impl TernaryBackend for MetalBackend {
         }))
     }
 
-    fn mpgemm(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        scales: &[f32],
-        shape: GemmShape,
-        _format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales,
+            shape,
+            format: _format,
+            out,
+        } = p;
         let buf = weights
             .as_any()
             .downcast_ref::<MetalBuffer>()
@@ -501,7 +501,7 @@ mod tests {
 
     use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
     use tritium_format::{TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row};
-    use tritium_spec::TernaryBackend;
+    use tritium_spec::{MpGemm, TernaryBackend};
 
     /// Build a deterministic random `[M,K]` activation + packed `[N,K]` tq2_0
     /// weights + `[N]` scales, plus the `reference_mpgemm` oracle output.
@@ -556,14 +556,14 @@ mod tests {
             .expect("upload");
         let mut out = vec![0.0f32; m * n];
         backend
-            .mpgemm(
-                &act,
-                buf.as_ref(),
-                &scales,
+            .mpgemm(MpGemm {
+                act: &act,
+                weights: buf.as_ref(),
+                scales: &scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            })
             .expect("mpgemm");
         let tol = Tolerance::default();
         for (i, (&g, &w)) in out.iter().zip(&expected).enumerate() {

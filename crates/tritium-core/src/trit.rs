@@ -9,7 +9,7 @@ use crate::error::TritError;
 /// once the invariant is established. The invariant (`-1 | 0 | 1`) is upheld by
 /// every constructor; do not build one by transmuting arbitrary bytes.
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Trit(i8);
 
 impl Trit {

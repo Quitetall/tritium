@@ -143,48 +143,30 @@ mod tests {
         );
         metadata.insert("general.alignment".to_owned(), GgufValue::U32(32));
 
-        GgufFile {
-            version: 3,
+        GgufFile::new(
+            3,
             metadata,
-            tensors: vec![
-                TensorInfo {
-                    name: "blk.0.weight".to_owned(),
-                    dims: vec![256, 4],
-                    ggml_type: tritium_format::GGML_TYPE_TQ2_0,
-                    offset: 0,
-                    n_bytes: 264,
-                },
-                TensorInfo {
-                    name: "blk.0.qh".to_owned(),
-                    dims: vec![256],
-                    ggml_type: tritium_format::GGML_TYPE_TQ1_0,
-                    offset: 264,
-                    n_bytes: 54,
-                },
-                TensorInfo {
-                    name: "output_norm.bias".to_owned(),
-                    dims: vec![4],
-                    ggml_type: 0,
-                    offset: 320,
-                    n_bytes: 16,
-                },
-                TensorInfo {
-                    name: "token_embd.weight".to_owned(),
-                    dims: vec![8],
-                    ggml_type: 1,
-                    offset: 336,
-                    n_bytes: 16,
-                },
-                TensorInfo {
-                    name: "mystery".to_owned(),
-                    dims: vec![1],
-                    ggml_type: 99,
-                    offset: 352,
-                    n_bytes: 0,
-                },
+            vec![
+                TensorInfo::new(
+                    "blk.0.weight".to_owned(),
+                    vec![256, 4],
+                    tritium_format::GGML_TYPE_TQ2_0,
+                    0,
+                    264,
+                ),
+                TensorInfo::new(
+                    "blk.0.qh".to_owned(),
+                    vec![256],
+                    tritium_format::GGML_TYPE_TQ1_0,
+                    264,
+                    54,
+                ),
+                TensorInfo::new("output_norm.bias".to_owned(), vec![4], 0, 320, 16),
+                TensorInfo::new("token_embd.weight".to_owned(), vec![8], 1, 336, 16),
+                TensorInfo::new("mystery".to_owned(), vec![1], 99, 352, 0),
             ],
-            tensor_data_offset: 0,
-        }
+            0,
+        )
     }
 
     #[test]

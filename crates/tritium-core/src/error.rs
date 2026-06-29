@@ -29,5 +29,6 @@ impl core::fmt::Display for TritError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for TritError {}
+// `core::error::Error` is stable since Rust 1.81 (MSRV here is 1.89), so the
+// Error impl is unconditional — no `std` feature gate.
+impl core::error::Error for TritError {}

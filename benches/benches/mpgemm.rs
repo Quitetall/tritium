@@ -8,7 +8,7 @@ use divan::Bencher;
 use tritium_benches::packed_tq2_0_weights;
 use tritium_core::{GemmShape, TernaryFormat};
 use tritium_cpu::CpuBackend;
-use tritium_spec::TernaryBackend;
+use tritium_spec::{MpGemm, TernaryBackend};
 
 fn main() {
     divan::main();
@@ -30,14 +30,14 @@ fn cpu_mpgemm_tq2_0_decode(bencher: Bencher, k: usize) {
 
     bencher.bench_local(move || {
         backend
-            .mpgemm(
-                &act,
-                weights.as_ref(),
-                &scales,
+            .mpgemm(MpGemm {
+                act: &act,
+                weights: weights.as_ref(),
+                scales: &scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            })
             .expect("mpgemm");
     });
 }

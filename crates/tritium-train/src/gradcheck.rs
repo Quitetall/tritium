@@ -38,10 +38,7 @@ impl Default for GradCheckCfg {
     fn default() -> Self {
         GradCheckCfg {
             h: 1e-3,
-            tol: Tolerance {
-                relative: 2e-3,
-                bit_exact: false,
-            },
+            tol: Tolerance::relative(2e-3),
             seed: 0xC0FFEE,
         }
     }

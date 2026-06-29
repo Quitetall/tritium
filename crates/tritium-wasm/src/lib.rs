@@ -30,7 +30,7 @@ use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
-use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, TernaryBackend};
+use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
 /// Owned host-memory buffer of packed weight bytes (the wasm linear-memory copy).
 #[derive(Debug, Clone)]
@@ -141,15 +141,15 @@ impl TernaryBackend for WasmBackend {
         }))
     }
 
-    fn mpgemm(
-        &self,
-        act: &[f32],
-        weights: &dyn DeviceBuffer,
-        scales: &[f32],
-        shape: GemmShape,
-        format: TernaryFormat,
-        out: &mut [f32],
-    ) -> Result<(), BackendError> {
+    fn mpgemm(&self, p: MpGemm<'_>) -> Result<(), BackendError> {
+        let MpGemm {
+            act,
+            weights,
+            scales,
+            shape,
+            format,
+            out,
+        } = p;
         let buf = weights
             .as_any()
             .downcast_ref::<WasmBuffer>()

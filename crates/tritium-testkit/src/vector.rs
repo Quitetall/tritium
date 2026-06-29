@@ -32,8 +32,10 @@ pub struct ConformanceVector {
     pub weights: Vec<i8>,
     /// `[N]` per-output-channel scales applied after the ternary contraction.
     pub scales: Vec<f32>,
-    /// Packing scheme name: `"tq2_0"` or `"tq1_0"`.
-    pub format: String,
+    /// Packing scheme. Serializes to its canonical lowercase tag (`"tq2_0"` /
+    /// `"tq1_0"`) via the `serde(rename = …)` attributes on
+    /// [`tritium_core::TernaryFormat`], so the on-disk JSONL is unchanged.
+    pub format: tritium_core::TernaryFormat,
     /// `[M, N]` reference output from [`tritium_core::reference_mpgemm`].
     pub expected: Vec<f32>,
 }
@@ -46,6 +48,7 @@ pub struct ConformanceVector {
 /// setting [`bit_exact`](Tolerance::bit_exact); there the comparison is `==`
 /// and `relative` is ignored.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Tolerance {
     /// Maximum permitted relative error `|got - want| / max(1, |want|)`.
     pub relative: f32,
@@ -57,14 +60,31 @@ impl Default for Tolerance {
     /// The fp32-accumulate matmul tolerance from ADR 0002: `relative = 1e-4`,
     /// not bit-exact.
     fn default() -> Self {
-        Tolerance {
-            relative: 1e-4,
-            bit_exact: false,
-        }
+        Tolerance::relative(1e-4)
     }
 }
 
 impl Tolerance {
+    /// A bit-exact tolerance: outputs must compare `==` ([`relative`](Self::relative)
+    /// is ignored). Use for integer / packing paths.
+    #[must_use]
+    pub fn bit_exact() -> Self {
+        Tolerance {
+            relative: 0.0,
+            bit_exact: true,
+        }
+    }
+
+    /// A relative-error tolerance with the given bound (not bit-exact). Use for
+    /// fp32-accumulate matmul, where accumulation reorders across backends.
+    #[must_use]
+    pub fn relative(rel: f32) -> Self {
+        Tolerance {
+            relative: rel,
+            bit_exact: false,
+        }
+    }
+
     /// `true` if `got` is acceptably close to `want` under this tolerance.
     ///
     /// In bit-exact mode this is `got == want`. Otherwise NaNs and infinities
@@ -155,10 +175,7 @@ mod tests {
 
     #[test]
     fn bit_exact_requires_equality() {
-        let t = Tolerance {
-            relative: 1.0,
-            bit_exact: true,
-        };
+        let t = Tolerance::bit_exact();
         assert!(t.accepts(1.5, 1.5));
         // Even a tiny difference is rejected, and relative is ignored.
         assert!(!t.accepts(1.5, 1.5000001));

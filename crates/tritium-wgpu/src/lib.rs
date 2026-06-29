@@ -137,14 +137,14 @@ mod tests {
             .expect("upload");
         let mut out = vec![0.0f32; m * n];
         backend
-            .mpgemm(
-                &act,
-                buf.as_ref(),
-                &scales,
+            .mpgemm(tritium_spec::MpGemm {
+                act: &act,
+                weights: buf.as_ref(),
+                scales: &scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            })
             .expect("mpgemm");
         let tol = Tolerance::default();
         for (i, (&g, &w)) in out.iter().zip(&expected).enumerate() {

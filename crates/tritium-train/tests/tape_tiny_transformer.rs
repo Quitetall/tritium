@@ -130,10 +130,7 @@ fn tape_tiny_transformer_end_to_end_gradient() {
 
     let analytic = composed_grads(&base);
     let h = 1e-3f32;
-    let tol = Tolerance {
-        relative: 2e-3,
-        bit_exact: false,
-    };
+    let tol = Tolerance::relative(2e-3);
     // Check every trainable leaf (0..=12); 13 is the data target.
     for leaf in 0..=12 {
         for i in 0..base[leaf].len() {

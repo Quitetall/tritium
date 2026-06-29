@@ -30,6 +30,25 @@ pub enum DType {
     F32,
 }
 
+impl core::fmt::Display for DType {
+    /// Short canonical token per variant (e.g. `ternary`, `i8`, `f16`, `f32`).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            DType::Ternary => "ternary",
+            DType::I4 => "i4",
+            DType::I8 => "i8",
+            DType::U8 => "u8",
+            DType::F8E4M3 => "f8e4m3",
+            DType::F8E5M2 => "f8e5m2",
+            DType::F4E2M1 => "f4e2m1",
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+            DType::F32 => "f32",
+        };
+        f.write_str(s)
+    }
+}
+
 impl DType {
     /// Nominal storage width in bits. Ternary returns its information-theoretic
     /// floor (`log2 3`); real packed width is format-dependent — see
@@ -65,13 +84,16 @@ impl DType {
 ///
 /// Both follow ggml's 256-element super-block with one fp16 block scale.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum TernaryFormat {
     /// llama.cpp **TQ1_0** — 5 trits per byte (`3^5 = 243 < 256`). 1.6875 bpw incl.
     /// block scale. Most compact; unpack needs base-3 division — CPU/edge oriented.
+    #[cfg_attr(feature = "serde", serde(rename = "tq1_0"))]
     Tq1_0,
     /// llama.cpp **TQ2_0** — 2 bits per trit, 4 per byte. 2.0625 bpw incl. block
     /// scale. Cheap shift/mask unpack; matches BitNet's int8 packing — GPU oriented.
+    #[cfg_attr(feature = "serde", serde(rename = "tq2_0"))]
     Tq2_0,
     /// **I2sInt8** — the IMMA (int8 tensor-core) GPU layout, derived from an I2_S
     /// checkpoint at load (`tritium_format::convert_i2s_to_int8`). Weights stay
@@ -79,9 +101,22 @@ pub enum TernaryFormat {
     /// carries a single per-tensor `f32` scale), interleaved so the IMMA kernel can
     /// unpack them to int8 operands for `mma.m16n8k32` in shared memory. Added in
     /// v0.30 (ADR 0005) for the compute-bound prefill path; the CPU/reference
-    /// backends do not consume it and return
-    /// [`UnsupportedFormat`](crate::TernaryFormat) — it is a GPU-only packing.
+    /// backends do not consume it and return an unsupported-format error — it is a
+    /// GPU-only packing.
+    #[cfg_attr(feature = "serde", serde(rename = "i2s_int8"))]
     I2sInt8,
+}
+
+impl core::fmt::Display for TernaryFormat {
+    /// Short canonical token per variant (e.g. `tq1_0`, `tq2_0`).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            TernaryFormat::Tq1_0 => "tq1_0",
+            TernaryFormat::Tq2_0 => "tq2_0",
+            TernaryFormat::I2sInt8 => "i2s_int8",
+        };
+        f.write_str(s)
+    }
 }
 
 impl TernaryFormat {

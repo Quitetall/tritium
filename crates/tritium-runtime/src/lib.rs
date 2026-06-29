@@ -31,8 +31,7 @@
 //! #     }
 //! #     fn upload_weights(&self, _: &[u8], _: tritium_core::GemmShape, _: tritium_core::TernaryFormat)
 //! #         -> Result<Box<dyn tritium_spec::DeviceBuffer>, BackendError> { unimplemented!() }
-//! #     fn mpgemm(&self, _: &[f32], _: &dyn tritium_spec::DeviceBuffer, _: &[f32],
-//! #         _: tritium_core::GemmShape, _: tritium_core::TernaryFormat, _: &mut [f32])
+//! #     fn mpgemm(&self, _: tritium_spec::MpGemm<'_>)
 //! #         -> Result<(), BackendError> { unimplemented!() }
 //! # }
 //! /// One `init` constructor per backend. Failure is reported as an `Err`, which
@@ -61,11 +60,17 @@ use std::sync::OnceLock;
 
 use tritium_spec::{BackendError, DeviceCaps, TernaryBackend};
 
+// Re-export the core vocabulary types the dispatch surface uses (via
+// `tritium-spec`'s re-exports) so a dispatch caller needs only depend on
+// `tritium-runtime`.
+pub use tritium_spec::{GemmShape, TernaryFormat, TritError};
+
 /// A single registration record contributed by a backend crate.
 ///
 /// Backends place one of these into the [`BACKENDS`] distributed slice; the
 /// runtime reads the slice at [`Registry::init`] time and calls each
 /// [`init`](BackendEntry::init) to instantiate the backend.
+#[derive(Clone, Copy)]
 pub struct BackendEntry {
     /// Stable, human-facing name used to look a backend up with
     /// [`Registry::get`], e.g. `"cpu"` or `"cuda"`. This is the *family* name; a
@@ -148,6 +153,8 @@ impl Registry {
                 Err(err) => {
                     // A failing backend (no GPU, missing ISA, OOM, …) is expected
                     // and must not abort the others. Log and move on.
+                    // TODO(log): route through the `log` facade once it's a dep;
+                    // not added here to keep the dependency set minimal.
                     eprintln!(
                         "tritium-runtime: backend `{}` failed to initialise, skipping: {err}",
                         entry.name
@@ -262,16 +269,8 @@ mod tests {
             Ok(Box::new(VecBuffer(packed.to_vec())))
         }
 
-        fn mpgemm(
-            &self,
-            _act: &[f32],
-            _weights: &dyn DeviceBuffer,
-            _scales: &[f32],
-            _shape: GemmShape,
-            _format: TernaryFormat,
-            out: &mut [f32],
-        ) -> Result<(), BackendError> {
-            out.fill(0.0);
+        fn mpgemm(&self, p: tritium_spec::MpGemm<'_>) -> Result<(), BackendError> {
+            p.out.fill(0.0);
             Ok(())
         }
     }
@@ -362,14 +361,14 @@ mod tests {
         let scales = [1.0_f32; 2];
         let mut out = [9.0_f32; 2];
         backend
-            .mpgemm(
-                &act,
-                buf.as_ref(),
-                &scales,
+            .mpgemm(tritium_spec::MpGemm {
+                act: &act,
+                weights: buf.as_ref(),
+                scales: &scales,
                 shape,
-                TernaryFormat::Tq2_0,
-                &mut out,
-            )
+                format: TernaryFormat::Tq2_0,
+                out: &mut out,
+            })
             .expect("mpgemm should succeed");
         assert_eq!(out, [0.0, 0.0], "dummy mpgemm fills zeros");
     }

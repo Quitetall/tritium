@@ -15,6 +15,32 @@ First stable release. The v1.0 Definition of Done (ADR 0012) is met: the public 
 (tiered — see below), the **real-model GPU capstone is proven on real hardware**, and every prior milestone
 gate (v0.10→v0.90) re-runs green on this commit.
 
+### Frozen-API ergonomics pass (pre-publish polish)
+
+Before locking the frozen tier, a final ergonomics audit + refactor (the last cheap moment for breaking
+changes — applied while unpublished). Highlights:
+
+- **Forward-compat:** `#[non_exhaustive]` added to every extensible public enum/struct that lacked it —
+  quantize (`Sensitivity`, `BaseScaleScope`, `QuantError`, `AllocError`), format (`SafeTensorsError`,
+  `GgufFile`, `TensorInfo`, `FormatError::SafeTensors`), testkit (`Tolerance`, `ConformanceVector`),
+  ffi (`TritiumStatus`, now also `#[repr(i32)]`). Free now, impossible post-publish.
+- **One-crate authoring:** `tritium-testkit` and `tritium-spec`/`-runtime` re-export the backend trait +
+  shared types, so a downstream backend author depends on one crate, not three.
+- **`TernaryBackend` shape:** `mpgemm`/`mpgemm_with_act_quant` now take an `MpGemm<'_>` params struct
+  (kills the transposable `act`/`scales` `&[f32]` footgun); the downcast escape hatch `as_any` → `as_concrete`
+  (no longer clashes with `DeviceBuffer::as_any`); `BackendError` gained `source()` chaining.
+- **quantize:** `QuantConfig` lost its lifetime (`Sensitivity::Custom(Vec<f64>)`) so configs are storable;
+  `ScaleGroup` → `BaseScaleScope` (disambiguated from `core::ScaleGranularity`).
+- **format:** `GgufValue::as_i64/as_f64/as_f32/as_bool/as_array`; `read_safetensors` free fn mirroring
+  `read_gguf`; `source()` chaining on `FormatError`.
+- **C ABI (ABI v1):** `tritium_generate` gained a versioned `const TritiumGenerateOptions*` (NULL = greedy
+  default) so sampling/stop-tokens/backend-select can be added later without a new symbol or ABI break;
+  new `tritium_last_error()` and `tritium_model_load_bytes()`; header lengths now `size_t`.
+- **core:** `Trit: Ord`; `Display` on `DType`/`TernaryFormat`; `TritError: core::error::Error` unconditionally.
+
+The on-disk conformance JSONL is byte-identical (serde renames), so the frozen-set drift gate stays green.
+The **evolving tier** (`tritium-nn`/`-train`/`-cuda` + interop + `-serve`) keeps its 1.x breaking-change runway.
+
 ### Real-model GPU capstone — PROVEN (RTX 4090, sm_89)
 
 Real `microsoft/bitnet-b1.58-2B-4T` runs correctly end-to-end on the GPU. All five acceptance gates pass:

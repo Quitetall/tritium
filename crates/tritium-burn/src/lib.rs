@@ -225,14 +225,6 @@ mod burn_op {
         /// The conformance backend: burn's CPU NdArray backend.
         type B = NdArray;
 
-        fn parse_format(tag: &str) -> TernaryFormat {
-            match tag {
-                "tq2_0" => TernaryFormat::Tq2_0,
-                "tq1_0" => TernaryFormat::Tq1_0,
-                other => panic!("unexpected format tag {other}"),
-            }
-        }
-
         /// Pack a vector's `[N, K]` `i8` weights exactly as the conformance harness
         /// does: per row, unit (1.0) block scales, concatenated output-major.
         fn pack(v: &ConformanceVector, format: TernaryFormat) -> Vec<u8> {
@@ -273,7 +265,7 @@ mod burn_op {
             let mut checked = 0usize;
             let device = Default::default();
             for v in vs {
-                let format = parse_format(&v.format);
+                let format = v.format;
                 let packed = pack(&v, format);
                 let act = Tensor::<B, 2>::from_data(
                     TensorData::new(v.activation.clone(), [v.m, v.k]),

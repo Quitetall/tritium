@@ -76,6 +76,7 @@ impl Default for AllocConfig {
 
 /// Why an allocation could not be produced.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum AllocError {
     /// `t_min > t_max` — empty feasible range.
     BadRange {

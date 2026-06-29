@@ -5,7 +5,7 @@
 use tritium_format::{
     dequant_salt_row, read_salt_bundle, read_salt_gguf, write_salt_bundle, write_salt_gguf,
 };
-use tritium_quantize::{QuantConfig, ScaleGroup, Sensitivity, quantize_tensor};
+use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A small fp32 weight matrix: 4 output rows × 256 input features.
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t_min: 1,
         t_max: 3,
         sensitivity: Sensitivity::Uniform,
-        scale_group: ScaleGroup::Block,
+        scale_group: BaseScaleScope::Block,
     };
     let qt = quantize_tensor(&weights, rows, k, &cfg)?;
     println!(

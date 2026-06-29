@@ -64,7 +64,7 @@ pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
-pub use safetensors::{SafeTensors, SafeTensorsError};
+pub use safetensors::{SafeTensors, SafeTensorsError, read_safetensors};
 pub use salt::{
     SALT_HEADER_BYTES, SALT_MAGIC, SALT_VERSION, SaltRow, dequant_salt_row, pack_salt_row,
     read_legacy_as_salt, unpack_salt_row,
@@ -129,6 +129,9 @@ pub enum FormatError {
     SaltRowTooLong(usize),
     /// A GGUF container operation (read/write) failed; carries the [`GgufError`].
     Gguf(GgufError),
+    /// A safetensors container operation failed; carries the [`SafeTensorsError`].
+    #[non_exhaustive]
+    SafeTensors(SafeTensorsError),
     /// A GGUF buffer was not a tritium SALT-in-GGUF container (missing or wrong
     /// `tritium.salt.format` marker, or a SALT tensor with malformed dims).
     SaltGgufBadFormat,
@@ -147,6 +150,12 @@ pub enum FormatError {
 impl From<GgufError> for FormatError {
     fn from(e: GgufError) -> Self {
         FormatError::Gguf(e)
+    }
+}
+
+impl From<SafeTensorsError> for FormatError {
+    fn from(e: SafeTensorsError) -> Self {
+        FormatError::SafeTensors(e)
     }
 }
 
@@ -185,6 +194,7 @@ impl fmt::Display for FormatError {
                 )
             }
             FormatError::Gguf(e) => write!(f, "GGUF container: {e}"),
+            FormatError::SafeTensors(e) => write!(f, "safetensors container: {e}"),
             FormatError::SaltGgufBadFormat => {
                 write!(f, "GGUF buffer is not a tritium SALT-in-GGUF container")
             }
@@ -204,7 +214,15 @@ impl fmt::Display for FormatError {
     }
 }
 
-impl std::error::Error for FormatError {}
+impl std::error::Error for FormatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FormatError::Gguf(e) => Some(e),
+            FormatError::SafeTensors(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<TritError> for FormatError {
     fn from(e: TritError) -> Self {

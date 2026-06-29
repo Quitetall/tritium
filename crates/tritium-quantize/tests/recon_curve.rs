@@ -6,7 +6,7 @@
 //! curve inverts (higher bpw regresses toward unusable weights — see `tritium-nn`'s
 //! `salt_accuracy`). A normal fp model's weights ARE the target, so SALT's residual planes
 //! genuinely improve fidelity: this gate quantizes every 2D weight tensor of gpt2 at a bpw
-//! sweep (per-256-block, `ScaleGroup::Block`), dequantizes, and asserts the aggregate
+//! sweep (per-256-block, `BaseScaleScope::Block`), dequantizes, and asserts the aggregate
 //! relative reconstruction error `‖W − Ŵ‖ / ‖W‖` **decreases monotonically** with bpw.
 //!
 //! Arch-agnostic (no forward), so it works on any fp16/f32 safetensors. `#[ignore]`d and
@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use tritium_format::{SafeTensors, dequant_salt_row};
-use tritium_quantize::{QuantConfig, ScaleGroup, Sensitivity, quantize_tensor};
+use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
 
 /// gpt2 `model.safetensors` under the HF hub cache (a small, normal fp model). `None` if
 /// absent (the test then skips).
@@ -42,7 +42,7 @@ fn recon_error_at(st: &SafeTensors, names: &[String], bpw: f64) -> f64 {
         t_min: 1,
         t_max: 3,
         sensitivity: Sensitivity::Uniform,
-        scale_group: ScaleGroup::Block,
+        scale_group: BaseScaleScope::Block,
     };
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for name in names {
