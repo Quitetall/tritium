@@ -78,6 +78,76 @@ pub fn unpack_tq2_0_block(
     Ok(())
 }
 
+/// Value of every qs byte in an all-zero TQ2_0 block (code 1 in all 4 slots).
+const ZERO_BLOCK_BYTE: u8 = 0x55;
+
+/// Compute a per-block zero bitmap for one packed TQ2_0 row.
+///
+/// Each bit corresponds to one 256-trit block (66 bytes: 64 qs + 2 scale).
+/// Bit is SET if the block is all-zero (every qs byte == `0x55`), CLEAR otherwise.
+/// The scale bytes are ignored — a zero-trit block contributes nothing regardless
+/// of its scale value.
+///
+/// Returns `Vec<u32>` of length `ceil(num_blocks / 32)`.
+///
+/// # Errors
+/// [`FormatError::WrongBlockLen`] if `packed_row` is shorter than the
+/// `ceil(k / QK_K) * TQ2_0_BLOCK_BYTES` bytes a fully-packed row requires
+/// (so a malformed/truncated row is a typed error, never a panic).
+pub fn compute_zero_bitmap(packed_row: &[u8], k: usize) -> Result<Vec<u32>, FormatError> {
+    let nb = k.div_ceil(QK_K);
+    let need = nb * TQ2_0_BLOCK_BYTES;
+    if packed_row.len() < need {
+        return Err(FormatError::WrongBlockLen {
+            expected: need,
+            got: packed_row.len(),
+        });
+    }
+    let words = nb.div_ceil(32);
+    let mut bitmap = vec![0u32; words];
+    for block_idx in 0..nb {
+        let offset = block_idx * TQ2_0_BLOCK_BYTES;
+        let qs = &packed_row[offset..offset + QS_BYTES];
+        if qs.iter().all(|&b| b == ZERO_BLOCK_BYTE) {
+            bitmap[block_idx / 32] |= 1u32 << (block_idx % 32);
+        }
+    }
+    Ok(bitmap)
+}
+
+/// Compute zero bitmaps for all N rows of packed TQ2_0 weights.
+///
+/// Returns a flat `Vec<u32>` of length `N * ceil(num_blocks(k) / 32)`,
+/// one bitmap per row, concatenated in row order.
+///
+/// # Errors
+/// [`FormatError::WrongBlockLen`] if `packed` is shorter than `n * row_bytes`
+/// (truncated input is a typed error, never a panic).
+pub fn compute_zero_bitmaps(
+    packed: &[u8],
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+) -> Result<Vec<u32>, FormatError> {
+    let nb = k.div_ceil(QK_K);
+    let words_per_row = nb.div_ceil(32);
+    if packed.len() < n * row_bytes {
+        return Err(FormatError::WrongBlockLen {
+            expected: n * row_bytes,
+            got: packed.len(),
+        });
+    }
+    let mut bitmaps = vec![0u32; n * words_per_row];
+    for ni in 0..n {
+        let row_start = ni * row_bytes;
+        let row_end = row_start + row_bytes;
+        let row_bitmap = compute_zero_bitmap(&packed[row_start..row_end], k)?;
+        let out_start = ni * words_per_row;
+        bitmaps[out_start..out_start + words_per_row].copy_from_slice(&row_bitmap);
+    }
+    Ok(bitmaps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +197,120 @@ mod tests {
             pack_tq2_0_block(&block_of(0), f16::ONE, &mut out[..65]),
             Err(FormatError::WrongBlockLen { .. })
         ));
+    }
+
+    // ── Bitmap tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn bitmap_all_zero_block() {
+        let mut packed = vec![0u8; TQ2_0_BLOCK_BYTES];
+        pack_tq2_0_block(&block_of(0), f16::ONE, &mut packed).unwrap();
+        let bm = compute_zero_bitmap(&packed, QK_K).unwrap();
+        assert_eq!(bm.len(), 1);
+        assert_eq!(bm[0], 1, "bit 0 should be set for all-zero block");
+    }
+
+    #[test]
+    fn bitmap_all_nonzero_block() {
+        let mut packed = vec![0u8; TQ2_0_BLOCK_BYTES];
+        pack_tq2_0_block(&block_of(1), f16::ONE, &mut packed).unwrap();
+        let bm = compute_zero_bitmap(&packed, QK_K).unwrap();
+        assert_eq!(bm.len(), 1);
+        assert_eq!(bm[0], 0, "bit should be clear for all-positive block");
+
+        pack_tq2_0_block(&block_of(-1), f16::ONE, &mut packed).unwrap();
+        let bm = compute_zero_bitmap(&packed, QK_K).unwrap();
+        assert_eq!(bm[0], 0, "bit should be clear for all-negative block");
+    }
+
+    #[test]
+    fn bitmap_mixed_blocks() {
+        // K=512: block 0 = all-zero, block 1 = all-nonzero
+        let nb = 2;
+        let row_bytes = nb * TQ2_0_BLOCK_BYTES;
+        let mut packed = vec![0u8; row_bytes];
+        // Block 0: all-zero
+        pack_tq2_0_block(&block_of(0), f16::ONE, &mut packed[..TQ2_0_BLOCK_BYTES]).unwrap();
+        // Block 1: all-positive
+        pack_tq2_0_block(&block_of(1), f16::ONE, &mut packed[TQ2_0_BLOCK_BYTES..]).unwrap();
+
+        let bm = compute_zero_bitmap(&packed, QK_K * 2).unwrap();
+        assert_eq!(bm.len(), 1);
+        assert_eq!(bm[0], 0b01, "bit 0 set (zero block), bit 1 clear (nonzero)");
+    }
+
+    #[test]
+    fn bitmap_empty_row() {
+        let bm = compute_zero_bitmap(&[], 0).unwrap();
+        assert!(bm.is_empty());
+    }
+
+    #[test]
+    fn bitmap_partial_zero_not_set() {
+        // K=256 with 255 zeros and 1 non-zero → bitmap bit is CLEAR
+        let mut trits = block_of(0);
+        trits[128] = Trit::POS; // one non-zero in the middle
+        let mut packed = vec![0u8; TQ2_0_BLOCK_BYTES];
+        pack_tq2_0_block(&trits, f16::ONE, &mut packed).unwrap();
+        let bm = compute_zero_bitmap(&packed, QK_K).unwrap();
+        assert_eq!(bm[0], 0, "bit should be clear when block has any nonzero");
+    }
+
+    #[test]
+    fn bitmap_multi_row() {
+        // N=2, K=256: row 0 all-zero, row 1 all-nonzero
+        let row_bytes = TQ2_0_BLOCK_BYTES;
+        let mut packed = vec![0u8; 2 * row_bytes];
+        pack_tq2_0_block(&block_of(0), f16::ONE, &mut packed[..row_bytes]).unwrap();
+        pack_tq2_0_block(&block_of(1), f16::ONE, &mut packed[row_bytes..]).unwrap();
+
+        let bm = compute_zero_bitmaps(&packed, 2, QK_K, row_bytes).unwrap();
+        assert_eq!(bm.len(), 2);
+        assert_eq!(bm[0], 1, "row 0: bit set");
+        assert_eq!(bm[1], 0, "row 1: bit clear");
+    }
+
+    #[test]
+    fn bitmap_many_blocks_per_row() {
+        // K=8192 = 32 blocks, all zero
+        let nb = 32;
+        let k = nb * QK_K;
+        let row_bytes = nb * TQ2_0_BLOCK_BYTES;
+        let mut packed = vec![0u8; row_bytes];
+        for b in 0..nb {
+            let start = b * TQ2_0_BLOCK_BYTES;
+            pack_tq2_0_block(
+                &block_of(0),
+                f16::ONE,
+                &mut packed[start..start + TQ2_0_BLOCK_BYTES],
+            )
+            .unwrap();
+        }
+        let bm = compute_zero_bitmap(&packed, k).unwrap();
+        assert_eq!(bm.len(), 1); // 32 blocks fit in one u32
+        assert_eq!(bm[0], 0xFFFF_FFFF, "all 32 bits set");
+    }
+
+    #[test]
+    fn bitmap_spans_multiple_u32_words() {
+        // K=8192 + 256 = 8448 → 33 blocks → needs 2 u32 words
+        let nb = 33;
+        let k = nb * QK_K;
+        let row_bytes = nb * TQ2_0_BLOCK_BYTES;
+        let mut packed = vec![0u8; row_bytes];
+        // All zero
+        for b in 0..nb {
+            let start = b * TQ2_0_BLOCK_BYTES;
+            pack_tq2_0_block(
+                &block_of(0),
+                f16::ONE,
+                &mut packed[start..start + TQ2_0_BLOCK_BYTES],
+            )
+            .unwrap();
+        }
+        let bm = compute_zero_bitmap(&packed, k).unwrap();
+        assert_eq!(bm.len(), 2);
+        assert_eq!(bm[0], 0xFFFF_FFFF, "word 0: all 32 bits set");
+        assert_eq!(bm[1], 0x0000_0001, "word 1: bit 0 set (block 32)");
     }
 }

@@ -82,7 +82,7 @@ pub use sparse::{
     sparse_to_tq2_0, unpack_sparse_plane,
 };
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
-pub use tq2::{pack_tq2_0_block, unpack_tq2_0_block};
+pub use tq2::{compute_zero_bitmap, compute_zero_bitmaps, pack_tq2_0_block, unpack_tq2_0_block};
 pub use tqbin::{TQBIN_HEADER_BYTES, TQBIN_MAGIC, TQBIN_VERSION, read_tqbin, write_tqbin};
 pub use tqidx::{ShardEntry, TQIDX_MAGIC, TQIDX_VERSION, TqIndex, read_tqidx, write_tqidx};
 

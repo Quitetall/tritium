@@ -59,6 +59,12 @@ const KERNEL_NAME_TILED_F32: &str = "tq2_0_add_mpgemm_tiled_f32";
 const KERNEL_NAME_TILED_SCALED: &str = "tq2_0_add_mpgemm_tiled_scaled";
 const KERNEL_NAME_TILED_F32_SCALED: &str = "tq2_0_add_mpgemm_tiled_f32_scaled";
 const KERNEL_NAME_TILED_F32_SCALED_RESIDUAL: &str = "tq2_0_add_mpgemm_tiled_f32_scaled_residual";
+/// Sparse-aware f32-tiled kernel: same as `tiled_f32` but accepts a per-row
+/// zero-block bitmap to skip all-zero 256-trit blocks.
+const KERNEL_NAME_TILED_F32_SPARSE: &str = "tq2_0_add_mpgemm_tiled_f32_sparse";
+/// Sparse-aware fused-scaled f32-tiled kernel: same as `tiled_f32_scaled` but
+/// with bitmap skip for zero blocks.
+const KERNEL_NAME_TILED_F32_SCALED_SPARSE: &str = "tq2_0_add_mpgemm_tiled_f32_scaled_sparse";
 /// SALT multi-plane accumulate (v0.4.0): sums `Σ_p scale_p·tmatmul(t_p)` over `T`
 /// stacked TQ2_0 planes, reading each block's f16 scale. Matches
 /// [`tritium_format::dequant_salt_row`] → fp32 matmul within 1e-4.
@@ -300,6 +306,14 @@ pub struct CudaBackend {
     /// The resolved `salt_mpgemm_tiled_f32` kernel (v0.4.0 SALT multi-plane GEMM),
     /// driven by the resident [`CudaBackend::salt_forward`] path.
     func_salt: CudaFunction,
+    /// Sparse-aware f32-tiled kernel: bitmap skip for zero blocks (P1 opt).
+    #[allow(dead_code)]
+    // validated sparse mpgemm kernel; auto-dispatch integration is future (1.x) work
+    func_tiled_f32_sparse: CudaFunction,
+    /// Sparse-aware fused-scaled f32-tiled kernel: bitmap skip + act_scale fold.
+    #[allow(dead_code)]
+    // validated sparse fused-scaled kernel; auto-dispatch integration is future (1.x) work
+    func_tiled_f32_scaled_sparse: CudaFunction,
     /// The resolved `tq2_0_imma_mpgemm` kernel (IMMA int8 tensor-core prefill).
     func_imma: CudaFunction,
     /// The resolved `act_quant_int8_per_token` kernel (on-device W1.58A8 quant).
@@ -415,6 +429,12 @@ impl CudaBackend {
         let func_salt = module
             .load_function(KERNEL_NAME_SALT)
             .map_err(|e| driver_err("resolve salt_mpgemm kernel", &e))?;
+        let func_tiled_f32_sparse = module
+            .load_function(KERNEL_NAME_TILED_F32_SPARSE)
+            .map_err(|e| driver_err("resolve tq2_0_add_tiled_f32_sparse kernel", &e))?;
+        let func_tiled_f32_scaled_sparse = module
+            .load_function(KERNEL_NAME_TILED_F32_SCALED_SPARSE)
+            .map_err(|e| driver_err("resolve tq2_0_add_tiled_f32_scaled_sparse kernel", &e))?;
 
         // The IMMA kernels live in their own compute_80 PTX (the add kernel's
         // compute_75 PTX cannot assemble `mma.m16n8k32`). Loading it JITs to the
@@ -511,6 +531,8 @@ impl CudaBackend {
             func_tiled,
             func_tiled_scaled,
             func_salt,
+            func_tiled_f32_sparse,
+            func_tiled_f32_scaled_sparse,
             func_imma,
             func_act_quant,
             _decode_module: decode_module,
@@ -2157,6 +2179,140 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Sparse-aware tiled mpGEMM: same as [`mpgemm_kernel`] with `AddKernel::Tiled`
+    /// but passes a pre-computed zero-block bitmap to the sparse kernel variant,
+    /// allowing it to skip all-zero 256-trit blocks entirely.
+    ///
+    /// `bitmap` is the output of [`tritium_format::compute_zero_bitmaps`] — one
+    /// u32 per 32 blocks, per row, concatenated in row order. `words_per_row` is
+    /// `ceil(num_blocks(k) / 32)`.
+    ///
+    /// Falls back to the non-sparse tiled kernel if `bitmap` is empty.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // sparse mpgemm host path; test-exercised, not yet in auto-dispatch (1.x)
+    fn mpgemm_kernel_with_bitmap(
+        &self,
+        act: &[f32],
+        weights: &dyn DeviceBuffer,
+        scales: &[f32],
+        bitmap: &[u32],
+        words_per_row: usize,
+        shape: GemmShape,
+        format: TernaryFormat,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        if format != TernaryFormat::Tq2_0 {
+            return Err(BackendError::UnsupportedFormat(format));
+        }
+        let buf = weights
+            .as_any()
+            .downcast_ref::<CudaBuffer>()
+            .ok_or_else(|| BackendError::InvalidInput("buffer is not a CudaBuffer".into()))?;
+        let Stride::Tq2_0 { row_bytes } = buf.stride else {
+            return Err(BackendError::UnsupportedFormat(buf.format));
+        };
+
+        let GemmShape { m, n, k } = shape;
+        if buf.n != n || buf.k != k {
+            return Err(BackendError::ShapeMismatch {
+                expected: buf.n * buf.k,
+                got: n * k,
+            });
+        }
+        if act.len() != m * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * k,
+                got: act.len(),
+            });
+        }
+        if scales.len() != n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: scales.len(),
+            });
+        }
+        if out.len() != m * n {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * n,
+                got: out.len(),
+            });
+        }
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+
+        if bitmap.is_empty() {
+            return self.mpgemm_kernel(act, weights, scales, shape, format, out, AddKernel::Tiled);
+        }
+
+        let d_act = self
+            .stream
+            .clone_htod(act)
+            .map_err(|e| alloc_or_backend("upload act (htod)", &e, act.len() * 4))?;
+        let d_scales = self
+            .stream
+            .clone_htod(scales)
+            .map_err(|e| alloc_or_backend("upload scales (htod)", &e, scales.len() * 4))?;
+        let d_bitmap = self
+            .stream
+            .clone_htod(bitmap)
+            .map_err(|e| alloc_or_backend("upload bitmap (htod)", &e, bitmap.len() * 4))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .map_err(|e| alloc_or_backend("alloc out", &e, m * n * 4))?;
+
+        debug_assert!(
+            k <= TILED_K_MAX,
+            "sparse tiled kernel K={k} exceeds the {TILED_K_MAX} shared-mem cap"
+        );
+        let grid_n = (n as u32).div_ceil(WARPS_PER_BLOCK);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_n, m as u32, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: (k * 4) as u32,
+        };
+
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let row_bytes_i = row_bytes as i32;
+        let wpr_i = words_per_row as i32;
+
+        let mut launch = self.stream.launch_builder(&self.func_tiled_f32_sparse);
+        launch
+            .arg(&d_act)
+            .arg(buf.device.as_ref())
+            .arg(&d_scales)
+            .arg(&d_bitmap)
+            .arg(&mut d_out)
+            .arg(&m_i)
+            .arg(&n_i)
+            .arg(&k_i)
+            .arg(&row_bytes_i)
+            .arg(&wpr_i);
+
+        // SAFETY: args match the `tq2_0_add_*_sparse` kernel signature `(const float*
+        // act, const u8* weights, const float* scales, const u32* bitmap, float* out,
+        // int m, int n, int k, int row_bytes, int words_per_row)`, pushed in that exact
+        // order/type. `d_act` is `[m,k]`, the weight buffer is the uploaded `[n,k]` TQ2_0
+        // rows, `d_scales` is `[n]`, `d_bitmap` is `[n*words_per_row]`, `d_out` is the
+        // `[m,n]` output. The grid is `(grid_n, m)`, `k*4` dynamic shared bytes; the
+        // kernel bounds every loop by the int dims, so no thread reads past a buffer.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch tq2_0_add_sparse", &e))?;
+        }
+
+        self.stream
+            .memcpy_dtoh(&d_out, out)
+            .map_err(|e| driver_err("download out (dtoh)", &e))?;
+
+        Ok(())
+    }
+
     /// Upload a SALT tensor's rows into VRAM as one plane-major buffer, ready for
     /// [`Self::salt_forward`]. Each [`SaltRow`] contributes its `T` planes; a row
     /// with fewer planes than the tensor max is zero-padded (a zeroed TQ2_0 plane
@@ -3463,9 +3619,12 @@ pub struct CudaDecodeModel {
     f_relu2: CudaFunction,
     f_quant: CudaFunction,
     f_rmsnorm_quant: CudaFunction,
+    #[allow(dead_code)] // unfused tiled handle; layer() now uses f_tiled_scaled
     f_tiled: CudaFunction,
+    #[allow(dead_code)] // standalone scale-fold; unused since the fused scaled path
     f_scale: CudaFunction,
     f_tiled_scaled: CudaFunction,
+    #[allow(dead_code)] // fused scaled+residual handle; wired into the residual path next
     f_tiled_scaled_residual: CudaFunction,
     // v0.3.6 batched (M>1) prefill kernels.
     f_rmsnorm_batch: CudaFunction,
@@ -3980,6 +4139,7 @@ impl CudaDecodeModel {
     }
 
     /// Run just the A8 quantization step (act → q_act + act_scale).
+    #[allow(dead_code)] // standalone quant launch; superseded by the fused path
     fn launch_quant(
         stream: &Arc<CudaStream>,
         f_quant: &CudaFunction,
@@ -6530,6 +6690,7 @@ impl CudaDecodeModel {
         )
     }
 
+    #[allow(dead_code)] // graph-decode residual; wired in as the CUDA Graphs path lands
     fn g_residual(
         &self,
         x: sys::CUdeviceptr,
@@ -6672,6 +6833,7 @@ struct LayerPtrs {
 }
 
 /// Pre-extracted device pointers for the shared dense weights + scratch buffers.
+#[allow(dead_code)] // CUDA-Graphs decode scaffolding; ptrs wired in as that path lands
 struct GraphPtrs {
     d_x: sys::CUdeviceptr,
     d_normed: sys::CUdeviceptr,
@@ -6698,6 +6860,7 @@ struct GraphPtrs {
 /// `sys::CUfunction` handle, which the safe `CudaFunction` keeps `pub(crate)`. These are
 /// a SECOND JIT of the same PTX the backend already loaded (a few MB of extra SASS);
 /// the modules are unloaded on drop.
+#[allow(dead_code)] // CUDA-Graphs decode scaffolding; handles wired in as that path lands
 struct RawGraphKernels {
     modules: Vec<sys::CUmodule>,
     embed_g: sys::CUfunction,
@@ -7538,6 +7701,35 @@ mod tests {
             kernel,
         )
         .expect("mpgemm_kernel");
+        out
+    }
+
+    /// Upload weights + run the sparse-aware tiled kernel with a pre-computed
+    /// zero-block bitmap. Returns the output `[M, N]`.
+    fn run_kernel_sparse(
+        cuda: &CudaBackend,
+        packed: &[u8],
+        act: &[f32],
+        scales: &[f32],
+        bitmap: &[u32],
+        words_per_row: usize,
+        shape: GemmShape,
+    ) -> Vec<f32> {
+        let buf = cuda
+            .upload_weights(packed, shape, TernaryFormat::Tq2_0)
+            .expect("upload weights");
+        let mut out = vec![0.0f32; shape.m * shape.n];
+        cuda.mpgemm_kernel_with_bitmap(
+            act,
+            buf.as_ref(),
+            scales,
+            bitmap,
+            words_per_row,
+            shape,
+            TernaryFormat::Tq2_0,
+            &mut out,
+        )
+        .expect("mpgemm_kernel_with_bitmap");
         out
     }
 
@@ -9091,6 +9283,228 @@ mod tests {
         #[allow(unsafe_code)]
         unsafe {
             result::module::unload(cu_module).expect("unload");
+        }
+    }
+
+    // ── Sparse kernel tests (P1: zero-block sparsity skip) ─────────────────
+    use tritium_format::QK_K;
+
+    /// Build a trit vector with a known sparsity pattern: `zero_blocks` out of
+    /// `total_blocks` are all-zero (placed at the start), the rest are all +1.
+    /// Build an `[n, k]` row-major trit matrix (POS everywhere) with the first
+    /// `zero_blocks` TQ2_0 blocks of EACH row zeroed (partial last block respected
+    /// via `.min(k)`). Length is `n * k`, matching what `pack_tq2_0(.., shape)`
+    /// slices per row — so the per-row zero pattern is what `compute_zero_bitmaps`
+    /// will flag and the sparse kernel must skip.
+    fn make_sparse_trits(n: usize, k: usize, zero_blocks: usize) -> Vec<tritium_core::Trit> {
+        let mut trits = vec![tritium_core::Trit::POS; n * k];
+        for row in 0..n {
+            let base = row * k;
+            for b in 0..zero_blocks {
+                let start = b * QK_K;
+                let end = ((b + 1) * QK_K).min(k);
+                for i in start..end {
+                    trits[base + i] = tritium_core::Trit::ZERO;
+                }
+            }
+        }
+        trits
+    }
+
+    /// The sparse-aware tiled kernel must match the CPU reference on mixed
+    /// zero/nonzero weights. This is the primary correctness gate for P1.
+    #[test]
+    fn sparse_kernel_matches_cpu_reference() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping sparse kernel test: no device ({e})");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+        let tol = Tolerance::default();
+
+        // K=4096 (16 blocks), ~40% zero blocks (7 out of 16)
+        let nb = 16;
+        let k = nb * QK_K; // 4096
+        let n = 8;
+        let m = 1;
+        let shape = GemmShape::new(m, n, k);
+
+        let trits = make_sparse_trits(n, k, 7);
+        let packed = pack_tq2_0(&trits, shape);
+        let act = seeded_f32(42, m * k, -1.0, 1.0);
+        let scales = seeded_f32(99, n, 0.5, 2.0);
+
+        let cpu_out = run_backend(&cpu, &packed, &act, &scales, shape);
+
+        let bitmap =
+            tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
+        let words_per_row = nb.div_ceil(32);
+        let sparse_out =
+            run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+
+        for (i, (&g, &c)) in sparse_out.iter().zip(&cpu_out).enumerate() {
+            assert!(tol.accepts(g, c), "sparse vs cpu [{i}]: sparse={g} cpu={c}");
+        }
+    }
+
+    /// The sparse kernel must produce identical output to the dense tiled kernel
+    /// on the same weights (the bitmap just skips zero contributions, which the
+    /// dense kernel also skips via branchless `a * (code - 1)` where code=1).
+    #[test]
+    fn sparse_matches_dense_tiled_on_mixed_weights() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping sparse-vs-dense test: no device ({e})");
+                return;
+            }
+        };
+        let tol = Tolerance::default();
+
+        let nb = 16;
+        let k = nb * QK_K;
+        let n = 8;
+        let m = 1;
+        let shape = GemmShape::new(m, n, k);
+
+        let trits = make_sparse_trits(n, k, 7);
+        let packed = pack_tq2_0(&trits, shape);
+        let act = seeded_f32(42, m * k, -1.0, 1.0);
+        let scales = seeded_f32(99, n, 0.5, 2.0);
+
+        // Dense tiled (double-accumulator, the reference-gated kernel)
+        let dense = run_kernel(&cuda, &packed, &act, &scales, shape, AddKernel::Tiled);
+
+        // Sparse-aware tiled
+        let bitmap =
+            tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
+        let words_per_row = nb.div_ceil(32);
+        let sparse =
+            run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+
+        for (i, (&d, &s)) in dense.iter().zip(&sparse).enumerate() {
+            assert!(
+                tol.accepts(s, d),
+                "sparse vs dense [{i}]: sparse={s} dense={d}"
+            );
+        }
+    }
+
+    /// All-zero weights: the sparse kernel must produce exactly zero output.
+    #[test]
+    fn sparse_kernel_all_zero_weights() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping sparse all-zero test: no device ({e})");
+                return;
+            }
+        };
+
+        let nb = 4;
+        let k = nb * QK_K;
+        let n = 4;
+        let m = 1;
+        let shape = GemmShape::new(m, n, k);
+
+        // All-zero trits → every block is zero
+        let trits = vec![tritium_core::Trit::ZERO; n * k];
+        let packed = pack_tq2_0(&trits, shape);
+        let act = seeded_f32(42, m * k, -1.0, 1.0);
+        let scales = seeded_f32(99, n, 0.5, 2.0);
+
+        let bitmap =
+            tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
+        let words_per_row = nb.div_ceil(32);
+        let sparse =
+            run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+
+        for (i, &v) in sparse.iter().enumerate() {
+            assert_eq!(v, 0.0, "all-zero weights should produce zero output [{i}]");
+        }
+    }
+
+    /// No zero blocks: the sparse kernel must match the dense kernel exactly.
+    #[test]
+    fn sparse_kernel_no_zero_blocks() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping sparse no-zero test: no device ({e})");
+                return;
+            }
+        };
+        let tol = Tolerance::default();
+
+        let nb = 8;
+        let k = nb * QK_K;
+        let n = 4;
+        let m = 1;
+        let shape = GemmShape::new(m, n, k);
+
+        // All-positive trits → no zero blocks
+        let trits = vec![tritium_core::Trit::POS; n * k];
+        let packed = pack_tq2_0(&trits, shape);
+        let act = seeded_f32(42, m * k, -1.0, 1.0);
+        let scales = seeded_f32(99, n, 0.5, 2.0);
+
+        let dense = run_kernel(&cuda, &packed, &act, &scales, shape, AddKernel::Tiled);
+
+        let bitmap =
+            tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
+        let words_per_row = nb.div_ceil(32);
+        let sparse =
+            run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+
+        for (i, (&d, &s)) in dense.iter().zip(&sparse).enumerate() {
+            assert!(
+                tol.accepts(s, d),
+                "no-zero sparse vs dense [{i}]: sparse={s} dense={d}"
+            );
+        }
+    }
+
+    /// Boundary shape: K not a multiple of QK_K (partial last block).
+    #[test]
+    fn sparse_kernel_partial_block() {
+        let cuda = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping sparse partial test: no device ({e})");
+                return;
+            }
+        };
+        let tol = Tolerance::default();
+
+        // K=300 → 2 blocks (one full 256, one partial 44)
+        let k = 300usize;
+        let nb = k.div_ceil(QK_K); // 2
+        let n = 4;
+        let m = 1;
+        let shape = GemmShape::new(m, n, k);
+
+        let trits = make_sparse_trits(n, k, 1); // block 0 zero, block 1 nonzero
+        let packed = pack_tq2_0(&trits, shape);
+        let act = seeded_f32(42, m * k, -1.0, 1.0);
+        let scales = seeded_f32(99, n, 0.5, 2.0);
+
+        let cpu = CpuBackend::new();
+        let cpu_out = run_backend(&cpu, &packed, &act, &scales, shape);
+
+        let bitmap =
+            tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
+        let words_per_row = nb.div_ceil(32);
+        let sparse =
+            run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+
+        for (i, (&g, &c)) in sparse.iter().zip(&cpu_out).enumerate() {
+            assert!(
+                tol.accepts(g, c),
+                "partial block sparse vs cpu [{i}]: sparse={g} cpu={c}"
+            );
         }
     }
 }

@@ -297,6 +297,75 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32(
     }
 }
 
+// Sparse-aware variant of `tq2_0_add_mpgemm_tiled_f32`. Accepts a pre-computed
+// per-row bitmap where each bit indicates whether the corresponding 256-trit
+// block is all-zero (every qs byte == 0x55). When a block's bit is SET, the
+// kernel skips the decode + accumulate for that block entirely — saving memory
+// bandwidth and compute for the ~42.8% of ternary weights that are zero.
+//
+// The bitmap is laid out as one u32 per 32 blocks, per row. Row `ni`'s bitmap
+// starts at `block_bitmap[ni * words_per_row]` where
+// `words_per_row = ceil(k / (QK_K * 32))`.
+//
+// If `block_bitmap` is NULL, behavior is identical to the non-sparse variant
+// (no blocks are skipped).
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_sparse(
+    const float* __restrict__ act,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const unsigned int* __restrict__ block_bitmap,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes,
+    const int words_per_row) {
+    extern __shared__ float s_act[];
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_act[i] = arow[i];
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    // Pointer to this row's bitmap words.
+    const unsigned int* row_bm = block_bitmap ? block_bitmap + (long long)ni * words_per_row : 0;
+    float acc = 0.0f;
+    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        // Check bitmap: skip entire block if all-zero.
+        if (row_bm && (row_bm[block / 32] & (1u << (block % 32)))) {
+            continue;
+        }
+        const int e = ki - block * QK_K;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        const float a = s_act[ki];
+        acc += a * (float)((int)code - 1);
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = acc * scales[ni];
+    }
+}
+
 // Fused-scaled f32-accumulate variant (v0.6.0 opt #15). Same as above but
 // epilogue folds both weight scale and per-token activation scale in one write.
 extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
@@ -332,6 +401,65 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
     float acc = 0.0f;
     for (int ki = lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
+        const int e = ki - block * QK_K;
+        const int c = e >> 7;
+        const int mm = e & 31;
+        const int l = (e & 127) >> 5;
+        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
+        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
+        const float a = s_act[ki];
+        acc += a * (float)((int)code - 1);
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = acc * scales[ni] * act_scale[mi];
+    }
+}
+
+// Sparse-aware variant of `tq2_0_add_mpgemm_tiled_f32_scaled`. Same bitmap
+// skip logic as `tq2_0_add_mpgemm_tiled_f32_sparse` — see that kernel's doc
+// for the bitmap layout. NULL bitmap → identical to the non-sparse variant.
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
+    const float* __restrict__ act,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const float* __restrict__ act_scale,
+    const unsigned int* __restrict__ block_bitmap,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes,
+    const int words_per_row) {
+    extern __shared__ float s_act[];
+
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const float* arow = act + (long long)mi * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        s_act[i] = arow[i];
+    }
+    __syncthreads();
+
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    const unsigned int* row_bm = block_bitmap ? block_bitmap + (long long)ni * words_per_row : 0;
+    float acc = 0.0f;
+    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        if (row_bm && (row_bm[block / 32] & (1u << (block % 32)))) {
+            continue;
+        }
         const int e = ki - block * QK_K;
         const int c = e >> 7;
         const int mm = e & 31;
