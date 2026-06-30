@@ -37,6 +37,10 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
   **mmaps each shard** so a 50GB+ master (e.g. a 27B bf16) is paged in per-tensor rather
   than read fully into RAM. Each shard is mapped once; shard + tensor order is
   deterministic.
+- **Parallel `report salt-model`**: the (independent) 2D tensors are quantized on a
+  bounded worker pool (`min(cores, 12)`), turning a 27B sweep from ~an hour into minutes.
+  Output is bit-identical to the sequential path — an indexed `par_iter().collect()`
+  preserves tensor order, so the global moments fold in the same sequence.
 
 ## [1.0.0] — 2026-06-28 — v1.0 Release 🎉
 

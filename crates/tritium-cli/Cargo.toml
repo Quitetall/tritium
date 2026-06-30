@@ -35,6 +35,9 @@ serde_json = { workspace = true }
 # `report salt-model` mmaps each (possibly sharded) safetensors file so a 50GB+ master is
 # never read fully into RAM.
 memmap2 = { workspace = true }
+# `report salt-model` quantizes the (independent) 2D tensors in parallel — a 27B sweep is
+# minutes instead of an hour. Bounded pool keeps the transient f32 buffers in check.
+rayon = { workspace = true }
 
 [dev-dependencies]
 # `salt_model_cli` parses the report's JSON output to assert fidelity invariants.

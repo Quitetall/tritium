@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context as _, bail};
+use rayon::prelude::*;
 use serde::Serialize;
 use tritium_format::{SafeTensors, dequant_salt_row};
 use tritium_nn::{ModelRunner, sample_greedy};
@@ -311,6 +312,77 @@ struct TensorReconRow {
     cosine: f64,
 }
 
+/// One tensor's contribution to the sweep, computed off-thread.
+struct TensorContribution {
+    params: u64,
+    per_budget: Vec<BudgetContribution>,
+}
+
+/// One (tensor, budget) cell: the reconstruction moments, the realized bit cost, and the
+/// per-tensor row (when `--per-tensor` is set).
+struct BudgetContribution {
+    accum: ReconAccum,
+    bits: f64,
+    row: Option<TensorReconRow>,
+}
+
+/// Quantize one 2D tensor at every budget and return its reconstruction contribution.
+/// Pure + `Send` so it runs on the worker pool; reads the tensor's bytes from the shared
+/// (mmap-backed) `SafeTensors` view.
+fn tensor_contribution(
+    st: &SafeTensors<'_>,
+    name: &str,
+    budgets: &[f64],
+    sensitivity: &Sensitivity,
+    scale_group: BaseScaleScope,
+    per_tensor: bool,
+) -> anyhow::Result<TensorContribution> {
+    let shape = st.shape(name).expect("filtered to a 2D shape");
+    let (rows, k) = (shape[0], shape[1]);
+    let w = st
+        .tensor_f32(name)
+        .with_context(|| format!("read tensor `{name}`"))?;
+    let mut per_budget = Vec::with_capacity(budgets.len());
+    for &bpw in budgets {
+        let cfg = QuantConfig {
+            budget_bpw: bpw,
+            t_min: 1,
+            t_max: 3,
+            sensitivity: sensitivity.clone(),
+            scale_group,
+        };
+        let qt = quantize_tensor(&w, rows, k, &cfg)
+            .with_context(|| format!("quantize `{name}` at {bpw} bpw"))?;
+        let lbpw = qt.logical_bpw();
+        // One dequant pass: fold into a local accumulator, derive the per-tensor stat from
+        // it, then hand the moments back for the global merge.
+        let mut accum = ReconAccum::default();
+        accum
+            .accumulate(&w, &qt)
+            .with_context(|| format!("reconstruction of `{name}`"))?;
+        let row = per_tensor.then(|| {
+            let s = accum.finish();
+            TensorReconRow {
+                name: name.to_owned(),
+                rows,
+                k,
+                logical_bpw: lbpw,
+                frob_rel: s.frob_rel,
+                cosine: s.cosine,
+            }
+        });
+        per_budget.push(BudgetContribution {
+            accum,
+            bits: lbpw * (rows * k) as f64,
+            row,
+        });
+    }
+    Ok(TensorContribution {
+        params: (rows * k) as u64,
+        per_budget,
+    })
+}
+
 /// SALT reconstruction-fidelity report over a real fp safetensors **master**: quantize
 /// every 2D weight at each bpw budget and report whole-model (and optionally per-tensor)
 /// error. The arch-agnostic proxy for output divergence — needs the fp (bf16/f16/f32)
@@ -336,6 +408,18 @@ pub(crate) fn salt_model(
     };
 
     let shards = resolve_shards(input)?;
+
+    // Bounded worker pool: parallelism speeds a multi-GB sweep ~linearly, but each worker
+    // holds one tensor's f32 widening (the embeddings are multi-GB), so cap threads to
+    // keep peak RSS sane rather than taking every core.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(12);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .context("build worker pool")?;
 
     // One accumulator per budget; read each tensor once (mmap-paged) and fold it into
     // every budget. Shards stream one at a time so a 50GB+ master never lands in RAM.
@@ -372,48 +456,36 @@ pub(crate) fn salt_model(
             .map(str::to_owned)
             .collect();
 
-        for name in &names {
-            if limit > 0 && tensors_done >= limit {
-                break 'shards;
-            }
-            let shape = st.shape(name).expect("filtered to Some");
-            let (rows, k) = (shape[0], shape[1]);
-            let w = st
-                .tensor_f32(name)
-                .with_context(|| format!("read tensor `{name}`"))?;
-            total_params += (rows * k) as u64;
-            for (bi, &bpw) in budget_values.iter().enumerate() {
-                let cfg = QuantConfig {
-                    budget_bpw: bpw,
-                    t_min: 1,
-                    t_max: 3,
-                    sensitivity: sens.clone(),
-                    scale_group: sg,
-                };
-                let qt = quantize_tensor(&w, rows, k, &cfg)
-                    .with_context(|| format!("quantize `{name}` at {bpw} bpw"))?;
-                let lbpw = qt.logical_bpw();
-                bits[bi] += lbpw * (rows * k) as f64;
-                // One dequant pass per tensor: fold into a local accumulator, derive the
-                // per-tensor stat from it, then merge into the budget total.
-                let mut tensor_accum = ReconAccum::default();
-                tensor_accum
-                    .accumulate(&w, &qt)
-                    .with_context(|| format!("reconstruction of `{name}`"))?;
-                if per_tensor {
-                    let s = tensor_accum.finish();
-                    per_tensor_rows[bi].push(TensorReconRow {
-                        name: name.clone(),
-                        rows,
-                        k,
-                        logical_bpw: lbpw,
-                        frob_rel: s.frob_rel,
-                        cosine: s.cosine,
-                    });
-                }
-                accums[bi].merge(&tensor_accum);
-            }
+        // How many tensors from this shard to process under --limit.
+        let take = if limit > 0 {
+            limit.saturating_sub(tensors_done).min(names.len())
+        } else {
+            names.len()
+        };
+        if take == 0 {
+            break 'shards;
+        }
+
+        // Quantize this shard's (independent) 2D tensors in parallel. `par_iter().collect()`
+        // preserves input order, so the per-tensor output stays deterministic; the global
+        // accumulators are then folded sequentially in that order.
+        let contribs: Vec<TensorContribution> = pool.install(|| {
+            names[..take]
+                .par_iter()
+                .map(|name| tensor_contribution(&st, name, &budget_values, &sens, sg, per_tensor))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
+
+        for c in contribs {
+            total_params += c.params;
             tensors_done += 1;
+            for (bi, bc) in c.per_budget.into_iter().enumerate() {
+                accums[bi].merge(&bc.accum);
+                bits[bi] += bc.bits;
+                if let Some(row) = bc.row {
+                    per_tensor_rows[bi].push(row);
+                }
+            }
         }
     }
 

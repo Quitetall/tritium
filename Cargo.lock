@@ -3753,6 +3753,7 @@ dependencies = [
  "anyhow",
  "clap",
  "memmap2",
+ "rayon",
  "serde",
  "serde_json",
  "tritium-cpu",
