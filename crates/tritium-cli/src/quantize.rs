@@ -16,6 +16,8 @@ use clap::ValueEnum;
 use tritium_format::{SafeTensors, SaltRow, write_salt_bundle, write_salt_gguf};
 use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
 
+use crate::SaltSensitivityArg;
+
 /// Base-plane scale granularity (CLI mirror of [`BaseScaleScope`]).
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum ScaleGroupArg {
@@ -40,11 +42,16 @@ pub(crate) fn run(
     output: &Path,
     bpw: f64,
     scale_group: ScaleGroupArg,
+    sensitivity: SaltSensitivityArg,
     format: OutputFormat,
 ) -> Result<()> {
     let sg = match scale_group {
         ScaleGroupArg::Block => BaseScaleScope::Block,
         ScaleGroupArg::Tensor => BaseScaleScope::Tensor,
+    };
+    let sens = match sensitivity {
+        SaltSensitivityArg::Uniform => Sensitivity::Uniform,
+        SaltSensitivityArg::Energy => Sensitivity::Energy,
     };
 
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
@@ -76,7 +83,7 @@ pub(crate) fn run(
             budget_bpw: bpw,
             t_min: 1,
             t_max: 3,
-            sensitivity: Sensitivity::Uniform,
+            sensitivity: sens.clone(),
             scale_group: sg,
         };
         let qt = quantize_tensor(&w, rows, k, &cfg).with_context(|| format!("quantize {name}"))?;

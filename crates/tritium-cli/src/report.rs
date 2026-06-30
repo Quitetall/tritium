@@ -9,10 +9,11 @@ use std::time::Instant;
 
 use anyhow::{Context as _, bail};
 use serde::Serialize;
-use tritium_format::dequant_salt_row;
+use tritium_format::{SafeTensors, dequant_salt_row};
 use tritium_nn::{ModelRunner, sample_greedy};
-use tritium_quantize::{QuantConfig, Sensitivity, quantize_tensor};
+use tritium_quantize::{BaseScaleScope, QuantConfig, ReconAccum, Sensitivity, quantize_tensor};
 
+use crate::quantize::ScaleGroupArg;
 use crate::{ReportFormat, SaltSensitivityArg};
 
 const RTX_4090_PEAK_HBM_BW_BYTES_PER_SEC: f64 = 1008.0e9;
@@ -272,6 +273,231 @@ pub(crate) fn salt(
         budgets: reports,
     };
     emit(format, &salt_table(&report), &report)
+}
+
+#[derive(Debug, Serialize)]
+struct SaltModelReport {
+    report: &'static str,
+    input: String,
+    sensitivity: &'static str,
+    scale_group: &'static str,
+    tensors: usize,
+    total_params: u64,
+    budgets: Vec<SaltModelBudget>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaltModelBudget {
+    requested_bpw: f64,
+    /// Param-weighted average logical bpw the allocator actually realized.
+    logical_bpw: f64,
+    mse: f64,
+    rmse: f64,
+    mae: f64,
+    max_abs: f64,
+    frob_rel: f64,
+    cosine: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    per_tensor: Vec<TensorReconRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct TensorReconRow {
+    name: String,
+    rows: usize,
+    k: usize,
+    logical_bpw: f64,
+    frob_rel: f64,
+    cosine: f64,
+}
+
+/// SALT reconstruction-fidelity report over a real fp safetensors **master**: quantize
+/// every 2D weight at each bpw budget and report whole-model (and optionally per-tensor)
+/// error. The arch-agnostic proxy for output divergence — needs the fp (bf16/f16/f32)
+/// master, NOT an already-quantized checkpoint (those carry no fp reference to measure
+/// against and won't even parse as fp here).
+pub(crate) fn salt_model(
+    input: &Path,
+    budgets: &str,
+    sensitivity: SaltSensitivityArg,
+    scale_group: ScaleGroupArg,
+    limit: usize,
+    per_tensor: bool,
+    format: ReportFormat,
+) -> anyhow::Result<()> {
+    let budget_values = parse_budgets(budgets)?;
+    let sens = match sensitivity {
+        SaltSensitivityArg::Uniform => Sensitivity::Uniform,
+        SaltSensitivityArg::Energy => Sensitivity::Energy,
+    };
+    let sg = match scale_group {
+        ScaleGroupArg::Block => BaseScaleScope::Block,
+        ScaleGroupArg::Tensor => BaseScaleScope::Tensor,
+    };
+
+    let bytes =
+        std::fs::read(input).with_context(|| format!("failed to read `{}`", input.display()))?;
+    let st = SafeTensors::parse(&bytes)
+        .with_context(|| format!("failed to parse `{}` as safetensors", input.display()))?;
+
+    // Quantize every 2D weight matrix; skip 1D tensors (norms/biases) and degenerate
+    // shapes — mirrors `tritium quantize`.
+    let mut names: Vec<String> = st
+        .names()
+        .filter(|n| {
+            st.shape(n)
+                .is_some_and(|s| s.len() == 2 && s[0] >= 2 && s[1] >= 2)
+        })
+        .map(str::to_owned)
+        .collect();
+    if names.is_empty() {
+        bail!("no 2D weight tensors found in `{}`", input.display());
+    }
+    if limit > 0 && names.len() > limit {
+        names.truncate(limit);
+    }
+
+    // One accumulator per budget; read each tensor once and fold it into every budget.
+    let nb = budget_values.len();
+    let mut accums = vec![ReconAccum::default(); nb];
+    let mut bits = vec![0.0f64; nb]; // Σ logical_bpw·params, for the param-weighted avg
+    let mut per_tensor_rows: Vec<Vec<TensorReconRow>> = if per_tensor {
+        (0..nb).map(|_| Vec::new()).collect()
+    } else {
+        Vec::new()
+    };
+    let mut total_params = 0u64;
+
+    for name in &names {
+        let shape = st.shape(name).expect("filtered to Some");
+        let (rows, k) = (shape[0], shape[1]);
+        let w = st
+            .tensor_f32(name)
+            .with_context(|| format!("read tensor `{name}`"))?;
+        total_params += (rows * k) as u64;
+        for (bi, &bpw) in budget_values.iter().enumerate() {
+            let cfg = QuantConfig {
+                budget_bpw: bpw,
+                t_min: 1,
+                t_max: 3,
+                sensitivity: sens.clone(),
+                scale_group: sg,
+            };
+            let qt = quantize_tensor(&w, rows, k, &cfg)
+                .with_context(|| format!("quantize `{name}` at {bpw} bpw"))?;
+            let lbpw = qt.logical_bpw();
+            bits[bi] += lbpw * (rows * k) as f64;
+            // One dequant pass per tensor: fold into a local accumulator, derive the
+            // per-tensor stat from it, then merge into the budget total.
+            let mut tensor_accum = ReconAccum::default();
+            tensor_accum
+                .accumulate(&w, &qt)
+                .with_context(|| format!("reconstruction of `{name}`"))?;
+            if per_tensor {
+                let s = tensor_accum.finish();
+                per_tensor_rows[bi].push(TensorReconRow {
+                    name: name.clone(),
+                    rows,
+                    k,
+                    logical_bpw: lbpw,
+                    frob_rel: s.frob_rel,
+                    cosine: s.cosine,
+                });
+            }
+            accums[bi].merge(&tensor_accum);
+        }
+    }
+
+    let reports = budget_values
+        .iter()
+        .enumerate()
+        .map(|(bi, &bpw)| {
+            let s = accums[bi].finish();
+            SaltModelBudget {
+                requested_bpw: bpw,
+                logical_bpw: if total_params > 0 {
+                    bits[bi] / total_params as f64
+                } else {
+                    0.0
+                },
+                mse: s.mse,
+                rmse: s.rmse,
+                mae: s.mae,
+                max_abs: s.max_abs,
+                frob_rel: s.frob_rel,
+                cosine: s.cosine,
+                per_tensor: if per_tensor {
+                    std::mem::take(&mut per_tensor_rows[bi])
+                } else {
+                    Vec::new()
+                },
+            }
+        })
+        .collect();
+
+    let report = SaltModelReport {
+        report: "salt-model",
+        input: input.display().to_string(),
+        sensitivity: match sensitivity {
+            SaltSensitivityArg::Uniform => "uniform",
+            SaltSensitivityArg::Energy => "energy",
+        },
+        scale_group: match scale_group {
+            ScaleGroupArg::Block => "block",
+            ScaleGroupArg::Tensor => "tensor",
+        },
+        tensors: names.len(),
+        total_params,
+        budgets: reports,
+    };
+    emit(format, &salt_model_table(&report), &report)
+}
+
+fn salt_model_table(r: &SaltModelReport) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "salt-model report\ninput: {}\nsensitivity: {}\nscale_group: {}\ntensors: {}\ntotal_params: {:.3}M\n\n",
+        r.input,
+        r.sensitivity,
+        r.scale_group,
+        r.tensors,
+        r.total_params as f64 / 1e6,
+    );
+    let _ = writeln!(
+        s,
+        "  {:>10} {:>10} {:>12} {:>12} {:>12} {:>10}",
+        "req_bpw", "log_bpw", "mse", "frob_rel", "cosine", "max_abs"
+    );
+    for b in &r.budgets {
+        let _ = writeln!(
+            s,
+            "  {:>10.4} {:>10.4} {:>12.3e} {:>12.6} {:>12.8} {:>10.4}",
+            b.requested_bpw, b.logical_bpw, b.mse, b.frob_rel, b.cosine, b.max_abs
+        );
+    }
+    // Per-tensor breakdown (only present when requested), grouped by budget.
+    for b in &r.budgets {
+        if b.per_tensor.is_empty() {
+            continue;
+        }
+        let _ = write!(s, "\n  per-tensor @ {:.4} bpw:\n", b.requested_bpw);
+        let _ = writeln!(
+            s,
+            "    {:>10} {:>8} {:>12} {:>12}  name",
+            "log_bpw", "k", "frob_rel", "cosine"
+        );
+        for t in &b.per_tensor {
+            let _ = writeln!(
+                s,
+                "    {:>10.4} {:>8} {:>12.6} {:>12.8}  {}",
+                t.logical_bpw, t.k, t.frob_rel, t.cosine, t.name
+            );
+        }
+    }
+    s.push('\n');
+    s
 }
 
 fn load_runner(model_path: &Path, backend: &str) -> anyhow::Result<ModelRunner> {

@@ -36,6 +36,7 @@
 mod allocate;
 mod plane;
 mod quantize;
+mod recon;
 
 pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
 pub use plane::{
@@ -44,3 +45,4 @@ pub use plane::{
 pub use quantize::{
     BaseScaleScope, QuantConfig, QuantError, QuantizedTensor, Sensitivity, quantize_tensor,
 };
+pub use recon::{ReconAccum, ReconError, ReconStats, reconstruction_stats};

@@ -9,6 +9,30 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 > tags `v0.10.0` / `v0.20.0` (the old `0.x0` milestone staircase) are immutable and
 > correspond conceptually to 0.1.0 / 0.2.0.
 
+## [Unreleased] — 1.x dev
+
+### Added
+
+- **SALT reconstruction-fidelity report** (`tritium report salt-model`): loads an fp
+  (bf16/f16/f32) safetensors **master**, SALT-quantizes every 2D weight at a sweep of
+  bits-per-weight budgets, and reports whole-model (and optional `--per-tensor`)
+  reconstruction error — MSE/RMSE/MAE/max-abs plus relative-Frobenius error and cosine
+  similarity, the weight-space proxies for output divergence (true output KL is a
+  forward-pass measurement layered on top, and needs general-architecture model support
+  not yet present). The arch-agnostic way to see where ternary quantization hurts and
+  how added bits/sensitivity-allocation recover it. Needs the fp master — an
+  already-quantized checkpoint (EXL3/GGUF-Qx) carries no fp reference and won't parse as
+  fp here.
+- **`tritium_quantize::{ReconStats, ReconAccum, reconstruction_stats, ReconError}`** —
+  the reconstruction metric, with a `ReconAccum` of raw moments that folds tensors and
+  reduces to a *true* whole-model statistic (frob_rel/cosine are ratios of summed
+  moments, not averages of per-tensor ratios). Purely additive (semver-minor).
+- **`--sensitivity {uniform,energy}`** on `tritium quantize` (previously hardcoded
+  `Uniform`) — exposes SALT's plane-allocation sensitivity on the model-quantize path,
+  matching `tritium report salt`. (Note: `energy` ≈ `uniform` whenever reconstruction
+  error tracks weight magnitude; a meaningfully different allocation needs a true
+  loss-sensitivity signal via `Sensitivity::Custom`.)
+
 ## [1.0.0] — 2026-06-28 — v1.0 Release 🎉
 
 First stable release. The v1.0 Definition of Done (ADR 0012) is met: the public API and C ABI are frozen

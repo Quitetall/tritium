@@ -94,6 +94,10 @@ enum Command {
         /// for a BitNet b1.58 master).
         #[arg(long, value_enum, default_value_t = quantize::ScaleGroupArg::Block)]
         scale_group: quantize::ScaleGroupArg,
+        /// Plane-allocation sensitivity: `uniform` (allocate purely by reconstruction-error
+        /// reduction) or `energy` (weight `‖w‖²` proxy — spend planes on high-energy groups).
+        #[arg(long, value_enum, default_value_t = SaltSensitivityArg::Uniform)]
+        sensitivity: SaltSensitivityArg,
         /// Output container: `sidecar` (single-file `.tslb` bundle) or `gguf`
         /// (GGUF container holding the SALT rows).
         #[arg(long, value_enum, default_value_t = quantize::OutputFormat::Sidecar)]
@@ -182,6 +186,32 @@ enum ReportCommand {
         #[arg(long, value_enum, default_value_t = ReportFormat::Both)]
         format: ReportFormat,
     },
+    /// SALT reconstruction-fidelity over a real fp safetensors master: quantize every
+    /// 2D weight at each bpw budget and report whole-model (± per-tensor) error
+    /// (Uniform vs sensitivity-allocated). Needs the fp master, not a quantized model.
+    SaltModel {
+        /// Path to the fp (bf16/f16/f32) safetensors master.
+        #[arg(long)]
+        input: PathBuf,
+        /// Comma-separated bpw budgets, e.g. `1.585,2.0,2.5,3.0`.
+        #[arg(long)]
+        budgets: String,
+        /// Sensitivity proxy for plane allocation.
+        #[arg(long, value_enum, default_value_t = SaltSensitivityArg::Uniform)]
+        sensitivity: SaltSensitivityArg,
+        /// Base-plane scale granularity.
+        #[arg(long, value_enum, default_value_t = quantize::ScaleGroupArg::Block)]
+        scale_group: quantize::ScaleGroupArg,
+        /// Only quantize the first N 2D tensors (0 = all) — a quick smoke on huge models.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        /// Include the per-tensor breakdown in the report.
+        #[arg(long, default_value_t = false)]
+        per_tensor: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ReportFormat::Both)]
+        format: ReportFormat,
+    },
 }
 
 /// Report output format.
@@ -259,14 +289,32 @@ fn main() -> anyhow::Result<()> {
                 sensitivity,
                 format,
             } => report::salt(&input, rows, k, &budgets, sensitivity, format)?,
+            ReportCommand::SaltModel {
+                input,
+                budgets,
+                sensitivity,
+                scale_group,
+                limit,
+                per_tensor,
+                format,
+            } => report::salt_model(
+                &input,
+                &budgets,
+                sensitivity,
+                scale_group,
+                limit,
+                per_tensor,
+                format,
+            )?,
         },
         Command::Quantize {
             input,
             output,
             bpw,
             scale_group,
+            sensitivity,
             format,
-        } => quantize::run(&input, &output, bpw, scale_group, format)?,
+        } => quantize::run(&input, &output, bpw, scale_group, sensitivity, format)?,
     }
     Ok(())
 }
