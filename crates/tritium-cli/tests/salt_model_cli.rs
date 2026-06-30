@@ -14,9 +14,9 @@ fn tritium_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tritium"))
 }
 
-/// Write a minimal fp32 safetensors file: `[u64 header_len][JSON header][f32 data]`.
+/// Build a minimal fp32 safetensors blob: `[u64 header_len][JSON header][f32 data]`.
 /// `tensors` is `(name, rows, k, values)` with `values.len() == rows*k`, row-major.
-fn write_safetensors(name: &str, tensors: &[(&str, usize, usize, Vec<f32>)]) -> PathBuf {
+fn build_safetensors(tensors: &[(&str, usize, usize, Vec<f32>)]) -> Vec<u8> {
     let mut data: Vec<u8> = Vec::new();
     let mut header = String::from("{");
     for (i, (tn, rows, k, vals)) in tensors.iter().enumerate() {
@@ -40,14 +40,26 @@ fn write_safetensors(name: &str, tensors: &[(&str, usize, usize, Vec<f32>)]) -> 
     buf.extend_from_slice(&(hbytes.len() as u64).to_le_bytes());
     buf.extend_from_slice(&hbytes);
     buf.extend_from_slice(&data);
+    buf
+}
 
+/// Write a single-file safetensors into the temp dir; returns its path.
+fn write_safetensors(name: &str, tensors: &[(&str, usize, usize, Vec<f32>)]) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
         "tritium-saltmodel-{}-{}.safetensors",
         name,
         std::process::id()
     ));
-    std::fs::write(&p, &buf).expect("write safetensors");
+    std::fs::write(&p, build_safetensors(tensors)).expect("write safetensors");
+    p
+}
+
+/// Create a fresh temp directory unique to this process + `tag`.
+fn temp_dir(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("tritium-saltmodel-{}-{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).expect("mkdir");
     p
 }
 
@@ -107,6 +119,46 @@ fn salt_model_reports_fidelity_and_improves_with_bpw() {
     );
     // The whole-model cosine is a real similarity in [-1, 1].
     assert!(cos(&budgets[0]) > 0.0 && cos(&budgets[1]) <= 1.0 + 1e-9);
+}
+
+#[test]
+fn salt_model_loads_sharded_via_index_json() {
+    // Two shards + a HF-style index.json; the report must process tensors from BOTH.
+    let dir = temp_dir("sharded");
+    std::fs::write(
+        dir.join("shard1.safetensors"),
+        build_safetensors(&[("w.a", 8, 512, synth(8, 512, 0.0))]),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("shard2.safetensors"),
+        build_safetensors(&[("w.b", 4, 256, synth(4, 256, 1.0))]),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        r#"{"metadata":{"total_size":0},"weight_map":{"w.a":"shard1.safetensors","w.b":"shard2.safetensors"}}"#,
+    )
+    .unwrap();
+
+    // Pass the directory: salt-model should discover the index and stream both shards.
+    let out = Command::new(tritium_bin())
+        .args(["report", "salt-model", "--input"])
+        .arg(&dir)
+        .args(["--budgets", "2.0", "--format", "json"])
+        .output()
+        .expect("spawn tritium");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.status.success(),
+        "sharded salt-model failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("parse JSON");
+    assert_eq!(json["tensors"], 2, "both shards' tensors must be counted");
+    assert_eq!(json["total_params"], (8 * 512 + 4 * 256) as u64);
 }
 
 #[test]

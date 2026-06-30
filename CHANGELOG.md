@@ -32,6 +32,11 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
   matching `tritium report salt`. (Note: `energy` ≈ `uniform` whenever reconstruction
   error tracks weight magnitude; a meaningfully different allocation needs a true
   loss-sensitivity signal via `Sensitivity::Custom`.)
+- **Sharded + streaming model loading** for `report salt-model`: accepts a single
+  `.safetensors`, a `*.safetensors.index.json` (reads `weight_map`), or a directory, and
+  **mmaps each shard** so a 50GB+ master (e.g. a 27B bf16) is paged in per-tensor rather
+  than read fully into RAM. Each shard is mapped once; shard + tensor order is
+  deterministic.
 
 ## [1.0.0] — 2026-06-28 — v1.0 Release 🎉
 

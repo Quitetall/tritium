@@ -32,6 +32,9 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 # `generate` reads input token IDs from a reproducible JSON file.
 serde_json = { workspace = true }
+# `report salt-model` mmaps each (possibly sharded) safetensors file so a 50GB+ master is
+# never read fully into RAM.
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 # `salt_model_cli` parses the report's JSON output to assert fidelity invariants.

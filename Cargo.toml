@@ -100,6 +100,9 @@ burn-ndarray = { version = "0.21", default-features = false, features = ["std"] 
 # cli
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# memory-map large/sharded safetensors masters so the quantize/report path never loads a
+# multi-GB (50GB+ sharded) model fully into RAM — pages fault in per touched tensor.
+memmap2 = "0.9"
 # serve (OpenAI HTTP/SSE server; all behind tritium-serve's `serve` feature)
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }

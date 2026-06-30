@@ -3752,6 +3752,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "memmap2",
  "serde",
  "serde_json",
  "tritium-cpu",

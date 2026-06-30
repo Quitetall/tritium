@@ -4,7 +4,7 @@
 //! run one requested scenario and emit stable JSON/table output suitable for local
 //! runs and CI logs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context as _, bail};
@@ -335,29 +335,10 @@ pub(crate) fn salt_model(
         ScaleGroupArg::Tensor => BaseScaleScope::Tensor,
     };
 
-    let bytes =
-        std::fs::read(input).with_context(|| format!("failed to read `{}`", input.display()))?;
-    let st = SafeTensors::parse(&bytes)
-        .with_context(|| format!("failed to parse `{}` as safetensors", input.display()))?;
+    let shards = resolve_shards(input)?;
 
-    // Quantize every 2D weight matrix; skip 1D tensors (norms/biases) and degenerate
-    // shapes — mirrors `tritium quantize`.
-    let mut names: Vec<String> = st
-        .names()
-        .filter(|n| {
-            st.shape(n)
-                .is_some_and(|s| s.len() == 2 && s[0] >= 2 && s[1] >= 2)
-        })
-        .map(str::to_owned)
-        .collect();
-    if names.is_empty() {
-        bail!("no 2D weight tensors found in `{}`", input.display());
-    }
-    if limit > 0 && names.len() > limit {
-        names.truncate(limit);
-    }
-
-    // One accumulator per budget; read each tensor once and fold it into every budget.
+    // One accumulator per budget; read each tensor once (mmap-paged) and fold it into
+    // every budget. Shards stream one at a time so a 50GB+ master never lands in RAM.
     let nb = budget_values.len();
     let mut accums = vec![ReconAccum::default(); nb];
     let mut bits = vec![0.0f64; nb]; // Σ logical_bpw·params, for the param-weighted avg
@@ -367,45 +348,77 @@ pub(crate) fn salt_model(
         Vec::new()
     };
     let mut total_params = 0u64;
+    let mut tensors_done = 0usize;
 
-    for name in &names {
-        let shape = st.shape(name).expect("filtered to Some");
-        let (rows, k) = (shape[0], shape[1]);
-        let w = st
-            .tensor_f32(name)
-            .with_context(|| format!("read tensor `{name}`"))?;
-        total_params += (rows * k) as u64;
-        for (bi, &bpw) in budget_values.iter().enumerate() {
-            let cfg = QuantConfig {
-                budget_bpw: bpw,
-                t_min: 1,
-                t_max: 3,
-                sensitivity: sens.clone(),
-                scale_group: sg,
-            };
-            let qt = quantize_tensor(&w, rows, k, &cfg)
-                .with_context(|| format!("quantize `{name}` at {bpw} bpw"))?;
-            let lbpw = qt.logical_bpw();
-            bits[bi] += lbpw * (rows * k) as f64;
-            // One dequant pass per tensor: fold into a local accumulator, derive the
-            // per-tensor stat from it, then merge into the budget total.
-            let mut tensor_accum = ReconAccum::default();
-            tensor_accum
-                .accumulate(&w, &qt)
-                .with_context(|| format!("reconstruction of `{name}`"))?;
-            if per_tensor {
-                let s = tensor_accum.finish();
-                per_tensor_rows[bi].push(TensorReconRow {
-                    name: name.clone(),
-                    rows,
-                    k,
-                    logical_bpw: lbpw,
-                    frob_rel: s.frob_rel,
-                    cosine: s.cosine,
-                });
+    'shards: for shard in &shards {
+        let file = std::fs::File::open(shard)
+            .with_context(|| format!("open shard `{}`", shard.display()))?;
+        // SAFETY: the model file is read-only input for the lifetime of this report — we
+        // never write through the map, and the standard mmap-the-weights contract assumes
+        // nothing truncates it mid-run (a concurrent external truncation could fault).
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("mmap shard `{}`", shard.display()))?;
+        let st = SafeTensors::parse(&mmap)
+            .with_context(|| format!("parse shard `{}` as safetensors", shard.display()))?;
+
+        // Quantize every 2D weight matrix; skip 1D tensors (norms/biases) and degenerate
+        // shapes — mirrors `tritium quantize`.
+        let names: Vec<String> = st
+            .names()
+            .filter(|n| {
+                st.shape(n)
+                    .is_some_and(|s| s.len() == 2 && s[0] >= 2 && s[1] >= 2)
+            })
+            .map(str::to_owned)
+            .collect();
+
+        for name in &names {
+            if limit > 0 && tensors_done >= limit {
+                break 'shards;
             }
-            accums[bi].merge(&tensor_accum);
+            let shape = st.shape(name).expect("filtered to Some");
+            let (rows, k) = (shape[0], shape[1]);
+            let w = st
+                .tensor_f32(name)
+                .with_context(|| format!("read tensor `{name}`"))?;
+            total_params += (rows * k) as u64;
+            for (bi, &bpw) in budget_values.iter().enumerate() {
+                let cfg = QuantConfig {
+                    budget_bpw: bpw,
+                    t_min: 1,
+                    t_max: 3,
+                    sensitivity: sens.clone(),
+                    scale_group: sg,
+                };
+                let qt = quantize_tensor(&w, rows, k, &cfg)
+                    .with_context(|| format!("quantize `{name}` at {bpw} bpw"))?;
+                let lbpw = qt.logical_bpw();
+                bits[bi] += lbpw * (rows * k) as f64;
+                // One dequant pass per tensor: fold into a local accumulator, derive the
+                // per-tensor stat from it, then merge into the budget total.
+                let mut tensor_accum = ReconAccum::default();
+                tensor_accum
+                    .accumulate(&w, &qt)
+                    .with_context(|| format!("reconstruction of `{name}`"))?;
+                if per_tensor {
+                    let s = tensor_accum.finish();
+                    per_tensor_rows[bi].push(TensorReconRow {
+                        name: name.clone(),
+                        rows,
+                        k,
+                        logical_bpw: lbpw,
+                        frob_rel: s.frob_rel,
+                        cosine: s.cosine,
+                    });
+                }
+                accums[bi].merge(&tensor_accum);
+            }
+            tensors_done += 1;
         }
+    }
+
+    if tensors_done == 0 {
+        bail!("no 2D weight tensors found in `{}`", input.display());
     }
 
     let reports = budget_values
@@ -446,11 +459,68 @@ pub(crate) fn salt_model(
             ScaleGroupArg::Block => "block",
             ScaleGroupArg::Tensor => "tensor",
         },
-        tensors: names.len(),
+        tensors: tensors_done,
         total_params,
         budgets: reports,
     };
     emit(format, &salt_model_table(&report), &report)
+}
+
+/// Resolve a model path to its safetensors shard files, in deterministic order. Accepts a
+/// single `.safetensors` file, a `*.index.json` (sharded model — reads its `weight_map`),
+/// or a directory. Directory resolution is ordered to avoid pulling in non-model weight
+/// files (e.g. `adapter_model.safetensors`): (1) `model.safetensors.index.json` if present,
+/// (2) a lone canonical `model.safetensors`, (3) otherwise every `*.safetensors` in the
+/// directory, sorted (an unindexed multi-shard layout).
+fn resolve_shards(input: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if input.is_dir() {
+        let idx = input.join("model.safetensors.index.json");
+        if idx.exists() {
+            return shards_from_index(&idx);
+        }
+        let canonical = input.join("model.safetensors");
+        if canonical.is_file() {
+            return Ok(vec![canonical]);
+        }
+        let mut v: Vec<PathBuf> = std::fs::read_dir(input)
+            .with_context(|| format!("read dir `{}`", input.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        v.sort();
+        if v.is_empty() {
+            bail!("no `.safetensors` files in `{}`", input.display());
+        }
+        return Ok(v);
+    }
+    if input.extension().is_some_and(|x| x == "json") {
+        return shards_from_index(input);
+    }
+    Ok(vec![input.to_path_buf()])
+}
+
+/// Read a HF `*.safetensors.index.json` and return the unique shard files it references,
+/// resolved relative to the index's directory, sorted.
+fn shards_from_index(idx: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let txt =
+        std::fs::read_to_string(idx).with_context(|| format!("read index `{}`", idx.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&txt).with_context(|| format!("parse index `{}`", idx.display()))?;
+    let wm = json
+        .get("weight_map")
+        .and_then(|v| v.as_object())
+        .with_context(|| format!("`{}` has no object `weight_map`", idx.display()))?;
+    let dir = idx.parent().unwrap_or_else(|| Path::new("."));
+    let mut set = std::collections::BTreeSet::new();
+    for v in wm.values() {
+        if let Some(file) = v.as_str() {
+            set.insert(dir.join(file));
+        }
+    }
+    if set.is_empty() {
+        bail!("index `{}` lists no shards", idx.display());
+    }
+    Ok(set.into_iter().collect())
 }
 
 fn salt_model_table(r: &SaltModelReport) -> String {
