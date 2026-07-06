@@ -4993,6 +4993,10 @@ impl CudaDecodeModel {
     /// plain greedy step — losslessness is by construction, since every
     /// returned token IS the target's greedy argmax at its position.
     ///
+    /// Intended tree sizes are small (BASTION budgets N at the roofline knee,
+    /// typically ≲ 64 nodes): the ancestor table is O(N²) and the scores
+    /// scratch O(N · n_head · (cache_len + N)) — both per-call allocations.
+    ///
     /// # Errors
     /// [`BackendError::InvalidInput`] on a malformed tree (root not at 0,
     /// non-topological parents, out-of-range token) or capacity overflow;
@@ -5045,7 +5049,7 @@ impl CudaDecodeModel {
                 depth[i] = depth[p] + 1;
                 let (dst_off, src_off) = (i * m, p * m);
                 let np = n_anc[p] as usize;
-                // anc[i] = anc[parent] ++ [slot(i)] — split_at_mut for the copy.
+                // anc[i] = anc[parent] ++ [slot(i)] (rows are disjoint: p < i).
                 anc.copy_within(src_off..src_off + np, dst_off);
                 anc[dst_off + np] = (self.cache_len + i) as i32;
                 n_anc[i] = n_anc[p] + 1;
@@ -5388,9 +5392,9 @@ impl CudaDecodeModel {
             let dst = (self.cache_len + k) * kv_width;
             for li in 0..self.layers.len() {
                 for arena in [&mut self.kv_k[li], &mut self.kv_v[li]] {
-                    // SAFETY(disjoint): src != dst rows within one arena; copy via a
-                    // temporary would be simpler but memcpy_dtod on non-overlapping
-                    // slices is exact and cheap (kv_width floats).
+                    // Copy via a device temporary: src/dst rows never overlap (path is
+                    // strictly increasing, src >= dst), but the tmp keeps the copy
+                    // trivially safe for any future path shape.
                     let row = {
                         let src_slice = arena.slice(src..src + kv_width);
                         let mut tmp = s

@@ -6,7 +6,10 @@
 //! y[r,i]  = x[r,i] · inv_r · w[i]
 //! ```
 //! `x` is `[rows, cols]`, `w` is `[cols]`, `y` is `[rows, cols]`. This is the BitNet /
-//! llama RMSNorm — computes the same formula as `tritium_nn::ops::rmsnorm` (the inference forward), but with a plain sequential sum — NOT bit-identical since ADR 0018 moved inference to the canonical tree order; adopt the canonical order here if train/inference bit-parity is ever asserted so the
+//! llama RMSNorm — computes the same formula as `tritium_nn::ops::rmsnorm` (the inference
+//! forward), but with a plain sequential sum — NOT bit-identical since ADR 0018
+//! moved inference to the canonical tree order; adopt the canonical order here
+//! if train/inference bit-parity is ever asserted so the
 //! gradient is taken of the same function the model evaluates.
 //!
 //! Backward (derived from `inv_r` depending on every `x[r,·]`): with

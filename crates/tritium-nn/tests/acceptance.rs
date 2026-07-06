@@ -664,7 +664,7 @@ fn cuda_tree_verify_greedy_lossless() {
                 // Branch: a wrong child first, then the right child carrying a
                 // right grandchild. Wrong token = right token + 1 (mod vocab-ish).
                 let right = want[c];
-                let wrong = right.wrapping_add(1);
+                let wrong = (right + 1) % 128_256;
                 let mut t = vec![root, wrong, right];
                 let mut p = vec![-1, 0, 0];
                 if remaining >= 2 {
@@ -676,12 +676,12 @@ fn cuda_tree_verify_greedy_lossless() {
             2 => {
                 // Chain that goes wrong after one correct draft.
                 let right = want[c];
-                let wrong = right.wrapping_add(7);
+                let wrong = (right + 7) % 128_256;
                 (vec![root, right, wrong], vec![-1, 0, 1])
             }
             _ => {
                 // Full draft reject: only wrong children.
-                let wrong = want[c].wrapping_add(3);
+                let wrong = (want[c] + 3) % 128_256;
                 (vec![root, wrong], vec![-1, 0])
             }
         };
