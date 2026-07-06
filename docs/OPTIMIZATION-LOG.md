@@ -466,6 +466,29 @@ perf-counter permissions), IMMA cp.async/ldmatrix, and — for the real
 multiplier — the BASTION drafter integration (the greedy verifier is live;
 the sampling accept rule is the remaining ADR 0014 Tritium-side item).
 
+### v1.x round 6 — serve/BASTION boundary, megakernel deferral, BLUT finding
+
+1. **tritium-serve: --backend cuda + tree-verify HTTP surface** (a0862ff):
+   the ADR 0014 boundary is now a wire protocol (/v1/tree/session,
+   /v1/tree/verify), validated lossless end-to-end on the 4090 over HTTP.
+   LAMU gained a `tritium` engine preset (lamu-rs 171b2c1) — Tritium is now
+   loadable from LAMU like any other engine, with the verifier endpoints
+   available to a future spec-decode orchestrator. Remaining: drafter
+   marginals (python, lucebox-hub) — see docs/bastion-lamu-integration.md.
+2. **Megakernel premise measured, ADR 0019 DEFERRED**: grid.sync costs
+   0.64–0.98µs vs graph-node 0.77–1.22µs — ~0.2µs × 370 boundaries ≈ 3%/token,
+   and the graph's kernel-time sum already ≈ wall time. Not worth the rewrite.
+3. **BLUT finding (T-MAC LUT, tritium-cpu/simd/lut.rs)**: the LUT's grouped
+   re-association — the reason it was tolerance-gated and left unwired — is
+   EXACT on the quantized decode path (integer-valued activations, sums
+   < 2²⁴; the same argument that unlocked dp4a). However on this box's CPU
+   (AVX2 + AVX-VNNI, no AVX-512) a `vpdpbusd` int8 path strictly dominates
+   the LUT (no tables, no gather, unpacks 2-bit→int8 in registers like the
+   CUDA dp4a kernel; Σ code·act − Σact identity handles the unsigned×signed
+   operand order). Plan: implement the VNNI quantized CPU kernel behind
+   `mpgemm_with_act_quant` (bit-identical on the model path), keep the LUT
+   for table-lookup-only ISAs. Not implemented this round.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time
