@@ -1225,7 +1225,10 @@ __global__ void gqa_attention_reduce_g(const float* __restrict__ v,
                                        const int max_ctx, const int n_head,
                                        const int n_head_kv, const int head_dim) {
   extern __shared__ float sc[];
-  __shared__ float s_red[256];  // block max scratch (blockDim.x <= 256, pow-2)
+  __shared__ float s_red[256];  // block max scratch — this kernel REQUIRES
+                                // blockDim.x == 128 exactly (hardcoded 64-level
+                                // + warp-0 shuffle tail below); keep in sync
+                                // with ATTN_REDUCE_THREADS in cuda.rs.
   __shared__ float s_inv;
   const int h = blockIdx.x;
   const int tid = threadIdx.x;
