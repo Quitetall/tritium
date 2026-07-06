@@ -104,7 +104,11 @@ fn run_chunk(
         // whole contraction is EXACT integer arithmetic (|Σ| ≤ 128·k < 2²⁴ for
         // k ≤ 65536, so even the reference's f32 fold never rounds), which makes
         // an int8 `maddubs` kernel **bit-identical** to the sequential reference
-        // fold while running ~an order of magnitude faster. Arbitrary-float
+        // fold — measured ~2x on the end-to-end BitNet CPU decode (the kernel
+        // itself is larger; other ops share the budget). It also preempts the
+        // AVX-512 kernel below: both are bit-identical, and 32 int8 elems/op
+        // beats 16 f32 lanes on paper, though that routing preference is
+        // unmeasured on an AVX-512 host (this build box is AVX2). Arbitrary-float
         // callers fall through to the bit-exact f32 kernels unchanged; the
         // detection scan is O(m·k), noise next to the O(m·n·k) GEMM.
         if is_x86_feature_detected!("avx2")
