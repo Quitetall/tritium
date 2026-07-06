@@ -184,6 +184,36 @@ fn driver_err(context: &str, err: &DriverError) -> BackendError {
     BackendError::Backend(format!("{context}: {err}"))
 }
 
+/// Default per-launch dynamic shared memory cap (bytes). Requesting more requires
+/// the explicit `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` opt-in on the
+/// function handle, up to the device's opt-in limit (~99 KiB on Ada / ~163 KiB on
+/// Ampere data-center parts).
+const DEFAULT_DYN_SMEM_CAP: usize = 48 * 1024;
+
+/// Opt the warp-attention kernel into `max_ctx * 4` dynamic shared bytes when that
+/// exceeds the 48 KiB default cap. `set` applies the attribute to the caller's
+/// function handle (safe `CudaFunction` or raw `CUfunction` — both launch the same
+/// kernel; a fresh JIT of the module needs its own opt-in). A device that cannot
+/// grant the request (context_length past its opt-in shared limit, ≈ 25K on Ada)
+/// surfaces HERE as an actionable model-build error, not a launch failure mid-decode.
+fn attn_shared_opt_in(
+    max_ctx: usize,
+    set: impl FnOnce(i32) -> Result<(), DriverError>,
+) -> Result<(), BackendError> {
+    let bytes = max_ctx * 4;
+    if bytes <= DEFAULT_DYN_SMEM_CAP {
+        return Ok(());
+    }
+    set(bytes as i32).map_err(|e| {
+        BackendError::Backend(format!(
+            "decode attention needs {bytes} B of dynamic shared memory for \
+             context_length={max_ctx} (scores are staged per head-block), which this \
+             device rejected: {e}. Reduce the model's context_length or run this model \
+             on a GPU with a larger opt-in shared-memory limit."
+        ))
+    })
+}
+
 /// Device-resident packed ternary weights for one matmul operand.
 ///
 /// Wraps a [`CudaSlice<u8>`] (the htod copy of the host-packed bytes) plus the
@@ -1930,13 +1960,25 @@ impl CudaBackend {
         };
         let dm = &self._decode_module;
 
+        // v0.50 opt: warp-parallel attention (1 warp/head, 32 threads) instead of
+        // single-thread-per-head. The warp kernel is already loaded by the graph path.
+        // It stages `max_ctx` f32 scores in dynamic shared memory; above the 48 KiB
+        // default per-launch cap that needs an explicit opt-in, and past the device
+        // limit the model is rejected HERE with an actionable error instead of a
+        // cryptic launch failure on the first decode step.
+        let f_attn = f(dm, KERNEL_NAME_ATTN_WARP)?;
+        attn_shared_opt_in(max_ctx, |bytes| {
+            f_attn.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        })?;
+
         Ok(CudaDecodeModel {
             stream: Arc::clone(&self.stream),
             f_rmsnorm: f(dm, KERNEL_NAME_RMSNORM)?,
             f_rope: f(dm, KERNEL_NAME_ROPE)?,
-            // v0.50 opt: warp-parallel attention (1 warp/head, 32 threads) instead of
-            // single-thread-per-head. The warp kernel is already loaded by the graph path.
-            f_attn: f(dm, KERNEL_NAME_ATTN_WARP)?,
+            f_attn,
             f_residual: f(dm, KERNEL_NAME_RESIDUAL)?,
             f_embed: f(dm, KERNEL_NAME_EMBED)?,
             f_lm_head: f(dm, KERNEL_NAME_LM_HEAD)?,
@@ -4111,11 +4153,12 @@ impl CudaDecodeModel {
         // 2. Tiled GEMM with fused act_scale fold (v0.6.0 opt #15).
         //    Epilogue: out[mi,ni] = acc * scales[ni] * act_scale[mi].
         //    Single launch replaces the former GEMM + scale_mul_f32 pair.
+        //    DP4A kernel: stages the row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
         {
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
-                shared_mem_bytes: (k * 4) as u32,
+                shared_mem_bytes: ((k + 3) & !3) as u32,
             };
             let mut l = stream.launch_builder(f_tiled_scaled);
             l.arg(&*d_qact)
@@ -4182,11 +4225,12 @@ impl CudaDecodeModel {
         let (n, k) = (lin.n, lin.k);
         let (n_i, k_i, m_i, rb_i) = (n as i32, k as i32, 1i32, lin.row_bytes as i32);
         // Fused tiled GEMM (M=1) with act_scale fold in the epilogue.
+        // DP4A kernel: stages the row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
         {
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
-                shared_mem_bytes: (k * 4) as u32,
+                shared_mem_bytes: ((k + 3) & !3) as u32,
             };
             let mut l = stream.launch_builder(f_tiled_scaled);
             l.arg(d_qact)
@@ -4932,11 +4976,12 @@ impl CudaDecodeModel {
         // Fused tiled GEMM + per-token act_scale fold (v0.6.0 opt #15).
         // grid.y = m dispatches one block-row per output row; the kernel reads
         // act_scale[mi] per row in the epilogue.
+        // DP4A kernel: stages each row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
         {
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), m as u32, 1),
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
-                shared_mem_bytes: (k * 4) as u32,
+                shared_mem_bytes: ((k + 3) & !3) as u32,
             };
             let mut l = s.launch_builder(f_tiled_scaled);
             l.arg(qact)
@@ -6309,7 +6354,23 @@ impl CudaDecodeModel {
     fn capture_graph(&mut self) -> Result<(), BackendError> {
         if self.raw.is_none() {
             let ctx = self.cap_stream.context().clone();
-            self.raw = Some(RawGraphKernels::load(&ctx)?);
+            let raw = RawGraphKernels::load(&ctx)?;
+            // The warp attention kernel's dynamic shared (`max_ctx` f32 scores) needs
+            // the same over-48-KiB opt-in on this second JIT's function handle as the
+            // eager path's `f_attn` (see `build_decode_model`).
+            attn_shared_opt_in(self.max_ctx, |bytes| {
+                // SAFETY: `raw.attn_g` is a valid function handle from the module just
+                // loaded above; setting a function attribute is not a launch.
+                #[allow(unsafe_code)]
+                unsafe {
+                    result::function::set_function_attribute(
+                        raw.attn_g,
+                        sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        bytes,
+                    )
+                }
+            })?;
+            self.raw = Some(raw);
         }
         let graph = self.record_graph()?;
         self.graph = Some(graph);
@@ -6538,9 +6599,10 @@ impl CudaDecodeModel {
         let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
         // Fused tiled GEMM + act_scale fold (v0.6.0 opt #15).
         // Single launch replaces the former tiled + scale_mul pair.
+        // DP4A kernel: stages the row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
         {
             let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
-            let smem = (lin.k * 4) as u32;
+            let smem = ((lin.k + 3) & !3) as u32;
             let mut params = [
                 pp(&d_qact),
                 pp(&lin.w),
@@ -6578,7 +6640,8 @@ impl CudaDecodeModel {
         let cs = self.cap_stream.cu_stream();
         let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
         let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
-        let smem = (lin.k * 4) as u32;
+        // DP4A kernel: stages the row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
+        let smem = ((lin.k + 3) & !3) as u32;
         let mut params = [
             pp(&d_qact),
             pp(&lin.w),
