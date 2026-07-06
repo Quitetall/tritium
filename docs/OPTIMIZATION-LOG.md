@@ -394,10 +394,13 @@ GPU; the kernel-level medians above are the authoritative deltas.
    Losslessness gate green across chains/branches/partial/full rejects.
    Sampling accept rule + the end-to-end speedup bench (needs the external
    block-diffusion drafter) remain open.
-3. **Known issue (documented, pre-existing)**: batch-path-produced KV
-   (prefill/tree-verify) differs ~1 ulp from step-produced KV somewhere —
-   verified with production prefill(); flips a near-tie a couple of tokens
-   downstream. Worth a dedicated root-cause pass.
+3. **"Known issue" RESOLVED (round 4)**: the suspected batch-vs-step KV gap
+   does not exist — batch-prefill and graph-step single-token logits are
+   BIT-IDENTICAL (0/128256 differing bits; now gated by
+   `cuda_batch_and_graph_single_token_bit_identical`). The tail divergence
+   was the EAGER path's f32-table LM head vs the graph's f16 head — a
+   designed logit difference. The tree-verify tail assertion was restored
+   to exact tokens via graph steps.
 
 | metric | session start | round 3 end |
 |---|---|---|

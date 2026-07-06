@@ -708,20 +708,75 @@ fn cuda_tree_verify_greedy_lossless() {
         "tree-verify committed stream must equal plain greedy (lossless)"
     );
 
-    // Mechanical handoff: a plain step after the promotes must run cleanly at
-    // the advanced watermark and produce finite logits. Its ARGMAX is not
-    // asserted against the plain-decode reference: batch-path-produced KV
-    // (prefill and tree-verify alike) differs from step-produced KV by ~1 ulp
-    // somewhere (verified empirically: driving this same loop with the
-    // PRODUCTION `prefill` shows the identical downstream near-tie flip), so a
-    // token-level tail assertion would gate a pre-existing batch/step state
-    // gap, not tree-verify. The committed-stream equality above is the
-    // losslessness contract.
-    let pos = prompt.len() + c_full - 1; // == cache_len (pending not yet forwarded)
-    let pending = *committed.last().expect("non-empty");
-    let logits = rm.step(pending, pos).expect("plain step after tree verify");
-    assert!(
-        logits.iter().all(|v| v.is_finite()),
-        "non-finite logits after tree-verify handoff"
-    );
+    // KV handoff: GRAPH steps after the promotes must continue the exact
+    // reference stream — any promote corruption shows up here. (The graph
+    // path, not the eager `step`: eager reads the f32 LM-head table while the
+    // reference stream was generated through the f16 graph head, a designed
+    // logit difference that flips near-ties; the transformer STATE is
+    // bit-identical across batch/graph, gated by
+    // `cuda_batch_and_graph_single_token_bit_identical`.)
+    let mut runner3 = load_on("cuda", &bytes).expect("third runner");
+    let want_tail = runner3
+        .generate(&prompt, c_full + 4, u32::MAX)
+        .expect("tail reference");
+    let mut pos = prompt.len() + c_full - 1; // == cache_len (pending not yet forwarded)
+    let mut pending = *committed.last().expect("non-empty");
+    for step in 0..4 {
+        let logits = rm
+            .step_graph(pending, pos)
+            .expect("graph step after tree verify");
+        let next = argmax(&logits) as u32;
+        assert_eq!(
+            next,
+            want_tail[c_full + step],
+            "post-tree graph decode diverged at tail step {step} — KV promote corruption"
+        );
+        pending = next;
+        pos += 1;
+    }
+}
+
+/// Batch↔graph single-token bit-parity: after the same prompt prefill,
+/// forwarding ONE token via the batch path (`prefill(&[t], _)`) and via the
+/// M=1 graph path (`step_graph(t, _)`) must give BIT-IDENTICAL logits — the
+/// two f32 pipelines share every kernel-level reduction order (dp4a exact
+/// GEMMs, canonical tree rmsnorm, order-preserving attention, f16 LM head).
+/// Measured while root-causing a tail divergence that turned out to be the
+/// EAGER path's f32-table LM head (a designed difference), not a state gap.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_batch_and_graph_single_token_bit_identical() {
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let prompt = reference.token_ids.clone();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    let t = reference.greedy_ids[0];
+    let p = prompt.len();
+
+    let mut r1 = load_on("cuda", &bytes).expect("runner1");
+    r1.forward(&prompt, &positions).expect("prefill1");
+    let l_step = r1
+        .resident_cuda()
+        .expect("resident")
+        .expect("cuda")
+        .step_graph(t, p)
+        .expect("step");
+
+    let mut r2 = load_on("cuda", &bytes).expect("runner2");
+    r2.forward(&prompt, &positions).expect("prefill2");
+    let l_batch = r2
+        .resident_cuda()
+        .expect("resident")
+        .expect("cuda")
+        .prefill(&[t], &[p])
+        .expect("batch prefill");
+
+    for (i, (&a, &b)) in l_step.iter().zip(&l_batch).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "batch/graph logit bit mismatch at vocab idx {i}: graph={a} batch={b}"
+        );
+    }
 }
