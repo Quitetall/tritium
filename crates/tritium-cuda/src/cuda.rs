@@ -126,7 +126,18 @@ const KERNEL_NAME_ROPE_G: &str = "rope_apply_f32_g";
 const KERNEL_NAME_KV_APPEND: &str = "kv_append_f32";
 /// Warp-per-head GQA attention for the graph (v0.3.3 perf) — bit-identical to the
 /// one-thread `_g` kernel (parallel across keys/output-dims, no reduction reorder).
+/// v1.x: legacy/fallback — the split scores+reduce pair below is preferred when
+/// `head_dim % 4 == 0` (float4 K rows); this stays for other geometries.
 const KERNEL_NAME_ATTN_WARP: &str = "gqa_attention_decode_warp_g";
+/// Split decode attention (v1.x): ctx-parallel scores fan-out + per-head 128-thread
+/// softmax/weighted reduce. Bit-identical to the warp kernel (no f32 sum reordered);
+/// measured 2×–9× over it across context lengths. `SCORE_CHUNK` mirrors decode.cu.
+const KERNEL_NAME_ATTN_SCORES: &str = "gqa_attention_scores_g";
+const KERNEL_NAME_ATTN_REDUCE: &str = "gqa_attention_reduce_g";
+/// Keys per scores-block — keep in sync with `SCORE_CHUNK` in decode.cu.
+const ATTN_SCORE_CHUNK: usize = 128;
+/// Threads per reduce block — keep ≤ its `s_red[256]` scratch and a power of two.
+const ATTN_REDUCE_THREADS: u32 = 128;
 /// Shared-staged rmsnorm for the graph (v0.3.4 perf) — bit-identical to rmsnorm_f32 (same
 /// sequential sum order, just from shared not global), ~8× faster (latency-bound → not).
 const KERNEL_NAME_RMSNORM_SHARED: &str = "rmsnorm_shared_f32";
@@ -1992,9 +2003,21 @@ impl CudaBackend {
                 bytes,
             )
         })?;
+        // v1.x split attention: the reduce kernel stages the same max_ctx scores in
+        // dynamic shared, so it needs the identical opt-in on its own handle.
+        let f_attn_scores = f(dm, KERNEL_NAME_ATTN_SCORES)?;
+        let f_attn_reduce = f(dm, KERNEL_NAME_ATTN_REDUCE)?;
+        attn_shared_opt_in(max_ctx, |bytes| {
+            f_attn_reduce.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        })?;
 
         Ok(CudaDecodeModel {
             stream: Arc::clone(&self.stream),
+            f_attn_scores,
+            f_attn_reduce,
             f_rmsnorm: f(dm, KERNEL_NAME_RMSNORM)?,
             f_rope: f(dm, KERNEL_NAME_ROPE)?,
             f_attn,
@@ -3677,6 +3700,9 @@ pub struct CudaDecodeModel {
     f_rmsnorm: CudaFunction,
     f_rope: CudaFunction,
     f_attn: CudaFunction,
+    /// v1.x split attention pair (preferred when head_dim % 4 == 0).
+    f_attn_scores: CudaFunction,
+    f_attn_reduce: CudaFunction,
     f_residual: CudaFunction,
     f_embed: CudaFunction,
     f_lm_head: CudaFunction,
@@ -3960,6 +3986,8 @@ impl CudaDecodeModel {
         Self::launch_attention(
             &self.stream,
             &self.f_attn,
+            &self.f_attn_scores,
+            &self.f_attn_reduce,
             &self.d_q,
             &self.kv_k[li],
             &self.kv_v[li],
@@ -4303,9 +4331,12 @@ impl CudaDecodeModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn launch_attention(
         stream: &Arc<CudaStream>,
-        func: &CudaFunction,
+        func_legacy: &CudaFunction,
+        func_scores: &CudaFunction,
+        func_reduce: &CudaFunction,
         q: &CudaSlice<f32>,
         k: &CudaSlice<f32>,
         v: &CudaSlice<f32>,
@@ -4324,16 +4355,73 @@ impl CudaDecodeModel {
             n_head_kv as i32,
             head_dim as i32,
         );
-        // One warp-block per head: the kernel stages the head's scores in dynamic
-        // shared memory (`max_ctx * 4` bytes), so each head needs its own block to
-        // stay under the 48 KiB default dynamic-shared cap. `scores` is the legacy
-        // global scratch, kept for ABI compatibility (the kernel no longer writes it).
+        if head_dim % 4 == 0 {
+            // v1.x split pair (bit-identical, ctx-parallel — see decode.cu).
+            // 1) scores fan-out: grid (n_head, ceil(max_ctx/SCORE_CHUNK)); blocks
+            //    past the live ctx early-exit via ctrl, so the static grid replays
+            //    at every context length.
+            {
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        n_head as u32,
+                        (max_ctx.div_ceil(ATTN_SCORE_CHUNK)) as u32,
+                        1,
+                    ),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut l = stream.launch_builder(func_scores);
+                l.arg(q)
+                    .arg(k)
+                    .arg(&mut *scores)
+                    .arg(ctrl)
+                    .arg(&mc_i)
+                    .arg(&nh_i)
+                    .arg(&nhkv_i)
+                    .arg(&hd_i)
+                    .arg(&scale);
+                // SAFETY: `gqa_attention_scores_g(q, k, scores, ctrl, max_ctx, n_head, n_head_kv, head_dim, scale)`.
+                #[allow(unsafe_code)]
+                unsafe {
+                    l.launch(cfg)
+                        .map_err(|e| driver_err("launch resident attention scores", &e))?;
+                }
+            }
+            // 2) per-head softmax + weighted reduce: 128-thread block, stages the
+            //    head's scores in dynamic shared (same over-48KiB opt-in).
+            {
+                let cfg = LaunchConfig {
+                    grid_dim: (n_head as u32, 1, 1),
+                    block_dim: (ATTN_REDUCE_THREADS, 1, 1),
+                    shared_mem_bytes: (max_ctx * 4) as u32,
+                };
+                let mut l = stream.launch_builder(func_reduce);
+                l.arg(v)
+                    .arg(&*scores)
+                    .arg(out)
+                    .arg(ctrl)
+                    .arg(&mc_i)
+                    .arg(&nh_i)
+                    .arg(&nhkv_i)
+                    .arg(&hd_i);
+                // SAFETY: `gqa_attention_reduce_g(v, scores, out, ctrl, max_ctx, n_head, n_head_kv, head_dim)`.
+                #[allow(unsafe_code)]
+                unsafe {
+                    l.launch(cfg)
+                        .map_err(|e| driver_err("launch resident attention reduce", &e))?;
+                }
+            }
+            return Ok(());
+        }
+        // Legacy geometry (head_dim % 4 != 0): one warp-block per head; the kernel
+        // stages the head's scores in dynamic shared memory (`max_ctx * 4` bytes).
+        // `scores` is the legacy global scratch, unused by the warp kernel.
         let cfg = LaunchConfig {
             grid_dim: (n_head as u32, 1, 1),
             block_dim: (32, 1, 1),
             shared_mem_bytes: (max_ctx * 4) as u32,
         };
-        let mut l = stream.launch_builder(func);
+        let mut l = stream.launch_builder(func_legacy);
         l.arg(q)
             .arg(k)
             .arg(v)
@@ -6373,18 +6461,20 @@ impl CudaDecodeModel {
             // The warp attention kernel's dynamic shared (`max_ctx` f32 scores) needs
             // the same over-48-KiB opt-in on this second JIT's function handle as the
             // eager path's `f_attn` (see `build_decode_model`).
-            attn_shared_opt_in(self.max_ctx, |bytes| {
-                // SAFETY: `raw.attn_g` is a valid function handle from the module just
-                // loaded above; setting a function attribute is not a launch.
-                #[allow(unsafe_code)]
-                unsafe {
-                    result::function::set_function_attribute(
-                        raw.attn_g,
-                        sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        bytes,
-                    )
-                }
-            })?;
+            for func in [raw.attn_g, raw.attn_reduce_g] {
+                attn_shared_opt_in(self.max_ctx, |bytes| {
+                    // SAFETY: `func` is a valid function handle from the module just
+                    // loaded above; setting a function attribute is not a launch.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        result::function::set_function_attribute(
+                            func,
+                            sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            bytes,
+                        )
+                    }
+                })?;
+            }
             self.raw = Some(raw);
         }
         let graph = self.record_graph()?;
@@ -6745,9 +6835,51 @@ impl CudaDecodeModel {
             self.head_dim as i32,
         );
         let scale = self.attn_scale;
-        // One warp-block per head: the kernel stages the head's scores in dynamic
-        // shared memory (`max_ctx * 4` bytes) — see `launch_attention`. `scores`
-        // stays in the arg list for ABI compatibility (no longer written).
+        let cs = self.cap_stream.cu_stream();
+        if self.head_dim % 4 == 0 {
+            // v1.x split pair — see `launch_attention` for the geometry rationale.
+            {
+                let grid = (
+                    self.n_head as u32,
+                    (self.max_ctx.div_ceil(ATTN_SCORE_CHUNK)) as u32,
+                    1,
+                );
+                let mut params = [
+                    pp(&q),
+                    pp(&k),
+                    pp(&scores),
+                    pp(&ctrl),
+                    pp(&mc_i),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&scale),
+                ];
+                raw_launch(self.raw().attn_scores_g, grid, (32, 1, 1), 0, cs, &mut params)?;
+            }
+            let grid = (self.n_head as u32, 1, 1);
+            let smem = (self.max_ctx * 4) as u32;
+            let mut params = [
+                pp(&v),
+                pp(&scores),
+                pp(&out),
+                pp(&ctrl),
+                pp(&mc_i),
+                pp(&nh_i),
+                pp(&nhkv_i),
+                pp(&hd_i),
+            ];
+            return raw_launch(
+                self.raw().attn_reduce_g,
+                grid,
+                (ATTN_REDUCE_THREADS, 1, 1),
+                smem,
+                cs,
+                &mut params,
+            );
+        }
+        // Legacy geometry (head_dim % 4 != 0): one warp-block per head, scores in
+        // dynamic shared (`max_ctx * 4` bytes); the global `scores` arg is unused.
         let grid = (self.n_head as u32, 1, 1);
         let smem = (self.max_ctx * 4) as u32;
         let mut params = [
@@ -6768,7 +6900,7 @@ impl CudaDecodeModel {
             grid,
             (32, 1, 1),
             smem,
-            self.cap_stream.cu_stream(),
+            cs,
             &mut params,
         )
     }
@@ -6950,6 +7082,9 @@ struct RawGraphKernels {
     rope_g: sys::CUfunction,
     kv_append: sys::CUfunction,
     attn_g: sys::CUfunction,
+    /// v1.x split attention pair (preferred when head_dim % 4 == 0).
+    attn_scores_g: sys::CUfunction,
+    attn_reduce_g: sys::CUfunction,
     rmsnorm: sys::CUfunction,
     rmsnorm_quant: sys::CUfunction,
     residual: sys::CUfunction,
@@ -6997,6 +7132,8 @@ impl RawGraphKernels {
             kv_append: get(dm, KERNEL_NAME_KV_APPEND)?,
             // Warp-per-head attention (bit-identical to the one-thread `_g`, just parallel).
             attn_g: get(dm, KERNEL_NAME_ATTN_WARP)?,
+            attn_scores_g: get(dm, KERNEL_NAME_ATTN_SCORES)?,
+            attn_reduce_g: get(dm, KERNEL_NAME_ATTN_REDUCE)?,
             // Shared-staged rmsnorm: BIT-IDENTICAL to the sequential rmsnorm_f32 (same sum
             // order, from shared), just ~8× faster — so greedy 256/256 holds. (A *parallel*
             // tree-reduction rmsnorm would reach ~132 tok/s but reorders the sum and breaks

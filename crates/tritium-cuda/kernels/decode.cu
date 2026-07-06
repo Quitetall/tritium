@@ -793,17 +793,36 @@ __global__ void gqa_attention_decode_warp_g(const float* __restrict__ q,
   const float* q_row = q + (long long)h * head_dim;
 
   // scores: lane-per-key; each lane's dot is sequential over head_dim (bit-exact).
-  for (int j = lane; j < ctx; j += 32) {
-    if (j > limit) {  // defensive — unreachable in decode (ctx == limit + 1), kept for parity
-      sc[j] = -INFINITY;
+  // Two keys' chains run interleaved per lane (v1.x ILP): the chains are
+  // INDEPENDENT — each key's dot still folds in the host's d-order, so every
+  // sc[j] is bit-identical; the interleave only hides the ~4-cycle fadd latency.
+  for (int j0 = lane; j0 < ctx; j0 += 64) {
+    const int j1 = j0 + 32;
+    if (j0 > limit) {  // defensive — unreachable in decode (ctx == limit + 1), kept for parity
+      sc[j0] = -INFINITY;
+      if (j1 < ctx) sc[j1] = -INFINITY;
       continue;
     }
-    const float* k_row = k + ((long long)j * n_head_kv + kv) * head_dim;
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; ++d) {
-      dot = __fadd_rn(dot, __fmul_rn(q_row[d], k_row[d]));
+    const float* k0 = k + ((long long)j0 * n_head_kv + kv) * head_dim;
+    if (j1 < ctx && j1 <= limit) {
+      const float* k1 = k + ((long long)j1 * n_head_kv + kv) * head_dim;
+      float d0 = 0.0f;
+      float d1 = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        const float qd = q_row[d];
+        d0 = __fadd_rn(d0, __fmul_rn(qd, k0[d]));
+        d1 = __fadd_rn(d1, __fmul_rn(qd, k1[d]));
+      }
+      sc[j0] = __fmul_rn(d0, scale);
+      sc[j1] = __fmul_rn(d1, scale);
+    } else {
+      float d0 = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        d0 = __fadd_rn(d0, __fmul_rn(q_row[d], k0[d]));
+      }
+      sc[j0] = __fmul_rn(d0, scale);
+      if (j1 < ctx) sc[j1] = -INFINITY;  // j1 > limit (defensive, unreachable)
     }
-    sc[j] = __fmul_rn(dot, scale);
   }
   __syncwarp();
 
@@ -842,14 +861,236 @@ __global__ void gqa_attention_decode_warp_g(const float* __restrict__ q,
   __syncwarp();
 
   // weighted sum: lane-per-output-dim; each output sums over j in the host's order.
+  // v1.x ILP: a lane owns dims d = lane, lane+32, … — all of them accumulate in ONE
+  // pass over j (independent per-dim chains, each still in j-order → bit-identical),
+  // instead of head_dim/32 separate passes. Each v row is now touched once per j
+  // with a full coalesced read, and the chains interleave to hide fadd latency.
+  // `ATTN_MAX_DIMS_PER_LANE` covers head_dim ≤ 256; larger heads take the fallback.
   float* o_row = out + (long long)h * head_dim;
-  for (int d = lane; d < head_dim; d += 32) {
-    float acc = 0.0f;
+  const int ndims = (head_dim > lane) ? (head_dim - lane + 31) / 32 : 0;
+#define ATTN_MAX_DIMS_PER_LANE 8
+  if (ndims <= ATTN_MAX_DIMS_PER_LANE) {
+    float acc[ATTN_MAX_DIMS_PER_LANE];
+    for (int t = 0; t < ndims; ++t) {
+      acc[t] = 0.0f;
+    }
     for (int j = 0; j < ctx; ++j) {
       const float w = sc[j];
       if (w == 0.0f) continue;
       const float* v_row = v + ((long long)j * n_head_kv + kv) * head_dim;
-      acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+#pragma unroll
+      for (int t = 0; t < ATTN_MAX_DIMS_PER_LANE; ++t) {
+        if (t < ndims) {
+          acc[t] = __fadd_rn(acc[t], __fmul_rn(w, v_row[lane + 32 * t]));
+        }
+      }
+    }
+    for (int t = 0; t < ndims; ++t) {
+      o_row[lane + 32 * t] = acc[t];
+    }
+  } else {
+    // head_dim > 256: the original one-dim-at-a-time loop (same order per dim).
+    for (int d = lane; d < head_dim; d += 32) {
+      float acc = 0.0f;
+      for (int j = 0; j < ctx; ++j) {
+        const float w = sc[j];
+        if (w == 0.0f) continue;
+        const float* v_row = v + ((long long)j * n_head_kv + kv) * head_dim;
+        acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+      }
+      o_row[d] = acc;
+    }
+  }
+#undef ATTN_MAX_DIMS_PER_LANE
+}
+
+// ─── Split decode attention (v1.x) — the bit-exact ctx-parallel pair ─────────
+//
+// The single warp-per-head kernel above is latency-bound: 20 warps on a 128-SM
+// GPU, each streaming its keys/values behind a dependent f32 chain — measured
+// ~0.5µs per context element. The split pair keeps EVERY f32 sum in the host's
+// order (per-key dot in d-order, softmax sum + weighted sum in j-order) but
+// distributes the independent work:
+//
+//   * `gqa_attention_scores_g` — grid (n_head, ceil(max_ctx/SCORE_CHUNK)), one
+//     warp per block, 4 keys per lane as float4 chains (in-vector order = the
+//     host's d-order, so each dot is bit-identical). Keys are mutually
+//     independent, so fanning them out across blocks reorders nothing. Scores
+//     land in the global `scores` scratch ([n_head, max_ctx], revived).
+//     Requires head_dim % 4 == 0 and 16-byte-aligned K rows (head_dim % 4 == 0
+//     implies it, rows being head_dim-strided from a 256-byte-aligned base);
+//     the host routes other geometries to the legacy warp kernel above.
+//   * `gqa_attention_reduce_g` — grid n_head, ONE 128-THREAD BLOCK per head:
+//     stages the head's scores into shared (coalesced), block-tree max (exact,
+//     `fmaxf` NaN-skip == the sequential scan), parallel `exp_f32`, the ONE
+//     rounded fold (softmax sum) sequential on thread 0 in j-order, parallel
+//     normalize, then ONE OUTPUT DIM PER THREAD for the weighted sum — each
+//     dim's j-order chain unchanged, 4× the outstanding v-loads of one warp.
+//     The v loads are hoisted OUT of the w==0 skip (the skip predicates only
+//     the fadd — identical accumulation, but the loads batch).
+//
+// Measured (4090, standalone, both kernels): 2.1× at ctx=64 → 9× at ctx=4096
+// vs the single-kernel form, bit-exact at every context length.
+// Launch contract: scores → block=32, no dynamic shared; reduce → block=128,
+// dynamic shared = max_ctx·4 (same over-48KiB opt-in as the legacy kernel).
+#define SCORE_CHUNK 128
+
+__global__ void gqa_attention_scores_g(const float* __restrict__ q,
+                                       const float* __restrict__ k,
+                                       float* __restrict__ scores,
+                                       const int* __restrict__ ctrl,
+                                       const int max_ctx, const int n_head,
+                                       const int n_head_kv, const int head_dim,
+                                       const float scale) {
+  const int h = blockIdx.x;
+  const int chunk = blockIdx.y * SCORE_CHUNK;
+  const int lane = threadIdx.x & 31;
+  const int ctx = ctrl[2] + 1;
+  if (h >= n_head || chunk >= ctx) return;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + (long long)h * head_dim);
+  const int hd4 = head_dim >> 2;
+  float* sc = scores + (long long)h * max_ctx;
+
+  const int j0 = chunk + lane;
+  const int j1 = j0 + 32;
+  const int j2 = j0 + 64;
+  const int j3 = j0 + 96;
+  const float4* k0 = (const float4*)(k + ((long long)j0 * n_head_kv + kv) * head_dim);
+  const float4* k1 = (const float4*)(k + ((long long)j1 * n_head_kv + kv) * head_dim);
+  const float4* k2 = (const float4*)(k + ((long long)j2 * n_head_kv + kv) * head_dim);
+  const float4* k3 = (const float4*)(k + ((long long)j3 * n_head_kv + kv) * head_dim);
+  if (j3 < ctx) {
+    // Fast path: all four of this lane's keys are live. Four independent
+    // chains; each folds x→y→z→w then the next float4 — exactly d-order.
+    float d0 = 0.0f;
+    float d1 = 0.0f;
+    float d2 = 0.0f;
+    float d3 = 0.0f;
+#pragma unroll 4
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float4 a = k0[d];
+      const float4 b = k1[d];
+      const float4 c = k2[d];
+      const float4 e = k3[d];
+      d0 = __fadd_rn(d0, __fmul_rn(qq.x, a.x));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.x, b.x));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.x, c.x));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.x, e.x));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.y, a.y));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.y, b.y));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.y, c.y));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.y, e.y));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.z, a.z));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.z, b.z));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.z, c.z));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.z, e.z));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.w, a.w));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.w, b.w));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.w, c.w));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.w, e.w));
+    }
+    sc[j0] = __fmul_rn(d0, scale);
+    sc[j1] = __fmul_rn(d1, scale);
+    sc[j2] = __fmul_rn(d2, scale);
+    sc[j3] = __fmul_rn(d3, scale);
+  } else {
+    // Chunk tail: per-key guarded, same per-key math. j ascends with t, so the
+    // break stops exactly at the first dead key.
+    const float4* ks[4] = {k0, k1, k2, k3};
+    const int js[4] = {j0, j1, j2, j3};
+    for (int t = 0; t < 4; ++t) {
+      if (js[t] >= ctx) break;
+      float dot = 0.0f;
+#pragma unroll 4
+      for (int d = 0; d < hd4; ++d) {
+        const float4 qq = qv[d];
+        const float4 a = ks[t][d];
+        dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+        dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+        dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+        dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+      }
+      sc[js[t]] = __fmul_rn(dot, scale);
+    }
+  }
+}
+
+__global__ void gqa_attention_reduce_g(const float* __restrict__ v,
+                                       const float* __restrict__ scores,
+                                       float* __restrict__ out,
+                                       const int* __restrict__ ctrl,
+                                       const int max_ctx, const int n_head,
+                                       const int n_head_kv, const int head_dim) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];  // block max scratch (blockDim.x <= 256, pow-2)
+  __shared__ float s_inv;
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (h >= n_head) return;
+  const int ctx = ctrl[2] + 1;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+
+  // Stage this head's raw scores from global (coalesced).
+  const float* gsc = scores + (long long)h * max_ctx;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  // max: block tree — exact (f32 max never rounds; fmaxf skips NaN like the
+  // sequential `>` scan).
+  float m = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    m = fmaxf(m, sc[j]);
+  }
+  s_red[tid] = m;
+  __syncthreads();
+  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    if (tid < off) {
+      s_red[tid] = fmaxf(s_red[tid], s_red[tid + off]);
+    }
+    __syncthreads();
+  }
+  m = s_red[0];
+
+  // exp: elementwise, parallel — identical exp_f32 bits per key.
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], m));
+  }
+  __syncthreads();
+
+  // sum: the ONE rounded f32 fold — sequential on thread 0 in j-order.
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  // weighted sum: one output dim per thread, j-order chain per dim (bit-exact).
+  // The v load is unconditional so the compiler batches loads across the
+  // unrolled j iterations; the w==0 skip predicates only the fadd.
+  float* o_row = out + (long long)h * head_dim;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    float acc = 0.0f;
+#pragma unroll 8
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const float vv = v[((long long)j * n_head_kv + kv) * head_dim + d];
+      if (w != 0.0f) {
+        acc = __fadd_rn(acc, __fmul_rn(w, vv));
+      }
     }
     o_row[d] = acc;
   }
