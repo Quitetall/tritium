@@ -343,6 +343,42 @@ GPU; the kernel-level medians above are the authoritative deltas.
 
 ---
 
+### v1.x round 2 — i8 activation pipeline + split attention + RFC probe
+
+**Commits:** f606bc0 (i8 pipeline), 21f2c8e (review fixes), 2a83301 (split attention)
+
+1. **Packed-int8 activation pipeline.** The f32-staged dp4a GEMMs re-read the
+   whole f32 activation row per N-column block (3.2 MiB of L2 traffic at
+   N=2560 — ~2× the weight bytes). Quant kernels now emit packed int8
+   (`rmsnorm_quant_i8` etc.); the `_i8_scaled*` GEMMs read it directly via
+   `__ldg` — no shared staging, no barrier. Kernel-level 25–45% across shapes,
+   70–85% of weight-bandwidth SOL. Split-K variants were swept and REGRESSED
+   (not parallelism-starved) — rejected by measurement. The batch-graph GEMM
+   also folded its separate `scale_mul_batch` launch into the fused epilogue.
+2. **Split ctx-parallel attention** (bit-exact): scores fan out over
+   `(n_head, ceil(max_ctx/128))` blocks as float4 chains in d-order; a
+   128-thread per-head block does tree-max (exact) + parallel exp + the one
+   ordered softmax sum + one-dim-per-thread weighted sum with loads hoisted
+   out of the w==0 skip. 34→16µs @ctx=64 … 2486→276µs @ctx=4096 (2.1–9×).
+   NOTE (review finding): the legacy `gqa_attention_decode_warp_g` fallback
+   body was also rewritten in 2a83301 (2-key ILP + register-tiled weighted
+   sum, bit-exact, verified in review) — it is the head_dim%4!=0 path and is
+   unexercised by the shipped model; a parity test for that geometry is a
+   good follow-up.
+
+| metric | round 1 end | round 2 end |
+|---|---|---|
+| e2e decode (4090, contended box) | ~165–185 tok/s | **~185–195 tok/s** |
+| e2e prefill | ~651 tok/s | ~600–760 tok/s (noise-bound) |
+| decode GPU profile | attn 33/rms 32/GEMM 20/head 12 | **rms 42/head ~20/GEMM 18/attn 15** |
+
+3. **Numerics-RFC probe (ADR 0018, reverted after measurement).** Switching
+   ONLY `rmsnorm_quant_i8`'s sum-of-squares to a deterministic tree order:
+   **decode 187 → 327 tok/s (+75%)**, perplexity rel err IMPROVED
+   2.957e-3 → 2.659e-4, `cuda_greedy_matches_transformers` PASSES,
+   `cpu_cuda_parity` fails (only one side changed — the RFC moves host +
+   backends together). Decision pending; see docs/adr/0018.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time

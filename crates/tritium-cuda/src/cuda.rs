@@ -4331,7 +4331,6 @@ impl CudaDecodeModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn launch_attention(
         stream: &Arc<CudaStream>,
         func_legacy: &CudaFunction,
