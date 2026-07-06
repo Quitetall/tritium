@@ -251,8 +251,22 @@ fn cpu_longer_greedy_matches_transformers() {
 
 // ───────────────────────── CUDA-gated GPU acceptance ─────────────────────────
 
+/// Minimum exact-prefix length of the CUDA greedy continuation vs the committed
+/// transformers reference (ADR 0018 re-baseline). Under the pre-1.x sequential
+/// reduction order the full 256 tokens happened to match; the canonical tree
+/// order (which is *more* accurate — perplexity rel err improved ~11×) rounds a
+/// handful of logits by 1 ulp, and a greedy chain amplifies any such change at
+/// the first near-tie. Measured divergence point on the 4090: token 104, into
+/// an equally coherent continuation. The gate now asserts a 96-token exact
+/// prefix — long enough that a real regression (wrong kernel, wrong scale)
+/// cannot hide, short enough not to fail on legitimate near-tie flips — plus
+/// the perplexity gate that `benches/e2e.rs` holds at ≤1% on every run.
+const CUDA_GREEDY_EXACT_PREFIX: usize = 96;
+
 /// (a) CUDA greedy acceptance: generate the full 256-token continuation on the
-/// `"cuda"` backend, assert the IDs equal the committed transformers reference.
+/// `"cuda"` backend; the first [`CUDA_GREEDY_EXACT_PREFIX`] IDs must equal the
+/// committed transformers reference (see the constant's doc for why the full
+/// 256 is no longer bit-pinned).
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_greedy_matches_transformers() {
@@ -274,13 +288,20 @@ fn cuda_greedy_matches_transformers() {
         .generate(&reference.token_ids, want.len(), reference.eos_token_id)
         .expect("cuda greedy generate");
     let dt = t0.elapsed();
-    println!("cuda greedy ({} tok in {:.1?}) ours={got:?}", got.len(), dt);
-    println!("cuda greedy ({} tok) ref ={want:?}", want.len());
-    assert_eq!(
-        got,
-        want,
-        "cuda greedy {}-token continuation must match transformers",
-        want.len()
+    let prefix = got
+        .iter()
+        .zip(&want)
+        .take_while(|(g, w)| g == w)
+        .count();
+    println!(
+        "cuda greedy ({} tok in {:.1?}) exact prefix vs transformers = {prefix}",
+        got.len(),
+        dt
+    );
+    assert!(
+        prefix >= CUDA_GREEDY_EXACT_PREFIX,
+        "cuda greedy diverged from transformers at token {prefix} (< {CUDA_GREEDY_EXACT_PREFIX}); \
+         ours={got:?} ref={want:?}"
     );
 }
 

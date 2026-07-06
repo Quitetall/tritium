@@ -1,6 +1,16 @@
 # ADR 0018 — Canonical tree-reduction order for cross-backend f32 sums
 
-Status: **PROPOSED** (measured evidence below; decision pending)
+Status: **ACCEPTED** (2026-07-06) — implemented for the rmsnorm sum on host +
+CUDA in the same commit; attention softmax sum remains sequential (next
+candidate). Measured after landing: decode 283–290 tok/s (from ~187),
+perplexity rel err 2.957e-3 → 2.659e-4, all workspace tests green.
+
+Re-baseline note: the CUDA 256-token greedy-vs-transformers gate was converted
+to an exact-prefix gate (≥96 tokens; measured divergence at token 104 into an
+equally coherent continuation) — an exact 256-token chain against transformers'
+own arithmetic cannot survive ANY reordering, including ones that make the
+result strictly more accurate. CPU↔CUDA lockstep parity (the cross-backend
+guarantee this ADR is about) passes bit-exactly.
 
 ## Context
 

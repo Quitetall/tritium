@@ -8684,10 +8684,27 @@ mod tests {
             }
         };
         // Host reference — identical to `tritium_nn::ops::rmsnorm` (this crate does
-        // not depend on tritium-nn, so the 4-line formula is replicated verbatim).
+        // not depend on tritium-nn, so the formula is replicated verbatim).
+        // Canonical tree sum-of-squares (ADR 0018) — replicates
+        // `tritium_nn::ops::rmsnorm`'s documented cross-backend order (this
+        // crate does not depend on tritium-nn).
+        fn sum_squares_canonical(x: &[f32]) -> f32 {
+            let mut part = [0.0f32; 256];
+            for (i, &v) in x.iter().enumerate() {
+                part[i % 256] = part[i % 256] + v * v;
+            }
+            let mut off = 128;
+            while off > 0 {
+                for t in 0..off {
+                    part[t] = part[t] + part[t + off];
+                }
+                off >>= 1;
+            }
+            part[0]
+        }
         fn host_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
             let n = x.len();
-            let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+            let mean_sq = sum_squares_canonical(x) / n as f32;
             let inv = 1.0 / (mean_sq + eps).sqrt();
             x.iter().zip(w).map(|(&xi, &wi)| xi * inv * wi).collect()
         }
@@ -9175,7 +9192,19 @@ mod tests {
         // activation-quant (absmax → 127/gamma scale → round-ties-even → clamp).
         fn host_rmsnorm_quant(x: &[f32], w: &[f32], eps: f32) -> (Vec<f32>, f32) {
             let n = x.len();
-            let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+            // Canonical tree sum-of-squares (ADR 0018), as in the rmsnorm test.
+            let mut part = [0.0f32; 256];
+            for (i, &v) in x.iter().enumerate() {
+                part[i % 256] = part[i % 256] + v * v;
+            }
+            let mut off = 128;
+            while off > 0 {
+                for t in 0..off {
+                    part[t] = part[t] + part[t + off];
+                }
+                off >>= 1;
+            }
+            let mean_sq = part[0] / n as f32;
             let inv = 1.0 / (mean_sq + eps).sqrt();
             let y: Vec<f32> = x.iter().zip(w).map(|(&xi, &wi)| xi * inv * wi).collect();
             let mut gamma = 0.0f32;

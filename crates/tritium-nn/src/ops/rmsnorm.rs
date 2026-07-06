@@ -2,9 +2,41 @@
 
 use crate::error::NnError;
 
+/// Slots in the canonical reduction order (ADR 0018). Mirrors the 256-thread
+/// blocks every backend rmsnorm kernel launches with — slot `t` on the host is
+/// thread `t` on the device, so the fold order is identical by construction.
+pub const CANONICAL_REDUCE_SLOTS: usize = 256;
+
+/// Sum of squares in the **canonical cross-backend order** (ADR 0018):
+/// slot `t` folds `x[t], x[t+256], …` in ascending index order (f32 multiply
+/// then add, no FMA), then a power-of-two tree combines the 256 slots
+/// (`off = 128, 64, …, 1`). Every backend implements this exact order, so
+/// cross-backend results are bit-identical by construction — and, unlike the
+/// pre-1.x sequential fold, the order is parallel- and SIMD-friendly on every
+/// target (it removed a hard latency floor from GPU decode; see ADR 0018 for
+/// the measurements). The tree sum is also *more* accurate than the
+/// sequential fold (shorter accumulation chains round less).
+#[inline]
+pub(crate) fn sum_squares_canonical(x: &[f32]) -> f32 {
+    let mut part = [0.0f32; CANONICAL_REDUCE_SLOTS];
+    for (i, &v) in x.iter().enumerate() {
+        let t = i % CANONICAL_REDUCE_SLOTS;
+        part[t] = part[t] + v * v;
+    }
+    let mut off = CANONICAL_REDUCE_SLOTS / 2;
+    while off > 0 {
+        for t in 0..off {
+            part[t] = part[t] + part[t + off];
+        }
+        off >>= 1;
+    }
+    part[0]
+}
+
 /// RMSNorm: `out[i] = x[i] / sqrt(mean(x²) + eps) · w[i]`.
 ///
-/// `x`, `w`, and `out` must have equal length. Computed in `f32`.
+/// `x`, `w`, and `out` must have equal length. Computed in `f32`; the `mean(x²)`
+/// reduction folds in the canonical cross-backend order (ADR 0018).
 ///
 /// # Errors
 /// [`NnError::Shape`] if the buffer lengths disagree.
@@ -25,7 +57,7 @@ pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) -> Result<(), Nn
     if n == 0 {
         return Ok(());
     }
-    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let mean_sq = sum_squares_canonical(x) / n as f32;
     let inv = 1.0 / (mean_sq + eps).sqrt();
     for ((o, &xi), &wi) in out.iter_mut().zip(x).zip(w) {
         *o = xi * inv * wi;

@@ -9,10 +9,12 @@
 // Free-running greedy decode is brutally sensitive: a ~1e-6 logit perturbation
 // flips a near-tie token within ~75 steps and cascades. So:
 //
-//   * **Reductions are sequential, single-thread, in the host's order.** A parallel
-//     tree reduction sums in a different order → different f32 rounding → divergence.
-//     At M=1 the reduced lengths are tiny (n_embd=2560, ctx<=4096), so a one-thread
-//     left-fold costs microseconds and is the correct choice.
+//   * **Rounded f32 reductions fold in a documented canonical order shared with
+//     the host.** RMSNorm sums use the ADR 0018 tree order (256 strided slots +
+//     pow-2 tree — implemented identically by `tritium_nn::ops::rmsnorm`, so
+//     cross-backend bits match by construction). Sums with no host-side tree
+//     counterpart yet (attention softmax) remain sequential in the host's
+//     order on a single thread.
 //   * **No FMA contraction.** nvcc fuses `a*b+c` into a single `fma` (one rounding)
 //     by default (`-fmad=true`), whereas the host does a multiply *then* an add (two
 //     roundings). We force the host's behaviour with the round-to-nearest intrinsics
@@ -40,30 +42,46 @@ __device__ __forceinline__ float exp_f32(float x) {
 extern "C" {
 
 // rmsnorm_f32 — bit-exact match of tritium_nn::ops::rmsnorm:
-//   mean_sq = (Σ_i x[i]*x[i]) / n        (sequential f32 left-fold, no FMA)
+//   mean_sq = (Σ_i x[i]*x[i]) / n        (canonical tree order, ADR 0018, no FMA)
 //   inv     = 1 / sqrt(mean_sq + eps)
 //   out[i]  = (x[i] * inv) * w[i]
 //
-// One block. Thread 0 does the sequential sum-of-squares (the only reduction);
-// after a barrier every thread writes the embarrassingly-parallel elementwise pass.
+// One 256-thread block. The sum-of-squares folds in the canonical cross-backend
+// order (slot t = thread t strided fold + pow-2 tree) that the host implements
+// identically; the elementwise pass is embarrassingly parallel.
 __global__ void rmsnorm_f32(const float* __restrict__ x,
                             const float* __restrict__ w,
                             const float eps,
                             const int n,
                             float* __restrict__ out) {
   __shared__ float s_inv;
+  __shared__ float s_red[256];
 
-  if (threadIdx.x == 0) {
-    // Sequential sum of squares in the host's i=0..n order, multiply-then-add with
-    // no FMA contraction (host: `x.iter().map(|v| v*v).sum::<f32>()`).
-    float ss = 0.0f;
-    for (int i = 0; i < n; ++i) {
+  // Canonical tree sum (ADR 0018): slot t = threadIdx.x folds x[t],
+  // x[t+256], ... in ascending order, then a power-of-two tree combines
+  // the slots — the documented cross-backend order tritium_nn::ops::rmsnorm
+  // implements identically on the host. Requires blockDim.x == 256 (all
+  // launches comply). Replaces the sequential thread-0 fold, which was the
+  // measured decode bottleneck (a 4-cycle-per-element latency chain).
+  {
+    float part = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
       const float xi = x[i];
-      ss = __fadd_rn(ss, __fmul_rn(xi, xi));
+      part = __fadd_rn(part, __fmul_rn(xi, xi));
     }
-    const float mean_sq = __fdiv_rn(ss, (float)n);             // host: sum / n as f32
-    const float denom = sqrtf(__fadd_rn(mean_sq, eps));        // host: (mean_sq+eps).sqrt()
-    s_inv = __fdiv_rn(1.0f, denom);                            // host: 1.0 / denom
+    s_red[threadIdx.x] = part;
+    __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+      if (threadIdx.x < off) {
+        s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
+      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+      s_inv = __fdiv_rn(1.0f, denom);
+    }
   }
   __syncthreads();
 
@@ -75,14 +93,10 @@ __global__ void rmsnorm_f32(const float* __restrict__ x,
   }
 }
 
-// rmsnorm_shared_f32 — **bit-identical** to rmsnorm_f32 but ~8× faster for the graph
-// (v0.3.3+ perf). rmsnorm_f32's thread-0 sum is latency-bound: one thread reads `n`
-// floats one-at-a-time from global, unable to hide ~400-cycle memory latency. Here the
-// whole block first stages `x` into shared memory with a COALESCED load, then thread 0
-// sums from shared **in the same i=0..n order** — so the f32 sum is byte-identical (no
-// reorder, unlike a tree reduction), keeping greedy 256/256, while the sum is now
-// compute-bound instead of memory-latency-bound. Dynamic shared = `n * 4` bytes (the
-// launch sets it); n_ff=6912 → 27 KiB < 48 KiB. The elementwise reads the staged `s_x`.
+// rmsnorm_shared_f32 — **bit-identical** to rmsnorm_f32 (same canonical tree
+// order, ADR 0018), reading from a COALESCED shared stage of `x` instead of
+// global. Dynamic shared = `n * 4` bytes (the launch sets it); n_ff=6912 →
+// 27 KiB < 48 KiB. The elementwise pass reads the staged `s_x`.
 __global__ void rmsnorm_shared_f32(const float* __restrict__ x,
                                    const float* __restrict__ w,
                                    const float eps,
@@ -90,19 +104,36 @@ __global__ void rmsnorm_shared_f32(const float* __restrict__ x,
                                    float* __restrict__ out) {
   extern __shared__ float s_x[];
   __shared__ float s_inv;
+  __shared__ float s_red[256];
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     s_x[i] = x[i];  // coalesced stage into shared
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    float ss = 0.0f;
-    for (int i = 0; i < n; ++i) {
+  // Canonical tree sum (ADR 0018): slot t = threadIdx.x folds s_x[t],
+  // s_x[t+256], ... in ascending order, then a power-of-two tree combines
+  // the slots — the documented cross-backend order tritium_nn::ops::rmsnorm
+  // implements identically on the host. Requires blockDim.x == 256 (all
+  // launches comply). Replaces the sequential thread-0 fold, which was the
+  // measured decode bottleneck (a 4-cycle-per-element latency chain).
+  {
+    float part = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
       const float xi = s_x[i];
-      ss = __fadd_rn(ss, __fmul_rn(xi, xi));  // same i=0..n order as rmsnorm_f32
+      part = __fadd_rn(part, __fmul_rn(xi, xi));
     }
-    const float mean_sq = __fdiv_rn(ss, (float)n);
-    const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-    s_inv = __fdiv_rn(1.0f, denom);
+    s_red[threadIdx.x] = part;
+    __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+      if (threadIdx.x < off) {
+        s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
+      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+      s_inv = __fdiv_rn(1.0f, denom);
+    }
   }
   __syncthreads();
   const float inv = s_inv;
@@ -136,6 +167,7 @@ __global__ void rmsnorm_quant_f32(const float* __restrict__ x,
   extern __shared__ float s_x[];
   __shared__ float s_inv;
   __shared__ float s_gamma;
+  __shared__ float s_red[1024];
 
   // 1. Stage x into shared memory (coalesced).
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -143,16 +175,31 @@ __global__ void rmsnorm_quant_f32(const float* __restrict__ x,
   }
   __syncthreads();
 
-  // 2. Thread 0: sequential sum-of-squares (bit-match with host).
-  if (threadIdx.x == 0) {
-    float ss = 0.0f;
-    for (int i = 0; i < n; ++i) {
+  // Canonical tree sum (ADR 0018): slot t = threadIdx.x folds s_x[t],
+  // s_x[t+256], ... in ascending order, then a power-of-two tree combines
+  // the slots — the documented cross-backend order tritium_nn::ops::rmsnorm
+  // implements identically on the host. Requires blockDim.x == 256 (all
+  // launches comply). Replaces the sequential thread-0 fold, which was the
+  // measured decode bottleneck (a 4-cycle-per-element latency chain).
+  {
+    float part = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
       const float xi = s_x[i];
-      ss = __fadd_rn(ss, __fmul_rn(xi, xi));
+      part = __fadd_rn(part, __fmul_rn(xi, xi));
     }
-    const float mean_sq = __fdiv_rn(ss, (float)n);
-    const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-    s_inv = __fdiv_rn(1.0f, denom);
+    s_red[threadIdx.x] = part;
+    __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+      if (threadIdx.x < off) {
+        s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
+      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+      s_inv = __fdiv_rn(1.0f, denom);
+    }
   }
   __syncthreads();
 
@@ -174,7 +221,6 @@ __global__ void rmsnorm_quant_f32(const float* __restrict__ x,
   //    scratch, which clobbered the first `blockDim.x` outputs before they were
   //    quantized → garbage activations. `blockDim.x` ≤ 1024 (CUDA max) and is a power
   //    of two (matches act_quant_tiled_f32's reduction).
-  __shared__ float s_red[1024];
   s_red[threadIdx.x] = local_max;
   __syncthreads();
   for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
@@ -455,15 +501,31 @@ __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
   }
   __syncthreads();
 
-  if (threadIdx.x == 0) {
-    float ss = 0.0f;
-    for (int i = 0; i < n; ++i) {
+  // Canonical tree sum (ADR 0018): slot t = threadIdx.x folds s_x[t],
+  // s_x[t+256], ... in ascending order, then a power-of-two tree combines
+  // the slots — the documented cross-backend order tritium_nn::ops::rmsnorm
+  // implements identically on the host. Requires blockDim.x == 256 (all
+  // launches comply). Replaces the sequential thread-0 fold, which was the
+  // measured decode bottleneck (a 4-cycle-per-element latency chain).
+  {
+    float part = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
       const float xi = s_x[i];
-      ss = __fadd_rn(ss, __fmul_rn(xi, xi));
+      part = __fadd_rn(part, __fmul_rn(xi, xi));
     }
-    const float mean_sq = __fdiv_rn(ss, (float)n);
-    const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-    s_inv = __fdiv_rn(1.0f, denom);
+    s_red[threadIdx.x] = part;
+    __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+      if (threadIdx.x < off) {
+        s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
+      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+      s_inv = __fdiv_rn(1.0f, denom);
+    }
   }
   __syncthreads();
 
@@ -1152,8 +1214,9 @@ __global__ void lm_head_warp_f16(const float* __restrict__ h, const __half* __re
 // elementwise so they reuse the M=1 kernels over `m*n` elements.
 // ===========================================================================
 
-// rmsnorm_batch_f32 — rmsnorm over `m` rows; block `mi` handles row `mi` (shared-staged
-// sum in the host's order). Bit-identical to rmsnorm_shared_f32 per row.
+// rmsnorm_batch_f32 — rmsnorm over `m` rows; block `mi` handles row `mi`
+// (shared-staged, canonical tree order per ADR 0018). Bit-identical to
+// rmsnorm_shared_f32 per row.
 __global__ void rmsnorm_batch_f32(const float* __restrict__ x, const float* __restrict__ w,
                                   const float eps, const int n, const int m,
                                   float* __restrict__ out) {
@@ -1161,19 +1224,36 @@ __global__ void rmsnorm_batch_f32(const float* __restrict__ x, const float* __re
   if (mi >= m) return;
   extern __shared__ float s_x[];
   __shared__ float s_inv;
+  __shared__ float s_red[256];
   const float* xr = x + (long long)mi * n;
   float* outr = out + (long long)mi * n;
   for (int i = threadIdx.x; i < n; i += blockDim.x) s_x[i] = xr[i];
   __syncthreads();
-  if (threadIdx.x == 0) {
-    float ss = 0.0f;
-    for (int i = 0; i < n; ++i) {
+  // Canonical tree sum (ADR 0018): slot t = threadIdx.x folds s_x[t],
+  // s_x[t+256], ... in ascending order, then a power-of-two tree combines
+  // the slots — the documented cross-backend order tritium_nn::ops::rmsnorm
+  // implements identically on the host. Requires blockDim.x == 256 (all
+  // launches comply). Replaces the sequential thread-0 fold, which was the
+  // measured decode bottleneck (a 4-cycle-per-element latency chain).
+  {
+    float part = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
       const float xi = s_x[i];
-      ss = __fadd_rn(ss, __fmul_rn(xi, xi));
+      part = __fadd_rn(part, __fmul_rn(xi, xi));
     }
-    const float mean_sq = __fdiv_rn(ss, (float)n);
-    const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-    s_inv = __fdiv_rn(1.0f, denom);
+    s_red[threadIdx.x] = part;
+    __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+      if (threadIdx.x < off) {
+        s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
+      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+      s_inv = __fdiv_rn(1.0f, denom);
+    }
   }
   __syncthreads();
   const float inv = s_inv;
