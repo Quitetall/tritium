@@ -136,8 +136,11 @@ extern "C" __global__ void __launch_bounds__({block_threads}) tq2_0_imma_mpgemm(
 
     // Double/multi-buffered shared staging (STAGES deep). Each stage holds the
     // unpacked int8 A (TILE_M x TILE_K) and B (TILE_N x TILE_K) for one K step.
-    __shared__ signed char s_a[STAGES][A_STAGE];
-    __shared__ signed char s_b[STAGES][B_STAGE];
+    // 16-byte aligned so fragment registers load as single u32s (below): every
+    // fragment offset is a multiple of 4 (TILE_K is a multiple of 32, kbase of
+    // 32, per-lane offsets of 4).
+    __shared__ __align__(16) signed char s_a[STAGES][A_STAGE];
+    __shared__ __align__(16) signed char s_b[STAGES][B_STAGE];
 
     // Per-warp int32 accumulators: 4 C-fragment regs per owned 16x8 sub-tile.
     // Warp `warp` owns sub-tiles {{warp, warp+WARPS, warp+2*WARPS, ...}} of the
@@ -223,58 +226,46 @@ extern "C" __global__ void __launch_bounds__({block_threads}) tq2_0_imma_mpgemm(
         }}
         __syncthreads();
 
-        // Each warp processes its owned sub-tiles for this K step.
+        // Each warp processes its owned sub-tiles for this K step, nn-major so
+        // the B fragment is loaded ONCE per (nn, kk) and reused across the mm
+        // sub-tiles that share it. Fragment registers are single u32 shared
+        // loads: the mma.m16n8k32.row.col operand layout puts each lane's
+        // (group=lane/4, tig=lane%4) quad at 4 CONSECUTIVE bytes — A rows
+        // `group`/`group+8` at k = 4*tig and 16+4*tig, B col `group` likewise —
+        // and the little-endian u32 read equals the byte-wise pack exactly.
+        // Numerics are untouched (same bytes into the same mma operands).
         #pragma unroll 1
-        for (int st = warp; st < SUBTILES; st += WARPS) {{
-            const int slot = st / WARPS;            // dense index into c0..c3
-            const int mm = st % M_SUBTILES;         // m sub-tile (mm-major flat grid)
-            const int nn = st / M_SUBTILES;         // n sub-tile
-            const signed char* A = s_a[buf] + mm * (IMMA_M * TILE_K);
-            const signed char* B = s_b[buf] + nn * (IMMA_N * TILE_K);
-            // Issue one mma per k-tile staged in this step.
+        for (int kk = 0; kk < KTILES_PER_STEP; ++kk) {{
+            const int kbase = kk * IMMA_K;
             #pragma unroll 1
-            for (int kk = 0; kk < KTILES_PER_STEP; ++kk) {{
-                // The mma.m16n8k32.row.col operand distribution across the warp's 32
-                // lanes (see PTX ISA): each lane (group=lane/4, tig=lane%4) holds, for
-                // the A operand, 4 packed int8 at k = 4*tig + {{0..3}} and a second
-                // group at k = 16 + 4*tig + {{0..3}}, for rows `group` and `group+8`.
-                // The B operand mirrors this per col `group`. `kbase` is the k-tile's
-                // base within the staged TILE_K; `4*tig` is the per-lane k offset —
-                // dropping it makes every lane in a group read the same bytes (a bug).
-                const int kbase = kk * IMMA_K;
-                // A fragment (4 regs): the m16n8k32.row.col A operand layout.
-                unsigned int a0, a1, a2, a3;
-                {{
-                    auto pack = [&](int row, int kb) -> unsigned int {{
-                        unsigned int v = 0;
-                        #pragma unroll
-                        for (int j = 0; j < 4; ++j)
-                            v |= ((unsigned int)(unsigned char)A[row * TILE_K + kbase + kb + j]) << (8 * j);
-                        return v;
-                    }};
-                    a0 = pack(group, 4 * tig);
-                    a1 = pack(group + 8, 4 * tig);
-                    a2 = pack(group, 16 + 4 * tig);
-                    a3 = pack(group + 8, 16 + 4 * tig);
+            for (int nn0 = 0; nn0 < N_SUBTILES; ++nn0) {{
+                // This warp's share of the (mm, nn) grid intersected with nn0:
+                // flat st = nn0*M_SUBTILES + mm, owned when st % WARPS == warp.
+                const signed char* B = s_b[buf] + nn0 * (IMMA_N * TILE_K);
+                const unsigned int b0 =
+                    *(const unsigned int*)(B + group * TILE_K + kbase + 4 * tig);
+                const unsigned int b1 =
+                    *(const unsigned int*)(B + group * TILE_K + kbase + 16 + 4 * tig);
+                #pragma unroll 1
+                for (int mm = 0; mm < M_SUBTILES; ++mm) {{
+                    const int st = nn0 * M_SUBTILES + mm;
+                    if (st % WARPS != warp) continue;
+                    const int slot = st / WARPS;
+                    const signed char* A = s_a[buf] + mm * (IMMA_M * TILE_K);
+                    const unsigned int a0 =
+                        *(const unsigned int*)(A + group * TILE_K + kbase + 4 * tig);
+                    const unsigned int a1 =
+                        *(const unsigned int*)(A + (group + 8) * TILE_K + kbase + 4 * tig);
+                    const unsigned int a2 =
+                        *(const unsigned int*)(A + group * TILE_K + kbase + 16 + 4 * tig);
+                    const unsigned int a3 =
+                        *(const unsigned int*)(A + (group + 8) * TILE_K + kbase + 16 + 4 * tig);
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{{%0,%1,%2,%3}}, {{%4,%5,%6,%7}}, {{%8,%9}}, {{%0,%1,%2,%3}};\n"
+                        : "+r"(c0[slot]), "+r"(c1[slot]), "+r"(c2[slot]), "+r"(c3[slot])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
                 }}
-                // B fragment (2 regs).
-                unsigned int b0, b1;
-                {{
-                    auto pack = [&](int col, int kb) -> unsigned int {{
-                        unsigned int v = 0;
-                        #pragma unroll
-                        for (int j = 0; j < 4; ++j)
-                            v |= ((unsigned int)(unsigned char)B[col * TILE_K + kbase + kb + j]) << (8 * j);
-                        return v;
-                    }};
-                    b0 = pack(group, 4 * tig);
-                    b1 = pack(group, 16 + 4 * tig);
-                }}
-                asm volatile(
-                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                    "{{%0,%1,%2,%3}}, {{%4,%5,%6,%7}}, {{%8,%9}}, {{%0,%1,%2,%3}};\n"
-                    : "+r"(c0[slot]), "+r"(c1[slot]), "+r"(c2[slot]), "+r"(c3[slot])
-                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
             }}
         }}
         __syncthreads();

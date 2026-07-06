@@ -2985,10 +2985,12 @@ impl CudaBackend {
             });
         }
 
-        // Time a few repetitions (median of the wall-clock per-launch time). This is a
-        // coarse but deterministic-enough metric for tile selection; the gate only
-        // requires that the *winner* be correct, not that timings be reproducible to
-        // the nanosecond.
+        // Time a few repetitions and take the MINIMUM: external contention (a
+        // desktop compositor, another process) only ever inflates a launch's
+        // wall-clock, so min-of-N is the noise-robust estimator of a tile's true
+        // cost — a median can crown the wrong winner on a busy GPU and the cache
+        // then pins that mistake. The gate only requires that the *winner* be
+        // correct, not that timings be reproducible to the nanosecond.
         const REPS: usize = 8;
         let mut times = Vec::with_capacity(REPS);
         for _ in 0..REPS {
@@ -3012,7 +3014,7 @@ impl CudaBackend {
             times.push(start.elapsed().as_secs_f64());
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let seconds = times[times.len() / 2];
+        let seconds = times[0];
         Ok(CandidateResult {
             correct: true,
             seconds,

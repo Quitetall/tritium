@@ -203,6 +203,53 @@ pub(crate) fn candidate_tiles() -> Vec<TileConfig> {
             warps: 8,
             stages: 3,
         },
+        // v1.x (post fragment-u32/B-reuse codegen): genuinely large block tiles.
+        // The old per-byte fragment packing made big tiles pointless (SIMT pack
+        // cost dwarfed the mma); with single-u32 fragment loads and B-fragment
+        // reuse the tensor cores finally see back-to-back work, and these are
+        // where compute-bound prefill shapes want to be.
+        TileConfig {
+            tile_m: 64,
+            tile_n: 32,
+            tile_k: 64,
+            warps: 8,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 128,
+            tile_n: 32,
+            tile_k: 32,
+            warps: 8,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 128,
+            tile_n: 64,
+            tile_k: 32,
+            warps: 8,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 128,
+            tile_n: 64,
+            tile_k: 64,
+            warps: 8,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 128,
+            tile_n: 128,
+            tile_k: 32,
+            warps: 8,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 256,
+            tile_n: 64,
+            tile_k: 32,
+            warps: 8,
+            stages: 2,
+        },
     ];
     RAW.iter()
         .copied()
@@ -261,19 +308,27 @@ pub(crate) struct CacheKey {
     pub(crate) cuda_version: u32,
 }
 
+/// Codegen revision, part of the cache key: bump when `codegen.rs` changes the
+/// rendered kernel's PERFORMANCE characteristics (fragment loads, loop order,
+/// staging) so previously tuned winners re-tune instead of persisting a choice
+/// made for a different kernel. rev 2 = u32 fragment loads + B-fragment reuse.
+pub(crate) const CODEGEN_REV: u32 = 2;
+
 impl CacheKey {
     /// Stable filesystem-safe string form, e.g.
-    /// `sm_89-i2sint8-m5-n2560-k2560-cuda13030`. The CUDA version suffix means a
-    /// driver bump keys a *different* file, transparently invalidating stale entries.
+    /// `sm_89-i2sint8-m5-n2560-k2560-cuda13030-r2`. The CUDA version and codegen
+    /// revision suffixes mean a driver bump or a codegen change keys a *different*
+    /// file, transparently invalidating stale entries.
     pub(crate) fn to_key_string(&self) -> String {
         format!(
-            "{}-{}-m{}-n{}-k{}-cuda{}",
+            "{}-{}-m{}-n{}-k{}-cuda{}-r{}",
             self.arch,
             self.dtype,
             self.bucket.m_log2,
             self.bucket.n,
             self.bucket.k,
-            self.cuda_version
+            self.cuda_version,
+            CODEGEN_REV
         )
     }
 }
@@ -522,7 +577,7 @@ mod tests {
         // driver bump invalidates the on-disk entry.
         assert_eq!(
             sample_key().to_key_string(),
-            "sm_89-i2sint8-m5-n2560-k2560-cuda13030"
+            "sm_89-i2sint8-m5-n2560-k2560-cuda13030-r2"
         );
     }
 

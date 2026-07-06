@@ -171,8 +171,9 @@ __global__ void tq2_0_imma_mpgemm(
     const int n_tile = blockIdx.x * IMMA_N;  // first output col of this tile
 
     // Double-buffered shared staging: int8 A (16×32) + int8 B (8×32) per buffer.
-    __shared__ signed char s_a[2][IMMA_M * IMMA_K];
-    __shared__ signed char s_b[2][IMMA_N * IMMA_K];
+    // 16-byte aligned so the fragment registers below load as single u32s.
+    __shared__ __align__(16) signed char s_a[2][IMMA_M * IMMA_K];
+    __shared__ __align__(16) signed char s_b[2][IMMA_N * IMMA_K];
 
     // Per-thread int32 accumulators (the 4 C-fragment registers), exact over K.
     int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
@@ -225,45 +226,26 @@ __global__ void tq2_0_imma_mpgemm(
         __syncthreads();  // current buffer fully staged (and next, if any)
 
         // --- Load the A fragment (4 regs, 4 packed int8 each) from s_a[cur]. ---
-        // a0: row=group,   k=4*tig + {0..3}
-        // a1: row=group+8, k=4*tig + {0..3}
-        // a2: row=group,   k=16 + 4*tig + {0..3}
-        // a3: row=group+8, k=16 + 4*tig + {0..3}
+        // a0: row=group,   k=4*tig + {0..3}      a1: row=group+8, same k
+        // a2: row=group,   k=16 + 4*tig + {0..3} a3: row=group+8, same k
+        // Each lane's quad is 4 CONSECUTIVE shared bytes, so one little-endian
+        // u32 load per register — identical bytes/bits to the old per-byte pack
+        // (offsets are 4-aligned: IMMA_K=32 stride, kbase 0/16, 4*tig).
         unsigned int a0, a1, a2, a3;
         {
             const signed char* A = s_a[cur];
-            auto pack = [&](int row, int kbase) -> unsigned int {
-                unsigned int v = 0;
-                for (int j = 0; j < 4; ++j) {
-                    const unsigned int byte =
-                        (unsigned int)(unsigned char)A[row * IMMA_K + kbase + j];
-                    v |= byte << (8 * j);
-                }
-                return v;
-            };
-            a0 = pack(group, 4 * tig);
-            a1 = pack(group + 8, 4 * tig);
-            a2 = pack(group, 16 + 4 * tig);
-            a3 = pack(group + 8, 16 + 4 * tig);
+            a0 = *(const unsigned int*)(A + group * IMMA_K + 4 * tig);
+            a1 = *(const unsigned int*)(A + (group + 8) * IMMA_K + 4 * tig);
+            a2 = *(const unsigned int*)(A + group * IMMA_K + 16 + 4 * tig);
+            a3 = *(const unsigned int*)(A + (group + 8) * IMMA_K + 16 + 4 * tig);
         }
 
-        // --- Load the B fragment (2 regs) from s_b[cur]. ---
-        // b0: n=group, k=4*tig + {0..3}
-        // b1: n=group, k=16 + 4*tig + {0..3}
+        // --- Load the B fragment (2 regs) from s_b[cur], same u32 trick. ---
         unsigned int b0, b1;
         {
             const signed char* B = s_b[cur];
-            auto pack = [&](int col, int kbase) -> unsigned int {
-                unsigned int v = 0;
-                for (int j = 0; j < 4; ++j) {
-                    const unsigned int byte =
-                        (unsigned int)(unsigned char)B[col * IMMA_K + kbase + j];
-                    v |= byte << (8 * j);
-                }
-                return v;
-            };
-            b0 = pack(group, 4 * tig);
-            b1 = pack(group, 16 + 4 * tig);
+            b0 = *(const unsigned int*)(B + group * IMMA_K + 4 * tig);
+            b1 = *(const unsigned int*)(B + group * IMMA_K + 16 + 4 * tig);
         }
 
         // int32 accumulate: D = A · Bᵀ + C, exact for int8×ternary (no overflow).
