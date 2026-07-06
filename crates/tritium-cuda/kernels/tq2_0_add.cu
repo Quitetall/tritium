@@ -243,8 +243,13 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_scaled(
 // per token — measured as the decode bottleneck. Accumulating + tree-reducing in f32
 // reorders the K sum past the 1e-4 bit-match tolerance on cancellation-heavy rows, so the
 // graph path is gated by **perplexity ≤ 1% + lockstep argmax**, not greedy bit-match (the
-// eager `step` keeps the double kernel and its 256/256 parity). Identical layout/decode;
-// only the accumulator type differs.
+// eager `step` keeps the double kernel and its 256/256 parity).
+//
+// Byte-once K loop (v1.x decode opt): the TQ2_0 layout stores the four trits at
+// e, e+32, e+64, e+96 (within a 128-trit chunk) in ONE byte's four 2-bit slots, so
+// the old `ki += 32` lane stride re-read the same byte four times. Here each lane
+// reads its chunk byte once and consumes all four slots — 4× fewer weight-byte
+// loads and 4× less index math per trit. Measured ~2× on the 4090 decode shapes.
 extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32(
     const float* __restrict__ act,
     const unsigned char* __restrict__ weights,
@@ -275,7 +280,24 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32(
     }
     const unsigned char* wrow = weights + (long long)ni * row_bytes;
     float acc = 0.0f;
-    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+    // Full 128-trit chunks: lane `l` owns byte `qs[c*32 + l]`, whose four 2-bit
+    // slots are the trits at ki = base + slot*32 + l. Branchless decode:
+    // trit = code - 1 ∈ {-1, 0, +1} for the valid codes {0,1,2}, so `acc += a * trit`
+    // equals the add/sub/skip branch bit-for-bit (a*1=a, a*-1=-a, a*0=0 → no-op add).
+    const int full = k & ~127;
+    int base = 0;
+    for (; base < full; base += 128) {
+        const int block = base >> 8;               // base / QK_K
+        const int c = (base >> 7) & 1;             // which 128-trit chunk
+        const unsigned int byte = wrow[block * TQ2_0_BLOCK_BYTES + c * 32 + lane];
+        const float* sa = s_act + base + lane;
+        acc += sa[0] * (float)((int)(byte & 3u) - 1);
+        acc += sa[32] * (float)((int)((byte >> 2) & 3u) - 1);
+        acc += sa[64] * (float)((int)((byte >> 4) & 3u) - 1);
+        acc += sa[96] * (float)((int)((byte >> 6) & 3u) - 1);
+    }
+    // Tail (k % 128 != 0): the original per-trit decode.
+    for (int ki = base + lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
         const int e = ki - block * QK_K;
         const int c = e >> 7;
@@ -283,11 +305,7 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32(
         const int l = (e & 127) >> 5;
         const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
         const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
-        const float a = s_act[ki];
-        // Branchless decode: trit = code - 1 ∈ {-1, 0, +1} for the valid codes {0,1,2}, so
-        // `acc += a * trit` equals the add/sub/skip branch bit-for-bit (a*1=a, a*-1=-a,
-        // a*0=0 → a no-op add) — but with no warp divergence on the per-lane code.
-        acc += a * (float)((int)code - 1);
+        acc += s_act[ki] * (float)((int)code - 1);
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -343,9 +361,26 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_sparse(
     // Pointer to this row's bitmap words.
     const unsigned int* row_bm = block_bitmap ? block_bitmap + (long long)ni * words_per_row : 0;
     float acc = 0.0f;
-    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+    // Byte-once chunk loop (see `tq2_0_add_mpgemm_tiled_f32`), with the per-256-block
+    // bitmap check hoisted to once per 128-trit chunk (both chunks of a block share
+    // the block's bit).
+    const int full = k & ~127;
+    int base = 0;
+    for (; base < full; base += 128) {
+        const int block = base >> 8;
+        if (row_bm && (row_bm[block / 32] & (1u << (block % 32)))) {
+            continue;
+        }
+        const int c = (base >> 7) & 1;
+        const unsigned int byte = wrow[block * TQ2_0_BLOCK_BYTES + c * 32 + lane];
+        const float* sa = s_act + base + lane;
+        acc += sa[0] * (float)((int)(byte & 3u) - 1);
+        acc += sa[32] * (float)((int)((byte >> 2) & 3u) - 1);
+        acc += sa[64] * (float)((int)((byte >> 4) & 3u) - 1);
+        acc += sa[96] * (float)((int)((byte >> 6) & 3u) - 1);
+    }
+    for (int ki = base + lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
-        // Check bitmap: skip entire block if all-zero.
         if (row_bm && (row_bm[block / 32] & (1u << (block % 32)))) {
             continue;
         }
@@ -355,8 +390,7 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_sparse(
         const int l = (e & 127) >> 5;
         const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
         const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
-        const float a = s_act[ki];
-        acc += a * (float)((int)code - 1);
+        acc += s_act[ki] * (float)((int)code - 1);
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -366,8 +400,35 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_sparse(
     }
 }
 
-// Fused-scaled f32-accumulate variant (v0.6.0 opt #15). Same as above but
-// epilogue folds both weight scale and per-token activation scale in one write.
+// ─── DP4A fused-scaled kernels (v1.x decode opt) ─────────────────────────────
+//
+// The `_scaled` family is only ever launched on **A8-quantized activations**:
+// every call site feeds `d_qact`, the output of `act_quant_tiled_f32` /
+// `rmsnorm_quant_f32` / `act_quant_batch_f32` — integer-valued f32 in
+// [-128, 127] (the W1.58A8 protocol; `act_scale` carries the dequant factor).
+// That precondition lets these kernels run the contraction on the int8 dot-
+// product units via `__dp4a` (sm_61+, under the compute_75 build floor):
+//
+//   * The staging pass converts the integer-valued floats to packed int8x4
+//     words in shared memory (`__float2int_rn` is exact on integers).
+//   * Each lane reads FOUR consecutive qs bytes as two u16 loads (the 66-byte
+//     block stride only guarantees 2-byte alignment) — one byte-once load of
+//     16 trits — and extracts one 2-bit slot across all four bytes at a time:
+//     `(w >> 2*slot) & 0x03030303` then a per-byte `- 1` (`__vsub4`) yields
+//     four int8 trits ∈ {-1,0,+1} ready for one `__dp4a` against the packed
+//     activation word. Lane l owns slot = l/8 and byte quad j = l%8, covering
+//     a whole 256-trit block per iteration with two independent accumulators.
+//   * The int32 accumulate is EXACT (|Σ| ≤ 127·K < 2³¹) and order-independent,
+//     so the result is bit-identical to the previous f32 kernel on this path:
+//     f32 sums of integer-valued products also stayed exact (< 2²⁴), and the
+//     epilogue multiplies are unchanged. Greedy/perplexity gates are unaffected.
+//
+// Measured on the RTX 4090 vs the previous f32 tiled kernel (M=1): ~2.7×–3.9×
+// per shape, reaching ~86% of the weight-bandwidth speed-of-light at
+// N=K=6912. If a future call site ever passes NON-integer activations here,
+// route it to `tq2_0_add_mpgemm_tiled_f32` instead — `__float2int_rn` rounds.
+
+// Fused-scaled variant (v0.6.0 opt #15 epilogue). DP4A contraction, see above.
 extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
     const float* __restrict__ act,
     const unsigned char* __restrict__ weights,
@@ -378,7 +439,8 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
     const int n,
     const int k,
     const int row_bytes) {
-    extern __shared__ float s_act[];
+    extern __shared__ int s_qact[];    // ceil(k/4) packed int8x4 words
+    signed char* s_bytes = (signed char*)s_qact;
 
     const int warps_per_block = blockDim.x / WARP_SIZE;
     const int warp_id = threadIdx.x / WARP_SIZE;
@@ -387,9 +449,12 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
     if (mi >= m) {
         return;
     }
+    // Stage the row as int8 (exact: values are A8-quantized integers). Byte
+    // writes to shared are race-free; the pad up to a word boundary is zeroed.
     const float* arow = act + (long long)mi * k;
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        s_act[i] = arow[i];
+    const int kpad = (k + 3) & ~3;
+    for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
+        s_bytes[i] = (i < k) ? (signed char)__float2int_rn(arow[i]) : 0;
     }
     __syncthreads();
 
@@ -398,29 +463,47 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
         return;
     }
     const unsigned char* wrow = weights + (long long)ni * row_bytes;
-    float acc = 0.0f;
-    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+    int acc0 = 0;
+    int acc1 = 0;
+    const int slot = lane >> 3;        // which 2-bit slot this lane extracts
+    const int j4 = (lane & 7) * 4;     // first of this lane's four qs bytes
+    const int nblocks = k >> 8;        // full 256-trit blocks
+    for (int b = 0; b < nblocks; ++b) {
+        const unsigned char* qs = wrow + b * TQ2_0_BLOCK_BYTES + j4;
+        const unsigned int w0 = (unsigned int)*(const unsigned short*)qs |
+                                ((unsigned int)*(const unsigned short*)(qs + 2) << 16);
+        const unsigned int w1 = (unsigned int)*(const unsigned short*)(qs + 32) |
+                                ((unsigned int)*(const unsigned short*)(qs + 34) << 16);
+        const int kidx = (b << 8) + slot * 32 + j4;
+        acc0 = __dp4a((int)__vsub4((w0 >> (2 * slot)) & 0x03030303u, 0x01010101u),
+                      s_qact[kidx >> 2], acc0);
+        acc1 = __dp4a((int)__vsub4((w1 >> (2 * slot)) & 0x03030303u, 0x01010101u),
+                      s_qact[(kidx + 128) >> 2], acc1);
+    }
+    int acc = acc0 + acc1;
+    // Tail (k % 256 != 0): scalar per-trit decode in exact int math.
+    for (int ki = (k & ~255) + lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
         const int e = ki - block * QK_K;
         const int c = e >> 7;
         const int mm = e & 31;
         const int l = (e & 127) >> 5;
-        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
-        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
-        const float a = s_act[ki];
-        acc += a * (float)((int)code - 1);
+        const unsigned int code =
+            ((unsigned int)wrow[block * TQ2_0_BLOCK_BYTES + c * 32 + mm] >> (2 * l)) & 3u;
+        acc += ((int)code - 1) * (int)s_bytes[ki];
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
     if (lane == 0) {
-        out[(long long)mi * n + ni] = acc * scales[ni] * act_scale[mi];
+        out[(long long)mi * n + ni] = (float)acc * scales[ni] * act_scale[mi];
     }
 }
 
-// Sparse-aware variant of `tq2_0_add_mpgemm_tiled_f32_scaled`. Same bitmap
-// skip logic as `tq2_0_add_mpgemm_tiled_f32_sparse` — see that kernel's doc
-// for the bitmap layout. NULL bitmap → identical to the non-sparse variant.
+// Sparse-aware variant of `tq2_0_add_mpgemm_tiled_f32_scaled`. Same DP4A
+// contraction + integer-valued-activation precondition; same bitmap layout as
+// `tq2_0_add_mpgemm_tiled_f32_sparse` (one bit per 256-trit block, set = all-
+// zero, skipped). NULL bitmap → identical to the non-sparse variant.
 extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
     const float* __restrict__ act,
     const unsigned char* __restrict__ weights,
@@ -433,7 +516,8 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
     const int k,
     const int row_bytes,
     const int words_per_row) {
-    extern __shared__ float s_act[];
+    extern __shared__ int s_qact[];
+    signed char* s_bytes = (signed char*)s_qact;
 
     const int warps_per_block = blockDim.x / WARP_SIZE;
     const int warp_id = threadIdx.x / WARP_SIZE;
@@ -443,8 +527,9 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
         return;
     }
     const float* arow = act + (long long)mi * k;
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        s_act[i] = arow[i];
+    const int kpad = (k + 3) & ~3;
+    for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
+        s_bytes[i] = (i < k) ? (signed char)__float2int_rn(arow[i]) : 0;
     }
     __syncthreads();
 
@@ -454,8 +539,28 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
     }
     const unsigned char* wrow = weights + (long long)ni * row_bytes;
     const unsigned int* row_bm = block_bitmap ? block_bitmap + (long long)ni * words_per_row : 0;
-    float acc = 0.0f;
-    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+    int acc0 = 0;
+    int acc1 = 0;
+    const int slot = lane >> 3;
+    const int j4 = (lane & 7) * 4;
+    const int nblocks = k >> 8;
+    for (int b = 0; b < nblocks; ++b) {
+        if (row_bm && (row_bm[b / 32] & (1u << (b % 32)))) {
+            continue;
+        }
+        const unsigned char* qs = wrow + b * TQ2_0_BLOCK_BYTES + j4;
+        const unsigned int w0 = (unsigned int)*(const unsigned short*)qs |
+                                ((unsigned int)*(const unsigned short*)(qs + 2) << 16);
+        const unsigned int w1 = (unsigned int)*(const unsigned short*)(qs + 32) |
+                                ((unsigned int)*(const unsigned short*)(qs + 34) << 16);
+        const int kidx = (b << 8) + slot * 32 + j4;
+        acc0 = __dp4a((int)__vsub4((w0 >> (2 * slot)) & 0x03030303u, 0x01010101u),
+                      s_qact[kidx >> 2], acc0);
+        acc1 = __dp4a((int)__vsub4((w1 >> (2 * slot)) & 0x03030303u, 0x01010101u),
+                      s_qact[(kidx + 128) >> 2], acc1);
+    }
+    int acc = acc0 + acc1;
+    for (int ki = (k & ~255) + lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
         if (row_bm && (row_bm[block / 32] & (1u << (block % 32)))) {
             continue;
@@ -464,20 +569,20 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
         const int c = e >> 7;
         const int mm = e & 31;
         const int l = (e & 127) >> 5;
-        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
-        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
-        const float a = s_act[ki];
-        acc += a * (float)((int)code - 1);
+        const unsigned int code =
+            ((unsigned int)wrow[block * TQ2_0_BLOCK_BYTES + c * 32 + mm] >> (2 * l)) & 3u;
+        acc += ((int)code - 1) * (int)s_bytes[ki];
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
     if (lane == 0) {
-        out[(long long)mi * n + ni] = acc * scales[ni] * act_scale[mi];
+        out[(long long)mi * n + ni] = (float)acc * scales[ni] * act_scale[mi];
     }
 }
 
-// Fused-scaled + residual-add f32 variant (v0.7.0 opt Phase 2).
+// Fused-scaled + residual-add variant (v0.7.0 opt Phase 2 epilogue, DP4A
+// contraction — same integer-valued-activation precondition as above).
 // Epilogue: out[mi,ni] = residual[mi,ni] + acc * scales[ni] * act_scale[mi]
 // Eliminates the separate residual_add_f32 kernel launch + its memory pass.
 extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
@@ -491,7 +596,8 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
     const int n,
     const int k,
     const int row_bytes) {
-    extern __shared__ float s_act[];
+    extern __shared__ int s_qact[];
+    signed char* s_bytes = (signed char*)s_qact;
 
     const int warps_per_block = blockDim.x / WARP_SIZE;
     const int warp_id = threadIdx.x / WARP_SIZE;
@@ -501,8 +607,9 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
         return;
     }
     const float* arow = act + (long long)mi * k;
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        s_act[i] = arow[i];
+    const int kpad = (k + 3) & ~3;
+    for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
+        s_bytes[i] = (i < k) ? (signed char)__float2int_rn(arow[i]) : 0;
     }
     __syncthreads();
 
@@ -511,24 +618,40 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
         return;
     }
     const unsigned char* wrow = weights + (long long)ni * row_bytes;
-    float acc = 0.0f;
-    for (int ki = lane; ki < k; ki += WARP_SIZE) {
+    int acc0 = 0;
+    int acc1 = 0;
+    const int slot = lane >> 3;
+    const int j4 = (lane & 7) * 4;
+    const int nblocks = k >> 8;
+    for (int b = 0; b < nblocks; ++b) {
+        const unsigned char* qs = wrow + b * TQ2_0_BLOCK_BYTES + j4;
+        const unsigned int w0 = (unsigned int)*(const unsigned short*)qs |
+                                ((unsigned int)*(const unsigned short*)(qs + 2) << 16);
+        const unsigned int w1 = (unsigned int)*(const unsigned short*)(qs + 32) |
+                                ((unsigned int)*(const unsigned short*)(qs + 34) << 16);
+        const int kidx = (b << 8) + slot * 32 + j4;
+        acc0 = __dp4a((int)__vsub4((w0 >> (2 * slot)) & 0x03030303u, 0x01010101u),
+                      s_qact[kidx >> 2], acc0);
+        acc1 = __dp4a((int)__vsub4((w1 >> (2 * slot)) & 0x03030303u, 0x01010101u),
+                      s_qact[(kidx + 128) >> 2], acc1);
+    }
+    int acc = acc0 + acc1;
+    for (int ki = (k & ~255) + lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
         const int e = ki - block * QK_K;
         const int c = e >> 7;
         const int mm = e & 31;
         const int l = (e & 127) >> 5;
-        const int byte_off = block * TQ2_0_BLOCK_BYTES + c * 32 + mm;
-        const unsigned int code = ((unsigned int)wrow[byte_off] >> (2 * l)) & 3u;
-        const float a = s_act[ki];
-        acc += a * (float)((int)code - 1);
+        const unsigned int code =
+            ((unsigned int)wrow[block * TQ2_0_BLOCK_BYTES + c * 32 + mm] >> (2 * l)) & 3u;
+        acc += ((int)code - 1) * (int)s_bytes[ki];
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
     if (lane == 0) {
         const long long idx = (long long)mi * n + ni;
-        out[idx] = __fadd_rn(residual[idx], acc * scales[ni] * act_scale[mi]);
+        out[idx] = __fadd_rn(residual[idx], (float)acc * scales[ni] * act_scale[mi]);
     }
 }
 

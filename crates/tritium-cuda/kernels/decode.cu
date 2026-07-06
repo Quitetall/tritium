@@ -581,14 +581,31 @@ __global__ void gqa_attention_decode_f32_g(const float* __restrict__ q,    // [n
 // gqa_attention_decode_warp_g — ONE WARP per query head (vs the one-thread-per-head
 // `_g` kernel, which leaves 31/32 of a warp idle). **Bit-identical** to it (modulo the
 // shared `exp_f32`): the parallelism is across keys + output dims, not inside any
-// reduction, so no f32 sum is reordered.
+// f32-SUM reduction, so no f32 sum is reordered.
+//
+// v1.x decode opt — this kernel was the measured decode bottleneck (~62% of decode
+// GPU time): scores lived in GLOBAL memory and the whole softmax ran sequentially
+// on lane 0, including the f64 `exp_f32` (1/64 rate on consumer GPUs) one key at a
+// time. Three bit-exactness-preserving fixes:
+//   * scores are staged in dynamic SHARED memory (`max_ctx · 4` bytes; the launch
+//     is now ONE warp per block so one head's scores fit the 48 KiB default cap
+//     up to max_ctx = 12288). The global `scores` scratch parameter is kept for
+//     launch/graph ABI compatibility but no longer written.
+//   * the max scan is a parallel warp reduction — f32 max is EXACT (no rounding)
+//     and NaN-skipping `fmaxf` matches the sequential `>` scan's NaN behaviour,
+//     so any reduction order yields the bit-identical maximum.
+//   * `exp_f32` is elementwise (not a reduction), so all 32 lanes exponentiate
+//     their own keys in parallel — same input, same function, same bits.
+// Only the softmax SUM is a rounded f32 fold, so it alone stays sequential on
+// lane 0, in the host's j-order, now reading shared instead of global.
+//
 //   * scores: lane-per-key — each lane runs the FULL sequential `head_dim` dot for its
 //     keys (j = lane, lane+32, …), so each dot keeps the host's d-order.
-//   * softmax: lane 0 only, sequential over ctx (same max→exp→sum→divide order).
 //   * weighted sum: lane-per-output-dim — lane `d` sums `Σ_j w[j]·v[j][d]` in the host's
 //     j-order, so each output keeps its order.
-// `__syncwarp` separates the phases. ctrl[2] = cache_len (ctx = +1, limit = cache_len);
-// `scores` is strided by the fixed `max_ctx`.
+// `__syncwarp` separates the phases. ctrl[2] = cache_len (ctx = +1, limit = cache_len).
+// Launch contract: grid.x = n_head, block = 32 (one warp), dynamic shared =
+// max_ctx · 4 bytes.
 __global__ void gqa_attention_decode_warp_g(const float* __restrict__ q,
                                             const float* __restrict__ k,
                                             const float* __restrict__ v,
@@ -598,17 +615,17 @@ __global__ void gqa_attention_decode_warp_g(const float* __restrict__ q,
                                             const int max_ctx, const int n_head,
                                             const int n_head_kv, const int head_dim,
                                             const float scale) {
-  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  extern __shared__ float sc[];  // this head's scores, [max_ctx] (ctx used)
+  (void)scores;                  // legacy global scratch — ABI-compatible, unused
+  const int h = blockIdx.x;      // one warp-block per head
   const int lane = threadIdx.x & 31;
-  if (warp >= n_head) return;
-  const int h = warp;
+  if (h >= n_head) return;
   const int cache_len = ctrl[2];
   const int ctx = cache_len + 1;
   const int limit = cache_len;
   const int n_rep = n_head / n_head_kv;
   const int kv = h / n_rep;
   const float* q_row = q + (long long)h * head_dim;
-  float* sc = scores + (long long)h * max_ctx;
 
   // scores: lane-per-key; each lane's dot is sequential over head_dim (bit-exact).
   for (int j = lane; j < ctx; j += 32) {
@@ -625,22 +642,37 @@ __global__ void gqa_attention_decode_warp_g(const float* __restrict__ q,
   }
   __syncwarp();
 
-  // softmax: lane 0 only, in the host's sequential order.
+  // max: parallel warp reduction — exact for f32 (max never rounds), and
+  // `fmaxf(m, NaN) == m` skips NaN exactly like the sequential `>` scan did.
+  float m = -INFINITY;
+  for (int j = lane; j < ctx; j += 32) {
+    m = fmaxf(m, sc[j]);
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+  }
+
+  // exp: elementwise, parallel across lanes — identical `exp_f32` bits per key.
+  for (int j = lane; j < ctx; j += 32) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], m));
+  }
+  __syncwarp();
+
+  // sum: the ONE rounded f32 fold — sequential on lane 0 in the host's j-order.
+  __shared__ float s_inv;
   if (lane == 0) {
-    float m = -INFINITY;
-    for (int j = 0; j < ctx; ++j) {
-      if (sc[j] > m) m = sc[j];
-    }
     float sum = 0.0f;
     for (int j = 0; j < ctx; ++j) {
-      const float e = exp_f32(__fsub_rn(sc[j], m));
-      sc[j] = e;
-      sum = __fadd_rn(sum, e);
+      sum = __fadd_rn(sum, sc[j]);
     }
-    const float inv = __fdiv_rn(1.0f, sum);
-    for (int j = 0; j < ctx; ++j) {
-      sc[j] = __fmul_rn(sc[j], inv);
-    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncwarp();
+
+  // normalize: elementwise, parallel.
+  const float inv = s_inv;
+  for (int j = lane; j < ctx; j += 32) {
+    sc[j] = __fmul_rn(sc[j], inv);
   }
   __syncwarp();
 

@@ -255,11 +255,112 @@ to ~244).
 
 ---
 
+### v1.x — DP4A decode mpGEMM + byte-once f32 decode ✅
+
+**Files:** `crates/tritium-cuda/kernels/tq2_0_add.cu`
+
+**Finding (profile-driven):** `nsys --cuda-graph-trace=node` on the e2e decode
+bench showed `tq2_0_add_mpgemm_tiled_f32_scaled` as the top GPU-time kernel.
+Root cause: the lane-per-`ki += 32` stride re-read the *same* qs byte four
+times (TQ2_0 stores the trits at e, e+32, e+64, e+96 in one byte's four 2-bit
+slots) and burned index math + I2F per trit.
+
+**Changes:**
+1. **DP4A rewrite of the `_scaled` family** (`_f32_scaled`, `_f32_scaled_residual`,
+   `_f32_scaled_sparse`). These kernels are only ever launched on A8-quantized
+   activations (integer-valued f32 in [-128,127] from `act_quant_*` /
+   `rmsnorm_quant_f32`), so the staging pass converts them to packed int8x4 in
+   shared memory (`__float2int_rn` is exact on integers) and the K loop runs
+   `(w >> 2·slot) & 0x03030303` → `__vsub4` → `__dp4a` — 4 trits per
+   instruction, each qs byte read once, int32 accumulate. The int32 sum is
+   EXACT and order-independent, and the old f32 sum was also exact on this
+   path (|Σ| ≤ 127·6912 < 2²⁴), so outputs are **bit-identical** — perplexity
+   ours=1.398684 unchanged to the last digit.
+2. **Byte-once restructure of the arbitrary-float kernels** (`_f32`,
+   `_f32_sparse`): each lane reads its chunk byte once and consumes all four
+   slots as FMAs. Public-path semantics unchanged (1e-4 tolerance gate).
+
+**Kernel-only (standalone cudaEvent harness, 4090, M=1):**
+
+| shape (N,K) | before | byte-once | dp4a | SOL (weights/1008GB/s) |
+|---|---|---|---|---|
+| 2560,2560 | 11.95µs | 6.43µs | **3.88µs** | 1.68µs |
+| 6912,2560 | 21.90µs | 11.00µs | **6.27µs** | 4.53µs |
+| 2560,6912 | 28.27µs | 13.51µs | **8.33µs** | 4.53µs |
+| 6912,6912 | 55.14µs | 29.11µs | **14.17µs** | 12.22µs (86% of SOL) |
+
+**In-model (nsys, same eval workload):** GEMM total 11.01ms → 4.71ms (2.34×),
+median instance 33.5µs → 13.7µs; GEMM share of GPU time 75% → 54%.
+
+**Verification:** 51/51 tritium-cuda tests, tritium-nn greedy 32/32 vs
+transformers, cpu_cuda_parity, e2e perplexity bit-identical.
+
+---
+
+### v1.x — decode attention: shared scores + parallel max/exp ✅
+
+**Files:** `crates/tritium-cuda/kernels/decode.cu` (`gqa_attention_decode_warp_g`),
+`crates/tritium-cuda/src/cuda.rs` (both launch sites)
+
+**Finding:** after the GEMM fix, node-level graph profiling showed the warp
+attention kernel at **61.6% of decode GPU time** (233µs median per layer call).
+Causes: scores staged in *global* memory, and the whole softmax — including the
+f64 `exp_f32` (1/64 rate on the 4090) — ran sequentially on lane 0, one key at
+a time.
+
+**Change (bit-exactness preserving):**
+- scores staged in dynamic shared memory; launch geometry changed from
+  8-warps/256-thread blocks to ONE warp-block per head with
+  `max_ctx·4` dynamic shared bytes (fits the 48 KiB cap up to max_ctx=12288).
+  The global `scores` scratch stays in the ABI but is no longer written.
+- max scan → parallel warp reduction (f32 max never rounds; `fmaxf` skips NaN
+  exactly like the sequential `>` scan).
+- `exp_f32` → elementwise-parallel across all 32 lanes (same function, same
+  bits per key).
+- ONLY the softmax sum (the one rounded f32 fold) stays sequential on lane 0
+  in the host's j-order — now reading shared instead of global.
+
+| metric | before | after |
+|---|---|---|
+| median per call (nsys node) | 232.8µs | 74.0µs (**3.1×**) |
+| share of decode GPU time | 61.6% | 32.7% |
+
+**Verification:** same suite as above; perplexity bit-identical (the kernel is
+bit-identical by construction).
+
+---
+
+### Combined effect (this pass)
+
+| metric | before | after |
+|---|---|---|
+| e2e decode (4090, cuda-graph, desktop-contended box) | ~143–161 tok/s | ~165–185 tok/s |
+| e2e prefill | ~405 tok/s | ~535 tok/s |
+| decode GPU-time profile | GEMM 75% | attn 33% / rmsnorm 32% / lm_head 12% / GEMM 20% |
+
+The e2e wall clock on this box carries ±10% noise from the desktop sharing the
+GPU; the kernel-level medians above are the authoritative deltas.
+
+---
+
 ## Still open (from the full optimization scan)
 
-See the conversation for the complete list of 29 findings across CUDA, CPU, and
-training paths. Highest-impact remaining:
-
-1. **M=N batch fusion** (CUDA, Q/K/V + gate/up in single GEMM)
-2. **AVX2 GEMM SIMD accumulator** (4-8× CPU GEMM win)
-3. **Fuse residual add into GEMM epilogue** (CUDA, 2 launches/layer saved)
+1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time
+   (12µs × 4/layer × 30 layers ≈ 1.45ms/token). Blocked by the bit-match
+   contract: the f32 sum-of-squares must fold in the host's order. Unblocking
+   requires changing the HOST (and every backend + goldens) to a documented
+   pairwise/tree order — a cross-cutting numerics RFC, not a kernel patch.
+2. **Attention phase 1/3 memory locality** — k-row reads are uncoalesced
+   (lane-per-key × sequential d). A warp-per-key staging pass (or 2-key ILP)
+   could take the remaining 74µs/call down further; bit-exact per-key d-order
+   must be kept.
+3. **AVX2 GEMM SIMD accumulator** (CPU) — blocked by the same bit-exact
+   sequential-fold contract (`to_bits` equality tests). Same RFC as (1). Note:
+   on the CPU decode path activations are also integer-valued int8 quants, so
+   an AVX2-VNNI (`vpdpbusd`) path would be exact and order-independent — the
+   contract question is only about the public arbitrary-f32 `mpgemm`.
+4. **IMMA prefill kernel** — one warp per block, one 16×8 tile; B tiles
+   re-unpacked per m-tile. Multi-warp blocks + B reuse should lift the
+   compute-bound prefill sharply.
+5. **lm_head_warp_f16** — already at ~100% of the 656 MB/token f16 read SOL;
+   only a format change (e.g. ternary-quantized tied head) moves it.

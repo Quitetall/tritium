@@ -4258,12 +4258,14 @@ impl CudaDecodeModel {
             n_head_kv as i32,
             head_dim as i32,
         );
-        // Warp-per-head: 256-thread block = 8 warps, grid = ceil(n_head/8).
-        let grid = ((n_head as u32).div_ceil(8), 1, 1);
+        // One warp-block per head: the kernel stages the head's scores in dynamic
+        // shared memory (`max_ctx * 4` bytes), so each head needs its own block to
+        // stay under the 48 KiB default dynamic-shared cap. `scores` is the legacy
+        // global scratch, kept for ABI compatibility (the kernel no longer writes it).
         let cfg = LaunchConfig {
-            grid_dim: grid,
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
+            grid_dim: (n_head as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: (max_ctx * 4) as u32,
         };
         let mut l = stream.launch_builder(func);
         l.arg(q)
@@ -6665,8 +6667,11 @@ impl CudaDecodeModel {
             self.head_dim as i32,
         );
         let scale = self.attn_scale;
-        // Warp-per-head: a 256-thread block holds 8 warps, so grid covers ceil(n_head/8).
-        let grid = ((self.n_head as u32).div_ceil(8), 1, 1);
+        // One warp-block per head: the kernel stages the head's scores in dynamic
+        // shared memory (`max_ctx * 4` bytes) — see `launch_attention`. `scores`
+        // stays in the arg list for ABI compatibility (no longer written).
+        let grid = (self.n_head as u32, 1, 1);
+        let smem = (self.max_ctx * 4) as u32;
         let mut params = [
             pp(&q),
             pp(&k),
@@ -6683,8 +6688,8 @@ impl CudaDecodeModel {
         raw_launch(
             self.raw().attn_g,
             grid,
-            (256, 1, 1),
-            0,
+            (32, 1, 1),
+            smem,
             self.cap_stream.cu_stream(),
             &mut params,
         )
