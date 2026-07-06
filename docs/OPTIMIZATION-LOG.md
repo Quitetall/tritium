@@ -335,7 +335,7 @@ bit-identical by construction).
 | metric | before | after |
 |---|---|---|
 | e2e decode (4090, cuda-graph, desktop-contended box) | ~143–161 tok/s | ~165–185 tok/s |
-| e2e prefill | ~405 tok/s | ~535 tok/s |
+| e2e prefill | ~405 tok/s | ~651 tok/s (median; after right-sizing dp4a launch shared to ceil(k/4)·4 bytes) |
 | decode GPU-time profile | GEMM 75% | attn 33% / rmsnorm 32% / lm_head 12% / GEMM 20% |
 
 The e2e wall clock on this box carries ±10% noise from the desktop sharing the
