@@ -379,6 +379,38 @@ GPU; the kernel-level medians above are the authoritative deltas.
    `cpu_cuda_parity` fails (only one side changed — the RFC moves host +
    backends together). Decision pending; see docs/adr/0018.
 
+### v1.x round 3 — ADR 0018 landed + BASTION tree-verify (commits 96d7ddf, bf3f9a8)
+
+1. **ADR 0018 accepted + implemented**: rmsnorm sum-of-squares folds in the
+   canonical 256-slot tree order on host AND all five CUDA rmsnorm kernels.
+   rmsnorm_quant med 12.2 → 6.3µs; cross-backend bit-parity holds by
+   construction (cpu_cuda_parity green). The 256-token greedy-vs-transformers
+   gate re-baselined to a ≥96-token exact prefix (measured divergence at 104,
+   into an equally coherent continuation; the tree sum is strictly MORE
+   accurate — perplexity rel err 2.957e-3 → 2.659e-4).
+2. **BASTION greedy tree-verify primitive (ADR 0014)**: gqa_attention_tree_f32
+   + CudaDecodeModel::tree_verify_greedy — one batched forward verifies a
+   draft token tree, promotes the accepted path's KV, O(1) rollback.
+   Losslessness gate green across chains/branches/partial/full rejects.
+   Sampling accept rule + the end-to-end speedup bench (needs the external
+   block-diffusion drafter) remain open.
+3. **Known issue (documented, pre-existing)**: batch-path-produced KV
+   (prefill/tree-verify) differs ~1 ulp from step-produced KV somewhere —
+   verified with production prefill(); flips a near-tie a couple of tokens
+   downstream. Worth a dedicated root-cause pass.
+
+| metric | session start | round 3 end |
+|---|---|---|
+| e2e decode | ~161 tok/s | **289–330 tok/s (34–39% of roofline)** |
+| e2e prefill | ~405 tok/s | **~941 tok/s median** |
+| decode GPU profile | GEMM 75% | rms 29 / head 20 (SOL) / GEMM 25 / attn 21 |
+
+Post-ADR profile note: the attention reduce's remaining cost is v-streaming +
+graph-node overhead, NOT the ordered softmax/weighted folds — canonicalizing
+the attention sums (ADR 0018's "next candidate") measures as low-value now.
+The remaining levers are contract-free: GEMM 60→90% SOL, node-count fusion
+(~460 graph nodes/token), and the IMMA prefill rewrite.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time
