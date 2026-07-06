@@ -737,6 +737,60 @@ __global__ void kv_append_f32(const float* __restrict__ src,
   }
 }
 
+// rope_kv_fused_g — fused q-RoPE + k-RoPE + K/V append for the M=1 decode graph
+// (v1.x node-count opt): replaces FOUR launches per layer (rope q, rope k,
+// kv_append k, kv_append v) with ONE, removing ~90 graph nodes per token.
+// Values are bit-identical to the unfused sequence:
+//   * q pairs rotate exactly as rope_apply_f32_g (same ops, in place);
+//   * k pairs rotate identically and the rotated pair is written DIRECTLY to
+//     the KV arena row ctrl[2] (the append fused at the value level; the k
+//     scratch row is no longer written back — nothing reads it post-append);
+//   * v lanes are the kv_append_f32 pure copy.
+// Thread space: [0, n_head·half) q-rotate | [+, n_head_kv·half) k-rotate+append
+// | [+, kv_width) v-copy.
+__global__ void rope_kv_fused_g(float* __restrict__ q,
+                                const float* __restrict__ k,
+                                const float* __restrict__ v,
+                                float* __restrict__ kv_k_base,  // [max_ctx*kv_width]
+                                float* __restrict__ kv_v_base,  // [max_ctx*kv_width]
+                                const float* __restrict__ cos_table,
+                                const float* __restrict__ sin_table,
+                                const int* __restrict__ ctrl,
+                                const int n_head, const int n_head_kv,
+                                const int head_dim, const int kv_width) {
+  const int half = head_dim >> 1;
+  const int q_total = n_head * half;
+  const int k_total = n_head_kv * half;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int pos = ctrl[1];
+  const long long row = (long long)ctrl[2] * kv_width;
+  if (idx < q_total) {
+    const int head = idx / half;
+    const int j = idx - head * half;
+    const int base = head * head_dim;
+    const float c = cos_table[(long long)pos * half + j];
+    const float s = sin_table[(long long)pos * half + j];
+    const float a = q[base + j];
+    const float b = q[base + j + half];
+    q[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+    q[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+  } else if (idx < q_total + k_total) {
+    const int t = idx - q_total;
+    const int head = t / half;
+    const int j = t - head * half;
+    const int base = head * head_dim;
+    const float c = cos_table[(long long)pos * half + j];
+    const float s = sin_table[(long long)pos * half + j];
+    const float a = k[base + j];
+    const float b = k[base + j + half];
+    kv_k_base[row + base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+    kv_k_base[row + base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+  } else if (idx < q_total + k_total + kv_width) {
+    const int i = idx - q_total - k_total;
+    kv_v_base[row + i] = v[i];
+  }
+}
+
 // gqa_attention_decode_f32_g — like gqa_attention_decode_f32 but cache_len = ctrl[2]
 // (so ctx = cache_len+1, limit = cache_len), and `scores` is strided by the FIXED
 // `max_ctx` (not the per-token `ctx`), since the scratch layout must be constant

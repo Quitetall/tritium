@@ -125,6 +125,9 @@ const KERNEL_NAME_RELU2_GATE: &str = "relu2_gate_f32";
 const KERNEL_NAME_EMBED_G: &str = "embedding_gather_f32_g";
 const KERNEL_NAME_ROPE_G: &str = "rope_apply_f32_g";
 const KERNEL_NAME_KV_APPEND: &str = "kv_append_f32";
+/// Fused q-RoPE + k-RoPE + K/V append for the decode graph (v1.x): one launch
+/// replaces four, bit-identical values (see the kernel doc).
+const KERNEL_NAME_ROPE_KV_FUSED: &str = "rope_kv_fused_g";
 /// Warp-per-head GQA attention for the graph (v0.3.3 perf) — bit-identical to the
 /// one-thread `_g` kernel (parallel across keys/output-dims, no reduction reorder).
 /// v1.x: legacy/fallback — the split scores+reduce pair below is preferred when
@@ -7150,7 +7153,6 @@ impl CudaDecodeModel {
     /// One transformer block, raw-launched into the capture. Mirrors [`layer`](Self::layer).
     fn g_layer(&self, p: &GraphPtrs, l: &LayerPtrs) -> Result<(), BackendError> {
         let (n_embd, q_width, kv_width) = (self.n_embd, self.q_width, self.kv_width);
-        let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
 
         // pre-norm attention. q/k/v are FUSED into one GEMM over `d_normed`; q/k/v are then
         // offset slices of the `[q_width + 2·kv_width]` output `d_qkv` (f32 → 4 bytes/elt).
@@ -7160,10 +7162,11 @@ impl CudaDecodeModel {
         let q_ptr = p.d_qkv;
         let knew_ptr = p.d_qkv + (q_width * 4) as sys::CUdeviceptr;
         let vnew_ptr = p.d_qkv + ((q_width + kv_width) * 4) as sys::CUdeviceptr;
-        self.g_rope(q_ptr, p.d_cos, p.d_sin, p.d_ctrl, n_head, head_dim)?;
-        self.g_rope(knew_ptr, p.d_cos, p.d_sin, p.d_ctrl, n_head_kv, head_dim)?;
-        self.g_kv_append(knew_ptr, l.kv_k, p.d_ctrl, kv_width)?;
-        self.g_kv_append(vnew_ptr, l.kv_v, p.d_ctrl, kv_width)?;
+        // Fused rope(q) + rope(k) + append(k) + append(v): one node, not four
+        // (v1.x node-count opt; values bit-identical to the unfused sequence).
+        self.g_rope_kv(
+            q_ptr, knew_ptr, vnew_ptr, l.kv_k, l.kv_v, p.d_cos, p.d_sin, p.d_ctrl,
+        )?;
         self.g_attn(q_ptr, l.kv_k, l.kv_v, p.d_attn, p.d_scores, p.d_ctrl)?;
         if let Some(sn) = l.attn_sub_norm {
             // Fused sub-norm + quant: skips intermediate attn_sn buffer.
@@ -7352,6 +7355,55 @@ impl CudaDecodeModel {
         )
     }
 
+    /// Fused rope(q)+rope(k)+append(k)+append(v) — one graph node per layer.
+    #[allow(clippy::too_many_arguments)]
+    fn g_rope_kv(
+        &self,
+        q: sys::CUdeviceptr,
+        knew: sys::CUdeviceptr,
+        vnew: sys::CUdeviceptr,
+        kv_k: sys::CUdeviceptr,
+        kv_v: sys::CUdeviceptr,
+        cos_t: sys::CUdeviceptr,
+        sin_t: sys::CUdeviceptr,
+        ctrl: sys::CUdeviceptr,
+    ) -> Result<(), BackendError> {
+        let (nh_i, nhkv_i, hd_i, kw_i) = (
+            self.n_head as i32,
+            self.n_head_kv as i32,
+            self.head_dim as i32,
+            self.kv_width as i32,
+        );
+        let half = self.head_dim / 2;
+        let total = (self.n_head * half + self.n_head_kv * half + self.kv_width) as u32;
+        let grid = (total.div_ceil(256), 1, 1);
+        let mut params = [
+            pp(&q),
+            pp(&knew),
+            pp(&vnew),
+            pp(&kv_k),
+            pp(&kv_v),
+            pp(&cos_t),
+            pp(&sin_t),
+            pp(&ctrl),
+            pp(&nh_i),
+            pp(&nhkv_i),
+            pp(&hd_i),
+            pp(&kw_i),
+        ];
+        // SAFETY: `rope_kv_fused_g(q, k, v, kv_k_base, kv_v_base, cos, sin, ctrl,
+        // n_head, n_head_kv, head_dim, kv_width)`.
+        raw_launch(
+            self.raw().rope_kv,
+            grid,
+            (256, 1, 1),
+            0,
+            self.cap_stream.cu_stream(),
+            &mut params,
+        )
+    }
+
+    #[allow(dead_code)] // superseded by g_rope_kv in the capture; kept for non-fused debugging
     fn g_rope(
         &self,
         x: sys::CUdeviceptr,
@@ -7382,6 +7434,7 @@ impl CudaDecodeModel {
         )
     }
 
+    #[allow(dead_code)] // superseded by g_rope_kv in the capture; kept for non-fused debugging
     fn g_kv_append(
         &self,
         src: sys::CUdeviceptr,
@@ -7664,6 +7717,8 @@ struct RawGraphKernels {
     embed_g: sys::CUfunction,
     rope_g: sys::CUfunction,
     kv_append: sys::CUfunction,
+    /// Fused rope(q)+rope(k)+append(k)+append(v) (v1.x node-count opt).
+    rope_kv: sys::CUfunction,
     attn_g: sys::CUfunction,
     /// v1.x split attention pair (preferred when head_dim % 4 == 0).
     attn_scores_g: sys::CUfunction,
@@ -7713,6 +7768,7 @@ impl RawGraphKernels {
             embed_g: get(dm, KERNEL_NAME_EMBED_G)?,
             rope_g: get(dm, KERNEL_NAME_ROPE_G)?,
             kv_append: get(dm, KERNEL_NAME_KV_APPEND)?,
+            rope_kv: get(dm, KERNEL_NAME_ROPE_KV_FUSED)?,
             // Warp-per-head attention (bit-identical to the one-thread `_g`, just parallel).
             attn_g: get(dm, KERNEL_NAME_ATTN_WARP)?,
             attn_scores_g: get(dm, KERNEL_NAME_ATTN_SCORES)?,

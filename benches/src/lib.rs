@@ -349,7 +349,12 @@ pub const LLAMA_CPP_2B4T_DECODE: Baseline = Baseline {
 /// M>1 decode, not per-kernel tuning, is the next lever.)
 pub const TRITIUM_2B4T_DECODE_4090: Baseline = Baseline {
     name: "tritium 2B4T decode (4090, cuda-graph)",
-    tokens_per_sec: 130.0,
+    // Re-recorded 2026-07-06 after the v1.x decode optimization passes (dp4a i8
+    // GEMMs, split attention, ADR 0018 canonical tree rmsnorm, rope+kv fusion):
+    // measured 289–335 tok/s on the build box; pinned conservatively below the
+    // contended-desktop floor so the >5% gate trips on real regressions, not on
+    // desktop GPU contention. (Previous record: 130.0.)
+    tokens_per_sec: 270.0,
     source: BaselineSource::BuiltOnBox,
 };
 

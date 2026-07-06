@@ -411,6 +411,34 @@ the attention sums (ADR 0018's "next candidate") measures as low-value now.
 The remaining levers are contract-free: GEMM 60→90% SOL, node-count fusion
 (~460 graph nodes/token), and the IMMA prefill rewrite.
 
+### v1.x round 4 — IMMA fragment fix, rope+kv fusion, GEMM chase closed
+
+1. **IMMA fragment u32 loads + B reuse** (3ae7b4c): the AOT kernel + nvrtc
+   template re-packed every mma operand byte-by-byte from shared (~100 SIMT
+   instructions per tensor-core op — why IMMA sat at ~1% of int8 peak). Each
+   fragment register is exactly one aligned little-endian u32 load; the
+   template's inner loop is now nn-major with B-fragment reuse. Candidate
+   space extended to 256×64-class tiles; CODEGEN_REV=2 keys the autotune
+   cache; the sweep takes min-of-8 (contention only inflates — a median can
+   crown the wrong winner and the cache pins it, observed on this box).
+   Op-level (transfer-inclusive): M=512 shapes 1.1–1.4×.
+2. **rope+kv fusion**: `rope_kv_fused_g` replaces four graph nodes per layer
+   (rope q, rope k, append k, append v) with one — ~90 nodes/token removed,
+   bit-identical values (k's rotated pair writes straight to the arena).
+3. **Decode GEMM %-chase CLOSED with two measured rejections**: __ldcs
+   streaming hints + 2-block ILP = no gain (like split-K before). The dp4a
+   kernels are at their DRAM-bound limit in-model; microbench SOL% readings
+   above ~85% are L2 artifacts (weights cached across iterations — in-model
+   the 30 layers' ~530 MB defeat L2). Next step requires ncu (needs
+   NVreg_RestrictProfilingToAdminUsers=0 + reboot on this box).
+4. **Regression baseline re-recorded**: 130 → 270 tok/s (measured 289–336;
+   pinned below the contended-desktop floor).
+
+| metric | session start | round 4 end |
+|---|---|---|
+| e2e decode | ~161 tok/s | **~296–336 tok/s** |
+| e2e prefill | ~405 tok/s | ~941 tok/s |
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time
