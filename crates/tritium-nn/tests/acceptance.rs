@@ -779,4 +779,37 @@ fn cuda_batch_and_graph_single_token_bit_identical() {
             "batch/graph logit bit mismatch at vocab idx {i}: graph={a} batch={b}"
         );
     }
+
+    // Eager-path cross-check on the same token: the eager `step` keeps the
+    // UNFUSED rope + kv_append sequence (the graph uses `rope_kv_fused_g`), so
+    // agreement here exercises the fused kernel against its unfused reference
+    // at the state level. Logits cannot be bit-compared and near-tie argmaxes
+    // can legitimately flip — eager reads the f32 LM-head table, the graph the
+    // f16 one (a designed difference; a flip was observed on this very prompt)
+    // — so the gate is the same 2e-3 relative bound as cpu↔cuda parity: a
+    // fused-kernel state bug (wrong/missing KV row) lands orders of magnitude
+    // past it, while the head-table delta stays well inside.
+    let mut r3 = load_on("cuda", &bytes).expect("runner3");
+    r3.forward(&prompt, &positions).expect("prefill3");
+    let l_eager = r3
+        .resident_cuda()
+        .expect("resident")
+        .expect("cuda")
+        .step(t, p)
+        .expect("eager step");
+    // Full-vocab max_rel_err is the wrong metric across the two head tables
+    // (near-zero logits make the relative error blow up on f16-vs-f32 rounding
+    // alone); a state bug shows in the DECISION region. Gate the graph's top-16
+    // logits: eager must agree there within the cpu↔cuda parity bound.
+    let mut order: Vec<usize> = (0..l_step.len()).collect();
+    order.sort_by(|&a, &b| l_step[b].partial_cmp(&l_step[a]).expect("finite logits"));
+    for &i in order.iter().take(16) {
+        let (g, e) = (l_step[i], l_eager[i]);
+        let rel = (g - e).abs() / g.abs().max(1e-6);
+        assert!(
+            rel <= 2e-3,
+            "eager/graph top-logit rel err {rel:.3e} > 2e-3 at vocab idx {i} \
+             (graph={g} eager={e}) — fused rope+kv vs unfused drifted?"
+        );
+    }
 }

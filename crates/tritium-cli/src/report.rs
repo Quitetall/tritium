@@ -19,7 +19,11 @@ use crate::{ReportFormat, SaltSensitivityArg};
 
 const RTX_4090_PEAK_HBM_BW_BYTES_PER_SEC: f64 = 1008.0e9;
 const BITNET_2B4T_I2S_BYTES: f64 = 1_187_801_280.0;
-const TRITIUM_2B4T_DECODE_4090_BASELINE: f64 = 142.0;
+/// Keep in sync with `tritium_benches::TRITIUM_2B4T_DECODE_4090` (the CLI does
+/// not depend on the bench crate). Re-recorded 2026-07-06 after the v1.x decode
+/// passes (measured 289–336 tok/s on the build box; pinned below the
+/// contended-desktop floor).
+const TRITIUM_2B4T_DECODE_4090_BASELINE: f64 = 270.0;
 
 #[derive(Debug, Serialize)]
 struct DecodeReport {

@@ -1890,6 +1890,14 @@ impl CudaBackend {
                 )));
             }
         }
+        // RoPE (and the fused rope+kv graph kernel) rotates (j, j+half) pairs;
+        // an odd head_dim would leave the last arena element unwritten. The CPU
+        // op rejects it too — reject here so the CUDA path can't load one.
+        if head_dim % 2 != 0 {
+            return Err(BackendError::InvalidInput(format!(
+                "decode model head_dim={head_dim} must be even (RoPE pairs)"
+            )));
+        }
         if spec.token_embd.len() != vocab * n_embd {
             return Err(BackendError::ShapeMismatch {
                 expected: vocab * n_embd,
@@ -3863,6 +3871,18 @@ impl CudaDecodeModel {
         }
         let n_embd = self.n_embd;
         let eps = self.rms_eps;
+
+        // Populate the control block BEFORE the layer loop: the attention kernels
+        // (`launch_attention` → the ctrl-driven split/warp kernels) read
+        // `cache_len` from `d_ctrl[2]`. This was silently missing — the eager step
+        // attended against whatever ctrl the last graph/batch call left behind
+        // (ctx = 1 on a fresh model), masked because the runner always routes
+        // decode through `step_graph`; caught by the eager↔graph cross-check in
+        // `cuda_batch_and_graph_single_token_bit_identical`.
+        let ctrl = [token as i32, pos as i32, self.cache_len as i32, 0i32];
+        self.stream
+            .memcpy_htod(&ctrl, &mut self.d_ctrl)
+            .map_err(|e| driver_err("decode eager ctrl htod", &e))?;
 
         // Embedding gather: d_x = token_embd[token].
         Self::launch_embed(
