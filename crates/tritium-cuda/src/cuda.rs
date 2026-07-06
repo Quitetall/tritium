@@ -350,7 +350,7 @@ pub struct CudaBackend {
     /// Sparse-aware fused-scaled f32-tiled kernel: bitmap skip + act_scale fold.
     #[allow(dead_code)]
     // validated sparse fused-scaled kernel; auto-dispatch integration is future (1.x) work
-    func_tiled_f32_scaled_sparse: CudaFunction,
+    func_tiled_i8_scaled_sparse: CudaFunction,
     /// The resolved `tq2_0_imma_mpgemm` kernel (IMMA int8 tensor-core prefill).
     func_imma: CudaFunction,
     /// The resolved `act_quant_int8_per_token` kernel (on-device W1.58A8 quant).
@@ -469,7 +469,7 @@ impl CudaBackend {
         let func_tiled_f32_sparse = module
             .load_function(KERNEL_NAME_TILED_F32_SPARSE)
             .map_err(|e| driver_err("resolve tq2_0_add_tiled_f32_sparse kernel", &e))?;
-        let func_tiled_f32_scaled_sparse = module
+        let func_tiled_i8_scaled_sparse = module
             .load_function(KERNEL_NAME_TILED_I8_SCALED_SPARSE)
             .map_err(|e| driver_err("resolve tq2_0_add_tiled_i8_scaled_sparse kernel", &e))?;
 
@@ -569,7 +569,7 @@ impl CudaBackend {
             func_tiled_scaled,
             func_salt,
             func_tiled_f32_sparse,
-            func_tiled_f32_scaled_sparse,
+            func_tiled_i8_scaled_sparse,
             func_imma,
             func_act_quant,
             _decode_module: decode_module,
@@ -1860,6 +1860,18 @@ impl CudaBackend {
         let half = head_dim / 2;
 
         // Validate the dense shapes the kernels assume.
+        // The i8 dp4a GEMMs read activation rows (`qact + mi*k`) as 4-byte words,
+        // so every dimension that can be a batched row stride must be a multiple
+        // of 4 — otherwise odd rows misalign and the first prefill/batch decode
+        // dies with a cryptic CUDA misaligned-address fault. Reject at build.
+        for (dim, name) in [(n_embd, "n_embd"), (q_width, "q_width"), (n_ff, "n_ff")] {
+            if dim % 4 != 0 {
+                return Err(BackendError::InvalidInput(format!(
+                    "decode model {name}={dim} is not a multiple of 4; the int8 \
+                     dp4a GEMMs require 4-byte-aligned activation rows"
+                )));
+            }
+        }
         if spec.token_embd.len() != vocab * n_embd {
             return Err(BackendError::ShapeMismatch {
                 expected: vocab * n_embd,
@@ -4119,7 +4131,7 @@ impl CudaDecodeModel {
             .arg(&n_i)
             .arg(&mut *d_qact)
             .arg(&mut *d_act_scale);
-        // SAFETY: `rmsnorm_quant_f32(x, w, eps, n, q_out, act_scale)`.
+        // SAFETY: `rmsnorm_quant_i8(x, w, eps, n, q_out /* i8 */, act_scale)`.
         #[allow(unsafe_code)]
         unsafe {
             l.launch(cfg)
@@ -4153,7 +4165,7 @@ impl CudaDecodeModel {
                 .arg(&k_i)
                 .arg(&mut *d_qact)
                 .arg(&mut *d_act_scale);
-            // SAFETY: `act_quant_tiled_f32(const float* act, int k, float* q, float* scale)`.
+            // SAFETY: `act_quant_tiled_i8(const float* act, int k, signed char* q, float* scale)`.
             #[allow(unsafe_code)]
             unsafe {
                 l.launch(cfg)
@@ -4180,8 +4192,8 @@ impl CudaDecodeModel {
                 .arg(&n_i)
                 .arg(&k_i)
                 .arg(&rb_i);
-            // SAFETY: `tq2_0_add_mpgemm_tiled_scaled(act, weights, scales, act_scale,
-            // out, m, n, k, row_bytes)`.
+            // SAFETY: `tq2_0_add_mpgemm_tiled_i8_scaled(qact /* i8 */, weights, scales,
+            // act_scale, out, m, n, k, row_bytes)`.
             #[allow(unsafe_code)]
             unsafe {
                 l.launch(cfg)
@@ -4212,7 +4224,7 @@ impl CudaDecodeModel {
             .arg(&k_i)
             .arg(&mut *d_qact)
             .arg(&mut *d_act_scale);
-        // SAFETY: `act_quant_tiled_f32(const float* act, int k, float* q, float* scale)`.
+        // SAFETY: `act_quant_tiled_i8(const float* act, int k, signed char* q, float* scale)`.
         #[allow(unsafe_code)]
         unsafe {
             l.launch(cfg)
@@ -4252,7 +4264,7 @@ impl CudaDecodeModel {
                 .arg(&n_i)
                 .arg(&k_i)
                 .arg(&rb_i);
-            // SAFETY: `tq2_0_add_mpgemm_tiled_f32_scaled(act, weights, scales,
+            // SAFETY: `tq2_0_add_mpgemm_tiled_i8_scaled(qact /* i8 */, weights, scales,
             // act_scale, out, m, n, k, row_bytes)`.
             #[allow(unsafe_code)]
             unsafe {
