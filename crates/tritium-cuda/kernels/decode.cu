@@ -1423,6 +1423,78 @@ __global__ void gqa_attention_batch_f32(const float* __restrict__ q, const float
   }
 }
 
+// gqa_attention_tree_f32 — BASTION tree-verify attention (ADR 0014).
+// N draft-tree nodes share the committed prefix KV; node `row` attends
+// `[0, prefix_len)` (the shared prefix, in arena order) followed by its
+// ancestor chain INCLUDING itself (arena slot indices `anc[row*max_anc + t]`,
+// `t < n_anc[row]`, root-first). Same per-key d-order dots, host-order softmax
+// fold, and j-order weighted sums as `gqa_attention_batch_f32` — for a CHAIN
+// tree (anc = prefix_len+0..=prefix_len+row) the key sequence is exactly the
+// batch kernel's `[0, ctx)`, so chain-tree output is bit-identical to the
+// batched prefill attention (the ADR 0014 parity gate).
+__global__ void gqa_attention_tree_f32(const float* __restrict__ q, const float* __restrict__ k,
+                                       const float* __restrict__ v, float* __restrict__ out,
+                                       float* __restrict__ scores,
+                                       const int* __restrict__ anc,    // [m, max_anc] arena slots
+                                       const int* __restrict__ n_anc,  // [m] = depth+1
+                                       const int ctx_max, const int n_head, const int n_head_kv,
+                                       const int head_dim, const float scale,
+                                       const int prefix_len, const int max_anc, const int m) {
+  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const long long total = (long long)m * n_head;
+  if (warp >= total) return;
+  const int row = warp / n_head;
+  const int h = warp - (long long)row * n_head;
+  const int na = n_anc[row];
+  const int ctx = prefix_len + na;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float* q_row = q + ((long long)row * n_head + h) * head_dim;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * ctx_max;
+
+  for (int j = lane; j < ctx; j += 32) {
+    const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+    const float* k_row = k + ((long long)slot * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot = __fadd_rn(dot, __fmul_rn(q_row[d], k_row[d]));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+  __syncwarp();
+  if (lane == 0) {
+    float mx = -INFINITY;
+    for (int j = 0; j < ctx; ++j) {
+      if (sc[j] > mx) mx = sc[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float e = exp_f32(__fsub_rn(sc[j], mx));
+      sc[j] = e;
+      sum = __fadd_rn(sum, e);
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+    for (int j = 0; j < ctx; ++j) {
+      sc[j] = __fmul_rn(sc[j], inv);
+    }
+  }
+  __syncwarp();
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    float acc = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      if (w == 0.0f) continue;
+      const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+      const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+      acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+    }
+    o_row[d] = acc;
+  }
+}
+
 // ===========================================================================
 // v0.3.7: M=N batched DECODE kernels — N concurrent sequences, one token each per step.
 // Unlike prefill (one sequence, all rows share the growing KV), each row r is a distinct

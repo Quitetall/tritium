@@ -113,7 +113,9 @@ fn perplexity(runner: &mut ModelRunner, eval_ids: &[u32]) -> f64 {
 }
 
 /// RMSNorm each `[e]` row of `x` (`[rows, e]`): `out = x / sqrt(mean(x²)+eps) · w`.
-/// Replicates `tritium_nn::ops::rmsnorm` (private) so it matches the model's forward.
+/// Same formula as `tritium_nn::ops::rmsnorm` with a plain sequential sum — NOT
+/// bit-identical since ADR 0018 (canonical tree order); fine here, every assertion
+/// in this gate is loss/perplexity-threshold based, not bit-based.
 fn rmsnorm_rows(x: &[f32], w: &[f32], eps: f32, e: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; x.len()];
     for (xr, or) in x.chunks_exact(e).zip(out.chunks_exact_mut(e)) {

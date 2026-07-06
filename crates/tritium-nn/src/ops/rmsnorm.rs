@@ -5,7 +5,7 @@ use crate::error::NnError;
 /// Slots in the canonical reduction order (ADR 0018). Mirrors the 256-thread
 /// blocks every backend rmsnorm kernel launches with — slot `t` on the host is
 /// thread `t` on the device, so the fold order is identical by construction.
-pub const CANONICAL_REDUCE_SLOTS: usize = 256;
+pub(crate) const CANONICAL_REDUCE_SLOTS: usize = 256;
 
 /// Sum of squares in the **canonical cross-backend order** (ADR 0018):
 /// slot `t` folds `x[t], x[t+256], …` in ascending index order (f32 multiply

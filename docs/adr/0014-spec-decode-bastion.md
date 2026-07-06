@@ -1,6 +1,13 @@
 # ADR 0014 — Speculative decoding: BASTION-style tree verify (Tritium = verifier)
 
-- **Status:** Proposed
+- **Status:** Partially implemented (2026-07-06) — the **greedy tree-verify
+  primitive** is live: `CudaDecodeModel::tree_verify_greedy` (batched M=N tree
+  forward via `gqa_attention_tree_f32` ancestor-masked attention, provisional
+  K/V rows past the watermark, accepted-path promote + O(1) rollback), gated by
+  `cuda_tree_verify_greedy_lossless` (chains, branches, partial + full rejects
+  all commit the exact plain-greedy stream). Still pending: the
+  speculative-SAMPLING accept rule, and the end-to-end speedup gate (needs the
+  external block-diffusion drafter).
 - **Date:** 2026-06-20
 - **Deciders:** Brian Lam
 - **Relates:** builds on the M=N batched decode (v0.3.7) + split-KV flash-decoding attention
@@ -10,7 +17,8 @@
 
 ## Status
 
-Proposed — **not started**, no code. Unblocked only once v0.4.1 is tagged: the tree-verify
+Greedy verifier landed (see Status above); the remainder of this section
+describes the original full scope. Unblocked only once v0.4.1 is tagged: the tree-verify
 attention is a direct sibling of the split-KV attention (it reuses the partial+combine structure and
 the M=N KV layout), so the split-KV kernels must be in production and gated first. This ADR fixes the
 **scope and the validation regime**; it does not schedule implementation against the capability

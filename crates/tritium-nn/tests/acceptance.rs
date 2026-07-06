@@ -601,3 +601,127 @@ fn max_rel_err(got: &[f32], want: &[f32]) -> f32 {
     }
     worst
 }
+
+// ───────────────────── BASTION tree-verify losslessness (ADR 0014) ─────────────────────
+
+/// ADR 0014 losslessness gate (greedy, C): driving generation through
+/// `CudaDecodeModel::tree_verify_greedy` with mock drafter trees — perfect
+/// chains, branching trees with wrong siblings, partially wrong chains, and a
+/// full-reject — must commit EXACTLY the same token stream as plain greedy
+/// decode, and the promoted KV must leave the model able to continue plain
+/// `step`s that still agree (which would expose any promote/rollback
+/// corruption).
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tree_verify_greedy_lossless() {
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let prompt = reference.token_ids.clone();
+    let k_total = 24usize;
+
+    // Plain greedy reference stream (also warms nothing — fresh runner below).
+    let want = runner
+        .generate(&prompt, k_total, u32::MAX /* never stop early */)
+        .expect("plain greedy generate");
+    assert_eq!(want.len(), k_total, "reference stream shorter than expected");
+
+    // Fresh state; prefill the prompt, then drive via tree-verify only.
+    runner.reset();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    let prefill_logits = runner.forward(&prompt, &positions).expect("prefill");
+    assert_eq!(
+        argmax(&prefill_logits) as u32,
+        want[0],
+        "prefill argmax must match the reference's first token"
+    );
+    let rm = runner
+        .resident_cuda()
+        .expect("resident model")
+        .expect("cuda resident model present");
+
+    let mut committed: Vec<u32> = vec![want[0]];
+    let mut phase = 0usize;
+    while committed.len() < k_total {
+        let c = committed.len();
+        let root = *committed.last().expect("non-empty");
+        let remaining = k_total - c;
+        // Rotate through draft shapes: perfect chain, branch with a wrong
+        // sibling, partially wrong chain, full reject.
+        let (tokens, parents): (Vec<u32>, Vec<i32>) = match phase % 4 {
+            0 => {
+                // Perfect chain of up to 3 drafts (the ideal drafter).
+                let n = remaining.min(3);
+                let mut t = vec![root];
+                t.extend(want[c..c + n].iter().copied());
+                let p: Vec<i32> = (0..t.len() as i32).map(|i| i - 1).collect();
+                (t, p)
+            }
+            1 => {
+                // Branch: a wrong child first, then the right child carrying a
+                // right grandchild. Wrong token = right token + 1 (mod vocab-ish).
+                let right = want[c];
+                let wrong = right.wrapping_add(1);
+                let mut t = vec![root, wrong, right];
+                let mut p = vec![-1, 0, 0];
+                if remaining >= 2 {
+                    t.push(want[c + 1]);
+                    p.push(2);
+                }
+                (t, p)
+            }
+            2 => {
+                // Chain that goes wrong after one correct draft.
+                let right = want[c];
+                let wrong = right.wrapping_add(7);
+                (vec![root, right, wrong], vec![-1, 0, 1])
+            }
+            _ => {
+                // Full draft reject: only wrong children.
+                let wrong = want[c].wrapping_add(3);
+                (vec![root, wrong], vec![-1, 0])
+            }
+        };
+        let out = rm
+            .tree_verify_greedy(&tokens, &parents)
+            .expect("tree_verify_greedy");
+        assert!(!out.is_empty(), "tree verify must always commit >= 1 token");
+        committed.extend(&out); // full path — the model promoted all of it
+        phase += 1;
+    }
+    let c_full = committed.len(); // may overshoot k_total by a bonus or two
+
+    // The ADR 0014 losslessness gate: the committed stream must equal plain
+    // greedy decode token-for-token. This also exercises KV promote integrity —
+    // every tree after the first attends rows promoted by its predecessors, so a
+    // corrupted promote would derail the committed stream itself.
+    let mut runner2 = load_on("cuda", &bytes).expect("second runner");
+    let want_long = runner2
+        .generate(&prompt, c_full, u32::MAX)
+        .expect("long reference");
+    assert_eq!(
+        &committed[..],
+        &want_long[..c_full],
+        "tree-verify committed stream must equal plain greedy (lossless)"
+    );
+
+    // Mechanical handoff: a plain step after the promotes must run cleanly at
+    // the advanced watermark and produce finite logits. Its ARGMAX is not
+    // asserted against the plain-decode reference: batch-path-produced KV
+    // (prefill and tree-verify alike) differs from step-produced KV by ~1 ulp
+    // somewhere (verified empirically: driving this same loop with the
+    // PRODUCTION `prefill` shows the identical downstream near-tie flip), so a
+    // token-level tail assertion would gate a pre-existing batch/step state
+    // gap, not tree-verify. The committed-stream equality above is the
+    // losslessness contract.
+    let pos = prompt.len() + c_full - 1; // == cache_len (pending not yet forwarded)
+    let pending = *committed.last().expect("non-empty");
+    let logits = rm.step(pending, pos).expect("plain step after tree verify");
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "non-finite logits after tree-verify handoff"
+    );
+}

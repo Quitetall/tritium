@@ -80,7 +80,7 @@ const KERNEL_NAME_IMMA: &str = "tq2_0_imma_mpgemm";
 /// the fused `mpgemm_with_act_quant` override.
 const KERNEL_NAME_ACT_QUANT: &str = "act_quant_int8_per_token";
 /// The device-resident RMSNorm decode kernel (v0.3.1) — bit-matches the host
-/// `tritium_nn::ops::rmsnorm` (sequential f32 sum-of-squares, no FMA).
+/// `tritium_nn::ops::rmsnorm` (ADR 0018 canonical tree sum-of-squares, no FMA).
 const KERNEL_NAME_RMSNORM: &str = "rmsnorm_f32";
 /// The device-resident RoPE decode kernel (v0.3.1) — bit-matches the host
 /// `tritium_nn::ops::rope_apply` (precomputed f64→f32 trig, f32 rotation, no FMA).
@@ -105,7 +105,8 @@ const KERNEL_NAME_ATTN_COMBINE: &str = "gqa_attention_combine_f32";
 // WIRED BY: mimo 2.5 pro — split-KV attention into M=N decode (plans/0001)
 const ATTN_SPLIT_CHUNK: usize = 64;
 /// On-device int8 activation quant for the tiled (TQ2_0) decode GEMM (v0.3.1) —
-/// bit-matches `ops::quantize_activation_int8` (int8 kept as f32 + per-token scale).
+/// bit-matches `ops::quantize_activation_int8` (int8 kept as f32 + per-token scale);
+/// its rmsnorm-fused sibling folds the sum in the ADR 0018 canonical order.
 const KERNEL_NAME_ACT_QUANT_TILED: &str = "act_quant_tiled_f32";
 const KERNEL_NAME_RMSNORM_QUANT: &str = "rmsnorm_quant_f32";
 /// i8-emitting siblings of the two quants above + the batch quant (v1.x): same
@@ -134,12 +135,15 @@ const KERNEL_NAME_ATTN_WARP: &str = "gqa_attention_decode_warp_g";
 /// measured 2×–9× over it across context lengths. `SCORE_CHUNK` mirrors decode.cu.
 const KERNEL_NAME_ATTN_SCORES: &str = "gqa_attention_scores_g";
 const KERNEL_NAME_ATTN_REDUCE: &str = "gqa_attention_reduce_g";
+/// BASTION tree-verify attention (ADR 0014): batch attention where row `i`
+/// attends the shared prefix + its ancestor slots instead of a contiguous range.
+const KERNEL_NAME_ATTN_TREE: &str = "gqa_attention_tree_f32";
 /// Keys per scores-block — keep in sync with `SCORE_CHUNK` in decode.cu.
 const ATTN_SCORE_CHUNK: usize = 128;
 /// Threads per reduce block — keep ≤ its `s_red[256]` scratch and a power of two.
 const ATTN_REDUCE_THREADS: u32 = 128;
-/// Shared-staged rmsnorm for the graph (v0.3.4 perf) — bit-identical to rmsnorm_f32 (same
-/// sequential sum order, just from shared not global), ~8× faster (latency-bound → not).
+/// Shared-staged rmsnorm for the graph (v0.3.4 perf) — bit-identical to rmsnorm_f32
+/// (same ADR 0018 canonical tree order, just reading a shared stage instead of global).
 const KERNEL_NAME_RMSNORM_SHARED: &str = "rmsnorm_shared_f32";
 /// f16-`token_embd` warp LM head for the graph (v0.3.4 perf) — bit-identical to the f32
 /// warp head (f16 is the GGUF's native precision), halves the 1.3 GB/token table read.
@@ -2043,6 +2047,9 @@ impl CudaBackend {
             f_scale_batch: f(dm, KERNEL_NAME_SCALE_BATCH)?,
             f_kv_append_batch: f(dm, KERNEL_NAME_KV_APPEND_BATCH)?,
             f_attn_batch: f(dm, KERNEL_NAME_ATTN_BATCH)?,
+            f_attn_tree: f(dm, KERNEL_NAME_ATTN_TREE)?,
+            f_lm_head_tiled: f(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
+            f_argmax_rows: f(dm, KERNEL_NAME_ARGMAX_ROWS)?,
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
             f_attn_mdecode: f(dm, KERNEL_NAME_ATTN_MDECODE)?,
@@ -3725,6 +3732,11 @@ pub struct CudaDecodeModel {
     f_scale_batch: CudaFunction,
     f_kv_append_batch: CudaFunction,
     f_attn_batch: CudaFunction,
+    /// Tree-verify attention (ADR 0014) + the batched LM head/argmax it shares
+    /// with the batch-decode graph, resolved eagerly for `tree_verify_greedy`.
+    f_attn_tree: CudaFunction,
+    f_lm_head_tiled: CudaFunction,
+    f_argmax_rows: CudaFunction,
     f_lm_head_f16: CudaFunction,
     f_kv_append_mdecode: CudaFunction,
     #[allow(dead_code)] // kept for fallback; split-KV replaced it in the M=N path
@@ -4954,7 +4966,573 @@ impl CudaDecodeModel {
         Ok(logits)
     }
 
+    /// **BASTION greedy tree-verify** (ADR 0014) — verify a draft token tree in ONE
+    /// batched forward and commit the longest greedy-accepted path.
+    ///
+    /// `tokens[i]` / `parents[i]` describe the tree: node 0 is the single root
+    /// (`parents[0] == -1`) and MUST be the token the caller was about to `step`
+    /// (greedy target semantics: the root is already committed by the caller's
+    /// previous argmax); every other node has `parents[i] < i`. Node `i` is a
+    /// draft candidate for the position after its parent. Duplicate sibling
+    /// tokens are allowed; the first matching child wins.
+    ///
+    /// The whole tree runs as an M=N batched forward (rows = nodes, RoPE at
+    /// `cache_len + depth(i)`, K/V written provisionally at arena rows
+    /// `cache_len + i`) with the tree-masked attention
+    /// (`gqa_attention_tree_f32`): each node attends the committed prefix plus
+    /// its own ancestor chain. Greedy acceptance walks from the root taking the
+    /// child whose token equals the target argmax at the current node; the
+    /// accepted path's K/V rows are then promoted (compacted) into
+    /// `cache_len..cache_len+L` and the watermark advances by `L` — rejected
+    /// rows sit past the watermark and are dead (O(1) rollback).
+    ///
+    /// Returns the `L` newly determined tokens: `out[k]` = target argmax at the
+    /// k-th accepted node. `out[k] == tokens[path[k+1]]` for the accepted
+    /// drafts and `out[L-1]` is the bonus token (feed it back as the next
+    /// root). `L >= 1` always: a full draft reject degenerates to exactly one
+    /// plain greedy step — losslessness is by construction, since every
+    /// returned token IS the target's greedy argmax at its position.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on a malformed tree (root not at 0,
+    /// non-topological parents, out-of-range token) or capacity overflow;
+    /// device errors otherwise.
+    pub fn tree_verify_greedy(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+    ) -> Result<Vec<u32>, BackendError> {
+        let m = tokens.len();
+        if m == 0 || parents.len() != m {
+            return Err(BackendError::InvalidInput(
+                "tree_verify: empty or mismatched parents".into(),
+            ));
+        }
+        if parents[0] != -1 {
+            return Err(BackendError::InvalidInput(
+                "tree_verify: node 0 must be the root (parent -1)".into(),
+            ));
+        }
+        for (i, &p) in parents.iter().enumerate().skip(1) {
+            if p < 0 || p as usize >= i {
+                return Err(BackendError::InvalidInput(format!(
+                    "tree_verify: parents[{i}]={p} is not topological (0 <= parent < i)"
+                )));
+            }
+        }
+        for &t in tokens {
+            if t as usize >= self.vocab {
+                return Err(BackendError::InvalidInput(format!(
+                    "tree_verify token {t} out of range"
+                )));
+            }
+        }
+        if self.cache_len + m > self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "tree_verify overflow: cache_len={} + {m} nodes > max_ctx={}",
+                self.cache_len, self.max_ctx
+            )));
+        }
+
+        // Depths, RoPE positions, and per-node ancestor slot lists (root-first,
+        // including self). Ancestors are arena slots (cache_len + node index).
+        let mut depth = vec![0usize; m];
+        let mut anc: Vec<i32> = vec![0; m * m]; // [m, max_anc=m], row-major
+        let mut n_anc = vec![0i32; m];
+        for i in 0..m {
+            if parents[i] >= 0 {
+                let p = parents[i] as usize;
+                depth[i] = depth[p] + 1;
+                let (dst_off, src_off) = (i * m, p * m);
+                let np = n_anc[p] as usize;
+                // anc[i] = anc[parent] ++ [slot(i)] — split_at_mut for the copy.
+                anc.copy_within(src_off..src_off + np, dst_off);
+                anc[dst_off + np] = (self.cache_len + i) as i32;
+                n_anc[i] = n_anc[p] + 1;
+            } else {
+                anc[i * m] = (self.cache_len + i) as i32;
+                n_anc[i] = 1;
+            }
+        }
+        let positions: Vec<i32> = depth.iter().map(|&d| (self.cache_len + d) as i32).collect();
+
+        let s = &self.stream;
+        let (n_embd, q_width, kv_width, n_ff) =
+            (self.n_embd, self.q_width, self.kv_width, self.n_ff);
+        let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);
+        let prefix_len = self.cache_len;
+        let ctx_max = self.cache_len + m;
+
+        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let d_tokens = s
+            .clone_htod(&tok_i)
+            .map_err(|e| driver_err("tree tokens htod", &e))?;
+        let d_positions = s
+            .clone_htod(&positions)
+            .map_err(|e| driver_err("tree positions htod", &e))?;
+        let d_anc = s
+            .clone_htod(&anc)
+            .map_err(|e| driver_err("tree anc htod", &e))?;
+        let d_nanc = s
+            .clone_htod(&n_anc)
+            .map_err(|e| driver_err("tree n_anc htod", &e))?;
+
+        // M=N scratch (allocated for this verify; freed on return).
+        let alloc =
+            |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
+        let mut d_x = alloc(m * n_embd, "tree d_x")?;
+        let mut d_normed = alloc(m * n_embd, "tree d_normed")?;
+        let mut d_q = alloc(m * q_width, "tree d_q")?;
+        let mut d_k = alloc(m * kv_width, "tree d_k")?;
+        let mut d_v = alloc(m * kv_width, "tree d_v")?;
+        let mut d_attn = alloc(m * q_width, "tree d_attn")?;
+        let mut d_attn_sn = alloc(m * q_width, "tree d_attn_sn")?;
+        let mut d_proj = alloc(m * n_embd, "tree d_proj")?;
+        let mut d_gate = alloc(m * n_ff, "tree d_gate")?;
+        let mut d_up = alloc(m * n_ff, "tree d_up")?;
+        let mut d_gate_sn = alloc(m * n_ff, "tree d_gate_sn")?;
+        let mut d_qact = s
+            .alloc_zeros::<i8>(m * n_ff)
+            .map_err(|e| driver_err("tree d_qact", &e))?;
+        let mut d_act_scale = alloc(m, "tree d_act_scale")?;
+        let mut d_scores = alloc(m * n_head * ctx_max, "tree d_scores")?;
+        let mut d_logits_all = alloc(m * self.vocab, "tree d_logits")?;
+        let mut d_norm_all = alloc(m * n_embd, "tree d_norm_all")?;
+        let mut d_ids = s
+            .alloc_zeros::<i32>(m)
+            .map_err(|e| driver_err("tree d_ids", &e))?;
+
+        Self::bl_embed(
+            s,
+            &self.f_embed_batch,
+            &self.d_token_embd,
+            &d_tokens,
+            n_embd,
+            m,
+            &mut d_x,
+        )?;
+
+        for li in 0..self.layers.len() {
+            Self::bl_rmsnorm(
+                s,
+                &self.f_rmsnorm_batch,
+                &d_x,
+                &self.layers[li].attn_norm,
+                self.rms_eps,
+                n_embd,
+                m,
+                &mut d_normed,
+            )?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                &d_normed,
+                n_embd,
+                m,
+                &mut d_qact,
+                &mut d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled_scaled,
+                &d_qact,
+                &self.layers[li].q,
+                &d_act_scale,
+                m,
+                &mut d_q,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled_scaled,
+                &d_qact,
+                &self.layers[li].k,
+                &d_act_scale,
+                m,
+                &mut d_k,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled_scaled,
+                &d_qact,
+                &self.layers[li].v,
+                &d_act_scale,
+                m,
+                &mut d_v,
+            )?;
+            Self::bl_rope(
+                s,
+                &self.f_rope_batch,
+                &mut d_q,
+                &self.d_cos,
+                &self.d_sin,
+                &d_positions,
+                n_head,
+                head_dim,
+                m,
+            )?;
+            Self::bl_rope(
+                s,
+                &self.f_rope_batch,
+                &mut d_k,
+                &self.d_cos,
+                &self.d_sin,
+                &d_positions,
+                n_head_kv,
+                head_dim,
+                m,
+            )?;
+            // Provisional K/V at arena rows [cache_len, cache_len + m) — node i's
+            // row is cache_len + i regardless of its depth (attention resolves
+            // rows through the ancestor table, not contiguity).
+            Self::bl_kv_append(
+                s,
+                &self.f_kv_append_batch,
+                &d_k,
+                &mut self.kv_k[li],
+                prefix_len,
+                kv_width,
+                m,
+            )?;
+            Self::bl_kv_append(
+                s,
+                &self.f_kv_append_batch,
+                &d_v,
+                &mut self.kv_v[li],
+                prefix_len,
+                kv_width,
+                m,
+            )?;
+            Self::bl_attn_tree(
+                s,
+                &self.f_attn_tree,
+                &d_q,
+                &self.kv_k[li],
+                &self.kv_v[li],
+                &mut d_attn,
+                &mut d_scores,
+                &d_anc,
+                &d_nanc,
+                ctx_max,
+                n_head,
+                n_head_kv,
+                head_dim,
+                self.attn_scale,
+                prefix_len,
+                m,
+            )?;
+            let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref()
+            {
+                Self::bl_rmsnorm(
+                    s,
+                    &self.f_rmsnorm_batch,
+                    &d_attn,
+                    sn,
+                    self.rms_eps,
+                    q_width,
+                    m,
+                    &mut d_attn_sn,
+                )?;
+                &d_attn_sn
+            } else {
+                &d_attn
+            };
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                attn_in,
+                q_width,
+                m,
+                &mut d_qact,
+                &mut d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled_scaled,
+                &d_qact,
+                &self.layers[li].o,
+                &d_act_scale,
+                m,
+                &mut d_proj,
+            )?;
+            Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
+
+            Self::bl_rmsnorm(
+                s,
+                &self.f_rmsnorm_batch,
+                &d_x,
+                &self.layers[li].ffn_norm,
+                self.rms_eps,
+                n_embd,
+                m,
+                &mut d_normed,
+            )?;
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                &d_normed,
+                n_embd,
+                m,
+                &mut d_qact,
+                &mut d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled_scaled,
+                &d_qact,
+                &self.layers[li].gate,
+                &d_act_scale,
+                m,
+                &mut d_gate,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled_scaled,
+                &d_qact,
+                &self.layers[li].up,
+                &d_act_scale,
+                m,
+                &mut d_up,
+            )?;
+            Self::bl_relu2(s, &self.f_relu2, &mut d_gate, &d_up, m * n_ff)?;
+            let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
+                Self::bl_rmsnorm(
+                    s,
+                    &self.f_rmsnorm_batch,
+                    &d_gate,
+                    sn,
+                    self.rms_eps,
+                    n_ff,
+                    m,
+                    &mut d_gate_sn,
+                )?;
+                &d_gate_sn
+            } else {
+                &d_gate
+            };
+            Self::bl_quant(
+                s,
+                &self.f_quant_batch,
+                down_in,
+                n_ff,
+                m,
+                &mut d_qact,
+                &mut d_act_scale,
+            )?;
+            Self::bl_matmul(
+                s,
+                &self.f_tiled_scaled,
+                &d_qact,
+                &self.layers[li].down,
+                &d_act_scale,
+                m,
+                &mut d_proj,
+            )?;
+            Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
+        }
+
+        // Final norm over ALL rows, batched LM head, per-row greedy argmax.
+        Self::bl_rmsnorm(
+            s,
+            &self.f_rmsnorm_batch,
+            &d_x,
+            &self.d_output_norm,
+            self.rms_eps,
+            n_embd,
+            m,
+            &mut d_norm_all,
+        )?;
+        Self::bl_lm_head_tiled(
+            s,
+            &self.f_lm_head_tiled,
+            &d_norm_all,
+            &self.d_token_embd_f16,
+            n_embd,
+            self.vocab,
+            m,
+            &mut d_logits_all,
+        )?;
+        Self::bl_argmax_rows(
+            s,
+            &self.f_argmax_rows,
+            &d_logits_all,
+            self.vocab,
+            m,
+            &mut d_ids,
+        )?;
+        let mut ids = vec![0i32; m];
+        s.memcpy_dtoh(&d_ids, &mut ids)
+            .map_err(|e| driver_err("tree ids dtoh", &e))?;
+
+        // Greedy accept walk: from the root, descend into the (first) child whose
+        // draft token equals the target argmax at the current node.
+        let mut path = vec![0usize];
+        loop {
+            let cur = *path.last().expect("path non-empty");
+            let want = ids[cur];
+            let next = (cur + 1..m).find(|&c| parents[c] as usize == cur && tok_i[c] == want);
+            match next {
+                Some(c) => path.push(c),
+                None => break,
+            }
+        }
+        let l = path.len();
+
+        // Promote the accepted path: node path[k] (arena slot cache_len + path[k])
+        // moves to arena row cache_len + k. path is strictly increasing, so
+        // src >= dst and no promoted row is overwritten before it is read.
+        for (k, &node) in path.iter().enumerate() {
+            if node == k {
+                continue; // already in place (chain prefix)
+            }
+            let src = (self.cache_len + node) * kv_width;
+            let dst = (self.cache_len + k) * kv_width;
+            for li in 0..self.layers.len() {
+                for arena in [&mut self.kv_k[li], &mut self.kv_v[li]] {
+                    // SAFETY(disjoint): src != dst rows within one arena; copy via a
+                    // temporary would be simpler but memcpy_dtod on non-overlapping
+                    // slices is exact and cheap (kv_width floats).
+                    let row = {
+                        let src_slice = arena.slice(src..src + kv_width);
+                        let mut tmp = s
+                            .alloc_zeros::<f32>(kv_width)
+                            .map_err(|e| driver_err("tree promote tmp", &e))?;
+                        s.memcpy_dtod(&src_slice, &mut tmp)
+                            .map_err(|e| driver_err("tree promote read", &e))?;
+                        tmp
+                    };
+                    let mut dst_slice = arena.slice_mut(dst..dst + kv_width);
+                    s.memcpy_dtod(&row, &mut dst_slice)
+                        .map_err(|e| driver_err("tree promote write", &e))?;
+                }
+            }
+        }
+        self.cache_len += l;
+
+        Ok(path.iter().map(|&n| ids[n] as u32).collect())
+    }
+
     // --- batched (M>1) prefill launch helpers (safe launches; eager one-shot path) ---
+
+    /// Tree-verify attention launch (ADR 0014): one warp per (node, head).
+    #[allow(clippy::too_many_arguments)]
+    fn bl_attn_tree(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        scores: &mut CudaSlice<f32>,
+        anc: &CudaSlice<i32>,
+        n_anc: &CudaSlice<i32>,
+        ctx_max: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        prefix_len: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
+        let (cm_i, nh_i, nhkv_i, hd_i) = (
+            ctx_max as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+        );
+        let (pl_i, ma_i, m_i) = (prefix_len as i32, m as i32, m as i32);
+        let total_warps = (m * n_head) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total_warps.div_ceil(8), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.launch_builder(f);
+        l.arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(out)
+            .arg(scores)
+            .arg(anc)
+            .arg(n_anc)
+            .arg(&cm_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&scale)
+            .arg(&pl_i)
+            .arg(&ma_i)
+            .arg(&m_i);
+        // SAFETY: `gqa_attention_tree_f32(q, k, v, out, scores, anc, n_anc, ctx_max,
+        // n_head, n_head_kv, head_dim, scale, prefix_len, max_anc, m)`; max_anc == m
+        // (the host builds the ancestor table [m, m]).
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree attention", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Batched tied LM head over `m` rows (f16 table, row-tiled).
+    #[allow(clippy::too_many_arguments)]
+    fn bl_lm_head_tiled(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        h: &CudaSlice<f32>,
+        embd_f16: &CudaSlice<u16>, // f16 bits (the kernel reinterprets as __half)
+        n_embd: usize,
+        vocab: usize,
+        m: usize,
+        logits: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let (ne_i, v_i, m_i) = (n_embd as i32, vocab as i32, m as i32);
+        let warps = vocab as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (warps * 32).div_ceil(256),
+                (m as u32).div_ceil(LMHEAD_ROW_TILE),
+                1,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.launch_builder(f);
+        l.arg(h).arg(embd_f16).arg(&ne_i).arg(&v_i).arg(&m_i).arg(logits);
+        // SAFETY: `lm_head_tiled_f16(const float* h, const __half* embd, int n_embd,
+        // int vocab, int m, float* logits)` — one warp per vocab row, grid.y tiles rows.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree lm_head", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Per-row greedy argmax over `[m, vocab]` logits (tie rule == `max_by`).
+    fn bl_argmax_rows(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        logits: &CudaSlice<f32>,
+        vocab: usize,
+        m: usize,
+        out: &mut CudaSlice<i32>,
+    ) -> Result<(), BackendError> {
+        let (v_i, m_i) = (vocab as i32, m as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (m as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.launch_builder(f);
+        l.arg(logits).arg(&v_i).arg(&m_i).arg(out);
+        // SAFETY: `argmax_rows_f32(const float* logits, int vocab, int m, int* out)`.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree argmax", &e))?;
+        }
+        Ok(())
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn bl_rmsnorm(
