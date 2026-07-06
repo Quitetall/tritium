@@ -489,6 +489,25 @@ the sampling accept rule is the remaining ADR 0014 Tritium-side item).
    `mpgemm_with_act_quant` (bit-identical on the model path), keep the LUT
    for table-lookup-only ISAs. Not implemented this round.
 
+### v1.x round 7 — CPU A8 int8 fast path (commit c68c9de)
+
+The dp4a exactness argument, applied to the CPU: integer-valued A8
+activations make the whole contraction exact, so a reordered AVX2
+`maddubs`-based int8 kernel is **bit-identical** to the sequential bit-exact
+reference (not tolerance-gated). Detection is an O(m·k) scan; arbitrary-float
+callers keep the existing kernels; `k ≤ 65536` guards the exactness bound.
+
+| metric | before | after |
+|---|---|---|
+| cpu greedy 32-token gate (incl. load) | 96.9s | **46.9s** |
+| greedy vs transformers | 32/32 | 32/32 (bit-identity held) |
+
+This SUBSUMES the earlier T-MAC LUT wiring plan on any CPU with int8 dot
+support (maddubs/VNNI); the LUT module remains for gather-only ISAs.
+(Correction for the record: "BLUT" in the user's roadmap is the training-
+pipeline DAG orchestrator repo at ~/blut, NOT the LUT kernel — the CPU
+fast-path work stands on its own merits.)
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time
