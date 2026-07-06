@@ -499,6 +499,8 @@ async fn tree_verify(State(st): State<AppState>, Json(req): Json<TreeVerifyReque
 fn tree_error(msg: &str) -> Response {
     let code = if msg.contains("not supported") || msg.contains("needs the") {
         StatusCode::NOT_IMPLEMENTED
+    } else if msg.contains("no open tree session") {
+        StatusCode::CONFLICT
     } else {
         StatusCode::BAD_REQUEST
     };

@@ -238,6 +238,11 @@ impl Generator for MockGenerator {
 pub struct RunnerGenerator {
     runner: tritium_nn::ModelRunner,
     eos: u32,
+    /// True between a successful [`Generator::open_tree_session`] and the next
+    /// [`Generator::generate`] (which resets the runner and would otherwise
+    /// leave `tree_verify` silently running against the chat's KV state —
+    /// valid-looking committed tokens from the wrong context).
+    tree_session_open: bool,
 }
 
 impl fmt::Debug for RunnerGenerator {
@@ -252,7 +257,11 @@ impl RunnerGenerator {
     /// Wrap a loaded runner, using `eos` as the stop token.
     #[must_use]
     pub fn new(runner: tritium_nn::ModelRunner, eos: u32) -> Self {
-        Self { runner, eos }
+        Self {
+            runner,
+            eos,
+            tree_session_open: false,
+        }
     }
 
     fn sample(logits: &[f32], s: &Sampling, step: u64) -> Option<u32> {
@@ -283,6 +292,9 @@ impl Generator for RunnerGenerator {
         }
         let max_new = req.max_new.min(n_ctx.saturating_sub(prompt_len));
 
+        // A generation owns the runner's KV from here on — close any tree
+        // session loudly instead of letting a later verify run on chat state.
+        self.tree_session_open = false;
         self.runner.reset();
         let positions: Vec<usize> = (0..prompt_len).collect();
         let mut logits = self
@@ -333,15 +345,25 @@ impl Generator for RunnerGenerator {
         }
         self.runner.reset();
         let positions: Vec<usize> = (0..prompt.len()).collect();
+        self.tree_session_open = false;
         let logits = self
             .runner
             .forward(prompt, &positions)
             .map_err(|e| GenError::Backend(e.to_string()))?;
-        tritium_nn::sample_greedy(&logits)
-            .ok_or_else(|| GenError::Backend("empty logits from prefill".to_owned()))
+        let pending = tritium_nn::sample_greedy(&logits)
+            .ok_or_else(|| GenError::Backend("empty logits from prefill".to_owned()))?;
+        self.tree_session_open = true;
+        Ok(pending)
     }
 
     fn tree_verify(&mut self, tokens: &[u32], parents: &[i32]) -> Result<Vec<u32>, GenError> {
+        if !self.tree_session_open {
+            return Err(GenError::Backend(
+                "no open tree session (open one with /v1/tree/session; a chat \
+                 completion closes it)"
+                    .to_owned(),
+            ));
+        }
         #[cfg(feature = "cuda")]
         {
             let rm = self
