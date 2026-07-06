@@ -588,9 +588,11 @@ __global__ void gqa_attention_decode_f32_g(const float* __restrict__ q,    // [n
 // on lane 0, including the f64 `exp_f32` (1/64 rate on consumer GPUs) one key at a
 // time. Three bit-exactness-preserving fixes:
 //   * scores are staged in dynamic SHARED memory (`max_ctx · 4` bytes; the launch
-//     is now ONE warp per block so one head's scores fit the 48 KiB default cap
-//     up to max_ctx = 12288). The global `scores` scratch parameter is kept for
-//     launch/graph ABI compatibility but no longer written.
+//     is now ONE warp per block, and the host opts the function into the size via
+//     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES — see `attn_shared_opt_in`
+//     in cuda.rs — up to the device opt-in limit, ≈ 25K ctx on Ada). The global
+//     `scores` scratch parameter is kept for launch/graph ABI compatibility but
+//     no longer written.
 //   * the max scan is a parallel warp reduction — f32 max is EXACT (no rounding)
 //     and NaN-skipping `fmaxf` matches the sequential `>` scan's NaN behaviour,
 //     so any reduction order yields the bit-identical maximum.

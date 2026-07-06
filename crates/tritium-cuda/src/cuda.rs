@@ -184,26 +184,23 @@ fn driver_err(context: &str, err: &DriverError) -> BackendError {
     BackendError::Backend(format!("{context}: {err}"))
 }
 
-/// Default per-launch dynamic shared memory cap (bytes). Requesting more requires
-/// the explicit `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` opt-in on the
-/// function handle, up to the device's opt-in limit (~99 KiB on Ada / ~163 KiB on
-/// Ampere data-center parts).
-const DEFAULT_DYN_SMEM_CAP: usize = 48 * 1024;
-
-/// Opt the warp-attention kernel into `max_ctx * 4` dynamic shared bytes when that
-/// exceeds the 48 KiB default cap. `set` applies the attribute to the caller's
-/// function handle (safe `CudaFunction` or raw `CUfunction` — both launch the same
-/// kernel; a fresh JIT of the module needs its own opt-in). A device that cannot
-/// grant the request (context_length past its opt-in shared limit, ≈ 25K on Ada)
-/// surfaces HERE as an actionable model-build error, not a launch failure mid-decode.
+/// Opt the warp-attention kernel into `max_ctx * 4` dynamic shared bytes via
+/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. `set` applies the attribute
+/// to the caller's function handle (safe `CudaFunction` or raw `CUfunction` — both
+/// launch the same kernel; a fresh JIT of the module needs its own opt-in).
+///
+/// Set UNCONDITIONALLY, not only above the 48 KiB default cap: the default
+/// dynamic budget is 48 KiB *minus the kernel's static shared* (its `__shared__
+/// float s_inv` rounds up to 16 B), so a threshold check would leave the
+/// boundary `max_ctx` values (12285..=12288) failing at launch. Setting a value
+/// at or below the default is legal and free. A device that cannot grant the
+/// request (context_length past its opt-in shared limit, ≈ 25K on Ada) surfaces
+/// HERE as an actionable model-build error, not a launch failure mid-decode.
 fn attn_shared_opt_in(
     max_ctx: usize,
     set: impl FnOnce(i32) -> Result<(), DriverError>,
 ) -> Result<(), BackendError> {
     let bytes = max_ctx * 4;
-    if bytes <= DEFAULT_DYN_SMEM_CAP {
-        return Ok(());
-    }
     set(bytes as i32).map_err(|e| {
         BackendError::Backend(format!(
             "decode attention needs {bytes} B of dynamic shared memory for \
