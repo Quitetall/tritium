@@ -442,6 +442,30 @@ The remaining levers are contract-free: GEMM 60→90% SOL, node-count fusion
 | e2e decode | ~161 tok/s | **~296–336 tok/s** |
 | e2e prefill | ~405 tok/s | ~941 tok/s |
 
+### v1.x round 5 — warp-shuffle reduction tails (commit c48c8dd)
+
+The block trees (ADR 0018 canonical sums + absmax + attention max) ran all 8
+levels through shared memory with a barrier per level; the last 6 levels live
+inside warp 0 and a `__shfl_down_sync` by `off` computes the identical
+canonical pairing on the previous level's outputs — same DAG, same roundings,
+6 fewer barriers per tree. Verified bit-identical standalone (0 differing
+quantized outputs) and by the full gate suite (cpu_cuda_parity bit-lockstep).
+decode 338 → **344.6 tok/s**.
+
+### Decode end-state analysis (2026-07-06)
+
+Per-token medians: rmsnorm_quant ~0.63ms, lm_head 0.70ms (AT weight-read SOL),
+GEMMs 0.94ms (DRAM-bound; SOL share 0.52ms), attention ~0.62ms, misc 0.05ms.
+The remaining gap to the 848 tok/s roofline is now dominated by **per-kernel
+latency floors** (hundreds of small kernels on a 128-SM GPU: launch/dispatch,
+staging passes, barrier minimums), not by any single inefficient kernel. The
+structural next step is a **persistent/mega-kernel decode** (one or a few
+resident kernels per token with grid-sync between stages) — an ADR-scale
+redesign, not an incremental patch. Secondary: ncu-guided GEMM work (needs
+perf-counter permissions), IMMA cp.async/ldmatrix, and — for the real
+multiplier — the BASTION drafter integration (the greedy verifier is live;
+the sampling accept rule is the remaining ADR 0014 Tritium-side item).
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time
