@@ -22,6 +22,7 @@ use crate::generator::{FinishReason, GenRequest, Generator, Sampling};
 use crate::sse::{
     IncrementalDetok, StopMatcher, content_chunk, error_chunk, role_chunk, terminal_chunk,
 };
+use crate::generator::TreeOpError;
 use crate::worker::{GenEvent, Job, spawn_worker};
 
 /// Server configuration.
@@ -453,15 +454,11 @@ async fn tree_session(State(st): State<AppState>, Json(req): Json<TreeSessionReq
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "draining", "server is draining", None);
     }
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    if st
-        .jobs
-        .try_send(Job::OpenTreeSession {
-            prompt: req.prompt_tokens,
-            resp: resp_tx,
-        })
-        .is_err()
-    {
-        return api_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded", "decode queue full; retry shortly", None);
+    if let Err(e) = st.jobs.try_send(Job::OpenTreeSession {
+        prompt: req.prompt_tokens,
+        resp: resp_tx,
+    }) {
+        return tree_queue_error(e);
     }
     match resp_rx.await {
         Ok(Ok(pending)) => Json(serde_json::json!({ "pending_token": pending })).into_response(),
@@ -475,16 +472,12 @@ async fn tree_verify(State(st): State<AppState>, Json(req): Json<TreeVerifyReque
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "draining", "server is draining", None);
     }
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    if st
-        .jobs
-        .try_send(Job::TreeVerify {
-            tokens: req.tokens,
-            parents: req.parents,
-            resp: resp_tx,
-        })
-        .is_err()
-    {
-        return api_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded", "decode queue full; retry shortly", None);
+    if let Err(e) = st.jobs.try_send(Job::TreeVerify {
+        tokens: req.tokens,
+        parents: req.parents,
+        resp: resp_tx,
+    }) {
+        return tree_queue_error(e);
     }
     match resp_rx.await {
         Ok(Ok(committed)) => Json(serde_json::json!({ "committed": committed })).into_response(),
@@ -493,16 +486,39 @@ async fn tree_verify(State(st): State<AppState>, Json(req): Json<TreeVerifyReque
     }
 }
 
-/// Map worker-side tree errors: capability refusals → 501, everything else 400
-/// (malformed trees) — the strings originate from `Generator`'s defaults and
-/// `tree_verify_greedy`'s validation.
-fn tree_error(msg: &str) -> Response {
-    let code = if msg.contains("not supported") || msg.contains("needs the") {
-        StatusCode::NOT_IMPLEMENTED
-    } else if msg.contains("no open tree session") {
-        StatusCode::CONFLICT
-    } else {
-        StatusCode::BAD_REQUEST
+/// Queue submission failures, matching the chat path's semantics: Full → 429
+/// with Retry-After; Closed (dead/shutting-down worker) → 503, so tree
+/// clients don't spin forever on a dead server.
+fn tree_queue_error(e: mpsc::error::TrySendError<Job>) -> Response {
+    match e {
+        mpsc::error::TrySendError::Full(_) => {
+            let mut r = api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_exceeded",
+                "decode queue full; retry shortly",
+                None,
+            );
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            r
+        }
+        mpsc::error::TrySendError::Closed(_) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "server is shutting down",
+            None,
+        ),
+    }
+}
+
+/// Map worker-side tree errors to HTTP by VARIANT (no string sniffing —
+/// a CUDA driver message containing "not supported" stays a 500).
+fn tree_error(e: &TreeOpError) -> Response {
+    let (code, kind) = match e {
+        TreeOpError::Unsupported(_) => (StatusCode::NOT_IMPLEMENTED, "tree_unsupported"),
+        TreeOpError::Conflict(_) => (StatusCode::CONFLICT, "tree_session_closed"),
+        TreeOpError::BadRequest(_) => (StatusCode::BAD_REQUEST, "tree_bad_request"),
+        TreeOpError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
     };
-    api_error(code, "tree_verify_error", msg, None)
+    api_error(code, kind, e.to_string(), None)
 }

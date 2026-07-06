@@ -15,6 +15,7 @@ categories.workspace = true
 # builds tritium-serve with no async deps). Only tritium-nn is used directly (it
 # pulls core/spec/runtime transitively); the Tokenizer trait + NnError come from it.
 tritium-nn = { workspace = true }
+tritium-spec = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 
-use crate::generator::{FinishReason, GenRequest, Generator};
+use crate::generator::{FinishReason, GenRequest, Generator, TreeOpError};
 
 /// An event streamed from the worker to a request's response task.
 #[derive(Debug, Clone)]
@@ -58,12 +58,12 @@ pub(crate) enum Job {
     /// the endpoint contract).
     OpenTreeSession {
         prompt: Vec<u32>,
-        resp: tokio::sync::oneshot::Sender<Result<u32, String>>,
+        resp: tokio::sync::oneshot::Sender<Result<u32, TreeOpError>>,
     },
     TreeVerify {
         tokens: Vec<u32>,
         parents: Vec<i32>,
-        resp: tokio::sync::oneshot::Sender<Result<Vec<u32>, String>>,
+        resp: tokio::sync::oneshot::Sender<Result<Vec<u32>, TreeOpError>>,
     },
 }
 
@@ -131,9 +131,10 @@ pub(crate) fn spawn_worker(
                             generator.open_tree_session(&prompt)
                         }));
                         let _ = resp.send(match outcome {
-                            Ok(Ok(pending)) => Ok(pending),
-                            Ok(Err(e)) => Err(e.to_string()),
-                            Err(_panic) => Err("internal tree-session error".to_owned()),
+                            Ok(r) => r,
+                            Err(_panic) => Err(TreeOpError::Internal(
+                                "internal tree-session error".to_owned(),
+                            )),
                         });
                     }
                     Job::TreeVerify {
@@ -145,9 +146,10 @@ pub(crate) fn spawn_worker(
                             generator.tree_verify(&tokens, &parents)
                         }));
                         let _ = resp.send(match outcome {
-                            Ok(Ok(committed)) => Ok(committed),
-                            Ok(Err(e)) => Err(e.to_string()),
-                            Err(_panic) => Err("internal tree-verify error".to_owned()),
+                            Ok(r) => r,
+                            Err(_panic) => Err(TreeOpError::Internal(
+                                "internal tree-verify error".to_owned(),
+                            )),
                         });
                     }
                 }

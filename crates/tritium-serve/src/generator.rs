@@ -98,6 +98,33 @@ impl fmt::Display for GenError {
 
 impl std::error::Error for GenError {}
 
+/// Structured error for the BASTION tree-verify surface (ADR 0014), carried
+/// over the worker oneshot so the HTTP layer maps status codes by VARIANT
+/// instead of sniffing strings (a CUDA driver error containing "not supported"
+/// must not turn into a 501).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeOpError {
+    /// The generator/backend cannot do tree-verify at all → HTTP 501.
+    Unsupported(String),
+    /// No open session (or it was invalidated by a generation) → HTTP 409.
+    Conflict(String),
+    /// A malformed tree / prompt (caller error) → HTTP 400.
+    BadRequest(String),
+    /// Device failure, panic, or any other internal fault → HTTP 500.
+    Internal(String),
+}
+
+impl fmt::Display for TreeOpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TreeOpError::Unsupported(m)
+            | TreeOpError::Conflict(m)
+            | TreeOpError::BadRequest(m)
+            | TreeOpError::Internal(m) => f.write_str(m),
+        }
+    }
+}
+
 /// The inference seam: prefill a prompt and stream decode steps.
 ///
 /// Synchronous and runtime-free by design — the serve-gated worker drives it on a
@@ -127,8 +154,8 @@ pub trait Generator: Send {
     /// (the target argmax after the prompt — the root the orchestrator's first
     /// draft tree must carry). One session at a time; a subsequent
     /// [`Generator::generate`] invalidates it (the worker owns one model).
-    fn open_tree_session(&mut self, _prompt: &[u32]) -> Result<u32, GenError> {
-        Err(GenError::Backend(
+    fn open_tree_session(&mut self, _prompt: &[u32]) -> Result<u32, TreeOpError> {
+        Err(TreeOpError::Unsupported(
             "tree-verify sessions are not supported by this generator".to_owned(),
         ))
     }
@@ -137,8 +164,8 @@ pub trait Generator: Send {
     /// `CudaDecodeModel::tree_verify_greedy` for the tree contract: node 0 is
     /// the pending token, `parents[i] < i`). Returns the newly committed
     /// tokens; the session's pending token becomes the last element.
-    fn tree_verify(&mut self, _tokens: &[u32], _parents: &[i32]) -> Result<Vec<u32>, GenError> {
-        Err(GenError::Backend(
+    fn tree_verify(&mut self, _tokens: &[u32], _parents: &[i32]) -> Result<Vec<u32>, TreeOpError> {
+        Err(TreeOpError::Unsupported(
             "tree-verify sessions are not supported by this generator".to_owned(),
         ))
     }
@@ -338,27 +365,51 @@ impl Generator for RunnerGenerator {
         self.runner.weights.vocab
     }
 
-    fn open_tree_session(&mut self, prompt: &[u32]) -> Result<u32, GenError> {
-        let n_ctx = self.runner.config.n_ctx as usize;
-        if prompt.is_empty() || prompt.len() >= n_ctx {
-            return Err(GenError::ContextOverflow);
+    fn open_tree_session(&mut self, prompt: &[u32]) -> Result<u32, TreeOpError> {
+        // Refuse at OPEN when verify can never succeed — cheaper and more
+        // honest than burning a full prefill before the client learns.
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = prompt;
+            return Err(TreeOpError::Unsupported(
+                "tree-verify needs the `cuda` feature".to_owned(),
+            ));
         }
-        self.runner.reset();
-        let positions: Vec<usize> = (0..prompt.len()).collect();
-        self.tree_session_open = false;
-        let logits = self
-            .runner
-            .forward(prompt, &positions)
-            .map_err(|e| GenError::Backend(e.to_string()))?;
-        let pending = tritium_nn::sample_greedy(&logits)
-            .ok_or_else(|| GenError::Backend("empty logits from prefill".to_owned()))?;
-        self.tree_session_open = true;
-        Ok(pending)
+        #[cfg(feature = "cuda")]
+        {
+            if self
+                .runner
+                .resident_cuda()
+                .map_err(|e| TreeOpError::Internal(e.to_string()))?
+                .is_none()
+            {
+                return Err(TreeOpError::Unsupported(
+                    "tree-verify needs the CUDA device-resident decoder".to_owned(),
+                ));
+            }
+            let n_ctx = self.runner.config.n_ctx as usize;
+            if prompt.is_empty() || prompt.len() >= n_ctx {
+                return Err(TreeOpError::BadRequest(
+                    "prompt is empty or exceeds the model context window".to_owned(),
+                ));
+            }
+            self.runner.reset();
+            let positions: Vec<usize> = (0..prompt.len()).collect();
+            self.tree_session_open = false;
+            let logits = self
+                .runner
+                .forward(prompt, &positions)
+                .map_err(|e| TreeOpError::Internal(e.to_string()))?;
+            let pending = tritium_nn::sample_greedy(&logits)
+                .ok_or_else(|| TreeOpError::Internal("empty logits from prefill".to_owned()))?;
+            self.tree_session_open = true;
+            Ok(pending)
+        }
     }
 
-    fn tree_verify(&mut self, tokens: &[u32], parents: &[i32]) -> Result<Vec<u32>, GenError> {
+    fn tree_verify(&mut self, tokens: &[u32], parents: &[i32]) -> Result<Vec<u32>, TreeOpError> {
         if !self.tree_session_open {
-            return Err(GenError::Backend(
+            return Err(TreeOpError::Conflict(
                 "no open tree session (open one with /v1/tree/session; a chat \
                  completion closes it)"
                     .to_owned(),
@@ -369,20 +420,23 @@ impl Generator for RunnerGenerator {
             let rm = self
                 .runner
                 .resident_cuda()
-                .map_err(|e| GenError::Backend(e.to_string()))?
+                .map_err(|e| TreeOpError::Internal(e.to_string()))?
                 .ok_or_else(|| {
-                    GenError::Backend(
+                    TreeOpError::Unsupported(
                         "tree-verify needs the CUDA device-resident decoder".to_owned(),
                     )
                 })?;
-            return rm
-                .tree_verify_greedy(tokens, parents)
-                .map_err(|e| GenError::Backend(e.to_string()));
+            return rm.tree_verify_greedy(tokens, parents).map_err(|e| match e {
+                // Caller-shaped errors (malformed tree, capacity overflow) → 400;
+                // anything else is a device/internal fault → 500.
+                tritium_spec::BackendError::InvalidInput(m) => TreeOpError::BadRequest(m),
+                other => TreeOpError::Internal(other.to_string()),
+            });
         }
         #[cfg(not(feature = "cuda"))]
         {
             let _ = (tokens, parents);
-            Err(GenError::Backend(
+            Err(TreeOpError::Unsupported(
                 "tree-verify needs the `cuda` feature".to_owned(),
             ))
         }

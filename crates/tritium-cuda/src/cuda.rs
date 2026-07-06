@@ -220,7 +220,10 @@ fn driver_err(context: &str, err: &DriverError) -> BackendError {
 /// replays it there exclusively (`tritium-serve`'s decode worker) — the same
 /// single-owner argument the `unsafe impl Send for RawGraphKernels` documents.
 /// Driver handles are context-scoped, not thread-scoped, so crossing threads
-/// by ownership transfer is sound.
+/// by ownership transfer is sound. One caveat the soundness argument relies
+/// on: cudarc's `CudaGraph::Drop` does not re-bind the context first, so the
+/// graph should be dropped on a thread that has touched the context — true
+/// for every current holder (the owning thread both replays and drops).
 struct SendGraph(CudaGraph);
 #[allow(unsafe_code)]
 // SAFETY: see the type doc — exclusive single-owner use only; the wrapper is

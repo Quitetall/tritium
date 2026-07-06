@@ -35,7 +35,7 @@ mod sse;
 mod worker;
 
 pub use generator::{
-    FinishReason, GenError, GenRequest, Generator, MockGenerator, RunnerGenerator, Sampling, Step,
+    FinishReason, GenError, GenRequest, Generator, MockGenerator, RunnerGenerator, Sampling, Step, TreeOpError,
 };
 pub use tokenizer_passthrough::IdPassthroughTokenizer;
 
