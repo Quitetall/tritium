@@ -83,6 +83,8 @@ pub fn build_router(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/healthz", get(health))
+        .route("/v1/tree/session", post(tree_session))
+        .route("/v1/tree/verify", post(tree_verify))
         .with_state(state);
     (router, draining)
 }
@@ -240,7 +242,7 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
     };
 
     let (tx, rx) = mpsc::channel::<GenEvent>(64);
-    match st.jobs.try_send(Job { req: gen_req, tx }) {
+    match st.jobs.try_send(Job::Generate { req: gen_req, tx }) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             let mut r = api_error(
@@ -419,4 +421,86 @@ async fn health(State(st): State<AppState>) -> Response {
     } else {
         Json(serde_json::json!({ "status": "ok" })).into_response()
     }
+}
+
+// ───────────────────── BASTION tree-verify surface (ADR 0014) ─────────────────────
+//
+// The stateful spec-decode boundary an external orchestrator (e.g. LAMU driving a
+// block-diffusion drafter) uses:
+//
+//   POST /v1/tree/session  {"prompt_tokens":[...]}      → {"pending_token":t1}
+//   POST /v1/tree/verify   {"tokens":[t1,d..],"parents":[-1,..]}
+//                                                        → {"committed":[...]}
+//
+// One session at a time (the worker owns one model); a chat completion invalidates
+// it. Node 0 of every verify tree must be the current pending token; the new
+// pending token is the last committed element. Backends without the CUDA
+// device-resident decoder answer 501.
+
+#[derive(serde::Deserialize)]
+struct TreeSessionRequest {
+    prompt_tokens: Vec<u32>,
+}
+
+#[derive(serde::Deserialize)]
+struct TreeVerifyRequest {
+    tokens: Vec<u32>,
+    parents: Vec<i32>,
+}
+
+async fn tree_session(State(st): State<AppState>, Json(req): Json<TreeSessionRequest>) -> Response {
+    if st.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "draining", "server is draining", None);
+    }
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    if st
+        .jobs
+        .try_send(Job::OpenTreeSession {
+            prompt: req.prompt_tokens,
+            resp: resp_tx,
+        })
+        .is_err()
+    {
+        return api_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded", "decode queue full; retry shortly", None);
+    }
+    match resp_rx.await {
+        Ok(Ok(pending)) => Json(serde_json::json!({ "pending_token": pending })).into_response(),
+        Ok(Err(e)) => tree_error(&e),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "worker dropped the request", None),
+    }
+}
+
+async fn tree_verify(State(st): State<AppState>, Json(req): Json<TreeVerifyRequest>) -> Response {
+    if st.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "draining", "server is draining", None);
+    }
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    if st
+        .jobs
+        .try_send(Job::TreeVerify {
+            tokens: req.tokens,
+            parents: req.parents,
+            resp: resp_tx,
+        })
+        .is_err()
+    {
+        return api_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded", "decode queue full; retry shortly", None);
+    }
+    match resp_rx.await {
+        Ok(Ok(committed)) => Json(serde_json::json!({ "committed": committed })).into_response(),
+        Ok(Err(e)) => tree_error(&e),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "worker dropped the request", None),
+    }
+}
+
+/// Map worker-side tree errors: capability refusals → 501, everything else 400
+/// (malformed trees) — the strings originate from `Generator`'s defaults and
+/// `tree_verify_greedy`'s validation.
+fn tree_error(msg: &str) -> Response {
+    let code = if msg.contains("not supported") || msg.contains("needs the") {
+        StatusCode::NOT_IMPLEMENTED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    api_error(code, "tree_verify_error", msg, None)
 }

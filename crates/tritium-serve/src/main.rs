@@ -1,22 +1,26 @@
-//! The `tritium-serve` binary: load a GGUF model on the CPU backend and serve it
-//! over the OpenAI HTTP/SSE protocol. Only built with `--features serve`.
+//! The `tritium-serve` binary: load a GGUF model on a registry backend and serve
+//! it over the OpenAI HTTP/SSE protocol. Only built with `--features serve`.
 //!
-//! Usage: `tritium-serve --model <path.gguf> [--port 8080] [--model-id tritium]
-//! [--max-new 256] [--eos 128001]`. Text input requires integer token IDs (the
-//! v0.80 id-passthrough tokenizer); inject a real BPE for prose.
+//! Usage: `tritium-serve --model <path.gguf> [--backend cpu|cuda] [--port 8080]
+//! [--model-id tritium] [--max-new 256] [--eos 128001]`. `--backend cuda` needs
+//! the `cuda` cargo feature (links tritium-cuda). Text input requires integer
+//! token IDs (the v0.80 id-passthrough tokenizer); inject a real BPE for prose.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tritium_serve::{IdPassthroughTokenizer, RunnerGenerator, ServeConfig, build_router};
 
-// Force-link the CPU backend so its `linkme` registration populates the runtime
-// registry that `ModelRunner::load_cpu` consults.
+// Force-link the backends so their `linkme` registrations populate the runtime
+// registry consulted below.
 use tritium_cpu as _;
+#[cfg(feature = "cuda")]
+use tritium_cuda as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_path: Option<String> = None;
+    let mut backend_name = "cpu".to_owned();
     let mut port: u16 = 8080;
     let mut model_id = "tritium".to_owned();
     let mut max_new: usize = 256;
@@ -37,14 +41,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--model" => model_path = Some(val::<String>(args.next(), "--model")?),
+            "--backend" => backend_name = val::<String>(args.next(), "--backend")?,
             "--port" => port = val(args.next(), "--port")?,
             "--model-id" => model_id = val::<String>(args.next(), "--model-id")?,
             "--max-new" => max_new = val(args.next(), "--max-new")?,
             "--eos" => eos = val(args.next(), "--eos")?,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: tritium-serve --model <gguf> [--port 8080] [--model-id tritium] \
-                     [--max-new 256] [--eos 128001]"
+                    "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--port 8080] \
+                     [--model-id tritium] [--max-new 256] [--eos 128001]"
                 );
                 return Ok(());
             }
@@ -53,9 +58,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let model_path = model_path.ok_or("missing --model <path-to-gguf>")?;
-    eprintln!("tritium-serve: loading {model_path} on the cpu backend...");
+    eprintln!("tritium-serve: loading {model_path} on the `{backend_name}` backend...");
     let bytes = std::fs::read(&model_path)?;
-    let runner = tritium_nn::ModelRunner::load_cpu(&bytes)?;
+    // Resolve the named backend from the runtime registry (the same owned-init
+    // pattern the acceptance tests use). `cpu` is always linked; `cuda` needs
+    // the `cuda` cargo feature and a working device.
+    let init = tritium_runtime::BACKENDS
+        .iter()
+        .find(|e| e.name == backend_name)
+        .map(|e| e.init)
+        .ok_or_else(|| {
+            format!(
+                "backend `{backend_name}` is not in the registry (linked backends: {}); \
+                 for cuda, build with `--features cuda`",
+                tritium_runtime::BACKENDS
+                    .iter()
+                    .map(|e| e.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    let backend = init().map_err(|e| format!("backend `{backend_name}` failed to init: {e}"))?;
+    let file = tritium_format::read_gguf(&bytes)?;
+    let runner = tritium_nn::ModelRunner::load(&file, &bytes, backend)?;
     let generator = Box::new(RunnerGenerator::new(runner, eos));
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, eos));
     let cfg = ServeConfig {

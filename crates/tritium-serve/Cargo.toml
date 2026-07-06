@@ -25,10 +25,15 @@ async-stream = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 # A backend must be linked for the binary to actually serve a model.
 tritium-cpu = { workspace = true, optional = true }
+tritium-cuda = { workspace = true, optional = true, features = ["cuda"] }
+tritium-runtime = { workspace = true, optional = true }
+tritium-format = { workspace = true, optional = true }
 
 [features]
 default = []
-serve = ["dep:tokio", "dep:axum", "dep:async-stream", "dep:futures-core", "dep:tritium-cpu"]
+serve = ["dep:tokio", "dep:axum", "dep:async-stream", "dep:futures-core", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format"]
+# Link the CUDA backend so `--backend cuda` can resolve (needs nvcc at build time).
+cuda = ["serve", "dep:tritium-cuda", "tritium-nn/cuda"]
 # Gated real-model end-to-end test (needs TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH).
 e2e = ["serve"]
 

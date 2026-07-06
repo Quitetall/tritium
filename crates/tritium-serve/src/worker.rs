@@ -40,14 +40,31 @@ pub(crate) enum GenEvent {
     Error(String),
 }
 
-/// A unit of work: a request plus the channel its events stream back on.
+/// A unit of work for the decode thread.
 #[derive(Debug)]
-pub(crate) struct Job {
-    /// The generation request.
-    pub(crate) req: GenRequest,
-    /// Per-request event channel (dropped by the handler on client disconnect,
-    /// which the worker observes as a send failure and treats as cancellation).
-    pub(crate) tx: mpsc::Sender<GenEvent>,
+pub(crate) enum Job {
+    /// A chat generation: request plus the channel its events stream back on.
+    Generate {
+        /// The generation request.
+        req: GenRequest,
+        /// Per-request event channel (dropped by the handler on client
+        /// disconnect, which the worker observes as a send failure and treats
+        /// as cancellation).
+        tx: mpsc::Sender<GenEvent>,
+    },
+    /// BASTION tree-verify session ops (ADR 0014): serialized on the same
+    /// queue as generations (the worker owns the one model), answered over a
+    /// oneshot. A `Generate` job invalidates any open session (documented in
+    /// the endpoint contract).
+    OpenTreeSession {
+        prompt: Vec<u32>,
+        resp: tokio::sync::oneshot::Sender<Result<u32, String>>,
+    },
+    TreeVerify {
+        tokens: Vec<u32>,
+        parents: Vec<i32>,
+        resp: tokio::sync::oneshot::Sender<Result<Vec<u32>, String>>,
+    },
 }
 
 /// Clears the liveness flag when the decode thread exits (normal or panic).
@@ -73,34 +90,65 @@ pub(crate) fn spawn_worker(
         .name("tritium-serve-decode".to_owned())
         .spawn(move || {
             let _alive = AliveGuard(worker_alive);
-            while let Some(Job { req, tx }) = job_rx.blocking_recv() {
-                // Run the (panic-prone) generation under catch_unwind so one bad
-                // job can't kill the worker. `final_reason` lives inside the
-                // closure so its &mut borrow can't cross the unwind boundary.
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    let mut final_reason = FinishReason::Stop;
-                    let res = generator.generate(&req, &mut |step| {
-                        if let Some(fr) = step.finish_reason {
-                            final_reason = fr;
+            while let Some(job) = job_rx.blocking_recv() {
+                match job {
+                    Job::Generate { req, tx } => {
+                        // Run the (panic-prone) generation under catch_unwind so one
+                        // bad job can't kill the worker. `final_reason` lives inside
+                        // the closure so its &mut borrow can't cross the unwind
+                        // boundary.
+                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                            let mut final_reason = FinishReason::Stop;
+                            let res = generator.generate(&req, &mut |step| {
+                                if let Some(fr) = step.finish_reason {
+                                    final_reason = fr;
+                                }
+                                // try_send (never blocks): Full (slow client) or
+                                // Closed (gone) cancels this request and frees the
+                                // worker. Tokens delivered so far are an in-order
+                                // prefix — no gaps.
+                                tx.try_send(GenEvent::Token(step.token)).is_ok()
+                                    && !draining.load(Ordering::Relaxed)
+                            });
+                            (res, final_reason)
+                        }));
+                        match outcome {
+                            Ok((Ok(()), final_reason)) => {
+                                let _ = tx.try_send(GenEvent::Done(final_reason));
+                            }
+                            Ok((Err(e), _)) => {
+                                let _ = tx.try_send(GenEvent::Error(e.to_string()));
+                            }
+                            Err(_panic) => {
+                                let _ = tx.try_send(GenEvent::Error(
+                                    "internal generation error".to_owned(),
+                                ));
+                            }
                         }
-                        // try_send (never blocks): Full (slow client) or Closed
-                        // (gone) cancels this request and frees the worker. Tokens
-                        // delivered so far are an in-order prefix — no gaps.
-                        tx.try_send(GenEvent::Token(step.token)).is_ok()
-                            && !draining.load(Ordering::Relaxed)
-                    });
-                    (res, final_reason)
-                }));
-                match outcome {
-                    Ok((Ok(()), final_reason)) => {
-                        let _ = tx.try_send(GenEvent::Done(final_reason));
                     }
-                    Ok((Err(e), _)) => {
-                        let _ = tx.try_send(GenEvent::Error(e.to_string()));
+                    Job::OpenTreeSession { prompt, resp } => {
+                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                            generator.open_tree_session(&prompt)
+                        }));
+                        let _ = resp.send(match outcome {
+                            Ok(Ok(pending)) => Ok(pending),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_panic) => Err("internal tree-session error".to_owned()),
+                        });
                     }
-                    Err(_panic) => {
-                        let _ =
-                            tx.try_send(GenEvent::Error("internal generation error".to_owned()));
+                    Job::TreeVerify {
+                        tokens,
+                        parents,
+                        resp,
+                    } => {
+                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                            generator.tree_verify(&tokens, &parents)
+                        }));
+                        let _ = resp.send(match outcome {
+                            Ok(Ok(committed)) => Ok(committed),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_panic) => Err("internal tree-verify error".to_owned()),
+                        });
                     }
                 }
             }

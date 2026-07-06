@@ -212,6 +212,28 @@ fn driver_err(context: &str, err: &DriverError) -> BackendError {
     BackendError::Backend(format!("{context}: {err}"))
 }
 
+/// [`CudaGraph`] with ownership-transfer `Send`.
+///
+/// cudarc's `CudaGraph` holds raw `CUgraph`/`CUgraphExec` handles and is not
+/// `Send` (it is not thread-SAFE — no concurrent use). Tritium only ever MOVES
+/// a decode model (and its captured graph) to a single owning thread and
+/// replays it there exclusively (`tritium-serve`'s decode worker) — the same
+/// single-owner argument the `unsafe impl Send for RawGraphKernels` documents.
+/// Driver handles are context-scoped, not thread-scoped, so crossing threads
+/// by ownership transfer is sound.
+struct SendGraph(CudaGraph);
+#[allow(unsafe_code)]
+// SAFETY: see the type doc — exclusive single-owner use only; the wrapper is
+// never shared (`&SendGraph` never crosses threads while a replay is live).
+unsafe impl Send for SendGraph {}
+
+impl std::ops::Deref for SendGraph {
+    type Target = CudaGraph;
+    fn deref(&self) -> &CudaGraph {
+        &self.0
+    }
+}
+
 /// Opt the warp-attention kernel into `max_ctx * 4` dynamic shared bytes via
 /// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. `set` applies the attribute
 /// to the caller's function handle (safe `CudaFunction` or raw `CUfunction` — both
@@ -3810,7 +3832,7 @@ pub struct CudaDecodeModel {
     cap_stream: Arc<CudaStream>,
     /// The captured decode graph, built lazily on first graph step. Declared **before**
     /// `raw` so it drops (graph-exec destroyed) before the modules it references unload.
-    graph: Option<CudaGraph>,
+    graph: Option<SendGraph>,
     /// Raw-loaded PTX modules + `CUfunction` handles for the captured raw launches
     /// (the safe `CudaFunction` hides `cu_function`). `None` until the graph path is used.
     raw: Option<RawGraphKernels>,
@@ -6415,7 +6437,7 @@ impl CudaDecodeModel {
         }
         if batch.graph.is_none() {
             let g = self.record_graph_batch(batch, false)?;
-            batch.graph = Some(g);
+            batch.graph = Some(SendGraph(g));
             // Keep the modules the captured graph references alive for as long as this
             // batch lives (see `BatchKv::raw_keepalive`).
             batch.raw_keepalive = self.batch_raw.clone();
@@ -7084,7 +7106,7 @@ impl CudaDecodeModel {
             self.raw = Some(raw);
         }
         let graph = self.record_graph()?;
-        self.graph = Some(graph);
+        self.graph = Some(SendGraph(graph));
         Ok(())
     }
 
@@ -8030,7 +8052,7 @@ pub struct BatchKv {
     /// Declared **before** `raw_keepalive` so the `CUgraphExec` is destroyed before the
     /// module ref it holds is released (the kernel nodes reference functions in those
     /// modules).
-    graph: Option<CudaGraph>,
+    graph: Option<SendGraph>,
     /// The captured on-device-sampling graph (built lazily on the first
     /// [`CudaDecodeModel::decode_batch_graph_argmax`]): the same forward plus the batched LM
     /// head + greedy argmax, ending at `d_argmax`. Also declared before `raw_keepalive`.

@@ -120,6 +120,28 @@ pub trait Generator: Send {
     fn n_ctx(&self) -> usize;
     /// Vocabulary size (for logit-shape sanity).
     fn vocab(&self) -> usize;
+
+    /// BASTION tree-verify session (ADR 0014), OPTIONAL — the default refuses.
+    ///
+    /// Reset the model, prefill `prompt`, and return the greedy pending token
+    /// (the target argmax after the prompt — the root the orchestrator's first
+    /// draft tree must carry). One session at a time; a subsequent
+    /// [`Generator::generate`] invalidates it (the worker owns one model).
+    fn open_tree_session(&mut self, _prompt: &[u32]) -> Result<u32, GenError> {
+        Err(GenError::Backend(
+            "tree-verify sessions are not supported by this generator".to_owned(),
+        ))
+    }
+
+    /// Verify one draft tree against the open session (see
+    /// `CudaDecodeModel::tree_verify_greedy` for the tree contract: node 0 is
+    /// the pending token, `parents[i] < i`). Returns the newly committed
+    /// tokens; the session's pending token becomes the last element.
+    fn tree_verify(&mut self, _tokens: &[u32], _parents: &[i32]) -> Result<Vec<u32>, GenError> {
+        Err(GenError::Backend(
+            "tree-verify sessions are not supported by this generator".to_owned(),
+        ))
+    }
 }
 
 /// A model-free generator that emits a fixed script of token IDs — the contract
@@ -303,6 +325,47 @@ impl Generator for RunnerGenerator {
     fn vocab(&self) -> usize {
         self.runner.weights.vocab
     }
+
+    fn open_tree_session(&mut self, prompt: &[u32]) -> Result<u32, GenError> {
+        let n_ctx = self.runner.config.n_ctx as usize;
+        if prompt.is_empty() || prompt.len() >= n_ctx {
+            return Err(GenError::ContextOverflow);
+        }
+        self.runner.reset();
+        let positions: Vec<usize> = (0..prompt.len()).collect();
+        let logits = self
+            .runner
+            .forward(prompt, &positions)
+            .map_err(|e| GenError::Backend(e.to_string()))?;
+        tritium_nn::sample_greedy(&logits)
+            .ok_or_else(|| GenError::Backend("empty logits from prefill".to_owned()))
+    }
+
+    fn tree_verify(&mut self, tokens: &[u32], parents: &[i32]) -> Result<Vec<u32>, GenError> {
+        #[cfg(feature = "cuda")]
+        {
+            let rm = self
+                .runner
+                .resident_cuda()
+                .map_err(|e| GenError::Backend(e.to_string()))?
+                .ok_or_else(|| {
+                    GenError::Backend(
+                        "tree-verify needs the CUDA device-resident decoder".to_owned(),
+                    )
+                })?;
+            return rm
+                .tree_verify_greedy(tokens, parents)
+                .map_err(|e| GenError::Backend(e.to_string()));
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (tokens, parents);
+            Err(GenError::Backend(
+                "tree-verify needs the `cuda` feature".to_owned(),
+            ))
+        }
+    }
+
 }
 
 #[cfg(test)]
