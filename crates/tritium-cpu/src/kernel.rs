@@ -96,7 +96,25 @@ fn run_chunk(
     out: &mut [f32],
 ) -> Result<(), BackendError> {
     #[cfg(target_arch = "x86_64")]
+    let k = shape.k;
+    #[cfg(target_arch = "x86_64")]
     {
+        // A8 fast path (v1.x): when every activation is an integer in [-128, 127]
+        // — the W1.58A8 protocol `TernaryLinear` always feeds this backend — the
+        // whole contraction is EXACT integer arithmetic (|Σ| ≤ 128·k < 2²⁴ for
+        // k ≤ 65536, so even the reference's f32 fold never rounds), which makes
+        // an int8 `maddubs` kernel **bit-identical** to the sequential reference
+        // fold while running ~an order of magnitude faster. Arbitrary-float
+        // callers fall through to the bit-exact f32 kernels unchanged; the
+        // detection scan is O(m·k), noise next to the O(m·n·k) GEMM.
+        if is_x86_feature_detected!("avx2")
+            && k <= A8_EXACT_K_MAX
+            && act_is_a8_integer(act)
+        {
+            // SAFETY: `avx2` was just confirmed; buffer lengths were validated by
+            // `dispatch_mpgemm` and are re-validated inside before any intrinsic.
+            return unsafe { avx2_mpgemm_a8(act, weights, scales, shape, out) };
+        }
         // Prefer the widest kernel the host can execute. AVX-512 (with the BW +
         // VL subsets, needed for the byte-lane trit compares that emit a mask from
         // a 128-bit operand) is selected first where present; otherwise AVX2;
@@ -309,6 +327,110 @@ pub(crate) unsafe fn avx2_mpgemm(
     Ok(())
 }
 
+/// Largest `K` the A8 integer fast path accepts: `128·k < 2²⁴` keeps every
+/// partial sum (and the reference's f32 fold of the same integers) exact, so
+/// the reordered int32 accumulation is bit-identical to the sequential fold.
+#[cfg(target_arch = "x86_64")]
+const A8_EXACT_K_MAX: usize = 65_536;
+
+/// True iff every activation is an integer-valued f32 in [-128, 127] — the
+/// shape `ops::quantize_activation_int8` always produces. NaN/inf fail the
+/// `v == v.trunc()` check.
+#[cfg(target_arch = "x86_64")]
+fn act_is_a8_integer(act: &[f32]) -> bool {
+    act.iter()
+        .all(|&v| v == v.trunc() && (-128.0..=127.0).contains(&v))
+}
+
+/// AVX2 int8 ternary mpGEMM for A8-quantized (integer-valued) activations.
+///
+/// Per row, activations convert to `i8` once (exact — see [`act_is_a8_integer`]).
+/// Ternary weights load as `i8 ∈ {-1,0,+1}` and shift to unsigned codes
+/// `w + 1 ∈ {0,1,2}` so `_mm256_maddubs_epi16(codes_u8, act_i8)` (unsigned ×
+/// signed) applies; the identity `Σ (w+1)·a = Σ w·a + Σ a` recovers the signed
+/// sum by subtracting the row's precomputed `Σ a`. `maddubs` pair-sums cannot
+/// saturate here (|code·a| ≤ 2·128, pair ≤ 512 ≪ 32767); `madd` widens to
+/// exact i32 lanes. The final `(Σ w·a) as f32 · scales[n]` is the identical
+/// last multiply the reference performs on the identical exact integer.
+///
+/// # Safety
+/// Caller must ensure `avx2` is available. Buffer lengths are re-validated
+/// before any intrinsic runs.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn avx2_mpgemm_a8(
+    act: &[f32],
+    weights: &[Trit],
+    scales: &[f32],
+    shape: GemmShape,
+    out: &mut [f32],
+) -> Result<(), BackendError> {
+    use core::arch::x86_64::{
+        __m256i, _mm256_add_epi32, _mm256_add_epi8, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set1_epi8, _mm256_set1_epi16,
+        _mm256_setzero_si256, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32,
+    };
+
+    let GemmShape { m, n, k } = shape;
+    if act.len() != m * k || weights.len() != n * k || scales.len() != n || out.len() != m * n {
+        return scalar_mpgemm(act, weights, scales, shape, out);
+    }
+
+    // SAFETY: `Trit` is `#[repr(transparent)]` over `i8` (see `avx2_mpgemm`).
+    let weights_i8: &[i8] =
+        unsafe { core::slice::from_raw_parts(weights.as_ptr().cast::<i8>(), weights.len()) };
+
+    const LANES: usize = 32; // i8 lanes per AVX2 register
+    let k_simd = k - (k % LANES);
+    let ones16 = _mm256_set1_epi16(1);
+    let one8 = _mm256_set1_epi8(1);
+
+    let mut q8 = vec![0i8; k];
+    for mi in 0..m {
+        let arow = &act[mi * k..mi * k + k];
+        // Exact f32 → i8 (integers in [-128, 127] by the caller's precondition),
+        // plus the row sum for the code-shift identity.
+        let mut row_sum: i64 = 0;
+        for (dst, &v) in q8.iter_mut().zip(arow) {
+            let q = v as i32 as i8;
+            *dst = q;
+            row_sum += i64::from(q);
+        }
+
+        for ni in 0..n {
+            let wrow = &weights_i8[ni * k..ni * k + k];
+            let mut acc = _mm256_setzero_si256();
+            let mut ki = 0;
+            while ki < k_simd {
+                // SAFETY: `ki + 32 <= k_simd <= len` for both slices; loadu has no
+                // alignment requirement.
+                let w = unsafe { _mm256_loadu_si256(wrow.as_ptr().add(ki).cast::<__m256i>()) };
+                let a = unsafe { _mm256_loadu_si256(q8.as_ptr().add(ki).cast::<__m256i>()) };
+                // codes = w + 1 ∈ {0,1,2} as u8 (no wrap: w ≥ -1).
+                let codes = _mm256_add_epi8(w, one8);
+                // u8×i8 pair-sum to i16 (exact, ≤ 512), widen to i32 (exact).
+                let pairs = _mm256_maddubs_epi16(codes, a);
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(pairs, ones16));
+                ki += LANES;
+            }
+            // Horizontal i32 sum of `acc` (order-free: integer adds are exact).
+            let lo = _mm256_extracti128_si256::<0>(acc);
+            let hi = _mm256_extracti128_si256::<1>(acc);
+            let s128 = _mm_add_epi32(lo, hi);
+            let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32::<0b00_01_10_11>(s128));
+            let s32 = _mm_add_epi32(s64, _mm_shuffle_epi32::<0b01_00_11_10>(s64));
+            let mut total: i64 = i64::from(_mm_cvtsi128_si32(s32));
+            // Scalar tail in the same exact integer arithmetic.
+            for kt in k_simd..k {
+                total += i64::from(i32::from(wrow[kt]) + 1) * i64::from(q8[kt]);
+            }
+            let signed = total - row_sum; // Σ (w+1)·a − Σ a = Σ w·a, exact
+            out[mi * n + ni] = signed as f32 * scales[ni];
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +448,52 @@ mod tests {
         let mut out = [0.0; 1];
         scalar_mpgemm(&act, &w, &[2.0], GemmShape::new(1, 1, 3), &mut out).unwrap();
         assert_eq!(out[0], 24.0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a8_fast_path_bit_matches_scalar_reference() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("avx2 not detected — skipping A8 kernel test");
+            return;
+        }
+        let mut s = 0xDEAD_BEEF_1234_5678u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // Integer-valued activations exactly as quantize_activation_int8 emits,
+        // including the extremes; ragged tails and the BitNet widths.
+        for &(m, n, k) in &[(1usize, 5usize, 19usize), (2, 4, 512), (1, 8, 2560), (3, 3, 33)] {
+            let act: Vec<f32> = (0..m * k)
+                .map(|_| ((next() % 256) as i64 - 128) as f32)
+                .collect();
+            assert!(act_is_a8_integer(&act));
+            let w = trits(
+                &(0..n * k)
+                    .map(|_| (next() % 3) as i8 - 1)
+                    .collect::<Vec<_>>(),
+            );
+            let scales: Vec<f32> = (0..n).map(|_| (next() % 50) as f32 / 25.0 + 0.1).collect();
+            let shape = GemmShape::new(m, n, k);
+            let mut want = vec![0.0f32; m * n];
+            scalar_mpgemm(&act, &w, &scales, shape, &mut want).unwrap();
+            let mut got = vec![0.0f32; m * n];
+            // SAFETY: avx2 confirmed above.
+            unsafe { avx2_mpgemm_a8(&act, &w, &scales, shape, &mut got).unwrap() };
+            for (g, e) in got.iter().zip(&want) {
+                assert_eq!(g.to_bits(), e.to_bits(), "got {g}, want {e} ({shape:?})");
+            }
+        }
+        // Non-integer / out-of-range activations must fail detection (the
+        // dispatch keeps them on the bit-exact f32 kernels).
+        assert!(!act_is_a8_integer(&[1.0, 2.5]));
+        assert!(!act_is_a8_integer(&[1.0, 200.0]));
+        assert!(!act_is_a8_integer(&[1.0, f32::NAN]));
+        assert!(!act_is_a8_integer(&[-129.0]));
+        assert!(act_is_a8_integer(&[-128.0, 127.0, 0.0, -0.0]));
     }
 
     #[cfg(target_arch = "x86_64")]
