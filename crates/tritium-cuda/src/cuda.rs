@@ -57,14 +57,17 @@ const KERNEL_NAME_TILED: &str = "tq2_0_add_mpgemm_tiled";
 /// 4090, the decode bottleneck. Not bit-exact; perplexity-gated.
 const KERNEL_NAME_TILED_F32: &str = "tq2_0_add_mpgemm_tiled_f32";
 const KERNEL_NAME_TILED_SCALED: &str = "tq2_0_add_mpgemm_tiled_scaled";
-const KERNEL_NAME_TILED_F32_SCALED: &str = "tq2_0_add_mpgemm_tiled_f32_scaled";
-const KERNEL_NAME_TILED_F32_SCALED_RESIDUAL: &str = "tq2_0_add_mpgemm_tiled_f32_scaled_residual";
+/// DP4A fused-scaled decode GEMMs (v1.x): consume PACKED INT8 activations (the
+/// `_i8` quant kernels' output) read directly from global — no shared staging.
+/// Exact int32 accumulate; bit-identical to the old f32 fold on this path.
+const KERNEL_NAME_TILED_I8_SCALED: &str = "tq2_0_add_mpgemm_tiled_i8_scaled";
+const KERNEL_NAME_TILED_I8_SCALED_RESIDUAL: &str = "tq2_0_add_mpgemm_tiled_i8_scaled_residual";
 /// Sparse-aware f32-tiled kernel: same as `tiled_f32` but accepts a per-row
 /// zero-block bitmap to skip all-zero 256-trit blocks.
 const KERNEL_NAME_TILED_F32_SPARSE: &str = "tq2_0_add_mpgemm_tiled_f32_sparse";
-/// Sparse-aware fused-scaled f32-tiled kernel: same as `tiled_f32_scaled` but
+/// Sparse-aware fused-scaled i8 dp4a kernel: same as `tiled_i8_scaled` but
 /// with bitmap skip for zero blocks.
-const KERNEL_NAME_TILED_F32_SCALED_SPARSE: &str = "tq2_0_add_mpgemm_tiled_f32_scaled_sparse";
+const KERNEL_NAME_TILED_I8_SCALED_SPARSE: &str = "tq2_0_add_mpgemm_tiled_i8_scaled_sparse";
 /// SALT multi-plane accumulate (v0.4.0): sums `Σ_p scale_p·tmatmul(t_p)` over `T`
 /// stacked TQ2_0 planes, reading each block's f16 scale. Matches
 /// [`tritium_format::dequant_salt_row`] → fp32 matmul within 1e-4.
@@ -105,6 +108,12 @@ const ATTN_SPLIT_CHUNK: usize = 64;
 /// bit-matches `ops::quantize_activation_int8` (int8 kept as f32 + per-token scale).
 const KERNEL_NAME_ACT_QUANT_TILED: &str = "act_quant_tiled_f32";
 const KERNEL_NAME_RMSNORM_QUANT: &str = "rmsnorm_quant_f32";
+/// i8-emitting siblings of the two quants above + the batch quant (v1.x): same
+/// math, `q_out` is packed int8 for the `tiled_i8_scaled*` dp4a GEMMs. The f32
+/// originals stay for the public host-facing quant helpers.
+const KERNEL_NAME_ACT_QUANT_TILED_I8: &str = "act_quant_tiled_i8";
+const KERNEL_NAME_RMSNORM_QUANT_I8: &str = "rmsnorm_quant_i8";
+const KERNEL_NAME_ACT_QUANT_BATCH_I8: &str = "act_quant_batch_i8";
 /// Per-token activation-scale fold `out *= act_scale` (v0.3.1) — the device half of
 /// the W1.58A8 dequant the host applies after the GEMM.
 const KERNEL_NAME_SCALE_MUL: &str = "scale_mul_f32";
@@ -128,7 +137,8 @@ const KERNEL_NAME_LM_HEAD_WARP_F16: &str = "lm_head_warp_f16";
 const KERNEL_NAME_RMSNORM_BATCH: &str = "rmsnorm_batch_f32";
 const KERNEL_NAME_EMBED_BATCH: &str = "embedding_gather_batch_f32";
 const KERNEL_NAME_ROPE_BATCH: &str = "rope_apply_batch_f32";
-const KERNEL_NAME_ACT_QUANT_BATCH: &str = "act_quant_batch_f32";
+// (act_quant_batch_f32 remains in decode.cu but has no host consumer since the
+// batch paths moved to the i8 quant + dp4a GEMMs — see KERNEL_NAME_ACT_QUANT_BATCH_I8.)
 const KERNEL_NAME_SCALE_BATCH: &str = "scale_mul_batch_f32";
 const KERNEL_NAME_KV_APPEND_BATCH: &str = "kv_append_batch_f32";
 const KERNEL_NAME_ATTN_BATCH: &str = "gqa_attention_batch_f32";
@@ -460,8 +470,8 @@ impl CudaBackend {
             .load_function(KERNEL_NAME_TILED_F32_SPARSE)
             .map_err(|e| driver_err("resolve tq2_0_add_tiled_f32_sparse kernel", &e))?;
         let func_tiled_f32_scaled_sparse = module
-            .load_function(KERNEL_NAME_TILED_F32_SCALED_SPARSE)
-            .map_err(|e| driver_err("resolve tq2_0_add_tiled_f32_scaled_sparse kernel", &e))?;
+            .load_function(KERNEL_NAME_TILED_I8_SCALED_SPARSE)
+            .map_err(|e| driver_err("resolve tq2_0_add_tiled_i8_scaled_sparse kernel", &e))?;
 
         // The IMMA kernels live in their own compute_80 PTX (the add kernel's
         // compute_75 PTX cannot assemble `mma.m16n8k32`). Loading it JITs to the
@@ -1980,19 +1990,21 @@ impl CudaBackend {
             f_embed: f(dm, KERNEL_NAME_EMBED)?,
             f_lm_head: f(dm, KERNEL_NAME_LM_HEAD)?,
             f_relu2: f(dm, KERNEL_NAME_RELU2_GATE)?,
-            f_quant: f(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
-            f_rmsnorm_quant: f(dm, KERNEL_NAME_RMSNORM_QUANT)?,
+            // v1.x: decode-path quants emit PACKED INT8 for the dp4a GEMMs; the
+            // f32 quant kernels remain for the public host-facing helpers.
+            f_quant: f(dm, KERNEL_NAME_ACT_QUANT_TILED_I8)?,
+            f_rmsnorm_quant: f(dm, KERNEL_NAME_RMSNORM_QUANT_I8)?,
             // v0.50 opt: f32-accumulate tiled GEMM (same kernel the graph path uses).
             // f64 is 1/64-rate on the 4090 — the original decode bottleneck. The f32
             // variant stays within the 1e-4 conformance bar (graph path already gated).
             f_tiled: f(&self._module, KERNEL_NAME_TILED_F32)?,
             f_scale: f(dm, KERNEL_NAME_SCALE_MUL)?,
-            f_tiled_scaled: f(&self._module, KERNEL_NAME_TILED_F32_SCALED)?,
-            f_tiled_scaled_residual: f(&self._module, KERNEL_NAME_TILED_F32_SCALED_RESIDUAL)?,
+            f_tiled_scaled: f(&self._module, KERNEL_NAME_TILED_I8_SCALED)?,
+            f_tiled_scaled_residual: f(&self._module, KERNEL_NAME_TILED_I8_SCALED_RESIDUAL)?,
             f_rmsnorm_batch: f(dm, KERNEL_NAME_RMSNORM_BATCH)?,
             f_embed_batch: f(dm, KERNEL_NAME_EMBED_BATCH)?,
             f_rope_batch: f(dm, KERNEL_NAME_ROPE_BATCH)?,
-            f_quant_batch: f(dm, KERNEL_NAME_ACT_QUANT_BATCH)?,
+            f_quant_batch: f(dm, KERNEL_NAME_ACT_QUANT_BATCH_I8)?,
             f_scale_batch: f(dm, KERNEL_NAME_SCALE_BATCH)?,
             f_kv_append_batch: f(dm, KERNEL_NAME_KV_APPEND_BATCH)?,
             f_attn_batch: f(dm, KERNEL_NAME_ATTN_BATCH)?,
@@ -2025,10 +2037,11 @@ impl CudaBackend {
             d_gate_sn: alloc(n_ff, "decode d_gate_sn")?,
             d_scores: alloc(n_head * max_ctx, "decode d_scores")?,
             d_logits: alloc(vocab, "decode d_logits")?,
-            d_qact: alloc(
-                TILED_K_MAX.min(n_ff.max(q_width).max(n_embd)),
-                "decode d_qact",
-            )?,
+            // v1.x: packed int8 A8 activations for the dp4a GEMMs (4× smaller than
+            // the old int8-as-f32 buffer; the GEMMs read it as 4-byte words).
+            d_qact: s
+                .alloc_zeros::<i8>(TILED_K_MAX.min(n_ff.max(q_width).max(n_embd)))
+                .map_err(|e| driver_err("decode d_qact", &e))?,
             d_act_scale: alloc(1, "decode d_act_scale")?,
             n_embd,
             n_head,
@@ -3711,7 +3724,7 @@ pub struct CudaDecodeModel {
     d_gate_sn: CudaSlice<f32>,
     d_scores: CudaSlice<f32>,
     d_logits: CudaSlice<f32>,
-    d_qact: CudaSlice<f32>,
+    d_qact: CudaSlice<i8>,
     d_act_scale: CudaSlice<f32>,
     // Geometry.
     n_embd: usize,
@@ -4090,7 +4103,7 @@ impl CudaDecodeModel {
         w: &CudaSlice<f32>,
         eps: f32,
         n: usize,
-        d_qact: &mut CudaSlice<f32>,
+        d_qact: &mut CudaSlice<i8>,
         d_act_scale: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         let n_i = n as i32;
@@ -4122,7 +4135,7 @@ impl CudaDecodeModel {
         f_tiled_scaled: &CudaFunction,
         d_in: &CudaSlice<f32>,
         lin: &ResidentLinear,
-        d_qact: &mut CudaSlice<f32>,
+        d_qact: &mut CudaSlice<i8>,
         d_act_scale: &mut CudaSlice<f32>,
         d_out: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
@@ -4150,12 +4163,12 @@ impl CudaDecodeModel {
         // 2. Tiled GEMM with fused act_scale fold (v0.6.0 opt #15).
         //    Epilogue: out[mi,ni] = acc * scales[ni] * act_scale[mi].
         //    Single launch replaces the former GEMM + scale_mul_f32 pair.
-        //    DP4A kernel: stages the row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
+        //    DP4A i8 kernel: reads the packed-int8 row directly — no dynamic shared.
         {
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
-                shared_mem_bytes: ((k + 3) & !3) as u32,
+                shared_mem_bytes: 0,
             };
             let mut l = stream.launch_builder(f_tiled_scaled);
             l.arg(&*d_qact)
@@ -4185,7 +4198,7 @@ impl CudaDecodeModel {
         f_quant: &CudaFunction,
         d_in: &CudaSlice<f32>,
         k: usize,
-        d_qact: &mut CudaSlice<f32>,
+        d_qact: &mut CudaSlice<i8>,
         d_act_scale: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         let k_i = k as i32;
@@ -4215,19 +4228,19 @@ impl CudaDecodeModel {
         stream: &Arc<CudaStream>,
         f_tiled_scaled: &CudaFunction,
         lin: &ResidentLinear,
-        d_qact: &CudaSlice<f32>,
+        d_qact: &CudaSlice<i8>,
         d_act_scale: &CudaSlice<f32>,
         d_out: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         let (n, k) = (lin.n, lin.k);
         let (n_i, k_i, m_i, rb_i) = (n as i32, k as i32, 1i32, lin.row_bytes as i32);
         // Fused tiled GEMM (M=1) with act_scale fold in the epilogue.
-        // DP4A kernel: stages the row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
+        // DP4A i8 kernel: reads the packed-int8 row directly — no dynamic shared.
         {
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
-                shared_mem_bytes: ((k + 3) & !3) as u32,
+                shared_mem_bytes: 0,
             };
             let mut l = stream.launch_builder(f_tiled_scaled);
             l.arg(d_qact)
@@ -4573,7 +4586,9 @@ impl CudaDecodeModel {
         let mut d_gate = alloc(m * n_ff, "prefill d_gate")?;
         let mut d_up = alloc(m * n_ff, "prefill d_up")?;
         let mut d_gate_sn = alloc(m * n_ff, "prefill d_gate_sn")?;
-        let mut d_qact = alloc(m * n_ff, "prefill d_qact")?;
+        let mut d_qact = s
+            .alloc_zeros::<i8>(m * n_ff)
+            .map_err(|e| driver_err("prefill d_qact", &e))?;
         let mut d_act_scale = alloc(m, "prefill d_act_scale")?;
         let mut d_scores = alloc(m * n_head * ctx_max, "prefill d_scores")?;
         let mut d_logits = alloc(self.vocab, "prefill d_logits")?;
@@ -4938,7 +4953,7 @@ impl CudaDecodeModel {
         d_in: &CudaSlice<f32>,
         k: usize,
         m: usize,
-        qact: &mut CudaSlice<f32>,
+        qact: &mut CudaSlice<i8>,
         scale: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
         let (k_i, m_i) = (k as i32, m as i32);
@@ -4949,7 +4964,7 @@ impl CudaDecodeModel {
         };
         let mut l = s.launch_builder(f);
         l.arg(d_in).arg(&k_i).arg(&m_i).arg(qact).arg(scale);
-        // SAFETY: `act_quant_batch_f32(const float* act, int k, int m, float* q, float* scale)`.
+        // SAFETY: `act_quant_batch_i8(const float* act, int k, int m, signed char* q, float* scale)`.
         #[allow(unsafe_code)]
         unsafe {
             l.launch(cfg)
@@ -4962,7 +4977,7 @@ impl CudaDecodeModel {
     fn bl_matmul(
         s: &Arc<CudaStream>,
         f_tiled_scaled: &CudaFunction,
-        qact: &CudaSlice<f32>,
+        qact: &CudaSlice<i8>,
         lin: &ResidentLinear,
         scale: &CudaSlice<f32>,
         m: usize,
@@ -4973,12 +4988,12 @@ impl CudaDecodeModel {
         // Fused tiled GEMM + per-token act_scale fold (v0.6.0 opt #15).
         // grid.y = m dispatches one block-row per output row; the kernel reads
         // act_scale[mi] per row in the epilogue.
-        // DP4A kernel: stages each row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
+        // DP4A i8 kernel: reads each packed-int8 row directly — no dynamic shared.
         {
             let cfg = LaunchConfig {
                 grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), m as u32, 1),
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
-                shared_mem_bytes: ((k + 3) & !3) as u32,
+                shared_mem_bytes: 0,
             };
             let mut l = s.launch_builder(f_tiled_scaled);
             l.arg(qact)
@@ -5192,7 +5207,9 @@ impl CudaDecodeModel {
             d_gate: alloc(n * self.n_ff, "batch d_gate")?,
             d_up: alloc(n * self.n_ff, "batch d_up")?,
             d_gate_sn: alloc(n * self.n_ff, "batch d_gate_sn")?,
-            d_qact: alloc(n * self.n_ff, "batch d_qact")?,
+            d_qact: s
+                .alloc_zeros::<i8>(n * self.n_ff)
+                .map_err(|e| driver_err("batch d_qact", &e))?,
             d_act_scale: alloc(n, "batch d_act_scale")?,
             d_scores: alloc(n * self.n_head * self.max_ctx, "batch d_scores")?,
             d_attn_partials: alloc(
@@ -6085,41 +6102,30 @@ impl CudaDecodeModel {
     ) -> Result<(), BackendError> {
         let cs = self.cap_stream.cu_stream();
         let (m_i, n_out_i, k_i, rb_i) = (n as i32, lin.n as i32, lin.k as i32, lin.rb as i32);
-        {
-            let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), n as u32, 1);
-            let smem = (lin.k * 4) as u32;
-            let mut params = [
-                pp(&d_qact),
-                pp(&lin.w),
-                pp(&lin.sc),
-                pp(&d_out),
-                pp(&m_i),
-                pp(&n_out_i),
-                pp(&k_i),
-                pp(&rb_i),
-            ];
-            raw_launch(
-                self.batch_raw().tiled,
-                grid,
-                (WARPS_PER_BLOCK * 32, 1, 1),
-                smem,
-                cs,
-                &mut params,
-            )?;
-        }
-        {
-            let grid = (((n * lin.n) as u32).div_ceil(256), 1, 1);
-            let mut params = [pp(&d_out), pp(&d_act_scale), pp(&n_out_i), pp(&m_i)];
-            raw_launch(
-                self.batch_raw().scale,
-                grid,
-                (256, 1, 1),
-                0,
-                cs,
-                &mut params,
-            )?;
-        }
-        Ok(())
+        // v1.x: one fused i8 dp4a launch — the `_scaled` epilogue folds the per-row
+        // act_scale, replacing the former tiled + scale_mul_batch pair. The multiply
+        // order is unchanged ((acc·weight_scale)·act_scale) and the int32 contraction
+        // is exact, so the batch-graph argmax lockstep gate is unaffected.
+        let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), n as u32, 1);
+        let mut params = [
+            pp(&d_qact),
+            pp(&lin.w),
+            pp(&lin.sc),
+            pp(&d_act_scale),
+            pp(&d_out),
+            pp(&m_i),
+            pp(&n_out_i),
+            pp(&k_i),
+            pp(&rb_i),
+        ];
+        raw_launch(
+            self.batch_raw().tiled_scaled,
+            grid,
+            (WARPS_PER_BLOCK * 32, 1, 1),
+            0,
+            cs,
+            &mut params,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6596,10 +6602,10 @@ impl CudaDecodeModel {
         let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
         // Fused tiled GEMM + act_scale fold (v0.6.0 opt #15).
         // Single launch replaces the former tiled + scale_mul pair.
-        // DP4A kernel: stages the row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
+        // DP4A i8 kernel: reads the packed-int8 row directly — no dynamic shared.
         {
             let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
-            let smem = ((lin.k + 3) & !3) as u32;
+            let smem = 0u32;
             let mut params = [
                 pp(&d_qact),
                 pp(&lin.w),
@@ -6637,8 +6643,8 @@ impl CudaDecodeModel {
         let cs = self.cap_stream.cu_stream();
         let (n_i, k_i, m_i, rb_i) = (lin.n as i32, lin.k as i32, 1i32, lin.rb as i32);
         let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
-        // DP4A kernel: stages the row as int8 — ceil(k/4)*4 shared BYTES, not k f32.
-        let smem = ((lin.k + 3) & !3) as u32;
+        // DP4A i8 kernel: reads the packed-int8 row directly — no dynamic shared.
+        let smem = 0u32;
         let mut params = [
             pp(&d_qact),
             pp(&lin.w),
@@ -6985,20 +6991,21 @@ impl RawGraphKernels {
             // the gate; this gets most of the win while staying bit-exact.)
             rmsnorm: get(dm, KERNEL_NAME_RMSNORM_SHARED)?,
             // Fused rmsnorm + quant: eliminates one global read+write per norm (v0.7.0).
-            rmsnorm_quant: get(dm, KERNEL_NAME_RMSNORM_QUANT)?,
+            rmsnorm_quant: get(dm, KERNEL_NAME_RMSNORM_QUANT_I8)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
-            act_quant: get(dm, KERNEL_NAME_ACT_QUANT_TILED)?,
+            act_quant: get(dm, KERNEL_NAME_ACT_QUANT_TILED_I8)?,
             scale: get(dm, KERNEL_NAME_SCALE_MUL)?,
             // Coalesced warp-per-row LM head reading the f16 token_embd (bit-identical to
             // the f32 warp head — f16 is the GGUF's native precision — at half the read).
             lm_head: get(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             // f32-accumulate GEMM (the f64 one is 1/64-rate on consumer GPUs).
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
-            // Fused-scaled variant: folds act_scale into the epilogue (v0.6.0 opt #15).
-            tiled_scaled: get(am, KERNEL_NAME_TILED_F32_SCALED)?,
+            // DP4A fused-scaled variant: packed-int8 activations, act_scale folded
+            // into the epilogue (v0.6.0 opt #15 → v1.x i8).
+            tiled_scaled: get(am, KERNEL_NAME_TILED_I8_SCALED)?,
             // Fused-scaled + residual: GEMM epilogue adds to residual (v0.7.0 Phase 2).
-            tiled_scaled_residual: get(am, KERNEL_NAME_TILED_F32_SCALED_RESIDUAL)?,
+            tiled_scaled_residual: get(am, KERNEL_NAME_TILED_I8_SCALED_RESIDUAL)?,
             modules: vec![dm, am],
         })
     }
@@ -7034,7 +7041,6 @@ struct BatchRawKernels {
     embed: sys::CUfunction,
     rmsnorm: sys::CUfunction,
     quant: sys::CUfunction,
-    scale: sys::CUfunction,
     rope: sys::CUfunction,
     kv_append: sys::CUfunction,
     #[allow(dead_code)] // kept for fallback; split-KV replaced it
@@ -7043,7 +7049,9 @@ struct BatchRawKernels {
     attn_combine: sys::CUfunction,
     residual: sys::CUfunction,
     relu2: sys::CUfunction,
-    tiled: sys::CUfunction,
+    /// i8 dp4a fused-scaled GEMM (v1.x): replaces the former `tiled` + separate
+    /// `scale_mul_batch` pair — the epilogue folds the per-row act_scale.
+    tiled_scaled: sys::CUfunction,
     lm_head_tiled: sys::CUfunction,
     argmax: sys::CUfunction,
 }
@@ -7087,8 +7095,7 @@ impl BatchRawKernels {
         Ok(Self {
             embed: get(dm, KERNEL_NAME_EMBED_BATCH)?,
             rmsnorm: get(dm, KERNEL_NAME_RMSNORM_BATCH)?,
-            quant: get(dm, KERNEL_NAME_ACT_QUANT_BATCH)?,
-            scale: get(dm, KERNEL_NAME_SCALE_BATCH)?,
+            quant: get(dm, KERNEL_NAME_ACT_QUANT_BATCH_I8)?,
             rope: get(dm, KERNEL_NAME_ROPE_BATCH)?,
             kv_append: get(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
             attn: get(dm, KERNEL_NAME_ATTN_MDECODE)?,
@@ -7096,7 +7103,7 @@ impl BatchRawKernels {
             attn_combine: get(dm, KERNEL_NAME_ATTN_COMBINE)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
-            tiled: get(am, KERNEL_NAME_TILED_F32)?,
+            tiled_scaled: get(am, KERNEL_NAME_TILED_I8_SCALED)?,
             lm_head_tiled: get(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             argmax: get(dm, KERNEL_NAME_ARGMAX_ROWS)?,
             modules: vec![dm, am],
@@ -7193,7 +7200,7 @@ pub struct BatchKv {
     d_gate: CudaSlice<f32>,
     d_up: CudaSlice<f32>,
     d_gate_sn: CudaSlice<f32>,
-    d_qact: CudaSlice<f32>,
+    d_qact: CudaSlice<i8>,
     d_act_scale: CudaSlice<f32>,
     d_scores: CudaSlice<f32>,
     /// Split-KV attention partials `[n · n_head · S · (head_dim+2)]`, `S = ceil(max_ctx/ATTN_SPLIT_CHUNK)`.

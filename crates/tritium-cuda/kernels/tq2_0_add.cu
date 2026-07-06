@@ -403,14 +403,19 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_sparse(
 // ─── DP4A fused-scaled kernels (v1.x decode opt) ─────────────────────────────
 //
 // The `_scaled` family is only ever launched on **A8-quantized activations**:
-// every call site feeds `d_qact`, the output of `act_quant_tiled_f32` /
-// `rmsnorm_quant_f32` / `act_quant_batch_f32` — integer-valued f32 in
-// [-128, 127] (the W1.58A8 protocol; `act_scale` carries the dequant factor).
-// That precondition lets these kernels run the contraction on the int8 dot-
-// product units via `__dp4a` (sm_61+, under the compute_75 build floor):
+// every call site feeds `d_qact`, now the PACKED INT8 output of
+// `act_quant_tiled_i8` / `rmsnorm_quant_i8` / `act_quant_batch_i8` (the
+// W1.58A8 protocol; `act_scale` carries the dequant factor). The contraction
+// runs on the int8 dot-product units via `__dp4a` (sm_61+, under the
+// compute_75 build floor):
 //
-//   * The staging pass converts the integer-valued floats to packed int8x4
-//     words in shared memory (`__float2int_rn` is exact on integers).
+//   * Activations are read DIRECTLY from global as packed int8x4 words via
+//     `__ldg` — no shared staging, no block-wide barrier. The row is tiny
+//     (K bytes ≤ 6.9 KiB) and every block reads the same one, so it lives in
+//     L1/L2 after the first touch; the earlier f32 staging design made every
+//     N-column block re-read a 4×-bigger f32 row through L2 (more traffic
+//     than the weights themselves at N=2560). Rows must be 4-byte aligned:
+//     the host guarantees `k % 4 == 0` (all decode dims are multiples of 256).
 //   * Each lane reads FOUR consecutive qs bytes as two u16 loads (the 66-byte
 //     block stride only guarantees 2-byte alignment) — one byte-once load of
 //     16 trits — and extracts one 2-bit slot across all four bytes at a time:
@@ -419,18 +424,20 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_sparse(
 //     activation word. Lane l owns slot = l/8 and byte quad j = l%8, covering
 //     a whole 256-trit block per iteration with two independent accumulators.
 //   * The int32 accumulate is EXACT (|Σ| ≤ 127·K < 2³¹) and order-independent,
-//     so the result is bit-identical to the previous f32 kernel on this path:
+//     so the result is bit-identical to the f32-fold original on this path:
 //     f32 sums of integer-valued products also stayed exact (< 2²⁴), and the
 //     epilogue multiplies are unchanged. Greedy/perplexity gates are unaffected.
 //
-// Measured on the RTX 4090 vs the previous f32 tiled kernel (M=1): ~2.7×–3.9×
-// per shape, reaching ~86% of the weight-bandwidth speed-of-light at
-// N=K=6912. If a future call site ever passes NON-integer activations here,
-// route it to `tq2_0_add_mpgemm_tiled_f32` instead — `__float2int_rn` rounds.
+// Measured on the RTX 4090 (M=1, standalone harness): ~2.5× vs the pre-dp4a
+// f32 kernel at N=K=2560 and ~70–85% of the weight-bandwidth speed-of-light
+// across the decode shapes. These kernels use NO dynamic shared memory.
+//
+// Named `_i8_scaled` (not `_f32_scaled`) so any stale host code that still
+// passes an f32 activation buffer fails at kernel-resolve time, not silently.
 
 // Fused-scaled variant (v0.6.0 opt #15 epilogue). DP4A contraction, see above.
-extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
-    const float* __restrict__ act,
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_i8_scaled(
+    const signed char* __restrict__ qact,  // [M, K] packed int8, k % 4 == 0
     const unsigned char* __restrict__ weights,
     const float* __restrict__ scales,
     const float* __restrict__ act_scale,
@@ -439,9 +446,6 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
     const int n,
     const int k,
     const int row_bytes) {
-    extern __shared__ int s_qact[];    // ceil(k/4) packed int8x4 words
-    signed char* s_bytes = (signed char*)s_qact;
-
     const int warps_per_block = blockDim.x / WARP_SIZE;
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -449,15 +453,7 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
     if (mi >= m) {
         return;
     }
-    // Stage the row as int8 (exact: values are A8-quantized integers). Byte
-    // writes to shared are race-free; the pad up to a word boundary is zeroed.
-    const float* arow = act + (long long)mi * k;
-    const int kpad = (k + 3) & ~3;
-    for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
-        s_bytes[i] = (i < k) ? (signed char)__float2int_rn(arow[i]) : 0;
-    }
-    __syncthreads();
-
+    const int* arow = (const int*)(qact + (long long)mi * k);
     const int ni = blockIdx.x * warps_per_block + warp_id;
     if (ni >= n) {
         return;
@@ -476,12 +472,13 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
                                 ((unsigned int)*(const unsigned short*)(qs + 34) << 16);
         const int kidx = (b << 8) + slot * 32 + j4;
         acc0 = __dp4a((int)__vsub4((w0 >> (2 * slot)) & 0x03030303u, 0x01010101u),
-                      s_qact[kidx >> 2], acc0);
+                      __ldg(arow + (kidx >> 2)), acc0);
         acc1 = __dp4a((int)__vsub4((w1 >> (2 * slot)) & 0x03030303u, 0x01010101u),
-                      s_qact[(kidx + 128) >> 2], acc1);
+                      __ldg(arow + ((kidx + 128) >> 2)), acc1);
     }
     int acc = acc0 + acc1;
     // Tail (k % 256 != 0): scalar per-trit decode in exact int math.
+    const signed char* abytes = (const signed char*)arow;
     for (int ki = (k & ~255) + lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
         const int e = ki - block * QK_K;
@@ -490,7 +487,7 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
         const int l = (e & 127) >> 5;
         const unsigned int code =
             ((unsigned int)wrow[block * TQ2_0_BLOCK_BYTES + c * 32 + mm] >> (2 * l)) & 3u;
-        acc += ((int)code - 1) * (int)s_bytes[ki];
+        acc += ((int)code - 1) * (int)abytes[ki];
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -500,12 +497,12 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled(
     }
 }
 
-// Sparse-aware variant of `tq2_0_add_mpgemm_tiled_f32_scaled`. Same DP4A
-// contraction + integer-valued-activation precondition; same bitmap layout as
+// Sparse-aware variant of `tq2_0_add_mpgemm_tiled_i8_scaled`. Same DP4A
+// contraction + packed-int8-activation contract; same bitmap layout as
 // `tq2_0_add_mpgemm_tiled_f32_sparse` (one bit per 256-trit block, set = all-
 // zero, skipped). NULL bitmap → identical to the non-sparse variant.
-extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
-    const float* __restrict__ act,
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_i8_scaled_sparse(
+    const signed char* __restrict__ qact,  // [M, K] packed int8, k % 4 == 0
     const unsigned char* __restrict__ weights,
     const float* __restrict__ scales,
     const float* __restrict__ act_scale,
@@ -516,9 +513,6 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
     const int k,
     const int row_bytes,
     const int words_per_row) {
-    extern __shared__ int s_qact[];
-    signed char* s_bytes = (signed char*)s_qact;
-
     const int warps_per_block = blockDim.x / WARP_SIZE;
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -526,13 +520,7 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
     if (mi >= m) {
         return;
     }
-    const float* arow = act + (long long)mi * k;
-    const int kpad = (k + 3) & ~3;
-    for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
-        s_bytes[i] = (i < k) ? (signed char)__float2int_rn(arow[i]) : 0;
-    }
-    __syncthreads();
-
+    const int* arow = (const int*)(qact + (long long)mi * k);
     const int ni = blockIdx.x * warps_per_block + warp_id;
     if (ni >= n) {
         return;
@@ -555,11 +543,12 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
                                 ((unsigned int)*(const unsigned short*)(qs + 34) << 16);
         const int kidx = (b << 8) + slot * 32 + j4;
         acc0 = __dp4a((int)__vsub4((w0 >> (2 * slot)) & 0x03030303u, 0x01010101u),
-                      s_qact[kidx >> 2], acc0);
+                      __ldg(arow + (kidx >> 2)), acc0);
         acc1 = __dp4a((int)__vsub4((w1 >> (2 * slot)) & 0x03030303u, 0x01010101u),
-                      s_qact[(kidx + 128) >> 2], acc1);
+                      __ldg(arow + ((kidx + 128) >> 2)), acc1);
     }
     int acc = acc0 + acc1;
+    const signed char* abytes = (const signed char*)arow;
     for (int ki = (k & ~255) + lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
         if (row_bm && (row_bm[block / 32] & (1u << (block % 32)))) {
@@ -571,7 +560,7 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
         const int l = (e & 127) >> 5;
         const unsigned int code =
             ((unsigned int)wrow[block * TQ2_0_BLOCK_BYTES + c * 32 + mm] >> (2 * l)) & 3u;
-        acc += ((int)code - 1) * (int)s_bytes[ki];
+        acc += ((int)code - 1) * (int)abytes[ki];
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -582,11 +571,11 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_sparse(
 }
 
 // Fused-scaled + residual-add variant (v0.7.0 opt Phase 2 epilogue, DP4A
-// contraction — same integer-valued-activation precondition as above).
+// contraction — same packed-int8-activation contract as above).
 // Epilogue: out[mi,ni] = residual[mi,ni] + acc * scales[ni] * act_scale[mi]
 // Eliminates the separate residual_add_f32 kernel launch + its memory pass.
-extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
-    const float* __restrict__ act,
+extern "C" __global__ void tq2_0_add_mpgemm_tiled_i8_scaled_residual(
+    const signed char* __restrict__ qact,  // [M, K] packed int8, k % 4 == 0
     const unsigned char* __restrict__ weights,
     const float* __restrict__ scales,
     const float* __restrict__ act_scale,
@@ -596,9 +585,6 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
     const int n,
     const int k,
     const int row_bytes) {
-    extern __shared__ int s_qact[];
-    signed char* s_bytes = (signed char*)s_qact;
-
     const int warps_per_block = blockDim.x / WARP_SIZE;
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -606,13 +592,7 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
     if (mi >= m) {
         return;
     }
-    const float* arow = act + (long long)mi * k;
-    const int kpad = (k + 3) & ~3;
-    for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
-        s_bytes[i] = (i < k) ? (signed char)__float2int_rn(arow[i]) : 0;
-    }
-    __syncthreads();
-
+    const int* arow = (const int*)(qact + (long long)mi * k);
     const int ni = blockIdx.x * warps_per_block + warp_id;
     if (ni >= n) {
         return;
@@ -631,11 +611,12 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
                                 ((unsigned int)*(const unsigned short*)(qs + 34) << 16);
         const int kidx = (b << 8) + slot * 32 + j4;
         acc0 = __dp4a((int)__vsub4((w0 >> (2 * slot)) & 0x03030303u, 0x01010101u),
-                      s_qact[kidx >> 2], acc0);
+                      __ldg(arow + (kidx >> 2)), acc0);
         acc1 = __dp4a((int)__vsub4((w1 >> (2 * slot)) & 0x03030303u, 0x01010101u),
-                      s_qact[(kidx + 128) >> 2], acc1);
+                      __ldg(arow + ((kidx + 128) >> 2)), acc1);
     }
     int acc = acc0 + acc1;
+    const signed char* abytes = (const signed char*)arow;
     for (int ki = (k & ~255) + lane; ki < k; ki += WARP_SIZE) {
         const int block = ki / QK_K;
         const int e = ki - block * QK_K;
@@ -644,7 +625,7 @@ extern "C" __global__ void tq2_0_add_mpgemm_tiled_f32_scaled_residual(
         const int l = (e & 127) >> 5;
         const unsigned int code =
             ((unsigned int)wrow[block * TQ2_0_BLOCK_BYTES + c * 32 + mm] >> (2 * l)) & 3u;
-        acc += ((int)code - 1) * (int)s_bytes[ki];
+        acc += ((int)code - 1) * (int)abytes[ki];
     }
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);

@@ -423,6 +423,169 @@ __global__ void act_quant_tiled_f32(const float* __restrict__ act, const int k,
   }
 }
 
+// ─── i8-emitting quant variants (v1.x decode opt) ────────────────────────────
+// Identical math to their `_f32` originals, but `q_out` is **packed int8** — the
+// exact same integer values the f32 kernels stored as floats (the final
+// f32→int8 conversion of an already-rounded, already-clamped value is exact),
+// just 4× smaller. The `tq2_0_add_mpgemm_tiled_i8_scaled*` GEMMs read this
+// buffer directly from global/L1 (no shared staging, no f32→i8 convert per
+// block), which removes the dominant redundant traffic at M=1: every N-column
+// block re-read the whole f32 activation row (e.g. N=2560 → 320 blocks × 10 KiB
+// = 3.2 MiB of L2 traffic vs only 1.7 MiB of weights). The f32 originals stay
+// for the public host-facing quant helpers and the f64 bit-parity GEMM path.
+//
+// The GEMMs read the row as `int` (4 bytes at a time) for full 256-trit blocks
+// only, so rows must be 4-byte aligned: the host guarantees `k % 4 == 0` on
+// every decode shape (all BitNet dims are multiples of 256).
+
+// i8 sibling of `rmsnorm_quant_f32` (fused RMSNorm + A8 quant, M=1).
+__global__ void rmsnorm_quant_i8(const float* __restrict__ x,
+                                 const float* __restrict__ w,
+                                 const float eps,
+                                 const int n,
+                                 signed char* __restrict__ q_out,
+                                 float* __restrict__ act_scale) {
+  extern __shared__ float s_x[];
+  __shared__ float s_inv;
+  __shared__ float s_gamma;
+  __shared__ float s_red[1024];
+
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    s_x[i] = x[i];
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; ++i) {
+      const float xi = s_x[i];
+      ss = __fadd_rn(ss, __fmul_rn(xi, xi));
+    }
+    const float mean_sq = __fdiv_rn(ss, (float)n);
+    const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+    s_inv = __fdiv_rn(1.0f, denom);
+  }
+  __syncthreads();
+
+  const float inv = s_inv;
+  float local_max = 0.0f;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float yi = __fmul_rn(__fmul_rn(s_x[i], inv), w[i]);
+    s_x[i] = yi;
+    const float a = fabsf(yi);
+    if (a > local_max) local_max = a;
+  }
+  __syncthreads();
+
+  s_red[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      const float o = s_red[threadIdx.x + off];
+      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float gamma = s_red[0];
+    s_gamma = gamma;
+    *act_scale = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);
+  }
+  __syncthreads();
+
+  const float gamma = s_gamma;
+  if (gamma == 0.0f) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) q_out[i] = 0;
+    return;
+  }
+  const float s = __fdiv_rn(127.0f, gamma);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float scaled = rintf(__fmul_rn(s_x[i], s));
+    q_out[i] = (signed char)fminf(fmaxf(scaled, -128.0f), 127.0f);
+  }
+}
+
+// i8 sibling of `act_quant_tiled_f32` (standalone A8 quant, M=1).
+__global__ void act_quant_tiled_i8(const float* __restrict__ act, const int k,
+                                   signed char* __restrict__ q_out,
+                                   float* __restrict__ act_scale) {
+  __shared__ float s_red[256];
+  __shared__ float s_gamma;
+  float local = 0.0f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float a = fabsf(act[i]);
+    if (a > local) local = a;
+  }
+  s_red[threadIdx.x] = local;
+  __syncthreads();
+  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      const float o = s_red[threadIdx.x + off];
+      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float gamma = s_red[0];
+    s_gamma = gamma;
+    *act_scale = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);
+  }
+  __syncthreads();
+
+  const float gamma = s_gamma;
+  if (gamma == 0.0f) {
+    for (int i = threadIdx.x; i < k; i += blockDim.x) q_out[i] = 0;
+    return;
+  }
+  const float s = __fdiv_rn(127.0f, gamma);
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float scaled = rintf(__fmul_rn(act[i], s));
+    q_out[i] = (signed char)fminf(fmaxf(scaled, -128.0f), 127.0f);
+  }
+}
+
+// i8 sibling of `act_quant_batch_f32` (per-row A8 quant of `[m, k]`).
+__global__ void act_quant_batch_i8(const float* __restrict__ act, const int k, const int m,
+                                   signed char* __restrict__ q_out,
+                                   float* __restrict__ act_scale) {
+  const int mi = blockIdx.x;
+  if (mi >= m) return;
+  __shared__ float s_red[256];
+  __shared__ float s_gamma;
+  const float* ar = act + (long long)mi * k;
+  signed char* qr = q_out + (long long)mi * k;
+  float local = 0.0f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float a = fabsf(ar[i]);
+    if (a > local) local = a;
+  }
+  s_red[threadIdx.x] = local;
+  __syncthreads();
+  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      const float o = s_red[threadIdx.x + off];
+      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float gamma = s_red[0];
+    s_gamma = gamma;
+    act_scale[mi] = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);
+  }
+  __syncthreads();
+  const float gamma = s_gamma;
+  if (gamma == 0.0f) {
+    for (int i = threadIdx.x; i < k; i += blockDim.x) qr[i] = 0;
+    return;
+  }
+  const float s = __fdiv_rn(127.0f, gamma);
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float scaled = rintf(__fmul_rn(ar[i], s));
+    qr[i] = (signed char)fminf(fmaxf(scaled, -128.0f), 127.0f);
+  }
+}
+
 // scale_mul_f32 — out[i] *= *s. The per-token activation-dequant fold the host applies
 // after the GEMM (`*slot *= act_scale[r]`); a single f32 mul (no FMA), `s` a device
 // scalar. Embarrassingly parallel.
