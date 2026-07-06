@@ -71,16 +71,25 @@ __global__ void rmsnorm_f32(const float* __restrict__ x,
     }
     s_red[threadIdx.x] = part;
     __syncthreads();
-    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    // Levels 128 and 64 in shared, then warp 0 finishes in registers: the
+    // shuffle pairing (t, t+off) IS the canonical tree's pairing, so the DAG
+    // (and every rounding) is identical — just 6 fewer block barriers.
+    for (int off = 128; off >= 64; off >>= 1) {
       if (threadIdx.x < off) {
         s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
       }
       __syncthreads();
     }
-    if (threadIdx.x == 0) {
-      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
-      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-      s_inv = __fdiv_rn(1.0f, denom);
+    if (threadIdx.x < 32) {
+      float v = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + 32]);  // level 32
+      for (int off = 16; off > 0; off >>= 1) {
+        v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, off));
+      }
+      if (threadIdx.x == 0) {
+        const float mean_sq = __fdiv_rn(v, (float)n);
+        const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+        s_inv = __fdiv_rn(1.0f, denom);
+      }
     }
   }
   __syncthreads();
@@ -123,16 +132,25 @@ __global__ void rmsnorm_shared_f32(const float* __restrict__ x,
     }
     s_red[threadIdx.x] = part;
     __syncthreads();
-    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    // Levels 128 and 64 in shared, then warp 0 finishes in registers: the
+    // shuffle pairing (t, t+off) IS the canonical tree's pairing, so the DAG
+    // (and every rounding) is identical — just 6 fewer block barriers.
+    for (int off = 128; off >= 64; off >>= 1) {
       if (threadIdx.x < off) {
         s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
       }
       __syncthreads();
     }
-    if (threadIdx.x == 0) {
-      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
-      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-      s_inv = __fdiv_rn(1.0f, denom);
+    if (threadIdx.x < 32) {
+      float v = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + 32]);  // level 32
+      for (int off = 16; off > 0; off >>= 1) {
+        v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, off));
+      }
+      if (threadIdx.x == 0) {
+        const float mean_sq = __fdiv_rn(v, (float)n);
+        const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+        s_inv = __fdiv_rn(1.0f, denom);
+      }
     }
   }
   __syncthreads();
@@ -189,16 +207,25 @@ __global__ void rmsnorm_quant_f32(const float* __restrict__ x,
     }
     s_red[threadIdx.x] = part;
     __syncthreads();
-    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    // Levels 128 and 64 in shared, then warp 0 finishes in registers: the
+    // shuffle pairing (t, t+off) IS the canonical tree's pairing, so the DAG
+    // (and every rounding) is identical — just 6 fewer block barriers.
+    for (int off = 128; off >= 64; off >>= 1) {
       if (threadIdx.x < off) {
         s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
       }
       __syncthreads();
     }
-    if (threadIdx.x == 0) {
-      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
-      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-      s_inv = __fdiv_rn(1.0f, denom);
+    if (threadIdx.x < 32) {
+      float v = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + 32]);  // level 32
+      for (int off = 16; off > 0; off >>= 1) {
+        v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, off));
+      }
+      if (threadIdx.x == 0) {
+        const float mean_sq = __fdiv_rn(v, (float)n);
+        const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+        s_inv = __fdiv_rn(1.0f, denom);
+      }
     }
   }
   __syncthreads();
@@ -223,17 +250,23 @@ __global__ void rmsnorm_quant_f32(const float* __restrict__ x,
   //    of two (matches act_quant_tiled_f32's reduction).
   s_red[threadIdx.x] = local_max;
   __syncthreads();
-  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+  // max is exact under any order; same shared-then-warp-shuffle shape as the
+  // sum tree above (6 fewer barriers).
+  for (int off = 128; off >= 64; off >>= 1) {
     if (threadIdx.x < off) {
-      const float o = s_red[threadIdx.x + off];
-      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
+      s_red[threadIdx.x] = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + off]);
     }
     __syncthreads();
   }
-  if (threadIdx.x == 0) {
-    const float gamma = s_red[0];
-    s_gamma = gamma;
-    *act_scale = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);
+  if (threadIdx.x < 32) {
+    float v = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    if (threadIdx.x == 0) {
+      s_gamma = v;
+      *act_scale = (v == 0.0f) ? 0.0f : __fdiv_rn(v, 127.0f);
+    }
   }
   __syncthreads();
 
@@ -443,12 +476,24 @@ __global__ void act_quant_tiled_f32(const float* __restrict__ act, const int k,
   }
   s_red[threadIdx.x] = local;
   __syncthreads();
-  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+  // max is exact under any order: shared levels 128/64, warp-0 shuffle tail
+  // (6 fewer barriers); thread 0 lands the result back in s_red[0] for the
+  // existing consumer below.
+  for (int off = 128; off >= 64; off >>= 1) {
     if (threadIdx.x < off) {
       const float o = s_red[threadIdx.x + off];
       if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
     }
     __syncthreads();
+  }
+  if (threadIdx.x < 32) {
+    float v = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    if (threadIdx.x == 0) {
+      s_red[0] = v;
+    }
   }
   if (threadIdx.x == 0) {
     const float gamma = s_red[0];
@@ -515,16 +560,25 @@ __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
     }
     s_red[threadIdx.x] = part;
     __syncthreads();
-    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    // Levels 128 and 64 in shared, then warp 0 finishes in registers: the
+    // shuffle pairing (t, t+off) IS the canonical tree's pairing, so the DAG
+    // (and every rounding) is identical — just 6 fewer block barriers.
+    for (int off = 128; off >= 64; off >>= 1) {
       if (threadIdx.x < off) {
         s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
       }
       __syncthreads();
     }
-    if (threadIdx.x == 0) {
-      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
-      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-      s_inv = __fdiv_rn(1.0f, denom);
+    if (threadIdx.x < 32) {
+      float v = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + 32]);  // level 32
+      for (int off = 16; off > 0; off >>= 1) {
+        v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, off));
+      }
+      if (threadIdx.x == 0) {
+        const float mean_sq = __fdiv_rn(v, (float)n);
+        const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+        s_inv = __fdiv_rn(1.0f, denom);
+      }
     }
   }
   __syncthreads();
@@ -541,17 +595,23 @@ __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
 
   s_red[threadIdx.x] = local_max;
   __syncthreads();
-  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+  // max is exact under any order; same shared-then-warp-shuffle shape as the
+  // sum tree above (6 fewer barriers).
+  for (int off = 128; off >= 64; off >>= 1) {
     if (threadIdx.x < off) {
-      const float o = s_red[threadIdx.x + off];
-      if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
+      s_red[threadIdx.x] = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + off]);
     }
     __syncthreads();
   }
-  if (threadIdx.x == 0) {
-    const float gamma = s_red[0];
-    s_gamma = gamma;
-    *act_scale = (gamma == 0.0f) ? 0.0f : __fdiv_rn(gamma, 127.0f);
+  if (threadIdx.x < 32) {
+    float v = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    if (threadIdx.x == 0) {
+      s_gamma = v;
+      *act_scale = (v == 0.0f) ? 0.0f : __fdiv_rn(v, 127.0f);
+    }
   }
   __syncthreads();
 
@@ -580,12 +640,24 @@ __global__ void act_quant_tiled_i8(const float* __restrict__ act, const int k,
   }
   s_red[threadIdx.x] = local;
   __syncthreads();
-  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+  // max is exact under any order: shared levels 128/64, warp-0 shuffle tail
+  // (6 fewer barriers); thread 0 lands the result back in s_red[0] for the
+  // existing consumer below.
+  for (int off = 128; off >= 64; off >>= 1) {
     if (threadIdx.x < off) {
       const float o = s_red[threadIdx.x + off];
       if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
     }
     __syncthreads();
+  }
+  if (threadIdx.x < 32) {
+    float v = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    if (threadIdx.x == 0) {
+      s_red[0] = v;
+    }
   }
   if (threadIdx.x == 0) {
     const float gamma = s_red[0];
@@ -623,12 +695,24 @@ __global__ void act_quant_batch_i8(const float* __restrict__ act, const int k, c
   }
   s_red[threadIdx.x] = local;
   __syncthreads();
-  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+  // max is exact under any order: shared levels 128/64, warp-0 shuffle tail
+  // (6 fewer barriers); thread 0 lands the result back in s_red[0] for the
+  // existing consumer below.
+  for (int off = 128; off >= 64; off >>= 1) {
     if (threadIdx.x < off) {
       const float o = s_red[threadIdx.x + off];
       if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
     }
     __syncthreads();
+  }
+  if (threadIdx.x < 32) {
+    float v = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    if (threadIdx.x == 0) {
+      s_red[0] = v;
+    }
   }
   if (threadIdx.x == 0) {
     const float gamma = s_red[0];
@@ -1165,12 +1249,22 @@ __global__ void gqa_attention_reduce_g(const float* __restrict__ v,
   }
   s_red[tid] = m;
   __syncthreads();
-  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
-    if (tid < off) {
-      s_red[tid] = fmaxf(s_red[tid], s_red[tid + off]);
-    }
-    __syncthreads();
+  // max is exact under any order: one shared level (blockDim == 128), then a
+  // warp-0 shuffle tail — 5 fewer block barriers than the full shared tree.
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
   }
+  __syncthreads();
+  if (tid < 32) {
+    float v = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    if (tid == 0) {
+      s_red[0] = v;
+    }
+  }
+  __syncthreads();
   m = s_red[0];
 
   // exp: elementwise, parallel — identical exp_f32 bits per key.
@@ -1297,16 +1391,25 @@ __global__ void rmsnorm_batch_f32(const float* __restrict__ x, const float* __re
     }
     s_red[threadIdx.x] = part;
     __syncthreads();
-    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+    // Levels 128 and 64 in shared, then warp 0 finishes in registers: the
+    // shuffle pairing (t, t+off) IS the canonical tree's pairing, so the DAG
+    // (and every rounding) is identical — just 6 fewer block barriers.
+    for (int off = 128; off >= 64; off >>= 1) {
       if (threadIdx.x < off) {
         s_red[threadIdx.x] = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + off]);
       }
       __syncthreads();
     }
-    if (threadIdx.x == 0) {
-      const float mean_sq = __fdiv_rn(s_red[0], (float)n);
-      const float denom = sqrtf(__fadd_rn(mean_sq, eps));
-      s_inv = __fdiv_rn(1.0f, denom);
+    if (threadIdx.x < 32) {
+      float v = __fadd_rn(s_red[threadIdx.x], s_red[threadIdx.x + 32]);  // level 32
+      for (int off = 16; off > 0; off >>= 1) {
+        v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, off));
+      }
+      if (threadIdx.x == 0) {
+        const float mean_sq = __fdiv_rn(v, (float)n);
+        const float denom = sqrtf(__fadd_rn(mean_sq, eps));
+        s_inv = __fdiv_rn(1.0f, denom);
+      }
     }
   }
   __syncthreads();
@@ -1369,12 +1472,24 @@ __global__ void act_quant_batch_f32(const float* __restrict__ act, const int k, 
   }
   s_red[threadIdx.x] = local;
   __syncthreads();
-  for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+  // max is exact under any order: shared levels 128/64, warp-0 shuffle tail
+  // (6 fewer barriers); thread 0 lands the result back in s_red[0] for the
+  // existing consumer below.
+  for (int off = 128; off >= 64; off >>= 1) {
     if (threadIdx.x < off) {
       const float o = s_red[threadIdx.x + off];
       if (o > s_red[threadIdx.x]) s_red[threadIdx.x] = o;
     }
     __syncthreads();
+  }
+  if (threadIdx.x < 32) {
+    float v = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    }
+    if (threadIdx.x == 0) {
+      s_red[0] = v;
+    }
   }
   if (threadIdx.x == 0) {
     const float gamma = s_red[0];
