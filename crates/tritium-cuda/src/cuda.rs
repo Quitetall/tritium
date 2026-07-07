@@ -2089,6 +2089,7 @@ impl CudaBackend {
             f_attn_reduce,
             tree_scratch: None,
             tree_graphs: None,
+            pending_tree: None,
             f_rmsnorm: f(dm, KERNEL_NAME_RMSNORM)?,
             f_rope: f(dm, KERNEL_NAME_ROPE)?,
             f_attn,
@@ -3838,6 +3839,10 @@ pub struct CudaDecodeModel {
     f_attn_reduce: CudaFunction,
     /// Lazily grown scratch for `tree_verify_greedy` (see [`TreeScratch`]).
     tree_scratch: Option<TreeScratch>,
+    /// The uncommitted tree from [`Self::tree_verify_logits`]: (node count,
+    /// parents). Consumed by [`Self::tree_commit`]; invalidated by any new
+    /// tree forward or [`Self::reset`].
+    pending_tree: Option<(usize, Vec<i32>)>,
     /// Captured tree-verify trunk graphs, keyed by bucket (see [`TreeGraphs`]).
     tree_graphs: Option<TreeGraphs>,
     f_residual: CudaFunction,
@@ -3952,6 +3957,7 @@ impl CudaDecodeModel {
     /// Reset the KV cache (start a fresh sequence). The arena bytes are left as-is;
     /// only the watermark moves, exactly like [`crate`]'s host `KvCache::reset`.
     pub fn reset(&mut self) {
+        self.pending_tree = None;
         self.cache_len = 0;
     }
 
@@ -5149,11 +5155,17 @@ impl CudaDecodeModel {
     /// [`BackendError::InvalidInput`] on a malformed tree (root not at 0,
     /// non-topological parents, out-of-range token) or capacity overflow;
     /// device errors otherwise.
-    pub fn tree_verify_greedy(
-        &mut self,
-        tokens: &[u32],
-        parents: &[i32],
-    ) -> Result<Vec<u32>, BackendError> {
+    ///
+    /// This is the shared FORWARD half: it validates the tree, appends
+    /// provisional K/V at arena rows [cache_len, cache_len + m) and leaves
+    /// every node's logits in `tree_scratch.d_logits_all` WITHOUT committing.
+    /// [`Self::tree_verify_greedy`] adds the device argmax + greedy walk;
+    /// [`Self::tree_verify_logits`] hands the logits to the host for the
+    /// speculative-sampling accept rule, with [`Self::tree_commit`] promoting
+    /// the host-chosen path.
+    fn tree_forward(&mut self, tokens: &[u32], parents: &[i32]) -> Result<usize, BackendError> {
+        // A new forward invalidates any uncommitted previous tree.
+        self.pending_tree = None;
         let m = tokens.len();
         if m == 0 || parents.len() != m {
             return Err(BackendError::InvalidInput(
@@ -5401,19 +5413,8 @@ impl CudaDecodeModel {
                 m,
                 &mut ts.d_logits_all,
             )?;
-            Self::bl_argmax_rows_chunked(
-                cs,
-                &self.f_argmax_partial,
-                &self.f_argmax_combine,
-                &ts.d_logits_all,
-                self.vocab,
-                m,
-                &mut ts.d_amax_val,
-                &mut ts.d_amax_idx,
-                &mut ts.d_ids,
-            )?;
             // The verify's writes (KV appends included) must be visible to the
-            // default-stream dtoh/promote/decode that follow.
+            // default-stream consumers that follow (argmax/logits dtoh/promote).
             cs.synchronize()
                 .map_err(|e| driver_err("tree post-replay sync", &e))?;
         } else {
@@ -5689,18 +5690,40 @@ impl CudaDecodeModel {
                 m,
                 &mut ts.d_logits_all,
             )?;
-            Self::bl_argmax_rows_chunked(
-                s,
-                &self.f_argmax_partial,
-                &self.f_argmax_combine,
-                &ts.d_logits_all,
-                self.vocab,
-                m,
-                &mut ts.d_amax_val,
-                &mut ts.d_amax_idx,
-                &mut ts.d_ids,
-            )?;
         }
+        // Forward complete: logits for every tree node sit in
+        // `tree_scratch.d_logits_all[0..m*vocab]`; provisional K/V occupy arena
+        // rows [cache_len, cache_len + m). Nothing is committed yet.
+        self.tree_scratch = Some(ts);
+        Ok(m)
+    }
+
+    /// Greedy tree verify (ADR 0014): forward the draft tree, device-argmax
+    /// every node, walk the accepted path and commit it. Returns the target's
+    /// greedy tokens along the accepted path (+ the bonus token).
+    pub fn tree_verify_greedy(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+    ) -> Result<Vec<u32>, BackendError> {
+        let m = self.tree_forward(tokens, parents)?;
+        let s = &self.stream;
+        let mut ts = self
+            .tree_scratch
+            .take()
+            .expect("tree scratch after forward");
+        Self::bl_argmax_rows_chunked(
+            s,
+            &self.f_argmax_partial,
+            &self.f_argmax_combine,
+            &ts.d_logits_all,
+            self.vocab,
+            m,
+            &mut ts.d_amax_val,
+            &mut ts.d_amax_idx,
+            &mut ts.d_ids,
+        )?;
+        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let mut ids = vec![0i32; m];
         // The cached buffer may exceed this call's `m` — copy exactly m ids.
         let ids_view = ts.d_ids.slice(0..m);
@@ -5723,11 +5746,72 @@ impl CudaDecodeModel {
                 None => break,
             }
         }
-        let l = path.len();
+        self.tree_promote(&path)?;
 
-        // Promote the accepted path: node path[k] (arena slot cache_len + path[k])
-        // moves to arena row cache_len + k. path is strictly increasing, so
-        // src >= dst and no promoted row is overwritten before it is read.
+        Ok(path.iter().map(|&n| ids[n] as u32).collect())
+    }
+
+    /// Forward a draft tree and return every node's logits `[m, vocab]`
+    /// row-major on the host, for a HOST-side accept rule (speculative
+    /// sampling). Provisional K/V occupy arena rows [cache_len, cache_len+m);
+    /// nothing is committed until [`Self::tree_commit`]. Any other decode
+    /// operation (or another tree forward) in between invalidates the
+    /// provisional rows — commit refuses once the pending tree is gone.
+    pub fn tree_verify_logits(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+    ) -> Result<Vec<f32>, BackendError> {
+        let m = self.tree_forward(tokens, parents)?;
+        let s = &self.stream;
+        let ts = self
+            .tree_scratch
+            .take()
+            .expect("tree scratch after forward");
+        let mut logits = vec![0.0f32; m * self.vocab];
+        let view = ts.d_logits_all.slice(0..m * self.vocab);
+        s.memcpy_dtoh(&view, &mut logits)
+            .map_err(|e| driver_err("tree logits dtoh", &e))?;
+        self.tree_scratch = Some(ts);
+        self.pending_tree = Some((m, parents.to_vec()));
+        Ok(logits)
+    }
+
+    /// Commit the host-chosen accepted path of the pending tree (from
+    /// [`Self::tree_verify_logits`]): promote its K/V rows and advance the
+    /// cache. `path` holds tree-node indices, starting at the root (0), each
+    /// subsequent node a child of the previous.
+    pub fn tree_commit(&mut self, path: &[usize]) -> Result<(), BackendError> {
+        let Some((m, parents)) = self.pending_tree.take() else {
+            return Err(BackendError::InvalidInput(
+                "tree_commit: no pending tree (call tree_verify_logits first; any \
+                 intervening decode operation invalidates the provisional rows)"
+                    .into(),
+            ));
+        };
+        if path.is_empty() || path[0] != 0 {
+            return Err(BackendError::InvalidInput(
+                "tree_commit: path must start at the root (node 0)".into(),
+            ));
+        }
+        for w in path.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if b >= m || parents[b] as usize != a {
+                return Err(BackendError::InvalidInput(format!(
+                    "tree_commit: node {b} is not a child of {a} (m={m})"
+                )));
+            }
+        }
+        self.tree_promote(path)
+    }
+
+    /// Promote the accepted path: node path[k] (arena slot cache_len + path[k])
+    /// moves to arena row cache_len + k, then the cache advances by the path
+    /// length. `path` is strictly increasing (children follow parents), so
+    /// src >= dst and no promoted row is overwritten before it is read.
+    fn tree_promote(&mut self, path: &[usize]) -> Result<(), BackendError> {
+        let s = &self.stream;
+        let kv_width = self.kv_width;
         for (k, &node) in path.iter().enumerate() {
             if node == k {
                 continue; // already in place (chain prefix)
@@ -5754,9 +5838,8 @@ impl CudaDecodeModel {
                 }
             }
         }
-        self.cache_len += l;
-
-        Ok(path.iter().map(|&n| ids[n] as u32).collect())
+        self.cache_len += path.len();
+        Ok(())
     }
 
     // --- batched (M>1) prefill launch helpers (safe launches; eager one-shot path) ---

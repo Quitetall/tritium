@@ -29,7 +29,7 @@ pub use layers::{
 };
 pub use model::{ForwardDump, LayerWeights, ModelRunner, ModelWeights, Tokenizer};
 pub use ops::{
-    QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_greedy, sample_top_k,
-    sample_top_p, softmax_rows,
+    QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_categorical,
+    sample_greedy, sample_top_k, sample_top_p, softmax_rows, truncated_top_k, truncated_top_p,
 };
 pub use tensor::f16_bytes_to_f32;

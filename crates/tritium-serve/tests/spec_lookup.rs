@@ -50,6 +50,70 @@ fn collect(generator: &mut dyn Generator, req: &GenRequest) -> (Vec<u32>, std::t
     (out, t0.elapsed())
 }
 
+/// temp→0 gate for the SAMPLING accept rule: TopK{k:1} makes p̃ collapse to
+/// the argmax candidate at probability 1, so the whole sampled machinery
+/// (tree_verify_logits → host accept walk → tree_commit) becomes
+/// deterministic and must reproduce the plain greedy stream token-for-token.
+#[test]
+fn cuda_spec_sampled_topk1_matches_plain_greedy() {
+    if !Path::new(GGUF_PATH).exists() {
+        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let prompt: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+
+    let greedy_req = GenRequest {
+        prompt_tokens: prompt.clone(),
+        max_new: 128,
+        sampling: Sampling::Greedy,
+        stop_eos: false,
+    };
+    let sampled_req = GenRequest {
+        prompt_tokens: prompt,
+        max_new: 128,
+        sampling: Sampling::TopK {
+            k: 1,
+            temp: 1.0,
+            seed: 42,
+        },
+        stop_eos: false,
+    };
+
+    let Some(runner) = load_runner(&bytes) else {
+        return;
+    };
+    let mut plain = RunnerGenerator::new(runner, u32::MAX);
+    let (want, _) = collect(&mut plain, &greedy_req);
+
+    let Some(runner) = load_runner(&bytes) else {
+        return;
+    };
+    let mut spec = RunnerGenerator::new(runner, u32::MAX).with_spec_lookup(true);
+    let (got, t) = collect(&mut spec, &sampled_req);
+    println!("spec-sampled k=1: {} tok in {t:.2?}", got.len());
+    assert_eq!(
+        got, want,
+        "spec-sampled TopK{{k:1}} must equal plain greedy"
+    );
+
+    // Same seed twice → identical stream (the spec path is deterministic).
+    let Some(runner) = load_runner(&bytes) else {
+        return;
+    };
+    let mut spec2 = RunnerGenerator::new(runner, u32::MAX).with_spec_lookup(true);
+    let (got2, _) = collect(&mut spec2, &sampled_req);
+    assert_eq!(got2, got, "same-seed spec-sampled runs must be identical");
+}
+
 #[test]
 fn cuda_spec_lookup_matches_plain_greedy() {
     if !Path::new(GGUF_PATH).exists() {

@@ -518,6 +518,250 @@ impl RunnerGenerator {
     }
 }
 
+impl RunnerGenerator {
+    /// The truncated, renormalized distribution the plain sampler draws from
+    /// for `s`, as parallel `(indices, probs)` (see `tritium_nn::truncated_*`
+    /// — the samplers are thin wrappers over these, so this IS the plain
+    /// sampler's distribution, not a reimplementation).
+    fn truncated(logits: &[f32], s: &Sampling) -> Option<(Vec<u32>, Vec<f32>)> {
+        match *s {
+            Sampling::Greedy => tritium_nn::sample_greedy(logits).map(|t| (vec![t], vec![1.0])),
+            Sampling::TopK { k, temp, .. } => tritium_nn::truncated_top_k(logits, k, temp),
+            Sampling::TopP { p, temp, .. } => tritium_nn::truncated_top_p(logits, p, temp),
+        }
+    }
+
+    /// One accept-rule step for a DETERMINISTIC drafter (q = δ_d): accept
+    /// draft `d` iff `u < p̃(d)` (returns `None` — the draft stands); on
+    /// rejection return the leftover-distribution sample — p̃ with `d`
+    /// removed, renormalized (if `d` wasn't in the truncated set, p̃(d) = 0
+    /// and the leftover IS p̃). Output distribution per position is exactly
+    /// p̃: P(d) = p̃(d), P(x≠d) = (1 − p̃(d)) · p̃(x)/(1 − p̃(d)) = p̃(x) —
+    /// gated by `spec_accept_step_is_lossless_in_distribution`.
+    pub(crate) fn spec_accept_step(
+        idx: &[u32],
+        probs: &[f32],
+        d: u32,
+        u: f32,
+        resample_seed: u64,
+    ) -> Option<u32> {
+        let pd = idx.iter().position(|&t| t == d).map_or(0.0, |i| probs[i]);
+        if u < pd {
+            return None;
+        }
+        let mut r_idx = Vec::with_capacity(idx.len());
+        let mut r_probs = Vec::with_capacity(probs.len());
+        let mut sum = 0.0f32;
+        for (&t, &pr) in idx.iter().zip(probs) {
+            if t != d {
+                r_idx.push(t);
+                r_probs.push(pr);
+                sum += pr;
+            }
+        }
+        if r_idx.is_empty() || sum <= 0.0 {
+            // Degenerate p̃ = δ_d rejected by a round-off-scale draw (p̃(d)≈1):
+            // emitting d is the correct limit.
+            return Some(d);
+        }
+        for pr in &mut r_probs {
+            *pr /= sum;
+        }
+        Some(tritium_nn::sample_categorical(
+            &r_idx,
+            &r_probs,
+            resample_seed,
+        ))
+    }
+
+    /// splitmix64 → uniform in [0, 1). The spec path's accept/resample draws
+    /// use their own deterministic stream derived from the request seed —
+    /// distributional losslessness doesn't require (and can't have) the plain
+    /// loop's exact random stream.
+    fn spec_uniform(seed: u64, salt: u64) -> f32 {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(salt.wrapping_add(1)));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // Top 24 bits → [0, 1) with full f32 precision.
+        (z >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Speculative SAMPLING loop (the temperature > 0 twin of
+    /// `generate_spec_lookup`): the prompt-lookup drafter is deterministic
+    /// (q = δ_draft), so the leftover-distribution accept rule reduces to:
+    /// accept draft `d` with probability p̃(d); on rejection sample from p̃
+    /// with `d` removed (renormalized). Algebraically the output distribution
+    /// is exactly p̃ at every position — lossless in distribution (gated at
+    /// temp → 0, where p̃ collapses to argmax and the stream must EQUAL plain
+    /// greedy token-for-token).
+    #[cfg(feature = "cuda")]
+    fn generate_spec_lookup_sampled(
+        &mut self,
+        req: &GenRequest,
+        _prompt_len: usize,
+        max_new: usize,
+        prefill_logits: Vec<f32>,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        const DRAFT_MIN: usize = 6;
+        const DRAFT_MAX: usize = 40;
+        let n_ctx = self.runner.config.n_ctx as usize;
+        let seed = match req.sampling {
+            Sampling::TopK { seed, .. } | Sampling::TopP { seed, .. } => seed,
+            Sampling::Greedy => 0,
+        };
+        if max_new == 0 {
+            return Ok(());
+        }
+        let mut history: Vec<u32> = req.prompt_tokens.clone();
+        let mut emitted = 0usize;
+        let mut draft_len = DRAFT_MIN;
+        // Every random decision gets a fresh salt so draws are independent.
+        let mut salt = 0u64;
+
+        let mut pending = {
+            let (idx, probs) = Self::truncated(&prefill_logits, &req.sampling)
+                .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+            salt += 1;
+            tritium_nn::sample_categorical(&idx, &probs, seed.wrapping_add(salt))
+        };
+        loop {
+            let is_eos = req.stop_eos && pending == self.eos;
+            let last = is_eos || emitted + 1 >= max_new;
+            let cont = on_step(Step {
+                token: pending,
+                finished: last,
+                finish_reason: if is_eos {
+                    Some(FinishReason::Stop)
+                } else if last {
+                    Some(FinishReason::Length)
+                } else {
+                    None
+                },
+            });
+            emitted += 1;
+            if last || !cont {
+                return Ok(());
+            }
+            history.push(pending);
+
+            let kv_room = n_ctx.saturating_sub(history.len());
+            let budget = max_new - emitted;
+            let max_draft = draft_len.min(kv_room).min(budget.saturating_sub(1));
+            let drafts = Self::lookup_draft(&history, max_draft);
+
+            if drafts.is_empty() {
+                let pos = history.len() - 1;
+                let logits = self
+                    .runner
+                    .forward(&[pending], &[pos])
+                    .map_err(|e| GenError::Backend(e.to_string()))?;
+                let (idx, probs) = Self::truncated(&logits, &req.sampling)
+                    .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+                salt += 1;
+                pending = tritium_nn::sample_categorical(&idx, &probs, seed.wrapping_add(salt));
+                continue;
+            }
+
+            let mut tokens = Vec::with_capacity(1 + drafts.len());
+            tokens.push(pending);
+            tokens.extend(&drafts);
+            let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
+            let logits_all = {
+                let rm = self
+                    .runner
+                    .resident_cuda()
+                    .map_err(|e| GenError::Backend(e.to_string()))?
+                    .ok_or_else(|| {
+                        GenError::Backend("spec lookup needs the CUDA resident decoder".into())
+                    })?;
+                rm.tree_verify_logits(&tokens, &parents)
+                    .map_err(|e| GenError::Backend(e.to_string()))?
+            };
+            let vocab = logits_all.len() / tokens.len();
+
+            // Chain walk with the accept rule. `path` holds tree-node indices;
+            // node j's child in the chain is node j+1.
+            let mut path = vec![0usize];
+            let mut final_token: Option<u32> = None;
+            for child in 1..tokens.len() {
+                let node = child - 1;
+                let row = &logits_all[node * vocab..(node + 1) * vocab];
+                let (idx, probs) = Self::truncated(row, &req.sampling)
+                    .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+                let d = tokens[child];
+                salt += 1;
+                let u = Self::spec_uniform(seed, salt);
+                salt += 1;
+                match Self::spec_accept_step(&idx, &probs, d, u, seed.wrapping_add(salt)) {
+                    None => {
+                        path.push(child);
+                        continue;
+                    }
+                    Some(t) => {
+                        final_token = Some(t);
+                        break;
+                    }
+                }
+            }
+            let final_token = match final_token {
+                Some(t) => t,
+                None => {
+                    // Full accept: bonus draw from the last node's distribution.
+                    let node = *path.last().expect("path non-empty");
+                    let row = &logits_all[node * vocab..(node + 1) * vocab];
+                    let (idx, probs) = Self::truncated(row, &req.sampling)
+                        .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+                    salt += 1;
+                    tritium_nn::sample_categorical(&idx, &probs, seed.wrapping_add(salt))
+                }
+            };
+            {
+                let rm = self
+                    .runner
+                    .resident_cuda()
+                    .map_err(|e| GenError::Backend(e.to_string()))?
+                    .ok_or_else(|| {
+                        GenError::Backend("spec lookup needs the CUDA resident decoder".into())
+                    })?;
+                rm.tree_commit(&path)
+                    .map_err(|e| GenError::Backend(e.to_string()))?;
+            }
+            draft_len = if path.len() == tokens.len() {
+                (draft_len * 2).min(DRAFT_MAX)
+            } else {
+                DRAFT_MIN
+            };
+
+            // Emit the accepted draft tokens; the final (resampled or bonus)
+            // token becomes the new pending, emitted at the top of the loop.
+            for &node in &path[1..] {
+                let c = tokens[node];
+                let is_eos = req.stop_eos && c == self.eos;
+                let last = is_eos || emitted + 1 >= max_new;
+                let cont = on_step(Step {
+                    token: c,
+                    finished: last,
+                    finish_reason: if is_eos {
+                        Some(FinishReason::Stop)
+                    } else if last {
+                        Some(FinishReason::Length)
+                    } else {
+                        None
+                    },
+                });
+                emitted += 1;
+                if last || !cont {
+                    return Ok(());
+                }
+                history.push(c);
+            }
+            pending = final_token;
+        }
+    }
+}
+
 impl Generator for RunnerGenerator {
     fn generate(
         &mut self,
@@ -546,12 +790,21 @@ impl Generator for RunnerGenerator {
         // disabled, sampling is stochastic, or no CUDA resident decoder exists
         // (probed HERE — e.g. `--spec lookup` on the cpu backend — so the
         // fallback is a dispatch decision, never a mid-stream error).
-        let spec = self.spec_lookup && matches!(req.sampling, Sampling::Greedy);
         #[cfg(feature = "cuda")]
-        if spec && matches!(self.runner.resident_cuda(), Ok(Some(_))) {
-            return self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step);
+        if self.spec_lookup && matches!(self.runner.resident_cuda(), Ok(Some(_))) {
+            return match req.sampling {
+                Sampling::Greedy => {
+                    self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step)
+                }
+                // Stochastic sampling uses the speculative accept rule
+                // (lossless IN DISTRIBUTION, not stream-equal to the plain
+                // loop — the plain loop and this one consume randomness
+                // differently by construction).
+                Sampling::TopK { .. } | Sampling::TopP { .. } => {
+                    self.generate_spec_lookup_sampled(req, prompt_len, max_new, logits, on_step)
+                }
+            };
         }
-        let _ = spec;
 
         for i in 0..max_new {
             let next = Self::sample(&logits, &req.sampling, i as u64)
@@ -669,6 +922,48 @@ impl Generator for RunnerGenerator {
 
 #[cfg(test)]
 mod tests {
+    /// Monte-Carlo gate for the deterministic-drafter accept rule: over many
+    /// independent (u, resample) draws, the per-position output distribution
+    /// must equal p̃ regardless of which token the drafter proposed.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn spec_accept_step_is_lossless_in_distribution() {
+        // p̃ over 4 tokens (already truncated + renormalized).
+        let idx = [10u32, 11, 12, 13];
+        let probs = [0.5f32, 0.25, 0.15, 0.10];
+        let trials = 200_000usize;
+        // Drafter proposals to exercise: in-set high, in-set low, out-of-set.
+        for &d in &[10u32, 13, 99] {
+            let mut counts = std::collections::HashMap::<u32, usize>::new();
+            for t in 0..trials {
+                let u = RunnerGenerator::spec_uniform(0xC0FFEE, t as u64);
+                let got = match RunnerGenerator::spec_accept_step(
+                    &idx,
+                    &probs,
+                    d,
+                    u,
+                    0xBADD_5EED_u64.wrapping_add(t as u64),
+                ) {
+                    None => d,
+                    Some(x) => x,
+                };
+                *counts.entry(got).or_insert(0) += 1;
+            }
+            for (&t, &p) in idx.iter().zip(&probs) {
+                let emp = counts.get(&t).copied().unwrap_or(0) as f64 / trials as f64;
+                assert!(
+                    (emp - f64::from(p)).abs() < 0.01,
+                    "draft {d}: token {t} empirical {emp:.4} vs p̃ {p} (must match: lossless)"
+                );
+            }
+            // Nothing outside p̃'s support may ever be emitted.
+            assert!(
+                counts.keys().all(|t| idx.contains(t)),
+                "draft {d}: out-of-support emission"
+            );
+        }
+    }
+
     use super::*;
 
     /// The mock drives `on_step` for each scripted token and reports the right

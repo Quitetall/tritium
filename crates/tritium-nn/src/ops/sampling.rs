@@ -81,7 +81,10 @@ fn softmax_over(candidates: &[(u32, f32)]) -> (Vec<u32>, Vec<f32>) {
 /// Categorical draw from `(indices, probs)` using one PRNG step. Assumes the
 /// probabilities are non-negative and sum to (approximately) one; the final
 /// index is returned as a fallback against floating-point round-off.
-fn sample_categorical(indices: &[u32], probs: &[f32], seed: u64) -> u32 {
+/// Draw one index from parallel `(indices, probs)` with the deterministic
+/// PRNG the samplers use. Public for the speculative-sampling resample step.
+#[must_use]
+pub fn sample_categorical(indices: &[u32], probs: &[f32], seed: u64) -> u32 {
     let mut state = seed;
     let r = next_unit(&mut state);
     let mut acc = 0.0_f32;
@@ -127,6 +130,25 @@ pub fn sample_top_k(logits: &[f32], k: usize, temp: f32, seed: u64) -> Option<u3
         return Some(argmax(logits));
     }
 
+    let (indices, probs) = truncated_top_k(logits, k, temp)?;
+    Some(sample_categorical(&indices, &probs, seed))
+}
+
+/// The exact truncated, temperature-scaled, renormalized distribution
+/// [`sample_top_k`] draws from, as parallel `(indices, probs)`. Public so the
+/// speculative-sampling accept rule (serve's spec-decode path) evaluates the
+/// SAME distribution the plain sampler uses — lossless-in-distribution by
+/// construction, not by re-implementation. `temp <= 0` (or non-finite)
+/// degenerates to the single argmax candidate at probability 1, exactly
+/// mirroring the sampler's greedy branch.
+#[must_use]
+pub fn truncated_top_k(logits: &[f32], k: usize, temp: f32) -> Option<(Vec<u32>, Vec<f32>)> {
+    if logits.is_empty() {
+        return None;
+    }
+    if !temp.is_finite() || temp <= 0.0 {
+        return Some((vec![argmax(logits)], vec![1.0]));
+    }
     let mut cands = scaled_candidates(logits, temp)?;
 
     // Restrict to the k highest logits. k == 0 or k >= len means "keep all".
@@ -142,8 +164,7 @@ pub fn sample_top_k(logits: &[f32], k: usize, temp: f32, seed: u64) -> Option<u3
         cands.truncate(keep);
     }
 
-    let (indices, probs) = softmax_over(&cands);
-    Some(sample_categorical(&indices, &probs, seed))
+    Some(softmax_over(&cands))
 }
 
 /// Temperature top-p (nucleus) sampling.
@@ -164,6 +185,21 @@ pub fn sample_top_p(logits: &[f32], p: f32, temp: f32, seed: u64) -> Option<u32>
         return Some(argmax(logits));
     }
 
+    let (kept_indices, kept_probs) = truncated_top_p(logits, p, temp)?;
+    Some(sample_categorical(&kept_indices, &kept_probs, seed))
+}
+
+/// The exact nucleus distribution [`sample_top_p`] draws from, as parallel
+/// `(indices, probs)` — see [`truncated_top_k`] for why this is public.
+/// `temp <= 0` (or non-finite) degenerates to the single argmax candidate.
+#[must_use]
+pub fn truncated_top_p(logits: &[f32], p: f32, temp: f32) -> Option<(Vec<u32>, Vec<f32>)> {
+    if logits.is_empty() {
+        return None;
+    }
+    if !temp.is_finite() || temp <= 0.0 {
+        return Some((vec![argmax(logits)], vec![1.0]));
+    }
     let cands = scaled_candidates(logits, temp)?;
 
     // Full softmax over all finite candidates, then sort by descending prob.
@@ -186,7 +222,7 @@ pub fn sample_top_p(logits: &[f32], p: f32, temp: f32, seed: u64) -> Option<u32>
     }
     ranked.truncate(cutoff.max(1));
 
-    // Renormalize the kept nucleus, then draw.
+    // Renormalize the kept nucleus.
     let kept_indices: Vec<u32> = ranked.iter().map(|&(i, _)| i).collect();
     let mut kept_probs: Vec<f32> = ranked.iter().map(|&(_, pr)| pr).collect();
     let sum: f32 = kept_probs.iter().sum();
@@ -195,7 +231,7 @@ pub fn sample_top_p(logits: &[f32], p: f32, temp: f32, seed: u64) -> Option<u32>
             *pr /= sum;
         }
     }
-    Some(sample_categorical(&kept_indices, &kept_probs, seed))
+    Some((kept_indices, kept_probs))
 }
 
 #[cfg(test)]
