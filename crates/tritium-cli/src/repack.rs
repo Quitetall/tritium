@@ -95,6 +95,16 @@ pub(crate) fn run(input: &Path, output: &Path, to: RepackTarget) -> anyhow::Resu
         }
         let k_in = info.dims[0] as usize;
         let n_out = info.dims[1] as usize;
+        if !k_in.is_multiple_of(QK_K) {
+            // repack writes per-row-padded blocks but the GGUF reader sizes TQ
+            // tensors flat (ceil(k*n/256)) — a ragged k would produce a file
+            // whose n_bytes under-counts its payload. ggml itself requires
+            // ne0 % 256 == 0 for TQ types; refuse rather than emit it.
+            bail!(
+                "{}: k={k_in} is not a multiple of {QK_K} — TQ formats require it",
+                info.name
+            );
+        }
         let n_elements = k_in * n_out;
         let p = payload(&file, &bytes, idx, n_elements)?;
 
@@ -287,10 +297,18 @@ mod tests {
             let s = unpack_i2s_tensor(p, n, &mut trits).expect("unpack");
             let h = f16::from_f32(s);
             eprintln!(
-                "{name}: f32 {s} (bits {:08x}) -> f16 {} exact={}",
+                "{name}: f32 {s} (bits {:08x}) -> f16 {}",
                 s.to_bits(),
                 f32::from(h),
-                f32::from(h) == s
+            );
+            // Load-bearing premise of the tritium.i2s_scale metadata: real
+            // BitNet scales are NOT f16-representable. If a future checkpoint
+            // makes this exact, the metadata mechanism is dead code — worth
+            // knowing, so gate it.
+            assert_ne!(
+                f32::from(h),
+                s,
+                "{name}: scale became f16-exact — revisit the metadata path"
             );
         }
     }

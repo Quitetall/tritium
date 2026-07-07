@@ -261,8 +261,10 @@ fn load_ternary(
                         let expect = f32::from(f16::from_f32(exact));
                         if sv != expect {
                             return Err(NnError::Backend(format!(
-                                "{}: metadata scale {exact} (f16 {expect}) disagrees with \
-                                 block scale {sv}",
+                                "{}: tritium.i2s_scale metadata ({exact}, f16 {expect}) \
+                                 disagrees with the file's block scale ({sv}) — stale \
+                                 metadata from a different tensor generation; delete the \
+                                 key or re-run `tritium repack` from the source file",
                                 info.name
                             )));
                         }
