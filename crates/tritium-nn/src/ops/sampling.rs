@@ -78,11 +78,11 @@ fn softmax_over(candidates: &[(u32, f32)]) -> (Vec<u32>, Vec<f32>) {
     (indices, probs)
 }
 
-/// Categorical draw from `(indices, probs)` using one PRNG step. Assumes the
-/// probabilities are non-negative and sum to (approximately) one; the final
-/// index is returned as a fallback against floating-point round-off.
-/// Draw one index from parallel `(indices, probs)` with the deterministic
-/// PRNG the samplers use. Public for the speculative-sampling resample step.
+/// Categorical draw from `(indices, probs)` using one deterministic PRNG
+/// step (the same stream the samplers use). Assumes the probabilities are
+/// non-negative and sum to (approximately) one; the final index is returned
+/// as a fallback against floating-point round-off. Public for the
+/// speculative-sampling resample step.
 #[must_use]
 pub fn sample_categorical(indices: &[u32], probs: &[f32], seed: u64) -> u32 {
     let mut state = seed;

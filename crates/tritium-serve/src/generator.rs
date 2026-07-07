@@ -331,6 +331,7 @@ impl RunnerGenerator {
     /// return up to `max_draft` of the tokens that followed the best match.
     /// One backwards scan: for each candidate position, extend the suffix
     /// match; keep the longest (most recent wins ties).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn lookup_draft(history: &[u32], max_draft: usize) -> Vec<u32> {
         const MAX_NGRAM: usize = 8;
         const MIN_NGRAM: usize = 2;
@@ -523,6 +524,7 @@ impl RunnerGenerator {
     /// for `s`, as parallel `(indices, probs)` (see `tritium_nn::truncated_*`
     /// — the samplers are thin wrappers over these, so this IS the plain
     /// sampler's distribution, not a reimplementation).
+    #[cfg(feature = "cuda")]
     fn truncated(logits: &[f32], s: &Sampling) -> Option<(Vec<u32>, Vec<f32>)> {
         match *s {
             Sampling::Greedy => tritium_nn::sample_greedy(logits).map(|t| (vec![t], vec![1.0])),
@@ -538,6 +540,7 @@ impl RunnerGenerator {
     /// and the leftover IS p̃). Output distribution per position is exactly
     /// p̃: P(d) = p̃(d), P(x≠d) = (1 − p̃(d)) · p̃(x)/(1 − p̃(d)) = p̃(x) —
     /// gated by `spec_accept_step_is_lossless_in_distribution`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // cuda-path production code; tested everywhere
     pub(crate) fn spec_accept_step(
         idx: &[u32],
         probs: &[f32],
@@ -578,6 +581,7 @@ impl RunnerGenerator {
     /// use their own deterministic stream derived from the request seed —
     /// distributional losslessness doesn't require (and can't have) the plain
     /// loop's exact random stream.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // cuda-path production code; tested everywhere
     fn spec_uniform(seed: u64, salt: u64) -> f32 {
         let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(salt.wrapping_add(1)));
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -924,8 +928,8 @@ impl Generator for RunnerGenerator {
 mod tests {
     /// Monte-Carlo gate for the deterministic-drafter accept rule: over many
     /// independent (u, resample) draws, the per-position output distribution
-    /// must equal p̃ regardless of which token the drafter proposed.
-    #[cfg(feature = "cuda")]
+    /// must equal p̃ regardless of which token the drafter proposed. Pure host
+    /// math — runs on every lane, no GPU needed.
     #[test]
     fn spec_accept_step_is_lossless_in_distribution() {
         // p̃ over 4 tokens (already truncated + renormalized).

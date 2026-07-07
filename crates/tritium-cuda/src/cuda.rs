@@ -3840,9 +3840,11 @@ pub struct CudaDecodeModel {
     /// Lazily grown scratch for `tree_verify_greedy` (see [`TreeScratch`]).
     tree_scratch: Option<TreeScratch>,
     /// The uncommitted tree from [`Self::tree_verify_logits`]: (node count,
-    /// parents). Consumed by [`Self::tree_commit`]; invalidated by any new
-    /// tree forward or [`Self::reset`].
-    pending_tree: Option<(usize, Vec<i32>)>,
+    /// forward-time cache_len, parents). Consumed by [`Self::tree_commit`];
+    /// invalidated by any new tree forward, any cache-advancing decode op
+    /// (`step`/`step_graph`/`prefill`) or [`Self::reset`] — and the stamped
+    /// cache_len makes commit REFUSE even if an invalidation site is missed.
+    pending_tree: Option<(usize, usize, Vec<i32>)>,
     /// Captured tree-verify trunk graphs, keyed by bucket (see [`TreeGraphs`]).
     tree_graphs: Option<TreeGraphs>,
     f_residual: CudaFunction,
@@ -3974,6 +3976,8 @@ impl CudaDecodeModel {
     /// # Errors
     /// [`BackendError`] on a device failure, capacity overflow, or shape mismatch.
     pub fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, BackendError> {
+        // A cache-advancing op invalidates any uncommitted tree.
+        self.pending_tree = None;
         if self.cache_len >= self.max_ctx {
             return Err(BackendError::InvalidInput(format!(
                 "decode context overflow: cache_len={} max_ctx={}",
@@ -4719,6 +4723,8 @@ impl CudaDecodeModel {
     /// # Errors
     /// [`BackendError`] on capacity overflow, a `pos`/token guard, or a device failure.
     pub fn step_graph(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, BackendError> {
+        // A cache-advancing op invalidates any uncommitted tree.
+        self.pending_tree = None;
         if self.cache_len >= self.max_ctx {
             return Err(BackendError::InvalidInput(format!(
                 "decode context overflow: cache_len={} max_ctx={}",
@@ -4789,6 +4795,8 @@ impl CudaDecodeModel {
         tokens: &[u32],
         positions: &[usize],
     ) -> Result<Vec<f32>, BackendError> {
+        // A cache-advancing op invalidates any uncommitted tree.
+        self.pending_tree = None;
         let m = tokens.len();
         if m == 0 || positions.len() != m {
             return Err(BackendError::InvalidInput(
@@ -5773,7 +5781,7 @@ impl CudaDecodeModel {
         s.memcpy_dtoh(&view, &mut logits)
             .map_err(|e| driver_err("tree logits dtoh", &e))?;
         self.tree_scratch = Some(ts);
-        self.pending_tree = Some((m, parents.to_vec()));
+        self.pending_tree = Some((m, self.cache_len, parents.to_vec()));
         Ok(logits)
     }
 
@@ -5782,13 +5790,21 @@ impl CudaDecodeModel {
     /// cache. `path` holds tree-node indices, starting at the root (0), each
     /// subsequent node a child of the previous.
     pub fn tree_commit(&mut self, path: &[usize]) -> Result<(), BackendError> {
-        let Some((m, parents)) = self.pending_tree.take() else {
+        let Some((m, fwd_cache_len, parents)) = self.pending_tree.take() else {
             return Err(BackendError::InvalidInput(
                 "tree_commit: no pending tree (call tree_verify_logits first; any \
                  intervening decode operation invalidates the provisional rows)"
                     .into(),
             ));
         };
+        if fwd_cache_len != self.cache_len {
+            return Err(BackendError::InvalidInput(format!(
+                "tree_commit: the cache moved since the tree forward ({} -> {}) — the \
+                 provisional rows were overwritten by an intervening decode operation; \
+                 re-run tree_verify_logits",
+                fwd_cache_len, self.cache_len
+            )));
+        }
         if path.is_empty() || path[0] != 0 {
             return Err(BackendError::InvalidInput(
                 "tree_commit: path must start at the root (node 0)".into(),
