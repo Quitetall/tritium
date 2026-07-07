@@ -127,9 +127,8 @@ pub(crate) fn spawn_worker(
                         }
                     }
                     Job::OpenTreeSession { prompt, resp } => {
-                        let outcome = catch_unwind(AssertUnwindSafe(|| {
-                            generator.open_tree_session(&prompt)
-                        }));
+                        let outcome =
+                            catch_unwind(AssertUnwindSafe(|| generator.open_tree_session(&prompt)));
                         let _ = resp.send(match outcome {
                             Ok(r) => r,
                             Err(_panic) => Err(TreeOpError::Internal(

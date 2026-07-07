@@ -45,6 +45,8 @@ required-features = ["serve"]
 [dev-dependencies]
 tower = { workspace = true }
 http-body-util = { workspace = true }
+tritium-runtime = { workspace = true }
+tritium-format = { workspace = true }
 
 [lints]
 workspace = true

@@ -553,14 +553,20 @@ impl Generator for TreeMock {
     }
 }
 
-async fn post_json(router: &mut Router, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+async fn post_json(
+    router: &mut Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
     let req = Request::builder()
         .method("POST")
         .uri(path)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("request");
-    let resp = tower::ServiceExt::oneshot(router.clone(), req).await.expect("oneshot");
+    let resp = tower::ServiceExt::oneshot(router.clone(), req)
+        .await
+        .expect("oneshot");
     let status = resp.status().as_u16();
     let bytes = http_body_util::BodyExt::collect(resp.into_body())
         .await
@@ -574,7 +580,12 @@ async fn post_json(router: &mut Router, path: &str, body: serde_json::Value) -> 
 async fn tree_endpoints_map_statuses_by_variant() {
     // Default MockGenerator refuses tree ops → 501 at session-open.
     let (mut router, _) = mock_router(vec![1], FinishReason::Stop);
-    let (st, _v) = post_json(&mut router, "/v1/tree/session", serde_json::json!({"prompt_tokens": [1, 2]})).await;
+    let (st, _v) = post_json(
+        &mut router,
+        "/v1/tree/session",
+        serde_json::json!({"prompt_tokens": [1, 2]}),
+    )
+    .await;
     assert_eq!(st, 501, "default generator must refuse with 501");
 
     // Session-capable mock: 200 open, 200 verify, 409 after a chat completion.
@@ -585,9 +596,19 @@ async fn tree_endpoints_map_statuses_by_variant() {
         verify_error: None,
     };
     let (mut router, _) = build_router(Box::new(tree), shared_tok(), ServeConfig::default());
-    let (st, v) = post_json(&mut router, "/v1/tree/session", serde_json::json!({"prompt_tokens": [1, 2]})).await;
+    let (st, v) = post_json(
+        &mut router,
+        "/v1/tree/session",
+        serde_json::json!({"prompt_tokens": [1, 2]}),
+    )
+    .await;
     assert_eq!((st, v["pending_token"].as_u64()), (200, Some(42)));
-    let (st, v) = post_json(&mut router, "/v1/tree/verify", serde_json::json!({"tokens": [42, 43], "parents": [-1, 0]})).await;
+    let (st, v) = post_json(
+        &mut router,
+        "/v1/tree/verify",
+        serde_json::json!({"tokens": [42, 43], "parents": [-1, 0]}),
+    )
+    .await;
     assert_eq!(st, 200);
     assert_eq!(v["committed"], serde_json::json!([43, 44]));
 
@@ -599,15 +620,26 @@ async fn tree_endpoints_map_statuses_by_variant() {
         verify_error: None,
     };
     let (mut router, _) = build_router(Box::new(tree), shared_tok(), ServeConfig::default());
-    let (st, _v) = post_json(&mut router, "/v1/tree/verify", serde_json::json!({"tokens": [1], "parents": [-1]})).await;
+    let (st, _v) = post_json(
+        &mut router,
+        "/v1/tree/verify",
+        serde_json::json!({"tokens": [1], "parents": [-1]}),
+    )
+    .await;
     assert_eq!(st, 409);
 
     // 400 (BadRequest) and 500 (Internal) map by variant, never by string.
     for (err, want) in [
-        (tritium_serve::TreeOpError::BadRequest("parents[1]=5 is not topological".into()), 400u16),
+        (
+            tritium_serve::TreeOpError::BadRequest("parents[1]=5 is not topological".into()),
+            400u16,
+        ),
         // The trap the string-sniffing version fell into: an INTERNAL error
         // whose message contains "not supported" must stay a 500, not 501.
-        (tritium_serve::TreeOpError::Internal("driver: operation not supported".into()), 500),
+        (
+            tritium_serve::TreeOpError::Internal("driver: operation not supported".into()),
+            500,
+        ),
     ] {
         let tree = TreeMock {
             session_open: false,
@@ -616,9 +648,19 @@ async fn tree_endpoints_map_statuses_by_variant() {
             verify_error: Some(err),
         };
         let (mut router, _) = build_router(Box::new(tree), shared_tok(), ServeConfig::default());
-        let (st, _v) = post_json(&mut router, "/v1/tree/session", serde_json::json!({"prompt_tokens": [1]})).await;
+        let (st, _v) = post_json(
+            &mut router,
+            "/v1/tree/session",
+            serde_json::json!({"prompt_tokens": [1]}),
+        )
+        .await;
         assert_eq!(st, 200);
-        let (st, _v) = post_json(&mut router, "/v1/tree/verify", serde_json::json!({"tokens": [1], "parents": [-1]})).await;
+        let (st, _v) = post_json(
+            &mut router,
+            "/v1/tree/verify",
+            serde_json::json!({"tokens": [1], "parents": [-1]}),
+        )
+        .await;
         assert_eq!(st, want);
     }
 }

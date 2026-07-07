@@ -1328,6 +1328,182 @@ __global__ void gqa_attention_reduce_g(const float* __restrict__ v,
   }
 }
 
+// ─── Split tree-verify attention (v1.x) — the verify-path twin of the decode
+// split pair. The single-kernel gqa_attention_tree_f32 above inherits the
+// latency-bound per-warp pattern (sequential scalar dots, softmax on lane 0,
+// weighted sum behind the w==0 branch) — measured ~150µs/layer at verify
+// context, i.e. ~4.5ms of attention per tree verify. The split keeps every
+// f32 fold order (per-key d-order dots via in-vector-ordered float4 chains,
+// j-order softmax sum on one thread, j-order weighted chains) so outputs stay
+// bit-identical; requires head_dim % 4 == 0 (the host routes other geometries
+// to the single kernel). Tree verifies launch eagerly, so grids are exact per
+// call — no ctrl-driven early-exit machinery needed.
+
+#define TREE_SCORE_CHUNK 128
+
+// Scores fan-out: grid (m·n_head, ceil(max_row_ctx/TREE_SCORE_CHUNK)), one
+// warp per block; lane owns keys chunk+lane, +32, +64, +96 as independent
+// float4 chains. Key j maps to arena slot j < prefix_len ? j : anc[row][j-prefix].
+__global__ void gqa_attention_tree_scores_g(
+    const float* __restrict__ q, const float* __restrict__ k,
+    float* __restrict__ scores, const int* __restrict__ anc,
+    const int* __restrict__ n_anc, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale,
+    const int prefix_len, const int max_anc, const int m) {
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= m) return;
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd4 = head_dim >> 2;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * ctx_max;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+    const float4* kr = (const float4*)(k + ((long long)slot * n_head_kv + kv) * head_dim);
+    float dot = 0.0f;
+#pragma unroll 8
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float4 a = kr[d];
+      dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+      dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+      dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+      dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// Per-(row, head) softmax + weighted sum: 128-thread block, scores staged in
+// dynamic shared (ctx_max·4 bytes ≤ the same opt-in budget as decode), tree
+// max (exact), parallel exp_f32, the ONE rounded fold sequential on thread 0
+// in j-order, weighted sum one-dim-per-thread with the slot indirection and
+// loads hoisted out of the w==0 skip.
+__global__ void gqa_attention_tree_reduce_g(
+    const float* __restrict__ v, const float* __restrict__ scores,
+    float* __restrict__ out, const int* __restrict__ anc,
+    const int* __restrict__ n_anc, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const int prefix_len,
+    const int max_anc, const int m) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= m) return;
+  const int ctx = prefix_len + n_anc[row];
+  const int tid = threadIdx.x;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int* arow = anc + (long long)row * max_anc;
+
+  const float* gsc = scores + ((long long)row * n_head + h) * ctx_max;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  const int ndims = (head_dim > tid) ? (head_dim - tid + (int)blockDim.x - 1) / (int)blockDim.x : 0;
+#define TREE_MAX_DIMS_PER_THREAD 8
+  if (ndims <= TREE_MAX_DIMS_PER_THREAD) {
+    float acc[TREE_MAX_DIMS_PER_THREAD];
+    for (int t = 0; t < ndims; ++t) {
+      acc[t] = 0.0f;
+    }
+#pragma unroll 4
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+      const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+      float vals[TREE_MAX_DIMS_PER_THREAD];
+#pragma unroll
+      for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+        if (t < ndims) {
+          vals[t] = v_row[tid + (int)blockDim.x * t];
+        }
+      }
+      if (w != 0.0f) {
+#pragma unroll
+        for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+          if (t < ndims) {
+            acc[t] = __fadd_rn(acc[t], __fmul_rn(w, vals[t]));
+          }
+        }
+      }
+    }
+    for (int t = 0; t < ndims; ++t) {
+      o_row[tid + (int)blockDim.x * t] = acc[t];
+    }
+  } else {
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      float acc = 0.0f;
+      for (int j = 0; j < ctx; ++j) {
+        const float w = sc[j];
+        if (w == 0.0f) continue;
+        const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+        const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+        acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+      }
+      o_row[d] = acc;
+    }
+  }
+#undef TREE_MAX_DIMS_PER_THREAD
+}
+
 // lm_head_warp_f32 — the tied LM head, ONE WARP per vocab row (vs lm_head_f32's one
 // thread). Lanes stride the row by 32 so the `token_embd` reads COALESCE (the by-thread
 // kernel reads one 10 KB row per thread — adjacent threads 10 KB apart, fully

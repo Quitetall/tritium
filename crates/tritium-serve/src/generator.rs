@@ -270,6 +270,14 @@ pub struct RunnerGenerator {
     /// leave `tree_verify` silently running against the chat's KV state —
     /// valid-looking committed tokens from the wrong context).
     tree_session_open: bool,
+    /// Prompt-lookup speculative decoding (greedy only): draft the tokens that
+    /// followed the most recent earlier occurrence of the trailing n-gram in
+    /// the generation history, verify the chain with the BASTION tree verifier
+    /// (`tree_verify_greedy`), and commit every accepted token in one forward.
+    /// LOSSLESS by construction (the verifier only commits the target's own
+    /// argmaxes); a model-free degenerate drafter — the ADR 0014 external-
+    /// drafter boundary applies to model drafters, which stay outside.
+    spec_lookup: bool,
 }
 
 impl fmt::Debug for RunnerGenerator {
@@ -288,7 +296,17 @@ impl RunnerGenerator {
             runner,
             eos,
             tree_session_open: false,
+            spec_lookup: false,
         }
+    }
+
+    /// Enable prompt-lookup speculative decoding for greedy requests (needs
+    /// the CUDA device-resident decoder at generate time; silently falls back
+    /// to plain stepping otherwise).
+    #[must_use]
+    pub fn with_spec_lookup(mut self, on: bool) -> Self {
+        self.spec_lookup = on;
+        self
     }
 
     fn sample(logits: &[f32], s: &Sampling, step: u64) -> Option<u32> {
@@ -302,6 +320,185 @@ impl RunnerGenerator {
             Sampling::TopP { p, temp, seed } => {
                 tritium_nn::sample_top_p(logits, p, temp, seed.wrapping_add(step))
             }
+        }
+    }
+}
+
+impl RunnerGenerator {
+    /// Draft continuation via prompt lookup: find the LONGEST match (up to an
+    /// 8-gram, at least a 2-gram — 1-gram matches draft noise and measured
+    /// below break-even) of `history`'s tail against an earlier position, and
+    /// return up to `max_draft` of the tokens that followed the best match.
+    /// One backwards scan: for each candidate position, extend the suffix
+    /// match; keep the longest (most recent wins ties).
+    fn lookup_draft(history: &[u32], max_draft: usize) -> Vec<u32> {
+        const MAX_NGRAM: usize = 8;
+        const MIN_NGRAM: usize = 2;
+        if max_draft == 0 || history.len() < MIN_NGRAM + 1 {
+            return Vec::new();
+        }
+        let len = history.len();
+        let max_n = MAX_NGRAM.min(len - 1);
+        let mut best_len = 0usize;
+        let mut best_end = 0usize; // index just past the matched needle
+        // `e` = candidate "end" (exclusive) of an earlier needle occurrence.
+        for e in (MIN_NGRAM..len).rev() {
+            if history[e - 1] != history[len - 1] {
+                continue;
+            }
+            let mut nlen = 1;
+            while nlen < max_n && nlen < e && history[e - 1 - nlen] == history[len - 1 - nlen] {
+                nlen += 1;
+            }
+            if nlen >= MIN_NGRAM && nlen > best_len {
+                best_len = nlen;
+                best_end = e;
+                if nlen == max_n {
+                    break;
+                }
+            }
+        }
+        if best_len == 0 || best_end == len {
+            return Vec::new();
+        }
+        let end = (best_end + max_draft).min(len);
+        history[best_end..end].to_vec()
+    }
+
+    /// The greedy speculative loop: pending token → lookup-draft a chain →
+    /// `tree_verify_greedy` commits the accepted prefix + one bonus in ONE
+    /// batched forward (the f16 LM-head table is read once per tree, not once
+    /// per token). No-draft steps use the plain M=1 graph step. Lossless: every
+    /// emitted token is the target's own greedy argmax at its position (gated
+    /// by `cuda_spec_lookup_matches_plain_greedy`).
+    #[cfg(feature = "cuda")]
+    fn generate_spec_lookup(
+        &mut self,
+        req: &GenRequest,
+        _prompt_len: usize,
+        max_new: usize,
+        prefill_logits: Vec<f32>,
+        on_step: &mut dyn FnMut(Step) -> bool,
+    ) -> Result<(), GenError> {
+        const DRAFT_MIN: usize = 6;
+        const DRAFT_MAX: usize = 40;
+        let n_ctx = self.runner.config.n_ctx as usize;
+        let mut history: Vec<u32> = req.prompt_tokens.clone();
+        let mut emitted = 0usize;
+        let stats = std::env::var("TRITIUM_SPEC_STATS").as_deref() == Ok("1");
+        // Verify cost is ~flat in tree size next to its fixed overhead, so when
+        // drafts keep being fully accepted, longer chains amortize it; an early
+        // rejection resets the length.
+        let mut draft_len = DRAFT_MIN;
+        let (mut n_verify, mut n_committed, mut n_plain, mut t_verify, mut t_plain) = (
+            0usize,
+            0usize,
+            0usize,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+
+        // Emit the prefill argmax exactly like the plain loop's first token.
+        let mut pending = tritium_nn::sample_greedy(&prefill_logits)
+            .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+        loop {
+            let is_eos = req.stop_eos && pending == self.eos;
+            let last = is_eos || emitted + 1 >= max_new;
+            let cont = on_step(Step {
+                token: pending,
+                finished: last,
+                finish_reason: if is_eos {
+                    Some(FinishReason::Stop)
+                } else if last {
+                    Some(FinishReason::Length)
+                } else {
+                    None
+                },
+            });
+            emitted += 1;
+            if last || !cont {
+                if stats && n_verify > 0 {
+                    eprintln!(
+                        "spec-stats: verifies={n_verify} committed={n_committed} ({:.2} tok/verify, {:.1?}/verify) plain={n_plain} ({:.1?}/step)",
+                        n_committed as f64 / n_verify as f64,
+                        t_verify / n_verify as u32,
+                        t_plain / n_plain.max(1) as u32,
+                    );
+                }
+                return Ok(());
+            }
+            history.push(pending);
+
+            // Budget-clamped draft: total tree rows must fit the KV arena, and
+            // committed tokens (≤ drafts + 1) must fit the emission budget.
+            let kv_room = n_ctx.saturating_sub(history.len()).saturating_sub(1);
+            let budget = max_new - emitted;
+            let max_draft = draft_len.min(kv_room).min(budget.saturating_sub(1));
+            let drafts = Self::lookup_draft(&history, max_draft);
+
+            if drafts.is_empty() {
+                // Plain M=1 graph step (faster than a 1-node tree).
+                let t0 = std::time::Instant::now();
+                let pos = history.len() - 1;
+                let logits = self
+                    .runner
+                    .forward(&[pending], &[pos])
+                    .map_err(|e| GenError::Backend(e.to_string()))?;
+                n_plain += 1;
+                t_plain += t0.elapsed();
+                pending = tritium_nn::sample_greedy(&logits)
+                    .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;
+                continue;
+            }
+
+            let mut tokens = Vec::with_capacity(1 + drafts.len());
+            tokens.push(pending);
+            tokens.extend(&drafts);
+            let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
+            let t0 = std::time::Instant::now();
+            let committed = {
+                let rm = self
+                    .runner
+                    .resident_cuda()
+                    .map_err(|e| GenError::Backend(e.to_string()))?
+                    .ok_or_else(|| {
+                        GenError::Backend("spec lookup needs the CUDA resident decoder".into())
+                    })?;
+                rm.tree_verify_greedy(&tokens, &parents)
+                    .map_err(|e| GenError::Backend(e.to_string()))?
+            };
+            n_verify += 1;
+            n_committed += committed.len();
+            t_verify += t0.elapsed();
+            draft_len = if committed.len() == tokens.len() {
+                (draft_len * 2).min(DRAFT_MAX)
+            } else {
+                DRAFT_MIN
+            };
+            // committed[..L-1] extend history as fully-processed tokens; the
+            // last committed becomes the new pending (top of the next loop
+            // emits it and pushes it into history).
+            for &c in &committed[..committed.len() - 1] {
+                let is_eos = req.stop_eos && c == self.eos;
+                let last = is_eos || emitted + 1 >= max_new;
+                let cont = on_step(Step {
+                    token: c,
+                    finished: last,
+                    finish_reason: if is_eos {
+                        Some(FinishReason::Stop)
+                    } else if last {
+                        Some(FinishReason::Length)
+                    } else {
+                        None
+                    },
+                });
+                emitted += 1;
+                if last || !cont {
+                    return Ok(());
+                }
+                history.push(c);
+            }
+            pending = *committed.last().expect("tree verify commits >= 1 token");
         }
     }
 }
@@ -328,6 +525,16 @@ impl Generator for RunnerGenerator {
             .runner
             .forward(&req.prompt_tokens, &positions)
             .map_err(|e| GenError::Backend(e.to_string()))?;
+
+        // Prompt-lookup speculative decoding (greedy only): verified chains
+        // commit several tokens per forward. Falls back to plain stepping when
+        // disabled, sampling is stochastic, or no CUDA resident decoder exists.
+        let spec = self.spec_lookup && matches!(req.sampling, Sampling::Greedy);
+        #[cfg(feature = "cuda")]
+        if spec {
+            return self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step);
+        }
+        let _ = spec;
 
         for i in 0..max_new {
             let next = Self::sample(&logits, &req.sampling, i as u64)
@@ -441,7 +648,6 @@ impl Generator for RunnerGenerator {
             ))
         }
     }
-
 }
 
 #[cfg(test)]

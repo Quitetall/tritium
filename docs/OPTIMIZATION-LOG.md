@@ -541,6 +541,34 @@ Findings + actions:
 decode 326–389 tok/s (contention spread; best-case 45.9% of roofline),
 perplexity bit-identical. 9/9 acceptance + 51/51 CUDA tests green.
 
+### v1.x round 9 — prompt-lookup speculative decoding, live end-to-end
+
+`tritium-serve --spec lookup`: greedy requests self-draft via prompt lookup
+(longest 2..8-gram suffix match against the generation history, adaptive
+draft length 6→40 doubling on full accepts) and commit chains through the
+BASTION tree verifier. Model-free drafter — ADR 0014's external-drafter
+boundary applies to model drafters and is unchanged.
+
+Getting the verify cheap enough took three measured passes:
+
+| change | speedup on the 224-tok reference run |
+|---|---|
+| naive loop (per-verify allocs, per-warp tree attention) | 0.61× (slower!) |
+| + cached TreeScratch (15 bufs incl. 6.7MB logits; uploads too) | 0.62× |
+| + split tree attention (scores fan-out + 128-thread reduce) | 0.89× |
+| + longest-match ≥2-gram drafter + adaptive length | **1.19×, lossless** |
+
+Telemetry (TRITIUM_SPEC_STATS=1): 3.65 tok/verify, verify 8.5ms vs plain
+step 2.8ms. The split tree-attention pair mirrors the decode split with the
+ancestor indirection in both phases; every rounded f32 fold keeps its order,
+so tree-vs-step bit-parity holds (`cuda_tree_verify_greedy_lossless` and the
+new `cuda_spec_lookup_matches_plain_greedy` both gate it).
+
+Next multiplier identified, not yet landed: the verify's remaining 3× cost
+over a decode step is the eager launch storm (~420 launches/verify) — a
+ctrl-driven CUDA graph for fixed-m trees would collapse it toward ~1 step,
+putting 2×+ in reach on repetitive text.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time

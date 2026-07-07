@@ -21,6 +21,7 @@ use tritium_cuda as _;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_path: Option<String> = None;
     let mut backend_name = "cpu".to_owned();
+    let mut spec: Option<String> = None;
     let mut port: u16 = 8080;
     let mut model_id = "tritium".to_owned();
     let mut max_new: usize = 256;
@@ -42,14 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match a.as_str() {
             "--model" => model_path = Some(val::<String>(args.next(), "--model")?),
             "--backend" => backend_name = val::<String>(args.next(), "--backend")?,
+            "--spec" => spec = Some(val::<String>(args.next(), "--spec")?),
             "--port" => port = val(args.next(), "--port")?,
             "--model-id" => model_id = val::<String>(args.next(), "--model-id")?,
             "--max-new" => max_new = val(args.next(), "--max-new")?,
             "--eos" => eos = val(args.next(), "--eos")?,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--port 8080] \
-                     [--model-id tritium] [--max-new 256] [--eos 128001]"
+                    "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--spec lookup] \
+                     [--port 8080] [--model-id tritium] [--max-new 256] [--eos 128001]"
                 );
                 return Ok(());
             }
@@ -81,7 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = init().map_err(|e| format!("backend `{backend_name}` failed to init: {e}"))?;
     let file = tritium_format::read_gguf(&bytes)?;
     let runner = tritium_nn::ModelRunner::load(&file, &bytes, backend)?;
-    let generator = Box::new(RunnerGenerator::new(runner, eos));
+    let spec_lookup = match spec.as_deref() {
+        None => false,
+        Some("lookup") => true,
+        Some(other) => return Err(format!("--spec: unknown mode {other:?} (try `lookup`)").into()),
+    };
+    let generator = Box::new(RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup));
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, eos));
     let cfg = ServeConfig {
         model_id,

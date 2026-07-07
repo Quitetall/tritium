@@ -18,11 +18,11 @@ use crate::dto::{
     ApiError, ChatChunk, ChatCompletion, ChatMessage, ChatRequest, Choice, ModelEntry, ModelList,
     StopField, Usage,
 };
+use crate::generator::TreeOpError;
 use crate::generator::{FinishReason, GenRequest, Generator, Sampling};
 use crate::sse::{
     IncrementalDetok, StopMatcher, content_chunk, error_chunk, role_chunk, terminal_chunk,
 };
-use crate::generator::TreeOpError;
 use crate::worker::{GenEvent, Job, spawn_worker};
 
 /// Server configuration.
@@ -451,7 +451,12 @@ struct TreeVerifyRequest {
 
 async fn tree_session(State(st): State<AppState>, Json(req): Json<TreeSessionRequest>) -> Response {
     if st.draining.load(std::sync::atomic::Ordering::Relaxed) {
-        return api_error(StatusCode::SERVICE_UNAVAILABLE, "draining", "server is draining", None);
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "draining",
+            "server is draining",
+            None,
+        );
     }
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     if let Err(e) = st.jobs.try_send(Job::OpenTreeSession {
@@ -463,13 +468,23 @@ async fn tree_session(State(st): State<AppState>, Json(req): Json<TreeSessionReq
     match resp_rx.await {
         Ok(Ok(pending)) => Json(serde_json::json!({ "pending_token": pending })).into_response(),
         Ok(Err(e)) => tree_error(&e),
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "worker dropped the request", None),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "worker dropped the request",
+            None,
+        ),
     }
 }
 
 async fn tree_verify(State(st): State<AppState>, Json(req): Json<TreeVerifyRequest>) -> Response {
     if st.draining.load(std::sync::atomic::Ordering::Relaxed) {
-        return api_error(StatusCode::SERVICE_UNAVAILABLE, "draining", "server is draining", None);
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "draining",
+            "server is draining",
+            None,
+        );
     }
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     if let Err(e) = st.jobs.try_send(Job::TreeVerify {
@@ -482,7 +497,12 @@ async fn tree_verify(State(st): State<AppState>, Json(req): Json<TreeVerifyReque
     match resp_rx.await {
         Ok(Ok(committed)) => Json(serde_json::json!({ "committed": committed })).into_response(),
         Ok(Err(e)) => tree_error(&e),
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "worker dropped the request", None),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "worker dropped the request",
+            None,
+        ),
     }
 }
 

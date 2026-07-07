@@ -147,6 +147,8 @@ const KERNEL_NAME_ATTN_REDUCE: &str = "gqa_attention_reduce_g";
 /// BASTION tree-verify attention (ADR 0014): batch attention where row `i`
 /// attends the shared prefix + its ancestor slots instead of a contiguous range.
 const KERNEL_NAME_ATTN_TREE: &str = "gqa_attention_tree_f32";
+const KERNEL_NAME_ATTN_TREE_SCORES: &str = "gqa_attention_tree_scores_g";
+const KERNEL_NAME_ATTN_TREE_REDUCE: &str = "gqa_attention_tree_reduce_g";
 /// Keys per scores-block — keep in sync with `SCORE_CHUNK` in decode.cu.
 const ATTN_SCORE_CHUNK: usize = 128;
 /// Threads per reduce block — keep ≤ its `s_red[256]` scratch and a power of two.
@@ -2065,11 +2067,20 @@ impl CudaBackend {
                 bytes,
             )
         })?;
+        let f_attn_tree_scores = f(dm, KERNEL_NAME_ATTN_TREE_SCORES)?;
+        let f_attn_tree_reduce = f(dm, KERNEL_NAME_ATTN_TREE_REDUCE)?;
+        attn_shared_opt_in(max_ctx, |bytes| {
+            f_attn_tree_reduce.set_attribute(
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        })?;
 
         Ok(CudaDecodeModel {
             stream: Arc::clone(&self.stream),
             f_attn_scores,
             f_attn_reduce,
+            tree_scratch: None,
             f_rmsnorm: f(dm, KERNEL_NAME_RMSNORM)?,
             f_rope: f(dm, KERNEL_NAME_ROPE)?,
             f_attn,
@@ -2096,6 +2107,8 @@ impl CudaBackend {
             f_kv_append_batch: f(dm, KERNEL_NAME_KV_APPEND_BATCH)?,
             f_attn_batch: f(dm, KERNEL_NAME_ATTN_BATCH)?,
             f_attn_tree: f(dm, KERNEL_NAME_ATTN_TREE)?,
+            f_attn_tree_scores,
+            f_attn_tree_reduce,
             f_lm_head_tiled: f(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             f_argmax_rows: f(dm, KERNEL_NAME_ARGMAX_ROWS)?,
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
@@ -3751,6 +3764,39 @@ struct ResidentLayer {
 /// A fully device-resident BitNet decoder. One [`step`](CudaDecodeModel::step) is a
 /// single-token (M=1) forward run entirely on the GPU. See the section banner above.
 #[allow(missing_debug_implementations)]
+/// Reusable device scratch for [`CudaDecodeModel::tree_verify_greedy`] —
+/// allocated on first use for the requested node count (and re-grown if a
+/// later tree is larger), then reused: a spec-decode loop calls verify every
+/// few tokens, and 15 alloc/free round-trips + a zeroed `[m, vocab]` logits
+/// buffer per call were measured to swallow the speculative gains entirely.
+/// Every buffer is fully overwritten by the kernels that read it (the scores
+/// scratch per live (row, head, key), the logits by the row-tiled LM head), so
+/// reuse needs no zeroing.
+struct TreeScratch {
+    m_cap: usize,
+    d_x: CudaSlice<f32>,
+    d_normed: CudaSlice<f32>,
+    d_q: CudaSlice<f32>,
+    d_k: CudaSlice<f32>,
+    d_v: CudaSlice<f32>,
+    d_attn: CudaSlice<f32>,
+    d_attn_sn: CudaSlice<f32>,
+    d_proj: CudaSlice<f32>,
+    d_gate: CudaSlice<f32>,
+    d_up: CudaSlice<f32>,
+    d_gate_sn: CudaSlice<f32>,
+    d_qact: CudaSlice<i8>,
+    d_act_scale: CudaSlice<f32>,
+    d_scores: CudaSlice<f32>,
+    d_logits_all: CudaSlice<f32>,
+    d_norm_all: CudaSlice<f32>,
+    d_ids: CudaSlice<i32>,
+    d_tok: CudaSlice<i32>,
+    d_pos: CudaSlice<i32>,
+    d_anc: CudaSlice<i32>,
+    d_nanc: CudaSlice<i32>,
+}
+
 pub struct CudaDecodeModel {
     stream: Arc<CudaStream>,
     // Decode kernels (loaded from the resident modules at build).
@@ -3760,6 +3806,8 @@ pub struct CudaDecodeModel {
     /// v1.x split attention pair (preferred when head_dim % 4 == 0).
     f_attn_scores: CudaFunction,
     f_attn_reduce: CudaFunction,
+    /// Lazily grown scratch for `tree_verify_greedy` (see [`TreeScratch`]).
+    tree_scratch: Option<TreeScratch>,
     f_residual: CudaFunction,
     f_embed: CudaFunction,
     f_lm_head: CudaFunction,
@@ -3785,6 +3833,11 @@ pub struct CudaDecodeModel {
     /// Tree-verify attention (ADR 0014) + the batched LM head/argmax it shares
     /// with the batch-decode graph, resolved eagerly for `tree_verify_greedy`.
     f_attn_tree: CudaFunction,
+    /// Split tree-verify attention pair (preferred when head_dim % 4 == 0):
+    /// the single-kernel `f_attn_tree` is latency-bound per (node, head) warp
+    /// and was the dominant per-verify cost (~150µs/layer at verify context).
+    f_attn_tree_scores: CudaFunction,
+    f_attn_tree_reduce: CudaFunction,
     f_lm_head_tiled: CudaFunction,
     f_argmax_rows: CudaFunction,
     f_lm_head_f16: CudaFunction,
@@ -4428,7 +4481,7 @@ impl CudaDecodeModel {
             n_head_kv as i32,
             head_dim as i32,
         );
-        if head_dim % 4 == 0 {
+        if head_dim.is_multiple_of(4) {
             // v1.x split pair (bit-identical, ctx-parallel — see decode.cu).
             // 1) scores fan-out: grid (n_head, ceil(max_ctx/SCORE_CHUNK)); blocks
             //    past the live ctx early-exit via ctrl, so the static grid replays
@@ -5129,109 +5182,131 @@ impl CudaDecodeModel {
         let prefix_len = self.cache_len;
         let ctx_max = self.cache_len + m;
 
-        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let d_tokens = s
-            .clone_htod(&tok_i)
-            .map_err(|e| driver_err("tree tokens htod", &e))?;
-        let d_positions = s
-            .clone_htod(&positions)
-            .map_err(|e| driver_err("tree positions htod", &e))?;
-        let d_anc = s
-            .clone_htod(&anc)
-            .map_err(|e| driver_err("tree anc htod", &e))?;
-        let d_nanc = s
-            .clone_htod(&n_anc)
-            .map_err(|e| driver_err("tree n_anc htod", &e))?;
+        // Reusable M=N scratch: allocated on first use (or re-grown for a larger
+        // tree), then cached on the model — per-call alloc/free measurably ate
+        // the speculative gains. Scores are sized by `max_ctx` (the largest any
+        // verify can need) so growth is driven by `m` alone.
+        if self.tree_scratch.as_ref().is_none_or(|t| t.m_cap < m) {
+            let alloc =
+                |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
+            self.tree_scratch = Some(TreeScratch {
+                m_cap: m,
+                d_x: alloc(m * n_embd, "tree d_x")?,
+                d_normed: alloc(m * n_embd, "tree d_normed")?,
+                d_q: alloc(m * q_width, "tree d_q")?,
+                d_k: alloc(m * kv_width, "tree d_k")?,
+                d_v: alloc(m * kv_width, "tree d_v")?,
+                d_attn: alloc(m * q_width, "tree d_attn")?,
+                d_attn_sn: alloc(m * q_width, "tree d_attn_sn")?,
+                d_proj: alloc(m * n_embd, "tree d_proj")?,
+                d_gate: alloc(m * n_ff, "tree d_gate")?,
+                d_up: alloc(m * n_ff, "tree d_up")?,
+                d_gate_sn: alloc(m * n_ff, "tree d_gate_sn")?,
+                d_qact: s
+                    .alloc_zeros::<i8>(m * n_ff)
+                    .map_err(|e| driver_err("tree d_qact", &e))?,
+                d_act_scale: alloc(m, "tree d_act_scale")?,
+                d_scores: alloc(m * n_head * self.max_ctx, "tree d_scores")?,
+                d_logits_all: alloc(m * self.vocab, "tree d_logits")?,
+                d_norm_all: alloc(m * n_embd, "tree d_norm_all")?,
+                d_ids: s
+                    .alloc_zeros::<i32>(m)
+                    .map_err(|e| driver_err("tree d_ids", &e))?,
+                d_tok: s
+                    .alloc_zeros::<i32>(m)
+                    .map_err(|e| driver_err("tree d_tok", &e))?,
+                d_pos: s
+                    .alloc_zeros::<i32>(m)
+                    .map_err(|e| driver_err("tree d_pos", &e))?,
+                d_anc: s
+                    .alloc_zeros::<i32>(m * m)
+                    .map_err(|e| driver_err("tree d_anc", &e))?,
+                d_nanc: s
+                    .alloc_zeros::<i32>(m)
+                    .map_err(|e| driver_err("tree d_nanc", &e))?,
+            });
+        }
+        // Move the scratch out for disjoint borrows vs `self.kv_*` below; put
+        // it back once the device work completes.
+        let mut ts = self.tree_scratch.take().expect("tree scratch just ensured");
 
-        // M=N scratch (allocated for this verify; freed on return).
-        let alloc =
-            |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
-        let mut d_x = alloc(m * n_embd, "tree d_x")?;
-        let mut d_normed = alloc(m * n_embd, "tree d_normed")?;
-        let mut d_q = alloc(m * q_width, "tree d_q")?;
-        let mut d_k = alloc(m * kv_width, "tree d_k")?;
-        let mut d_v = alloc(m * kv_width, "tree d_v")?;
-        let mut d_attn = alloc(m * q_width, "tree d_attn")?;
-        let mut d_attn_sn = alloc(m * q_width, "tree d_attn_sn")?;
-        let mut d_proj = alloc(m * n_embd, "tree d_proj")?;
-        let mut d_gate = alloc(m * n_ff, "tree d_gate")?;
-        let mut d_up = alloc(m * n_ff, "tree d_up")?;
-        let mut d_gate_sn = alloc(m * n_ff, "tree d_gate_sn")?;
-        let mut d_qact = s
-            .alloc_zeros::<i8>(m * n_ff)
-            .map_err(|e| driver_err("tree d_qact", &e))?;
-        let mut d_act_scale = alloc(m, "tree d_act_scale")?;
-        let mut d_scores = alloc(m * n_head * ctx_max, "tree d_scores")?;
-        let mut d_logits_all = alloc(m * self.vocab, "tree d_logits")?;
-        let mut d_norm_all = alloc(m * n_embd, "tree d_norm_all")?;
-        let mut d_ids = s
-            .alloc_zeros::<i32>(m)
-            .map_err(|e| driver_err("tree d_ids", &e))?;
+        // Uploads go into the cached buffers too (oversized is fine — kernels
+        // read exactly the first m / m·m entries; `max_anc == m` is a stride
+        // into linear memory, not a buffer shape).
+        let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        s.memcpy_htod(&tok_i, &mut ts.d_tok)
+            .map_err(|e| driver_err("tree tokens htod", &e))?;
+        s.memcpy_htod(&positions, &mut ts.d_pos)
+            .map_err(|e| driver_err("tree positions htod", &e))?;
+        s.memcpy_htod(&anc, &mut ts.d_anc)
+            .map_err(|e| driver_err("tree anc htod", &e))?;
+        s.memcpy_htod(&n_anc, &mut ts.d_nanc)
+            .map_err(|e| driver_err("tree n_anc htod", &e))?;
 
         Self::bl_embed(
             s,
             &self.f_embed_batch,
             &self.d_token_embd,
-            &d_tokens,
+            &ts.d_tok,
             n_embd,
             m,
-            &mut d_x,
+            &mut ts.d_x,
         )?;
 
         for li in 0..self.layers.len() {
             Self::bl_rmsnorm(
                 s,
                 &self.f_rmsnorm_batch,
-                &d_x,
+                &ts.d_x,
                 &self.layers[li].attn_norm,
                 self.rms_eps,
                 n_embd,
                 m,
-                &mut d_normed,
+                &mut ts.d_normed,
             )?;
             Self::bl_quant(
                 s,
                 &self.f_quant_batch,
-                &d_normed,
+                &ts.d_normed,
                 n_embd,
                 m,
-                &mut d_qact,
-                &mut d_act_scale,
+                &mut ts.d_qact,
+                &mut ts.d_act_scale,
             )?;
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
-                &d_qact,
+                &ts.d_qact,
                 &self.layers[li].q,
-                &d_act_scale,
+                &ts.d_act_scale,
                 m,
-                &mut d_q,
+                &mut ts.d_q,
             )?;
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
-                &d_qact,
+                &ts.d_qact,
                 &self.layers[li].k,
-                &d_act_scale,
+                &ts.d_act_scale,
                 m,
-                &mut d_k,
+                &mut ts.d_k,
             )?;
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
-                &d_qact,
+                &ts.d_qact,
                 &self.layers[li].v,
-                &d_act_scale,
+                &ts.d_act_scale,
                 m,
-                &mut d_v,
+                &mut ts.d_v,
             )?;
             Self::bl_rope(
                 s,
                 &self.f_rope_batch,
-                &mut d_q,
+                &mut ts.d_q,
                 &self.d_cos,
                 &self.d_sin,
-                &d_positions,
+                &ts.d_pos,
                 n_head,
                 head_dim,
                 m,
@@ -5239,10 +5314,10 @@ impl CudaDecodeModel {
             Self::bl_rope(
                 s,
                 &self.f_rope_batch,
-                &mut d_k,
+                &mut ts.d_k,
                 &self.d_cos,
                 &self.d_sin,
-                &d_positions,
+                &ts.d_pos,
                 n_head_kv,
                 head_dim,
                 m,
@@ -5253,7 +5328,7 @@ impl CudaDecodeModel {
             Self::bl_kv_append(
                 s,
                 &self.f_kv_append_batch,
-                &d_k,
+                &ts.d_k,
                 &mut self.kv_k[li],
                 prefix_len,
                 kv_width,
@@ -5262,45 +5337,67 @@ impl CudaDecodeModel {
             Self::bl_kv_append(
                 s,
                 &self.f_kv_append_batch,
-                &d_v,
+                &ts.d_v,
                 &mut self.kv_v[li],
                 prefix_len,
                 kv_width,
                 m,
             )?;
-            Self::bl_attn_tree(
-                s,
-                &self.f_attn_tree,
-                &d_q,
-                &self.kv_k[li],
-                &self.kv_v[li],
-                &mut d_attn,
-                &mut d_scores,
-                &d_anc,
-                &d_nanc,
-                ctx_max,
-                n_head,
-                n_head_kv,
-                head_dim,
-                self.attn_scale,
-                prefix_len,
-                m,
-            )?;
+            if head_dim.is_multiple_of(4) {
+                Self::bl_attn_tree_split(
+                    s,
+                    &self.f_attn_tree_scores,
+                    &self.f_attn_tree_reduce,
+                    &ts.d_q,
+                    &self.kv_k[li],
+                    &self.kv_v[li],
+                    &mut ts.d_attn,
+                    &mut ts.d_scores,
+                    &ts.d_anc,
+                    &ts.d_nanc,
+                    ctx_max,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    self.attn_scale,
+                    prefix_len,
+                    m,
+                )?;
+            } else {
+                Self::bl_attn_tree(
+                    s,
+                    &self.f_attn_tree,
+                    &ts.d_q,
+                    &self.kv_k[li],
+                    &self.kv_v[li],
+                    &mut ts.d_attn,
+                    &mut ts.d_scores,
+                    &ts.d_anc,
+                    &ts.d_nanc,
+                    ctx_max,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    self.attn_scale,
+                    prefix_len,
+                    m,
+                )?;
+            }
             let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref()
             {
                 Self::bl_rmsnorm(
                     s,
                     &self.f_rmsnorm_batch,
-                    &d_attn,
+                    &ts.d_attn,
                     sn,
                     self.rms_eps,
                     q_width,
                     m,
-                    &mut d_attn_sn,
+                    &mut ts.d_attn_sn,
                 )?;
-                &d_attn_sn
+                &ts.d_attn_sn
             } else {
-                &d_attn
+                &ts.d_attn
             };
             Self::bl_quant(
                 s,
@@ -5308,72 +5405,72 @@ impl CudaDecodeModel {
                 attn_in,
                 q_width,
                 m,
-                &mut d_qact,
-                &mut d_act_scale,
+                &mut ts.d_qact,
+                &mut ts.d_act_scale,
             )?;
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
-                &d_qact,
+                &ts.d_qact,
                 &self.layers[li].o,
-                &d_act_scale,
+                &ts.d_act_scale,
                 m,
-                &mut d_proj,
+                &mut ts.d_proj,
             )?;
-            Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
+            Self::bl_residual(s, &self.f_residual, &mut ts.d_x, &ts.d_proj, m * n_embd)?;
 
             Self::bl_rmsnorm(
                 s,
                 &self.f_rmsnorm_batch,
-                &d_x,
+                &ts.d_x,
                 &self.layers[li].ffn_norm,
                 self.rms_eps,
                 n_embd,
                 m,
-                &mut d_normed,
+                &mut ts.d_normed,
             )?;
             Self::bl_quant(
                 s,
                 &self.f_quant_batch,
-                &d_normed,
+                &ts.d_normed,
                 n_embd,
                 m,
-                &mut d_qact,
-                &mut d_act_scale,
+                &mut ts.d_qact,
+                &mut ts.d_act_scale,
             )?;
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
-                &d_qact,
+                &ts.d_qact,
                 &self.layers[li].gate,
-                &d_act_scale,
+                &ts.d_act_scale,
                 m,
-                &mut d_gate,
+                &mut ts.d_gate,
             )?;
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
-                &d_qact,
+                &ts.d_qact,
                 &self.layers[li].up,
-                &d_act_scale,
+                &ts.d_act_scale,
                 m,
-                &mut d_up,
+                &mut ts.d_up,
             )?;
-            Self::bl_relu2(s, &self.f_relu2, &mut d_gate, &d_up, m * n_ff)?;
+            Self::bl_relu2(s, &self.f_relu2, &mut ts.d_gate, &ts.d_up, m * n_ff)?;
             let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
                 Self::bl_rmsnorm(
                     s,
                     &self.f_rmsnorm_batch,
-                    &d_gate,
+                    &ts.d_gate,
                     sn,
                     self.rms_eps,
                     n_ff,
                     m,
-                    &mut d_gate_sn,
+                    &mut ts.d_gate_sn,
                 )?;
-                &d_gate_sn
+                &ts.d_gate_sn
             } else {
-                &d_gate
+                &ts.d_gate
             };
             Self::bl_quant(
                 s,
@@ -5381,53 +5478,59 @@ impl CudaDecodeModel {
                 down_in,
                 n_ff,
                 m,
-                &mut d_qact,
-                &mut d_act_scale,
+                &mut ts.d_qact,
+                &mut ts.d_act_scale,
             )?;
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
-                &d_qact,
+                &ts.d_qact,
                 &self.layers[li].down,
-                &d_act_scale,
+                &ts.d_act_scale,
                 m,
-                &mut d_proj,
+                &mut ts.d_proj,
             )?;
-            Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
+            Self::bl_residual(s, &self.f_residual, &mut ts.d_x, &ts.d_proj, m * n_embd)?;
         }
 
         // Final norm over ALL rows, batched LM head, per-row greedy argmax.
         Self::bl_rmsnorm(
             s,
             &self.f_rmsnorm_batch,
-            &d_x,
+            &ts.d_x,
             &self.d_output_norm,
             self.rms_eps,
             n_embd,
             m,
-            &mut d_norm_all,
+            &mut ts.d_norm_all,
         )?;
         Self::bl_lm_head_tiled(
             s,
             &self.f_lm_head_tiled,
-            &d_norm_all,
+            &ts.d_norm_all,
             &self.d_token_embd_f16,
             n_embd,
             self.vocab,
             m,
-            &mut d_logits_all,
+            &mut ts.d_logits_all,
         )?;
         Self::bl_argmax_rows(
             s,
             &self.f_argmax_rows,
-            &d_logits_all,
+            &ts.d_logits_all,
             self.vocab,
             m,
-            &mut d_ids,
+            &mut ts.d_ids,
         )?;
         let mut ids = vec![0i32; m];
-        s.memcpy_dtoh(&d_ids, &mut ids)
+        // The cached buffer may exceed this call's `m` — copy exactly m ids.
+        let ids_view = ts.d_ids.slice(0..m);
+        s.memcpy_dtoh(&ids_view, &mut ids)
             .map_err(|e| driver_err("tree ids dtoh", &e))?;
+
+        // Device work is done — return the scratch to the cache. (An early `?`
+        // above drops it instead; the next call simply re-allocates.)
+        self.tree_scratch = Some(ts);
 
         // Greedy accept walk: from the root, descend into the (first) child whose
         // draft token equals the target argmax at the current node.
@@ -5539,6 +5642,102 @@ impl CudaDecodeModel {
         Ok(())
     }
 
+    /// Split tree-verify attention (head_dim % 4 == 0): a context-parallel
+    /// scores fan-out (one warp per (node, head, 128-key chunk), float4 d-order
+    /// chains) followed by a per-(node, head) 128-thread softmax + weighted-sum
+    /// reduce. Bit-identical to `bl_attn_tree` — every rounded f32 fold keeps
+    /// its order (per-key dots in d-order, the softmax sum in j-order on one
+    /// thread, per-dim weighted chains in j-order).
+    #[allow(clippy::too_many_arguments)]
+    fn bl_attn_tree_split(
+        s: &Arc<CudaStream>,
+        f_scores: &CudaFunction,
+        f_reduce: &CudaFunction,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        scores: &mut CudaSlice<f32>,
+        anc: &CudaSlice<i32>,
+        n_anc: &CudaSlice<i32>,
+        ctx_max: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        prefix_len: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
+        const TREE_SCORE_CHUNK: usize = 128;
+        let (cm_i, nh_i, nhkv_i, hd_i) = (
+            ctx_max as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+        );
+        let (pl_i, ma_i, m_i) = (prefix_len as i32, m as i32, m as i32);
+        // Upper bound over rows: every row's context is prefix_len + n_anc[row]
+        // with n_anc[row] <= m; the kernels guard per-row.
+        let ctx_bound = prefix_len + m;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (m * n_head) as u32,
+                (ctx_bound.div_ceil(TREE_SCORE_CHUNK)) as u32,
+                1,
+            ),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.launch_builder(f_scores);
+        l.arg(q)
+            .arg(k)
+            .arg(&mut *scores)
+            .arg(anc)
+            .arg(n_anc)
+            .arg(&cm_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&scale)
+            .arg(&pl_i)
+            .arg(&ma_i)
+            .arg(&m_i);
+        // SAFETY: `gqa_attention_tree_scores_g(q, k, scores, anc, n_anc, ctx_max,
+        // n_head, n_head_kv, head_dim, scale, prefix_len, max_anc, m)`.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree attention scores", &e))?;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: ((m * n_head) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (ctx_bound * 4) as u32,
+        };
+        let mut l = s.launch_builder(f_reduce);
+        l.arg(v)
+            .arg(&*scores)
+            .arg(out)
+            .arg(anc)
+            .arg(n_anc)
+            .arg(&cm_i)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&pl_i)
+            .arg(&ma_i)
+            .arg(&m_i);
+        // SAFETY: `gqa_attention_tree_reduce_g(v, scores, out, anc, n_anc, ctx_max,
+        // n_head, n_head_kv, head_dim, prefix_len, max_anc, m)` with ctx_bound·4 B
+        // of dynamic shared (opt-in set at load for up to max_ctx·4).
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch tree attention reduce", &e))?;
+        }
+        Ok(())
+    }
+
     /// Batched tied LM head over `m` rows (f16 table, row-tiled).
     #[allow(clippy::too_many_arguments)]
     fn bl_lm_head_tiled(
@@ -5563,7 +5762,12 @@ impl CudaDecodeModel {
             shared_mem_bytes: 0,
         };
         let mut l = s.launch_builder(f);
-        l.arg(h).arg(embd_f16).arg(&ne_i).arg(&v_i).arg(&m_i).arg(logits);
+        l.arg(h)
+            .arg(embd_f16)
+            .arg(&ne_i)
+            .arg(&v_i)
+            .arg(&m_i)
+            .arg(logits);
         // SAFETY: `lm_head_tiled_f16(const float* h, const __half* embd, int n_embd,
         // int vocab, int m, float* logits)` — one warp per vocab row, grid.y tiles rows.
         #[allow(unsafe_code)]
@@ -7529,7 +7733,7 @@ impl CudaDecodeModel {
         );
         let scale = self.attn_scale;
         let cs = self.cap_stream.cu_stream();
-        if self.head_dim % 4 == 0 {
+        if self.head_dim.is_multiple_of(4) {
             // v1.x split pair — see `launch_attention` for the geometry rationale.
             {
                 let grid = (
@@ -7548,7 +7752,14 @@ impl CudaDecodeModel {
                     pp(&hd_i),
                     pp(&scale),
                 ];
-                raw_launch(self.raw().attn_scores_g, grid, (32, 1, 1), 0, cs, &mut params)?;
+                raw_launch(
+                    self.raw().attn_scores_g,
+                    grid,
+                    (32, 1, 1),
+                    0,
+                    cs,
+                    &mut params,
+                )?;
             }
             let grid = (self.n_head as u32, 1, 1);
             let smem = (self.max_ctx * 4) as u32;
@@ -7588,14 +7799,7 @@ impl CudaDecodeModel {
             pp(&hd_i),
             pp(&scale),
         ];
-        raw_launch(
-            self.raw().attn_g,
-            grid,
-            (32, 1, 1),
-            smem,
-            cs,
-            &mut params,
-        )
+        raw_launch(self.raw().attn_g, grid, (32, 1, 1), smem, cs, &mut params)
     }
 
     #[allow(dead_code)] // graph-decode residual; wired in as the CUDA Graphs path lands

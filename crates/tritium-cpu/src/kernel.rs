@@ -111,10 +111,7 @@ fn run_chunk(
         // unmeasured on an AVX-512 host (this build box is AVX2). Arbitrary-float
         // callers fall through to the bit-exact f32 kernels unchanged; the
         // detection scan is O(m·k), noise next to the O(m·n·k) GEMM.
-        if is_x86_feature_detected!("avx2")
-            && k <= A8_EXACT_K_MAX
-            && act_is_a8_integer(act)
-        {
+        if is_x86_feature_detected!("avx2") && k <= A8_EXACT_K_MAX && act_is_a8_integer(act) {
             // SAFETY: `avx2` was just confirmed; buffer lengths were validated by
             // `dispatch_mpgemm` and are re-validated inside before any intrinsic.
             return unsafe { avx2_mpgemm_a8(act, weights, scales, shape, out) };
@@ -370,9 +367,9 @@ pub(crate) unsafe fn avx2_mpgemm_a8(
     out: &mut [f32],
 ) -> Result<(), BackendError> {
     use core::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_add_epi8, _mm256_extracti128_si256, _mm256_loadu_si256,
-        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set1_epi8, _mm256_set1_epi16,
-        _mm256_setzero_si256, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32,
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm256_add_epi8,
+        _mm256_add_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_maddubs_epi16, _mm256_set1_epi8, _mm256_set1_epi16, _mm256_setzero_si256,
     };
 
     let GemmShape { m, n, k } = shape;
@@ -470,7 +467,12 @@ mod tests {
         };
         // Integer-valued activations exactly as quantize_activation_int8 emits,
         // including the extremes; ragged tails and the BitNet widths.
-        for &(m, n, k) in &[(1usize, 5usize, 19usize), (2, 4, 512), (1, 8, 2560), (3, 3, 33)] {
+        for &(m, n, k) in &[
+            (1usize, 5usize, 19usize),
+            (2, 4, 512),
+            (1, 8, 2560),
+            (3, 3, 33),
+        ] {
             let act: Vec<f32> = (0..m * k)
                 .map(|_| ((next() % 256) as i64 - 128) as f32)
                 .collect();

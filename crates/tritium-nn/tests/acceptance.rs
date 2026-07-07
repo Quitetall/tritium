@@ -288,11 +288,7 @@ fn cuda_greedy_matches_transformers() {
         .generate(&reference.token_ids, want.len(), reference.eos_token_id)
         .expect("cuda greedy generate");
     let dt = t0.elapsed();
-    let prefix = got
-        .iter()
-        .zip(&want)
-        .take_while(|(g, w)| g == w)
-        .count();
+    let prefix = got.iter().zip(&want).take_while(|(g, w)| g == w).count();
     println!(
         "cuda greedy ({} tok in {:.1?}) exact prefix vs transformers = {prefix}",
         got.len(),
@@ -627,7 +623,11 @@ fn cuda_tree_verify_greedy_lossless() {
     let want = runner
         .generate(&prompt, k_total, u32::MAX /* never stop early */)
         .expect("plain greedy generate");
-    assert_eq!(want.len(), k_total, "reference stream shorter than expected");
+    assert_eq!(
+        want.len(),
+        k_total,
+        "reference stream shorter than expected"
+    );
 
     // Fresh state; prefill the prompt, then drive via tree-verify only.
     runner.reset();
