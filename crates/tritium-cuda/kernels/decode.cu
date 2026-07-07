@@ -1339,6 +1339,7 @@ __global__ void gqa_attention_reduce_g(const float* __restrict__ v,
 // to the single kernel). Tree verifies launch eagerly, so grids are exact per
 // call — no ctrl-driven early-exit machinery needed.
 
+// Keep in sync with the host-side const in `bl_attn_tree_split` (cuda.rs).
 #define TREE_SCORE_CHUNK 128
 
 // Scores fan-out: grid (m·n_head, ceil(max_row_ctx/TREE_SCORE_CHUNK)), one
@@ -1391,6 +1392,8 @@ __global__ void gqa_attention_tree_scores_g(
 // max (exact), parallel exp_f32, the ONE rounded fold sequential on thread 0
 // in j-order, weighted sum one-dim-per-thread with the slot indirection and
 // loads hoisted out of the w==0 skip.
+// REQUIRES blockDim.x == 128 (the max-fold levels below hardcode 64/32; the
+// host launches comply). s_red[256] is headroom, not configurability.
 __global__ void gqa_attention_tree_reduce_g(
     const float* __restrict__ v, const float* __restrict__ scores,
     float* __restrict__ out, const int* __restrict__ anc,

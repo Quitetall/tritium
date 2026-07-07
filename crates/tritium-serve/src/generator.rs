@@ -385,6 +385,11 @@ impl RunnerGenerator {
         let n_ctx = self.runner.config.n_ctx as usize;
         let mut history: Vec<u32> = req.prompt_tokens.clone();
         let mut emitted = 0usize;
+        // The plain loop (`for i in 0..max_new`) emits nothing on a zero
+        // budget; match it before the first emission below.
+        if max_new == 0 {
+            return Ok(());
+        }
         let stats = std::env::var("TRITIUM_SPEC_STATS").as_deref() == Ok("1");
         // Verify cost is ~flat in tree size next to its fixed overhead, so when
         // drafts keep being fully accepted, longer chains amortize it; an early
@@ -429,9 +434,11 @@ impl RunnerGenerator {
             }
             history.push(pending);
 
-            // Budget-clamped draft: total tree rows must fit the KV arena, and
-            // committed tokens (≤ drafts + 1) must fit the emission budget.
-            let kv_room = n_ctx.saturating_sub(history.len()).saturating_sub(1);
+            // Budget-clamped draft: total tree rows must fit the KV arena
+            // (cache_len = history.len() - 1 here, the verifier needs
+            // cache_len + 1 + d <= n_ctx, so d <= n_ctx - history.len()), and
+            // committed tokens (<= drafts + 1) must fit the emission budget.
+            let kv_room = n_ctx.saturating_sub(history.len());
             let budget = max_new - emitted;
             let max_draft = draft_len.min(kv_room).min(budget.saturating_sub(1));
             let drafts = Self::lookup_draft(&history, max_draft);
@@ -494,6 +501,14 @@ impl RunnerGenerator {
                 });
                 emitted += 1;
                 if last || !cont {
+                    if stats && n_verify > 0 {
+                        eprintln!(
+                            "spec-stats: verifies={n_verify} committed={n_committed} ({:.2} tok/verify, {:.1?}/verify) plain={n_plain} ({:.1?}/step)",
+                            n_committed as f64 / n_verify as f64,
+                            t_verify / n_verify as u32,
+                            t_plain / n_plain.max(1) as u32,
+                        );
+                    }
                     return Ok(());
                 }
                 history.push(c);
@@ -528,10 +543,12 @@ impl Generator for RunnerGenerator {
 
         // Prompt-lookup speculative decoding (greedy only): verified chains
         // commit several tokens per forward. Falls back to plain stepping when
-        // disabled, sampling is stochastic, or no CUDA resident decoder exists.
+        // disabled, sampling is stochastic, or no CUDA resident decoder exists
+        // (probed HERE — e.g. `--spec lookup` on the cpu backend — so the
+        // fallback is a dispatch decision, never a mid-stream error).
         let spec = self.spec_lookup && matches!(req.sampling, Sampling::Greedy);
         #[cfg(feature = "cuda")]
-        if spec {
+        if spec && matches!(self.runner.resident_cuda(), Ok(Some(_))) {
             return self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step);
         }
         let _ = spec;

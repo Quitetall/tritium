@@ -5668,6 +5668,7 @@ impl CudaDecodeModel {
         prefix_len: usize,
         m: usize,
     ) -> Result<(), BackendError> {
+        // Keep in sync with `#define TREE_SCORE_CHUNK` in decode.cu.
         const TREE_SCORE_CHUNK: usize = 128;
         let (cm_i, nh_i, nhkv_i, hd_i) = (
             ctx_max as i32,
