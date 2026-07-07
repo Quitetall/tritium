@@ -624,6 +624,28 @@ ALU — not this GPU at these shapes. The entropy argument stays correct as
 *storage* (a TQ1_0 file is ~18% smaller on disk); it just doesn't convert to
 decode speed here.
 
+### v1.x round 11 — f16 KV cache (ADR 0020 rung 1): +33–40% at long context
+
+Eight `_h` twin kernels (append ×3, rope_kv fused, decode split pair, batch
+attention, tree split pair) whose ONLY delta is the KV element type — stores
+round once via `__float2half_rn`, loads widen via `__half2float`, every f32
+fold keeps its order. The f32 originals are byte-for-byte untouched (default
+path stays bit-exact, 9/9 acceptance green). Arenas became byte buffers with
+a `kv_elem` switch; dtype-selected function handles mean launch sites don't
+change; verify trees route eager under f16 (ctrl twins deliberately not
+duplicated — the graph measured ≈ no win). Eager step's dtod KV appends
+became kernel appends (a dtod can't convert element types).
+
+| metric | f32 | f16 KV |
+|---|---|---|
+| decode @ ctx≈4K | 68–72 tok/s | **95.6 tok/s** |
+| decode @ short ctx | ~330–390 | unchanged (latency-bound) |
+| perplexity rel err | 2.659e-4 | 1.582e-3 (~0.16%) |
+| KV memory @ 4K | 630 MB | 315 MB |
+
+Spec-decode gates pass under the rung (spec == plain within the same KV
+dtype). New explicit bench: `long_ctx.rs` (ignored test, env-flagged runs).
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time

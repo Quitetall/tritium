@@ -1699,6 +1699,459 @@ __global__ void gqa_attention_tree_reduce_ctrl_g(
 #undef TREE_MAX_DIMS_PER_THREAD
 }
 
+// ─── f16 KV-cache twins (ADR 0020, rung 1) — every kernel that touches the
+// single-sequence KV arenas gets an `_h` twin whose ONLY change is the KV
+// element type: stores round once via __float2half_rn, loads widen via
+// __half2float, and every f32 fold keeps its order. The f32 originals are
+// untouched (the default path stays bit-exact); an f16 model instance loads
+// the `_h` names into the same function handles, so launch sites don't
+// change. Verify trees route to the EAGER path under f16 (the ctrl twins are
+// deliberately not duplicated — the graph measured ≈ no wall-clock win).
+
+// 8-byte load of 4 halves → float4 (the f16 twin of a float4 KV read).
+__device__ __forceinline__ float4 kvh_load4(const __half* p) {
+  const __half2* h2 = (const __half2*)p;
+  const float2 lo = __half22float2(h2[0]);
+  const float2 hi = __half22float2(h2[1]);
+  return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
+__global__ void kv_append_h(const float* __restrict__ src,
+                            __half* __restrict__ kv_base,  // [max_ctx*kv_width]
+                            const int* __restrict__ ctrl,
+                            const int kv_width) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < kv_width) {
+    const long long off = (long long)ctrl[2] * kv_width + i;
+    kv_base[off] = __float2half_rn(src[i]);
+  }
+}
+
+__global__ void kv_append_batch_h(const float* __restrict__ src, __half* __restrict__ kv_base,
+                                  const int cache_len, const int kv_width, const int m) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)m * kv_width) return;
+  const int row = idx / kv_width;
+  const int e = idx - (long long)row * kv_width;
+  kv_base[((long long)(cache_len + row)) * kv_width + e] =
+      __float2half_rn(src[(long long)row * kv_width + e]);
+}
+
+__global__ void rope_kv_fused_h(float* __restrict__ q,
+                                const float* __restrict__ k,
+                                const float* __restrict__ v,
+                                __half* __restrict__ kv_k_base,
+                                __half* __restrict__ kv_v_base,
+                                const float* __restrict__ cos_table,
+                                const float* __restrict__ sin_table,
+                                const int* __restrict__ ctrl,
+                                const int n_head, const int n_head_kv,
+                                const int head_dim, const int kv_width) {
+  const int half = head_dim >> 1;
+  const int q_total = n_head * half;
+  const int k_total = n_head_kv * half;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int pos = ctrl[1];
+  const long long row = (long long)ctrl[2] * kv_width;
+  if (idx < q_total) {
+    const int head = idx / half;
+    const int j = idx - head * half;
+    const int base = head * head_dim;
+    const float c = cos_table[(long long)pos * half + j];
+    const float s = sin_table[(long long)pos * half + j];
+    const float a = q[base + j];
+    const float b = q[base + j + half];
+    q[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+    q[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+  } else if (idx < q_total + k_total) {
+    const int t = idx - q_total;
+    const int head = t / half;
+    const int j = t - head * half;
+    const int base = head * head_dim;
+    const float c = cos_table[(long long)pos * half + j];
+    const float s = sin_table[(long long)pos * half + j];
+    const float a = k[base + j];
+    const float b = k[base + j + half];
+    kv_k_base[row + base + j] =
+        __float2half_rn(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
+    kv_k_base[row + base + j + half] =
+        __float2half_rn(__fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s)));
+  } else if (idx < q_total + k_total + kv_width) {
+    const int i = idx - q_total - k_total;
+    kv_v_base[row + i] = __float2half_rn(v[i]);
+  }
+}
+
+__global__ void gqa_attention_scores_h(const float* __restrict__ q,
+                                       const __half* __restrict__ k,
+                                       float* __restrict__ scores,
+                                       const int* __restrict__ ctrl,
+                                       const int max_ctx, const int n_head,
+                                       const int n_head_kv, const int head_dim,
+                                       const float scale) {
+  const int h = blockIdx.x;
+  const int chunk = blockIdx.y * SCORE_CHUNK;
+  const int lane = threadIdx.x & 31;
+  const int ctx = ctrl[2] + 1;
+  if (h >= n_head || chunk >= ctx) return;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + (long long)h * head_dim);
+  const int hd4 = head_dim >> 2;
+  float* sc = scores + (long long)h * max_ctx;
+
+  const int j0 = chunk + lane;
+  const int j1 = j0 + 32;
+  const int j2 = j0 + 64;
+  const int j3 = j0 + 96;
+  const __half* k0 = k + ((long long)j0 * n_head_kv + kv) * head_dim;
+  const __half* k1 = k + ((long long)j1 * n_head_kv + kv) * head_dim;
+  const __half* k2 = k + ((long long)j2 * n_head_kv + kv) * head_dim;
+  const __half* k3 = k + ((long long)j3 * n_head_kv + kv) * head_dim;
+  if (j3 < ctx) {
+    float d0 = 0.0f;
+    float d1 = 0.0f;
+    float d2 = 0.0f;
+    float d3 = 0.0f;
+#pragma unroll 4
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float4 a = kvh_load4(k0 + 4 * d);
+      const float4 b = kvh_load4(k1 + 4 * d);
+      const float4 c = kvh_load4(k2 + 4 * d);
+      const float4 e = kvh_load4(k3 + 4 * d);
+      d0 = __fadd_rn(d0, __fmul_rn(qq.x, a.x));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.x, b.x));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.x, c.x));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.x, e.x));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.y, a.y));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.y, b.y));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.y, c.y));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.y, e.y));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.z, a.z));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.z, b.z));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.z, c.z));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.z, e.z));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.w, a.w));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.w, b.w));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.w, c.w));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.w, e.w));
+    }
+    sc[j0] = __fmul_rn(d0, scale);
+    sc[j1] = __fmul_rn(d1, scale);
+    sc[j2] = __fmul_rn(d2, scale);
+    sc[j3] = __fmul_rn(d3, scale);
+  } else {
+    const __half* ks[4] = {k0, k1, k2, k3};
+    const int js[4] = {j0, j1, j2, j3};
+    for (int t = 0; t < 4; ++t) {
+      if (js[t] >= ctx) break;
+      float dot = 0.0f;
+#pragma unroll 4
+      for (int d = 0; d < hd4; ++d) {
+        const float4 qq = qv[d];
+        const float4 a = kvh_load4(ks[t] + 4 * d);
+        dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+        dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+        dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+        dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+      }
+      sc[js[t]] = __fmul_rn(dot, scale);
+    }
+  }
+}
+
+// REQUIRES blockDim.x == 128 (same contract as gqa_attention_reduce_g).
+__global__ void gqa_attention_reduce_h(const __half* __restrict__ v,
+                                       const float* __restrict__ scores,
+                                       float* __restrict__ out,
+                                       const int* __restrict__ ctrl,
+                                       const int max_ctx, const int n_head,
+                                       const int n_head_kv, const int head_dim) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (h >= n_head) return;
+  const int ctx = ctrl[2] + 1;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+
+  const float* gsc = scores + (long long)h * max_ctx;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  float* o_row = out + (long long)h * head_dim;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    float acc = 0.0f;
+#pragma unroll 8
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const float vv = __half2float(v[((long long)j * n_head_kv + kv) * head_dim + d]);
+      if (w != 0.0f) {
+        acc = __fadd_rn(acc, __fmul_rn(w, vv));
+      }
+    }
+    o_row[d] = acc;
+  }
+}
+
+__global__ void gqa_attention_batch_h(const float* __restrict__ q, const __half* __restrict__ k,
+                                      const __half* __restrict__ v, float* __restrict__ out,
+                                      float* __restrict__ scores, const int ctx_max,
+                                      const int n_head, const int n_head_kv, const int head_dim,
+                                      const float scale, const int causal_offset, const int m) {
+  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const long long total = (long long)m * n_head;
+  if (warp >= total) return;
+  const int row = warp / n_head;
+  const int h = warp - (long long)row * n_head;
+  const int limit = causal_offset + row;
+  const int ctx = limit + 1;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float* q_row = q + ((long long)row * n_head + h) * head_dim;
+  float* sc = scores + ((long long)row * n_head + h) * ctx_max;
+
+  for (int j = lane; j < ctx; j += 32) {
+    const __half* k_row = k + ((long long)j * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot = __fadd_rn(dot, __fmul_rn(q_row[d], __half2float(k_row[d])));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+  __syncwarp();
+  if (lane == 0) {
+    float mx = -INFINITY;
+    for (int j = 0; j < ctx; ++j) {
+      if (sc[j] > mx) mx = sc[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float e = exp_f32(__fsub_rn(sc[j], mx));
+      sc[j] = e;
+      sum = __fadd_rn(sum, e);
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+    for (int j = 0; j < ctx; ++j) {
+      sc[j] = __fmul_rn(sc[j], inv);
+    }
+  }
+  __syncwarp();
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    float acc = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      if (w == 0.0f) continue;
+      const __half* v_row = v + ((long long)j * n_head_kv + kv) * head_dim;
+      acc = __fadd_rn(acc, __fmul_rn(w, __half2float(v_row[d])));
+    }
+    o_row[d] = acc;
+  }
+}
+
+__global__ void gqa_attention_tree_scores_h(
+    const float* __restrict__ q, const __half* __restrict__ k,
+    float* __restrict__ scores, const int* __restrict__ anc,
+    const int* __restrict__ n_anc, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale,
+    const int prefix_len, const int max_anc, const int m) {
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= m) return;
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd4 = head_dim >> 2;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * ctx_max;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+    const __half* kr = k + ((long long)slot * n_head_kv + kv) * head_dim;
+    float dot = 0.0f;
+#pragma unroll 8
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float4 a = kvh_load4(kr + 4 * d);
+      dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+      dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+      dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+      dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// REQUIRES blockDim.x == 128 (same contract as gqa_attention_tree_reduce_g).
+__global__ void gqa_attention_tree_reduce_h(
+    const __half* __restrict__ v, const float* __restrict__ scores,
+    float* __restrict__ out, const int* __restrict__ anc,
+    const int* __restrict__ n_anc, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const int prefix_len,
+    const int max_anc, const int m) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= m) return;
+  const int ctx = prefix_len + n_anc[row];
+  const int tid = threadIdx.x;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int* arow = anc + (long long)row * max_anc;
+
+  const float* gsc = scores + ((long long)row * n_head + h) * ctx_max;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  const int ndims = (head_dim > tid) ? (head_dim - tid + (int)blockDim.x - 1) / (int)blockDim.x : 0;
+#define TREEH_MAX_DIMS_PER_THREAD 8
+  if (ndims <= TREEH_MAX_DIMS_PER_THREAD) {
+    float acc[TREEH_MAX_DIMS_PER_THREAD];
+    for (int t = 0; t < ndims; ++t) {
+      acc[t] = 0.0f;
+    }
+#pragma unroll 4
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+      const __half* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+      float vals[TREEH_MAX_DIMS_PER_THREAD];
+#pragma unroll
+      for (int t = 0; t < TREEH_MAX_DIMS_PER_THREAD; ++t) {
+        if (t < ndims) {
+          vals[t] = __half2float(v_row[tid + (int)blockDim.x * t]);
+        }
+      }
+      if (w != 0.0f) {
+#pragma unroll
+        for (int t = 0; t < TREEH_MAX_DIMS_PER_THREAD; ++t) {
+          if (t < ndims) {
+            acc[t] = __fadd_rn(acc[t], __fmul_rn(w, vals[t]));
+          }
+        }
+      }
+    }
+    for (int t = 0; t < ndims; ++t) {
+      o_row[tid + (int)blockDim.x * t] = acc[t];
+    }
+  } else {
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      float acc = 0.0f;
+      for (int j = 0; j < ctx; ++j) {
+        const float w = sc[j];
+        if (w == 0.0f) continue;
+        const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+        const __half* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+        acc = __fadd_rn(acc, __fmul_rn(w, __half2float(v_row[d])));
+      }
+      o_row[d] = acc;
+    }
+  }
+#undef TREEH_MAX_DIMS_PER_THREAD
+}
+
 // lm_head_warp_f32 — the tied LM head, ONE WARP per vocab row (vs lm_head_f32's one
 // thread). Lanes stride the row by 32 so the `token_embd` reads COALESCE (the by-thread
 // kernel reads one 10 KB row per thread — adjacent threads 10 KB apart, fully

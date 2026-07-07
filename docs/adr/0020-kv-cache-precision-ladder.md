@@ -1,6 +1,11 @@
 # ADR 0020 — KV-cache precision ladder (f16 → i8 → ternary "KVTQ")
 
-Status: **PROPOSED** (2026-07-07)
+Status: **RUNG 1 (f16) ACCEPTED** (2026-07-07) — implemented + measured:
+long-context decode (ctx≈4K) **68–72 → 95.6 tok/s (+33–40%)**, short-context
+unchanged (latency-bound, as predicted), perplexity rel err 2.659e-4 →
+1.582e-3 (~0.16%, inside the quality bar), KV memory halved. Opt-in via
+`TRITIUM_KV_F16=1`; the f32 default stays bit-exact and gate-covered.
+i8-grouped and ternary rungs remain PROPOSED.
 
 ## Context
 

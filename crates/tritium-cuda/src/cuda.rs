@@ -131,6 +131,25 @@ const KERNEL_NAME_RELU2_GATE: &str = "relu2_gate_f32";
 const KERNEL_NAME_EMBED_G: &str = "embedding_gather_f32_g";
 const KERNEL_NAME_ROPE_G: &str = "rope_apply_f32_g";
 const KERNEL_NAME_KV_APPEND: &str = "kv_append_f32";
+/// f16-KV twins (ADR 0020 rung 1): selected into the SAME function handles at
+/// build when the model runs with `TRITIUM_KV_F16=1`, so launch sites don't
+/// change. Suffix `_h` = `__half` KV element type; math identical.
+const KERNEL_NAME_KV_APPEND_H: &str = "kv_append_h";
+const KERNEL_NAME_KV_APPEND_BATCH_H: &str = "kv_append_batch_h";
+const KERNEL_NAME_ROPE_KV_FUSED_H: &str = "rope_kv_fused_h";
+const KERNEL_NAME_ATTN_SCORES_H: &str = "gqa_attention_scores_h";
+const KERNEL_NAME_ATTN_REDUCE_H: &str = "gqa_attention_reduce_h";
+const KERNEL_NAME_ATTN_BATCH_H: &str = "gqa_attention_batch_h";
+const KERNEL_NAME_ATTN_TREE_SCORES_H: &str = "gqa_attention_tree_scores_h";
+const KERNEL_NAME_ATTN_TREE_REDUCE_H: &str = "gqa_attention_tree_reduce_h";
+
+/// Whether this process' decode models store their KV cache as f16
+/// (opt-in, env `TRITIUM_KV_F16=1`; see docs/adr/0020). Halves KV memory and
+/// attention read bandwidth; each written K/V rounds once, so outputs are
+/// perplexity-gated rather than bit-exact vs the f32 reference.
+fn kv_f16_enabled() -> bool {
+    std::env::var("TRITIUM_KV_F16").as_deref() == Ok("1")
+}
 /// Fused q-RoPE + k-RoPE + K/V append for the decode graph (v1.x): one launch
 /// replaces four, bit-identical values (see the kernel doc).
 const KERNEL_NAME_ROPE_KV_FUSED: &str = "rope_kv_fused_g";
@@ -1921,6 +1940,16 @@ impl CudaBackend {
         } = *spec;
         let q_width = n_head * head_dim;
         let kv_width = n_head_kv * head_dim;
+        // ADR 0020 rung 1: f16 KV opt-in. The f16 attention twins are float4-
+        // shaped (half4 loads), so the same geometry gate as the split
+        // attention applies.
+        let kv_f16 = kv_f16_enabled();
+        if kv_f16 && !head_dim.is_multiple_of(4) {
+            return Err(BackendError::InvalidInput(format!(
+                "TRITIUM_KV_F16=1 requires head_dim % 4 == 0 (got {head_dim})"
+            )));
+        }
+        let kv_elem = if kv_f16 { 2usize } else { 4usize };
         let half = head_dim / 2;
 
         // Validate the dense shapes the kernels assume.
@@ -2040,8 +2069,14 @@ impl CudaBackend {
                 qkv: ResidentLinear::build_fused(s, &[&ls.q, &ls.k, &ls.v])?,
                 gateup: ResidentLinear::build_fused(s, &[&ls.gate, &ls.up])?,
             });
-            kv_k.push(alloc(max_ctx * kv_width, "decode kv_k alloc")?);
-            kv_v.push(alloc(max_ctx * kv_width, "decode kv_v alloc")?);
+            kv_k.push(
+                s.alloc_zeros::<u8>(max_ctx * kv_width * kv_elem)
+                    .map_err(|e| driver_err("decode kv_k alloc", &e))?,
+            );
+            kv_v.push(
+                s.alloc_zeros::<u8>(max_ctx * kv_width * kv_elem)
+                    .map_err(|e| driver_err("decode kv_v alloc", &e))?,
+            );
         }
 
         // Resolve the kernels from the resident modules (decode + the add module's tiled GEMM).
@@ -2066,16 +2101,25 @@ impl CudaBackend {
         })?;
         // v1.x split attention: the reduce kernel stages the same max_ctx scores in
         // dynamic shared, so it needs the identical opt-in on its own handle.
-        let f_attn_scores = f(dm, KERNEL_NAME_ATTN_SCORES)?;
-        let f_attn_reduce = f(dm, KERNEL_NAME_ATTN_REDUCE)?;
+        let sel = |f32_name: &'static str, h_name: &'static str| {
+            if kv_f16 { h_name } else { f32_name }
+        };
+        let f_attn_scores = f(dm, sel(KERNEL_NAME_ATTN_SCORES, KERNEL_NAME_ATTN_SCORES_H))?;
+        let f_attn_reduce = f(dm, sel(KERNEL_NAME_ATTN_REDUCE, KERNEL_NAME_ATTN_REDUCE_H))?;
         attn_shared_opt_in(max_ctx, |bytes| {
             f_attn_reduce.set_attribute(
                 sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 bytes,
             )
         })?;
-        let f_attn_tree_scores = f(dm, KERNEL_NAME_ATTN_TREE_SCORES)?;
-        let f_attn_tree_reduce = f(dm, KERNEL_NAME_ATTN_TREE_REDUCE)?;
+        let f_attn_tree_scores = f(
+            dm,
+            sel(KERNEL_NAME_ATTN_TREE_SCORES, KERNEL_NAME_ATTN_TREE_SCORES_H),
+        )?;
+        let f_attn_tree_reduce = f(
+            dm,
+            sel(KERNEL_NAME_ATTN_TREE_REDUCE, KERNEL_NAME_ATTN_TREE_REDUCE_H),
+        )?;
         attn_shared_opt_in(max_ctx, |bytes| {
             f_attn_tree_reduce.set_attribute(
                 sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -2090,6 +2134,7 @@ impl CudaBackend {
             tree_scratch: None,
             tree_graphs: None,
             pending_tree: None,
+            kv_elem,
             f_rmsnorm: f(dm, KERNEL_NAME_RMSNORM)?,
             f_rope: f(dm, KERNEL_NAME_ROPE)?,
             f_attn,
@@ -2113,8 +2158,11 @@ impl CudaBackend {
             f_rope_batch: f(dm, KERNEL_NAME_ROPE_BATCH)?,
             f_quant_batch: f(dm, KERNEL_NAME_ACT_QUANT_BATCH_I8)?,
             f_scale_batch: f(dm, KERNEL_NAME_SCALE_BATCH)?,
-            f_kv_append_batch: f(dm, KERNEL_NAME_KV_APPEND_BATCH)?,
-            f_attn_batch: f(dm, KERNEL_NAME_ATTN_BATCH)?,
+            f_kv_append_batch: f(
+                dm,
+                sel(KERNEL_NAME_KV_APPEND_BATCH, KERNEL_NAME_KV_APPEND_BATCH_H),
+            )?,
+            f_attn_batch: f(dm, sel(KERNEL_NAME_ATTN_BATCH, KERNEL_NAME_ATTN_BATCH_H))?,
             f_attn_tree: f(dm, KERNEL_NAME_ATTN_TREE)?,
             f_attn_tree_scores,
             f_attn_tree_reduce,
@@ -3895,9 +3943,14 @@ pub struct CudaDecodeModel {
     d_cos: CudaSlice<f32>,
     d_sin: CudaSlice<f32>,
     layers: Vec<ResidentLayer>,
-    // Per-layer KV arenas `[max_ctx * kv_width]`, model-side for disjoint borrows.
-    kv_k: Vec<CudaSlice<f32>>,
-    kv_v: Vec<CudaSlice<f32>>,
+    // Per-layer KV arenas, model-side for disjoint borrows. Stored as BYTES
+    // (`max_ctx * kv_width * kv_elem`): elements are f32 (kv_elem = 4) or,
+    // under the ADR 0020 f16 rung, __half (kv_elem = 2) — the dtype-selected
+    // kernels interpret them; host code only ever slices by byte offsets.
+    kv_k: Vec<CudaSlice<u8>>,
+    kv_v: Vec<CudaSlice<u8>>,
+    /// KV element size in bytes: 4 (f32, default) or 2 (f16 rung).
+    kv_elem: usize,
     cache_len: usize,
     // Reused scratch (sized once).
     d_x: CudaSlice<f32>,
@@ -4136,19 +4189,30 @@ impl CudaDecodeModel {
             )?;
         }
 
-        // Append the new k/v to this layer's KV arena at the watermark, dtod.
-        let off = self.cache_len * kv_width;
+        // Append the new k/v to this layer's KV arena at the watermark via the
+        // dtype-selected append kernel (a plain copy for f32; converts under
+        // the f16 rung — a dtod byte copy can't change element type).
         {
-            let mut dst = self.kv_k[li].slice_mut(off..off + kv_width);
-            self.stream
-                .memcpy_dtod(&self.d_knew, &mut dst)
-                .map_err(|e| driver_err("kv append k", &e))?;
-        }
-        {
-            let mut dst = self.kv_v[li].slice_mut(off..off + kv_width);
-            self.stream
-                .memcpy_dtod(&self.d_vnew, &mut dst)
-                .map_err(|e| driver_err("kv append v", &e))?;
+            let (d_knew, d_vnew) = (&self.d_knew, &self.d_vnew);
+            let s = &self.stream;
+            Self::bl_kv_append(
+                s,
+                &self.f_kv_append_batch,
+                d_knew,
+                &mut self.kv_k[li],
+                self.cache_len,
+                kv_width,
+                1,
+            )?;
+            Self::bl_kv_append(
+                s,
+                &self.f_kv_append_batch,
+                d_vnew,
+                &mut self.kv_v[li],
+                self.cache_len,
+                kv_width,
+                1,
+            )?;
         }
 
         // Attention over the cached prefix (ctx = watermark+1, last visible = watermark).
@@ -4507,8 +4571,8 @@ impl CudaDecodeModel {
         func_scores: &CudaFunction,
         func_reduce: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<u8>,
+        v: &CudaSlice<u8>,
         out: &mut CudaSlice<f32>,
         scores: &mut CudaSlice<f32>,
         ctrl: &CudaSlice<i32>,
@@ -5216,6 +5280,7 @@ impl CudaDecodeModel {
         let bucket = if self.head_dim.is_multiple_of(4)
             && m <= TREE_BUCKET_MAX
             && self.max_ctx * 4 <= 48 * 1024
+            && self.kv_elem == 4 // f16 KV: eager tree (no ctrl _h twins; graph measured ≈ no win)
             && std::env::var_os("TRITIUM_TREE_EAGER").is_none()
         {
             TREE_BUCKETS
@@ -5827,28 +5892,30 @@ impl CudaDecodeModel {
     /// src >= dst and no promoted row is overwritten before it is read.
     fn tree_promote(&mut self, path: &[usize]) -> Result<(), BackendError> {
         let s = &self.stream;
-        let kv_width = self.kv_width;
+        // Arena rows are addressed in BYTES (kv_elem = 4 for f32, 2 for f16);
+        // a row copy is dtype-agnostic.
+        let row_bytes = self.kv_width * self.kv_elem;
         for (k, &node) in path.iter().enumerate() {
             if node == k {
                 continue; // already in place (chain prefix)
             }
-            let src = (self.cache_len + node) * kv_width;
-            let dst = (self.cache_len + k) * kv_width;
+            let src = (self.cache_len + node) * row_bytes;
+            let dst = (self.cache_len + k) * row_bytes;
             for li in 0..self.layers.len() {
                 for arena in [&mut self.kv_k[li], &mut self.kv_v[li]] {
                     // Copy via a device temporary: src/dst rows never overlap (path is
                     // strictly increasing, src >= dst), but the tmp keeps the copy
                     // trivially safe for any future path shape.
                     let row = {
-                        let src_slice = arena.slice(src..src + kv_width);
+                        let src_slice = arena.slice(src..src + row_bytes);
                         let mut tmp = s
-                            .alloc_zeros::<f32>(kv_width)
+                            .alloc_zeros::<u8>(row_bytes)
                             .map_err(|e| driver_err("tree promote tmp", &e))?;
                         s.memcpy_dtod(&src_slice, &mut tmp)
                             .map_err(|e| driver_err("tree promote read", &e))?;
                         tmp
                     };
-                    let mut dst_slice = arena.slice_mut(dst..dst + kv_width);
+                    let mut dst_slice = arena.slice_mut(dst..dst + row_bytes);
                     s.memcpy_dtod(&row, &mut dst_slice)
                         .map_err(|e| driver_err("tree promote write", &e))?;
                 }
@@ -5866,8 +5933,8 @@ impl CudaDecodeModel {
         s: &Arc<CudaStream>,
         f: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<u8>,
+        v: &CudaSlice<u8>,
         out: &mut CudaSlice<f32>,
         scores: &mut CudaSlice<f32>,
         anc: &CudaSlice<i32>,
@@ -5932,8 +5999,8 @@ impl CudaDecodeModel {
         f_scores: &CudaFunction,
         f_reduce: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<u8>,
+        v: &CudaSlice<u8>,
         out: &mut CudaSlice<f32>,
         scores: &mut CudaSlice<f32>,
         anc: &CudaSlice<i32>,
@@ -6271,7 +6338,7 @@ impl CudaDecodeModel {
         s: &Arc<CudaStream>,
         f: &CudaFunction,
         src: &CudaSlice<f32>,
-        kv_base: &mut CudaSlice<f32>,
+        kv_base: &mut CudaSlice<u8>,
         cache_len: usize,
         kv_width: usize,
         m: usize,
@@ -6294,12 +6361,12 @@ impl CudaDecodeModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bl_attn(
+    fn bl_attn<KV: cudarc::driver::DeviceRepr>(
         s: &Arc<CudaStream>,
         f: &CudaFunction,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<KV>,
+        v: &CudaSlice<KV>,
         out: &mut CudaSlice<f32>,
         scores: &mut CudaSlice<f32>,
         ctx_max: usize,
@@ -7828,7 +7895,7 @@ impl CudaDecodeModel {
     fn capture_graph(&mut self) -> Result<(), BackendError> {
         if self.raw.is_none() {
             let ctx = self.cap_stream.context().clone();
-            let raw = RawGraphKernels::load(&ctx)?;
+            let raw = RawGraphKernels::load(&ctx, self.kv_elem == 2)?;
             // The warp attention kernel's dynamic shared (`max_ctx` f32 scores) needs
             // the same over-48-KiB opt-in on this second JIT's function handle as the
             // eager path's `f_attn` (see `build_decode_model`).
@@ -8528,7 +8595,10 @@ struct RawGraphKernels {
 unsafe impl Send for RawGraphKernels {}
 
 impl RawGraphKernels {
-    fn load(ctx: &Arc<CudaContext>) -> Result<Self, BackendError> {
+    fn load(ctx: &Arc<CudaContext>, kv_f16: bool) -> Result<Self, BackendError> {
+        let sel = |f32_name: &'static str, h_name: &'static str| {
+            if kv_f16 { h_name } else { f32_name }
+        };
         ctx.bind_to_thread()
             .map_err(|e| driver_err("raw kernels bind", &e))?;
         let load_mod = |ptx: &str| -> Result<sys::CUmodule, BackendError> {
@@ -8552,12 +8622,15 @@ impl RawGraphKernels {
         Ok(Self {
             embed_g: get(dm, KERNEL_NAME_EMBED_G)?,
             rope_g: get(dm, KERNEL_NAME_ROPE_G)?,
-            kv_append: get(dm, KERNEL_NAME_KV_APPEND)?,
-            rope_kv: get(dm, KERNEL_NAME_ROPE_KV_FUSED)?,
+            kv_append: get(dm, sel(KERNEL_NAME_KV_APPEND, KERNEL_NAME_KV_APPEND_H))?,
+            rope_kv: get(
+                dm,
+                sel(KERNEL_NAME_ROPE_KV_FUSED, KERNEL_NAME_ROPE_KV_FUSED_H),
+            )?,
             // Warp-per-head attention (bit-identical to the one-thread `_g`, just parallel).
             attn_g: get(dm, KERNEL_NAME_ATTN_WARP)?,
-            attn_scores_g: get(dm, KERNEL_NAME_ATTN_SCORES)?,
-            attn_reduce_g: get(dm, KERNEL_NAME_ATTN_REDUCE)?,
+            attn_scores_g: get(dm, sel(KERNEL_NAME_ATTN_SCORES, KERNEL_NAME_ATTN_SCORES_H))?,
+            attn_reduce_g: get(dm, sel(KERNEL_NAME_ATTN_REDUCE, KERNEL_NAME_ATTN_REDUCE_H))?,
             // Shared-staged rmsnorm: BIT-IDENTICAL to the sequential rmsnorm_f32 (same sum
             // order, from shared), just ~8× faster — so greedy 256/256 holds. (A *parallel*
             // tree-reduction rmsnorm would reach ~132 tok/s but reorders the sum and breaks
