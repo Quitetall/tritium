@@ -71,6 +71,12 @@ Sequencing: f16 first (plumbing pass, expected keep), i8-grouped second
 (validates the scales side-arena machinery), ternary last (the research
 rung, group-size and K/V-asymmetry sweeps on the perplexity harness).
 
+## Ops notes
+
+- `TRITIUM_KV_F16` is read by the **CUDA backend only**; ROCm/Metal/CPU
+  ignore it (their rungs land when promoted). Values other than `1`/`0` are
+  rejected loudly at model build.
+
 ## Consequences
 
 - Long-context decode stops being KV-bound at whatever rung survives the

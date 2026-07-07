@@ -147,8 +147,18 @@ const KERNEL_NAME_ATTN_TREE_REDUCE_H: &str = "gqa_attention_tree_reduce_h";
 /// (opt-in, env `TRITIUM_KV_F16=1`; see docs/adr/0020). Halves KV memory and
 /// attention read bandwidth; each written K/V rounds once, so outputs are
 /// perplexity-gated rather than bit-exact vs the f32 reference.
-fn kv_f16_enabled() -> bool {
-    std::env::var("TRITIUM_KV_F16").as_deref() == Ok("1")
+fn kv_f16_enabled() -> Result<bool, BackendError> {
+    match std::env::var("TRITIUM_KV_F16") {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" || v.is_empty() => Ok(false),
+        // Reject loudly: `TRITIUM_KV_F16=true` silently running f32 would
+        // invalidate whatever comparison the user thought they were making.
+        Ok(v) => Err(BackendError::InvalidInput(format!(
+            "TRITIUM_KV_F16={v:?} — use 1 (f16 KV) or 0/unset (f32)"
+        ))),
+        Err(e) => Err(BackendError::InvalidInput(format!("TRITIUM_KV_F16: {e}"))),
+    }
 }
 /// Fused q-RoPE + k-RoPE + K/V append for the decode graph (v1.x): one launch
 /// replaces four, bit-identical values (see the kernel doc).
@@ -1943,7 +1953,7 @@ impl CudaBackend {
         // ADR 0020 rung 1: f16 KV opt-in. The f16 attention twins are float4-
         // shaped (half4 loads), so the same geometry gate as the split
         // attention applies.
-        let kv_f16 = kv_f16_enabled();
+        let kv_f16 = kv_f16_enabled()?;
         if kv_f16 && !head_dim.is_multiple_of(4) {
             return Err(BackendError::InvalidInput(format!(
                 "TRITIUM_KV_F16=1 requires head_dim % 4 == 0 (got {head_dim})"
@@ -6355,7 +6365,7 @@ impl CudaDecodeModel {
         #[allow(unsafe_code)]
         unsafe {
             l.launch(cfg)
-                .map_err(|e| driver_err("launch prefill kv_append", &e))?;
+                .map_err(|e| driver_err("launch kv_append (prefill/step/tree)", &e))?;
         }
         Ok(())
     }
