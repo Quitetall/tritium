@@ -115,6 +115,12 @@ const KERNEL_NAME_RMSNORM_QUANT: &str = "rmsnorm_quant_f32";
 const KERNEL_NAME_ACT_QUANT_TILED_I8: &str = "act_quant_tiled_i8";
 const KERNEL_NAME_RMSNORM_QUANT_I8: &str = "rmsnorm_quant_i8";
 const KERNEL_NAME_ACT_QUANT_BATCH_I8: &str = "act_quant_batch_i8";
+/// Threads for the `rmsnorm_quant_i8` launches. The kernel pins its canonical
+/// fold to 256 slots explicitly, so extra threads (ncu: the kernel is
+/// single-block latency-bound at ~1% of every throughput ceiling with 256)
+/// legally accelerate its elementwise passes. Must be a multiple of 32, ≥ 256,
+/// ≤ 1024 (`s_red[1024]`).
+const RMSNORM_QUANT_THREADS: u32 = 512;
 /// Per-token activation-scale fold `out *= act_scale` (v0.3.1) — the device half of
 /// the W1.58A8 dequant the host applies after the GEMM.
 const KERNEL_NAME_SCALE_MUL: &str = "scale_mul_f32";
@@ -180,7 +186,13 @@ const ACT_QUANT_THREADS: u32 = 256;
 /// CUDA threads per block for the 1-D launch grid (simple kernel).
 const THREADS_PER_BLOCK: u32 = 256;
 /// Warps per block for the tiled kernel — each warp computes one output column,
-/// so a block covers this many `N` at once (8 warps = 256 threads).
+/// so a block covers this many `N` at once (8 warps = 256 threads). ncu note
+/// (2026-07-07): the small decode GEMMs run at 0.42–0.62 waves / 44–48% DRAM —
+/// warp-count-starved by the shape itself (N columns < machine warp capacity
+/// at M=1). Halving block width (4 warps) changes nothing (same total warps),
+/// and three split-K variants measured slower; the architectural fix for the
+/// underfill is batching rows (M=N decode / BASTION tree-verify), not a finer
+/// launch geometry.
 const WARPS_PER_BLOCK: u32 = 8;
 /// Largest `K` the tiled kernel accepts: it stages `K` f32 activations in shared
 /// memory (`K * 4` bytes = 32 KiB at the cap), comfortably under the 48 KiB
@@ -4211,7 +4223,7 @@ impl CudaDecodeModel {
         let n_i = n as i32;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
-            block_dim: (256, 1, 1),
+            block_dim: (RMSNORM_QUANT_THREADS, 1, 1),
             shared_mem_bytes: (n * 4) as u32,
         };
         let mut l = stream.launch_builder(func);
@@ -7315,7 +7327,7 @@ impl CudaDecodeModel {
         raw_launch(
             self.raw().rmsnorm_quant,
             (1, 1, 1),
-            (256, 1, 1),
+            (RMSNORM_QUANT_THREADS, 1, 1),
             smem,
             self.cap_stream.cu_stream(),
             &mut params,

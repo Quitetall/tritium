@@ -508,6 +508,39 @@ support (maddubs/VNNI); the LUT module remains for gather-only ISAs.
 pipeline DAG orchestrator repo at ~/blut, NOT the LUT kernel — the CPU
 fast-path work stands on its own merits.)
 
+### v1.x round 8 — ncu counter-guided pass (first with real counters)
+
+Perf-counter access unlocked (`NVreg_RestrictProfilingToAdminUsers=0`).
+Counter data on the live decode graph (medians, `--set basic`):
+
+| kernel | dur | DRAM% | occ% | waves/SM |
+|---|---|---|---|---|
+| GEMM gateup (1728 blk) | 14.4µs | 68 | 87 | 2.25 |
+| GEMM qkv (480 blk) | 5.8µs | 47 | 61 | 0.62 |
+| GEMM o/down (320 blk) | 10.1µs | 44 | 41 | 0.42 |
+| rmsnorm_quant_i8 (1 blk, 256t) | 8.4µs | ~1 | 17 | 0.00 |
+| attention scores / reduce | 6.7 / 3.8µs | ~2 | ~8 | ~0.2 |
+
+Findings + actions:
+1. **Small GEMMs are WARP-COUNT-starved, not DRAM-bound** (the earlier
+   conclusion was wrong for N ≤ 3840): the shape has fewer columns than the
+   machine has warp slots at M=1. Split-K re-tested on the i8-direct kernel
+   (interleaved AND contiguous k-ranges) — still slower; halving block width
+   (WARPS_PER_BLOCK 4) is a no-op (same warp count). Warp-per-column stands;
+   the architectural fix for underfill is batching rows — which is exactly
+   what M=N decode and BASTION tree-verify provide.
+2. **rmsnorm_quant_i8 runs at ~1% of every throughput ceiling** (single
+   block, pure latency). The kernel now pins its canonical fold to 256 slots
+   EXPLICITLY and launches with 512 threads (extra threads accelerate the
+   staging/normalize/quant passes; the ADR 0018 order is unchanged and the
+   absmax merge stays exact): **8.35 → 5.82µs (−30%)**, ~0.3ms/token.
+3. Attention scores/reduce are latency floors at decode ctx (~10.5µs/layer
+   combined under ncu isolation); no counter-indicated lever beyond what
+   ADR 0019 already deferred.
+
+decode 326–389 tok/s (contention spread; best-case 45.9% of roofline),
+perplexity bit-identical. 9/9 acceptance + 51/51 CUDA tests green.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time

@@ -546,19 +546,26 @@ __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
   }
   __syncthreads();
 
-  // Canonical tree sum (ADR 0018): slot t = threadIdx.x folds s_x[t],
+  // Canonical tree sum (ADR 0018): slot t (t < 256) folds s_x[t],
   // s_x[t+256], ... in ascending order, then a power-of-two tree combines
   // the slots — the documented cross-backend order tritium_nn::ops::rmsnorm
-  // implements identically on the host. Requires blockDim.x == 256 (all
-  // launches comply). Replaces the sequential thread-0 fold, which was the
-  // measured decode bottleneck (a 4-cycle-per-element latency chain).
+  // implements identically on the host. Unlike its siblings this kernel pins
+  // the fold to 256 slots EXPLICITLY, so it may launch with blockDim.x > 256
+  // (multiples of 32, ≤ 1024): the extra threads accelerate the staging /
+  // normalize / quant passes of this single-block, latency-bound kernel.
   {
+    // Canonical 256-SLOT fold regardless of blockDim (ADR 0018): slot t < 256
+    // folds x[t], x[t+256], … — threads ≥ 256 sit out the fold but accelerate
+    // every elementwise pass (this kernel is single-block latency-bound; ncu:
+    // ~1% of every throughput ceiling at 256 threads).
     float part = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-      const float xi = s_x[i];
-      part = __fadd_rn(part, __fmul_rn(xi, xi));
+    if (threadIdx.x < 256) {
+      for (int i = threadIdx.x; i < n; i += 256) {
+        const float xi = s_x[i];
+        part = __fadd_rn(part, __fmul_rn(xi, xi));
+      }
+      s_red[threadIdx.x] = part;
     }
-    s_red[threadIdx.x] = part;
     __syncthreads();
     // Levels 128 and 64 in shared, then warp 0 finishes in registers: the
     // shuffle pairing (t, t+off) IS the canonical tree's pairing, so the DAG
@@ -593,7 +600,14 @@ __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
   }
   __syncthreads();
 
+  // absmax slots: threads < 256 own s_red[t]; threads ≥ 256 park their max in
+  // s_red[256 + (t-256)] (s_red is 1024 wide) and one extra exact max-merge
+  // level folds the upper half in. Max is order-free, so any shape is exact.
   s_red[threadIdx.x] = local_max;
+  __syncthreads();
+  if (threadIdx.x < 256 && threadIdx.x + 256 < blockDim.x) {
+    s_red[threadIdx.x] = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 256]);
+  }
   __syncthreads();
   // max is exact under any order; same shared-then-warp-shuffle shape as the
   // sum tree above (6 fewer barriers).
