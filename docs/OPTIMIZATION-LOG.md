@@ -569,6 +569,33 @@ over a decode step is the eager launch storm (~420 launches/verify) — a
 ctrl-driven CUDA graph for fixed-m trees would collapse it toward ~1 step,
 putting 2×+ in reach on repetitive text.
 
+### v1.x round 10 — ctrl-driven tree-verify graph (kept) + the launch-storm hypothesis killed
+
+Built the fixed-m verify graph: the trunk (embed → 30 layers) is captured per
+padded bucket {8,16,24,32,48} with three ctrl-driven kernel twins
+(`kv_append_tree_g`, `gqa_attention_tree_{scores,reduce}_ctrl_g` reading
+[prefix_len, real_m] from a device buffer), pad rows early-exited in
+attention; LM head + argmax stay eager at the real node count. Lossless gate
+green on the graph path AND the `TRITIUM_TREE_EAGER=1` fallback.
+
+**Measured: no wall-clock win (8.6 → 8.5ms/verify).** nsys per-verify budget:
+tree attention 1.85ms, GEMMs ~2.2ms (weight-traffic floor ~1.15ms), LM head
+1.0ms, rmsnorm+quant ~1.2ms — the verify is GPU-bound; the ~420 eager
+launches were overlapped with GPU execution all along. Kept anyway: the graph
+frees the CPU during verifies (matters once an external drafter shares the
+host) and holds verify dispatch cost flat as buckets grow.
+
+Also from the same counter data:
+- `argmax_rows` was 129µs at m=13 (m blocks × 128k-vocab scans) → chunked
+  partial/combine pair with the identical tie rule (~10µs, exact).
+- LMHEAD_ROW_TILE 8→16 **regressed 2×** (verify 8.5→13.5ms): 16 predicated
+  MACs per table element tips the head kernel compute-bound. Reverted; 8 is
+  the measured balance point.
+
+Verify-cost end-state: the remaining levers are the tree reduce (40µs/layer)
+and acceptance itself — drafter quality (DFlash marginals) moves the
+multiplier far more than any remaining verify µs.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time

@@ -1507,6 +1507,198 @@ __global__ void gqa_attention_tree_reduce_g(
 #undef TREE_MAX_DIMS_PER_THREAD
 }
 
+// ─── Ctrl-driven tree-verify kernels (v1.x) — graph-capturable twins of the
+// tree trunk's shape-varying launches. A CUDA graph bakes every scalar arg and
+// grid at capture, but a spec-decode loop calls verify with a growing prefix
+// and a varying node count; these variants read the two per-call values from
+// `tree_ctrl` = [prefix_len, real_m] (device i32[2], uploaded before replay)
+// so ONE graph per padded tree size (bucket) serves every verify. Pad rows
+// (real_m <= row < m) are early-exited in attention (the expensive per-row
+// cost) and left to compute harmless junk elsewhere — pads are root-token
+// duplicates, and every trunk op is row-independent, so real rows are
+// bit-identical to the eager path.
+
+// kv_append_tree_g — append m provisional K/V rows at arena rows
+// [ctrl[0], ctrl[0] + m). Pad rows write junk into dead arena space (rows at
+// or above the post-accept cache_len are never read and get overwritten).
+__global__ void kv_append_tree_g(const float* __restrict__ src, float* __restrict__ kv_base,
+                                 const int* __restrict__ tree_ctrl, const int kv_width,
+                                 const int m) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long total = (long long)m * kv_width;
+  if (idx >= total) return;
+  const int prefix_len = tree_ctrl[0];
+  const int row = (int)(idx / kv_width);
+  const int col = (int)(idx - (long long)row * kv_width);
+  kv_base[((long long)prefix_len + row) * kv_width + col] = src[idx];
+}
+
+// gqa_attention_tree_scores_ctrl_g — the scores fan-out with prefix_len from
+// ctrl and a FIXED score stride (max_ctx, baked) instead of the eager path's
+// per-call ctx_max. The stride only addresses scratch — values are identical.
+// grid.y is baked at ceil(max_ctx / TREE_SCORE_CHUNK); chunks past the live
+// context exit like the decode split's ctrl-driven grid does.
+__global__ void gqa_attention_tree_scores_ctrl_g(
+    const float* __restrict__ q, const float* __restrict__ k, float* __restrict__ scores,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale, const int max_anc,
+    const int m) {
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= tree_ctrl[1]) return;  // pad row (uniform per block)
+  const int prefix_len = tree_ctrl[0];
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd4 = head_dim >> 2;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * score_stride;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+    const float4* kr = (const float4*)(k + ((long long)slot * n_head_kv + kv) * head_dim);
+    float dot = 0.0f;
+#pragma unroll 8
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float4 a = kr[d];
+      dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+      dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+      dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+      dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// gqa_attention_tree_reduce_ctrl_g — the per-(row, head) softmax + weighted
+// reduce with prefix_len from ctrl + fixed score stride. REQUIRES
+// blockDim.x == 128 (fold levels hardcode 64/32). Every f32 fold keeps the
+// canonical order of the non-ctrl twin; the pad-row early return precedes the
+// first barrier and is uniform per block.
+__global__ void gqa_attention_tree_reduce_ctrl_g(
+    const float* __restrict__ v, const float* __restrict__ scores, float* __restrict__ out,
+    const int* __restrict__ anc, const int* __restrict__ n_anc,
+    const int* __restrict__ tree_ctrl, const int score_stride, const int n_head,
+    const int n_head_kv, const int head_dim, const int max_anc, const int m) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= tree_ctrl[1]) return;  // pad row (uniform per block)
+  const int prefix_len = tree_ctrl[0];
+  const int ctx = prefix_len + n_anc[row];
+  const int tid = threadIdx.x;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int* arow = anc + (long long)row * max_anc;
+
+  const float* gsc = scores + ((long long)row * n_head + h) * score_stride;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  const int ndims = (head_dim > tid) ? (head_dim - tid + (int)blockDim.x - 1) / (int)blockDim.x : 0;
+#define TREE_MAX_DIMS_PER_THREAD 8
+  if (ndims <= TREE_MAX_DIMS_PER_THREAD) {
+    float acc[TREE_MAX_DIMS_PER_THREAD];
+    for (int t = 0; t < ndims; ++t) {
+      acc[t] = 0.0f;
+    }
+#pragma unroll 4
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+      const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+      float vals[TREE_MAX_DIMS_PER_THREAD];
+#pragma unroll
+      for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+        if (t < ndims) {
+          vals[t] = v_row[tid + (int)blockDim.x * t];
+        }
+      }
+      if (w != 0.0f) {
+#pragma unroll
+        for (int t = 0; t < TREE_MAX_DIMS_PER_THREAD; ++t) {
+          if (t < ndims) {
+            acc[t] = __fadd_rn(acc[t], __fmul_rn(w, vals[t]));
+          }
+        }
+      }
+    }
+    for (int t = 0; t < ndims; ++t) {
+      o_row[tid + (int)blockDim.x * t] = acc[t];
+    }
+  } else {
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      float acc = 0.0f;
+      for (int j = 0; j < ctx; ++j) {
+        const float w = sc[j];
+        if (w == 0.0f) continue;
+        const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+        const float* v_row = v + ((long long)slot * n_head_kv + kv) * head_dim;
+        acc = __fadd_rn(acc, __fmul_rn(w, v_row[d]));
+      }
+      o_row[d] = acc;
+    }
+  }
+#undef TREE_MAX_DIMS_PER_THREAD
+}
+
 // lm_head_warp_f32 — the tied LM head, ONE WARP per vocab row (vs lm_head_f32's one
 // thread). Lanes stride the row by 32 so the `token_embd` reads COALESCE (the by-thread
 // kernel reads one 10 KB row per thread — adjacent threads 10 KB apart, fully
@@ -2046,6 +2238,77 @@ __global__ void argmax_rows_f32(const float* __restrict__ logits, const int voca
 // this warp's key chunk `[s*chunk, min((s+1)*chunk, ctx))` → a partial
 // {acc[head_dim] relative to the chunk max, m = chunk max, l = chunk sumexp}, written
 // to `partials[warp][head_dim+2]` (warp index = (row*n_head+h)*n_split + s).
+// Chunked argmax pair — the single-kernel argmax_rows_f32 spawns only m
+// blocks (measured 129us at m=13: a 128k-vocab scan on 13 of 128 SMs). The
+// partial kernel fans a row's scan over ARGMAX_CHUNKS blocks; the combine
+// folds the per-chunk (val, idx) pairs with the SAME tie rule (equal value ->
+// higher index, matching host sample_greedy's max_by), so the result is
+// exactly argmax_rows_f32's.
+#define ARGMAX_CHUNKS 16
+__global__ void argmax_rows_partial_f32(const float* __restrict__ logits, const int vocab,
+                                        const int m, float* __restrict__ pvals,
+                                        int* __restrict__ pidx) {
+  const int mi = blockIdx.x;
+  const int c = blockIdx.y;
+  if (mi >= m) return;
+  const int chunk_len = (vocab + ARGMAX_CHUNKS - 1) / ARGMAX_CHUNKS;
+  const int j0 = c * chunk_len;
+  const int j1 = min(j0 + chunk_len, vocab);
+  const float* row = logits + (long long)mi * vocab;
+  float best_val = -INFINITY;
+  int best_idx = -1;
+  for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
+    const float v = row[j];
+    if (v > best_val || (v == best_val && j > best_idx)) {
+      best_val = v;
+      best_idx = j;
+    }
+  }
+  __shared__ float s_val[256];
+  __shared__ int s_idx[256];
+  s_val[threadIdx.x] = best_val;
+  s_idx[threadIdx.x] = best_idx;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const float ov = s_val[threadIdx.x + stride];
+      const int oi = s_idx[threadIdx.x + stride];
+      if (ov > s_val[threadIdx.x] || (ov == s_val[threadIdx.x] && oi > s_idx[threadIdx.x])) {
+        s_val[threadIdx.x] = ov;
+        s_idx[threadIdx.x] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    pvals[mi * ARGMAX_CHUNKS + c] = s_val[0];
+    pidx[mi * ARGMAX_CHUNKS + c] = s_idx[0];
+  }
+}
+
+__global__ void argmax_rows_combine_f32(const float* __restrict__ pvals,
+                                        const int* __restrict__ pidx, const int m,
+                                        int* __restrict__ out) {
+  const int mi = blockIdx.x;
+  if (mi >= m) return;
+  const int lane = threadIdx.x & 31;
+  float best_val = -INFINITY;
+  int best_idx = -1;
+  if (lane < ARGMAX_CHUNKS) {
+    best_val = pvals[mi * ARGMAX_CHUNKS + lane];
+    best_idx = pidx[mi * ARGMAX_CHUNKS + lane];
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    const float ov = __shfl_down_sync(0xffffffffu, best_val, off);
+    const int oi = __shfl_down_sync(0xffffffffu, best_idx, off);
+    if (ov > best_val || (ov == best_val && oi > best_idx)) {
+      best_val = ov;
+      best_idx = oi;
+    }
+  }
+  if (lane == 0) out[mi] = best_idx;
+}
+
 __global__ void gqa_attention_split_partial_f32(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ partials, const int* __restrict__ positions, const int max_ctx,
