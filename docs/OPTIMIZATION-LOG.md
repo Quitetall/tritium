@@ -596,6 +596,34 @@ Verify-cost end-state: the remaining levers are the tree reduce (40µs/layer)
 and acceptance itself — drafter quality (DFlash marginals) moves the
 multiplier far more than any remaining verify µs.
 
+### v1.x round 10b — entropy packing (base-243 / TQ1_0-class): REJECTED by measurement
+
+Hypothesis: TQ2_0 spends 2.0625 bits/trit; base-243 packing (5 trits/byte,
+1.6875 bpw, GGML TQ1_0's trick: byte = ceil(v·256/243), digit i =
+((uint8)(b·3^i)·3)>>8) is a LOSSLESS repack that cuts ternary weight bytes
+~18%. Decode is "bandwidth-bound", so fewer bytes should mean faster GEMMs.
+
+Measured in a standalone harness (kbench6.cu: exhaustive 243+81-value
+pack/unpack roundtrip + GEMM checked against the f64 reference; SoA planes so
+alignment is clean; BitNet decode shapes, warm numbers):
+
+| kernel | vs TQ2_0 dp4a |
+|---|---|
+| naive multiply-trick unpack (funnel-shift act assembly) | 1.38–1.79× slower |
+| shared-LUT + __byte_perm 4×4 transpose + digit-major repack (all dp4a aligned) | **1.19–1.37× slower** |
+
+Why it loses: TQ2_0's base-4 decode is ~3 ALU ops per 8 trits (shift, mask,
+vsub4, 2×dp4a); base-243 is ~22 ops per 20 trits even in the LUT variant —
+~4× the per-trit ALU. The counter data (round 8) shows the in-model decode
+GEMMs at only 44–68% DRAM (warp-count-starved), so there is no bandwidth
+wall for an 18% byte saving to relieve; the extra ALU lands straight on the
+critical path. At prefill (compute-bound) it's worse by construction.
+
+Where it WOULD pay: a machine whose ternary GEMMs run at >85% DRAM with idle
+ALU — not this GPU at these shapes. The entropy argument stays correct as
+*storage* (a TQ1_0 file is ~18% smaller on disk); it just doesn't convert to
+decode speed here.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time
