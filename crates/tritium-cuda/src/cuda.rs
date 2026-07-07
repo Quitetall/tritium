@@ -5260,9 +5260,11 @@ impl CudaDecodeModel {
             .as_ref()
             .is_none_or(|t| t.m_cap < m_cap_want)
         {
-            if self.tree_scratch.is_some() {
-                self.tree_graphs = None;
-            }
+            // Unconditional: an error-path `?` between take and put-back drops
+            // the scratch while captured graphs keep its baked pointers — on
+            // the next call the scratch is None but stale graphs would replay
+            // into freed memory if this drop were guarded on `is_some()`.
+            self.tree_graphs = None;
             let m = m_cap_want;
             let alloc =
                 |n: usize, what: &str| s.alloc_zeros::<f32>(n).map_err(|e| driver_err(what, &e));
@@ -5956,7 +5958,7 @@ impl CudaDecodeModel {
         Ok(())
     }
 
-    /// Chunked per-row argmax: the single-kernel `bl_argmax_rows` spawns only
+    /// Chunked per-row argmax: the single-kernel `argmax_rows_f32` spawns only
     /// `m` blocks (129µs measured at m=13); the partial/combine pair fans each
     /// row over `ARGMAX_CHUNKS` blocks with the identical tie rule, so the
     /// result is exactly the single kernel's.
