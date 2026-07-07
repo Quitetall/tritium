@@ -3752,10 +3752,12 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "half",
  "memmap2",
  "rayon",
  "serde",
  "serde_json",
+ "tritium-core",
  "tritium-cpu",
  "tritium-cuda",
  "tritium-format",
@@ -3928,7 +3930,11 @@ dependencies = [
  "tokio",
  "tower",
  "tritium-cpu",
+ "tritium-cuda",
+ "tritium-format",
  "tritium-nn",
+ "tritium-runtime",
+ "tritium-spec",
 ]
 
 [[package]]

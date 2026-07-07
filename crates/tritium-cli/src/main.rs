@@ -25,6 +25,7 @@ mod backends;
 mod generate;
 mod inspect;
 mod quantize;
+mod repack;
 mod report;
 
 /// BitNet 2B4T uses the LLaMA-3 tokenizer, whose end-of-text token is `128001`.
@@ -78,6 +79,19 @@ enum Command {
         /// The report to run.
         #[command(subcommand)]
         report: ReportCommand,
+    },
+    /// Losslessly repack ternary GGUF tensors between formats (I2_S/TQ1_0/TQ2_0 in;
+    /// TQ1_0 for ~18% smaller storage or TQ2_0 for the GPU compute layout out).
+    Repack {
+        /// Path to the source `.gguf` (ternary tensors in I2_S, TQ1_0 or TQ2_0).
+        #[arg(long)]
+        input: PathBuf,
+        /// Path to write the repacked `.gguf`.
+        #[arg(long)]
+        output: PathBuf,
+        /// Target ternary format.
+        #[arg(long, value_enum)]
+        to: repack::RepackTarget,
     },
     /// SALT-quantize an fp safetensors model to a SALT bundle.
     Quantize {
@@ -249,6 +263,7 @@ fn main() -> anyhow::Result<()> {
             let ids = generate::read_token_file(&tokens)?;
             generate::run(&model, &ids, max_new, greedy, eos)?;
         }
+        Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
         Command::Report { report: command } => match command {
             ReportCommand::Decode {
                 model,

@@ -27,6 +27,9 @@ tritium-nn = { workspace = true }
 # Optional CUDA backend linkage for `report --backend cuda` / parity reports.
 tritium-cuda = { workspace = true, optional = true }
 tritium-quantize = { workspace = true }
+# `repack` converts ternary tensors at the trits level.
+tritium-core = { workspace = true }
+half = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
