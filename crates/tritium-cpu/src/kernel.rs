@@ -112,6 +112,13 @@ fn run_chunk(
         // callers fall through to the bit-exact f32 kernels unchanged; the
         // detection scan is O(m·k), noise next to the O(m·n·k) GEMM.
         if is_x86_feature_detected!("avx2") && k <= A8_EXACT_K_MAX && act_is_a8_integer(act) {
+            // AVX-VNNI (Alder/Raptor Lake +): one vpdpbusd where the AVX2 path
+            // needs maddubs+madd+add — bit-identical (exact integer arithmetic
+            // either way), ~1/3 the port-0/1 µops in the inner loop.
+            if is_x86_feature_detected!("avxvnni") {
+                // SAFETY: `avxvnni`+`avx2` just confirmed; lengths re-validated inside.
+                return unsafe { avx2vnni_mpgemm_a8(act, weights, scales, shape, out) };
+            }
             // SAFETY: `avx2` was just confirmed; buffer lengths were validated by
             // `dispatch_mpgemm` and are re-validated inside before any intrinsic.
             return unsafe { avx2_mpgemm_a8(act, weights, scales, shape, out) };
@@ -432,6 +439,81 @@ pub(crate) unsafe fn avx2_mpgemm_a8(
     Ok(())
 }
 
+/// AVX-VNNI variant of [`avx2_mpgemm_a8`]: `vpdpbusd` fuses the
+/// `maddubs → madd → add` triple into one instruction (u8×i8 products summed
+/// 4-wide straight into the i32 accumulator — every intermediate ≤ 1016, so
+/// the arithmetic is exact and the result is BIT-IDENTICAL to the AVX2 path
+/// and the scalar reference; only the instruction count changes).
+///
+/// # Safety
+/// Caller must ensure `avxvnni` (and `avx2`) are available and that `act`
+/// holds integer-valued f32 in [-128, 127] (checked by [`act_is_a8_integer`]).
+#[target_feature(enable = "avx2,avxvnni")]
+pub(crate) unsafe fn avx2vnni_mpgemm_a8(
+    act: &[f32],
+    weights: &[Trit],
+    scales: &[f32],
+    shape: GemmShape,
+    out: &mut [f32],
+) -> Result<(), BackendError> {
+    use core::arch::x86_64::{
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm256_add_epi8,
+        _mm256_dpbusd_avx_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_set1_epi8,
+        _mm256_setzero_si256,
+    };
+
+    let GemmShape { m, n, k } = shape;
+    if act.len() != m * k || weights.len() != n * k || scales.len() != n || out.len() != m * n {
+        return scalar_mpgemm(act, weights, scales, shape, out);
+    }
+
+    // SAFETY: `Trit` is `#[repr(transparent)]` over `i8` (see `avx2_mpgemm`).
+    let weights_i8: &[i8] =
+        unsafe { core::slice::from_raw_parts(weights.as_ptr().cast::<i8>(), weights.len()) };
+
+    const LANES: usize = 32;
+    let k_simd = k - (k % LANES);
+    let one8 = _mm256_set1_epi8(1);
+
+    let mut q8 = vec![0i8; k];
+    for mi in 0..m {
+        let arow = &act[mi * k..mi * k + k];
+        let mut row_sum: i64 = 0;
+        for (dst, &v) in q8.iter_mut().zip(arow) {
+            let q = v as i32 as i8;
+            *dst = q;
+            row_sum += i64::from(q);
+        }
+
+        for ni in 0..n {
+            let wrow = &weights_i8[ni * k..ni * k + k];
+            let mut acc = _mm256_setzero_si256();
+            let mut ki = 0;
+            while ki < k_simd {
+                // SAFETY: `ki + 32 <= k_simd <= len` for both slices.
+                let w = unsafe { _mm256_loadu_si256(wrow.as_ptr().add(ki).cast::<__m256i>()) };
+                let a = unsafe { _mm256_loadu_si256(q8.as_ptr().add(ki).cast::<__m256i>()) };
+                let codes = _mm256_add_epi8(w, one8);
+                // u8×i8, 4-wide sum into i32 lanes — one instruction, exact.
+                acc = _mm256_dpbusd_avx_epi32(acc, codes, a);
+                ki += LANES;
+            }
+            let lo = _mm256_extracti128_si256::<0>(acc);
+            let hi = _mm256_extracti128_si256::<1>(acc);
+            let s128 = _mm_add_epi32(lo, hi);
+            let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32::<0b00_01_10_11>(s128));
+            let s32 = _mm_add_epi32(s64, _mm_shuffle_epi32::<0b01_00_11_10>(s64));
+            let mut total: i64 = i64::from(_mm_cvtsi128_si32(s32));
+            for kt in k_simd..k {
+                total += i64::from(i32::from(wrow[kt]) + 1) * i64::from(q8[kt]);
+            }
+            let signed = total - row_sum;
+            out[mi * n + ni] = signed as f32 * scales[ni];
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +531,49 @@ mod tests {
         let mut out = [0.0; 1];
         scalar_mpgemm(&act, &w, &[2.0], GemmShape::new(1, 1, 3), &mut out).unwrap();
         assert_eq!(out[0], 24.0);
+    }
+
+    /// Micro-benchmark (run explicitly: `cargo test -p tritium-cpu --release
+    /// -- --ignored a8_paths_bench --nocapture`): AVX2 vs AVX-VNNI A8 GEMM at
+    /// a BitNet decode shape.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "micro-benchmark, run with --ignored"]
+    fn a8_paths_bench() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let (m, n, k) = (1usize, 2560usize, 2560usize);
+        let shape = GemmShape::new(m, n, k);
+        let act: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 37 + 11) % 255) as f32 - 127.0)
+            .collect();
+        let w: Vec<Trit> = (0..n * k)
+            .map(|i| Trit::from_i8(((i * 31 + 7) % 3) as i8 - 1).unwrap())
+            .collect();
+        let scales = vec![0.01f32; n];
+        let mut out = vec![0.0f32; m * n];
+        let iters = 200;
+        // SAFETY: avx2 confirmed.
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe { avx2_mpgemm_a8(&act, &w, &scales, shape, &mut out).unwrap() };
+        }
+        let t_avx2 = t0.elapsed();
+        eprintln!("avx2   : {:?}/iter", t_avx2 / iters);
+        if is_x86_feature_detected!("avxvnni") {
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                // SAFETY: avxvnni confirmed.
+                unsafe { avx2vnni_mpgemm_a8(&act, &w, &scales, shape, &mut out).unwrap() };
+            }
+            let t_vnni = t0.elapsed();
+            eprintln!(
+                "avxvnni: {:?}/iter  ({:.2}x)",
+                t_vnni / iters,
+                t_avx2.as_secs_f64() / t_vnni.as_secs_f64()
+            );
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -491,6 +616,18 @@ mod tests {
             unsafe { avx2_mpgemm_a8(&act, &w, &scales, shape, &mut got).unwrap() };
             for (g, e) in got.iter().zip(&want) {
                 assert_eq!(g.to_bits(), e.to_bits(), "got {g}, want {e} ({shape:?})");
+            }
+            if is_x86_feature_detected!("avxvnni") {
+                let mut got = vec![0.0f32; m * n];
+                // SAFETY: avxvnni confirmed above.
+                unsafe { avx2vnni_mpgemm_a8(&act, &w, &scales, shape, &mut got).unwrap() };
+                for (g, e) in got.iter().zip(&want) {
+                    assert_eq!(
+                        g.to_bits(),
+                        e.to_bits(),
+                        "vnni: got {g}, want {e} ({shape:?})"
+                    );
+                }
             }
         }
         // Non-integer / out-of-range activations must fail detection (the
