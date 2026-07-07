@@ -1,6 +1,12 @@
 # ADR 0012 — v1.0 Release
 
-- **Status:** Accepted — **DONE, tagged `v1.0.0` (2026-06-28)**
+> **Amended by [ADR 0020](./0020-v1x-salt-distillation-capstone.md) (2026-07-07):** this ADR's
+> capstone (BitNet-2B4T, a *from-scratch* ternary model) proved the **infrastructure**; the tag
+> `v1.0.0` stands for the frozen API. The **public launch** (crates.io publish + announcement) is
+> now additionally gated on ADR 0020 — ternarizing a 27–35B **SOTA** model to near-fp16 via
+> SALT-distillation. `v1.0.0` = infra milestone; the public "1.0" waits on the model proof.
+
+- **Status:** Accepted — **DONE, tagged `v1.0.0` (2026-06-28)**; public launch re-gated by ADR 0020
 - **Date:** 2026-06-15 (planned); 2026-06-28 (completed)
 - **Relates:** executes the 1.0 milestone of [ADR 0002](./0002-release-roadmap.md); gated on the prior milestone [ADR 0011](./0011-v090-hardening.md); final step after [ADR 0004](./0004-v020-inference-spine.md) and the milestone chain it heads.
 
