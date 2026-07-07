@@ -600,13 +600,18 @@ __global__ void rmsnorm_quant_i8(const float* __restrict__ x,
   }
   __syncthreads();
 
-  // absmax slots: threads < 256 own s_red[t]; threads ≥ 256 park their max in
-  // s_red[256 + (t-256)] (s_red is 1024 wide) and one extra exact max-merge
-  // level folds the upper half in. Max is order-free, so any shape is exact.
+  // absmax slots: every thread parks its max in s_red[threadIdx.x] (s_red is
+  // 1024 wide, blockDim ≤ 1024), then slot owners t < 256 fold EVERY upper
+  // 256-stride bank in — generic over blockDim (512, 768, 1024 all correct),
+  // and exact because max is order-free.
   s_red[threadIdx.x] = local_max;
   __syncthreads();
-  if (threadIdx.x < 256 && threadIdx.x + 256 < blockDim.x) {
-    s_red[threadIdx.x] = fmaxf(s_red[threadIdx.x], s_red[threadIdx.x + 256]);
+  if (threadIdx.x < 256) {
+    float v = s_red[threadIdx.x];
+    for (int base = 256; base + threadIdx.x < blockDim.x; base += 256) {
+      v = fmaxf(v, s_red[threadIdx.x + base]);
+    }
+    s_red[threadIdx.x] = v;
   }
   __syncthreads();
   // max is exact under any order; same shared-then-warp-shuffle shape as the
