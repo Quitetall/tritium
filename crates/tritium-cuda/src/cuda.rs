@@ -2120,7 +2120,6 @@ impl CudaBackend {
             f_argmax_partial: f(dm, KERNEL_NAME_ARGMAX_PARTIAL)?,
             f_argmax_combine: f(dm, KERNEL_NAME_ARGMAX_COMBINE)?,
             f_lm_head_tiled: f(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
-            f_argmax_rows: f(dm, KERNEL_NAME_ARGMAX_ROWS)?,
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
             f_attn_mdecode: f(dm, KERNEL_NAME_ATTN_MDECODE)?,
@@ -3822,7 +3821,9 @@ const TREE_BUCKET_MAX: usize = 48;
 struct TreeGraphs {
     d_ctrl: CudaSlice<i32>,
     graphs: HashMap<usize, SendGraph>,
-    /// Keeps the raw modules the captured graphs reference alive.
+    /// Keeps the raw modules the captured graphs reference alive (read only
+    /// by Drop — the ownership IS the point).
+    #[allow(dead_code)]
     raw_keepalive: Option<Arc<BatchRawKernels>>,
 }
 
@@ -3872,7 +3873,6 @@ pub struct CudaDecodeModel {
     f_argmax_partial: CudaFunction,
     f_argmax_combine: CudaFunction,
     f_lm_head_tiled: CudaFunction,
-    f_argmax_rows: CudaFunction,
     f_lm_head_f16: CudaFunction,
     f_kv_append_mdecode: CudaFunction,
     #[allow(dead_code)] // kept for fallback; split-KV replaced it in the M=N path
@@ -6003,32 +6003,6 @@ impl CudaDecodeModel {
         unsafe {
             l.launch(cfg)
                 .map_err(|e| driver_err("launch argmax combine", &e))?;
-        }
-        Ok(())
-    }
-
-    /// Per-row greedy argmax over `[m, vocab]` logits (tie rule == `max_by`).
-    fn bl_argmax_rows(
-        s: &Arc<CudaStream>,
-        f: &CudaFunction,
-        logits: &CudaSlice<f32>,
-        vocab: usize,
-        m: usize,
-        out: &mut CudaSlice<i32>,
-    ) -> Result<(), BackendError> {
-        let (v_i, m_i) = (vocab as i32, m as i32);
-        let cfg = LaunchConfig {
-            grid_dim: (m as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut l = s.launch_builder(f);
-        l.arg(logits).arg(&v_i).arg(&m_i).arg(out);
-        // SAFETY: `argmax_rows_f32(const float* logits, int vocab, int m, int* out)`.
-        #[allow(unsafe_code)]
-        unsafe {
-            l.launch(cfg)
-                .map_err(|e| driver_err("launch tree argmax", &e))?;
         }
         Ok(())
     }
