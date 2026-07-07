@@ -410,9 +410,9 @@ pub(crate) unsafe fn avx2_mpgemm_a8(
             let mut acc = _mm256_setzero_si256();
             let mut ki = 0;
             while ki < k_simd {
-                // SAFETY: `ki + 32 <= k_simd <= len` for both slices; loadu has no
-                // alignment requirement.
+                // SAFETY: `ki + 32 <= k_simd <= wrow.len()`; loadu is unaligned.
                 let w = unsafe { _mm256_loadu_si256(wrow.as_ptr().add(ki).cast::<__m256i>()) };
+                // SAFETY: `ki + 32 <= k_simd <= q8.len()`; loadu is unaligned.
                 let a = unsafe { _mm256_loadu_si256(q8.as_ptr().add(ki).cast::<__m256i>()) };
                 // codes = w + 1 ∈ {0,1,2} as u8 (no wrap: w ≥ -1).
                 let codes = _mm256_add_epi8(w, one8);
@@ -441,13 +441,14 @@ pub(crate) unsafe fn avx2_mpgemm_a8(
 
 /// AVX-VNNI variant of [`avx2_mpgemm_a8`]: `vpdpbusd` fuses the
 /// `maddubs → madd → add` triple into one instruction (u8×i8 products summed
-/// 4-wide straight into the i32 accumulator — every intermediate ≤ 1016, so
+/// 4-wide straight into the i32 accumulator — every 4-group |sum| ≤ 1024, so
 /// the arithmetic is exact and the result is BIT-IDENTICAL to the AVX2 path
 /// and the scalar reference; only the instruction count changes).
 ///
 /// # Safety
 /// Caller must ensure `avxvnni` (and `avx2`) are available and that `act`
 /// holds integer-valued f32 in [-128, 127] (checked by [`act_is_a8_integer`]).
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
 pub(crate) unsafe fn avx2vnni_mpgemm_a8(
     act: &[f32],
@@ -490,8 +491,9 @@ pub(crate) unsafe fn avx2vnni_mpgemm_a8(
             let mut acc = _mm256_setzero_si256();
             let mut ki = 0;
             while ki < k_simd {
-                // SAFETY: `ki + 32 <= k_simd <= len` for both slices.
+                // SAFETY: `ki + 32 <= k_simd <= wrow.len()`; loadu is unaligned.
                 let w = unsafe { _mm256_loadu_si256(wrow.as_ptr().add(ki).cast::<__m256i>()) };
+                // SAFETY: `ki + 32 <= k_simd <= q8.len()`; loadu is unaligned.
                 let a = unsafe { _mm256_loadu_si256(q8.as_ptr().add(ki).cast::<__m256i>()) };
                 let codes = _mm256_add_epi8(w, one8);
                 // u8×i8, 4-wide sum into i32 lanes — one instruction, exact.
@@ -554,9 +556,9 @@ mod tests {
         let scales = vec![0.01f32; n];
         let mut out = vec![0.0f32; m * n];
         let iters = 200;
-        // SAFETY: avx2 confirmed.
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
+            // SAFETY: avx2 confirmed above.
             unsafe { avx2_mpgemm_a8(&act, &w, &scales, shape, &mut out).unwrap() };
         }
         let t_avx2 = t0.elapsed();
