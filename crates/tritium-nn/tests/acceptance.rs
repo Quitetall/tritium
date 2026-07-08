@@ -261,6 +261,7 @@ fn cpu_longer_greedy_matches_transformers() {
 /// prefix — long enough that a real regression (wrong kernel, wrong scale)
 /// cannot hide, short enough not to fail on legitimate near-tie flips — plus
 /// the perplexity gate that `benches/e2e.rs` holds at ≤1% on every run.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const CUDA_GREEDY_EXACT_PREFIX: usize = 96;
 
 /// (a) CUDA greedy acceptance: generate the full 256-token continuation on the

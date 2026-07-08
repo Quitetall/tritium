@@ -21,7 +21,7 @@ mod model;
 mod ops;
 mod tensor;
 
-pub use config::ModelConfig;
+pub use config::{ArchSpec, MlpKind, ModelConfig};
 pub use error::NnError;
 pub use kv_cache::KvCache;
 pub use layers::{

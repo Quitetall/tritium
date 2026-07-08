@@ -15,6 +15,9 @@ pub enum NnError {
     },
     /// A required GGUF metadata key was absent or the wrong type.
     MissingMetadata(String),
+    /// A required HuggingFace `config.json` key was absent or the wrong type; the
+    /// `String` is the key (or a short reason).
+    MissingConfig(String),
     /// A backend call failed; the message is the stringified `BackendError`.
     Backend(String),
     /// A tensor used a ggml type-id this layer cannot consume (the `u32` is the
@@ -39,6 +42,9 @@ impl fmt::Display for NnError {
             }
             NnError::MissingMetadata(key) => {
                 write!(f, "missing or mistyped GGUF metadata: {key}")
+            }
+            NnError::MissingConfig(key) => {
+                write!(f, "missing or mistyped HF config key: {key}")
             }
             NnError::Backend(msg) => write!(f, "backend error: {msg}"),
             NnError::UnsupportedTensorType(t) => {

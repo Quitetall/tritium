@@ -26,11 +26,13 @@ rayon = { workspace = true }
 # and runs no `nvcc`; only `--features cuda` links it (and forwards its own `cuda`
 # feature so the backend self-registers as `"cuda"` into the runtime `BACKENDS` slice).
 tritium-cuda = { workspace = true, optional = true }
+# `ModelConfig::from_hf_config` parses a HuggingFace `config.json` (library code, so a
+# regular dep, not dev-only).
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 # A concrete backend for the layer/forward integration tests (WF-3): the layers
 # speak the `tritium-spec` contract, so the tests drive them through the CPU
 # ternary mpGEMM. Not a runtime dependency of the crate.

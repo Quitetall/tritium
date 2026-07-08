@@ -21,12 +21,12 @@ pub(crate) fn sum_squares_canonical(x: &[f32]) -> f32 {
     let mut part = [0.0f32; CANONICAL_REDUCE_SLOTS];
     for (i, &v) in x.iter().enumerate() {
         let t = i % CANONICAL_REDUCE_SLOTS;
-        part[t] = part[t] + v * v;
+        part[t] += v * v;
     }
     let mut off = CANONICAL_REDUCE_SLOTS / 2;
     while off > 0 {
         for t in 0..off {
-            part[t] = part[t] + part[t + off];
+            part[t] += part[t + off];
         }
         off >>= 1;
     }
