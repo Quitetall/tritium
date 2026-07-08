@@ -25,7 +25,8 @@ pub use config::{ArchSpec, MlpKind, ModelConfig};
 pub use error::NnError;
 pub use kv_cache::KvCache;
 pub use layers::{
-    BlockDump, BlockScratch, DenseLinear, Projection, Relu2Mlp, TernaryLinear, TransformerBlock,
+    BlockDump, BlockScratch, DenseLinear, Mlp, Projection, Relu2Mlp, SwiGluMlp, TernaryLinear,
+    TransformerBlock,
 };
 pub use model::{ForwardDump, LayerWeights, ModelRunner, ModelWeights, Tokenizer};
 pub use ops::{

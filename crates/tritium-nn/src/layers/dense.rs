@@ -20,7 +20,11 @@ use rayon::prelude::*;
 use crate::error::NnError;
 use crate::ops::quantize_activation_int8;
 
-/// A dense fp32 projection through the A8 activation path. `W` is row-major
+/// A dense fp32 projection. Two modes: the **A8 activation path** (the default,
+/// [`DenseLinear::new`] — int8-quantizes activations exactly as [`TernaryLinear`] does,
+/// for the SALT weight-only accuracy eval), or an **exact fp32** matmul
+/// ([`DenseLinear::new_exact`] — no activation quantization, for running a standard fp
+/// model whose logits must match a `transformers` reference). `W` is row-major
 /// `[n_out, k_in]`.
 #[derive(Clone, Debug)]
 pub struct DenseLinear {
@@ -30,14 +34,35 @@ pub struct DenseLinear {
     pub k_in: usize,
     /// Row-major `[n_out, k_in]` fp32 weights.
     pub weights: Vec<f32>,
+    /// `true` ⇒ int8-quantize activations (A8 eval path); `false` ⇒ exact fp32 matmul.
+    quantize_act: bool,
 }
 
 impl DenseLinear {
-    /// Build from row-major `[n_out, k_in]` fp32 weights.
+    /// Build an **A8-path** projection from row-major `[n_out, k_in]` fp32 weights
+    /// (int8 activation quantization — the SALT accuracy-eval reference).
     ///
     /// # Errors
     /// [`NnError::Shape`] if `weights.len() != n_out * k_in`.
     pub fn new(weights: Vec<f32>, n_out: usize, k_in: usize) -> Result<Self, NnError> {
+        Self::build(weights, n_out, k_in, true)
+    }
+
+    /// Build an **exact fp32** projection (no activation quantization) — for running a
+    /// standard fp model (teacher/student) whose output must match a reference.
+    ///
+    /// # Errors
+    /// [`NnError::Shape`] if `weights.len() != n_out * k_in`.
+    pub fn new_exact(weights: Vec<f32>, n_out: usize, k_in: usize) -> Result<Self, NnError> {
+        Self::build(weights, n_out, k_in, false)
+    }
+
+    fn build(
+        weights: Vec<f32>,
+        n_out: usize,
+        k_in: usize,
+        quantize_act: bool,
+    ) -> Result<Self, NnError> {
         let expected = n_out.checked_mul(k_in).ok_or(NnError::Shape {
             expected: usize::MAX,
             got: weights.len(),
@@ -52,6 +77,7 @@ impl DenseLinear {
             n_out,
             k_in,
             weights,
+            quantize_act,
         })
     }
 
@@ -76,6 +102,27 @@ impl DenseLinear {
                 expected: out_len,
                 got: out.len(),
             });
+        }
+
+        // Exact fp32 matmul: `out[r,n] = Σ_k act[r,k]·W[n,k]`, no activation quantization.
+        // Used for a standard fp model whose logits must match a `transformers` reference.
+        if !self.quantize_act {
+            let weights = &self.weights;
+            for r in 0..m {
+                let arow = &act[r * k..r * k + k];
+                out[r * self.n_out..r * self.n_out + self.n_out]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(n, slot)| {
+                        let wn = &weights[n * k..n * k + k];
+                        let mut acc = 0.0f32;
+                        for kk in 0..k {
+                            acc += arow[kk] * wn[kk];
+                        }
+                        *slot = acc;
+                    });
+            }
+            return Ok(());
         }
 
         // Same per-token int8 absmax quant as `TernaryLinear` — the apples-to-apples
