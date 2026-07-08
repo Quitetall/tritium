@@ -4,6 +4,7 @@
 //! This is the top of the inference spine; the heavy integration (full forward,
 //! the fidelity ladder, the acceptance gate) lands in WF-4 as documented stubs.
 
+mod hf;
 mod runner;
 mod tokenizer;
 mod weights;

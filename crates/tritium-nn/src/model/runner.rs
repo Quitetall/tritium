@@ -10,6 +10,8 @@
 //! `tie_word_embeddings = true` and ships no separate `output.weight`), so
 //! unembedding is a dense fp32 matmul against `token_embd`.
 
+use std::path::Path;
+
 use tritium_spec::TernaryBackend;
 
 use crate::config::ModelConfig;
@@ -128,6 +130,18 @@ impl ModelRunner {
             #[cfg(feature = "cuda")]
             resident_probed: false,
         }
+    }
+
+    /// Load a **standard-transformer fp** model (Llama/SmolLM2/…) from a HuggingFace
+    /// directory (`config.json` + safetensors) onto `backend` — the general (non-BitNet)
+    /// inference path. See [`ModelWeights::load_hf`].
+    ///
+    /// # Errors
+    /// Propagates [`ModelWeights::load_hf`] errors (bad config, missing/unreadable tensor,
+    /// unsupported arch, shape mismatch).
+    pub fn from_hf(dir: &Path, backend: Box<dyn TernaryBackend>) -> Result<Self, NnError> {
+        let (config, _spec, weights) = ModelWeights::load_hf(dir)?;
+        Ok(Self::from_weights(config, weights, backend))
     }
 
     /// (cuda) Borrow the lazily-built device-resident decoder, building it first if
