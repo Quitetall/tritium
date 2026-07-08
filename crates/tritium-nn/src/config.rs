@@ -97,6 +97,14 @@ impl ModelConfig {
     pub fn from_hf_config(config_json: &str) -> Result<(ModelConfig, ArchSpec), NnError> {
         let json: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| NnError::MissingConfig(format!("invalid config.json: {e}")))?;
+        // RoPE scaling (llama3 / linear / dynamic) changes the inverse-frequency schedule;
+        // the plain `theta^(-2j/d)` RoPE here would silently diverge. Reject loudly until a
+        // later plan implements the scaling (SmolLM2 / Llama-2 have none).
+        if json.get("rope_scaling").is_some_and(|v| !v.is_null()) {
+            return Err(NnError::MissingConfig(
+                "rope_scaling (llama3/linear/dynamic) not yet supported".to_owned(),
+            ));
+        }
         let req_u32 = |key: &str| -> Result<u32, NnError> {
             json.get(key)
                 .and_then(serde_json::Value::as_u64)
@@ -278,6 +286,20 @@ mod tests {
         assert!((c.rope_theta - 10_000.0).abs() < 1e-3); // default θ
         assert_eq!(spec.mlp, MlpKind::Relu2);
         assert!(!spec.tied_embeddings);
+    }
+
+    #[test]
+    fn from_hf_config_rejects_rope_scaling() {
+        // A Llama-3.x-style config with rope_scaling must be rejected (not silently run
+        // with the wrong inverse-frequency schedule).
+        let err = ModelConfig::from_hf_config(
+            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"intermediate_size":16,"rms_norm_eps":1e-5,
+                "hidden_act":"silu","rope_theta":500000.0,
+                "rope_scaling":{"rope_type":"llama3","factor":32.0}}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, NnError::MissingConfig(_)), "got {err:?}");
     }
 
     #[test]

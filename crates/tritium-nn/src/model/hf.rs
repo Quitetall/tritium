@@ -60,6 +60,20 @@ impl ModelWeights {
                 loc.insert(n, i);
             }
         }
+        // Robust arch guard: reject weights carrying features the standard forward doesn't run
+        // yet (Qwen2/2.5 QKV bias, Qwen3 QK-norm) — checked on the actual tensors, since the
+        // config flags don't always advertise them. Loud reject beats silently dropping them.
+        if loc.keys().any(|k| {
+            k.ends_with(".q_proj.bias")
+                || k.ends_with(".k_proj.bias")
+                || k.ends_with(".v_proj.bias")
+                || k.ends_with(".q_norm.weight")
+                || k.ends_with(".k_norm.weight")
+        }) {
+            return Err(NnError::MissingConfig(
+                "model has QKV-bias or QK-norm tensors — not yet supported (plan 0037)".to_owned(),
+            ));
+        }
         let get = |name: &str| -> Result<Vec<f32>, NnError> {
             let i = *loc
                 .get(name)
