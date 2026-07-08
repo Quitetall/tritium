@@ -18,7 +18,7 @@
 
 use tritium_core::Trit;
 use tritium_cpu::CpuBackend;
-use tritium_nn::{ModelConfig, Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
+use tritium_nn::{Mlp, ModelConfig, Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
 
 /// Deterministic xorshift64 PRNG so the "random" weights/activations are
 /// reproducible without a dependency.
@@ -325,13 +325,13 @@ fn build_block(backend: &CpuBackend, rng: &mut Rng, cfg: &ModelConfig) -> Transf
         // Empty sub-norm => skipped, keeping the WF-3 assembly smoke test unchanged.
         attn_sub_norm: Vec::new(),
         ffn_norm: (0..n_embd).map(|_| 1.0 + rng.next_f32(0.1)).collect(),
-        mlp: Relu2Mlp {
+        mlp: Mlp::Relu2(Relu2Mlp {
             gate: rand_linear(backend, rng, n_ff, n_embd),
             up: rand_linear(backend, rng, n_ff, n_embd),
             down: rand_linear(backend, rng, n_embd, n_ff),
             ffn_sub_norm: Vec::new(),
             rms_eps: 1e-5,
-        },
+        }),
     }
 }
 

@@ -30,7 +30,7 @@ use tritium_spec::TernaryBackend;
 
 use crate::config::ModelConfig;
 use crate::error::NnError;
-use crate::layers::{Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
+use crate::layers::{Mlp, Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
 use crate::tensor::f16_bytes_to_f32;
 
 /// The weights for one decoder layer, ready to run.
@@ -58,6 +58,9 @@ pub struct ModelWeights {
     pub layers: Vec<LayerWeights>,
     /// Final RMSNorm weight before the LM head; length `n_embd`.
     pub output_norm: Vec<f32>,
+    /// Untied LM head projection (`n_embd → vocab`). `None` ⇒ the head is **tied** to
+    /// `token_embd` (BitNet and models with `tie_word_embeddings`).
+    pub lm_head: Option<Projection>,
 }
 
 impl ModelWeights {
@@ -110,6 +113,8 @@ impl ModelWeights {
             n_embd,
             layers,
             output_norm,
+            // BitNet ties the LM head to the token embedding.
+            lm_head: None,
         })
     }
 }
@@ -311,12 +316,12 @@ fn load_layer(
         o_proj: Projection::Ternary(o_proj),
         attn_sub_norm,
         ffn_norm,
-        mlp: Relu2Mlp {
+        mlp: Mlp::Relu2(Relu2Mlp {
             gate: Projection::Ternary(gate),
             up: Projection::Ternary(up),
             down: Projection::Ternary(down),
             ffn_sub_norm,
             rms_eps: config.rms_eps,
-        },
+        }),
     })
 }

@@ -318,27 +318,36 @@ impl ModelRunner {
             )?;
         }
 
-        // Tied LM head: logits[v] = <last_norm, token_embd[v]>.
-        // Parallelized with rayon: 128K × 2560 dot products.
-        use rayon::prelude::*;
-        let vocab = self.weights.vocab;
-        let mut logits = vec![0.0f32; vocab];
-        let embd = &self.weights.token_embd;
-        logits
-            .par_chunks_mut(1024)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                let base = chunk_idx * 1024;
-                for (i, slot) in chunk.iter_mut().enumerate() {
-                    let v = base + i;
-                    let row = &embd[v * n_embd..v * n_embd + n_embd];
-                    let mut acc = 0.0f32;
-                    for k in 0..n_embd {
-                        acc += last_norm[k] * row[k];
+        // LM head. Untied ⇒ a dedicated `lm_head` projection; tied ⇒ the dot-product
+        // against the token embedding (BitNet). Both map `last_norm` ([n_embd]) → logits.
+        let logits = if let Some(head) = &self.weights.lm_head {
+            let mut logits = vec![0.0f32; head.n_out()];
+            head.forward(self.backend.as_ref(), &last_norm, 1, &mut logits)?;
+            logits
+        } else {
+            // Tied LM head: logits[v] = <last_norm, token_embd[v]>.
+            // Parallelized with rayon: 128K × 2560 dot products.
+            use rayon::prelude::*;
+            let vocab = self.weights.vocab;
+            let mut logits = vec![0.0f32; vocab];
+            let embd = &self.weights.token_embd;
+            logits
+                .par_chunks_mut(1024)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base = chunk_idx * 1024;
+                    for (i, slot) in chunk.iter_mut().enumerate() {
+                        let v = base + i;
+                        let row = &embd[v * n_embd..v * n_embd + n_embd];
+                        let mut acc = 0.0f32;
+                        for k in 0..n_embd {
+                            acc += last_norm[k] * row[k];
+                        }
+                        *slot = acc;
                     }
-                    *slot = acc;
-                }
-            });
+                });
+            logits
+        };
         if let Some(d) = dump {
             d.logits = logits.clone();
         }
@@ -448,18 +457,21 @@ impl ModelRunner {
             .layers
             .iter()
             .map(|b| {
+                // The resident decoder is BitNet-only; a non-Relu2 MLP ⇒ no resident build
+                // (fall back to the host path).
+                let mlp = b.mlp.as_relu2()?;
                 Some(DecodeLayerSpec {
                     attn_norm: &b.attn_norm,
                     attn_sub_norm: &b.attn_sub_norm,
                     ffn_norm: &b.ffn_norm,
-                    ffn_sub_norm: &b.mlp.ffn_sub_norm,
+                    ffn_sub_norm: &mlp.ffn_sub_norm,
                     q: lin(&b.q_proj)?,
                     k: lin(&b.k_proj)?,
                     v: lin(&b.v_proj)?,
                     o: lin(&b.o_proj)?,
-                    gate: lin(&b.mlp.gate)?,
-                    up: lin(&b.mlp.up)?,
-                    down: lin(&b.mlp.down)?,
+                    gate: lin(&mlp.gate)?,
+                    up: lin(&mlp.up)?,
+                    down: lin(&mlp.down)?,
                 })
             })
             .collect::<Option<Vec<_>>>()?;

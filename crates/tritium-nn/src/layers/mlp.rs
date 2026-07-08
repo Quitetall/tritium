@@ -181,6 +181,17 @@ impl Mlp {
             Mlp::SwiGlu(mlp) => mlp.forward(backend, x, m, out),
         }
     }
+
+    /// The inner [`Relu2Mlp`] if this is a BitNet MLP, else `None`. Used by the
+    /// BitNet-only paths (the CUDA resident decoder, accuracy diagnostics) that read
+    /// `gate`/`up`/`down`/`ffn_sub_norm` directly.
+    #[must_use]
+    pub fn as_relu2(&self) -> Option<&Relu2Mlp> {
+        match self {
+            Mlp::Relu2(mlp) => Some(mlp),
+            Mlp::SwiGlu(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]

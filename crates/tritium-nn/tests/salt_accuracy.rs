@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use tritium_format::{SafeTensors, dequant_salt_row};
 use tritium_nn::{
-    DenseLinear, ForwardDump, ModelConfig, ModelRunner, ModelWeights, Projection, Relu2Mlp,
+    DenseLinear, ForwardDump, Mlp, ModelConfig, ModelRunner, ModelWeights, Projection, Relu2Mlp,
     TransformerBlock,
 };
 use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
@@ -130,13 +130,13 @@ fn build_weights(st: &SafeTensors, cfg: &ModelConfig, mode: Mode) -> ModelWeight
                 ffn_norm: st
                     .tensor_f32(&nm("post_attention_layernorm.weight"))
                     .unwrap(),
-                mlp: Relu2Mlp {
+                mlp: Mlp::Relu2(Relu2Mlp {
                     gate: proj(st, &nm("mlp.gate_proj.weight"), n_ff, n_embd, mode),
                     up: proj(st, &nm("mlp.up_proj.weight"), n_ff, n_embd, mode),
                     down: proj(st, &nm("mlp.down_proj.weight"), n_embd, n_ff, mode),
                     ffn_sub_norm: st.tensor_f32(&nm("mlp.ffn_sub_norm.weight")).unwrap(),
                     rms_eps: cfg.rms_eps,
-                },
+                }),
             }
         })
         .collect();
@@ -147,6 +147,7 @@ fn build_weights(st: &SafeTensors, cfg: &ModelConfig, mode: Mode) -> ModelWeight
         n_embd,
         layers,
         output_norm,
+        lm_head: None,
     }
 }
 
@@ -394,7 +395,11 @@ fn salt_fp_vs_gguf_stage_dump() {
     pr("attn_norm.w", &hb.attn_norm, &gb.attn_norm);
     pr("attn_sub_norm.w", &hb.attn_sub_norm, &gb.attn_sub_norm);
     pr("ffn_norm.w", &hb.ffn_norm, &gb.ffn_norm);
-    pr("ffn_sub_norm.w", &hb.mlp.ffn_sub_norm, &gb.mlp.ffn_sub_norm);
+    pr(
+        "ffn_sub_norm.w",
+        &hb.mlp.as_relu2().unwrap().ffn_sub_norm,
+        &gb.mlp.as_relu2().unwrap().ffn_sub_norm,
+    );
     pr(
         "output_norm.w",
         &hf.weights.output_norm,
@@ -427,8 +432,16 @@ fn salt_fp_vs_gguf_stage_dump() {
         ("k_proj", &hb.k_proj, &gb.k_proj),
         ("v_proj", &hb.v_proj, &gb.v_proj),
         ("o_proj", &hb.o_proj, &gb.o_proj),
-        ("gate", &hb.mlp.gate, &gb.mlp.gate),
-        ("down", &hb.mlp.down, &gb.mlp.down),
+        (
+            "gate",
+            &hb.mlp.as_relu2().unwrap().gate,
+            &gb.mlp.as_relu2().unwrap().gate,
+        ),
+        (
+            "down",
+            &hb.mlp.as_relu2().unwrap().down,
+            &gb.mlp.as_relu2().unwrap().down,
+        ),
     ] {
         let am = absmean(&hf_w(hp));
         let sc = gg_scale(gp);

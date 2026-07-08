@@ -16,7 +16,7 @@ use tritium_spec::TernaryBackend;
 use crate::config::ModelConfig;
 use crate::error::NnError;
 use crate::kv_cache::KvCache;
-use crate::layers::{Projection, Relu2Mlp};
+use crate::layers::{Mlp, Projection};
 use crate::ops::{gqa_attention, rmsnorm, rope_apply};
 
 /// Pre-allocated scratch buffers reused across all transformer blocks in a forward
@@ -74,8 +74,8 @@ pub struct TransformerBlock {
     /// RMSNorm weight applied before the MLP (`post_attention_layernorm`); length
     /// `n_embd`.
     pub ffn_norm: Vec<f32>,
-    /// The gated ReLU² feed-forward.
-    pub mlp: Relu2Mlp,
+    /// The feed-forward (BitNet ReLU² or Llama/Qwen SwiGLU).
+    pub mlp: Mlp,
 }
 
 /// Per-stage activations captured during a block forward, for the fidelity
