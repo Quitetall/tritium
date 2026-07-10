@@ -120,7 +120,8 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
             max_new: short,
             sampling: Sampling::Greedy,
             stop_eos: false,
-        };
+        logprobs: None,
+    };
         let mut out = Vec::new();
         single
             .generate(&req, &mut |step| {

@@ -540,7 +540,8 @@ impl Generator for TreeMock {
             token: 7,
             finished: true,
             finish_reason: Some(FinishReason::Stop),
-        });
+                logprobs: None,
+            });
         Ok(())
     }
     fn n_ctx(&self) -> usize {
@@ -899,4 +900,63 @@ async fn stream_usage_chunk() {
     let chunks = sse_chunks(&parse_sse(&body));
     assert!(chunks.iter().all(|c| c["usage"].is_null()));
     assert!(!chunks.last().unwrap()["choices"][0]["finish_reason"].is_null());
+}
+
+/// logprobs: OpenAI shape on both paths — sampled token's record per
+/// completion token with top-k alternatives; absent when not requested;
+/// top_logprobs without logprobs is a 400.
+#[tokio::test]
+async fn logprobs_shapes() {
+    // Non-stream: 3 tokens, k=2 alternatives each (mock synthesizes -0.1 /
+    // -1.0 / -2.0).
+    let (router, _) = mock_router(vec![10, 11, 12], FinishReason::Stop);
+    let (status, body) = send(
+        &router,
+        chat(json!({"model":"tritium","logprobs":true,"top_logprobs":2,
+                    "messages":[{"role":"user","content":"1"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let content = v["choices"][0]["logprobs"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["token"], "10");
+    assert!((content[0]["logprob"].as_f64().unwrap() + 0.1).abs() < 1e-6);
+    assert_eq!(content[0]["top_logprobs"].as_array().unwrap().len(), 2);
+    assert_eq!(content[0]["bytes"], json!([49, 48])); // b"10"
+
+    // Stream: each content chunk carries its token's record.
+    let (router, _) = mock_router(vec![10, 11], FinishReason::Stop);
+    let (_, body) = send(
+        &router,
+        chat(json!({"model":"tritium","stream":true,"logprobs":true,"top_logprobs":1,
+                    "messages":[{"role":"user","content":"1"}]})),
+    )
+    .await;
+    let chunks = sse_chunks(&parse_sse(&body));
+    let with_lp: Vec<_> = chunks
+        .iter()
+        .filter(|c| !c["choices"][0]["logprobs"].is_null())
+        .collect();
+    assert_eq!(with_lp.len(), 2, "one logprobs record per content chunk");
+    assert_eq!(with_lp[0]["choices"][0]["logprobs"]["content"][0]["token"], "10");
+
+    // Not requested -> absent entirely.
+    let (router, _) = mock_router(vec![10], FinishReason::Stop);
+    let (_, body) = send(
+        &router,
+        chat(json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})),
+    )
+    .await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["choices"][0]["logprobs"].is_null());
+
+    // top_logprobs without logprobs -> 400.
+    let (router, _) = mock_router(vec![10], FinishReason::Stop);
+    let (status, _) = send(
+        &router,
+        chat(json!({"model":"tritium","top_logprobs":3,"messages":[{"role":"user","content":"1"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

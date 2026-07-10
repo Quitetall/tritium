@@ -151,6 +151,7 @@ pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatChunk {
                 content: None,
             },
             finish_reason: None,
+            logprobs: None,
         }],
     }
 }
@@ -171,6 +172,7 @@ pub(crate) fn content_chunk(id: &str, created: u64, model: &str, content: &str) 
                 content: Some(content.to_owned()),
             },
             finish_reason: None,
+            logprobs: None,
         }],
     }
 }
@@ -193,6 +195,7 @@ pub(crate) fn terminal_chunk(
             index: 0,
             delta: Delta::default(),
             finish_reason: Some(finish.as_str().to_owned()),
+            logprobs: None,
         }],
     }
 }
@@ -212,6 +215,7 @@ pub(crate) fn error_chunk(id: &str, created: u64, model: &str) -> ChatChunk {
             index: 0,
             delta: Delta::default(),
             finish_reason: Some("error".to_owned()),
+            logprobs: None,
         }],
     }
 }

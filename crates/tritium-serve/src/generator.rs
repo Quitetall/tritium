@@ -20,6 +20,10 @@ pub struct GenRequest {
     pub sampling: Sampling,
     /// Honor the model EOS token (always true except for adversarial tests).
     pub stop_eos: bool,
+    /// When `Some(k)`, each emitted token carries its logprob plus the top-`k`
+    /// alternatives (OpenAI `logprobs`/`top_logprobs`). Supported on the
+    /// plain and batched paths; spec-lookup falls back to plain stepping.
+    pub logprobs: Option<usize>,
 }
 
 /// Sampling strategy, lowered from the OpenAI request fields.
@@ -48,7 +52,7 @@ pub enum Sampling {
 }
 
 /// One decoded step handed to the `on_step` callback.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Step {
     /// The decoded token ID (special tokens like EOS are dropped by the HTTP detok).
     pub token: u32,
@@ -56,6 +60,9 @@ pub struct Step {
     pub finished: bool,
     /// Set on the terminal step.
     pub finish_reason: Option<FinishReason>,
+    /// `(token, logprob)` — the SAMPLED token first, then the top-k
+    /// alternatives by logprob. Present only when the request asked.
+    pub logprobs: Option<Vec<(u32, f32)>>,
 }
 
 /// Why generation stopped (maps to the OpenAI `finish_reason`).
@@ -242,6 +249,14 @@ impl Generator for MockGenerator {
                 token: self.script[i],
                 finished: last,
                 finish_reason,
+                // Deterministic synthetic logprobs: sampled at -0.1, k
+                // alternatives at -1.0, -2.0, ... (token id = sampled + j).
+                logprobs: req.logprobs.map(|k| {
+                    let t = self.script[i];
+                    let mut v = vec![(t, -0.1f32)];
+                    v.extend((1..=k as u32).map(|j| (t.wrapping_add(j), -(j as f32))));
+                    v
+                }),
             });
             if last || !cont {
                 break;
@@ -286,6 +301,32 @@ impl fmt::Debug for RunnerGenerator {
             .field("eos", &self.eos)
             .finish_non_exhaustive()
     }
+}
+
+/// Log-softmax top-k: the sampled token's logprob first, then the `k`
+/// highest-logprob alternatives (excluding a duplicate of `sampled`). One
+/// O(vocab) pass + an O(vocab·log k)-ish partial select — computed only when
+/// the request asked for logprobs.
+pub(crate) fn top_logprobs(logits: &[f32], sampled: u32, k: usize) -> Vec<(u32, f32)> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = max + logits.iter().map(|l| (l - max).exp()).sum::<f32>().ln();
+    let mut out = Vec::with_capacity(k + 1);
+    out.push((sampled, logits[sampled as usize] - lse));
+    if k > 0 {
+        // Partial top-k by logit (logprob is monotone in logit).
+        let mut top: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+        for (i, &l) in logits.iter().enumerate() {
+            if top.len() < k {
+                top.push((i as u32, l));
+                top.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            } else if l > top[k - 1].1 {
+                top[k - 1] = (i as u32, l);
+                top.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            }
+        }
+        out.extend(top.into_iter().map(|(i, l)| (i, l - lse)));
+    }
+    out
 }
 
 impl RunnerGenerator {
@@ -420,6 +461,7 @@ impl RunnerGenerator {
                 } else {
                     None
                 },
+                logprobs: None,
             });
             emitted += 1;
             if last || !cont {
@@ -492,7 +534,8 @@ impl RunnerGenerator {
                     } else {
                         None
                     },
-                });
+                logprobs: None,
+            });
                 emitted += 1;
                 if last || !cont {
                     if stats && n_verify > 0 {
@@ -638,6 +681,7 @@ impl RunnerGenerator {
                 } else {
                     None
                 },
+                logprobs: None,
             });
             emitted += 1;
             if last || !cont {
@@ -736,7 +780,8 @@ impl RunnerGenerator {
                     } else {
                         None
                     },
-                });
+                logprobs: None,
+            });
                 emitted += 1;
                 if last || !cont {
                     return Ok(());
@@ -777,7 +822,9 @@ impl Generator for RunnerGenerator {
         // (probed HERE — e.g. `--spec lookup` on the cpu backend — so the
         // fallback is a dispatch decision, never a mid-stream error).
         #[cfg(feature = "cuda")]
-        if self.spec_lookup && self.runner.has_resident_decoder() {
+        // Spec-lookup emits committed tokens without per-token logits on the
+        // host, so logprobs requests take the plain path (exact semantics).
+        if self.spec_lookup && req.logprobs.is_none() && self.runner.has_resident_decoder() {
             return match req.sampling {
                 Sampling::Greedy => {
                     self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step)
@@ -808,6 +855,7 @@ impl Generator for RunnerGenerator {
                 token: next,
                 finished: last,
                 finish_reason,
+                logprobs: req.logprobs.map(|k| top_logprobs(&logits, next, k)),
             });
             if last || !cont {
                 break;
@@ -968,7 +1016,8 @@ mod tests {
                 max_new: 8,
                 sampling: Sampling::Greedy,
                 stop_eos: true,
-            },
+        logprobs: None,
+    },
             &mut |s| {
                 seen.push(s.token);
                 if let Some(r) = s.finish_reason {
@@ -994,7 +1043,8 @@ mod tests {
                 max_new: 2,
                 sampling: Sampling::Greedy,
                 stop_eos: true,
-            },
+        logprobs: None,
+    },
             &mut |s| {
                 count += 1;
                 last_reason = s.finish_reason.or(last_reason);
@@ -1017,7 +1067,8 @@ mod tests {
                 max_new: 5,
                 sampling: Sampling::Greedy,
                 stop_eos: true,
-            },
+        logprobs: None,
+    },
             &mut |_s| {
                 count += 1;
                 count < 2 // stop after the 2nd

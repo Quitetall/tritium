@@ -27,6 +27,8 @@ use crate::worker::{GenEvent, Job};
 struct Active {
     tx: mpsc::Sender<GenEvent>,
     sampling: Sampling,
+    /// Top-k logprobs per token, when the request asked.
+    logprobs: Option<usize>,
     stop_eos: bool,
     /// Tokens still allowed to be emitted.
     remaining: usize,
@@ -82,10 +84,13 @@ fn req_seed(s: &Sampling) -> u64 {
 
 /// Emit one token on a slot's channel. Returns `false` when the request is
 /// finished (EOS/budget) or the client went away — the slot should retire.
-fn emit(active: &mut Active, token: u32, eos: u32) -> bool {
+fn emit(active: &mut Active, token: u32, eos: u32, logits: &[f32]) -> bool {
     let is_eos = active.stop_eos && token == eos;
     let last = is_eos || active.remaining <= 1;
-    let sent = active.tx.try_send(GenEvent::Token(token)).is_ok();
+    let lp = active
+        .logprobs
+        .map(|k| crate::generator::top_logprobs(logits, token, k));
+    let sent = active.tx.try_send(GenEvent::Token(token, lp)).is_ok();
     active.remaining = active.remaining.saturating_sub(1);
     if last && sent {
         let reason = if is_eos {
@@ -223,6 +228,7 @@ pub(crate) fn run_batched(
                     }
                     let mut active = Active {
                         tx,
+                        logprobs: req.logprobs,
                         stop_eos: req.stop_eos,
                         remaining: max_new,
                         last_token: 0,
@@ -239,7 +245,7 @@ pub(crate) fn run_batched(
                         continue;
                     };
                     active.last_token = first;
-                    if emit(&mut active, first, eos) {
+                    if emit(&mut active, first, eos, &logits) {
                         pool[row] = Some(active);
                     }
                 }
@@ -301,7 +307,7 @@ pub(crate) fn run_batched(
                 continue;
             };
             active.last_token = tok;
-            if !emit(active, tok, eos) {
+            if !emit(active, tok, eos, &all_logits[row]) {
                 *slot = None;
             }
         }

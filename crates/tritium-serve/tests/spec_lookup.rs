@@ -76,6 +76,7 @@ fn cuda_spec_sampled_topk1_matches_plain_greedy() {
         max_new: 128,
         sampling: Sampling::Greedy,
         stop_eos: false,
+        logprobs: None,
     };
     let sampled_req = GenRequest {
         prompt_tokens: prompt,
@@ -86,6 +87,7 @@ fn cuda_spec_sampled_topk1_matches_plain_greedy() {
             seed: 42,
         },
         stop_eos: false,
+        logprobs: None,
     };
 
     let Some(runner) = load_runner(&bytes) else {
@@ -136,6 +138,7 @@ fn cuda_spec_lookup_matches_plain_greedy() {
         max_new: 224,
         sampling: Sampling::Greedy,
         stop_eos: false,
+        logprobs: None,
     };
     // Warmup request: builds the CUDA graph + JIT outside the timed runs.
     let warm = GenRequest {
@@ -143,6 +146,7 @@ fn cuda_spec_lookup_matches_plain_greedy() {
         max_new: 4,
         sampling: Sampling::Greedy,
         stop_eos: false,
+        logprobs: None,
     };
 
     let Some(runner) = load_runner(&bytes) else {

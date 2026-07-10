@@ -54,6 +54,12 @@ pub struct ChatRequest {
     /// OpenAI `stream_options` (only `include_usage` is meaningful here).
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Return per-token logprobs.
+    #[serde(default)]
+    pub logprobs: bool,
+    /// Number of top alternatives per token (0..=20; needs `logprobs: true`).
+    #[serde(default)]
+    pub top_logprobs: Option<u8>,
     /// Max new tokens to generate.
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -91,6 +97,40 @@ pub struct Choice {
     pub message: ChatMessage,
     /// Why generation stopped (`"stop"` / `"length"`).
     pub finish_reason: String,
+    /// Per-token logprobs, present only when the request asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
+}
+
+/// OpenAI `choices[].logprobs` object.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChoiceLogprobs {
+    /// One entry per emitted completion token.
+    pub content: Vec<TokenLogprob>,
+}
+
+/// One token's logprob record.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenLogprob {
+    /// The token's text.
+    pub token: String,
+    /// Its log-probability.
+    pub logprob: f32,
+    /// UTF-8 bytes of `token` (OpenAI convention).
+    pub bytes: Vec<u8>,
+    /// The top-k alternatives (may include the sampled token itself).
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+/// One alternative in `top_logprobs`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopLogprob {
+    /// The alternative token's text.
+    pub token: String,
+    /// Its log-probability.
+    pub logprob: f32,
+    /// UTF-8 bytes of `token`.
+    pub bytes: Vec<u8>,
 }
 
 /// `object: "chat.completion"` — the non-streaming response.
@@ -131,6 +171,9 @@ pub struct ChunkChoice {
     /// `null` until the terminal chunk.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// This chunk's token logprobs, when the request asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
 }
 
 /// `object: "chat.completion.chunk"` — one SSE `data:` payload.

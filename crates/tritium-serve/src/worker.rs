@@ -32,8 +32,9 @@ use crate::generator::{FinishReason, GenRequest, Generator, TreeOpError};
 /// An event streamed from the worker to a request's response task.
 #[derive(Debug, Clone)]
 pub(crate) enum GenEvent {
-    /// One decoded token (special tokens are dropped by the detok layer).
-    Token(u32),
+    /// One decoded token (special tokens are dropped by the detok layer),
+    /// plus its logprob top-k when the request asked (sampled token first).
+    Token(u32, Option<Vec<(u32, f32)>>),
     /// Generation finished cleanly with this reason.
     Done(FinishReason),
     /// Generation failed (stringified [`crate::generator::GenError`] or a panic).
@@ -107,7 +108,7 @@ pub(crate) fn spawn_worker(
                                 // Closed (gone) cancels this request and frees the
                                 // worker. Tokens delivered so far are an in-order
                                 // prefix — no gaps.
-                                tx.try_send(GenEvent::Token(step.token)).is_ok()
+                                tx.try_send(GenEvent::Token(step.token, step.logprobs)).is_ok()
                                     && !draining.load(Ordering::Relaxed)
                             });
                             (res, final_reason)

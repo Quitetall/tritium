@@ -342,6 +342,22 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
             None,
         );
     }
+    if req.top_logprobs.is_some() && !req.logprobs {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "top_logprobs requires logprobs: true",
+            Some("top_logprobs"),
+        );
+    }
+    if req.top_logprobs.is_some_and(|k| k > 20) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "top_logprobs must be in [0, 20]",
+            Some("top_logprobs"),
+        );
+    }
     if !req.stream && req.stream_options.is_some() {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -440,9 +456,13 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
     }
     let prompt_len = prompt_tokens.len();
     let max_new = req.max_tokens.map_or(st.max_new_default, |m| m as usize);
+    let logprobs_k = req
+        .logprobs
+        .then(|| req.top_logprobs.unwrap_or(0) as usize);
     let gen_req = GenRequest {
         prompt_tokens,
         max_new,
+        logprobs: logprobs_k,
         sampling: lower_sampling(&req),
         stop_eos: true,
     };
@@ -499,6 +519,7 @@ async fn nonstream_response(
     metrics: Arc<Metrics>,
 ) -> Response {
     let eos = tok.eos();
+    let detok_ref = tok.clone();
     // Mirror the streaming loop: incremental detok + stop-matcher, BREAK on a
     // stop hit (dropping `rx` cancels the worker's generation) — so stop
     // strings no longer burn decode budget past the match, and
@@ -507,13 +528,17 @@ async fn nonstream_response(
     let mut matcher = StopMatcher::new(stops);
     let mut text = String::new();
     let mut completion_tokens = 0usize;
+    let mut logprob_rows: Vec<Vec<(u32, f32)>> = Vec::new();
     let mut fr = FinishReason::Stop;
     while let Some(ev) = rx.recv().await {
         match ev {
-            GenEvent::Token(t) => {
+            GenEvent::Token(t, lp) => {
                 if t != eos {
                     completion_tokens += 1;
                     metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
+                    if let Some(lp) = lp {
+                        logprob_rows.push(lp);
+                    }
                 }
                 let piece = detok.push(t);
                 if !piece.is_empty() {
@@ -547,6 +572,8 @@ async fn nonstream_response(
                 content: text,
             },
             finish_reason: fr.as_str().to_owned(),
+            logprobs: (!logprob_rows.is_empty())
+                .then(|| render_logprobs(&logprob_rows, detok_ref.as_ref())),
         }],
         usage: Usage {
             prompt_tokens: prompt_len,
@@ -555,6 +582,40 @@ async fn nonstream_response(
         },
     };
     Json(completion).into_response()
+}
+
+/// Lower `(token, logprob)` rows into the OpenAI logprobs shape. Row layout:
+/// sampled token first, then the top-k alternatives.
+fn render_logprobs(
+    rows: &[Vec<(u32, f32)>],
+    tok: &(dyn Tokenizer + Send + Sync),
+) -> crate::dto::ChoiceLogprobs {
+    let piece = |id: u32| tok.decode(&[id]).unwrap_or_default();
+    crate::dto::ChoiceLogprobs {
+        content: rows
+            .iter()
+            .filter_map(|row| {
+                let (t, lp) = *row.first()?;
+                let text = piece(t);
+                Some(crate::dto::TokenLogprob {
+                    bytes: text.as_bytes().to_vec(),
+                    token: text,
+                    logprob: lp,
+                    top_logprobs: row[1..]
+                        .iter()
+                        .map(|&(alt, alp)| {
+                            let atext = piece(alt);
+                            crate::dto::TopLogprob {
+                                bytes: atext.as_bytes().to_vec(),
+                                token: atext,
+                                logprob: alp,
+                            }
+                        })
+                        .collect(),
+                })
+            })
+            .collect(),
+    }
 }
 
 fn sse_data(chunk: &ChatChunk) -> Event {
@@ -574,6 +635,7 @@ fn stream_response(
     let id = make_id();
     let created = now_secs();
     let detok_eos = tok.eos();
+    let stream_tok = tok.clone();
     let stream = async_stream::stream! {
         // 1. role-first chunk
         yield Ok::<Event, std::convert::Infallible>(sse_data(&role_chunk(&id, created, &model)));
@@ -587,7 +649,7 @@ fn stream_response(
 
         while let Some(ev) = rx.recv().await {
             match ev {
-                GenEvent::Token(t) => {
+                GenEvent::Token(t, lp) => {
                     // Count like the non-stream path: eos terminates, it is
                     // not an emitted completion token.
                     if t != detok_eos {
@@ -598,7 +660,14 @@ fn stream_response(
                     if !text.is_empty() {
                         let (emit, hit) = matcher.feed(&text);
                         if !emit.is_empty() {
-                            yield Ok(sse_data(&content_chunk(&id, created, &model, &emit)));
+                            let mut chunk = content_chunk(&id, created, &model, &emit);
+                            if t != detok_eos
+                                && let Some(lp) = lp
+                            {
+                                chunk.choices[0].logprobs =
+                                    Some(render_logprobs(&[lp], stream_tok.as_ref()));
+                            }
+                            yield Ok(sse_data(&chunk));
                         }
                         if hit {
                             stopped_by_string = true;
