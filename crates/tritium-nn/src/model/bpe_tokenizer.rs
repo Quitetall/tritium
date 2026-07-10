@@ -26,6 +26,11 @@ use crate::model::tokenizer::Tokenizer;
 /// ggml token type for control/special tokens (`LLAMA_TOKEN_TYPE_CONTROL`).
 const GGML_TOKEN_TYPE_CONTROL: i64 = 3;
 
+/// The LLaMA-3 pre-split regex (verbatim from the official tokenizer.json).
+/// Notable vs gpt2: digits group in runs of at most THREE, contractions match
+/// case-insensitively, and a word may absorb one leading non-letter.
+const LLAMA3_SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// A [`Tokenizer`] rebuilt from GGUF-embedded vocab/merges (byte-level BPE).
 pub struct GgufBpeTokenizer {
     inner: HfTokenizer,
@@ -107,14 +112,35 @@ impl GgufBpeTokenizer {
 
         let bpe = BPE::builder()
             .vocab_and_merges(vocab, merges)
+            // The official LLaMA-3 tokenizer.json sets ignore_merges: vocab
+            // hits bypass merge derivation.
+            .ignore_merges(true)
             .build()
             .map_err(|e| meta_err(&format!("BPE build failed: {e}")))?;
 
         let mut inner = HfTokenizer::new(bpe);
-        // gpt2-style byte-level pipeline: regex pre-split + byte mapping in,
-        // byte re-assembly out. No prefix space (LLaMA-3 convention).
-        inner.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::byte_level::ByteLevel::new(
-            false, true, true,
+        // The LLaMA-3 pipeline is Sequence[Split(llama3 regex, Isolated),
+        // ByteLevel(use_regex=FALSE)] — NOT ByteLevel's built-in gpt2 regex,
+        // which diverges on >=4-digit runs (\p{N}{1,3} vs \p{N}+), words with
+        // leading punctuation, case-insensitive contractions and \r\n
+        // (review-measured: 9/21 probe inputs mis-tokenized under gpt2).
+        let split = tokenizers::pre_tokenizers::split::Split::new(
+            // SplitPattern::Regex must be NAMED: From<&str> yields the
+            // String (literal-match) variant.
+            tokenizers::pre_tokenizers::split::SplitPattern::Regex(
+                LLAMA3_SPLIT_PATTERN.to_owned(),
+            ),
+            tokenizers::SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|e| meta_err(&format!("split regex: {e}")))?;
+        inner.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::PreTokenizerWrapper::Sequence(
+            tokenizers::pre_tokenizers::sequence::Sequence::new(vec![
+                tokenizers::pre_tokenizers::PreTokenizerWrapper::Split(split),
+                tokenizers::pre_tokenizers::PreTokenizerWrapper::ByteLevel(
+                    tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
+                ),
+            ]),
         )));
         inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::new(
             false, true, true,
@@ -149,8 +175,12 @@ impl GgufBpeTokenizer {
 }
 
 impl Tokenizer for GgufBpeTokenizer {
-    /// Encode `text`, prepending BOS (the convention the committed
-    /// `transformers` reference uses: raw prefill = `[bos] + encode(text)`).
+    /// Encode `text`, prepending BOS — the `tokenizer.ggml.add_bos_token`
+    /// convention the GGUF declares and the committed reference uses
+    /// (raw prefill = `[bos] + encode(text)`). NOTE this diverges from
+    /// transformers' `apply_chat_template` (which adds no BOS for this
+    /// family); a client that embeds a literal `<|begin_of_text|>` in its
+    /// text will get a double BOS.
     fn encode(&self, text: &str) -> Result<Vec<u32>, NnError> {
         let enc = self
             .inner

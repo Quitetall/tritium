@@ -70,4 +70,31 @@ fn bpe_matches_transformers_reference() {
         let ids = tok.encode(s).expect("encode");
         assert_eq!(tok.decode(&ids).expect("decode"), s, "round-trip {s:?}");
     }
+
+    // Pre-split conformance: the classes where the gpt2 regex DIVERGES from
+    // llama3 (review-measured against the official tokenizer.json via HF
+    // tokenizers). Ids exclude the BOS this impl prepends.
+    // - digit runs group in threes (\p{N}{1,3}), not greedily;
+    // - a word may absorb one leading non-letter (".hello" is one unit);
+    // - contractions match case-insensitively ("DON'T" splits at 'T);
+    // - \r\n stays one whitespace unit.
+    let vectors: [(&str, &[u32]); 4] = [
+        ("1234567", &[4513, 10961, 22]),
+        (".hello", &[870, 4896]),
+        ("DON'T", &[85741, 17773]),
+        ("a\r\nb", &[64, 319, 65]),
+    ];
+    for (text, want) in vectors {
+        let got = tok.encode(text).expect("encode");
+        assert_eq!(
+            &got[1..],
+            want,
+            "llama3 pre-split conformance: encode({text:?}) diverged from the \
+             official tokenizer"
+        );
+    }
+    // And the date/number sentence class round-trips through the same split.
+    let s = "In 2024, 100000 people attended";
+    let ids = tok.encode(s).expect("encode");
+    assert_eq!(tok.decode(&ids).expect("decode"), s);
 }

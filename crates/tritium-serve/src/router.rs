@@ -55,11 +55,12 @@ impl ChatTemplate {
             ChatTemplate::RoleEot => {
                 let mut out = String::new();
                 for (role, content) in messages {
-                    // `role | capitalize`: first ASCII char uppercased.
+                    // Jinja `capitalize`: first char uppercased, REST
+                    // lowercased ("USER" -> "User", matching transformers).
                     let mut cs = role.chars();
                     if let Some(c) = cs.next() {
                         out.extend(c.to_uppercase());
-                        out.push_str(cs.as_str());
+                        out.push_str(&cs.as_str().to_lowercase());
                     }
                     out.push_str(": ");
                     out.push_str(content.trim());
