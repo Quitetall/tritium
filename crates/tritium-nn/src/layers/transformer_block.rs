@@ -71,6 +71,18 @@ pub struct TransformerBlock {
     /// `attn_sub_norm` (`BitNetRMSNorm` over `n_embd`) applied to the attention
     /// output before `o_proj`; length `n_embd` (empty to skip, for the WF-3 tests).
     pub attn_sub_norm: Vec<f32>,
+    /// Optional additive bias on the Q/K/V projections (Qwen2/2.5). Each is empty (no bias)
+    /// or length = that projection's output width; added right after the projection.
+    pub q_bias: Vec<f32>,
+    /// K-projection bias (see [`q_bias`](Self::q_bias)).
+    pub k_bias: Vec<f32>,
+    /// V-projection bias (see [`q_bias`](Self::q_bias)).
+    pub v_bias: Vec<f32>,
+    /// Optional per-head RMSNorm weight on Q (Qwen3 QK-norm); empty (skip) or length
+    /// `head_dim`. Applied per head **before** RoPE.
+    pub q_norm: Vec<f32>,
+    /// Per-head RMSNorm weight on K (see [`q_norm`](Self::q_norm)).
+    pub k_norm: Vec<f32>,
     /// RMSNorm weight applied before the MLP (`post_attention_layernorm`); length
     /// `n_embd`.
     pub ffn_norm: Vec<f32>,
@@ -241,6 +253,15 @@ impl TransformerBlock {
         self.k_proj.forward(backend, normed, seq, k)?;
         self.v_proj.forward(backend, normed, seq, v)?;
 
+        // Optional additive QKV bias (Qwen2/2.5), per output channel.
+        add_bias(q, seq, &self.q_bias);
+        add_bias(k, seq, &self.k_bias);
+        add_bias(v, seq, &self.v_bias);
+
+        // Optional QK-norm (Qwen3): per-head RMSNorm over head_dim, applied BEFORE RoPE.
+        qk_norm(q, seq, n_head, head_dim, &self.q_norm, cfg.rms_eps)?;
+        qk_norm(k, seq, n_head_kv, head_dim, &self.k_norm, cfg.rms_eps)?;
+
         // RoPE on q and k (NeoX half-rotated; values untouched). The projection
         // output is already `[token, head, head_dim]` row-major.
         rope_apply(q, positions, n_head, head_dim, cfg.rope_theta)?;
@@ -304,4 +325,47 @@ impl TransformerBlock {
 
         Ok(())
     }
+}
+
+/// Add a per-output-channel bias (`bias[c]`) to `buf` (`[seq, bias.len()]`), in place.
+/// No-op if `bias` is empty (the standard/BitNet case).
+fn add_bias(buf: &mut [f32], seq: usize, bias: &[f32]) {
+    if bias.is_empty() {
+        return;
+    }
+    let width = bias.len();
+    for t in 0..seq {
+        for (x, &b) in buf[t * width..t * width + width].iter_mut().zip(bias) {
+            *x += b;
+        }
+    }
+}
+
+/// Apply per-head RMSNorm (Qwen3 QK-norm) over `head_dim` to `buf` (`[seq, n_head·head_dim]`),
+/// in place. No-op if `weight` is empty.
+///
+/// # Errors
+/// Propagates [`rmsnorm`] shape errors (cannot occur here: `head_dim`-length slices vs a
+/// `head_dim` weight).
+fn qk_norm(
+    buf: &mut [f32],
+    seq: usize,
+    n_head: usize,
+    head_dim: usize,
+    weight: &[f32],
+    eps: f32,
+) -> Result<(), NnError> {
+    if weight.is_empty() {
+        return Ok(());
+    }
+    let width = n_head * head_dim;
+    let mut tmp = vec![0.0f32; head_dim];
+    for t in 0..seq {
+        for h in 0..n_head {
+            let off = t * width + h * head_dim;
+            rmsnorm(&buf[off..off + head_dim], weight, eps, &mut tmp)?;
+            buf[off..off + head_dim].copy_from_slice(&tmp);
+        }
+    }
+    Ok(())
 }

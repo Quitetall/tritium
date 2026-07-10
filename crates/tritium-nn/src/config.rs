@@ -18,6 +18,9 @@ pub struct ModelConfig {
     pub n_head: u32,
     /// KV heads for GQA (`{arch}.attention.head_count_kv`).
     pub n_head_kv: u32,
+    /// Per-head dimension. Usually `n_embd / n_head`, but Qwen3 **decouples** it (an
+    /// explicit `head_dim` in `config.json`, so `n_head · head_dim` may exceed `n_embd`).
+    pub head_dim: u32,
     /// FFN intermediate size (`{arch}.feed_forward_length`).
     pub n_ff: u32,
     /// Max context (`{arch}.context_length`).
@@ -29,10 +32,10 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    /// Per-head dimension, `n_embd / n_head`.
+    /// Per-head dimension (the explicit [`head_dim`](Self::head_dim) field).
     #[must_use]
     pub const fn head_dim(&self) -> u32 {
-        self.n_embd / self.n_head
+        self.head_dim
     }
 
     /// GQA grouping factor, `n_head / n_head_kv`.
@@ -68,11 +71,14 @@ impl ModelConfig {
             }
         };
 
+        let n_embd = u32_key("embedding_length")?;
+        let n_head = u32_key("attention.head_count")?;
         Ok(ModelConfig {
             n_layers: u32_key("block_count")?,
-            n_embd: u32_key("embedding_length")?,
-            n_head: u32_key("attention.head_count")?,
+            n_embd,
+            n_head,
             n_head_kv: u32_key("attention.head_count_kv")?,
+            head_dim: n_embd / n_head,
             n_ff: u32_key("feed_forward_length")?,
             n_ctx: u32_key("context_length")?,
             rope_theta: f32_key("rope.freq_base")?,
@@ -141,11 +147,14 @@ impl ModelConfig {
             .map(|v| v as f32)
             .ok_or_else(|| NnError::MissingConfig("rms_norm_eps".to_owned()))?;
 
+        let n_embd = req_u32("hidden_size")?;
         let cfg = ModelConfig {
             n_layers: req_u32("num_hidden_layers")?,
-            n_embd: req_u32("hidden_size")?,
+            n_embd,
             n_head,
             n_head_kv,
+            // Qwen3 sets an explicit head_dim that need not equal n_embd/n_head.
+            head_dim: opt_u32("head_dim", n_embd / n_head),
             n_ff: req_u32("intermediate_size")?,
             n_ctx: opt_u32("max_position_embeddings", 4096),
             rope_theta: opt_f32("rope_theta", 10_000.0),
@@ -232,6 +241,7 @@ mod tests {
             n_embd: 2560,
             n_head: 20,
             n_head_kv: 5,
+            head_dim: 128,
             n_ff: 6912,
             n_ctx: 4096,
             rope_theta: 500000.0,

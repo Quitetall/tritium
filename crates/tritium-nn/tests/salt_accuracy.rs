@@ -62,6 +62,7 @@ fn config() -> ModelConfig {
         n_embd: 2560,
         n_head: 20,
         n_head_kv: 5,
+        head_dim: 128,
         n_ff: 6912,
         n_ctx: 4096,
         rope_theta: 500_000.0,
@@ -127,6 +128,11 @@ fn build_weights(st: &SafeTensors, cfg: &ModelConfig, mode: Mode) -> ModelWeight
                 attn_sub_norm: st
                     .tensor_f32(&nm("self_attn.attn_sub_norm.weight"))
                     .unwrap(),
+                q_bias: Vec::new(),
+                k_bias: Vec::new(),
+                v_bias: Vec::new(),
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
                 ffn_norm: st
                     .tensor_f32(&nm("post_attention_layernorm.weight"))
                     .unwrap(),

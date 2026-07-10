@@ -315,6 +315,12 @@ fn load_layer(
         v_proj: Projection::Ternary(v_proj),
         o_proj: Projection::Ternary(o_proj),
         attn_sub_norm,
+        // BitNet has no QKV bias or QK-norm.
+        q_bias: Vec::new(),
+        k_bias: Vec::new(),
+        v_bias: Vec::new(),
+        q_norm: Vec::new(),
+        k_norm: Vec::new(),
         ffn_norm,
         mlp: Mlp::Relu2(Relu2Mlp {
             gate: Projection::Ternary(gate),

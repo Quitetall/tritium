@@ -302,6 +302,7 @@ fn tiny_cfg() -> ModelConfig {
         n_embd: 16,
         n_head: 4,
         n_head_kv: 2,
+        head_dim: 4,
         n_ff: 32,
         n_ctx: 64,
         rope_theta: 10000.0,
@@ -324,6 +325,11 @@ fn build_block(backend: &CpuBackend, rng: &mut Rng, cfg: &ModelConfig) -> Transf
         o_proj: rand_linear(backend, rng, n_embd, q_width),
         // Empty sub-norm => skipped, keeping the WF-3 assembly smoke test unchanged.
         attn_sub_norm: Vec::new(),
+        q_bias: Vec::new(),
+        k_bias: Vec::new(),
+        v_bias: Vec::new(),
+        q_norm: Vec::new(),
+        k_norm: Vec::new(),
         ffn_norm: (0..n_embd).map(|_| 1.0 + rng.next_f32(0.1)).collect(),
         mlp: Mlp::Relu2(Relu2Mlp {
             gate: rand_linear(backend, rng, n_ff, n_embd),

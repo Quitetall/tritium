@@ -1,10 +1,14 @@
-//! Conformance gate for the general inference engine (plan 0035 / ADR 0020 keystone):
-//! a **standard-transformer fp** model (SmolLM2-135M, Llama-arch: SwiGLU/GQA/RoPE/RMSNorm,
-//! tied) loaded via [`ModelRunner::from_hf`] runs a CPU forward that is **greedy-token-exact**
-//! vs a `transformers` reference, with a last-position logit **rel-err < 1e-3**.
+//! Conformance gates for the general inference engine (plan 0035 / 0037 / ADR 0020 keystone):
+//! standard-transformer fp models loaded via [`ModelRunner::from_hf`] run a CPU forward that is
+//! **greedy-token-exact** vs a `transformers` reference, with a last-position logit
+//! **rel-err < 1e-3**.
 //!
-//! `#[ignore]`d (needs the model downloaded + is a real forward); skips cleanly when absent.
-//! Regenerate the reference with `tools/gen_hf_logits.py`. Run:
+//! - SmolLM2-135M — Llama-arch (SwiGLU/GQA/RoPE/RMSNorm, tied). Plan 0035.
+//! - Qwen2.5-0.5B — adds **QKV bias**. Plan 0037.
+//! - Qwen3-0.6B — adds **QK-norm** + an explicit **head_dim** (≠ n_embd/n_head). Plan 0037.
+//!
+//! `#[ignore]`d (need the models downloaded); skip cleanly when absent. Regenerate a reference
+//! with `python3 tools/gen_hf_logits.py <model_dir> <out.json>`. Run:
 //!
 //! ```text
 //! cargo test -p tritium-nn --release --test hf_inference -- --ignored --nocapture
@@ -14,18 +18,21 @@ use std::path::PathBuf;
 
 use tritium_nn::ModelRunner;
 
-fn model_dir() -> PathBuf {
+fn cache(subdir: &str) -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default();
-    PathBuf::from(home).join(".cache/tritium-models/smollm2-135m")
+    PathBuf::from(home)
+        .join(".cache/tritium-models")
+        .join(subdir)
 }
 
-fn reference() -> PathBuf {
+fn reference(file: &str) -> PathBuf {
     PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tools/reference/smollm2_ref.json"
+        "/../../tools/reference"
     ))
+    .join(file)
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -37,18 +44,19 @@ fn argmax(v: &[f32]) -> usize {
         .0
 }
 
-#[test]
-#[ignore = "needs SmolLM2-135M under ~/.cache/tritium-models/smollm2-135m; run explicitly"]
-fn smollm2_greedy_matches_transformers() {
-    let dir = model_dir();
+/// Load `<cache>/<model_subdir>` via `from_hf`, teacher-force the reference prompt, and assert
+/// greedy token-exactness + last-row logit rel-err < 1e-3. Skips (passing) if the model or its
+/// reference is absent.
+fn assert_conforms(label: &str, model_subdir: &str, ref_file: &str) {
+    let dir = cache(model_subdir);
     if !dir.join("model.safetensors").exists() {
-        eprintln!("skipping: {} absent", dir.display());
+        eprintln!("skipping {label}: {} absent", dir.display());
         return;
     }
-    let ref_raw = match std::fs::read(reference()) {
+    let ref_raw = match std::fs::read(reference(ref_file)) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("skipping: reference: {e}");
+            eprintln!("skipping {label}: reference: {e}");
             return;
         }
     };
@@ -76,8 +84,8 @@ fn smollm2_greedy_matches_transformers() {
     let mut runner = ModelRunner::from_hf(&dir, backend).expect("from_hf");
     runner.reset();
 
-    // Teacher-force the prompt: prefill token 0, then step each true token; collect the
-    // greedy argmax at every position (`got[t]` predicts token `t+1`, matching HF `out[t]`).
+    // Teacher-force: prefill token 0, then step each true token; `got[t]` predicts token `t+1`,
+    // matching HF `logits[t]`.
     let n = ids.len();
     let mut got = Vec::with_capacity(n);
     let mut logits = runner.forward(&ids[..1], &[0]).expect("prefill");
@@ -86,7 +94,6 @@ fn smollm2_greedy_matches_transformers() {
         logits = runner.forward(&[tok], &[t]).expect("decode");
         got.push(argmax(&logits));
     }
-    // `logits` is now the last-position row.
 
     let matched = got
         .iter()
@@ -103,13 +110,36 @@ fn smollm2_greedy_matches_transformers() {
         .sum();
     let den: f64 = ref_last.iter().map(|&r| f64::from(r) * f64::from(r)).sum();
     let rel = (num / den).sqrt();
-    println!(
-        "SmolLM2-135M conformance: greedy match {matched}/{n}, last-row logit rel-err {rel:.3e}"
-    );
+    println!("{label} conformance: greedy match {matched}/{n}, last-row logit rel-err {rel:.3e}");
 
     assert_eq!(
         got, ref_argmax,
-        "greedy tokens must match transformers exactly"
+        "{label}: greedy tokens must match transformers"
     );
-    assert!(rel < 1e-3, "last-row logit rel-err {rel:.3e} exceeds 1e-3");
+    assert!(
+        rel < 1e-3,
+        "{label}: last-row logit rel-err {rel:.3e} exceeds 1e-3"
+    );
+}
+
+#[test]
+#[ignore = "needs SmolLM2-135M under ~/.cache/tritium-models/smollm2-135m; run explicitly"]
+fn smollm2_greedy_matches_transformers() {
+    assert_conforms("SmolLM2-135M", "smollm2-135m", "smollm2_ref.json");
+}
+
+#[test]
+#[ignore = "needs Qwen2.5-0.5B under ~/.cache/tritium-models/qwen2.5-0.5b; run explicitly"]
+fn qwen25_greedy_matches_transformers() {
+    assert_conforms(
+        "Qwen2.5-0.5B (QKV-bias)",
+        "qwen2.5-0.5b",
+        "qwen25_0.5b_ref.json",
+    );
+}
+
+#[test]
+#[ignore = "needs Qwen3-0.6B under ~/.cache/tritium-models/qwen3-0.6b; run explicitly"]
+fn qwen3_greedy_matches_transformers() {
+    assert_conforms("Qwen3-0.6B (QK-norm)", "qwen3-0.6b", "qwen3_0.6b_ref.json");
 }

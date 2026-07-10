@@ -35,13 +35,7 @@ impl ModelWeights {
         let cfg_path = dir.join("config.json");
         let cfg_json = std::fs::read_to_string(&cfg_path)
             .map_err(|e| NnError::MissingConfig(format!("read {}: {e}", cfg_path.display())))?;
-        let (config, spec) = ModelConfig::from_hf_config(&cfg_json)?;
-
-        if spec.qk_norm || spec.qkv_bias {
-            return Err(NnError::MissingConfig(
-                "arch needs QK-norm/QKV-bias — not yet supported (plan 0037)".to_owned(),
-            ));
-        }
+        let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
 
         // Read every shard eagerly, parse each, and index tensor name → shard.
         let shards = resolve_shards(dir)?;
@@ -65,20 +59,10 @@ impl ModelWeights {
                 loc.insert(n, i);
             }
         }
-        // Robust arch guard: reject weights carrying features the standard forward doesn't run
-        // yet (Qwen2/2.5 QKV bias, Qwen3 QK-norm) — checked on the actual tensors, since the
-        // config flags don't always advertise them. Loud reject beats silently dropping them.
-        if loc.keys().any(|k| {
-            k.ends_with(".q_proj.bias")
-                || k.ends_with(".k_proj.bias")
-                || k.ends_with(".v_proj.bias")
-                || k.ends_with(".q_norm.weight")
-                || k.ends_with(".k_norm.weight")
-        }) {
-            return Err(NnError::MissingConfig(
-                "model has QKV-bias or QK-norm tensors — not yet supported (plan 0037)".to_owned(),
-            ));
-        }
+        // Detect Qwen-family features from the actual weights (config flags don't always
+        // advertise them) and enable them: Qwen2/2.5 QKV bias, Qwen3 per-head QK-norm.
+        spec.qkv_bias = loc.keys().any(|k| k.ends_with(".q_proj.bias"));
+        spec.qk_norm = loc.keys().any(|k| k.ends_with(".q_norm.weight"));
         let get = |name: &str| -> Result<Vec<f32>, NnError> {
             let i = *loc
                 .get(name)
@@ -109,12 +93,7 @@ impl ModelWeights {
         let cfg_path = model_dir.join("config.json");
         let cfg_json = std::fs::read_to_string(&cfg_path)
             .map_err(|e| NnError::MissingConfig(format!("read {}: {e}", cfg_path.display())))?;
-        let (config, spec) = ModelConfig::from_hf_config(&cfg_json)?;
-        if spec.qk_norm || spec.qkv_bias {
-            return Err(NnError::MissingConfig(
-                "arch needs QK-norm/QKV-bias — not yet supported (plan 0037)".to_owned(),
-            ));
-        }
+        let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
 
         // Dequantize every bundle tensor (the 2D ternary weights + the embedding) to dense fp32.
         let bundle_bytes = std::fs::read(bundle)
@@ -153,6 +132,18 @@ impl ModelWeights {
             for n in v.names() {
                 loc.insert(n, i);
             }
+        }
+
+        // Detect Qwen-family features from the MASTER weights (bias/QK-norm are 1D → they live in
+        // the safetensors, not the bundle). SALT inference of those isn't supported yet — reject
+        // loudly rather than silently building a bias-less / QK-norm-less model. (load_hf runs this
+        // same detection; load_salt must too, or its guard is dead.)
+        spec.qkv_bias = loc.keys().any(|k| k.ends_with(".q_proj.bias"));
+        spec.qk_norm = loc.keys().any(|k| k.ends_with(".q_norm.weight"));
+        if spec.qkv_bias || spec.qk_norm {
+            return Err(NnError::MissingConfig(
+                "SALT inference of QKV-bias/QK-norm (Qwen) models is not yet supported".to_owned(),
+            ));
         }
 
         // 2D weights (in the bundle) → dequanted ternary; 1D norms → the original safetensors.
@@ -233,6 +224,42 @@ fn build_standard_model(
                 rms_eps: config.rms_eps,
             }),
         };
+        // Optional Qwen2/2.5 QKV bias and Qwen3 QK-norm (empty = absent).
+        let (q_bias, k_bias, v_bias) = if spec.qkv_bias {
+            (
+                provider(&p("self_attn.q_proj.bias"))?,
+                provider(&p("self_attn.k_proj.bias"))?,
+                provider(&p("self_attn.v_proj.bias"))?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        let (q_norm, k_norm) = if spec.qk_norm {
+            (
+                provider(&p("self_attn.q_norm.weight"))?,
+                provider(&p("self_attn.k_norm.weight"))?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        // Validate optional-weight lengths at load — a wrong-length bias would mis-stride
+        // `add_bias`, a wrong-length QK-norm would mis-normalize. Fail loudly here, not later.
+        for (b, w) in [(&q_bias, q_width), (&k_bias, kv_width), (&v_bias, kv_width)] {
+            if !b.is_empty() && b.len() != w {
+                return Err(NnError::Shape {
+                    expected: w,
+                    got: b.len(),
+                });
+            }
+        }
+        for n in [&q_norm, &k_norm] {
+            if !n.is_empty() && n.len() != head_dim {
+                return Err(NnError::Shape {
+                    expected: head_dim,
+                    got: n.len(),
+                });
+            }
+        }
         layers.push(TransformerBlock {
             attn_norm: provider(&p("input_layernorm.weight"))?,
             q_proj: proj(&p("self_attn.q_proj.weight"), q_width, n_embd)?,
@@ -241,6 +268,11 @@ fn build_standard_model(
             o_proj: proj(&p("self_attn.o_proj.weight"), n_embd, q_width)?,
             // Standard transformer: no BitNet sub-norm.
             attn_sub_norm: Vec::new(),
+            q_bias,
+            k_bias,
+            v_bias,
+            q_norm,
+            k_norm,
             ffn_norm: provider(&p("post_attention_layernorm.weight"))?,
             mlp,
         });
@@ -524,6 +556,30 @@ mod tests {
             matches!(err, crate::NnError::MissingTensor(_)),
             "missing 2D weight must error, got {err:?}"
         );
+
+        // Negative: a master carrying a QKV bias (Qwen) → SALT inference rejected, not silently
+        // built bias-less. (load_salt detects bias/QK-norm from the master weights, like load_hf.)
+        let qdir = std::env::temp_dir().join(format!("tritium-salt-qwen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&qdir);
+        std::fs::create_dir_all(&qdir).unwrap();
+        let qshape = [qw];
+        let bias: Vec<(&str, &[usize], Vec<f32>)> =
+            vec![("model.layers.0.self_attn.q_proj.bias", &qshape, fill(qw))];
+        std::fs::write(qdir.join("model.safetensors"), safetensors(&bias)).unwrap();
+        std::fs::copy(dir.join("config.json"), qdir.join("config.json")).unwrap();
+        std::fs::write(
+            qdir.join("model.tslb"),
+            write_salt_bundle(&bundle_refs).unwrap(),
+        )
+        .unwrap();
+        let err = ModelWeights::load_salt(&qdir, &qdir.join("model.tslb"))
+            .err()
+            .expect("load_salt must reject a QKV-bias (Qwen) master");
+        assert!(
+            matches!(err, crate::NnError::MissingConfig(_)),
+            "Qwen SALT must be rejected, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&qdir);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
