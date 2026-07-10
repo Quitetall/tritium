@@ -120,10 +120,16 @@ pub fn salt_quantize_forward(wf: &[f32], rows: usize, cols: usize, t: usize) -> 
 }
 
 /// Straight-through backward for [`salt_quantize_forward`]: the `t`-plane reconstruction tracks
-/// the latent `Wf` closely (that is what the residual planes buy), so the estimator passes the
-/// output gradient straight to the latent — `gWf = grad_out`. Masking out-of-base-range elements
-/// (as the single-plane [`quantize_vjp`] does) would under-train exactly the large weights the
-/// residual planes exist to represent. Returns `[gWf]`.
+/// the latent `Wf` closely (that is what the residual planes buy — `Ŵ → Wf` as `t` grows, so
+/// `dŴ/dWf → I`), so the estimator passes the output gradient straight to the latent —
+/// `gWf = grad_out`. Masking out-of-base-range elements (as the single-plane [`quantize_vjp`]
+/// does) would under-train exactly the large weights the residual planes exist to represent.
+///
+/// **Caveat:** although [`salt_quantize_forward`] at `t == 1` equals `s·trit` (the single-plane
+/// forward), this identity backward is *not* the single-plane [`quantize_vjp`] — it passes the
+/// gradient in the saturated region the mask would kill. `salt_ste(…, 1)` is therefore a stricter
+/// (more lenient) estimator than [`quantize_surrogate`]; use the latter for pure single-plane QAT.
+/// Returns `[gWf]`.
 #[must_use]
 pub fn salt_quantize_vjp(
     _wf: &[f32],
