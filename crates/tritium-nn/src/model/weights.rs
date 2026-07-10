@@ -119,7 +119,9 @@ impl ModelWeights {
             // check them against the config-derived n_out/k_in so a
             // config/file head_dim disagreement fails at load, not runtime.
             |name, _n_out, _k_in| {
-                Ok(Projection::Ternary(load_ternary(file, bytes, backend, name)?))
+                Ok(Projection::Ternary(load_ternary(
+                    file, bytes, backend, name,
+                )?))
             },
         )
     }
