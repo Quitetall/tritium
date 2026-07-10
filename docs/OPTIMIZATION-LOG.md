@@ -646,6 +646,36 @@ became kernel appends (a dtod can't convert element types).
 Spec-decode gates pass under the rung (spec == plain within the same KV
 dtype). New explicit bench: `long_ctx.rs` (ignored test, env-flagged runs).
 
+### v1.x round 12 — measured competitor comparison (same file, same machine)
+
+Model: `ggml-model-i2_s.gguf` (BitNet 2B4T, 1.71 GiB). Machine: RTX 4090 +
+i5-13600K. bitnet.cpp = upstream microsoft/BitNet @ 1f86f058 (build 3962),
+built locally (I2_S path, preset LUT header); its llama-bench numbers are
+mean ± σ. Tritium numbers via `tritium report decode` + session benches.
+
+| engine | backend | decode tok/s | prefill tok/s |
+|---|---|---|---|
+| **Tritium** | CUDA (4090) | **295–390** (contention spread; ×1.19 spec-decode on repetitive text) | **~941** |
+| **Tritium**, f16 KV @ ctx≈4K | CUDA | **95.6** | — |
+| bitnet.cpp | CPU (14t best) | 23.1 ± 0.1 | 203 (222 @ 20t) |
+| Tritium | CPU | 0.95 | — |
+| llama.cpp (mainline-class, ggml 0.10.x) | CUDA | **cannot load the model** (arch `bitnet-b1.58` unknown; segfaults) | — |
+| bitnet.cpp `gpu/` (W2A8) | — | separate custom build targeting datacenter GPUs; not runnable here | — |
+
+Reading:
+- **On GPU, Tritium is effectively the only engine that runs this model on
+  consumer CUDA** — and it does so at 13–17× the best available alternative
+  on this box (bitnet.cpp CPU decode) and ~4.4× its prefill.
+- **On pure CPU, bitnet.cpp is ~24× ahead of our CPU backend.** Honest
+  framing: Tritium's CPU path is the bit-exact reference/parity backend
+  (every CUDA optimization is gated against it), not a performance target;
+  bitnet.cpp's entire project is hand-tuned CPU ternary kernels. Closing
+  that gap (TL2-class LUTs, threading the GEMM) is real work that exists in
+  the backlog but has never been the thesis.
+
+Repro: `llama-bench -m <i2_s.gguf> -p 512 -n 128 -t 14` (bitnet.cpp build);
+`tritium report decode --backend cuda|cpu --decode-steps 128 …`.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time
