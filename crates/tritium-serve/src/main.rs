@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut backend_name = "cpu".to_owned();
     let mut spec: Option<String> = None;
     let mut batch_slots: usize = 1;
+    let mut host = "127.0.0.1".to_owned();
     let mut port: u16 = 8080;
     let mut model_id = "tritium".to_owned();
     let mut max_new: usize = 256;
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--backend" => backend_name = val::<String>(args.next(), "--backend")?,
             "--spec" => spec = Some(val::<String>(args.next(), "--spec")?),
             "--batch-slots" => batch_slots = val::<usize>(args.next(), "--batch-slots")?,
+            "--host" => host = val::<String>(args.next(), "--host")?,
             "--port" => port = val(args.next(), "--port")?,
             "--model-id" => model_id = val::<String>(args.next(), "--model-id")?,
             "--max-new" => max_new = val(args.next(), "--max-new")?,
@@ -53,8 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--spec lookup] \
-                     [--batch-slots N] [--port 8080] [--model-id tritium] [--max-new 256] \
-                     [--eos 128001]"
+                     [--batch-slots N] [--host 127.0.0.1] [--port 8080] [--model-id tritium] \
+                     [--max-new 256] [--eos 128001]  (non-loopback --host requires \
+                     TRITIUM_AUTH_TOKEN)"
                 );
                 return Ok(());
             }
@@ -92,10 +95,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(other) => return Err(format!("--spec: unknown mode {other:?} (try `lookup`)").into()),
     };
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, eos));
+    // Binding beyond loopback requires a bearer token (TRITIUM_AUTH_TOKEN):
+    // the server is otherwise an unauthenticated code-adjacent surface.
+    let host_ip: std::net::IpAddr = host.parse().map_err(|e| format!("--host {host:?}: {e}"))?;
+    let auth_token = std::env::var("TRITIUM_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    if !host_ip.is_loopback() {
+        if auth_token.is_none() {
+            return Err(format!(
+                "--host {host} binds beyond loopback; set TRITIUM_AUTH_TOKEN to require \
+                 `Authorization: Bearer <token>` on every request (refusing to serve \
+                 an open endpoint)"
+            )
+            .into());
+        }
+        eprintln!(
+            "tritium-serve: WARNING — binding {host} (non-loopback). Bearer auth is \
+             enforced; requests time out after 600s to first byte; body limit 2 MiB."
+        );
+    }
     let cfg = ServeConfig {
         model_id,
         queue_cap: 32,
         max_new_default: max_new,
+        auth_token,
+        ..ServeConfig::default()
     };
     #[cfg(feature = "cuda")]
     let (router, draining) = if batch_slots > 1 {
@@ -122,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_router(generator, tok, cfg)
     };
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = std::net::SocketAddr::new(host_ip, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("tritium-serve: listening on http://{addr}/v1 (Ctrl-C to drain + stop)");
     axum::serve(listener, router)

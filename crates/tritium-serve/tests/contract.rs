@@ -664,3 +664,67 @@ async fn tree_endpoints_map_statuses_by_variant() {
         assert_eq!(st, want);
     }
 }
+
+/// Bearer auth: with `auth_token` set, requests without (or with a wrong)
+/// token are 401; the right token passes. (P1 network-exposure hardening.)
+#[tokio::test]
+async fn bearer_auth_enforced_when_configured() {
+    let (router, _d) = router_with(
+        MockGenerator::new(vec![10, 11]),
+        ServeConfig {
+            auth_token: Some("sekrit".into()),
+            ..ServeConfig::default()
+        },
+    );
+    // No token → 401.
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})
+                .to_string(),
+        ))
+        .unwrap();
+    let (status, _) = send(&router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Wrong token → 401.
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer nope")
+        .body(Body::from(
+            serde_json::json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})
+                .to_string(),
+        ))
+        .unwrap();
+    let (status, _) = send(&router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Right token → 200.
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sekrit")
+        .body(Body::from(
+            serde_json::json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})
+                .to_string(),
+        ))
+        .unwrap();
+    let (status, _) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK);
+    // Health is also behind auth when configured (uniform surface).
+    let req = Request::get("/healthz").body(Body::empty()).unwrap();
+    let (status, _) = send(&router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Body limit: an over-2MiB request body is rejected, not buffered.
+#[tokio::test]
+async fn oversized_body_rejected() {
+    let (router, _d) = router_with(MockGenerator::new(vec![10]), ServeConfig::default());
+    let big = "9 ".repeat(2 * 1024 * 1024); // > 2 MiB of token text
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"model":"tritium","messages":[{{"role":"user","content":"{big}"}}]}}"#
+        )))
+        .unwrap();
+    let (status, _) = send(&router, req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}

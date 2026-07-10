@@ -139,6 +139,7 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
             model_id: "tritium".into(),
             queue_cap: 32,
             max_new_default: max_tokens,
+            ..ServeConfig::default()
         };
         let (router, _draining) =
             build_router_batched(runner, u32::MAX, 4, tok, cfg).expect("batched router");
@@ -251,6 +252,7 @@ async fn cuda_batched_throughput_vs_sequential() {
         model_id: "tritium".into(),
         queue_cap: 32,
         max_new_default: max_tokens,
+        ..ServeConfig::default()
     };
     let (router, _d) = tritium_serve::build_router(
         Box::new(RunnerGenerator::new(runner, u32::MAX)),

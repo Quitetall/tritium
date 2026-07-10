@@ -15,6 +15,9 @@
 //! whole batch for the prompt's prefill time, and free slots burn a row of
 //! compute. Chunked prefill, per-row masks and paged KV are phase 2.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tokio::sync::mpsc;
 
 use crate::generator::{FinishReason, Sampling};
@@ -102,6 +105,7 @@ pub(crate) fn run_batched(
     eos: u32,
     slots: usize,
     mut job_rx: mpsc::Receiver<Job>,
+    draining: Arc<AtomicBool>,
 ) {
     if slots == 0 {
         eprintln!("tritium-serve: --batch-slots must be >= 1");
@@ -130,8 +134,25 @@ pub(crate) fn run_batched(
     let mut pool: Vec<Option<Active>> = (0..slots).map(|_| None).collect();
 
     loop {
+        // Graceful drain (mirrors the single worker): cancel in-flight
+        // requests; the router already 503s new ones. Keep looping so the
+        // final channel close still exits cleanly.
+        if draining.load(Ordering::Relaxed) {
+            for slot in pool.iter_mut() {
+                if let Some(a) = slot.take() {
+                    let _ = a.tx.try_send(GenEvent::Error("server draining".into()));
+                }
+            }
+        }
         // Admit into free slots: drain waiting jobs, block only when idle.
+        // Cap admissions per pass: instantly-retiring jobs (errors, dead
+        // channels) don't occupy a slot, and an unbounded pass would let a
+        // flood of them starve stepping (each admission costs a prefill).
+        let mut admissions = 0usize;
         loop {
+            if admissions >= slots * 2 {
+                break;
+            }
             let free = pool.iter().position(Option::is_none);
             let any_live = pool.iter().any(Option::is_some);
             let job = match free {
@@ -146,7 +167,10 @@ pub(crate) fn run_batched(
                     None => return,
                 },
             };
-            let row = pool.iter().position(Option::is_none).expect("free slot");
+            admissions += 1;
+            let Some(row) = pool.iter().position(Option::is_none) else {
+                break; // defensive: no free slot
+            };
             match job {
                 Job::Generate { req, tx } => {
                     let prompt_len = req.prompt_tokens.len();
@@ -265,8 +289,9 @@ pub(crate) fn run_batched(
                 &active.sampling,
                 (req_seed(&active.sampling), active.salt),
             ) else {
-                let a = slot.take().expect("checked");
-                let _ = a.tx.try_send(GenEvent::Error("empty logits".into()));
+                if let Some(a) = slot.take() {
+                    let _ = a.tx.try_send(GenEvent::Error("empty logits".into()));
+                }
                 continue;
             };
             active.last_token = tok;

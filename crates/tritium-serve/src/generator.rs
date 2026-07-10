@@ -514,7 +514,9 @@ impl RunnerGenerator {
                 }
                 history.push(c);
             }
-            pending = *committed.last().expect("tree verify commits >= 1 token");
+            pending = *committed
+                .last()
+                .ok_or_else(|| GenError::Backend("tree verify returned an empty commit".into()))?;
         }
     }
 }
@@ -713,7 +715,9 @@ impl RunnerGenerator {
                 Some(t) => t,
                 None => {
                     // Full accept: bonus draw from the last node's distribution.
-                    let node = *path.last().expect("path non-empty");
+                    let node = *path.last().ok_or_else(|| {
+                        GenError::Backend("accept walk produced an empty path".into())
+                    })?;
                     let row = &logits_all[node * vocab..(node + 1) * vocab];
                     let (idx, probs) = Self::truncated(row, &req.sampling)
                         .ok_or_else(|| GenError::Backend("sampler produced no token".into()))?;

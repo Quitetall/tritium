@@ -34,6 +34,17 @@ pub struct ServeConfig {
     pub queue_cap: usize,
     /// `max_tokens` used when the request omits it.
     pub max_new_default: usize,
+    /// Per-request time-to-first-byte budget (queue wait + prefill + first
+    /// token for streaming; the whole aggregation for non-streaming). SSE
+    /// bodies stream past this deadline — the timeout bounds the service
+    /// future, not the stream. 0 disables.
+    pub request_timeout_secs: u64,
+    /// Global in-flight request cap (DoS bound on handler memory/FDs).
+    /// 0 disables.
+    pub max_concurrent_requests: usize,
+    /// When set, every request must carry `Authorization: Bearer <token>`.
+    /// Required by `main` when binding beyond loopback.
+    pub auth_token: Option<String>,
 }
 
 impl Default for ServeConfig {
@@ -42,6 +53,9 @@ impl Default for ServeConfig {
             model_id: "tritium".to_owned(),
             queue_cap: 32,
             max_new_default: 256,
+            request_timeout_secs: 600,
+            max_concurrent_requests: 64,
+            auth_token: None,
         }
     }
 }
@@ -96,7 +110,9 @@ pub fn build_router_batched(
     }
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel(cfg.queue_cap);
     let worker_alive = Arc::new(AtomicBool::new(true));
+    let draining = Arc::new(AtomicBool::new(false));
     let alive = worker_alive.clone();
+    let drain_flag = draining.clone();
     std::thread::Builder::new()
         .name("tritium-serve-batch".into())
         .spawn(move || {
@@ -109,9 +125,8 @@ pub fn build_router_batched(
                 }
             }
             let _guard = Guard(alive);
-            crate::batch::run_batched(runner, eos, slots, jobs_rx);
+            crate::batch::run_batched(runner, eos, slots, jobs_rx, drain_flag);
         })?;
-    let draining = Arc::new(AtomicBool::new(false));
     Ok(build_router_inner(
         jobs_tx,
         tok,
@@ -136,13 +151,65 @@ fn build_router_inner(
         worker_alive,
         max_new_default: cfg.max_new_default,
     };
-    let router = Router::new()
+    let auth_token: Option<Arc<str>> = cfg.auth_token.as_deref().map(Arc::from);
+    let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/healthz", get(health))
         .route("/v1/tree/session", post(tree_session))
         .route("/v1/tree/verify", post(tree_verify))
-        .with_state(state);
+        .with_state(state)
+        // Explicit request-body cap (axum's default, stated rather than
+        // implied — threat-model DoS bound).
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024));
+    if cfg.request_timeout_secs > 0 {
+        // Bounds time-to-first-byte (queue wait + prefill); SSE bodies stream
+        // past the deadline — the layer times the service future only.
+        router = router.layer(tower_http::timeout::TimeoutLayer::new(
+            std::time::Duration::from_secs(cfg.request_timeout_secs),
+        ));
+    }
+    if cfg.max_concurrent_requests > 0 {
+        // Global in-flight cap: bounds handler memory/FD growth under
+        // connection floods (threat-model slowloris item; the accept loop
+        // itself remains unbounded — documented residual).
+        router = router.layer(tower::limit::ConcurrencyLimitLayer::new(
+            cfg.max_concurrent_requests,
+        ));
+    }
+    if let Some(token) = auth_token {
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let token = token.clone();
+                async move {
+                    let ok = req
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .is_some_and(|t| {
+                            // Constant-time-ish compare (length + bytes).
+                            t.len() == token.len()
+                                && t.bytes()
+                                    .zip(token.bytes())
+                                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                                    == 0
+                        });
+                    if ok {
+                        next.run(req).await
+                    } else {
+                        api_error(
+                            StatusCode::UNAUTHORIZED,
+                            "invalid_request_error",
+                            "missing or invalid bearer token",
+                            None,
+                        )
+                        .into_response()
+                    }
+                }
+            },
+        ));
+    }
     (router, draining)
 }
 
