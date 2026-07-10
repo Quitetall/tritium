@@ -719,10 +719,10 @@ to 0; per-slot host sampling reuses the plain samplers' truncated
 distributions; retirement on EOS/budget/disconnect frees the slot for the
 next admission. Tree/spec endpoints answer 501 in this mode.
 
-Measured (8 slots, 24-token prompts, 64 tokens each, SHARED GPU — a 10 GB
-llama-server was co-resident, so conservative): sequential 284.1 tok/s →
-concurrent **468.6 tok/s aggregate (1.65×)**, admission prefills inside the
-timed window.
+Measured (8 slots, 24-token prompts, 64 tokens each): shared-GPU run
+284.1 → 468.6 tok/s (1.65×); UNCONTENDED re-run 300.8 → **453.5 tok/s
+aggregate (1.51×)** — the honest number — with all 8 admission prefills
+inside the timed window (decode-only steady state is higher).
 
 Gates: adoption bit-exactness (30 layers × 26 rows × K/V), token-0 exactness
 + agreement-prefix reporting vs single-seq, and cross-pool determinism
