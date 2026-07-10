@@ -190,12 +190,31 @@ impl ModelRunner {
         }
     }
 
+    /// (cuda) Probe for the CUDA device-resident decoder, building it on the
+    /// first call: `Ok(true)` = present, `Ok(false)` = non-CUDA backend,
+    /// `Err(Build)` = a CUDA backend whose decoder build FAILED — callers that
+    /// answer clients should surface that as an internal error, not "feature
+    /// unsupported".
+    ///
+    /// # Errors
+    /// [`ResidentOpError::Build`] when the lazy decoder build fails.
+    #[cfg(feature = "cuda")]
+    pub fn try_resident_decoder(&mut self) -> Result<bool, ResidentOpError> {
+        match self.ensure_resident() {
+            Err(e) => Err(ResidentOpError::Build(e.to_string())),
+            Ok(ok) => Ok(ok && self.resident.is_some()),
+        }
+    }
+
     /// (cuda) Whether this runner has (or can build) the CUDA device-resident
-    /// decoder — the gate for spec-decode lookup and continuous batching.
-    /// Build failures read as `false` (callers fall back to the plain path).
+    /// decoder — the DISPATCH probe for spec-decode lookup and continuous
+    /// batching, where a build failure just means "fall back to the plain
+    /// path" (it reads as `false`). Client-facing feature gates should use
+    /// [`try_resident_decoder`](Self::try_resident_decoder) instead so build
+    /// failures classify as errors, not absence.
     #[cfg(feature = "cuda")]
     pub fn has_resident_decoder(&mut self) -> bool {
-        matches!(self.ensure_resident(), Ok(true)) && self.resident.is_some()
+        self.try_resident_decoder().unwrap_or(false)
     }
 
     /// (cuda) BASTION tree-verify, greedy rule: forward the token tree
@@ -251,7 +270,9 @@ impl ModelRunner {
     /// (per-layer `[n, max_ctx, kv_width]` KV arenas + M=N scratch).
     ///
     /// # Errors
-    /// [`ResidentOpError`] — `Op(OutOfMemory)` on a device allocation failure.
+    /// [`ResidentOpError`] — `Op` with the stringified device error on an
+    /// allocation failure (the CUDA path reports these as
+    /// `BackendError::Backend`, not `OutOfMemory`).
     #[cfg(feature = "cuda")]
     pub fn new_batch(&mut self, n: usize) -> Result<tritium_cuda::BatchKv, ResidentOpError> {
         self.resident_for_op()?

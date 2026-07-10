@@ -840,10 +840,16 @@ impl Generator for RunnerGenerator {
         }
         #[cfg(feature = "cuda")]
         {
-            if !self.runner.has_resident_decoder() {
-                return Err(TreeOpError::Unsupported(
-                    "tree-verify needs the CUDA device-resident decoder".to_owned(),
-                ));
+            match self.runner.try_resident_decoder() {
+                // Build failure on a CUDA backend is an internal fault (500),
+                // not feature absence (501) — the pre-facade classification.
+                Err(e) => return Err(TreeOpError::Internal(e.to_string())),
+                Ok(false) => {
+                    return Err(TreeOpError::Unsupported(
+                        "tree-verify needs the CUDA device-resident decoder".to_owned(),
+                    ));
+                }
+                Ok(true) => {}
             }
             let n_ctx = self.runner.config.n_ctx as usize;
             if prompt.is_empty() || prompt.len() >= n_ctx {
