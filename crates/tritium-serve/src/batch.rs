@@ -111,10 +111,6 @@ pub(crate) fn run_batched(
         eprintln!("tritium-serve: --batch-slots must be >= 1");
         return;
     }
-    // Phase-1 fairness note: instantly-retiring jobs (errors, dead channels,
-    // tree 501s) don't occupy a slot, so a sustained flood of them can starve
-    // stepping — bounded by the queue cap per burst, not per second. A
-    // per-iteration admission cap is the phase-2 fix if it bites.
     let n_ctx = runner.config.n_ctx as usize;
     // Build the resident decoder + the slot pool up front; failures here are
     // fatal for the worker (the router will see a closed queue → 503s).
@@ -171,6 +167,27 @@ pub(crate) fn run_batched(
             let Some(row) = pool.iter().position(Option::is_none) else {
                 break; // defensive: no free slot
             };
+            // Jobs already queued when the drain started get errored BEFORE
+            // paying their prefill (the router 503s new ones; this covers the
+            // in-queue backlog).
+            if draining.load(Ordering::Relaxed) {
+                match job {
+                    Job::Generate { tx, .. } => {
+                        let _ = tx.try_send(GenEvent::Error("server draining".into()));
+                    }
+                    Job::OpenTreeSession { resp, .. } => {
+                        let _ = resp.send(Err(crate::generator::TreeOpError::Unsupported(
+                            "server draining".into(),
+                        )));
+                    }
+                    Job::TreeVerify { resp, .. } => {
+                        let _ = resp.send(Err(crate::generator::TreeOpError::Unsupported(
+                            "server draining".into(),
+                        )));
+                    }
+                }
+                continue;
+            }
             match job {
                 Job::Generate { req, tx } => {
                     let prompt_len = req.prompt_tokens.len();

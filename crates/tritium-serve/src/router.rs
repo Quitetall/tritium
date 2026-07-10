@@ -34,10 +34,12 @@ pub struct ServeConfig {
     pub queue_cap: usize,
     /// `max_tokens` used when the request omits it.
     pub max_new_default: usize,
-    /// Per-request time-to-first-byte budget (queue wait + prefill + first
-    /// token for streaming; the whole aggregation for non-streaming). SSE
-    /// bodies stream past this deadline — the timeout bounds the service
-    /// future, not the stream. 0 disables.
+    /// Per-request service-future budget. For NON-STREAMING requests this
+    /// bounds queue wait + the whole generation. For streaming requests the
+    /// service future resolves at headers (the SSE body is lazy), so the
+    /// timeout bounds essentially nothing — streaming slow-clients are
+    /// instead bounded by the 64-event channel + try_send cancellation.
+    /// 0 disables.
     pub request_timeout_secs: u64,
     /// Global in-flight request cap (DoS bound on handler memory/FDs).
     /// 0 disables.
@@ -163,9 +165,11 @@ fn build_router_inner(
         // implied — threat-model DoS bound).
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024));
     if cfg.request_timeout_secs > 0 {
-        // Bounds time-to-first-byte (queue wait + prefill); SSE bodies stream
-        // past the deadline — the layer times the service future only.
-        router = router.layer(tower_http::timeout::TimeoutLayer::new(
+        // Times the SERVICE FUTURE only: bounds non-streaming requests
+        // end-to-end; streaming resolves at headers (lazy SSE body), so this
+        // bounds nothing there — see `request_timeout_secs` docs.
+        router = router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(cfg.request_timeout_secs),
         ));
     }
@@ -198,13 +202,18 @@ fn build_router_inner(
                     if ok {
                         next.run(req).await
                     } else {
-                        api_error(
+                        let mut resp = api_error(
                             StatusCode::UNAUTHORIZED,
                             "invalid_request_error",
                             "missing or invalid bearer token",
                             None,
                         )
-                        .into_response()
+                        .into_response();
+                        resp.headers_mut().insert(
+                            axum::http::header::WWW_AUTHENTICATE,
+                            axum::http::HeaderValue::from_static("Bearer"),
+                        );
+                        resp
                     }
                 }
             },

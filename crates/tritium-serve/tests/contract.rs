@@ -728,3 +728,64 @@ async fn oversized_body_rejected() {
     let (status, _) = send(&router, req).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+/// Non-streaming requests are bounded by the request timeout: the handler
+/// awaits the full aggregation, so a generation slower than the deadline
+/// surfaces as 408.
+#[tokio::test]
+async fn nonstream_timeout_408() {
+    let mock = MockGenerator {
+        step_delay_ms: 400, // 4 tokens x 400ms = 1.6s > the 1s deadline
+        ..MockGenerator::new(vec![1, 2, 3, 4])
+    };
+    let (router, _d) = router_with(
+        mock,
+        ServeConfig {
+            request_timeout_secs: 1,
+            ..ServeConfig::default()
+        },
+    );
+    let (status, _) = send(
+        &router,
+        chat(json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "slow non-streaming -> 408");
+}
+
+/// Streaming is NOT bounded by the request timeout: the SSE body is lazy, so
+/// the service future resolves at headers and tokens keep flowing past the
+/// deadline. This pins the documented contract (the timeout is a
+/// non-streaming bound, not a streaming TTFB bound).
+#[tokio::test]
+async fn sse_streams_past_timeout_deadline() {
+    let mock = MockGenerator {
+        step_delay_ms: 400, // total 1.6s of generation vs a 1s deadline
+        ..MockGenerator::new(vec![1, 2, 3, 4])
+    };
+    let (router, _d) = router_with(
+        mock,
+        ServeConfig {
+            request_timeout_secs: 1,
+            ..ServeConfig::default()
+        },
+    );
+    let t0 = std::time::Instant::now();
+    let (status, body) = send(
+        &router,
+        chat(json!({"model":"tritium","stream":true,"messages":[{"role":"user","content":"1"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = parse_sse(&body);
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    assert_eq!(
+        sse_chunks(&events).len(),
+        1 + 4 + 1,
+        "role prelude + 4 tokens + finish chunk"
+    );
+    assert!(
+        t0.elapsed() > Duration::from_secs(1),
+        "stream must have outlived the 1s deadline to prove the point"
+    );
+}

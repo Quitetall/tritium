@@ -110,7 +110,7 @@ async-stream = "0.3"
 futures-core = "0.3"
 http-body-util = "0.1"
 tower = { version = "0.5", default-features = false, features = ["util", "limit"] }
-tower-http = { version = "0.6", default-features = false, features = ["timeout", "limit"] }
+tower-http = { version = "0.6", default-features = false, features = ["timeout"] }
 # dev / test / bench
 proptest = "1"
 divan = "0.1"
