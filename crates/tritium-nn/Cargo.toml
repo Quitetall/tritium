@@ -29,6 +29,10 @@ tritium-cuda = { workspace = true, optional = true }
 # `ModelConfig::from_hf_config` parses a HuggingFace `config.json` (library code, so a
 # regular dep, not dev-only).
 serde_json = { workspace = true }
+# Real byte-level BPE behind the `tokenizer` feature: `GgufBpeTokenizer` builds a
+# HuggingFace `tokenizers` pipeline from the vocab/merges a GGUF embeds (single-file
+# UX — no sidecar tokenizer.json). Optional so the default build stays lean.
+tokenizers = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -53,6 +57,8 @@ tritium-train = { workspace = true }
 [features]
 default = []
 cuda = ["dep:tritium-cuda", "tritium-cuda/cuda"]
+# Real text tokenization (GGUF-embedded byte-level BPE via the `tokenizers` crate).
+tokenizer = ["dep:tokenizers"]
 
 [lints]
 workspace = true

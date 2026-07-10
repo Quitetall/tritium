@@ -789,3 +789,25 @@ async fn sse_streams_past_timeout_deadline() {
         "stream must have outlived the 1s deadline to prove the point"
     );
 }
+
+/// Chat-template rendering: the RoleEot template must reproduce the official
+/// transformers template ("{Role}: {content}<|eot_id|>" per message + the
+/// "Assistant: " generation prompt); Concat stays the id-passthrough join.
+#[test]
+fn chat_template_render() {
+    use tritium_serve::ChatTemplate;
+    let msgs = [
+        ("system", "Be terse."),
+        ("user", " What is 2+2? "),
+        ("assistant", "4"),
+        ("user", "And 3+3?"),
+    ];
+    let rendered = ChatTemplate::RoleEot.render(msgs.iter().map(|&(r, c)| (r, c)));
+    assert_eq!(
+        rendered,
+        "System: Be terse.<|eot_id|>User: What is 2+2?<|eot_id|>\
+         Assistant: 4<|eot_id|>User: And 3+3?<|eot_id|>Assistant: "
+    );
+    let concat = ChatTemplate::Concat.render(msgs.iter().map(|&(r, c)| (r, c)));
+    assert_eq!(concat, "Be terse.\n What is 2+2? \n4\nAnd 3+3?");
+}

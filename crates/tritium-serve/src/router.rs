@@ -25,6 +25,53 @@ use crate::sse::{
 };
 use crate::worker::{GenEvent, Job, spawn_worker};
 
+/// How `/v1/chat/completions` renders `messages` into the prompt string
+/// handed to the tokenizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatTemplate {
+    /// Join message contents with newlines (the id-passthrough MVP: clients
+    /// send integer token ids, roles carry no wire meaning).
+    #[default]
+    Concat,
+    /// The official BitNet/LLaMA-3-family template the `transformers`
+    /// reference uses: `{Role}: {content}<|eot_id|>` per message, then the
+    /// `Assistant: ` generation prompt. BOS comes from the tokenizer's
+    /// encode. Requires a real BPE tokenizer (the special tokens must map
+    /// to their control ids).
+    RoleEot,
+}
+
+impl ChatTemplate {
+    /// Render `(role, content)` messages into the prompt string.
+    pub fn render<'a>(
+        self,
+        messages: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> String {
+        match self {
+            ChatTemplate::Concat => messages
+                .map(|(_, content)| content)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ChatTemplate::RoleEot => {
+                let mut out = String::new();
+                for (role, content) in messages {
+                    // `role | capitalize`: first ASCII char uppercased.
+                    let mut cs = role.chars();
+                    if let Some(c) = cs.next() {
+                        out.extend(c.to_uppercase());
+                        out.push_str(cs.as_str());
+                    }
+                    out.push_str(": ");
+                    out.push_str(content.trim());
+                    out.push_str("<|eot_id|>");
+                }
+                out.push_str("Assistant: ");
+                out
+            }
+        }
+    }
+}
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
@@ -47,6 +94,8 @@ pub struct ServeConfig {
     /// When set, every request must carry `Authorization: Bearer <token>`.
     /// Required by `main` when binding beyond loopback.
     pub auth_token: Option<String>,
+    /// How chat messages render into the prompt (see [`ChatTemplate`]).
+    pub chat_template: ChatTemplate,
 }
 
 impl Default for ServeConfig {
@@ -58,6 +107,7 @@ impl Default for ServeConfig {
             request_timeout_secs: 600,
             max_concurrent_requests: 64,
             auth_token: None,
+            chat_template: ChatTemplate::default(),
         }
     }
 }
@@ -70,6 +120,7 @@ struct AppState {
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
     max_new_default: usize,
+    chat_template: ChatTemplate,
 }
 
 /// Build the router. Returns it plus the drain flag — set the flag (then run
@@ -152,6 +203,7 @@ fn build_router_inner(
         draining: draining.clone(),
         worker_alive,
         max_new_default: cfg.max_new_default,
+        chat_template: cfg.chat_template,
     };
     let auth_token: Option<Arc<str>> = cfg.auth_token.as_deref().map(Arc::from);
     let mut router = Router::new()
@@ -338,14 +390,11 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
         );
     }
 
-    // MVP prompt build: join message contents (the LLaMA-3 chat template ships
-    // with the real BPE tokenizer; the id-passthrough wants integer token IDs).
-    let prompt_text = req
-        .messages
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let prompt_text = st.chat_template.render(
+        req.messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str())),
+    );
     let prompt_tokens = match st.tok.encode(&prompt_text) {
         Ok(t) => t,
         Err(e) => {

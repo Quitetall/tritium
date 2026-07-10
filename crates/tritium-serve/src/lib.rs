@@ -45,4 +45,4 @@ pub use tokenizer_passthrough::IdPassthroughTokenizer;
 #[cfg(feature = "cuda")]
 pub use router::build_router_batched;
 #[cfg(feature = "serve")]
-pub use router::{ServeConfig, build_router};
+pub use router::{ChatTemplate, ServeConfig, build_router};

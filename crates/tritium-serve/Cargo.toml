@@ -34,7 +34,7 @@ tritium-format = { workspace = true, optional = true }
 
 [features]
 default = []
-serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:tower-http", "dep:async-stream", "dep:futures-core", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format"]
+serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:tower-http", "dep:async-stream", "dep:futures-core", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
 # Link the CUDA backend so `--backend cuda` can resolve (needs nvcc at build time).
 cuda = ["serve", "dep:tritium-cuda", "tritium-nn/cuda"]
 # Gated real-model end-to-end test (needs TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH).

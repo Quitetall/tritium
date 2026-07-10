@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_id = "tritium".to_owned();
     let mut max_new: usize = 256;
     let mut eos: u32 = 128_001;
+    let mut raw_tokens = false;
 
     // Parse a required value for `name`, erroring (not silently defaulting) on a
     // missing or malformed value.
@@ -52,11 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--model-id" => model_id = val::<String>(args.next(), "--model-id")?,
             "--max-new" => max_new = val(args.next(), "--max-new")?,
             "--eos" => eos = val(args.next(), "--eos")?,
+            "--raw-tokens" => raw_tokens = true,
             "-h" | "--help" => {
                 eprintln!(
                     "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--spec lookup] \
                      [--batch-slots N] [--host 127.0.0.1] [--port 8080] [--model-id tritium] \
-                     [--max-new 256] [--eos 128001]  (non-loopback --host requires \
+                     [--max-new 256] [--eos 128001] [--raw-tokens]  (non-loopback --host requires \
                      TRITIUM_AUTH_TOKEN)"
                 );
                 return Ok(());
@@ -94,7 +96,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("lookup") => true,
         Some(other) => return Err(format!("--spec: unknown mode {other:?} (try `lookup`)").into()),
     };
-    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, eos));
+    // Real text mode by default: rebuild the byte-level BPE the GGUF embeds
+    // (vocab + merges + control tokens) and render chat via the official
+    // template. `--raw-tokens` (or a GGUF without a gpt2 tokenizer) falls back
+    // to the id-passthrough MVP: whitespace-separated integer token ids.
+    let mut chat_template = tritium_serve::ChatTemplate::Concat;
+    let tok: Arc<dyn tritium_nn::Tokenizer + Send + Sync> = if raw_tokens {
+        eprintln!("tritium-serve: --raw-tokens — id-passthrough tokenizer");
+        Arc::new(IdPassthroughTokenizer::new(128_000, eos))
+    } else {
+        match tritium_nn::GgufBpeTokenizer::from_gguf(&file) {
+            Ok(t) => {
+                eos = tritium_nn::Tokenizer::eos(&t);
+                chat_template = tritium_serve::ChatTemplate::RoleEot;
+                eprintln!(
+                    "tritium-serve: GGUF-embedded BPE tokenizer (eos {eos}); chat template: role-eot"
+                );
+                Arc::new(t)
+            }
+            Err(e) => {
+                eprintln!(
+                    "tritium-serve: no usable embedded tokenizer ({e}); falling back to \
+                     id-passthrough (send integer token ids)"
+                );
+                Arc::new(IdPassthroughTokenizer::new(128_000, eos))
+            }
+        }
+    };
     // Binding beyond loopback requires a bearer token (TRITIUM_AUTH_TOKEN):
     // the server is otherwise an unauthenticated code-adjacent surface.
     let host_ip: std::net::IpAddr = host.parse().map_err(|e| format!("--host {host:?}: {e}"))?;
@@ -120,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         queue_cap: 32,
         max_new_default: max_new,
         auth_token,
+        chat_template,
         ..ServeConfig::default()
     };
     #[cfg(feature = "cuda")]

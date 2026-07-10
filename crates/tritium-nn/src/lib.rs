@@ -31,6 +31,8 @@ pub use layers::{
     TransformerBlock,
 };
 pub use model::{ForwardDump, LayerWeights, ModelRunner, ModelWeights, Tokenizer};
+#[cfg(feature = "tokenizer")]
+pub use model::GgufBpeTokenizer;
 pub use ops::{
     QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_categorical,
     sample_greedy, sample_top_k, sample_top_p, softmax_rows, truncated_top_k, truncated_top_p,
