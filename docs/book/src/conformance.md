@@ -59,3 +59,26 @@ cargo test -p tritium-wgpu --features register      # on a Vulkan adapter
 
 The CPU and wasm lanes run on every push; the CUDA and wgpu lanes are
 hardware-gated (they self-skip or are manual where the hardware is absent).
+
+## Numerics domains
+
+Tritium's end-to-end gates assert three DIFFERENT strengths of "matches", and
+every gate's doc comment says which one it pins. When a doc claim and an
+assertion disagree, the assertion is the contract — fix the doc.
+
+| domain | contract | why not stronger | gated by |
+|---|---|---|---|
+| **Single-sequence decode** (eager, `step_graph`, CPU↔CUDA, tree-verify commit) | **bit-exact**: logits `to_bits()`-equal across launch mechanisms; token IDs equal the committed `transformers` reference | — (kernels are compiled `--fmad=false` and share one reduction order, ADR 0018) | `acceptance.rs` greedy/parity gates, graph==eager `to_bits` gates, `cuda/tests.rs` kernel gates |
+| **M=N batch decode** (vs the M=1 path) | **token parity**: greedy decisions match single-sequence over a short horizon; WITHIN a batch, sequences are bit-exact independent and graph==eager is bit-exact | split-KV attention reorders the f32 sum vs the M=1 warp kernel — logit bits differ at ulp level, and near-tie argmaxes can flip at long horizons | `acceptance.rs::cuda_batch_decode_matches_single`, `batch_serve.rs` (G1 token equality + G2 batch-domain determinism), kernel-level 1e-4 equivalence gate |
+| **KV-cache rungs below f32** (f16 / i8; ADR 0020) | **perplexity-gated**: e2e perplexity relative error inside the quality bar (~0.16% f16, ~0.26% i8); no token or logit claim | every written K/V rounds once by design; opt-in per model instance, f32 default stays in the bit-exact domain | perplexity gates + long-context quality probe (ADR 0020) |
+
+Two corollaries worth internalizing:
+
+- A batched server (`--batch-slots N`) is its own reproducibility domain: the
+  same request re-run through the SAME domain reproduces exactly (slot
+  assignment and admission order don't matter — gated), but it is not
+  bit-comparable to the single-request server beyond the greedy-token horizon.
+- Combining domains multiplies caveats: batch + f16 KV inherits BOTH the token
+  parity bound and the perplexity bound. The f32 single-sequence path is the
+  only fully bit-exact end-to-end configuration, which is why it is the
+  reference every other domain is measured against.

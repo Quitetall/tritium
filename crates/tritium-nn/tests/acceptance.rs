@@ -317,10 +317,16 @@ fn cuda_greedy_matches_transformers() {
     );
 }
 
-/// Batched M=N decode (v0.3.7) must be **bit-identical** to a single-sequence M=1 decode:
-/// (1) two identical sequences in one batch produce identical logits (they are
-/// independent), and (2) each matches the `step_graph` reference for the same tokens. The
-/// batch kernels share the M=1 reduction order, so the per-sequence result is byte-for-byte.
+/// Batched M=N decode (v0.3.7) parity with single-sequence M=1 decode — two DISTINCT
+/// contracts (see the book's Conformance chapter, "Numerics domains"):
+/// (1) WITHIN a batch: two identical sequences produce **bit-identical** logits
+///     (independence — asserted `to_bits()` equal), and
+/// (2) ACROSS paths: batch vs `step_graph` matches on the **greedy token**, not the
+///     logit bits — the batch path's split-KV attention reorders the f32 sum vs the
+///     M=1 warp kernel, so logit-level bit-exactness is structurally unavailable.
+///     Numeric closeness is covered by the kernel-level 1e-4 equivalence gate
+///     (`attn_split_kv_matches_direct_attention`); the graph==eager bit-exact gate
+///     covers the launch mechanism.
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_batch_decode_matches_single() {
