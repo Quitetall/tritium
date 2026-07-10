@@ -176,6 +176,21 @@ pub fn dequant_salt_row(row: &SaltRow) -> Result<Vec<f32>, FormatError> {
     Ok(acc)
 }
 
+/// Dequantize a full SALT tensor — one [`SaltRow`] per output channel — to a **row-major
+/// `[rows.len(), k]` dense fp32 matrix**, concatenating [`dequant_salt_row`] over the rows.
+/// Reused to build a runnable dense projection from SALT-quantized weights (both a bundle's
+/// `SaltTensor` and a live `QuantizedTensor`).
+///
+/// # Errors
+/// Propagates [`dequant_salt_row`] errors from any malformed row plane.
+pub fn salt_rows_to_dense(rows: &[SaltRow]) -> Result<Vec<f32>, FormatError> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.extend_from_slice(&dequant_salt_row(row)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +224,22 @@ mod tests {
             })
             .collect();
         SaltRow { k, planes }
+    }
+
+    #[test]
+    fn salt_rows_to_dense_concatenates_per_row_dequant() {
+        let k = 300; // 2 blocks (256 + 44)
+        let rows = [
+            make_salt_row(k, 2),
+            make_salt_row(k, 1),
+            make_salt_row(k, 3),
+        ];
+        let dense = salt_rows_to_dense(&rows).unwrap();
+        assert_eq!(dense.len(), rows.len() * k);
+        for (r, row) in rows.iter().enumerate() {
+            let want = dequant_salt_row(row).unwrap();
+            assert_eq!(&dense[r * k..r * k + k], &want[..], "row {r}");
+        }
     }
 
     // ── Gate (ADR 0006): multi-plane roundtrip. ──────────────────────────────

@@ -1,16 +1,21 @@
-//! Config-driven loading of a standard-transformer fp model from HuggingFace
-//! safetensors (plan 0035 step 4). Reads `config.json` → [`ArchSpec`], resolves the
-//! (possibly sharded) safetensors, and builds [`ModelWeights`] with **exact-fp** dense
-//! projections ([`DenseLinear::new_exact`]) on the standard llama/qwen tensor-name schema.
+//! Config-driven loading of a standard-transformer model from HuggingFace artifacts.
 //!
+//! - [`ModelWeights::load_hf`] (plan 0035): fp model from `config.json` + safetensors —
+//!   exact-fp dense projections ([`DenseLinear::new_exact`]).
+//! - [`ModelWeights::load_salt`] (plan 0036): a **SALT-quantized** model — ternary 2D weights
+//!   from a SALT bundle via dequant-to-dense + the A8 int8-activation `DenseLinear` (a CPU/eval
+//!   path — numerically ≈ the native multi-plane ternary GEMM within ~1e-4, not bit-identical),
+//!   with 1D norms + config from the original model dir.
+//!
+//! Both share [`build_standard_model`] over the standard llama/qwen tensor-name schema.
 //! Scope: standard SwiGLU/GQA/RoPE models (Llama, SmolLM2, …). Arches needing QK-norm or
-//! QKV-bias are rejected here (plan 0037); SSM/MoE are later still. Weights are read eagerly
-//! (fine for the small conformance model); streaming/mmap for 50GB+ masters is plan 0040.
+//! QKV-bias are rejected (plan 0037); SSM/MoE are later still. Weights are read eagerly (fine
+//! for the small conformance model); streaming/mmap for 50GB+ masters is plan 0040.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use tritium_format::SafeTensors;
+use tritium_format::{SafeTensors, read_salt_bundle, read_salt_gguf, salt_rows_to_dense};
 
 use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
@@ -82,72 +87,180 @@ impl ModelWeights {
                 .tensor_f32(name)
                 .map_err(|e| NnError::MissingTensor(format!("{name}: {e}")))
         };
-        let dense = |name: &str, n_out: usize, k_in: usize| -> Result<Projection, NnError> {
-            Ok(Projection::Dense(DenseLinear::new_exact(
-                get(name)?,
-                n_out,
-                k_in,
-            )?))
-        };
-
-        let n_embd = config.n_embd as usize;
-        let head_dim = config.head_dim() as usize;
-        let q_width = config.n_head as usize * head_dim;
-        let kv_width = config.n_head_kv as usize * head_dim;
-        let n_ff = config.n_ff as usize;
-
-        let token_embd = get("model.embed_tokens.weight")?;
-        let vocab = token_embd.len() / n_embd;
-        let output_norm = get("model.norm.weight")?;
-
-        let mut layers = Vec::with_capacity(config.n_layers as usize);
-        for i in 0..config.n_layers as usize {
-            let p = |s: &str| format!("model.layers.{i}.{s}");
-            let (gate, up, down) = (
-                dense(&p("mlp.gate_proj.weight"), n_ff, n_embd)?,
-                dense(&p("mlp.up_proj.weight"), n_ff, n_embd)?,
-                dense(&p("mlp.down_proj.weight"), n_embd, n_ff)?,
-            );
-            let mlp = match spec.mlp {
-                MlpKind::SwiGlu => Mlp::SwiGlu(SwiGluMlp { gate, up, down }),
-                MlpKind::Relu2 => Mlp::Relu2(Relu2Mlp {
-                    gate,
-                    up,
-                    down,
-                    ffn_sub_norm: Vec::new(),
-                    rms_eps: config.rms_eps,
-                }),
-            };
-            layers.push(TransformerBlock {
-                attn_norm: get(&p("input_layernorm.weight"))?,
-                q_proj: dense(&p("self_attn.q_proj.weight"), q_width, n_embd)?,
-                k_proj: dense(&p("self_attn.k_proj.weight"), kv_width, n_embd)?,
-                v_proj: dense(&p("self_attn.v_proj.weight"), kv_width, n_embd)?,
-                o_proj: dense(&p("self_attn.o_proj.weight"), n_embd, q_width)?,
-                // Standard transformer: no BitNet sub-norm.
-                attn_sub_norm: Vec::new(),
-                ffn_norm: get(&p("post_attention_layernorm.weight"))?,
-                mlp,
-            });
-        }
-
-        // Untied lm_head when present / the config says so; else tie to the embedding.
-        let lm_head = if spec.tied_embeddings {
-            None
-        } else {
-            Some(dense("lm_head.weight", vocab, n_embd)?)
-        };
-
-        let weights = ModelWeights {
-            token_embd,
-            vocab,
-            n_embd,
-            layers,
-            output_norm,
-            lm_head,
-        };
+        // Every tensor is read from the safetensors as exact fp32.
+        let weights = build_standard_model(&config, &spec, get, true)?;
         Ok((config, spec, weights))
     }
+
+    /// Load a **SALT-quantized** standard-transformer model: the ternary 2D weights come from a
+    /// SALT bundle (`.tslb` or SALT-GGUF) via dequant-to-dense (numerically ≈ the native
+    /// multi-plane ternary GEMM within ~1e-4, a CPU/eval path — not bit-identical), while the 1D
+    /// norms + `config.json` come from `model_dir` (bundles carry neither). A 2D weight missing
+    /// from the bundle is a **hard error** (never a silent fp fallback). Runs a degraded-but-working
+    /// ternary model.
+    ///
+    /// # Errors
+    /// [`NnError::MissingConfig`] (bad config / unsupported arch), [`NnError::MissingTensor`]
+    /// (bundle unreadable, or a norm absent from `model_dir`), [`NnError::Shape`].
+    pub fn load_salt(
+        model_dir: &Path,
+        bundle: &Path,
+    ) -> Result<(ModelConfig, ModelWeights), NnError> {
+        let cfg_path = model_dir.join("config.json");
+        let cfg_json = std::fs::read_to_string(&cfg_path)
+            .map_err(|e| NnError::MissingConfig(format!("read {}: {e}", cfg_path.display())))?;
+        let (config, spec) = ModelConfig::from_hf_config(&cfg_json)?;
+        if spec.qk_norm || spec.qkv_bias {
+            return Err(NnError::MissingConfig(
+                "arch needs QK-norm/QKV-bias — not yet supported (plan 0037)".to_owned(),
+            ));
+        }
+
+        // Dequantize every bundle tensor (the 2D ternary weights + the embedding) to dense fp32.
+        let bundle_bytes = std::fs::read(bundle)
+            .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", bundle.display())))?;
+        // Sniff by magic, not filename: GGUF starts with `b"GGUF"`, a SALT bundle with `b"TSLB"`.
+        let tensors = if bundle_bytes.starts_with(b"GGUF") {
+            read_salt_gguf(&bundle_bytes)
+        } else {
+            read_salt_bundle(&bundle_bytes)
+        }
+        .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?;
+        let mut dequant: HashMap<String, Vec<f32>> = HashMap::new();
+        for t in &tensors {
+            let d = salt_rows_to_dense(&t.salt_rows)
+                .map_err(|e| NnError::MissingTensor(format!("dequant {}: {e}", t.name)))?;
+            dequant.insert(t.name.clone(), d);
+        }
+
+        // The 1D norms (and any tensor the bundle lacks) come from the original safetensors.
+        let shard_bytes: Vec<Vec<u8>> = resolve_shards(model_dir)?
+            .iter()
+            .map(|p| {
+                std::fs::read(p)
+                    .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", p.display())))
+            })
+            .collect::<Result<_, _>>()?;
+        let views: Vec<SafeTensors> = shard_bytes
+            .iter()
+            .map(|b| {
+                SafeTensors::parse(b)
+                    .map_err(|e| NnError::MissingTensor(format!("parse safetensors: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+        let mut loc: HashMap<&str, usize> = HashMap::new();
+        for (i, v) in views.iter().enumerate() {
+            for n in v.names() {
+                loc.insert(n, i);
+            }
+        }
+
+        // 2D weights (in the bundle) → dequanted ternary; 1D norms → the original safetensors.
+        let provider = |name: &str| -> Result<Vec<f32>, NnError> {
+            if let Some(d) = dequant.get(name) {
+                return Ok(d.clone());
+            }
+            // Only the 1D norms come from the fp master. A 2D weight (any non-`*norm.weight`
+            // name — projections, embedding, lm_head) absent from the bundle must NOT silently
+            // fall back to fp: that would load a secretly-unquantized weight. Fail loudly.
+            if !name.ends_with("norm.weight") {
+                return Err(NnError::MissingTensor(format!(
+                    "`{name}` absent from the SALT bundle (a 2D weight must be quantized, not read fp)"
+                )));
+            }
+            let i = *loc
+                .get(name)
+                .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
+            views[i]
+                .tensor_f32(name)
+                .map_err(|e| NnError::MissingTensor(format!("{name}: {e}")))
+        };
+        // `exact_fp = false` ⇒ the A8 int8-activation `DenseLinear`. dequant-to-dense is
+        // *numerically* equivalent to the native multi-plane ternary GEMM (within the ~1e-4
+        // kernel tolerance) but not bit-identical — a CPU/eval path; the GPU native path (plan
+        // 0040) is the deployed one.
+        let weights = build_standard_model(&config, &spec, provider, false)?;
+        Ok((config, weights))
+    }
+}
+
+/// Assemble [`ModelWeights`] for a standard transformer from a single fp-weight `provider`
+/// (name → row-major `[n_out, k_in]` / `[len]` fp32) and an `exact_fp` flag (`true` ⇒ exact
+/// [`DenseLinear::new_exact`]; `false` ⇒ the A8 int8-activation path [`DenseLinear::new`]).
+/// Shared by [`ModelWeights::load_hf`] (exact-fp from safetensors) and `load_salt`
+/// (dequant-to-dense from a SALT bundle). 1D norms + the embedding come through `provider` too.
+fn build_standard_model(
+    config: &ModelConfig,
+    spec: &ArchSpec,
+    provider: impl Fn(&str) -> Result<Vec<f32>, NnError>,
+    exact_fp: bool,
+) -> Result<ModelWeights, NnError> {
+    let n_embd = config.n_embd as usize;
+    let head_dim = config.head_dim() as usize;
+    let q_width = config.n_head as usize * head_dim;
+    let kv_width = config.n_head_kv as usize * head_dim;
+    let n_ff = config.n_ff as usize;
+
+    let proj = |name: &str, n_out: usize, k_in: usize| -> Result<Projection, NnError> {
+        let w = provider(name)?;
+        let dl = if exact_fp {
+            DenseLinear::new_exact(w, n_out, k_in)?
+        } else {
+            DenseLinear::new(w, n_out, k_in)?
+        };
+        Ok(Projection::Dense(dl))
+    };
+
+    let token_embd = provider("model.embed_tokens.weight")?;
+    let vocab = token_embd.len() / n_embd;
+    let output_norm = provider("model.norm.weight")?;
+
+    let mut layers = Vec::with_capacity(config.n_layers as usize);
+    for i in 0..config.n_layers as usize {
+        let p = |s: &str| format!("model.layers.{i}.{s}");
+        let (gate, up, down) = (
+            proj(&p("mlp.gate_proj.weight"), n_ff, n_embd)?,
+            proj(&p("mlp.up_proj.weight"), n_ff, n_embd)?,
+            proj(&p("mlp.down_proj.weight"), n_embd, n_ff)?,
+        );
+        let mlp = match spec.mlp {
+            MlpKind::SwiGlu => Mlp::SwiGlu(SwiGluMlp { gate, up, down }),
+            MlpKind::Relu2 => Mlp::Relu2(Relu2Mlp {
+                gate,
+                up,
+                down,
+                ffn_sub_norm: Vec::new(),
+                rms_eps: config.rms_eps,
+            }),
+        };
+        layers.push(TransformerBlock {
+            attn_norm: provider(&p("input_layernorm.weight"))?,
+            q_proj: proj(&p("self_attn.q_proj.weight"), q_width, n_embd)?,
+            k_proj: proj(&p("self_attn.k_proj.weight"), kv_width, n_embd)?,
+            v_proj: proj(&p("self_attn.v_proj.weight"), kv_width, n_embd)?,
+            o_proj: proj(&p("self_attn.o_proj.weight"), n_embd, q_width)?,
+            // Standard transformer: no BitNet sub-norm.
+            attn_sub_norm: Vec::new(),
+            ffn_norm: provider(&p("post_attention_layernorm.weight"))?,
+            mlp,
+        });
+    }
+
+    // Untied lm_head when the config says so; else tie to the embedding.
+    let lm_head = if spec.tied_embeddings {
+        None
+    } else {
+        Some(proj("lm_head.weight", vocab, n_embd)?)
+    };
+
+    Ok(ModelWeights {
+        token_embd,
+        vocab,
+        n_embd,
+        layers,
+        output_norm,
+        lm_head,
+    })
 }
 
 /// Resolve a model directory to its safetensors shard files, in deterministic order:
@@ -294,5 +407,124 @@ mod tests {
         assert_eq!(l0.q_proj.k_in(), n_embd);
         assert_eq!(l0.k_proj.n_out(), kw);
         assert!(l0.attn_sub_norm.is_empty(), "standard ⇒ no attn_sub_norm");
+    }
+
+    #[test]
+    fn load_salt_dequants_bundle_and_runs() {
+        use crate::{ModelRunner, Projection};
+        use tritium_format::{SaltRow, salt_rows_to_dense, write_salt_bundle};
+        use tritium_quantize::{QuantConfig, quantize_tensor};
+
+        let (n_embd, n_head, n_kv, n_ff, vocab) = (8usize, 2usize, 1usize, 16usize, 10usize);
+        let hd = n_embd / n_head;
+        let (qw, kw) = (n_head * hd, n_kv * hd);
+        let fill = |n: usize| {
+            (0..n)
+                .map(|i| (i as f32 * 0.017).sin() * 0.5)
+                .collect::<Vec<f32>>()
+        };
+        // The 2D weights SALT quantizes: (name, n_out, k_in).
+        let w2d: Vec<(&str, usize, usize)> = vec![
+            ("model.embed_tokens.weight", vocab, n_embd),
+            ("model.layers.0.self_attn.q_proj.weight", qw, n_embd),
+            ("model.layers.0.self_attn.k_proj.weight", kw, n_embd),
+            ("model.layers.0.self_attn.v_proj.weight", kw, n_embd),
+            ("model.layers.0.self_attn.o_proj.weight", n_embd, qw),
+            ("model.layers.0.mlp.gate_proj.weight", n_ff, n_embd),
+            ("model.layers.0.mlp.up_proj.weight", n_ff, n_embd),
+            ("model.layers.0.mlp.down_proj.weight", n_embd, n_ff),
+        ];
+        let norms = [
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+        ];
+
+        // Original fp safetensors (2D weights + 1D norms).
+        let mut st: Vec<(&str, Vec<usize>, Vec<f32>)> = Vec::new();
+        for &(n, no, ki) in &w2d {
+            st.push((n, vec![no, ki], fill(no * ki)));
+        }
+        for &n in &norms {
+            st.push((n, vec![n_embd], fill(n_embd)));
+        }
+        let refs: Vec<(&str, &[usize], Vec<f32>)> = st
+            .iter()
+            .map(|(n, s, v)| (*n, s.as_slice(), v.clone()))
+            .collect();
+
+        let dir = std::env::temp_dir().join(format!("tritium-salt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), safetensors(&refs)).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"num_key_value_heads":1,"intermediate_size":16,
+                "rms_norm_eps":1e-5,"hidden_act":"silu","tie_word_embeddings":true,
+                "rope_theta":10000.0}"#,
+        )
+        .unwrap();
+
+        // SALT-quantize each 2D weight → a bundle.
+        let cfg = QuantConfig {
+            budget_bpw: 2.0,
+            ..Default::default()
+        };
+        let salt: Vec<(String, Vec<SaltRow>)> = w2d
+            .iter()
+            .map(|&(n, no, ki)| {
+                let w = &st.iter().find(|(t, _, _)| *t == n).unwrap().2;
+                (
+                    n.to_owned(),
+                    quantize_tensor(w, no, ki, &cfg).unwrap().salt_rows,
+                )
+            })
+            .collect();
+        let bundle_refs: Vec<(&str, &[SaltRow])> = salt
+            .iter()
+            .map(|(n, r)| (n.as_str(), r.as_slice()))
+            .collect();
+        let bundle_path = dir.join("model.tslb");
+        std::fs::write(&bundle_path, write_salt_bundle(&bundle_refs).unwrap()).unwrap();
+
+        // Load via from_salt and run.
+        let backend = Box::new(tritium_cpu::CpuBackend::new());
+        let mut runner = ModelRunner::from_salt(&dir, &bundle_path, backend).expect("from_salt");
+
+        // Wiring: the loaded q_proj weights equal the bundle's dequant (bundle → read → dequant).
+        let q = "model.layers.0.self_attn.q_proj.weight";
+        let q_expect = salt_rows_to_dense(&salt.iter().find(|(n, _)| n == q).unwrap().1).unwrap();
+        match &runner.weights.layers[0].q_proj {
+            Projection::Dense(d) => assert_eq!(d.weights, q_expect, "q_proj = bundle dequant"),
+            Projection::Ternary(_) => panic!("expected a Dense (dequant-to-dense) projection"),
+        }
+        assert!(runner.weights.lm_head.is_none(), "tied ⇒ no lm_head");
+
+        // Runs: a forward yields finite, vocab-length logits.
+        let logits = runner.forward(&[0u32], &[0]).expect("forward");
+        assert_eq!(logits.len(), vocab);
+        assert!(
+            logits.iter().all(|x| x.is_finite()),
+            "logits must be finite"
+        );
+
+        // Negative: a bundle MISSING a 2D weight must error — never silently load the fp master.
+        let partial: Vec<(&str, &[SaltRow])> = salt
+            .iter()
+            .filter(|(n, _)| !n.ends_with("q_proj.weight"))
+            .map(|(n, r)| (n.as_str(), r.as_slice()))
+            .collect();
+        let partial_path = dir.join("partial.tslb");
+        std::fs::write(&partial_path, write_salt_bundle(&partial).unwrap()).unwrap();
+        let err = ModelWeights::load_salt(&dir, &partial_path)
+            .err()
+            .expect("load_salt must error on a missing 2D weight");
+        assert!(
+            matches!(err, crate::NnError::MissingTensor(_)),
+            "missing 2D weight must error, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

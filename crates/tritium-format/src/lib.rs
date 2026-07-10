@@ -67,7 +67,7 @@ pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unp
 pub use safetensors::{SafeTensors, SafeTensorsError, read_safetensors};
 pub use salt::{
     SALT_HEADER_BYTES, SALT_MAGIC, SALT_VERSION, SaltRow, dequant_salt_row, pack_salt_row,
-    read_legacy_as_salt, unpack_salt_row,
+    read_legacy_as_salt, salt_rows_to_dense, unpack_salt_row,
 };
 pub use salt_bundle::{
     SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltTensor, read_salt_bundle, write_salt_bundle,

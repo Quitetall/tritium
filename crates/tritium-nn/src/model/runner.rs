@@ -144,6 +144,20 @@ impl ModelRunner {
         Ok(Self::from_weights(config, weights, backend))
     }
 
+    /// Load a **SALT-quantized** model: ternary 2D weights from `bundle` (dequant-to-dense),
+    /// norms + `config.json` from `model_dir`. See [`ModelWeights::load_salt`].
+    ///
+    /// # Errors
+    /// Propagates [`ModelWeights::load_salt`] errors.
+    pub fn from_salt(
+        model_dir: &Path,
+        bundle: &Path,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Self, NnError> {
+        let (config, weights) = ModelWeights::load_salt(model_dir, bundle)?;
+        Ok(Self::from_weights(config, weights, backend))
+    }
+
     /// (cuda) Borrow the lazily-built device-resident decoder, building it first if
     /// needed (returns `None` on a non-CUDA backend). Advanced/test access — it exposes
     /// the M=1 graph decode + the batched (M=N) `decode_batch` path directly.
