@@ -2196,7 +2196,8 @@ __device__ __forceinline__ void kv_quant_row_q8(const float* __restrict__ src_ro
 
 // ─── Ternary KV experiment ("KVTQ", ADR 0020 rung 3) — values quantize to
 // {-s, 0, +s} per KV_QGROUP group and ride the SAME i8 lattice + scale arena
-// as rung 2 (code = trit·127, scale = s/127 → dequant = trit·s exactly), so
+// as rung 2 (code = trit·127, scale = fl(s/127) → dequant = trit·fl(s/127),
+// within a ulp of trit·s), so
 // the attention kernels are the unmodified _q8 ones; only the append rounding
 // differs. Level s = 1.5·(group absmean) with threshold s/2 — near the
 // MSE-optimal 3-level quantizer for zero-mean Gaussian data (level ≈ 1.53·E|v|).
@@ -2204,7 +2205,11 @@ __device__ __forceinline__ void kv_quant_row_t2(const float* __restrict__ src_ro
                                                 signed char* __restrict__ dst_row,
                                                 float* __restrict__ sc_row,
                                                 const int kv_width) {
-  __shared__ float s_sum[64]; // group Σ|v| (kv_width ≤ 64·KV_QGROUP, build-guarded)
+  // group Σ|v| — NOTE: float atomicAdd is order-nondeterministic, so t2
+  // appends are not bit-reproducible run-to-run (near-threshold trits can
+  // flip); acceptable for the rejected-experiment harness. kv_width ≤
+  // 64·KV_QGROUP is build-guarded.
+  __shared__ float s_sum[64];
   const int n_groups = kv_width / KV_QGROUP;
   for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
     s_sum[g] = 0.0f;

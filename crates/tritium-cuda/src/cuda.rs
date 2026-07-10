@@ -6205,6 +6205,13 @@ impl CudaDecodeModel {
                 batch.max_ctx.min(self.max_ctx)
             )));
         }
+        if len > self.cache_len {
+            return Err(BackendError::InvalidInput(format!(
+                "copy_kv_into_batch_row: len {len} > cache_len {} — prefill the \
+                 prompt through the single-sequence path first",
+                self.cache_len
+            )));
+        }
         let s = &self.stream;
         let bytes = len * self.kv_width * 4;
         for li in 0..self.layers.len() {
@@ -6228,11 +6235,10 @@ impl CudaDecodeModel {
                 drop(dg);
             }
         }
-        // The next batched step replays on the CAPTURE stream; the adopt
-        // copies ran on the default stream. Synchronize so a mid-flight
-        // admission's rows are visible before the pool steps again (the
-        // first-ever step is accidentally safe — graph capture syncs both
-        // streams — but replays don't).
+        // Belt-and-braces ordering: decode_batch_graph's replay already
+        // syncs the default stream first, so this is redundant for the
+        // current caller — kept so future capture-stream consumers can't
+        // read a half-landed adoption.
         s.synchronize()
             .map_err(|e| driver_err("batch row adopt sync", &e))?;
         Ok(())
@@ -9412,7 +9418,7 @@ impl BatchKv {
 
     /// Per-sequence positions (the number of tokens each sequence has decoded).
     /// Set one sequence slot's position (continuous-batching admission: the
-    /// slot's KV rows `[0, pos)` must already hold that sequence's cache —
+    /// slot's KV rows `[0, pos)` must already hold that sequence's cache;
     /// see [`CudaDecodeModel::copy_kv_into_batch_row`]).
     ///
     /// # Errors
@@ -9435,6 +9441,8 @@ impl BatchKv {
         Ok(())
     }
 
+    /// Per-sequence positions (the next KV write slot of each sequence).
+    #[must_use]
     pub fn positions(&self) -> &[usize] {
         &self.positions
     }

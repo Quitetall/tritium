@@ -30,6 +30,10 @@ struct Active {
     /// The last sampled token — fed to the model on the next step.
     last_token: u32,
     /// Per-request draw counter (salts the deterministic sampler stream).
+    /// NOTE: the batched sampler stream (splitmix64 over (seed, salt)) is
+    /// distribution-equal but NOT stream-equal to the single-request path's
+    /// `seed + step` derivation — the same seed reproduces within a mode,
+    /// not across modes.
     salt: u64,
 }
 
@@ -99,6 +103,14 @@ pub(crate) fn run_batched(
     slots: usize,
     mut job_rx: mpsc::Receiver<Job>,
 ) {
+    if slots == 0 {
+        eprintln!("tritium-serve: --batch-slots must be >= 1");
+        return;
+    }
+    // Phase-1 fairness note: instantly-retiring jobs (errors, dead channels,
+    // tree 501s) don't occupy a slot, so a sustained flood of them can starve
+    // stepping — bounded by the queue cap per burst, not per second. A
+    // per-iteration admission cap is the phase-2 fix if it bites.
     let n_ctx = runner.config.n_ctx as usize;
     // Build the resident decoder + the slot pool up front; failures here are
     // fatal for the worker (the router will see a closed queue → 503s).

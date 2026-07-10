@@ -88,14 +88,28 @@ pub fn build_router_batched(
     cfg: ServeConfig,
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     use std::sync::atomic::Ordering;
+    if slots == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--batch-slots must be >= 1",
+        ));
+    }
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel(cfg.queue_cap);
     let worker_alive = Arc::new(AtomicBool::new(true));
     let alive = worker_alive.clone();
     std::thread::Builder::new()
         .name("tritium-serve-batch".into())
         .spawn(move || {
+            // Drop guard: liveness flips false even if the loop panics
+            // (mirrors the single worker's AliveGuard).
+            struct Guard(Arc<AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _guard = Guard(alive);
             crate::batch::run_batched(runner, eos, slots, jobs_rx);
-            alive.store(false, Ordering::SeqCst);
         })?;
     let draining = Arc::new(AtomicBool::new(false));
     Ok(build_router_inner(
