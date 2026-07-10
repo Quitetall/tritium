@@ -8,5 +8,6 @@ pub mod loss;
 pub mod matmul;
 pub mod norm;
 pub mod rope;
+pub mod shape;
 pub mod softmax;
 pub mod ste;

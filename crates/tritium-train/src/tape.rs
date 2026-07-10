@@ -13,7 +13,7 @@
 //! the `ste` module). The graph this tape differentiates is therefore the smooth
 //! surrogate model; `round` is a forward-only QAT detail layered on later (ADR 0007).
 
-use crate::ops::{act, bias, dense, elementwise, loss, matmul, norm, rope, softmax, ste};
+use crate::ops::{act, bias, dense, elementwise, loss, matmul, norm, rope, shape, softmax, ste};
 
 /// Index of a value buffer in a [`Tape`]'s arena.
 pub type ValueId = usize;
@@ -183,6 +183,50 @@ impl Tape {
                 let gs = dense::transpose_vjp(rows, cols, g);
                 for (j, &v) in gs[0].iter().enumerate() {
                     grads[ids[0]][j] += v;
+                }
+            }),
+        )
+    }
+
+    /// Extract a contiguous column range `[rows, len]` (cols `start..start+len`) from a
+    /// `[rows, cols]` matrix. The multi-head/GQA reshape that splits a projection into per-head
+    /// slices (plan 0040).
+    pub fn slice_cols(
+        &mut self,
+        x: ValueId,
+        rows: usize,
+        cols: usize,
+        start: usize,
+        len: usize,
+    ) -> ValueId {
+        let out = shape::slice_cols_forward(&self.values[x], rows, cols, start, len);
+        self.record(
+            vec![x],
+            out,
+            Box::new(move |_ins, g, grads, ids| {
+                let gx = shape::slice_cols_vjp(rows, cols, start, len, g);
+                for (j, &v) in gx.iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
+        )
+    }
+
+    /// Concatenate `parts` (each `[rows, lens[i]]`) along columns → `[rows, Σ lens]`. Reassembles
+    /// per-head attention outputs (plan 0040). `parts.len()` must equal `lens.len()`.
+    pub fn concat_cols(&mut self, parts: &[ValueId], rows: usize, lens: &[usize]) -> ValueId {
+        let bufs: Vec<&[f32]> = parts.iter().map(|&p| self.values[p].as_slice()).collect();
+        let out = shape::concat_cols_forward(&bufs, rows, lens);
+        let lens = lens.to_vec();
+        self.record(
+            parts.to_vec(),
+            out,
+            Box::new(move |_ins, g, grads, ids| {
+                let gs = shape::concat_cols_vjp(rows, &lens, g);
+                for (i, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[i]][j] += v;
+                    }
                 }
             }),
         )
