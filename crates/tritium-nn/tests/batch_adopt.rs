@@ -45,3 +45,49 @@ fn adopt_copy_is_bit_exact() {
     }
     println!("adoption copy bit-exact: 30 layers x 26 rows x K/V");
 }
+
+/// A capture that fails mid-body must not poison the capture stream: the
+/// next graph capture + replay (and everything after) has to work.
+#[test]
+fn failed_capture_does_not_poison_the_stream() {
+    if !Path::new(GGUF_PATH).exists() {
+        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+        return;
+    }
+    let bytes = std::fs::read(GGUF_PATH).expect("read");
+    let file = tritium_format::read_gguf(&bytes).expect("parse");
+    let init = tritium_runtime::BACKENDS
+        .iter()
+        .find(|e| e.name == "cuda")
+        .expect("cuda")
+        .init;
+    let Ok(backend) = init() else { return };
+    let mut runner = tritium_nn::ModelRunner::load(&file, &bytes, backend).expect("load");
+    let prompt = [128000u32, 791, 6864, 315, 9822, 374];
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+
+    // Inject a failed capture BEFORE the decode graph exists, then decode:
+    // graph capture + replay must succeed on the recovered stream.
+    {
+        let rm = runner.resident_cuda().expect("r").expect("c");
+        rm.debug_fail_capture().expect("injected failure handled");
+    }
+    let logits = runner.forward(&prompt, &positions).expect("prefill");
+    let t0 = tritium_nn::sample_greedy(&logits).expect("token");
+    let logits = runner
+        .forward(&[t0], &[prompt.len()])
+        .expect("step_graph after failed capture");
+    let _ = tritium_nn::sample_greedy(&logits).expect("token");
+
+    // And again with the graph already captured (replay path).
+    {
+        let rm = runner.resident_cuda().expect("r").expect("c");
+        rm.debug_fail_capture()
+            .expect("second injected failure handled");
+    }
+    let logits = runner
+        .forward(&[t0], &[prompt.len() + 1])
+        .expect("step_graph after second failed capture");
+    let _ = tritium_nn::sample_greedy(&logits).expect("token");
+    println!("stream survived two injected capture failures");
+}

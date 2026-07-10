@@ -359,6 +359,28 @@ impl std::ops::Deref for SendGraph {
 /// at or below the default is legal and free. A device that cannot grant the
 /// request (context_length past its opt-in shared limit, ≈ 25K on Ada) surfaces
 /// HERE as an actionable model-build error, not a launch failure mid-decode.
+/// Run a graph-capture body; on error, TERMINATE the capture (best-effort)
+/// before propagating. Without this, a mid-capture failure leaves the capture
+/// stream in capture mode and every later operation on it fails with
+/// confusing `STREAM_CAPTURE_*` errors (reviewer-accepted deferred item from
+/// three capture sites; fixed for all of them here).
+fn capture_body<T>(
+    s: &Arc<CudaStream>,
+    body: impl FnOnce() -> Result<T, BackendError>,
+) -> Result<T, BackendError> {
+    match body() {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // End the wedged capture; any partial graph is dropped. The
+            // primary error wins over secondary termination errors.
+            let _ = s.end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            );
+            Err(e)
+        }
+    }
+}
+
 fn attn_shared_opt_in(
     max_ctx: usize,
     set: impl FnOnce(i32) -> Result<(), DriverError>,
@@ -6104,6 +6126,27 @@ impl CudaDecodeModel {
         self.tree_promote(path)
     }
 
+    /// Debug/test access: start a capture on the capture stream and fail it
+    /// through [`capture_body`] — exercises the mid-capture error recovery
+    /// (the stream must be usable afterwards).
+    #[doc(hidden)]
+    pub fn debug_fail_capture(&mut self) -> Result<(), BackendError> {
+        let s = &self.cap_stream;
+        s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|e| driver_err("debug begin_capture", &e))?;
+        let r: Result<(), BackendError> = capture_body(s, || {
+            Err(BackendError::InvalidInput(
+                "injected capture failure".into(),
+            ))
+        });
+        match r {
+            Err(_) => Ok(()), // the injected error propagated; capture terminated
+            Ok(()) => Err(BackendError::Backend(
+                "debug_fail_capture: injected error vanished".into(),
+            )),
+        }
+    }
+
     /// Debug/test access: dtoh one K/V row of the single-sequence arena (bytes).
     #[doc(hidden)]
     pub fn debug_kv_row(&self, li: usize, row: usize, v: bool) -> Result<Vec<u8>, BackendError> {
@@ -7762,43 +7805,46 @@ impl CudaDecodeModel {
         s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| driver_err("tree begin_capture", &e))?;
 
-        self.gb_embed(d_token_embd, d_tok, d_x, mb)?;
-        for lp in &layers {
-            self.gb_rmsnorm(d_x, lp.attn_norm, n_embd, d_normed, mb)?;
-            self.gb_quant(d_normed, n_embd, d_qact, d_act_scale, mb)?;
-            self.gb_matmul(&lp.q, d_qact, d_act_scale, d_q, mb)?;
-            self.gb_matmul(&lp.k, d_qact, d_act_scale, d_k, mb)?;
-            self.gb_matmul(&lp.v, d_qact, d_act_scale, d_v, mb)?;
-            self.gb_rope(d_q, d_cos, d_sin, d_pos, n_head, head_dim, mb)?;
-            self.gb_rope(d_k, d_cos, d_sin, d_pos, n_head_kv, head_dim, mb)?;
-            kv_append(d_k, lp.kv_k)?;
-            kv_append(d_v, lp.kv_v)?;
-            attn(lp.kv_k, lp.kv_v)?;
-            let attn_in = if let Some(sn) = lp.attn_sub_norm {
-                self.gb_rmsnorm(d_attn, sn, q_width, d_attn_sn, mb)?;
-                d_attn_sn
-            } else {
-                d_attn
-            };
-            self.gb_quant(attn_in, q_width, d_qact, d_act_scale, mb)?;
-            self.gb_matmul(&lp.o, d_qact, d_act_scale, d_proj, mb)?;
-            self.gb_residual(d_x, d_proj, mb * n_embd)?;
+        capture_body(s, || {
+            self.gb_embed(d_token_embd, d_tok, d_x, mb)?;
+            for lp in &layers {
+                self.gb_rmsnorm(d_x, lp.attn_norm, n_embd, d_normed, mb)?;
+                self.gb_quant(d_normed, n_embd, d_qact, d_act_scale, mb)?;
+                self.gb_matmul(&lp.q, d_qact, d_act_scale, d_q, mb)?;
+                self.gb_matmul(&lp.k, d_qact, d_act_scale, d_k, mb)?;
+                self.gb_matmul(&lp.v, d_qact, d_act_scale, d_v, mb)?;
+                self.gb_rope(d_q, d_cos, d_sin, d_pos, n_head, head_dim, mb)?;
+                self.gb_rope(d_k, d_cos, d_sin, d_pos, n_head_kv, head_dim, mb)?;
+                kv_append(d_k, lp.kv_k)?;
+                kv_append(d_v, lp.kv_v)?;
+                attn(lp.kv_k, lp.kv_v)?;
+                let attn_in = if let Some(sn) = lp.attn_sub_norm {
+                    self.gb_rmsnorm(d_attn, sn, q_width, d_attn_sn, mb)?;
+                    d_attn_sn
+                } else {
+                    d_attn
+                };
+                self.gb_quant(attn_in, q_width, d_qact, d_act_scale, mb)?;
+                self.gb_matmul(&lp.o, d_qact, d_act_scale, d_proj, mb)?;
+                self.gb_residual(d_x, d_proj, mb * n_embd)?;
 
-            self.gb_rmsnorm(d_x, lp.ffn_norm, n_embd, d_normed, mb)?;
-            self.gb_quant(d_normed, n_embd, d_qact, d_act_scale, mb)?;
-            self.gb_matmul(&lp.gate, d_qact, d_act_scale, d_gate, mb)?;
-            self.gb_matmul(&lp.up, d_qact, d_act_scale, d_up, mb)?;
-            self.gb_relu2(d_gate, d_up, mb * n_ff)?;
-            let down_in = if let Some(sn) = lp.ffn_sub_norm {
-                self.gb_rmsnorm(d_gate, sn, n_ff, d_gate_sn, mb)?;
-                d_gate_sn
-            } else {
-                d_gate
-            };
-            self.gb_quant(down_in, n_ff, d_qact, d_act_scale, mb)?;
-            self.gb_matmul(&lp.down, d_qact, d_act_scale, d_proj, mb)?;
-            self.gb_residual(d_x, d_proj, mb * n_embd)?;
-        }
+                self.gb_rmsnorm(d_x, lp.ffn_norm, n_embd, d_normed, mb)?;
+                self.gb_quant(d_normed, n_embd, d_qact, d_act_scale, mb)?;
+                self.gb_matmul(&lp.gate, d_qact, d_act_scale, d_gate, mb)?;
+                self.gb_matmul(&lp.up, d_qact, d_act_scale, d_up, mb)?;
+                self.gb_relu2(d_gate, d_up, mb * n_ff)?;
+                let down_in = if let Some(sn) = lp.ffn_sub_norm {
+                    self.gb_rmsnorm(d_gate, sn, n_ff, d_gate_sn, mb)?;
+                    d_gate_sn
+                } else {
+                    d_gate
+                };
+                self.gb_quant(down_in, n_ff, d_qact, d_act_scale, mb)?;
+                self.gb_matmul(&lp.down, d_qact, d_act_scale, d_proj, mb)?;
+                self.gb_residual(d_x, d_proj, mb * n_embd)?;
+            }
+            Ok(())
+        })?;
 
         let graph = s
             .end_capture(
@@ -7895,18 +7941,21 @@ impl CudaDecodeModel {
         s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| driver_err("batch begin_capture", &e))?;
 
-        // The exact op order of `decode_batch`, all raw-launched on `cap_stream`.
-        self.gb_embed(p.d_token_embd, p.d_tokens, p.d_x, n)?;
-        for lp in &layers {
-            self.gb_layer(&p, lp, n)?;
-        }
-        self.gb_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed, n)?;
-        if with_head {
-            // Batched LM head over all n rows → d_logits_batch, then per-row greedy argmax →
-            // d_argmax. Both raw-launched into the capture; only d_argmax is read back.
-            self.gb_lm_head_batch(p.d_normed, p.d_token_embd_f16, p.d_logits_batch, n)?;
-            self.gb_argmax(p.d_logits_batch, p.d_argmax, n)?;
-        }
+        capture_body(s, || {
+            // The exact op order of `decode_batch`, all raw-launched on `cap_stream`.
+            self.gb_embed(p.d_token_embd, p.d_tokens, p.d_x, n)?;
+            for lp in &layers {
+                self.gb_layer(&p, lp, n)?;
+            }
+            self.gb_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed, n)?;
+            if with_head {
+                // Batched LM head over all n rows → d_logits_batch, then per-row greedy argmax →
+                // d_argmax. Both raw-launched into the capture; only d_argmax is read back.
+                self.gb_lm_head_batch(p.d_normed, p.d_token_embd_f16, p.d_logits_batch, n)?;
+                self.gb_argmax(p.d_logits_batch, p.d_argmax, n)?;
+            }
+            Ok(())
+        })?;
 
         let graph = s
             .end_capture(
@@ -8416,13 +8465,16 @@ impl CudaDecodeModel {
         s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| driver_err("decode begin_capture", &e))?;
 
-        // The exact op order of `step` + `layer`, all raw-launched on `cap_stream`.
-        self.g_embed(p.d_token_embd, p.d_ctrl, p.d_x)?;
-        for lp in &layers {
-            self.g_layer(&p, lp)?;
-        }
-        self.g_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed)?;
-        self.g_lm_head(p.d_normed, p.d_token_embd_f16, p.d_logits)?;
+        capture_body(s, || {
+            // The exact op order of `step` + `layer`, all raw-launched on `cap_stream`.
+            self.g_embed(p.d_token_embd, p.d_ctrl, p.d_x)?;
+            for lp in &layers {
+                self.g_layer(&p, lp)?;
+            }
+            self.g_rmsnorm(p.d_x, p.d_output_norm, self.n_embd, p.d_normed)?;
+            self.g_lm_head(p.d_normed, p.d_token_embd_f16, p.d_logits)?;
+            Ok(())
+        })?;
 
         let graph = s
             .end_capture(
