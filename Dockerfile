@@ -5,13 +5,15 @@
 # GBs and version independently of the server.
 #
 #   docker build -t tritium-serve .
-#   docker run --gpus all -p 8080:8080 -v ~/.cache/tritium-models:/models:ro \
+#   docker run --gpus all -p 127.0.0.1:8080:8080 -e TRITIUM_AUTH_TOKEN=change-me \
+#     -v ~/.cache/tritium-models:/models:ro \
 #     tritium-serve --model /models/<repo>/<file>.gguf --backend cuda
 #
 # CPU-only image (no GPU, no nvcc needed at runtime; build still uses the
 # devel base for simplicity):
 #   docker build --build-arg FEATURES=serve -t tritium-serve:cpu .
-#   docker run -p 8080:8080 -v ~/.cache/tritium-models:/models:ro \
+#   docker run -p 127.0.0.1:8080:8080 -e TRITIUM_AUTH_TOKEN=change-me \
+#     -v ~/.cache/tritium-models:/models:ro \
 #     tritium-serve:cpu --model /models/<...>.gguf --backend cpu
 #
 # Exposure note (threat model): binding 0.0.0.0 inside the container is
@@ -20,7 +22,6 @@
 # non-loopback binds without it, and the container entrypoint binds 0.0.0.0.
 
 ARG CUDA_TAG=13.0.1-devel-ubuntu24.04
-ARG CUDA_RUNTIME_TAG=13.0.1-runtime-ubuntu24.04
 
 FROM nvidia/cuda:${CUDA_TAG} AS build
 ARG FEATURES=cuda
@@ -37,15 +38,19 @@ RUN cargo build --release --locked -p tritium-serve --features ${FEATURES} \
         --bin tritium-serve \
     && cargo build --release --locked -p tritium-cli --bin tritium
 
-FROM nvidia/cuda:${CUDA_RUNTIME_TAG}
+# Plain ubuntu runtime: the CUDA build dlopens the DRIVER api at runtime
+# (cudarc fallback-dynamic-loading — no libcuda link dependency), and
+# `--gpus all` injects libcuda via the NVIDIA container toolkit. PTX is
+# compiled into the binary at build time, so no toolkit libs are needed.
+FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home tritium
 COPY --from=build /src/target/release/tritium-serve /usr/local/bin/
 COPY --from=build /src/target/release/tritium /usr/local/bin/
-USER tritium
 VOLUME /models
+USER tritium
 EXPOSE 8080
 # 0.0.0.0 inside the container: docker's -p mapping decides real exposure.
 # TRITIUM_AUTH_TOKEN must be set (the server enforces this for non-loopback).

@@ -94,18 +94,70 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
     }
 
     let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{filename}");
-    let part = dest.with_extension("gguf.part");
-    let have = part.metadata().map(|m| m.len()).unwrap_or(0);
+    // NOT with_extension (it would replace a non-.gguf final extension and
+    // collide same-stem files): always append.
+    let file_name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("model");
+    let part = dir.join(format!("{file_name}.part"));
+    // Sidecar recording the upstream validator: "<etag> <total_bytes>".
+    // Resume without it is a splice hazard (old-file prefix + new-file
+    // tail both parse as GGUF and serve garbage), so no meta = restart.
+    let meta_path = dir.join(format!("{file_name}.part.meta"));
+    let meta: Option<(String, u64)> = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|m| {
+            let (etag, total) = m.trim().rsplit_once(' ')?;
+            Some((etag.to_owned(), total.parse().ok()?))
+        });
+    let have = match (&meta, part.metadata().map(|m| m.len())) {
+        (Some(_), Ok(len)) => len,
+        _ => 0, // no validator (or no .part): restart from scratch
+    };
+    if let Some((_, total)) = &meta
+        && have == *total
+        && have > 0
+    {
+        // Complete but unpromoted (died between EOF and rename): promote.
+        std::fs::rename(&part, &dest)
+            .with_context(|| format!("renaming into {}", dest.display()))?;
+        let _ = std::fs::remove_file(&meta_path);
+        eprintln!("pulled {} (recovered complete download)", dest.display());
+        print_next_steps(&dest);
+        return Ok(());
+    }
 
     eprintln!("pulling {url}");
-    let mut req = ureq::get(&url);
-    if have > 0 {
+    let mut req = ureq::get(&url)
+        .config()
+        // Handle 416 ourselves instead of erroring in .call().
+        .http_status_as_error(false)
+        .build();
+    // Gated repos: HF_TOKEN if present. ureq strips Authorization on
+    // redirect, so the token never leaks to the CDN host (HF's design).
+    if let Ok(token) = std::env::var("HF_TOKEN")
+        && !token.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    if have > 0
+        && let Some((etag, _)) = &meta
+    {
         eprintln!("resuming at {} MiB", have / (1024 * 1024));
-        req = req.header("Range", format!("bytes={have}-"));
+        req = req
+            .header("Range", format!("bytes={have}-"))
+            // If upstream changed since the .part was written, the server
+            // answers 200 with the full new file (never splices).
+            .header("If-Range", etag);
     }
     let mut resp = req.call().with_context(|| format!("GET {url}"))?;
     let status = resp.status();
-    // 206 = resuming; 200 = server ignored Range (or fresh start) → truncate.
+    let etag = resp
+        .headers()
+        .get("ETag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_owned();
+    // 206 = validated resume; 200 = fresh start or upstream changed →
+    // truncate; 416 with a matching validator = nothing left to fetch.
     let (mut out, mut done) = if status == 206 && have > 0 {
         let f = std::fs::OpenOptions::new()
             .append(true)
@@ -116,8 +168,15 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
         let f = std::fs::File::create(&part)
             .with_context(|| format!("creating {}", part.display()))?;
         (f, 0)
+    } else if status == 416 {
+        // If-Range guarantees a changed file comes back as 200, so a 416
+        // means our range start >= total for the SAME file — stale state
+        // beyond recovery; clear it and ask for a re-run.
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&meta_path);
+        bail!("range not satisfiable — cleared stale partial state, re-run to restart");
     } else {
-        bail!("GET {url} -> HTTP {status}");
+        bail!("GET {url} -> HTTP {status} (gated repo? set HF_TOKEN)");
     };
     let total = resp
         .headers()
@@ -125,6 +184,10 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .map(|len| len + done);
+    if let Some(total) = total {
+        std::fs::write(&meta_path, format!("{etag} {total}"))
+            .with_context(|| format!("writing {}", meta_path.display()))?;
+    }
 
     let mut reader = resp.body_mut().with_config().limit(u64::MAX).reader();
     let mut buf = vec![0u8; 1 << 20];
@@ -160,6 +223,7 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
     }
     std::fs::rename(&part, &dest)
         .with_context(|| format!("renaming into {}", dest.display()))?;
+    let _ = std::fs::remove_file(&meta_path);
     eprintln!("pulled {}", dest.display());
     print_next_steps(&dest);
     Ok(())

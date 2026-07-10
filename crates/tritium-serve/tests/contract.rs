@@ -831,10 +831,10 @@ async fn metrics_exposition() {
     let (status, body) = send(&router, req).await;
     assert_eq!(status, StatusCode::OK);
     let text = String::from_utf8(body).unwrap();
-    assert!(text.contains("tritium_chat_requests_total 2"), "{text}");
-    assert!(text.contains("tritium_tokens_out_total 6"), "{text}");
-    assert!(text.contains("tritium_queue_rejections_total 0"), "{text}");
-    assert!(text.contains("tritium_worker_alive 1"), "{text}");
+    assert!(text.contains("tritium_chat_requests_total 2\n"), "{text}");
+    assert!(text.contains("tritium_tokens_out_total 6\n"), "{text}");
+    assert!(text.contains("tritium_queue_rejections_total 0\n"), "{text}");
+    assert!(text.contains("tritium_worker_alive 1\n"), "{text}");
     assert!(text.contains("# TYPE tritium_queue_depth gauge"), "{text}");
 
     // Auth uniformity: with a token configured, /metrics 401s like the rest.

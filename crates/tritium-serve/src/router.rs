@@ -545,6 +545,7 @@ fn stream_response(
 ) -> Response {
     let id = make_id();
     let created = now_secs();
+    let detok_eos = tok.eos();
     let stream = async_stream::stream! {
         // 1. role-first chunk
         yield Ok::<Event, std::convert::Infallible>(sse_data(&role_chunk(&id, created, &model)));
@@ -558,7 +559,11 @@ fn stream_response(
         while let Some(ev) = rx.recv().await {
             match ev {
                 GenEvent::Token(t) => {
-                    metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
+                    // Count like the non-stream path: eos terminates, it is
+                    // not an emitted completion token.
+                    if t != detok_eos {
+                        metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
+                    }
                     let text = detok.push(t);
                     if !text.is_empty() {
                         let (emit, hit) = matcher.feed(&text);
