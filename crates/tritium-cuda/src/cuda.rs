@@ -347,18 +347,6 @@ impl std::ops::Deref for SendGraph {
     }
 }
 
-/// Opt the warp-attention kernel into `max_ctx * 4` dynamic shared bytes via
-/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. `set` applies the attribute
-/// to the caller's function handle (safe `CudaFunction` or raw `CUfunction` — both
-/// launch the same kernel; a fresh JIT of the module needs its own opt-in).
-///
-/// Set UNCONDITIONALLY, not only above the 48 KiB default cap: the default
-/// dynamic budget is 48 KiB *minus the kernel's static shared* (its `__shared__
-/// float s_inv` rounds up to 16 B), so a threshold check would leave the
-/// boundary `max_ctx` values (12285..=12288) failing at launch. Setting a value
-/// at or below the default is legal and free. A device that cannot grant the
-/// request (context_length past its opt-in shared limit, ≈ 25K on Ada) surfaces
-/// HERE as an actionable model-build error, not a launch failure mid-decode.
 /// Run a graph-capture body; on error, TERMINATE the capture (best-effort)
 /// before propagating. Without this, a mid-capture failure leaves the capture
 /// stream in capture mode and every later operation on it fails with
@@ -381,6 +369,18 @@ fn capture_body<T>(
     }
 }
 
+/// Opt the warp-attention kernel into `max_ctx * 4` dynamic shared bytes via
+/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. `set` applies the attribute
+/// to the caller's function handle (safe `CudaFunction` or raw `CUfunction` — both
+/// launch the same kernel; a fresh JIT of the module needs its own opt-in).
+///
+/// Set UNCONDITIONALLY, not only above the 48 KiB default cap: the default
+/// dynamic budget is 48 KiB *minus the kernel's static shared* (its `__shared__
+/// float s_inv` rounds up to 16 B), so a threshold check would leave the
+/// boundary `max_ctx` values (12285..=12288) failing at launch. Setting a value
+/// at or below the default is legal and free. A device that cannot grant the
+/// request (context_length past its opt-in shared limit, ≈ 25K on Ada) surfaces
+/// HERE as an actionable model-build error, not a launch failure mid-decode.
 fn attn_shared_opt_in(
     max_ctx: usize,
     set: impl FnOnce(i32) -> Result<(), DriverError>,
@@ -6141,9 +6141,17 @@ impl CudaDecodeModel {
         });
         match r {
             Err(_) => Ok(()), // the injected error propagated; capture terminated
-            Ok(()) => Err(BackendError::Backend(
-                "debug_fail_capture: injected error vanished".into(),
-            )),
+            Ok(()) => {
+                // Unreachable with the hardcoded Err body, but end the capture
+                // anyway so even a misuse of this debug hook can't wedge the
+                // stream.
+                let _ = s.end_capture(
+                    sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                );
+                Err(BackendError::Backend(
+                    "debug_fail_capture: injected error vanished".into(),
+                ))
+            }
         }
     }
 

@@ -7,8 +7,19 @@ use std::path::Path;
 const GGUF_PATH: &str =
     "/home/brianklam/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf";
 
+/// Both tests here load a full model (~2.5 GB VRAM) — serialize them within
+/// this binary (same OOM-flake pattern the acceptance suite guards against).
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+    GPU_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn adopt_copy_is_bit_exact() {
+    let _gpu = gpu_serial();
     if !Path::new(GGUF_PATH).exists() {
         eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
         return;
@@ -50,6 +61,7 @@ fn adopt_copy_is_bit_exact() {
 /// next graph capture + replay (and everything after) has to work.
 #[test]
 fn failed_capture_does_not_poison_the_stream() {
+    let _gpu = gpu_serial();
     if !Path::new(GGUF_PATH).exists() {
         eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
         return;

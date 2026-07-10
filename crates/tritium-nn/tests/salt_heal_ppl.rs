@@ -227,34 +227,59 @@ fn salt_heal_recovers_smollm2_perplexity() {
     ptq.invalidate_resident();
     let ppl_ptq = perplexity(&mut ptq, &eval_ids);
 
-    // Mechanism gate: across EVERY layer's q/k/v, does the SALT-STE heal shrink the projection-
-    // OUTPUT error to the fp target vs plain SALT PTQ, on real weights driven by real activations?
+    // Locally-healed model: start from full PTQ, then replace q/k/v with the SALT-STE-healed
+    // reconstructions. As we heal each projection we (a) accumulate its calibration-set output
+    // error vs the fp target — the MECHANISM gate — and (b) install it into the model so we can
+    // measure whether a purely local q/k/v heal moves model-level ppl (it does not — o/gate/up/down
+    // stay PTQ and the compounding upstream damage dominates; that's the case for end-to-end).
+    let mut healed = ModelRunner::from_hf(&dir, cpu()).expect("from_hf");
+    ptq_in_place(&mut healed.weights);
     let (mut ptq_err, mut healed_err) = (0.0f64, 0.0f64);
     for (li, x) in attn_in.iter().enumerate() {
-        for (fp_w, n, k) in &fp_qkv[li] {
+        let b = &mut healed.weights.layers[li];
+        let projs: [&mut Projection; 3] = [&mut b.q_proj, &mut b.k_proj, &mut b.v_proj];
+        for (pi, p) in projs.into_iter().enumerate() {
+            let (fp_w, n, k) = &fp_qkv[li][pi];
             let fp_out = matmul(x, fp_w, seq, *n, *k);
             let ptq_out = matmul(x, &salt_quantize_forward(fp_w, *n, *k, T), seq, *n, *k);
-            let healed_out = matmul(x, &heal(fp_w, x, seq, *n, *k), seq, *n, *k);
+            let healed_w = heal(fp_w, x, seq, *n, *k);
+            let healed_out = matmul(x, &healed_w, seq, *n, *k);
             ptq_err += mse(&ptq_out, &fp_out);
             healed_err += mse(&healed_out, &fp_out);
+            set_dense(p, healed_w);
         }
     }
+    healed.invalidate_resident();
+    let ppl_healed = perplexity(&mut healed, &eval_ids);
     let recovered = 100.0 * (1.0 - healed_err / ptq_err);
 
     println!(
-        "SmolLM2-135M: fp ppl {ppl_fp:.3} | full-PTQ(T={T}) ppl {ppl_ptq:.3e} \
-         (catastrophic — a local heal can't fix the compounding; model-level recovery needs e2e). \
-         q/k/v output-error over all {n_layers} layers on real activations: \
-         PTQ {ptq_err:.4e} → healed {healed_err:.4e} ({recovered:.1}% recovered)"
+        "SmolLM2-135M: fp ppl {ppl_fp:.3} | full-PTQ(T={T}) ppl {ppl_ptq:.3e} | q/k/v-locally-healed ppl {ppl_healed:.3e}. \
+         q/k/v projection output-error vs fp target (in-sample, calibration = eval seq) over all {n_layers} layers: \
+         PTQ {ptq_err:.4e} → healed {healed_err:.4e} ({recovered:.1}% recovered). \
+         → the heal MECHANISM works on real weights, yet a local q/k/v heal leaves model ppl catastrophic: END-TO-END distillation is required (0038b)."
     );
 
+    // (1) PTQ degrades the model.
     assert!(
         ppl_ptq > ppl_fp,
         "PTQ must degrade ppl: {ppl_ptq} vs fp {ppl_fp}"
     );
+    // (2) MECHANISM gate: the SALT-STE heal shrinks the q/k/v projection output error ≥50% on real
+    // weights driven by their real calibration activations (in-sample fit — this gates that the
+    // STE-backward + AdamW loop actually learns; per-projection generalization is carried by the
+    // atomic salt_distill.rs test).
     assert!(
         healed_err < 0.5 * ptq_err,
-        "SALT-STE heal must recover ≥50% of the q/k/v output error on real weights: healed {healed_err:.4e} vs PTQ {ptq_err:.4e}"
+        "SALT-STE heal must recover ≥50% of the q/k/v output error: healed {healed_err:.4e} vs PTQ {ptq_err:.4e}"
+    );
+    // (3) FINDING (the load-bearing claim, now demonstrated not just narrated): a purely local
+    // q/k/v heal does NOT rescue model-level ppl — it stays catastrophic (≫ fp) because the four
+    // un-healed projections keep the residual stream broken. This is why model-level recovery needs
+    // end-to-end distillation, not layerwise healing against clean activations.
+    assert!(
+        ppl_healed > 100.0 * ppl_fp,
+        "a local q/k/v heal must NOT rescue model ppl (stays catastrophic — motivates e2e): healed {ppl_healed:.3e} vs fp {ppl_fp:.3}"
     );
 }
 
