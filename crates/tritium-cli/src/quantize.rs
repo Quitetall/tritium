@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use tritium_format::{SafeTensors, SaltRow, write_salt_bundle, write_salt_gguf};
+use tritium_quantize::fisher::tile_sensitivity;
 use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
 
 use crate::SaltSensitivityArg;
@@ -43,6 +44,7 @@ pub(crate) fn run(
     bpw: f64,
     scale_group: ScaleGroupArg,
     sensitivity: SaltSensitivityArg,
+    fisher: Option<&Path>,
     format: OutputFormat,
 ) -> Result<()> {
     let sg = match scale_group {
@@ -56,6 +58,16 @@ pub(crate) fn run(
 
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     let st = SafeTensors::parse(&bytes).context("parse safetensors")?;
+
+    // Optional diagonal-Fisher sensitivity sidecar (plan 0039). When present it overrides
+    // `--sensitivity`: each weight is allocated by loss curvature per 256-block tile.
+    let fisher_bytes = fisher
+        .map(|p| std::fs::read(p).with_context(|| format!("read Fisher sidecar {}", p.display())))
+        .transpose()?;
+    let fisher_st = fisher_bytes
+        .as_ref()
+        .map(|b| SafeTensors::parse(b).context("parse Fisher sidecar safetensors"))
+        .transpose()?;
 
     // Quantize every 2D weight matrix; skip 1D tensors (norms/biases) and degenerate shapes.
     let names: Vec<String> = st
@@ -79,11 +91,31 @@ pub(crate) fn run(
         let w = st
             .tensor_f32(name)
             .with_context(|| format!("read tensor {name}"))?;
+        let sensitivity = match &fisher_st {
+            Some(fst) => {
+                let f = fst
+                    .tensor_f32(name)
+                    .with_context(|| format!("Fisher sidecar missing tensor {name}"))?;
+                if f.len() != rows * k {
+                    anyhow::bail!(
+                        "Fisher for {name} has {} entries, expected {} (= rows*k)",
+                        f.len(),
+                        rows * k
+                    );
+                }
+                if let Some(bad) = f.iter().find(|v| !v.is_finite() || **v < 0.0) {
+                    anyhow::bail!("Fisher for {name} must be finite and ≥ 0; found {bad}");
+                }
+                let f64v: Vec<f64> = f.iter().map(|&x| f64::from(x)).collect();
+                Sensitivity::Custom(tile_sensitivity(&f64v, rows, k))
+            }
+            None => sens.clone(),
+        };
         let cfg = QuantConfig {
             budget_bpw: bpw,
             t_min: 1,
             t_max: 3,
-            sensitivity: sens.clone(),
+            sensitivity,
             scale_group: sg,
         };
         let qt = quantize_tensor(&w, rows, k, &cfg).with_context(|| format!("quantize {name}"))?;
@@ -113,12 +145,18 @@ pub(crate) fn run(
     } else {
         0.0
     };
+    let sens_desc = if fisher.is_some() {
+        "Fisher".to_string()
+    } else {
+        format!("{sensitivity:?}")
+    };
     println!(
-        "quantized {} tensors ({:.2}M params) at {:.3} bpw target, {:?} scale → {} {} ({:.1} MiB, {:.3} avg bpw)",
+        "quantized {} tensors ({:.2}M params) at {:.3} bpw target, {:?} scale, {} sensitivity → {} {} ({:.1} MiB, {:.3} avg bpw)",
         names.len(),
         total_params as f64 / 1e6,
         bpw,
         scale_group,
+        sens_desc,
         container,
         output.display(),
         out_bytes.len() as f64 / (1024.0 * 1024.0),

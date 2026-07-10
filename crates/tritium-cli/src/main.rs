@@ -126,6 +126,12 @@ enum Command {
         /// reduction) or `energy` (weight `‖w‖²` proxy — spend planes on high-energy groups).
         #[arg(long, value_enum, default_value_t = SaltSensitivityArg::Uniform)]
         sensitivity: SaltSensitivityArg,
+        /// Optional diagonal-Fisher sensitivity sidecar: a `.safetensors` file mapping each
+        /// weight-tensor name to its per-weight Fisher `E[(∂L/∂w)²]` (same shape as the weight).
+        /// When set it OVERRIDES `--sensitivity`, allocating planes by loss curvature per tile
+        /// (plan 0039) — spend bits where the loss is sensitive, not merely where magnitude is.
+        #[arg(long)]
+        fisher: Option<PathBuf>,
         /// Output container: `sidecar` (single-file `.tslb` bundle) or `gguf`
         /// (GGUF container holding the SALT rows).
         #[arg(long, value_enum, default_value_t = quantize::OutputFormat::Sidecar)]
@@ -347,8 +353,17 @@ fn main() -> anyhow::Result<()> {
             bpw,
             scale_group,
             sensitivity,
+            fisher,
             format,
-        } => quantize::run(&input, &output, bpw, scale_group, sensitivity, format)?,
+        } => quantize::run(
+            &input,
+            &output,
+            bpw,
+            scale_group,
+            sensitivity,
+            fisher.as_deref(),
+            format,
+        )?,
     }
     Ok(())
 }

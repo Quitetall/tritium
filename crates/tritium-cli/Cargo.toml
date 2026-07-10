@@ -48,6 +48,9 @@ rayon = { workspace = true }
 [dev-dependencies]
 # `salt_model_cli` parses the report's JSON output to assert fidelity invariants.
 serde_json = { workspace = true }
+# `fisher_quantize_cli` reads back the emitted SALT bundle to assert the Fisher sidecar drove
+# plane allocation (plan 0039 step 4).
+tritium-format = { workspace = true }
 
 [features]
 default = []
