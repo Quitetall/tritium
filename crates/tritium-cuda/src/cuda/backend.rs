@@ -1758,14 +1758,7 @@ impl CudaBackend {
         })?;
         // v1.x split attention: the reduce kernel stages the same max_ctx scores in
         // dynamic shared, so it needs the identical opt-in on its own handle.
-        let sel =
-            |f32_name: &'static str, h_name: &'static str, q8_name: &'static str| match kv_dtype {
-                KvDtype::F32 => f32_name,
-                KvDtype::F16 => h_name,
-                // T2 rides the i8 lattice: every CONSUMER uses the q8 kernels;
-                // only the append selections below override to the _t2 names.
-                KvDtype::I8 | KvDtype::T2 => q8_name,
-            };
+        let sel = |a, b, c| kv_dtype.pick(a, b, c);
         let f_attn_scores = f(
             dm,
             sel(

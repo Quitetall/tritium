@@ -15,7 +15,8 @@ families by the rung count:
 | `gqa_attention_{scores,reduce,batch,tree_scores,tree_reduce}` | 3 each (f32/f16/i8) |
 | `lm_head_warp` | 2 (f32/f16 table) |
 
-That is ~22 kernels that are "the same kernel at a different KV dtype". The
+That is 29 kernel symbols across these families — 20 duplicates beyond one
+canonical body each. The
 Phase-2 architecture question: consolidate via C++ templates with
 `extern "C"` shims (one body, N instantiations), or keep the explicit
 duplication?
@@ -24,10 +25,10 @@ duplication?
 
 The twins are **not** mechanical dtype swaps:
 
-- `gqa_attention_scores_g` (82 lines) vs `_h` (78 lines): ~39 diff lines —
-  roughly half the body. The f32 kernel reads K rows as `float4`; the f16
-  kernel converts `__half2` pairs; the load width, the unroll shape and the
-  tail handling all differ.
+- `gqa_attention_scores_g` (82 lines) vs `_h` (78 lines): 28 of 82 source
+  lines differ (~34%). The f32 kernel reads K rows as `float4`; the f16
+  kernel converts `__half2` pairs; the load width and the tail-path types
+  differ (the unroll pragma is shared).
 - The `_q8` variants are structurally different, not just retyped: the inner
   loop carries a **per-(token, head, group) scale stream** (the i8 rung's
   dynamic dequant), an extra global-memory operand the f32/f16 kernels do
@@ -40,8 +41,10 @@ The twins are **not** mechanical dtype swaps:
 ### What the numerics contract demands
 
 The f32 single-sequence path is the repo's only fully bit-exact end-to-end
-domain (book: Conformance → "Numerics domains"). Every kernel is compiled
-`--fmad=false` and gate-pinned `to_bits()`-equal against the host oracle. Any
+domain (book: Conformance → "Numerics domains"). The decode and training
+kernels (`decode.cu`, `train_grad.cu`) are compiled `--fmad=false` and
+gate-pinned `to_bits()`-equal against the host oracle (the add/IMMA mpgemm
+kernels accumulate in integers, where fmad is moot). Any
 consolidation must leave the f32 instantiation **provably byte-identical** —
 in practice a SASS diff of the f32 instantiation against the current kernel,
 plus the full gate suite, per toolchain bump. That proof is cheap once but
@@ -58,7 +61,7 @@ genuinely differ.
 
 ## Decision
 
-**Keep explicit per-dtype kernels. Duplication is the contract**, with three
+**Keep explicit per-dtype kernels. Duplication is the contract**, with four
 codified guardrails:
 
 1. **Twin-sync rule (review discipline).** A change to any member of a twin
@@ -69,9 +72,20 @@ codified guardrails:
    (f32: bit-exact; f16/i8: kernel-level equivalence + e2e perplexity bars
    per ADR 0020). A twin drifting semantically from its family fails a gate,
    not a code review.
-3. **The codec seam stays host-side.** New KV-touching launch paths go
-   through the `KvDtype` dispatch (cuda/kv.rs) so the *selection* logic never
-   duplicates; only kernel bodies may.
+3. **The codec seam stays host-side.** New KV-touching launch paths select
+   symbols through `KvDtype::pick` (cuda/kv.rs) — the one dispatch point —
+   so the *selection* logic never duplicates; only kernel bodies may.
+4. **Table drift has teeth.** `adr_0022_twin_family_table_matches_decode_cu`
+   (cuda/tests.rs, no GPU needed) pins this ADR's family table and the total
+   kernel count against `decode.cu`; a new variant or family fails the suite
+   until both the ADR and the revisit-trigger assessment are updated.
+
+Accepted debt, recorded: the shared host-side builders live in two places by
+two conventions — `gb_*` graph builders are `pub(super)` in batch.rs (tree.rs
+depends on a sibling's internals), while the `bl_*` raw-launch helpers sit in
+mod.rs (used by prefill, tree and batch alike). Coherent enough to ship;
+co-locating them in one builders module is a candidate cleanup if the seam
+grows.
 
 ## Revisit trigger
 
@@ -93,6 +107,6 @@ suite green, and a CI step that re-diffs SASS on toolchain bumps.
 - No behavior or performance change now; per-dtype inner-loop tuning freedom
   is preserved (the i8 rung depends on it).
 - The cost is process, not code: the twin-sync rule adds reviewer burden per
-  KV-touching change (~22 kernels across 9 families).
+  KV-touching change (29 kernel symbols across 9 families).
 - The decision is explicitly reversible and the reversal condition is
   mechanical, not a judgment call.

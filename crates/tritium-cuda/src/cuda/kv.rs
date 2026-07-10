@@ -35,6 +35,23 @@ impl KvDtype {
     pub(super) fn has_scales(self) -> bool {
         matches!(self, KvDtype::I8 | KvDtype::T2)
     }
+
+    /// Select a twin-kernel symbol by rung — THE dispatch point (ADR 0022
+    /// guardrail 3: selection logic lives here exactly once; only kernel
+    /// bodies may duplicate). T2 rides the i8 lattice: every CONSUMER uses
+    /// the q8 kernels; only append selections override to the `_t2` names.
+    pub(super) fn pick(
+        self,
+        f32_name: &'static str,
+        h_name: &'static str,
+        q8_name: &'static str,
+    ) -> &'static str {
+        match self {
+            KvDtype::F32 => f32_name,
+            KvDtype::F16 => h_name,
+            KvDtype::I8 | KvDtype::T2 => q8_name,
+        }
+    }
 }
 
 /// Keep in sync with `KV_QGROUP` in decode.cu (i8 rung group size).

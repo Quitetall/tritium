@@ -2349,3 +2349,54 @@ fn sparse_kernel_partial_block() {
         );
     }
 }
+
+/// ADR 0022 guardrail with teeth: the twin-kernel family table must match
+/// decode.cu. Drift — a new variant (the revisit trigger: a 4th KV rung or a
+/// new attention family) or a removed one — fails here mechanically instead
+/// of relying on reviewer memory. No GPU needed: this parses the source.
+#[test]
+fn adr_0022_twin_family_table_matches_decode_cu() {
+    let src = include_str!("../../kernels/decode.cu");
+    let names: Vec<&str> = src
+        .lines()
+        .filter_map(|l| l.strip_prefix("__global__ void "))
+        .map(|l| l.split('(').next().unwrap_or(l).trim())
+        .collect();
+    let count = |prefix: &str| {
+        names
+            .iter()
+            .filter(|n| {
+                // exact family match: prefix, then either end or a variant
+                // suffix — avoids kv_append counting kv_append_batch.
+                n.strip_prefix(prefix).is_some_and(|rest| {
+                    rest.is_empty() || matches!(rest, "_g" | "_h" | "_q8" | "_t2" | "_f32" | "_f16")
+                })
+            })
+            .count()
+    };
+    // The ADR 0022 family table (docs/adr/0022-twin-kernel-contract.md).
+    let table = [
+        ("rope_kv_fused", 4),
+        ("kv_append", 4),
+        ("kv_append_batch", 4),
+        ("gqa_attention_scores", 3),
+        ("gqa_attention_reduce", 3),
+        ("gqa_attention_batch", 3),
+        ("gqa_attention_tree_scores", 3),
+        ("gqa_attention_tree_reduce", 3),
+        ("lm_head_warp", 2),
+    ];
+    for (family, want) in table {
+        assert_eq!(
+            count(family),
+            want,
+            "twin family `{family}` drifted from the ADR 0022 table — update \
+             the ADR (and check the revisit trigger) alongside the kernel"
+        );
+    }
+    assert_eq!(
+        names.len(),
+        65,
+        "decode.cu kernel count drifted from ADR 0022 — update the ADR"
+    );
+}

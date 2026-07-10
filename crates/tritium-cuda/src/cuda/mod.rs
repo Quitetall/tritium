@@ -1,10 +1,23 @@
 //! GPU host side for the CUDA backend. Compiled only with `--features cuda`.
 //!
-//! This module owns a [`cudarc`] context + default stream, loads the PTX emitted
-//! by `build.rs`, and drives the addition-only TQ2_0 mpGEMM kernel. It maps every
-//! `cudarc` driver error to a [`BackendError`] so the backend never panics on a
-//! device failure, and reports allocation failures as
-//! [`BackendError::OutOfMemory`].
+//! ## Module map (P2a split of the former 11.8k-line cuda.rs)
+//!
+//! - **mod.rs (here)**: `CudaDecodeModel` core — the eager M=1 step, prefill,
+//!   single-sequence graph capture (`g_*` builders), the shared raw-launch
+//!   helpers (`bl_*`, used by prefill + tree + batch), `CudaBuffer`, the
+//!   decode-model specs and resident structs.
+//! - **backend.rs**: `CudaBackend` — context/stream ownership, PTX loading,
+//!   mpgemm dispatch (tiled/IMMA/sparse/SALT), uploads, autotune glue,
+//!   registration. Every `cudarc` driver error maps to [`BackendError`]
+//!   (allocation failures as [`BackendError::OutOfMemory`]) so the backend
+//!   never panics on a device failure.
+//! - **tree.rs / batch.rs**: sibling `impl CudaDecodeModel` blocks — BASTION
+//!   tree-verify and M=N continuous batching. Tree graph capture reuses
+//!   batch's `gb_*` builders (pub(super); recorded in ADR 0022).
+//! - **graph_raw.rs**: `cuLaunchKernel` capture plumbing + `BatchKv`.
+//! - **consts.rs / kv.rs**: kernel symbols + launch geometry + embedded PTX;
+//!   the `KvDtype` rung ladder and its single `pick` dispatch point.
+//! - **tests.rs**: the GPU conformance/parity suite.
 //!
 //! ## cudarc 0.19 API
 //!

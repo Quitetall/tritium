@@ -138,14 +138,7 @@ unsafe impl Send for RawGraphKernels {}
 
 impl RawGraphKernels {
     pub(super) fn load(ctx: &Arc<CudaContext>, kv_dtype: KvDtype) -> Result<Self, BackendError> {
-        let sel =
-            |f32_name: &'static str, h_name: &'static str, q8_name: &'static str| match kv_dtype {
-                KvDtype::F32 => f32_name,
-                KvDtype::F16 => h_name,
-                // T2 rides the i8 lattice: every CONSUMER uses the q8 kernels;
-                // only the append selections below override to the _t2 names.
-                KvDtype::I8 | KvDtype::T2 => q8_name,
-            };
+        let sel = |a, b, c| kv_dtype.pick(a, b, c);
         ctx.bind_to_thread()
             .map_err(|e| driver_err("raw kernels bind", &e))?;
         let load_mod = |ptx: &str| -> Result<sys::CUmodule, BackendError> {
