@@ -2009,6 +2009,15 @@ impl CudaBackend {
                 "TRITIUM_KV=i8 requires head_dim % {KV_QGROUP} == 0 (got {head_dim})"
             )));
         }
+        if kv_dtype == KvDtype::I8 && kv_width > 64 * KV_QGROUP {
+            // kv_quant_row_q8's shared absmax array holds 64 groups, and the
+            // fused-rope twin's dynamic shared (2·kv_width·4 B) must stay
+            // under the 48 KiB default the raw handle never opts past.
+            return Err(BackendError::InvalidInput(format!(
+                "TRITIUM_KV=i8 supports kv_width <= {} (got {kv_width})",
+                64 * KV_QGROUP
+            )));
+        }
         let kv_elem = kv_dtype.elem();
         let half = head_dim / 2;
 
@@ -4703,7 +4712,6 @@ impl CudaDecodeModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn launch_attention(
         stream: &Arc<CudaStream>,
         func_legacy: &CudaFunction,
@@ -5449,7 +5457,7 @@ impl CudaDecodeModel {
         let bucket = if self.head_dim.is_multiple_of(4)
             && m <= TREE_BUCKET_MAX
             && self.max_ctx * 4 <= 48 * 1024
-            && self.kv_elem == 4 // f16 KV: eager tree (no ctrl _h twins; graph measured ≈ no win)
+            && self.kv_elem == 4 // non-f32 KV: eager tree (no ctrl twins; graph measured ≈ no win)
             && std::env::var_os("TRITIUM_TREE_EAGER").is_none()
         {
             TREE_BUCKETS
@@ -8475,7 +8483,6 @@ impl CudaDecodeModel {
 
     /// Fused rope(q)+rope(k)+append(k)+append(v) — one graph node per layer.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn g_rope_kv(
         &self,
         q: sys::CUdeviceptr,
@@ -8568,7 +8575,11 @@ impl CudaDecodeModel {
         )
     }
 
-    #[allow(dead_code)] // superseded by g_rope_kv in the capture; kept for non-fused debugging
+    // Superseded by g_rope_kv in the capture; kept for non-fused debugging.
+    // NOTE: f32-ONLY — under i8 `raw().kv_append` is the 5-param one-block-
+    // per-row `kv_append_q8`; this helper's 4-param elementwise launch would
+    // be params-array UB. Assert kv_dtype == F32 before resurrecting.
+    #[allow(dead_code)]
     fn g_kv_append(
         &self,
         src: sys::CUdeviceptr,
