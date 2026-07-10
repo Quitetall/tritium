@@ -85,10 +85,10 @@ fn task_loss(w1: &[f32], w2: &[f32], x: &[f32], targets: &[f32]) -> f64 {
     se / (D * M) as f64
 }
 
-/// SALT-quantize `W1` at `BPW` under `sens`, returning the dense reconstruction and per-group planes.
-fn quant_recon(w1: &[f32], sens: Sensitivity) -> (Vec<f32>, Vec<usize>) {
+/// SALT-quantize `W1` at `bpw` under `sens`, returning the dense reconstruction and per-group planes.
+fn quant_recon(w1: &[f32], bpw: f64, sens: Sensitivity) -> (Vec<f32>, Vec<usize>) {
     let cfg = QuantConfig {
-        budget_bpw: BPW,
+        budget_bpw: bpw,
         sensitivity: sens,
         ..Default::default()
     };
@@ -97,28 +97,26 @@ fn quant_recon(w1: &[f32], sens: Sensitivity) -> (Vec<f32>, Vec<usize>) {
     (dense, q.plane_counts)
 }
 
-#[test]
-fn fisher_allocation_beats_energy_and_uniform_on_forward_loss() {
-    let w1 = build_w1();
-    let w2 = seeded(2, M * H, -0.5, 0.5);
-    let x = seeded(1, D * K, 0.0, 1.0); // non-negative data
-
-    // Distillation targets = the fp model's own output (so quantization strictly degrades).
-    let mut targets = vec![0.0f32; D * M];
+/// Distillation targets = the fp model's own output `y = W2·relu²(W1·x)` over the batch.
+fn fp_targets(w1: &[f32], w2: &[f32], x: &[f32]) -> Vec<f32> {
+    let mut t = vec![0.0f32; D * M];
     for d in 0..D {
-        let z2 = act::relu2_forward(&dense::forward(&x[d * K..d * K + K], &w1, 1, H, K));
-        targets[d * M..d * M + M].copy_from_slice(&dense::forward(&z2, &w2, 1, M, H));
+        let z2 = act::relu2_forward(&dense::forward(&x[d * K..d * K + K], w1, 1, H, K));
+        t[d * M..d * M + M].copy_from_slice(&dense::forward(&z2, w2, 1, M, H));
     }
+    t
+}
 
-    // True diagonal Fisher (output sensitivity) of W1: F_i = E_x Σ_o (∂y_o/∂W1_i)². For each sample
-    // and output, one backward with a unit residual at o (target = y - e_o so ∂mse/∂y = (2/M)·e_o),
-    // giving grad ∝ ∂y_o/∂W1; square-accumulate. Scale is common → allocation ranking is unaffected.
+/// The TRUE diagonal Fisher (output sensitivity) of `W1`, reduced to per-(row,block) tiles:
+/// `F_i = E_x Σ_o (∂y_o/∂W1_i)²`, computed exactly via a per-(sample,output) unit-residual backward
+/// (target = y − e_o ⇒ ∂mse/∂y = (2/M)·e_o ⇒ grad ∝ ∂y_o/∂W1). The common scale is rank-irrelevant.
+fn true_fisher_tiles(w1: &[f32], w2: &[f32], x: &[f32]) -> Vec<f64> {
     let mut fisher = FisherAccumulator::new(H * K);
     for d in 0..D {
         for o in 0..M {
             let mut t = Tape::new();
-            let w1l = t.leaf(w1.clone());
-            let w2l = t.leaf(w2.clone());
+            let w1l = t.leaf(w1.to_vec());
+            let w2l = t.leaf(w2.to_vec());
             let xd = t.leaf(x[d * K..d * K + K].to_vec());
             let z = t.dense_matmul(xd, w1l, 1, H, K);
             let z2 = t.relu2(z);
@@ -131,8 +129,16 @@ fn fisher_allocation_beats_energy_and_uniform_on_forward_loss() {
             fisher.accumulate(&grads[w1l]);
         }
     }
-    let fisher_w1 = fisher.into_diag();
-    let tiles = tile_sensitivity(&fisher_w1, H, K); // one H_g per row (K < 256 → 1 block/row)
+    tile_sensitivity(&fisher.into_diag(), H, K)
+}
+
+#[test]
+fn fisher_allocation_beats_energy_and_uniform_on_forward_loss() {
+    let w1 = build_w1();
+    let w2 = seeded(2, M * H, -0.5, 0.5);
+    let x = seeded(1, D * K, 0.0, 1.0); // non-negative data
+    let targets = fp_targets(&w1, &w2, &x);
+    let tiles = true_fisher_tiles(&w1, &w2, &x); // one H_g per row (K < 256 → 1 block/row)
 
     // Sanity: Fisher must actually be concentrated on the live (even) rows, near-zero on the dead
     // ones — otherwise the gate would prove nothing about decorrelation.
@@ -144,9 +150,9 @@ fn fisher_allocation_beats_energy_and_uniform_on_forward_loss() {
     );
 
     let l_fp = task_loss(&w1, &w2, &x, &targets);
-    let (u, pu) = quant_recon(&w1, Sensitivity::Uniform);
-    let (e, pe) = quant_recon(&w1, Sensitivity::Energy);
-    let (f, pf) = quant_recon(&w1, Sensitivity::Custom(tiles));
+    let (u, pu) = quant_recon(&w1, BPW, Sensitivity::Uniform);
+    let (e, pe) = quant_recon(&w1, BPW, Sensitivity::Energy);
+    let (f, pf) = quant_recon(&w1, BPW, Sensitivity::Custom(tiles));
     let l_uniform = task_loss(&u, &w2, &x, &targets);
     let l_energy = task_loss(&e, &w2, &x, &targets);
     let l_fisher = task_loss(&f, &w2, &x, &targets);
@@ -184,5 +190,57 @@ fn fisher_allocation_beats_energy_and_uniform_on_forward_loss() {
         plane_split(&pf).0 > plane_split(&pf).1,
         "Fisher must spend more planes on live rows than dead: {:?}",
         plane_split(&pf)
+    );
+}
+
+/// Plan 0039 step 3 — adaptive plane growth: the DUAL of step 2. Instead of "lower loss at fixed
+/// bits", show Fisher reaches a fixed QUALITY target at **lower average bits** than uniform growth —
+/// the user's thesis "add ternary planes only up to where accuracy needs them". Growth is realized
+/// through the allocator's monotone-in-budget property (higher bpw only adds planes to a tile), so
+/// stepping a rising bpw grid IS incremental plane growth; the honest signal is bits-to-target.
+#[test]
+fn fisher_reaches_a_quality_target_at_lower_bpw_than_uniform() {
+    let w1 = build_w1();
+    let w2 = seeded(2, M * H, -0.5, 0.5);
+    let x = seeded(1, D * K, 0.0, 1.0);
+    let targets = fp_targets(&w1, &w2, &x);
+    let tiles = true_fisher_tiles(&w1, &w2, &x);
+
+    // Ascending budget grid from the ternary floor (log2 3 ≈ 1.585) toward the 3-plane ceiling.
+    let grid = [1.6, 1.9, 2.2, 2.5, 2.8, 3.1, 3.4, 3.7, 4.0, 4.3, 4.6];
+    let loss_at = |bpw: f64, sens: Sensitivity| {
+        let (recon, _) = quant_recon(&w1, bpw, sens);
+        task_loss(&recon, &w2, &x, &targets)
+    };
+    // Smallest grid bpw at which `sens` meets `target` (curves are monotone-decreasing in bpw).
+    let min_bpw = |sens: &dyn Fn() -> Sensitivity, target: f64| {
+        grid.iter().copied().find(|&b| loss_at(b, sens()) <= target)
+    };
+
+    // Quality bar = the loss uniform allocation buys at a mid-grid budget (not the plane ceiling, so
+    // there is headroom for Fisher to reach it cheaper). Fisher must hit the SAME quality for less.
+    let ref_bpw = grid[5]; // 3.1
+    let uniform: &dyn Fn() -> Sensitivity = &|| Sensitivity::Uniform;
+    let fisher: &dyn Fn() -> Sensitivity = &|| Sensitivity::Custom(tiles.clone());
+    let target = loss_at(ref_bpw, Sensitivity::Uniform);
+
+    let bpw_uniform = min_bpw(uniform, target).expect("uniform meets its own target");
+    let bpw_fisher = min_bpw(fisher, target).expect("fisher meets the target");
+
+    println!(
+        "0039 adaptive-growth gate: quality target = Uniform@{ref_bpw} bpw (loss {target:.4}). \
+         Uniform reaches it at {bpw_uniform} bpw; Fisher reaches it at {bpw_fisher} bpw \
+         → {:.0}% of the bits for equal quality.",
+        100.0 * bpw_fisher / bpw_uniform
+    );
+
+    assert!(
+        (bpw_uniform - ref_bpw).abs() < 1e-9,
+        "uniform should first meet its own {ref_bpw}-bpw quality exactly at {ref_bpw}: got {bpw_uniform}"
+    );
+    assert!(
+        bpw_fisher < bpw_uniform,
+        "Fisher must reach the same quality at strictly lower bpw (adaptive growth is more bit-efficient): \
+         Fisher {bpw_fisher} vs Uniform {bpw_uniform}"
     );
 }
