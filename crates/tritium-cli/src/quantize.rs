@@ -93,16 +93,21 @@ pub(crate) fn run(
             .with_context(|| format!("read tensor {name}"))?;
         let sensitivity = match &fisher_st {
             Some(fst) => {
+                // The Fisher must be present with the SAME shape as the weight — not merely the same
+                // element count: a transposed [k, rows] sidecar would pass a length check yet mis-map
+                // every per-tile sensitivity (silent-wrong), so compare the shape exactly.
+                match fst.shape(name) {
+                    None => anyhow::bail!(
+                        "Fisher sidecar has no tensor {name} (every quantized weight needs a Fisher entry)"
+                    ),
+                    Some([r, c]) if *r == rows && *c == k => {}
+                    Some(s) => anyhow::bail!(
+                        "Fisher for {name} has shape {s:?}, expected [{rows}, {k}] (the weight's shape)"
+                    ),
+                }
                 let f = fst
                     .tensor_f32(name)
-                    .with_context(|| format!("Fisher sidecar missing tensor {name}"))?;
-                if f.len() != rows * k {
-                    anyhow::bail!(
-                        "Fisher for {name} has {} entries, expected {} (= rows*k)",
-                        f.len(),
-                        rows * k
-                    );
-                }
+                    .with_context(|| format!("read Fisher for tensor {name}"))?;
                 if let Some(bad) = f.iter().find(|v| !v.is_finite() || **v < 0.0) {
                     anyhow::bail!("Fisher for {name} must be finite and ≥ 0; found {bad}");
                 }

@@ -121,3 +121,50 @@ fn fisher_sidecar_concentrates_planes_on_high_fisher_rows() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn mis_shaped_fisher_sidecar_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("tritium-fisher-badshape-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let weight_path = dir.join("w.safetensors");
+    let fisher_path = dir.join("fisher.safetensors");
+    let out = dir.join("out.tslb");
+
+    // Weight is [ROWS, K]; the Fisher sidecar has the WRONG number of rows (would silently mis-map
+    // if only element count were checked). Must be a clean hard error, not a bad allocation.
+    let w: Vec<f32> = (0..ROWS * K).map(|i| (i as f32 % 5.0) - 2.0).collect();
+    let bad_rows = ROWS / 2;
+    let fisher: Vec<f32> = vec![1.0; bad_rows * K];
+    std::fs::write(&weight_path, build_safetensors(&[("w", ROWS, K, w)])).expect("write w");
+    std::fs::write(
+        &fisher_path,
+        build_safetensors(&[("w", bad_rows, K, fisher)]),
+    )
+    .expect("write fisher");
+
+    let output = Command::new(tritium_bin())
+        .args([
+            "quantize",
+            "--input",
+            weight_path.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--bpw",
+            "2.0",
+            "--fisher",
+            fisher_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run tritium quantize");
+    assert!(
+        !output.status.success(),
+        "a mis-shaped Fisher sidecar must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shape"),
+        "error should name the shape mismatch; got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
