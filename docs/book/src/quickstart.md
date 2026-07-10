@@ -1,5 +1,46 @@
 # Quickstart
 
+## Chat with a model in three commands
+
+```sh
+cargo build --release -p tritium-cli -p tritium-serve --features tritium-serve/cuda
+target/release/tritium pull microsoft/bitnet-b1.58-2B-4T-gguf
+target/release/tritium-serve \
+  --model ~/.cache/tritium-models/microsoft--bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf \
+  --backend cuda
+```
+
+Then talk to it — the tokenizer travels inside the GGUF, so this is real text
+over the OpenAI wire (point LM Studio, Open WebUI or `curl` at it):
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"tritium","messages":[{"role":"user","content":"What is the capital of France?"}]}'
+```
+
+No GPU? Use `--backend cpu` (and build without the `cuda` feature). No
+network exposure by default: the server binds loopback; `--host` beyond
+loopback refuses to start unless `TRITIUM_AUTH_TOKEN` is set.
+
+### Docker
+
+The repo ships a two-stage `Dockerfile` (CUDA devel build → slim runtime,
+model as a bind mount):
+
+```sh
+docker build -t tritium-serve .
+docker run --gpus all -p 127.0.0.1:8080:8080 \
+  -e TRITIUM_AUTH_TOKEN=change-me \
+  -v ~/.cache/tritium-models:/models:ro \
+  tritium-serve --model /models/microsoft--bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf --backend cuda
+```
+
+The container entrypoint binds `0.0.0.0` (the `-p` mapping decides real
+exposure), so the server's exposure hardening requires the token — that is
+deliberate.
+
+## Building from source
+
 Tritium builds with Cargo only — no CMake. The default build is CPU-only;
 backends and frontends are gated behind feature flags so the lean build stays
 free of CUDA, `wgpu`, the framework adapters, and the server stack.
@@ -28,6 +69,18 @@ cargo run -p tritium-cli -- --help
 ```
 
 The subcommands:
+
+### `pull`
+
+Download a GGUF from the HuggingFace hub into `~/.cache/tritium-models`
+(override with `TRITIUM_MODEL_CACHE`). One `.gguf` in the repo → pulls it;
+several → lists them and asks for `--file`; interrupted downloads resume on
+re-run (HTTP Range on the kept `.part` file).
+
+```sh
+tritium pull microsoft/bitnet-b1.58-2B-4T-gguf
+tritium pull bartowski/SmolLM2-135M-Instruct-GGUF --file SmolLM2-135M-Instruct-Q4_K_M.gguf
+```
 
 ### `inspect`
 

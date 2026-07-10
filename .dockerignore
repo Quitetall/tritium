@@ -1,0 +1,11 @@
+target/
+crates/*/fuzz/target/
+crates/*/fuzz/corpus/
+crates/*/fuzz/artifacts/
+.git/
+.claude/
+.codex/
+graphify-out/
+scratch_st/
+docs/
+*.gguf
