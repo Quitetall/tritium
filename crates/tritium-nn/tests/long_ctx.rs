@@ -77,9 +77,14 @@ fn cuda_long_ctx_decode_bench() {
         pos += 1;
     }
     let dt = t0.elapsed();
-    let kv = std::env::var("TRITIUM_KV_F16").unwrap_or_else(|_| "0".into());
+    let kv = std::env::var("TRITIUM_KV")
+        .or_else(|_| {
+            std::env::var("TRITIUM_KV_F16")
+                .map(|v| if v == "1" { "f16".into() } else { "f32".into() })
+        })
+        .unwrap_or_else(|_| "f32".into());
     println!(
-        "long-ctx (KV_F16={kv}): prefill {} tok in {t_prefill:.2?} ({:.0} tok/s) | decode @ctx≈{} {decode_steps} tok in {dt:.2?} ({:.1} tok/s)",
+        "long-ctx (KV={kv}): prefill {} tok in {t_prefill:.2?} ({:.0} tok/s) | decode @ctx≈{} {decode_steps} tok in {dt:.2?} ({:.1} tok/s)",
         prompt.len(),
         prompt.len() as f64 / t_prefill.as_secs_f64(),
         prompt.len(),

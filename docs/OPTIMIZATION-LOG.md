@@ -676,6 +676,38 @@ Reading:
 Repro: `llama-bench -m <i2_s.gguf> -p 512 -n 128 -t 14` (bitnet.cpp build);
 `tritium report decode --backend cuda|cpu --decode-steps 128 …`.
 
+### v1.x round 13 — KV rung 2 (i8 + per-group dynamic scales): a MEMORY rung
+
+Eight `_q8` twin kernels (appends quantize per-(token, kv-head, 64-dim group)
+at absmax/127 — the A8 activation recipe; attention dequants to f32 then runs
+the identical fold chains), a scales side-arena `[max_ctx, n_head_kv,
+head_dim/64]` f32 per layer/direction, three-way dtype selection
+(`TRITIUM_KV=f32|f16|i8`, legacy `TRITIUM_KV_F16=1` honored), promote moves
+scale rows, tree verifies eager under non-f32.
+
+| KV dtype | decode @ ctx≈4K | ppl rel err | KV mem @4K |
+|---|---|---|---|
+| f32 | 69.5 tok/s | 2.659e-4 | 630 MB |
+| f16 | **103.2 tok/s** | 1.582e-3 | 315 MB |
+| i8-g64 | 72.5 tok/s | 2.614e-3 | **~160 MB** |
+
+Honest verdict: **i8 is a memory rung, not a speed rung on this GPU.** The
+grouped-dequant attention kernels are latency-bound; the per-(j, group)
+scale-load stream cancels the DRAM saving (scores DO win — 14.8 vs 23.8 µs —
+but the reduce loses it back). Two speed attempts measured and rejected:
+a 4-chain ILP scores rewrite (kept — it fixed a real regression) and a
+shared weight-bank reduce (386 vs 340 µs, reverted). Value proposition:
+4× KV capacity — batching slots and long contexts per GB.
+
+Also bisected the hard way: `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`
+is a CAP, not a floor — the capture-path opt-in loop sizing it below a
+launch's request makes that launch CUDA_ERROR_INVALID_VALUE. The raw-launch
+error path now prints grid/block/smem/nparams.
+
+Gates: 9/9 acceptance (f32 default bit-exact, untouched), 51/51 CUDA, spec
+losslessness green under i8 (exercises the q8 tree kernels), long-ctx A/B
+above.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time

@@ -2152,6 +2152,509 @@ __global__ void gqa_attention_tree_reduce_h(
 #undef TREEH_MAX_DIMS_PER_THREAD
 }
 
+// ─── i8 KV-cache twins (ADR 0020, rung 2) — per-(token, kv-head, KV_QGROUP-
+// dim group) DYNAMIC scales computed at append (absmax/127, the A8 activation
+// recipe); attention loads dequant to f32 (`(float)k8 * scale_g`) and then run
+// the IDENTICAL fold chains as the f32/f16 kernels. Scales live in a side
+// arena `[max_ctx, n_head_kv, head_dim/KV_QGROUP]` f32, passed as a TRAILING
+// param so the dtype-selected launch sites share a common arg prefix.
+#define KV_QGROUP 64
+
+// Per-row append + group-quantize: ONE BLOCK PER ROW (grid.x = m); shared
+// absmax reduction over each contiguous KV_QGROUP run of the row.
+__device__ __forceinline__ void kv_quant_row_q8(const float* __restrict__ src_row,
+                                                signed char* __restrict__ dst_row,
+                                                float* __restrict__ sc_row,
+                                                const int kv_width) {
+  __shared__ float s_absmax[64]; // up to 64 groups per row (kv_width ≤ 4096)
+  const int n_groups = kv_width / KV_QGROUP;
+  for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
+    s_absmax[g] = 0.0f;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < kv_width; i += blockDim.x) {
+    const float a = fabsf(src_row[i]);
+    // Non-negative floats compare correctly as ints — atomicMax on the bits.
+    atomicMax((int*)&s_absmax[i / KV_QGROUP], __float_as_int(a));
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < kv_width; i += blockDim.x) {
+    const int g = i / KV_QGROUP;
+    const float am = s_absmax[g];
+    if (am == 0.0f) {
+      dst_row[i] = 0;
+      if (i % KV_QGROUP == 0) sc_row[g] = 0.0f;
+    } else {
+      const float scale = am / 127.0f;
+      float q = roundf(src_row[i] / scale);
+      q = fminf(127.0f, fmaxf(-127.0f, q));
+      dst_row[i] = (signed char)q;
+      if (i % KV_QGROUP == 0) sc_row[g] = scale;
+    }
+  }
+}
+
+__global__ void kv_append_q8(const float* __restrict__ src,
+                             signed char* __restrict__ kv_base,
+                             const int* __restrict__ ctrl,
+                             const int kv_width,
+                             float* __restrict__ scales) {
+  const long long row = ctrl[2];
+  const int n_groups = kv_width / KV_QGROUP;
+  kv_quant_row_q8(src, kv_base + row * kv_width, scales + row * n_groups, kv_width);
+}
+
+__global__ void kv_append_batch_q8(const float* __restrict__ src,
+                                   signed char* __restrict__ kv_base,
+                                   const int cache_len, const int kv_width, const int m,
+                                   float* __restrict__ scales) {
+  const int r = blockIdx.x;
+  if (r >= m) return;
+  const long long row = (long long)cache_len + r;
+  const int n_groups = kv_width / KV_QGROUP;
+  kv_quant_row_q8(src + (long long)r * kv_width, kv_base + row * kv_width,
+                  scales + row * n_groups, kv_width);
+}
+
+// grid (2,1,1): block 0 rotates q in place; block 1 stages rotated k + v in
+// dynamic shared (2·kv_width floats), then group-quantizes both into the
+// arenas. Rotation math identical to rope_kv_fused_g.
+__global__ void rope_kv_fused_q8(float* __restrict__ q,
+                                 const float* __restrict__ k,
+                                 const float* __restrict__ v,
+                                 signed char* __restrict__ kv_k_base,
+                                 signed char* __restrict__ kv_v_base,
+                                 const float* __restrict__ cos_table,
+                                 const float* __restrict__ sin_table,
+                                 const int* __restrict__ ctrl,
+                                 const int n_head, const int n_head_kv,
+                                 const int head_dim, const int kv_width,
+                                 float* __restrict__ k_scales,
+                                 float* __restrict__ v_scales) {
+  extern __shared__ float s_kv[]; // [kv_width] rotated k, then [kv_width] v
+  const int half = head_dim >> 1;
+  const int pos = ctrl[1];
+  const long long row = ctrl[2];
+  if (blockIdx.x == 0) {
+    const int q_total = n_head * half;
+    for (int idx = threadIdx.x; idx < q_total; idx += blockDim.x) {
+      const int head = idx / half;
+      const int j = idx - head * half;
+      const int base = head * head_dim;
+      const float c = cos_table[(long long)pos * half + j];
+      const float s = sin_table[(long long)pos * half + j];
+      const float a = q[base + j];
+      const float b = q[base + j + half];
+      q[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+      q[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+    }
+    return;
+  }
+  // Block 1: rotate k into shared, copy v into shared.
+  float* s_k = s_kv;
+  float* s_v = s_kv + kv_width;
+  const int k_total = n_head_kv * half;
+  for (int t = threadIdx.x; t < k_total; t += blockDim.x) {
+    const int head = t / half;
+    const int j = t - head * half;
+    const int base = head * head_dim;
+    const float c = cos_table[(long long)pos * half + j];
+    const float s = sin_table[(long long)pos * half + j];
+    const float a = k[base + j];
+    const float b = k[base + j + half];
+    s_k[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+    s_k[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+  }
+  for (int i = threadIdx.x; i < kv_width; i += blockDim.x) {
+    s_v[i] = v[i];
+  }
+  __syncthreads();
+  const int n_groups = kv_width / KV_QGROUP;
+  kv_quant_row_q8(s_k, kv_k_base + row * kv_width, k_scales + row * n_groups, kv_width);
+  __syncthreads();
+  kv_quant_row_q8(s_v, kv_v_base + row * kv_width, v_scales + row * n_groups, kv_width);
+}
+
+// Dequantizing float4-equivalent load: 4 consecutive i8 KV elements (one
+// aligned 32-bit read) × the group scale.
+__device__ __forceinline__ float4 kvq8_load4(const signed char* p, const float scale) {
+  const int w = *(const int*)p;
+  return make_float4((float)(signed char)(w & 0xFF) * scale,
+                     (float)(signed char)((w >> 8) & 0xFF) * scale,
+                     (float)(signed char)((w >> 16) & 0xFF) * scale,
+                     (float)(signed char)((w >> 24) & 0xFF) * scale);
+}
+
+__global__ void gqa_attention_scores_q8(const float* __restrict__ q,
+                                        const signed char* __restrict__ k,
+                                        float* __restrict__ scores,
+                                        const int* __restrict__ ctrl,
+                                        const int max_ctx, const int n_head,
+                                        const int n_head_kv, const int head_dim,
+                                        const float scale,
+                                        const float* __restrict__ k_scales) {
+  const int h = blockIdx.x;
+  const int chunk = blockIdx.y * SCORE_CHUNK;
+  const int lane = threadIdx.x & 31;
+  const int ctx = ctrl[2] + 1;
+  if (h >= n_head || chunk >= ctx) return;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + (long long)h * head_dim);
+  const int hd4 = head_dim >> 2;
+  const int gph = head_dim / KV_QGROUP; // groups per head
+  float* sc = scores + (long long)h * max_ctx;
+
+  const int j0 = chunk + lane;
+  const int j1 = j0 + 32;
+  const int j2 = j0 + 64;
+  const int j3 = j0 + 96;
+  const signed char* k0 = k + ((long long)j0 * n_head_kv + kv) * head_dim;
+  const signed char* k1 = k + ((long long)j1 * n_head_kv + kv) * head_dim;
+  const signed char* k2 = k + ((long long)j2 * n_head_kv + kv) * head_dim;
+  const signed char* k3 = k + ((long long)j3 * n_head_kv + kv) * head_dim;
+  const float* s0 = k_scales + ((long long)j0 * n_head_kv + kv) * gph;
+  const float* s1 = k_scales + ((long long)j1 * n_head_kv + kv) * gph;
+  const float* s2 = k_scales + ((long long)j2 * n_head_kv + kv) * gph;
+  const float* s3 = k_scales + ((long long)j3 * n_head_kv + kv) * gph;
+  if (j3 < ctx) {
+    // Fast path: 4 independent per-key chains (memory-level parallelism —
+    // the same shape as the f32/f16 decode scores kernels).
+    float d0 = 0.0f;
+    float d1 = 0.0f;
+    float d2 = 0.0f;
+    float d3 = 0.0f;
+#pragma unroll 4
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const int gi = (4 * d) / KV_QGROUP;
+      const float4 a = kvq8_load4(k0 + 4 * d, s0[gi]);
+      const float4 b = kvq8_load4(k1 + 4 * d, s1[gi]);
+      const float4 c = kvq8_load4(k2 + 4 * d, s2[gi]);
+      const float4 e = kvq8_load4(k3 + 4 * d, s3[gi]);
+      d0 = __fadd_rn(d0, __fmul_rn(qq.x, a.x));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.x, b.x));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.x, c.x));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.x, e.x));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.y, a.y));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.y, b.y));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.y, c.y));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.y, e.y));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.z, a.z));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.z, b.z));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.z, c.z));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.z, e.z));
+      d0 = __fadd_rn(d0, __fmul_rn(qq.w, a.w));
+      d1 = __fadd_rn(d1, __fmul_rn(qq.w, b.w));
+      d2 = __fadd_rn(d2, __fmul_rn(qq.w, c.w));
+      d3 = __fadd_rn(d3, __fmul_rn(qq.w, e.w));
+    }
+    sc[j0] = __fmul_rn(d0, scale);
+    sc[j1] = __fmul_rn(d1, scale);
+    sc[j2] = __fmul_rn(d2, scale);
+    sc[j3] = __fmul_rn(d3, scale);
+  } else {
+    const signed char* krs[4] = {k0, k1, k2, k3};
+    const float* kss[4] = {s0, s1, s2, s3};
+    const int js[4] = {j0, j1, j2, j3};
+    for (int t = 0; t < 4; ++t) {
+      if (js[t] >= ctx) break;
+      float dot = 0.0f;
+#pragma unroll 4
+      for (int d = 0; d < hd4; ++d) {
+        const float4 qq = qv[d];
+        const float4 a = kvq8_load4(krs[t] + 4 * d, kss[t][(4 * d) / KV_QGROUP]);
+        dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+        dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+        dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+        dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+      }
+      sc[js[t]] = __fmul_rn(dot, scale);
+    }
+  }
+}
+
+// REQUIRES blockDim.x == 128 (same contract as gqa_attention_reduce_g).
+__global__ void gqa_attention_reduce_q8(const signed char* __restrict__ v,
+                                        const float* __restrict__ scores,
+                                        float* __restrict__ out,
+                                        const int* __restrict__ ctrl,
+                                        const int max_ctx, const int n_head,
+                                        const int n_head_kv, const int head_dim,
+                                        const float* __restrict__ v_scales) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (h >= n_head) return;
+  const int ctx = ctrl[2] + 1;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int gph = head_dim / KV_QGROUP;
+
+  const float* gsc = scores + (long long)h * max_ctx;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  // Weighted sum with per-(j, group) dequant. A weight-bank variant (V scales
+  // pre-folded into shared per-group weights) was MEASURED SLOWER (386 vs
+  // 340 µs at ctx≈4K) — the loop is latency-bound and the extra staging pass
+  // cost more than the removed scale loads saved. Keep the simple form.
+  float* o_row = out + (long long)h * head_dim;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const int g = d / KV_QGROUP;
+    float acc = 0.0f;
+#pragma unroll 8
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      const float vv = (float)v[((long long)j * n_head_kv + kv) * head_dim + d]
+          * v_scales[((long long)j * n_head_kv + kv) * gph + g];
+      if (w != 0.0f) {
+        acc = __fadd_rn(acc, __fmul_rn(w, vv));
+      }
+    }
+    o_row[d] = acc;
+  }
+}
+
+__global__ void gqa_attention_batch_q8(const float* __restrict__ q,
+                                       const signed char* __restrict__ k,
+                                       const signed char* __restrict__ v,
+                                       float* __restrict__ out,
+                                       float* __restrict__ scores, const int ctx_max,
+                                       const int n_head, const int n_head_kv,
+                                       const int head_dim, const float scale,
+                                       const int causal_offset, const int m,
+                                       const float* __restrict__ k_scales,
+                                       const float* __restrict__ v_scales) {
+  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const long long total = (long long)m * n_head;
+  if (warp >= total) return;
+  const int row = warp / n_head;
+  const int h = warp - (long long)row * n_head;
+  const int limit = causal_offset + row;
+  const int ctx = limit + 1;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int gph = head_dim / KV_QGROUP;
+  const float* q_row = q + ((long long)row * n_head + h) * head_dim;
+  float* sc = scores + ((long long)row * n_head + h) * ctx_max;
+
+  for (int j = lane; j < ctx; j += 32) {
+    const signed char* k_row = k + ((long long)j * n_head_kv + kv) * head_dim;
+    const float* ks = k_scales + ((long long)j * n_head_kv + kv) * gph;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot = __fadd_rn(dot, __fmul_rn(q_row[d], (float)k_row[d] * ks[d / KV_QGROUP]));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+  __syncwarp();
+  if (lane == 0) {
+    float mx = -INFINITY;
+    for (int j = 0; j < ctx; ++j) {
+      if (sc[j] > mx) mx = sc[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float e = exp_f32(__fsub_rn(sc[j], mx));
+      sc[j] = e;
+      sum = __fadd_rn(sum, e);
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+    for (int j = 0; j < ctx; ++j) {
+      sc[j] = __fmul_rn(sc[j], inv);
+    }
+  }
+  __syncwarp();
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    const int g = d / KV_QGROUP;
+    float acc = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      if (w == 0.0f) continue;
+      const float vv = (float)v[((long long)j * n_head_kv + kv) * head_dim + d]
+          * v_scales[((long long)j * n_head_kv + kv) * gph + g];
+      acc = __fadd_rn(acc, __fmul_rn(w, vv));
+    }
+    o_row[d] = acc;
+  }
+}
+
+__global__ void gqa_attention_tree_scores_q8(
+    const float* __restrict__ q, const signed char* __restrict__ k,
+    float* __restrict__ scores, const int* __restrict__ anc,
+    const int* __restrict__ n_anc, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale,
+    const int prefix_len, const int max_anc, const int m,
+    const float* __restrict__ k_scales) {
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= m) return;
+  const int ctx = prefix_len + n_anc[row];
+  const int chunk = blockIdx.y * TREE_SCORE_CHUNK;
+  if (chunk >= ctx) return;
+  const int lane = threadIdx.x & 31;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const float4* qv = (const float4*)(q + ((long long)row * n_head + h) * head_dim);
+  const int hd4 = head_dim >> 2;
+  const int gph = head_dim / KV_QGROUP;
+  const int* arow = anc + (long long)row * max_anc;
+  float* sc = scores + ((long long)row * n_head + h) * ctx_max;
+
+  const int j0 = chunk + lane;
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    const int j = j0 + 32 * t;
+    if (j >= ctx) break;
+    const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+    const signed char* kr = k + ((long long)slot * n_head_kv + kv) * head_dim;
+    const float* ks = k_scales + ((long long)slot * n_head_kv + kv) * gph;
+    float dot = 0.0f;
+#pragma unroll 8
+    for (int d = 0; d < hd4; ++d) {
+      const float4 qq = qv[d];
+      const float g = ks[(4 * d) / KV_QGROUP];
+      const float4 a = kvq8_load4(kr + 4 * d, g);
+      dot = __fadd_rn(dot, __fmul_rn(qq.x, a.x));
+      dot = __fadd_rn(dot, __fmul_rn(qq.y, a.y));
+      dot = __fadd_rn(dot, __fmul_rn(qq.z, a.z));
+      dot = __fadd_rn(dot, __fmul_rn(qq.w, a.w));
+    }
+    sc[j] = __fmul_rn(dot, scale);
+  }
+}
+
+// REQUIRES blockDim.x == 128 (same contract as gqa_attention_tree_reduce_g).
+__global__ void gqa_attention_tree_reduce_q8(
+    const signed char* __restrict__ v, const float* __restrict__ scores,
+    float* __restrict__ out, const int* __restrict__ anc,
+    const int* __restrict__ n_anc, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const int prefix_len,
+    const int max_anc, const int m, const float* __restrict__ v_scales) {
+  extern __shared__ float sc[];
+  __shared__ float s_red[256];
+  __shared__ float s_inv;
+  const int rowhead = blockIdx.x;
+  const int row = rowhead / n_head;
+  const int h = rowhead - row * n_head;
+  if (row >= m) return;
+  const int ctx = prefix_len + n_anc[row];
+  const int tid = threadIdx.x;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const int gph = head_dim / KV_QGROUP;
+  const int* arow = anc + (long long)row * max_anc;
+
+  const float* gsc = scores + ((long long)row * n_head + h) * ctx_max;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = gsc[j];
+  }
+  __syncthreads();
+
+  float mx = -INFINITY;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    mx = fmaxf(mx, sc[j]);
+  }
+  s_red[tid] = mx;
+  __syncthreads();
+  if (tid < 64) {
+    s_red[tid] = fmaxf(s_red[tid], s_red[tid + 64]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float vv = fmaxf(s_red[tid], s_red[tid + 32]);
+    for (int off = 16; off > 0; off >>= 1) {
+      vv = fmaxf(vv, __shfl_down_sync(0xffffffffu, vv, off));
+    }
+    if (tid == 0) {
+      s_red[0] = vv;
+    }
+  }
+  __syncthreads();
+  mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, sc[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += blockDim.x) {
+    sc[j] = __fmul_rn(sc[j], inv);
+  }
+  __syncthreads();
+
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const int g = d / KV_QGROUP;
+    float acc = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float w = sc[j];
+      if (w == 0.0f) continue;
+      const int slot = (j < prefix_len) ? j : arow[j - prefix_len];
+      const float vv = (float)v[((long long)slot * n_head_kv + kv) * head_dim + d]
+          * v_scales[((long long)slot * n_head_kv + kv) * gph + g];
+      acc = __fadd_rn(acc, __fmul_rn(w, vv));
+    }
+    o_row[d] = acc;
+  }
+}
+
 // lm_head_warp_f32 — the tied LM head, ONE WARP per vocab row (vs lm_head_f32's one
 // thread). Lanes stride the row by 32 so the `token_embd` reads COALESCE (the by-thread
 // kernel reads one 10 KB row per thread — adjacent threads 10 KB apart, fully

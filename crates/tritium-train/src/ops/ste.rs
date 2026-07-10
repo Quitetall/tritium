@@ -90,3 +90,47 @@ pub fn quantize_vjp(
     let g_sq = vec![0.0f32; rows];
     vec![g_wf, g_sq]
 }
+
+/// Multi-plane **SALT** residual quantize (round), `t` ternary planes with per-row AbsMean
+/// scales — the SALT student's forward. Returns the **dense reconstruction**
+/// `Ŵ = Σ_p s_p·trit_p` (`[rows, cols]` row-major). Greedy residual expansion: each plane fits
+/// the AbsMean of the running residual, subtracts its contribution, and the next plane fits
+/// what's left (ADR 0001 §1). `t == 1` is [`quantize_forward`] scaled back to weight space.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn salt_quantize_forward(wf: &[f32], rows: usize, cols: usize, t: usize) -> Vec<f32> {
+    let mut residual = wf.to_vec();
+    let mut recon = vec![0.0f32; rows * cols];
+    for _plane in 0..t {
+        let s = absmean_scale_per_row(&residual, rows, cols);
+        for r in 0..rows {
+            let sr = s[r];
+            if sr == 0.0 {
+                continue;
+            }
+            for c in 0..cols {
+                let i = r * cols + c;
+                let contrib = sr * (residual[i] / sr).round().clamp(-1.0, 1.0);
+                recon[i] += contrib;
+                residual[i] -= contrib;
+            }
+        }
+    }
+    recon
+}
+
+/// Straight-through backward for [`salt_quantize_forward`]: the `t`-plane reconstruction tracks
+/// the latent `Wf` closely (that is what the residual planes buy), so the estimator passes the
+/// output gradient straight to the latent — `gWf = grad_out`. Masking out-of-base-range elements
+/// (as the single-plane [`quantize_vjp`] does) would under-train exactly the large weights the
+/// residual planes exist to represent. Returns `[gWf]`.
+#[must_use]
+pub fn salt_quantize_vjp(
+    _wf: &[f32],
+    _rows: usize,
+    _cols: usize,
+    _t: usize,
+    grad_out: &[f32],
+) -> Vec<f32> {
+    grad_out.to_vec()
+}

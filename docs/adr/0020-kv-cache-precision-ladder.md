@@ -1,6 +1,14 @@
 # ADR 0020 — KV-cache precision ladder (f16 → i8 → ternary "KVTQ")
 
-Status: **RUNG 1 (f16) ACCEPTED** (2026-07-07) — implemented + measured:
+Status: **RUNG 1 (f16) ACCEPTED; RUNG 2 (i8-grouped) ACCEPTED AS A MEMORY
+RUNG** (2026-07-09). Rung 2 measured: KV @4K 630 → ~160 MB (+2.5 MB scales),
+perplexity rel err 2.614e-3 (~0.26%), decode @ctx≈4K **72.5 tok/s ≈ f32's
+69.5 — NOT a speed rung** (f16's 103.2 stays the speed choice): the grouped-
+dequant attention is latency-bound and the per-(j,group) scale-load stream
+eats the bandwidth saving (a shared weight-bank variant measured WORSE,
+386 vs 340 µs — recorded in the reduce kernel comment). Select with
+`TRITIUM_KV=i8`; the i8 rung's value is capacity — N concurrent sequences ×
+KV for batching, longer contexts per GB. Rung 1 (f16) measured:
 long-context decode (ctx≈4K) **68–72 → 95.6 tok/s (+33–40%)**, short-context
 unchanged (latency-bound, as predicted), perplexity rel err 2.659e-4 →
 1.582e-3 (~0.16%, inside the quality bar), KV memory halved. Opt-in via

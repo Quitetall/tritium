@@ -132,6 +132,23 @@ impl Tape {
         )
     }
 
+    /// Multi-plane **SALT** STE: forward is the `t`-plane residual quantize (the dense
+    /// reconstruction `Ŵ`, `[rows, cols]`), backward is straight-through to the latent. Use the
+    /// output as a dense weight (e.g. via [`dense_matmul`](Self::dense_matmul)) for the student.
+    pub fn salt_ste(&mut self, wf: ValueId, rows: usize, cols: usize, t: usize) -> ValueId {
+        let out = ste::salt_quantize_forward(&self.values[wf], rows, cols, t);
+        self.record(
+            vec![wf],
+            out,
+            Box::new(move |ins, g, grads, ids| {
+                let gwf = ste::salt_quantize_vjp(ins[0], rows, cols, t, g);
+                for (j, &v) in gwf.iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
+        )
+    }
+
     /// Plain dense matmul `Y[m,n] = Σ_k X[m,k]·W[n,k]` (no scale, real `f32`).
     pub fn dense_matmul(
         &mut self,
