@@ -218,6 +218,23 @@ async fn stop_string_truncates_nonstream() {
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "10 ");
     assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    // Stop-string hits CANCEL generation (review parity fix): usage counts
+    // tokens up to the match (2: "10", "11"), not the whole scripted budget,
+    // and agrees with what the streamed path reports for the same request.
+    assert_eq!(v["usage"]["completion_tokens"], 2);
+}
+
+/// OpenAI parity: stream_options without stream:true is a 400.
+#[tokio::test]
+async fn stream_options_requires_stream() {
+    let (router, _) = mock_router(vec![1], FinishReason::Stop);
+    let (status, _) = send(
+        &router,
+        chat(json!({"model":"tritium","stream_options":{"include_usage":true},
+                    "messages":[{"role":"user","content":"1"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

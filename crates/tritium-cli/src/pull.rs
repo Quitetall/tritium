@@ -50,7 +50,15 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
         Some(f) => f.to_owned(),
         None => {
             let url = format!("https://huggingface.co/api/models/{repo}");
-            let info: ModelInfo = ureq::get(&url)
+            let mut req = ureq::get(&url);
+            // Gated repos need the token on the LISTING too, or pull dies on
+            // an opaque 401 before ever reaching the download path's hint.
+            if let Ok(token) = std::env::var("HF_TOKEN")
+                && !token.is_empty()
+            {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            let info: ModelInfo = req
                 .call()
                 .with_context(|| format!("querying {url}"))?
                 .body_mut()
@@ -187,6 +195,10 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
     if let Some(total) = total {
         std::fs::write(&meta_path, format!("{etag} {total}"))
             .with_context(|| format!("writing {}", meta_path.display()))?;
+    } else {
+        // No Content-Length: no validator worth keeping — a stale sidecar
+        // from a previous attempt must not authorize a future resume.
+        let _ = std::fs::remove_file(&meta_path);
     }
 
     let mut reader = resp.body_mut().with_config().limit(u64::MAX).reader();

@@ -342,6 +342,14 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
             None,
         );
     }
+    if !req.stream && req.stream_options.is_some() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "stream_options is only allowed when stream is true",
+            Some("stream_options"),
+        );
+    }
     if req.messages.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -491,32 +499,41 @@ async fn nonstream_response(
     metrics: Arc<Metrics>,
 ) -> Response {
     let eos = tok.eos();
-    let mut tokens: Vec<u32> = Vec::new();
-    let mut finish = FinishReason::Stop;
+    // Mirror the streaming loop: incremental detok + stop-matcher, BREAK on a
+    // stop hit (dropping `rx` cancels the worker's generation) — so stop
+    // strings no longer burn decode budget past the match, and
+    // usage.completion_tokens agrees with the streamed accounting.
+    let mut detok = IncrementalDetok::new(tok);
+    let mut matcher = StopMatcher::new(stops);
+    let mut text = String::new();
+    let mut completion_tokens = 0usize;
+    let mut fr = FinishReason::Stop;
     while let Some(ev) = rx.recv().await {
         match ev {
             GenEvent::Token(t) => {
                 if t != eos {
-                    tokens.push(t);
+                    completion_tokens += 1;
                     metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
                 }
+                let piece = detok.push(t);
+                if !piece.is_empty() {
+                    let (emit, hit) = matcher.feed(&piece);
+                    text.push_str(&emit);
+                    if hit {
+                        fr = FinishReason::Stop;
+                        break;
+                    }
+                }
             }
-            GenEvent::Done(fr) => {
-                finish = fr;
+            GenEvent::Done(reason) => {
+                fr = reason;
+                text.push_str(&matcher.flush());
                 break;
             }
             GenEvent::Error(e) => {
                 return api_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e, None);
             }
         }
-    }
-    let mut text = tok.decode(&tokens).unwrap_or_default();
-    let mut fr = finish;
-    // Truncate at the EARLIEST stop match across all sequences (order-independent —
-    // matches the streaming StopMatcher's `.min()` semantics).
-    if let Some(pos) = stops.iter().filter_map(|s| text.find(s.as_str())).min() {
-        text.truncate(pos);
-        fr = FinishReason::Stop;
     }
     let completion = ChatCompletion {
         id: make_id(),
@@ -533,8 +550,8 @@ async fn nonstream_response(
         }],
         usage: Usage {
             prompt_tokens: prompt_len,
-            completion_tokens: tokens.len(),
-            total_tokens: prompt_len + tokens.len(),
+            completion_tokens,
+            total_tokens: prompt_len + completion_tokens,
         },
     };
     Json(completion).into_response()
