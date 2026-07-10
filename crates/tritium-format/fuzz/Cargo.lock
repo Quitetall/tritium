@@ -185,11 +185,11 @@ dependencies = [
 
 [[package]]
 name = "tritium-core"
-version = "0.5.8"
+version = "1.0.0"
 
 [[package]]
 name = "tritium-format"
-version = "0.5.8"
+version = "1.0.0"
 dependencies = [
  "half",
  "serde",
@@ -201,7 +201,9 @@ dependencies = [
 name = "tritium-format-fuzz"
 version = "0.0.0"
 dependencies = [
+ "half",
  "libfuzzer-sys",
+ "tritium-core",
  "tritium-format",
 ]
 

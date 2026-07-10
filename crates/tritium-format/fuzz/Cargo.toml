@@ -14,9 +14,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+half = "2"
 
 [dependencies.tritium-format]
 path = ".."
+
+# unpack_* / zero_bitmap targets decode into typed buffers.
+[dependencies.tritium-core]
+path = "../../tritium-core"
 
 # Standalone: do not join the parent virtual workspace.
 [workspace]
@@ -73,6 +78,27 @@ bench = false
 [[bin]]
 name = "salt_legacy_parse"
 path = "fuzz_targets/salt_legacy_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpack_i2s"
+path = "fuzz_targets/unpack_i2s.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpack_tq_rows"
+path = "fuzz_targets/unpack_tq_rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zero_bitmap"
+path = "fuzz_targets/zero_bitmap.rs"
 test = false
 doc = false
 bench = false

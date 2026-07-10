@@ -131,9 +131,18 @@ pub fn compute_zero_bitmaps(
 ) -> Result<Vec<u32>, FormatError> {
     let nb = k.div_ceil(QK_K);
     let words_per_row = nb.div_ceil(32);
-    if packed.len() < n * row_bytes {
+    // Checked: `n * row_bytes` on attacker-influenced sizes must not wrap
+    // (a wrapped product could pass the length check then slice out of
+    // bounds below).
+    let need = n
+        .checked_mul(row_bytes)
+        .ok_or(FormatError::WrongBlockLen {
+            expected: usize::MAX,
+            got: packed.len(),
+        })?;
+    if packed.len() < need {
         return Err(FormatError::WrongBlockLen {
-            expected: n * row_bytes,
+            expected: need,
             got: packed.len(),
         });
     }

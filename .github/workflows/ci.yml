@@ -85,7 +85,8 @@ jobs:
         run: |
           for t in gguf_parse salt_gguf_parse sparse_plane_parse \
                    tqbin_parse tqidx_parse salt_bundle_parse \
-                   safetensors_parse salt_legacy_parse; do
+                   safetensors_parse salt_legacy_parse \
+                   unpack_i2s unpack_tq_rows zero_bitmap; do
             echo "::group::fuzz $t"
             cargo +nightly fuzz run "$t" -- -max_len=131072 -max_total_time=450
             echo "::endgroup::"
