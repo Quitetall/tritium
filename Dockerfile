@@ -23,7 +23,7 @@
 
 ARG CUDA_TAG=13.0.1-devel-ubuntu24.04
 
-FROM nvidia/cuda:${CUDA_TAG} AS build
+FROM docker.io/nvidia/cuda:${CUDA_TAG} AS build
 ARG FEATURES=cuda
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates build-essential pkg-config \
@@ -42,7 +42,7 @@ RUN cargo build --release --locked -p tritium-serve --features ${FEATURES} \
 # (cudarc fallback-dynamic-loading — no libcuda link dependency), and
 # `--gpus all` injects libcuda via the NVIDIA container toolkit. PTX is
 # compiled into the binary at build time, so no toolkit libs are needed.
-FROM ubuntu:24.04
+FROM docker.io/library/ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
