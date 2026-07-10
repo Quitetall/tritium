@@ -32,6 +32,9 @@ tritium-core = { workspace = true }
 half = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+# `pull` fetches GGUFs from the HuggingFace hub (blocking, tiny footprint —
+# already in-tree transitively via ort).
+ureq = { version = "3.3", features = ["json"] }
 serde = { workspace = true }
 # `generate` reads input token IDs from a reproducible JSON file.
 serde_json = { workspace = true }

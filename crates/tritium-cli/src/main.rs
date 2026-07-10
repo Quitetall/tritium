@@ -24,6 +24,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod backends;
 mod generate;
 mod inspect;
+mod pull;
 mod quantize;
 mod repack;
 mod report;
@@ -55,6 +56,19 @@ enum Command {
     },
     /// List every backend the runtime discovered, with its capabilities.
     ListBackends,
+    /// Download a GGUF model from the HuggingFace hub into the local cache
+    /// (~/.cache/tritium-models, override with TRITIUM_MODEL_CACHE). Resumes
+    /// partial downloads on re-run.
+    Pull {
+        /// Hub repo, `owner/name` (e.g. `microsoft/bitnet-b1.58-2B-4T-gguf`).
+        repo: String,
+        /// Which file to pull when the repo holds several .gguf files.
+        #[arg(long)]
+        file: Option<String>,
+        /// Git revision (branch, tag or commit) to pull from.
+        #[arg(long, default_value = "main")]
+        revision: String,
+    },
     /// Load a GGUF model and greedily generate tokens from a JSON file of input IDs.
     Generate {
         /// Path to the `.gguf` model file.
@@ -253,6 +267,11 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Inspect { path } => inspect::run(&path)?,
         Command::ListBackends => backends::run(),
+        Command::Pull {
+            repo,
+            file,
+            revision,
+        } => pull::run(&repo, file.as_deref(), &revision)?,
         Command::Generate {
             model,
             tokens,
