@@ -113,6 +113,18 @@ impl Default for ServeConfig {
     }
 }
 
+/// Serve-level counters for `/metrics` (Prometheus text format, no deps).
+/// Counters are monotone; gauges are computed at scrape time.
+#[derive(Debug, Default)]
+pub(crate) struct Metrics {
+    /// Chat completions accepted into the queue (streaming + non-streaming).
+    pub(crate) chat_requests: AtomicU64,
+    /// 429s returned because the job queue was full.
+    pub(crate) queue_rejections: AtomicU64,
+    /// Completion tokens emitted to clients across all requests.
+    pub(crate) tokens_out: AtomicU64,
+}
+
 #[derive(Clone)]
 struct AppState {
     jobs: mpsc::Sender<Job>,
@@ -122,6 +134,7 @@ struct AppState {
     worker_alive: Arc<AtomicBool>,
     max_new_default: usize,
     chat_template: ChatTemplate,
+    metrics: Arc<Metrics>,
 }
 
 /// Build the router. Returns it plus the drain flag — set the flag (then run
@@ -205,12 +218,14 @@ fn build_router_inner(
         worker_alive,
         max_new_default: cfg.max_new_default,
         chat_template: cfg.chat_template,
+        metrics: Arc::new(Metrics::default()),
     };
     let auth_token: Option<Arc<str>> = cfg.auth_token.as_deref().map(Arc::from);
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/tree/session", post(tree_session))
         .route("/v1/tree/verify", post(tree_verify))
         .with_state(state)
@@ -426,8 +441,11 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
 
     let (tx, rx) = mpsc::channel::<GenEvent>(64);
     match st.jobs.try_send(Job::Generate { req: gen_req, tx }) {
-        Ok(()) => {}
+        Ok(()) => {
+            st.metrics.chat_requests.fetch_add(1, Ordering::Relaxed);
+        }
         Err(mpsc::error::TrySendError::Full(_)) => {
+            st.metrics.queue_rejections.fetch_add(1, Ordering::Relaxed);
             let mut r = api_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_exceeded",
@@ -449,9 +467,10 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
     }
 
     if req.stream {
-        stream_response(rx, st.tok.clone(), req.model, stops)
+        stream_response(rx, st.tok.clone(), req.model, stops, st.metrics.clone())
     } else {
-        nonstream_response(rx, st.tok.clone(), req.model, prompt_len, stops).await
+        nonstream_response(rx, st.tok.clone(), req.model, prompt_len, stops, st.metrics.clone())
+            .await
     }
 }
 
@@ -461,6 +480,7 @@ async fn nonstream_response(
     model: String,
     prompt_len: usize,
     stops: Vec<String>,
+    metrics: Arc<Metrics>,
 ) -> Response {
     let eos = tok.eos();
     let mut tokens: Vec<u32> = Vec::new();
@@ -470,6 +490,7 @@ async fn nonstream_response(
             GenEvent::Token(t) => {
                 if t != eos {
                     tokens.push(t);
+                    metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
                 }
             }
             GenEvent::Done(fr) => {
@@ -520,6 +541,7 @@ fn stream_response(
     tok: Arc<dyn Tokenizer + Send + Sync>,
     model: String,
     stops: Vec<String>,
+    metrics: Arc<Metrics>,
 ) -> Response {
     let id = make_id();
     let created = now_secs();
@@ -536,6 +558,7 @@ fn stream_response(
         while let Some(ev) = rx.recv().await {
             match ev {
                 GenEvent::Token(t) => {
+                    metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
                     let text = detok.push(t);
                     if !text.is_empty() {
                         let (emit, hit) = matcher.feed(&text);
@@ -588,22 +611,65 @@ async fn models(State(st): State<AppState>) -> Response {
 }
 
 async fn health(State(st): State<AppState>) -> Response {
+    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
     if !st.worker_alive.load(Ordering::Relaxed) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "status": "unhealthy", "detail": "decode worker stopped" })),
+            Json(serde_json::json!({
+                "status": "unhealthy",
+                "detail": "decode worker stopped",
+                "model": &*st.model_id,
+            })),
         )
             .into_response();
     }
     if st.draining.load(Ordering::Relaxed) {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "status": "draining" })),
+            Json(serde_json::json!({ "status": "draining", "model": &*st.model_id })),
         )
             .into_response()
     } else {
-        Json(serde_json::json!({ "status": "ok" })).into_response()
+        Json(serde_json::json!({
+            "status": "ok",
+            "model": &*st.model_id,
+            "queue_depth": queue_depth,
+        }))
+        .into_response()
     }
+}
+
+/// Prometheus text exposition (behind the same auth as everything else).
+/// Gauges are scrape-time reads; counters live in [`Metrics`].
+async fn metrics(State(st): State<AppState>) -> Response {
+    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let body = format!(
+        "# HELP tritium_chat_requests_total Chat completions accepted into the queue.\n\
+         # TYPE tritium_chat_requests_total counter\n\
+         tritium_chat_requests_total {}\n\
+         # HELP tritium_queue_rejections_total Requests 429'd because the job queue was full.\n\
+         # TYPE tritium_queue_rejections_total counter\n\
+         tritium_queue_rejections_total {}\n\
+         # HELP tritium_tokens_out_total Completion tokens emitted to clients.\n\
+         # TYPE tritium_tokens_out_total counter\n\
+         tritium_tokens_out_total {}\n\
+         # HELP tritium_queue_depth Jobs waiting in the decode queue.\n\
+         # TYPE tritium_queue_depth gauge\n\
+         tritium_queue_depth {}\n\
+         # HELP tritium_worker_alive Decode worker liveness (1 = alive).\n\
+         # TYPE tritium_worker_alive gauge\n\
+         tritium_worker_alive {}\n",
+        st.metrics.chat_requests.load(Ordering::Relaxed),
+        st.metrics.queue_rejections.load(Ordering::Relaxed),
+        st.metrics.tokens_out.load(Ordering::Relaxed),
+        queue_depth,
+        u8::from(st.worker_alive.load(Ordering::Relaxed)),
+    );
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
+        .into_response()
 }
 
 // ───────────────────── BASTION tree-verify surface (ADR 0014) ─────────────────────

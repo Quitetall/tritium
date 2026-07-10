@@ -811,3 +811,41 @@ fn chat_template_render() {
     let concat = ChatTemplate::Concat.render(msgs.iter().map(|&(r, c)| (r, c)));
     assert_eq!(concat, "Be terse.\n What is 2+2? \n4\nAnd 3+3?");
 }
+
+/// /metrics: Prometheus text exposition — counters move with traffic, the
+/// queue gauge and worker liveness render, and the endpoint sits behind the
+/// same auth as everything else (uniform surface).
+#[tokio::test]
+async fn metrics_exposition() {
+    let (router, _d) = mock_router(vec![10, 11, 12], FinishReason::Stop);
+    // Two requests -> 2 accepted, 6 tokens.
+    for _ in 0..2 {
+        let (status, _) = send(
+            &router,
+            chat(json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("tritium_chat_requests_total 2"), "{text}");
+    assert!(text.contains("tritium_tokens_out_total 6"), "{text}");
+    assert!(text.contains("tritium_queue_rejections_total 0"), "{text}");
+    assert!(text.contains("tritium_worker_alive 1"), "{text}");
+    assert!(text.contains("# TYPE tritium_queue_depth gauge"), "{text}");
+
+    // Auth uniformity: with a token configured, /metrics 401s like the rest.
+    let (router, _d) = router_with(
+        MockGenerator::new(vec![1]),
+        ServeConfig {
+            auth_token: Some("sekrit".into()),
+            ..ServeConfig::default()
+        },
+    );
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let (status, _) = send(&router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
