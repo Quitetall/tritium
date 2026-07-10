@@ -121,7 +121,6 @@ impl CudaDecodeModel {
         Ok(())
     }
 
-
     /// Allocate batched-decode state for `n` concurrent sequences: a per-sequence KV arena
     /// (`[n, max_ctx, kv_width]` per layer) + the M=N scratch, all starting empty.
     ///
@@ -808,7 +807,6 @@ impl CudaDecodeModel {
         Ok(ids.into_iter().map(|t| t as u32).collect())
     }
 
-
     /// Extract every batch + weight buffer's stable device pointer (guards dropped here,
     /// outside capture), then capture the full M=N forward via raw launches on
     /// `cap_stream`. Mirrors [`record_graph`](Self::record_graph) for the batched path,
@@ -916,7 +914,12 @@ impl CudaDecodeModel {
 
     /// One transformer block of the M=N forward, raw-launched into the capture. Mirrors
     /// the per-layer body of [`decode_batch`](Self::decode_batch) op-for-op.
-    pub(super) fn gb_layer(&self, p: &BatchPtrs, l: &BatchLayerPtrs, n: usize) -> Result<(), BackendError> {
+    pub(super) fn gb_layer(
+        &self,
+        p: &BatchPtrs,
+        l: &BatchLayerPtrs,
+        n: usize,
+    ) -> Result<(), BackendError> {
         let (n_embd, q_width, kv_width, n_ff) =
             (self.n_embd, self.q_width, self.kv_width, self.n_ff);
         let (n_head, n_head_kv, head_dim) = (self.n_head, self.n_head_kv, self.head_dim);

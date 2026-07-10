@@ -230,8 +230,10 @@ async fn stream_options_requires_stream() {
     let (router, _) = mock_router(vec![1], FinishReason::Stop);
     let (status, _) = send(
         &router,
-        chat(json!({"model":"tritium","stream_options":{"include_usage":true},
-                    "messages":[{"role":"user","content":"1"}]})),
+        chat(
+            json!({"model":"tritium","stream_options":{"include_usage":true},
+                    "messages":[{"role":"user","content":"1"}]}),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -540,8 +542,8 @@ impl Generator for TreeMock {
             token: 7,
             finished: true,
             finish_reason: Some(FinishReason::Stop),
-                logprobs: None,
-            });
+            logprobs: None,
+        });
         Ok(())
     }
     fn n_ctx(&self) -> usize {
@@ -768,7 +770,11 @@ async fn nonstream_timeout_408() {
         chat(json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})),
     )
     .await;
-    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "slow non-streaming -> 408");
+    assert_eq!(
+        status,
+        StatusCode::REQUEST_TIMEOUT,
+        "slow non-streaming -> 408"
+    );
 }
 
 /// Streaming is NOT bounded by the request timeout: the SSE body is lazy, so
@@ -851,7 +857,10 @@ async fn metrics_exposition() {
     let text = String::from_utf8(body).unwrap();
     assert!(text.contains("tritium_chat_requests_total 2\n"), "{text}");
     assert!(text.contains("tritium_tokens_out_total 6\n"), "{text}");
-    assert!(text.contains("tritium_queue_rejections_total 0\n"), "{text}");
+    assert!(
+        text.contains("tritium_queue_rejections_total 0\n"),
+        "{text}"
+    );
     assert!(text.contains("tritium_worker_alive 1\n"), "{text}");
     assert!(text.contains("# TYPE tritium_queue_depth gauge"), "{text}");
 
@@ -888,7 +897,11 @@ async fn stream_usage_chunk() {
     assert_eq!(last["usage"]["completion_tokens"], 3);
     assert_eq!(last["usage"]["total_tokens"], 5);
     // Every earlier chunk omits usage entirely.
-    assert!(chunks[..chunks.len() - 1].iter().all(|c| c["usage"].is_null()));
+    assert!(
+        chunks[..chunks.len() - 1]
+            .iter()
+            .all(|c| c["usage"].is_null())
+    );
 
     // Without stream_options: no usage chunk, terminal chunk is last.
     let (router, _) = mock_router(vec![10, 11, 12], FinishReason::Stop);
@@ -929,8 +942,10 @@ async fn logprobs_shapes() {
     let (router, _) = mock_router(vec![10, 11], FinishReason::Stop);
     let (_, body) = send(
         &router,
-        chat(json!({"model":"tritium","stream":true,"logprobs":true,"top_logprobs":1,
-                    "messages":[{"role":"user","content":"1"}]})),
+        chat(
+            json!({"model":"tritium","stream":true,"logprobs":true,"top_logprobs":1,
+                    "messages":[{"role":"user","content":"1"}]}),
+        ),
     )
     .await;
     let chunks = sse_chunks(&parse_sse(&body));
@@ -939,7 +954,10 @@ async fn logprobs_shapes() {
         .filter(|c| !c["choices"][0]["logprobs"].is_null())
         .collect();
     assert_eq!(with_lp.len(), 2, "one logprobs record per content chunk");
-    assert_eq!(with_lp[0]["choices"][0]["logprobs"]["content"][0]["token"], "10");
+    assert_eq!(
+        with_lp[0]["choices"][0]["logprobs"]["content"][0]["token"],
+        "10"
+    );
 
     // Not requested -> absent entirely.
     let (router, _) = mock_router(vec![10], FinishReason::Stop);
@@ -955,8 +973,46 @@ async fn logprobs_shapes() {
     let (router, _) = mock_router(vec![10], FinishReason::Stop);
     let (status, _) = send(
         &router,
-        chat(json!({"model":"tritium","top_logprobs":3,"messages":[{"role":"user","content":"1"}]})),
+        chat(
+            json!({"model":"tritium","top_logprobs":3,"messages":[{"role":"user","content":"1"}]}),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Review finding: streamed logprob rows must never be dropped — with a stop
+/// string active (StopMatcher holds text back) the row count must still
+/// equal the non-streaming path's for the same generation.
+#[tokio::test]
+async fn stream_logprobs_survive_stop_holdback() {
+    let req = json!({"model":"tritium","logprobs":true,"top_logprobs":1,
+                     "stop":"11","messages":[{"role":"user","content":"1"}]});
+    // Non-stream reference: rows for tokens up to the stop hit.
+    let (router, _) = mock_router(vec![10, 11, 12], FinishReason::Stop);
+    let (_, body) = send(&router, chat(req.clone())).await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let want_rows = v["choices"][0]["logprobs"]["content"]
+        .as_array()
+        .unwrap()
+        .len();
+
+    // Stream: sum rows across all chunks (incl. any empty-content carrier).
+    let mut sreq = req;
+    sreq["stream"] = json!(true);
+    let (router, _) = mock_router(vec![10, 11, 12], FinishReason::Stop);
+    let (_, body) = send(&router, chat(sreq)).await;
+    let got_rows: usize = sse_chunks(&parse_sse(&body))
+        .iter()
+        .filter_map(|c| c["choices"][0]["logprobs"]["content"].as_array())
+        .map(Vec::len)
+        .sum();
+    assert_eq!(
+        got_rows, want_rows,
+        "streamed logprob rows must match non-streamed for the same request"
+    );
+    assert!(
+        want_rows >= 2,
+        "sanity: stop at second token yields >= 2 rows"
+    );
 }

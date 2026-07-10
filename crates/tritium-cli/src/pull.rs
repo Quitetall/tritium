@@ -110,12 +110,10 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
     // Resume without it is a splice hazard (old-file prefix + new-file
     // tail both parse as GGUF and serve garbage), so no meta = restart.
     let meta_path = dir.join(format!("{file_name}.part.meta"));
-    let meta: Option<(String, u64)> = std::fs::read_to_string(&meta_path)
-        .ok()
-        .and_then(|m| {
-            let (etag, total) = m.trim().rsplit_once(' ')?;
-            Some((etag.to_owned(), total.parse().ok()?))
-        });
+    let meta: Option<(String, u64)> = std::fs::read_to_string(&meta_path).ok().and_then(|m| {
+        let (etag, total) = m.trim().rsplit_once(' ')?;
+        Some((etag.to_owned(), total.parse().ok()?))
+    });
     let have = match (&meta, part.metadata().map(|m| m.len())) {
         (Some(_), Ok(len)) => len,
         _ => 0, // no validator (or no .part): restart from scratch
@@ -173,8 +171,8 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
             .with_context(|| format!("opening {}", part.display()))?;
         (f, have)
     } else if status == 200 {
-        let f = std::fs::File::create(&part)
-            .with_context(|| format!("creating {}", part.display()))?;
+        let f =
+            std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
         (f, 0)
     } else if status == 416 {
         // If-Range guarantees a changed file comes back as 200, so a 416
@@ -233,8 +231,7 @@ pub(crate) fn run(repo: &str, file: Option<&str>, revision: &str) -> anyhow::Res
             part.display()
         );
     }
-    std::fs::rename(&part, &dest)
-        .with_context(|| format!("renaming into {}", dest.display()))?;
+    std::fs::rename(&part, &dest).with_context(|| format!("renaming into {}", dest.display()))?;
     let _ = std::fs::remove_file(&meta_path);
     eprintln!("pulled {}", dest.display());
     print_next_steps(&dest);

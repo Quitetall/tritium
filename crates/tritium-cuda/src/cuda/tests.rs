@@ -338,8 +338,7 @@ fn salt_resident_forward_matches_dequant() {
                         let scales: Vec<f16> = (0..nb)
                             .map(|_| {
                                 f16::from_f32(
-                                    (0.05 + ((next() >> 40) % 8) as f32 * 0.3)
-                                        / (p as f32 + 1.0),
+                                    (0.05 + ((next() >> 40) % 8) as f32 * 0.3) / (p as f32 + 1.0),
                                 )
                             })
                             .collect();
@@ -2039,14 +2038,12 @@ fn cuda_graph_raw_launch_replay_bit_identical() {
     let ptx_c = CString::new(DECODE_PTX).expect("ptx cstring");
     // SAFETY: `ptx_c` is a valid NUL-terminated PTX image; `load_data` JIT-compiles it.
     #[allow(unsafe_code)]
-    let cu_module = unsafe {
-        result::module::load_data(ptx_c.as_ptr() as *const c_void).expect("load_data")
-    };
+    let cu_module =
+        unsafe { result::module::load_data(ptx_c.as_ptr() as *const c_void).expect("load_data") };
     let fname = CString::new("residual_add_f32").expect("fn cstring");
     // SAFETY: `cu_module` is a loaded module; `residual_add_f32` is one of its entry points.
     #[allow(unsafe_code)]
-    let cu_func =
-        unsafe { result::module::get_function(cu_module, fname).expect("get_function") };
+    let cu_func = unsafe { result::module::get_function(cu_module, fname).expect("get_function") };
 
     let n = 2560usize;
     let x0 = vec![1.0f32; n];
@@ -2098,9 +2095,7 @@ fn cuda_graph_raw_launch_replay_bit_identical() {
         }
     }
     let graph = cap
-        .end_capture(
-            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-        )
+        .end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
         .expect("end_capture")
         .expect("non-empty graph");
 
@@ -2224,8 +2219,7 @@ fn sparse_matches_dense_tiled_on_mixed_weights() {
     let bitmap =
         tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
     let words_per_row = nb.div_ceil(32);
-    let sparse =
-        run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+    let sparse = run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
 
     for (i, (&d, &s)) in dense.iter().zip(&sparse).enumerate() {
         assert!(
@@ -2261,8 +2255,7 @@ fn sparse_kernel_all_zero_weights() {
     let bitmap =
         tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
     let words_per_row = nb.div_ceil(32);
-    let sparse =
-        run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+    let sparse = run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
 
     for (i, &v) in sparse.iter().enumerate() {
         assert_eq!(v, 0.0, "all-zero weights should produce zero output [{i}]");
@@ -2298,8 +2291,7 @@ fn sparse_kernel_no_zero_blocks() {
     let bitmap =
         tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
     let words_per_row = nb.div_ceil(32);
-    let sparse =
-        run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+    let sparse = run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
 
     for (i, (&d, &s)) in dense.iter().zip(&sparse).enumerate() {
         assert!(
@@ -2339,8 +2331,7 @@ fn sparse_kernel_partial_block() {
     let bitmap =
         tritium_format::compute_zero_bitmaps(&packed, n, k, nb * TQ2_0_BLOCK_BYTES).unwrap();
     let words_per_row = nb.div_ceil(32);
-    let sparse =
-        run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
+    let sparse = run_kernel_sparse(&cuda, &packed, &act, &scales, &bitmap, words_per_row, shape);
 
     for (i, (&g, &c)) in sparse.iter().zip(&cpu_out).enumerate() {
         assert!(

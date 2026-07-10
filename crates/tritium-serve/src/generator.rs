@@ -304,7 +304,8 @@ impl fmt::Debug for RunnerGenerator {
 }
 
 /// Log-softmax top-k: the sampled token's logprob first, then the `k`
-/// highest-logprob alternatives (excluding a duplicate of `sampled`). One
+/// highest-logprob alternatives (which MAY include the sampled token again —
+/// matching OpenAI, whose top_logprobs contains the sampled token). One
 /// O(vocab) pass + an O(vocab·log k)-ish partial select — computed only when
 /// the request asked for logprobs.
 pub(crate) fn top_logprobs(logits: &[f32], sampled: u32, k: usize) -> Vec<(u32, f32)> {
@@ -534,8 +535,8 @@ impl RunnerGenerator {
                     } else {
                         None
                     },
-                logprobs: None,
-            });
+                    logprobs: None,
+                });
                 emitted += 1;
                 if last || !cont {
                     if stats && n_verify > 0 {
@@ -780,8 +781,8 @@ impl RunnerGenerator {
                     } else {
                         None
                     },
-                logprobs: None,
-            });
+                    logprobs: None,
+                });
                 emitted += 1;
                 if last || !cont {
                     return Ok(());
@@ -938,9 +939,9 @@ impl Generator for RunnerGenerator {
                     ),
                     // Caller-shaped errors (malformed tree, capacity overflow) → 400;
                     // anything else is a device/internal fault → 500.
-                    tritium_nn::ResidentOpError::Op(
-                        tritium_spec::BackendError::InvalidInput(m),
-                    ) => TreeOpError::BadRequest(m),
+                    tritium_nn::ResidentOpError::Op(tritium_spec::BackendError::InvalidInput(
+                        m,
+                    )) => TreeOpError::BadRequest(m),
                     other => TreeOpError::Internal(other.to_string()),
                 });
         }
@@ -1016,8 +1017,8 @@ mod tests {
                 max_new: 8,
                 sampling: Sampling::Greedy,
                 stop_eos: true,
-        logprobs: None,
-    },
+                logprobs: None,
+            },
             &mut |s| {
                 seen.push(s.token);
                 if let Some(r) = s.finish_reason {
@@ -1043,8 +1044,8 @@ mod tests {
                 max_new: 2,
                 sampling: Sampling::Greedy,
                 stop_eos: true,
-        logprobs: None,
-    },
+                logprobs: None,
+            },
             &mut |s| {
                 count += 1;
                 last_reason = s.finish_reason.or(last_reason);
@@ -1067,8 +1068,8 @@ mod tests {
                 max_new: 5,
                 sampling: Sampling::Greedy,
                 stop_eos: true,
-        logprobs: None,
-    },
+                logprobs: None,
+            },
             &mut |_s| {
                 count += 1;
                 count < 2 // stop after the 2nd

@@ -720,7 +720,6 @@ impl CudaDecodeModel {
         self.tree_promote(path)
     }
 
-
     /// Promote the accepted path: node path[k] (arena slot cache_len + path[k])
     /// moves to arena row cache_len + k, then the cache advances by the path
     /// length. `path` is strictly increasing (children follow parents), so
@@ -784,7 +783,6 @@ impl CudaDecodeModel {
     }
 
     // --- batched (M>1) prefill launch helpers (safe launches; eager one-shot path) ---
-
 
     /// Capture the tree-verify trunk (embed → 30 layers, NO final norm / LM
     /// head — those run eagerly at the real node count) for a padded tree of
@@ -1008,5 +1006,4 @@ impl CudaDecodeModel {
             .ok_or_else(|| BackendError::Backend("tree graph capture produced no graph".into()))?;
         Ok(graph)
     }
-
 }

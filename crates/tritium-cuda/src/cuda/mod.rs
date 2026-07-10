@@ -3151,8 +3151,8 @@ impl CudaDecodeModel {
 }
 
 mod graph_raw;
-use graph_raw::*;
 pub use graph_raw::BatchKv;
+use graph_raw::*;
 mod batch;
 mod tree;
 

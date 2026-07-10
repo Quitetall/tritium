@@ -58,7 +58,10 @@ fn string_array<'a>(file: &'a GgufFile, key: &str) -> Result<Vec<&'a str>, NnErr
         .and_then(GgufValue::as_array)
         .ok_or_else(|| meta_err(&format!("missing array `{key}`")))?
         .iter()
-        .map(|v| v.as_str().ok_or_else(|| meta_err(&format!("`{key}` holds a non-string"))))
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| meta_err(&format!("`{key}` holds a non-string")))
+        })
         .collect()
 }
 
@@ -127,21 +130,21 @@ impl GgufBpeTokenizer {
         let split = tokenizers::pre_tokenizers::split::Split::new(
             // SplitPattern::Regex must be NAMED: From<&str> yields the
             // String (literal-match) variant.
-            tokenizers::pre_tokenizers::split::SplitPattern::Regex(
-                LLAMA3_SPLIT_PATTERN.to_owned(),
-            ),
+            tokenizers::pre_tokenizers::split::SplitPattern::Regex(LLAMA3_SPLIT_PATTERN.to_owned()),
             tokenizers::SplitDelimiterBehavior::Isolated,
             false,
         )
         .map_err(|e| meta_err(&format!("split regex: {e}")))?;
-        inner.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::PreTokenizerWrapper::Sequence(
-            tokenizers::pre_tokenizers::sequence::Sequence::new(vec![
-                tokenizers::pre_tokenizers::PreTokenizerWrapper::Split(split),
-                tokenizers::pre_tokenizers::PreTokenizerWrapper::ByteLevel(
-                    tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
-                ),
-            ]),
-        )));
+        inner.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::PreTokenizerWrapper::Sequence(
+                tokenizers::pre_tokenizers::sequence::Sequence::new(vec![
+                    tokenizers::pre_tokenizers::PreTokenizerWrapper::Split(split),
+                    tokenizers::pre_tokenizers::PreTokenizerWrapper::ByteLevel(
+                        tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
+                    ),
+                ]),
+            ),
+        ));
         inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::new(
             false, true, true,
         )));

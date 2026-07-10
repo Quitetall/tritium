@@ -108,7 +108,8 @@ pub(crate) fn spawn_worker(
                                 // Closed (gone) cancels this request and frees the
                                 // worker. Tokens delivered so far are an in-order
                                 // prefix — no gaps.
-                                tx.try_send(GenEvent::Token(step.token, step.logprobs)).is_ok()
+                                tx.try_send(GenEvent::Token(step.token, step.logprobs))
+                                    .is_ok()
                                     && !draining.load(Ordering::Relaxed)
                             });
                             (res, final_reason)

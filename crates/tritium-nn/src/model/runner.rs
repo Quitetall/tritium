@@ -180,9 +180,7 @@ impl ModelRunner {
     /// (cuda) Borrow the resident decoder for a facade op, folding the two failure
     /// modes into [`ResidentOpError`].
     #[cfg(feature = "cuda")]
-    fn resident_for_op(
-        &mut self,
-    ) -> Result<&mut tritium_cuda::CudaDecodeModel, ResidentOpError> {
+    fn resident_for_op(&mut self) -> Result<&mut tritium_cuda::CudaDecodeModel, ResidentOpError> {
         match self.ensure_resident() {
             Err(e) => Err(ResidentOpError::Build(e.to_string())),
             Ok(false) => Err(ResidentOpError::Unavailable),

@@ -43,10 +43,7 @@ pub enum ChatTemplate {
 
 impl ChatTemplate {
     /// Render `(role, content)` messages into the prompt string.
-    pub fn render<'a>(
-        self,
-        messages: impl Iterator<Item = (&'a str, &'a str)>,
-    ) -> String {
+    pub fn render<'a>(self, messages: impl Iterator<Item = (&'a str, &'a str)>) -> String {
         match self {
             ChatTemplate::Concat => messages
                 .map(|(_, content)| content)
@@ -456,9 +453,7 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
     }
     let prompt_len = prompt_tokens.len();
     let max_new = req.max_tokens.map_or(st.max_new_default, |m| m as usize);
-    let logprobs_k = req
-        .logprobs
-        .then(|| req.top_logprobs.unwrap_or(0) as usize);
+    let logprobs_k = req.logprobs.then(|| req.top_logprobs.unwrap_or(0) as usize);
     let gen_req = GenRequest {
         prompt_tokens,
         max_new,
@@ -505,8 +500,15 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
             include_usage.then_some(prompt_len),
         )
     } else {
-        nonstream_response(rx, st.tok.clone(), req.model, prompt_len, stops, st.metrics.clone())
-            .await
+        nonstream_response(
+            rx,
+            st.tok.clone(),
+            req.model,
+            prompt_len,
+            stops,
+            st.metrics.clone(),
+        )
+        .await
     }
 }
 
@@ -643,6 +645,7 @@ fn stream_response(
         let mut detok = IncrementalDetok::new(tok);
         let mut matcher = StopMatcher::new(stops);
         let mut completion_tokens = 0usize;
+        let mut pending_rows: Vec<Vec<(u32, f32)>> = Vec::new();
         let mut finish = FinishReason::Stop;
         let mut stopped_by_string = false;
         let mut errored = false;
@@ -655,17 +658,25 @@ fn stream_response(
                     if t != detok_eos {
                         metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
                         completion_tokens += 1;
+                        // Buffer the row: text may be held back (StopMatcher
+                        // partial match, mid-codepoint byte-level token), so
+                        // records ride the NEXT chunk that actually emits —
+                        // no row is ever dropped (review finding).
+                        if let Some(lp) = lp {
+                            pending_rows.push(lp);
+                        }
                     }
                     let text = detok.push(t);
                     if !text.is_empty() {
                         let (emit, hit) = matcher.feed(&text);
                         if !emit.is_empty() {
                             let mut chunk = content_chunk(&id, created, &model, &emit);
-                            if t != detok_eos
-                                && let Some(lp) = lp
-                            {
-                                chunk.choices[0].logprobs =
-                                    Some(render_logprobs(&[lp], stream_tok.as_ref()));
+                            if !pending_rows.is_empty() {
+                                chunk.choices[0].logprobs = Some(render_logprobs(
+                                    &pending_rows,
+                                    stream_tok.as_ref(),
+                                ));
+                                pending_rows.clear();
                             }
                             yield Ok(sse_data(&chunk));
                         }
@@ -689,8 +700,23 @@ fn stream_response(
             if !stopped_by_string {
                 let tail = matcher.flush();
                 if !tail.is_empty() {
-                    yield Ok(sse_data(&content_chunk(&id, created, &model, &tail)));
+                    let mut chunk = content_chunk(&id, created, &model, &tail);
+                    if !pending_rows.is_empty() {
+                        chunk.choices[0].logprobs =
+                            Some(render_logprobs(&pending_rows, stream_tok.as_ref()));
+                        pending_rows.clear();
+                    }
+                    yield Ok(sse_data(&chunk));
                 }
+            }
+            // Rows still pending (empty flush tail, or a stop-string hit
+            // whose matched token never emitted): carry them on an
+            // empty-content chunk so streamed rows == non-streamed rows.
+            if !pending_rows.is_empty() {
+                let mut chunk = content_chunk(&id, created, &model, "");
+                chunk.choices[0].logprobs =
+                    Some(render_logprobs(&pending_rows, stream_tok.as_ref()));
+                yield Ok(sse_data(&chunk));
             }
             yield Ok(sse_data(&terminal_chunk(&id, created, &model, finish)));
             // OpenAI stream_options.include_usage: one final chunk with
@@ -780,11 +806,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
         queue_depth,
         u8::from(st.worker_alive.load(Ordering::Relaxed)),
     );
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        body,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 // ───────────────────── BASTION tree-verify surface (ADR 0014) ─────────────────────

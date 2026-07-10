@@ -2852,7 +2852,10 @@ impl CudaBackend {
     /// # Errors
     /// [`BackendError::InvalidInput`] for an invalid tile; [`BackendError::Backend`]
     /// on an nvrtc compile or module-load failure.
-    pub(super) fn imma_function_for_tile(&self, tile: TileConfig) -> Result<CudaFunction, BackendError> {
+    pub(super) fn imma_function_for_tile(
+        &self,
+        tile: TileConfig,
+    ) -> Result<CudaFunction, BackendError> {
         // Common-shape fast path: the AOT-equivalent tile is the embedded cubin.
         if tile == TileConfig::AOT_EQUIVALENT {
             return Ok(self.func_imma.clone());
