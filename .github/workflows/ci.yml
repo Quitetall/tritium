@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz
-      # ~1 hour split across EVERY tritium-format untrusted-byte parser (U5:
+      # ~85 min split across EVERY tritium-format untrusted-byte parser (U5:
       # every parser introduced has a target). Looped so adding a parser is a
       # one-line change here + a new fuzz_targets/*.rs + a [[bin]] block.
       - name: fuzz all parsers

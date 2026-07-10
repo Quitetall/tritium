@@ -93,10 +93,14 @@ const ZERO_BLOCK_BYTE: u8 = 0x55;
 /// # Errors
 /// [`FormatError::WrongBlockLen`] if `packed_row` is shorter than the
 /// `ceil(k / QK_K) * TQ2_0_BLOCK_BYTES` bytes a fully-packed row requires
-/// (so a malformed/truncated row is a typed error, never a panic).
+/// (so a malformed/truncated row is a typed error, never a panic). The
+/// required size saturates on absurd `k` (the `expected` field reads
+/// `usize::MAX`), which no real slice can satisfy — still a typed error.
 pub fn compute_zero_bitmap(packed_row: &[u8], k: usize) -> Result<Vec<u32>, FormatError> {
     let nb = k.div_ceil(QK_K);
-    let need = nb * TQ2_0_BLOCK_BYTES;
+    // Saturating: a wrapped product on an absurd `k` could pass the length
+    // check, then panic at the bitmap allocation or the block slicing below.
+    let need = nb.saturating_mul(TQ2_0_BLOCK_BYTES);
     if packed_row.len() < need {
         return Err(FormatError::WrongBlockLen {
             expected: need,
@@ -121,8 +125,10 @@ pub fn compute_zero_bitmap(packed_row: &[u8], k: usize) -> Result<Vec<u32>, Form
 /// one bitmap per row, concatenated in row order.
 ///
 /// # Errors
-/// [`FormatError::WrongBlockLen`] if `packed` is shorter than `n * row_bytes`
-/// (truncated input is a typed error, never a panic).
+/// [`FormatError::WrongBlockLen`] if `row_bytes` is smaller than a fully
+/// packed row of `k` elements, or `packed` is shorter than `n * row_bytes`
+/// (truncated/malformed input is a typed error, never a panic). Required
+/// sizes saturate to `usize::MAX` on absurd inputs — still typed errors.
 pub fn compute_zero_bitmaps(
     packed: &[u8],
     n: usize,
@@ -131,15 +137,30 @@ pub fn compute_zero_bitmaps(
 ) -> Result<Vec<u32>, FormatError> {
     let nb = k.div_ceil(QK_K);
     let words_per_row = nb.div_ceil(32);
-    // Checked: `n * row_bytes` on attacker-influenced sizes must not wrap
-    // (a wrapped product could pass the length check then slice out of
-    // bounds below).
-    let need = n
-        .checked_mul(row_bytes)
-        .ok_or(FormatError::WrongBlockLen {
-            expected: usize::MAX,
-            got: packed.len(),
-        })?;
+    // `k = 0` means zero blocks per row and an empty result regardless of
+    // `n` — return before the row loop, whose `n` iterations of no-op work
+    // are otherwise unbounded (`k = 0` also zeroes `min_row`, so the
+    // row-size precondition below cannot bound `n` for it; fuzz-found hang).
+    if nb == 0 {
+        return Ok(Vec::new());
+    }
+    // `row_bytes` must hold a full packed row: without this, `row_bytes = 0`
+    // passes the total-length check below with `need = 0`, and an
+    // attacker-sized `n` then panics at the bitmap allocation ("capacity
+    // overflow") before any per-row typed error can fire. With it, `n` is
+    // bounded by `packed.len() / row_bytes`, so the allocation is bounded by
+    // the input length.
+    let min_row = nb.saturating_mul(TQ2_0_BLOCK_BYTES);
+    if row_bytes < min_row {
+        return Err(FormatError::WrongBlockLen {
+            expected: min_row,
+            got: row_bytes,
+        });
+    }
+    // Saturating: a wrapped `n * row_bytes` on attacker-influenced sizes
+    // could pass the length check then slice out of bounds below (the
+    // saturated `usize::MAX` requirement fails against any real slice).
+    let need = n.saturating_mul(row_bytes);
     if packed.len() < need {
         return Err(FormatError::WrongBlockLen {
             expected: need,
@@ -160,6 +181,28 @@ pub fn compute_zero_bitmaps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review-found panic class: `row_bytes = 0` makes `n * row_bytes = 0`
+    /// pass the total-length check, then a huge `n` used to panic with
+    /// "capacity overflow" at the bitmap allocation. All absurd-size shapes
+    /// must be typed errors.
+    #[test]
+    fn zero_bitmaps_absurd_sizes_are_typed_errors() {
+        // The exact repro from the review.
+        assert!(compute_zero_bitmaps(&[], usize::MAX, 256, 0).is_err());
+        // Wrapping n * row_bytes.
+        assert!(compute_zero_bitmaps(&[], usize::MAX, 256, TQ2_0_BLOCK_BYTES).is_err());
+        // row_bytes under a packed row.
+        assert!(compute_zero_bitmaps(&[0u8; 1024], 1, 256, TQ2_0_BLOCK_BYTES - 1).is_err());
+        // Wrapping nb * TQ2_0_BLOCK_BYTES in the single-row fn.
+        assert!(compute_zero_bitmap(&[], usize::MAX).is_err());
+        // k = 0 zeroes min_row, letting row_bytes = 0 through — the row loop
+        // must not spin n times (fuzz-found hang); empty result, instantly.
+        assert_eq!(
+            compute_zero_bitmaps(&[], usize::MAX, 0, 0).unwrap(),
+            Vec::<u32>::new()
+        );
+    }
 
     fn block_of(v: i8) -> Vec<Trit> {
         vec![Trit::from_i8(v).unwrap(); QK_K]
