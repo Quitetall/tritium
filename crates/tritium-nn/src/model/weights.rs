@@ -81,9 +81,13 @@ impl ModelWeights {
         config: &ModelConfig,
         backend: &dyn TernaryBackend,
     ) -> Result<Self, NnError> {
-        // Preserve the GGUF-specific integrity check the generic builder
-        // (which derives vocab as len/n_embd) can't express: the declared
-        // dims must agree with the decoded payload length.
+        // GGUF-specific integrity check the generic builder (vocab =
+        // len/n_embd) can't express: the file's declared embedding dims must
+        // agree with the CONFIG's n_embd. Dims-vs-payload consistency is
+        // already enforced by the reader (n_bytes is computed FROM dims and
+        // bounds-checked), so element_count suffices — no decode needed
+        // (review: the old full F16->f32 decode here was information-free,
+        // ~657MB read + ~1.3GB transient per load).
         let n_embd = config.n_embd as usize;
         let embd_info = require(file, "token_embd.weight")?;
         let vocab = *embd_info
@@ -91,7 +95,10 @@ impl ModelWeights {
             .last()
             .ok_or_else(|| NnError::MissingTensor("token_embd.weight (no dims)".to_owned()))?
             as usize;
-        let embd_len = load_dense(file, bytes, "token_embd.weight")?.len();
+        let embd_len = embd_info
+            .element_count()
+            .map_err(|e| NnError::Backend(format!("token_embd.weight dims: {e}")))?
+            as usize;
         if embd_len != vocab * n_embd {
             return Err(NnError::Shape {
                 expected: vocab * n_embd,
@@ -107,6 +114,10 @@ impl ModelWeights {
             &ArchSpec::bitnet(),
             crate::model::hf::NameSchema::Gguf,
             |name| load_dense(file, bytes, name),
+            // Shape hints unused: load_ternary derives [N, K] from the
+            // file's own dims (pre-existing behavior). TODO(non-BitNet GGUF):
+            // check them against the config-derived n_out/k_in so a
+            // config/file head_dim disagreement fails at load, not runtime.
             |name, _n_out, _k_in| {
                 Ok(Projection::Ternary(load_ternary(file, bytes, backend, name)?))
             },

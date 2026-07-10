@@ -7,7 +7,10 @@
 //!   path — numerically ≈ the native multi-plane ternary GEMM within ~1e-4, not bit-identical),
 //!   with 1D norms + config from the original model dir.
 //!
-//! Both share [`build_standard_model`] over the standard llama/qwen tensor-name schema.
+//! All loading paths — these two AND the BitNet GGUF path
+//! ([`ModelWeights::load`], P2e) — share [`build_standard_model`], the one
+//! config-driven skeleton, each supplying its [`NameSchema`] dialect and
+//! projection provider.
 //! Scope: standard SwiGLU/GQA/RoPE models (Llama, SmolLM2, …). Arches needing QK-norm or
 //! QKV-bias are rejected (plan 0037); SSM/MoE are later still. Weights are read eagerly (fine
 //! for the small conformance model); streaming/mmap for 50GB+ masters is plan 0040.
