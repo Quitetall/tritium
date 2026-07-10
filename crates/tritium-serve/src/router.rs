@@ -467,7 +467,15 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
     }
 
     if req.stream {
-        stream_response(rx, st.tok.clone(), req.model, stops, st.metrics.clone())
+        let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
+        stream_response(
+            rx,
+            st.tok.clone(),
+            req.model,
+            stops,
+            st.metrics.clone(),
+            include_usage.then_some(prompt_len),
+        )
     } else {
         nonstream_response(rx, st.tok.clone(), req.model, prompt_len, stops, st.metrics.clone())
             .await
@@ -542,6 +550,9 @@ fn stream_response(
     model: String,
     stops: Vec<String>,
     metrics: Arc<Metrics>,
+    // `Some(prompt_tokens)` when the client asked for
+    // `stream_options.include_usage`: emit the final usage chunk.
+    usage_prompt_len: Option<usize>,
 ) -> Response {
     let id = make_id();
     let created = now_secs();
@@ -552,6 +563,7 @@ fn stream_response(
 
         let mut detok = IncrementalDetok::new(tok);
         let mut matcher = StopMatcher::new(stops);
+        let mut completion_tokens = 0usize;
         let mut finish = FinishReason::Stop;
         let mut stopped_by_string = false;
         let mut errored = false;
@@ -563,6 +575,7 @@ fn stream_response(
                     // not an emitted completion token.
                     if t != detok_eos {
                         metrics.tokens_out.fetch_add(1, Ordering::Relaxed);
+                        completion_tokens += 1;
                     }
                     let text = detok.push(t);
                     if !text.is_empty() {
@@ -594,6 +607,17 @@ fn stream_response(
                 }
             }
             yield Ok(sse_data(&terminal_chunk(&id, created, &model, finish)));
+            // OpenAI stream_options.include_usage: one final chunk with
+            // empty choices carrying the token accounting.
+            if let Some(prompt_tokens) = usage_prompt_len {
+                yield Ok(sse_data(&crate::sse::usage_chunk(
+                    &id,
+                    created,
+                    &model,
+                    prompt_tokens,
+                    completion_tokens,
+                )));
+            }
         }
         yield Ok(Event::default().data("[DONE]"));
     };

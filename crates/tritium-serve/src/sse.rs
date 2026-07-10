@@ -113,12 +113,37 @@ impl StopMatcher {
 
 /// The role-first delta chunk (`delta: {role: "assistant"}`, `finish_reason: null`).
 #[must_use]
+/// The final `stream_options.include_usage` chunk: empty `choices`, `usage`
+/// set (OpenAI convention — emitted after the terminal chunk, before
+/// `[DONE]`).
+pub(crate) fn usage_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> ChatChunk {
+    ChatChunk {
+        id: id.to_owned(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_owned(),
+        usage: Some(crate::dto::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }),
+        choices: Vec::new(),
+    }
+}
+
 pub(crate) fn role_chunk(id: &str, created: u64, model: &str) -> ChatChunk {
     ChatChunk {
         id: id.to_owned(),
         object: "chat.completion.chunk",
         created,
         model: model.to_owned(),
+        usage: None,
         choices: vec![ChunkChoice {
             index: 0,
             delta: Delta {
@@ -138,6 +163,7 @@ pub(crate) fn content_chunk(id: &str, created: u64, model: &str, content: &str) 
         object: "chat.completion.chunk",
         created,
         model: model.to_owned(),
+        usage: None,
         choices: vec![ChunkChoice {
             index: 0,
             delta: Delta {
@@ -162,6 +188,7 @@ pub(crate) fn terminal_chunk(
         object: "chat.completion.chunk",
         created,
         model: model.to_owned(),
+        usage: None,
         choices: vec![ChunkChoice {
             index: 0,
             delta: Delta::default(),
@@ -180,6 +207,7 @@ pub(crate) fn error_chunk(id: &str, created: u64, model: &str) -> ChatChunk {
         object: "chat.completion.chunk",
         created,
         model: model.to_owned(),
+        usage: None,
         choices: vec![ChunkChoice {
             index: 0,
             delta: Delta::default(),

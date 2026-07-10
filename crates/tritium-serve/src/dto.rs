@@ -51,6 +51,9 @@ pub struct ChatRequest {
     /// Stream the response as SSE deltas.
     #[serde(default)]
     pub stream: bool,
+    /// OpenAI `stream_options` (only `include_usage` is meaningful here).
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     /// Max new tokens to generate.
     #[serde(default)]
     pub max_tokens: Option<u32>,
@@ -141,8 +144,21 @@ pub struct ChatChunk {
     pub created: u64,
     /// Served model id.
     pub model: String,
-    /// The (single) choice delta.
+    /// The (single) choice delta. Empty on the final usage chunk when the
+    /// client asked for `stream_options.include_usage` (OpenAI convention).
     pub choices: Vec<ChunkChoice>,
+    /// Token accounting, present only on the final chunk when
+    /// `stream_options.include_usage` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// OpenAI `stream_options` request object.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+pub struct StreamOptions {
+    /// Emit a final pre-`[DONE]` chunk with empty `choices` and `usage`.
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 /// `GET /v1/models` entry.

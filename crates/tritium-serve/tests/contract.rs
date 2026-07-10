@@ -849,3 +849,37 @@ async fn metrics_exposition() {
     let (status, _) = send(&router, req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// stream_options.include_usage: a final pre-[DONE] chunk with empty choices
+/// and usage matching the non-streaming accounting; absent when not asked.
+#[tokio::test]
+async fn stream_usage_chunk() {
+    let (router, _) = mock_router(vec![10, 11, 12], FinishReason::Stop);
+    let (_, body) = send(
+        &router,
+        chat(json!({"model":"tritium","stream":true,
+                    "stream_options":{"include_usage":true},
+                    "messages":[{"role":"user","content":"1 2"}]})),
+    )
+    .await;
+    let events = parse_sse(&body);
+    let chunks = sse_chunks(&events);
+    let last = chunks.last().unwrap();
+    assert!(last["choices"].as_array().unwrap().is_empty(), "{last}");
+    assert_eq!(last["usage"]["prompt_tokens"], 2);
+    assert_eq!(last["usage"]["completion_tokens"], 3);
+    assert_eq!(last["usage"]["total_tokens"], 5);
+    // Every earlier chunk omits usage entirely.
+    assert!(chunks[..chunks.len() - 1].iter().all(|c| c["usage"].is_null()));
+
+    // Without stream_options: no usage chunk, terminal chunk is last.
+    let (router, _) = mock_router(vec![10, 11, 12], FinishReason::Stop);
+    let (_, body) = send(
+        &router,
+        chat(json!({"model":"tritium","stream":true,"messages":[{"role":"user","content":"1"}]})),
+    )
+    .await;
+    let chunks = sse_chunks(&parse_sse(&body));
+    assert!(chunks.iter().all(|c| c["usage"].is_null()));
+    assert!(!chunks.last().unwrap()["choices"][0]["finish_reason"].is_null());
+}
