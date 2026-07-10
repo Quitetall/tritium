@@ -66,3 +66,42 @@ impl From<tritium_spec::BackendError> for NnError {
         NnError::Backend(e.to_string())
     }
 }
+
+/// Error from the typed resident-decoder facade on [`ModelRunner`]
+/// (`tree_verify_*` / `tree_commit` / `new_batch` / `adopt_into_batch_row` /
+/// `decode_batch_graph`) — the seam tritium-serve's spec-decode and
+/// continuous-batching paths depend on.
+///
+/// The three variants map onto the server's response classes: `Unavailable` →
+/// 501 (feature needs the CUDA resident decoder), `Op(InvalidInput)` → 400
+/// (caller-shaped), everything else → 500.
+///
+/// [`ModelRunner`]: crate::ModelRunner
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub enum ResidentOpError {
+    /// This runner has no CUDA device-resident decoder (non-CUDA backend).
+    Unavailable,
+    /// Building the resident decoder failed (stringified [`NnError`]).
+    Build(String),
+    /// The decoder op itself failed.
+    Op(tritium_spec::BackendError),
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Display for ResidentOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResidentOpError::Unavailable => {
+                write!(f, "no CUDA device-resident decoder on this runner")
+            }
+            ResidentOpError::Build(msg) => {
+                write!(f, "building the resident decoder failed: {msg}")
+            }
+            ResidentOpError::Op(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl std::error::Error for ResidentOpError {}

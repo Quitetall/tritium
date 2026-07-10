@@ -23,6 +23,8 @@ mod tensor;
 
 pub use config::{ArchSpec, MlpKind, ModelConfig};
 pub use error::NnError;
+#[cfg(feature = "cuda")]
+pub use error::ResidentOpError;
 pub use kv_cache::KvCache;
 pub use layers::{
     BlockDump, BlockScratch, DenseLinear, Mlp, Projection, Relu2Mlp, SwiGluMlp, TernaryLinear,

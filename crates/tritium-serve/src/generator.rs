@@ -464,17 +464,10 @@ impl RunnerGenerator {
             tokens.extend(&drafts);
             let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
             let t0 = std::time::Instant::now();
-            let committed = {
-                let rm = self
-                    .runner
-                    .resident_cuda()
-                    .map_err(|e| GenError::Backend(e.to_string()))?
-                    .ok_or_else(|| {
-                        GenError::Backend("spec lookup needs the CUDA resident decoder".into())
-                    })?;
-                rm.tree_verify_greedy(&tokens, &parents)
-                    .map_err(|e| GenError::Backend(e.to_string()))?
-            };
+            let committed = self
+                .runner
+                .tree_verify_greedy(&tokens, &parents)
+                .map_err(|e| GenError::Backend(e.to_string()))?;
             n_verify += 1;
             n_committed += committed.len();
             t_verify += t0.elapsed();
@@ -674,17 +667,10 @@ impl RunnerGenerator {
             tokens.push(pending);
             tokens.extend(&drafts);
             let parents: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
-            let logits_all = {
-                let rm = self
-                    .runner
-                    .resident_cuda()
-                    .map_err(|e| GenError::Backend(e.to_string()))?
-                    .ok_or_else(|| {
-                        GenError::Backend("spec lookup needs the CUDA resident decoder".into())
-                    })?;
-                rm.tree_verify_logits(&tokens, &parents)
-                    .map_err(|e| GenError::Backend(e.to_string()))?
-            };
+            let logits_all = self
+                .runner
+                .tree_verify_logits(&tokens, &parents)
+                .map_err(|e| GenError::Backend(e.to_string()))?;
             let vocab = logits_all.len() / tokens.len();
 
             // Chain walk with the accept rule. `path` holds tree-node indices;
@@ -725,17 +711,9 @@ impl RunnerGenerator {
                     tritium_nn::sample_categorical(&idx, &probs, seed.wrapping_add(salt))
                 }
             };
-            {
-                let rm = self
-                    .runner
-                    .resident_cuda()
-                    .map_err(|e| GenError::Backend(e.to_string()))?
-                    .ok_or_else(|| {
-                        GenError::Backend("spec lookup needs the CUDA resident decoder".into())
-                    })?;
-                rm.tree_commit(&path)
-                    .map_err(|e| GenError::Backend(e.to_string()))?;
-            }
+            self.runner
+                .tree_commit(&path)
+                .map_err(|e| GenError::Backend(e.to_string()))?;
             draft_len = if path.len() == tokens.len() {
                 (draft_len * 2).min(DRAFT_MAX)
             } else {
@@ -799,7 +777,7 @@ impl Generator for RunnerGenerator {
         // (probed HERE — e.g. `--spec lookup` on the cpu backend — so the
         // fallback is a dispatch decision, never a mid-stream error).
         #[cfg(feature = "cuda")]
-        if self.spec_lookup && matches!(self.runner.resident_cuda(), Ok(Some(_))) {
+        if self.spec_lookup && self.runner.has_resident_decoder() {
             return match req.sampling {
                 Sampling::Greedy => {
                     self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step)
@@ -862,12 +840,7 @@ impl Generator for RunnerGenerator {
         }
         #[cfg(feature = "cuda")]
         {
-            if self
-                .runner
-                .resident_cuda()
-                .map_err(|e| TreeOpError::Internal(e.to_string()))?
-                .is_none()
-            {
+            if !self.runner.has_resident_decoder() {
                 return Err(TreeOpError::Unsupported(
                     "tree-verify needs the CUDA device-resident decoder".to_owned(),
                 ));
@@ -902,21 +875,20 @@ impl Generator for RunnerGenerator {
         }
         #[cfg(feature = "cuda")]
         {
-            let rm = self
+            return self
                 .runner
-                .resident_cuda()
-                .map_err(|e| TreeOpError::Internal(e.to_string()))?
-                .ok_or_else(|| {
-                    TreeOpError::Unsupported(
+                .tree_verify_greedy(tokens, parents)
+                .map_err(|e| match e {
+                    tritium_nn::ResidentOpError::Unavailable => TreeOpError::Unsupported(
                         "tree-verify needs the CUDA device-resident decoder".to_owned(),
-                    )
-                })?;
-            return rm.tree_verify_greedy(tokens, parents).map_err(|e| match e {
-                // Caller-shaped errors (malformed tree, capacity overflow) → 400;
-                // anything else is a device/internal fault → 500.
-                tritium_spec::BackendError::InvalidInput(m) => TreeOpError::BadRequest(m),
-                other => TreeOpError::Internal(other.to_string()),
-            });
+                    ),
+                    // Caller-shaped errors (malformed tree, capacity overflow) → 400;
+                    // anything else is a device/internal fault → 500.
+                    tritium_nn::ResidentOpError::Op(
+                        tritium_spec::BackendError::InvalidInput(m),
+                    ) => TreeOpError::BadRequest(m),
+                    other => TreeOpError::Internal(other.to_string()),
+                });
         }
         #[cfg(not(feature = "cuda"))]
         {

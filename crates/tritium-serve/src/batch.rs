@@ -114,17 +114,15 @@ pub(crate) fn run_batched(
     let n_ctx = runner.config.n_ctx as usize;
     // Build the resident decoder + the slot pool up front; failures here are
     // fatal for the worker (the router will see a closed queue → 503s).
-    let mut batch = {
-        let Ok(Some(rm)) = runner.resident_cuda() else {
+    let mut batch = match runner.new_batch(slots) {
+        Ok(b) => b,
+        Err(tritium_nn::ResidentOpError::Unavailable) => {
             eprintln!("tritium-serve: --batch-slots needs the CUDA resident decoder");
             return;
-        };
-        match rm.new_batch(slots) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("tritium-serve: batch pool alloc failed: {e}");
-                return;
-            }
+        }
+        Err(e) => {
+            eprintln!("tritium-serve: batch pool alloc failed: {e}");
+            return;
         }
     };
     let mut pool: Vec<Option<Active>> = (0..slots).map(|_| None).collect();
@@ -212,11 +210,8 @@ pub(crate) fn run_batched(
                         }
                     };
                     let adopt = (|| -> Result<(), String> {
-                        let rm = runner
-                            .resident_cuda()
-                            .map_err(|e| e.to_string())?
-                            .ok_or("resident decoder vanished")?;
-                        rm.copy_kv_into_batch_row(&mut batch, row, prompt_len)
+                        runner
+                            .adopt_into_batch_row(&mut batch, row, prompt_len)
                             .map_err(|e| e.to_string())?;
                         batch
                             .set_position(row, prompt_len)
@@ -278,13 +273,7 @@ pub(crate) fn run_batched(
                 let _ = batch.set_position(row, 0);
             }
         }
-        let step = {
-            let Ok(Some(rm)) = runner.resident_cuda() else {
-                eprintln!("tritium-serve: resident decoder vanished mid-batch");
-                return;
-            };
-            rm.decode_batch_graph(&mut batch, &tokens)
-        };
+        let step = runner.decode_batch_graph(&mut batch, &tokens);
         let all_logits = match step {
             Ok(l) => l,
             Err(e) => {

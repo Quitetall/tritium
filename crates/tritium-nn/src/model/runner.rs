@@ -16,6 +16,8 @@ use tritium_spec::TernaryBackend;
 
 use crate::config::ModelConfig;
 use crate::error::NnError;
+#[cfg(feature = "cuda")]
+use crate::error::ResidentOpError;
 use crate::kv_cache::KvCache;
 use crate::layers::{BlockDump, BlockScratch};
 use crate::model::weights::ModelWeights;
@@ -159,8 +161,10 @@ impl ModelRunner {
     }
 
     /// (cuda) Borrow the lazily-built device-resident decoder, building it first if
-    /// needed (returns `None` on a non-CUDA backend). Advanced/test access — it exposes
-    /// the M=1 graph decode + the batched (M=N) `decode_batch` path directly.
+    /// needed (returns `None` on a non-CUDA backend). TEST access — production
+    /// callers (tritium-serve) go through the typed facade below
+    /// ([`tree_verify_greedy`](Self::tree_verify_greedy), [`new_batch`](Self::new_batch), …),
+    /// which is the supported API.
     ///
     /// # Errors
     /// [`NnError::Backend`] if building the resident decoder fails.
@@ -171,6 +175,122 @@ impl ModelRunner {
             return Ok(None);
         }
         Ok(self.resident.as_mut())
+    }
+
+    /// (cuda) Borrow the resident decoder for a facade op, folding the two failure
+    /// modes into [`ResidentOpError`].
+    #[cfg(feature = "cuda")]
+    fn resident_for_op(
+        &mut self,
+    ) -> Result<&mut tritium_cuda::CudaDecodeModel, ResidentOpError> {
+        match self.ensure_resident() {
+            Err(e) => Err(ResidentOpError::Build(e.to_string())),
+            Ok(false) => Err(ResidentOpError::Unavailable),
+            Ok(true) => self.resident.as_mut().ok_or(ResidentOpError::Unavailable),
+        }
+    }
+
+    /// (cuda) Whether this runner has (or can build) the CUDA device-resident
+    /// decoder — the gate for spec-decode lookup and continuous batching.
+    /// Build failures read as `false` (callers fall back to the plain path).
+    #[cfg(feature = "cuda")]
+    pub fn has_resident_decoder(&mut self) -> bool {
+        matches!(self.ensure_resident(), Ok(true)) && self.resident.is_some()
+    }
+
+    /// (cuda) BASTION tree-verify, greedy rule: forward the token tree
+    /// (`parents[i] < i`, root parent `-1`), walk greedy acceptance on the
+    /// device and commit the accepted path's KV. Returns the committed tokens
+    /// (always ≥ 1: the root's successor). Lossless vs plain greedy decode.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Unavailable` on a non-CUDA backend, `Op` with the
+    /// device/validation error otherwise.
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_greedy(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+    ) -> Result<Vec<u32>, ResidentOpError> {
+        self.resident_for_op()?
+            .tree_verify_greedy(tokens, parents)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) BASTION tree-verify, logits form: forward the token tree and
+    /// return the flat `[tokens.len() × vocab]` logits for a host-side accept
+    /// rule (sampling). Pair with [`tree_commit`](Self::tree_commit).
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — see [`tree_verify_greedy`](Self::tree_verify_greedy).
+    #[cfg(feature = "cuda")]
+    pub fn tree_verify_logits(
+        &mut self,
+        tokens: &[u32],
+        parents: &[i32],
+    ) -> Result<Vec<f32>, ResidentOpError> {
+        self.resident_for_op()?
+            .tree_verify_logits(tokens, parents)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Commit the accepted `path` (tree-node indices from
+    /// [`tree_verify_logits`](Self::tree_verify_logits)) into the KV cache.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Op(InvalidInput)` when no tree is pending or the
+    /// path is malformed.
+    #[cfg(feature = "cuda")]
+    pub fn tree_commit(&mut self, path: &[usize]) -> Result<(), ResidentOpError> {
+        self.resident_for_op()?
+            .tree_commit(path)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Allocate continuous-batching state for `n` concurrent sequences
+    /// (per-layer `[n, max_ctx, kv_width]` KV arenas + M=N scratch).
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Op(OutOfMemory)` on a device allocation failure.
+    #[cfg(feature = "cuda")]
+    pub fn new_batch(&mut self, n: usize) -> Result<tritium_cuda::BatchKv, ResidentOpError> {
+        self.resident_for_op()?
+            .new_batch(n)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) Continuous-batching admission: copy this runner's single-sequence
+    /// KV rows `[0, len)` into batch slot `row` (prefill the prompt through the
+    /// single-sequence path first, then adopt + [`BatchKv::set_position`]).
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Op(InvalidInput)` on a bad row/len or a non-f32 KV rung.
+    #[cfg(feature = "cuda")]
+    pub fn adopt_into_batch_row(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        row: usize,
+        len: usize,
+    ) -> Result<(), ResidentOpError> {
+        self.resident_for_op()?
+            .copy_kv_into_batch_row(batch, row, len)
+            .map_err(ResidentOpError::Op)
+    }
+
+    /// (cuda) One lockstep M=N decode step through the captured batch graph:
+    /// feed each slot's token, return per-slot logits.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Op` with the device error.
+    #[cfg(feature = "cuda")]
+    pub fn decode_batch_graph(
+        &mut self,
+        batch: &mut tritium_cuda::BatchKv,
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>, ResidentOpError> {
+        self.resident_for_op()?
+            .decode_batch_graph(batch, tokens)
+            .map_err(ResidentOpError::Op)
     }
 
     /// Convenience: load from a GGUF byte buffer using the runtime registry's
