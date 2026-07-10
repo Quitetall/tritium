@@ -94,8 +94,8 @@ const ZERO_BLOCK_BYTE: u8 = 0x55;
 /// [`FormatError::WrongBlockLen`] if `packed_row` is shorter than the
 /// `ceil(k / QK_K) * TQ2_0_BLOCK_BYTES` bytes a fully-packed row requires
 /// (so a malformed/truncated row is a typed error, never a panic). The
-/// required size saturates on absurd `k` (the `expected` field reads
-/// `usize::MAX`), which no real slice can satisfy — still a typed error.
+/// required-size math is saturating as belt-and-braces (`nb * 66` cannot
+/// actually reach `usize::MAX` for any 64-bit `k`).
 pub fn compute_zero_bitmap(packed_row: &[u8], k: usize) -> Result<Vec<u32>, FormatError> {
     let nb = k.div_ceil(QK_K);
     // Saturating: a wrapped product on an absurd `k` could pass the length

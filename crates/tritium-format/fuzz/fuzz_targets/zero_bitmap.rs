@@ -13,9 +13,12 @@ fuzz_target!(|data: &[u8]| {
     }
     let n = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
     let row_bytes = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+    // Low bytes of row_bytes double as a full-width k draw: both functions
+    // are total, so absurd k is free extra coverage, not an OOM risk.
     let k = u16::from_le_bytes([data[16], data[17]]) as usize;
     let payload = &data[18..];
     let _ = tritium_format::compute_zero_bitmap(payload, k);
     let _ = tritium_format::compute_zero_bitmap(payload, n); // absurd k too
     let _ = tritium_format::compute_zero_bitmaps(payload, n, k, row_bytes);
+    let _ = tritium_format::compute_zero_bitmaps(payload, n, row_bytes, row_bytes);
 });
