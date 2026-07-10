@@ -322,7 +322,7 @@ impl CudaBackend {
     /// device's `int` index arithmetic (the kernels form `m*n`, `n*k`, `m*k` as int32),
     /// which also bounds the `u32` launch grid. A silent `as` truncation would otherwise
     /// give a wrong answer; BitNet shapes are orders of magnitude below this limit.
-    pub(super) fn check_grad_launch_bounds(m: usize, n: usize, k: usize) -> Result<(), BackendError> {
+    fn check_grad_launch_bounds(m: usize, n: usize, k: usize) -> Result<(), BackendError> {
         let lim = i32::MAX as usize;
         if m.checked_mul(n).is_none_or(|v| v > lim)
             || n.checked_mul(k).is_none_or(|v| v > lim)
@@ -1935,7 +1935,7 @@ impl CudaBackend {
     /// Pick the add-only kernel for this problem shape. The tiled (decode) kernel
     /// wins for small `M` and is bounded by its shared-memory activation stage
     /// (`K * 4` ≤ 48 KiB); everything else uses the one-thread-per-output kernel.
-    pub(super) fn select_add_kernel(m: usize, k: usize) -> AddKernel {
+    fn select_add_kernel(m: usize, k: usize) -> AddKernel {
         if m > 0 && m <= TILED_M_MAX && k <= TILED_K_MAX {
             AddKernel::Tiled
         } else {
@@ -2657,7 +2657,7 @@ impl CudaBackend {
     }
 
     /// The autotune cache key for an IMMA launch of `shape` on this device.
-    pub(super) fn imma_cache_key(&self, shape: GemmShape) -> CacheKey {
+    fn imma_cache_key(&self, shape: GemmShape) -> CacheKey {
         CacheKey {
             arch: self.sm_arch.clone(),
             dtype: IMMA_DTYPE_TAG,
@@ -2705,7 +2705,7 @@ impl CudaBackend {
     /// reference (the same exact-int contraction the kernel computes), and time it.
     /// A compile/launch failure or an out-of-tolerance result marks the candidate
     /// incorrect (rejected), never aborting the search.
-    pub(super) fn evaluate_candidate(&self, tile: TileConfig, shape: GemmShape) -> CandidateResult {
+    fn evaluate_candidate(&self, tile: TileConfig, shape: GemmShape) -> CandidateResult {
         match self.try_evaluate_candidate(tile, shape) {
             Ok(r) => r,
             Err(_) => CandidateResult {
@@ -2717,7 +2717,7 @@ impl CudaBackend {
 
     /// Fallible inner body of [`evaluate_candidate`]; any `Err` is folded to an
     /// "incorrect" candidate by the caller.
-    pub(super) fn try_evaluate_candidate(
+    fn try_evaluate_candidate(
         &self,
         tile: TileConfig,
         shape: GemmShape,
@@ -2916,7 +2916,7 @@ const CUDARC_BINDING_CUDA_MAJOR: u32 = 13;
 /// Read the device compute capability and format it as an `sm_XY` tag for the
 /// autotune cache key. Falls back to the IMMA floor `sm_80` if the query fails (the
 /// kernel needs sm_80+ regardless, so this is the most conservative correct default).
-pub(super) fn query_sm_arch(ctx: &Arc<CudaContext>) -> String {
+fn query_sm_arch(ctx: &Arc<CudaContext>) -> String {
     match ctx.compute_capability() {
         Ok((major, minor)) => format!("sm_{major}{minor}"),
         Err(_) => "sm_80".to_owned(),
@@ -2926,7 +2926,7 @@ pub(super) fn query_sm_arch(ctx: &Arc<CudaContext>) -> String {
 /// Query the CUDA driver version via `cuDriverGetVersion` (e.g. `13030` for 13.3),
 /// used as the autotune cache invalidation axis. Returns `0` if the query fails,
 /// which still keys a stable (if uninformative) cache slot.
-pub(super) fn query_driver_version() -> u32 {
+fn query_driver_version() -> u32 {
     let mut version: core::ffi::c_int = 0;
     // SAFETY: `cuDriverGetVersion` writes a single `int` through the supplied
     // pointer and returns a `CUresult`; `version` is a live local `c_int` that
@@ -2950,7 +2950,7 @@ pub(super) fn cuda_driver_major(version: u32) -> Option<u32> {
     }
 }
 
-pub(super) fn warn_if_cuda_driver_outside_bound_major(version: u32) {
+fn warn_if_cuda_driver_outside_bound_major(version: u32) {
     let Some(major) = cuda_driver_major(version) else {
         eprintln!(
             "tritium-cuda: warning: could not query CUDA driver version; cudarc is bound to cuda-13020"
@@ -3218,7 +3218,7 @@ const IMMA_AUTOTUNE_REL_TOL: f32 = 1e-4;
 /// the absolute error is within `IMMA_AUTOTUNE_REL_TOL · max(1, |reference|)`. Mirrors
 /// the testkit's `Tolerance::accepts` shape so the in-tree probe matches the
 /// committed conformance gate.
-pub(super) fn imma_close(got: f32, reference: f32) -> bool {
+fn imma_close(got: f32, reference: f32) -> bool {
     let diff = (got - reference).abs();
     diff <= IMMA_AUTOTUNE_REL_TOL * reference.abs().max(1.0)
 }
