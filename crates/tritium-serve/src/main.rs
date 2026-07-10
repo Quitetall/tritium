@@ -22,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_path: Option<String> = None;
     let mut backend_name = "cpu".to_owned();
     let mut spec: Option<String> = None;
+    let mut batch_slots: usize = 1;
     let mut port: u16 = 8080;
     let mut model_id = "tritium".to_owned();
     let mut max_new: usize = 256;
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--model" => model_path = Some(val::<String>(args.next(), "--model")?),
             "--backend" => backend_name = val::<String>(args.next(), "--backend")?,
             "--spec" => spec = Some(val::<String>(args.next(), "--spec")?),
+            "--batch-slots" => batch_slots = val::<usize>(args.next(), "--batch-slots")?,
             "--port" => port = val(args.next(), "--port")?,
             "--model-id" => model_id = val::<String>(args.next(), "--model-id")?,
             "--max-new" => max_new = val(args.next(), "--max-new")?,
@@ -51,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--spec lookup] \
-                     [--port 8080] [--model-id tritium] [--max-new 256] [--eos 128001]"
+                     [--batch-slots N] [--port 8080] [--model-id tritium] [--max-new 256] \
+                     [--eos 128001]"
                 );
                 return Ok(());
             }
@@ -88,14 +91,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("lookup") => true,
         Some(other) => return Err(format!("--spec: unknown mode {other:?} (try `lookup`)").into()),
     };
-    let generator = Box::new(RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup));
     let tok = Arc::new(IdPassthroughTokenizer::new(128_000, eos));
     let cfg = ServeConfig {
         model_id,
         queue_cap: 32,
         max_new_default: max_new,
     };
-    let (router, draining) = build_router(generator, tok, cfg);
+    #[cfg(feature = "cuda")]
+    let (router, draining) = if batch_slots > 1 {
+        // Continuous batching: a dedicated worker owns the runner + a fixed
+        // slot pool; requests stream through the same job queue + SSE plumbing.
+        if spec_lookup {
+            return Err(
+                "--spec lookup and --batch-slots > 1 are mutually exclusive \
+                        (the spec loop owns the single-sequence KV)"
+                    .into(),
+            );
+        }
+        tritium_serve::build_router_batched(runner, eos, batch_slots, tok, cfg)?
+    } else {
+        let generator = Box::new(RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup));
+        build_router(generator, tok, cfg)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let (router, draining) = {
+        if batch_slots > 1 {
+            return Err("--batch-slots > 1 requires the cuda feature".into());
+        }
+        let generator = Box::new(RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup));
+        build_router(generator, tok, cfg)
+    };
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;

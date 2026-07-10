@@ -150,6 +150,9 @@ const KERNEL_NAME_ATTN_REDUCE_Q8: &str = "gqa_attention_reduce_q8";
 const KERNEL_NAME_ATTN_BATCH_Q8: &str = "gqa_attention_batch_q8";
 const KERNEL_NAME_ATTN_TREE_SCORES_Q8: &str = "gqa_attention_tree_scores_q8";
 const KERNEL_NAME_ATTN_TREE_REDUCE_Q8: &str = "gqa_attention_tree_reduce_q8";
+const KERNEL_NAME_KV_APPEND_T2: &str = "kv_append_t2";
+const KERNEL_NAME_KV_APPEND_BATCH_T2: &str = "kv_append_batch_t2";
+const KERNEL_NAME_ROPE_KV_FUSED_T2: &str = "rope_kv_fused_t2";
 
 /// KV-cache element type for this process' decode models (ADR 0020 ladder).
 /// Selected by `TRITIUM_KV=f32|f16|i8` (legacy `TRITIUM_KV_F16=1` = f16).
@@ -162,6 +165,10 @@ enum KvDtype {
     /// i8 with per-(token, kv-head, `KV_QGROUP`-dim group) dynamic scales
     /// (absmax/127 at append; rung 2).
     I8,
+    /// Ternary KV experiment (rung 3, "KVTQ"): values quantize to
+    /// {-s, 0, +s} per group but ride the i8 lattice + scale arena, so only
+    /// the APPEND kernels differ from I8.
+    T2,
 }
 
 impl KvDtype {
@@ -170,7 +177,14 @@ impl KvDtype {
             KvDtype::F32 => 4,
             KvDtype::F16 => 2,
             KvDtype::I8 => 1,
+            KvDtype::T2 => 1,
         }
+    }
+
+    /// Rungs that carry a per-group scale arena (and pass it as the trailing
+    /// kernel arg).
+    fn has_scales(self) -> bool {
+        matches!(self, KvDtype::I8 | KvDtype::T2)
     }
 }
 
@@ -196,10 +210,11 @@ fn kv_dtype_from_env() -> Result<KvDtype, BackendError> {
             "f32" | "" => Ok(KvDtype::F32),
             "f16" => Ok(KvDtype::F16),
             "i8" => Ok(KvDtype::I8),
+            "t2" => Ok(KvDtype::T2),
             // Reject loudly: a typo silently running f32 would invalidate
             // whatever comparison the user thought they were making.
             other => Err(BackendError::InvalidInput(format!(
-                "TRITIUM_KV={other:?} — use f32, f16 or i8"
+                "TRITIUM_KV={other:?} — use f32, f16, i8 or t2"
             ))),
         },
         Err(e) => Err(BackendError::InvalidInput(format!("TRITIUM_KV: {e}"))),
@@ -2004,12 +2019,12 @@ impl CudaBackend {
                 "TRITIUM_KV={kv_dtype:?} requires head_dim % 4 == 0 (got {head_dim})"
             )));
         }
-        if kv_dtype == KvDtype::I8 && !head_dim.is_multiple_of(KV_QGROUP) {
+        if kv_dtype.has_scales() && !head_dim.is_multiple_of(KV_QGROUP) {
             return Err(BackendError::InvalidInput(format!(
                 "TRITIUM_KV=i8 requires head_dim % {KV_QGROUP} == 0 (got {head_dim})"
             )));
         }
-        if kv_dtype == KvDtype::I8 && kv_width > 64 * KV_QGROUP {
+        if kv_dtype.has_scales() && kv_width > 64 * KV_QGROUP {
             // kv_quant_row_q8's shared absmax array holds 64 groups, and the
             // fused-rope twin's dynamic shared (2·kv_width·4 B) must stay
             // under the 48 KiB default the raw handle never opts past.
@@ -2148,7 +2163,7 @@ impl CudaBackend {
                 s.alloc_zeros::<u8>(max_ctx * kv_width * kv_elem)
                     .map_err(|e| driver_err("decode kv_v alloc", &e))?,
             );
-            if kv_dtype == KvDtype::I8 {
+            if kv_dtype.has_scales() {
                 let n_scales = max_ctx * n_head_kv * (head_dim / KV_QGROUP);
                 kv_k_scales.push(
                     s.alloc_zeros::<f32>(n_scales)
@@ -2187,7 +2202,9 @@ impl CudaBackend {
             |f32_name: &'static str, h_name: &'static str, q8_name: &'static str| match kv_dtype {
                 KvDtype::F32 => f32_name,
                 KvDtype::F16 => h_name,
-                KvDtype::I8 => q8_name,
+                // T2 rides the i8 lattice: every CONSUMER uses the q8 kernels;
+                // only the append selections below override to the _t2 names.
+                KvDtype::I8 | KvDtype::T2 => q8_name,
             };
         let f_attn_scores = f(
             dm,
@@ -2270,11 +2287,15 @@ impl CudaBackend {
             f_scale_batch: f(dm, KERNEL_NAME_SCALE_BATCH)?,
             f_kv_append_batch: f(
                 dm,
-                sel(
-                    KERNEL_NAME_KV_APPEND_BATCH,
-                    KERNEL_NAME_KV_APPEND_BATCH_H,
-                    KERNEL_NAME_KV_APPEND_BATCH_Q8,
-                ),
+                if kv_dtype == KvDtype::T2 {
+                    KERNEL_NAME_KV_APPEND_BATCH_T2
+                } else {
+                    sel(
+                        KERNEL_NAME_KV_APPEND_BATCH,
+                        KERNEL_NAME_KV_APPEND_BATCH_H,
+                        KERNEL_NAME_KV_APPEND_BATCH_Q8,
+                    )
+                },
             )?,
             f_attn_batch: f(
                 dm,
@@ -4330,7 +4351,7 @@ impl CudaDecodeModel {
                 self.cache_len,
                 kv_width,
                 1,
-                if self.kv_dtype == KvDtype::I8 {
+                if self.kv_dtype.has_scales() {
                     Some(&mut self.kv_k_scales[li])
                 } else {
                     None
@@ -4344,7 +4365,7 @@ impl CudaDecodeModel {
                 self.cache_len,
                 kv_width,
                 1,
-                if self.kv_dtype == KvDtype::I8 {
+                if self.kv_dtype.has_scales() {
                     Some(&mut self.kv_v_scales[li])
                 } else {
                     None
@@ -4362,12 +4383,12 @@ impl CudaDecodeModel {
             &self.d_q,
             &self.kv_k[li],
             &self.kv_v[li],
-            if self.kv_dtype == KvDtype::I8 {
+            if self.kv_dtype.has_scales() {
                 Some(&self.kv_k_scales[li])
             } else {
                 None
             },
-            if self.kv_dtype == KvDtype::I8 {
+            if self.kv_dtype.has_scales() {
                 Some(&self.kv_v_scales[li])
             } else {
                 None
@@ -5177,7 +5198,7 @@ impl CudaDecodeModel {
                 causal_offset,
                 kv_width,
                 m,
-                if self.kv_dtype == KvDtype::I8 {
+                if self.kv_dtype.has_scales() {
                     Some(&mut self.kv_k_scales[li])
                 } else {
                     None
@@ -5191,7 +5212,7 @@ impl CudaDecodeModel {
                 causal_offset,
                 kv_width,
                 m,
-                if self.kv_dtype == KvDtype::I8 {
+                if self.kv_dtype.has_scales() {
                     Some(&mut self.kv_v_scales[li])
                 } else {
                     None
@@ -5203,12 +5224,12 @@ impl CudaDecodeModel {
                 &d_q,
                 &self.kv_k[li],
                 &self.kv_v[li],
-                if self.kv_dtype == KvDtype::I8 {
+                if self.kv_dtype.has_scales() {
                     Some(&self.kv_k_scales[li])
                 } else {
                     None
                 },
-                if self.kv_dtype == KvDtype::I8 {
+                if self.kv_dtype.has_scales() {
                     Some(&self.kv_v_scales[li])
                 } else {
                     None
@@ -5758,7 +5779,7 @@ impl CudaDecodeModel {
                     prefix_len,
                     kv_width,
                     m,
-                    if self.kv_dtype == KvDtype::I8 {
+                    if self.kv_dtype.has_scales() {
                         Some(&mut self.kv_k_scales[li])
                     } else {
                         None
@@ -5772,7 +5793,7 @@ impl CudaDecodeModel {
                     prefix_len,
                     kv_width,
                     m,
-                    if self.kv_dtype == KvDtype::I8 {
+                    if self.kv_dtype.has_scales() {
                         Some(&mut self.kv_v_scales[li])
                     } else {
                         None
@@ -5786,12 +5807,12 @@ impl CudaDecodeModel {
                         &ts.d_q,
                         &self.kv_k[li],
                         &self.kv_v[li],
-                        if self.kv_dtype == KvDtype::I8 {
+                        if self.kv_dtype.has_scales() {
                             Some(&self.kv_k_scales[li])
                         } else {
                             None
                         },
-                        if self.kv_dtype == KvDtype::I8 {
+                        if self.kv_dtype.has_scales() {
                             Some(&self.kv_v_scales[li])
                         } else {
                             None
@@ -6083,6 +6104,140 @@ impl CudaDecodeModel {
         self.tree_promote(path)
     }
 
+    /// Debug/test access: dtoh one K/V row of the single-sequence arena (bytes).
+    #[doc(hidden)]
+    pub fn debug_kv_row(&self, li: usize, row: usize, v: bool) -> Result<Vec<u8>, BackendError> {
+        let rb = self.kv_width * self.kv_elem;
+        let arena = if v { &self.kv_v[li] } else { &self.kv_k[li] };
+        let view = arena.slice(row * rb..(row + 1) * rb);
+        let mut out = vec![0u8; rb];
+        self.stream
+            .memcpy_dtoh(&view, &mut out)
+            .map_err(|e| driver_err("debug kv row dtoh", &e))?;
+        Ok(out)
+    }
+
+    /// Debug/test access: dtoh one K row of the single-sequence arena (bytes).
+    #[doc(hidden)]
+    pub fn debug_kv_k_row(&self, li: usize, row: usize) -> Result<Vec<u8>, BackendError> {
+        let rb = self.kv_width * self.kv_elem;
+        let view = self.kv_k[li].slice(row * rb..(row + 1) * rb);
+        let mut out = vec![0u8; rb];
+        self.stream
+            .memcpy_dtoh(&view, &mut out)
+            .map_err(|e| driver_err("debug kv row dtoh", &e))?;
+        Ok(out)
+    }
+
+    /// Debug/test access: dtoh one K row of a batch slot (f32 bytes).
+    #[doc(hidden)]
+    pub fn debug_batch_kv_row(
+        &self,
+        batch: &BatchKv,
+        li: usize,
+        row_slot: usize,
+        row: usize,
+        v: bool,
+    ) -> Result<Vec<u8>, BackendError> {
+        let kw = self.kv_width;
+        let off = (row_slot * batch.max_ctx + row) * kw;
+        let arena = if v { &batch.kv_v[li] } else { &batch.kv_k[li] };
+        let view = arena.slice(off..off + kw);
+        let mut out = vec![0f32; kw];
+        self.stream
+            .memcpy_dtoh(&view, &mut out)
+            .map_err(|e| driver_err("debug batch kv row dtoh", &e))?;
+        Ok(out.iter().flat_map(|v| v.to_le_bytes()).collect())
+    }
+
+    /// Debug/test access: dtoh one K row of a batch slot (f32 bytes).
+    #[doc(hidden)]
+    pub fn debug_batch_kv_k_row(
+        &self,
+        batch: &BatchKv,
+        li: usize,
+        row_slot: usize,
+        row: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        let kw = self.kv_width;
+        let off = (row_slot * batch.max_ctx + row) * kw;
+        let view = batch.kv_k[li].slice(off..off + kw);
+        let mut out = vec![0f32; kw];
+        self.stream
+            .memcpy_dtoh(&view, &mut out)
+            .map_err(|e| driver_err("debug batch kv row dtoh", &e))?;
+        Ok(out.iter().flat_map(|v| v.to_le_bytes()).collect())
+    }
+
+    /// Continuous-batching admission: copy this model's single-sequence KV
+    /// rows `[0, len)` (every layer, K and V) into batch slot `row`'s arena.
+    /// The caller prefills the prompt through the SINGLE-sequence path (the
+    /// optimized prefill), then adopts the cache into the slot and
+    /// [`BatchKv::set_position`]s it — zero new kernels.
+    ///
+    /// Phase-1 constraint: batch arenas are f32, so this requires the f32 KV
+    /// rung (`kv_elem == 4`); other rungs are rejected loudly.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on a bad row/len or a non-f32 KV rung.
+    pub fn copy_kv_into_batch_row(
+        &self,
+        batch: &mut BatchKv,
+        row: usize,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        if self.kv_elem != 4 {
+            return Err(BackendError::InvalidInput(
+                "continuous batching requires the f32 KV rung (batch arenas are f32); \
+                 unset TRITIUM_KV"
+                    .into(),
+            ));
+        }
+        if row >= batch.n {
+            return Err(BackendError::InvalidInput(format!(
+                "copy_kv_into_batch_row: row {row} >= batch n {}",
+                batch.n
+            )));
+        }
+        if len > batch.max_ctx || len > self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "copy_kv_into_batch_row: len {len} exceeds max_ctx {}",
+                batch.max_ctx.min(self.max_ctx)
+            )));
+        }
+        let s = &self.stream;
+        let bytes = len * self.kv_width * 4;
+        for li in 0..self.layers.len() {
+            for (src, dst) in [
+                (&self.kv_k[li], &mut batch.kv_k[li]),
+                (&self.kv_v[li], &mut batch.kv_v[li]),
+            ] {
+                let (src_ptr, sg) = src.device_ptr(s);
+                let dst_off = row * batch.max_ctx * self.kv_width;
+                // f32 elements → byte pointer offset ×4.
+                let (dst_base, dg) = dst.device_ptr(s);
+                let dst_ptr = dst_base + (dst_off * 4) as sys::CUdeviceptr;
+                // SAFETY: raw byte copy between live device allocations on this
+                // model's stream: src holds `len·kv_width` f32 rows from
+                // position 0 (single-seq arena, byte-typed) and dst is the
+                // slot's leading `len·kv_width` f32 span; sizes checked above.
+                #[allow(unsafe_code)]
+                unsafe { result::memcpy_dtod_async(dst_ptr, src_ptr, bytes, s.cu_stream()) }
+                    .map_err(|e| driver_err("batch row adopt dtod", &e))?;
+                drop(sg);
+                drop(dg);
+            }
+        }
+        // The next batched step replays on the CAPTURE stream; the adopt
+        // copies ran on the default stream. Synchronize so a mid-flight
+        // admission's rows are visible before the pool steps again (the
+        // first-ever step is accidentally safe — graph capture syncs both
+        // streams — but replays don't).
+        s.synchronize()
+            .map_err(|e| driver_err("batch row adopt sync", &e))?;
+        Ok(())
+    }
+
     /// Promote the accepted path: node path[k] (arena slot cache_len + path[k])
     /// moves to arena row cache_len + k, then the cache advances by the path
     /// length. `path` is strictly increasing (children follow parents), so
@@ -6092,7 +6247,7 @@ impl CudaDecodeModel {
         // Arena rows are addressed in BYTES (kv_elem = 4/2/1); a row copy is
         // dtype-agnostic. Under the i8 rung each token also owns a scale row.
         let row_bytes = self.kv_width * self.kv_elem;
-        let sc_row = if self.kv_dtype == KvDtype::I8 {
+        let sc_row = if self.kv_dtype.has_scales() {
             self.n_head_kv * (self.head_dim / KV_QGROUP)
         } else {
             0
@@ -6759,6 +6914,7 @@ impl CudaDecodeModel {
         }
         Ok(BatchKv {
             n,
+            max_ctx: self.max_ctx,
             kv_k,
             kv_v,
             positions: vec![0; n],
@@ -8211,12 +8367,12 @@ impl CudaDecodeModel {
                 gateup: lin(&l.gateup),
                 kv_k: dptr(&self.kv_k[li], s),
                 kv_v: dptr(&self.kv_v[li], s),
-                kv_k_sc: if self.kv_dtype == KvDtype::I8 {
+                kv_k_sc: if self.kv_dtype.has_scales() {
                     dptr(&self.kv_k_scales[li], s)
                 } else {
                     0
                 },
-                kv_v_sc: if self.kv_dtype == KvDtype::I8 {
+                kv_v_sc: if self.kv_dtype.has_scales() {
                     dptr(&self.kv_v_scales[li], s)
                 } else {
                     0
@@ -8508,7 +8664,7 @@ impl CudaDecodeModel {
         // in shared memory, so it runs block 0 = q rotation, block 1 = k/v
         // stage + quantize + store (dynamic shared = 2·kv_width·4 B); the
         // f32/f16 kernels are elementwise over `total` threads.
-        let (grid, smem) = if self.kv_dtype == KvDtype::I8 {
+        let (grid, smem) = if self.kv_dtype.has_scales() {
             ((2u32, 1, 1), (2 * self.kv_width * 4) as u32)
         } else {
             ((total.div_ceil(256), 1, 1), 0u32)
@@ -8527,7 +8683,7 @@ impl CudaDecodeModel {
             pp(&hd_i),
             pp(&kw_i),
         ];
-        if self.kv_dtype == KvDtype::I8 {
+        if self.kv_dtype.has_scales() {
             params.push(pp(&kv_k_sc));
             params.push(pp(&kv_v_sc));
         }
@@ -8639,7 +8795,7 @@ impl CudaDecodeModel {
                     pp(&hd_i),
                     pp(&scale),
                 ];
-                if self.kv_dtype == KvDtype::I8 {
+                if self.kv_dtype.has_scales() {
                     params.push(pp(&k_sc));
                 }
                 raw_launch(
@@ -8663,7 +8819,7 @@ impl CudaDecodeModel {
                 pp(&nhkv_i),
                 pp(&hd_i),
             ];
-            if self.kv_dtype == KvDtype::I8 {
+            if self.kv_dtype.has_scales() {
                 params.push(pp(&v_sc));
             }
             return raw_launch(
@@ -8912,7 +9068,9 @@ impl RawGraphKernels {
             |f32_name: &'static str, h_name: &'static str, q8_name: &'static str| match kv_dtype {
                 KvDtype::F32 => f32_name,
                 KvDtype::F16 => h_name,
-                KvDtype::I8 => q8_name,
+                // T2 rides the i8 lattice: every CONSUMER uses the q8 kernels;
+                // only the append selections below override to the _t2 names.
+                KvDtype::I8 | KvDtype::T2 => q8_name,
             };
         ctx.bind_to_thread()
             .map_err(|e| driver_err("raw kernels bind", &e))?;
@@ -8939,19 +9097,27 @@ impl RawGraphKernels {
             rope_g: get(dm, KERNEL_NAME_ROPE_G)?,
             kv_append: get(
                 dm,
-                sel(
-                    KERNEL_NAME_KV_APPEND,
-                    KERNEL_NAME_KV_APPEND_H,
-                    KERNEL_NAME_KV_APPEND_Q8,
-                ),
+                if kv_dtype == KvDtype::T2 {
+                    KERNEL_NAME_KV_APPEND_T2
+                } else {
+                    sel(
+                        KERNEL_NAME_KV_APPEND,
+                        KERNEL_NAME_KV_APPEND_H,
+                        KERNEL_NAME_KV_APPEND_Q8,
+                    )
+                },
             )?,
             rope_kv: get(
                 dm,
-                sel(
-                    KERNEL_NAME_ROPE_KV_FUSED,
-                    KERNEL_NAME_ROPE_KV_FUSED_H,
-                    KERNEL_NAME_ROPE_KV_FUSED_Q8,
-                ),
+                if kv_dtype == KvDtype::T2 {
+                    KERNEL_NAME_ROPE_KV_FUSED_T2
+                } else {
+                    sel(
+                        KERNEL_NAME_ROPE_KV_FUSED,
+                        KERNEL_NAME_ROPE_KV_FUSED_H,
+                        KERNEL_NAME_ROPE_KV_FUSED_Q8,
+                    )
+                },
             )?,
             // Warp-per-head attention (bit-identical to the one-thread `_g`, just parallel).
             attn_g: get(dm, KERNEL_NAME_ATTN_WARP)?,
@@ -9177,6 +9343,8 @@ struct BatchPtrs {
 #[allow(missing_debug_implementations)]
 pub struct BatchKv {
     n: usize,
+    /// Per-sequence KV capacity (the arena stride, in tokens).
+    max_ctx: usize,
     kv_k: Vec<CudaSlice<f32>>,
     kv_v: Vec<CudaSlice<f32>>,
     /// Per-sequence current position (next KV write slot); length `n`.
@@ -9243,7 +9411,30 @@ impl BatchKv {
     }
 
     /// Per-sequence positions (the number of tokens each sequence has decoded).
-    #[must_use]
+    /// Set one sequence slot's position (continuous-batching admission: the
+    /// slot's KV rows `[0, pos)` must already hold that sequence's cache —
+    /// see [`CudaDecodeModel::copy_kv_into_batch_row`]).
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on a bad row or a position beyond the
+    /// arena.
+    pub fn set_position(&mut self, row: usize, pos: usize) -> Result<(), BackendError> {
+        if row >= self.n {
+            return Err(BackendError::InvalidInput(format!(
+                "set_position: row {row} >= batch n {}",
+                self.n
+            )));
+        }
+        if pos > self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "set_position: pos {pos} > max_ctx {}",
+                self.max_ctx
+            )));
+        }
+        self.positions[row] = pos;
+        Ok(())
+    }
+
     pub fn positions(&self) -> &[usize] {
         &self.positions
     }

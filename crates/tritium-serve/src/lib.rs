@@ -27,6 +27,8 @@ pub mod dto;
 pub mod generator;
 pub mod tokenizer_passthrough;
 
+#[cfg(feature = "cuda")]
+mod batch;
 #[cfg(feature = "serve")]
 mod router;
 #[cfg(feature = "serve")]
@@ -40,5 +42,7 @@ pub use generator::{
 };
 pub use tokenizer_passthrough::IdPassthroughTokenizer;
 
+#[cfg(feature = "cuda")]
+pub use router::build_router_batched;
 #[cfg(feature = "serve")]
 pub use router::{ServeConfig, build_router};

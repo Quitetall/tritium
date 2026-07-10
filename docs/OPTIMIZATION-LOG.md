@@ -708,6 +708,50 @@ Gates: 9/9 acceptance (f32 default bit-exact, untouched), 51/51 CUDA, spec
 losslessness green under i8 (exercises the q8 tree kernels), long-ctx A/B
 above.
 
+### v1.x round 14 — continuous batching phase 1: 1.65× aggregate throughput, zero new kernels
+
+`tritium-serve --batch-slots N`: a fixed N-slot pool over ONE `BatchKv` whose
+M=N graph is captured once. Admission runs the prompt through the OPTIMIZED
+single-sequence prefill (941 tok/s) and adopts the KV rows into the slot
+(`copy_kv_into_batch_row`, byte dtod + a cross-stream sync — the replay runs
+on the capture stream); free slots are fed a pad token with position pinned
+to 0; per-slot host sampling reuses the plain samplers' truncated
+distributions; retirement on EOS/budget/disconnect frees the slot for the
+next admission. Tree/spec endpoints answer 501 in this mode.
+
+Measured (8 slots, 24-token prompts, 64 tokens each, SHARED GPU — a 10 GB
+llama-server was co-resident, so conservative): sequential 284.1 tok/s →
+concurrent **468.6 tok/s aggregate (1.65×)**, admission prefills inside the
+timed window.
+
+Gates: adoption bit-exactness (30 layers × 26 rows × K/V), token-0 exactness
++ agreement-prefix reporting vs single-seq, and cross-pool determinism
+(same requests, reversed submission order → different slots → identical
+streams; covers concurrency, slot reuse and pad isolation).
+
+DISCOVERED en route (worth its own line): **the M=N batch path was never
+bit-identical to `step_graph`** — the existing acceptance gate pins TOKENS
+over a short horizon, and the mdecode attention's reduction shapes differ at
+the ulp level, so near-tie argmaxes can flip at long horizons (measured:
+128k/128k logits differ at step 0 even at prompt length 8; greedy tokens
+still agree for 10/10 on four of six probe prompts, 5/10 and 2/10 on two).
+The serve gates encode this honestly instead of pretending exactness.
+
+### v1.x round 15 — ternary KV ("KVTQ", ADR 0020 rung 3): REJECTED by measurement
+
+`TRITIUM_KV=t2`: appends quantize K and V to {-s, 0, +s} per 64-dim group
+(s = 1.5·group-absmean ≈ the MSE-optimal 3-level quantizer for Gaussian
+data), encoded in the i8 lattice so the rung-2 attention kernels run
+unchanged. Perplexity: **1.4028 → 1.9203 (rel err 3.7e-1)** — catastrophic;
+speed ≈ f32 (67.9 tok/s @4K). Verdict: ternary is too coarse for BOTH K and
+V at G=64 on this model; the experiment cost three append kernels and zero
+attention work, exactly as planned. Untested variants recorded for a future
+probe: V-only ternary + K at i8/f16 (asymmetric), smaller groups. The `t2`
+mode stays selectable as the experiment harness. Note: the user's beellama
+fork ships a `turbo3_tcq` ternary-coded KV cache for Qwen — whatever it does
+beyond plain MSE-ternary (hybrid precision? outlier channels?) is the
+interesting difference to study.
+
 ## Still open (from the full optimization scan)
 
 1. **rmsnorm_quant_f32 sequential sum** — now ~32% of decode GPU time

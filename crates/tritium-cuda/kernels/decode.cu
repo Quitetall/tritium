@@ -2194,6 +2194,118 @@ __device__ __forceinline__ void kv_quant_row_q8(const float* __restrict__ src_ro
   }
 }
 
+// ─── Ternary KV experiment ("KVTQ", ADR 0020 rung 3) — values quantize to
+// {-s, 0, +s} per KV_QGROUP group and ride the SAME i8 lattice + scale arena
+// as rung 2 (code = trit·127, scale = s/127 → dequant = trit·s exactly), so
+// the attention kernels are the unmodified _q8 ones; only the append rounding
+// differs. Level s = 1.5·(group absmean) with threshold s/2 — near the
+// MSE-optimal 3-level quantizer for zero-mean Gaussian data (level ≈ 1.53·E|v|).
+__device__ __forceinline__ void kv_quant_row_t2(const float* __restrict__ src_row,
+                                                signed char* __restrict__ dst_row,
+                                                float* __restrict__ sc_row,
+                                                const int kv_width) {
+  __shared__ float s_sum[64]; // group Σ|v| (kv_width ≤ 64·KV_QGROUP, build-guarded)
+  const int n_groups = kv_width / KV_QGROUP;
+  for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
+    s_sum[g] = 0.0f;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < kv_width; i += blockDim.x) {
+    atomicAdd(&s_sum[i / KV_QGROUP], fabsf(src_row[i]));
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < kv_width; i += blockDim.x) {
+    const int g = i / KV_QGROUP;
+    const float level = 1.5f * (s_sum[g] / (float)KV_QGROUP);
+    if (level == 0.0f) {
+      dst_row[i] = 0;
+      if (i % KV_QGROUP == 0) sc_row[g] = 0.0f;
+    } else {
+      const float v = src_row[i];
+      const signed char trit = (fabsf(v) > 0.5f * level) ? (v > 0.0f ? 1 : -1) : 0;
+      dst_row[i] = (signed char)(trit * 127);
+      if (i % KV_QGROUP == 0) sc_row[g] = level / 127.0f;
+    }
+  }
+}
+
+__global__ void kv_append_t2(const float* __restrict__ src,
+                             signed char* __restrict__ kv_base,
+                             const int* __restrict__ ctrl,
+                             const int kv_width,
+                             float* __restrict__ scales) {
+  const long long row = ctrl[2];
+  const int n_groups = kv_width / KV_QGROUP;
+  kv_quant_row_t2(src, kv_base + row * kv_width, scales + row * n_groups, kv_width);
+}
+
+__global__ void kv_append_batch_t2(const float* __restrict__ src,
+                                   signed char* __restrict__ kv_base,
+                                   const int cache_len, const int kv_width, const int m,
+                                   float* __restrict__ scales) {
+  const int r = blockIdx.x;
+  if (r >= m) return;
+  const long long row = (long long)cache_len + r;
+  const int n_groups = kv_width / KV_QGROUP;
+  kv_quant_row_t2(src + (long long)r * kv_width, kv_base + row * kv_width,
+                  scales + row * n_groups, kv_width);
+}
+
+__global__ void rope_kv_fused_t2(float* __restrict__ q,
+                                 const float* __restrict__ k,
+                                 const float* __restrict__ v,
+                                 signed char* __restrict__ kv_k_base,
+                                 signed char* __restrict__ kv_v_base,
+                                 const float* __restrict__ cos_table,
+                                 const float* __restrict__ sin_table,
+                                 const int* __restrict__ ctrl,
+                                 const int n_head, const int n_head_kv,
+                                 const int head_dim, const int kv_width,
+                                 float* __restrict__ k_scales,
+                                 float* __restrict__ v_scales) {
+  extern __shared__ float s_kv[];
+  const int half = head_dim >> 1;
+  const int pos = ctrl[1];
+  const long long row = ctrl[2];
+  if (blockIdx.x == 0) {
+    const int q_total = n_head * half;
+    for (int idx = threadIdx.x; idx < q_total; idx += blockDim.x) {
+      const int head = idx / half;
+      const int j = idx - head * half;
+      const int base = head * head_dim;
+      const float c = cos_table[(long long)pos * half + j];
+      const float s = sin_table[(long long)pos * half + j];
+      const float a = q[base + j];
+      const float b = q[base + j + half];
+      q[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+      q[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+    }
+    return;
+  }
+  float* s_k = s_kv;
+  float* s_v = s_kv + kv_width;
+  const int k_total = n_head_kv * half;
+  for (int t = threadIdx.x; t < k_total; t += blockDim.x) {
+    const int head = t / half;
+    const int j = t - head * half;
+    const int base = head * head_dim;
+    const float c = cos_table[(long long)pos * half + j];
+    const float s = sin_table[(long long)pos * half + j];
+    const float a = k[base + j];
+    const float b = k[base + j + half];
+    s_k[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+    s_k[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+  }
+  for (int i = threadIdx.x; i < kv_width; i += blockDim.x) {
+    s_v[i] = v[i];
+  }
+  __syncthreads();
+  const int n_groups = kv_width / KV_QGROUP;
+  kv_quant_row_t2(s_k, kv_k_base + row * kv_width, k_scales + row * n_groups, kv_width);
+  __syncthreads();
+  kv_quant_row_t2(s_v, kv_v_base + row * kv_width, v_scales + row * n_groups, kv_width);
+}
+
 __global__ void kv_append_q8(const float* __restrict__ src,
                              signed char* __restrict__ kv_base,
                              const int* __restrict__ ctrl,

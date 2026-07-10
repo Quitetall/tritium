@@ -72,6 +72,48 @@ pub fn build_router(
         worker_alive.clone(),
         cfg.queue_cap,
     );
+    build_router_inner(jobs, tok, cfg, draining, worker_alive)
+}
+
+/// Continuous-batching router (`--batch-slots > 1`): spawns the batched
+/// worker (`batch::run_batched`) on its own thread — a fixed slot pool over
+/// the M=N decode graph — and routes the same job queue + SSE plumbing at it.
+/// Tree/spec endpoints answer 501 in this mode (the pool owns the model).
+#[cfg(feature = "cuda")]
+pub fn build_router_batched(
+    runner: tritium_nn::ModelRunner,
+    eos: u32,
+    slots: usize,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+) -> std::io::Result<(Router, Arc<AtomicBool>)> {
+    use std::sync::atomic::Ordering;
+    let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel(cfg.queue_cap);
+    let worker_alive = Arc::new(AtomicBool::new(true));
+    let alive = worker_alive.clone();
+    std::thread::Builder::new()
+        .name("tritium-serve-batch".into())
+        .spawn(move || {
+            crate::batch::run_batched(runner, eos, slots, jobs_rx);
+            alive.store(false, Ordering::SeqCst);
+        })?;
+    let draining = Arc::new(AtomicBool::new(false));
+    Ok(build_router_inner(
+        jobs_tx,
+        tok,
+        cfg,
+        draining,
+        worker_alive,
+    ))
+}
+
+fn build_router_inner(
+    jobs: tokio::sync::mpsc::Sender<crate::worker::Job>,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    draining: Arc<AtomicBool>,
+    worker_alive: Arc<AtomicBool>,
+) -> (Router, Arc<AtomicBool>) {
     let state = AppState {
         jobs,
         tok,
