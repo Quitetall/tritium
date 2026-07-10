@@ -72,7 +72,13 @@ impl ModelWeights {
                 .map_err(|e| NnError::MissingTensor(format!("{name}: {e}")))
         };
         // Every tensor is read from the safetensors as exact fp32.
-        let weights = build_standard_model(&config, &spec, get, true)?;
+        let weights = build_standard_model(
+            &config,
+            &spec,
+            NameSchema::Hf,
+            &get,
+            |name, n_out, k_in| Ok(Projection::Dense(DenseLinear::new_exact(get(name)?, n_out, k_in)?)),
+        )?;
         Ok((config, spec, weights))
     }
 
@@ -170,21 +176,106 @@ impl ModelWeights {
         // *numerically* equivalent to the native multi-plane ternary GEMM (within the ~1e-4
         // kernel tolerance) but not bit-identical — a CPU/eval path; the GPU native path (plan
         // 0040) is the deployed one.
-        let weights = build_standard_model(&config, &spec, provider, false)?;
+        let weights = build_standard_model(
+            &config,
+            &spec,
+            NameSchema::Hf,
+            &provider,
+            |name, n_out, k_in| {
+                Ok(Projection::Dense(DenseLinear::new(provider(name)?, n_out, k_in)?))
+            },
+        )?;
         Ok((config, weights))
     }
 }
 
-/// Assemble [`ModelWeights`] for a standard transformer from a single fp-weight `provider`
-/// (name → row-major `[n_out, k_in]` / `[len]` fp32) and an `exact_fp` flag (`true` ⇒ exact
-/// [`DenseLinear::new_exact`]; `false` ⇒ the A8 int8-activation path [`DenseLinear::new`]).
-/// Shared by [`ModelWeights::load_hf`] (exact-fp from safetensors) and `load_salt`
-/// (dequant-to-dense from a SALT bundle). 1D norms + the embedding come through `provider` too.
-fn build_standard_model(
+/// Tensor-name schema: which source names fill the canonical model slots.
+/// The one config-driven builder (P2e loader unification) is schema-agnostic;
+/// each loading path picks its dialect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameSchema {
+    /// HuggingFace safetensors names (`model.layers.N.self_attn.q_proj.weight`).
+    Hf,
+    /// GGUF/ggml names (`blk.N.attn_q.weight`).
+    Gguf,
+}
+
+impl NameSchema {
+    /// Top-level (non-layer) slot name.
+    fn top(self, slot: &str) -> &'static str {
+        match (self, slot) {
+            (NameSchema::Hf, "token_embd") => "model.embed_tokens.weight",
+            (NameSchema::Hf, "output_norm") => "model.norm.weight",
+            (NameSchema::Hf, "lm_head") => "lm_head.weight",
+            (NameSchema::Gguf, "token_embd") => "token_embd.weight",
+            (NameSchema::Gguf, "output_norm") => "output_norm.weight",
+            (NameSchema::Gguf, "lm_head") => "output.weight",
+            _ => unreachable!("unknown top-level slot {slot}"),
+        }
+    }
+
+    /// Per-layer slot name.
+    fn layer(self, i: usize, slot: &str) -> String {
+        let s = match (self, slot) {
+            (NameSchema::Hf, _) => {
+                return format!(
+                    "model.layers.{i}.{}",
+                    match slot {
+                        "attn_norm" => "input_layernorm.weight",
+                        "q" => "self_attn.q_proj.weight",
+                        "k" => "self_attn.k_proj.weight",
+                        "v" => "self_attn.v_proj.weight",
+                        "o" => "self_attn.o_proj.weight",
+                        "q_bias" => "self_attn.q_proj.bias",
+                        "k_bias" => "self_attn.k_proj.bias",
+                        "v_bias" => "self_attn.v_proj.bias",
+                        "q_norm" => "self_attn.q_norm.weight",
+                        "k_norm" => "self_attn.k_norm.weight",
+                        "attn_sub_norm" => "self_attn.attn_sub_norm.weight",
+                        "ffn_norm" => "post_attention_layernorm.weight",
+                        "ffn_sub_norm" => "mlp.ffn_sub_norm.weight",
+                        "gate" => "mlp.gate_proj.weight",
+                        "up" => "mlp.up_proj.weight",
+                        "down" => "mlp.down_proj.weight",
+                        _ => unreachable!("unknown layer slot {slot}"),
+                    }
+                );
+            }
+            (NameSchema::Gguf, "attn_norm") => "attn_norm.weight",
+            (NameSchema::Gguf, "q") => "attn_q.weight",
+            (NameSchema::Gguf, "k") => "attn_k.weight",
+            (NameSchema::Gguf, "v") => "attn_v.weight",
+            (NameSchema::Gguf, "o") => "attn_output.weight",
+            (NameSchema::Gguf, "q_bias") => "attn_q.bias",
+            (NameSchema::Gguf, "k_bias") => "attn_k.bias",
+            (NameSchema::Gguf, "v_bias") => "attn_v.bias",
+            (NameSchema::Gguf, "q_norm") => "attn_q_norm.weight",
+            (NameSchema::Gguf, "k_norm") => "attn_k_norm.weight",
+            (NameSchema::Gguf, "attn_sub_norm") => "attn_sub_norm.weight",
+            (NameSchema::Gguf, "ffn_norm") => "ffn_norm.weight",
+            (NameSchema::Gguf, "ffn_sub_norm") => "ffn_sub_norm.weight",
+            (NameSchema::Gguf, "gate") => "ffn_gate.weight",
+            (NameSchema::Gguf, "up") => "ffn_up.weight",
+            (NameSchema::Gguf, "down") => "ffn_down.weight",
+            _ => unreachable!("unknown layer slot {slot}"),
+        };
+        format!("blk.{i}.{s}")
+    }
+}
+
+/// Assemble [`ModelWeights`] for a standard transformer — THE one config-driven
+/// loading skeleton (P2e). `dense` provides 1D norms + the embedding (name →
+/// fp32); `proj` builds each 2D projection (name, n_out, k_in) — exact-fp
+/// [`DenseLinear`], A8 `DenseLinear`, or a backend-uploaded ternary linear.
+/// `spec` drives every architecture axis: MLP family, QKV bias, QK-norm,
+/// BitNet sub-norms, tied embeddings. Used by [`ModelWeights::load_hf`],
+/// `load_salt` AND the BitNet GGUF path ([`ModelWeights::load`]).
+pub(crate) fn build_standard_model(
     config: &ModelConfig,
     spec: &ArchSpec,
-    provider: impl Fn(&str) -> Result<Vec<f32>, NnError>,
-    exact_fp: bool,
+    schema: NameSchema,
+    dense: impl Fn(&str) -> Result<Vec<f32>, NnError>,
+    mut proj: impl FnMut(&str, usize, usize) -> Result<Projection, NnError>,
 ) -> Result<ModelWeights, NnError> {
     let n_embd = config.n_embd as usize;
     let head_dim = config.head_dim() as usize;
@@ -192,27 +283,17 @@ fn build_standard_model(
     let kv_width = config.n_head_kv as usize * head_dim;
     let n_ff = config.n_ff as usize;
 
-    let proj = |name: &str, n_out: usize, k_in: usize| -> Result<Projection, NnError> {
-        let w = provider(name)?;
-        let dl = if exact_fp {
-            DenseLinear::new_exact(w, n_out, k_in)?
-        } else {
-            DenseLinear::new(w, n_out, k_in)?
-        };
-        Ok(Projection::Dense(dl))
-    };
-
-    let token_embd = provider("model.embed_tokens.weight")?;
+    let token_embd = dense(schema.top("token_embd"))?;
     let vocab = token_embd.len() / n_embd;
-    let output_norm = provider("model.norm.weight")?;
+    let output_norm = dense(schema.top("output_norm"))?;
 
     let mut layers = Vec::with_capacity(config.n_layers as usize);
     for i in 0..config.n_layers as usize {
-        let p = |s: &str| format!("model.layers.{i}.{s}");
+        let p = |s: &str| schema.layer(i, s);
         let (gate, up, down) = (
-            proj(&p("mlp.gate_proj.weight"), n_ff, n_embd)?,
-            proj(&p("mlp.up_proj.weight"), n_ff, n_embd)?,
-            proj(&p("mlp.down_proj.weight"), n_embd, n_ff)?,
+            proj(&p("gate"), n_ff, n_embd)?,
+            proj(&p("up"), n_ff, n_embd)?,
+            proj(&p("down"), n_embd, n_ff)?,
         );
         let mlp = match spec.mlp {
             MlpKind::SwiGlu => Mlp::SwiGlu(SwiGluMlp { gate, up, down }),
@@ -220,25 +301,26 @@ fn build_standard_model(
                 gate,
                 up,
                 down,
-                ffn_sub_norm: Vec::new(),
+                ffn_sub_norm: if spec.ffn_sub_norm {
+                    dense(&p("ffn_sub_norm"))?
+                } else {
+                    Vec::new()
+                },
                 rms_eps: config.rms_eps,
             }),
         };
         // Optional Qwen2/2.5 QKV bias and Qwen3 QK-norm (empty = absent).
         let (q_bias, k_bias, v_bias) = if spec.qkv_bias {
             (
-                provider(&p("self_attn.q_proj.bias"))?,
-                provider(&p("self_attn.k_proj.bias"))?,
-                provider(&p("self_attn.v_proj.bias"))?,
+                dense(&p("q_bias"))?,
+                dense(&p("k_bias"))?,
+                dense(&p("v_bias"))?,
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
         let (q_norm, k_norm) = if spec.qk_norm {
-            (
-                provider(&p("self_attn.q_norm.weight"))?,
-                provider(&p("self_attn.k_norm.weight"))?,
-            )
+            (dense(&p("q_norm"))?, dense(&p("k_norm"))?)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -261,19 +343,23 @@ fn build_standard_model(
             }
         }
         layers.push(TransformerBlock {
-            attn_norm: provider(&p("input_layernorm.weight"))?,
-            q_proj: proj(&p("self_attn.q_proj.weight"), q_width, n_embd)?,
-            k_proj: proj(&p("self_attn.k_proj.weight"), kv_width, n_embd)?,
-            v_proj: proj(&p("self_attn.v_proj.weight"), kv_width, n_embd)?,
-            o_proj: proj(&p("self_attn.o_proj.weight"), n_embd, q_width)?,
-            // Standard transformer: no BitNet sub-norm.
-            attn_sub_norm: Vec::new(),
+            attn_norm: dense(&p("attn_norm"))?,
+            q_proj: proj(&p("q"), q_width, n_embd)?,
+            k_proj: proj(&p("k"), kv_width, n_embd)?,
+            v_proj: proj(&p("v"), kv_width, n_embd)?,
+            o_proj: proj(&p("o"), n_embd, q_width)?,
+            // BitNet applies attn_sub_norm before o_proj; absent elsewhere.
+            attn_sub_norm: if spec.attn_sub_norm {
+                dense(&p("attn_sub_norm"))?
+            } else {
+                Vec::new()
+            },
             q_bias,
             k_bias,
             v_bias,
             q_norm,
             k_norm,
-            ffn_norm: provider(&p("post_attention_layernorm.weight"))?,
+            ffn_norm: dense(&p("ffn_norm"))?,
             mlp,
         });
     }
@@ -282,7 +368,7 @@ fn build_standard_model(
     let lm_head = if spec.tied_embeddings {
         None
     } else {
-        Some(proj("lm_head.weight", vocab, n_embd)?)
+        Some(proj(schema.top("lm_head"), vocab, n_embd)?)
     };
 
     Ok(ModelWeights {

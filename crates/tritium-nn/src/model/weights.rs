@@ -28,7 +28,7 @@ use tritium_format::{
 };
 use tritium_spec::TernaryBackend;
 
-use crate::config::ModelConfig;
+use crate::config::{ArchSpec, ModelConfig};
 use crate::error::NnError;
 use crate::layers::{Mlp, Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
 use crate::tensor::f16_bytes_to_f32;
@@ -81,41 +81,36 @@ impl ModelWeights {
         config: &ModelConfig,
         backend: &dyn TernaryBackend,
     ) -> Result<Self, NnError> {
+        // Preserve the GGUF-specific integrity check the generic builder
+        // (which derives vocab as len/n_embd) can't express: the declared
+        // dims must agree with the decoded payload length.
         let n_embd = config.n_embd as usize;
-
-        // Token embedding (F16 -> fp32). dims are [n_embd, vocab] (fastest-first),
-        // so vocab = dims[1].
         let embd_info = require(file, "token_embd.weight")?;
         let vocab = *embd_info
             .dims
             .last()
             .ok_or_else(|| NnError::MissingTensor("token_embd.weight (no dims)".to_owned()))?
             as usize;
-        let token_embd = load_dense(file, bytes, "token_embd.weight")?;
-        if token_embd.len() != vocab * n_embd {
+        let embd_len = load_dense(file, bytes, "token_embd.weight")?.len();
+        if embd_len != vocab * n_embd {
             return Err(NnError::Shape {
                 expected: vocab * n_embd,
-                got: token_embd.len(),
+                got: embd_len,
             });
         }
 
-        // Per-layer blocks.
-        let mut layers = Vec::with_capacity(config.n_layers as usize);
-        for l in 0..config.n_layers {
-            layers.push(load_layer(file, bytes, config, backend, l)?);
-        }
-
-        let output_norm = load_dense(file, bytes, "output_norm.weight")?;
-
-        Ok(Self {
-            token_embd,
-            vocab,
-            n_embd,
-            layers,
-            output_norm,
-            // BitNet ties the LM head to the token embedding.
-            lm_head: None,
-        })
+        // P2e: one config-driven skeleton for every loading path — the GGUF
+        // dialect supplies the name schema, `load_dense` the norms/embedding,
+        // and `load_ternary` (backend upload) the projections.
+        crate::model::hf::build_standard_model(
+            config,
+            &ArchSpec::bitnet(),
+            crate::model::hf::NameSchema::Gguf,
+            |name| load_dense(file, bytes, name),
+            |name, _n_out, _k_in| {
+                Ok(Projection::Ternary(load_ternary(file, bytes, backend, name)?))
+            },
+        )
     }
 }
 
@@ -284,50 +279,4 @@ fn load_ternary(
     };
 
     TernaryLinear::new(backend, &trits, n_out, k_in, scale)
-}
-
-/// Load one decoder layer's weights from `blk.{l}.*`.
-fn load_layer(
-    file: &GgufFile,
-    bytes: &[u8],
-    config: &ModelConfig,
-    backend: &dyn TernaryBackend,
-    l: u32,
-) -> Result<TransformerBlock, NnError> {
-    let p = |suffix: &str| format!("blk.{l}.{suffix}");
-
-    let attn_norm = load_dense(file, bytes, &p("attn_norm.weight"))?;
-    let q_proj = load_ternary(file, bytes, backend, &p("attn_q.weight"))?;
-    let k_proj = load_ternary(file, bytes, backend, &p("attn_k.weight"))?;
-    let v_proj = load_ternary(file, bytes, backend, &p("attn_v.weight"))?;
-    let o_proj = load_ternary(file, bytes, backend, &p("attn_output.weight"))?;
-    let attn_sub_norm = load_dense(file, bytes, &p("attn_sub_norm.weight"))?;
-    let ffn_norm = load_dense(file, bytes, &p("ffn_norm.weight"))?;
-    let ffn_sub_norm = load_dense(file, bytes, &p("ffn_sub_norm.weight"))?;
-    let gate = load_ternary(file, bytes, backend, &p("ffn_gate.weight"))?;
-    let up = load_ternary(file, bytes, backend, &p("ffn_up.weight"))?;
-    let down = load_ternary(file, bytes, backend, &p("ffn_down.weight"))?;
-
-    Ok(TransformerBlock {
-        attn_norm,
-        q_proj: Projection::Ternary(q_proj),
-        k_proj: Projection::Ternary(k_proj),
-        v_proj: Projection::Ternary(v_proj),
-        o_proj: Projection::Ternary(o_proj),
-        attn_sub_norm,
-        // BitNet has no QKV bias or QK-norm.
-        q_bias: Vec::new(),
-        k_bias: Vec::new(),
-        v_bias: Vec::new(),
-        q_norm: Vec::new(),
-        k_norm: Vec::new(),
-        ffn_norm,
-        mlp: Mlp::Relu2(Relu2Mlp {
-            gate: Projection::Ternary(gate),
-            up: Projection::Ternary(up),
-            down: Projection::Ternary(down),
-            ffn_sub_norm,
-            rms_eps: config.rms_eps,
-        }),
-    })
 }
