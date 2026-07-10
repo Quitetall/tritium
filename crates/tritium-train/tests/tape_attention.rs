@@ -118,8 +118,9 @@ fn tape_attention_gradient_matches_finite_difference() {
 
     // Scalar loss L = Σ out·r for a fixed random cotangent r (a dot-product = matmul to [1,1]).
     let r = seeded(9, SEQ * N_EMBD);
-    let loss_of = |wq: &[f32]| -> f64 {
-        ref_attention(&x, wq, &wk, &wv, &wo)
+    // Loss as a function of ALL five inputs, so we can perturb any one of them.
+    let loss_of = |x: &[f32], wq: &[f32], wk: &[f32], wv: &[f32], wo: &[f32]| -> f64 {
+        ref_attention(x, wq, wk, wv, wo)
             .iter()
             .zip(&r)
             .map(|(&y, &ri)| f64::from(y) * f64::from(ri))
@@ -140,19 +141,35 @@ fn tape_attention_gradient_matches_finite_difference() {
     let rid = t.leaf(r.clone());
     let scalar = t.dense_matmul(out, rid, 1, 1, SEQ * N_EMBD); // Σ out·r
     let grads = t.backward(scalar);
-    let grad_wq = &grads[wqid];
 
+    // Probe EVERY input (x + all four projections — wk/wv carry the GQA-shared paths, x carries the
+    // multi-slice accumulation into q/k/v). A broken vjp or accumulate on any path fails here.
     let h = 1e-3f64;
-    for &i in &[0usize, 5, 17, QD * N_EMBD - 1] {
-        let (mut plus, mut minus) = (wq.clone(), wq.clone());
-        plus[i] += h as f32;
-        minus[i] -= h as f32;
-        let numeric = (loss_of(&plus) - loss_of(&minus)) / (2.0 * h);
-        let analytic = f64::from(grad_wq[i]);
-        let denom = numeric.abs().max(1.0);
-        assert!(
-            ((analytic - numeric) / denom).abs() < 3e-3,
-            "dL/dwq[{i}]: analytic {analytic} vs numeric {numeric}"
-        );
+    for (name, base, id) in [
+        ("x", &x, xid),
+        ("wq", &wq, wqid),
+        ("wk", &wk, wkid),
+        ("wv", &wv, wvid),
+        ("wo", &wo, woid),
+    ] {
+        let n = base.len();
+        for &i in &[0usize, n / 3, n - 1] {
+            let (mut plus, mut minus) = (base.clone(), base.clone());
+            plus[i] += h as f32;
+            minus[i] -= h as f32;
+            let numeric = match name {
+                "x" => loss_of(&plus, &wq, &wk, &wv, &wo) - loss_of(&minus, &wq, &wk, &wv, &wo),
+                "wq" => loss_of(&x, &plus, &wk, &wv, &wo) - loss_of(&x, &minus, &wk, &wv, &wo),
+                "wk" => loss_of(&x, &wq, &plus, &wv, &wo) - loss_of(&x, &wq, &minus, &wv, &wo),
+                "wv" => loss_of(&x, &wq, &wk, &plus, &wo) - loss_of(&x, &wq, &wk, &minus, &wo),
+                _ => loss_of(&x, &wq, &wk, &wv, &plus) - loss_of(&x, &wq, &wk, &wv, &minus),
+            } / (2.0 * h);
+            let analytic = f64::from(grads[id][i]);
+            let denom = numeric.abs().max(1.0);
+            assert!(
+                ((analytic - numeric) / denom).abs() < 3e-3,
+                "dL/d{name}[{i}]: analytic {analytic} vs numeric {numeric}"
+            );
+        }
     }
 }
