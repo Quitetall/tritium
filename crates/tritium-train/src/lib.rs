@@ -20,6 +20,7 @@ pub mod fsdp;
 pub mod gradcheck;
 pub mod lora;
 pub mod lr;
+pub mod nn;
 pub mod ops;
 pub mod optim;
 pub mod tape;
