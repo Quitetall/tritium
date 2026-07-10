@@ -280,6 +280,21 @@ impl Tape {
         )
     }
 
+    /// SiLU / swish activation `Y = x·σ(x)` — the SwiGLU gate.
+    pub fn silu(&mut self, x: ValueId) -> ValueId {
+        let out = act::silu_forward(&self.values[x]);
+        self.record(
+            vec![x],
+            out,
+            Box::new(|ins, g, grads, ids| {
+                let gs = act::silu_vjp(ins[0], g);
+                for (j, &v) in gs[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
+        )
+    }
+
     /// Element-wise add `Y = A + B`.
     pub fn add(&mut self, a: ValueId, b: ValueId) -> ValueId {
         let out = elementwise::add_forward(&self.values[a], &self.values[b]);

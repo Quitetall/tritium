@@ -50,6 +50,21 @@ fn relu2_grad_wrt_x() {
 }
 
 #[test]
+fn silu_grad_wrt_x() {
+    // SiLU is C^∞; spread values across both sides of 0.
+    let x = seeded(5, 16, -3.0, 3.0);
+    let inputs = vec![x];
+    check_op(
+        |ins| act::silu_forward(ins[0]),
+        |ins, g| act::silu_vjp(ins[0], g),
+        &inputs,
+        &[0],
+        GradCheckCfg::default(),
+    )
+    .expect("silu grad wrt x must match finite difference");
+}
+
+#[test]
 fn mse_grad_wrt_pred() {
     let pred = seeded(4, 12, -2.0, 2.0);
     let target = seeded(5, 12, -1.0, 1.0); // constant of the forward
