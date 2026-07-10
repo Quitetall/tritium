@@ -34,6 +34,7 @@
 #![deny(missing_docs)]
 
 mod allocate;
+pub mod fisher;
 mod plane;
 mod quantize;
 mod recon;
