@@ -924,6 +924,13 @@ extern "C" __global__ void tq1_0_add_mpgemm_tiled_i8_scaled_residual(
 // presence byte (8 elements = 2 dp4a words), its sign-stream position found
 // by a warp-wide popcount prefix scan (5 shfl_up) — no divergence, dense
 // coalesced loads. k % 256 == 0 required (prototype; gateup shapes qualify).
+//
+// ARENA CONTRACT: the weights arena MUST carry >= 2 (use 4) trailing slack
+// bytes past the last row. The sign window reads signs[byte0] and
+// signs[byte0+1] unconditionally — a trailing cnt==0 lane on the LAST row
+// with nnz % 32 in {0, 25..=31} lands byte0(+1) up to 2 bytes past the
+// packed data. Host uploaders must append the slack (see run_tb1 / the
+// bench harness).
 extern "C" __global__ void tb1_mpgemm_tiled_i8_scaled(
     const signed char* __restrict__ qact,   // [M, K] packed int8, k % 4 == 0
     const unsigned char* __restrict__ weights,

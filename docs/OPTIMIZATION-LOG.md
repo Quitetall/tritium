@@ -812,11 +812,19 @@ contention cannot invert):
 
 | kernel | bytes (vs TQ2) | µs/launch |
 |---|---|---|
-| TQ2 dense 2-bit  | 100%  | **12.14** |
-| TQ1 5-trits/byte | 81.8% | 21.47 (1.77× slower) |
-| TB1 bitmap+signs | 72.7% | 35.93 (2.96× slower) |
+| TQ2 dense 2-bit  | 100%  | **13.11** |
+| TQ1 5-trits/byte | 81.8% | 19.74 (1.51× slower) |
+| TB1 bitmap+signs | 81.1% | 33.77 (2.58× slower) |
 
-Both compact kernels are BIT-exact vs TQ2 (gates green, first run) — the loss
+(Re-run on mixed-sign ~1/3-zero trits after the vacuous-gate fix; the first
+run's block-structured 50%-zero pattern gave 12.14/21.47/35.93 — same
+ordering, same conclusion. TB1 at BitNet's true 42% zeros would be ~77%
+bytes.)
+
+Both compact kernels are BIT-exact vs TQ2 (gates green — NOTE: the original
+gates ran on degenerate all-zero/no-negative trits (review-found vacuous) and
+were re-pointed at mixed-sign random trits, still green; single shared launch
+config, per-kernel occupancy untuned) — the loss
 is pure decode cost: TQ1 pays ~24 ALU ops per dp4a word (per-byte mul-shift
 chains) vs TQ2's ~3; TB1 additionally serializes on a per-block warp prefix
 scan for sign addressing. At M=1 the GEMM is not DRAM-bound ENOUGH (round-8:

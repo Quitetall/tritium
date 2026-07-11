@@ -14,6 +14,12 @@
 //!
 //! Scale-free (like I2_S consumers here): the caller carries per-channel
 //! scales; block scales are not stored (the prototype's GEMM contract).
+//!
+//! **Consumer contract**: a device arena of concatenated TB1 rows must carry
+//! **>= 2 (recommend 4) trailing slack bytes** — the GPU kernel's sign
+//! window unconditionally reads one byte past a row's last sign byte, which
+//! on the final row can land past the packed data (in-arena for interior
+//! rows).
 
 use tritium_core::Trit;
 
@@ -45,7 +51,7 @@ pub fn pack_tb1_row(trits: &[Trit]) -> Result<Vec<u8>, FormatError> {
         let v = t.get();
         if v != 0 {
             presence[i / 8] |= 1 << (i % 8);
-            if sign_bit % 8 == 0 {
+            if sign_bit.is_multiple_of(8) {
                 signs.push(0);
             }
             if v > 0 {
@@ -57,7 +63,7 @@ pub fn pack_tb1_row(trits: &[Trit]) -> Result<Vec<u8>, FormatError> {
     let mut out = presence;
     out.extend_from_slice(&signs);
     // 4-byte-align the row so the next row's presence plane is word-aligned.
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
     Ok(out)

@@ -2445,7 +2445,7 @@ fn tq1_matches_tq2_tiled_scaled_bit_exact() {
 
     // Aligned + tail shapes; m > 1 exercises the act_scale fold per row.
     for &(m, n, k) in &[(1usize, 8usize, 1024usize), (2, 5, 256 + 128)] {
-        let trits = make_sparse_trits(n, k, 3);
+        let trits = mixed_trits(n, k, 0xA2 ^ (k as u64));
         let nb = num_blocks(k);
         let unit = vec![half::f16::ONE; nb];
         let (rb2, rb1) = (nb * TQ2_0_BLOCK_BYTES, nb * TQ1_0_BLOCK_BYTES);
@@ -2548,6 +2548,23 @@ fn tq1_matches_tq2_tiled_scaled_bit_exact() {
     }
 }
 
+/// Mixed-sign random trits (~1/3 each of -1/0/+1) — the A2/A4 bit-equality
+/// gates MUST use these: `make_sparse_trits` zeroes leading blocks and emits
+/// no -1 at all, which made the original gates vacuous (review-found: both
+/// kernels correctly output 0.0 on all-zero weights, proving nothing).
+#[cfg(test)]
+fn mixed_trits(n: usize, k: usize, seed: u64) -> Vec<tritium_core::Trit> {
+    let mut s = seed;
+    (0..n * k)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            tritium_core::Trit::from_i8(((s >> 33) % 3) as i8 - 1).unwrap()
+        })
+        .collect()
+}
+
 /// A4 harness: upload TB1 rows (concatenated variable-length + offsets) and
 /// launch the prototype kernel.
 #[cfg(test)]
@@ -2564,6 +2581,7 @@ fn run_tb1(
 ) -> Vec<f32> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     let mut arena: Vec<u8> = Vec::new();
+    // u32 offsets cap the arena at 4 GiB — fine for the prototype scale.
     let mut offsets: Vec<u32> = Vec::with_capacity(n);
     for ni in 0..n {
         offsets.push(arena.len() as u32);
@@ -2624,7 +2642,7 @@ fn tb1_matches_tq2_tiled_scaled_bit_exact() {
     let f_tb1 = module.load_function("tb1_mpgemm_tiled_i8_scaled").unwrap();
 
     for &(m, n, k) in &[(1usize, 8usize, 1024usize), (2, 5, 512)] {
-        let trits = make_sparse_trits(n, k, 11);
+        let trits = mixed_trits(n, k, 0xB1 ^ (k as u64));
         let nb = num_blocks(k);
         let unit = vec![half::f16::ONE; nb];
         let rb2 = nb * TQ2_0_BLOCK_BYTES;
@@ -2702,7 +2720,9 @@ fn tb1_tq1_tq2_gateup_bench() {
     let (m, n, k) = (1usize, 13824usize, 2560usize); // BitNet fused gateup
     let iters = 2000u32;
 
-    let trits = make_sparse_trits(n, k, 5);
+    // Mixed-sign ~1/3 zeros — closer to BitNet's 42% than block-structured
+    // patterns; the bench also PRINTS actual byte counts (self-documenting).
+    let trits = mixed_trits(n, k, 0xBE);
     let nb = num_blocks(k);
     let unit = vec![half::f16::ONE; nb];
     let (rb2, rb1) = (nb * TQ2_0_BLOCK_BYTES, nb * TQ1_0_BLOCK_BYTES);

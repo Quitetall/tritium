@@ -105,8 +105,9 @@ impl TernaryLinear {
         })
     }
 
-    /// Re-pack `[n_out, k_in]` ternary `trits` to TQ2_0 (one `1.0` f16 block scale per
-    /// 256-trit block, so the unpacked values are the raw trits) and validate the shape.
+    /// Re-pack `[n_out, k_in]` ternary `trits` to `format` (TQ2_0 or TQ1_0; one `1.0`
+    /// f16 block scale per 256-trit block, so the unpacked values are the raw trits)
+    /// and validate the shape.
     fn pack_rows(
         trits: &[Trit],
         n_out: usize,
