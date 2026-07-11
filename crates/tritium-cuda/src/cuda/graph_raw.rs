@@ -59,6 +59,8 @@ pub(super) struct LinPtrs {
     pub(super) bm: sys::CUdeviceptr,
     /// Bitmap words per row (`ceil(ceil(k/256)/32)`).
     pub(super) wpr: i32,
+    /// A2: TQ1_0-packed rows — launch the tq1 kernel twins.
+    pub(super) tq1: bool,
     pub(super) n: usize,
     pub(super) k: usize,
     pub(super) rb: usize,
@@ -131,6 +133,9 @@ pub(super) struct RawGraphKernels {
     pub(super) tiled: sys::CUfunction,
     pub(super) tiled_scaled: sys::CUfunction,
     pub(super) tiled_scaled_residual: sys::CUfunction,
+    /// A2 TQ1-native twins (dense; no bitmap arg).
+    pub(super) tq1_tiled_scaled: sys::CUfunction,
+    pub(super) tq1_tiled_scaled_residual: sys::CUfunction,
 }
 
 // SAFETY: the raw `CUmodule`/`CUfunction` are process-valid device handles, used only on
@@ -230,6 +235,8 @@ impl RawGraphKernels {
             // NULL bitmap is bit-identical to the dense kernel by contract
             // (tq2_0_add.cu), so only bitmap-carrying tensors skip.
             tiled_scaled: get(am, KERNEL_NAME_TILED_I8_SCALED_SPARSE)?,
+            tq1_tiled_scaled: get(am, KERNEL_NAME_TQ1_TILED_I8_SCALED)?,
+            tq1_tiled_scaled_residual: get(am, KERNEL_NAME_TQ1_TILED_I8_SCALED_RESIDUAL)?,
             // Fused-scaled + residual: GEMM epilogue adds to residual (v0.7.0 Phase 2).
             tiled_scaled_residual: get(am, KERNEL_NAME_TILED_I8_SCALED_RESIDUAL)?,
             modules: vec![dm, am],

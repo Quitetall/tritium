@@ -1457,6 +1457,11 @@ impl CudaBackend {
         }
         let row_bytes = match buf.stride {
             Stride::Tq2_0 { row_bytes } => row_bytes,
+            // Host mpgemm has no TQ1 kernel path (v1: the resident decoder is
+            // TQ1's only consumer).
+            Stride::Tq1_0 { .. } => {
+                return Err(BackendError::UnsupportedFormat(TernaryFormat::Tq1_0));
+            }
             Stride::I2sInt8 { .. } => {
                 return Err(BackendError::UnsupportedFormat(TernaryFormat::I2sInt8));
             }
@@ -1834,6 +1839,7 @@ impl CudaBackend {
             f_tiled: f(&self._module, KERNEL_NAME_TILED_F32)?,
             f_scale: f(dm, KERNEL_NAME_SCALE_MUL)?,
             f_tiled_scaled: f(&self._module, KERNEL_NAME_TILED_I8_SCALED)?,
+            f_tq1_tiled_scaled: f(&self._module, KERNEL_NAME_TQ1_TILED_I8_SCALED)?,
             f_tiled_scaled_residual: f(&self._module, KERNEL_NAME_TILED_I8_SCALED_RESIDUAL)?,
             f_rmsnorm_batch: f(dm, KERNEL_NAME_RMSNORM_BATCH)?,
             f_embed_batch: f(dm, KERNEL_NAME_EMBED_BATCH)?,
@@ -3005,6 +3011,13 @@ impl TernaryBackend for CudaBackend {
             TernaryFormat::Tq2_0 => {
                 let row_bytes = Self::row_bytes(k);
                 (n * row_bytes, Stride::Tq2_0 { row_bytes })
+            }
+            // A2: entropy-dense rows consumed natively by the tq1 decode
+            // kernels (the host mpgemm path rejects this format — the
+            // resident decoder is TQ1's only consumer in v1).
+            TernaryFormat::Tq1_0 => {
+                let row_bytes = num_blocks(k) * tritium_format::TQ1_0_BLOCK_BYTES;
+                (n * row_bytes, Stride::Tq1_0 { row_bytes })
             }
             TernaryFormat::I2sInt8 => {
                 // The IMMA tile interleave (see `tritium_format::convert_i2s_to_int8`):

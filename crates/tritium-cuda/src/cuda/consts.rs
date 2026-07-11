@@ -23,6 +23,10 @@ pub(super) const KERNEL_NAME_TILED_I8_SCALED_RESIDUAL: &str =
 /// zero-block bitmap to skip all-zero 256-trit blocks.
 pub(super) const KERNEL_NAME_TILED_F32_SPARSE: &str = "tq2_0_add_mpgemm_tiled_f32_sparse";
 /// Sparse-aware fused-scaled i8 dp4a kernel: same as `tiled_i8_scaled` but
+/// A2: TQ1_0-native decode GEMM twins (entropy-dense weights read natively).
+pub(super) const KERNEL_NAME_TQ1_TILED_I8_SCALED: &str = "tq1_0_add_mpgemm_tiled_i8_scaled";
+pub(super) const KERNEL_NAME_TQ1_TILED_I8_SCALED_RESIDUAL: &str =
+    "tq1_0_add_mpgemm_tiled_i8_scaled_residual";
 /// with bitmap skip for zero blocks.
 pub(super) const KERNEL_NAME_TILED_I8_SCALED_SPARSE: &str =
     "tq2_0_add_mpgemm_tiled_i8_scaled_sparse";

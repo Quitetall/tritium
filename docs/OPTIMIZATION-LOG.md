@@ -773,3 +773,32 @@ interesting difference to study.
    compute-bound prefill sharply.
 5. **lm_head_warp_f16** — already at ~100% of the 656 MB/token f16 read SOL;
    only a format change (e.g. ternary-quantized tied head) moves it.
+
+## v1.x round 15 — Track A: zero-skip wiring + TQ1_0-native decode (2026-07-11)
+
+Census first (`tritium report sparsity`, full 2.08B ternary weights): 42.21%
+element zeros, 2.441% all-zero 256-blocks (blk.1 gate/up is a 43.6% dead-neuron
+outlier; attention ~0%), entropy floor 1.560 b/w, TQ1_0 real rate 1.625
+(payload) / 1.688 (stored), bitmap+signs 1.578.
+
+- **A1b block-skip**: the validated `_sparse` kernels wired into the decode
+  graph (bitmap uploaded only for tensors ≥0.5% zero-blocks — the fused gateup
+  qualifies at ~1%). Bit-exact by construction and by gate (9/9 acceptance with
+  skipping live). Decode delta: noise on BitNet, as the census predicted — the
+  machinery's customer is sparse-trained students (ADR 0024).
+- **A2 TQ1_0-native**: tq1 dp4a kernel twins (plain + residual), BIT-identical
+  to the TQ2 kernels on the same trits (gate: tq1_matches_tq2_tiled_scaled_
+  bit_exact, first-run pass). `TRITIUM_WEIGHTS=tq1` packs/uploads/runs TQ1
+  natively through the resident decoder (decode graph + prefill); batch/tree
+  reject loudly in v1; host mpgemm rejects (resident-only consumer).
+  Gates: TQ1 greedy token-exact, ppl within 1%, CPU↔CUDA parity (CPU speaks
+  TQ1 interchange). **Measured (contended box: llama-server 8.3GB +
+  Helldivers 6.3GB co-resident)**: decode 172–182 tok/s BOTH formats — parity
+  within noise, exactly the honest pre-analysis (~4% ideal gateup saving is
+  invisible in a latency-bound profile); **resident VRAM 3750 → 3590 MiB
+  (−160 MB, −18% of ternary bytes)** — the capacity win is real. (Single-
+  sample VRAM readings mid-load race the resident build: profile over time.)
+
+Verdict: TQ1-native is a CAPACITY rung, not a speed rung at M=1 — same
+pattern as i8 KV. Bigger models / more KV headroom per GB; decode unchanged.
+Next: A4 bitmap+signs prototype (1.578 b/w + element-skip) head-to-head.

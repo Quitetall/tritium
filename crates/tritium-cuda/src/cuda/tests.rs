@@ -649,22 +649,40 @@ fn tiled_handles_tail_shapes() {
     }
 }
 
+/// A2 flipped this contract: TQ1_0 UPLOADS are now first-class (the tq1
+/// decode kernels read them natively) — a correct-length upload succeeds and
+/// a wrong-length one is a typed InvalidInput; the HOST mpgemm path still
+/// rejects the format (the resident decoder is TQ1's only consumer in v1).
 #[test]
-fn rejects_tq1_0_format() {
+fn tq1_0_upload_accepted_host_mpgemm_rejected() {
     let backend = match CudaBackend::new(0) {
         Ok(b) => b,
         Err(_) => return, // no device: nothing to assert about format handling
     };
     let shape = GemmShape { m: 1, n: 1, k: 256 };
-    // The format gate runs before any length check, so the bytes need not be a
-    // valid TQ1_0 length. `Box<dyn DeviceBuffer>` is not `Debug`, so `unwrap_err`
-    // is unavailable — match on the result instead (same idiom as tritium-cpu).
+    // Wrong length (66 = a TQ2 block) -> typed error, not a panic.
     match backend.upload_weights(&[0u8; 66], shape, TernaryFormat::Tq1_0) {
-        Err(BackendError::UnsupportedFormat(_)) => {}
-        other => panic!(
-            "expected UnsupportedFormat, got {:?}",
-            other.map(|_| "ok-buffer")
-        ),
+        Err(BackendError::InvalidInput(_)) => {}
+        other => panic!("expected InvalidInput, got {:?}", other.map(|_| "ok")),
+    }
+    // Correct length (54 = one TQ1 block) uploads.
+    let buf = backend
+        .upload_weights(&[0u8; 54], shape, TernaryFormat::Tq1_0)
+        .expect("tq1 upload");
+    // Host mpgemm rejects the format loudly.
+    let act = vec![0.0f32; 256];
+    let scales = vec![1.0f32];
+    let mut out = vec![0.0f32; 1];
+    match backend.mpgemm(tritium_spec::MpGemm {
+        act: &act,
+        weights: &*buf,
+        scales: &scales,
+        shape,
+        format: TernaryFormat::Tq1_0,
+        out: &mut out,
+    }) {
+        Err(BackendError::UnsupportedFormat(TernaryFormat::Tq1_0)) => {}
+        other => panic!("expected UnsupportedFormat(Tq1_0), got {other:?}"),
     }
 }
 

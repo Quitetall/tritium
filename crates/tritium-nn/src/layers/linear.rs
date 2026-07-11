@@ -22,7 +22,9 @@
 
 use half::f16;
 use tritium_core::{GemmShape, TernaryFormat, Trit};
-use tritium_format::{TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row};
+use tritium_format::{
+    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, pack_tq1_0_row, pack_tq2_0_row,
+};
 use tritium_spec::{DeviceBuffer, TernaryBackend};
 
 use crate::error::NnError;
@@ -43,6 +45,19 @@ pub struct TernaryLinear {
     pub scales: Vec<f32>,
     /// Opaque device handle to the uploaded packed ternary weight.
     pub weights: Box<dyn DeviceBuffer>,
+}
+
+/// Weight packing selected by `TRITIUM_WEIGHTS` (A2): `tq2` (default — the
+/// GPU-native 2-bit layout) or `tq1` (entropy-dense 1.6875 b/w stored, read
+/// natively by the TQ1 decode kernels; batch/tree paths reject it in v1).
+/// Any other value is rejected loudly at first pack (a typo silently running
+/// tq2 would invalidate whatever comparison the user intended).
+fn weights_format() -> TernaryFormat {
+    match std::env::var("TRITIUM_WEIGHTS").as_deref() {
+        Ok("tq1") => TernaryFormat::Tq1_0,
+        Ok("tq2") | Ok("") | Err(_) => TernaryFormat::Tq2_0,
+        Ok(other) => panic!("TRITIUM_WEIGHTS={other:?} — use tq1 or tq2"),
+    }
 }
 
 impl TernaryLinear {
@@ -68,7 +83,7 @@ impl TernaryLinear {
     ) -> Result<Self, NnError> {
         let packed = Self::pack_rows(trits, n_out, k_in)?;
         let shape = GemmShape::new(0, n_out, k_in);
-        let weights = backend.upload_weights(&packed, shape, TernaryFormat::Tq2_0)?;
+        let weights = backend.upload_weights(&packed, shape, weights_format())?;
 
         Ok(Self {
             n_out,
@@ -99,12 +114,22 @@ impl TernaryLinear {
             });
         }
         let nb = num_blocks(k_in);
-        let row_bytes = nb * TQ2_0_BLOCK_BYTES;
+        let tq1 = weights_format() == TernaryFormat::Tq1_0;
+        let row_bytes = nb
+            * if tq1 {
+                TQ1_0_BLOCK_BYTES
+            } else {
+                TQ2_0_BLOCK_BYTES
+            };
         let block_scales = vec![f16::ONE; nb];
         let mut packed = vec![0u8; n_out * row_bytes];
         for (row, out_row) in trits.chunks_exact(k_in).zip(packed.chunks_mut(row_bytes)) {
-            pack_tq2_0_row(row, &block_scales, out_row)
-                .map_err(|e| NnError::Backend(e.to_string()))?;
+            if tq1 {
+                pack_tq1_0_row(row, &block_scales, out_row)
+            } else {
+                pack_tq2_0_row(row, &block_scales, out_row)
+            }
+            .map_err(|e| NnError::Backend(e.to_string()))?;
         }
         Ok(packed)
     }
@@ -132,7 +157,7 @@ impl TernaryLinear {
         }
         let packed = Self::pack_rows(trits, self.n_out, self.k_in)?;
         let shape = GemmShape::new(0, self.n_out, self.k_in);
-        self.weights = backend.upload_weights(&packed, shape, TernaryFormat::Tq2_0)?;
+        self.weights = backend.upload_weights(&packed, shape, weights_format())?;
         self.scales = scales;
         Ok(())
     }
@@ -185,7 +210,7 @@ impl TernaryLinear {
             weights: &*self.weights,
             scales: &self.scales,
             shape: self.shape(m),
-            format: TernaryFormat::Tq2_0,
+            format: weights_format(),
             out,
         })?;
 

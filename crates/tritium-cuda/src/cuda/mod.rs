@@ -179,6 +179,9 @@ pub(crate) struct CudaBuffer {
 enum Stride {
     /// TQ2_0: packed bytes per weight row (`num_blocks(k) * TQ2_0_BLOCK_BYTES`).
     Tq2_0 { row_bytes: usize },
+    /// TQ1_0 (A2): packed bytes per row (`num_blocks(k) * TQ1_0_BLOCK_BYTES`),
+    /// consumed natively by the tq1 decode kernels.
+    Tq1_0 { row_bytes: usize },
     /// I2sInt8: the packed K-tile count (`ceil(k / IMMA_K)`), the kernel's
     /// `num_ktiles` launch argument and the per-n-tile k-tile stride.
     I2sInt8 { num_ktiles: usize },
@@ -211,6 +214,15 @@ impl CudaBuffer {
     pub(crate) fn tq2_0_row_bytes(&self) -> Option<usize> {
         match self.stride {
             Stride::Tq2_0 { row_bytes } => Some(row_bytes),
+            _ => None,
+        }
+    }
+
+    /// `(row_bytes, is_tq1)` for the decode-resident formats; `None` for IMMA.
+    pub(crate) fn decode_row_bytes(&self) -> Option<(usize, bool)> {
+        match self.stride {
+            Stride::Tq2_0 { row_bytes } => Some((row_bytes, false)),
+            Stride::Tq1_0 { row_bytes } => Some((row_bytes, true)),
             Stride::I2sInt8 { .. } => None,
         }
     }
@@ -319,6 +331,8 @@ struct ResidentLinear {
     /// [`BITMAP_MIN_ZERO_BLOCK_FRAC`]; `None` ⇒ the kernel gets a NULL
     /// pointer (bit-identical dense behavior by the kernel's contract).
     bitmap: Option<CudaSlice<u32>>,
+    /// A2: true = TQ1_0-packed rows (the tq1 kernel twins); false = TQ2_0.
+    tq1: bool,
 }
 
 /// Minimum all-zero-block fraction before a skip bitmap is worth carrying
@@ -373,8 +387,8 @@ impl ResidentLinear {
             .ok_or_else(|| {
                 BackendError::InvalidInput("decode weight is not a CudaBuffer".into())
             })?;
-        let row_bytes = buf
-            .tq2_0_row_bytes()
+        let (row_bytes, tq1) = buf
+            .decode_row_bytes()
             .ok_or(BackendError::UnsupportedFormat(TernaryFormat::I2sInt8))?;
         let (n, k) = buf.dims();
         if spec.scales.len() != n {
@@ -392,7 +406,8 @@ impl ResidentLinear {
             .clone_htod(spec.scales)
             .map_err(|e| driver_err("decode scales htod", &e))?;
         let device = buf.device_arc();
-        let bitmap = if enable_bitmap {
+        // The skip bitmap is a TQ2 geometry (66-byte blocks); TQ1 rows go dense.
+        let bitmap = if enable_bitmap && !tq1 {
             maybe_bitmap(stream, device.as_ref(), n, k, row_bytes)?
         } else {
             None
@@ -404,6 +419,7 @@ impl ResidentLinear {
             k,
             row_bytes,
             bitmap,
+            tq1,
         })
     }
 
@@ -430,13 +446,13 @@ impl ResidentLinear {
             })
             .collect::<Result<_, _>>()?;
         let (_, k) = bufs[0].dims();
-        let row_bytes = bufs[0]
-            .tq2_0_row_bytes()
+        let (row_bytes, tq1) = bufs[0]
+            .decode_row_bytes()
             .ok_or(BackendError::UnsupportedFormat(TernaryFormat::I2sInt8))?;
         let mut total_n = 0usize;
         for (b, p) in bufs.iter().zip(parts) {
             let (n, bk) = b.dims();
-            if bk != k || b.tq2_0_row_bytes() != Some(row_bytes) || p.scales.len() != n {
+            if bk != k || b.decode_row_bytes() != Some((row_bytes, tq1)) || p.scales.len() != n {
                 return Err(BackendError::InvalidInput(
                     "fused decode parts disagree on K/rb/scales".into(),
                 ));
@@ -462,7 +478,11 @@ impl ResidentLinear {
         let d_scales = stream
             .clone_htod(&scales)
             .map_err(|e| driver_err("fused decode scales htod", &e))?;
-        let bitmap = maybe_bitmap(stream, &device, total_n, k, row_bytes)?;
+        let bitmap = if tq1 {
+            None // skip bitmaps are TQ2-geometry; TQ1 rows run dense
+        } else {
+            maybe_bitmap(stream, &device, total_n, k, row_bytes)?
+        };
         Ok(Self {
             device: Arc::new(device),
             scales: d_scales,
@@ -470,6 +490,7 @@ impl ResidentLinear {
             k,
             row_bytes,
             bitmap,
+            tq1,
         })
     }
 }
@@ -583,6 +604,8 @@ pub struct CudaDecodeModel {
     #[allow(dead_code)] // standalone scale-fold; unused since the fused scaled path
     f_scale: CudaFunction,
     f_tiled_scaled: CudaFunction,
+    /// A2: TQ1-native twin picked when a linear's rows are TQ1-packed.
+    f_tq1_tiled_scaled: CudaFunction,
     #[allow(dead_code)] // fused scaled+residual handle; wired into the residual path next
     f_tiled_scaled_residual: CudaFunction,
     // v0.3.6 batched (M>1) prefill kernels.
@@ -821,6 +844,7 @@ impl CudaDecodeModel {
         Self::gemm_prequantized(
             &self.stream,
             &self.f_tiled_scaled,
+            &self.f_tq1_tiled_scaled,
             &self.layers[li].q,
             &self.d_qact,
             &self.d_act_scale,
@@ -829,6 +853,7 @@ impl CudaDecodeModel {
         Self::gemm_prequantized(
             &self.stream,
             &self.f_tiled_scaled,
+            &self.f_tq1_tiled_scaled,
             &self.layers[li].k,
             &self.d_qact,
             &self.d_act_scale,
@@ -837,6 +862,7 @@ impl CudaDecodeModel {
         Self::gemm_prequantized(
             &self.stream,
             &self.f_tiled_scaled,
+            &self.f_tq1_tiled_scaled,
             &self.layers[li].v,
             &self.d_qact,
             &self.d_act_scale,
@@ -958,6 +984,7 @@ impl CudaDecodeModel {
             &self.stream,
             &self.f_quant,
             &self.f_tiled_scaled,
+            &self.f_tq1_tiled_scaled,
             attn_in,
             &self.layers[li].o,
             &mut self.d_qact,
@@ -987,6 +1014,7 @@ impl CudaDecodeModel {
         Self::gemm_prequantized(
             &self.stream,
             &self.f_tiled_scaled,
+            &self.f_tq1_tiled_scaled,
             &self.layers[li].gate,
             &self.d_qact,
             &self.d_act_scale,
@@ -995,6 +1023,7 @@ impl CudaDecodeModel {
         Self::gemm_prequantized(
             &self.stream,
             &self.f_tiled_scaled,
+            &self.f_tq1_tiled_scaled,
             &self.layers[li].up,
             &self.d_qact,
             &self.d_act_scale,
@@ -1025,6 +1054,7 @@ impl CudaDecodeModel {
             &self.stream,
             &self.f_quant,
             &self.f_tiled_scaled,
+            &self.f_tq1_tiled_scaled,
             down_in,
             &self.layers[li].down,
             &mut self.d_qact,
@@ -1110,6 +1140,7 @@ impl CudaDecodeModel {
         stream: &Arc<CudaStream>,
         f_quant: &CudaFunction,
         f_tiled_scaled: &CudaFunction,
+        f_tq1_tiled_scaled: &CudaFunction,
         d_in: &CudaSlice<f32>,
         lin: &ResidentLinear,
         d_qact: &mut CudaSlice<i8>,
@@ -1147,7 +1178,11 @@ impl CudaDecodeModel {
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut l = stream.launch_builder(f_tiled_scaled);
+            let mut l = stream.launch_builder(if lin.tq1 {
+                f_tq1_tiled_scaled
+            } else {
+                f_tiled_scaled
+            });
             l.arg(&*d_qact)
                 .arg(lin.device.as_ref())
                 .arg(&lin.scales)
@@ -1204,6 +1239,7 @@ impl CudaDecodeModel {
     fn gemm_prequantized(
         stream: &Arc<CudaStream>,
         f_tiled_scaled: &CudaFunction,
+        f_tq1_tiled_scaled: &CudaFunction,
         lin: &ResidentLinear,
         d_qact: &CudaSlice<i8>,
         d_act_scale: &CudaSlice<f32>,
@@ -1219,7 +1255,11 @@ impl CudaDecodeModel {
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut l = stream.launch_builder(f_tiled_scaled);
+            let mut l = stream.launch_builder(if lin.tq1 {
+                f_tq1_tiled_scaled
+            } else {
+                f_tiled_scaled
+            });
             l.arg(d_qact)
                 .arg(lin.device.as_ref())
                 .arg(&lin.scales)
@@ -1679,6 +1719,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].q,
                 &d_act_scale,
@@ -1688,6 +1729,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].k,
                 &d_act_scale,
@@ -1697,6 +1739,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].v,
                 &d_act_scale,
@@ -1807,6 +1850,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].o,
                 &d_act_scale,
@@ -1838,6 +1882,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].gate,
                 &d_act_scale,
@@ -1847,6 +1892,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].up,
                 &d_act_scale,
@@ -1881,6 +1927,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].down,
                 &d_act_scale,
@@ -2357,6 +2404,7 @@ impl CudaDecodeModel {
     fn bl_matmul(
         s: &Arc<CudaStream>,
         f_tiled_scaled: &CudaFunction,
+        f_tq1_tiled_scaled: &CudaFunction,
         qact: &CudaSlice<i8>,
         lin: &ResidentLinear,
         scale: &CudaSlice<f32>,
@@ -2375,7 +2423,12 @@ impl CudaDecodeModel {
                 block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut l = s.launch_builder(f_tiled_scaled);
+            // A2: pick the kernel matching the row packing.
+            let mut l = s.launch_builder(if lin.tq1 {
+                f_tq1_tiled_scaled
+            } else {
+                f_tiled_scaled
+            });
             l.arg(qact)
                 .arg(lin.device.as_ref())
                 .arg(&lin.scales)
@@ -2624,6 +2677,7 @@ impl CudaDecodeModel {
             // NULL bitmap = dense-identical (the sparse kernel's contract).
             bm: l.bitmap.as_ref().map_or(0, |b| dptr(b, s)),
             wpr: l.k.div_ceil(256).div_ceil(32) as i32,
+            tq1: l.tq1,
             n: l.n,
             k: l.k,
             rb: l.row_bytes,
@@ -2855,27 +2909,50 @@ impl CudaDecodeModel {
         {
             let grid = ((lin.n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1);
             let smem = 0u32;
-            let mut params = [
-                pp(&d_qact),
-                pp(&lin.w),
-                pp(&lin.sc),
-                pp(&d_act_scale),
-                pp(&lin.bm),
-                pp(&d_out),
-                pp(&m_i),
-                pp(&n_i),
-                pp(&k_i),
-                pp(&rb_i),
-                pp(&lin.wpr),
-            ];
-            raw_launch(
-                self.raw().tiled_scaled,
-                grid,
-                (WARPS_PER_BLOCK * 32, 1, 1),
-                smem,
-                cs,
-                &mut params,
-            )?;
+            if lin.tq1 {
+                // TQ1-native twin: dense 9-arg signature (no bitmap).
+                let mut params = [
+                    pp(&d_qact),
+                    pp(&lin.w),
+                    pp(&lin.sc),
+                    pp(&d_act_scale),
+                    pp(&d_out),
+                    pp(&m_i),
+                    pp(&n_i),
+                    pp(&k_i),
+                    pp(&rb_i),
+                ];
+                raw_launch(
+                    self.raw().tq1_tiled_scaled,
+                    grid,
+                    (WARPS_PER_BLOCK * 32, 1, 1),
+                    smem,
+                    cs,
+                    &mut params,
+                )?;
+            } else {
+                let mut params = [
+                    pp(&d_qact),
+                    pp(&lin.w),
+                    pp(&lin.sc),
+                    pp(&d_act_scale),
+                    pp(&lin.bm),
+                    pp(&d_out),
+                    pp(&m_i),
+                    pp(&n_i),
+                    pp(&k_i),
+                    pp(&rb_i),
+                    pp(&lin.wpr),
+                ];
+                raw_launch(
+                    self.raw().tiled_scaled,
+                    grid,
+                    (WARPS_PER_BLOCK * 32, 1, 1),
+                    smem,
+                    cs,
+                    &mut params,
+                )?;
+            }
         }
         Ok(())
     }
@@ -2909,7 +2986,11 @@ impl CudaDecodeModel {
             pp(&rb_i),
         ];
         raw_launch(
-            self.raw().tiled_scaled_residual,
+            if lin.tq1 {
+                self.raw().tq1_tiled_scaled_residual
+            } else {
+                self.raw().tiled_scaled_residual
+            },
             grid,
             (WARPS_PER_BLOCK * 32, 1, 1),
             smem,

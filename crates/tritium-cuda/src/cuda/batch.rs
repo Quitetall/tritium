@@ -127,6 +127,10 @@ impl CudaDecodeModel {
     /// # Errors
     /// [`BackendError`] on a device allocation failure.
     pub fn new_batch(&self, n: usize) -> Result<BatchKv, BackendError> {
+        // v1: the batched graph builders (gb_*) are TQ2-only.
+        if self.layers.first().is_some_and(|l| l.qkv.tq1) {
+            return Err(BackendError::UnsupportedFormat(TernaryFormat::Tq1_0));
+        }
         let s = &self.stream;
         let alloc =
             |k: usize, what: &str| s.alloc_zeros::<f32>(k).map_err(|e| driver_err(what, &e));
@@ -258,6 +262,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].q,
                 &batch.d_act_scale,
@@ -267,6 +272,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].k,
                 &batch.d_act_scale,
@@ -276,6 +282,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].v,
                 &batch.d_act_scale,
@@ -369,6 +376,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].o,
                 &batch.d_act_scale,
@@ -405,6 +413,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].gate,
                 &batch.d_act_scale,
@@ -414,6 +423,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].up,
                 &batch.d_act_scale,
@@ -448,6 +458,7 @@ impl CudaDecodeModel {
             Self::bl_matmul(
                 s,
                 &self.f_tiled_scaled,
+                &self.f_tq1_tiled_scaled,
                 &batch.d_qact,
                 &self.layers[li].down,
                 &batch.d_act_scale,
@@ -831,6 +842,7 @@ impl CudaDecodeModel {
             // there but kept uniform.
             bm: l.bitmap.as_ref().map_or(0, |b| dptr(b, s)),
             wpr: l.k.div_ceil(256).div_ceil(32) as i32,
+            tq1: l.tq1,
             n: l.n,
             k: l.k,
             rb: l.row_bytes,
