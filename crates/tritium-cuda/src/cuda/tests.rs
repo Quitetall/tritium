@@ -2405,8 +2405,9 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        65,
-        "decode.cu kernel count drifted from ADR 0022 — update the ADR"
+        64,
+        "decode.cu kernel count drifted from ADR 0022 — update the ADR \
+         (65 → 64: gqa_attention_mdecode_f32 retired, ADR 0025 step 2)"
     );
 }
 

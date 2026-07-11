@@ -276,8 +276,6 @@ pub(super) struct BatchRawKernels {
     pub(super) quant: sys::CUfunction,
     pub(super) rope: sys::CUfunction,
     pub(super) kv_append: sys::CUfunction,
-    #[allow(dead_code)] // kept for fallback; split-KV replaced it
-    pub(super) attn: sys::CUfunction,
     pub(super) attn_split_partial: sys::CUfunction,
     pub(super) attn_combine: sys::CUfunction,
     pub(super) residual: sys::CUfunction,
@@ -336,7 +334,6 @@ impl BatchRawKernels {
             quant: get(dm, KERNEL_NAME_ACT_QUANT_BATCH_I8)?,
             rope: get(dm, KERNEL_NAME_ROPE_BATCH)?,
             kv_append: get(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
-            attn: get(dm, KERNEL_NAME_ATTN_MDECODE)?,
             attn_split_partial: get(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
             attn_combine: get(dm, KERNEL_NAME_ATTN_COMBINE)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
@@ -404,8 +401,6 @@ pub(super) struct BatchPtrs {
     pub(super) d_gate_sn: sys::CUdeviceptr,
     pub(super) d_qact: sys::CUdeviceptr,
     pub(super) d_act_scale: sys::CUdeviceptr,
-    #[allow(dead_code)] // kept for fallback; split-KV partials replaced it
-    pub(super) d_scores: sys::CUdeviceptr,
     pub(super) d_attn_partials: sys::CUdeviceptr,
     pub(super) d_cos: sys::CUdeviceptr,
     pub(super) d_sin: sys::CUdeviceptr,
@@ -450,7 +445,6 @@ pub struct BatchKv {
     pub(super) d_gate_sn: CudaSlice<f32>,
     pub(super) d_qact: CudaSlice<i8>,
     pub(super) d_act_scale: CudaSlice<f32>,
-    pub(super) d_scores: CudaSlice<f32>,
     /// Split-KV attention partials `[n · n_head · S · (head_dim+2)]`, `S = ceil(max_ctx/ATTN_SPLIT_CHUNK)`.
     pub(super) d_attn_partials: CudaSlice<f32>,
     pub(super) d_h: CudaSlice<f32>,

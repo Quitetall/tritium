@@ -116,8 +116,10 @@ obligations:
 - **Still duplicated, with cause**: every `_q8`/`_t2` variant (row-granular
   grouped-scale quant/dequant — an element codec cannot express them; the
   appends already delegate to shared `kv_quant_row_*` helpers), the mdecode
-  family (f32-only today), and `gqa_attention_decode_warp_g` (legacy
-  geometry fallback, f32-only).
+  family (f32-only today; its direct-attention member
+  `gqa_attention_mdecode_f32` was RETIRED by ADR 0025 step 2 — the split
+  partial+combine pair is the only batch attention), and
+  `gqa_attention_decode_warp_g` (legacy geometry fallback, f32-only).
 
 ### Re-proof procedure (toolchain bumps)
 

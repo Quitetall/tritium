@@ -168,7 +168,6 @@ impl CudaDecodeModel {
                 .alloc_zeros::<i8>(n * self.n_ff)
                 .map_err(|e| driver_err("batch d_qact", &e))?,
             d_act_scale: alloc(n, "batch d_act_scale")?,
-            d_scores: alloc(n * self.n_head * self.max_ctx, "batch d_scores")?,
             d_attn_partials: alloc(
                 n * self.n_head * self.max_ctx.div_ceil(ATTN_SPLIT_CHUNK) * (self.head_dim + 2),
                 "batch d_attn_partials",
@@ -893,7 +892,6 @@ impl CudaDecodeModel {
             d_gate_sn: dptr(&batch.d_gate_sn, s),
             d_qact: dptr(&batch.d_qact, s),
             d_act_scale: dptr(&batch.d_act_scale, s),
-            d_scores: dptr(&batch.d_scores, s),
             d_attn_partials: dptr(&batch.d_attn_partials, s),
             d_cos: dptr(&self.d_cos, s),
             d_sin: dptr(&self.d_sin, s),

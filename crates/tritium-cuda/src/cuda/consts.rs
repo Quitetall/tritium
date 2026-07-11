@@ -161,8 +161,11 @@ pub(super) const KERNEL_NAME_SCALE_BATCH: &str = "scale_mul_batch_f32";
 pub(super) const KERNEL_NAME_KV_APPEND_BATCH: &str = "kv_append_batch_f32";
 pub(super) const KERNEL_NAME_ATTN_BATCH: &str = "gqa_attention_batch_f32";
 /// v0.3.7 batched M=N decode (N concurrent sequences, per-sequence KV).
+/// The direct M=N attention (`gqa_attention_mdecode_f32`) was retired in ADR
+/// 0025 step 2 — the split partial+combine pair is the only batch attention
+/// (a loaded-but-never-launched dense-indexed fallback would have silently
+/// bypassed paging).
 pub(super) const KERNEL_NAME_KV_APPEND_MDECODE: &str = "kv_append_mdecode_f32";
-pub(super) const KERNEL_NAME_ATTN_MDECODE: &str = "gqa_attention_mdecode_f32";
 
 /// v0.3.8 on-device sampling for the batched decode graph.
 pub(super) const KERNEL_NAME_LM_HEAD_TILED_F16: &str = "lm_head_tiled_f16";

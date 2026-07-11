@@ -627,7 +627,6 @@ pub struct CudaDecodeModel {
     f_lm_head_f16: CudaFunction,
     f_kv_append_mdecode: CudaFunction,
     #[allow(dead_code)] // kept for fallback; split-KV replaced it in the M=N path
-    f_attn_mdecode: CudaFunction,
     f_attn_split_partial: CudaFunction,
     f_attn_combine: CudaFunction,
     // Dense device weights (uploaded once).

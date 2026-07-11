@@ -1874,7 +1874,6 @@ impl CudaBackend {
             f_lm_head_tiled: f(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
-            f_attn_mdecode: f(dm, KERNEL_NAME_ATTN_MDECODE)?,
             f_attn_split_partial: f(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
             f_attn_combine: f(dm, KERNEL_NAME_ATTN_COMBINE)?,
             d_token_embd,
