@@ -22,7 +22,10 @@
 //! admission only runs when no prefill is in flight. Chunking is bit-exact by
 //! construction: `prefill` is bit-identical per row to the sequential step
 //! loop, so any chunking of it is too — the first sampled token still equals
-//! the single-sequence path's exactly.
+//! the single-sequence path's exactly. Deliberate trade: while a prefill is in
+//! flight the queue is not polled, so even instantly-rejectable jobs
+//! (validation failures, tree ops) wait out the remaining chunks — bounded by
+//! one prompt's chunked prefill.
 //!
 //! Remaining phase-2 costs: free slots burn a row of compute (per-row masks,
 //! C2) and KV arenas are dense `[n, max_ctx]` (paged KV, C3).

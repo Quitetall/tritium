@@ -880,3 +880,25 @@ chunks (bonus of the state machine).
 
 Next: C2 per-row masks (free slots still burn a row), C3 paged KV (arenas
 still dense `[n, max_ctx]`).
+
+### Round 15/16 caveat CLOSED — uncontended re-bench (2026-07-11, game exited)
+
+Deferred verifications, run in the least-contended window this session
+(llama-server 8.3 GB idle-resident only):
+
+- **TQ1 e2e decode (the round-15 "parity within noise" caveat)**: interleaved
+  ×3, 256 steps, 6-token prompt (short-context cut — GEMM share is at its
+  largest): TQ2 276.9/287.8/285.6 tok/s, TQ1 290.9/292.3/292.3. **TQ1 shows NO
+  e2e regression** — median +2.3% (within run-to-run spread of the slower TQ2
+  runs; claim "parity, possibly a hair better"). The round-16 kernel-level
+  1.51× gateup penalty does NOT materialize end-to-end: decode is
+  latency-bound outside the GEMMs and the −20% gateup DRAM traffic offsets
+  the ALU cost. The TQ1 capacity rung (−160 MB resident) is **free**.
+- **The 3 environmental OOM flakes all pass**: cuda_tree_verify_greedy_lossless,
+  cuda_batch_and_graph_single_token_bit_identical (acceptance),
+  cuda_spec_sampled_topk1_matches_plain_greedy (serve) — green serially,
+  confirming the failures were foreign-VRAM contention (game + llama-server),
+  not code.
+- **C1 review nit N1**: G1/G2 re-run with TRITIUM_PREFILL_CHUNK=15 (forces a
+  1-token final chunk through step_graph + the mid-admission M=1 graph
+  capture): green, identical agreement prefixes to the default-chunk run.
