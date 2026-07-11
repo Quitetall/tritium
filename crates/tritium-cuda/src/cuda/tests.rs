@@ -2547,3 +2547,302 @@ fn tq1_matches_tq2_tiled_scaled_bit_exact() {
         }
     }
 }
+
+/// A4 harness: upload TB1 rows (concatenated variable-length + offsets) and
+/// launch the prototype kernel.
+#[cfg(test)]
+fn run_tb1(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    f: &cudarc::driver::CudaFunction,
+    trits: &[tritium_core::Trit],
+    qact: &[i8],
+    scales: &[f32],
+    act_scale: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let mut arena: Vec<u8> = Vec::new();
+    let mut offsets: Vec<u32> = Vec::with_capacity(n);
+    for ni in 0..n {
+        offsets.push(arena.len() as u32);
+        arena.extend(tritium_format::pack_tb1_row(&trits[ni * k..(ni + 1) * k]).unwrap());
+    }
+    arena.extend_from_slice(&[0u8; 4]); // sign-read slack (kernel loads byte0+1)
+    let d_w = stream.clone_htod(&arena).unwrap();
+    let d_off = stream.clone_htod(&offsets).unwrap();
+    let d_qact = stream.clone_htod(qact).unwrap();
+    let d_sc = stream.clone_htod(scales).unwrap();
+    let d_as = stream.clone_htod(act_scale).unwrap();
+    let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+    let (m_i, n_i, k_i) = (m as i32, n as i32, k as i32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(8), m as u32, 1),
+        block_dim: (8 * 32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut l = stream.launch_builder(f);
+    l.arg(&d_qact)
+        .arg(&d_w)
+        .arg(&d_off)
+        .arg(&d_sc)
+        .arg(&d_as)
+        .arg(&mut d_out)
+        .arg(&m_i)
+        .arg(&n_i)
+        .arg(&k_i);
+    // SAFETY: tb1_mpgemm_tiled_i8_scaled(qact, weights, row_offsets, scales,
+    // act_scale, out, m, n, k); grid.y = m.
+    #[allow(unsafe_code)]
+    unsafe {
+        l.launch(cfg).unwrap()
+    };
+    let mut out = vec![0.0f32; m * n];
+    stream.memcpy_dtoh(&d_out, &mut out).unwrap();
+    out
+}
+
+/// A4 gate: TB1 bitmap+signs kernel is BIT-identical to the TQ2 i8-scaled
+/// kernel on the same trits (integer accumulation, same epilogue).
+#[test]
+fn tb1_matches_tq2_tiled_scaled_bit_exact() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping tb1 gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(TQ2_0_ADD_PTX)).unwrap();
+    let f_tq2 = module
+        .load_function("tq2_0_add_mpgemm_tiled_i8_scaled")
+        .unwrap();
+    let f_tb1 = module.load_function("tb1_mpgemm_tiled_i8_scaled").unwrap();
+
+    for &(m, n, k) in &[(1usize, 8usize, 1024usize), (2, 5, 512)] {
+        let trits = make_sparse_trits(n, k, 11);
+        let nb = num_blocks(k);
+        let unit = vec![half::f16::ONE; nb];
+        let rb2 = nb * TQ2_0_BLOCK_BYTES;
+        let mut p2 = vec![0u8; n * rb2];
+        for ni in 0..n {
+            tritium_format::pack_tq2_0_row(
+                &trits[ni * k..(ni + 1) * k],
+                &unit,
+                &mut p2[ni * rb2..(ni + 1) * rb2],
+            )
+            .unwrap();
+        }
+        let qact: Vec<i8> = (0..m * k).map(|i| ((i * 41 + 5) % 251) as i8).collect();
+        let scales = seeded_f32(3, n, 0.5, 2.0);
+        let act_scale = seeded_f32(9, m, 0.5, 1.5);
+
+        // TQ2 reference launch.
+        let d_qact = stream.clone_htod(&qact).unwrap();
+        let d_w2 = stream.clone_htod(&p2).unwrap();
+        let d_sc = stream.clone_htod(&scales).unwrap();
+        let d_as = stream.clone_htod(&act_scale).unwrap();
+        let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+        let (m_i, n_i, k_i, rb_i) = (m as i32, n as i32, k as i32, rb2 as i32);
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(8), m as u32, 1),
+            block_dim: (8 * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = stream.launch_builder(&f_tq2);
+        l.arg(&d_qact)
+            .arg(&d_w2)
+            .arg(&d_sc)
+            .arg(&d_as)
+            .arg(&mut d_out)
+            .arg(&m_i)
+            .arg(&n_i)
+            .arg(&k_i)
+            .arg(&rb_i);
+        // SAFETY: 9-arg dense signature; grid.y = m.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg).unwrap()
+        };
+        let mut o2 = vec![0.0f32; m * n];
+        stream.memcpy_dtoh(&d_out, &mut o2).unwrap();
+
+        let o1 = run_tb1(&stream, &f_tb1, &trits, &qact, &scales, &act_scale, m, n, k);
+        for (i, (a, b)) in o2.iter().zip(&o1).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "tb1 m{m} n{n} k{k} [{i}]: tq2={a} tb1={b}"
+            );
+        }
+    }
+}
+
+/// A4 verdict bench (run explicitly): TQ2 vs TQ1 vs TB1 kernel wall-time on
+/// the REAL gateup shape (the one DRAM-bound decode GEMM) at M=1.
+#[test]
+#[ignore = "A4 head-to-head bench: run with --ignored --nocapture"]
+fn tb1_tq1_tq2_gateup_bench() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+    use tritium_format::TQ1_0_BLOCK_BYTES;
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping bench: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from_src(TQ2_0_ADD_PTX)).unwrap();
+    let (m, n, k) = (1usize, 13824usize, 2560usize); // BitNet fused gateup
+    let iters = 2000u32;
+
+    let trits = make_sparse_trits(n, k, 5);
+    let nb = num_blocks(k);
+    let unit = vec![half::f16::ONE; nb];
+    let (rb2, rb1) = (nb * TQ2_0_BLOCK_BYTES, nb * TQ1_0_BLOCK_BYTES);
+    let mut p2 = vec![0u8; n * rb2];
+    let mut p1 = vec![0u8; n * rb1];
+    let mut tb1: Vec<u8> = Vec::new();
+    let mut off: Vec<u32> = Vec::new();
+    for ni in 0..n {
+        let row = &trits[ni * k..(ni + 1) * k];
+        tritium_format::pack_tq2_0_row(row, &unit, &mut p2[ni * rb2..(ni + 1) * rb2]).unwrap();
+        tritium_format::pack_tq1_0_row(row, &unit, &mut p1[ni * rb1..(ni + 1) * rb1]).unwrap();
+        off.push(tb1.len() as u32);
+        tb1.extend(tritium_format::pack_tb1_row(row).unwrap());
+    }
+    tb1.extend_from_slice(&[0u8; 4]);
+    println!(
+        "weight bytes: TQ2 {} | TQ1 {} ({:.1}%) | TB1 {} ({:.1}%)",
+        n * rb2,
+        n * rb1,
+        (n * rb1) as f64 / (n * rb2) as f64 * 100.0,
+        tb1.len(),
+        tb1.len() as f64 / (n * rb2) as f64 * 100.0,
+    );
+
+    let qact: Vec<i8> = (0..m * k).map(|i| ((i * 37) % 253) as i8).collect();
+    let scales = seeded_f32(1, n, 0.5, 2.0);
+    let act_scale = seeded_f32(2, m, 0.5, 1.5);
+    let d_qact = stream.clone_htod(&qact).unwrap();
+    let d_sc = stream.clone_htod(&scales).unwrap();
+    let d_as = stream.clone_htod(&act_scale).unwrap();
+    let d_w2 = stream.clone_htod(&p2).unwrap();
+    let d_w1 = stream.clone_htod(&p1).unwrap();
+    let d_wb = stream.clone_htod(&tb1).unwrap();
+    let d_off = stream.clone_htod(&off).unwrap();
+    let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+    let (m_i, n_i, k_i) = (m as i32, n as i32, k as i32);
+    let (rb2_i, rb1_i) = (rb2 as i32, rb1 as i32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(8), m as u32, 1),
+        block_dim: (8 * 32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut bench = |name: &str, which: u8| {
+        let f = match which {
+            0 => module
+                .load_function("tq2_0_add_mpgemm_tiled_i8_scaled")
+                .unwrap(),
+            1 => module
+                .load_function("tq1_0_add_mpgemm_tiled_i8_scaled")
+                .unwrap(),
+            _ => module.load_function("tb1_mpgemm_tiled_i8_scaled").unwrap(),
+        };
+        // Warm.
+        for _ in 0..50 {
+            let mut l = stream.launch_builder(&f);
+            match which {
+                0 => l
+                    .arg(&d_qact)
+                    .arg(&d_w2)
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i)
+                    .arg(&rb2_i),
+                1 => l
+                    .arg(&d_qact)
+                    .arg(&d_w1)
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i)
+                    .arg(&rb1_i),
+                _ => l
+                    .arg(&d_qact)
+                    .arg(&d_wb)
+                    .arg(&d_off)
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i),
+            };
+            // SAFETY: signatures as gated bit-exact above.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg).unwrap()
+            };
+        }
+        stream.synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut l = stream.launch_builder(&f);
+            match which {
+                0 => l
+                    .arg(&d_qact)
+                    .arg(&d_w2)
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i)
+                    .arg(&rb2_i),
+                1 => l
+                    .arg(&d_qact)
+                    .arg(&d_w1)
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i)
+                    .arg(&rb1_i),
+                _ => l
+                    .arg(&d_qact)
+                    .arg(&d_wb)
+                    .arg(&d_off)
+                    .arg(&d_sc)
+                    .arg(&d_as)
+                    .arg(&mut d_out)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i),
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg).unwrap()
+            };
+        }
+        stream.synchronize().unwrap();
+        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+        println!("{name}: {us:.2} µs/launch");
+    };
+    bench("TQ2 (2.06 b/w)", 0);
+    bench("TQ1 (1.69 b/w)", 1);
+    bench("TB1 (1.58 b/w)", 2);
+}

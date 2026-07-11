@@ -802,3 +802,37 @@ outlier; attention ~0%), entropy floor 1.560 b/w, TQ1_0 real rate 1.625
 Verdict: TQ1-native is a CAPACITY rung, not a speed rung at M=1 — same
 pattern as i8 KV. Bigger models / more KV headroom per GB; decode unchanged.
 Next: A4 bitmap+signs prototype (1.578 b/w + element-skip) head-to-head.
+
+## v1.x round 16 — A4 verdict: bitmap+signs (and TQ1) lose the gateup race (2026-07-11)
+
+Head-to-head kernel bench, REAL gateup shape (M=1, N=13824, K=2560), 2000
+launches, 4090 (CAVEAT: box contended by a co-resident game + llama-server —
+absolute µs inflated, but the relative ordering is an ALU-vs-bytes signal the
+contention cannot invert):
+
+| kernel | bytes (vs TQ2) | µs/launch |
+|---|---|---|
+| TQ2 dense 2-bit  | 100%  | **12.14** |
+| TQ1 5-trits/byte | 81.8% | 21.47 (1.77× slower) |
+| TB1 bitmap+signs | 72.7% | 35.93 (2.96× slower) |
+
+Both compact kernels are BIT-exact vs TQ2 (gates green, first run) — the loss
+is pure decode cost: TQ1 pays ~24 ALU ops per dp4a word (per-byte mul-shift
+chains) vs TQ2's ~3; TB1 additionally serializes on a per-block warp prefix
+scan for sign addressing. At M=1 the GEMM is not DRAM-bound ENOUGH (round-8:
+68% on gateup, less elsewhere) to hide that; byte savings of 18–27% bought
+77–196% more time.
+
+**Verdicts (recorded, either way, per the A4 plan):**
+- TB1 is REFUTED as a decode format at BitNet's density. Its niche survives
+  on paper only for high-sparsity students (p ≥ ~0.6, where the sign stream
+  shrinks and 2:4/block-skip compose) — revisit IF ADR 0024 produces one.
+  Kernel + format + gates stay in-tree (small, bit-exact, bench harness).
+- TQ1-native is confirmed a CAPACITY-ONLY rung: −18% weight VRAM, and the e2e
+  "parity within noise" from round 15 must be RE-BENCHED uncontended — the
+  kernel-level +9µs on gateup (~+5% e2e) may be visible there. Until then the
+  honest recommendation is TRITIUM_WEIGHTS=tq1 only when VRAM-constrained.
+- The compact-format speed path, if ever needed, is shared-memory staged
+  decode (amortize ALU across the warp) — not attempted; the ceiling (~4% e2e)
+  does not justify it. The REAL sparsity speed play remains ADR 0024's 2:4
+  tensor cores in the compute-bound regimes.

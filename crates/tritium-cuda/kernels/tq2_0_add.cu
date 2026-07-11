@@ -911,3 +911,90 @@ extern "C" __global__ void tq1_0_add_mpgemm_tiled_i8_scaled_residual(
         out[idx] = __fadd_rn(residual[idx], (float)acc * scales[ni] * act_scale[mi]);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TB1 bitmap+signs GEMM (A4 prototype): presence plane (1 b/w) + compacted
+// sign stream (1 b/nonzero) = 1 + (1-p) b/w — 1.578 at BitNet's p=0.422,
+// under dense TQ1_0's 1.625, sparsity-adaptive, and ZEROS COST NO SIGN BIT:
+// element-level skipping falls out of the layout.
+//
+// Row layout: [presence: nb·32 B][signs: bit per nonzero, 4B-aligned]. Rows
+// are variable-length → per-row byte offsets. The warp walks blocks in order
+// keeping a RUNNING sign-bit base; within a block each lane owns one
+// presence byte (8 elements = 2 dp4a words), its sign-stream position found
+// by a warp-wide popcount prefix scan (5 shfl_up) — no divergence, dense
+// coalesced loads. k % 256 == 0 required (prototype; gateup shapes qualify).
+extern "C" __global__ void tb1_mpgemm_tiled_i8_scaled(
+    const signed char* __restrict__ qact,   // [M, K] packed int8, k % 4 == 0
+    const unsigned char* __restrict__ weights,
+    const unsigned int* __restrict__ row_offsets,  // [N] byte offset per row
+    const float* __restrict__ scales,
+    const float* __restrict__ act_scale,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k) {
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const int* arow = (const int*)(qact + (long long)mi * k);
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const int nb = k >> 8;
+    const unsigned char* presence = weights + row_offsets[ni];
+    const unsigned char* signs = presence + nb * 32;
+    int acc = 0;
+    int sign_base = 0;  // running bit offset into this row's sign stream
+    for (int b = 0; b < nb; ++b) {
+        const unsigned int pb = presence[b * 32 + lane];
+        const int cnt = __popc(pb);
+        // Inclusive prefix sum of per-lane popcounts across the warp.
+        int pre = cnt;
+#pragma unroll
+        for (int off = 1; off < WARP_SIZE; off <<= 1) {
+            const int up = __shfl_up_sync(0xffffffffu, pre, off);
+            if (lane >= off) {
+                pre += up;
+            }
+        }
+        const int my_start = sign_base + pre - cnt;  // exclusive prefix
+        // ≤8 sign bits span ≤2 bytes of the stream.
+        const int byte0 = my_start >> 3;
+        const unsigned int sw =
+            ((unsigned int)signs[byte0] | ((unsigned int)signs[byte0 + 1] << 8)) >>
+            (my_start & 7);
+        // Two dp4a words from the byte's low/high nibbles; the high nibble's
+        // signs start after the low nibble's nonzeros.
+        const int e = (b << 8) + lane * 8;
+        int sbit = 0;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            int w8 = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int idx = half * 4 + j;
+                if (pb & (1u << idx)) {
+                    const int t = (sw >> sbit) & 1 ? 1 : -1;
+                    w8 |= (t & 0xff) << (8 * j);
+                    ++sbit;
+                }
+            }
+            acc = __dp4a(w8, __ldg(arow + ((e + half * 4) >> 2)), acc);
+        }
+        // Advance the running base by the whole block's nonzeros (lane 31's
+        // inclusive prefix).
+        sign_base += __shfl_sync(0xffffffffu, pre, WARP_SIZE - 1);
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = (float)acc * scales[ni] * act_scale[mi];
+    }
+}

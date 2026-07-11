@@ -46,6 +46,7 @@ mod salt;
 mod salt_bundle;
 mod salt_gguf;
 mod sparse;
+mod tb1;
 mod tq1;
 mod tq2;
 mod tqbin;
@@ -81,6 +82,7 @@ pub use sparse::{
     dequant_sparse_plane, expand_plane_repr, pack_sparse_plane, sparse_dot, sparse_from_tq2_0,
     sparse_to_tq2_0, unpack_sparse_plane,
 };
+pub use tb1::{TB1_PRESENCE_BYTES, pack_tb1_row, tb1_row_bytes, unpack_tb1_row};
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{compute_zero_bitmap, compute_zero_bitmaps, pack_tq2_0_block, unpack_tq2_0_block};
 pub use tqbin::{TQBIN_HEADER_BYTES, TQBIN_MAGIC, TQBIN_VERSION, read_tqbin, write_tqbin};
