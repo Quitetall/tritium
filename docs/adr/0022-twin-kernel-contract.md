@@ -108,7 +108,7 @@ obligations:
   the drift test are untouched. Dynamic-shared arrays inside template bodies
   need unique names (C++ vs C linkage of `extern __shared__` collide).
 - **Proof status (tools/sass_diff.sh, sm_89, CUDA 13)**: 63/65 kernels SASS
-  **byte-identical** after the refactor, including all ten templated
+  **byte-identical** after the refactor, including all twelve templated
   attention/lm_head instantiations. The two exceptions — kv_append_batch
   f32/h — are **justified**: identical 152-instruction opcode streams,
   register-allocation permutation only (13 sites), plus the batch
@@ -131,6 +131,8 @@ nvcc -arch=sm_89 -ptx --fmad=false /tmp/old.cu -o /tmp/old.ptx
 nvcc -arch=sm_89 -ptx --fmad=false crates/tritium-cuda/kernels/decode.cu -o /tmp/new.ptx
 tools/sass_diff.sh /tmp/old.ptx /tmp/before && tools/sass_diff.sh /tmp/new.ptx /tmp/after
 diff -rq /tmp/before /tmp/after   # expect: only the two justified kernels
+                                  # (plus the all.sass/all.cubin container
+                                  # files, which always differ — not kernels)
 ```
 
 `<pre-consolidation>` = the parent of the first Track B commit (4f3c566^).

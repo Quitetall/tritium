@@ -833,9 +833,10 @@ __global__ void rope_apply_f32_g(float* __restrict__ x,
 
 // ── KV store codecs (ADR 0022 twin consolidation, Track B) ──────────────────
 // One templated body per KV-touching family; extern "C" shims preserve every
-// launch symbol, so the host side is untouched. PROOF OBLIGATION: the f32
-// instantiation must stay SASS-identical to the retired hand-written kernel
-// (tools/sass_diff.sh; re-diff on toolchain bumps). The q8/t2 rungs keep
+// launch symbol, so the host side is untouched. PROOF OBLIGATION: every
+// instantiation stays SASS byte-identical to the retired hand-written kernel
+// or is justified in ADR 0022 (kv_append_batch f32/h: opcode-identical,
+// register permutation only). tools/sass_diff.sh; re-diff on toolchain bumps. The q8/t2 rungs keep
 // their own signatures — they already delegate to the shared kv_quant_row_*
 // helpers (scale-arena axis), i.e. they were born consolidated.
 struct KvStoreF32 {
