@@ -34,6 +34,6 @@ pub use fisher::FisherAccumulator;
 pub use fsdp::{FlatShardError, FlatShardPlan};
 pub use lora::Lora;
 pub use lr::LrSchedule;
-pub use optim::{AdamState, AdamW, Optimizer};
+pub use optim::{AdamState, AdamW, Muon, MuonState, Optimizer, newton_schulz};
 pub use tape::{Tape, ValueId};
 pub use value::Shape;

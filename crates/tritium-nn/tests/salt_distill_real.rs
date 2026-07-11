@@ -17,7 +17,13 @@ use std::path::PathBuf;
 use tritium_nn::{Mlp, ModelRunner, Projection};
 use tritium_train::nn::attention;
 use tritium_train::ops::ste;
-use tritium_train::{AdamW, Optimizer, Tape, ValueId};
+use tritium_train::{AdamState, AdamW, Muon, MuonState, Optimizer, Tape, ValueId};
+
+/// Per-leaf optimizer: AdamW everywhere, or the hybrid Muon (2D hidden weights) + AdamW (embedding).
+enum Opt {
+    Adam(AdamW, AdamState),
+    Muon(Muon, MuonState),
+}
 
 const T: usize = 2; // SALT planes (matches 0038 step 5's PTQ config)
 const STEPS: u64 = 8; // smoke default; the real run overrides via TRITIUM_DISTILL_STEPS
@@ -220,11 +226,31 @@ fn salt_distillation_recovers_smollm2_perplexity() {
         .collect();
     let ppl_ptq = perplexity(&logits_of(&ptq, &a, &eval), &eval, a.vocab);
 
-    // Distill: latents start at fp; SALT-STE in the forward; AdamW on all latents against the
-    // teacher's soft logits (softmax_xent = KL gradient).
+    // Distill: latents start at fp; SALT-STE in the forward; the optimizer steps all latents against
+    // the teacher's soft logits (softmax_xent = KL gradient). TRITIUM_DISTILL_OPT=muon uses the
+    // hybrid Muon (2D hidden weights) + AdamW (the tied embedding) recipe — half the optimizer state.
+    let use_muon = std::env::var("TRITIUM_DISTILL_OPT")
+        .map(|s| s == "muon")
+        .unwrap_or(false);
+    let muon_lr: f32 = std::env::var("TRITIUM_MUON_LR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.02);
     let mut lat = fp.clone();
-    let opt = AdamW::new(LR);
-    let mut states: Vec<_> = lat.iter().map(|wv| opt.init_state(wv.len())).collect();
+    let mut opts: Vec<Opt> = (0..lat.len())
+        .map(|i| {
+            if use_muon && i > 0 {
+                let (n, k) = shapes[i];
+                let m = Muon::new(muon_lr, n, k);
+                let s = m.init_state(lat[i].len());
+                Opt::Muon(m, s)
+            } else {
+                let ad = AdamW::new(LR);
+                let s = ad.init_state(lat[i].len());
+                Opt::Adam(ad, s)
+            }
+        })
+        .collect();
     let (mut first, mut last) = (f32::NAN, f32::NAN);
     for step in 1..=steps {
         let mut t = Tape::new();
@@ -246,7 +272,10 @@ fn salt_distillation_recovers_smollm2_perplexity() {
         last = lv;
         let grads = t.backward(l);
         for i in 0..lat.len() {
-            opt.step(step, &mut lat[i], &grads[leaf_ids[i]], &mut states[i]);
+            match &mut opts[i] {
+                Opt::Adam(o, s) => o.step(step, &mut lat[i], &grads[leaf_ids[i]], s),
+                Opt::Muon(o, s) => o.step(step, &mut lat[i], &grads[leaf_ids[i]], s),
+            }
         }
         if step % 10 == 0 || step == 1 {
             eprintln!("  step {step}/{steps}  xent {lv:.4}");
@@ -261,12 +290,17 @@ fn salt_distillation_recovers_smollm2_perplexity() {
     let ppl_distilled = perplexity(&logits_of(&distilled, &a, &eval), &eval, a.vocab);
 
     println!(
-        "0040 step4 SmolLM2 real distillation (T={tp}, {steps} steps, IN-SAMPLE {seq}-tok calib): \
+        "0040 step4 SmolLM2 real distillation (T={tp}, {steps} steps, opt={}, IN-SAMPLE {seq}-tok calib): \
          fp ppl {ppl_fp:.3} | PTQ ppl {ppl_ptq:.3e} | distilled ppl {ppl_distilled:.3e}  \
          (surrogate xent {first:.4}→{last:.4}). Distilled ppl is {:.1}× lower than PTQ — end-to-end \
          distillation recovers the real 30-layer model where a local heal (0038 step 5) could not. \
          (distilled ≤ fp is in-sample overfit to this one sequence; held-out generalization = a real \
          corpus, 0041 scale.)",
+        if use_muon {
+            format!("muon+adam(mlr={muon_lr})")
+        } else {
+            "adamw".to_string()
+        },
         ppl_ptq / ppl_distilled
     );
 
