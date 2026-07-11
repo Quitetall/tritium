@@ -872,6 +872,49 @@ static __device__ __forceinline__ void kv_append_batch_body(
            src[(long long)row * kv_width + e]);
 }
 
+template <class C>
+static __device__ __forceinline__ void rope_kv_fused_body(
+    float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, typename C::T* __restrict__ kv_k_base,
+    typename C::T* __restrict__ kv_v_base, const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table, const int* __restrict__ ctrl,
+    const int n_head, const int n_head_kv, const int head_dim,
+    const int kv_width) {
+  const int half = head_dim >> 1;
+  const int q_total = n_head * half;
+  const int k_total = n_head_kv * half;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int pos = ctrl[1];
+  const long long row = (long long)ctrl[2] * kv_width;
+  if (idx < q_total) {
+    const int head = idx / half;
+    const int j = idx - head * half;
+    const int base = head * head_dim;
+    const float c = cos_table[(long long)pos * half + j];
+    const float s = sin_table[(long long)pos * half + j];
+    const float a = q[base + j];
+    const float b = q[base + j + half];
+    q[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+    q[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+  } else if (idx < q_total + k_total) {
+    const int t = idx - q_total;
+    const int head = t / half;
+    const int j = t - head * half;
+    const int base = head * head_dim;
+    const float c = cos_table[(long long)pos * half + j];
+    const float s = sin_table[(long long)pos * half + j];
+    const float a = k[base + j];
+    const float b = k[base + j + half];
+    C::store(&kv_k_base[row + base + j],
+             __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
+    C::store(&kv_k_base[row + base + j + half],
+             __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s)));
+  } else if (idx < q_total + k_total + kv_width) {
+    const int i = idx - q_total - k_total;
+    C::store(&kv_v_base[row + i], v[i]);
+  }
+}
+
 extern "C" {
 
 __global__ void kv_append_f32(const float* __restrict__ src,
@@ -902,37 +945,9 @@ __global__ void rope_kv_fused_g(float* __restrict__ q,
                                 const int* __restrict__ ctrl,
                                 const int n_head, const int n_head_kv,
                                 const int head_dim, const int kv_width) {
-  const int half = head_dim >> 1;
-  const int q_total = n_head * half;
-  const int k_total = n_head_kv * half;
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int pos = ctrl[1];
-  const long long row = (long long)ctrl[2] * kv_width;
-  if (idx < q_total) {
-    const int head = idx / half;
-    const int j = idx - head * half;
-    const int base = head * head_dim;
-    const float c = cos_table[(long long)pos * half + j];
-    const float s = sin_table[(long long)pos * half + j];
-    const float a = q[base + j];
-    const float b = q[base + j + half];
-    q[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
-    q[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
-  } else if (idx < q_total + k_total) {
-    const int t = idx - q_total;
-    const int head = t / half;
-    const int j = t - head * half;
-    const int base = head * head_dim;
-    const float c = cos_table[(long long)pos * half + j];
-    const float s = sin_table[(long long)pos * half + j];
-    const float a = k[base + j];
-    const float b = k[base + j + half];
-    kv_k_base[row + base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
-    kv_k_base[row + base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
-  } else if (idx < q_total + k_total + kv_width) {
-    const int i = idx - q_total - k_total;
-    kv_v_base[row + i] = v[i];
-  }
+  rope_kv_fused_body<KvStoreF32>(q, k, v, kv_k_base, kv_v_base, cos_table,
+                                 sin_table, ctrl, n_head, n_head_kv, head_dim,
+                                 kv_width);
 }
 
 // gqa_attention_decode_f32_g — like gqa_attention_decode_f32 but cache_len = ctrl[2]
@@ -1779,39 +1794,9 @@ __global__ void rope_kv_fused_h(float* __restrict__ q,
                                 const int* __restrict__ ctrl,
                                 const int n_head, const int n_head_kv,
                                 const int head_dim, const int kv_width) {
-  const int half = head_dim >> 1;
-  const int q_total = n_head * half;
-  const int k_total = n_head_kv * half;
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int pos = ctrl[1];
-  const long long row = (long long)ctrl[2] * kv_width;
-  if (idx < q_total) {
-    const int head = idx / half;
-    const int j = idx - head * half;
-    const int base = head * head_dim;
-    const float c = cos_table[(long long)pos * half + j];
-    const float s = sin_table[(long long)pos * half + j];
-    const float a = q[base + j];
-    const float b = q[base + j + half];
-    q[base + j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
-    q[base + j + half] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
-  } else if (idx < q_total + k_total) {
-    const int t = idx - q_total;
-    const int head = t / half;
-    const int j = t - head * half;
-    const int base = head * head_dim;
-    const float c = cos_table[(long long)pos * half + j];
-    const float s = sin_table[(long long)pos * half + j];
-    const float a = k[base + j];
-    const float b = k[base + j + half];
-    kv_k_base[row + base + j] =
-        __float2half_rn(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
-    kv_k_base[row + base + j + half] =
-        __float2half_rn(__fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s)));
-  } else if (idx < q_total + k_total + kv_width) {
-    const int i = idx - q_total - k_total;
-    kv_v_base[row + i] = __float2half_rn(v[i]);
-  }
+  rope_kv_fused_body<KvStoreF16>(q, k, v, kv_k_base, kv_v_base, cos_table,
+                                 sin_table, ctrl, n_head, n_head_kv, head_dim,
+                                 kv_width);
 }
 
 __global__ void gqa_attention_scores_h(const float* __restrict__ q,
