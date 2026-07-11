@@ -31,12 +31,17 @@ fn model_dir() -> PathBuf {
 }
 
 fn corpus() -> (Vec<u32>, Vec<u32>) {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tools/reference/heldout_corpus.json"
-    );
+    // TRITIUM_CORPUS overrides the committed fixture (for the large-budget endpoint sweeps, which
+    // use a bigger locally-generated corpus we don't commit as a multi-MB fixture).
+    let path = std::env::var("TRITIUM_CORPUS").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/reference/heldout_corpus.json"
+        )
+        .to_string()
+    });
     let j: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).expect("corpus json")).expect("parse");
+        serde_json::from_slice(&std::fs::read(&path).expect("corpus json")).expect("parse");
     let ids = |k: &str| {
         j[k].as_array()
             .expect(k)
@@ -92,12 +97,6 @@ fn salt_distillation_recovers_heldout_perplexity() {
     let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
-    // Teacher soft targets for each training window (fp forward, cached once).
-    let teacher_probs: Vec<Vec<f32>> = windows
-        .iter()
-        .map(|w| row_softmax(&logits_of(&fp, &a, w), a.vocab))
-        .collect();
-
     // Held-out baselines (fp + full PTQ), on the disjoint eval split.
     let ppl_fp = perplexity(&logits_of(&fp, &a, &eval_ids), &eval_ids, a.vocab);
     let ptq: Vec<Vec<f32>> = fp
@@ -115,6 +114,9 @@ fn salt_distillation_recovers_heldout_perplexity() {
     for step in 1..=steps {
         let wi = ((step - 1) as usize) % windows.len();
         let toks = windows[wi];
+        // Teacher soft targets for this window, computed on the fly (O(1) memory — precomputing all
+        // windows' full-vocab probs is ~26GB at the 128k-token endpoint).
+        let tprobs = row_softmax(&logits_of(&fp, &a, toks), a.vocab);
         let mut t = Tape::new();
         let mut leaf_ids = Vec::with_capacity(lat.len());
         let mut ste_ids = Vec::with_capacity(lat.len());
@@ -125,7 +127,7 @@ fn salt_distillation_recovers_heldout_perplexity() {
             leaf_ids.push(l);
         }
         let logits = forward(&mut t, &ste_ids, &a, toks);
-        let tg = t.leaf(teacher_probs[wi].clone());
+        let tg = t.leaf(tprobs);
         let l = t.softmax_xent(logits, tg, TRAIN_SEQ, a.vocab);
         let lv = t.value(l)[0];
         if step == 1 {
