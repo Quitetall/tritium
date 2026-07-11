@@ -305,6 +305,7 @@ pub struct RunnerGenerator {
     draft: Option<Box<tritium_nn::ModelRunner>>,
     /// Number of leading positions of the DRAFT's KV known to match the
     /// generation history.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     draft_pos: usize,
     /// Tokens fed to the draft at positions `draft_pos..` during the LAST
     /// draft call (pending + its own greedy outputs). The next call compares
@@ -312,6 +313,7 @@ pub struct RunnerGenerator {
     /// (forward-contiguous — the resident runner rejects position rewinds);
     /// the first mismatch (a rejected draft) resets the draft for a full
     /// re-prefill.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     draft_fed: Vec<u32>,
 }
 
@@ -440,12 +442,6 @@ impl RunnerGenerator {
         history[best_end..end].to_vec()
     }
 
-    /// The greedy speculative loop: pending token → lookup-draft a chain →
-    /// `tree_verify_greedy` commits the accepted prefix + one bonus in ONE
-    /// batched forward (the f16 LM-head table is read once per tree, not once
-    /// per token). No-draft steps use the plain M=1 graph step. Lossless: every
-    /// emitted token is the target's own greedy argmax at its position (gated
-    /// by `cuda_spec_lookup_matches_plain_greedy`).
     #[cfg(feature = "cuda")]
     /// Draft up to `max_draft` tokens with the attached draft model (greedy),
     /// starting after `history` (whose last element is the pending token).
@@ -516,6 +512,13 @@ impl RunnerGenerator {
         out
     }
 
+    /// The greedy speculative loop: pending token → draft a chain (model
+    /// drafter when attached, else prompt-lookup) → `tree_verify_greedy`
+    /// commits the accepted prefix + one bonus in ONE batched forward (the
+    /// f16 LM-head table is read once per tree, not once per token). No-draft
+    /// steps use the plain M=1 graph step. Lossless: every emitted token is
+    /// the target's own greedy argmax at its position (gated by
+    /// `cuda_spec_lookup_matches_plain_greedy`).
     #[cfg(feature = "cuda")]
     fn generate_spec_lookup(
         &mut self,
@@ -871,6 +874,10 @@ impl RunnerGenerator {
             self.runner
                 .tree_commit(&path)
                 .map_err(|e| GenError::Backend(e.to_string()))?;
+            SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
+            // Committed = accepted drafts (path[1..]) + the resampled/bonus
+            // final token — same accounting as the greedy path's `committed`.
+            SPEC_COMMITTED.fetch_add(path.len() as u64, Ordering::Relaxed);
             draft_len = if path.len() == tokens.len() {
                 (draft_len * 2).min(DRAFT_MAX)
             } else {
@@ -1006,9 +1013,9 @@ impl Generator for RunnerGenerator {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = prompt;
-            return Err(TreeOpError::Unsupported(
+            Err(TreeOpError::Unsupported(
                 "tree-verify needs the `cuda` feature".to_owned(),
-            ));
+            ))
         }
         #[cfg(feature = "cuda")]
         {

@@ -161,15 +161,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let draft_runner = match &draft_model {
         None => None,
         Some(path) => {
+            // The spec path needs the CUDA resident decoder; a draft that can
+            // never be consulted must not load silently (stated contract).
+            if backend_name != "cuda" {
+                return Err(format!(
+                    "--draft-model requires --backend cuda (spec decoding runs on the \
+                     resident decoder); got --backend {backend_name}"
+                )
+                .into());
+            }
             eprintln!("tritium-serve: loading draft model {path} ...");
             let dbytes = std::fs::read(path).map_err(|e| format!("--draft-model {path}: {e}"))?;
             let dfile = tritium_format::read_gguf(&dbytes)
                 .map_err(|e| format!("--draft-model {path}: {e}"))?;
             let dbackend = init().map_err(|e| format!("--draft-model backend init: {e}"))?;
-            Some(
-                tritium_nn::ModelRunner::load(&dfile, &dbytes, dbackend)
-                    .map_err(|e| format!("--draft-model {path}: {e}"))?,
-            )
+            let d = tritium_nn::ModelRunner::load(&dfile, &dbytes, dbackend)
+                .map_err(|e| format!("--draft-model {path}: {e}"))?;
+            // A vocab mismatch degrades to silent per-call draft failures —
+            // reject at startup instead.
+            if d.weights.vocab != runner.weights.vocab {
+                return Err(format!(
+                    "--draft-model vocab {} != target vocab {} (the drafter must share \
+                     the target's tokenizer, ADR 0021)",
+                    d.weights.vocab, runner.weights.vocab
+                )
+                .into());
+            }
+            Some(d)
         }
     };
     #[cfg(feature = "cuda")]

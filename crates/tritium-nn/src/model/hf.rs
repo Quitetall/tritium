@@ -75,14 +75,19 @@ impl ModelWeights {
                 .map_err(|e| NnError::MissingTensor(format!("{name}: {e}")))
         };
         // Every tensor is read from the safetensors as exact fp32.
-        let weights =
-            build_standard_model(&config, &spec, NameSchema::Hf, &get, |name, n_out, k_in| {
+        let weights = build_standard_model(
+            &config,
+            &spec,
+            NameSchema::Hf,
+            |n| get(n),
+            |name, n_out, k_in| {
                 Ok(Projection::Dense(DenseLinear::new_exact(
                     get(name)?,
                     n_out,
                     k_in,
                 )?))
-            })?;
+            },
+        )?;
         Ok((config, spec, weights))
     }
 
@@ -184,7 +189,7 @@ impl ModelWeights {
             &config,
             &spec,
             NameSchema::Hf,
-            &provider,
+            |n| provider(n),
             |name, n_out, k_in| {
                 Ok(Projection::Dense(DenseLinear::new(
                     provider(name)?,
