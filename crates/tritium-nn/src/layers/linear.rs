@@ -45,6 +45,10 @@ pub struct TernaryLinear {
     pub scales: Vec<f32>,
     /// Opaque device handle to the uploaded packed ternary weight.
     pub weights: Box<dyn DeviceBuffer>,
+    /// The packing `weights` was uploaded with (decided ONCE at construction
+    /// from `TRITIUM_WEIGHTS`; the buffer's actual layout is the single
+    /// source of truth thereafter — a later env flip cannot desync it).
+    format: TernaryFormat,
 }
 
 /// Weight packing selected by `TRITIUM_WEIGHTS` (A2): `tq2` (default — the
@@ -52,11 +56,17 @@ pub struct TernaryLinear {
 /// natively by the TQ1 decode kernels; batch/tree paths reject it in v1).
 /// Any other value is rejected loudly at first pack (a typo silently running
 /// tq2 would invalidate whatever comparison the user intended).
-fn weights_format() -> TernaryFormat {
-    match std::env::var("TRITIUM_WEIGHTS").as_deref() {
-        Ok("tq1") => TernaryFormat::Tq1_0,
-        Ok("tq2") | Ok("") | Err(_) => TernaryFormat::Tq2_0,
-        Ok(other) => panic!("TRITIUM_WEIGHTS={other:?} — use tq1 or tq2"),
+fn weights_format() -> Result<TernaryFormat, NnError> {
+    match std::env::var("TRITIUM_WEIGHTS") {
+        Ok(v) => match v.as_str() {
+            "tq1" => Ok(TernaryFormat::Tq1_0),
+            "tq2" | "" => Ok(TernaryFormat::Tq2_0),
+            other => Err(NnError::Backend(format!(
+                "TRITIUM_WEIGHTS={other:?} — use tq1 or tq2"
+            ))),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(TernaryFormat::Tq2_0),
+        Err(e) => Err(NnError::Backend(format!("TRITIUM_WEIGHTS: {e}"))),
     }
 }
 
@@ -81,21 +91,28 @@ impl TernaryLinear {
         k_in: usize,
         weight_scale: f32,
     ) -> Result<Self, NnError> {
-        let packed = Self::pack_rows(trits, n_out, k_in)?;
+        let format = weights_format()?;
+        let packed = Self::pack_rows(trits, n_out, k_in, format)?;
         let shape = GemmShape::new(0, n_out, k_in);
-        let weights = backend.upload_weights(&packed, shape, weights_format())?;
+        let weights = backend.upload_weights(&packed, shape, format)?;
 
         Ok(Self {
             n_out,
             k_in,
             scales: vec![weight_scale; n_out],
             weights,
+            format,
         })
     }
 
     /// Re-pack `[n_out, k_in]` ternary `trits` to TQ2_0 (one `1.0` f16 block scale per
     /// 256-trit block, so the unpacked values are the raw trits) and validate the shape.
-    fn pack_rows(trits: &[Trit], n_out: usize, k_in: usize) -> Result<Vec<u8>, NnError> {
+    fn pack_rows(
+        trits: &[Trit],
+        n_out: usize,
+        k_in: usize,
+        format: TernaryFormat,
+    ) -> Result<Vec<u8>, NnError> {
         let expected = n_out.checked_mul(k_in).ok_or(NnError::Shape {
             expected: usize::MAX,
             got: trits.len(),
@@ -114,7 +131,7 @@ impl TernaryLinear {
             });
         }
         let nb = num_blocks(k_in);
-        let tq1 = weights_format() == TernaryFormat::Tq1_0;
+        let tq1 = format == TernaryFormat::Tq1_0;
         let row_bytes = nb
             * if tq1 {
                 TQ1_0_BLOCK_BYTES
@@ -155,9 +172,11 @@ impl TernaryLinear {
                 got: scales.len(),
             });
         }
-        let packed = Self::pack_rows(trits, self.n_out, self.k_in)?;
+        // Repack in the layer's CONSTRUCTION format (the graph reads the
+        // buffer's stride; swapping formats mid-life would desync them).
+        let packed = Self::pack_rows(trits, self.n_out, self.k_in, self.format)?;
         let shape = GemmShape::new(0, self.n_out, self.k_in);
-        self.weights = backend.upload_weights(&packed, shape, weights_format())?;
+        self.weights = backend.upload_weights(&packed, shape, self.format)?;
         self.scales = scales;
         Ok(())
     }
@@ -210,7 +229,7 @@ impl TernaryLinear {
             weights: &*self.weights,
             scales: &self.scales,
             shape: self.shape(m),
-            format: weights_format(),
+            format: self.format,
             out,
         })?;
 

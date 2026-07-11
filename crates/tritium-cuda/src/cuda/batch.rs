@@ -1071,6 +1071,12 @@ impl CudaDecodeModel {
         d_out: sys::CUdeviceptr,
         n: usize,
     ) -> Result<(), BackendError> {
+        // The batched builders are TQ2-only; new_batch rejects TQ1 models at
+        // layer 0 — this asserts the whole-model invariant those checks rely on.
+        debug_assert!(
+            !lin.tq1,
+            "gb_matmul: TQ1 linear reached the TQ2-only batch builder"
+        );
         let cs = self.cap_stream.cu_stream();
         let (m_i, n_out_i, k_i, rb_i) = (n as i32, lin.n as i32, lin.k as i32, lin.rb as i32);
         // v1.x: one fused i8 dp4a launch — the `_scaled` epilogue folds the per-row

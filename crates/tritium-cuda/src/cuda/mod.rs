@@ -211,13 +211,6 @@ impl CudaBuffer {
 
     /// The TQ2_0 per-row byte stride, or `None` if this buffer is not TQ2_0
     /// (the resident decode path is TQ2_0-only; IMMA stays the prefill format).
-    pub(crate) fn tq2_0_row_bytes(&self) -> Option<usize> {
-        match self.stride {
-            Stride::Tq2_0 { row_bytes } => Some(row_bytes),
-            _ => None,
-        }
-    }
-
     /// `(row_bytes, is_tq1)` for the decode-resident formats; `None` for IMMA.
     pub(crate) fn decode_row_bytes(&self) -> Option<(usize, bool)> {
         match self.stride {
@@ -229,6 +222,9 @@ impl CudaBuffer {
 }
 
 mod backend;
+// Lib code no longer references backend items directly (post-P2a/A2 churn),
+// but cuda::tests reaches them through `use super::*` via this glob.
+#[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;
 pub use backend::{CudaBackend, SaltResidentLinear};
 
