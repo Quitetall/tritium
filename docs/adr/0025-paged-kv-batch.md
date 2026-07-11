@@ -8,9 +8,9 @@ last planned P2 step.
 
 The batch KV arenas are dense `[n, max_ctx, kv_width]` per layer: every slot
 pre-pays `max_ctx` tokens of VRAM whether its request uses 60 tokens or 4000.
-At n=8, max_ctx=4096, kv_width=640, 30 layers, f32 that is ~2.5 GB of which a
-typical chat workload touches a few percent. Slots-per-GB — the batching
-capacity number — is bounded by the worst case, not the actual load.
+At n=8, max_ctx=4096, kv_width=640, 30 layers, f32 that is ~5.0 GB (K+V) of
+which a typical chat workload touches a few percent. Slots-per-GB — the
+batching capacity number — is bounded by the worst case, not the actual load.
 
 C2 established the contract paging needs: a dead row owns no write slot and
 touches no arena bytes (`set_live`, device position `-1`, gated by
@@ -18,7 +18,7 @@ touches no arena bytes (`set_live`, device position `-1`, gated by
 
 ## Decision (proposed)
 
-1. **Page pool + per-slot page table.** One pool per layer pair (K and V):
+1. **Page pool + per-slot page table.** Separate K and V pools per layer:
    `[pool_pages, PAGE_TOKENS, kv_width]` f32, `PAGE_TOKENS = 256` (power of
    two: in-kernel index math is shift/mask; 256 tokens × 640 f32 = 640 KB per
    K or V page per layer at BitNet geometry). A per-slot page table
@@ -34,6 +34,18 @@ touches no arena bytes (`set_live`, device position `-1`, gated by
    byte-identical to the retired hand-written kernel** (tools/sass_diff.sh,
    the ADR 0022 procedure); the paged instantiation is the new member.
    `combine`, `rope`, and everything else never touch KV — unchanged.
+   Also in this step (review findings on this ADR):
+   - **Retire `gqa_attention_mdecode_f32`** — the legacy dense-indexed
+     fallback is loaded but never launched (`f_attn_mdecode`,
+     `BatchRawKernels.attn`); reviving it would silently bypass paging.
+     Delete the kernel, both load sites, and the `d_scores` scratch
+     (`n·n_head·max_ctx` f32) that exists solely for it.
+   - The cfg(test) helper `attn_split_dense` (backend.rs) launches
+     `gqa_attention_split_partial_f32` with an M=1 layout — a third call
+     site the templating must carry (it becomes the dense instantiation).
+   - `d_attn_partials` still scales with `ceil(max_ctx/64)` (~5 MB at the
+     example geometry) — a dense residual the "sum of footprints" claim
+     explicitly excludes; acceptable, recorded.
 3. **Bit-exactness by construction.** Paging changes ADDRESSES, never values
    or reduction order: for the same logical contents, paged attention output
    is bit-identical to dense. Gate: a paged batch and a dense batch fed the
