@@ -144,6 +144,12 @@ fn salt_distillation_recovers_smollm2_perplexity() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(STEPS);
+    // SALT plane count; T=1 is a "lesser" single-plane ternary STE (plain BitNet b1.58 QAT),
+    // T≥2 is SALT residual expansion. Override to compare (plan 0041 / SALT-vs-STE study).
+    let tp: usize = std::env::var("TRITIUM_DISTILL_T")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(T);
 
     let runner =
         ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
@@ -210,7 +216,7 @@ fn salt_distillation_recovers_smollm2_perplexity() {
     let ptq: Vec<Vec<f32>> = fp
         .iter()
         .zip(&shapes)
-        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
+        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, tp))
         .collect();
     let ppl_ptq = perplexity(&logits_of(&ptq, &a, &eval), &eval, a.vocab);
 
@@ -227,7 +233,7 @@ fn salt_distillation_recovers_smollm2_perplexity() {
         for (i, wv) in lat.iter().enumerate() {
             let l = t.leaf(wv.clone());
             let (n, k) = shapes[i];
-            ste_ids.push(t.salt_ste(l, n, k, T));
+            ste_ids.push(t.salt_ste(l, n, k, tp));
             leaf_ids.push(l);
         }
         let logits = forward(&mut t, &ste_ids, &a, &eval);
@@ -250,12 +256,12 @@ fn salt_distillation_recovers_smollm2_perplexity() {
     let distilled: Vec<Vec<f32>> = lat
         .iter()
         .zip(&shapes)
-        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
+        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, tp))
         .collect();
     let ppl_distilled = perplexity(&logits_of(&distilled, &a, &eval), &eval, a.vocab);
 
     println!(
-        "0040 step4 SmolLM2 real distillation (T={T}, {steps} steps, IN-SAMPLE {seq}-tok calib): \
+        "0040 step4 SmolLM2 real distillation (T={tp}, {steps} steps, IN-SAMPLE {seq}-tok calib): \
          fp ppl {ppl_fp:.3} | PTQ ppl {ppl_ptq:.3e} | distilled ppl {ppl_distilled:.3e}  \
          (surrogate xent {first:.4}→{last:.4}). Distilled ppl is {:.1}× lower than PTQ — end-to-end \
          distillation recovers the real 30-layer model where a local heal (0038 step 5) could not. \
