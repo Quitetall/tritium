@@ -26,7 +26,9 @@ Serving (already live):
 tritium-serve --model bitnet-2b4t.gguf --draft-model student.gguf --backend cuda
 ```
 
-Falls back to prompt-lookup drafting when `--draft-model` is absent. Accept
+Without `--draft-model`, spec decoding requires the explicit `--spec
+lookup` flag (plain decode otherwise); a failing draft mid-run falls back
+to a plain step, never to lookup. Accept
 telemetry: `/metrics` → `tritium_spec_verifies_total`,
 `tritium_spec_committed_total` (tok/verify = ratio); `TRITIUM_SPEC_STATS=1`
 prints per-request stats.
@@ -70,8 +72,13 @@ stage flow matches 1:1.
 ## Acceptance gate (from ADR 0021)
 
 - **≥ 6 tok/verify on prose** (self-speculation ceiling measured at 11.75;
-  the lookup drafter does 3.65 on repetitive text only). At 6 tok/verify and
-  ~14–19 ms/verify, projected decode ≈ **2.5–3×** plain.
+  the lookup drafter does 3.65 on repetitive text only). At the measured
+  **8.5 ms/verify** (OPTIMIZATION-LOG rounds 9–10; the self-spec run's
+  14–19 ms includes a full-size 2B draft — a 100–200M student drafts ~10×
+  cheaper) plus the student's own draft steps, ≥6 tok/verify projects
+  **≈2× plain** (ADR 0021's number); the 2.5–3× band needs ~8–10
+  tok/verify, which the 11.75 self-spec ceiling shows the verifier
+  supports.
 - Validation procedure (no Tritium changes needed):
   1. `tritium-serve --model target.gguf --draft-model student.gguf`
   2. Run `tools/openai_compat_check.py` — output must be text-sane.

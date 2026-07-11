@@ -10,12 +10,20 @@ f32 single-sequence path reproduces the host oracle `to_bits()`-equal, greedy
 decode is token-exact vs `transformers`, and every kernel keeps one canonical
 reduction order. That contract is also now the **dominant decode cost**:
 
-- Round-8+ profiling: attention (scores+reduce ~21%) and rmsnorm (~29%) are
-  ~50% of decode GPU time and **latency-bound** (~1–2% DRAM), pinned to
-  sync-heavy canonical-order reductions. The GEMMs, by contrast, are 20–25%.
-- Every reduction speedup tried under the contract was rejected for reordering
-  sums (recorded in kernel comments and the OPTIMIZATION-LOG); the bit-exact
-  tier has hit its structural floor at ~45% of roofline.
+- Recorded profiles (OPTIMIZATION-LOG): the flat GPU-time distribution at
+  line 339 reads **attn 33% / rmsnorm 32% / lm_head 12% / GEMM 20%**; round-8
+  per-layer counters read rmsnorm_quant 5.82µs + attn scores/reduce
+  6.7+3.8µs vs GEMMs ~30µs (a GEMM-heavier per-layer mix — the two profiles
+  bracket the truth). Both agree the reduction kernels are **latency-bound**
+  (~1–2% DRAM) and sit at 30–65% of decode time depending on the cut.
+- IMPORTANT scope correction (review of this RFC's draft): the rmsnorm
+  reduction is ALREADY the canonical tree implemented with warp shuffles
+  (ADR 0018, decode.cu:60-211) — "switch to a shuffle tree" shipped. The
+  remaining rmsnorm levers that genuinely need a relaxed tier are
+  **`--fmad=true` compilation** (fused multiply-add changes roundings) and
+  **restructuring the per-thread strided fold** (changes accumulation
+  order); attention's scores/reduce accumulation order is the other real
+  target. The bit-exact tier's floor stands at ~45.9% of roofline (round 8).
 
 Meanwhile the repo already ships and documents TWO non-bit-exact numerics
 domains (book, "Numerics domains"): the M=N batch path (token-parity) and the
@@ -27,11 +35,10 @@ acceptable when it is **opt-in, gated, and honestly documented**.
 A third numerics domain: `TRITIUM_KERNEL_TIER=fast` (default `exact`; any
 other value rejected loudly, mirroring `TRITIUM_KV`).
 
-- **Scope (initial)**: `rmsnorm_f32`/`rmsnorm_quant_*` (warp-shuffle tree
-  reduction instead of the canonical serial order) and the decode attention
-  `scores/reduce` pair (reordered f32 accumulation, wider warps, fewer
-  syncs). GEMMs are OUT of scope (integer accumulation is already order-free;
-  their limits are warp occupancy, not sum order).
+- **Scope (initial)**: `rmsnorm_quant_*` with `--fmad=true` + a reordered
+  per-thread fold, and the decode attention `scores/reduce` pair (reordered
+  f32 accumulation, fmad on). GEMMs are OUT of scope (integer accumulation
+  is already order-free; their limits are warp occupancy, not sum order).
 - **Selection**: the same host-side single-dispatch-point pattern as
   `KvDtype::pick` (ADR 0022 guardrail 3) — a `KernelTier` enum in the CUDA
   backend; twin `_fast` kernels are new members of the existing families and
@@ -49,18 +56,19 @@ other value rejected loudly, mirroring `TRITIUM_KV`).
 
 ## Expected win (to be measured, not promised)
 
-rmsnorm + attention ≈ 50% of a ~52µs decode step. Latency-bound kernels with
-sync-count reductions of 2–4× typically recover 30–60% of their time; the
-honest projection band is **+10–20% e2e decode** at M=1, additive with Track
-A's memory work (different kernels). The measurement plan holds the tier to
+rmsnorm + attention are 30–65% of decode GPU time depending on the profile
+cut (see Context). fmad alone typically buys 10–30% on FMA-dense reduction
+kernels; fold/order restructuring is workload-dependent. The honest
+projection band is **+5–15% e2e decode** at M=1, additive with Track A's
+memory work (different kernels). The measurement plan holds the tier to
 that: any kernel whose fast variant wins <3% e2e is dropped (complexity not
 carried for noise).
 
 ## Measurement & acceptance plan
 
-1. `rmsnorm_fast` first (smallest, biggest single share): implement, gate
-   (token-parity over the 256-token acceptance horizon + ppl bound), bench.
-   Decision point: proceed to attention only if ≥3% e2e.
+1. `rmsnorm_fast` first (smallest surface): fmad-on + reordered fold,
+   gate (token-parity over the 256-token acceptance horizon + ppl bound),
+   bench. Decision point: proceed to attention only if ≥3% e2e.
 2. `attn_scores/reduce_fast`: same procedure.
 3. Each lands as its own reviewed commit with before/after numbers in
    OPTIMIZATION-LOG; "no win" results recorded and the variant deleted.

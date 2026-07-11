@@ -958,6 +958,15 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
                             TQ2_0_BLOCK_BYTES
                         };
                     let mut scales = vec![half::f16::ZERO; nb];
+                    if n_rows * row_bytes > payload.len() {
+                        anyhow::bail!(
+                            "{}: payload {} B < {} rows x {} B (k % 256 != 0?)",
+                            info.name,
+                            payload.len(),
+                            n_rows,
+                            row_bytes
+                        );
+                    }
                     for r in 0..n_rows {
                         let row = &payload[r * row_bytes..(r + 1) * row_bytes];
                         let out = &mut trits[r * k..(r + 1) * k];
@@ -1003,7 +1012,10 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
     });
     let p = tot_z as f64 / tot as f64;
     let pnz = (1.0 - p) / 2.0;
-    let entropy = -(p * p.log2() + 2.0 * pnz * pnz.log2());
+    // x·log2(x) with the 0·log2(0)=0 convention — keeps the floor total at
+    // degenerate p (synthetic all-zero / no-zero fixtures).
+    let xlx = |x: f64| if x > 0.0 { x * x.log2() } else { 0.0 };
+    let entropy = -(xlx(p) + 2.0 * xlx(pnz));
 
     println!("ternary sparsity census — {}", model.display());
     println!(
@@ -1027,9 +1039,11 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
     println!("format math at this sparsity (bits/weight, lower = less weight traffic):");
     println!("  entropy floor        {entropy:.3}");
     println!("  TQ2_0 (current)      2.000  (+ scales)");
+    // TQ1_0's REAL payload rate: 48B qs @5 trits/byte + 4B qh @4 trits/byte
+    // per 256-trit block = 1.625 b/w (1.6875 stored, with the f16 scale).
     println!(
-        "  TQ1_0 (dense pack)   1.600  ({:.0}% of floor)",
-        1.6 / entropy * 100.0
+        "  TQ1_0 (dense pack)   1.625  ({:.0}% of floor; 1.688 with scales)",
+        1.625 / entropy * 100.0
     );
     println!(
         "  bitmap+signs         {:.3}  (1 + (1-p); sparsity-adaptive)",
