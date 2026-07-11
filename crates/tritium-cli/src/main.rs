@@ -142,6 +142,14 @@ enum Command {
 /// Benchmark/validation reports.
 #[derive(Subcommand, Debug)]
 enum ReportCommand {
+    /// Ternary weight sparsity census: element-zero %, all-zero-block %,
+    /// entropy bits/weight and projected traffic savings per tensor (Track A
+    /// ground truth — run per model, per checkpoint).
+    Sparsity {
+        /// Path to the `.gguf` model file (I2_S / TQ1_0 / TQ2_0 tensors).
+        #[arg(long)]
+        model: PathBuf,
+    },
     /// Decode-only throughput after prefill.
     Decode {
         /// Path to the `.gguf` model file.
@@ -290,6 +298,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Repack { input, output, to } => repack::run(&input, &output, to)?,
         Command::Report { report: command } => match command {
+            ReportCommand::Sparsity { model } => report::sparsity(&model)?,
             ReportCommand::Decode {
                 model,
                 tokens,

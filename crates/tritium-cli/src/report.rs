@@ -886,3 +886,158 @@ mod tests {
         assert!(table.contains("roofline_4090_pct"));
     }
 }
+
+/// `tritium report sparsity` — the Track-A ternary census: per-tensor
+/// element-zero fraction, all-zero-256-block fraction, and the model-level
+/// entropy/format math that decides which memory-access strategy pays
+/// (block-skip vs dense entropy packing vs bitmap+signs).
+pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
+    use tritium_core::Trit;
+    use tritium_format::{
+        GGML_TYPE_I2_S, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES,
+        unpack_i2s_tensor, unpack_tq1_0_row, unpack_tq2_0_row,
+    };
+    let bytes = std::fs::read(model).with_context(|| format!("read {}", model.display()))?;
+    let file = tritium_format::read_gguf(&bytes).context("parse gguf")?;
+    let data0 = file.tensor_data_offset as usize;
+
+    struct Row {
+        name: String,
+        n: u64,
+        zeros: u64,
+        zero_blocks: u64,
+        blocks: u64,
+    }
+    let ternary: Vec<_> = file
+        .tensors
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.ggml_type,
+                GGML_TYPE_I2_S | GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0
+            )
+        })
+        .collect();
+    if ternary.is_empty() {
+        bail!(
+            "no ternary tensors (I2_S/TQ1_0/TQ2_0) in {}",
+            model.display()
+        );
+    }
+
+    let rows: Vec<Row> = ternary
+        .par_iter()
+        .map(|info| -> anyhow::Result<Row> {
+            let k = info.dims.first().copied().unwrap_or(0) as usize;
+            let n_el: usize = info.dims.iter().product::<u64>() as usize;
+            let n_rows = if k == 0 { 0 } else { n_el / k };
+            let start = data0 + info.offset as usize;
+            // I2_S is a bitnet.cpp extension the generic reader sizes as 0 —
+            // compute its payload length (packed 2-bit body + f32 scale) the
+            // way the model loader does; TQ1/TQ2 are known types.
+            let len = if info.ggml_type == GGML_TYPE_I2_S {
+                n_el / 4 + tritium_format::I2S_SCALE_BYTES
+            } else {
+                info.n_bytes as usize
+            };
+            let payload = bytes
+                .get(start..start + len)
+                .context("tensor payload out of bounds")?;
+            let mut trits = vec![Trit::ZERO; n_el];
+            match info.ggml_type {
+                GGML_TYPE_I2_S => {
+                    unpack_i2s_tensor(payload, n_el, &mut trits)
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
+                }
+                t @ (GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0) => {
+                    let nb = k.div_ceil(256);
+                    let row_bytes = nb
+                        * if t == GGML_TYPE_TQ1_0 {
+                            TQ1_0_BLOCK_BYTES
+                        } else {
+                            TQ2_0_BLOCK_BYTES
+                        };
+                    let mut scales = vec![half::f16::ZERO; nb];
+                    for r in 0..n_rows {
+                        let row = &payload[r * row_bytes..(r + 1) * row_bytes];
+                        let out = &mut trits[r * k..(r + 1) * k];
+                        if t == GGML_TYPE_TQ1_0 {
+                            unpack_tq1_0_row(row, out, &mut scales)
+                        } else {
+                            unpack_tq2_0_row(row, out, &mut scales)
+                        }
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", info.name))?;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let zeros = trits.iter().filter(|t| t.get() == 0).count() as u64;
+            // Block stats on the SAME geometry the skip kernels use: 256-trit
+            // blocks along k, per row.
+            let (mut zero_blocks, mut blocks) = (0u64, 0u64);
+            for r in 0..n_rows {
+                for c in trits[r * k..(r + 1) * k].chunks(256) {
+                    blocks += 1;
+                    if c.iter().all(|t| t.get() == 0) {
+                        zero_blocks += 1;
+                    }
+                }
+            }
+            Ok(Row {
+                name: info.name.clone(),
+                n: n_el as u64,
+                zeros,
+                zero_blocks,
+                blocks,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    let (tot, tot_z, tot_zb, tot_b) = rows.iter().fold((0u64, 0u64, 0u64, 0u64), |a, r| {
+        (
+            a.0 + r.n,
+            a.1 + r.zeros,
+            a.2 + r.zero_blocks,
+            a.3 + r.blocks,
+        )
+    });
+    let p = tot_z as f64 / tot as f64;
+    let pnz = (1.0 - p) / 2.0;
+    let entropy = -(p * p.log2() + 2.0 * pnz * pnz.log2());
+
+    println!("ternary sparsity census — {}", model.display());
+    println!(
+        "{:<28} {:>12} {:>8} {:>10}",
+        "tensor", "elements", "zero%", "0-block%"
+    );
+    for r in &rows {
+        println!(
+            "{:<28} {:>12} {:>7.1}% {:>9.3}%",
+            r.name,
+            r.n,
+            r.zeros as f64 / r.n as f64 * 100.0,
+            r.zero_blocks as f64 / r.blocks.max(1) as f64 * 100.0,
+        );
+    }
+    println!(
+        "\nTOTAL: {tot} weights | element zeros {:.2}% | all-zero 256-blocks {:.3}% ({tot_zb}/{tot_b})",
+        p * 100.0,
+        tot_zb as f64 / tot_b.max(1) as f64 * 100.0,
+    );
+    println!("format math at this sparsity (bits/weight, lower = less weight traffic):");
+    println!("  entropy floor        {entropy:.3}");
+    println!("  TQ2_0 (current)      2.000  (+ scales)");
+    println!(
+        "  TQ1_0 (dense pack)   1.600  ({:.0}% of floor)",
+        1.6 / entropy * 100.0
+    );
+    println!(
+        "  bitmap+signs         {:.3}  (1 + (1-p); sparsity-adaptive)",
+        1.0 + (1.0 - p)
+    );
+    println!(
+        "  block-skip savings   {:.3}%  (all-zero-block fraction — what the _sparse kernels skip)",
+        tot_zb as f64 / tot_b.max(1) as f64 * 100.0
+    );
+    Ok(())
+}
