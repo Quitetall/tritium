@@ -278,6 +278,25 @@ impl ModelRunner {
             .map_err(ResidentOpError::Op)
     }
 
+    /// (cuda) Paged-KV batch pool (ADR 0025): page pools of `pool_pages`
+    /// pages shared by all `n` slots through per-slot page tables — KV VRAM
+    /// scales with the pool, not `n × max_ctx`. Callers must
+    /// [`tritium_cuda::BatchKv::reserve_pages`] before stepping/adopting into
+    /// a slot and [`tritium_cuda::BatchKv::release_pages`] at retirement.
+    ///
+    /// # Errors
+    /// [`ResidentOpError`] — `Op` with the device error.
+    #[cfg(feature = "cuda")]
+    pub fn new_batch_paged(
+        &mut self,
+        n: usize,
+        pool_pages: usize,
+    ) -> Result<tritium_cuda::BatchKv, ResidentOpError> {
+        self.resident_for_op()?
+            .new_batch_paged(n, pool_pages)
+            .map_err(ResidentOpError::Op)
+    }
+
     /// (cuda) Continuous-batching admission: copy this runner's single-sequence
     /// KV rows `[0, len)` into batch slot `row` (prefill the prompt through the
     /// single-sequence path first, then adopt + [`BatchKv::set_position`]).

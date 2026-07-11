@@ -17,7 +17,18 @@ impl CudaDecodeModel {
         v: bool,
     ) -> Result<Vec<u8>, BackendError> {
         let kw = self.kv_width;
-        let off = (row_slot * batch.max_ctx + row) * kw;
+        let off = match batch.pages.as_ref() {
+            None => (row_slot * batch.max_ctx + row) * kw,
+            Some(pg) => {
+                let page = pg.table[row_slot * pg.tstride + row / KV_PAGE_TOKENS];
+                if page < 0 {
+                    return Err(BackendError::InvalidInput(format!(
+                        "debug_batch_kv_row: slot {row_slot} token {row} unmapped"
+                    )));
+                }
+                (page as usize * KV_PAGE_TOKENS + row % KV_PAGE_TOKENS) * kw
+            }
+        };
         let arena = if v { &batch.kv_v[li] } else { &batch.kv_k[li] };
         let view = arena.slice(off..off + kw);
         let mut out = vec![0f32; kw];
@@ -89,25 +100,56 @@ impl CudaDecodeModel {
                 self.cache_len
             )));
         }
+        // Destination spans: ONE contiguous copy for the dense arena, or one
+        // copy per page for paged mode (ADR 0025) — (dst f32 offset, src f32
+        // offset, f32 count) triples, identical bytes either way.
+        let spans: Vec<(usize, usize, usize)> = match batch.pages.as_ref() {
+            None => vec![(row * batch.max_ctx * self.kv_width, 0, len * self.kv_width)],
+            Some(pg) => {
+                let mut v = Vec::new();
+                let mut done = 0usize;
+                while done < len {
+                    let page = pg.table[row * pg.tstride + done / KV_PAGE_TOKENS];
+                    if page < 0 {
+                        return Err(BackendError::InvalidInput(format!(
+                            "copy_kv_into_batch_row: token {done} has no reserved \
+                             page (reserve_pages before adopting)"
+                        )));
+                    }
+                    let take = (KV_PAGE_TOKENS).min(len - done);
+                    v.push((
+                        page as usize * KV_PAGE_TOKENS * self.kv_width,
+                        done * self.kv_width,
+                        take * self.kv_width,
+                    ));
+                    done += take;
+                }
+                v
+            }
+        };
         let s = &self.stream;
-        let bytes = len * self.kv_width * 4;
         for li in 0..self.layers.len() {
             for (src, dst) in [
                 (&self.kv_k[li], &mut batch.kv_k[li]),
                 (&self.kv_v[li], &mut batch.kv_v[li]),
             ] {
-                let (src_ptr, sg) = src.device_ptr(s);
-                let dst_off = row * batch.max_ctx * self.kv_width;
-                // f32 elements → byte pointer offset ×4.
+                let (src_base, sg) = src.device_ptr(s);
                 let (dst_base, dg) = dst.device_ptr(s);
-                let dst_ptr = dst_base + (dst_off * 4) as sys::CUdeviceptr;
-                // SAFETY: raw byte copy between live device allocations on this
-                // model's stream: src holds `len·kv_width` f32 rows from
-                // position 0 (single-seq arena, byte-typed) and dst is the
-                // slot's leading `len·kv_width` f32 span; sizes checked above.
-                #[allow(unsafe_code)]
-                unsafe { result::memcpy_dtod_async(dst_ptr, src_ptr, bytes, s.cu_stream()) }
+                for &(dst_off, src_off, count) in &spans {
+                    // f32 elements → byte pointer offset ×4.
+                    let dst_ptr = dst_base + (dst_off * 4) as sys::CUdeviceptr;
+                    let src_ptr = src_base + (src_off * 4) as sys::CUdeviceptr;
+                    // SAFETY: raw byte copy between live device allocations on
+                    // this model's stream: src holds the single-seq arena's
+                    // rows [src_off, src_off+count) and dst the slot's mapped
+                    // span (dense row or a reserved page); sizes checked above
+                    // and by the span construction.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        result::memcpy_dtod_async(dst_ptr, src_ptr, count * 4, s.cu_stream())
+                    }
                     .map_err(|e| driver_err("batch row adopt dtod", &e))?;
+                }
                 drop(sg);
                 drop(dg);
             }
@@ -127,6 +169,29 @@ impl CudaDecodeModel {
     /// # Errors
     /// [`BackendError`] on a device allocation failure.
     pub fn new_batch(&self, n: usize) -> Result<BatchKv, BackendError> {
+        self.build_batch(n, None)
+    }
+
+    /// Paged-KV sibling of [`new_batch`](Self::new_batch) (ADR 0025): instead
+    /// of dense `[n, max_ctx, kv_width]` arenas, each layer gets K/V page
+    /// POOLS of `pool_pages` pages (`KV_PAGE_TOKENS` tokens each) shared by
+    /// all slots through a per-slot page table. KV VRAM becomes
+    /// `pool_pages · KV_PAGE_TOKENS` tokens total instead of `n · max_ctx` —
+    /// the caller sizes the pool to the expected aggregate footprint and
+    /// [`BatchKv::reserve_pages`] admissions against it.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a zero-size pool or an allocation failure.
+    pub fn new_batch_paged(&self, n: usize, pool_pages: usize) -> Result<BatchKv, BackendError> {
+        if pool_pages == 0 {
+            return Err(BackendError::InvalidInput(
+                "new_batch_paged: pool_pages must be >= 1".into(),
+            ));
+        }
+        self.build_batch(n, Some(pool_pages))
+    }
+
+    fn build_batch(&self, n: usize, pool_pages: Option<usize>) -> Result<BatchKv, BackendError> {
         // v1: the batched graph builders (gb_*) are TQ2-only.
         if self.layers.first().is_some_and(|l| l.qkv.tq1) {
             return Err(BackendError::UnsupportedFormat(TernaryFormat::Tq1_0));
@@ -134,12 +199,35 @@ impl CudaDecodeModel {
         let s = &self.stream;
         let alloc =
             |k: usize, what: &str| s.alloc_zeros::<f32>(k).map_err(|e| driver_err(what, &e));
+        let kv_len = match pool_pages {
+            Some(p) => p * KV_PAGE_TOKENS * self.kv_width,
+            None => n * self.max_ctx * self.kv_width,
+        };
         let mut kv_k = Vec::with_capacity(self.layers.len());
         let mut kv_v = Vec::with_capacity(self.layers.len());
         for _ in 0..self.layers.len() {
-            kv_k.push(alloc(n * self.max_ctx * self.kv_width, "batch kv_k")?);
-            kv_v.push(alloc(n * self.max_ctx * self.kv_width, "batch kv_v")?);
+            kv_k.push(alloc(kv_len, "batch kv_k")?);
+            kv_v.push(alloc(kv_len, "batch kv_v")?);
         }
+        let pages = match pool_pages {
+            None => None,
+            Some(pp) => {
+                let tstride = self.max_ctx.div_ceil(KV_PAGE_TOKENS);
+                let table = vec![-1i32; n * tstride];
+                let mut d_table = s
+                    .alloc_zeros::<i32>(n * tstride)
+                    .map_err(|e| driver_err("batch d_table", &e))?;
+                s.memcpy_htod(&table, &mut d_table)
+                    .map_err(|e| driver_err("batch d_table init", &e))?;
+                Some(BatchPages {
+                    d_table,
+                    table,
+                    tstride,
+                    // Hand out low ids first (pop from the back).
+                    free: (0..pp as i32).rev().collect(),
+                })
+            }
+        };
         Ok(BatchKv {
             n,
             max_ctx: self.max_ctx,
@@ -147,6 +235,7 @@ impl CudaDecodeModel {
             kv_v,
             positions: vec![0; n],
             live: vec![true; n],
+            pages,
             d_tokens: s
                 .alloc_zeros::<i32>(n)
                 .map_err(|e| driver_err("batch d_tokens", &e))?,
@@ -221,6 +310,17 @@ impl CudaDecodeModel {
                 ));
             }
         }
+        // Paged (ADR 0025): every live row's write position must land on a
+        // reserved page — an unmapped (-1) entry inside a kernel is UB, so it
+        // is a loud host error instead (reserve_pages at admission).
+        for (r, (&p, &l)) in batch.positions.iter().zip(&batch.live).enumerate() {
+            if l && !batch.page_mapped(r, p) {
+                return Err(BackendError::InvalidInput(format!(
+                    "decode_batch: row {r} position {p} has no reserved page \
+                     (call reserve_pages before stepping)"
+                )));
+            }
+        }
         let s = &self.stream;
         let (n_embd, q_width, kv_width, n_ff) =
             (self.n_embd, self.q_width, self.kv_width, self.n_ff);
@@ -233,6 +333,10 @@ impl CudaDecodeModel {
             .map_err(|e| driver_err("batch tokens htod", &e))?;
         s.memcpy_htod(&pos_i, &mut batch.d_positions)
             .map_err(|e| driver_err("batch pos htod", &e))?;
+        if let Some(pg) = batch.pages.as_mut() {
+            s.memcpy_htod(&pg.table, &mut pg.d_table)
+                .map_err(|e| driver_err("batch table htod", &e))?;
+        }
 
         Self::bl_embed(
             s,
@@ -316,29 +420,41 @@ impl CudaDecodeModel {
                 head_dim,
                 n,
             )?;
+            let f_append = if batch.pages.is_some() {
+                &self.f_kv_append_mdecode_paged
+            } else {
+                &self.f_kv_append_mdecode
+            };
+            let f_partial = if batch.pages.is_some() {
+                &self.f_attn_split_partial_paged
+            } else {
+                &self.f_attn_split_partial
+            };
             Self::md_kv_append(
                 s,
-                &self.f_kv_append_mdecode,
+                f_append,
                 &batch.d_k,
                 &mut batch.kv_k[li],
                 &batch.d_positions,
+                batch.pages.as_ref().map(|g| (&g.d_table, g.tstride as i32)),
                 max_ctx,
                 kv_width,
                 n,
             )?;
             Self::md_kv_append(
                 s,
-                &self.f_kv_append_mdecode,
+                f_append,
                 &batch.d_v,
                 &mut batch.kv_v[li],
                 &batch.d_positions,
+                batch.pages.as_ref().map(|g| (&g.d_table, g.tstride as i32)),
                 max_ctx,
                 kv_width,
                 n,
             )?;
             Self::md_attn(
                 s,
-                &self.f_attn_split_partial,
+                f_partial,
                 &self.f_attn_combine,
                 &batch.d_q,
                 &batch.kv_k[li],
@@ -346,6 +462,7 @@ impl CudaDecodeModel {
                 &mut batch.d_attn,
                 &mut batch.d_attn_partials,
                 &batch.d_positions,
+                batch.pages.as_ref().map(|g| (&g.d_table, g.tstride as i32)),
                 max_ctx,
                 n_head,
                 n_head_kv,
@@ -515,6 +632,8 @@ impl CudaDecodeModel {
         Ok(out)
     }
 
+    /// `paged`: `(d_table, tstride)` selects the ADR 0025 paged twin (then
+    /// `kv_base` is the page pool and `max_ctx` is unused).
     #[allow(clippy::too_many_arguments)]
     fn md_kv_append(
         s: &Arc<CudaStream>,
@@ -522,6 +641,7 @@ impl CudaDecodeModel {
         src: &CudaSlice<f32>,
         kv_base: &mut CudaSlice<f32>,
         positions: &CudaSlice<i32>,
+        paged: Option<(&CudaSlice<i32>, i32)>,
         max_ctx: usize,
         kv_width: usize,
         n: usize,
@@ -533,13 +653,18 @@ impl CudaDecodeModel {
             shared_mem_bytes: 0,
         };
         let mut l = s.launch_builder(f);
-        l.arg(src)
-            .arg(kv_base)
-            .arg(positions)
-            .arg(&mc_i)
-            .arg(&kw_i)
-            .arg(&n_i);
-        // SAFETY: `kv_append_mdecode_f32(const float* src, float* kv_base, const int* pos, int max_ctx, int kv_width, int n)`.
+        l.arg(src).arg(kv_base).arg(positions);
+        let ts_i;
+        if let Some((table, tstride)) = paged {
+            ts_i = tstride;
+            l.arg(table).arg(&ts_i);
+        } else {
+            l.arg(&mc_i);
+        }
+        l.arg(&kw_i).arg(&n_i);
+        // SAFETY: matches `kv_append_mdecode_f32(src, kv_base, pos, max_ctx, kv_width, n)`
+        // or `kv_append_mdecode_paged_f32(src, pool, pos, table, tstride, kv_width, n)` —
+        // the caller pairs `f` with the matching `paged` argument.
         #[allow(unsafe_code)]
         unsafe {
             l.launch(cfg)
@@ -548,6 +673,8 @@ impl CudaDecodeModel {
         Ok(())
     }
 
+    /// `paged`: `(d_table, tstride)` selects the ADR 0025 paged partial twin
+    /// (then `k`/`v` are the page pools; the combine never touches KV).
     #[allow(clippy::too_many_arguments)]
     fn md_attn(
         s: &Arc<CudaStream>,
@@ -559,6 +686,7 @@ impl CudaDecodeModel {
         out: &mut CudaSlice<f32>,
         partials: &mut CudaSlice<f32>,
         positions: &CudaSlice<i32>,
+        paged: Option<(&CudaSlice<i32>, i32)>,
         max_ctx: usize,
         n_head: usize,
         n_head_kv: usize,
@@ -584,13 +712,15 @@ impl CudaDecodeModel {
                 shared_mem_bytes: 0,
             };
             let mut l = s.launch_builder(f_partial);
-            l.arg(q)
-                .arg(k)
-                .arg(v)
-                .arg(&mut *partials)
-                .arg(positions)
-                .arg(&mc_i)
-                .arg(&nh_i)
+            l.arg(q).arg(k).arg(v).arg(&mut *partials).arg(positions);
+            let ts_i;
+            if let Some((table, tstride)) = paged {
+                ts_i = tstride;
+                l.arg(table).arg(&ts_i);
+            } else {
+                l.arg(&mc_i);
+            }
+            l.arg(&nh_i)
                 .arg(&nhkv_i)
                 .arg(&hd_i)
                 .arg(&scale)
@@ -598,8 +728,10 @@ impl CudaDecodeModel {
                 .arg(&ns_i)
                 .arg(&ck_i);
             // SAFETY: matches `gqa_attention_split_partial_f32(q, k, v, partials, positions,
-            // max_ctx, n_head, n_head_kv, head_dim, scale, n, n_split, chunk)`; only `partials`
-            // mutable; partials is `n·n_head·n_split·(head_dim+2)`; grid covers n·n_head·n_split warps.
+            // max_ctx, n_head, n_head_kv, head_dim, scale, n, n_split, chunk)` or the paged
+            // twin `(..., positions, table, tstride, n_head, ...)` — the caller pairs
+            // `f_partial` with the matching `paged` argument. Only `partials` mutable;
+            // partials is `n·n_head·n_split·(head_dim+2)`; grid covers n·n_head·n_split warps.
             #[allow(unsafe_code)]
             unsafe {
                 l.launch(cfg)
@@ -672,6 +804,17 @@ impl CudaDecodeModel {
                 ));
             }
         }
+        // Paged (ADR 0025): every live row's write position must land on a
+        // reserved page — an unmapped (-1) entry inside a kernel is UB, so it
+        // is a loud host error instead (reserve_pages at admission).
+        for (r, (&p, &l)) in batch.positions.iter().zip(&batch.live).enumerate() {
+            if l && !batch.page_mapped(r, p) {
+                return Err(BackendError::InvalidInput(format!(
+                    "decode_batch_graph: row {r} position {p} has no reserved page \
+                     (call reserve_pages before stepping)"
+                )));
+            }
+        }
 
         // Lazily load the raw batch kernels, then capture this batch's graph (per-N).
         if self.batch_raw.is_none() {
@@ -703,6 +846,11 @@ impl CudaDecodeModel {
         self.cap_stream
             .memcpy_htod(&pos_i, &mut batch.d_positions)
             .map_err(|e| driver_err("batch graph pos htod", &e))?;
+        if let Some(pg) = batch.pages.as_mut() {
+            self.cap_stream
+                .memcpy_htod(&pg.table, &mut pg.d_table)
+                .map_err(|e| driver_err("batch graph table htod", &e))?;
+        }
         batch
             .graph
             .as_ref()
@@ -785,6 +933,17 @@ impl CudaDecodeModel {
                 ));
             }
         }
+        // Paged (ADR 0025): every live row's write position must land on a
+        // reserved page — an unmapped (-1) entry inside a kernel is UB, so it
+        // is a loud host error instead (reserve_pages at admission).
+        for (r, (&p, &l)) in batch.positions.iter().zip(&batch.live).enumerate() {
+            if l && !batch.page_mapped(r, p) {
+                return Err(BackendError::InvalidInput(format!(
+                    "decode_batch_graph_argmax: row {r} position {p} has no reserved page \
+                     (call reserve_pages before stepping)"
+                )));
+            }
+        }
 
         if self.batch_raw.is_none() {
             let ctx = self.cap_stream.context().clone();
@@ -808,6 +967,11 @@ impl CudaDecodeModel {
         self.cap_stream
             .memcpy_htod(&pos_i, &mut batch.d_positions)
             .map_err(|e| driver_err("batch argmax pos htod", &e))?;
+        if let Some(pg) = batch.pages.as_mut() {
+            self.cap_stream
+                .memcpy_htod(&pg.table, &mut pg.d_table)
+                .map_err(|e| driver_err("batch argmax table htod", &e))?;
+        }
         batch
             .graph_argmax
             .as_ref()
@@ -900,6 +1064,10 @@ impl CudaDecodeModel {
             d_token_embd_f16: dptr(&self.d_token_embd_f16, s),
             d_logits_batch: dptr(&batch.d_logits_batch, s),
             d_argmax: dptr(&batch.d_argmax, s),
+            paged: batch
+                .pages
+                .as_ref()
+                .map(|pg| (dptr(&pg.d_table, s), pg.tstride as i32)),
         };
         // Drain the events the device_ptr extraction recorded, so the capture (raw
         // launches only) carries no pre-capture dependency.
@@ -965,8 +1133,8 @@ impl CudaDecodeModel {
             head_dim,
             n,
         )?;
-        self.gb_kv_append(p.d_k, l.kv_k, p.d_positions, kv_width, n)?;
-        self.gb_kv_append(p.d_v, l.kv_v, p.d_positions, kv_width, n)?;
+        self.gb_kv_append(p.d_k, l.kv_k, p.d_positions, p.paged, kv_width, n)?;
+        self.gb_kv_append(p.d_v, l.kv_v, p.d_positions, p.paged, kv_width, n)?;
         self.gb_attn(
             p.d_q,
             l.kv_k,
@@ -974,6 +1142,7 @@ impl CudaDecodeModel {
             p.d_attn,
             p.d_attn_partials,
             p.d_positions,
+            p.paged,
             n,
         )?;
         let attn_in = if let Some(sn) = l.attn_sub_norm {
@@ -1151,27 +1320,44 @@ impl CudaDecodeModel {
         src: sys::CUdeviceptr,
         kv_base: sys::CUdeviceptr,
         positions: sys::CUdeviceptr,
+        paged: Option<(sys::CUdeviceptr, i32)>,
         kv_width: usize,
         n: usize,
     ) -> Result<(), BackendError> {
         let (mc_i, kw_i, n_i) = (self.max_ctx as i32, kv_width as i32, n as i32);
         let grid = (((n * kv_width) as u32).div_ceil(256), 1, 1);
-        let mut params = [
-            pp(&src),
-            pp(&kv_base),
-            pp(&positions),
-            pp(&mc_i),
-            pp(&kw_i),
-            pp(&n_i),
-        ];
-        raw_launch(
-            self.batch_raw().kv_append,
-            grid,
-            (256, 1, 1),
-            0,
-            self.cap_stream.cu_stream(),
-            &mut params,
-        )
+        let cs = self.cap_stream.cu_stream();
+        // SAFETY (both arms): params match the launched kernel's signature
+        // one-to-one; only kv_base is written; grid covers n·kv_width threads.
+        if let Some((table, tstride)) = paged {
+            let mut params = [
+                pp(&src),
+                pp(&kv_base),
+                pp(&positions),
+                pp(&table),
+                pp(&tstride),
+                pp(&kw_i),
+                pp(&n_i),
+            ];
+            raw_launch(
+                self.batch_raw().kv_append_paged,
+                grid,
+                (256, 1, 1),
+                0,
+                cs,
+                &mut params,
+            )
+        } else {
+            let mut params = [
+                pp(&src),
+                pp(&kv_base),
+                pp(&positions),
+                pp(&mc_i),
+                pp(&kw_i),
+                pp(&n_i),
+            ];
+            raw_launch(self.batch_raw().kv_append, grid, (256, 1, 1), 0, cs, &mut params)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1183,6 +1369,7 @@ impl CudaDecodeModel {
         out: sys::CUdeviceptr,
         partials: sys::CUdeviceptr,
         positions: sys::CUdeviceptr,
+        paged: Option<(sys::CUdeviceptr, i32)>,
         n: usize,
     ) -> Result<(), BackendError> {
         let n_split = self.max_ctx.div_ceil(ATTN_SPLIT_CHUNK);
@@ -1199,29 +1386,58 @@ impl CudaDecodeModel {
         let cs = self.cap_stream.cu_stream();
         {
             let grid = ((n * self.n_head * n_split) as u32, 1, 1);
-            let mut params = [
-                pp(&q),
-                pp(&k),
-                pp(&v),
-                pp(&partials),
-                pp(&positions),
-                pp(&mc_i),
-                pp(&nh_i),
-                pp(&nhkv_i),
-                pp(&hd_i),
-                pp(&scale),
-                pp(&n_i),
-                pp(&ns_i),
-                pp(&ck_i),
-            ];
-            raw_launch(
-                self.batch_raw().attn_split_partial,
-                grid,
-                (32, 1, 1),
-                0,
-                cs,
-                &mut params,
-            )?;
+            // SAFETY (both arms): params match the launched kernel's
+            // signature one-to-one; only partials is written.
+            if let Some((table, tstride)) = paged {
+                let mut params = [
+                    pp(&q),
+                    pp(&k),
+                    pp(&v),
+                    pp(&partials),
+                    pp(&positions),
+                    pp(&table),
+                    pp(&tstride),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&scale),
+                    pp(&n_i),
+                    pp(&ns_i),
+                    pp(&ck_i),
+                ];
+                raw_launch(
+                    self.batch_raw().attn_split_partial_paged,
+                    grid,
+                    (32, 1, 1),
+                    0,
+                    cs,
+                    &mut params,
+                )?;
+            } else {
+                let mut params = [
+                    pp(&q),
+                    pp(&k),
+                    pp(&v),
+                    pp(&partials),
+                    pp(&positions),
+                    pp(&mc_i),
+                    pp(&nh_i),
+                    pp(&nhkv_i),
+                    pp(&hd_i),
+                    pp(&scale),
+                    pp(&n_i),
+                    pp(&ns_i),
+                    pp(&ck_i),
+                ];
+                raw_launch(
+                    self.batch_raw().attn_split_partial,
+                    grid,
+                    (32, 1, 1),
+                    0,
+                    cs,
+                    &mut params,
+                )?;
+            }
         }
         {
             let grid = ((n * self.n_head) as u32, 1, 1);

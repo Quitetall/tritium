@@ -166,6 +166,14 @@ pub(super) const KERNEL_NAME_ATTN_BATCH: &str = "gqa_attention_batch_f32";
 /// (a loaded-but-never-launched dense-indexed fallback would have silently
 /// bypassed paging).
 pub(super) const KERNEL_NAME_KV_APPEND_MDECODE: &str = "kv_append_mdecode_f32";
+/// ADR 0025 paged-KV twins: kv pools + per-slot page table instead of the
+/// dense `[n, max_ctx, kv_width]` arenas.
+pub(super) const KERNEL_NAME_KV_APPEND_MDECODE_PAGED: &str = "kv_append_mdecode_paged_f32";
+pub(super) const KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED: &str =
+    "gqa_attention_split_partial_paged_f32";
+/// Tokens per KV page (ADR 0025). MUST equal decode.cu's KV_PAGE_TOKENS —
+/// the paged==dense bit-equality gate breaks instantly on a mismatch.
+pub(super) const KV_PAGE_TOKENS: usize = 256;
 
 /// v0.3.8 on-device sampling for the batched decode graph.
 pub(super) const KERNEL_NAME_LM_HEAD_TILED_F16: &str = "lm_head_tiled_f16";

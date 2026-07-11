@@ -562,6 +562,119 @@ fn cuda_batch_dead_row_touches_nothing() {
     );
 }
 
+/// C3 paged KV (ADR 0025): a paged batch must be **bit-identical** to a dense
+/// batch fed the same requests — paging changes addresses, never values or
+/// reduction order. Exercised: prompt adoption through the per-page copy,
+/// lockstep graph steps, a dead row (C2 composes: it owns no pages), a
+/// retire + re-admit cycle whose pages come back through the free list
+/// (reuse over stale bytes — never read, positions restart), and loud
+/// rejection on pool exhaustion and on stepping an unmapped position.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_batch_paged_matches_dense_bit_exact() {
+    let _gpu = gpu_serial();
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+    const N: usize = 3;
+    const POOL_PAGES: usize = 2; // deliberately tight: forces reuse + exhaustion
+    let prompt = reference.token_ids.clone();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    let toks: [u32; 4] = [128000, 791, 6864, 315];
+
+    // One single-seq prefill; adopt the SAME KV into row 0 of both batches.
+    runner.forward(&prompt, &positions).expect("prefill");
+    let mut dense = runner.new_batch(N).expect("new_batch dense");
+    let mut paged = runner
+        .new_batch_paged(N, POOL_PAGES)
+        .expect("new_batch_paged");
+    assert!(paged.paged() && !dense.paged());
+
+    // Exhaustion is loud: 3 pages from a 2-page pool must fail all-or-nothing.
+    assert!(
+        paged.reserve_pages(0, 2 * 256 + 1).is_err(),
+        "exhaustion must reject"
+    );
+    assert_eq!(paged.free_pages(), POOL_PAGES, "failed reserve must not leak");
+    // Stepping an unmapped live row is loud, not UB.
+    assert!(
+        runner.decode_batch_graph(&mut paged, &[toks[0]; N]).is_err(),
+        "unmapped position must be rejected"
+    );
+
+    paged.reserve_pages(0, prompt.len() + toks.len()).expect("reserve row0");
+    paged.reserve_pages(2, toks.len()).expect("reserve row2");
+    for b in [&mut dense, &mut paged] {
+        b.set_live(1, false).expect("dead row");
+    }
+    runner
+        .adopt_into_batch_row(&mut dense, 0, prompt.len())
+        .expect("adopt dense");
+    runner
+        .adopt_into_batch_row(&mut paged, 0, prompt.len())
+        .expect("adopt paged");
+    for b in [&mut dense, &mut paged] {
+        b.set_position(0, prompt.len()).expect("pos row0");
+    }
+
+    let step_both = |runner: &mut tritium_nn::ModelRunner,
+                     dense: &mut tritium_cuda::BatchKv,
+                     paged: &mut tritium_cuda::BatchKv,
+                     t: u32,
+                     tag: &str| {
+        let want = runner
+            .decode_batch_graph(dense, &[t, 0, t])
+            .expect("dense step");
+        let got = runner
+            .decode_batch_graph(paged, &[t, 0, t])
+            .expect("paged step");
+        for r in [0usize, 2] {
+            for v in 0..want[r].len() {
+                assert_eq!(
+                    got[r][v].to_bits(),
+                    want[r][v].to_bits(),
+                    "paged != dense at {tag} row {r} vocab {v}"
+                );
+            }
+        }
+    };
+    for (i, &t) in toks.iter().enumerate() {
+        step_both(&mut runner, &mut dense, &mut paged, t, &format!("step {i}"));
+    }
+
+    // Retire row 0: pages return to the pool; both twins go dead.
+    paged.release_pages(0).expect("release");
+    assert_eq!(paged.free_pages(), 1, "row0's page must come back");
+    for b in [&mut dense, &mut paged] {
+        b.set_live(0, false).expect("retire");
+    }
+    step_both(&mut runner, &mut dense, &mut paged, toks[0], "retired step");
+
+    // Re-admit row 0 fresh at position 0: the reservation REUSES the freed
+    // page (stale bytes are never read — the first step appends before it
+    // attends). Dense mirrors with its own stale arena.
+    paged.reserve_pages(0, toks.len()).expect("re-reserve");
+    assert_eq!(paged.free_pages(), 0);
+    for b in [&mut dense, &mut paged] {
+        b.set_position(0, 0).expect("restart");
+        b.set_live(0, true).expect("revive");
+    }
+    for (i, &t) in toks.iter().enumerate() {
+        step_both(&mut runner, &mut dense, &mut paged, t, &format!("re-admit step {i}"));
+    }
+
+    drop(dense);
+    drop(paged);
+    println!(
+        "paged-KV gate: bit-identical to dense through adoption, {} steps, \
+         retire/re-admit page reuse, dead row; exhaustion + unmapped-step loud",
+        toks.len() * 2 + 1
+    );
+}
+
 /// The on-device-sampling M=N graph (`decode_batch_graph_argmax`) folds the LM head + a
 /// greedy argmax into the captured graph and returns N token ids (N·4 bytes) instead of N
 /// full logit vectors (the 33 MB/step readback). Its per-row token must equal the host

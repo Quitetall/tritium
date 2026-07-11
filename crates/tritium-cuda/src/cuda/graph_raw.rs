@@ -277,6 +277,9 @@ pub(super) struct BatchRawKernels {
     pub(super) rope: sys::CUfunction,
     pub(super) kv_append: sys::CUfunction,
     pub(super) attn_split_partial: sys::CUfunction,
+    /// ADR 0025 paged twins (page-pool kv + per-slot page table).
+    pub(super) kv_append_paged: sys::CUfunction,
+    pub(super) attn_split_partial_paged: sys::CUfunction,
     pub(super) attn_combine: sys::CUfunction,
     pub(super) residual: sys::CUfunction,
     pub(super) relu2: sys::CUfunction,
@@ -335,6 +338,8 @@ impl BatchRawKernels {
             rope: get(dm, KERNEL_NAME_ROPE_BATCH)?,
             kv_append: get(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,
             attn_split_partial: get(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL)?,
+            kv_append_paged: get(dm, KERNEL_NAME_KV_APPEND_MDECODE_PAGED)?,
+            attn_split_partial_paged: get(dm, KERNEL_NAME_ATTN_SPLIT_PARTIAL_PAGED)?,
             attn_combine: get(dm, KERNEL_NAME_ATTN_COMBINE)?,
             residual: get(dm, KERNEL_NAME_RESIDUAL)?,
             relu2: get(dm, KERNEL_NAME_RELU2_GATE)?,
@@ -410,12 +415,37 @@ pub(super) struct BatchPtrs {
     pub(super) d_token_embd_f16: sys::CUdeviceptr,
     pub(super) d_logits_batch: sys::CUdeviceptr,
     pub(super) d_argmax: sys::CUdeviceptr,
+    /// Paged KV (ADR 0025): `(d_table, tstride)`; `None` = dense. The table
+    /// POINTER is baked into the capture; its CONTENT is per-step data.
+    pub(super) paged: Option<(sys::CUdeviceptr, i32)>,
+}
+
+/// Paged-KV state (ADR 0025): per-slot page table + host free-list allocator.
+/// One page id spans the SAME index in every layer's K and V pool (mirroring
+/// how a dense row is the same offset in every layer's arena), so one table
+/// and one free list serve the whole model.
+pub(super) struct BatchPages {
+    /// Device page table `[n, tstride]` i32; `-1` = unmapped (touching one
+    /// from a kernel is a host-allocator bug, not a fallback).
+    pub(super) d_table: CudaSlice<i32>,
+    /// Host mirror of the table, uploaded each step next to `d_positions`.
+    pub(super) table: Vec<i32>,
+    /// Table columns per slot (= `ceil(max_ctx / KV_PAGE_TOKENS)`).
+    pub(super) tstride: usize,
+    /// Free page ids (pool_pages total at build).
+    pub(super) free: Vec<i32>,
 }
 
 /// State for batched M=N decode of `n` concurrent sequences (v0.3.7): per-sequence KV
 /// arenas + the M=N forward scratch. Built by [`CudaDecodeModel::new_batch`] and advanced
 /// by [`CudaDecodeModel::decode_batch`]. Each sequence has its own KV slice
 /// (`kv_k[layer]` is `[n, max_ctx, kv_width]`) and its own [`positions`](Self::positions).
+///
+/// **Paged mode** (ADR 0025, [`CudaDecodeModel::new_batch_paged`]): `kv_k[layer]` /
+/// `kv_v[layer]` are instead page POOLS `[pool_pages, KV_PAGE_TOKENS, kv_width]` shared
+/// by all slots, and `pages` maps each slot's logical tokens onto them. The caller must
+/// [`reserve_pages`](Self::reserve_pages) before stepping/adopting into a slot and
+/// [`release_pages`](Self::release_pages) at retirement.
 #[allow(missing_debug_implementations)]
 pub struct BatchKv {
     pub(super) n: usize,
@@ -430,6 +460,8 @@ pub struct BatchKv {
     /// bytes — the paged-KV contract) and its attention output is zeros.
     /// Defaults to all-live, which reproduces the pre-C2 behavior exactly.
     pub(super) live: Vec<bool>,
+    /// Paged-KV state (ADR 0025); `None` = dense arenas (the default).
+    pub(super) pages: Option<BatchPages>,
     pub(super) d_tokens: CudaSlice<i32>,
     pub(super) d_positions: CudaSlice<i32>,
     pub(super) d_x: CudaSlice<f32>,
@@ -559,5 +591,94 @@ impl BatchKv {
                 *p += 1;
             }
         }
+    }
+
+    /// True when this batch runs paged KV (ADR 0025).
+    #[must_use]
+    pub fn paged(&self) -> bool {
+        self.pages.is_some()
+    }
+
+    /// Dense batches are always "mapped"; paged ones require `pos`'s page in
+    /// `row`'s table (reservation is prefix-contiguous, so mapping of page
+    /// `pos / KV_PAGE_TOKENS` implies every earlier page is mapped too).
+    pub(super) fn page_mapped(&self, row: usize, pos: usize) -> bool {
+        self.pages.as_ref().is_none_or(|pg| {
+            pg.table[row * pg.tstride + pos / KV_PAGE_TOKENS] >= 0
+        })
+    }
+
+    /// Free pages remaining in the pool (0 when dense).
+    #[must_use]
+    pub fn free_pages(&self) -> usize {
+        self.pages.as_ref().map_or(0, |p| p.free.len())
+    }
+
+    /// Reserve enough pages for `row` to hold `tokens` logical tokens
+    /// (admission: `prompt_len + max_new` — the v1 no-eviction policy means
+    /// a reservation can never be outgrown mid-decode). Idempotent upward:
+    /// only the delta beyond already-mapped pages is drawn from the pool; on
+    /// exhaustion NOTHING is drawn (all-or-nothing) and the caller queues.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on a bad row, `tokens` beyond max_ctx,
+    /// a dense batch, or pool exhaustion.
+    pub fn reserve_pages(&mut self, row: usize, tokens: usize) -> Result<(), BackendError> {
+        if row >= self.n {
+            return Err(BackendError::InvalidInput(format!(
+                "reserve_pages: row {row} >= batch n {}",
+                self.n
+            )));
+        }
+        if tokens > self.max_ctx {
+            return Err(BackendError::InvalidInput(format!(
+                "reserve_pages: {tokens} tokens > max_ctx {}",
+                self.max_ctx
+            )));
+        }
+        let Some(pg) = self.pages.as_mut() else {
+            return Err(BackendError::InvalidInput(
+                "reserve_pages: dense batch (build with new_batch_paged)".into(),
+            ));
+        };
+        let need = tokens.div_ceil(KV_PAGE_TOKENS);
+        let trow = &mut pg.table[row * pg.tstride..row * pg.tstride + pg.tstride];
+        let held = trow.iter().take_while(|&&e| e >= 0).count();
+        let delta = need.saturating_sub(held);
+        if delta > pg.free.len() {
+            return Err(BackendError::InvalidInput(format!(
+                "reserve_pages: pool exhausted (need {delta} more pages, {} free)",
+                pg.free.len()
+            )));
+        }
+        for slot in trow.iter_mut().skip(held).take(delta) {
+            *slot = pg.free.pop().expect("checked above");
+        }
+        Ok(())
+    }
+
+    /// Return all of `row`'s pages to the pool (retirement) and unmap them.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on a bad row or a dense batch.
+    pub fn release_pages(&mut self, row: usize) -> Result<(), BackendError> {
+        if row >= self.n {
+            return Err(BackendError::InvalidInput(format!(
+                "release_pages: row {row} >= batch n {}",
+                self.n
+            )));
+        }
+        let Some(pg) = self.pages.as_mut() else {
+            return Err(BackendError::InvalidInput(
+                "release_pages: dense batch".into(),
+            ));
+        };
+        for e in &mut pg.table[row * pg.tstride..row * pg.tstride + pg.tstride] {
+            if *e >= 0 {
+                pg.free.push(*e);
+                *e = -1;
+            }
+        }
+        Ok(())
     }
 }
