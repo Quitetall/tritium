@@ -104,8 +104,6 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
                 .collect()
         })
         .collect();
-    let max_new = 24usize;
-
     // G1 — short-horizon token equality vs single-sequence greedy (the
     // acceptance-gate contract: same tokens over a modest horizon).
     let short = 10usize;
@@ -210,6 +208,171 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
         );
         assert!(!a[i].is_empty(), "stream {i} empty");
     }
+}
+
+/// Spawn a streaming chat request; each emitted token's arrival time is pushed
+/// into the returned shared vec (live — the caller polls it mid-stream). SSE
+/// events may split across body frames, so a rolling buffer reassembles them.
+fn spawn_stream(
+    router: &Router,
+    ids: &str,
+    max_tokens: usize,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+) {
+    let body = serde_json::json!({
+        "model": "tritium",
+        "max_tokens": max_tokens,
+        "stream": true,
+        "messages": [{"role": "user", "content": ids}],
+    });
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let router = router.clone();
+    let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = times.clone();
+    let handle = tokio::spawn(async move {
+        let resp = router.oneshot(req).await.expect("send");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let mut buf = String::new();
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else { break };
+            let Some(data) = frame.data_ref() else {
+                continue;
+            };
+            buf.push_str(&String::from_utf8_lossy(data));
+            while let Some(pos) = buf.find("\n\n") {
+                let event: String = buf.drain(..pos + 2).collect();
+                let Some(json_str) = event.trim().strip_prefix("data: ") else {
+                    continue;
+                };
+                if json_str.trim() == "[DONE]" {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+                    continue;
+                };
+                if v["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty())
+                {
+                    sink.lock().expect("times lock").push(std::time::Instant::now());
+                }
+            }
+        }
+    });
+    (handle, times)
+}
+
+/// C1 gate — chunked prefill keeps live slots streaming during admission.
+///
+/// A short request (A) decodes steadily in one slot; then a 2048-token-prompt
+/// request (B) is admitted into the other. With monolithic admission A stalls
+/// for B's entire prefill (~0–1 tokens in that window); with chunked prefill
+/// A gets a decode step between every chunk (~prompt/chunk tokens). The gate
+/// asserts the interleaving structurally (≥4 A-tokens inside B's admission
+/// window) and prints A's max inter-token gap for the log. Set
+/// `TRITIUM_PREFILL_CHUNK` huge to reproduce the "before" behavior.
+#[tokio::test(flavor = "multi_thread")]
+async fn cuda_batched_admission_interleaves_live_slot() {
+    if !Path::new(GGUF_PATH).exists() {
+        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let Some(runner) = load_runner(&bytes) else {
+        return;
+    };
+    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+    let cfg = ServeConfig {
+        model_id: "tritium".into(),
+        queue_cap: 8,
+        max_new_default: 256,
+        ..ServeConfig::default()
+    };
+    let (router, _draining) =
+        build_router_batched(runner, u32::MAX, 2, tok, cfg).expect("batched router");
+
+    let join_ids = |n: usize| {
+        base.iter()
+            .cycle()
+            .take(n)
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // Warm: graph capture + first prefill paths off the clock.
+    let _ = chat(&router, &join_ids(8), 2).await;
+
+    // A: short prompt, long budget — must outlive B's admission.
+    let (a_handle, a_times) = spawn_stream(&router, &join_ids(16), 256);
+    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while a_times.lock().expect("lock").len() < 4 {
+        assert!(
+            std::time::Instant::now() < wait_deadline,
+            "A never started streaming"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // B: 2048-token prompt into the free slot.
+    let t_submit = std::time::Instant::now();
+    let (b_handle, b_times) = spawn_stream(&router, &join_ids(2048), 4);
+    let b_first = loop {
+        if let Some(&t) = b_times.lock().expect("lock").first() {
+            break t;
+        }
+        assert!(
+            std::time::Instant::now() < wait_deadline,
+            "B never produced a token"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+
+    // A tokens that landed inside B's admission window, and A's max gap there.
+    let a_snapshot: Vec<std::time::Instant> = a_times.lock().expect("lock").clone();
+    let in_window: Vec<std::time::Instant> = a_snapshot
+        .iter()
+        .copied()
+        .filter(|&t| t > t_submit && t < b_first)
+        .collect();
+    let mut max_gap = std::time::Duration::ZERO;
+    let mut prev = t_submit;
+    for &t in &in_window {
+        max_gap = max_gap.max(t - prev);
+        prev = t;
+    }
+    max_gap = max_gap.max(b_first - prev);
+    println!(
+        "C1: B admission {:?} (2048-token prompt); A tokens inside the window: {}; \
+         A max inter-token gap in window: {:?}",
+        b_first - t_submit,
+        in_window.len(),
+        max_gap,
+    );
+    assert!(
+        in_window.len() >= 4,
+        "C1: live slot starved during admission — {} tokens in a {:?} window \
+         (monolithic-prefill behavior)",
+        in_window.len(),
+        b_first - t_submit,
+    );
+
+    a_handle.abort(); // measurement done; disconnecting A also exercises retire-on-close
+    let _ = b_handle.await;
 }
 
 /// Throughput bench (run explicitly): aggregate tok/s of N concurrent

@@ -844,3 +844,39 @@ scan for sign addressing. At M=1 the GEMM is not DRAM-bound ENOUGH (round-8:
   decode (amortize ALU across the warp) — not attempted; the ceiling (~4% e2e)
   does not justify it. The REAL sparsity speed play remains ADR 0024's 2:4
   tensor cores in the compute-bound regimes.
+
+## v1.x round 17 — Track C1: chunked prefill unstalls live slots at admission (2026-07-11)
+
+Batching P2 step 1. Phase-1 admission ran the whole prompt through one
+monolithic single-sequence prefill, stalling every live slot for the prompt's
+full prefill time. Now admission parks the request as the ONE in-flight
+`Pending` and prefills it in fixed chunks (`TRITIUM_PREFILL_CHUNK`, default
+128) interleaved with the lockstep decode steps — serve/batch.rs state machine
+only, zero kernel changes. Bit-exact by construction: `prefill` is documented
+bit-identical per row to the sequential step loop, so chunking it cannot
+change the KV or the admission logits (G1's first-token bit-guarantee holds
+verbatim).
+
+**Measured (gate `cuda_batched_admission_interleaves_live_slot`: slot A
+decoding, slot B admitted with a 2048-token prompt; 4090, CONTENDED — game +
+llama-server co-resident):**
+
+| admission mode | A tokens in B's window | A max inter-token gap | B admission |
+|---|---|---|---|
+| monolithic (`TRITIUM_PREFILL_CHUNK=1000000`) | 1 | **3.59 s** | 3.60 s |
+| chunked 128 (default) | 16 | **458 ms** | 4.51 s |
+
+Worst-case live-slot stall −7.8×; the admission itself pays ~25% more
+wall-clock (the 16 interleaved decode steps ARE the live slots' tokens — the
+deliberate trade). The gap bound scales with chunk size; 128 ≈ one ~225 ms
+chunk-prefill + one batch step + SSE jitter on this contended box.
+
+Gates: G1/G2 unchanged-green (first tokens bit-equal, determinism across
+reversed admission order); contract 25/25. `cuda_spec_sampled_topk1` OOM'd at
+model load (16.8 GB foreign VRAM resident) — third environmental flake of
+this class this session, spec path untouched by this change, queued for the
+uncontended re-run. Client disconnect mid-prefill now abandons the remaining
+chunks (bonus of the state machine).
+
+Next: C2 per-row masks (free slots still burn a row), C3 paged KV (arenas
+still dense `[n, max_ctx]`).

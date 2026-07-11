@@ -11,17 +11,63 @@
 //! distributions — the same per-row math the parity gates pin to the
 //! single-sequence path.
 //!
-//! Known phase-1 costs (documented in the plan): admission prefill stalls the
-//! whole batch for the prompt's prefill time, and free slots burn a row of
-//! compute. Chunked prefill, per-row masks and paged KV are phase 2.
+//! **Chunked prefill (batching P2, C1)**: admission no longer stalls the batch
+//! for the whole prompt. The prompt runs through the single-sequence prefill in
+//! fixed chunks (`TRITIUM_PREFILL_CHUNK`, default 128), one chunk per loop
+//! iteration, interleaved with the lockstep decode steps — a live slot's
+//! inter-token gap during admission is bounded by one chunk + one step instead
+//! of the full prompt. At most ONE admission is mid-prefill at a time (the
+//! chunks accumulate in the runner's one single-sequence KV, which the adoption
+//! copy reads at completion); its slot row is implicitly reserved because
+//! admission only runs when no prefill is in flight. Chunking is bit-exact by
+//! construction: `prefill` is bit-identical per row to the sequential step
+//! loop, so any chunking of it is too — the first sampled token still equals
+//! the single-sequence path's exactly.
+//!
+//! Remaining phase-2 costs: free slots burn a row of compute (per-row masks,
+//! C2) and KV arenas are dense `[n, max_ctx]` (paged KV, C3).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 
-use crate::generator::{FinishReason, Sampling};
+use crate::generator::{FinishReason, GenRequest, Sampling};
 use crate::worker::{GenEvent, Job};
+
+/// Default prompt tokens per prefill chunk during admission (C1). 128 bounds a
+/// live slot's inter-token gap to one ~128-token prefill + one decode step.
+const PREFILL_CHUNK_DEFAULT: usize = 128;
+
+/// Chunk size from `TRITIUM_PREFILL_CHUNK` (default
+/// [`PREFILL_CHUNK_DEFAULT`]); rejects invalid values loudly rather than
+/// guessing (the `TRITIUM_KV` selector pattern).
+fn prefill_chunk() -> Result<usize, String> {
+    match std::env::var("TRITIUM_PREFILL_CHUNK") {
+        Ok(s) => match s.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(format!(
+                "TRITIUM_PREFILL_CHUNK must be a positive integer, got {s:?}"
+            )),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(PREFILL_CHUNK_DEFAULT),
+        Err(e) => Err(format!("TRITIUM_PREFILL_CHUNK: {e}")),
+    }
+}
+
+/// An admission mid-prefill: `done` prompt tokens are already in the runner's
+/// single-sequence KV; the reserved pool row stays `None` until adoption (no
+/// other admission can take it — admission is gated on `pending.is_none()`).
+struct Pending {
+    tx: mpsc::Sender<GenEvent>,
+    req: GenRequest,
+    /// Token budget after context clamping (validated at admission).
+    max_new: usize,
+    /// The pool row this request will occupy once adopted.
+    row: usize,
+    /// Prompt tokens already prefilled.
+    done: usize,
+}
 
 /// One live request occupying a slot.
 struct Active {
@@ -130,7 +176,15 @@ pub(crate) fn run_batched(
             return;
         }
     };
+    let chunk = match prefill_chunk() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("tritium-serve: {e}");
+            return;
+        }
+    };
     let mut pool: Vec<Option<Active>> = (0..slots).map(|_| None).collect();
+    let mut pending: Option<Pending> = None;
 
     loop {
         // Graceful drain (mirrors the single worker): cancel in-flight
@@ -142,13 +196,19 @@ pub(crate) fn run_batched(
                     let _ = a.tx.try_send(GenEvent::Error("server draining".into()));
                 }
             }
+            if let Some(p) = pending.take() {
+                let _ = p.tx.try_send(GenEvent::Error("server draining".into()));
+            }
         }
         // Admit into free slots: drain waiting jobs, block only when idle.
         // Cap admissions per pass: instantly-retiring jobs (errors, dead
         // channels) don't occupy a slot, and an unbounded pass would let a
-        // flood of them starve stepping (each admission costs a prefill).
+        // flood of them starve stepping. Gated on `pending.is_none()`: the
+        // chunks own the single-sequence KV, so one admission prefills at a
+        // time (a valid job below parks itself as `pending` and ends the
+        // pass via this condition).
         let mut admissions = 0usize;
-        loop {
+        while pending.is_none() {
             if admissions >= slots * 2 {
                 break;
             }
@@ -203,51 +263,17 @@ pub(crate) fn run_batched(
                         let _ = tx.try_send(GenEvent::Done(FinishReason::Length));
                         continue;
                     }
-                    // Admission: optimized single-seq prefill, then adopt the
-                    // KV rows into the slot.
+                    // Admission (C1): park the job as the one in-flight
+                    // chunked prefill. Reset starts a fresh single-sequence
+                    // KV; the chunks below accumulate into it.
                     runner.reset();
-                    let positions: Vec<usize> = (0..prompt_len).collect();
-                    let logits = match runner.forward(&req.prompt_tokens, &positions) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = tx.try_send(GenEvent::Error(e.to_string()));
-                            continue;
-                        }
-                    };
-                    let adopt = (|| -> Result<(), String> {
-                        runner
-                            .adopt_into_batch_row(&mut batch, row, prompt_len)
-                            .map_err(|e| e.to_string())?;
-                        batch
-                            .set_position(row, prompt_len)
-                            .map_err(|e| e.to_string())
-                    })();
-                    if let Err(e) = adopt {
-                        let _ = tx.try_send(GenEvent::Error(e));
-                        continue;
-                    }
-                    let mut active = Active {
+                    pending = Some(Pending {
                         tx,
-                        logprobs: req.logprobs,
-                        stop_eos: req.stop_eos,
-                        remaining: max_new,
-                        last_token: 0,
-                        salt: 0,
-                        sampling: req.sampling,
-                    };
-                    active.salt += 1;
-                    let Some(first) = sample(
-                        &logits,
-                        &active.sampling,
-                        (req_seed(&active.sampling), active.salt),
-                    ) else {
-                        let _ = active.tx.try_send(GenEvent::Error("empty logits".into()));
-                        continue;
-                    };
-                    active.last_token = first;
-                    if emit(&mut active, first, eos, &logits) {
-                        pool[row] = Some(active);
-                    }
+                        req,
+                        max_new,
+                        row,
+                        done: 0,
+                    });
                 }
                 // Tree/spec sessions need exclusive ownership of the model's
                 // single-sequence KV — incompatible with a live slot pool.
@@ -264,8 +290,79 @@ pub(crate) fn run_batched(
             }
         }
 
+        // One prefill chunk for the pending admission (C1). Bounded work per
+        // iteration: live slots get a decode step between chunks. With no
+        // live slots the loop spins straight through the chunks back-to-back
+        // (admission is skipped while `pending` is set, the step below while
+        // the pool is empty).
+        if let Some(p) = pending.as_mut() {
+            if p.tx.is_closed() {
+                // Client gone mid-prefill: abandon the remaining chunks. The
+                // partial single-sequence KV is dead weight until the next
+                // admission's reset.
+                pending = None;
+            } else {
+                let len = p.req.prompt_tokens.len();
+                let end = (p.done + chunk).min(len);
+                let positions: Vec<usize> = (p.done..end).collect();
+                match runner.forward(&p.req.prompt_tokens[p.done..end], &positions) {
+                    Err(e) => {
+                        let p = pending.take().expect("pending checked above");
+                        let _ = p.tx.try_send(GenEvent::Error(e.to_string()));
+                    }
+                    Ok(logits) => {
+                        p.done = end;
+                        if p.done == len {
+                            // Prompt complete: adopt the KV rows into the
+                            // reserved slot and activate. `logits` is the last
+                            // token's — bit-identical to a monolithic prefill's
+                            // (chunking preserves the per-row order), so the
+                            // first sampled token keeps the single-sequence
+                            // guarantee the G1 gate pins.
+                            let p = pending.take().expect("pending checked above");
+                            let adopt = (|| -> Result<(), String> {
+                                runner
+                                    .adopt_into_batch_row(&mut batch, p.row, len)
+                                    .map_err(|e| e.to_string())?;
+                                batch.set_position(p.row, len).map_err(|e| e.to_string())
+                            })();
+                            if let Err(e) = adopt {
+                                let _ = p.tx.try_send(GenEvent::Error(e));
+                            } else {
+                                let mut active = Active {
+                                    tx: p.tx,
+                                    logprobs: p.req.logprobs,
+                                    stop_eos: p.req.stop_eos,
+                                    remaining: p.max_new,
+                                    last_token: 0,
+                                    salt: 0,
+                                    sampling: p.req.sampling,
+                                };
+                                active.salt += 1;
+                                if let Some(first) = sample(
+                                    &logits,
+                                    &active.sampling,
+                                    (req_seed(&active.sampling), active.salt),
+                                ) {
+                                    active.last_token = first;
+                                    if emit(&mut active, first, eos, &logits) {
+                                        pool[p.row] = Some(active);
+                                    }
+                                } else {
+                                    let _ = active
+                                        .tx
+                                        .try_send(GenEvent::Error("empty logits".into()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if !pool.iter().any(Option::is_some) {
-            continue; // nothing live; loop back to the blocking recv
+            continue; // nothing live (a pending admission loops straight back
+            // to its next chunk; a fully idle pool back to the blocking recv)
         }
 
         // One lockstep decode step. Free slots are fed token 0 at position 0
