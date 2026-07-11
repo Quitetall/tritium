@@ -340,6 +340,8 @@ fn maybe_bitmap(
         .map_err(|e| driver_err("bitmap dtoh", &e))?;
     let bm = tritium_format::compute_zero_bitmaps(&host, n, k, row_bytes)
         .map_err(|e| BackendError::InvalidInput(format!("zero bitmap: {e}")))?;
+    // Counting over n*words_per_row words vs blocks = n*nb is exact because
+    // compute_zero_bitmap never sets padding bits (loop bound block_idx < nb).
     let set: u64 = bm.iter().map(|w| u64::from(w.count_ones())).sum();
     let blocks = (n * k.div_ceil(256)) as u64;
     if blocks == 0 || (set as f64 / blocks as f64) < BITMAP_MIN_ZERO_BLOCK_FRAC {
@@ -354,7 +356,16 @@ fn maybe_bitmap(
 impl ResidentLinear {
     /// Build from a borrowed spec: share the device weight (`Arc` clone, no
     /// re-upload) and upload the per-channel scales once.
-    fn build(stream: &Arc<CudaStream>, spec: &DecodeLinearSpec) -> Result<Self, BackendError> {
+    /// `enable_bitmap`: compute the A1b zero-block skip bitmap. Only linears
+    /// launched through the decode graph's `g_matmul` consume it (today: the
+    /// FUSED qkv/gateup) — o/down go through the dense residual kernel and
+    /// the individual linears feed dense batch/tree paths, so building
+    /// bitmaps for them is dead dtoh + scan work (review N1).
+    fn build(
+        stream: &Arc<CudaStream>,
+        spec: &DecodeLinearSpec,
+        enable_bitmap: bool,
+    ) -> Result<Self, BackendError> {
         let buf = spec
             .weights
             .as_any()
@@ -381,7 +392,11 @@ impl ResidentLinear {
             .clone_htod(spec.scales)
             .map_err(|e| driver_err("decode scales htod", &e))?;
         let device = buf.device_arc();
-        let bitmap = maybe_bitmap(stream, device.as_ref(), n, k, row_bytes)?;
+        let bitmap = if enable_bitmap {
+            maybe_bitmap(stream, device.as_ref(), n, k, row_bytes)?
+        } else {
+            None
+        };
         Ok(Self {
             device,
             scales,

@@ -1705,13 +1705,15 @@ impl CudaBackend {
                 attn_sub_norm: opt_norm(ls.attn_sub_norm, q_width, "decode attn_sub_norm htod")?,
                 ffn_norm: upload(ls.ffn_norm, "decode ffn_norm htod")?,
                 ffn_sub_norm: opt_norm(ls.ffn_sub_norm, n_ff, "decode ffn_sub_norm htod")?,
-                q: ResidentLinear::build(s, &ls.q)?,
-                k: ResidentLinear::build(s, &ls.k)?,
-                v: ResidentLinear::build(s, &ls.v)?,
-                o: ResidentLinear::build(s, &ls.o)?,
-                gate: ResidentLinear::build(s, &ls.gate)?,
-                up: ResidentLinear::build(s, &ls.up)?,
-                down: ResidentLinear::build(s, &ls.down)?,
+                q: ResidentLinear::build(s, &ls.q, false)?,
+                k: ResidentLinear::build(s, &ls.k, false)?,
+                v: ResidentLinear::build(s, &ls.v, false)?,
+                o: ResidentLinear::build(s, &ls.o, false)?,
+                gate: ResidentLinear::build(s, &ls.gate, false)?,
+                up: ResidentLinear::build(s, &ls.up, false)?,
+                down: ResidentLinear::build(s, &ls.down, false)?,
+                // Only the fused pair launches through the sparse decode-graph
+                // slot — bitmaps computed here alone (review N1).
                 qkv: ResidentLinear::build_fused(s, &[&ls.q, &ls.k, &ls.v])?,
                 gateup: ResidentLinear::build_fused(s, &[&ls.gate, &ls.up])?,
             });
