@@ -15,6 +15,7 @@
 use rayon::prelude::*;
 
 use crate::checkpoint::{CheckpointError, Cursor};
+use crate::ops::dense;
 
 /// Parallelize a leaf's AdamW update above this element count (element-wise ⇒ bit-identical to the
 /// serial loop). Set high: the optimizer is called on every leaf every step, so rayon's per-call
@@ -153,5 +154,224 @@ impl Optimizer for AdamW {
         let m = cursor.f32_vec(len)?;
         let v = cursor.f32_vec(len)?;
         Ok(AdamState { m, v })
+    }
+}
+
+/// Newton–Schulz quintic orthogonalization (Muon): drives the singular values of a `[rows, cols]`
+/// matrix toward 1 (returns `≈ U·Vᵀ`), using ONLY matmuls — no SVD — so it runs on the same device
+/// as training. The iteration operates on the smaller Gram matrix (transpose if `rows > cols`), so
+/// its cost is `O(min(rows,cols)² · max)` per step; the quintic coefficients are the Muon paper's.
+#[must_use]
+pub fn newton_schulz(g: &[f32], rows: usize, cols: usize, steps: usize) -> Vec<f32> {
+    const A: f32 = 3.4445;
+    const B: f32 = -4.7750;
+    const C: f32 = 2.0315;
+    let fnorm = g.iter().map(|&v| v * v).sum::<f32>().sqrt() + 1e-7;
+    let normed: Vec<f32> = g.iter().map(|&v| v / fnorm).collect();
+    // Work with `x` shaped `[r, c]` where `r ≤ c`, so the `X·Xᵀ` Gram is `[r, r]` (the smaller one).
+    let (mut x, r, c, transposed) = if rows > cols {
+        (
+            dense::transpose_forward(&normed, rows, cols),
+            cols,
+            rows,
+            true,
+        )
+    } else {
+        (normed, rows, cols, false)
+    };
+    for _ in 0..steps {
+        let a_mat = dense::forward(&x, &x, r, r, c); // A = X·Xᵀ   [r,r]
+        let a2 = dense::forward(&a_mat, &a_mat, r, r, r); // A·A (A symmetric ⇒ A·Aᵀ = A·A)  [r,r]
+        let b_mat: Vec<f32> = a_mat
+            .iter()
+            .zip(&a2)
+            .map(|(&av, &a2v)| B * av + C * a2v)
+            .collect();
+        let xt = dense::transpose_forward(&x, r, c); // [c,r]
+        let bx = dense::forward(&b_mat, &xt, r, c, r); // B·X   [r,c]
+        for (xi, &bxi) in x.iter_mut().zip(&bx) {
+            *xi = A * *xi + bxi;
+        }
+    }
+    if transposed {
+        dense::transpose_forward(&x, r, c) // back to [rows, cols]
+    } else {
+        x
+    }
+}
+
+/// **Muon** (Momentum Orthogonalized by Newton–Schulz) — a memory-lean optimizer for 2D hidden
+/// weights: **one** momentum buffer (SGD-momentum memory, half of AdamW's `m`+`v`) with the update
+/// spectrally orthogonalized ([`newton_schulz`]) to match AdamW-class convergence. At 32B this
+/// halves optimizer-state RAM vs AdamW (128 GB vs 256 GB). Not for embeddings/heads/1D norms —
+/// those keep [`AdamW`] (their Gram matrix is huge and orthogonalization is ill-posed). One `Muon`
+/// per weight *shape* (it holds `rows`/`cols`); the momentum ↔ update math is bias-correction-free.
+#[derive(Clone, Copy, Debug)]
+pub struct Muon {
+    /// Learning rate (the RMS-match factor `√max(rows,cols)` is applied internally).
+    pub lr: f32,
+    /// Momentum decay `μ`.
+    pub momentum: f32,
+    /// Decoupled weight decay (as in AdamW).
+    pub weight_decay: f32,
+    /// Output rows of the weight this instance steps.
+    pub rows: usize,
+    /// Input cols of the weight this instance steps.
+    pub cols: usize,
+    /// Newton–Schulz iterations (5 is the standard; the quintic converges fast).
+    pub ns_steps: usize,
+}
+
+impl Muon {
+    /// Muon at learning rate `lr` for a `[rows, cols]` weight — `μ = 0.95`, `wd = 0.01`, 5 NS steps.
+    #[must_use]
+    pub fn new(lr: f32, rows: usize, cols: usize) -> Self {
+        Self {
+            lr,
+            momentum: 0.95,
+            weight_decay: 0.01,
+            rows,
+            cols,
+            ns_steps: 5,
+        }
+    }
+}
+
+/// Muon's per-weight state: a single momentum buffer (vs AdamW's two).
+#[derive(Clone, Debug)]
+pub struct MuonState {
+    /// Momentum accumulator `M = μ·M + g`.
+    pub momentum: Vec<f32>,
+}
+
+impl Optimizer for Muon {
+    type State = MuonState;
+
+    fn init_state(&self, len: usize) -> MuonState {
+        MuonState {
+            momentum: vec![0.0; len],
+        }
+    }
+
+    fn step(&self, _t: u64, param: &mut [f32], grad: &[f32], state: &mut MuonState) {
+        assert_eq!(
+            param.len(),
+            self.rows * self.cols,
+            "Muon param shape mismatch"
+        );
+        assert_eq!(param.len(), grad.len(), "param/grad length mismatch");
+        assert_eq!(
+            param.len(),
+            state.momentum.len(),
+            "param/state length mismatch"
+        );
+        for (mi, &g) in state.momentum.iter_mut().zip(grad) {
+            *mi = self.momentum * *mi + g;
+        }
+        let ortho = newton_schulz(&state.momentum, self.rows, self.cols, self.ns_steps);
+        // The orthogonalized update has unit singular values; scale by √max(rows,cols) so its
+        // per-element RMS matches an AdamW step (Muon's standard RMS match). Decoupled weight decay.
+        let scale = self.lr * (self.rows.max(self.cols) as f32).sqrt();
+        let shrink = 1.0 - self.lr * self.weight_decay;
+        for (p, &o) in param.iter_mut().zip(&ortho) {
+            *p = *p * shrink - scale * o;
+        }
+    }
+
+    fn write_state(&self, state: &MuonState, out: &mut Vec<u8>) {
+        for &x in &state.momentum {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+
+    fn read_state(&self, len: usize, cursor: &mut Cursor) -> Result<MuonState, CheckpointError> {
+        Ok(MuonState {
+            momentum: cursor.f32_vec(len)?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod muon_tests {
+    use super::*;
+
+    fn seeded(seed: u64, n: usize) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % 1000) as f32 / 500.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Newton–Schulz drives the singular values toward 1: for the orthogonalized `O` (`r ≤ c`),
+    /// `O·Oᵀ → I_r`. Muon's quintic coefficients aim for a *band* around 1 (fast, not exact), so we
+    /// check (a) it lands close-ish (`< 0.4`), (b) it SUBSTANTIALLY improves over the raw input's
+    /// `X·Xᵀ` deviation, and (c) it preserves energy (`trace(O·Oᵀ) = Σσ² ≈ r`).
+    #[test]
+    fn newton_schulz_orthogonalizes() {
+        let (rows, cols) = (6usize, 10usize);
+        let g = seeded(7, rows * cols);
+        let dev = |m: &[f32]| {
+            let mut e = 0.0f32;
+            for i in 0..rows {
+                for j in 0..rows {
+                    let t = if i == j { 1.0 } else { 0.0 };
+                    e = e.max((m[i * rows + j] - t).abs());
+                }
+            }
+            e
+        };
+        // Normalize the raw input the same way NS does, for a fair before/after comparison.
+        let fnorm = g.iter().map(|&v| v * v).sum::<f32>().sqrt() + 1e-7;
+        let normed: Vec<f32> = g.iter().map(|&v| v / fnorm).collect();
+        let before = dev(&dense::forward(&normed, &normed, rows, rows, cols));
+
+        let o = newton_schulz(&g, rows, cols, 5);
+        let oot = dense::forward(&o, &o, rows, rows, cols); // O·Oᵀ  [rows,rows]
+        let after = dev(&oot);
+        let trace: f32 = (0..rows).map(|i| oot[i * rows + i]).sum();
+
+        assert!(
+            after < 0.4,
+            "O·Oᵀ should be near I after NS; deviation {after}"
+        );
+        assert!(
+            after < 0.5 * before,
+            "NS must improve orthogonality: {before} → {after}"
+        );
+        assert!(
+            (trace - rows as f32).abs() < 0.6 * rows as f32,
+            "singular values should be ~1 (trace≈r={rows}); trace {trace}"
+        );
+    }
+
+    /// Muon descends a quadratic `½‖W − target‖²` (grad = W − target) to near-zero loss.
+    #[test]
+    fn muon_minimizes_a_quadratic() {
+        let (rows, cols) = (8usize, 8usize);
+        let target = seeded(3, rows * cols);
+        let mut w = seeded(99, rows * cols);
+        let opt = Muon::new(0.02, rows, cols);
+        let mut st = opt.init_state(w.len());
+        let loss = |w: &[f32]| {
+            w.iter()
+                .zip(&target)
+                .map(|(&a, &b)| (a - b) * (a - b))
+                .sum::<f32>()
+        };
+        let l0 = loss(&w);
+        for t in 1..=200u64 {
+            let grad: Vec<f32> = w.iter().zip(&target).map(|(&a, &b)| a - b).collect();
+            opt.step(t, &mut w, &grad, &mut st);
+        }
+        let l1 = loss(&w);
+        assert!(
+            l1 < 0.05 * l0,
+            "Muon must reduce the quadratic: {l0} → {l1}"
+        );
     }
 }
