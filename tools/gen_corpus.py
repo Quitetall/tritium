@@ -55,19 +55,36 @@ to curtsey as she spoke, fancy curtseying as you're falling through the air! Do 
 manage it?"""
 
 
+def arg(flag: str, default):
+    return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
+
+
 def main() -> None:
     tok_path = sys.argv[1]
     out_path = sys.argv[2]
-    frac = 0.75
-    if "--frac" in sys.argv:
-        frac = float(sys.argv[sys.argv.index("--frac") + 1])
+    pool = int(arg("--pool", 8192))       # train pool = first `pool` tokens
+    heldout = int(arg("--heldout", 256))  # held-out = the next `heldout` tokens (disjoint)
+    text = TEXT
+    if "--file" in sys.argv:
+        raw = open(arg("--file", ""), encoding="utf-8", errors="ignore").read()
+        # Strip Project Gutenberg boilerplate: keep the body between the START/END markers.
+        s = raw.find("*** START")
+        if s != -1:
+            raw = raw[raw.find("\n", s) + 1 :]
+        e = raw.find("*** END")
+        if e != -1:
+            raw = raw[:e]
+        text = raw
     tok = Tokenizer.from_file(tok_path)
-    ids = tok.encode(" ".join(TEXT.split())).ids
-    split = int(len(ids) * frac)
-    out = {"train_ids": ids[:split], "eval_ids": ids[split:]}
+    ids = tok.encode(" ".join(text.split())).ids
+    assert len(ids) >= pool + heldout, f"corpus too short: {len(ids)} < {pool + heldout}"
+    out = {"train_ids": ids[:pool], "eval_ids": ids[pool : pool + heldout]}
     with open(out_path, "w") as f:
         json.dump(out, f)
-    print(f"{len(ids)} tokens → train {len(out['train_ids'])}, held-out {len(out['eval_ids'])} → {out_path}")
+    print(
+        f"{len(ids)} tokens → train pool {len(out['train_ids'])}, "
+        f"held-out {len(out['eval_ids'])} (disjoint) → {out_path}"
+    )
 
 
 if __name__ == "__main__":

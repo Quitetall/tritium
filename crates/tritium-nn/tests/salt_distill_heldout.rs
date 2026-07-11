@@ -79,7 +79,14 @@ fn salt_distillation_recovers_heldout_perplexity() {
     let runner =
         ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
     let (a, fp, shapes) = extract(&runner);
-    let (train_ids, eval_ids) = corpus();
+    let (mut train_ids, eval_ids) = corpus();
+    // Cap the train pool to sweep the recovery-vs-tokens curve (held-out set is fixed & disjoint).
+    if let Some(n) = std::env::var("TRITIUM_TRAIN_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        train_ids.truncate(n);
+    }
 
     // Non-overlapping training windows.
     let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
@@ -144,8 +151,8 @@ fn salt_distillation_recovers_heldout_perplexity() {
         "0042 HELD-OUT SmolLM2 distillation (T={T}, {steps} steps, train {} tok / {} windows, eval {} HELD-OUT tok): \
          fp ppl {ppl_fp:.3} | PTQ ppl {ppl_ptq:.3e} | distilled ppl {ppl_distilled:.3}  \
          (train-xent {first:.3}→{last:.3}). GENERALIZES: held-out ppl {:.0}× better than PTQ on unseen text \
-         (not memorization). DATA-LIMITED: still {:.1}× fp — 675 train tok is a floor; the residual gap is \
-         what more tokens close (this is the first point on the recovery-vs-tokens curve, 0042).",
+         (not memorization). DATA-LIMITED: still {:.1}× fp at this budget — the residual gap is what more \
+         tokens close (a point on the recovery-vs-tokens curve; sweep TRITIUM_TRAIN_TOKENS to trace it, 0042).",
         train_ids.len(),
         windows.len(),
         eval_ids.len(),
@@ -157,7 +164,7 @@ fn salt_distillation_recovers_heldout_perplexity() {
     assert!(last < first, "training surrogate must decrease");
     // The load-bearing claim: end-to-end distillation on TRAIN recovers HELD-OUT ppl vs PTQ — real
     // generalization, not the in-sample memorization of salt_distill_real. (Full recovery to fp
-    // needs more tokens; this tiny 675-tok corpus is a floor.)
+    // needs more tokens — the recovery-vs-tokens curve; this budget is one point on it.)
     assert!(
         ppl_distilled < 0.5 * ppl_ptq,
         "distillation must recover held-out ppl vs PTQ: {ppl_distilled:.3} vs PTQ {ppl_ptq:.3e}"
