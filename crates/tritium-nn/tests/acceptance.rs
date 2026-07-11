@@ -606,15 +606,25 @@ fn cuda_batch_paged_matches_dense_bit_exact() {
         paged.reserve_pages(0, 2 * 256 + 1).is_err(),
         "exhaustion must reject"
     );
-    assert_eq!(paged.free_pages(), POOL_PAGES, "failed reserve must not leak");
+    assert_eq!(
+        paged.free_pages(),
+        POOL_PAGES,
+        "failed reserve must not leak"
+    );
     // Stepping an unmapped live row is loud, not UB.
     assert!(
-        runner.decode_batch_graph(&mut paged, &[toks[0]; N]).is_err(),
+        runner
+            .decode_batch_graph(&mut paged, &[toks[0]; N])
+            .is_err(),
         "unmapped position must be rejected"
     );
 
-    paged.reserve_pages(0, prompt.len() + toks.len()).expect("reserve row0");
-    paged.reserve_pages(2, toks.len()).expect("reserve row2");
+    paged
+        .reserve_pages(0, prompt.len() + toks.len())
+        .expect("reserve row0");
+    // Row 2's true footprint: 4+4 lockstep loops + retired step + eager +
+    // argmax = 11 advances; 16 keeps the no-outgrow story exact with slack.
+    paged.reserve_pages(2, 16).expect("reserve row2");
     for b in [&mut dense, &mut paged] {
         b.set_live(1, false).expect("dead row");
     }
@@ -671,7 +681,13 @@ fn cuda_batch_paged_matches_dense_bit_exact() {
         b.set_live(0, true).expect("revive");
     }
     for (i, &t) in toks.iter().enumerate() {
-        step_both(&mut runner, &mut dense, &mut paged, t, &format!("re-admit step {i}"));
+        step_both(
+            &mut runner,
+            &mut dense,
+            &mut paged,
+            t,
+            &format!("re-admit step {i}"),
+        );
     }
 
     // The other two dispatch paths (review N2): the EAGER step and the
@@ -710,9 +726,10 @@ fn cuda_batch_paged_matches_dense_bit_exact() {
     drop(dense);
     drop(paged);
     println!(
-        "paged-KV gate: bit-identical to dense through adoption, {} steps, \
-         retire/re-admit page reuse, dead row; exhaustion + unmapped-step loud",
-        toks.len() * 2 + 1
+        "paged-KV gate: bit-identical to dense through adoption, {} lockstep \
+         advances (graph + eager + argmax), retire/re-admit page reuse, dead \
+         row; exhaustion + unmapped-step loud",
+        toks.len() * 2 + 3
     );
 }
 

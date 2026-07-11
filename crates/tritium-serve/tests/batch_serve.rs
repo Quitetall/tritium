@@ -214,9 +214,12 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
 /// bit-exact by construction (same values, different addresses; gated at the
 /// kernel level by `cuda_batch_paged_matches_dense_bit_exact`), so the same
 /// request set through a paged pool must produce IDENTICAL text. The pool is
-/// deliberately tight (4 pages for 6 requests through 4 slots) so admissions
-/// also exercise the park-on-exhaustion path — parking delays a stream, it
-/// must never change one.
+/// deliberately SCARCER than the slots (3 pages, 4 slots, 1 page per
+/// request) so a 4th concurrent admission finds a free SLOT but no free
+/// PAGE — reserve fails → the job parks and is retried after a retirement.
+/// Parking delays a stream; it must never change one. (A 4-page pool would
+/// never park: every retirement frees slot and page together, so a free
+/// slot would imply a free page — review finding on the first version.)
 #[tokio::test(flavor = "multi_thread")]
 async fn cuda_batched_paged_streams_equal_dense() {
     if !Path::new(GGUF_PATH).exists() {
@@ -280,10 +283,10 @@ async fn cuda_batched_paged_streams_equal_dense() {
     };
 
     let dense = run(&bytes, None).await;
-    // 4 pages × 256 tokens: each request needs 1 page (max prompt 31 + 24),
-    // so all 4 slots can hold one — the 5th/6th admissions park until a
-    // retirement frees a page.
-    let paged = run(&bytes, Some(1024)).await;
+    // 3 pages × 256 tokens for 4 slots: each request needs 1 page (max
+    // prompt 31 + 24 ≤ 256), so at most 3 slots decode concurrently and the
+    // next admission PARKS on page exhaustion until a retirement.
+    let paged = run(&bytes, Some(768)).await;
     for i in 0..prompts.len() {
         assert!(!dense[i].is_empty(), "dense stream {i} empty");
         assert_eq!(
@@ -291,7 +294,7 @@ async fn cuda_batched_paged_streams_equal_dense() {
             "G3: paged stream {i} must equal the dense stream exactly"
         );
     }
-    println!("G3: 6 paged streams identical to dense (4-page pool, parking exercised)");
+    println!("G3: 6 paged streams identical to dense (3-page/4-slot pool — parking exercised)");
 }
 
 /// Spawn a streaming chat request; each emitted token's arrival time is pushed

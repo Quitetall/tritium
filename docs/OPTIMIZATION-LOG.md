@@ -978,9 +978,11 @@ batch arenas are now optional: `--kv-pool-tokens N` (serve) /
 - **Bit-exactness**: paged == dense BIT-IDENTICAL (gate
   `cuda_batch_paged_matches_dense_bit_exact`: adoption, graph+eager+argmax
   lockstep, dead row, retire/re-admit page REUSE over stale bytes,
-  exhaustion/no-leak). Serve G3: 6 streams through a deliberately tight
-  4-page pool == dense streams exactly (parking exercised, delays never
-  change content).
+  exhaustion/no-leak). Serve G3: 6 streams through a 3-page/4-slot pool ==
+  dense streams exactly. CORRECTION (review of a1be4dd): the first G3 used
+  4 pages for 4 slots, where a free slot implies a free page — parking was
+  NEVER exercised despite the claim; 3 pages makes page exhaustion the
+  binding constraint, so the park/retry path now has real coverage.
 - **Memory (arithmetic at BitNet 2B4T geometry, f32 KV, 30 layers)**: the
   G3 workload's 4-slot dense arenas = 2.52 GB; its 4-page pool = 157 MB
   (−94%). Honest caveats: the win is the workload's length-distribution

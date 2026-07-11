@@ -191,7 +191,8 @@ pub(crate) fn run_batched(
         Some(t) => {
             let pages = t.div_ceil(tritium_cuda::KV_PAGE_TOKENS);
             eprintln!(
-                "tritium-serve: paged KV — {pages} pages ({} tokens) shared by {slots} slots                  (dense would be {} tokens)",
+                "tritium-serve: paged KV — {pages} pages ({} tokens) shared by {slots} \
+                 slots (dense would be {} tokens)",
                 pages * tritium_cuda::KV_PAGE_TOKENS,
                 slots * n_ctx,
             );
@@ -333,6 +334,11 @@ pub(crate) fn run_batched(
                         if tx.is_closed() {
                             continue; // don't hold pages for a gone client
                         }
+                        // Any reserve error parks. Today only exhaustion is
+                        // reachable from here (row < slots, paged() checked,
+                        // needed < max_ctx via the clamp above); if
+                        // reserve_pages ever grows another error kind, match
+                        // on it — a permanent error would park-loop.
                         if batch.reserve_pages(row, needed).is_err() {
                             parked = Some(Job::Generate { req, tx });
                             break;

@@ -39,7 +39,6 @@ impl CudaDecodeModel {
     }
 
 
-
     /// Continuous-batching admission: copy this model's single-sequence KV
     /// rows `[0, len)` (every layer, K and V) into batch slot `row`'s arena.
     /// The caller prefills the prompt through the SINGLE-sequence path (the
