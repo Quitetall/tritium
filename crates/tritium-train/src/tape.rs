@@ -13,7 +13,9 @@
 //! the `ste` module). The graph this tape differentiates is therefore the smooth
 //! surrogate model; `round` is a forward-only QAT detail layered on later (ADR 0007).
 
-use crate::ops::{act, bias, dense, elementwise, loss, matmul, norm, rope, shape, softmax, ste};
+use crate::ops::{
+    act, bias, dense, elementwise, embed, loss, matmul, norm, rope, shape, softmax, ste,
+};
 
 /// Index of a value buffer in a [`Tape`]'s arena.
 pub type ValueId = usize;
@@ -182,6 +184,29 @@ impl Tape {
             Box::new(move |_ins, g, grads, ids| {
                 let gs = dense::transpose_vjp(rows, cols, g);
                 for (j, &v) in gs[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
+                }
+            }),
+        )
+    }
+
+    /// Gather `[seq, n_embd]` embedding rows from `weight [vocab, n_embd]` by token id — the
+    /// differentiable input embedding (grad scatters back to the rows read; tied heads train it).
+    pub fn embed_gather(
+        &mut self,
+        weight: ValueId,
+        tokens: &[u32],
+        vocab: usize,
+        n_embd: usize,
+    ) -> ValueId {
+        let out = embed::gather_forward(&self.values[weight], tokens, n_embd);
+        let tokens = tokens.to_vec();
+        self.record(
+            vec![weight],
+            out,
+            Box::new(move |_ins, g, grads, ids| {
+                let gw = embed::gather_vjp(vocab, &tokens, n_embd, g);
+                for (j, &v) in gw.iter().enumerate() {
                     grads[ids[0]][j] += v;
                 }
             }),

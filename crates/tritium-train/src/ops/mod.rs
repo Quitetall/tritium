@@ -4,6 +4,7 @@ pub mod act;
 pub mod bias;
 pub mod dense;
 pub mod elementwise;
+pub mod embed;
 pub mod loss;
 pub mod matmul;
 pub mod norm;
