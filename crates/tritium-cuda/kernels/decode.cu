@@ -829,15 +829,56 @@ __global__ void rope_apply_f32_g(float* __restrict__ x,
 // kv_append_f32 — the device half of the KV append: copy this token's `src` row
 // (`[kv_width]`) into the layer's KV arena at offset `ctrl[2]*kv_width`. Replaces the
 // eager path's `memcpy_dtod` (whose offset would be baked into the graph). Pure copy.
+}  // extern "C" — templates cannot carry C linkage; the shims below reopen it.
+
+// ── KV store codecs (ADR 0022 twin consolidation, Track B) ──────────────────
+// One templated body per KV-touching family; extern "C" shims preserve every
+// launch symbol, so the host side is untouched. PROOF OBLIGATION: the f32
+// instantiation must stay SASS-identical to the retired hand-written kernel
+// (tools/sass_diff.sh; re-diff on toolchain bumps). The q8/t2 rungs keep
+// their own signatures — they already delegate to the shared kv_quant_row_*
+// helpers (scale-arena axis), i.e. they were born consolidated.
+struct KvStoreF32 {
+  using T = float;
+  static __device__ __forceinline__ void store(float* p, float v) { *p = v; }
+};
+struct KvStoreF16 {
+  using T = __half;
+  static __device__ __forceinline__ void store(__half* p, float v) {
+    *p = __float2half_rn(v);
+  }
+};
+
+template <class C>
+static __device__ __forceinline__ void kv_append_body(
+    const float* __restrict__ src, typename C::T* __restrict__ kv_base,
+    const int* __restrict__ ctrl, const int kv_width) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < kv_width) {
+    const long long off = (long long)ctrl[2] * kv_width + i;
+    C::store(kv_base + off, src[i]);
+  }
+}
+
+template <class C>
+static __device__ __forceinline__ void kv_append_batch_body(
+    const float* __restrict__ src, typename C::T* __restrict__ kv_base,
+    const int cache_len, const int kv_width, const int m) {
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)m * kv_width) return;
+  const int row = idx / kv_width;
+  const int e = idx - (long long)row * kv_width;
+  C::store(&kv_base[((long long)(cache_len + row)) * kv_width + e],
+           src[(long long)row * kv_width + e]);
+}
+
+extern "C" {
+
 __global__ void kv_append_f32(const float* __restrict__ src,
                               float* __restrict__ kv_base,   // [max_ctx*kv_width]
                               const int* __restrict__ ctrl,
                               const int kv_width) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < kv_width) {
-    const long long off = (long long)ctrl[2] * kv_width + i;
-    kv_base[off] = src[i];
-  }
+  kv_append_body<KvStoreF32>(src, kv_base, ctrl, kv_width);
 }
 
 // rope_kv_fused_g — fused q-RoPE + k-RoPE + K/V append for the M=1 decode graph
@@ -1720,21 +1761,12 @@ __global__ void kv_append_h(const float* __restrict__ src,
                             __half* __restrict__ kv_base,  // [max_ctx*kv_width]
                             const int* __restrict__ ctrl,
                             const int kv_width) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < kv_width) {
-    const long long off = (long long)ctrl[2] * kv_width + i;
-    kv_base[off] = __float2half_rn(src[i]);
-  }
+  kv_append_body<KvStoreF16>(src, kv_base, ctrl, kv_width);
 }
 
 __global__ void kv_append_batch_h(const float* __restrict__ src, __half* __restrict__ kv_base,
                                   const int cache_len, const int kv_width, const int m) {
-  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= (long long)m * kv_width) return;
-  const int row = idx / kv_width;
-  const int e = idx - (long long)row * kv_width;
-  kv_base[((long long)(cache_len + row)) * kv_width + e] =
-      __float2half_rn(src[(long long)row * kv_width + e]);
+  kv_append_batch_body<KvStoreF16>(src, kv_base, cache_len, kv_width, m);
 }
 
 __global__ void rope_kv_fused_h(float* __restrict__ q,
@@ -2988,11 +3020,7 @@ __global__ void scale_mul_batch_f32(float* __restrict__ out, const float* __rest
 // src[m, kv_width] → kv_base[(cache_len + r)*kv_width ...]. One thread per (row, element).
 __global__ void kv_append_batch_f32(const float* __restrict__ src, float* __restrict__ kv_base,
                                     const int cache_len, const int kv_width, const int m) {
-  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= (long long)m * kv_width) return;
-  const int row = idx / kv_width;
-  const int e = idx - (long long)row * kv_width;
-  kv_base[((long long)(cache_len + row)) * kv_width + e] = src[(long long)row * kv_width + e];
+  kv_append_batch_body<KvStoreF32>(src, kv_base, cache_len, kv_width, m);
 }
 
 // gqa_attention_batch_f32 — causal attention for `m` query rows (prefill). Query row `r`
