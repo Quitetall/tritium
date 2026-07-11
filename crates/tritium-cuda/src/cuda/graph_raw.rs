@@ -55,6 +55,10 @@ pub(super) fn raw_launch(
 pub(super) struct LinPtrs {
     pub(super) w: sys::CUdeviceptr,
     pub(super) sc: sys::CUdeviceptr,
+    /// Zero-block skip bitmap devptr, 0 = none (NULL → dense-identical).
+    pub(super) bm: sys::CUdeviceptr,
+    /// Bitmap words per row (`ceil(ceil(k/256)/32)`).
+    pub(super) wpr: i32,
     pub(super) n: usize,
     pub(super) k: usize,
     pub(super) rb: usize,
@@ -222,7 +226,10 @@ impl RawGraphKernels {
             tiled: get(am, KERNEL_NAME_TILED_F32)?,
             // DP4A fused-scaled variant: packed-int8 activations, act_scale folded
             // into the epilogue (v0.6.0 opt #15 → v1.x i8).
-            tiled_scaled: get(am, KERNEL_NAME_TILED_I8_SCALED)?,
+            // A1b: the decode graph launches the _sparse variant everywhere —
+            // NULL bitmap is bit-identical to the dense kernel by contract
+            // (tq2_0_add.cu), so only bitmap-carrying tensors skip.
+            tiled_scaled: get(am, KERNEL_NAME_TILED_I8_SCALED_SPARSE)?,
             // Fused-scaled + residual: GEMM epilogue adds to residual (v0.7.0 Phase 2).
             tiled_scaled_residual: get(am, KERNEL_NAME_TILED_I8_SCALED_RESIDUAL)?,
             modules: vec![dm, am],

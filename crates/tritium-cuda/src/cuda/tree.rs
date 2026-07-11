@@ -813,6 +813,11 @@ impl CudaDecodeModel {
         let lin = |l: &ResidentLinear| LinPtrs {
             w: dptr(l.device.as_ref(), s),
             sc: dptr(&l.scales, s),
+            // Batch/tree launches use the dense kernel (no _sparse residual /
+            // batch twins yet — Track B consolidation first); fields unused
+            // there but kept uniform.
+            bm: l.bitmap.as_ref().map_or(0, |b| dptr(b, s)),
+            wpr: l.k.div_ceil(256).div_ceil(32) as i32,
             n: l.n,
             k: l.k,
             rb: l.row_bytes,

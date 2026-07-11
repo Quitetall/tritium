@@ -313,6 +313,42 @@ struct ResidentLinear {
     n: usize,
     k: usize,
     row_bytes: usize,
+    /// Zero-block skip bitmap (A1b): one bit per 256-trit block per row, SET
+    /// = all-zero (skipped by the `_sparse` decode GEMM). Uploaded at build
+    /// only when the tensor's zero-block fraction clears
+    /// [`BITMAP_MIN_ZERO_BLOCK_FRAC`]; `None` ⇒ the kernel gets a NULL
+    /// pointer (bit-identical dense behavior by the kernel's contract).
+    bitmap: Option<CudaSlice<u32>>,
+}
+
+/// Minimum all-zero-block fraction before a skip bitmap is worth carrying
+/// (census: BitNet ffn gate/up ≈1%, attention 0%; SALT students higher).
+const BITMAP_MIN_ZERO_BLOCK_FRAC: f64 = 0.005;
+
+/// dtoh the packed rows and build the zero-block bitmap when it clears the
+/// threshold (load-time only; one pass over the packed bytes).
+fn maybe_bitmap(
+    stream: &Arc<CudaStream>,
+    device: &CudaSlice<u8>,
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+) -> Result<Option<CudaSlice<u32>>, BackendError> {
+    let mut host = vec![0u8; n * row_bytes];
+    stream
+        .memcpy_dtoh(device, &mut host)
+        .map_err(|e| driver_err("bitmap dtoh", &e))?;
+    let bm = tritium_format::compute_zero_bitmaps(&host, n, k, row_bytes)
+        .map_err(|e| BackendError::InvalidInput(format!("zero bitmap: {e}")))?;
+    let set: u64 = bm.iter().map(|w| u64::from(w.count_ones())).sum();
+    let blocks = (n * k.div_ceil(256)) as u64;
+    if blocks == 0 || (set as f64 / blocks as f64) < BITMAP_MIN_ZERO_BLOCK_FRAC {
+        return Ok(None);
+    }
+    stream
+        .clone_htod(&bm)
+        .map(Some)
+        .map_err(|e| driver_err("bitmap htod", &e))
 }
 
 impl ResidentLinear {
@@ -344,12 +380,15 @@ impl ResidentLinear {
         let scales = stream
             .clone_htod(spec.scales)
             .map_err(|e| driver_err("decode scales htod", &e))?;
+        let device = buf.device_arc();
+        let bitmap = maybe_bitmap(stream, device.as_ref(), n, k, row_bytes)?;
         Ok(Self {
-            device: buf.device_arc(),
+            device,
             scales,
             n,
             k,
             row_bytes,
+            bitmap,
         })
     }
 
@@ -408,12 +447,14 @@ impl ResidentLinear {
         let d_scales = stream
             .clone_htod(&scales)
             .map_err(|e| driver_err("fused decode scales htod", &e))?;
+        let bitmap = maybe_bitmap(stream, &device, total_n, k, row_bytes)?;
         Ok(Self {
             device: Arc::new(device),
             scales: d_scales,
             n: total_n,
             k,
             row_bytes,
+            bitmap,
         })
     }
 }
@@ -2565,6 +2606,9 @@ impl CudaDecodeModel {
         let lin = |l: &ResidentLinear| LinPtrs {
             w: dptr(l.device.as_ref(), s),
             sc: dptr(&l.scales, s),
+            // NULL bitmap = dense-identical (the sparse kernel's contract).
+            bm: l.bitmap.as_ref().map_or(0, |b| dptr(b, s)),
+            wpr: l.k.div_ceil(256).div_ceil(32) as i32,
             n: l.n,
             k: l.k,
             rb: l.row_bytes,
@@ -2801,11 +2845,13 @@ impl CudaDecodeModel {
                 pp(&lin.w),
                 pp(&lin.sc),
                 pp(&d_act_scale),
+                pp(&lin.bm),
                 pp(&d_out),
                 pp(&m_i),
                 pp(&n_i),
                 pp(&k_i),
                 pp(&rb_i),
+                pp(&lin.wpr),
             ];
             raw_launch(
                 self.raw().tiled_scaled,
