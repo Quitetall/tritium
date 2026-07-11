@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut eos: u32 = 128_001;
     let mut raw_tokens = false;
     let mut draft_model: Option<String> = None;
+    let mut kv_pool_tokens: Option<usize> = None;
 
     // Parse a required value for `name`, erroring (not silently defaulting) on a
     // missing or malformed value.
@@ -56,13 +57,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--eos" => eos = val(args.next(), "--eos")?,
             "--raw-tokens" => raw_tokens = true,
             "--draft-model" => draft_model = Some(val(args.next(), "--draft-model")?),
+            "--kv-pool-tokens" => {
+                let t: usize = val(args.next(), "--kv-pool-tokens")?;
+                if t == 0 {
+                    return Err("--kv-pool-tokens must be >= 1".into());
+                }
+                kv_pool_tokens = Some(t);
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--spec lookup] \
                      [--batch-slots N] [--host 127.0.0.1] [--port 8080] [--model-id tritium] \
                      [--max-new 256] [--eos 128001] [--raw-tokens] \
-                     [--draft-model <gguf>]  (non-loopback --host requires \
-                     TRITIUM_AUTH_TOKEN)"
+                     [--draft-model <gguf>] [--kv-pool-tokens N]  (non-loopback \
+                     --host requires TRITIUM_AUTH_TOKEN)"
                 );
                 return Ok(());
             }
@@ -146,11 +154,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              enforced; requests time out after 600s to first byte; body limit 2 MiB."
         );
     }
+    if kv_pool_tokens.is_some() && batch_slots <= 1 {
+        return Err("--kv-pool-tokens requires --batch-slots > 1 (paged KV is the \
+                    batched worker's pool)"
+            .into());
+    }
     let cfg = ServeConfig {
         model_id,
         queue_cap: 32,
         max_new_default: max_new,
         auth_token,
+        kv_pool_tokens,
         chat_template,
         ..ServeConfig::default()
     };

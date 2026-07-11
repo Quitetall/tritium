@@ -210,6 +210,90 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
     }
 }
 
+/// C3 gate — paged KV streams equal dense streams exactly. Paging is
+/// bit-exact by construction (same values, different addresses; gated at the
+/// kernel level by `cuda_batch_paged_matches_dense_bit_exact`), so the same
+/// request set through a paged pool must produce IDENTICAL text. The pool is
+/// deliberately tight (4 pages for 6 requests through 4 slots) so admissions
+/// also exercise the park-on-exhaustion path — parking delays a stream, it
+/// must never change one.
+#[tokio::test(flavor = "multi_thread")]
+async fn cuda_batched_paged_streams_equal_dense() {
+    if !Path::new(GGUF_PATH).exists() {
+        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let prompts: Vec<Vec<u32>> = (0..6usize)
+        .map(|i| {
+            base.iter()
+                .cycle()
+                .skip(i)
+                .take(16 + 3 * i)
+                .copied()
+                .collect()
+        })
+        .collect();
+    let max_tokens = 24usize;
+
+    let run = |bytes: &[u8], kv_pool_tokens: Option<usize>| {
+        let runner = load_runner(bytes).expect("runner");
+        let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+        let cfg = ServeConfig {
+            model_id: "tritium".into(),
+            queue_cap: 32,
+            max_new_default: max_tokens,
+            kv_pool_tokens,
+            ..ServeConfig::default()
+        };
+        let (router, _draining) =
+            build_router_batched(runner, u32::MAX, 4, tok, cfg).expect("batched router");
+        let prompts = prompts.clone();
+        async move {
+            let handles: Vec<_> = (0..prompts.len())
+                .map(|i| {
+                    let ids = prompts[i]
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let router = router.clone();
+                    tokio::spawn(async move { (i, chat(&router, &ids, max_tokens).await) })
+                })
+                .collect();
+            let mut out = vec![String::new(); prompts.len()];
+            for h in handles {
+                let (i, text) = h.await.expect("join");
+                out[i] = text;
+            }
+            out
+        }
+    };
+
+    let dense = run(&bytes, None).await;
+    // 4 pages × 256 tokens: each request needs 1 page (max prompt 31 + 24),
+    // so all 4 slots can hold one — the 5th/6th admissions park until a
+    // retirement frees a page.
+    let paged = run(&bytes, Some(1024)).await;
+    for i in 0..prompts.len() {
+        assert!(!dense[i].is_empty(), "dense stream {i} empty");
+        assert_eq!(
+            dense[i], paged[i],
+            "G3: paged stream {i} must equal the dense stream exactly"
+        );
+    }
+    println!("G3: 6 paged streams identical to dense (4-page pool, parking exercised)");
+}
+
 /// Spawn a streaming chat request; each emitted token's arrival time is pushed
 /// into the returned shared vec (live — the caller polls it mid-stream). SSE
 /// events may split across body frames, so a rolling buffer reassembles them.

@@ -92,6 +92,11 @@ pub struct ServeConfig {
     /// When set, every request must carry `Authorization: Bearer <token>`.
     /// Required by `main` when binding beyond loopback.
     pub auth_token: Option<String>,
+    /// Paged-KV pool size in TOKENS for the batched worker (ADR 0025,
+    /// `--kv-pool-tokens`). `None` = dense per-slot arenas. KV VRAM scales
+    /// with the pool instead of `slots × n_ctx`; admissions reserve
+    /// `prompt + max_tokens` and queue when the pool is exhausted.
+    pub kv_pool_tokens: Option<usize>,
     /// How chat messages render into the prompt (see [`ChatTemplate`]).
     pub chat_template: ChatTemplate,
 }
@@ -105,6 +110,7 @@ impl Default for ServeConfig {
             request_timeout_secs: 600,
             max_concurrent_requests: 64,
             auth_token: None,
+            kv_pool_tokens: None,
             chat_template: ChatTemplate::default(),
         }
     }
@@ -177,6 +183,7 @@ pub fn build_router_batched(
     let draining = Arc::new(AtomicBool::new(false));
     let alive = worker_alive.clone();
     let drain_flag = draining.clone();
+    let pool_tokens = cfg.kv_pool_tokens;
     std::thread::Builder::new()
         .name("tritium-serve-batch".into())
         .spawn(move || {
@@ -189,7 +196,7 @@ pub fn build_router_batched(
                 }
             }
             let _guard = Guard(alive);
-            crate::batch::run_batched(runner, eos, slots, jobs_rx, drain_flag);
+            crate::batch::run_batched(runner, eos, slots, pool_tokens, jobs_rx, drain_flag);
         })?;
     Ok(build_router_inner(
         jobs_tx,

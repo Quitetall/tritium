@@ -582,6 +582,14 @@ fn cuda_batch_paged_matches_dense_bit_exact() {
     const N: usize = 3;
     const POOL_PAGES: usize = 2; // deliberately tight: forces reuse + exhaustion
     let prompt = reference.token_ids.clone();
+    // The tight-pool arithmetic below (free_pages asserts, POOL_PAGES=2)
+    // assumes row 0's whole footprint fits ONE page. Named here so a larger
+    // fixture fails at the cause, not at a downstream reserve.
+    assert!(
+        prompt.len() + 4 <= 256,
+        "fixture grew past one KV page — retune POOL_PAGES and the \
+         free_pages asserts"
+    );
     let positions: Vec<usize> = (0..prompt.len()).collect();
     let toks: [u32; 4] = [128000, 791, 6864, 315];
 
@@ -664,6 +672,39 @@ fn cuda_batch_paged_matches_dense_bit_exact() {
     }
     for (i, &t) in toks.iter().enumerate() {
         step_both(&mut runner, &mut dense, &mut paged, t, &format!("re-admit step {i}"));
+    }
+
+    // The other two dispatch paths (review N2): the EAGER step and the
+    // on-device-sampling ARGMAX graph also select paged kernels off
+    // batch.pages — one lockstep each, pinned to dense.
+    {
+        let model = runner
+            .resident_cuda()
+            .expect("resident")
+            .expect("cuda resident");
+        let want = model
+            .decode_batch(&mut dense, &[toks[0], 0, toks[0]])
+            .expect("dense eager");
+        let got = model
+            .decode_batch(&mut paged, &[toks[0], 0, toks[0]])
+            .expect("paged eager");
+        for r in [0usize, 2] {
+            for v in 0..want[r].len() {
+                assert_eq!(
+                    got[r][v].to_bits(),
+                    want[r][v].to_bits(),
+                    "paged != dense at eager step row {r} vocab {v}"
+                );
+            }
+        }
+        let want_ids = model
+            .decode_batch_graph_argmax(&mut dense, &[toks[1], 0, toks[1]])
+            .expect("dense argmax");
+        let got_ids = model
+            .decode_batch_graph_argmax(&mut paged, &[toks[1], 0, toks[1]])
+            .expect("paged argmax");
+        assert_eq!(want_ids[0], got_ids[0], "argmax row 0 diverged");
+        assert_eq!(want_ids[2], got_ids[2], "argmax row 2 diverged");
     }
 
     drop(dense);

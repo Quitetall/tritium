@@ -951,3 +951,42 @@ kv_append guard it pins: an unguarded -1 writes into row 0's arena TAIL
 (pos max_ctx-1), not row 1's — the gate now asserts that exact aliasing
 target stays zero, plus loud rejection of an out-of-range token on a dead
 row. Re-run green first try.
+
+## v1.x round 19 — Track C3: paged KV shipped end-to-end (2026-07-11)
+
+Batching P2 step 3, ADR 0025 executed. The dense `[n, max_ctx, kv_width]`
+batch arenas are now optional: `--kv-pool-tokens N` (serve) /
+`new_batch_paged` (API) replaces them with per-layer K/V page POOLS
+(256-token pages) shared by all slots through per-slot page tables.
+
+- **Kernels**: kv_append_mdecode + attn split_partial became ONE body each,
+  templated on `bool PAGED` — the `if constexpr`-pruned dense instantiation
+  is **SASS byte-identical** to the retired hand-written kernels
+  (independently re-verified in review; a struct-shaped codec drifted the
+  schedule by 566 opcodes first — the constexpr body is the shape ptxas
+  reproduces). The never-launched dense-indexed fallback
+  `gqa_attention_mdecode_f32` and its per-batch `d_scores` scratch
+  (n·n_head·max_ctx f32) were retired ahead of paging.
+- **Host**: prefix-contiguous all-or-nothing reservation (free-list; one
+  page id spans all layers' K+V pools), release at retirement, table
+  content uploaded per step next to d_positions (pointer baked at capture —
+  no recapture ever), unmapped positions rejected loudly pre-launch.
+- **Serve policy (v1, no eviction)**: admission reserves prompt+max_tokens
+  up front; a full pool PARKS the job (FIFO, retried before new work); a
+  request that can never fit errors loudly. Every retirement/abandonment
+  path releases pages.
+- **Bit-exactness**: paged == dense BIT-IDENTICAL (gate
+  `cuda_batch_paged_matches_dense_bit_exact`: adoption, graph+eager+argmax
+  lockstep, dead row, retire/re-admit page REUSE over stale bytes,
+  exhaustion/no-leak). Serve G3: 6 streams through a deliberately tight
+  4-page pool == dense streams exactly (parking exercised, delays never
+  change content).
+- **Memory (arithmetic at BitNet 2B4T geometry, f32 KV, 30 layers)**: the
+  G3 workload's 4-slot dense arenas = 2.52 GB; its 4-page pool = 157 MB
+  (−94%). Honest caveats: the win is the workload's length-distribution
+  gap to max_ctx, not a constant; `d_attn_partials` (~5 MB) still scales
+  with max_ctx; dense remains the default.
+
+Gates: 54/54 cuda unit, 6/6 batch acceptance, serve G1/G2 + C1 interleave
+(dense default regression-free) + new G3. Track C batching P2 = C1 + C2 +
+C3 COMPLETE. C4 (batched spec-decode coexistence) remains the stretch item.

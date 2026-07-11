@@ -46,7 +46,9 @@ pub use cuda::CudaBackend;
 // borrowed `DecodeModelSpec`, then drives it per token — keeping the residual stream
 // + KV cache in VRAM across all layers.
 #[cfg(feature = "cuda")]
-pub use cuda::{BatchKv, CudaDecodeModel, DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
+pub use cuda::{
+    BatchKv, CudaDecodeModel, DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec, KV_PAGE_TOKENS,
+};
 
 // v0.4.0: the resident SALT projection primitive — upload multi-plane TQ2_0 weights
 // plane-major once, then run the `salt_mpgemm_tiled_f32` kernel against them. The

@@ -38,24 +38,7 @@ impl CudaDecodeModel {
         Ok(out.iter().flat_map(|v| v.to_le_bytes()).collect())
     }
 
-    /// Debug/test access: dtoh one K row of a batch slot (f32 bytes).
-    #[doc(hidden)]
-    pub fn debug_batch_kv_k_row(
-        &self,
-        batch: &BatchKv,
-        li: usize,
-        row_slot: usize,
-        row: usize,
-    ) -> Result<Vec<u8>, BackendError> {
-        let kw = self.kv_width;
-        let off = (row_slot * batch.max_ctx + row) * kw;
-        let view = batch.kv_k[li].slice(off..off + kw);
-        let mut out = vec![0f32; kw];
-        self.stream
-            .memcpy_dtoh(&view, &mut out)
-            .map_err(|e| driver_err("debug batch kv row dtoh", &e))?;
-        Ok(out.iter().flat_map(|v| v.to_le_bytes()).collect())
-    }
+
 
     /// Continuous-batching admission: copy this model's single-sequence KV
     /// rows `[0, len)` (every layer, K and V) into batch slot `row`'s arena.

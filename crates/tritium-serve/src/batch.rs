@@ -28,8 +28,15 @@
 //! (validation failures, tree ops) wait out the remaining chunks — bounded by
 //! one prompt's chunked prefill.
 //!
-//! Remaining phase-2 costs: free slots burn a row of compute (per-row masks,
-//! C2) and KV arenas are dense `[n, max_ctx]` (paged KV, C3).
+//! **Paged KV (batching P2, C3, ADR 0025)**: with `--kv-pool-tokens N`, the
+//! per-slot dense arenas are replaced by a shared page pool. Admission
+//! reserves `prompt + max_tokens` up front (never outgrown — the v1
+//! no-eviction policy); a full pool parks the job until a retirement frees
+//! pages (FIFO, retried before new work); a request that can never fit is a
+//! loud error. Every retirement/abandonment path releases its row's pages.
+//! Paging is bit-exact by construction (gated: paged == dense).
+//!
+//! Remaining phase-2 cost: free slots still burn their dense GEMM rows.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -132,6 +139,15 @@ fn req_seed(s: &Sampling) -> u64 {
     }
 }
 
+/// Return a vacated row's KV pages to the pool (no-op on a dense batch).
+/// Called at EVERY site that retires an Active or abandons a Pending.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn release_slot(batch: &mut tritium_cuda::BatchKv, row: usize) {
+    if batch.paged() {
+        let _ = batch.release_pages(row);
+    }
+}
+
 /// Emit one token on a slot's channel. Returns `false` when the request is
 /// finished (EOS/budget) or the client went away — the slot should retire.
 fn emit(active: &mut Active, token: u32, eos: u32, logits: &[f32]) -> bool {
@@ -159,6 +175,7 @@ pub(crate) fn run_batched(
     mut runner: tritium_nn::ModelRunner,
     eos: u32,
     slots: usize,
+    pool_tokens: Option<usize>,
     mut job_rx: mpsc::Receiver<Job>,
     draining: Arc<AtomicBool>,
 ) {
@@ -169,7 +186,19 @@ pub(crate) fn run_batched(
     let n_ctx = runner.config.n_ctx as usize;
     // Build the resident decoder + the slot pool up front; failures here are
     // fatal for the worker (the router will see a closed queue → 503s).
-    let mut batch = match runner.new_batch(slots) {
+    let build = match pool_tokens {
+        None => runner.new_batch(slots),
+        Some(t) => {
+            let pages = t.div_ceil(tritium_cuda::KV_PAGE_TOKENS);
+            eprintln!(
+                "tritium-serve: paged KV — {pages} pages ({} tokens) shared by {slots} slots                  (dense would be {} tokens)",
+                pages * tritium_cuda::KV_PAGE_TOKENS,
+                slots * n_ctx,
+            );
+            runner.new_batch_paged(slots, pages)
+        }
+    };
+    let mut batch = match build {
         Ok(b) => b,
         Err(tritium_nn::ResidentOpError::Unavailable) => {
             eprintln!("tritium-serve: --batch-slots needs the CUDA resident decoder");
@@ -180,6 +209,12 @@ pub(crate) fn run_batched(
             return;
         }
     };
+    // Whole-pool capacity in tokens (0 = dense/unlimited): requests that can
+    // NEVER fit are errored loudly instead of parking forever.
+    let pool_cap_tokens = batch.free_pages() * tritium_cuda::KV_PAGE_TOKENS;
+    // A job that validated but found the page pool exhausted: retried before
+    // pulling new work (FIFO), admitted once retirements free pages.
+    let mut parked: Option<Job> = None;
     let chunk = match prefill_chunk() {
         Ok(c) => c,
         Err(e) => {
@@ -195,13 +230,18 @@ pub(crate) fn run_batched(
         // requests; the router already 503s new ones. Keep looping so the
         // final channel close still exits cleanly.
         if draining.load(Ordering::Relaxed) {
-            for slot in pool.iter_mut() {
+            for (row, slot) in pool.iter_mut().enumerate() {
                 if let Some(a) = slot.take() {
                     let _ = a.tx.try_send(GenEvent::Error("server draining".into()));
+                    release_slot(&mut batch, row);
                 }
             }
             if let Some(p) = pending.take() {
                 let _ = p.tx.try_send(GenEvent::Error("server draining".into()));
+                release_slot(&mut batch, p.row);
+            }
+            if let Some(Job::Generate { tx, .. }) = parked.take() {
+                let _ = tx.try_send(GenEvent::Error("server draining".into()));
             }
         }
         // Admit into free slots: drain waiting jobs, block only when idle.
@@ -218,17 +258,26 @@ pub(crate) fn run_batched(
             }
             let free = pool.iter().position(Option::is_none);
             let any_live = pool.iter().any(Option::is_some);
-            let job = match free {
-                None => break,
-                Some(_) if any_live => match job_rx.try_recv() {
-                    Ok(j) => j,
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => return,
-                },
-                Some(_) => match job_rx.blocking_recv() {
-                    Some(j) => j,
-                    None => return,
-                },
+            // A parked (pool-exhausted) job is retried before pulling new
+            // work — FIFO — but only once a slot row is free to take (a full
+            // pool must NOT take it: the row-pick below would break and drop
+            // the job). If it parks again below, admission breaks, so this
+            // cannot spin.
+            let job = if free.is_some() && parked.is_some() {
+                parked.take().expect("checked is_some")
+            } else {
+                match free {
+                    None => break,
+                    Some(_) if any_live => match job_rx.try_recv() {
+                        Ok(j) => j,
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => return,
+                    },
+                    Some(_) => match job_rx.blocking_recv() {
+                        Some(j) => j,
+                        None => return,
+                    },
+                }
             };
             admissions += 1;
             let Some(row) = pool.iter().position(Option::is_none) else {
@@ -267,6 +316,28 @@ pub(crate) fn run_batched(
                         let _ = tx.try_send(GenEvent::Done(FinishReason::Length));
                         continue;
                     }
+                    // Paged KV (C3): reserve the request's whole footprint up
+                    // front (v1 no-eviction policy — it can never be outgrown
+                    // mid-decode). A request that can NEVER fit is a loud
+                    // error; a pool that is merely full right now parks the
+                    // job until a retirement frees pages.
+                    if batch.paged() {
+                        let needed = prompt_len + max_new;
+                        if needed > pool_cap_tokens {
+                            let _ = tx.try_send(GenEvent::Error(format!(
+                                "prompt + max_tokens = {needed} tokens exceeds the \
+                                 --kv-pool-tokens capacity ({pool_cap_tokens})"
+                            )));
+                            continue;
+                        }
+                        if tx.is_closed() {
+                            continue; // don't hold pages for a gone client
+                        }
+                        if batch.reserve_pages(row, needed).is_err() {
+                            parked = Some(Job::Generate { req, tx });
+                            break;
+                        }
+                    }
                     // Admission (C1): park the job as the one in-flight
                     // chunked prefill. Reset starts a fresh single-sequence
                     // KV; the chunks below accumulate into it.
@@ -301,10 +372,12 @@ pub(crate) fn run_batched(
         // the pool is empty).
         if let Some(p) = pending.as_mut() {
             if p.tx.is_closed() {
-                // Client gone mid-prefill: abandon the remaining chunks. The
-                // partial single-sequence KV is dead weight until the next
-                // admission's reset.
+                // Client gone mid-prefill: abandon the remaining chunks (and
+                // free the reserved pages). The partial single-sequence KV is
+                // dead weight until the next admission's reset.
+                let row = p.row;
                 pending = None;
+                release_slot(&mut batch, row);
             } else {
                 let len = p.req.prompt_tokens.len();
                 let end = (p.done + chunk).min(len);
@@ -313,6 +386,7 @@ pub(crate) fn run_batched(
                     Err(e) => {
                         let p = pending.take().expect("pending checked above");
                         let _ = p.tx.try_send(GenEvent::Error(e.to_string()));
+                        release_slot(&mut batch, p.row);
                     }
                     Ok(logits) => {
                         p.done = end;
@@ -332,6 +406,7 @@ pub(crate) fn run_batched(
                             })();
                             if let Err(e) = adopt {
                                 let _ = p.tx.try_send(GenEvent::Error(e));
+                                release_slot(&mut batch, p.row);
                             } else {
                                 let mut active = Active {
                                     tx: p.tx,
@@ -343,6 +418,7 @@ pub(crate) fn run_batched(
                                     sampling: p.req.sampling,
                                 };
                                 active.salt += 1;
+                                let mut adopted = false;
                                 if let Some(first) = sample(
                                     &logits,
                                     &active.sampling,
@@ -351,11 +427,15 @@ pub(crate) fn run_batched(
                                     active.last_token = first;
                                     if emit(&mut active, first, eos, &logits) {
                                         pool[p.row] = Some(active);
+                                        adopted = true;
                                     }
                                 } else {
                                     let _ = active
                                         .tx
                                         .try_send(GenEvent::Error("empty logits".into()));
+                                }
+                                if !adopted {
+                                    release_slot(&mut batch, p.row);
                                 }
                             }
                         }
@@ -385,9 +465,10 @@ pub(crate) fn run_batched(
         let all_logits = match step {
             Ok(l) => l,
             Err(e) => {
-                for slot in pool.iter_mut() {
+                for (row, slot) in pool.iter_mut().enumerate() {
                     if let Some(a) = slot.take() {
                         let _ = a.tx.try_send(GenEvent::Error(e.to_string()));
+                        release_slot(&mut batch, row);
                     }
                 }
                 continue;
@@ -405,12 +486,14 @@ pub(crate) fn run_batched(
             ) else {
                 if let Some(a) = slot.take() {
                     let _ = a.tx.try_send(GenEvent::Error("empty logits".into()));
+                    release_slot(&mut batch, row);
                 }
                 continue;
             };
             active.last_token = tok;
             if !emit(active, tok, eos, &all_logits[row]) {
                 *slot = None;
+                release_slot(&mut batch, row);
             }
         }
     }

@@ -8,7 +8,9 @@ different scale-stream contractions, tuning-sensitive).
 
 ## Context
 
-`decode.cu` holds 65 `__global__` kernels. Nine families exist in 2–4 dtype
+`decode.cu` holds 66 `__global__` kernels (65 at this ADR's writing; −1
+`gqa_attention_mdecode_f32` retired + +2 paged-KV twins, ADR 0025 — the
+drift test pins the count with the cause chain). Nine families exist in 2–4 dtype
 variants — the ADR 0020 KV precision ladder multiplied the KV-touching
 families by the rung count:
 
@@ -107,7 +109,7 @@ obligations:
   template); shims inside it preserve every launch symbol — host code and
   the drift test are untouched. Dynamic-shared arrays inside template bodies
   need unique names (C++ vs C linkage of `extern __shared__` collide).
-- **Proof status (tools/sass_diff.sh, sm_89, CUDA 13)**: 63/65 kernels SASS
+- **Proof status (tools/sass_diff.sh, sm_89, CUDA 13; counts as of Track B)**: 63/65 kernels SASS
   **byte-identical** after the refactor, including all twelve templated
   attention/lm_head instantiations. The two exceptions — kv_append_batch
   f32/h — are **justified**: identical 152-instruction opcode streams,

@@ -60,6 +60,7 @@ use crate::autotune::{
 use crate::codegen::{JIT_KERNEL_NAME, compile_imma};
 
 mod consts;
+pub use consts::KV_PAGE_TOKENS;
 mod kv;
 
 use consts::*;
@@ -627,7 +628,6 @@ pub struct CudaDecodeModel {
     f_lm_head_f16: CudaFunction,
     f_kv_append_mdecode: CudaFunction,
     f_kv_append_mdecode_paged: CudaFunction,
-    #[allow(dead_code)] // kept for fallback; split-KV replaced it in the M=N path
     f_attn_split_partial: CudaFunction,
     f_attn_split_partial_paged: CudaFunction,
     f_attn_combine: CudaFunction,
