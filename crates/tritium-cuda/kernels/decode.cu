@@ -2935,8 +2935,9 @@ __global__ void kv_append_mdecode_f32(const float* __restrict__ src, float* __re
   if (idx >= (long long)n * kv_width) return;
   const int row = idx / kv_width;
   // Dead row (position -1, batching P2 C2): touch NOTHING — an unguarded -1
-  // would write into the PREVIOUS row's arena. This is the paged-KV contract:
-  // a dead row owns no write slot.
+  // would write into the previous row's arena tail (or before the whole
+  // arena for row 0). This is the paged-KV contract: a dead row owns no
+  // write slot.
   if (positions[row] < 0) return;
   const int e = idx - (long long)row * kv_width;
   const long long off = ((long long)row * max_ctx + positions[row]) * kv_width + e;

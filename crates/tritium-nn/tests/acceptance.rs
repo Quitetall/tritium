@@ -471,6 +471,7 @@ fn cuda_batch_dead_row_touches_nothing() {
         return;
     };
     let n_layers = runner.config.n_layers as usize;
+    let max_ctx = runner.config.n_ctx as usize;
     let model = match runner.resident_cuda() {
         Ok(Some(m)) => m,
         _ => {
@@ -484,6 +485,16 @@ fn cuda_batch_dead_row_touches_nothing() {
     let mut masked = model.new_batch(N).expect("new_batch masked");
     masked.set_live(1, false).expect("set_live");
     let mut all_live = model.new_batch(N).expect("new_batch all_live");
+
+    // A dead row's token is STILL vocab-checked (the embed gather reads
+    // every row's token — an out-of-range one is an OOB device read, dead
+    // or not). Must reject loudly, before any launch.
+    assert!(
+        model
+            .decode_batch_graph(&mut masked, &[toks[0], u32::MAX, toks[0]])
+            .is_err(),
+        "out-of-range token on a DEAD row must still be rejected"
+    );
 
     for (i, &t) in toks.iter().enumerate() {
         let got = model
@@ -527,6 +538,18 @@ fn cuda_batch_dead_row_touches_nothing() {
             assert!(
                 live.iter().any(|&b| b != 0),
                 "live row 0 wrote nothing at layer {li} v={v} — vacuous gate"
+            );
+            // Aliasing target: an UNGUARDED -1 append computes
+            // (1*max_ctx - 1)*kv_width — i.e. row 0's arena at its LAST
+            // position, not row 1's. Assert that exact spot stayed zero so a
+            // regression of the kv_append guard cannot slip past this gate.
+            let alias = model
+                .debug_batch_kv_row(&masked, li, 0, max_ctx - 1, v)
+                .expect("alias target kv");
+            assert!(
+                alias.iter().all(|&b| b == 0),
+                "row 0's tail (pos max_ctx-1) written at layer {li} v={v} — \
+                 the dead row's -1 append aliased into it"
             );
         }
     }

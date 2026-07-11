@@ -206,17 +206,17 @@ impl CudaDecodeModel {
             )));
         }
         for ((&t, &p), &l) in tokens.iter().zip(&batch.positions).zip(&batch.live) {
-            // Dead rows are skipped by the kernels (position -1); their pad
-            // token and frozen position need no validation.
-            if !l {
-                continue;
-            }
+            // The vocab bound is unconditional: the embed gather reads
+            // `table[tokens[row]]` for EVERY row, dead or not — an
+            // out-of-range token on a dead row is still an OOB device read.
             if t as usize >= self.vocab {
                 return Err(BackendError::InvalidInput(format!(
                     "decode_batch token {t} out of range"
                 )));
             }
-            if p >= self.max_ctx {
+            // Dead rows' positions are frozen and skipped by the
+            // positions-reading kernels (sentinel -1) — no overflow check.
+            if l && p >= self.max_ctx {
                 return Err(BackendError::InvalidInput(
                     "decode_batch context overflow".into(),
                 ));
@@ -657,17 +657,17 @@ impl CudaDecodeModel {
             )));
         }
         for ((&t, &p), &l) in tokens.iter().zip(&batch.positions).zip(&batch.live) {
-            // Dead rows are skipped by the kernels (position -1); their pad
-            // token and frozen position need no validation.
-            if !l {
-                continue;
-            }
+            // The vocab bound is unconditional: the embed gather reads
+            // `table[tokens[row]]` for EVERY row, dead or not — an
+            // out-of-range token on a dead row is still an OOB device read.
             if t as usize >= self.vocab {
                 return Err(BackendError::InvalidInput(format!(
                     "decode_batch_graph token {t} out of range"
                 )));
             }
-            if p >= self.max_ctx {
+            // Dead rows' positions are frozen and skipped by the
+            // positions-reading kernels (sentinel -1) — no overflow check.
+            if l && p >= self.max_ctx {
                 return Err(BackendError::InvalidInput(
                     "decode_batch_graph context overflow".into(),
                 ));
@@ -770,17 +770,17 @@ impl CudaDecodeModel {
             )));
         }
         for ((&t, &p), &l) in tokens.iter().zip(&batch.positions).zip(&batch.live) {
-            // Dead rows are skipped by the kernels (position -1); their pad
-            // token and frozen position need no validation.
-            if !l {
-                continue;
-            }
+            // The vocab bound is unconditional: the embed gather reads
+            // `table[tokens[row]]` for EVERY row, dead or not — an
+            // out-of-range token on a dead row is still an OOB device read.
             if t as usize >= self.vocab {
                 return Err(BackendError::InvalidInput(format!(
                     "decode_batch_graph_argmax token {t} out of range"
                 )));
             }
-            if p >= self.max_ctx {
+            // Dead rows' positions are frozen and skipped by the
+            // positions-reading kernels (sentinel -1) — no overflow check.
+            if l && p >= self.max_ctx {
                 return Err(BackendError::InvalidInput(
                     "decode_batch_graph_argmax context overflow".into(),
                 ));

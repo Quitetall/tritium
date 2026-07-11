@@ -941,3 +941,13 @@ behavior exactly). Serve: G1/G2 + C1 interleave re-run green. What C2 does
 NOT claim: dead rows still cost their dense GEMM rows (inherent to M=N GEMM
 — the real free-slot compute lives there, and that is a C3/occupancy story,
 not a masking one).
+
+Review (NEEDS CHANGES, both findings verified + folded): (1) the dead-row
+validation skip had un-guarded the vocab bound — but the embed gather reads
+EVERY row's token, so a garbage token on a dead row was an OOB device read;
+vocab check restored unconditional, only the position-overflow check is
+liveness-gated. (2) The gate was blind to a regression of the very
+kv_append guard it pins: an unguarded -1 writes into row 0's arena TAIL
+(pos max_ctx-1), not row 1's — the gate now asserts that exact aliasing
+target stays zero, plus loud rejection of an out-of-range token on a dead
+row. Re-run green first try.
