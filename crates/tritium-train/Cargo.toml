@@ -13,6 +13,10 @@ categories.workspace = true
 [dependencies]
 tritium-core = { workspace = true }
 tritium-testkit = { workspace = true }
+# Row-parallel dense matmul forward/vjp — the training hot path. Parallelizing over OUTPUT rows
+# leaves each element's k-accumulation order untouched, so results are bit-identical to the serial
+# loop (verified by the tape gradchecks + the ModelRunner conformance gate). Not in the wasm build.
+rayon = { workspace = true }
 
 [dev-dependencies]
 # Property-based gates for LoRA (frozen-base zero-grad, merge correctness, rank edges) —

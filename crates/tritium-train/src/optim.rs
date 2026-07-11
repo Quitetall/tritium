@@ -12,7 +12,15 @@
 //! live outside the tape; the QAT loop rebuilds the forward graph each step, extracts
 //! grads, and calls [`Optimizer::step`].
 
+use rayon::prelude::*;
+
 use crate::checkpoint::{CheckpointError, Cursor};
+
+/// Parallelize a leaf's AdamW update above this element count (element-wise ⇒ bit-identical to the
+/// serial loop). Set high: the optimizer is called on every leaf every step, so rayon's per-call
+/// fork overhead only pays off on the very large tensors (embeddings, and every weight at 32B
+/// scale) — small leaves at 135M-scale stay serial. ~1M elements.
+const PAR_MIN_ELEMS: usize = 1 << 20;
 
 /// A first-order optimizer over flat `f32` parameter buffers, with per-parameter state
 /// that can be serialized into a checkpoint.
@@ -103,15 +111,32 @@ impl Optimizer for AdamW {
         // Decoupled weight decay: a multiplicative shrink on the param, applied outside
         // the adaptive denominator (the "W" in AdamW).
         let shrink = 1.0 - self.lr * self.weight_decay;
-        for i in 0..param.len() {
-            let g = grad[i];
-            let m = self.beta1 * state.m[i] + (1.0 - self.beta1) * g;
-            let v = self.beta2 * state.v[i] + (1.0 - self.beta2) * g * g;
-            state.m[i] = m;
-            state.v[i] = v;
-            let m_hat = m / bc1;
-            let v_hat = v / bc2;
-            param[i] = param[i] * shrink - self.lr * (m_hat / (v_hat.sqrt() + self.eps));
+        // Each element updates independently, so the parallel and serial results are bit-identical.
+        // Big leaves (every trained 2D weight) go parallel; tiny ones stay serial (rayon overhead).
+        let elem = |p: &mut f32, g: f32, mi: &mut f32, vi: &mut f32| {
+            let m = self.beta1 * *mi + (1.0 - self.beta1) * g;
+            let v = self.beta2 * *vi + (1.0 - self.beta2) * g * g;
+            *mi = m;
+            *vi = v;
+            *p = *p * shrink - self.lr * (m / bc1 / ((v / bc2).sqrt() + self.eps));
+        };
+        let (m, v) = (&mut state.m, &mut state.v);
+        if param.len() >= PAR_MIN_ELEMS {
+            param
+                .par_iter_mut()
+                .zip(grad.par_iter())
+                .zip(m.par_iter_mut())
+                .zip(v.par_iter_mut())
+                .for_each(|(((p, &g), mi), vi)| elem(p, g, mi, vi));
+        } else {
+            for (((p, &g), mi), vi) in param
+                .iter_mut()
+                .zip(grad)
+                .zip(m.iter_mut())
+                .zip(v.iter_mut())
+            {
+                elem(p, g, mi, vi);
+            }
         }
     }
 

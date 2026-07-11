@@ -11,7 +11,14 @@
 //! `s_q` is per-row AbsMean (BitNet b1.58), recomputed each step but treated as a
 //! constant of the forward (stop-gradient on the quantizer scale).
 
+use rayon::prelude::*;
 use tritium_core::absmean;
+
+/// Parallelize a weight's SALT quantization above this element count (per-row work is independent
+/// ⇒ bit-identical to the serial loop). Set high: quantization runs on every weight every step
+/// (T planes each), so rayon's per-call fork overhead only pays off on the very large tensors
+/// (embeddings, and every weight at 32B scale) — small weights at 135M-scale stay serial. ~1M.
+const PAR_MIN_ELEMS: usize = 1 << 20;
 
 /// Per-row AbsMean quantizer scale for `[rows, cols]` latent weights.
 #[must_use]
@@ -101,19 +108,33 @@ pub fn quantize_vjp(
 pub fn salt_quantize_forward(wf: &[f32], rows: usize, cols: usize, t: usize) -> Vec<f32> {
     let mut residual = wf.to_vec();
     let mut recon = vec![0.0f32; rows * cols];
+    let par = rows * cols >= PAR_MIN_ELEMS;
+    // One row's quantize: subtract this plane's ternary contribution from the residual and add it to
+    // the reconstruction. Rows are independent within a plane, so parallel == serial bit-for-bit.
+    let quant_row = |rec: &mut [f32], res: &mut [f32], sr: f32| {
+        if sr == 0.0 {
+            return;
+        }
+        for c in 0..cols {
+            let contrib = sr * (res[c] / sr).round().clamp(-1.0, 1.0);
+            rec[c] += contrib;
+            res[c] -= contrib;
+        }
+    };
     for _plane in 0..t {
         let s = absmean_scale_per_row(&residual, rows, cols);
-        for r in 0..rows {
-            let sr = s[r];
-            if sr == 0.0 {
-                continue;
-            }
-            for c in 0..cols {
-                let i = r * cols + c;
-                let contrib = sr * (residual[i] / sr).round().clamp(-1.0, 1.0);
-                recon[i] += contrib;
-                residual[i] -= contrib;
-            }
+        if par {
+            recon
+                .par_chunks_mut(cols)
+                .zip(residual.par_chunks_mut(cols))
+                .zip(s.par_iter())
+                .for_each(|((rec, res), &sr)| quant_row(rec, res, sr));
+        } else {
+            recon
+                .chunks_mut(cols)
+                .zip(residual.chunks_mut(cols))
+                .zip(s.iter())
+                .for_each(|((rec, res), &sr)| quant_row(rec, res, sr));
         }
     }
     recon
