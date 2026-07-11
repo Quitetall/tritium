@@ -799,12 +799,20 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_queue_depth {}\n\
          # HELP tritium_worker_alive Decode worker liveness (1 = alive).\n\
          # TYPE tritium_worker_alive gauge\n\
-         tritium_worker_alive {}\n",
+         tritium_worker_alive {}\n\
+         # HELP tritium_spec_verifies_total Spec-decode tree verifies.\n\
+         # TYPE tritium_spec_verifies_total counter\n\
+         tritium_spec_verifies_total {}\n\
+         # HELP tritium_spec_committed_total Tokens committed by spec verifies.\n\
+         # TYPE tritium_spec_committed_total counter\n\
+         tritium_spec_committed_total {}\n",
         st.metrics.chat_requests.load(Ordering::Relaxed),
         st.metrics.queue_rejections.load(Ordering::Relaxed),
         st.metrics.tokens_out.load(Ordering::Relaxed),
         queue_depth,
         u8::from(st.worker_alive.load(Ordering::Relaxed)),
+        crate::generator::SPEC_VERIFIES.load(Ordering::Relaxed),
+        crate::generator::SPEC_COMMITTED.load(Ordering::Relaxed),
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }

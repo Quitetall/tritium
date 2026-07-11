@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_new: usize = 256;
     let mut eos: u32 = 128_001;
     let mut raw_tokens = false;
+    let mut draft_model: Option<String> = None;
 
     // Parse a required value for `name`, erroring (not silently defaulting) on a
     // missing or malformed value.
@@ -54,11 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--max-new" => max_new = val(args.next(), "--max-new")?,
             "--eos" => eos = val(args.next(), "--eos")?,
             "--raw-tokens" => raw_tokens = true,
+            "--draft-model" => draft_model = Some(val(args.next(), "--draft-model")?),
             "-h" | "--help" => {
                 eprintln!(
                     "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--spec lookup] \
                      [--batch-slots N] [--host 127.0.0.1] [--port 8080] [--model-id tritium] \
-                     [--max-new 256] [--eos 128001] [--raw-tokens]  (non-loopback --host requires \
+                     [--max-new 256] [--eos 128001] [--raw-tokens] \
+                     [--draft-model <gguf>]  (non-loopback --host requires \
                      TRITIUM_AUTH_TOKEN)"
                 );
                 return Ok(());
@@ -151,29 +154,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat_template,
         ..ServeConfig::default()
     };
+    // ADR 0021 model drafter: a SECOND runner in-process on the same device
+    // (its own KV + decode graphs). Load failures are loud — a missing or
+    // unloadable draft must never silently degrade to lookup drafting. A
+    // device-OOM here also fails at startup, not mid-request.
+    let draft_runner = match &draft_model {
+        None => None,
+        Some(path) => {
+            eprintln!("tritium-serve: loading draft model {path} ...");
+            let dbytes = std::fs::read(path).map_err(|e| format!("--draft-model {path}: {e}"))?;
+            let dfile = tritium_format::read_gguf(&dbytes)
+                .map_err(|e| format!("--draft-model {path}: {e}"))?;
+            let dbackend = init().map_err(|e| format!("--draft-model backend init: {e}"))?;
+            Some(
+                tritium_nn::ModelRunner::load(&dfile, &dbytes, dbackend)
+                    .map_err(|e| format!("--draft-model {path}: {e}"))?,
+            )
+        }
+    };
     #[cfg(feature = "cuda")]
     let (router, draining) = if batch_slots > 1 {
         // Continuous batching: a dedicated worker owns the runner + a fixed
         // slot pool; requests stream through the same job queue + SSE plumbing.
-        if spec_lookup {
+        if spec_lookup || draft_runner.is_some() {
             return Err(
-                "--spec lookup and --batch-slots > 1 are mutually exclusive \
-                        (the spec loop owns the single-sequence KV)"
+                "--spec lookup / --draft-model and --batch-slots > 1 are mutually \
+                        exclusive (the spec loop owns the single-sequence KV)"
                     .into(),
             );
         }
         tritium_serve::build_router_batched(runner, eos, batch_slots, tok, cfg)?
     } else {
-        let generator = Box::new(RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup));
-        build_router(generator, tok, cfg)
+        let mut generator = RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup);
+        if let Some(d) = draft_runner {
+            generator = generator.with_draft_model(d);
+        }
+        build_router(Box::new(generator), tok, cfg)
     };
     #[cfg(not(feature = "cuda"))]
     let (router, draining) = {
         if batch_slots > 1 {
             return Err("--batch-slots > 1 requires the cuda feature".into());
         }
-        let generator = Box::new(RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup));
-        build_router(generator, tok, cfg)
+        let mut generator = RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup);
+        if let Some(d) = draft_runner {
+            generator = generator.with_draft_model(d);
+        }
+        build_router(Box::new(generator), tok, cfg)
     };
 
     let addr = std::net::SocketAddr::new(host_ip, port);

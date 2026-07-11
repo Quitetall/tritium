@@ -7,7 +7,13 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// Process-wide spec-decode telemetry, read by `/metrics` (the generator is
+/// deliberately runtime-free, so counters are statics rather than plumbing).
+pub static SPEC_VERIFIES: AtomicU64 = AtomicU64::new(0);
+/// Tokens committed by spec verifies (tok/verify = committed / verifies).
+pub static SPEC_COMMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// One generation request: a tokenized prompt + decode controls.
 #[derive(Debug, Clone)]
@@ -293,6 +299,20 @@ pub struct RunnerGenerator {
     /// argmaxes); a model-free degenerate drafter — the ADR 0014 external-
     /// drafter boundary applies to model drafters, which stay outside.
     spec_lookup: bool,
+    /// ADR 0021 model drafter: a second (small, ternary) runner drafting K
+    /// greedy tokens per verify, replacing `lookup_draft` when present.
+    /// Lossless like lookup — the verifier only commits target argmaxes.
+    draft: Option<Box<tritium_nn::ModelRunner>>,
+    /// Number of leading positions of the DRAFT's KV known to match the
+    /// generation history.
+    draft_pos: usize,
+    /// Tokens fed to the draft at positions `draft_pos..` during the LAST
+    /// draft call (pending + its own greedy outputs). The next call compares
+    /// them against the committed history: matches advance `draft_pos`
+    /// (forward-contiguous — the resident runner rejects position rewinds);
+    /// the first mismatch (a rejected draft) resets the draft for a full
+    /// re-prefill.
+    draft_fed: Vec<u32>,
 }
 
 impl fmt::Debug for RunnerGenerator {
@@ -339,7 +359,19 @@ impl RunnerGenerator {
             eos,
             tree_session_open: false,
             spec_lookup: false,
+            draft: None,
+            draft_pos: 0,
+            draft_fed: Vec::new(),
         }
+    }
+
+    /// Attach an ADR 0021 draft model (a second runner on the same device).
+    /// Enables the spec path for greedy/sampled requests; `--spec lookup`'s
+    /// prompt-lookup remains the drafter when no model is attached.
+    #[must_use]
+    pub fn with_draft_model(mut self, draft: tritium_nn::ModelRunner) -> Self {
+        self.draft = Some(Box::new(draft));
+        self
     }
 
     /// Enable prompt-lookup speculative decoding for greedy requests (needs
@@ -415,6 +447,76 @@ impl RunnerGenerator {
     /// emitted token is the target's own greedy argmax at its position (gated
     /// by `cuda_spec_lookup_matches_plain_greedy`).
     #[cfg(feature = "cuda")]
+    /// Draft up to `max_draft` tokens with the attached draft model (greedy),
+    /// starting after `history` (whose last element is the pending token).
+    /// Syncs the draft's KV to `history` first by re-feeding the gap — see
+    /// `draft_pos` for why that is always correct. Stops early at the draft's
+    /// own EOS. Returns `[]` on any draft error (caller falls back to a plain
+    /// step; drafting must never break generation).
+    fn model_draft(&mut self, history: &[u32], max_draft: usize) -> Vec<u32> {
+        let Some(draft) = self.draft.as_mut() else {
+            return Vec::new();
+        };
+        if max_draft == 0 || history.is_empty() {
+            return Vec::new();
+        }
+        let p = history.len() - 1; // pending's position
+        let draft_ctx = draft.config.n_ctx as usize;
+        if p + max_draft + 1 >= draft_ctx {
+            return Vec::new(); // draft context exhausted; plain steps carry on
+        }
+        // Reconcile last call's speculatively-fed tokens against the now-
+        // committed history: matches ADVANCE the watermark (those KV rows are
+        // proven correct); the first mismatch means a rejected draft sits in
+        // the KV — the resident runner rejects position rewinds, so recover
+        // with a reset + full re-prefill (rare for a good drafter).
+        let mut clean = true;
+        for (i, &fed) in self.draft_fed.iter().enumerate() {
+            if history.get(self.draft_pos + i) != Some(&fed) {
+                clean = false;
+                break;
+            }
+        }
+        if clean {
+            self.draft_pos = (self.draft_pos + self.draft_fed.len()).min(p);
+        } else {
+            draft.reset();
+            self.draft_pos = 0;
+        }
+        self.draft_fed.clear();
+        // Forward-contiguous sync: feed the history the draft hasn't seen,
+        // EXCLUDING pending (fed by the loop below).
+        if self.draft_pos < p {
+            let gap: Vec<u32> = history[self.draft_pos..p].to_vec();
+            let positions: Vec<usize> = (self.draft_pos..p).collect();
+            if draft.forward(&gap, &positions).is_err() {
+                draft.reset();
+                self.draft_pos = 0; // full resync next time
+                return Vec::new();
+            }
+            self.draft_pos = p;
+        }
+        let mut out = Vec::with_capacity(max_draft);
+        let mut tok = history[p];
+        for i in 0..max_draft {
+            let logits = match draft.forward(&[tok], &[p + i]) {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            self.draft_fed.push(tok);
+            let Some(next) = tritium_nn::sample_greedy(&logits) else {
+                break;
+            };
+            out.push(next);
+            if next == self.eos {
+                break; // the draft believes the turn ends here
+            }
+            tok = next;
+        }
+        out
+    }
+
+    #[cfg(feature = "cuda")]
     fn generate_spec_lookup(
         &mut self,
         req: &GenRequest,
@@ -485,7 +587,11 @@ impl RunnerGenerator {
             let kv_room = n_ctx.saturating_sub(history.len());
             let budget = max_new - emitted;
             let max_draft = draft_len.min(kv_room).min(budget.saturating_sub(1));
-            let drafts = Self::lookup_draft(&history, max_draft);
+            let drafts = if self.draft.is_some() {
+                self.model_draft(&history, max_draft)
+            } else {
+                Self::lookup_draft(&history, max_draft)
+            };
 
             if drafts.is_empty() {
                 // Plain M=1 graph step (faster than a 1-node tree).
@@ -513,6 +619,8 @@ impl RunnerGenerator {
                 .map_err(|e| GenError::Backend(e.to_string()))?;
             n_verify += 1;
             n_committed += committed.len();
+            SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
+            SPEC_COMMITTED.fetch_add(committed.len() as u64, Ordering::Relaxed);
             t_verify += t0.elapsed();
             draft_len = if committed.len() == tokens.len() {
                 (draft_len * 2).min(DRAFT_MAX)
@@ -693,7 +801,11 @@ impl RunnerGenerator {
             let kv_room = n_ctx.saturating_sub(history.len());
             let budget = max_new - emitted;
             let max_draft = draft_len.min(kv_room).min(budget.saturating_sub(1));
-            let drafts = Self::lookup_draft(&history, max_draft);
+            let drafts = if self.draft.is_some() {
+                self.model_draft(&history, max_draft)
+            } else {
+                Self::lookup_draft(&history, max_draft)
+            };
 
             if drafts.is_empty() {
                 let pos = history.len() - 1;
@@ -822,22 +934,33 @@ impl Generator for RunnerGenerator {
         // disabled, sampling is stochastic, or no CUDA resident decoder exists
         // (probed HERE — e.g. `--spec lookup` on the cpu backend — so the
         // fallback is a dispatch decision, never a mid-stream error).
-        #[cfg(feature = "cuda")]
-        // Spec-lookup emits committed tokens without per-token logits on the
+        // Spec paths emit committed tokens without per-token logits on the
         // host, so logprobs requests take the plain path (exact semantics).
-        if self.spec_lookup && req.logprobs.is_none() && self.runner.has_resident_decoder() {
-            return match req.sampling {
-                Sampling::Greedy => {
-                    self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step)
-                }
-                // Stochastic sampling uses the speculative accept rule
-                // (lossless IN DISTRIBUTION, not stream-equal to the plain
-                // loop — the plain loop and this one consume randomness
-                // differently by construction).
-                Sampling::TopK { .. } | Sampling::TopP { .. } => {
-                    self.generate_spec_lookup_sampled(req, prompt_len, max_new, logits, on_step)
-                }
-            };
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(d) = self.draft.as_mut() {
+                // Fresh request: the draft re-prefills lazily via the sync gap.
+                d.reset();
+                self.draft_pos = 0;
+                self.draft_fed.clear();
+            }
+            if (self.spec_lookup || self.draft.is_some())
+                && req.logprobs.is_none()
+                && self.runner.has_resident_decoder()
+            {
+                return match req.sampling {
+                    Sampling::Greedy => {
+                        self.generate_spec_lookup(req, prompt_len, max_new, logits, on_step)
+                    }
+                    // Stochastic sampling uses the speculative accept rule
+                    // (lossless IN DISTRIBUTION, not stream-equal to the plain
+                    // loop — the plain loop and this one consume randomness
+                    // differently by construction).
+                    Sampling::TopK { .. } | Sampling::TopP { .. } => {
+                        self.generate_spec_lookup_sampled(req, prompt_len, max_new, logits, on_step)
+                    }
+                };
+            }
         }
 
         for i in 0..max_new {

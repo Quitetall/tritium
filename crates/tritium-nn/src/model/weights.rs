@@ -30,7 +30,7 @@ use tritium_spec::TernaryBackend;
 
 use crate::config::{ArchSpec, ModelConfig};
 use crate::error::NnError;
-use crate::layers::{Mlp, Projection, Relu2Mlp, TernaryLinear, TransformerBlock};
+use crate::layers::{Projection, TernaryLinear, TransformerBlock};
 use crate::tensor::f16_bytes_to_f32;
 
 /// The weights for one decoder layer, ready to run.
