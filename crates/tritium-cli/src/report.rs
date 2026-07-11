@@ -930,7 +930,7 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
         .map(|info| -> anyhow::Result<Row> {
             let k = info.dims.first().copied().unwrap_or(0) as usize;
             let n_el: usize = info.dims.iter().product::<u64>() as usize;
-            let n_rows = if k == 0 { 0 } else { n_el / k };
+            let n_rows = n_el.checked_div(k).unwrap_or(0);
             let start = data0 + info.offset as usize;
             // I2_S is a bitnet.cpp extension the generic reader sizes as 0 —
             // compute its payload length (packed 2-bit body + f32 scale) the
