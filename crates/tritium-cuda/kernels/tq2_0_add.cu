@@ -717,3 +717,197 @@ extern "C" __global__ void salt_mpgemm_tiled_f32(
         out[(long long)mi * n + ni] = acc;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TQ1_0-native decode GEMMs (A2, Track A): the entropy-dense weight format
+// (1.625 b/w payload vs TQ2_0's 2.0) read NATIVELY — ~21% less weight traffic
+// on the DRAM-bound GEMMs, ~21% less resident weight VRAM.
+//
+// TQ1_0 block (54 B): qs[48] + qh[4] + f16 scale, 5 trits/byte (3^5 = 243).
+// Decode contract — must match `tritium_format::tq1::decode` EXACTLY:
+//     q = (uint8_t)(byte * pow3[n]);   trit = ((q * 3) >> 8) - 1   ∈ {-1,0,1}
+// Element map (per 256-trit block):
+//     e = n*32 + m        ← qs[m]       n ∈ 0..5, m ∈ 0..32
+//     e = 160 + n*16 + m  ← qs[32+m]    n ∈ 0..5, m ∈ 0..16
+//     e = 240 + n*4 + j   ← qh[j]       n ∈ 0..4, j ∈ 0..4
+//
+// Every element base above is 4-aligned, so a block is exactly 64 dp4a words:
+// 40 (5 levels × 8 byte-quads) + 20 (5 × 4) + 4 (qh: 4 levels × 1 quad) —
+// two words per lane, the same acc0/acc1 shape as the TQ2 kernel. The word→
+// (byte offset, pow3, element) map is loop-invariant per lane. Blocks are
+// 54 B (≡ 2 mod 4), so quads load as two u16s exactly like the TQ2 kernel.
+//
+// Integer accumulation ⇒ bit-exact vs the TQ2 kernel on the same trits
+// (gated by `tq1_matches_tq2_tiled_scaled`).
+#define TQ1_0_BLOCK_BYTES 54
+
+__device__ __forceinline__ int tq1_decode4(unsigned int bytes4, unsigned int p3) {
+    int w8 = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const unsigned int b = (bytes4 >> (8 * j)) & 0xffu;
+        const unsigned int q = (b * p3) & 0xffu;   // u8 wraparound is the scheme
+        const int t = (int)((q * 3u) >> 8) - 1;    // {-1, 0, 1}
+        w8 |= (t & 0xff) << (8 * j);
+    }
+    return w8;
+}
+
+__device__ __forceinline__ void tq1_word(int w, int* boff, unsigned int* p3, int* e) {
+    const unsigned int P3[5] = {1u, 3u, 9u, 27u, 81u};
+    if (w < 40) {
+        const int nn = w >> 3, g = w & 7;
+        *boff = g * 4;
+        *p3 = P3[nn];
+        *e = nn * 32 + g * 4;
+    } else if (w < 60) {
+        const int v = w - 40, nn = v >> 2, g = v & 3;
+        *boff = 32 + g * 4;
+        *p3 = P3[nn];
+        *e = 160 + nn * 16 + g * 4;
+    } else {
+        const int nn = w - 60;
+        *boff = 48;
+        *p3 = P3[nn];
+        *e = 240 + nn * 4;
+    }
+}
+
+// Scalar single-trit decode for the k % 256 tail (exact same contract).
+__device__ __forceinline__ int tq1_trit(const unsigned char* blk, int e) {
+    const unsigned int P3[5] = {1u, 3u, 9u, 27u, 81u};
+    unsigned int byte, p3;
+    if (e < 160) {
+        byte = blk[e & 31];
+        p3 = P3[e >> 5];
+    } else if (e < 240) {
+        const int r = e - 160;
+        byte = blk[32 + (r & 15)];
+        p3 = P3[r >> 4];
+    } else {
+        const int r = e - 240;
+        byte = blk[48 + (r & 3)];
+        p3 = P3[r >> 2];
+    }
+    const unsigned int q = (byte * p3) & 0xffu;
+    return (int)((q * 3u) >> 8) - 1;
+}
+
+extern "C" __global__ void tq1_0_add_mpgemm_tiled_i8_scaled(
+    const signed char* __restrict__ qact,  // [M, K] packed int8, k % 4 == 0
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const float* __restrict__ act_scale,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const int* arow = (const int*)(qact + (long long)mi * k);
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    int boff0, boff1, e0, e1;
+    unsigned int p30, p31;
+    tq1_word(lane, &boff0, &p30, &e0);
+    tq1_word(lane + 32, &boff1, &p31, &e1);
+    int acc0 = 0;
+    int acc1 = 0;
+    const int nblocks = k >> 8;
+    for (int b = 0; b < nblocks; ++b) {
+        const unsigned char* blk = wrow + b * TQ1_0_BLOCK_BYTES;
+        const unsigned char* s0 = blk + boff0;
+        const unsigned char* s1 = blk + boff1;
+        const unsigned int b0 = (unsigned int)*(const unsigned short*)s0 |
+                                ((unsigned int)*(const unsigned short*)(s0 + 2) << 16);
+        const unsigned int b1 = (unsigned int)*(const unsigned short*)s1 |
+                                ((unsigned int)*(const unsigned short*)(s1 + 2) << 16);
+        const int kbase = b << 8;
+        acc0 = __dp4a(tq1_decode4(b0, p30), __ldg(arow + ((kbase + e0) >> 2)), acc0);
+        acc1 = __dp4a(tq1_decode4(b1, p31), __ldg(arow + ((kbase + e1) >> 2)), acc1);
+    }
+    int acc = acc0 + acc1;
+    // Tail (k % 256 != 0): scalar per-trit decode in exact int math.
+    const signed char* abytes = (const signed char*)arow;
+    for (int ki = (k & ~255) + lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        acc += tq1_trit(wrow + block * TQ1_0_BLOCK_BYTES, ki - block * QK_K) *
+               (int)abytes[ki];
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[(long long)mi * n + ni] = (float)acc * scales[ni] * act_scale[mi];
+    }
+}
+
+// Residual twin: identical contraction, `out = residual + acc·scales·act_scale`
+// epilogue (mirrors `tq2_0_add_mpgemm_tiled_i8_scaled_residual`).
+extern "C" __global__ void tq1_0_add_mpgemm_tiled_i8_scaled_residual(
+    const signed char* __restrict__ qact,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ scales,
+    const float* __restrict__ act_scale,
+    const float* __restrict__ residual,
+    float* __restrict__ out,
+    const int m,
+    const int n,
+    const int k,
+    const int row_bytes) {
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int mi = blockIdx.y;
+    if (mi >= m) {
+        return;
+    }
+    const int* arow = (const int*)(qact + (long long)mi * k);
+    const int ni = blockIdx.x * warps_per_block + warp_id;
+    if (ni >= n) {
+        return;
+    }
+    const unsigned char* wrow = weights + (long long)ni * row_bytes;
+    int boff0, boff1, e0, e1;
+    unsigned int p30, p31;
+    tq1_word(lane, &boff0, &p30, &e0);
+    tq1_word(lane + 32, &boff1, &p31, &e1);
+    int acc0 = 0;
+    int acc1 = 0;
+    const int nblocks = k >> 8;
+    for (int b = 0; b < nblocks; ++b) {
+        const unsigned char* blk = wrow + b * TQ1_0_BLOCK_BYTES;
+        const unsigned char* s0 = blk + boff0;
+        const unsigned char* s1 = blk + boff1;
+        const unsigned int b0 = (unsigned int)*(const unsigned short*)s0 |
+                                ((unsigned int)*(const unsigned short*)(s0 + 2) << 16);
+        const unsigned int b1 = (unsigned int)*(const unsigned short*)s1 |
+                                ((unsigned int)*(const unsigned short*)(s1 + 2) << 16);
+        const int kbase = b << 8;
+        acc0 = __dp4a(tq1_decode4(b0, p30), __ldg(arow + ((kbase + e0) >> 2)), acc0);
+        acc1 = __dp4a(tq1_decode4(b1, p31), __ldg(arow + ((kbase + e1) >> 2)), acc1);
+    }
+    int acc = acc0 + acc1;
+    const signed char* abytes = (const signed char*)arow;
+    for (int ki = (k & ~255) + lane; ki < k; ki += WARP_SIZE) {
+        const int block = ki / QK_K;
+        acc += tq1_trit(wrow + block * TQ1_0_BLOCK_BYTES, ki - block * QK_K) *
+               (int)abytes[ki];
+    }
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        const long long idx = (long long)mi * n + ni;
+        out[idx] = __fadd_rn(residual[idx], (float)acc * scales[ni] * act_scale[mi]);
+    }
+}

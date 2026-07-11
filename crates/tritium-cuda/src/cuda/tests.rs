@@ -2391,3 +2391,141 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
         "decode.cu kernel count drifted from ADR 0022 — update the ADR"
     );
 }
+
+/// A2 gate: the TQ1_0-native i8-scaled kernel is BIT-identical to the TQ2_0
+/// one on the same trits (integer accumulation; identical epilogue) — for the
+/// plain and residual twins, across aligned and tail (k % 256 != 0) shapes.
+#[test]
+fn tq1_matches_tq2_tiled_scaled_bit_exact() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+    use tritium_format::{TQ1_0_BLOCK_BYTES, num_blocks, pack_tq1_0_row};
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping tq1-vs-tq2 gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let module = ctx
+        .load_module(Ptx::from_src(TQ2_0_ADD_PTX))
+        .expect("load add module");
+    let f_tq2 = module
+        .load_function("tq2_0_add_mpgemm_tiled_i8_scaled")
+        .expect("tq2 fn");
+    let f_tq1 = module
+        .load_function("tq1_0_add_mpgemm_tiled_i8_scaled")
+        .expect("tq1 fn");
+    let f_tq2_res = module
+        .load_function("tq2_0_add_mpgemm_tiled_i8_scaled_residual")
+        .expect("tq2 res fn");
+    let f_tq1_res = module
+        .load_function("tq1_0_add_mpgemm_tiled_i8_scaled_residual")
+        .expect("tq1 res fn");
+
+    // Aligned + tail shapes; m > 1 exercises the act_scale fold per row.
+    for &(m, n, k) in &[(1usize, 8usize, 1024usize), (2, 5, 256 + 128)] {
+        let trits = make_sparse_trits(n, k, 3);
+        let nb = num_blocks(k);
+        let unit = vec![half::f16::ONE; nb];
+        let (rb2, rb1) = (nb * TQ2_0_BLOCK_BYTES, nb * TQ1_0_BLOCK_BYTES);
+        let mut p2 = vec![0u8; n * rb2];
+        let mut p1 = vec![0u8; n * rb1];
+        for ni in 0..n {
+            let row = &trits[ni * k..(ni + 1) * k];
+            tritium_format::pack_tq2_0_row(row, &unit, &mut p2[ni * rb2..(ni + 1) * rb2])
+                .expect("pack tq2");
+            pack_tq1_0_row(row, &unit, &mut p1[ni * rb1..(ni + 1) * rb1]).expect("pack tq1");
+        }
+        // Deterministic i8 activations (k % 4 == 0 holds for both shapes).
+        let qact: Vec<i8> = (0..m * k).map(|i| ((i * 37 + 11) % 255) as i8).collect();
+        let scales = seeded_f32(7, n, 0.5, 2.0);
+        let act_scale = seeded_f32(13, m, 0.5, 1.5);
+        let residual = seeded_f32(21, m * n, -1.0, 1.0);
+
+        let d_qact = stream.clone_htod(&qact).unwrap();
+        let d_w2 = stream.clone_htod(&p2).unwrap();
+        let d_w1 = stream.clone_htod(&p1).unwrap();
+        let d_sc = stream.clone_htod(&scales).unwrap();
+        let d_as = stream.clone_htod(&act_scale).unwrap();
+        let d_res = stream.clone_htod(&residual).unwrap();
+        let (m_i, n_i, k_i) = (m as i32, n as i32, k as i32);
+        let (rb2_i, rb1_i) = (rb2 as i32, rb1 as i32);
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(8), m as u32, 1),
+            block_dim: (8 * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let launch_plain = |f: &cudarc::driver::CudaFunction,
+                            w: &cudarc::driver::CudaSlice<u8>,
+                            rb: &i32|
+         -> Vec<f32> {
+            let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+            let mut l = stream.launch_builder(f);
+            l.arg(&d_qact)
+                .arg(w)
+                .arg(&d_sc)
+                .arg(&d_as)
+                .arg(&mut d_out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(rb);
+            // SAFETY: matches the kernel signatures asserted in the kernel
+            // source; grid.y = m.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg).unwrap()
+            };
+            let mut out = vec![0.0f32; m * n];
+            stream.memcpy_dtoh(&d_out, &mut out).unwrap();
+            out
+        };
+        let o2 = launch_plain(&f_tq2, &d_w2, &rb2_i);
+        let o1 = launch_plain(&f_tq1, &d_w1, &rb1_i);
+        for (i, (a, b)) in o2.iter().zip(&o1).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "plain m{m} n{n} k{k} [{i}]: tq2={a} tq1={b}"
+            );
+        }
+
+        let launch_res = |f: &cudarc::driver::CudaFunction,
+                          w: &cudarc::driver::CudaSlice<u8>,
+                          rb: &i32|
+         -> Vec<f32> {
+            let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+            let mut l = stream.launch_builder(f);
+            l.arg(&d_qact)
+                .arg(w)
+                .arg(&d_sc)
+                .arg(&d_as)
+                .arg(&d_res)
+                .arg(&mut d_out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(rb);
+            // SAFETY: residual-twin signature; grid.y = m.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg).unwrap()
+            };
+            let mut out = vec![0.0f32; m * n];
+            stream.memcpy_dtoh(&d_out, &mut out).unwrap();
+            out
+        };
+        let r2 = launch_res(&f_tq2_res, &d_w2, &rb2_i);
+        let r1 = launch_res(&f_tq1_res, &d_w1, &rb1_i);
+        for (i, (a, b)) in r2.iter().zip(&r1).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "residual m{m} n{n} k{k} [{i}]: tq2={a} tq1={b}"
+            );
+        }
+    }
+}
