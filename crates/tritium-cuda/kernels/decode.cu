@@ -2927,10 +2927,33 @@ __global__ void gqa_attention_tree_f32(const float* __restrict__ q, const float*
 // at offset r·max_ctx·kv_width). Per row math is bit-identical to the M=1 decode.
 // ===========================================================================
 
-// kv_append_mdecode_f32 — append `n` new k/v rows, row r → seq r's KV at positions[r].
-__global__ void kv_append_mdecode_f32(const float* __restrict__ src, float* __restrict__ kv_base,
-                                      const int* __restrict__ positions, const int max_ctx,
-                                      const int kv_width, const int n) {
+}  // extern "C" — KV MAPPING codecs + M=N KV kernel bodies (ADR 0025, C3).
+
+// ── KV mapping (ADR 0025 paged KV) ──────────────────────────────────────────
+// One body per M=N KV kernel, templated on PAGED. `if constexpr` prunes to
+// exactly the retired hand-written dense source (the dense shims' SASS
+// byte-identity vs those kernels is the proof obligation, tools/sass_diff.sh;
+// a struct-shaped mapping codec was tried first and drifted the schedule —
+// the constexpr-pruned body is the shape ptxas reproduces). Paged mapping:
+// physical token = table_row[j >> KV_PAGE_SHIFT] · KV_PAGE_TOKENS +
+// (j & KV_PAGE_MASK); pools are `[pool_pages, KV_PAGE_TOKENS, kv_width]`.
+// An unmapped (-1) table entry is a host-allocator bug, not a fallback — the
+// kernels do not guard it.
+#define KV_PAGE_TOKENS 256
+#define KV_PAGE_SHIFT 8
+#define KV_PAGE_MASK 255
+
+// Per-lane register budget for one warp's accumulator: head_dim / 32, capped
+// at 8 (head_dim ≤ 256; the Rust launch asserts it). Hoisted above the
+// template body that uses it.
+#define SPLIT_MAX_HD_PER_LANE 8
+
+// kv_append_mdecode_body — append `n` new k/v rows, row r → seq r's KV at positions[r].
+template <bool PAGED>
+static __device__ __forceinline__ void kv_append_mdecode_body(
+    const float* __restrict__ src, float* __restrict__ kv_base,
+    const int* __restrict__ positions, const int* __restrict__ table, const int tstride,
+    const int max_ctx, const int kv_width, const int n) {
   const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= (long long)n * kv_width) return;
   const int row = idx / kv_width;
@@ -2940,8 +2963,111 @@ __global__ void kv_append_mdecode_f32(const float* __restrict__ src, float* __re
   // write slot.
   if (positions[row] < 0) return;
   const int e = idx - (long long)row * kv_width;
-  const long long off = ((long long)row * max_ctx + positions[row]) * kv_width + e;
+  long long tok;
+  if constexpr (PAGED) {
+    const int p = positions[row];
+    tok = (long long)table[(long long)row * tstride + (p >> KV_PAGE_SHIFT)] * KV_PAGE_TOKENS +
+          (p & KV_PAGE_MASK);
+  } else {
+    tok = (long long)row * max_ctx + positions[row];
+  }
+  const long long off = tok * kv_width + e;
   kv_base[off] = src[(long long)row * kv_width + e];
+}
+
+// gqa_attention_split_partial_body — warp per (row, head, split); see the
+// dense shim's doc below. Only the KV addressing is PAGED-conditional;
+// everything else is the retired kernel verbatim.
+template <bool PAGED>
+static __device__ __forceinline__ void gqa_attention_split_partial_body(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ partials, const int* __restrict__ positions,
+    const int* __restrict__ table, const int tstride, const int max_ctx,
+    const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
+    const int n_split, const int chunk) {
+  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= (long long)n * n_head * n_split) return;
+  const int s = warp % n_split;
+  const long long rh = warp / n_split;  // row*n_head + h
+  const int row = rh / n_head;
+  const int h = rh - (long long)row * n_head;
+  const int ctx = positions[row] + 1;  // keys 0..=positions[row]
+  const int start = s * chunk;
+  const int end = min(start + chunk, ctx);
+  float* part = partials + warp * (long long)(head_dim + 2);
+
+  // Split beyond this row's ctx → identity partial (m = -inf contributes 0 in combine).
+  if (start >= ctx) {
+    for (int d = lane; d < head_dim; d += 32) part[d] = 0.0f;
+    if (lane == 0) {
+      part[head_dim] = -INFINITY;
+      part[head_dim + 1] = 0.0f;
+    }
+    return;
+  }
+
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  const long long kv_seq = PAGED ? 0 : (long long)row * max_ctx * n_head_kv * head_dim;
+  const float* k_seq = k + kv_seq;
+  const float* v_seq = v + kv_seq;
+  const int* trow = PAGED ? table + (long long)row * tstride : nullptr;
+  const float* q_row = q + rh * (long long)head_dim;
+
+  float acc[SPLIT_MAX_HD_PER_LANE];
+  const int per_lane = (head_dim + 31) / 32;
+  for (int i = 0; i < per_lane; ++i) acc[i] = 0.0f;
+  float m = -INFINITY, l = 0.0f;
+
+  for (int j = start; j < end; ++j) {
+    long long jt;
+    if constexpr (PAGED) {
+      jt = (long long)trow[j >> KV_PAGE_SHIFT] * KV_PAGE_TOKENS + (j & KV_PAGE_MASK);
+    } else {
+      jt = j;
+    }
+    const float* k_row = k_seq + (jt * n_head_kv + kv) * head_dim;
+    // Lane-strided partial dot, then a warp tree-reduce to the full q·k.
+    float pd = 0.0f;
+    for (int d = lane; d < head_dim; d += 32) pd = __fadd_rn(pd, __fmul_rn(q_row[d], k_row[d]));
+    for (int off = 16; off > 0; off >>= 1) pd += __shfl_down_sync(0xffffffff, pd, off);
+    float sj = __shfl_sync(0xffffffff, pd, 0);  // broadcast the reduced dot to all lanes
+    sj = __fmul_rn(sj, scale);
+    const float m_new = fmaxf(m, sj);
+    const float corr = exp_f32(__fsub_rn(m, m_new));  // 0 on the first key (m = -inf)
+    const float p = exp_f32(__fsub_rn(sj, m_new));
+    l = __fadd_rn(__fmul_rn(l, corr), p);
+    const float* v_row = v_seq + (jt * n_head_kv + kv) * head_dim;
+    for (int i = 0, d = lane; d < head_dim; d += 32, ++i)
+      acc[i] = __fadd_rn(__fmul_rn(acc[i], corr), __fmul_rn(p, v_row[d]));
+    m = m_new;
+  }
+  for (int i = 0, d = lane; d < head_dim; d += 32, ++i) part[d] = acc[i];
+  if (lane == 0) {
+    part[head_dim] = m;
+    part[head_dim + 1] = l;
+  }
+}
+
+extern "C" {
+
+// kv_append_mdecode_f32 — append `n` new k/v rows, row r → seq r's KV at positions[r].
+__global__ void kv_append_mdecode_f32(const float* __restrict__ src, float* __restrict__ kv_base,
+                                      const int* __restrict__ positions, const int max_ctx,
+                                      const int kv_width, const int n) {
+  kv_append_mdecode_body<false>(src, kv_base, positions, nullptr, 0, max_ctx, kv_width, n);
+}
+
+// kv_append_mdecode_paged_f32 — the paged twin: `kv_base` is the page POOL
+// (`[pool_pages, KV_PAGE_TOKENS, kv_width]`), `table` the `[n, tstride]`
+// page table. Same dead-row contract.
+__global__ void kv_append_mdecode_paged_f32(const float* __restrict__ src,
+                                            float* __restrict__ kv_base,
+                                            const int* __restrict__ positions,
+                                            const int* __restrict__ table, const int tstride,
+                                            const int kv_width, const int n) {
+  kv_append_mdecode_body<true>(src, kv_base, positions, table, tstride, 0, kv_width, n);
 }
 
 
@@ -3036,9 +3162,6 @@ __global__ void argmax_rows_f32(const float* __restrict__ logits, const int voca
 // reference / parity), and eager + graph share these kernels to stay mutually exact.
 // ===========================================================================
 
-// Per-lane register budget for one warp's accumulator: head_dim / 32, capped at 8
-// (head_dim ≤ 256). The Rust launch asserts head_dim ≤ 256.
-#define SPLIT_MAX_HD_PER_LANE 8
 
 // gqa_attention_split_partial_f32 — warp per (row, head, split). Online-softmax over
 // this warp's key chunk `[s*chunk, min((s+1)*chunk, ctx))` → a partial
@@ -3120,62 +3243,23 @@ __global__ void gqa_attention_split_partial_f32(
     float* __restrict__ partials, const int* __restrict__ positions, const int max_ctx,
     const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
     const int n_split, const int chunk) {
-  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int lane = threadIdx.x & 31;
-  if (warp >= (long long)n * n_head * n_split) return;
-  const int s = warp % n_split;
-  const long long rh = warp / n_split;  // row*n_head + h
-  const int row = rh / n_head;
-  const int h = rh - (long long)row * n_head;
-  const int ctx = positions[row] + 1;  // keys 0..=positions[row]
-  const int start = s * chunk;
-  const int end = min(start + chunk, ctx);
-  float* part = partials + warp * (long long)(head_dim + 2);
+  gqa_attention_split_partial_body<false>(q, k, v, partials, positions, nullptr, 0, max_ctx,
+                                               n_head, n_head_kv, head_dim, scale, n, n_split,
+                                               chunk);
+}
 
-  // Split beyond this row's ctx → identity partial (m = -inf contributes 0 in combine).
-  if (start >= ctx) {
-    for (int d = lane; d < head_dim; d += 32) part[d] = 0.0f;
-    if (lane == 0) {
-      part[head_dim] = -INFINITY;
-      part[head_dim + 1] = 0.0f;
-    }
-    return;
-  }
-
-  const int n_rep = n_head / n_head_kv;
-  const int kv = h / n_rep;
-  const long long kv_seq = (long long)row * max_ctx * n_head_kv * head_dim;
-  const float* k_seq = k + kv_seq;
-  const float* v_seq = v + kv_seq;
-  const float* q_row = q + rh * (long long)head_dim;
-
-  float acc[SPLIT_MAX_HD_PER_LANE];
-  const int per_lane = (head_dim + 31) / 32;
-  for (int i = 0; i < per_lane; ++i) acc[i] = 0.0f;
-  float m = -INFINITY, l = 0.0f;
-
-  for (int j = start; j < end; ++j) {
-    const float* k_row = k_seq + ((long long)j * n_head_kv + kv) * head_dim;
-    // Lane-strided partial dot, then a warp tree-reduce to the full q·k.
-    float pd = 0.0f;
-    for (int d = lane; d < head_dim; d += 32) pd = __fadd_rn(pd, __fmul_rn(q_row[d], k_row[d]));
-    for (int off = 16; off > 0; off >>= 1) pd += __shfl_down_sync(0xffffffff, pd, off);
-    float sj = __shfl_sync(0xffffffff, pd, 0);  // broadcast the reduced dot to all lanes
-    sj = __fmul_rn(sj, scale);
-    const float m_new = fmaxf(m, sj);
-    const float corr = exp_f32(__fsub_rn(m, m_new));  // 0 on the first key (m = -inf)
-    const float p = exp_f32(__fsub_rn(sj, m_new));
-    l = __fadd_rn(__fmul_rn(l, corr), p);
-    const float* v_row = v_seq + ((long long)j * n_head_kv + kv) * head_dim;
-    for (int i = 0, d = lane; d < head_dim; d += 32, ++i)
-      acc[i] = __fadd_rn(__fmul_rn(acc[i], corr), __fmul_rn(p, v_row[d]));
-    m = m_new;
-  }
-  for (int i = 0, d = lane; d < head_dim; d += 32, ++i) part[d] = acc[i];
-  if (lane == 0) {
-    part[head_dim] = m;
-    part[head_dim + 1] = l;
-  }
+// gqa_attention_split_partial_paged_f32 — the paged twin: `k`/`v` are the page
+// POOLS, `table` the `[n, tstride]` page table (bit-identical values to dense —
+// paging changes addresses, never the reduction order).
+__global__ void gqa_attention_split_partial_paged_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ partials, const int* __restrict__ positions,
+    const int* __restrict__ table, const int tstride,
+    const int n_head, const int n_head_kv, const int head_dim, const float scale, const int n,
+    const int n_split, const int chunk) {
+  gqa_attention_split_partial_body<true>(q, k, v, partials, positions, table, tstride, 0,
+                                               n_head, n_head_kv, head_dim, scale, n, n_split,
+                                               chunk);
 }
 
 // gqa_attention_combine_f32 — warp per (row, head). Flash-merge the `n_split` partials

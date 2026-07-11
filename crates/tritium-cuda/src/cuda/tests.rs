@@ -2405,9 +2405,11 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        64,
+        66,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
-         (65 → 64: gqa_attention_mdecode_f32 retired, ADR 0025 step 2)"
+         (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
+         twins kv_append_mdecode_paged_f32 + gqa_attention_split_partial_\
+         paged_f32 added, ADR 0025 step 2)"
     );
 }
 
