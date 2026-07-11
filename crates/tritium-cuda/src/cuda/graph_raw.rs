@@ -430,6 +430,11 @@ pub struct BatchKv {
     pub(super) kv_v: Vec<CudaSlice<f32>>,
     /// Per-sequence current position (next KV write slot); length `n`.
     pub(super) positions: Vec<usize>,
+    /// Per-sequence liveness (batching P2 C2). A dead row is uploaded as
+    /// position `-1`: rope/kv-append skip it entirely (it touches NO arena
+    /// bytes — the paged-KV contract) and its attention output is zeros.
+    /// Defaults to all-live, which reproduces the pre-C2 behavior exactly.
+    pub(super) live: Vec<bool>,
     pub(super) d_tokens: CudaSlice<i32>,
     pub(super) d_positions: CudaSlice<i32>,
     pub(super) d_x: CudaSlice<f32>,
@@ -520,5 +525,45 @@ impl BatchKv {
     #[must_use]
     pub fn positions(&self) -> &[usize] {
         &self.positions
+    }
+
+    /// Mark one sequence slot live or dead (batching P2 C2). A dead row is
+    /// fed to the kernels as position `-1`: it writes NO KV bytes, skips
+    /// RoPE, and its attention output is zeros — its logits are junk to be
+    /// discarded by the caller. The row's stored [`position`](Self::positions)
+    /// is untouched (ignored while dead). New batches start all-live.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] on a bad row.
+    pub fn set_live(&mut self, row: usize, live: bool) -> Result<(), BackendError> {
+        if row >= self.n {
+            return Err(BackendError::InvalidInput(format!(
+                "set_live: row {row} >= batch n {}",
+                self.n
+            )));
+        }
+        self.live[row] = live;
+        Ok(())
+    }
+
+    /// Device-facing positions: `positions[r]` for live rows, `-1` for dead
+    /// ones (the kernels' dead-row sentinel).
+    pub(super) fn device_positions(&self) -> Vec<i32> {
+        self.positions
+            .iter()
+            .zip(&self.live)
+            .map(|(&p, &l)| if l { p as i32 } else { -1 })
+            .collect()
+    }
+
+    /// Advance live rows' positions by one after a step; dead rows stay
+    /// frozen (an unconditionally advancing dead row would eventually trip
+    /// the `max_ctx` overflow guard and poison the whole batch).
+    pub(super) fn advance_live(&mut self) {
+        for (p, &l) in self.positions.iter_mut().zip(&self.live) {
+            if l {
+                *p += 1;
+            }
+        }
     }
 }

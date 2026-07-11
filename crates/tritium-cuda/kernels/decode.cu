@@ -2750,6 +2750,9 @@ __global__ void rope_apply_batch_f32(float* __restrict__ x, const float* __restr
   const int head = rem / half;
   const int j = rem - head * half;
   const int pos = positions[row];
+  // Dead row (position -1, batching P2 C2): no rotation — the row's q/k are
+  // never appended or attended, and a -1 cos/sin index would read OOB.
+  if (pos < 0) return;
   const long long base = ((long long)row * n_head + head) * head_dim;
   const float c = cos_table[(long long)pos * half + j];
   const float s = sin_table[(long long)pos * half + j];
@@ -2931,6 +2934,10 @@ __global__ void kv_append_mdecode_f32(const float* __restrict__ src, float* __re
   const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= (long long)n * kv_width) return;
   const int row = idx / kv_width;
+  // Dead row (position -1, batching P2 C2): touch NOTHING — an unguarded -1
+  // would write into the PREVIOUS row's arena. This is the paged-KV contract:
+  // a dead row owns no write slot.
+  if (positions[row] < 0) return;
   const int e = idx - (long long)row * kv_width;
   const long long off = ((long long)row * max_ctx + positions[row]) * kv_width + e;
   kv_base[off] = src[(long long)row * kv_width + e];
@@ -3255,8 +3262,17 @@ __global__ void gqa_attention_combine_f32(const float* __restrict__ partials,
       L = __fadd_rn(L, __fmul_rn(ls, exp_f32(__fsub_rn(ms, M))));
     }
   }
-  const float inv = __fdiv_rn(1.0f, L);
   float* o_row = out + rh * (long long)head_dim;
+  // Dead row (position -1, batching P2 C2): every split emitted the identity
+  // partial (m = -inf, l = 0), so L == 0 and 1/L would turn the 0-sum into
+  // NaN. Emit zeros instead (finite, deterministic; the row's output is
+  // discarded). Live rows always have L > 0 — this branch never retouches
+  // their arithmetic.
+  if (L == 0.0f) {
+    for (int d = lane; d < head_dim; d += 32) o_row[d] = 0.0f;
+    return;
+  }
+  const float inv = __fdiv_rn(1.0f, L);
   for (int d = lane; d < head_dim; d += 32) {
     float a = 0.0f;
     for (int s = 0; s < n_split; ++s) {

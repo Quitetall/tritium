@@ -902,3 +902,42 @@ Deferred verifications, run in the least-contended window this session
 - **C1 review nit N1**: G1/G2 re-run with TRITIUM_PREFILL_CHUNK=15 (forces a
   1-token final chunk through step_graph + the mid-admission M=1 graph
   capture): green, identical agreement prefixes to the default-chunk run.
+
+## v1.x round 18 — Track C2: per-row masks — dead rows touch nothing (2026-07-11)
+
+Batching P2 step 2. Free/retired slots in the M=N batch previously decoded as
+position-0 pad rows: a junk KV write at row offset 0 every step plus 1-key
+attention. C2 introduces per-row liveness with a **sentinel, not a new
+buffer**: `BatchKv::set_live(row, false)` uploads that row's position as
+`-1`, and `ctx = positions[row] + 1 = 0` falls out of the existing kernel
+arithmetic —
+
+- `gqa_attention_split_partial_f32` already emitted identity partials for
+  `start >= ctx` (zero-key windows needed NO change);
+- `gqa_attention_combine_f32` gains an `L == 0 → zeros` guard (all-identity
+  partials would otherwise produce `0·inf = NaN`);
+- `kv_append_mdecode_f32` gains `p < 0 → return` (an unguarded `-1` writes
+  into the PREVIOUS row's arena — the latent OOB this work removed);
+- `rope_apply_batch_f32` gains the same guard (`-1` cos/sin index is OOB).
+
+Dead rows' positions freeze (`advance_live`) — an unconditionally advancing
+dead row would eventually trip the max_ctx overflow guard and poison the
+whole batch. Zero new kernel args, zero new buffers, graphs unaffected
+(positions are per-step data). Deviations from the plan text, recorded:
+len-only masks (no `start` offset — no consumer until C3 pages it) and no
+speculative f16 twins (the mdecode family is f32-only; ADR 0022 consolidates
+real twins, not hypothetical ones). The legacy `gqa_attention_mdecode_f32`
+is loaded-but-never-launched and was left position-based.
+
+This is the **paged-KV contract** C3 builds on: a dead row owns no write
+slot and touches no arena bytes.
+
+Gates: NEW `cuda_batch_dead_row_touches_nothing` (live rows bit-identical to
+an all-live batch over the horizon; dead row's arena byte-zero at first+last
+layer, K+V, whole stepped span; non-vacuity asserted on a live row) — first-
+run pass. All 5 batch acceptance gates green (bit-identity eager==graph,
+argmax==greedy, batch==single unchanged — all-live defaults reproduce pre-C2
+behavior exactly). Serve: G1/G2 + C1 interleave re-run green. What C2 does
+NOT claim: dead rows still cost their dense GEMM rows (inherent to M=N GEMM
+— the real free-slot compute lives there, and that is a C3/occupancy story,
+not a masking one).

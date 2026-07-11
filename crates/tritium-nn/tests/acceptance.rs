@@ -454,6 +454,91 @@ fn cuda_batch_decode_graph_matches_eager() {
     );
 }
 
+/// C2 per-row masks (batching P2): a DEAD slot (`set_live(row, false)`) must
+/// touch NOTHING — zero KV-arena bytes written (the paged-KV contract: a dead
+/// row owns no write slot) — and the live rows must stay **bit-identical** to
+/// the same rows of an all-live batch (dead-row skipping cannot perturb
+/// anyone else's arithmetic). Row 1 of a 3-row batch is dead and fed the pad
+/// token (mirroring the serve worker); rows 0/2 decode normally.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_batch_dead_row_touches_nothing() {
+    let _gpu = gpu_serial();
+    let Some((_reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let n_layers = runner.config.n_layers as usize;
+    let model = match runner.resident_cuda() {
+        Ok(Some(m)) => m,
+        _ => {
+            eprintln!("skipping dead-row gate: no cuda resident");
+            return;
+        }
+    };
+    const N: usize = 3;
+    let toks: [u32; 4] = [128000, 791, 6864, 315];
+
+    let mut masked = model.new_batch(N).expect("new_batch masked");
+    masked.set_live(1, false).expect("set_live");
+    let mut all_live = model.new_batch(N).expect("new_batch all_live");
+
+    for (i, &t) in toks.iter().enumerate() {
+        let got = model
+            .decode_batch_graph(&mut masked, &[t, 0, t])
+            .expect("decode_batch_graph masked");
+        let want = model
+            .decode_batch_graph(&mut all_live, &[t, t, t])
+            .expect("decode_batch_graph all_live");
+        for r in [0usize, 2] {
+            for v in 0..want[r].len() {
+                assert_eq!(
+                    got[r][v].to_bits(),
+                    want[r][v].to_bits(),
+                    "dead row perturbed a live row: step {i} row {r} vocab {v}"
+                );
+            }
+        }
+    }
+    // Dead row frozen at position 0 (advance skips it); live rows advanced.
+    assert_eq!(masked.positions()[1], 0, "dead row's position must freeze");
+    assert_eq!(masked.positions()[0], toks.len());
+
+    // The contract itself: row 1's KV arena is untouched — every byte still
+    // the alloc_zeros init — at the first/last layer, K and V, for the whole
+    // stepped span. Row 0 must have non-zero KV at the same spots (the
+    // assertion is not vacuous).
+    for li in [0usize, n_layers - 1] {
+        for v in [false, true] {
+            for pos in 0..toks.len() {
+                let dead = model
+                    .debug_batch_kv_row(&masked, li, 1, pos, v)
+                    .expect("dead row kv");
+                assert!(
+                    dead.iter().all(|&b| b == 0),
+                    "dead row wrote KV bytes at layer {li} pos {pos} v={v}"
+                );
+            }
+            let live = model
+                .debug_batch_kv_row(&masked, li, 0, 0, v)
+                .expect("live row kv");
+            assert!(
+                live.iter().any(|&b| b != 0),
+                "live row 0 wrote nothing at layer {li} v={v} — vacuous gate"
+            );
+        }
+    }
+    drop(masked);
+    drop(all_live);
+    println!(
+        "dead-row gate: live rows bit-identical to all-live batch over {} steps; \
+         dead row wrote zero KV bytes (first+last layer, K+V)",
+        toks.len()
+    );
+}
+
 /// The on-device-sampling M=N graph (`decode_batch_graph_argmax`) folds the LM head + a
 /// greedy argmax into the captured graph and returns N token ids (N·4 bytes) instead of N
 /// full logit vectors (the 33 MB/step readback). Its per-row token must equal the host

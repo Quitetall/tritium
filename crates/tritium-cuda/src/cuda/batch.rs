@@ -146,6 +146,7 @@ impl CudaDecodeModel {
             kv_k,
             kv_v,
             positions: vec![0; n],
+            live: vec![true; n],
             d_tokens: s
                 .alloc_zeros::<i32>(n)
                 .map_err(|e| driver_err("batch d_tokens", &e))?,
@@ -204,7 +205,12 @@ impl CudaDecodeModel {
                 tokens.len()
             )));
         }
-        for (&t, &p) in tokens.iter().zip(&batch.positions) {
+        for ((&t, &p), &l) in tokens.iter().zip(&batch.positions).zip(&batch.live) {
+            // Dead rows are skipped by the kernels (position -1); their pad
+            // token and frozen position need no validation.
+            if !l {
+                continue;
+            }
             if t as usize >= self.vocab {
                 return Err(BackendError::InvalidInput(format!(
                     "decode_batch token {t} out of range"
@@ -223,7 +229,7 @@ impl CudaDecodeModel {
             (self.n_head, self.n_head_kv, self.head_dim, self.max_ctx);
 
         let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let pos_i: Vec<i32> = batch.positions.iter().map(|&p| p as i32).collect();
+        let pos_i = batch.device_positions();
         s.memcpy_htod(&tok_i, &mut batch.d_tokens)
             .map_err(|e| driver_err("batch tokens htod", &e))?;
         s.memcpy_htod(&pos_i, &mut batch.d_positions)
@@ -506,9 +512,7 @@ impl CudaDecodeModel {
                 .map_err(|e| driver_err("batch logits dtoh", &e))?;
             out.push(logits);
         }
-        for p in &mut batch.positions {
-            *p += 1;
-        }
+        batch.advance_live();
         Ok(out)
     }
 
@@ -652,7 +656,12 @@ impl CudaDecodeModel {
                 tokens.len()
             )));
         }
-        for (&t, &p) in tokens.iter().zip(&batch.positions) {
+        for ((&t, &p), &l) in tokens.iter().zip(&batch.positions).zip(&batch.live) {
+            // Dead rows are skipped by the kernels (position -1); their pad
+            // token and frozen position need no validation.
+            if !l {
+                continue;
+            }
             if t as usize >= self.vocab {
                 return Err(BackendError::InvalidInput(format!(
                     "decode_batch_graph token {t} out of range"
@@ -688,7 +697,7 @@ impl CudaDecodeModel {
         // replay (the captured embed/rope/kv/attn read them as stable pointers — the M=N
         // analogue of the M=1 `d_ctrl`).
         let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let pos_i: Vec<i32> = batch.positions.iter().map(|&p| p as i32).collect();
+        let pos_i = batch.device_positions();
         self.cap_stream
             .memcpy_htod(&tok_i, &mut batch.d_tokens)
             .map_err(|e| driver_err("batch graph tokens htod", &e))?;
@@ -734,9 +743,7 @@ impl CudaDecodeModel {
                 .map_err(|e| driver_err("batch graph logits dtoh", &e))?;
             out.push(logits);
         }
-        for p in &mut batch.positions {
-            *p += 1;
-        }
+        batch.advance_live();
         Ok(out)
     }
 
@@ -762,7 +769,12 @@ impl CudaDecodeModel {
                 tokens.len()
             )));
         }
-        for (&t, &p) in tokens.iter().zip(&batch.positions) {
+        for ((&t, &p), &l) in tokens.iter().zip(&batch.positions).zip(&batch.live) {
+            // Dead rows are skipped by the kernels (position -1); their pad
+            // token and frozen position need no validation.
+            if !l {
+                continue;
+            }
             if t as usize >= self.vocab {
                 return Err(BackendError::InvalidInput(format!(
                     "decode_batch_graph_argmax token {t} out of range"
@@ -790,7 +802,7 @@ impl CudaDecodeModel {
             .map_err(|e| driver_err("batch argmax pre default sync", &e))?;
 
         let tok_i: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let pos_i: Vec<i32> = batch.positions.iter().map(|&p| p as i32).collect();
+        let pos_i = batch.device_positions();
         self.cap_stream
             .memcpy_htod(&tok_i, &mut batch.d_tokens)
             .map_err(|e| driver_err("batch argmax tokens htod", &e))?;
@@ -812,9 +824,7 @@ impl CudaDecodeModel {
         self.cap_stream
             .memcpy_dtoh(&batch.d_argmax, &mut ids)
             .map_err(|e| driver_err("batch argmax dtoh", &e))?;
-        for p in &mut batch.positions {
-            *p += 1;
-        }
+        batch.advance_live();
         Ok(ids.into_iter().map(|t| t as u32).collect())
     }
 

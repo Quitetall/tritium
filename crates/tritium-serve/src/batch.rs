@@ -4,9 +4,10 @@
 //! graph is captured once. Requests are admitted into free slots by running
 //! the prompt through the OPTIMIZED single-sequence prefill and adopting the
 //! resulting KV rows into the slot ([`CudaDecodeModel::copy_kv_into_batch_row`]);
-//! every decode step advances all slots in lockstep (free slots are fed a pad
-//! token whose output is ignored and whose position is pinned to 0 so it can
-//! never overflow the arena). Per-slot sampling runs on the host against each
+//! every decode step advances all slots in lockstep (free slots are marked
+//! DEAD — `BatchKv::set_live(row, false)` — so the kernels skip them: no KV
+//! writes, no attention; their pad-token outputs are ignored). Per-slot
+//! sampling runs on the host against each
 //! request's own parameters, reusing the plain samplers' truncated
 //! distributions — the same per-row math the parity gates pin to the
 //! single-sequence path.
@@ -368,16 +369,17 @@ pub(crate) fn run_batched(
             // to its next chunk; a fully idle pool back to the blocking recv)
         }
 
-        // One lockstep decode step. Free slots are fed token 0 at position 0
-        // (their KV row-0 write is junk in a dead slot; outputs ignored).
+        // One lockstep decode step. Free slots are marked dead (C2): the
+        // kernels skip them entirely — no KV writes, no attention — and
+        // their pad-token outputs are ignored. Liveness is re-derived from
+        // the pool every step (self-healing; adoption/retirement need no
+        // separate bookkeeping).
         let tokens: Vec<u32> = pool
             .iter()
             .map(|s| s.as_ref().map_or(0, |a| a.last_token))
             .collect();
         for (row, slot) in pool.iter().enumerate() {
-            if slot.is_none() {
-                let _ = batch.set_position(row, 0);
-            }
+            let _ = batch.set_live(row, slot.is_some());
         }
         let step = runner.decode_batch_graph(&mut batch, &tokens);
         let all_logits = match step {
