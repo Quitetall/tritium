@@ -1,6 +1,10 @@
 # ADR 0022 — Twin kernels: duplication is the contract (for now)
 
-Status: **ACCEPTED** (2026-07-10). Revisit trigger defined below.
+Status: **ACCEPTED** (2026-07-10); **REVISIT TRIGGER PULLED + CONSOLIDATION
+EXECUTED for the f32/f16 axis** (2026-07-11, Track B — user-directed, ahead
+of paged KV which will add a new family). See "Executed consolidation" below.
+The q8/t2 axis REMAINS duplicated per the original evidence (structurally
+different scale-stream contractions, tuning-sensitive).
 
 ## Context
 
@@ -86,6 +90,52 @@ depends on a sibling's internals), while the `bl_*` raw-launch helpers sit in
 mod.rs (used by prefill, tree and batch alike). Coherent enough to ship;
 co-locating them in one builders module is a candidate cleanup if the seam
 grows.
+
+## Executed consolidation (2026-07-11)
+
+The f32↔f16 axis is now codec-templated in-tree, under this ADR's proof
+obligations:
+
+- **Codecs**: `KvStoreF32/F16` (store axis: kv_append, kv_append_batch,
+  rope_kv_fused) and `KvLoadF32/F16` (load axis: the five gqa_attention
+  families + lm_head_warp). The load codec is **Row-typed** — it hands the
+  body the SAME pointer shape the hand-written kernels used (float4* indexed
+  per d for f32; __half* + kvh_load4 for f16), which is what makes the f32
+  instantiations compile byte-identically (a plain `T*`+cast-per-load shape
+  produced 1.4k lines of scheduling drift before this was found).
+- **Templates live outside the file's `extern "C"` block** (C linkage cannot
+  template); shims inside it preserve every launch symbol — host code and
+  the drift test are untouched. Dynamic-shared arrays inside template bodies
+  need unique names (C++ vs C linkage of `extern __shared__` collide).
+- **Proof status (tools/sass_diff.sh, sm_89, CUDA 13)**: 63/65 kernels SASS
+  **byte-identical** after the refactor, including all ten templated
+  attention/lm_head instantiations. The two exceptions — kv_append_batch
+  f32/h — are **justified**: identical 152-instruction opcode streams,
+  register-allocation permutation only (13 sites), plus the batch
+  bit-exactness gates.
+- **Still duplicated, with cause**: every `_q8`/`_t2` variant (row-granular
+  grouped-scale quant/dequant — an element codec cannot express them; the
+  appends already delegate to shared `kv_quant_row_*` helpers), the mdecode
+  family (f32-only today), and `gqa_attention_decode_warp_g` (legacy
+  geometry fallback, f32-only).
+
+### Re-proof procedure (toolchain bumps)
+
+Byte-identity is toolchain-relative, so a pinned SASS hash would false-alarm
+on every CUDA update. Instead, on a toolchain bump re-run the comparison
+UNDER THE NEW TOOLCHAIN:
+
+```sh
+git show <pre-consolidation>:crates/tritium-cuda/kernels/decode.cu > /tmp/old.cu
+nvcc -arch=sm_89 -ptx --fmad=false /tmp/old.cu -o /tmp/old.ptx
+nvcc -arch=sm_89 -ptx --fmad=false crates/tritium-cuda/kernels/decode.cu -o /tmp/new.ptx
+tools/sass_diff.sh /tmp/old.ptx /tmp/before && tools/sass_diff.sh /tmp/new.ptx /tmp/after
+diff -rq /tmp/before /tmp/after   # expect: only the two justified kernels
+```
+
+`<pre-consolidation>` = the parent of the first Track B commit (4f3c566^).
+Run alongside the GPU lane's gate suite; a NEW divergence means the new
+compiler treats the template differently — re-justify or fix before shipping.
 
 ## Revisit trigger
 
