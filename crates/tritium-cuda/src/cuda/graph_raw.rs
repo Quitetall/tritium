@@ -603,9 +603,9 @@ impl BatchKv {
     /// `row`'s table (reservation is prefix-contiguous, so mapping of page
     /// `pos / KV_PAGE_TOKENS` implies every earlier page is mapped too).
     pub(super) fn page_mapped(&self, row: usize, pos: usize) -> bool {
-        self.pages.as_ref().is_none_or(|pg| {
-            pg.table[row * pg.tstride + pos / KV_PAGE_TOKENS] >= 0
-        })
+        self.pages
+            .as_ref()
+            .is_none_or(|pg| pg.table[row * pg.tstride + pos / KV_PAGE_TOKENS] >= 0)
     }
 
     /// Free pages remaining in the pool (0 when dense).

@@ -1,7 +1,9 @@
 # ADR 0023 — Opt-in relaxed-reduction tier (`TRITIUM_KERNEL_TIER=fast`)
 
-Status: **PROPOSED** (2026-07-10). RFC — implementation gated on this ADR's
-acceptance; measurement plan below decides kernel-by-kernel.
+Status: **REJECTED BY MEASUREMENT** (2026-07-11). Step 1 (rmsnorm_fast) was
+implemented in full, gated, benchmarked, and DELETED per this ADR's own
+decision rule — see the verdict section at the end. The attention fast pair
+was never authorized (its gate was rmsnorm reaching ≥3%).
 
 ## Context
 
@@ -91,3 +93,29 @@ carried for noise).
 
 PENDING review. Accepting this ADR authorizes step 1 (rmsnorm_fast) only;
 each further kernel needs its measured decision point.
+
+## Verdict (2026-07-11, measured — the tier is rejected)
+
+Step 1 was executed end-to-end: `rmsnorm_quant_i8_fast` (the M=1 decode
+graph's hottest reduction — 4 launches/layer) with the fold FUSED into the
+staging pass (one barrier fewer), four independent `__fmaf_rn` accumulators
+(4-way ILP, one rounding per element), all-thread folding and a
+blockDim-generic combine; `TRITIUM_KERNEL_TIER=exact|fast` resolved once per
+model build (graphs bake the picked symbol), loud-reject selector, healthz
+disclosure. Gates all green under `fast`: 256-token greedy EXACTLY equal to
+the transformers reference; perplexity rel 2.93e-3 vs the fp32 oracle
+(exact tier: 2.66e-4 — the tier's own drift ≈ 3.2e-3, slightly above this
+RFC's optimistic ~2e-3 band, inside the 1% acceptance bar).
+
+**Bench (4090, quiet box, 512 decode steps, order-alternated ABBA ×2):
+exact median 274.0 tok/s (266.8–274.9), fast median 278.5 (278.3–279.3) —
++1.6–1.9% e2e, pairwise median +1.75%. Below the ≥3% bar. Deleted.**
+
+What the measurement settled: the two conflicting profiles (flat: rmsnorm
+~32% of GPU time; per-layer counters: ~5%) are resolved in favor of the
+counters. The rmsnorm cost at M=1 is launch overhead + barriers + the
+elementwise passes — structural, not sum-order — so relaxing the reduction
+order buys only the fold's latency chain, worth ~2% e2e. The kernel and
+plumbing live in git history (this commit's parent) if a future architecture
+changes the calculus; the honest projection for any revival is bounded by
+this measurement, not by the flat profile.
