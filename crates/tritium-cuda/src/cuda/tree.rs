@@ -749,42 +749,52 @@ impl CudaDecodeModel {
             if node == k {
                 continue; // already in place (chain prefix)
             }
+            // node > k always (a node's index is >= its depth in the accepted
+            // path), so src and dst are DISJOINT row-aligned ranges — a direct
+            // device-to-device copy is safe. The previous shape allocated a
+            // fresh device temp per (row, layer, arena) and copied twice —
+            // an alloc storm on long accepts (review D1-corrected item, plan
+            // SOTA P3); the raw-pointer copy is the copy_kv_into_batch_row
+            // pattern.
+            debug_assert!(node > k, "tree_promote: path must be strictly increasing");
             let src = (self.cache_len + node) * row_bytes;
             let dst = (self.cache_len + k) * row_bytes;
             for li in 0..self.layers.len() {
                 for arena in [&mut self.kv_k[li], &mut self.kv_v[li]] {
-                    // Copy via a device temporary: src/dst rows never overlap (path is
-                    // strictly increasing, src >= dst), but the tmp keeps the copy
-                    // trivially safe for any future path shape.
-                    let row = {
-                        let src_slice = arena.slice(src..src + row_bytes);
-                        let mut tmp = s
-                            .alloc_zeros::<u8>(row_bytes)
-                            .map_err(|e| driver_err("tree promote tmp", &e))?;
-                        s.memcpy_dtod(&src_slice, &mut tmp)
-                            .map_err(|e| driver_err("tree promote read", &e))?;
-                        tmp
-                    };
-                    let mut dst_slice = arena.slice_mut(dst..dst + row_bytes);
-                    s.memcpy_dtod(&row, &mut dst_slice)
-                        .map_err(|e| driver_err("tree promote write", &e))?;
+                    let (base, guard) = arena.device_ptr(s);
+                    // SAFETY: one dtod within a live arena; src/dst are
+                    // row-aligned, equal-length, disjoint (node > k) byte
+                    // ranges inside the allocation; ordered on this stream.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        result::memcpy_dtod_async(
+                            base + dst as sys::CUdeviceptr,
+                            base + src as sys::CUdeviceptr,
+                            row_bytes,
+                            s.cu_stream(),
+                        )
+                    }
+                    .map_err(|e| driver_err("tree promote row", &e))?;
+                    drop(guard);
                 }
                 if sc_row > 0 {
-                    let s_src = (self.cache_len + node) * sc_row;
-                    let s_dst = (self.cache_len + k) * sc_row;
+                    let s_src = (self.cache_len + node) * sc_row * 4;
+                    let s_dst = (self.cache_len + k) * sc_row * 4;
                     for arena in [&mut self.kv_k_scales[li], &mut self.kv_v_scales[li]] {
-                        let row = {
-                            let src_slice = arena.slice(s_src..s_src + sc_row);
-                            let mut tmp = s
-                                .alloc_zeros::<f32>(sc_row)
-                                .map_err(|e| driver_err("tree promote sc tmp", &e))?;
-                            s.memcpy_dtod(&src_slice, &mut tmp)
-                                .map_err(|e| driver_err("tree promote sc read", &e))?;
-                            tmp
-                        };
-                        let mut dst_slice = arena.slice_mut(s_dst..s_dst + sc_row);
-                        s.memcpy_dtod(&row, &mut dst_slice)
-                            .map_err(|e| driver_err("tree promote sc write", &e))?;
+                        let (base, guard) = arena.device_ptr(s);
+                        // SAFETY: as above — f32 arena addressed in bytes
+                        // (offsets ×4), disjoint row-aligned ranges.
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            result::memcpy_dtod_async(
+                                base + s_dst as sys::CUdeviceptr,
+                                base + s_src as sys::CUdeviceptr,
+                                sc_row * 4,
+                                s.cu_stream(),
+                            )
+                        }
+                        .map_err(|e| driver_err("tree promote sc row", &e))?;
+                        drop(guard);
                     }
                 }
             }
