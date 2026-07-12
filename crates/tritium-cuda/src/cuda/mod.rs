@@ -1792,30 +1792,9 @@ impl CudaDecodeModel {
                 &mut d_qact,
                 &mut d_act_scale,
             )?;
-            self.matmul_m(
-                s,
-                &d_qact,
-                &self.layers[li].q,
-                &d_act_scale,
-                m,
-                &mut d_q,
-                )?;
-            self.matmul_m(
-                s,
-                &d_qact,
-                &self.layers[li].k,
-                &d_act_scale,
-                m,
-                &mut d_k,
-                )?;
-            self.matmul_m(
-                s,
-                &d_qact,
-                &self.layers[li].v,
-                &d_act_scale,
-                m,
-                &mut d_v,
-                )?;
+            self.matmul_m(s, &d_qact, &self.layers[li].q, &d_act_scale, m, &mut d_q)?;
+            self.matmul_m(s, &d_qact, &self.layers[li].k, &d_act_scale, m, &mut d_k)?;
+            self.matmul_m(s, &d_qact, &self.layers[li].v, &d_act_scale, m, &mut d_v)?;
             Self::bl_rope(
                 s,
                 &self.f_rope_batch,
@@ -1917,14 +1896,7 @@ impl CudaDecodeModel {
                 &mut d_qact,
                 &mut d_act_scale,
             )?;
-            self.matmul_m(
-                s,
-                &d_qact,
-                &self.layers[li].o,
-                &d_act_scale,
-                m,
-                &mut d_proj,
-                )?;
+            self.matmul_m(s, &d_qact, &self.layers[li].o, &d_act_scale, m, &mut d_proj)?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
 
             // --- ReLU² MLP ---
@@ -1954,15 +1926,8 @@ impl CudaDecodeModel {
                 &d_act_scale,
                 m,
                 &mut d_gate,
-                )?;
-            self.matmul_m(
-                s,
-                &d_qact,
-                &self.layers[li].up,
-                &d_act_scale,
-                m,
-                &mut d_up,
-                )?;
+            )?;
+            self.matmul_m(s, &d_qact, &self.layers[li].up, &d_act_scale, m, &mut d_up)?;
             Self::bl_relu2(s, &self.f_relu2, &mut d_gate, &d_up, m * n_ff)?;
             let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
                 Self::bl_rmsnorm(
@@ -1995,7 +1960,7 @@ impl CudaDecodeModel {
                 &d_act_scale,
                 m,
                 &mut d_proj,
-                )?;
+            )?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
         }
 

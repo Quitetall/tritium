@@ -2729,7 +2729,27 @@ impl CudaBackend {
         let kv_dtype = kv_dtype_from_env()?;
         // ADR 0026 Track P: build I2sInt8 IMMA shadows for the prefill
         // tensor-core path (~0.25 B/weight beside the TQ2 rows). Kill switch:
-        // TRITIUM_IMMA_PREFILL=0 skips the shadows AND the dispatch.
+        // TRITIUM_IMMA_PREFILL=0 skips the shadows AND the dispatch; the tune
+        // policy `off` ALSO skips the shadows (review N3 — half a GB of
+        // shadow that can never dispatch is waste, not caution).
+        let imma_tune_policy = match std::env::var("TRITIUM_IMMA_TUNE") {
+            Err(std::env::VarError::NotPresent) => ImmaTunePolicy::Tune,
+            Ok(v) => match v.as_str() {
+                "tune" | "" => ImmaTunePolicy::Tune,
+                "load" => ImmaTunePolicy::Load,
+                "off" => ImmaTunePolicy::Off,
+                other => {
+                    return Err(BackendError::InvalidInput(format!(
+                        "TRITIUM_IMMA_TUNE={other:?} — use tune, load or off"
+                    )));
+                }
+            },
+            Err(e) => {
+                return Err(BackendError::InvalidInput(format!(
+                    "TRITIUM_IMMA_TUNE: {e}"
+                )));
+            }
+        };
         let enable_imma = match std::env::var("TRITIUM_IMMA_PREFILL") {
             Err(std::env::VarError::NotPresent) => true,
             Ok(v) if v == "0" => false,
@@ -2744,7 +2764,7 @@ impl CudaBackend {
                     "TRITIUM_IMMA_PREFILL: {e}"
                 )));
             }
-        };
+        } && imma_tune_policy != ImmaTunePolicy::Off;
         if kv_dtype != KvDtype::F32 && !head_dim.is_multiple_of(4) {
             return Err(BackendError::InvalidInput(format!(
                 "TRITIUM_KV={kv_dtype:?} requires head_dim % 4 == 0 (got {head_dim})"
@@ -3007,36 +3027,13 @@ impl CudaBackend {
         //   load — disk-cache-or-AOT, never sweeps;
         //   off  — no IMMA functions (dispatch falls back to dp4a).
         let imma_funcs = {
-            #[derive(PartialEq)]
-            enum TunePolicy {
-                Tune,
-                Load,
-                Off,
-            }
-            let policy = if !enable_imma {
-                TunePolicy::Off
+            let policy = if enable_imma {
+                imma_tune_policy
             } else {
-                match std::env::var("TRITIUM_IMMA_TUNE") {
-                    Err(std::env::VarError::NotPresent) => TunePolicy::Tune,
-                    Ok(v) => match v.as_str() {
-                        "tune" | "" => TunePolicy::Tune,
-                        "load" => TunePolicy::Load,
-                        "off" => TunePolicy::Off,
-                        other => {
-                            return Err(BackendError::InvalidInput(format!(
-                                "TRITIUM_IMMA_TUNE={other:?} — use tune, load or off"
-                            )));
-                        }
-                    },
-                    Err(e) => {
-                        return Err(BackendError::InvalidInput(format!(
-                            "TRITIUM_IMMA_TUNE: {e}"
-                        )));
-                    }
-                }
+                ImmaTunePolicy::Off
             };
             let mut map = HashMap::new();
-            if policy != TunePolicy::Off {
+            if policy != ImmaTunePolicy::Off {
                 let mut shapes = std::collections::BTreeSet::new();
                 for l in &layers {
                     for lin in [&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down] {
@@ -3056,17 +3053,34 @@ impl CudaBackend {
                             k,
                         };
                         let tile = match policy {
-                            TunePolicy::Tune => self.resolve_imma_tile(shape),
-                            TunePolicy::Load => {
-                                crate::autotune::load_cached(
-                                    &cache_dir(),
-                                    &self.imma_cache_key(shape),
-                                )
-                                .unwrap_or(TileConfig::AOT_EQUIVALENT)
-                            }
-                            TunePolicy::Off => unreachable!(),
+                            ImmaTunePolicy::Tune => self.resolve_imma_tile(shape),
+                            ImmaTunePolicy::Load => crate::autotune::load_cached(
+                                &cache_dir(),
+                                &self.imma_cache_key(shape),
+                            )
+                            .unwrap_or(TileConfig::AOT_EQUIVALENT),
+                            ImmaTunePolicy::Off => unreachable!(),
                         };
-                        let func = self.imma_function_for_tile(tile)?;
+                        // Review N5: a JIT failure for a cached non-AOT tile
+                        // degrades to the embedded AOT cubin (correct, slower)
+                        // instead of aborting the whole model build. The TILE
+                        // must fall back WITH the function — the launch derives
+                        // its grid/block geometry from the stored TileConfig,
+                        // and the AOT kernel under a big tile's geometry would
+                        // compute garbage.
+                        let (tile, func) = match self.imma_function_for_tile(tile) {
+                            Ok(f) => (tile, f),
+                            Err(e) => {
+                                eprintln!(
+                                    "tritium-cuda: IMMA tile {tile:?} JIT failed ({e}); \
+                                     falling back to the AOT tile for ({n},{k},m2^{m_log2})"
+                                );
+                                (
+                                    TileConfig::AOT_EQUIVALENT,
+                                    self.imma_function_for_tile(TileConfig::AOT_EQUIVALENT)?,
+                                )
+                            }
+                        };
                         map.insert((n, k, m_log2), (tile, func));
                     }
                 }
@@ -3998,12 +4012,36 @@ impl CudaBackend {
             return *t;
         }
         let dir = cache_dir();
+        // The candidate-invariant probe state (operands, host reference, device
+        // uploads) is built ONCE per shape — review M2: recomputing the O(m·n·k)
+        // host reference per candidate made a cold 2B4T tune ~17× more expensive
+        // (~12 min release / hours in a dev-profile test binary).
+        if crate::autotune::load_cached(&dir, &key).is_none() {
+            eprintln!(
+                "tritium-cuda: autotune sweep for {}x{}xk{} (m-bucket {}) — one-time, \
+                 winners persist in {}",
+                shape.m,
+                shape.n,
+                shape.k,
+                ShapeBucket::from_shape(shape).m_log2,
+                dir.display(),
+            );
+        }
+        let probe = match self.build_imma_probe(shape) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "tritium-cuda: autotune probe setup failed ({e}); using the AOT tile"
+                );
+                return TileConfig::AOT_EQUIVALENT;
+            }
+        };
         // The device-side evaluation half: JIT + launch each candidate on this shape,
-        // validate it against a host reference, and time it.
+        // validate it against the (pre-computed) host reference, and time it.
         let tile = tune_or_load(
             &dir,
             &key,
-            |cand| self.evaluate_candidate(cand, shape),
+            |cand| self.evaluate_candidate(cand, &probe),
             |e| eprintln!("tritium-cuda: autotune cache write failed ({e}); continuing un-cached"),
         );
         self.tuned_tiles
@@ -4013,13 +4051,12 @@ impl CudaBackend {
         tile
     }
 
-    /// Evaluate one candidate `tile` on `shape`: JIT-compile it, run it on a small
-    /// deterministic problem of this shape, check the result against the host
-    /// reference (the same exact-int contraction the kernel computes), and time it.
-    /// A compile/launch failure or an out-of-tolerance result marks the candidate
-    /// incorrect (rejected), never aborting the search.
-    fn evaluate_candidate(&self, tile: TileConfig, shape: GemmShape) -> CandidateResult {
-        match self.try_evaluate_candidate(tile, shape) {
+    /// Evaluate one candidate `tile` against a pre-built [`ImmaProbe`]:
+    /// JIT-compile it, launch once for correctness against the probe's host
+    /// reference, and time it. A compile/launch failure or a bit-mismatch
+    /// marks the candidate incorrect (rejected), never aborting the search.
+    fn evaluate_candidate(&self, tile: TileConfig, probe: &ImmaProbe) -> CandidateResult {
+        match self.try_evaluate_candidate(tile, probe) {
             Ok(r) => r,
             Err(_) => CandidateResult {
                 correct: false,
@@ -4028,13 +4065,10 @@ impl CudaBackend {
         }
     }
 
-    /// Fallible inner body of [`evaluate_candidate`]; any `Err` is folded to an
-    /// "incorrect" candidate by the caller.
-    fn try_evaluate_candidate(
-        &self,
-        tile: TileConfig,
-        shape: GemmShape,
-    ) -> Result<CandidateResult, BackendError> {
+    /// Build the candidate-INVARIANT half of a tune sweep once per shape:
+    /// deterministic operands, the exact host reference, and the device
+    /// uploads (review M2 — this used to run per candidate, ~17× the cost).
+    fn build_imma_probe(&self, shape: GemmShape) -> Result<ImmaProbe, BackendError> {
         let GemmShape { m, n, k } = shape;
         // Guard against degenerate buckets (M=0 etc.): use at least one row/col/tile.
         let m = m.max(1);
@@ -4050,38 +4084,80 @@ impl CudaBackend {
         // Host reference: exact int32 contraction folded by the two scales in the
         // kernel's EXACT association ((float)acc * wscale * act_scale — unified with
         // the dp4a family, ADR 0026 bit-identity contract), so a correct tile matches
-        // bit-for-bit (the acceptance check below is to_bits-strict).
+        // bit-for-bit (the acceptance check is to_bits-strict). Threaded over rows:
+        // the largest bucket (m=2048, n=6912, k=2560) is ~36G MACs — ~8 s single-
+        // threaded in release, minutes in a dev-profile test binary.
         let mut reference = vec![0.0f32; m * n];
-        for mi in 0..m {
-            for ni in 0..n {
-                let mut acc: i64 = 0;
-                for ki in 0..k {
-                    acc += qact[mi * k + ki] as i64 * trits[ni * k + ki] as i64;
-                }
-                reference[mi * n + ni] = acc as f32 * wscale[ni] * act_scale[mi];
+        let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
+        let rows_per = m.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (chunk_idx, out_chunk) in reference.chunks_mut(rows_per * n).enumerate() {
+                let qact = &qact;
+                let trits = &trits;
+                let wscale = &wscale;
+                let act_scale = &act_scale;
+                scope.spawn(move || {
+                    let mi0 = chunk_idx * rows_per;
+                    for (r, out_row) in out_chunk.chunks_mut(n).enumerate() {
+                        let mi = mi0 + r;
+                        for (ni, out) in out_row.iter_mut().enumerate() {
+                            let mut acc: i64 = 0;
+                            for ki in 0..k {
+                                acc += qact[mi * k + ki] as i64 * trits[ni * k + ki] as i64;
+                            }
+                            *out = acc as f32 * wscale[ni] * act_scale[mi];
+                        }
+                    }
+                });
             }
-        }
+        });
 
         // Pack the weights into the I2sInt8 tile layout the kernel expects.
         let packed = pack_i2s_int8_tiles(&trits, n, k);
 
-        // Upload operands.
-        let d_qact = self
-            .stream
-            .clone_htod(&qact)
-            .map_err(|e| driver_err("autotune upload qact", &e))?;
-        let d_weights = self
-            .stream
-            .clone_htod(&packed)
-            .map_err(|e| driver_err("autotune upload weights", &e))?;
-        let d_act_scale = self
-            .stream
-            .clone_htod(&act_scale)
-            .map_err(|e| driver_err("autotune upload act_scale", &e))?;
-        let d_wscale = self
-            .stream
-            .clone_htod(&wscale)
-            .map_err(|e| driver_err("autotune upload wscale", &e))?;
+        // Upload operands once; every candidate launches over the same buffers.
+        Ok(ImmaProbe {
+            m,
+            n,
+            k,
+            reference,
+            d_qact: self
+                .stream
+                .clone_htod(&qact)
+                .map_err(|e| driver_err("autotune upload qact", &e))?,
+            d_weights: self
+                .stream
+                .clone_htod(&packed)
+                .map_err(|e| driver_err("autotune upload weights", &e))?,
+            d_act_scale: self
+                .stream
+                .clone_htod(&act_scale)
+                .map_err(|e| driver_err("autotune upload act_scale", &e))?,
+            d_wscale: self
+                .stream
+                .clone_htod(&wscale)
+                .map_err(|e| driver_err("autotune upload wscale", &e))?,
+        })
+    }
+
+    /// Fallible inner body of [`evaluate_candidate`]; any `Err` is folded to an
+    /// "incorrect" candidate by the caller.
+    fn try_evaluate_candidate(
+        &self,
+        tile: TileConfig,
+        probe: &ImmaProbe,
+    ) -> Result<CandidateResult, BackendError> {
+        let ImmaProbe {
+            m,
+            n,
+            k,
+            reference,
+            d_qact,
+            d_weights,
+            d_act_scale,
+            d_wscale,
+        } = probe;
+        let (m, n, k) = (*m, *n, *k);
         let mut d_out = self
             .stream
             .alloc_zeros::<f32>(m * n)
@@ -4094,10 +4170,10 @@ impl CudaBackend {
         self.launch_imma_tile(
             &func,
             tile,
-            &d_qact,
-            &d_weights,
-            &d_act_scale,
-            &d_wscale,
+            d_qact,
+            d_weights,
+            d_act_scale,
+            d_wscale,
             &mut d_out,
             m as i32,
             n as i32,
@@ -4118,7 +4194,7 @@ impl CudaBackend {
         // reference to the bit — imma_close's tolerance band retired here.
         let correct = got
             .iter()
-            .zip(&reference)
+            .zip(reference)
             .all(|(&g, &r)| g.to_bits() == r.to_bits());
         if !correct {
             return Ok(CandidateResult {
@@ -4140,10 +4216,10 @@ impl CudaBackend {
             self.launch_imma_tile(
                 &func,
                 tile,
-                &d_qact,
-                &d_weights,
-                &d_act_scale,
-                &d_wscale,
+                d_qact,
+                d_weights,
+                d_act_scale,
+                d_wscale,
                 &mut d_out,
                 m as i32,
                 n as i32,
@@ -4542,9 +4618,27 @@ pub(super) fn quantize_act_int8_host(
 
 /// The IMMA conformance tolerance the autotune correctness check uses (relative,
 /// matching ADR 0002's `1e-4`). A candidate tile whose output lands outside this band
-/// is a launch-geometry bug (the int contraction is exact), so it is rejected.
-const IMMA_AUTOTUNE_REL_TOL: f32 = 1e-4;
+/// `TRITIUM_IMMA_TUNE` policy (ADR 0026 Track P step 3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImmaTunePolicy {
+    Tune,
+    Load,
+    Off,
+}
 
+/// Candidate-invariant tune-probe state: deterministic operands uploaded
+/// once, plus the exact host reference every candidate is bit-compared to
+/// (review M2 — previously rebuilt per candidate at O(m·n·k)).
+struct ImmaProbe {
+    m: usize,
+    n: usize,
+    k: usize,
+    reference: Vec<f32>,
+    d_qact: CudaSlice<i8>,
+    d_weights: CudaSlice<u8>,
+    d_act_scale: CudaSlice<f32>,
+    d_wscale: CudaSlice<f32>,
+}
 
 /// Pack an `[N, K]` ternary weight matrix (`i8` codes in `{-1,0,+1}`, row-major) into
 /// the IMMA `I2sInt8` tile layout the kernel reads (the same interleave
