@@ -34,12 +34,17 @@
 #![deny(missing_docs)]
 
 mod allocate;
+mod conversion;
 pub mod fisher;
 mod plane;
 mod quantize;
 mod recon;
 
 pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
+pub use conversion::{
+    CONVERSION_STATE_MAGIC, CONVERSION_STATE_VERSION, ConversionError, ConversionRun,
+    ConversionStage, RunStatus, StageAttempt, StageFailure, StageReceipt,
+};
 pub use plane::{
     Plane, PlaneStack, absmean_ternary, recon_error, residual_expand, ternary_at_scale,
 };
