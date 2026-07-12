@@ -1021,13 +1021,15 @@ Also in this change: the admission job-pull is no longer gated on a free
 slot. Tree ops need no seat, so the queue drains whenever nothing is parked;
 a seatless Generate PARKS (the C3 mechanism, FIFO) instead of gating the
 whole queue on slot availability — verify latency under a full pool is
-bounded by the op itself, not by a retirement.
+bounded by the op itself while nothing is parked (a parked Generate holds
+FIFO, so verifies behind it still wait for one retirement).
 
 Gate `cuda_batched_tree_session_coexists` (first-run pass): batched open +
 two chained verifies token-identical to the single-worker server (losslessness
-across modes); an INFORMED draft forces the accept/promote path (2 committed,
-identical across modes — junk drafts degenerate to L=1 and never exercise
-compaction); session ops succeed and return identical tokens WHILE a chat
+across modes); an INFORMED draft forces the accept path (2 committed, identical across
+modes — junk drafts degenerate to L=1; note the accepted CHAIN is
+compaction-free, node==k along the path, so KV row-moving promotion is
+exercised by the kernel-level tree gates, not here); session ops succeed and return identical tokens WHILE a chat
 stream decodes in the other slot (stream unaffected); verify after a chat
 admission answers 409. Full serve regression re-run (G1/G2, G3, C1
 interleave, contract, spec) — the worker restructure must not move anything.

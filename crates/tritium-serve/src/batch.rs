@@ -127,6 +127,7 @@ impl Pending {
             PendingGoal::TreeOpen { .. } => None,
         }
     }
+    /// Fail with an internal error (device/forward faults).
     fn fail(self, msg: String) {
         match self.goal {
             PendingGoal::Admit { tx, .. } => {
@@ -134,6 +135,21 @@ impl Pending {
             }
             PendingGoal::TreeOpen { resp, .. } => {
                 let _ = resp.send(Err(crate::generator::TreeOpError::Internal(msg)));
+            }
+        }
+    }
+
+    /// Fail because the server is draining — same classification a
+    /// queue-drained job gets (Unsupported/503-shaped, not Internal/500).
+    fn fail_draining(self) {
+        match self.goal {
+            PendingGoal::Admit { tx, .. } => {
+                let _ = tx.try_send(GenEvent::Error("server draining".into()));
+            }
+            PendingGoal::TreeOpen { resp, .. } => {
+                let _ = resp.send(Err(crate::generator::TreeOpError::Unsupported(
+                    "server draining".into(),
+                )));
             }
         }
     }
@@ -303,20 +319,28 @@ pub(crate) fn run_batched(
             }
             if let Some(p) = pending.take() {
                 let row = p.row();
-                p.fail("server draining".into());
+                p.fail_draining();
                 if let Some(row) = row {
                     release_slot(&mut batch, row);
                 }
             }
             tree_open = false;
-            if let Some(Job::Generate { tx, .. }) = parked.take() {
-                let _ = tx.try_send(GenEvent::Error("server draining".into()));
+            match parked.take() {
+                None => {}
+                Some(Job::Generate { tx, .. }) => {
+                    let _ = tx.try_send(GenEvent::Error("server draining".into()));
+                }
+                // Only Generate parks today; a third park site must extend
+                // this drain arm rather than silently dropping a responder.
+                Some(other) => unreachable!("non-Generate job parked: {other:?}"),
             }
         }
         // Admit into free slots: drain waiting jobs, block only when idle.
         // Cap admissions per pass: instantly-retiring jobs (errors, dead
         // channels) don't occupy a slot, and an unbounded pass would let a
-        // flood of them starve stepping. Gated on `pending.is_none()`: the
+        // flood of them starve stepping. Tree VERIFIES also consume this
+        // budget (each is a bounded device tree-forward), so one pass costs
+        // live streams at most slots*2 verifies. Gated on `pending.is_none()`: the
         // chunks own the single-sequence KV, so one admission prefills at a
         // time (a valid job below parks itself as `pending` and ends the
         // pass via this condition).
@@ -507,8 +531,7 @@ pub(crate) fn run_batched(
                 let len = p.prompt().len();
                 let end = (p.done + chunk).min(len);
                 let positions: Vec<usize> = (p.done..end).collect();
-                let chunk_tokens: Vec<u32> = p.prompt()[p.done..end].to_vec();
-                match runner.forward(&chunk_tokens, &positions) {
+                match runner.forward(&p.prompt()[p.done..end], &positions) {
                     Err(e) => {
                         let p = pending.take().expect("pending checked above");
                         let row = p.row();

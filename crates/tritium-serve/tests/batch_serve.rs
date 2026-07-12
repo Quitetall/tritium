@@ -364,10 +364,12 @@ async fn cuda_batched_tree_session_coexists() {
         "C4b: chat stream stalled out during tree traffic"
     );
 
-    // (a2) Force an ACCEPT so the promote/compact path runs (junk drafts
-    // degenerate to L=1 plain steps): round 1 told us the argmax after the
-    // root is single_rounds[0][0] — draft exactly that. Both modes must
-    // commit ≥2 tokens (accepted draft + bonus) and agree exactly.
+    // (a2) Force an ACCEPT (junk drafts degenerate to L=1 plain steps):
+    // round 1 told us the argmax after the root is single_rounds[0][0] —
+    // draft exactly that. Both modes must commit ≥2 tokens (accepted draft
+    // + bonus) and agree exactly. NB an accepted CHAIN is compaction-free
+    // (node == k along the path); KV row-moving promotion is covered by the
+    // kernel-level tree gates, not this HTTP-level one.
     let informed = vec![single_root, single_rounds[0][0], drafts[1]];
     let accept_on = |router: Router, prompt: Vec<u32>, tokens: Vec<u32>| async move {
         let (st, v) = tree_post(
