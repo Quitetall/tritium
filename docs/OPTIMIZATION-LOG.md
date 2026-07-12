@@ -1070,3 +1070,48 @@ protocol is the keeper).
 Track E closed. The remaining decode headroom at M=1 per this session's
 measurements: spec decode (Track D's drafter, gated on BLUT training) ≫
 everything else.
+
+## v1.x round 22 — Track P: IMMA prefill live — pp512 1,068 → 1,970 tok/s (2026-07-12)
+
+ADR 0026 Track P executed (5 commits + review folds): the ORPHANED IMMA
+tensor-core path (kernel + JIT big-tile codegen + autotuner, built in the
+v0.4.x era and never wired to the model) now serves prefill.
+
+- **Step 1**: epilogue association unified with dp4a ((float)acc · wscale ·
+  act_scale — a pure multiply chain, no contraction possible) ⇒ IMMA output
+  is BIT-IDENTICAL to dp4a. Gate: kernel-level to_bits equality (reviewer
+  measured 32.8% of elements ULP-diverge under the OLD association — real
+  teeth). Autotune acceptance upgraded to bit-strict.
+- **Steps 2-4**: I2sInt8 shadows on the seven per-projection linears
+  (~0.52 GB, one dtoh shared with the bitmap scan; TQ1 → dp4a), build-time
+  tile resolution over (4 shapes × m-buckets 5..=11) with
+  TRITIUM_IMMA_TUNE=tune|load|off (no serving-path nvrtc, cold sweep
+  disk-cached), matmul_m dispatch at M ≥ TRITIUM_IMMA_MIN_M=32 — prefill
+  only (eager); graph-captured batch/tree keep dp4a by design.
+- **Review (NEEDS CHANGES, folded)**: M2 — the tune probe rebuilt an
+  O(m·n·k) host reference PER CANDIDATE (~25 min cold build measured live);
+  now built once per shape + threaded. M1 — commit 184b654 swept ~430 lines
+  of the parallel session's WIP (broken bisect point; recorded, protocol
+  hardened: audit hunks before staging shared files). N5 fold caught a real
+  hazard: a JIT-failure fallback that kept the big tile's GEOMETRY with the
+  AOT function would compute garbage — tile falls back WITH the function.
+- **Real-model gates**: cuda_imma_prefill_matches_dp4a_bit_exact GREEN —
+  one-shot M=512 == 4×128 chunked == dp4a, to_bits over all 128,256 logits
+  (C1/G1 contracts stand verbatim, zero re-gating). Tree lossless green
+  over the P3 promote fix. NOTE the legacy acceptance prompts are 6-31
+  tokens (< the M=32 threshold ⇒ dp4a path, unaffected); the 512-token gate
+  IS the IMMA coverage. Broad-battery re-runs kept being killed by box
+  activity — queued.
+- **Measured (quiet box, warm tune cache, report compare)**: pp512
+  **1,969.7 tok/s** (p50 260 ms) vs 1,068 baseline = **+84%**; prompt-64
+  prefill 1,693 tok/s (was ~1,068 at pp512 shapes). Decode untouched
+  (317.9 tok/s @ 32-step short-ctx; 221.5 @ 256-step post-512-prefill ctx —
+  shape-dependent, not a regression). **The ≥6,000 gate is OPEN**: the
+  remaining ~260 ms is NOT GEMM-dominated anymore — profile-driven gap
+  analysis is the next step (candidate levers, in order: attention/norm/
+  rope/quant kernels at M=512, per-layer act-quant launches, cp.async
+  staging in the IMMA kernel, fused qkv/gateup shadows).
+
+Also: `tritium report compare` + docs/BENCHMARKS.md shipped (Track R) —
+one-command ledger with environment capture (it disclosed the co-resident
+llama-server on its first run).

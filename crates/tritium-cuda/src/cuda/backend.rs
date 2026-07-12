@@ -4030,9 +4030,7 @@ impl CudaBackend {
         let probe = match self.build_imma_probe(shape) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "tritium-cuda: autotune probe setup failed ({e}); using the AOT tile"
-                );
+                eprintln!("tritium-cuda: autotune probe setup failed ({e}); using the AOT tile");
                 return TileConfig::AOT_EQUIVALENT;
             }
         };

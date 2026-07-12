@@ -38,6 +38,22 @@ JSON is the artifact; the tables below are transcriptions of it.
 
 <!-- Newest first. Each entry: date, git commit, environment line, table, JSON path/attachment. -->
 
+### 2026-07-12 — IMMA prefill live (ADR 0026 Track P steps 1-4)
+
+Command: `tritium report compare --model ggml-model-i2_s.gguf --tokens <ids> --backend cuda
+--prompt-len 512 --decode-steps 256 --warmup 16 --reps 3 --runs 5` @ git 5075683-era tree
+(Track P complete through the dispatch), RTX 4090, driver 610.43.02, co-resident: kwin only.
+
+| metric | value | vs 2026-07-11 baseline |
+|---|---:|---|
+| pp512 prefill | **1,969.7 tok/s** (p50 260.0 ms) | 1,068 → **+84%** |
+| decode (256 steps after the 512-token prefill, ctx 512→768) | 221.5 tok/s median | shape differs from the 6-token-prompt baseline (273-276); not comparable directly |
+| decode (32 steps, 64-token prompt) | 317.9 tok/s | — |
+
+Numerics: IMMA prefill is BIT-IDENTICAL to dp4a (gate: 128,256 logits to_bits, one-shot ==
+4×128-chunked == dp4a). The ≥6,000 pp512 campaign gate remains open — gap analysis in
+OPTIMIZATION-LOG round 22.
+
 ### (pending) 2026-07-XX — post-Track-P run
 
 To be recorded by re-running the command above on a quiet box once ADR 0026 Track P (IMMA

@@ -38,7 +38,6 @@ impl CudaDecodeModel {
         Ok(out.iter().flat_map(|v| v.to_le_bytes()).collect())
     }
 
-
     /// Continuous-batching admission: copy this model's single-sequence KV
     /// rows `[0, len)` (every layer, K and V) into batch slot `row`'s arena.
     /// The caller prefills the prompt through the SINGLE-sequence path (the
@@ -1338,7 +1337,14 @@ impl CudaDecodeModel {
                 pp(&kw_i),
                 pp(&n_i),
             ];
-            raw_launch(self.batch_raw().kv_append, grid, (256, 1, 1), 0, cs, &mut params)
+            raw_launch(
+                self.batch_raw().kv_append,
+                grid,
+                (256, 1, 1),
+                0,
+                cs,
+                &mut params,
+            )
         }
     }
 
