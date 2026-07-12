@@ -319,7 +319,7 @@ pub(crate) const CODEGEN_REV: u32 = 3;
 
 impl CacheKey {
     /// Stable filesystem-safe string form, e.g.
-    /// `sm_89-i2sint8-m5-n2560-k2560-cuda13030-r2`. The CUDA version and codegen
+    /// `sm_89-i2sint8-m5-n2560-k2560-cuda13030-r3`. The CUDA version and codegen
     /// revision suffixes mean a driver bump or a codegen change keys a *different*
     /// file, transparently invalidating stale entries.
     pub(crate) fn to_key_string(&self) -> String {

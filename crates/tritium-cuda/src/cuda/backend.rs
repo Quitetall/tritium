@@ -3952,7 +3952,7 @@ impl CudaBackend {
         // Host reference: exact int32 contraction folded by the two scales in the
         // kernel's EXACT association ((float)acc * wscale * act_scale — unified with
         // the dp4a family, ADR 0026 bit-identity contract), so a correct tile matches
-        // bit-for-bit; imma_close's tolerance remains as slack for nothing.
+        // bit-for-bit (the acceptance check below is to_bits-strict).
         let mut reference = vec![0.0f32; m * n];
         for mi in 0..m {
             for ni in 0..n {
@@ -4014,7 +4014,14 @@ impl CudaBackend {
             .synchronize()
             .map_err(|e| driver_err("autotune sync", &e))?;
 
-        let correct = got.iter().zip(&reference).all(|(&g, &r)| imma_close(g, r));
+        // Bit-strict since the epilogue unification (ADR 0026 Track P step 1):
+        // every rendered tile computes the exact i32 contraction + the one
+        // canonical float fold, so a correct candidate matches the host
+        // reference to the bit — imma_close's tolerance band retired here.
+        let correct = got
+            .iter()
+            .zip(&reference)
+            .all(|(&g, &r)| g.to_bits() == r.to_bits());
         if !correct {
             return Ok(CandidateResult {
                 correct: false,
@@ -4440,14 +4447,6 @@ pub(super) fn quantize_act_int8_host(
 /// is a launch-geometry bug (the int contraction is exact), so it is rejected.
 const IMMA_AUTOTUNE_REL_TOL: f32 = 1e-4;
 
-/// Relative-or-absolute closeness check for the autotune correctness gate: accept if
-/// the absolute error is within `IMMA_AUTOTUNE_REL_TOL · max(1, |reference|)`. Mirrors
-/// the testkit's `Tolerance::accepts` shape so the in-tree probe matches the
-/// committed conformance gate.
-fn imma_close(got: f32, reference: f32) -> bool {
-    let diff = (got - reference).abs();
-    diff <= IMMA_AUTOTUNE_REL_TOL * reference.abs().max(1.0)
-}
 
 /// Pack an `[N, K]` ternary weight matrix (`i8` codes in `{-1,0,+1}`, row-major) into
 /// the IMMA `I2sInt8` tile layout the kernel reads (the same interleave
