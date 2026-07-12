@@ -242,8 +242,9 @@ memory at scale, which A–E remove.
 - **Bit-exactness oracles:** `crates/tritium-train/src/ops/*` (`norm`, `act`,
   `elementwise`, `softmax`, `rope`, `shape`, `embed`, `loss`, `ste`) and
   `optim::AdamW` — every device kernel is gated against these.
-- **Engine:** `DeviceTape` + the `*_dev` methods + `train_grad.cu` (add kernels here,
-  same `--fmad=false` module — no `build.rs` change needed for train_grad.cu).
+- **Engine:** `DeviceTape` + the `*_dev` methods + `crates/tritium-cuda/kernels/train_grad.cu`
+  (add kernels here, same `--fmad=false` module — no `build.rs` change needed for it; note
+  there are stale copies under `.claude/worktrees/` — the crate-root path is the live one).
 - **Ternary weights on device:** `salt_mpgemm_tiled_f32`, `CudaBackend::upload_salt`,
   `SaltResidentLinear` (Track D forward oracle + packing).
 - **Model builder:** `crates/tritium-nn/tests/common/mod.rs::device_forward` +
