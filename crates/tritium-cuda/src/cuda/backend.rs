@@ -1453,7 +1453,10 @@ impl CudaBackend {
         sign: f32,
     ) -> Result<(), BackendError> {
         let total = n_token * n_head * head_dim;
-        if head_dim % 2 != 0 || d_x.len() < total || d_y.len() < total || d_positions.len() < n_token
+        if !head_dim.is_multiple_of(2)
+            || d_x.len() < total
+            || d_y.len() < total
+            || d_positions.len() < n_token
         {
             return Err(BackendError::ShapeMismatch {
                 expected: total,
@@ -1552,7 +1555,13 @@ impl CudaBackend {
         }
         let (ri, ti, si, li) = (rows as i32, total as i32, start as i32, len as i32);
         let mut launch = self.stream.launch_builder(&self.func_copy_into_cols);
-        launch.arg(d_src).arg(d_dst).arg(&ri).arg(&ti).arg(&si).arg(&li);
+        launch
+            .arg(d_src)
+            .arg(d_dst)
+            .arg(&ri)
+            .arg(&ti)
+            .arg(&si)
+            .arg(&li);
         // SAFETY: `(const float* src, float* dst, int rows, int total, int start, int len)`; thread
         // per source element (rows*len).
         #[allow(unsafe_code)]
@@ -1662,7 +1671,13 @@ impl CudaBackend {
         }
         let (si, di, vi) = (seq as i32, dim as i32, vocab as i32);
         let mut launch = self.stream.launch_builder(&self.func_embed_gather_bwd);
-        launch.arg(d_gy).arg(d_tokens).arg(d_gw).arg(&si).arg(&di).arg(&vi);
+        launch
+            .arg(d_gy)
+            .arg(d_tokens)
+            .arg(d_gw)
+            .arg(&si)
+            .arg(&di)
+            .arg(&vi);
         // SAFETY: `(const float* gy, const int* tokens, float* gw, int seq, int dim, int vocab)`;
         // one thread per gw element (vocab*dim).
         #[allow(unsafe_code)]
@@ -1689,7 +1704,9 @@ impl CudaBackend {
         cols: usize,
         gscale: f32,
     ) -> Result<(), BackendError> {
-        if d_logits.len() < rows * cols || d_target.len() < rows * cols || d_glogits.len() < rows * cols
+        if d_logits.len() < rows * cols
+            || d_target.len() < rows * cols
+            || d_glogits.len() < rows * cols
         {
             return Err(BackendError::ShapeMismatch {
                 expected: rows * cols,
@@ -1701,7 +1718,13 @@ impl CudaBackend {
         }
         let (ri, ci) = (rows as i32, cols as i32);
         let mut launch = self.stream.launch_builder(&self.func_softmax_xent_bwd);
-        launch.arg(d_logits).arg(d_target).arg(d_glogits).arg(&ri).arg(&ci).arg(&gscale);
+        launch
+            .arg(d_logits)
+            .arg(d_target)
+            .arg(d_glogits)
+            .arg(&ri)
+            .arg(&ci)
+            .arg(&gscale);
         // SAFETY: `(const float* logits, const float* target, float* g_logits, int rows, int cols,
         // float gscale)`; one thread per row.
         #[allow(unsafe_code)]

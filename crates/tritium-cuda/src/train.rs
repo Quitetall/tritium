@@ -818,6 +818,230 @@ mod tests {
         assert!(gw_d < 1e-4, "rmsnorm grad_w: {gw_d:.3e}");
     }
 
+    /// Gate (plan 0043 P2.4): the device-resident attention glue ops vs their `tritium-train`
+    /// oracles. Copy/select ops (mask, slice, insert, transpose, gather) are BIT-EXACT; softmax,
+    /// RoPE and softmax-xent (expf/sin/cos) are device==CPU within 1e-4.
+    #[test]
+    fn resident_attention_ops_match_cpu() {
+        use tritium_train::ops::{dense, embed, loss, rope, shape, softmax};
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping resident_attention_ops_match_cpu: no CUDA device ({e})");
+                return;
+            }
+        };
+        let dl = |d: &_, n: usize| {
+            let mut h = vec![0.0f32; n];
+            backend.dev_download(d, &mut h).unwrap();
+            h
+        };
+        let rel = |dev: &[f32], cpu: &[f32]| {
+            let range = cpu.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                - cpu.iter().copied().fold(f32::INFINITY, f32::min);
+            max_abs_diff(dev, cpu) / range.max(1e-6)
+        };
+
+        // ── softmax fwd/bwd (rows×cols attention scores) ──
+        let (rows, cols) = (32usize, 40usize);
+        let sx = seeded_uniform(0x81, rows * cols, -3.0, 3.0);
+        let sgy = seeded_uniform(0x82, rows * cols, -1.0, 1.0);
+        let d_sx = backend.dev_upload(&sx).unwrap();
+        let d_sgy = backend.dev_upload(&sgy).unwrap();
+        let mut d_p = backend.dev_alloc_zeros(rows * cols).unwrap();
+        backend
+            .softmax_forward_dev(&d_sx, &mut d_p, rows, cols)
+            .unwrap();
+        let cpu_p = softmax::forward(&sx, rows, cols);
+        assert!(rel(&dl(&d_p, rows * cols), &cpu_p) < 1e-4, "softmax fwd");
+        let mut d_sgx = backend.dev_alloc_zeros(rows * cols).unwrap();
+        backend
+            .softmax_backward_dev(&d_p, &d_sgy, &mut d_sgx, rows, cols)
+            .unwrap();
+        let cpu_sgx = softmax::vjp(&sx, rows, cols, &sgy);
+        assert!(
+            rel(&dl(&d_sgx, rows * cols), &cpu_sgx[0]) < 1e-4,
+            "softmax bwd"
+        );
+
+        // ── causal mask fwd/bwd (bit-exact) ──
+        let mut d_mask = backend.dev_alloc_zeros(rows * cols).unwrap();
+        backend
+            .causal_mask_forward_dev(&d_sx, &mut d_mask, rows, cols)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(
+                &dl(&d_mask, rows * cols),
+                &softmax::causal_mask_forward(&sx, rows, cols)
+            ),
+            0.0,
+            "causal mask fwd"
+        );
+        let mut d_mgx = backend.dev_alloc_zeros(rows * cols).unwrap();
+        backend
+            .causal_mask_backward_dev(&d_sgy, &mut d_mgx, rows, cols)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(
+                &dl(&d_mgx, rows * cols),
+                &softmax::causal_mask_vjp(rows, cols, &sgy)[0]
+            ),
+            0.0,
+            "causal mask bwd"
+        );
+
+        // ── RoPE fwd/bwd over [n_token, n_head, head_dim] ──
+        let (n_token, n_head, head_dim, theta) = (8usize, 4usize, 16usize, 10000.0f32);
+        let rn = n_token * n_head * head_dim;
+        let rx = seeded_uniform(0x83, rn, -1.0, 1.0);
+        let rgy = seeded_uniform(0x84, rn, -1.0, 1.0);
+        let positions: Vec<usize> = (0..n_token).collect();
+        let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let d_rx = backend.dev_upload(&rx).unwrap();
+        let d_pos = backend.dev_upload_i32(&pos_i32).unwrap();
+        let mut d_ry = backend.dev_alloc_zeros(rn).unwrap();
+        backend
+            .rope_apply_dev(
+                &d_rx, &mut d_ry, &d_pos, n_head, head_dim, theta, n_token, 1.0,
+            )
+            .unwrap();
+        let cpu_ry = rope::forward(&rx, &positions, n_head, head_dim, theta);
+        assert!(rel(&dl(&d_ry, rn), &cpu_ry) < 1e-4, "rope fwd");
+        let d_rgy = backend.dev_upload(&rgy).unwrap();
+        let mut d_rgx = backend.dev_alloc_zeros(rn).unwrap();
+        backend
+            .rope_apply_dev(
+                &d_rgy, &mut d_rgx, &d_pos, n_head, head_dim, theta, n_token, -1.0,
+            )
+            .unwrap();
+        let cpu_rgx = rope::vjp(&positions, n_head, head_dim, theta, &rgy);
+        assert!(rel(&dl(&d_rgx, rn), &cpu_rgx[0]) < 1e-4, "rope bwd");
+
+        // ── slice_cols + copy_into_cols (bit-exact; slice's vjp = insert into a zeroed buffer) ──
+        let (sr, sc, start, len) = (6usize, 12usize, 3usize, 5usize);
+        let slx = seeded_uniform(0x85, sr * sc, -1.0, 1.0);
+        let d_slx = backend.dev_upload(&slx).unwrap();
+        let mut d_sl = backend.dev_alloc_zeros(sr * len).unwrap();
+        backend
+            .slice_cols_forward_dev(&d_slx, &mut d_sl, sr, sc, start, len)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(
+                &dl(&d_sl, sr * len),
+                &shape::slice_cols_forward(&slx, sr, sc, start, len)
+            ),
+            0.0,
+            "slice fwd"
+        );
+        // slice vjp: scatter the [sr,len] grad back into a zeroed [sr,sc] at [start,start+len).
+        let slg = seeded_uniform(0x86, sr * len, -1.0, 1.0);
+        let d_slg = backend.dev_upload(&slg).unwrap();
+        let mut d_scat = backend.dev_alloc_zeros(sr * sc).unwrap();
+        backend
+            .copy_into_cols_dev(&d_slg, &mut d_scat, sr, sc, start, len)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(
+                &dl(&d_scat, sr * sc),
+                &shape::slice_cols_vjp(sr, sc, start, len, &slg)
+            ),
+            0.0,
+            "slice vjp / copy_into_cols"
+        );
+        // concat: two inserts reproduce concat_cols_forward.
+        let (pa, pb) = (
+            seeded_uniform(0x87, sr * 4, -1.0, 1.0),
+            seeded_uniform(0x88, sr * 3, -1.0, 1.0),
+        );
+        let d_pa = backend.dev_upload(&pa).unwrap();
+        let d_pb = backend.dev_upload(&pb).unwrap();
+        let mut d_cat = backend.dev_alloc_zeros(sr * 7).unwrap();
+        backend
+            .copy_into_cols_dev(&d_pa, &mut d_cat, sr, 7, 0, 4)
+            .unwrap();
+        backend
+            .copy_into_cols_dev(&d_pb, &mut d_cat, sr, 7, 4, 3)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(
+                &dl(&d_cat, sr * 7),
+                &shape::concat_cols_forward(&[&pa, &pb], sr, &[4, 3])
+            ),
+            0.0,
+            "concat via copy_into_cols"
+        );
+
+        // ── transpose (bit-exact; its own vjp) ──
+        let (tr, tc) = (7usize, 5usize);
+        let tx = seeded_uniform(0x89, tr * tc, -1.0, 1.0);
+        let d_tx = backend.dev_upload(&tx).unwrap();
+        let mut d_ty = backend.dev_alloc_zeros(tr * tc).unwrap();
+        backend
+            .transpose_forward_dev(&d_tx, &mut d_ty, tr, tc)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(&dl(&d_ty, tr * tc), &dense::transpose_forward(&tx, tr, tc)),
+            0.0,
+            "transpose"
+        );
+
+        // ── embed gather fwd/bwd (bit-exact) ──
+        let (vocab, dim, seq) = (50usize, 24usize, 10usize);
+        let w = seeded_uniform(0x8A, vocab * dim, -1.0, 1.0);
+        let tokens: Vec<u32> = [3u32, 0, 49, 3, 12, 0, 7, 3, 25, 1].to_vec();
+        let tok_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let d_w = backend.dev_upload(&w).unwrap();
+        let d_tok = backend.dev_upload_i32(&tok_i32).unwrap();
+        let mut d_ey = backend.dev_alloc_zeros(seq * dim).unwrap();
+        backend
+            .embed_gather_forward_dev(&d_w, &d_tok, &mut d_ey, seq, dim)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(
+                &dl(&d_ey, seq * dim),
+                &embed::gather_forward(&w, &tokens, dim)
+            ),
+            0.0,
+            "gather fwd"
+        );
+        let egy = seeded_uniform(0x8B, seq * dim, -1.0, 1.0);
+        let d_egy = backend.dev_upload(&egy).unwrap();
+        let mut d_egw = backend.dev_alloc_zeros(vocab * dim).unwrap();
+        backend
+            .embed_gather_backward_dev(&d_egy, &d_tok, &mut d_egw, seq, dim, vocab)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(
+                &dl(&d_egw, vocab * dim),
+                &embed::gather_vjp(vocab, &tokens, dim, &egy)
+            ),
+            0.0,
+            "gather bwd (repeated tokens accumulate)"
+        );
+
+        // ── softmax cross-entropy backward (expf ⇒ 1e-4) ──
+        let (xr, xc) = (16usize, 32usize);
+        let logits = seeded_uniform(0x8C, xr * xc, -2.0, 2.0);
+        let target = softmax::forward(&seeded_uniform(0x8D, xr * xc, -1.0, 1.0), xr, xc); // a distribution
+        let d_lg = backend.dev_upload(&logits).unwrap();
+        let d_tg = backend.dev_upload(&target).unwrap();
+        let mut d_xgl = backend.dev_alloc_zeros(xr * xc).unwrap();
+        backend
+            .softmax_xent_backward_dev(&d_lg, &d_tg, &mut d_xgl, xr, xc, 1.0 / xr as f32)
+            .unwrap();
+        let cpu_xgl = loss::softmax_xent_vjp(&logits, &target, xr, xc, &[1.0]);
+        assert!(
+            rel(&dl(&d_xgl, xr * xc), &cpu_xgl[0]) < 1e-4,
+            "softmax_xent bwd"
+        );
+
+        eprintln!(
+            "0043 P2.4 resident attention glue: softmax/mask/rope/slice/copy_into_cols/transpose/\
+             gather/xent all match CPU (copy ops bit-exact; softmax/rope/xent within 1e-4)"
+        );
+    }
+
     /// Gate + payoff (plan 0043 P2.4a): a full **device-resident SwiGLU MLP block** — rmsnorm →
     /// gate/up matmul → silu → mul → down matmul → residual — run forward AND backward entirely on
     /// resident VRAM buffers (activations never leave the device; grads of a value with two

@@ -240,3 +240,170 @@ extern "C" __global__ void rmsnorm_train_grad_w(
         acc += gy[(long)r * cols + i] * x[(long)r * cols + i] * inv[r];
     gw[i] = acc;
 }
+
+// ───────────────────────── device-resident attention glue (plan 0043 P2.4) ─────────────────────────
+// Softmax + causal mask + RoPE + reshape (slice/insert/transpose) + embedding gather + softmax-xent,
+// mirroring the tritium_train::ops::{softmax,rope,shape,embed,loss} vjps. The pure-copy/select ops
+// (mask, slice, insert, transpose, gather) are BIT-EXACT; softmax/xent (expf/logf) and RoPE
+// (sin/cos) are device==CPU within 1e-4.
+
+// Row softmax forward — one thread per row (stable: subtract row max). ops::softmax::forward.
+extern "C" __global__ void softmax_forward(
+    const float* __restrict__ x, float* __restrict__ y, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + (long)r * cols;
+    float* yr = y + (long)r * cols;
+    float m = -INFINITY;
+    for (int i = 0; i < cols; ++i) m = fmaxf(m, xr[i]);
+    float sum = 0.0f;
+    for (int i = 0; i < cols; ++i) { float e = expf(xr[i] - m); yr[i] = e; sum += e; }
+    for (int i = 0; i < cols; ++i) yr[i] /= sum;
+}
+
+// Softmax backward from the saved probs p: gx[r,i] = p[r,i]·(g[r,i] − Σ_j p·g). ops::softmax::vjp.
+extern "C" __global__ void softmax_backward(
+    const float* __restrict__ p, const float* __restrict__ gy,
+    float* __restrict__ gx, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* pr = p + (long)r * cols;
+    const float* gr = gy + (long)r * cols;
+    float* gxr = gx + (long)r * cols;
+    float dot = 0.0f;
+    for (int j = 0; j < cols; ++j) dot += pr[j] * gr[j];
+    for (int i = 0; i < cols; ++i) gxr[i] = pr[i] * (gr[i] - dot);
+}
+
+// Additive causal mask: key j visible to query i iff j<=i, else MASK_NEG (-1e30). ops::softmax.
+extern "C" __global__ void causal_mask_forward(
+    const float* __restrict__ x, float* __restrict__ y, int rows, int cols)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)rows * cols) return;
+    int i = idx / cols, j = idx % cols;
+    y[idx] = (j <= i) ? x[idx] : -1e30f;
+}
+
+// Causal-mask backward: gx[i,j] = (j<=i) ? gy[i,j] : 0. ops::softmax::causal_mask_vjp.
+extern "C" __global__ void causal_mask_backward(
+    const float* __restrict__ gy, float* __restrict__ gx, int rows, int cols)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)rows * cols) return;
+    int i = idx / cols, j = idx % cols;
+    gx[idx] = (j <= i) ? gy[idx] : 0.0f;
+}
+
+// RoPE apply over [n_token, n_head, head_dim]. sign=+1 forward, sign=-1 vjp (inverse rotation).
+// Angles in double to track ops::rope (which uses f64 sin_cos/powf then casts). One thread per
+// rotation pair (token, head, j<half). ops::rope::{forward,vjp}.
+extern "C" __global__ void rope_apply(
+    const float* __restrict__ x, float* __restrict__ y, const int* __restrict__ positions,
+    int n_head, int head_dim, float theta, int n_token, float sign)
+{
+    int half = head_dim / 2;
+    long total = (long)n_token * n_head * half;
+    long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= total) return;
+    int j = t % half;
+    int head = (t / half) % n_head;
+    int token = t / ((long)n_head * half);
+    long base = ((long)token * n_head + head) * head_dim;
+    double inv_freq = pow((double)theta, -2.0 * (double)j / (double)head_dim);
+    double angle = (double)positions[token] * inv_freq;
+    double sd, cd;
+    sincos(angle, &sd, &cd);
+    float cos = (float)cd;
+    float sin = sign * (float)sd;
+    float a = x[base + j];
+    float b = x[base + j + half];
+    y[base + j] = a * cos - b * sin;
+    y[base + j + half] = b * cos + a * sin;
+}
+
+// Extract a contiguous column range: y[r,c] = x[r, start+c], c in [0,len). ops::shape::slice_cols_forward.
+extern "C" __global__ void slice_cols_forward(
+    const float* __restrict__ x, float* __restrict__ y,
+    int rows, int cols, int start, int len)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)rows * len) return;
+    int r = idx / len, c = idx % len;
+    y[idx] = x[(long)r * cols + start + c];
+}
+
+// Insert a [rows,len] block into columns [start,start+len) of a [rows,total] buffer:
+// dst[r, start+c] = src[r,c]. Builds concat (N inserts) and slice's vjp (insert into a zeroed buf).
+extern "C" __global__ void copy_into_cols(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int rows, int total, int start, int len)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)rows * len) return;
+    int r = idx / len, c = idx % len;
+    dst[(long)r * total + start + c] = src[idx];
+}
+
+// Transpose [rows,cols] → [cols,rows]: y[c,r] = x[r,c]. Its own vjp (transpose again).
+// ops::dense::transpose_{forward,vjp}.
+extern "C" __global__ void transpose_forward(
+    const float* __restrict__ x, float* __restrict__ y, int rows, int cols)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)rows * cols) return;
+    int r = idx / cols, c = idx % cols;
+    y[(long)c * rows + r] = x[idx];
+}
+
+// Embedding gather forward: y[t,:] = w[tokens[t], :]. ops::embed::gather_forward.
+extern "C" __global__ void embed_gather_forward(
+    const float* __restrict__ w, const int* __restrict__ tokens,
+    float* __restrict__ y, int seq, int dim)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)seq * dim) return;
+    int t = idx / dim, d = idx % dim;
+    y[idx] = w[(long)tokens[t] * dim + d];
+}
+
+// Embedding gather backward: gw[v,d] = Σ_{t: tokens[t]==v} gy[t,d], summed in ASCENDING t (matches
+// the host's sequential scatter-add). One thread per gw element → bit-exact (no atomics/reorder).
+// ops::embed::gather_vjp.
+extern "C" __global__ void embed_gather_backward(
+    const float* __restrict__ gy, const int* __restrict__ tokens,
+    float* __restrict__ gw, int seq, int dim, int vocab)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)vocab * dim) return;
+    int v = idx / dim, d = idx % dim;
+    float acc = 0.0f;
+    for (int t = 0; t < seq; ++t)
+        if (tokens[t] == v) acc += gy[(long)t * dim + d];
+    gw[idx] = acc;
+}
+
+// Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
+// gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
+extern "C" __global__ void softmax_xent_backward(
+    const float* __restrict__ logits, const float* __restrict__ target,
+    float* __restrict__ g_logits, int rows, int cols, float gscale)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* lr = logits + (long)r * cols;
+    const float* tr = target + (long)r * cols;
+    float* gr = g_logits + (long)r * cols;
+    float m = -INFINITY;
+    for (int c = 0; c < cols; ++c) m = fmaxf(m, lr[c]);
+    float sum = 0.0f;
+    for (int c = 0; c < cols; ++c) sum += expf(lr[c] - m);
+    float sum_t = 0.0f;
+    for (int c = 0; c < cols; ++c) sum_t += tr[c];
+    for (int c = 0; c < cols; ++c) {
+        float p = expf(lr[c] - m) / sum;
+        gr[c] = gscale * (p * sum_t - tr[c]);
+    }
+}

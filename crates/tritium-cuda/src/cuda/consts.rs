@@ -195,6 +195,18 @@ pub(super) const KERNEL_NAME_RMSNORM_TRAIN_FWD: &str = "rmsnorm_train_forward";
 pub(super) const KERNEL_NAME_RMSNORM_TRAIN_INV: &str = "rmsnorm_train_inv";
 pub(super) const KERNEL_NAME_RMSNORM_TRAIN_GRAD_X: &str = "rmsnorm_train_grad_x";
 pub(super) const KERNEL_NAME_RMSNORM_TRAIN_GRAD_W: &str = "rmsnorm_train_grad_w";
+/// plan 0043 P2.4 device-resident attention glue (softmax/mask/rope/reshape/gather/xent).
+pub(super) const KERNEL_NAME_SOFTMAX_FWD: &str = "softmax_forward";
+pub(super) const KERNEL_NAME_SOFTMAX_BWD: &str = "softmax_backward";
+pub(super) const KERNEL_NAME_CAUSAL_MASK_FWD: &str = "causal_mask_forward";
+pub(super) const KERNEL_NAME_CAUSAL_MASK_BWD: &str = "causal_mask_backward";
+pub(super) const KERNEL_NAME_ROPE_APPLY: &str = "rope_apply";
+pub(super) const KERNEL_NAME_SLICE_COLS_FWD: &str = "slice_cols_forward";
+pub(super) const KERNEL_NAME_COPY_INTO_COLS: &str = "copy_into_cols";
+pub(super) const KERNEL_NAME_TRANSPOSE_FWD: &str = "transpose_forward";
+pub(super) const KERNEL_NAME_EMBED_GATHER_FWD: &str = "embed_gather_forward";
+pub(super) const KERNEL_NAME_EMBED_GATHER_BWD: &str = "embed_gather_backward";
+pub(super) const KERNEL_NAME_SOFTMAX_XENT_BWD: &str = "softmax_xent_backward";
 /// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
 pub(super) const LMHEAD_ROW_TILE: u32 = 8;
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
