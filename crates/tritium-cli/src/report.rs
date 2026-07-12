@@ -51,6 +51,36 @@ struct TtftReport {
     tokens_per_sec: f64,
 }
 
+/// Environment capture for the reproducibility ledger (ADR 0026 Track R):
+/// every BENCHMARKS.md number carries the box state it was measured on.
+/// Captured via `nvidia-smi` when present ("unavailable" otherwise) — an
+/// observation of the environment, not a measurement dependency.
+#[derive(Debug, Serialize)]
+struct EnvCapture {
+    gpu: String,
+    driver: String,
+    vram_total_mib: String,
+    vram_used_mib: String,
+    /// Other compute processes resident on the GPU at capture time — the
+    /// honest contention disclosure (a co-resident llama-server changes
+    /// every number).
+    co_resident: Vec<String>,
+    date_utc: String,
+    git_commit: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompareReport {
+    report: &'static str,
+    model: String,
+    model_bytes: u64,
+    environment: EnvCapture,
+    decode_runs: Vec<DecodeReport>,
+    decode_median_tok_s: f64,
+    prefill: TtftReport,
+    prefill_tok_s: f64,
+}
+
 #[derive(Debug, Serialize)]
 struct ParityReport {
     report: &'static str,
@@ -102,8 +132,20 @@ pub(crate) fn decode(
     if decode_steps == 0 {
         bail!("decode report requires --decode-steps > 0");
     }
-
     let mut runner = load_runner(model_path, backend)?;
+    let report = decode_core(&mut runner, tokens, backend, decode_steps, warmup)?;
+    emit(format, &decode_table(&report), &report)
+}
+
+/// One timed decode run on an already-loaded runner (shared by `decode` and
+/// `compare` — compare repeats it without re-loading the model).
+fn decode_core(
+    runner: &mut ModelRunner,
+    tokens: &[u32],
+    backend: &str,
+    decode_steps: usize,
+    warmup: usize,
+) -> anyhow::Result<DecodeReport> {
     runner.reset();
     let positions: Vec<usize> = (0..tokens.len()).collect();
     let mut logits = runner
@@ -127,7 +169,7 @@ pub(crate) fn decode(
     let elapsed = start.elapsed().as_secs_f64();
     let tokens_per_sec = decode_steps as f64 / elapsed;
     let ceiling = RTX_4090_PEAK_HBM_BW_BYTES_PER_SEC / BITNET_2B4T_I2S_BYTES;
-    let report = DecodeReport {
+    Ok(DecodeReport {
         report: "decode",
         backend: backend.to_owned(),
         prompt_tokens: tokens.len(),
@@ -141,8 +183,7 @@ pub(crate) fn decode(
             * ((TRITIUM_2B4T_DECODE_4090_BASELINE - tokens_per_sec)
                 / TRITIUM_2B4T_DECODE_4090_BASELINE)
                 .max(0.0),
-    };
-    emit(format, &decode_table(&report), &report)
+    })
 }
 
 pub(crate) fn ttft(
@@ -160,6 +201,19 @@ pub(crate) fn ttft(
     }
 
     let mut runner = load_runner(model_path, backend)?;
+    let report = ttft_core(&mut runner, tokens, backend, runs)?;
+    emit(format, &ttft_table(&report), &report)
+}
+
+/// One prefill-latency measurement on an already-loaded runner (shared by
+/// `ttft` and `compare`). `tokens_per_sec` here is the prefill throughput —
+/// the pp512 ledger number when the prompt is 512 tokens.
+fn ttft_core(
+    runner: &mut ModelRunner,
+    tokens: &[u32],
+    backend: &str,
+    runs: usize,
+) -> anyhow::Result<TtftReport> {
     let positions: Vec<usize> = (0..tokens.len()).collect();
     let mut samples = Vec::with_capacity(runs);
     for _ in 0..runs {
@@ -172,7 +226,7 @@ pub(crate) fn ttft(
     }
     samples.sort_by(|a, b| a.total_cmp(b));
     let total_ms: f64 = samples.iter().sum();
-    let report = TtftReport {
+    Ok(TtftReport {
         report: "ttft",
         backend: backend.to_owned(),
         prompt_tokens: tokens.len(),
@@ -181,8 +235,131 @@ pub(crate) fn ttft(
         p50_ms: percentile_sorted(&samples, 0.50),
         p95_ms: percentile_sorted(&samples, 0.95),
         tokens_per_sec: (tokens.len() * runs) as f64 / (total_ms / 1000.0),
+    })
+}
+
+/// One shell-out line of `nvidia-smi --query...`; "unavailable" on any error.
+fn smi(args: &[&str]) -> String {
+    std::process::Command::new("nvidia-smi")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_else(|| "unavailable".to_owned())
+}
+
+fn env_capture() -> EnvCapture {
+    let co_resident = smi(&[
+        "--query-compute-apps=process_name,used_memory",
+        "--format=csv,noheader",
+    ]);
+    EnvCapture {
+        gpu: smi(&["--query-gpu=name", "--format=csv,noheader"]),
+        driver: smi(&["--query-gpu=driver_version", "--format=csv,noheader"]),
+        vram_total_mib: smi(&["--query-gpu=memory.total", "--format=csv,noheader"]),
+        vram_used_mib: smi(&["--query-gpu=memory.used", "--format=csv,noheader"]),
+        co_resident: if co_resident == "unavailable" || co_resident.is_empty() {
+            vec![]
+        } else {
+            co_resident.lines().map(str::to_owned).collect()
+        },
+        date_utc: std::process::Command::new("date")
+            .args(["-u", "-Is"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default(),
+        git_commit: std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// The one-command ledger bundle (ADR 0026 Track R): decode ×`reps` +
+/// prefill p50 on one loaded runner, with environment capture. Every number
+/// in docs/BENCHMARKS.md must reproduce from this command's JSON within
+/// run-to-run spread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compare(
+    model_path: &Path,
+    tokens: &[u32],
+    backend: &str,
+    prompt_len: usize,
+    decode_steps: usize,
+    warmup: usize,
+    reps: usize,
+    runs: usize,
+    format: ReportFormat,
+) -> anyhow::Result<()> {
+    if tokens.is_empty() {
+        bail!("compare report requires at least one prompt token");
+    }
+    if reps == 0 || runs == 0 || decode_steps == 0 {
+        bail!("compare report requires --reps, --runs and --decode-steps > 0");
+    }
+    // Cycle/truncate to the requested prompt shape (512 = the pp512 ledger).
+    let prompt: Vec<u32> = if prompt_len == 0 {
+        tokens.to_vec()
+    } else {
+        tokens.iter().copied().cycle().take(prompt_len).collect()
     };
-    emit(format, &ttft_table(&report), &report)
+    let environment = env_capture();
+    let mut runner = load_runner(model_path, backend)?;
+
+    let mut decode_runs = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        decode_runs.push(decode_core(
+            &mut runner,
+            &prompt,
+            backend,
+            decode_steps,
+            warmup,
+        )?);
+    }
+    let mut tok_s: Vec<f64> = decode_runs.iter().map(|r| r.tokens_per_sec).collect();
+    tok_s.sort_by(|a, b| a.total_cmp(b));
+    let decode_median_tok_s = tok_s[tok_s.len() / 2];
+
+    let prefill = ttft_core(&mut runner, &prompt, backend, runs)?;
+    let prefill_tok_s = prefill.tokens_per_sec;
+
+    let report = CompareReport {
+        report: "compare",
+        model: model_path.display().to_string(),
+        model_bytes: std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0),
+        environment,
+        decode_runs,
+        decode_median_tok_s,
+        prefill,
+        prefill_tok_s,
+    };
+    let table = format!(
+        "compare report\nmodel: {}\ngpu: {} (driver {})\nco-resident: {}\n\
+         decode median: {:.1} tok/s ({} reps x {} steps)\n\
+         prefill: {:.1} tok/s (p50 {:.1} ms over {} tokens, {} runs)\ngit: {}",
+        report.model,
+        report.environment.gpu,
+        report.environment.driver,
+        if report.environment.co_resident.is_empty() {
+            "none".to_owned()
+        } else {
+            report.environment.co_resident.join("; ")
+        },
+        report.decode_median_tok_s,
+        reps,
+        decode_steps,
+        report.prefill_tok_s,
+        report.prefill.p50_ms,
+        report.prefill.prompt_tokens,
+        runs,
+        report.environment.git_commit,
+    );
+    emit(format, &table, &report)
 }
 
 pub(crate) fn parity(

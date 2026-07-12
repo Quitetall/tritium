@@ -189,6 +189,40 @@ enum ReportCommand {
         #[arg(long, value_enum, default_value_t = ReportFormat::Both)]
         format: ReportFormat,
     },
+    /// One-command benchmark bundle for the public ledger (ADR 0026 Track R):
+    /// decode ×N (order-stable) + prefill/ttft, plus environment capture
+    /// (GPU, driver, VRAM co-residency) — the JSON that docs/BENCHMARKS.md
+    /// numbers must reproduce from.
+    Compare {
+        /// Path to the `.gguf` model file.
+        #[arg(long)]
+        model: PathBuf,
+        /// Path to a JSON file holding the input token IDs.
+        #[arg(long)]
+        tokens: PathBuf,
+        /// Backend name from the runtime registry.
+        #[arg(long, default_value = "cuda")]
+        backend: String,
+        /// Cycle/truncate the token file to exactly this prompt length
+        /// (512 = the pp512 ledger shape). 0 = use the file as-is.
+        #[arg(long, default_value_t = 512)]
+        prompt_len: usize,
+        /// Timed decode steps per decode repetition.
+        #[arg(long, default_value_t = 256)]
+        decode_steps: usize,
+        /// Untimed decode warmup steps after prefill.
+        #[arg(long, default_value_t = 16)]
+        warmup: usize,
+        /// Decode repetitions (median reported).
+        #[arg(long, default_value_t = 3)]
+        reps: usize,
+        /// Prefill runs for the ttft p50.
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ReportFormat::Both)]
+        format: ReportFormat,
+    },
     /// CPU-vs-CUDA greedy parity.
     Parity {
         /// Path to the `.gguf` model file.
@@ -309,6 +343,30 @@ fn main() -> anyhow::Result<()> {
             } => {
                 let ids = generate::read_token_file(&tokens)?;
                 report::decode(&model, &ids, &backend, decode_steps, warmup, format)?;
+            }
+            ReportCommand::Compare {
+                model,
+                tokens,
+                backend,
+                prompt_len,
+                decode_steps,
+                warmup,
+                reps,
+                runs,
+                format,
+            } => {
+                let ids = generate::read_token_file(&tokens)?;
+                report::compare(
+                    &model,
+                    &ids,
+                    &backend,
+                    prompt_len,
+                    decode_steps,
+                    warmup,
+                    reps,
+                    runs,
+                    format,
+                )?
             }
             ReportCommand::Ttft {
                 model,
