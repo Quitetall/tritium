@@ -1046,16 +1046,18 @@ one barrier fewer, blockDim-generic combine) behind
 `TRITIUM_KERNEL_TIER=fast` (loud-reject selector resolved at model build;
 graphs bake the symbol; healthz disclosure). Correctness under `fast`:
 256-token greedy == transformers reference EXACTLY; ppl rel 2.93e-3
-(exact tier 2.66e-4 ⇒ tier drift ≈ 3.2e-3 — above the RFC's ~2e-3 hope,
-inside the 1% bar).
+(exact tier 2.66e-4 ⇒ tier drift ≤ 3.2e-3 by triangle inequality, measured
+difference 2.66e-3 — above the RFC's ~2e-3 hope, inside the 1% bar).
 
 | tier | tok/s (512 steps, ABBA ×2, quiet 4090) |
 |---|---|
 | exact | 274.6 / 273.5 / 266.8 / 274.9 — median 274.0 |
 | fast | 278.3 / 278.7 / 278.3 / 279.3 — median 278.5 |
 
-**+1.6–1.9% e2e (pairwise median +1.75%) < the ≥3% bar → variant deleted,
-attention fast pair not authorized (its gate was rmsnorm ≥3%).** The
+**Pairwise +1.35/+1.60/+1.90/+4.31% (outlier = an exact-side dip), median
++1.75%, ratio of medians +1.62% — < the ≥3% bar under every reading →
+variant deleted, attention fast pair not authorized (its gate was rmsnorm
+≥3%).** The
 refutation settles the profile conflict: rmsnorm's M=1 cost is structural
 (launch + barriers + elementwise passes), not sum-order — the flat profile's
 ~32% attribution was not an optimization target. CORRECTION: the implementation

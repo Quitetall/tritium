@@ -91,8 +91,12 @@ carried for noise).
 
 ## Decision
 
-PENDING review. Accepting this ADR authorizes step 1 (rmsnorm_fast) only;
-each further kernel needs its measured decision point.
+SUPERSEDED — see the Verdict below. (Original text: "PENDING review.
+Accepting this ADR authorizes step 1 (rmsnorm_fast) only; each further
+kernel needs its measured decision point." Step 1 was executed under that
+rule and the measurement rejected the tier. Process note, recorded: the ADR
+was never formally flipped to ACCEPTED before step 1 was built — the
+decision rule it was held to is this RFC's own.)
 
 ## Verdict (2026-07-11, measured — the tier is rejected)
 
@@ -104,12 +108,15 @@ blockDim-generic combine; `TRITIUM_KERNEL_TIER=exact|fast` resolved once per
 model build (graphs bake the picked symbol), loud-reject selector, healthz
 disclosure. Gates all green under `fast`: 256-token greedy EXACTLY equal to
 the transformers reference; perplexity rel 2.93e-3 vs the fp32 oracle
-(exact tier: 2.66e-4 — the tier's own drift ≈ 3.2e-3, slightly above this
-RFC's optimistic ~2e-3 band, inside the 1% acceptance bar).
+(exact tier: 2.66e-4 — bounding the tier's own drift at ≤ 3.2e-3 by the
+triangle inequality, measured difference 2.66e-3; either way slightly above
+this RFC's optimistic ~2e-3 band, inside the 1% acceptance bar).
 
 **Bench (4090, quiet box, 512 decode steps, order-alternated ABBA ×2):
 exact median 274.0 tok/s (266.8–274.9), fast median 278.5 (278.3–279.3) —
-+1.6–1.9% e2e, pairwise median +1.75%. Below the ≥3% bar. Deleted.**
+pairwise deltas +1.35/+1.60/+1.90/+4.31% (the outlier rides an exact-side
+dip), pairwise median +1.75%, ratio of medians +1.62%. Below the ≥3% bar
+under every reading. Deleted.**
 
 What the measurement settled: the two conflicting profiles (flat: rmsnorm
 ~32% of GPU time; per-layer counters: ~5%) are resolved in favor of the
