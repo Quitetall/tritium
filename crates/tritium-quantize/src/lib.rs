@@ -34,6 +34,7 @@
 #![deny(missing_docs)]
 
 mod allocate;
+mod architecture;
 mod conversion;
 pub mod fisher;
 mod plane;
@@ -41,6 +42,10 @@ mod quantize;
 mod recon;
 
 pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
+pub use architecture::{
+    AdapterError, ArchitectureAdapter, ArchitectureFeature, ArchitectureRequirements,
+    CapabilityGap, CapabilitySet, TensorDescriptor, TensorDisposition, TensorRole,
+};
 pub use conversion::{
     CONVERSION_STATE_MAGIC, CONVERSION_STATE_VERSION, ConversionError, ConversionRun,
     ConversionStage, RunStatus, StageAttempt, StageFailure, StageReceipt,
