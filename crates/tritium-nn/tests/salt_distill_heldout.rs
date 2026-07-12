@@ -200,3 +200,111 @@ fn salt_distillation_recovers_heldout_perplexity() {
         "distillation must recover held-out ppl vs PTQ: {ppl_distilled:.3} vs PTQ {ppl_ptq:.3e}"
     );
 }
+
+/// Device-resident SALT distillation (plan 0043 P2.5d): the SAME held-out distillation as above, but
+/// the student model forward+backward AND the teacher forward run on the GPU `DeviceTape` instead of
+/// the CPU autograd tape. `salt_ste` stays on the host — quantize the masters each step; its STE
+/// backward is identity ([`ste::salt_quantize_vjp`] = `grad_out`), so the device gradient w.r.t. the
+/// quantized weight IS the master gradient (no device salt_ste kernel needed). Proves the device
+/// engine recovers held-out ppl like the CPU path, and measures the per-step speedup.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "slow device distillation; needs SmolLM2-135M + a CUDA device; run explicitly"]
+fn salt_distillation_device_tape_recovers_heldout() {
+    use std::time::Instant;
+
+    use common::device_forward;
+    use tritium_cuda::CudaBackend;
+    use tritium_cuda::train::DeviceTape;
+
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: {} absent", dir.display());
+        return;
+    }
+    let steps: u64 = std::env::var("TRITIUM_DISTILL_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(STEPS);
+    let runner =
+        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+    let (a, fp, shapes) = extract(&runner);
+    let (mut train_ids, eval_ids) = corpus();
+    if let Some(n) = std::env::var("TRITIUM_TRAIN_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        train_ids.truncate(n);
+    }
+    let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
+    assert!(!windows.is_empty(), "train corpus shorter than one window");
+
+    let backend = CudaBackend::new(0).expect("open CUDA device");
+
+    // Held-out baselines (fp + full PTQ) on the disjoint eval split.
+    let ppl_fp = perplexity(&logits_of(&fp, &a, &eval_ids), &eval_ids, a.vocab);
+    let ptq: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
+        .collect();
+    let ppl_ptq = perplexity(&logits_of(&ptq, &a, &eval_ids), &eval_ids, a.vocab);
+
+    let mut lat = fp.clone();
+    let opt = AdamW::new(LR);
+    let mut states: Vec<_> = lat.iter().map(|w| opt.init_state(w.len())).collect();
+    let mut step_ms = 0.0f64;
+    for step in 1..=steps {
+        let t0 = Instant::now();
+        let wi = ((step - 1) as usize) % windows.len();
+        let toks = windows[wi];
+        let tokens_i32: Vec<i32> = toks.iter().map(|&t| t as i32).collect();
+        // Teacher: device forward with the fp weights → soft targets (tape dropped after readout).
+        let tprobs = {
+            let mut tt = DeviceTape::new(&backend, a.vocab).unwrap();
+            let (tlogits, _) = device_forward(&mut tt, &a, &fp, &tokens_i32, TRAIN_SEQ);
+            row_softmax(&tt.value(tlogits).unwrap(), a.vocab)
+        };
+        // Student: quantize masters (host salt_ste forward), device fwd+bwd → master grads (identity STE).
+        let quantized: Vec<Vec<f32>> = lat
+            .iter()
+            .zip(&shapes)
+            .map(|(w, &(n, k))| ste::salt_quantize_forward(w, n, k, T))
+            .collect();
+        let mut st = DeviceTape::new(&backend, a.vocab).unwrap();
+        let (slogits, wids) = device_forward(&mut st, &a, &quantized, &tokens_i32, TRAIN_SEQ);
+        let grads = st
+            .xent_backward(slogits, &tprobs, TRAIN_SEQ, a.vocab, &wids)
+            .unwrap();
+        for i in 0..lat.len() {
+            opt.step(step, &mut lat[i], &grads[i], &mut states[i]);
+        }
+        step_ms += t0.elapsed().as_secs_f64() * 1e3;
+        if step % 10 == 0 || step == 1 {
+            eprintln!("  step {step}/{steps} (win {wi})");
+        }
+    }
+
+    let distilled: Vec<Vec<f32>> = lat
+        .iter()
+        .zip(&shapes)
+        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
+        .collect();
+    let ppl_distilled = perplexity(&logits_of(&distilled, &a, &eval_ids), &eval_ids, a.vocab);
+    println!(
+        "0043 P2.5d DEVICE SALT distillation (T={T}, {steps} steps, {} tok / {} win, eval {} HELD-OUT): \
+         fp ppl {ppl_fp:.3} | PTQ ppl {ppl_ptq:.3e} | distilled ppl {ppl_distilled:.3}. \
+         Recovers {:.0}× vs PTQ. Mean device step {:.0}ms (teacher fwd + student fwd+bwd on GPU; \
+         salt_ste quantize on host).",
+        train_ids.len(),
+        windows.len(),
+        eval_ids.len(),
+        ppl_ptq / ppl_distilled,
+        step_ms / steps as f64,
+    );
+    assert!(ppl_ptq > ppl_fp, "PTQ must degrade held-out ppl");
+    assert!(
+        ppl_distilled < 0.5 * ppl_ptq,
+        "device distillation must recover held-out ppl vs PTQ: {ppl_distilled:.3} vs {ppl_ptq:.3e}"
+    );
+}

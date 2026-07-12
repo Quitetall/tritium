@@ -109,6 +109,66 @@ pub fn forward(t: &mut Tape, wids: &[ValueId], a: &Arch, tokens: &[u32]) -> Valu
     t.dense_matmul(fnorm, wids[0], seq, a.vocab, a.n_embd) // tied head
 }
 
+/// The device mirror of [`forward`] on the GPU [`DeviceTape`](tritium_cuda::train::DeviceTape)
+/// (plan 0043 P2.5): assembles the whole model on-device using `weights` as the 2D-weight leaves
+/// (fp order: `[0]` = tied embed, then per layer `q,k,v,o,gate,up,down`) and the `Arch` fp norms.
+/// Returns the logits value id and the weight-leaf ids **in `weights` order** (so a caller can map
+/// downloaded grads straight back to the master weights). The op sequence is identical to
+/// [`forward`], so the device tape reproduces it within 1e-4.
+#[cfg(feature = "cuda")]
+pub fn device_forward(
+    dt: &mut tritium_cuda::train::DeviceTape<'_>,
+    a: &Arch,
+    weights: &[Vec<f32>],
+    tokens_i32: &[i32],
+    seq: usize,
+) -> (usize, Vec<usize>) {
+    let embd = dt.leaf(&weights[0]).unwrap();
+    let mut wids = vec![embd];
+    let mut hidden = dt.embed(embd, tokens_i32, seq, a.n_embd, a.vocab).unwrap();
+    for li in 0..a.n_layers {
+        let base = 1 + 7 * li;
+        let an = dt.leaf(&a.attn_norms[li]).unwrap();
+        let xn = dt.rmsnorm(hidden, an, seq, a.n_embd, a.eps).unwrap();
+        let wq = dt.leaf(&weights[base]).unwrap();
+        let wk = dt.leaf(&weights[base + 1]).unwrap();
+        let wv = dt.leaf(&weights[base + 2]).unwrap();
+        let wo = dt.leaf(&weights[base + 3]).unwrap();
+        let attn = dt
+            .attention(
+                xn,
+                wq,
+                wk,
+                wv,
+                wo,
+                seq,
+                a.n_embd,
+                a.n_head,
+                a.n_head_kv,
+                a.head_dim,
+                a.theta,
+            )
+            .unwrap();
+        hidden = dt.add(hidden, attn).unwrap();
+        let fnw = dt.leaf(&a.ffn_norms[li]).unwrap();
+        let hn = dt.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps).unwrap();
+        let wg = dt.leaf(&weights[base + 4]).unwrap();
+        let wu = dt.leaf(&weights[base + 5]).unwrap();
+        let wd = dt.leaf(&weights[base + 6]).unwrap();
+        let g = dt.matmul(hn, wg, seq, a.ff, a.n_embd).unwrap();
+        let u = dt.matmul(hn, wu, seq, a.ff, a.n_embd).unwrap();
+        let ga = dt.silu(g).unwrap();
+        let gated = dt.mul(ga, u).unwrap();
+        let down = dt.matmul(gated, wd, seq, a.n_embd, a.ff).unwrap();
+        hidden = dt.add(hidden, down).unwrap();
+        wids.extend([wq, wk, wv, wo, wg, wu, wd]);
+    }
+    let onw = dt.leaf(&a.out_norm).unwrap();
+    let fnorm = dt.rmsnorm(hidden, onw, seq, a.n_embd, a.eps).unwrap();
+    let logits = dt.matmul(fnorm, embd, seq, a.vocab, a.n_embd).unwrap(); // tied head
+    (logits, wids)
+}
+
 /// Forward once with a fixed weight set (leaves), returning `[seq, vocab]` logits values.
 pub fn logits_of(weights: &[Vec<f32>], a: &Arch, tokens: &[u32]) -> Vec<f32> {
     let mut t = Tape::new();

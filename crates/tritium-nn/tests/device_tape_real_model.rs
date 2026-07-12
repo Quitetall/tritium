@@ -16,7 +16,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use common::{Arch, extract, forward};
+use common::{device_forward, extract, forward};
 use tritium_cuda::CudaBackend;
 use tritium_cuda::train::DeviceTape;
 use tritium_nn::ModelRunner;
@@ -66,53 +66,6 @@ fn max_rel(cpu: &[f32], dev: &[f32]) -> f32 {
     max_abs / range.max(1e-9)
 }
 
-/// Assemble the whole model on the `DeviceTape` — the device mirror of `common::forward`. Returns the
-/// tape, the logits value id, and the tied-embed weight id.
-fn build_device<'a>(
-    dt: &mut DeviceTape<'a>,
-    a: &Arch,
-    fp: &[Vec<f32>],
-    tokens_i32: &[i32],
-    seq: usize,
-) -> (usize, usize) {
-    let embd = dt.leaf(&fp[0]).unwrap();
-    let mut hidden = dt.embed(embd, tokens_i32, seq, a.n_embd, a.vocab).unwrap();
-    for li in 0..a.n_layers {
-        let base = 1 + 7 * li;
-        let an = dt.leaf(&a.attn_norms[li]).unwrap();
-        let xn = dt.rmsnorm(hidden, an, seq, a.n_embd, a.eps).unwrap();
-        let (wq, wk, wv, wo) = (
-            dt.leaf(&fp[base]).unwrap(),
-            dt.leaf(&fp[base + 1]).unwrap(),
-            dt.leaf(&fp[base + 2]).unwrap(),
-            dt.leaf(&fp[base + 3]).unwrap(),
-        );
-        let attn = dt
-            .attention(
-                xn, wq, wk, wv, wo, seq, a.n_embd, a.n_head, a.n_head_kv, a.head_dim, a.theta,
-            )
-            .unwrap();
-        hidden = dt.add(hidden, attn).unwrap();
-        let fnw = dt.leaf(&a.ffn_norms[li]).unwrap();
-        let hn = dt.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps).unwrap();
-        let (wg, wu, wd) = (
-            dt.leaf(&fp[base + 4]).unwrap(),
-            dt.leaf(&fp[base + 5]).unwrap(),
-            dt.leaf(&fp[base + 6]).unwrap(),
-        );
-        let g = dt.matmul(hn, wg, seq, a.ff, a.n_embd).unwrap();
-        let u = dt.matmul(hn, wu, seq, a.ff, a.n_embd).unwrap();
-        let ga = dt.silu(g).unwrap();
-        let gated = dt.mul(ga, u).unwrap();
-        let down = dt.matmul(gated, wd, seq, a.n_embd, a.ff).unwrap();
-        hidden = dt.add(hidden, down).unwrap();
-    }
-    let onw = dt.leaf(&a.out_norm).unwrap();
-    let fnorm = dt.rmsnorm(hidden, onw, seq, a.n_embd, a.eps).unwrap();
-    let logits = dt.matmul(fnorm, embd, seq, a.vocab, a.n_embd).unwrap(); // tied head
-    (logits, embd)
-}
-
 #[test]
 #[ignore = "needs SmolLM2-135M + a CUDA device; run explicitly"]
 fn device_tape_trains_smollm2_matching_cpu_tape() {
@@ -140,34 +93,53 @@ fn device_tape_trains_smollm2_matching_cpu_tape() {
     let closs = t.softmax_xent(clogits, ctg, seq, vocab);
     let cgrads = t.backward(closs);
     let cpu_embd_grad = cgrads[cwids[0]].clone();
+    let cpu_wd0_grad = cgrads[cwids[7]].clone(); // layer-0 down-proj: an intermediate leaf-sink grad_w
     let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1e3;
 
     // ── DeviceTape: whole model fwd+bwd on the GPU ──
     let backend = CudaBackend::new(0).expect("open CUDA device");
+    // Warm up (CUDA context + kernel JIT + allocator) so the timing below reflects steady state, not
+    // a cold first launch — a single cold measurement is unreliable in either direction.
+    {
+        let mut warm = DeviceTape::new(&backend, vocab).expect("device tape");
+        let (wl, ww) = device_forward(&mut warm, &a, &fp, &tokens_i32, seq);
+        let _ = warm
+            .xent_backward(wl, &target, seq, vocab, &[ww[0]])
+            .unwrap();
+    }
     let dev_start = Instant::now();
     let mut dt = DeviceTape::new(&backend, vocab).expect("device tape");
-    let (logits, embd) = build_device(&mut dt, &a, &fp, &tokens_i32, seq);
+    let (logits, wids) = device_forward(&mut dt, &a, &fp, &tokens_i32, seq);
     let dev_logits = dt.value(logits).unwrap();
-    let dev_embd_grad = dt
-        .xent_backward(logits, &target, seq, vocab, &[embd])
-        .unwrap()
-        .pop()
+    // Request the tied embed (wids[0]) AND layer-0's wd (wids[7]) — the latter is an intermediate
+    // grad_w sink that the tied-embed grad alone would not exercise.
+    let grads = dt
+        .xent_backward(logits, &target, seq, vocab, &[wids[0], wids[7]])
         .unwrap();
+    let (dev_embd_grad, dev_wd0_grad) = (&grads[0], &grads[1]);
     let dev_ms = dev_start.elapsed().as_secs_f64() * 1e3;
 
     let logit_rel = max_rel(&cpu_logits, &dev_logits);
-    let grad_rel = max_rel(&cpu_embd_grad, &dev_embd_grad);
+    let grad_rel = max_rel(&cpu_embd_grad, dev_embd_grad);
+    let wd0_rel = max_rel(&cpu_wd0_grad, dev_wd0_grad);
     println!(
         "0043 P2.5c DeviceTape ON REAL SmolLM2-135M ({} layers, seq {seq}, vocab {vocab}): \
-         logits rel {logit_rel:.2e} | tied-embd grad rel {grad_rel:.2e} vs CPU tape. \
-         whole-model fwd+bwd: device {dev_ms:.0}ms | CPU tape {cpu_ms:.0}ms ({:.1}× faster).",
+         logits rel {logit_rel:.2e} | tied-embd grad rel {grad_rel:.2e} | layer0 wd grad rel {wd0_rel:.2e} \
+         vs CPU tape. whole-model fwd+bwd: device {dev_ms:.0}ms | CPU tape {cpu_ms:.0}ms ({:.1}× faster).",
         a.n_layers,
         cpu_ms / dev_ms.max(1e-9)
     );
 
-    assert!(logit_rel < 1e-4, "device logits vs CPU tape: {logit_rel:.3e}");
+    assert!(
+        logit_rel < 1e-4,
+        "device logits vs CPU tape: {logit_rel:.3e}"
+    );
     assert!(
         grad_rel < 1e-4,
         "device tied-embed grad vs CPU tape: {grad_rel:.3e}"
+    );
+    assert!(
+        wd0_rel < 1e-4,
+        "device layer0 wd grad vs CPU tape: {wd0_rel:.3e}"
     );
 }
