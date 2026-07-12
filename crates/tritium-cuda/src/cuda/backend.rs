@@ -139,6 +139,18 @@ pub struct CudaBackend {
     pub(super) func_rmsnorm_train_inv: CudaFunction,
     pub(super) func_rmsnorm_train_grad_x: CudaFunction,
     pub(super) func_rmsnorm_train_grad_w: CudaFunction,
+    /// plan 0043 P2.4 device-resident attention glue.
+    pub(super) func_softmax_fwd: CudaFunction,
+    pub(super) func_softmax_bwd: CudaFunction,
+    pub(super) func_causal_mask_fwd: CudaFunction,
+    pub(super) func_causal_mask_bwd: CudaFunction,
+    pub(super) func_rope_apply: CudaFunction,
+    pub(super) func_slice_cols_fwd: CudaFunction,
+    pub(super) func_copy_into_cols: CudaFunction,
+    pub(super) func_transpose_fwd: CudaFunction,
+    pub(super) func_embed_gather_fwd: CudaFunction,
+    pub(super) func_embed_gather_bwd: CudaFunction,
+    pub(super) func_softmax_xent_bwd: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -303,6 +315,39 @@ impl CudaBackend {
         let func_rmsnorm_train_grad_w = grad_module
             .load_function(KERNEL_NAME_RMSNORM_TRAIN_GRAD_W)
             .map_err(|e| driver_err("resolve rmsnorm_train_grad_w kernel", &e))?;
+        let func_softmax_fwd = grad_module
+            .load_function(KERNEL_NAME_SOFTMAX_FWD)
+            .map_err(|e| driver_err("resolve softmax_forward kernel", &e))?;
+        let func_softmax_bwd = grad_module
+            .load_function(KERNEL_NAME_SOFTMAX_BWD)
+            .map_err(|e| driver_err("resolve softmax_backward kernel", &e))?;
+        let func_causal_mask_fwd = grad_module
+            .load_function(KERNEL_NAME_CAUSAL_MASK_FWD)
+            .map_err(|e| driver_err("resolve causal_mask_forward kernel", &e))?;
+        let func_causal_mask_bwd = grad_module
+            .load_function(KERNEL_NAME_CAUSAL_MASK_BWD)
+            .map_err(|e| driver_err("resolve causal_mask_backward kernel", &e))?;
+        let func_rope_apply = grad_module
+            .load_function(KERNEL_NAME_ROPE_APPLY)
+            .map_err(|e| driver_err("resolve rope_apply kernel", &e))?;
+        let func_slice_cols_fwd = grad_module
+            .load_function(KERNEL_NAME_SLICE_COLS_FWD)
+            .map_err(|e| driver_err("resolve slice_cols_forward kernel", &e))?;
+        let func_copy_into_cols = grad_module
+            .load_function(KERNEL_NAME_COPY_INTO_COLS)
+            .map_err(|e| driver_err("resolve copy_into_cols kernel", &e))?;
+        let func_transpose_fwd = grad_module
+            .load_function(KERNEL_NAME_TRANSPOSE_FWD)
+            .map_err(|e| driver_err("resolve transpose_forward kernel", &e))?;
+        let func_embed_gather_fwd = grad_module
+            .load_function(KERNEL_NAME_EMBED_GATHER_FWD)
+            .map_err(|e| driver_err("resolve embed_gather_forward kernel", &e))?;
+        let func_embed_gather_bwd = grad_module
+            .load_function(KERNEL_NAME_EMBED_GATHER_BWD)
+            .map_err(|e| driver_err("resolve embed_gather_backward kernel", &e))?;
+        let func_softmax_xent_bwd = grad_module
+            .load_function(KERNEL_NAME_SOFTMAX_XENT_BWD)
+            .map_err(|e| driver_err("resolve softmax_xent_backward kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -357,6 +402,17 @@ impl CudaBackend {
             func_rmsnorm_train_inv,
             func_rmsnorm_train_grad_x,
             func_rmsnorm_train_grad_w,
+            func_softmax_fwd,
+            func_softmax_bwd,
+            func_causal_mask_fwd,
+            func_causal_mask_bwd,
+            func_rope_apply,
+            func_slice_cols_fwd,
+            func_copy_into_cols,
+            func_transpose_fwd,
+            func_embed_gather_fwd,
+            func_embed_gather_bwd,
+            func_softmax_xent_bwd,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -1223,6 +1279,436 @@ impl CudaBackend {
         unsafe {
             l_gw.launch(Self::elementwise_cfg(cols))
                 .map_err(|e| driver_err("launch rmsnorm_train_grad_w", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Upload an i32 host slice to a resident device buffer (positions / token ids for rope/gather).
+    ///
+    /// # Errors
+    /// Device failure via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn dev_upload_i32(&self, host: &[i32]) -> Result<CudaSlice<i32>, BackendError> {
+        self.stream
+            .clone_htod(host)
+            .map_err(|e| driver_err("dev_upload_i32 htod", &e))
+    }
+
+    /// Row-softmax forward on resident buffers (`ops::softmax::forward`; expf ⇒ within 1e-4).
+    /// `x`,`y`:[rows,cols].
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn softmax_forward_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        if d_x.len() < rows * cols || d_y.len() < rows * cols {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * cols,
+                got: d_y.len(),
+            });
+        }
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_softmax_fwd);
+        launch.arg(d_x).arg(d_y).arg(&ri).arg(&ci);
+        // SAFETY: `(const float* x, float* y, int rows, int cols)`; one thread per row.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch softmax_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Softmax backward from the saved probs `p` (`ops::softmax::vjp`). `p`,`gy`,`gx`:[rows,cols].
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn softmax_backward_dev(
+        &self,
+        d_p: &CudaSlice<f32>,
+        d_gy: &CudaSlice<f32>,
+        d_gx: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        if d_p.len() < rows * cols || d_gy.len() < rows * cols || d_gx.len() < rows * cols {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * cols,
+                got: d_gx.len(),
+            });
+        }
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_softmax_bwd);
+        launch.arg(d_p).arg(d_gy).arg(d_gx).arg(&ri).arg(&ci);
+        // SAFETY: `(const float* p, const float* gy, float* gx, int rows, int cols)`; thread/row.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch softmax_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Additive causal mask forward on resident scores [rows=queries, cols=keys]
+    /// (`ops::softmax::causal_mask_forward`; bit-exact).
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn causal_mask_forward_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        if d_x.len() < rows * cols || d_y.len() < rows * cols {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * cols,
+                got: d_y.len(),
+            });
+        }
+        if rows * cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_causal_mask_fwd);
+        launch.arg(d_x).arg(d_y).arg(&ri).arg(&ci);
+        // SAFETY: `(const float* x, float* y, int rows, int cols)`; one thread per element.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows * cols))
+                .map_err(|e| driver_err("launch causal_mask_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Causal-mask backward (`ops::softmax::causal_mask_vjp`; bit-exact). `gy`,`gx`:[rows,cols].
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn causal_mask_backward_dev(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        d_gx: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        if d_gy.len() < rows * cols || d_gx.len() < rows * cols {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * cols,
+                got: d_gx.len(),
+            });
+        }
+        if rows * cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_causal_mask_bwd);
+        launch.arg(d_gy).arg(d_gx).arg(&ri).arg(&ci);
+        // SAFETY: `(const float* gy, float* gx, int rows, int cols)`; one thread per element.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows * cols))
+                .map_err(|e| driver_err("launch causal_mask_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// RoPE apply on a resident [n_token, n_head, head_dim] buffer (`ops::rope`; sin/cos ⇒ within
+    /// 1e-4). `sign = +1.0` forward, `-1.0` for the vjp (inverse rotation). `positions` is a resident
+    /// i32 buffer of length `n_token`.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer / odd head_dim; device failure via cudarc.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)] // resident buffers + rope geometry: a kernel-launch wrapper
+    pub(crate) fn rope_apply_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        d_positions: &CudaSlice<i32>,
+        n_head: usize,
+        head_dim: usize,
+        theta: f32,
+        n_token: usize,
+        sign: f32,
+    ) -> Result<(), BackendError> {
+        let total = n_token * n_head * head_dim;
+        if head_dim % 2 != 0 || d_x.len() < total || d_y.len() < total || d_positions.len() < n_token
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: total,
+                got: d_y.len(),
+            });
+        }
+        let half = head_dim / 2;
+        let pairs = n_token * n_head * half;
+        if pairs == 0 {
+            return Ok(());
+        }
+        let (nh, hd, nt) = (n_head as i32, head_dim as i32, n_token as i32);
+        let mut launch = self.stream.launch_builder(&self.func_rope_apply);
+        launch
+            .arg(d_x)
+            .arg(d_y)
+            .arg(d_positions)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&theta)
+            .arg(&nt)
+            .arg(&sign);
+        // SAFETY: `(const float* x, float* y, const int* positions, int n_head, int head_dim,
+        // float theta, int n_token, float sign)`; one thread per rotation pair.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(pairs))
+                .map_err(|e| driver_err("launch rope_apply_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Extract columns [start, start+len) from a resident [rows,cols] buffer into [rows,len]
+    /// (`ops::shape::slice_cols_forward`; bit-exact).
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized/out-of-range buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn slice_cols_forward_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        start: usize,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        if start + len > cols || d_x.len() < rows * cols || d_y.len() < rows * len {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * len,
+                got: d_y.len(),
+            });
+        }
+        if rows * len == 0 {
+            return Ok(());
+        }
+        let (ri, ci, si, li) = (rows as i32, cols as i32, start as i32, len as i32);
+        let mut launch = self.stream.launch_builder(&self.func_slice_cols_fwd);
+        launch.arg(d_x).arg(d_y).arg(&ri).arg(&ci).arg(&si).arg(&li);
+        // SAFETY: `(const float* x, float* y, int rows, int cols, int start, int len)`; thread per
+        // output element (rows*len).
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows * len))
+                .map_err(|e| driver_err("launch slice_cols_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Insert a resident [rows,len] block into columns [start,start+len) of a [rows,total] buffer
+    /// (`dst[r,start+c]=src[r,c]`; bit-exact). Builds `concat_cols` (N inserts) and `slice_cols`'s vjp
+    /// (insert into a zeroed buffer).
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized/out-of-range buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn copy_into_cols_dev(
+        &self,
+        d_src: &CudaSlice<f32>,
+        d_dst: &mut CudaSlice<f32>,
+        rows: usize,
+        total: usize,
+        start: usize,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        if start + len > total || d_src.len() < rows * len || d_dst.len() < rows * total {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * total,
+                got: d_dst.len(),
+            });
+        }
+        if rows * len == 0 {
+            return Ok(());
+        }
+        let (ri, ti, si, li) = (rows as i32, total as i32, start as i32, len as i32);
+        let mut launch = self.stream.launch_builder(&self.func_copy_into_cols);
+        launch.arg(d_src).arg(d_dst).arg(&ri).arg(&ti).arg(&si).arg(&li);
+        // SAFETY: `(const float* src, float* dst, int rows, int total, int start, int len)`; thread
+        // per source element (rows*len).
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows * len))
+                .map_err(|e| driver_err("launch copy_into_cols_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Transpose a resident [rows,cols] buffer → [cols,rows] (`ops::dense::transpose_forward`; also
+    /// its own vjp; bit-exact).
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn transpose_forward_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        if d_x.len() < rows * cols || d_y.len() < rows * cols {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * cols,
+                got: d_y.len(),
+            });
+        }
+        if rows * cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_transpose_fwd);
+        launch.arg(d_x).arg(d_y).arg(&ri).arg(&ci);
+        // SAFETY: `(const float* x, float* y, int rows, int cols)`; one thread per element.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows * cols))
+                .map_err(|e| driver_err("launch transpose_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Embedding gather forward `y[t,:] = w[tokens[t],:]` on resident buffers
+    /// (`ops::embed::gather_forward`; bit-exact). `tokens` is a resident i32 buffer of length `seq`.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn embed_gather_forward_dev(
+        &self,
+        d_w: &CudaSlice<f32>,
+        d_tokens: &CudaSlice<i32>,
+        d_y: &mut CudaSlice<f32>,
+        seq: usize,
+        dim: usize,
+    ) -> Result<(), BackendError> {
+        if d_tokens.len() < seq || d_y.len() < seq * dim {
+            return Err(BackendError::ShapeMismatch {
+                expected: seq * dim,
+                got: d_y.len(),
+            });
+        }
+        if seq * dim == 0 {
+            return Ok(());
+        }
+        let (si, di) = (seq as i32, dim as i32);
+        let mut launch = self.stream.launch_builder(&self.func_embed_gather_fwd);
+        launch.arg(d_w).arg(d_tokens).arg(d_y).arg(&si).arg(&di);
+        // SAFETY: `(const float* w, const int* tokens, float* y, int seq, int dim)`; thread per
+        // output element (seq*dim). w indexed by tokens[t]∈[0,vocab); caller supplies valid ids.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(seq * dim))
+                .map_err(|e| driver_err("launch embed_gather_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Embedding gather backward: `gw[v,:] = Σ_{t:tokens[t]==v} gy[t,:]`, summed ascending-t (bit-exact
+    /// vs `ops::embed::gather_vjp`; one thread per gw element, no atomics). `gw`:[vocab,dim].
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn embed_gather_backward_dev(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        d_tokens: &CudaSlice<i32>,
+        d_gw: &mut CudaSlice<f32>,
+        seq: usize,
+        dim: usize,
+        vocab: usize,
+    ) -> Result<(), BackendError> {
+        if d_gy.len() < seq * dim || d_tokens.len() < seq || d_gw.len() < vocab * dim {
+            return Err(BackendError::ShapeMismatch {
+                expected: vocab * dim,
+                got: d_gw.len(),
+            });
+        }
+        if vocab * dim == 0 {
+            return Ok(());
+        }
+        let (si, di, vi) = (seq as i32, dim as i32, vocab as i32);
+        let mut launch = self.stream.launch_builder(&self.func_embed_gather_bwd);
+        launch.arg(d_gy).arg(d_tokens).arg(d_gw).arg(&si).arg(&di).arg(&vi);
+        // SAFETY: `(const float* gy, const int* tokens, float* gw, int seq, int dim, int vocab)`;
+        // one thread per gw element (vocab*dim).
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(vocab * dim))
+                .map_err(|e| driver_err("launch embed_gather_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Softmax cross-entropy backward on resident logits (`ops::loss::softmax_xent_vjp`; expf ⇒ within
+    /// 1e-4). `gscale = grad_out/rows`. `logits`,`target`,`g_logits`:[rows,cols].
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn softmax_xent_backward_dev(
+        &self,
+        d_logits: &CudaSlice<f32>,
+        d_target: &CudaSlice<f32>,
+        d_glogits: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        gscale: f32,
+    ) -> Result<(), BackendError> {
+        if d_logits.len() < rows * cols || d_target.len() < rows * cols || d_glogits.len() < rows * cols
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * cols,
+                got: d_glogits.len(),
+            });
+        }
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_softmax_xent_bwd);
+        launch.arg(d_logits).arg(d_target).arg(d_glogits).arg(&ri).arg(&ci).arg(&gscale);
+        // SAFETY: `(const float* logits, const float* target, float* g_logits, int rows, int cols,
+        // float gscale)`; one thread per row.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch softmax_xent_backward_dev", &e))?;
         }
         Ok(())
     }
@@ -2178,6 +2664,24 @@ impl CudaBackend {
         // shaped (half4 loads), so the same geometry gate as the split
         // attention applies.
         let kv_dtype = kv_dtype_from_env()?;
+        // ADR 0026 Track P: build I2sInt8 IMMA shadows for the prefill
+        // tensor-core path (~0.25 B/weight beside the TQ2 rows). Kill switch:
+        // TRITIUM_IMMA_PREFILL=0 skips the shadows AND the dispatch.
+        let enable_imma = match std::env::var("TRITIUM_IMMA_PREFILL") {
+            Err(std::env::VarError::NotPresent) => true,
+            Ok(v) if v == "0" => false,
+            Ok(v) if v == "1" || v.is_empty() => true,
+            Ok(v) => {
+                return Err(BackendError::InvalidInput(format!(
+                    "TRITIUM_IMMA_PREFILL={v:?} — use 1 (default) or 0"
+                )));
+            }
+            Err(e) => {
+                return Err(BackendError::InvalidInput(format!(
+                    "TRITIUM_IMMA_PREFILL: {e}"
+                )));
+            }
+        };
         if kv_dtype != KvDtype::F32 && !head_dim.is_multiple_of(4) {
             return Err(BackendError::InvalidInput(format!(
                 "TRITIUM_KV={kv_dtype:?} requires head_dim % 4 == 0 (got {head_dim})"
@@ -2309,13 +2813,16 @@ impl CudaBackend {
                 attn_sub_norm: opt_norm(ls.attn_sub_norm, q_width, "decode attn_sub_norm htod")?,
                 ffn_norm: upload(ls.ffn_norm, "decode ffn_norm htod")?,
                 ffn_sub_norm: opt_norm(ls.ffn_sub_norm, n_ff, "decode ffn_sub_norm htod")?,
-                q: ResidentLinear::build(s, &ls.q, false)?,
-                k: ResidentLinear::build(s, &ls.k, false)?,
-                v: ResidentLinear::build(s, &ls.v, false)?,
-                o: ResidentLinear::build(s, &ls.o, false)?,
-                gate: ResidentLinear::build(s, &ls.gate, false)?,
-                up: ResidentLinear::build(s, &ls.up, false)?,
-                down: ResidentLinear::build(s, &ls.down, false)?,
+                // The seven per-projection linears are what prefill launches
+                // — they carry the IMMA shadow (ADR 0026 Track P) unless the
+                // kill switch is set.
+                q: ResidentLinear::build(s, &ls.q, false, enable_imma)?,
+                k: ResidentLinear::build(s, &ls.k, false, enable_imma)?,
+                v: ResidentLinear::build(s, &ls.v, false, enable_imma)?,
+                o: ResidentLinear::build(s, &ls.o, false, enable_imma)?,
+                gate: ResidentLinear::build(s, &ls.gate, false, enable_imma)?,
+                up: ResidentLinear::build(s, &ls.up, false, enable_imma)?,
+                down: ResidentLinear::build(s, &ls.down, false, enable_imma)?,
                 // Only the fused pair launches through the sparse decode-graph
                 // slot — bitmaps computed here alone (review N1).
                 qkv: ResidentLinear::build_fused(s, &[&ls.q, &ls.k, &ls.v])?,

@@ -314,6 +314,17 @@ pub struct DecodeModelSpec<'a> {
     pub rms_eps: f32,
 }
 
+/// ADR 0026 Track P: the I2sInt8 tile-interleaved twin of a linear's TQ2_0
+/// rows, consumed by the IMMA tensor-core mpGEMM at prefill M ≥ the tuned
+/// crossover. ~0.25 B/weight beside the ~0.258 B/weight TQ2_0 rows; built
+/// only for the per-projection linears the prefill path launches.
+#[derive(Debug)]
+struct ImmaShadow {
+    device: CudaSlice<u8>,
+    /// `ceil(k / IMMA_K)` — the packed k-tile stride the kernel takes.
+    num_ktiles: i32,
+}
+
 /// One ternary projection, resident: the shared device weight + device scales.
 #[derive(Debug)]
 struct ResidentLinear {
@@ -330,6 +341,8 @@ struct ResidentLinear {
     bitmap: Option<CudaSlice<u32>>,
     /// A2: true = TQ1_0-packed rows (the tq1 kernel twins); false = TQ2_0.
     tq1: bool,
+    /// ADR 0026 Track P: IMMA twin of the rows (prefill tensor-core path).
+    imma: Option<ImmaShadow>,
 }
 
 /// Minimum all-zero-block fraction before a skip bitmap is worth carrying
@@ -338,18 +351,14 @@ const BITMAP_MIN_ZERO_BLOCK_FRAC: f64 = 0.005;
 
 /// dtoh the packed rows and build the zero-block bitmap when it clears the
 /// threshold (load-time only; one pass over the packed bytes).
-fn maybe_bitmap(
+fn maybe_bitmap_from_host(
     stream: &Arc<CudaStream>,
-    device: &CudaSlice<u8>,
+    host: &[u8],
     n: usize,
     k: usize,
-    row_bytes: usize,
 ) -> Result<Option<CudaSlice<u32>>, BackendError> {
-    let mut host = vec![0u8; n * row_bytes];
-    stream
-        .memcpy_dtoh(device, &mut host)
-        .map_err(|e| driver_err("bitmap dtoh", &e))?;
-    let bm = tritium_format::compute_zero_bitmaps(&host, n, k, row_bytes)
+    let row_bytes = if n == 0 { 0 } else { host.len() / n };
+    let bm = tritium_format::compute_zero_bitmaps(host, n, k, row_bytes)
         .map_err(|e| BackendError::InvalidInput(format!("zero bitmap: {e}")))?;
     // Counting over n*words_per_row words vs blocks = n*nb is exact because
     // compute_zero_bitmap never sets padding bits (loop bound block_idx < nb).
@@ -364,6 +373,34 @@ fn maybe_bitmap(
         .map_err(|e| driver_err("bitmap htod", &e))
 }
 
+/// TQ2_0 packed rows → the I2sInt8 tile interleave (the IMMA kernel's weight
+/// layout). Trits-level: block scales are DISCARDED — both GEMM paths read
+/// the per-channel `scales` array as the only weight scale, so the shadow
+/// carries codes only. Host-side, load-time only.
+fn imma_shadow_bytes(
+    host_rows: &[u8],
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+) -> Result<Vec<u8>, BackendError> {
+    let nb = k.div_ceil(256);
+    let mut trits = vec![0i8; n * k];
+    let mut row = vec![tritium_core::Trit::ZERO; k];
+    let mut block_scales = vec![half::f16::ZERO; nb];
+    for ni in 0..n {
+        tritium_format::unpack_tq2_0_row(
+            &host_rows[ni * row_bytes..(ni + 1) * row_bytes],
+            &mut row,
+            &mut block_scales,
+        )
+        .map_err(|e| BackendError::InvalidInput(format!("imma shadow unpack: {e}")))?;
+        for (dst, t) in trits[ni * k..(ni + 1) * k].iter_mut().zip(&row) {
+            *dst = t.get();
+        }
+    }
+    Ok(pack_i2s_int8_tiles(&trits, n, k))
+}
+
 impl ResidentLinear {
     /// Build from a borrowed spec: share the device weight (`Arc` clone, no
     /// re-upload) and upload the per-channel scales once.
@@ -372,10 +409,14 @@ impl ResidentLinear {
     /// FUSED qkv/gateup) — o/down go through the dense residual kernel and
     /// the individual linears feed dense batch/tree paths, so building
     /// bitmaps for them is dead dtoh + scan work (review N1).
+    /// `enable_imma` (ADR 0026 Track P): also build the I2sInt8 IMMA shadow
+    /// (TQ2 rows only; TQ1 prefill stays dp4a). One dtoh serves both the
+    /// bitmap scan and the shadow repack.
     fn build(
         stream: &Arc<CudaStream>,
         spec: &DecodeLinearSpec,
         enable_bitmap: bool,
+        enable_imma: bool,
     ) -> Result<Self, BackendError> {
         let buf = spec
             .weights
@@ -403,11 +444,32 @@ impl ResidentLinear {
             .clone_htod(spec.scales)
             .map_err(|e| driver_err("decode scales htod", &e))?;
         let device = buf.device_arc();
-        // The skip bitmap is a TQ2 geometry (66-byte blocks); TQ1 rows go dense.
-        let bitmap = if enable_bitmap && !tq1 {
-            maybe_bitmap(stream, device.as_ref(), n, k, row_bytes)?
+        // The skip bitmap and the IMMA shadow are TQ2 geometries; TQ1 rows go
+        // dense/dp4a. One dtoh of the packed rows serves both consumers.
+        let (bitmap, imma) = if (enable_bitmap || enable_imma) && !tq1 {
+            let mut host = vec![0u8; n * row_bytes];
+            stream
+                .memcpy_dtoh(device.as_ref(), &mut host)
+                .map_err(|e| driver_err("resident rows dtoh", &e))?;
+            let bitmap = if enable_bitmap {
+                maybe_bitmap_from_host(stream, &host, n, k)?
+            } else {
+                None
+            };
+            let imma = if enable_imma {
+                let bytes = imma_shadow_bytes(&host, n, k, row_bytes)?;
+                Some(ImmaShadow {
+                    device: stream
+                        .clone_htod(&bytes)
+                        .map_err(|e| driver_err("imma shadow htod", &e))?,
+                    num_ktiles: k.div_ceil(tritium_format::IMMA_K) as i32,
+                })
+            } else {
+                None
+            };
+            (bitmap, imma)
         } else {
-            None
+            (None, None)
         };
         Ok(Self {
             device,
@@ -417,6 +479,7 @@ impl ResidentLinear {
             row_bytes,
             bitmap,
             tq1,
+            imma,
         })
     }
 
@@ -478,7 +541,11 @@ impl ResidentLinear {
         let bitmap = if tq1 {
             None // skip bitmaps are TQ2-geometry; TQ1 rows run dense
         } else {
-            maybe_bitmap(stream, &device, total_n, k, row_bytes)?
+            let mut host = vec![0u8; total_n * row_bytes];
+            stream
+                .memcpy_dtoh(&device, &mut host)
+                .map_err(|e| driver_err("fused rows dtoh", &e))?;
+            maybe_bitmap_from_host(stream, &host, total_n, k)?
         };
         Ok(Self {
             device: Arc::new(device),
@@ -488,6 +555,9 @@ impl ResidentLinear {
             row_bytes,
             bitmap,
             tq1,
+            // The fused pair feeds the M=1 decode graph only — no IMMA twin
+            // (prefill launches the per-projection linears).
+            imma: None,
         })
     }
 }

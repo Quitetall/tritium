@@ -982,6 +982,38 @@ fn imma_handles_tail_shapes() {
     }
 }
 
+/// ADR 0026 Track P step 2: the load-time IMMA shadow (TQ2 packed rows →
+/// unpack → `pack_i2s_int8_tiles`) must produce byte-identical output to the
+/// production I2_S converter (`convert_i2s_to_int8`) for the same trits —
+/// the kernel sees exactly one weight layout regardless of which path packed
+/// it. Host-only, no GPU.
+#[test]
+fn imma_shadow_matches_i2s_converter_bytes() {
+    use tritium_format::{TQ2_0_BLOCK_BYTES, num_blocks};
+    for &(n, k) in &[(8usize, 256usize), (13, 512), (40, 2560), (5, 6912)] {
+        let trits = mixed_trits(n, k, 0x77 ^ (n as u64) ^ (k as u64));
+        let nb = num_blocks(k);
+        let unit = vec![half::f16::ONE; nb];
+        let rb = nb * TQ2_0_BLOCK_BYTES;
+        let mut rows = vec![0u8; n * rb];
+        for ni in 0..n {
+            tritium_format::pack_tq2_0_row(
+                &trits[ni * k..(ni + 1) * k],
+                &unit,
+                &mut rows[ni * rb..(ni + 1) * rb],
+            )
+            .expect("pack tq2");
+        }
+        let shadow = imma_shadow_bytes(&rows, n, k, rb).expect("shadow");
+        let trits_i8: Vec<i8> = trits.iter().map(|t| t.get()).collect();
+        let converter = pack_i2s_int8(&trits_i8, GemmShape { m: 0, n, k });
+        assert_eq!(
+            shadow, converter,
+            "n{n} k{k}: shadow bytes != convert_i2s_to_int8 bytes"
+        );
+    }
+}
+
 /// ADR 0026 Track P bit-identity gate: the IMMA tensor-core kernel must be
 /// **bit-identical** to the dp4a `tiled_i8_scaled` kernel on the SAME int8
 /// activations, act scales and per-channel weight scales. Both contract in
