@@ -2940,6 +2940,89 @@ impl CudaBackend {
             )
         })?;
 
+        // ADR 0026 Track P step 3: resolve the IMMA tile functions at BUILD
+        // time for every shadowed (N, K) shape × the prefill M buckets, so
+        // the serving path never touches nvrtc or the tune sweep. Policy:
+        //   TRITIUM_IMMA_TUNE=tune (default) — sweep on a cold disk cache
+        //     (one-time, printed notice; winners persist on disk);
+        //   load — disk-cache-or-AOT, never sweeps;
+        //   off  — no IMMA functions (dispatch falls back to dp4a).
+        let imma_funcs = {
+            #[derive(PartialEq)]
+            enum TunePolicy {
+                Tune,
+                Load,
+                Off,
+            }
+            let policy = if !enable_imma {
+                TunePolicy::Off
+            } else {
+                match std::env::var("TRITIUM_IMMA_TUNE") {
+                    Err(std::env::VarError::NotPresent) => TunePolicy::Tune,
+                    Ok(v) => match v.as_str() {
+                        "tune" | "" => TunePolicy::Tune,
+                        "load" => TunePolicy::Load,
+                        "off" => TunePolicy::Off,
+                        other => {
+                            return Err(BackendError::InvalidInput(format!(
+                                "TRITIUM_IMMA_TUNE={other:?} — use tune, load or off"
+                            )));
+                        }
+                    },
+                    Err(e) => {
+                        return Err(BackendError::InvalidInput(format!(
+                            "TRITIUM_IMMA_TUNE: {e}"
+                        )));
+                    }
+                }
+            };
+            let mut map = HashMap::new();
+            if policy != TunePolicy::Off {
+                let mut shapes = std::collections::BTreeSet::new();
+                for l in &layers {
+                    for lin in [&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down] {
+                        if lin.imma.is_some() {
+                            shapes.insert((lin.n, lin.k));
+                        }
+                    }
+                }
+                // Prefill M buckets: 32.. (the dp4a/IMMA crossover) up to
+                // 2048+-token one-shot prompts; log2 floor matches
+                // ShapeBucket::from_shape, so the disk keys line up.
+                for &(n, k) in &shapes {
+                    for m_log2 in 5u32..=11 {
+                        let shape = GemmShape {
+                            m: 1usize << m_log2,
+                            n,
+                            k,
+                        };
+                        let tile = match policy {
+                            TunePolicy::Tune => self.resolve_imma_tile(shape),
+                            TunePolicy::Load => {
+                                crate::autotune::load_cached(
+                                    &cache_dir(),
+                                    &self.imma_cache_key(shape),
+                                )
+                                .unwrap_or(TileConfig::AOT_EQUIVALENT)
+                            }
+                            TunePolicy::Off => unreachable!(),
+                        };
+                        let func = self.imma_function_for_tile(tile)?;
+                        map.insert((n, k, m_log2), (tile, func));
+                    }
+                }
+                if !map.is_empty() {
+                    eprintln!(
+                        "tritium-cuda: IMMA prefill ready — {} tile functions over {} \
+                         weight shapes (TRITIUM_IMMA_TUNE policy applied)",
+                        map.len(),
+                        shapes.len(),
+                    );
+                }
+            }
+            map
+        };
+
         Ok(CudaDecodeModel {
             stream: Arc::clone(&self.stream),
             f_attn_scores,
@@ -3060,6 +3143,7 @@ impl CudaBackend {
             graph: None,
             raw: None,
             batch_raw: None,
+            imma_funcs,
         })
     }
 

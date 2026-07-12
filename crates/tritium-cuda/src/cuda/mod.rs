@@ -779,6 +779,12 @@ pub struct CudaDecodeModel {
     /// drop-order guarantee the M=1 `graph`/`raw` fields rely on does not exist for the
     /// caller-owned `BatchKv`).
     batch_raw: Option<Arc<BatchRawKernels>>,
+    /// ADR 0026 Track P: build-time-resolved IMMA tile functions, keyed
+    /// `(n, k, m_log2 bucket)`. The `CudaFunction`s are Arc-backed and hold
+    /// their modules alive; a lookup miss at dispatch falls back to dp4a.
+    /// Empty when shadows are disabled (`TRITIUM_IMMA_PREFILL=0` /
+    /// `TRITIUM_IMMA_TUNE=off` / TQ1 models).
+    imma_funcs: HashMap<(usize, usize, u32), (TileConfig, CudaFunction)>,
 }
 
 impl CudaDecodeModel {
