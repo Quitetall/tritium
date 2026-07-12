@@ -15,8 +15,6 @@
 
 use std::rc::Rc;
 
-use tritium_core::GemmShape;
-
 use crate::gemm::TrainGemm;
 use crate::ops::{
     act, bias, dense, elementwise, embed, loss, matmul, norm, rope, shape, softmax, ste,
@@ -178,18 +176,10 @@ impl Tape {
         n: usize,
         k: usize,
     ) -> ValueId {
-        // fp dense = the scaled GEMM with a unit per-row scale (`s = 1`), so a device engine reuses
-        // its ternary-matmul kernels; the CPU default keeps calling `dense::{forward,vjp}` verbatim.
+        // A device engine (e.g. GPU) runs the fp matmul fwd/bwd on-device; the CPU default (no engine)
+        // keeps calling `dense::{forward,vjp}` verbatim, so every existing gate is bit-for-bit unchanged.
         let out = match &self.gemm {
-            Some(eng) => {
-                let ones = vec![1.0f32; n];
-                eng.forward(
-                    &self.values[x],
-                    &self.values[w],
-                    &ones,
-                    GemmShape { m, n, k },
-                )
-            }
+            Some(eng) => eng.dense_forward(&self.values[x], &self.values[w], m, n, k),
             None => dense::forward(&self.values[x], &self.values[w], m, n, k),
         };
         let gemm = self.gemm.clone();
@@ -198,9 +188,7 @@ impl Tape {
             out,
             Box::new(move |ins, g, grads, ids| match &gemm {
                 Some(eng) => {
-                    let ones = vec![1.0f32; n];
-                    let (ga, gw, _gs) =
-                        eng.backward(g, ins[0], ins[1], &ones, GemmShape { m, n, k });
+                    let (ga, gw) = eng.dense_backward(g, ins[0], ins[1], m, n, k);
                     for (j, &v) in ga.iter().enumerate() {
                         grads[ids[0]][j] += v;
                     }

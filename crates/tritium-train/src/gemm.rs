@@ -7,24 +7,24 @@
 //! per-row scale ⇒ the ternary `matmul` (`Y = s·(A·Wᵀ)`). A `Tape` with no engine (the default) runs
 //! the built-in CPU path bit-for-bit, so every existing gate is untouched.
 
-use tritium_core::GemmShape;
-
-/// A device (or host) GEMM engine the [`Tape`](crate::Tape) can dispatch its matmuls to.
+/// A device (or host) GEMM engine the [`Tape`](crate::Tape) can dispatch its `dense_matmul` to.
 ///
-/// Contract: the result must match the CPU `ops::{dense,matmul}` forward/vjp within the training
-/// tolerance (the reference GPU kernels are compiled `--fmad=false` with a fixed sequential
-/// reduction so they reproduce the host rounding — see `tritium-cuda/kernels/train_grad.cu`).
+/// Contract: the result must match the CPU `ops::dense` forward/vjp within the training tolerance
+/// (the reference GPU kernels are compiled `--fmad=false` with a fixed sequential reduction so they
+/// reproduce the host rounding — see `tritium-cuda/kernels/train_grad.cu`).
 pub trait TrainGemm {
-    /// `Y[m,n] = s[n]·Σ_k A[m,k]·W[n,k]`  (`A:[M,K]`, `W:[N,K]`, `s:[N]`, `Y:[M,N]`).
-    fn forward(&self, a: &[f32], w: &[f32], s: &[f32], shape: GemmShape) -> Vec<f32>;
+    /// `Y[m,n] = Σ_k X[m,k]·W[n,k]`  (`X:[M,K]`, `W:[N,K]`, `Y:[M,N]`).
+    fn dense_forward(&self, x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32>;
 
-    /// `(g_a[M,K], g_w[N,K], g_s[N])` for `gy[M,N]` — the three matmul gradients.
-    fn backward(
+    /// `(g_x[M,K], g_w[N,K])` for `gy[M,N]` — the two fp-matmul gradients. (No per-row scale, so no
+    /// `grad_s` — a real saving vs the ternary path, since the `grad_s` kernel costs a full GEMM.)
+    fn dense_backward(
         &self,
         gy: &[f32],
-        a: &[f32],
+        x: &[f32],
         w: &[f32],
-        s: &[f32],
-        shape: GemmShape,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>);
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> (Vec<f32>, Vec<f32>);
 }

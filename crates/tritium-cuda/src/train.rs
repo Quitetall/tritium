@@ -118,23 +118,36 @@ impl GpuGemm {
 }
 
 impl TrainGemm for GpuGemm {
-    fn forward(&self, a: &[f32], w: &[f32], s: &[f32], shape: GemmShape) -> Vec<f32> {
+    fn dense_forward(&self, x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        // fp dense = the ternary-matmul forward with a unit per-row scale (`s = 1`).
+        let ones = vec![1.0f32; n];
         GpuEngine(&self.0)
-            .forward(a, w, s, shape)
-            .expect("GpuGemm forward: device error")
+            .forward(x, w, &ones, GemmShape { m, n, k })
+            .expect("GpuGemm dense_forward: device error")
     }
 
-    fn backward(
+    fn dense_backward(
         &self,
         gy: &[f32],
-        a: &[f32],
+        x: &[f32],
         w: &[f32],
-        s: &[f32],
-        shape: GemmShape,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        GpuEngine(&self.0)
-            .backward(gy, a, w, s, shape)
-            .expect("GpuGemm backward: device error")
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        // Only `grad_a`/`grad_w` — the fp path has no per-row scale, so we skip the `grad_s` kernel
+        // (a full GEMM's worth of work) that the ternary `GpuEngine::backward` would compute.
+        let shape = GemmShape { m, n, k };
+        let ones = vec![1.0f32; n];
+        let mut g_x = vec![0.0f32; m * k];
+        let mut g_w = vec![0.0f32; n * k];
+        self.0
+            .grad_a(gy, w, &ones, shape, &mut g_x)
+            .expect("GpuGemm dense_backward grad_a: device error");
+        self.0
+            .grad_w(gy, x, &ones, shape, &mut g_w)
+            .expect("GpuGemm dense_backward grad_w: device error");
+        (g_x, g_w)
     }
 }
 
