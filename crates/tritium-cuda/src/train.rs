@@ -25,10 +25,12 @@
 //! is immaterial at this scale (measured in the smoke) and load-bearing only for the deferred full-2B
 //! resident training engine.
 
+use std::rc::Rc;
+
 use tritium_core::GemmShape;
 use tritium_spec::BackendError;
 use tritium_train::ops::{act, loss, matmul, ste};
-use tritium_train::{AdamState, AdamW, LrSchedule, Optimizer};
+use tritium_train::{AdamState, AdamW, LrSchedule, Optimizer, TrainGemm};
 
 use crate::cuda::CudaBackend;
 
@@ -89,6 +91,50 @@ impl GemmEngine for GpuEngine<'_> {
         self.0.grad_w(gy, a, s, shape, &mut g_w)?;
         self.0.grad_s(gy, a, w, shape, &mut g_s)?;
         Ok((g_a, g_w, g_s))
+    }
+}
+
+/// Owned GPU GEMM engine for injecting into a [`tritium_train::Tape`] via `Tape::with_gemm`
+/// (plan 0043): it holds the [`CudaBackend`] (so it is `'static` for `Rc<dyn TrainGemm>`) and
+/// delegates each matmul to the borrowed [`GpuEngine`] (the `train_grad.cu` kernels). A device error
+/// is fatal to a training step, so the `TrainGemm` methods (which cannot return `Result` — the tape
+/// builds the graph eagerly) surface it as a panic.
+pub struct GpuGemm(Rc<CudaBackend>);
+
+impl core::fmt::Debug for GpuGemm {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GpuGemm").finish_non_exhaustive()
+    }
+}
+
+impl GpuGemm {
+    /// Open CUDA `device` and build a tape GEMM engine on it.
+    ///
+    /// # Errors
+    /// [`BackendError`] if the device cannot be opened.
+    pub fn new(device: usize) -> Result<Self, BackendError> {
+        Ok(Self(Rc::new(CudaBackend::new(device)?)))
+    }
+}
+
+impl TrainGemm for GpuGemm {
+    fn forward(&self, a: &[f32], w: &[f32], s: &[f32], shape: GemmShape) -> Vec<f32> {
+        GpuEngine(&self.0)
+            .forward(a, w, s, shape)
+            .expect("GpuGemm forward: device error")
+    }
+
+    fn backward(
+        &self,
+        gy: &[f32],
+        a: &[f32],
+        w: &[f32],
+        s: &[f32],
+        shape: GemmShape,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        GpuEngine(&self.0)
+            .backward(gy, a, w, s, shape)
+            .expect("GpuGemm backward: device error")
     }
 }
 

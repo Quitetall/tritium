@@ -13,6 +13,11 @@
 //! the `ste` module). The graph this tape differentiates is therefore the smooth
 //! surrogate model; `round` is a forward-only QAT detail layered on later (ADR 0007).
 
+use std::rc::Rc;
+
+use tritium_core::GemmShape;
+
+use crate::gemm::TrainGemm;
 use crate::ops::{
     act, bias, dense, elementwise, embed, loss, matmul, norm, rope, shape, softmax, ste,
 };
@@ -42,6 +47,9 @@ struct Node {
 pub struct Tape {
     values: Vec<Vec<f32>>,
     nodes: Vec<Node>,
+    /// Optional device GEMM engine (plan 0043). `None` ⇒ the built-in CPU matmul path (bit-for-bit
+    /// the pre-0043 behaviour). `Some` ⇒ `dense_matmul`/`matmul` dispatch to the engine (e.g. GPU).
+    gemm: Option<Rc<dyn TrainGemm>>,
 }
 
 impl core::fmt::Debug for Tape {
@@ -54,10 +62,20 @@ impl core::fmt::Debug for Tape {
 }
 
 impl Tape {
-    /// An empty tape.
+    /// An empty tape (CPU matmuls).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty tape whose `dense_matmul`/`matmul` run on the given engine (e.g. a GPU backend)
+    /// instead of the built-in CPU path — the training hot path offloaded to the device (plan 0043).
+    #[must_use]
+    pub fn with_gemm(gemm: Rc<dyn TrainGemm>) -> Self {
+        Self {
+            gemm: Some(gemm),
+            ..Self::default()
+        }
     }
 
     /// Register a leaf (parameter or input) buffer; returns its [`ValueId`].
@@ -160,15 +178,42 @@ impl Tape {
         n: usize,
         k: usize,
     ) -> ValueId {
-        let out = dense::forward(&self.values[x], &self.values[w], m, n, k);
+        // fp dense = the scaled GEMM with a unit per-row scale (`s = 1`), so a device engine reuses
+        // its ternary-matmul kernels; the CPU default keeps calling `dense::{forward,vjp}` verbatim.
+        let out = match &self.gemm {
+            Some(eng) => {
+                let ones = vec![1.0f32; n];
+                eng.forward(
+                    &self.values[x],
+                    &self.values[w],
+                    &ones,
+                    GemmShape { m, n, k },
+                )
+            }
+            None => dense::forward(&self.values[x], &self.values[w], m, n, k),
+        };
+        let gemm = self.gemm.clone();
         self.record(
             vec![x, w],
             out,
-            Box::new(move |ins, g, grads, ids| {
-                let gs = dense::vjp(ins[0], ins[1], m, n, k, g);
-                for (k_idx, gv) in gs.into_iter().enumerate() {
-                    for (j, &v) in gv.iter().enumerate() {
-                        grads[ids[k_idx]][j] += v;
+            Box::new(move |ins, g, grads, ids| match &gemm {
+                Some(eng) => {
+                    let ones = vec![1.0f32; n];
+                    let (ga, gw, _gs) =
+                        eng.backward(g, ins[0], ins[1], &ones, GemmShape { m, n, k });
+                    for (j, &v) in ga.iter().enumerate() {
+                        grads[ids[0]][j] += v;
+                    }
+                    for (j, &v) in gw.iter().enumerate() {
+                        grads[ids[1]][j] += v;
+                    }
+                }
+                None => {
+                    let gs = dense::vjp(ins[0], ins[1], m, n, k, g);
+                    for (k_idx, gv) in gs.into_iter().enumerate() {
+                        for (j, &v) in gv.iter().enumerate() {
+                            grads[ids[k_idx]][j] += v;
+                        }
                     }
                 }
             }),
