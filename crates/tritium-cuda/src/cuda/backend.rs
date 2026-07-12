@@ -151,6 +151,7 @@ pub struct CudaBackend {
     pub(super) func_embed_gather_fwd: CudaFunction,
     pub(super) func_embed_gather_bwd: CudaFunction,
     pub(super) func_softmax_xent_bwd: CudaFunction,
+    pub(super) func_scale_const: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -348,6 +349,9 @@ impl CudaBackend {
         let func_softmax_xent_bwd = grad_module
             .load_function(KERNEL_NAME_SOFTMAX_XENT_BWD)
             .map_err(|e| driver_err("resolve softmax_xent_backward kernel", &e))?;
+        let func_scale_const = grad_module
+            .load_function(KERNEL_NAME_SCALE_CONST)
+            .map_err(|e| driver_err("resolve scale_const kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -413,6 +417,7 @@ impl CudaBackend {
             func_embed_gather_fwd,
             func_embed_gather_bwd,
             func_softmax_xent_bwd,
+            func_scale_const,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -1292,6 +1297,41 @@ impl CudaBackend {
         self.stream
             .clone_htod(host)
             .map_err(|e| driver_err("dev_upload_i32 htod", &e))
+    }
+
+    /// Multiply a resident buffer by a constant scalar: `y[i] = x[i]·c` (attention's `1/√head_dim`;
+    /// bit-exact). Its own vjp shape (backward = `scale_const_dev(gy, c)`).
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn scale_const_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        c: f32,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if d_x.len() < n || d_y.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: d_y.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i32;
+        let mut launch = self.stream.launch_builder(&self.func_scale_const);
+        launch.arg(d_x).arg(d_y).arg(&c).arg(&ni);
+        // SAFETY: `(const float* x, float* y, float c, int n)`; one thread per element.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch scale_const_dev", &e))?;
+        }
+        Ok(())
     }
 
     /// Row-softmax forward on resident buffers (`ops::softmax::forward`; expf ⇒ within 1e-4).

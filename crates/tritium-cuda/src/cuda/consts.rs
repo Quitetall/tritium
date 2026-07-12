@@ -207,6 +207,7 @@ pub(super) const KERNEL_NAME_TRANSPOSE_FWD: &str = "transpose_forward";
 pub(super) const KERNEL_NAME_EMBED_GATHER_FWD: &str = "embed_gather_forward";
 pub(super) const KERNEL_NAME_EMBED_GATHER_BWD: &str = "embed_gather_backward";
 pub(super) const KERNEL_NAME_SOFTMAX_XENT_BWD: &str = "softmax_xent_backward";
+pub(super) const KERNEL_NAME_SCALE_CONST: &str = "scale_const";
 /// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
 pub(super) const LMHEAD_ROW_TILE: u32 = 8;
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's

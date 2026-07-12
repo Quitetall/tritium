@@ -472,6 +472,53 @@ enum DevOp {
         vocab: usize,
         out: usize,
     },
+    Rope {
+        x: usize,
+        pos: CudaSlice<i32>,
+        n_head: usize,
+        head_dim: usize,
+        theta: f32,
+        n_token: usize,
+        out: usize,
+    },
+    SliceCols {
+        x: usize,
+        rows: usize,
+        cols: usize,
+        start: usize,
+        len: usize,
+        out: usize,
+    },
+    ScaleConst {
+        x: usize,
+        c: f32,
+        n: usize,
+        out: usize,
+    },
+    CausalMask {
+        x: usize,
+        rows: usize,
+        cols: usize,
+        out: usize,
+    },
+    Softmax {
+        x: usize,
+        rows: usize,
+        cols: usize,
+        out: usize,
+    },
+    Transpose {
+        x: usize,
+        rows: usize,
+        cols: usize,
+        out: usize,
+    },
+    Concat {
+        parts: Vec<usize>,
+        rows: usize,
+        lens: Vec<usize>,
+        out: usize,
+    },
 }
 
 /// A device-resident autograd tape (plan 0043 P2.5): the GPU analogue of [`tritium_train::Tape`].
@@ -608,6 +655,10 @@ impl<'a> DeviceTape<'a> {
     }
 
     pub(crate) fn mul(&mut self, a: usize, b: usize) -> Result<usize, BackendError> {
+        debug_assert_eq!(
+            self.lens[a], self.lens[b],
+            "mul operands must be same length"
+        );
         let n = self.lens[a];
         let mut out = self.b.dev_alloc_zeros(n)?;
         self.b
@@ -618,6 +669,10 @@ impl<'a> DeviceTape<'a> {
     }
 
     pub(crate) fn add(&mut self, a: usize, b: usize) -> Result<usize, BackendError> {
+        debug_assert_eq!(
+            self.lens[a], self.lens[b],
+            "add operands must be same length"
+        );
         let n = self.lens[a];
         let mut out = self.b.dev_alloc_zeros(n)?;
         self.b
@@ -650,6 +705,207 @@ impl<'a> DeviceTape<'a> {
             out: id,
         });
         Ok(id)
+    }
+
+    /// RoPE over a `[n_token, n_head, head_dim]` buffer (forward rotation).
+    pub(crate) fn rope(
+        &mut self,
+        x: usize,
+        positions: &[i32],
+        n_head: usize,
+        head_dim: usize,
+        theta: f32,
+        n_token: usize,
+    ) -> Result<usize, BackendError> {
+        let n = self.lens[x];
+        let pos = self.b.dev_upload_i32(positions)?;
+        let mut out = self.b.dev_alloc_zeros(n)?;
+        self.b.rope_apply_dev(
+            &self.vals[x],
+            &mut out,
+            &pos,
+            n_head,
+            head_dim,
+            theta,
+            n_token,
+            1.0,
+        )?;
+        let id = self.push(out, n);
+        self.ops.push(DevOp::Rope {
+            x,
+            pos,
+            n_head,
+            head_dim,
+            theta,
+            n_token,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    /// Extract columns `[start, start+len)` from a `[rows, cols]` buffer → `[rows, len]`.
+    pub(crate) fn slice_cols(
+        &mut self,
+        x: usize,
+        rows: usize,
+        cols: usize,
+        start: usize,
+        len: usize,
+    ) -> Result<usize, BackendError> {
+        let mut out = self.b.dev_alloc_zeros(rows * len)?;
+        self.b
+            .slice_cols_forward_dev(&self.vals[x], &mut out, rows, cols, start, len)?;
+        let id = self.push(out, rows * len);
+        self.ops.push(DevOp::SliceCols {
+            x,
+            rows,
+            cols,
+            start,
+            len,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    /// Multiply by a constant scalar (attention's `1/√head_dim`).
+    pub(crate) fn scale_const(&mut self, x: usize, c: f32) -> Result<usize, BackendError> {
+        let n = self.lens[x];
+        let mut out = self.b.dev_alloc_zeros(n)?;
+        self.b.scale_const_dev(&self.vals[x], &mut out, c, n)?;
+        let id = self.push(out, n);
+        self.ops.push(DevOp::ScaleConst { x, c, n, out: id });
+        Ok(id)
+    }
+
+    /// Additive causal mask over `[rows=queries, cols=keys]` scores.
+    pub(crate) fn causal_mask(
+        &mut self,
+        x: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<usize, BackendError> {
+        let mut out = self.b.dev_alloc_zeros(rows * cols)?;
+        self.b
+            .causal_mask_forward_dev(&self.vals[x], &mut out, rows, cols)?;
+        let id = self.push(out, rows * cols);
+        self.ops.push(DevOp::CausalMask {
+            x,
+            rows,
+            cols,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    /// Row softmax over `[rows, cols]`.
+    pub(crate) fn softmax(
+        &mut self,
+        x: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<usize, BackendError> {
+        let mut out = self.b.dev_alloc_zeros(rows * cols)?;
+        self.b
+            .softmax_forward_dev(&self.vals[x], &mut out, rows, cols)?;
+        let id = self.push(out, rows * cols);
+        self.ops.push(DevOp::Softmax {
+            x,
+            rows,
+            cols,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    /// Transpose `[rows, cols]` → `[cols, rows]`.
+    pub(crate) fn transpose(
+        &mut self,
+        x: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<usize, BackendError> {
+        let mut out = self.b.dev_alloc_zeros(rows * cols)?;
+        self.b
+            .transpose_forward_dev(&self.vals[x], &mut out, rows, cols)?;
+        let id = self.push(out, rows * cols);
+        self.ops.push(DevOp::Transpose {
+            x,
+            rows,
+            cols,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    /// Concatenate `parts` (each `[rows, lens[i]]`) along columns → `[rows, Σ lens]`.
+    pub(crate) fn concat(
+        &mut self,
+        parts: &[usize],
+        rows: usize,
+        lens: &[usize],
+    ) -> Result<usize, BackendError> {
+        let total: usize = lens.iter().sum();
+        let mut out = self.b.dev_alloc_zeros(rows * total)?;
+        let mut off = 0;
+        for (&p, &len) in parts.iter().zip(lens) {
+            self.b
+                .copy_into_cols_dev(&self.vals[p], &mut out, rows, total, off, len)?;
+            off += len;
+        }
+        let id = self.push(out, rows * total);
+        self.ops.push(DevOp::Concat {
+            parts: parts.to_vec(),
+            rows,
+            lens: lens.to_vec(),
+            out: id,
+        });
+        Ok(id)
+    }
+
+    /// Multi-head causal self-attention with GQA — the device analogue of `tritium_train::nn::attention`.
+    /// `x` is `[seq, n_embd]` (normed). Returns the attention output `[seq, n_embd]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention(
+        &mut self,
+        x: usize,
+        wq: usize,
+        wk: usize,
+        wv: usize,
+        wo: usize,
+        seq: usize,
+        n_embd: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> Result<usize, BackendError> {
+        let qd = n_head * head_dim;
+        let kvd = n_kv_head * head_dim;
+        let group = n_head / n_kv_head;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let pos: Vec<i32> = (0..seq as i32).collect();
+
+        let q = self.matmul(x, wq, seq, qd, n_embd)?;
+        let k = self.matmul(x, wk, seq, kvd, n_embd)?;
+        let v = self.matmul(x, wv, seq, kvd, n_embd)?;
+        let q = self.rope(q, &pos, n_head, head_dim, theta, seq)?;
+        let k = self.rope(k, &pos, n_kv_head, head_dim, theta, seq)?;
+
+        let mut head_outs = Vec::with_capacity(n_head);
+        for h in 0..n_head {
+            let kv = h / group;
+            let qh = self.slice_cols(q, seq, qd, h * head_dim, head_dim)?;
+            let kh = self.slice_cols(k, seq, kvd, kv * head_dim, head_dim)?;
+            let vh = self.slice_cols(v, seq, kvd, kv * head_dim, head_dim)?;
+            let scores = self.matmul(qh, kh, seq, seq, head_dim)?; // qh · khᵀ
+            let scores = self.scale_const(scores, scale)?;
+            let scores = self.causal_mask(scores, seq, seq)?;
+            let p = self.softmax(scores, seq, seq)?;
+            let vt = self.transpose(vh, seq, head_dim)?;
+            head_outs.push(self.matmul(p, vt, seq, head_dim, seq)?); // p · vh
+        }
+        let cat = self.concat(&head_outs, seq, &vec![head_dim; n_head])?;
+        self.matmul(cat, wo, seq, n_embd, qd)
     }
 
     /// Reverse pass: seed `grads[seed_id] += seed` (e.g. the xent `g_logits`), then replay the ops in
@@ -744,6 +1000,97 @@ impl<'a> DeviceTape<'a> {
                         vocab,
                     )?;
                     self.b.accumulate_dev(&mut grads[w], &gw, vocab * dim)?;
+                }
+                DevOp::Rope {
+                    x,
+                    ref pos,
+                    n_head,
+                    head_dim,
+                    theta,
+                    n_token,
+                    out,
+                } => {
+                    // vjp = inverse rotation (sign = -1) of the output grad.
+                    let n = self.lens[out];
+                    let mut gx = self.b.dev_alloc_zeros(n)?;
+                    self.b.rope_apply_dev(
+                        &grads[out],
+                        &mut gx,
+                        pos,
+                        n_head,
+                        head_dim,
+                        theta,
+                        n_token,
+                        -1.0,
+                    )?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, n)?;
+                }
+                DevOp::SliceCols {
+                    x,
+                    rows,
+                    cols,
+                    start,
+                    len,
+                    out,
+                } => {
+                    // vjp = scatter the [rows,len] grad back into a zeroed [rows,cols] at [start,+len).
+                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                    self.b
+                        .copy_into_cols_dev(&grads[out], &mut gx, rows, cols, start, len)?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                }
+                DevOp::ScaleConst { x, c, n, out } => {
+                    let mut gx = self.b.dev_alloc_zeros(n)?;
+                    self.b.scale_const_dev(&grads[out], &mut gx, c, n)?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, n)?;
+                }
+                DevOp::CausalMask { x, rows, cols, out } => {
+                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                    self.b
+                        .causal_mask_backward_dev(&grads[out], &mut gx, rows, cols)?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                }
+                DevOp::Softmax { x, rows, cols, out } => {
+                    // vjp uses the saved probabilities p = vals[out].
+                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                    self.b.softmax_backward_dev(
+                        &self.vals[out],
+                        &grads[out],
+                        &mut gx,
+                        rows,
+                        cols,
+                    )?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                }
+                DevOp::Transpose { x, rows, cols, out } => {
+                    // vjp = transpose the [cols,rows] output grad back to [rows,cols].
+                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                    self.b
+                        .transpose_forward_dev(&grads[out], &mut gx, cols, rows)?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                }
+                DevOp::Concat {
+                    ref parts,
+                    rows,
+                    ref lens,
+                    out,
+                } => {
+                    // vjp = slice each part's column range back out of the concatenated grad.
+                    let total: usize = lens.iter().sum();
+                    let mut off = 0;
+                    for (&p, &len) in parts.iter().zip(lens) {
+                        let mut gp = self.b.dev_alloc_zeros(rows * len)?;
+                        self.b.slice_cols_forward_dev(
+                            &grads[out],
+                            &mut gp,
+                            rows,
+                            total,
+                            off,
+                            len,
+                        )?;
+                        self.b.accumulate_dev(&mut grads[p], &gp, rows * len)?;
+                        off += len;
+                    }
                 }
             }
         }
@@ -1591,6 +1938,212 @@ mod tests {
              matches CPU tape (worst grad rel {worst:.2e} at {worst_name}). \
              fwd+bwd step: device-resident {dev_ms:.2}ms | CPU tape {cpu_ms:.2}ms ({:.1}× faster)",
             cpu_ms / dev_ms.max(1e-9)
+        );
+    }
+
+    /// Gate (plan 0043 P2.5b): a full **transformer block** — rmsnorm → GQA attention (q/k/v proj →
+    /// RoPE → per-head scaled scores → causal mask → softmax → P·V → concat → o_proj) → residual →
+    /// rmsnorm → SwiGLU MLP → residual — assembled on the `DeviceTape` (`attention` + MLP ops) vs the
+    /// same block on the tritium-train CPU tape (`nn::attention`). This closes the last op gap: every
+    /// piece the real standard-transformer forward+backward uses now runs device-resident and matches
+    /// the CPU tape (within 1e-4; rope/softmax carry transcendentals). Grouped-query (n_kv_head <
+    /// n_head) is exercised.
+    #[test]
+    fn device_tape_transformer_block_matches_cpu_tape() {
+        use tritium_train::Tape;
+        use tritium_train::nn::attention;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping device_tape_transformer_block_matches_cpu_tape: no CUDA device ({e})"
+                );
+                return;
+            }
+        };
+        let (n_embd, n_head, n_kv_head, head_dim, seq, ff, eps, theta) = (
+            64usize, 4usize, 2usize, 16usize, 8usize, 128usize, 1e-5f32, 10000.0f32,
+        );
+        let (qd, kvd) = (n_head * head_dim, n_kv_head * head_dim);
+        let hidden = seeded_uniform(0x200, seq * n_embd, -1.0, 1.0);
+        let attn_norm = seeded_uniform(0x201, n_embd, 0.5, 1.5);
+        let ffn_norm = seeded_uniform(0x202, n_embd, 0.5, 1.5);
+        let wq = seeded_uniform(0x203, qd * n_embd, -0.1, 0.1);
+        let wk = seeded_uniform(0x204, kvd * n_embd, -0.1, 0.1);
+        let wv = seeded_uniform(0x205, kvd * n_embd, -0.1, 0.1);
+        let wo = seeded_uniform(0x206, n_embd * qd, -0.1, 0.1);
+        let wg = seeded_uniform(0x207, ff * n_embd, -0.1, 0.1);
+        let wu = seeded_uniform(0x208, ff * n_embd, -0.1, 0.1);
+        let wd = seeded_uniform(0x209, n_embd * ff, -0.1, 0.1);
+        let cot = seeded_uniform(0x20A, seq * n_embd, -1.0, 1.0); // dL/dout for L = Σ out·cot
+
+        // ── CPU reference (nn::attention) ──
+        let mut t = Tape::new();
+        let h = t.leaf(hidden.clone());
+        let a_n = t.leaf(attn_norm.clone());
+        let xn = t.rmsnorm(h, a_n, seq, n_embd, eps);
+        let (cwq, cwk, cwv, cwo) = (
+            t.leaf(wq.clone()),
+            t.leaf(wk.clone()),
+            t.leaf(wv.clone()),
+            t.leaf(wo.clone()),
+        );
+        let attn = attention(
+            &mut t, xn, cwq, cwk, cwv, cwo, seq, n_embd, n_head, n_kv_head, head_dim, theta,
+        );
+        let h1 = t.add(h, attn);
+        let f_n = t.leaf(ffn_norm.clone());
+        let hn = t.rmsnorm(h1, f_n, seq, n_embd, eps);
+        let (cwg, cwu, cwd) = (t.leaf(wg.clone()), t.leaf(wu.clone()), t.leaf(wd.clone()));
+        let cg = t.dense_matmul(hn, cwg, seq, ff, n_embd);
+        let cu = t.dense_matmul(hn, cwu, seq, ff, n_embd);
+        let cga = t.silu(cg);
+        let cgated = t.mul(cga, cu);
+        let cdown = t.dense_matmul(cgated, cwd, seq, n_embd, ff);
+        let cout = t.add(h1, cdown);
+        let clc = t.leaf(cot.clone());
+        let closs = t.dense_matmul(cout, clc, 1, 1, seq * n_embd);
+        let cpu_out = t.value(cout).to_vec();
+        let cgrads = t.backward(closs);
+
+        // ── Device tape ──
+        let ones_max = n_embd.max(ff).max(qd);
+        let mut dt = DeviceTape::new(&backend, ones_max).unwrap();
+        let dh = dt.leaf(&hidden).unwrap();
+        let dan = dt.leaf(&attn_norm).unwrap();
+        let dxn = dt.rmsnorm(dh, dan, seq, n_embd, eps).unwrap();
+        let (dwq, dwk, dwv, dwo) = (
+            dt.leaf(&wq).unwrap(),
+            dt.leaf(&wk).unwrap(),
+            dt.leaf(&wv).unwrap(),
+            dt.leaf(&wo).unwrap(),
+        );
+        let dattn = dt
+            .attention(
+                dxn, dwq, dwk, dwv, dwo, seq, n_embd, n_head, n_kv_head, head_dim, theta,
+            )
+            .unwrap();
+        let dh1 = dt.add(dh, dattn).unwrap();
+        let dfn = dt.leaf(&ffn_norm).unwrap();
+        let dhn = dt.rmsnorm(dh1, dfn, seq, n_embd, eps).unwrap();
+        let (dwg, dwu, dwd) = (
+            dt.leaf(&wg).unwrap(),
+            dt.leaf(&wu).unwrap(),
+            dt.leaf(&wd).unwrap(),
+        );
+        let dg = dt.matmul(dhn, dwg, seq, ff, n_embd).unwrap();
+        let du = dt.matmul(dhn, dwu, seq, ff, n_embd).unwrap();
+        let dga = dt.silu(dg).unwrap();
+        let dgated = dt.mul(dga, du).unwrap();
+        let ddown = dt.matmul(dgated, dwd, seq, n_embd, ff).unwrap();
+        let dout = dt.add(dh1, ddown).unwrap();
+        let dev_out = dt.value(dout).unwrap();
+        // L = Σ out·cot ⇒ dL/dout = cot; seed the block output's grad and backprop.
+        let seed = backend.dev_upload(&cot).unwrap();
+        let grads = dt.backward(dout, &seed).unwrap();
+
+        let dl = |g: &CudaSlice<f32>, n: usize| {
+            let mut hbuf = vec![0.0f32; n];
+            backend.dev_download(g, &mut hbuf).unwrap();
+            hbuf
+        };
+        let rel = |dev: &[f32], cpu: &[f32]| {
+            let range = cpu.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                - cpu.iter().copied().fold(f32::INFINITY, f32::min);
+            max_abs_diff(dev, cpu) / range.max(1e-6)
+        };
+        let mut worst = rel(&dev_out, &cpu_out);
+        let mut wn = "out";
+        let mut ck = |dev: &[f32],
+                      cpu: &[f32],
+                      name: &'static str,
+                      worst: &mut f32,
+                      wn: &mut &'static str| {
+            let r = rel(dev, cpu);
+            if r > *worst {
+                *worst = r;
+                *wn = name;
+            }
+        };
+        ck(
+            &dl(&grads[dh], seq * n_embd),
+            &cgrads[h],
+            "hidden",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dan], n_embd),
+            &cgrads[a_n],
+            "attn_norm",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dfn], n_embd),
+            &cgrads[f_n],
+            "ffn_norm",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dwq], qd * n_embd),
+            &cgrads[cwq],
+            "wq",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dwk], kvd * n_embd),
+            &cgrads[cwk],
+            "wk",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dwv], kvd * n_embd),
+            &cgrads[cwv],
+            "wv",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dwo], n_embd * qd),
+            &cgrads[cwo],
+            "wo",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dwg], ff * n_embd),
+            &cgrads[cwg],
+            "wg",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dwu], ff * n_embd),
+            &cgrads[cwu],
+            "wu",
+            &mut worst,
+            &mut wn,
+        );
+        ck(
+            &dl(&grads[dwd], n_embd * ff),
+            &cgrads[cwd],
+            "wd",
+            &mut worst,
+            &mut wn,
+        );
+        assert!(
+            worst < 1e-4,
+            "transformer block worst grad rel {worst:.3e} at {wn}"
+        );
+        eprintln!(
+            "0043 P2.5b DeviceTape transformer block (GQA n_head={n_head} n_kv={n_kv_head} \
+             head_dim={head_dim} seq={seq} n_embd={n_embd} ff={ff}): full attention+MLP fwd+bwd \
+             matches CPU tape (worst grad rel {worst:.2e} at {wn})"
         );
     }
 

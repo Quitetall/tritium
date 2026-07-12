@@ -247,6 +247,16 @@ extern "C" __global__ void rmsnorm_train_grad_w(
 // (mask, slice, insert, transpose, gather) are BIT-EXACT; softmax/xent (expf/logf) and RoPE
 // (sin/cos) are device==CPU within 1e-4.
 
+// Multiply by a constant scalar: y[i] = x[i]·c (attention's 1/sqrt(head_dim); its own vjp form,
+// gx = gy·c). ops::* scale_const. Bit-exact (single multiply, --fmad=false).
+extern "C" __global__ void scale_const(
+    const float* __restrict__ x, float* __restrict__ y, float c, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = x[i] * c;
+}
+
 // Row softmax forward — one thread per row (stable: subtract row max). ops::softmax::forward.
 extern "C" __global__ void softmax_forward(
     const float* __restrict__ x, float* __restrict__ y, int rows, int cols)
