@@ -533,6 +533,154 @@ mod tests {
         assert!(max_abs_diff(&gpu.g_s2, &cpu.g_s2) <= tol, "g_s2 mismatch");
     }
 
+    /// Gate (plan 0043 P2.1): a device-**resident** 2-matmul chain (fwd + bwd) matches the CPU
+    /// `tritium-train` tape BIT-EXACTLY, and eliminates the per-op host↔device round-trips. Unlike
+    /// Phase 1 (each matmul htod→launch→dtoh), the activations `h`, `y` and the backprop grad `gh`
+    /// live in VRAM across the whole step — uploaded once (leaves), downloaded once (results). This
+    /// is the foundational proof of the device-resident execution model; the glue ops (rmsnorm,
+    /// silu, …) chain onto the same buffers in later increments.
+    #[test]
+    fn resident_matmul_chain_matches_cpu_tape() {
+        use std::time::Instant;
+
+        use tritium_train::Tape;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping resident_matmul_chain_matches_cpu_tape: no CUDA device ({e})");
+                return;
+            }
+        };
+        // Non-trivial sizes so the matmuls dominate and residency (no round-trips) actually shows.
+        let (m, k0, n1, n2) = (64usize, 512usize, 1024usize, 512usize);
+        let x = seeded_uniform(0x1111, m * k0, -1.0, 1.0);
+        let w1 = seeded_uniform(0x2222, n1 * k0, -0.5, 0.5);
+        let w2 = seeded_uniform(0x3333, n2 * n1, -0.5, 0.5);
+        let cot = seeded_uniform(0x4444, m * n2, -1.0, 1.0); // upstream cotangent: L = Σ y·cot
+
+        // ── CPU reference: the same chain on the tritium-train tape ──
+        let mut t = Tape::new();
+        let xid = t.leaf(x.clone());
+        let w1id = t.leaf(w1.clone());
+        let w2id = t.leaf(w2.clone());
+        let hid = t.dense_matmul(xid, w1id, m, n1, k0); // [m, n1]
+        let yid = t.dense_matmul(hid, w2id, m, n2, n1); // [m, n2]
+        let cid = t.leaf(cot.clone());
+        let loss = t.dense_matmul(yid, cid, 1, 1, m * n2); // Σ y·cot ⇒ dL/dy = cot
+        let cpu_y = t.value(yid).to_vec();
+        let grads = t.backward(loss);
+        let (cpu_gx, cpu_gw1, cpu_gw2) =
+            (grads[xid].clone(), grads[w1id].clone(), grads[w2id].clone());
+
+        // ── Device-resident: upload leaves once, chain on-device, download results once ──
+        let shape1 = GemmShape { m, n: n1, k: k0 };
+        let shape2 = GemmShape { m, n: n2, k: n1 };
+        let ones = vec![1.0f32; n1.max(n2)]; // s = 1 (fp dense); one buffer serves both matmuls
+        let resident_step = || -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+            let d_x = backend.dev_upload(&x).unwrap();
+            let d_w1 = backend.dev_upload(&w1).unwrap();
+            let d_w2 = backend.dev_upload(&w2).unwrap();
+            let d_ones = backend.dev_upload(&ones).unwrap();
+            // forward — h and y stay resident
+            let mut d_h = backend.dev_alloc_zeros(m * n1).unwrap();
+            backend
+                .matmul_forward_dev(&d_x, &d_w1, &d_ones, shape1, &mut d_h)
+                .unwrap();
+            let mut d_y = backend.dev_alloc_zeros(m * n2).unwrap();
+            backend
+                .matmul_forward_dev(&d_h, &d_w2, &d_ones, shape2, &mut d_y)
+                .unwrap();
+            // backward — gy2 = cot; gh stays resident between the two layers' grads
+            let d_gy2 = backend.dev_upload(&cot).unwrap();
+            let mut d_gw2 = backend.dev_alloc_zeros(n2 * n1).unwrap();
+            backend
+                .grad_w_dev(&d_gy2, &d_h, &d_ones, shape2, &mut d_gw2)
+                .unwrap();
+            let mut d_gh = backend.dev_alloc_zeros(m * n1).unwrap();
+            backend
+                .grad_a_dev(&d_gy2, &d_w2, &d_ones, shape2, &mut d_gh)
+                .unwrap();
+            let mut d_gw1 = backend.dev_alloc_zeros(n1 * k0).unwrap();
+            backend
+                .grad_w_dev(&d_gh, &d_x, &d_ones, shape1, &mut d_gw1)
+                .unwrap();
+            let mut d_gx = backend.dev_alloc_zeros(m * k0).unwrap();
+            backend
+                .grad_a_dev(&d_gh, &d_w1, &d_ones, shape1, &mut d_gx)
+                .unwrap();
+            let (mut y, mut gx, mut gw1, mut gw2) = (
+                vec![0.0f32; m * n2],
+                vec![0.0f32; m * k0],
+                vec![0.0f32; n1 * k0],
+                vec![0.0f32; n2 * n1],
+            );
+            backend.dev_download(&d_y, &mut y).unwrap();
+            backend.dev_download(&d_gx, &mut gx).unwrap();
+            backend.dev_download(&d_gw1, &mut gw1).unwrap();
+            backend.dev_download(&d_gw2, &mut gw2).unwrap();
+            (y, gx, gw1, gw2)
+        };
+        let (dev_y, dev_gx, dev_gw1, dev_gw2) = resident_step();
+
+        // ── Bit-exact gate ──
+        assert_eq!(max_abs_diff(&dev_y, &cpu_y), 0.0, "forward y not bit-exact");
+        assert_eq!(max_abs_diff(&dev_gx, &cpu_gx), 0.0, "grad x not bit-exact");
+        assert_eq!(
+            max_abs_diff(&dev_gw1, &cpu_gw1),
+            0.0,
+            "grad w1 not bit-exact"
+        );
+        assert_eq!(
+            max_abs_diff(&dev_gw2, &cpu_gw2),
+            0.0,
+            "grad w2 not bit-exact"
+        );
+
+        // ── Bench: resident vs host-orchestrated (the same chain via the Phase-1 htod/dtoh methods) ──
+        // (The host-slice methods require `s.len() == n` exactly, so slice `ones` per shape.)
+        let (ones1, ones2) = (&ones[..n1], &ones[..n2]);
+        let host_orch_step = || {
+            let mut h = vec![0.0f32; m * n1];
+            backend
+                .train_forward(&x, &w1, ones1, shape1, &mut h)
+                .unwrap();
+            let mut y = vec![0.0f32; m * n2];
+            backend
+                .train_forward(&h, &w2, ones2, shape2, &mut y)
+                .unwrap();
+            let mut gw2 = vec![0.0f32; n2 * n1];
+            backend.grad_w(&cot, &h, ones2, shape2, &mut gw2).unwrap();
+            let mut gh = vec![0.0f32; m * n1];
+            backend.grad_a(&cot, &w2, ones2, shape2, &mut gh).unwrap();
+            let mut gw1 = vec![0.0f32; n1 * k0];
+            backend.grad_w(&gh, &x, ones1, shape1, &mut gw1).unwrap();
+            let mut gx = vec![0.0f32; m * k0];
+            backend.grad_a(&gh, &w1, ones1, shape1, &mut gx).unwrap();
+        };
+        let iters = 50;
+        for _ in 0..5 {
+            resident_step();
+            host_orch_step();
+        } // warm up
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            resident_step();
+        }
+        let resident_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            host_orch_step();
+        }
+        let host_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "0043 P2.1 resident matmul chain (m={m} k0={k0} n1={n1} n2={n2}): BIT-EXACT vs CPU tape. \
+             fwd+bwd step: resident {resident_ms:.3}ms | host-orchestrated {host_ms:.3}ms \
+             ({:.2}× fewer round-trips)",
+            host_ms / resident_ms.max(1e-9)
+        );
+    }
+
     /// Gate: the from-scratch tiny model's loss falls well below its start over the step budget,
     /// with no non-finite loss along the way.
     #[test]

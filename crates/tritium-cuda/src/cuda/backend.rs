@@ -628,6 +628,188 @@ impl CudaBackend {
         Ok(())
     }
 
+    // ───────────────────────── device-resident training (plan 0043 P2) ─────────────────────────
+    // The methods above round-trip host↔device per call (Phase 1). For the device-resident tape,
+    // activations and gradients live in VRAM across the whole fwd+bwd step: upload the leaves ONCE,
+    // chain the kernels below on the resident buffers (no per-op copies), download only the final
+    // result. Each kernel is the SAME `train_grad.cu` code as its host-slice sibling, so the resident
+    // path stays bit-exact vs the CPU tape.
+
+    /// Upload a host slice to a resident device buffer (htod). Leaves of the device tape.
+    ///
+    /// # Errors
+    /// Device failures via the cudarc mapping.
+    // Test-exercised (`resident_matmul_chain_matches_cpu_tape`) until the `DeviceTape` wires these
+    // resident primitives into the full model forward+backward (plan 0043 P2.5).
+    #[allow(dead_code)]
+    pub(crate) fn dev_upload(&self, host: &[f32]) -> Result<CudaSlice<f32>, BackendError> {
+        self.stream
+            .clone_htod(host)
+            .map_err(|e| driver_err("dev_upload htod", &e))
+    }
+
+    /// Allocate a zeroed resident device buffer of `n` f32 (fresh activation / grad accumulator).
+    ///
+    /// # Errors
+    /// Device failures via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn dev_alloc_zeros(&self, n: usize) -> Result<CudaSlice<f32>, BackendError> {
+        self.stream
+            .alloc_zeros::<f32>(n)
+            .map_err(|e| driver_err("dev_alloc_zeros", &e))
+    }
+
+    /// Download a resident device buffer to host (dtoh). The single copy at the end of the step.
+    ///
+    /// # Errors
+    /// Device failures via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn dev_download(
+        &self,
+        d: &CudaSlice<f32>,
+        out: &mut [f32],
+    ) -> Result<(), BackendError> {
+        self.stream
+            .memcpy_dtoh(d, out)
+            .map_err(|e| driver_err("dev_download dtoh", &e))
+    }
+
+    /// `Y[m,n] = s[n]·Σ_k A[m,k]·W[n,k]` on ALREADY-RESIDENT buffers — the device-resident companion
+    /// to [`train_forward`](Self::train_forward): same kernel, same `--fmad=false` sequential
+    /// reduction, no htod/dtoh. `d_y` must be preallocated `m*n` (e.g. via [`dev_alloc_zeros`]).
+    ///
+    /// # Errors
+    /// [`BackendError`] on launch-bound violation or device failure.
+    #[allow(dead_code)]
+    pub(crate) fn matmul_forward_dev(
+        &self,
+        d_a: &CudaSlice<f32>,
+        d_w: &CudaSlice<f32>,
+        d_s: &CudaSlice<f32>,
+        shape: GemmShape,
+        d_y: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        Self::check_grad_launch_bounds(m, n, k)?;
+        if m * n == 0 || k == 0 {
+            return Ok(()); // k==0 ⇒ Y = s·0 = 0, and d_y is caller-zeroed.
+        }
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        let threads = THREADS_PER_BLOCK;
+        let cfg = LaunchConfig {
+            grid_dim: (((m * n) as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_train_forward);
+        launch
+            .arg(d_a)
+            .arg(d_w)
+            .arg(d_s)
+            .arg(d_y)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        // SAFETY: same signature/contract as `train_forward`, on resident buffers.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch matmul_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// `gA[m,k] = Σ_n gy[m,n]·s[n]·W[n,k]` on resident buffers (device-resident companion to
+    /// [`grad_a`](Self::grad_a)). `d_ga` preallocated `m*k`; the kernel writes every element.
+    ///
+    /// # Errors
+    /// [`BackendError`] on launch-bound violation or device failure.
+    #[allow(dead_code)]
+    pub(crate) fn grad_a_dev(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        d_w: &CudaSlice<f32>,
+        d_s: &CudaSlice<f32>,
+        shape: GemmShape,
+        d_ga: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        Self::check_grad_launch_bounds(m, n, k)?;
+        if m * k == 0 {
+            return Ok(());
+        }
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        let threads = THREADS_PER_BLOCK;
+        let cfg = LaunchConfig {
+            grid_dim: (((m * k) as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_grad_a);
+        launch
+            .arg(d_gy)
+            .arg(d_w)
+            .arg(d_s)
+            .arg(d_ga)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        // SAFETY: same signature/contract as `grad_a`, on resident buffers.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch grad_a_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// `gW[n,k] = Σ_m gy[m,n]·s[n]·A[m,k]` on resident buffers (device-resident companion to
+    /// [`grad_w`](Self::grad_w)). `d_gw` preallocated `n*k`; the kernel writes every element.
+    ///
+    /// # Errors
+    /// [`BackendError`] on launch-bound violation or device failure.
+    #[allow(dead_code)]
+    pub(crate) fn grad_w_dev(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        d_a: &CudaSlice<f32>,
+        d_s: &CudaSlice<f32>,
+        shape: GemmShape,
+        d_gw: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        Self::check_grad_launch_bounds(m, n, k)?;
+        if n * k == 0 {
+            return Ok(());
+        }
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        let threads = THREADS_PER_BLOCK;
+        let cfg = LaunchConfig {
+            grid_dim: (((n * k) as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_grad_w);
+        launch
+            .arg(d_gy)
+            .arg(d_a)
+            .arg(d_s)
+            .arg(d_gw)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        // SAFETY: same signature/contract as `grad_w`, on resident buffers.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch grad_w_dev", &e))?;
+        }
+        Ok(())
+    }
+
     /// Device RMSNorm on host slices (htod → launch → dtoh), **bit-matching**
     /// `tritium_nn::ops::rmsnorm`. A building block for the v0.3.1 device-resident
     /// forward (which calls the same kernel on already-resident buffers, no copies)
