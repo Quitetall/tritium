@@ -834,6 +834,8 @@ async fn metrics(State(st): State<AppState>) -> Response {
 //                                                        → {"committed":[...]}
 //
 // One session at a time (the worker owns one model); a chat completion invalidates
+// it — in batched mode (`--batch-slots > 1`, C4) the same contract reads: a chat
+// ADMISSION closes the session while already-running chat streams coexist with
 // it. Node 0 of every verify tree must be the current pending token; the new
 // pending token is the last committed element. Backends without the CUDA
 // device-resident decoder answer 501.

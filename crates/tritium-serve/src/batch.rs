@@ -28,6 +28,16 @@
 //! (validation failures, tree ops) wait out the remaining chunks — bounded by
 //! one prompt's chunked prefill.
 //!
+//! **Tree-session coexistence (C4)**: the BASTION tree endpoints work with
+//! `--batch-slots > 1`. A session open is a prompt prefill through the SAME
+//! chunk machine admissions use (interleaved, never stalling live slots);
+//! verifies run inline between batch steps as bounded ops. The session owns
+//! the single-sequence KV with the single-worker contract verbatim: any chat
+//! ADMISSION resets the runner and closes the session (the next verify gets
+//! 409 Conflict; the drafter re-opens). Recorded follow-up (not v1): sessions
+//! that SURVIVE admissions by leasing a slot's paged region — requires the
+//! tree kernel stack parametrized over KV regions.
+//!
 //! **Paged KV (batching P2, C3, ADR 0025)**: with `--kv-pool-tokens N`, the
 //! per-slot dense arenas are replaced by a shared page pool. Admission
 //! reserves `prompt + max_tokens` up front (never outgrown — the v1
@@ -66,18 +76,67 @@ fn prefill_chunk() -> Result<usize, String> {
     }
 }
 
-/// An admission mid-prefill: `done` prompt tokens are already in the runner's
-/// single-sequence KV; the reserved pool row stays `None` until adoption (no
-/// other admission can take it — admission is gated on `pending.is_none()`).
+/// A prompt being chunk-prefilled through the runner's single-sequence KV;
+/// `done` tokens are already in. At most one exists (admission is gated on
+/// `pending.is_none()`), so the goal's resources can't be double-booked.
 struct Pending {
-    tx: mpsc::Sender<GenEvent>,
-    req: GenRequest,
-    /// Token budget after context clamping (validated at admission).
-    max_new: usize,
-    /// The pool row this request will occupy once adopted.
-    row: usize,
     /// Prompt tokens already prefilled.
     done: usize,
+    goal: PendingGoal,
+}
+
+/// What a completed prefill turns into (C4: the chunk machine serves both
+/// chat admissions and BASTION tree-session opens).
+enum PendingGoal {
+    /// A chat admission: adopt into `row` and activate.
+    Admit {
+        tx: mpsc::Sender<GenEvent>,
+        req: GenRequest,
+        /// Token budget after context clamping (validated at admission).
+        max_new: usize,
+        /// The pool row this request will occupy once adopted.
+        row: usize,
+    },
+    /// A tree-session open (ADR 0014): reply the prefill's greedy root; the
+    /// session then OWNS the single-sequence KV until the next admission
+    /// resets it (the single-worker contract — "a chat completion closes
+    /// it" — verbatim in batched mode).
+    TreeOpen {
+        prompt: Vec<u32>,
+        resp: tokio::sync::oneshot::Sender<Result<u32, crate::generator::TreeOpError>>,
+    },
+}
+
+impl Pending {
+    fn prompt(&self) -> &[u32] {
+        match &self.goal {
+            PendingGoal::Admit { req, .. } => &req.prompt_tokens,
+            PendingGoal::TreeOpen { prompt, .. } => prompt,
+        }
+    }
+    fn client_gone(&self) -> bool {
+        match &self.goal {
+            PendingGoal::Admit { tx, .. } => tx.is_closed(),
+            PendingGoal::TreeOpen { resp, .. } => resp.is_closed(),
+        }
+    }
+    /// The reserved pool row (pages to release on abandonment), if any.
+    fn row(&self) -> Option<usize> {
+        match &self.goal {
+            PendingGoal::Admit { row, .. } => Some(*row),
+            PendingGoal::TreeOpen { .. } => None,
+        }
+    }
+    fn fail(self, msg: String) {
+        match self.goal {
+            PendingGoal::Admit { tx, .. } => {
+                let _ = tx.try_send(GenEvent::Error(msg));
+            }
+            PendingGoal::TreeOpen { resp, .. } => {
+                let _ = resp.send(Err(crate::generator::TreeOpError::Internal(msg)));
+            }
+        }
+    }
 }
 
 /// One live request occupying a slot.
@@ -216,6 +275,11 @@ pub(crate) fn run_batched(
     // A job that validated but found the page pool exhausted: retried before
     // pulling new work (FIFO), admitted once retirements free pages.
     let mut parked: Option<Job> = None;
+    // C4: a BASTION tree session owns the runner's single-sequence KV. The
+    // single-worker contract carries over verbatim: any chat admission
+    // resets the runner and closes the session (clients see Conflict on the
+    // next verify and re-open).
+    let mut tree_open = false;
     let chunk = match prefill_chunk() {
         Ok(c) => c,
         Err(e) => {
@@ -238,9 +302,13 @@ pub(crate) fn run_batched(
                 }
             }
             if let Some(p) = pending.take() {
-                let _ = p.tx.try_send(GenEvent::Error("server draining".into()));
-                release_slot(&mut batch, p.row);
+                let row = p.row();
+                p.fail("server draining".into());
+                if let Some(row) = row {
+                    release_slot(&mut batch, row);
+                }
             }
+            tree_open = false;
             if let Some(Job::Generate { tx, .. }) = parked.take() {
                 let _ = tx.try_send(GenEvent::Error("server draining".into()));
             }
@@ -259,31 +327,30 @@ pub(crate) fn run_batched(
             }
             let free = pool.iter().position(Option::is_none);
             let any_live = pool.iter().any(Option::is_some);
-            // A parked (pool-exhausted) job is retried before pulling new
-            // work — FIFO — but only once a slot row is free to take (a full
-            // pool must NOT take it: the row-pick below would break and drop
-            // the job). If it parks again below, admission breaks, so this
-            // cannot spin.
-            let job = if free.is_some() && parked.is_some() {
-                parked.take().expect("checked is_some")
-            } else {
+            // A parked (seat- or page-starved) Generate is retried before
+            // pulling new work — FIFO, nothing leapfrogs it. If it parks
+            // again below, admission breaks, so this cannot spin.
+            let job = if parked.is_some() {
                 match free {
-                    None => break,
-                    Some(_) if any_live => match job_rx.try_recv() {
-                        Ok(j) => j,
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return,
-                    },
-                    Some(_) => match job_rx.blocking_recv() {
-                        Some(j) => j,
-                        None => return,
-                    },
+                    None => break, // still no seat; wait for a retirement
+                    Some(_) => parked.take().expect("checked is_some"),
+                }
+            } else if any_live {
+                // C4: pull even when the pool is FULL — tree ops need no
+                // seat, and a seatless Generate parks below instead of
+                // gating the whole queue on slot availability.
+                match job_rx.try_recv() {
+                    Ok(j) => j,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                }
+            } else {
+                match job_rx.blocking_recv() {
+                    Some(j) => j,
+                    None => return,
                 }
             };
             admissions += 1;
-            let Some(row) = pool.iter().position(Option::is_none) else {
-                break; // defensive: no free slot
-            };
             // Jobs already queued when the drain started get errored BEFORE
             // paying their prefill (the router 503s new ones; this covers the
             // in-queue backlog).
@@ -317,6 +384,13 @@ pub(crate) fn run_batched(
                         let _ = tx.try_send(GenEvent::Done(FinishReason::Length));
                         continue;
                     }
+                    // Seat the request; a full pool parks it (FIFO — nothing
+                    // is pulled past a parked job; it is retried as soon as a
+                    // retirement frees a slot).
+                    let Some(row) = pool.iter().position(Option::is_none) else {
+                        parked = Some(Job::Generate { req, tx });
+                        break;
+                    };
                     // Paged KV (C3): reserve the request's whole footprint up
                     // front (v1 no-eviction policy — it can never be outgrown
                     // mid-decode). A request that can NEVER fit is a loud
@@ -346,27 +420,70 @@ pub(crate) fn run_batched(
                     }
                     // Admission (C1): park the job as the one in-flight
                     // chunked prefill. Reset starts a fresh single-sequence
-                    // KV; the chunks below accumulate into it.
+                    // KV; the chunks below accumulate into it — and closes
+                    // any open tree session (the single-worker contract).
                     runner.reset();
+                    tree_open = false;
                     pending = Some(Pending {
-                        tx,
-                        req,
-                        max_new,
-                        row,
                         done: 0,
+                        goal: PendingGoal::Admit {
+                            tx,
+                            req,
+                            max_new,
+                            row,
+                        },
                     });
                 }
-                // Tree/spec sessions need exclusive ownership of the model's
-                // single-sequence KV — incompatible with a live slot pool.
-                Job::OpenTreeSession { resp, .. } => {
-                    let _ = resp.send(Err(crate::generator::TreeOpError::Unsupported(
-                        "tree sessions are unavailable with --batch-slots > 1".into(),
-                    )));
+                // C4: a tree-session open is a prompt prefill on the
+                // single-sequence KV — the same resource + chunk machine the
+                // admissions use, so it interleaves with live slots instead
+                // of stalling them.
+                Job::OpenTreeSession { prompt, resp } => {
+                    if prompt.is_empty() || prompt.len() >= n_ctx {
+                        let _ = resp.send(Err(crate::generator::TreeOpError::BadRequest(
+                            "prompt is empty or exceeds the model context window".into(),
+                        )));
+                        continue;
+                    }
+                    runner.reset();
+                    tree_open = false;
+                    pending = Some(Pending {
+                        done: 0,
+                        goal: PendingGoal::TreeOpen { prompt, resp },
+                    });
                 }
-                Job::TreeVerify { resp, .. } => {
-                    let _ = resp.send(Err(crate::generator::TreeOpError::Unsupported(
-                        "tree verify is unavailable with --batch-slots > 1".into(),
-                    )));
+                // C4: verifies are bounded single ops against the open
+                // session's KV, run inline between batch steps. Ordering
+                // makes stale verifies impossible: this arm only runs when
+                // no prefill is in flight, and any admission since the open
+                // flipped `tree_open` off.
+                Job::TreeVerify {
+                    tokens,
+                    parents,
+                    resp,
+                } => {
+                    if !tree_open {
+                        let _ = resp.send(Err(crate::generator::TreeOpError::Conflict(
+                            "no open tree session (open one with /v1/tree/session; a chat \
+                             completion closes it)"
+                                .into(),
+                        )));
+                        continue;
+                    }
+                    let out = runner.tree_verify_greedy(&tokens, &parents).map_err(|e| {
+                        match e {
+                            tritium_nn::ResidentOpError::Unavailable => {
+                                crate::generator::TreeOpError::Unsupported(
+                                    "tree-verify needs the CUDA device-resident decoder".into(),
+                                )
+                            }
+                            tritium_nn::ResidentOpError::Op(
+                                tritium_spec::BackendError::InvalidInput(m),
+                            ) => crate::generator::TreeOpError::BadRequest(m),
+                            other => crate::generator::TreeOpError::Internal(other.to_string()),
+                        }
+                    });
+                    let _ = resp.send(out);
                 }
             }
         }
@@ -377,71 +494,104 @@ pub(crate) fn run_batched(
         // (admission is skipped while `pending` is set, the step below while
         // the pool is empty).
         if let Some(p) = pending.as_mut() {
-            if p.tx.is_closed() {
+            if p.client_gone() {
                 // Client gone mid-prefill: abandon the remaining chunks (and
-                // free the reserved pages). The partial single-sequence KV is
+                // free any reserved pages). The partial single-sequence KV is
                 // dead weight until the next admission's reset.
-                let row = p.row;
+                let row = p.row();
                 pending = None;
-                release_slot(&mut batch, row);
+                if let Some(row) = row {
+                    release_slot(&mut batch, row);
+                }
             } else {
-                let len = p.req.prompt_tokens.len();
+                let len = p.prompt().len();
                 let end = (p.done + chunk).min(len);
                 let positions: Vec<usize> = (p.done..end).collect();
-                match runner.forward(&p.req.prompt_tokens[p.done..end], &positions) {
+                let chunk_tokens: Vec<u32> = p.prompt()[p.done..end].to_vec();
+                match runner.forward(&chunk_tokens, &positions) {
                     Err(e) => {
                         let p = pending.take().expect("pending checked above");
-                        let _ = p.tx.try_send(GenEvent::Error(e.to_string()));
-                        release_slot(&mut batch, p.row);
+                        let row = p.row();
+                        p.fail(e.to_string());
+                        if let Some(row) = row {
+                            release_slot(&mut batch, row);
+                        }
                     }
                     Ok(logits) => {
                         p.done = end;
                         if p.done == len {
-                            // Prompt complete: adopt the KV rows into the
-                            // reserved slot and activate. `logits` is the last
-                            // token's — bit-identical to a monolithic prefill's
-                            // (chunking preserves the per-row order), so the
-                            // first sampled token keeps the single-sequence
-                            // guarantee the G1 gate pins.
                             let p = pending.take().expect("pending checked above");
-                            let adopt = (|| -> Result<(), String> {
-                                runner
-                                    .adopt_into_batch_row(&mut batch, p.row, len)
-                                    .map_err(|e| e.to_string())?;
-                                batch.set_position(p.row, len).map_err(|e| e.to_string())
-                            })();
-                            if let Err(e) = adopt {
-                                let _ = p.tx.try_send(GenEvent::Error(e));
-                                release_slot(&mut batch, p.row);
-                            } else {
-                                let mut active = Active {
-                                    tx: p.tx,
-                                    logprobs: p.req.logprobs,
-                                    stop_eos: p.req.stop_eos,
-                                    remaining: p.max_new,
-                                    last_token: 0,
-                                    salt: 0,
-                                    sampling: p.req.sampling,
-                                };
-                                active.salt += 1;
-                                let mut adopted = false;
-                                if let Some(first) = sample(
-                                    &logits,
-                                    &active.sampling,
-                                    (req_seed(&active.sampling), active.salt),
-                                ) {
-                                    active.last_token = first;
-                                    if emit(&mut active, first, eos, &logits) {
-                                        pool[p.row] = Some(active);
-                                        adopted = true;
+                            match p.goal {
+                                // Prompt complete: adopt the KV rows into the
+                                // reserved slot and activate. `logits` is the
+                                // last token's — bit-identical to a monolithic
+                                // prefill's (chunking preserves the per-row
+                                // order), so the first sampled token keeps the
+                                // single-sequence guarantee the G1 gate pins.
+                                PendingGoal::Admit {
+                                    tx,
+                                    req,
+                                    max_new,
+                                    row,
+                                } => {
+                                    let adopt = (|| -> Result<(), String> {
+                                        runner
+                                            .adopt_into_batch_row(&mut batch, row, len)
+                                            .map_err(|e| e.to_string())?;
+                                        batch.set_position(row, len).map_err(|e| e.to_string())
+                                    })();
+                                    if let Err(e) = adopt {
+                                        let _ = tx.try_send(GenEvent::Error(e));
+                                        release_slot(&mut batch, row);
+                                    } else {
+                                        let mut active = Active {
+                                            tx,
+                                            logprobs: req.logprobs,
+                                            stop_eos: req.stop_eos,
+                                            remaining: max_new,
+                                            last_token: 0,
+                                            salt: 0,
+                                            sampling: req.sampling,
+                                        };
+                                        active.salt += 1;
+                                        let mut adopted = false;
+                                        if let Some(first) = sample(
+                                            &logits,
+                                            &active.sampling,
+                                            (req_seed(&active.sampling), active.salt),
+                                        ) {
+                                            active.last_token = first;
+                                            if emit(&mut active, first, eos, &logits) {
+                                                pool[row] = Some(active);
+                                                adopted = true;
+                                            }
+                                        } else {
+                                            let _ = active
+                                                .tx
+                                                .try_send(GenEvent::Error("empty logits".into()));
+                                        }
+                                        if !adopted {
+                                            release_slot(&mut batch, row);
+                                        }
                                     }
-                                } else {
-                                    let _ = active
-                                        .tx
-                                        .try_send(GenEvent::Error("empty logits".into()));
                                 }
-                                if !adopted {
-                                    release_slot(&mut batch, p.row);
+                                // Session open complete: the greedy root goes
+                                // back; the session now owns the single-seq
+                                // KV (until the next admission resets it).
+                                PendingGoal::TreeOpen { resp, .. } => {
+                                    match tritium_nn::sample_greedy(&logits) {
+                                        Some(root) => {
+                                            tree_open = true;
+                                            let _ = resp.send(Ok(root));
+                                        }
+                                        None => {
+                                            let _ = resp.send(Err(
+                                                crate::generator::TreeOpError::Internal(
+                                                    "empty logits from prefill".into(),
+                                                ),
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }

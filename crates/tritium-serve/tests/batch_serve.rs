@@ -210,6 +210,245 @@ async fn cuda_batched_serve_matches_single_sequence_greedy() {
     }
 }
 
+async fn tree_post(
+    router: &Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::post(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let resp = router.clone().oneshot(req).await.expect("send");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+/// C4 gate — BASTION tree sessions coexist with the batch pool.
+///
+/// (a) Losslessness: open + two chained verifies on the batched server must
+///     return EXACTLY what the single-worker server returns (same model, same
+///     tree ops on the single-sequence KV — the mode must not change one
+///     committed token).
+/// (b) Coexistence: the same session ops succeed WHILE a chat stream decodes
+///     in a slot, return the same tokens, and the chat stream is unaffected.
+/// (c) The single-worker contract carries over: a chat ADMISSION closes the
+///     session — the next verify gets 409 Conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn cuda_batched_tree_session_coexists() {
+    if !Path::new(GGUF_PATH).exists() {
+        eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(REF_PATH).expect("read reference"))
+            .expect("parse reference");
+    let base: Vec<u32> = reference["token_ids"]
+        .as_array()
+        .expect("token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id") as u32)
+        .collect();
+    let bytes = std::fs::read(GGUF_PATH).expect("read gguf");
+    let session_prompt: Vec<u32> = base.iter().cycle().take(16).copied().collect();
+    let drafts: Vec<u32> = base.iter().cycle().skip(2).take(2).copied().collect();
+
+    // Two chained verify rounds against whatever router: open → verify
+    // [root, d1, d2] chain → verify again rooted at the last committed token.
+    // Returns (pending_token, committed_round1, committed_round2).
+    let session_rounds = |router: Router,
+                          prompt: Vec<u32>,
+                          drafts: Vec<u32>| async move {
+        let (st, v) = tree_post(
+            &router,
+            "/v1/tree/session",
+            serde_json::json!({ "prompt_tokens": prompt }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "session open failed: {v}");
+        let root = v["pending_token"].as_u64().expect("pending_token") as u32;
+        let mut rounds = Vec::new();
+        let mut cur_root = root;
+        for _ in 0..2 {
+            let tokens = vec![cur_root, drafts[0], drafts[1]];
+            let (st, v) = tree_post(
+                &router,
+                "/v1/tree/verify",
+                serde_json::json!({ "tokens": tokens, "parents": [-1, 0, 1] }),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "verify failed: {v}");
+            let committed: Vec<u32> = v["committed"]
+                .as_array()
+                .expect("committed")
+                .iter()
+                .map(|t| t.as_u64().expect("token") as u32)
+                .collect();
+            assert!(!committed.is_empty(), "verify must commit >= 1 token");
+            cur_root = *committed.last().expect("non-empty");
+            rounds.push(committed);
+        }
+        (root, rounds)
+    };
+
+    // (a) Single-worker reference.
+    let (single_root, single_rounds) = {
+        let runner = load_runner(&bytes).expect("runner");
+        let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+        let cfg = ServeConfig {
+            model_id: "tritium".into(),
+            queue_cap: 8,
+            max_new_default: 32,
+            ..ServeConfig::default()
+        };
+        let (router, _d) = tritium_serve::build_router(
+            Box::new(RunnerGenerator::new(runner, u32::MAX)),
+            tok,
+            cfg,
+        );
+        session_rounds(router, session_prompt.clone(), drafts.clone()).await
+    };
+
+    // Batched server, 2 slots.
+    let runner = load_runner(&bytes).expect("runner");
+    let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+    let cfg = ServeConfig {
+        model_id: "tritium".into(),
+        queue_cap: 8,
+        max_new_default: 128,
+        ..ServeConfig::default()
+    };
+    let (router, _draining) =
+        build_router_batched(runner, u32::MAX, 2, tok, cfg).expect("batched router");
+
+    // Warm the batch graph off the clock.
+    let _ = chat(&router, "128000 791", 2).await;
+
+    // (a) Idle-pool batched session == single-worker session, token for token.
+    let (b_root, b_rounds) =
+        session_rounds(router.clone(), session_prompt.clone(), drafts.clone()).await;
+    assert_eq!(b_root, single_root, "C4a: batched root != single-worker root");
+    assert_eq!(
+        b_rounds, single_rounds,
+        "C4a: batched committed tokens != single-worker (mode must be lossless)"
+    );
+
+    // (b) Same session ops WHILE a chat stream decodes in the other slot.
+    let a_ids = base
+        .iter()
+        .cycle()
+        .skip(1)
+        .take(16)
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (a_handle, a_times) = spawn_stream(&router, &a_ids, 96);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while a_times.lock().expect("lock").len() < 2 {
+        assert!(std::time::Instant::now() < deadline, "chat never streamed");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let (c_root, c_rounds) =
+        session_rounds(router.clone(), session_prompt.clone(), drafts.clone()).await;
+    assert_eq!(c_root, single_root, "C4b: root changed under coexistence");
+    assert_eq!(
+        c_rounds, single_rounds,
+        "C4b: committed tokens changed while a chat stream was live"
+    );
+    let a_before = a_times.lock().expect("lock").len();
+    a_handle.abort();
+    assert!(
+        a_before >= 2,
+        "C4b: chat stream stalled out during tree traffic"
+    );
+
+    // (a2) Force an ACCEPT so the promote/compact path runs (junk drafts
+    // degenerate to L=1 plain steps): round 1 told us the argmax after the
+    // root is single_rounds[0][0] — draft exactly that. Both modes must
+    // commit ≥2 tokens (accepted draft + bonus) and agree exactly.
+    let informed = vec![single_root, single_rounds[0][0], drafts[1]];
+    let accept_on = |router: Router, prompt: Vec<u32>, tokens: Vec<u32>| async move {
+        let (st, v) = tree_post(
+            &router,
+            "/v1/tree/session",
+            serde_json::json!({ "prompt_tokens": prompt }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "accept-round open failed: {v}");
+        let (st, v) = tree_post(
+            &router,
+            "/v1/tree/verify",
+            serde_json::json!({ "tokens": tokens, "parents": [-1, 0, 1] }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "accept-round verify failed: {v}");
+        v["committed"]
+            .as_array()
+            .expect("committed")
+            .iter()
+            .map(|t| t.as_u64().expect("token") as u32)
+            .collect::<Vec<u32>>()
+    };
+    let single_accept = {
+        let runner = load_runner(&bytes).expect("runner");
+        let tok = Arc::new(IdPassthroughTokenizer::new(128_000, u32::MAX));
+        let cfg = ServeConfig {
+            model_id: "tritium".into(),
+            queue_cap: 8,
+            max_new_default: 32,
+            ..ServeConfig::default()
+        };
+        let (r, _d) = tritium_serve::build_router(
+            Box::new(RunnerGenerator::new(runner, u32::MAX)),
+            tok,
+            cfg,
+        );
+        accept_on(r, session_prompt.clone(), informed.clone()).await
+    };
+    assert!(
+        single_accept.len() >= 2,
+        "informed draft must be accepted (committed {single_accept:?})"
+    );
+    let batched_accept = accept_on(router.clone(), session_prompt.clone(), informed).await;
+    assert_eq!(
+        batched_accept, single_accept,
+        "C4a2: accepted-path commit differs across modes"
+    );
+
+    // (c) A chat ADMISSION closes the session: open, run a chat to Done,
+    // then verify must 409.
+    let (st, v) = tree_post(
+        &router,
+        "/v1/tree/session",
+        serde_json::json!({ "prompt_tokens": session_prompt }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "re-open failed: {v}");
+    let root = v["pending_token"].as_u64().expect("pending_token") as u32;
+    let _ = chat(&router, &a_ids, 4).await;
+    let (st, v) = tree_post(
+        &router,
+        "/v1/tree/verify",
+        serde_json::json!({ "tokens": [root, drafts[0]], "parents": [-1, 0] }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "C4c: verify after a chat admission must 409 (got {st}: {v})"
+    );
+    println!(
+        "C4: batched tree session == single-worker (root {single_root}, {} + {} committed; \
+         accepted-path round {} committed); coexists with a live chat stream; chat \
+         admission closes it (409)",
+        single_rounds[0].len(),
+        single_rounds[1].len(),
+        single_accept.len(),
+    );
+}
+
 /// C3 gate — paged KV streams equal dense streams exactly. Paging is
 /// bit-exact by construction (same values, different addresses; gated at the
 /// kernel level by `cuda_batch_paged_matches_dense_bit_exact`), so the same

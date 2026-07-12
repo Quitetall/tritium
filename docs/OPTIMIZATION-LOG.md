@@ -992,3 +992,45 @@ batch arenas are now optional: `--kv-pool-tokens N` (serve) /
 Gates: 54/54 cuda unit, 6/6 batch acceptance, serve G1/G2 + C1 interleave
 (dense default regression-free) + new G3. Track C batching P2 = C1 + C2 +
 C3 COMPLETE. C4 (batched spec-decode coexistence) remains the stretch item.
+
+## v1.x round 20 — Track C4: tree sessions coexist with the batch pool (2026-07-11)
+
+Batching P2 stretch item. The BASTION tree endpoints (`/v1/tree/session`,
+`/v1/tree/verify` — the external-drafter spec-decode surface) previously
+answered 501 with `--batch-slots > 1`. Now they work: C1's chunk machine
+generalizes to a `PendingGoal` (chat Admit | TreeOpen), so a session open
+prefills interleaved with live-slot decode steps exactly like an admission;
+verifies run inline between batch steps as bounded ops.
+
+**Design decision, recorded honestly**: v1 is SERIALIZED-OWNERSHIP
+coexistence — the session owns the single-sequence KV between admissions,
+and the single-worker contract carries over verbatim ("a chat completion
+closes it" ⇒ in batched mode: a chat ADMISSION resets the runner and closes
+the session; the next verify gets 409 and the drafter re-opens). Sessions do
+NOT survive concurrent admissions. The plan's fuller vision — sessions
+leasing a slot's paged region and surviving admissions — needs the tree
+kernel stack (kv_append_tree + two ctrl twins + promote/compact + per-bucket
+graphs whose pointers bake the single-seq arenas) parametrized over KV
+regions; recorded as the follow-up, with C3's constexpr-codec methodology
+ready for it. A cheaper middle rung (stash/restore: reverse-adoption copy of
+the session rows into pages around each admission, ~30 ms per admission at
+2K ctx) was also considered and shelved — it changes the session-lifetime
+contract rather than porting it.
+
+Also in this change: the admission job-pull is no longer gated on a free
+slot. Tree ops need no seat, so the queue drains whenever nothing is parked;
+a seatless Generate PARKS (the C3 mechanism, FIFO) instead of gating the
+whole queue on slot availability — verify latency under a full pool is
+bounded by the op itself, not by a retirement.
+
+Gate `cuda_batched_tree_session_coexists` (first-run pass): batched open +
+two chained verifies token-identical to the single-worker server (losslessness
+across modes); an INFORMED draft forces the accept/promote path (2 committed,
+identical across modes — junk drafts degenerate to L=1 and never exercise
+compaction); session ops succeed and return identical tokens WHILE a chat
+stream decodes in the other slot (stream unaffected); verify after a chat
+admission answers 409. Full serve regression re-run (G1/G2, G3, C1
+interleave, contract, spec) — the worker restructure must not move anything.
+
+Track C is now COMPLETE INCLUDING THE STRETCH. Next: Track E step 1
+(rmsnorm_fast, ADR 0023).
