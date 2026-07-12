@@ -19,7 +19,9 @@
 
 use half::f16;
 use tritium_core::{Trit, absmean};
-use tritium_format::{FormatError, QK_K, SaltRow, TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row};
+use tritium_format::{
+    FormatError, QK_K, SALT_HEADER_BYTES, SaltRow, TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row,
+};
 
 use crate::{
     AllocConfig, AllocError, GroupInput, Plane, PlaneStack, TRIT_BITS, allocate, residual_expand,
@@ -104,6 +106,14 @@ pub struct QuantizedTensor {
 }
 
 impl QuantizedTensor {
+    fn packed_plane_bytes(&self) -> u128 {
+        self.salt_rows
+            .iter()
+            .flat_map(|row| row.planes.iter())
+            .map(|plane| plane.len() as u128)
+            .sum()
+    }
+
     /// The allocator's logical bits-per-weight (`Σ|g|·log2(3)·T_g / N`), which is
     /// `≤ budget_bpw`. Dense storage may exceed this until the sparse plane lands.
     pub fn logical_bpw(&self) -> f64 {
@@ -124,6 +134,33 @@ impl QuantizedTensor {
             })
             .sum();
         bits / total as f64
+    }
+
+    /// Physical bits per original weight occupied by packed TQ2_0 plane bytes.
+    ///
+    /// This includes each plane's f16 block scales and excludes SALT row
+    /// headers or any enclosing artifact metadata.
+    pub fn packed_weight_bpw(&self) -> f64 {
+        let total_weights = self.rows as u128 * self.k as u128;
+        if total_weights == 0 {
+            return 0.0;
+        }
+        let packed_bytes = self.packed_plane_bytes();
+        packed_bytes as f64 * 8.0 / total_weights as f64
+    }
+
+    /// Physical bits per original weight occupied by serialized SALT rows.
+    ///
+    /// This includes packed TQ2_0 plane bytes and one SALT row header per row,
+    /// but excludes metadata belonging to a whole-model container.
+    pub fn sidecar_bpw(&self) -> f64 {
+        let total_weights = self.rows as u128 * self.k as u128;
+        if total_weights == 0 {
+            return 0.0;
+        }
+        let packed_bytes = self.packed_plane_bytes();
+        let header_bytes = self.salt_rows.len() as u128 * SALT_HEADER_BYTES as u128;
+        (packed_bytes + header_bytes) as f64 * 8.0 / total_weights as f64
     }
 }
 
@@ -626,6 +663,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn physical_bpw_uses_packed_tq2_bytes() {
+        let w = make_tensor(1, QK_K, 0xB17E5);
+        let qt = quantize_tensor(
+            &w,
+            1,
+            QK_K,
+            &QuantConfig {
+                budget_bpw: crate::TRIT_BITS,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // One TQ2_0 plane is 66 bytes for 256 weights: 66*8/256 = 2.0625 bpw.
+        assert_eq!(qt.packed_weight_bpw(), 2.0625);
+        // Serialized SALT row adds its 10-byte header: 76*8/256 = 2.375 bpw.
+        assert_eq!(qt.sidecar_bpw(), 2.375);
+    }
+
     // ── Gate: determinism — same tensor+config ⇒ byte-identical packed rows. ──
     #[test]
     fn quantize_is_deterministic() {
@@ -647,10 +704,14 @@ mod tests {
         assert_eq!(two_empty.salt_rows.len(), 2);
         assert!(two_empty.salt_rows.iter().all(|r| r.planes.is_empty()));
         assert_eq!(two_empty.logical_bpw(), 0.0);
+        assert_eq!(two_empty.packed_weight_bpw(), 0.0);
+        assert_eq!(two_empty.sidecar_bpw(), 0.0);
 
         let no_rows = quantize_tensor(&empty, 0, 256, &QuantConfig::default()).unwrap();
         assert!(no_rows.salt_rows.is_empty());
         assert_eq!(no_rows.logical_bpw(), 0.0);
+        assert_eq!(no_rows.packed_weight_bpw(), 0.0);
+        assert_eq!(no_rows.sidecar_bpw(), 0.0);
     }
 
     #[test]

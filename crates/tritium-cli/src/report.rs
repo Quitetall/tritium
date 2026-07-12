@@ -105,7 +105,12 @@ struct SaltReport {
 struct SaltBudgetReport {
     requested_bpw: f64,
     logical_bpw: f64,
+    /// Legacy nominal dense rate: maximum plane count times ternary entropy.
     dense_stored_bpw: f64,
+    /// Packed TQ2_0 plane bytes, including block scales but excluding SALT headers.
+    packed_weight_bpw: f64,
+    /// Serialized SALT row bytes, including plane data and row headers.
+    sidecar_bpw: f64,
     mse: f64,
     rmse: f64,
     max_abs_error: f64,
@@ -440,6 +445,8 @@ pub(crate) fn salt(
             &qt.plane_counts,
             rows,
             k,
+            qt.packed_weight_bpw(),
+            qt.sidecar_bpw(),
             &weights,
             &deq,
         ));
@@ -860,6 +867,8 @@ fn salt_budget_report(
     plane_counts: &[usize],
     rows: usize,
     k: usize,
+    packed_weight_bpw: f64,
+    sidecar_bpw: f64,
     weights: &[f32],
     deq: &[f32],
 ) -> SaltBudgetReport {
@@ -880,7 +889,11 @@ fn salt_budget_report(
     SaltBudgetReport {
         requested_bpw,
         logical_bpw,
+        // Preserve the 1.0 report schema's historical metric. Exact physical
+        // rates are exposed separately instead of silently changing this key.
         dense_stored_bpw: max_planes as f64 * tritium_quantize::TRIT_BITS,
+        packed_weight_bpw,
+        sidecar_bpw,
         mse,
         rmse: mse.sqrt(),
         max_abs_error,
@@ -983,7 +996,7 @@ fn parity_table(r: &ParityReport) -> String {
 
 fn salt_table(r: &SaltReport) -> String {
     let mut out = format!(
-        "salt report\nrows: {}\nk: {}\nsensitivity: {}\n\nbudget_bpw logical_bpw dense_bpw mse rmse max_abs_error planes\n",
+        "salt report\nrows: {}\nk: {}\nsensitivity: {}\n\nbudget_bpw logical_bpw dense_bpw mse rmse max_abs_error planes packed_bpw sidecar_bpw\n",
         r.rows, r.k, r.sensitivity
     );
     for b in &r.budgets {
@@ -994,14 +1007,16 @@ fn salt_table(r: &SaltReport) -> String {
             .collect::<Vec<_>>()
             .join(",");
         out.push_str(&format!(
-            "{:.6} {:.6} {:.6} {:.6e} {:.6e} {:.6e} {}\n",
+            "{:.6} {:.6} {:.6} {:.6e} {:.6e} {:.6e} {} {:.6} {:.6}\n",
             b.requested_bpw,
             b.logical_bpw,
             b.dense_stored_bpw,
             b.mse,
             b.rmse,
             b.max_abs_error,
-            hist
+            hist,
+            b.packed_weight_bpw,
+            b.sidecar_bpw,
         ));
     }
     out.push('\n');
@@ -1038,7 +1053,10 @@ mod tests {
     fn salt_budget_metrics_are_finite() {
         let weights = vec![0.0, 1.0, -1.0, 0.5];
         let deq = vec![0.0, 0.75, -1.0, 0.25];
-        let report = salt_budget_report(2.0, &[1], 1, 4, &weights, &deq);
+        let report = salt_budget_report(2.0, &[1], 1, 4, 2.0625, 2.375, &weights, &deq);
+        assert_eq!(report.dense_stored_bpw, tritium_quantize::TRIT_BITS);
+        assert_eq!(report.packed_weight_bpw, 2.0625);
+        assert_eq!(report.sidecar_bpw, 2.375);
         assert!(report.mse > 0.0);
         assert_eq!(report.plane_histogram[0].planes, 1);
         assert_eq!(report.plane_histogram[0].groups, 1);
