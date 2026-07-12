@@ -35,6 +35,7 @@ use core::fmt;
 use half::f16;
 use tritium_core::TritError;
 
+mod artifact;
 mod gguf;
 mod gguf_write;
 mod i2s;
@@ -52,6 +53,7 @@ mod tq2;
 mod tqbin;
 mod tqidx;
 
+pub use artifact::{ArtifactError, ModelId, PackageId, SemanticModelManifest, SemanticTensor};
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
     TensorInfo, read_gguf,

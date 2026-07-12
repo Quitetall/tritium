@@ -65,6 +65,7 @@ tritium-nn = { path = "crates/tritium-nn", version = "1.0.0" }
 tritium-train = { path = "crates/tritium-train", version = "1.0.0" }
 # foundation
 bytemuck = "1"
+blake3 = "1"
 half = "2"
 linkme = "0.3"
 # cpu
