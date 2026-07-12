@@ -27,6 +27,7 @@
 
 use std::rc::Rc;
 
+use cudarc::driver::CudaSlice;
 use tritium_core::GemmShape;
 use tritium_spec::BackendError;
 use tritium_train::ops::{act, loss, matmul, ste};
@@ -420,6 +421,334 @@ fn seeded_uniform(seed: u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
             lo + unit * (hi - lo)
         })
         .collect()
+}
+
+/// An op recorded on the [`DeviceTape`] for the reverse pass — input/output value ids + params. The
+/// backward reads the output's grad + the saved forward values (`vals`) and accumulates into the
+/// inputs' grad buffers (so a value with >1 consumer — residuals, the tied embedding — sums exactly
+/// like the CPU tape's `grads[id] += v`).
+// Test-exercised (`device_tape_mlp_stack_matches_cpu_tape`) until the distillation loop drives the
+// DeviceTape on a real model (plan 0043 P2.5b onward).
+#[allow(dead_code)]
+enum DevOp {
+    Matmul {
+        x: usize,
+        w: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        out: usize,
+    },
+    Rmsnorm {
+        x: usize,
+        w: usize,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        out: usize,
+    },
+    Silu {
+        x: usize,
+        n: usize,
+        out: usize,
+    },
+    Mul {
+        a: usize,
+        b: usize,
+        n: usize,
+        out: usize,
+    },
+    Add {
+        a: usize,
+        b: usize,
+        n: usize,
+        out: usize,
+    },
+    Embed {
+        w: usize,
+        tokens: CudaSlice<i32>,
+        seq: usize,
+        dim: usize,
+        vocab: usize,
+        out: usize,
+    },
+}
+
+/// A device-resident autograd tape (plan 0043 P2.5): the GPU analogue of [`tritium_train::Tape`].
+/// Every activation and gradient lives in VRAM across the whole fwd+bwd step — leaves upload once,
+/// results download once, and the recorded ops chain the resident kernels ([`super`]'s `*_dev`
+/// methods) with no host round-trips. Forward ops append a device buffer to `vals` and record a
+/// [`DevOp`]; [`backward`](Self::backward) replays them in reverse, accumulating grads on-device.
+/// A `dense_matmul` uses `s = ones`; the shared `ones` buffer is sized once at construction.
+#[allow(dead_code)]
+pub(crate) struct DeviceTape<'a> {
+    b: &'a CudaBackend,
+    vals: Vec<CudaSlice<f32>>,
+    lens: Vec<usize>,
+    ops: Vec<DevOp>,
+    ones: CudaSlice<f32>,
+}
+
+#[allow(dead_code)] // test-only until the distillation loop drives it (plan 0043 P2.5b onward)
+impl<'a> DeviceTape<'a> {
+    /// New empty tape on `b`. `ones_max` must be ≥ the largest matmul output width `n` used (the
+    /// per-row unit scale buffer is allocated once to this size).
+    pub(crate) fn new(b: &'a CudaBackend, ones_max: usize) -> Result<Self, BackendError> {
+        let ones = b.dev_upload(&vec![1.0f32; ones_max.max(1)])?;
+        Ok(Self {
+            b,
+            vals: Vec::new(),
+            lens: Vec::new(),
+            ops: Vec::new(),
+            ones,
+        })
+    }
+
+    fn push(&mut self, buf: CudaSlice<f32>, len: usize) -> usize {
+        let id = self.vals.len();
+        self.vals.push(buf);
+        self.lens.push(len);
+        id
+    }
+
+    /// Upload a weight/input leaf; returns its value id.
+    pub(crate) fn leaf(&mut self, host: &[f32]) -> Result<usize, BackendError> {
+        let buf = self.b.dev_upload(host)?;
+        Ok(self.push(buf, host.len()))
+    }
+
+    /// Download a value (e.g. the logits) to host.
+    pub(crate) fn value(&self, id: usize) -> Result<Vec<f32>, BackendError> {
+        let mut h = vec![0.0f32; self.lens[id]];
+        self.b.dev_download(&self.vals[id], &mut h)?;
+        Ok(h)
+    }
+
+    /// `g_logits` of `L = mean_row softmax-xent(logits, target)` — the seed for [`backward`](Self::backward)
+    /// when the loss is distillation cross-entropy (`grad_out = 1`, so `gscale = 1/rows`).
+    pub(crate) fn softmax_xent_grad(
+        &self,
+        logits: usize,
+        target: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<CudaSlice<f32>, BackendError> {
+        let d_target = self.b.dev_upload(target)?;
+        let mut g = self.b.dev_alloc_zeros(rows * cols)?;
+        self.b.softmax_xent_backward_dev(
+            &self.vals[logits],
+            &d_target,
+            &mut g,
+            rows,
+            cols,
+            1.0 / rows as f32,
+        )?;
+        Ok(g)
+    }
+
+    /// `Y[m,n] = X[m,k]·W[n,k]ᵀ` (fp dense).
+    pub(crate) fn matmul(
+        &mut self,
+        x: usize,
+        w: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<usize, BackendError> {
+        let mut out = self.b.dev_alloc_zeros(m * n)?;
+        self.b.matmul_forward_dev(
+            &self.vals[x],
+            &self.vals[w],
+            &self.ones,
+            GemmShape { m, n, k },
+            &mut out,
+        )?;
+        let id = self.push(out, m * n);
+        self.ops.push(DevOp::Matmul {
+            x,
+            w,
+            m,
+            n,
+            k,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    pub(crate) fn rmsnorm(
+        &mut self,
+        x: usize,
+        w: usize,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<usize, BackendError> {
+        let mut out = self.b.dev_alloc_zeros(rows * cols)?;
+        self.b
+            .rmsnorm_forward_dev(&self.vals[x], &self.vals[w], &mut out, rows, cols, eps)?;
+        let id = self.push(out, rows * cols);
+        self.ops.push(DevOp::Rmsnorm {
+            x,
+            w,
+            rows,
+            cols,
+            eps,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    pub(crate) fn silu(&mut self, x: usize) -> Result<usize, BackendError> {
+        let n = self.lens[x];
+        let mut out = self.b.dev_alloc_zeros(n)?;
+        self.b.silu_forward_dev(&self.vals[x], &mut out, n)?;
+        let id = self.push(out, n);
+        self.ops.push(DevOp::Silu { x, n, out: id });
+        Ok(id)
+    }
+
+    pub(crate) fn mul(&mut self, a: usize, b: usize) -> Result<usize, BackendError> {
+        let n = self.lens[a];
+        let mut out = self.b.dev_alloc_zeros(n)?;
+        self.b
+            .ew_mul_forward_dev(&self.vals[a], &self.vals[b], &mut out, n)?;
+        let id = self.push(out, n);
+        self.ops.push(DevOp::Mul { a, b, n, out: id });
+        Ok(id)
+    }
+
+    pub(crate) fn add(&mut self, a: usize, b: usize) -> Result<usize, BackendError> {
+        let n = self.lens[a];
+        let mut out = self.b.dev_alloc_zeros(n)?;
+        self.b
+            .ew_add_forward_dev(&self.vals[a], &self.vals[b], &mut out, n)?;
+        let id = self.push(out, n);
+        self.ops.push(DevOp::Add { a, b, n, out: id });
+        Ok(id)
+    }
+
+    /// Tied-embedding gather `y[t,:] = w[tokens[t],:]`. `w` is the `[vocab,dim]` embedding leaf.
+    pub(crate) fn embed(
+        &mut self,
+        w: usize,
+        tokens: &[i32],
+        seq: usize,
+        dim: usize,
+        vocab: usize,
+    ) -> Result<usize, BackendError> {
+        let d_tok = self.b.dev_upload_i32(tokens)?;
+        let mut out = self.b.dev_alloc_zeros(seq * dim)?;
+        self.b
+            .embed_gather_forward_dev(&self.vals[w], &d_tok, &mut out, seq, dim)?;
+        let id = self.push(out, seq * dim);
+        self.ops.push(DevOp::Embed {
+            w,
+            tokens: d_tok,
+            seq,
+            dim,
+            vocab,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    /// Reverse pass: seed `grads[seed_id] += seed` (e.g. the xent `g_logits`), then replay the ops in
+    /// reverse, accumulating each input's grad on-device. Returns the grad buffer per value id.
+    pub(crate) fn backward(
+        &self,
+        seed_id: usize,
+        seed: &CudaSlice<f32>,
+    ) -> Result<Vec<CudaSlice<f32>>, BackendError> {
+        let mut grads: Vec<CudaSlice<f32>> = self
+            .lens
+            .iter()
+            .map(|&l| self.b.dev_alloc_zeros(l))
+            .collect::<Result<_, _>>()?;
+        self.b
+            .accumulate_dev(&mut grads[seed_id], seed, self.lens[seed_id])?;
+        for op in self.ops.iter().rev() {
+            match *op {
+                DevOp::Matmul { x, w, m, n, k, out } => {
+                    let shape = GemmShape { m, n, k };
+                    let mut gx = self.b.dev_alloc_zeros(m * k)?;
+                    self.b
+                        .grad_a_dev(&grads[out], &self.vals[w], &self.ones, shape, &mut gx)?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, m * k)?;
+                    let mut gw = self.b.dev_alloc_zeros(n * k)?;
+                    self.b
+                        .grad_w_dev(&grads[out], &self.vals[x], &self.ones, shape, &mut gw)?;
+                    self.b.accumulate_dev(&mut grads[w], &gw, n * k)?;
+                }
+                DevOp::Rmsnorm {
+                    x,
+                    w,
+                    rows,
+                    cols,
+                    eps,
+                    out,
+                } => {
+                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                    let mut gw = self.b.dev_alloc_zeros(cols)?;
+                    self.b.rmsnorm_backward_dev(
+                        &self.vals[x],
+                        &self.vals[w],
+                        &grads[out],
+                        &mut gx,
+                        &mut gw,
+                        rows,
+                        cols,
+                        eps,
+                    )?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                    self.b.accumulate_dev(&mut grads[w], &gw, cols)?;
+                }
+                DevOp::Silu { x, n, out } => {
+                    let mut gx = self.b.dev_alloc_zeros(n)?;
+                    self.b
+                        .silu_backward_dev(&self.vals[x], &grads[out], &mut gx, n)?;
+                    self.b.accumulate_dev(&mut grads[x], &gx, n)?;
+                }
+                DevOp::Mul { a, b, n, out } => {
+                    let mut ga = self.b.dev_alloc_zeros(n)?;
+                    self.b
+                        .ew_mul_backward_dev(&grads[out], &self.vals[b], &mut ga, n)?;
+                    self.b.accumulate_dev(&mut grads[a], &ga, n)?;
+                    let mut gb = self.b.dev_alloc_zeros(n)?;
+                    self.b
+                        .ew_mul_backward_dev(&grads[out], &self.vals[a], &mut gb, n)?;
+                    self.b.accumulate_dev(&mut grads[b], &gb, n)?;
+                }
+                DevOp::Add { a, b, n, out } => {
+                    // out = a + b ⇒ grad flows unchanged to both. Copy grad_out into a temp first
+                    // (accumulate into a zeroed buffer) so the two accumulates don't alias grads[out].
+                    let mut t = self.b.dev_alloc_zeros(n)?;
+                    self.b.accumulate_dev(&mut t, &grads[out], n)?;
+                    self.b.accumulate_dev(&mut grads[a], &t, n)?;
+                    self.b.accumulate_dev(&mut grads[b], &t, n)?;
+                }
+                DevOp::Embed {
+                    w,
+                    ref tokens,
+                    seq,
+                    dim,
+                    vocab,
+                    out,
+                } => {
+                    let mut gw = self.b.dev_alloc_zeros(vocab * dim)?;
+                    self.b.embed_gather_backward_dev(
+                        &grads[out],
+                        tokens,
+                        &mut gw,
+                        seq,
+                        dim,
+                        vocab,
+                    )?;
+                    self.b.accumulate_dev(&mut grads[w], &gw, vocab * dim)?;
+                }
+            }
+        }
+        Ok(grads)
+    }
 }
 
 #[cfg(test)]
@@ -1039,6 +1368,229 @@ mod tests {
         eprintln!(
             "0043 P2.4 resident attention glue: softmax/mask/rope/slice/copy_into_cols/transpose/\
              gather/xent all match CPU (copy ops bit-exact; softmax/rope/xent within 1e-4)"
+        );
+    }
+
+    /// Gate + bench (plan 0043 P2.5a): a whole multi-layer MLP stack (embed → N×[rmsnorm → gate/up →
+    /// silu → mul → down → residual] → final rmsnorm → tied lm-head → softmax-xent) assembled on the
+    /// `DeviceTape` and run forward+backward entirely on-device, vs the same model on the
+    /// tritium-train CPU `Tape`. Exercises the generic device tape, multi-layer chaining, and the
+    /// tricky **tied-embedding** grad (accumulated from the input gather AND the output head). The
+    /// per-weight grads match within 1e-4; the device step is timed against the CPU tape.
+    #[test]
+    fn device_tape_mlp_stack_matches_cpu_tape() {
+        use std::time::Instant;
+
+        use tritium_train::Tape;
+        use tritium_train::ops::softmax;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping device_tape_mlp_stack_matches_cpu_tape: no CUDA device ({e})");
+                return;
+            }
+        };
+        // Realistic transformer dims (SmolLM2-ish) so the multi-layer matmuls dominate and the
+        // compounding device-resident speedup shows. Vocab kept moderate: the tied-embedding backward
+        // is O(vocab·seq·dim) (a known hotspot for a later perf pass), so a huge vocab would swamp it.
+        let (vocab, dim, ff, seq, layers, eps) =
+            (2048usize, 576usize, 1536usize, 48usize, 4usize, 1e-5f32);
+        let embd = seeded_uniform(0x100, vocab * dim, -0.1, 0.1);
+        let out_norm = seeded_uniform(0x101, dim, 0.5, 1.5);
+        let ffn_norm: Vec<Vec<f32>> = (0..layers)
+            .map(|l| seeded_uniform(0x110 + l as u64, dim, 0.5, 1.5))
+            .collect();
+        let wg: Vec<Vec<f32>> = (0..layers)
+            .map(|l| seeded_uniform(0x120 + l as u64, ff * dim, -0.1, 0.1))
+            .collect();
+        let wu: Vec<Vec<f32>> = (0..layers)
+            .map(|l| seeded_uniform(0x130 + l as u64, ff * dim, -0.1, 0.1))
+            .collect();
+        let wd: Vec<Vec<f32>> = (0..layers)
+            .map(|l| seeded_uniform(0x140 + l as u64, dim * ff, -0.1, 0.1))
+            .collect();
+        let tokens: Vec<u32> = (0..seq).map(|i| ((i * 37 + 5) % vocab) as u32).collect();
+        let tokens_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let target = softmax::forward(&seeded_uniform(0x150, seq * vocab, -1.0, 1.0), seq, vocab);
+
+        // ── CPU reference ──
+        let mut t = Tape::new();
+        let c_embd = t.leaf(embd.clone());
+        let mut c_hidden = t.embed_gather(c_embd, &tokens, vocab, dim);
+        let mut c_w = Vec::new(); // (ffn_norm, wg, wu, wd) leaf ids per layer
+        for l in 0..layers {
+            let fnid = t.leaf(ffn_norm[l].clone());
+            let (gid, uid, did) = (
+                t.leaf(wg[l].clone()),
+                t.leaf(wu[l].clone()),
+                t.leaf(wd[l].clone()),
+            );
+            let hn = t.rmsnorm(c_hidden, fnid, seq, dim, eps);
+            let g = t.dense_matmul(hn, gid, seq, ff, dim);
+            let u = t.dense_matmul(hn, uid, seq, ff, dim);
+            let ga = t.silu(g);
+            let gated = t.mul(ga, u);
+            let down = t.dense_matmul(gated, did, seq, dim, ff);
+            c_hidden = t.add(c_hidden, down);
+            c_w.push((fnid, gid, uid, did));
+        }
+        let c_on = t.leaf(out_norm.clone());
+        let c_fn = t.rmsnorm(c_hidden, c_on, seq, dim, eps);
+        let c_logits = t.dense_matmul(c_fn, c_embd, seq, vocab, dim); // tied head
+        let c_tg = t.leaf(target.clone());
+        let c_loss = t.softmax_xent(c_logits, c_tg, seq, vocab);
+        let cg = t.backward(c_loss);
+
+        // ── Device tape ──
+        let build_device = || -> Result<(Vec<f32>, Vec<CudaSlice<f32>>, Vec<(usize, usize, usize, usize)>, usize, usize), BackendError> {
+            let mut dt = DeviceTape::new(&backend, vocab)?;
+            let d_embd = dt.leaf(&embd)?;
+            let mut d_hidden = dt.embed(d_embd, &tokens_i32, seq, dim, vocab)?;
+            let mut d_w = Vec::new();
+            for l in 0..layers {
+                let fnid = dt.leaf(&ffn_norm[l])?;
+                let (gid, uid, did) = (dt.leaf(&wg[l])?, dt.leaf(&wu[l])?, dt.leaf(&wd[l])?);
+                let hn = dt.rmsnorm(d_hidden, fnid, seq, dim, eps)?;
+                let g = dt.matmul(hn, gid, seq, ff, dim)?;
+                let u = dt.matmul(hn, uid, seq, ff, dim)?;
+                let ga = dt.silu(g)?;
+                let gated = dt.mul(ga, u)?;
+                let down = dt.matmul(gated, did, seq, dim, ff)?;
+                d_hidden = dt.add(d_hidden, down)?;
+                d_w.push((fnid, gid, uid, did));
+            }
+            let d_on = dt.leaf(&out_norm)?;
+            let d_fn = dt.rmsnorm(d_hidden, d_on, seq, dim, eps)?;
+            let d_logits = dt.matmul(d_fn, d_embd, seq, vocab, dim)?;
+            let logits_h = dt.value(d_logits)?;
+            let seed = dt.softmax_xent_grad(d_logits, &target, seq, vocab)?;
+            let grads = dt.backward(d_logits, &seed)?;
+            Ok((logits_h, grads, d_w, d_embd, d_on))
+        };
+        let (dev_logits, grads, d_w, d_embd, d_on) = build_device().expect("device tape");
+
+        // download a device grad buffer
+        let dl = |g: &CudaSlice<f32>, n: usize| {
+            let mut h = vec![0.0f32; n];
+            backend.dev_download(g, &mut h).unwrap();
+            h
+        };
+        let rel = |dev: &[f32], cpu: &[f32]| {
+            let range = cpu.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                - cpu.iter().copied().fold(f32::INFINITY, f32::min);
+            max_abs_diff(dev, cpu) / range.max(1e-6)
+        };
+
+        // Compare logits + every weight grad (incl. the tied embedding + norms).
+        let mut worst = rel(&dev_logits, &t.value(c_logits));
+        let mut worst_name = "logits";
+        let mut check = |dev: &[f32],
+                         cpu: &[f32],
+                         name: &'static str,
+                         worst: &mut f32,
+                         wn: &mut &'static str| {
+            let r = rel(dev, cpu);
+            if r > *worst {
+                *worst = r;
+                *wn = name;
+            }
+        };
+        check(
+            &dl(&grads[d_embd], vocab * dim),
+            &cg[c_embd],
+            "embd(tied)",
+            &mut worst,
+            &mut worst_name,
+        );
+        check(
+            &dl(&grads[d_on], dim),
+            &cg[c_on],
+            "out_norm",
+            &mut worst,
+            &mut worst_name,
+        );
+        for l in 0..layers {
+            let (dfn, dg, du, dd) = d_w[l];
+            let (cfn, cgi, cu, cd) = c_w[l];
+            check(
+                &dl(&grads[dfn], dim),
+                &cg[cfn],
+                "ffn_norm",
+                &mut worst,
+                &mut worst_name,
+            );
+            check(
+                &dl(&grads[dg], ff * dim),
+                &cg[cgi],
+                "wg",
+                &mut worst,
+                &mut worst_name,
+            );
+            check(
+                &dl(&grads[du], ff * dim),
+                &cg[cu],
+                "wu",
+                &mut worst,
+                &mut worst_name,
+            );
+            check(
+                &dl(&grads[dd], dim * ff),
+                &cg[cd],
+                "wd",
+                &mut worst,
+                &mut worst_name,
+            );
+        }
+        assert!(worst < 1e-4, "worst grad rel {worst:.3e} at {worst_name}");
+
+        // Bench: device tape vs CPU tape (full rebuild + fwd + bwd).
+        let cpu_step = || {
+            let mut t = Tape::new();
+            let c_embd = t.leaf(embd.clone());
+            let mut c_hidden = t.embed_gather(c_embd, &tokens, vocab, dim);
+            for l in 0..layers {
+                let fnid = t.leaf(ffn_norm[l].clone());
+                let (gid, uid, did) = (
+                    t.leaf(wg[l].clone()),
+                    t.leaf(wu[l].clone()),
+                    t.leaf(wd[l].clone()),
+                );
+                let hn = t.rmsnorm(c_hidden, fnid, seq, dim, eps);
+                let g = t.dense_matmul(hn, gid, seq, ff, dim);
+                let u = t.dense_matmul(hn, uid, seq, ff, dim);
+                let ga = t.silu(g);
+                let gated = t.mul(ga, u);
+                let down = t.dense_matmul(gated, did, seq, dim, ff);
+                c_hidden = t.add(c_hidden, down);
+            }
+            let c_on = t.leaf(out_norm.clone());
+            let c_fn = t.rmsnorm(c_hidden, c_on, seq, dim, eps);
+            let c_logits = t.dense_matmul(c_fn, c_embd, seq, vocab, dim);
+            let c_tg = t.leaf(target.clone());
+            let c_loss = t.softmax_xent(c_logits, c_tg, seq, vocab);
+            let _ = t.backward(c_loss);
+        };
+        for _ in 0..2 {
+            build_device().unwrap();
+            cpu_step();
+        }
+        let iters = 10;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            build_device().unwrap();
+        }
+        let dev_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            cpu_step();
+        }
+        let cpu_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "0043 P2.5a DeviceTape MLP stack ({layers} layers, vocab={vocab} dim={dim} ff={ff} seq={seq}): \
+             matches CPU tape (worst grad rel {worst:.2e} at {worst_name}). \
+             fwd+bwd step: device-resident {dev_ms:.2}ms | CPU tape {cpu_ms:.2}ms ({:.1}× faster)",
+            cpu_ms / dev_ms.max(1e-9)
         );
     }
 
