@@ -2940,6 +2940,25 @@ impl CudaBackend {
             )
         })?;
 
+        // ADR 0026 Track P: dispatch threshold (default 32 = the tuned
+        // dp4a/IMMA crossover). Loud-reject selector.
+        let imma_min_m = match std::env::var("TRITIUM_IMMA_MIN_M") {
+            Err(std::env::VarError::NotPresent) => 32usize,
+            Ok(v) => match v.trim().parse::<usize>() {
+                Ok(t) if t >= 2 => t,
+                _ => {
+                    return Err(BackendError::InvalidInput(format!(
+                        "TRITIUM_IMMA_MIN_M={v:?} — use an integer >= 2"
+                    )));
+                }
+            },
+            Err(e) => {
+                return Err(BackendError::InvalidInput(format!(
+                    "TRITIUM_IMMA_MIN_M: {e}"
+                )));
+            }
+        };
+
         // ADR 0026 Track P step 3: resolve the IMMA tile functions at BUILD
         // time for every shadowed (N, K) shape × the prefill M buckets, so
         // the serving path never touches nvrtc or the tune sweep. Policy:
@@ -3144,6 +3163,7 @@ impl CudaBackend {
             raw: None,
             batch_raw: None,
             imma_funcs,
+            imma_min_m,
         })
     }
 
@@ -3833,6 +3853,42 @@ impl CudaBackend {
         k_i: i32,
         num_ktiles_i: i32,
     ) -> Result<(), BackendError> {
+        launch_imma_tile_on(
+            &self.stream,
+            func,
+            tile,
+            d_qact,
+            d_weights,
+            d_act_scale,
+            d_wscale,
+            d_out,
+            m_i,
+            n_i,
+            k_i,
+            num_ktiles_i,
+        )
+    }
+}
+
+/// Free-function IMMA tile launch (ADR 0026 Track P): callable from the
+/// resident model's prefill dispatch (`CudaDecodeModel` holds no backend
+/// handle, only the shared stream).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_imma_tile_on(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    tile: TileConfig,
+    d_qact: &CudaSlice<i8>,
+    d_weights: &CudaSlice<u8>,
+    d_act_scale: &CudaSlice<f32>,
+    d_wscale: &CudaSlice<f32>,
+    d_out: &mut CudaSlice<f32>,
+    m_i: i32,
+    n_i: i32,
+    k_i: i32,
+    num_ktiles_i: i32,
+) -> Result<(), BackendError> {
+    {
         let grid_n = (n_i as u32).div_ceil(tile.tile_n as u32);
         let grid_m = (m_i as u32).div_ceil(tile.tile_m as u32);
         let cfg = LaunchConfig {
@@ -3840,7 +3896,7 @@ impl CudaBackend {
             block_dim: (tile.block_threads(), 1, 1),
             shared_mem_bytes: 0, // the kernel's staging is static __shared__
         };
-        let mut launch = self.stream.launch_builder(func);
+        let mut launch = stream.launch_builder(func);
         launch
             .arg(d_qact)
             .arg(d_weights)
@@ -3870,7 +3926,9 @@ impl CudaBackend {
         }
         Ok(())
     }
+}
 
+impl CudaBackend {
     /// The autotune cache key for an IMMA launch of `shape` on this device.
     fn imma_cache_key(&self, shape: GemmShape) -> CacheKey {
         CacheKey {

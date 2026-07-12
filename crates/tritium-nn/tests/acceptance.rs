@@ -562,6 +562,79 @@ fn cuda_batch_dead_row_touches_nothing() {
     );
 }
 
+/// ADR 0026 Track P step 4: the IMMA prefill dispatch must be BIT-IDENTICAL
+/// to the dp4a path on the real model — one runner, the same prompt
+/// prefilled with the tensor-core dispatch live and then with it disabled
+/// (`debug_disable_imma`), logits compared to_bits. Also pins chunk-size
+/// independence UNDER the IMMA path: a 4-chunk prefill must equal the
+/// one-shot prefill bit-for-bit (the C1 contract carried onto tensor cores;
+/// chunks of 128 and a 512 one-shot land in different M buckets / tile
+/// configs and must still agree).
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_imma_prefill_matches_dp4a_bit_exact() {
+    let _gpu = gpu_serial();
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut runner) = load_on("cuda", &bytes) else {
+        return;
+    };
+    // A 512-token prompt (the pp512 shape): cycle the reference ids.
+    let prompt: Vec<u32> = reference
+        .token_ids
+        .iter()
+        .cycle()
+        .take(512)
+        .copied()
+        .collect();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+
+    // One-shot prefill, IMMA dispatch live (M=512 → its own tile bucket).
+    runner.reset();
+    let imma_oneshot = runner.forward(&prompt, &positions).expect("imma one-shot");
+
+    // Chunked prefill under IMMA (4×128 — the serve C1 shape, bucket 7).
+    runner.reset();
+    let mut imma_chunked = Vec::new();
+    for c in 0..4 {
+        let lo = c * 128;
+        let hi = lo + 128;
+        imma_chunked = runner
+            .forward(&prompt[lo..hi], &positions[lo..hi])
+            .expect("imma chunk");
+    }
+    for (i, (&a, &b)) in imma_oneshot.iter().zip(&imma_chunked).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "IMMA chunked != one-shot at vocab {i}: {a} vs {b}"
+        );
+    }
+
+    // Disable the dispatch on the SAME model → dp4a path; must be bit-equal.
+    runner
+        .resident_cuda()
+        .expect("resident")
+        .expect("cuda")
+        .debug_disable_imma();
+    runner.reset();
+    let dp4a = runner.forward(&prompt, &positions).expect("dp4a one-shot");
+    for (i, (&a, &b)) in imma_oneshot.iter().zip(&dp4a).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "IMMA prefill != dp4a at vocab {i}: imma={a} dp4a={b} — the \
+             bit-identity contract (ADR 0026) broke"
+        );
+    }
+    println!(
+        "IMMA prefill gate: one-shot == 4x128 chunked == dp4a, all to_bits \
+         over {} logits (M=512 prompt)",
+        dp4a.len()
+    );
+}
+
 /// C3 paged KV (ADR 0025): a paged batch must be **bit-identical** to a dense
 /// batch fed the same requests — paging changes addresses, never values or
 /// reduction order. Exercised: prompt adoption through the per-page copy,

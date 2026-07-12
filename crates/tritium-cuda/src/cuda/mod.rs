@@ -785,6 +785,9 @@ pub struct CudaDecodeModel {
     /// Empty when shadows are disabled (`TRITIUM_IMMA_PREFILL=0` /
     /// `TRITIUM_IMMA_TUNE=off` / TQ1 models).
     imma_funcs: HashMap<(usize, usize, u32), (TileConfig, CudaFunction)>,
+    /// Prefill M at/above which the IMMA path dispatches
+    /// (`TRITIUM_IMMA_MIN_M`, default 32 — the tuned dp4a/IMMA crossover).
+    imma_min_m: usize,
 }
 
 impl CudaDecodeModel {
@@ -1789,36 +1792,30 @@ impl CudaDecodeModel {
                 &mut d_qact,
                 &mut d_act_scale,
             )?;
-            Self::bl_matmul(
+            self.matmul_m(
                 s,
-                &self.f_tiled_scaled,
-                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].q,
                 &d_act_scale,
                 m,
                 &mut d_q,
-            )?;
-            Self::bl_matmul(
+                )?;
+            self.matmul_m(
                 s,
-                &self.f_tiled_scaled,
-                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].k,
                 &d_act_scale,
                 m,
                 &mut d_k,
-            )?;
-            Self::bl_matmul(
+                )?;
+            self.matmul_m(
                 s,
-                &self.f_tiled_scaled,
-                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].v,
                 &d_act_scale,
                 m,
                 &mut d_v,
-            )?;
+                )?;
             Self::bl_rope(
                 s,
                 &self.f_rope_batch,
@@ -1920,16 +1917,14 @@ impl CudaDecodeModel {
                 &mut d_qact,
                 &mut d_act_scale,
             )?;
-            Self::bl_matmul(
+            self.matmul_m(
                 s,
-                &self.f_tiled_scaled,
-                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].o,
                 &d_act_scale,
                 m,
                 &mut d_proj,
-            )?;
+                )?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
 
             // --- ReLU² MLP ---
@@ -1952,26 +1947,22 @@ impl CudaDecodeModel {
                 &mut d_qact,
                 &mut d_act_scale,
             )?;
-            Self::bl_matmul(
+            self.matmul_m(
                 s,
-                &self.f_tiled_scaled,
-                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].gate,
                 &d_act_scale,
                 m,
                 &mut d_gate,
-            )?;
-            Self::bl_matmul(
+                )?;
+            self.matmul_m(
                 s,
-                &self.f_tiled_scaled,
-                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].up,
                 &d_act_scale,
                 m,
                 &mut d_up,
-            )?;
+                )?;
             Self::bl_relu2(s, &self.f_relu2, &mut d_gate, &d_up, m * n_ff)?;
             let down_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].ffn_sub_norm.as_ref() {
                 Self::bl_rmsnorm(
@@ -1997,16 +1988,14 @@ impl CudaDecodeModel {
                 &mut d_qact,
                 &mut d_act_scale,
             )?;
-            Self::bl_matmul(
+            self.matmul_m(
                 s,
-                &self.f_tiled_scaled,
-                &self.f_tq1_tiled_scaled,
                 &d_qact,
                 &self.layers[li].down,
                 &d_act_scale,
                 m,
                 &mut d_proj,
-            )?;
+                )?;
             Self::bl_residual(s, &self.f_residual, &mut d_x, &d_proj, m * n_embd)?;
         }
 
@@ -2474,6 +2463,67 @@ impl CudaDecodeModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Debug/test access: drop every build-time-resolved IMMA tile function
+    /// so `matmul_m` falls back to dp4a — the bit-identity gate prefills the
+    /// same prompt with and without the dispatch on ONE model (no env games,
+    /// no second 2.5 GB build).
+    #[doc(hidden)]
+    pub fn debug_disable_imma(&mut self) {
+        self.imma_funcs.clear();
+    }
+
+    /// Prefill GEMM dispatch (ADR 0026 Track P): route to the IMMA
+    /// tensor-core path when `m` clears the tuned crossover and this linear
+    /// carries a shadow + a build-time-resolved tile function; else the dp4a
+    /// `bl_matmul`, byte-for-byte unchanged. The two paths are BIT-IDENTICAL
+    /// (gated: `imma_matches_dp4a_tiled_scaled_bit_exact`), so this branch is
+    /// purely a performance decision — no numerics seam. Called ONLY from the
+    /// eager prefill; the graph-captured batch/tree paths keep calling
+    /// `bl_matmul` directly (a capture-time branch would bake one kernel and
+    /// silently change replay semantics).
+    fn matmul_m(
+        &self,
+        s: &Arc<CudaStream>,
+        qact: &CudaSlice<i8>,
+        lin: &ResidentLinear,
+        scale: &CudaSlice<f32>,
+        m: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        if m >= self.imma_min_m && !lin.tq1 {
+            if let Some(shadow) = lin.imma.as_ref() {
+                // floor(log2(m)), clamped to the resolved bucket range.
+                let bucket = (usize::BITS - 1 - m.leading_zeros()).clamp(5, 11);
+                if let Some((tile, func)) = self.imma_funcs.get(&(lin.n, lin.k, bucket)) {
+                    return backend::launch_imma_tile_on(
+                        s,
+                        func,
+                        *tile,
+                        qact,
+                        &shadow.device,
+                        scale,
+                        &lin.scales,
+                        out,
+                        m as i32,
+                        lin.n as i32,
+                        lin.k as i32,
+                        shadow.num_ktiles,
+                    );
+                }
+            }
+        }
+        Self::bl_matmul(
+            s,
+            &self.f_tiled_scaled,
+            &self.f_tq1_tiled_scaled,
+            qact,
+            lin,
+            scale,
+            m,
+            out,
+        )
+    }
+
     fn bl_matmul(
         s: &Arc<CudaStream>,
         f_tiled_scaled: &CudaFunction,
