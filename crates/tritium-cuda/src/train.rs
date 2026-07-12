@@ -818,6 +818,243 @@ mod tests {
         assert!(gw_d < 1e-4, "rmsnorm grad_w: {gw_d:.3e}");
     }
 
+    /// Gate + payoff (plan 0043 P2.4a): a full **device-resident SwiGLU MLP block** — rmsnorm →
+    /// gate/up matmul → silu → mul → down matmul → residual — run forward AND backward entirely on
+    /// resident VRAM buffers (activations never leave the device; grads of a value with two
+    /// consumers — `hn` from gate+up, `h` from norm+residual — summed via `accumulate`). Uses ONLY
+    /// the P2.1–P2.3 ops, so it proves the resident execution model end-to-end on a realistic block
+    /// BEFORE the attention ops land. Matches the CPU tape within 1e-4 (silu's expf), and the
+    /// device-resident block is timed against the CPU tape — the compounding-speedup proof.
+    #[test]
+    fn resident_swiglu_block_matches_cpu_tape() {
+        use std::time::Instant;
+
+        use tritium_train::Tape;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping resident_swiglu_block_matches_cpu_tape: no CUDA device ({e})");
+                return;
+            }
+        };
+        let (seq, d, ff, eps) = (64usize, 576usize, 1536usize, 1e-5f32); // SmolLM2 MLP shape
+        let h = seeded_uniform(0x71, seq * d, -1.0, 1.0);
+        let wn = seeded_uniform(0x72, d, 0.5, 1.5);
+        let wg = seeded_uniform(0x73, ff * d, -0.1, 0.1);
+        let wu = seeded_uniform(0x74, ff * d, -0.1, 0.1);
+        let wd = seeded_uniform(0x75, d * ff, -0.1, 0.1);
+        let cot = seeded_uniform(0x76, seq * d, -1.0, 1.0); // dL/dout for L = Σ out·cot
+
+        // ── CPU reference on the tape ──
+        let mut t = Tape::new();
+        let hid = t.leaf(h.clone());
+        let (lwn, lwg, lwu, lwd) = (
+            t.leaf(wn.clone()),
+            t.leaf(wg.clone()),
+            t.leaf(wu.clone()),
+            t.leaf(wd.clone()),
+        );
+        let hn = t.rmsnorm(hid, lwn, seq, d, eps);
+        let g = t.dense_matmul(hn, lwg, seq, ff, d);
+        let u = t.dense_matmul(hn, lwu, seq, ff, d);
+        let ga = t.silu(g);
+        let gated = t.mul(ga, u);
+        let down = t.dense_matmul(gated, lwd, seq, d, ff);
+        let out = t.add(hid, down);
+        let lc = t.leaf(cot.clone());
+        let loss = t.dense_matmul(out, lc, 1, 1, seq * d);
+        let cpu_out = t.value(out).to_vec();
+        let gr = t.backward(loss);
+        let (c_gh, c_gwn, c_gwg, c_gwu, c_gwd) = (
+            gr[hid].clone(),
+            gr[lwn].clone(),
+            gr[lwg].clone(),
+            gr[lwu].clone(),
+            gr[lwd].clone(),
+        );
+
+        // ── Device-resident block ──
+        let sh_gu = GemmShape {
+            m: seq,
+            n: ff,
+            k: d,
+        }; // gate/up: [seq,d]·[ff,d]ᵀ
+        let sh_d = GemmShape {
+            m: seq,
+            n: d,
+            k: ff,
+        }; // down:    [seq,ff]·[d,ff]ᵀ
+        let ones = vec![1.0f32; ff.max(d)];
+        let resident_block = || -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+            let up = |v: &[f32]| backend.dev_upload(v).unwrap();
+            let z = |n: usize| backend.dev_alloc_zeros(n).unwrap();
+            let (d_h, d_wn, d_wg, d_wu, d_wd, d_ones) =
+                (up(&h), up(&wn), up(&wg), up(&wu), up(&wd), up(&ones));
+            // forward
+            let mut d_hn = z(seq * d);
+            backend
+                .rmsnorm_forward_dev(&d_h, &d_wn, &mut d_hn, seq, d, eps)
+                .unwrap();
+            let mut d_g = z(seq * ff);
+            backend
+                .matmul_forward_dev(&d_hn, &d_wg, &d_ones, sh_gu, &mut d_g)
+                .unwrap();
+            let mut d_u = z(seq * ff);
+            backend
+                .matmul_forward_dev(&d_hn, &d_wu, &d_ones, sh_gu, &mut d_u)
+                .unwrap();
+            let mut d_ga = z(seq * ff);
+            backend.silu_forward_dev(&d_g, &mut d_ga, seq * ff).unwrap();
+            let mut d_gated = z(seq * ff);
+            backend
+                .ew_mul_forward_dev(&d_ga, &d_u, &mut d_gated, seq * ff)
+                .unwrap();
+            let mut d_down = z(seq * d);
+            backend
+                .matmul_forward_dev(&d_gated, &d_wd, &d_ones, sh_d, &mut d_down)
+                .unwrap();
+            let mut d_out = z(seq * d);
+            backend
+                .ew_add_forward_dev(&d_h, &d_down, &mut d_out, seq * d)
+                .unwrap();
+            // backward: dL/dout = cot; residual sends it to both h and down.
+            let d_gout = up(&cot);
+            let mut d_gwd = z(d * ff);
+            backend
+                .grad_w_dev(&d_gout, &d_gated, &d_ones, sh_d, &mut d_gwd)
+                .unwrap();
+            let mut d_ggated = z(seq * ff);
+            backend
+                .grad_a_dev(&d_gout, &d_wd, &d_ones, sh_d, &mut d_ggated)
+                .unwrap();
+            let mut d_gga = z(seq * ff);
+            backend
+                .ew_mul_backward_dev(&d_ggated, &d_u, &mut d_gga, seq * ff)
+                .unwrap(); // g_ga = g_gated·u
+            let mut d_gu = z(seq * ff);
+            backend
+                .ew_mul_backward_dev(&d_ggated, &d_ga, &mut d_gu, seq * ff)
+                .unwrap(); // g_u = g_gated·ga
+            let mut d_gg = z(seq * ff);
+            backend
+                .silu_backward_dev(&d_g, &d_gga, &mut d_gg, seq * ff)
+                .unwrap();
+            let mut d_gwu = z(ff * d);
+            backend
+                .grad_w_dev(&d_gu, &d_hn, &d_ones, sh_gu, &mut d_gwu)
+                .unwrap();
+            let mut d_ghn = z(seq * d); // hn's grad: start from the up path…
+            backend
+                .grad_a_dev(&d_gu, &d_wu, &d_ones, sh_gu, &mut d_ghn)
+                .unwrap();
+            let mut d_gwg = z(ff * d);
+            backend
+                .grad_w_dev(&d_gg, &d_hn, &d_ones, sh_gu, &mut d_gwg)
+                .unwrap();
+            let mut d_ghn_g = z(seq * d);
+            backend
+                .grad_a_dev(&d_gg, &d_wg, &d_ones, sh_gu, &mut d_ghn_g)
+                .unwrap();
+            backend
+                .accumulate_dev(&mut d_ghn, &d_ghn_g, seq * d)
+                .unwrap(); // …+ the gate path
+            let mut d_ghnorm = z(seq * d);
+            let mut d_gwn = z(d);
+            backend
+                .rmsnorm_backward_dev(&d_h, &d_wn, &d_ghn, &mut d_ghnorm, &mut d_gwn, seq, d, eps)
+                .unwrap();
+            let mut d_gh = up(&cot); // residual grad on h = cot…
+            backend
+                .accumulate_dev(&mut d_gh, &d_ghnorm, seq * d)
+                .unwrap(); // …+ the norm path
+            let dl = |dv: &_, n: usize| {
+                let mut hv = vec![0.0f32; n];
+                backend.dev_download(dv, &mut hv).unwrap();
+                hv
+            };
+            (
+                dl(&d_out, seq * d),
+                dl(&d_gh, seq * d),
+                dl(&d_gwn, d),
+                dl(&d_gwg, ff * d),
+                dl(&d_gwu, ff * d),
+                dl(&d_gwd, d * ff),
+            )
+        };
+        let (o, gh, gwn, gwg, gwu, gwd) = resident_block();
+
+        let rel = |dev: &[f32], cpu: &[f32]| {
+            let range = cpu.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                - cpu.iter().copied().fold(f32::INFINITY, f32::min);
+            max_abs_diff(dev, cpu) / range.max(1e-6)
+        };
+        let (r_o, r_gh, r_gwn, r_gwg, r_gwu, r_gwd) = (
+            rel(&o, &cpu_out),
+            rel(&gh, &c_gh),
+            rel(&gwn, &c_gwn),
+            rel(&gwg, &c_gwg),
+            rel(&gwu, &c_gwu),
+            rel(&gwd, &c_gwd),
+        );
+        for (name, r) in [
+            ("out", r_o),
+            ("g_h", r_gh),
+            ("g_wn", r_gwn),
+            ("g_wg", r_gwg),
+            ("g_wu", r_gwu),
+            ("g_wd", r_gwd),
+        ] {
+            assert!(r < 1e-4, "swiglu block {name} rel {r:.3e}");
+        }
+
+        // Payoff bench: resident device block vs the CPU tape (rebuild + fwd + bwd).
+        let cpu_block = || {
+            let mut t = Tape::new();
+            let hid = t.leaf(h.clone());
+            let (lwn, lwg, lwu, lwd) = (
+                t.leaf(wn.clone()),
+                t.leaf(wg.clone()),
+                t.leaf(wu.clone()),
+                t.leaf(wd.clone()),
+            );
+            let hn = t.rmsnorm(hid, lwn, seq, d, eps);
+            let g = t.dense_matmul(hn, lwg, seq, ff, d);
+            let u = t.dense_matmul(hn, lwu, seq, ff, d);
+            let ga = t.silu(g);
+            let gated = t.mul(ga, u);
+            let down = t.dense_matmul(gated, lwd, seq, d, ff);
+            let out = t.add(hid, down);
+            let lc = t.leaf(cot.clone());
+            let loss = t.dense_matmul(out, lc, 1, 1, seq * d);
+            let _ = t.backward(loss);
+        };
+        for _ in 0..3 {
+            resident_block();
+            cpu_block();
+        }
+        let iters = 20;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            resident_block();
+        }
+        let dev_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            cpu_block();
+        }
+        let cpu_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "0043 P2.4a resident SwiGLU block (seq={seq} d={d} ff={ff}): matches CPU tape (max rel {:.2e}). \
+             fwd+bwd block: device-resident {dev_ms:.2}ms | CPU tape {cpu_ms:.2}ms ({:.1}× faster)",
+            [r_o, r_gh, r_gwn, r_gwg, r_gwu, r_gwd]
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max),
+            cpu_ms / dev_ms.max(1e-9)
+        );
+    }
+
     /// Gate: the from-scratch tiny model's loss falls well below its start over the step budget,
     /// with no non-finite loss along the way.
     #[test]
