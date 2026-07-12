@@ -527,8 +527,7 @@ enum DevOp {
 /// methods) with no host round-trips. Forward ops append a device buffer to `vals` and record a
 /// [`DevOp`]; [`backward`](Self::backward) replays them in reverse, accumulating grads on-device.
 /// A `dense_matmul` uses `s = ones`; the shared `ones` buffer is sized once at construction.
-#[allow(dead_code)]
-pub(crate) struct DeviceTape<'a> {
+pub struct DeviceTape<'a> {
     b: &'a CudaBackend,
     vals: Vec<CudaSlice<f32>>,
     lens: Vec<usize>,
@@ -536,11 +535,19 @@ pub(crate) struct DeviceTape<'a> {
     ones: CudaSlice<f32>,
 }
 
-#[allow(dead_code)] // test-only until the distillation loop drives it (plan 0043 P2.5b onward)
+impl core::fmt::Debug for DeviceTape<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceTape")
+            .field("n_values", &self.vals.len())
+            .field("n_ops", &self.ops.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> DeviceTape<'a> {
     /// New empty tape on `b`. `ones_max` must be ≥ the largest matmul output width `n` used (the
     /// per-row unit scale buffer is allocated once to this size).
-    pub(crate) fn new(b: &'a CudaBackend, ones_max: usize) -> Result<Self, BackendError> {
+    pub fn new(b: &'a CudaBackend, ones_max: usize) -> Result<Self, BackendError> {
         let ones = b.dev_upload(&vec![1.0f32; ones_max.max(1)])?;
         Ok(Self {
             b,
@@ -559,13 +566,13 @@ impl<'a> DeviceTape<'a> {
     }
 
     /// Upload a weight/input leaf; returns its value id.
-    pub(crate) fn leaf(&mut self, host: &[f32]) -> Result<usize, BackendError> {
+    pub fn leaf(&mut self, host: &[f32]) -> Result<usize, BackendError> {
         let buf = self.b.dev_upload(host)?;
         Ok(self.push(buf, host.len()))
     }
 
     /// Download a value (e.g. the logits) to host.
-    pub(crate) fn value(&self, id: usize) -> Result<Vec<f32>, BackendError> {
+    pub fn value(&self, id: usize) -> Result<Vec<f32>, BackendError> {
         let mut h = vec![0.0f32; self.lens[id]];
         self.b.dev_download(&self.vals[id], &mut h)?;
         Ok(h)
@@ -594,7 +601,7 @@ impl<'a> DeviceTape<'a> {
     }
 
     /// `Y[m,n] = X[m,k]·W[n,k]ᵀ` (fp dense).
-    pub(crate) fn matmul(
+    pub fn matmul(
         &mut self,
         x: usize,
         w: usize,
@@ -622,7 +629,7 @@ impl<'a> DeviceTape<'a> {
         Ok(id)
     }
 
-    pub(crate) fn rmsnorm(
+    pub fn rmsnorm(
         &mut self,
         x: usize,
         w: usize,
@@ -645,7 +652,7 @@ impl<'a> DeviceTape<'a> {
         Ok(id)
     }
 
-    pub(crate) fn silu(&mut self, x: usize) -> Result<usize, BackendError> {
+    pub fn silu(&mut self, x: usize) -> Result<usize, BackendError> {
         let n = self.lens[x];
         let mut out = self.b.dev_alloc_zeros(n)?;
         self.b.silu_forward_dev(&self.vals[x], &mut out, n)?;
@@ -654,7 +661,7 @@ impl<'a> DeviceTape<'a> {
         Ok(id)
     }
 
-    pub(crate) fn mul(&mut self, a: usize, b: usize) -> Result<usize, BackendError> {
+    pub fn mul(&mut self, a: usize, b: usize) -> Result<usize, BackendError> {
         debug_assert_eq!(
             self.lens[a], self.lens[b],
             "mul operands must be same length"
@@ -668,7 +675,7 @@ impl<'a> DeviceTape<'a> {
         Ok(id)
     }
 
-    pub(crate) fn add(&mut self, a: usize, b: usize) -> Result<usize, BackendError> {
+    pub fn add(&mut self, a: usize, b: usize) -> Result<usize, BackendError> {
         debug_assert_eq!(
             self.lens[a], self.lens[b],
             "add operands must be same length"
@@ -683,7 +690,7 @@ impl<'a> DeviceTape<'a> {
     }
 
     /// Tied-embedding gather `y[t,:] = w[tokens[t],:]`. `w` is the `[vocab,dim]` embedding leaf.
-    pub(crate) fn embed(
+    pub fn embed(
         &mut self,
         w: usize,
         tokens: &[i32],
@@ -865,7 +872,7 @@ impl<'a> DeviceTape<'a> {
     /// Multi-head causal self-attention with GQA — the device analogue of `tritium_train::nn::attention`.
     /// `x` is `[seq, n_embd]` (normed). Returns the attention output `[seq, n_embd]`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn attention(
+    pub fn attention(
         &mut self,
         x: usize,
         wq: usize,
@@ -1095,6 +1102,30 @@ impl<'a> DeviceTape<'a> {
             }
         }
         Ok(grads)
+    }
+
+    /// One distillation-step gradient, host in / host out: seed the softmax-xent loss grad at the
+    /// `logits` value, run the whole device-resident backward, and download the gradients for the
+    /// requested value ids. Hides the device buffers entirely — the caller (the distillation loop)
+    /// works in host `Vec<f32>` and never touches a `CudaSlice`. `want` is typically the weight-leaf
+    /// ids; the returned grads are in `want` order.
+    pub fn xent_backward(
+        &self,
+        logits: usize,
+        target: &[f32],
+        rows: usize,
+        cols: usize,
+        want: &[usize],
+    ) -> Result<Vec<Vec<f32>>, BackendError> {
+        let seed = self.softmax_xent_grad(logits, target, rows, cols)?;
+        let grads = self.backward(logits, &seed)?;
+        want.iter()
+            .map(|&id| {
+                let mut h = vec![0.0f32; self.lens[id]];
+                self.b.dev_download(&grads[id], &mut h)?;
+                Ok(h)
+            })
+            .collect()
     }
 }
 
