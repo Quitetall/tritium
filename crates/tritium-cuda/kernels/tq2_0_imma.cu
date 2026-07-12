@@ -264,13 +264,18 @@ __global__ void tq2_0_imma_mpgemm(
     // c1: row=group,   col=2*tig+1
     // c2: row=group+8, col=2*tig
     // c3: row=group+8, col=2*tig+1
-    // out[m,n] = act_scale[m] · weight_scale[n] · acc  (exact int32 acc → f32).
+    // out[m,n] = ((float)acc · weight_scale[n]) · act_scale[m] — the EXACT
+    // association the dp4a family uses (tq2_0_add.cu tiled_i8_scaled:
+    // `(float)acc * scales[ni] * act_scale[mi]`). The integer acc is
+    // order-free, and this is a pure multiply chain (no FMA contraction
+    // possible), so matching the association makes IMMA output BIT-IDENTICAL
+    // to the dp4a path — the ADR 0026 Track P prefill dispatch relies on it.
     auto store = [&](int acc, int row_in_tile, int col_in_tile) {
         const int gm = m_tile + row_in_tile;
         const int gn = n_tile + col_in_tile;
         if (gm < m && gn < n) {
             out[(long long)gm * n + gn] =
-                act_scale[gm] * weight_scale[gn] * (float)acc;
+                (float)acc * weight_scale[gn] * act_scale[gm];
         }
     };
     store(c0, group, 2 * tig);

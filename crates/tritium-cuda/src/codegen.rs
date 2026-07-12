@@ -272,7 +272,8 @@ extern "C" __global__ void __launch_bounds__({block_threads}) tq2_0_imma_mpgemm(
     }}
 
     // Store each owned sub-tile, folding scales (single f32 multiply chain, the
-    // same order as the AOT kernel: act_scale * weight_scale * acc).
+    // same order as the AOT kernel: (float)acc * weight_scale * act_scale —
+    // the dp4a family's exact association (bit-identity contract, ADR 0026).
     #pragma unroll 1
     for (int st = warp; st < SUBTILES; st += WARPS) {{
         const int slot = st / WARPS;
@@ -285,7 +286,7 @@ extern "C" __global__ void __launch_bounds__({block_threads}) tq2_0_imma_mpgemm(
             const int gn = tile_n0 + col_in_tile;
             if (gm < m && gn < n) {{
                 out[(long long)gm * n + gn] =
-                    act_scale[gm] * weight_scale[gn] * (float)acc;
+                    (float)acc * weight_scale[gn] * act_scale[gm];
             }}
         }};
         store(c0[slot], group, 2 * tig);

@@ -3335,9 +3335,10 @@ impl CudaBackend {
         let wscale: Vec<f32> = (0..n).map(|j| 1.0 + (j % 4) as f32 * 0.5).collect();
         let trits: Vec<i8> = (0..n * k).map(|i| ((i % 3) as i8) - 1).collect();
 
-        // Host reference: exact int32 contraction folded by the two scales — the same
-        // arithmetic the kernel performs, so a correct tile matches to the bit modulo
-        // the single f32 fold's rounding (within the IMMA tolerance).
+        // Host reference: exact int32 contraction folded by the two scales in the
+        // kernel's EXACT association ((float)acc * wscale * act_scale — unified with
+        // the dp4a family, ADR 0026 bit-identity contract), so a correct tile matches
+        // bit-for-bit; imma_close's tolerance remains as slack for nothing.
         let mut reference = vec![0.0f32; m * n];
         for mi in 0..m {
             for ni in 0..n {
@@ -3345,7 +3346,7 @@ impl CudaBackend {
                 for ki in 0..k {
                     acc += qact[mi * k + ki] as i64 * trits[ni * k + ki] as i64;
                 }
-                reference[mi * n + ni] = act_scale[mi] * wscale[ni] * acc as f32;
+                reference[mi * n + ni] = acc as f32 * wscale[ni] * act_scale[mi];
             }
         }
 

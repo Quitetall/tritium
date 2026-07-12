@@ -982,6 +982,149 @@ fn imma_handles_tail_shapes() {
     }
 }
 
+/// ADR 0026 Track P bit-identity gate: the IMMA tensor-core kernel must be
+/// **bit-identical** to the dp4a `tiled_i8_scaled` kernel on the SAME int8
+/// activations, act scales and per-channel weight scales. Both contract in
+/// exact i32 (order-free) and both fold `(float)acc * wscale[n] * act_scale[m]`
+/// in the same association (a pure multiply chain — no FMA contraction), so
+/// every output bit matches. This is what lets the prefill dispatch swap
+/// kernels by M with ZERO numerics re-gating (C1 chunking, G1 first-token).
+/// Shapes cover 16/8/32-tile boundaries and tails at the real K values.
+#[test]
+fn imma_matches_dp4a_tiled_scaled_bit_exact() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+    use tritium_format::{TQ2_0_BLOCK_BYTES, num_blocks};
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping imma-vs-dp4a gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let m_add = ctx
+        .load_module(Ptx::from_src(TQ2_0_ADD_PTX))
+        .expect("load add module");
+    let m_imma = ctx
+        .load_module(Ptx::from_src(TQ2_0_IMMA_PTX))
+        .expect("load imma module");
+    let f_dp4a = m_add
+        .load_function("tq2_0_add_mpgemm_tiled_i8_scaled")
+        .expect("dp4a fn");
+    let f_imma = m_imma.load_function("tq2_0_imma_mpgemm").expect("imma fn");
+
+    // (m, n, k): tile-aligned and tail shapes at prefill-realistic K
+    // (k % 256 == 0 — the TQ2 packer's block size; covers K=2560/6912-class
+    // contractions via 2560 and a 6912-divisor tail mix).
+    for &(m, n, k) in &[
+        (16usize, 8usize, 256usize),
+        (33, 13, 512),
+        (128, 40, 2560),
+        (7, 9, 1024),
+    ] {
+        let trits = mixed_trits(n, k, 0x51 ^ (m as u64) ^ (k as u64));
+        // dp4a weights: TQ2_0 rows with unit block scales (both kernels ignore
+        // block scales; the per-channel `scales` array is the shared truth).
+        let nb = num_blocks(k);
+        let unit = vec![half::f16::ONE; nb];
+        let rb = nb * TQ2_0_BLOCK_BYTES;
+        let mut packed_tq2 = vec![0u8; n * rb];
+        for ni in 0..n {
+            tritium_format::pack_tq2_0_row(
+                &trits[ni * k..(ni + 1) * k],
+                &unit,
+                &mut packed_tq2[ni * rb..(ni + 1) * rb],
+            )
+            .expect("pack tq2");
+        }
+        // IMMA weights: the I2sInt8 tile interleave from the SAME trits.
+        let trits_i8: Vec<i8> = trits.iter().map(|t| t.get()).collect();
+        let packed_imma = pack_i2s_int8_tiles(&trits_i8, n, k);
+        let num_ktiles = k.div_ceil(tritium_format::IMMA_K);
+
+        let qact: Vec<i8> = (0..m * k).map(|i| ((i * 37 + 11) % 255) as i8).collect();
+        let scales = seeded_f32(7, n, 0.5, 2.0);
+        let act_scale = seeded_f32(13, m, 0.5, 1.5);
+
+        let d_qact = stream.clone_htod(&qact).unwrap();
+        let d_w2 = stream.clone_htod(&packed_tq2).unwrap();
+        let d_wi = stream.clone_htod(&packed_imma).unwrap();
+        let d_sc = stream.clone_htod(&scales).unwrap();
+        let d_as = stream.clone_htod(&act_scale).unwrap();
+        let (m_i, n_i, k_i, rb_i, nkt_i) =
+            (m as i32, n as i32, k as i32, rb as i32, num_ktiles as i32);
+
+        // dp4a launch (the production tiled_i8_scaled geometry).
+        let dp4a_out = {
+            let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(8), m as u32, 1),
+                block_dim: (8 * 32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut l = stream.launch_builder(&f_dp4a);
+            l.arg(&d_qact)
+                .arg(&d_w2)
+                .arg(&d_sc)
+                .arg(&d_as)
+                .arg(&mut d_out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(&rb_i);
+            // SAFETY: matches `tq2_0_add_mpgemm_tiled_i8_scaled(qact, w, scales,
+            // act_scale, out, m, n, k, row_bytes)`; grid.y = m.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg).unwrap()
+            };
+            let mut out = vec![0.0f32; m * n];
+            stream.memcpy_dtoh(&d_out, &mut out).unwrap();
+            out
+        };
+
+        // IMMA launch (one warp per 16x8 tile).
+        let imma_out = {
+            let mut d_out = stream.alloc_zeros::<f32>(m * n).unwrap();
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(8), (m as u32).div_ceil(16), 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut l = stream.launch_builder(&f_imma);
+            l.arg(&d_qact)
+                .arg(&d_wi)
+                .arg(&d_as)
+                .arg(&d_sc)
+                .arg(&mut d_out)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i)
+                .arg(&nkt_i);
+            // SAFETY: matches `tq2_0_imma_mpgemm(qact, weights, act_scale,
+            // weight_scale, out, m, n, k, num_ktiles)`; grid covers all tiles.
+            #[allow(unsafe_code)]
+            unsafe {
+                l.launch(cfg).unwrap()
+            };
+            let mut out = vec![0.0f32; m * n];
+            stream.memcpy_dtoh(&d_out, &mut out).unwrap();
+            out
+        };
+
+        for (i, (a, b)) in dp4a_out.iter().zip(&imma_out).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "m{m} n{n} k{k} [{i}]: dp4a={a} imma={b} — the epilogue \
+                 association drifted (bit-identity contract, ADR 0026)"
+            );
+        }
+    }
+}
+
 // ---- WF-B: autotune + nvrtc JIT determinism (ADR 0005) ---------------------
 //
 // These gate the WF-B contract: a JIT-compiled tile is BIT-IDENTICAL to the AOT

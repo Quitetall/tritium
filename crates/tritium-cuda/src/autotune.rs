@@ -312,7 +312,10 @@ pub(crate) struct CacheKey {
 /// rendered kernel's PERFORMANCE characteristics (fragment loads, loop order,
 /// staging) so previously tuned winners re-tune instead of persisting a choice
 /// made for a different kernel. rev 2 = u32 fragment loads + B-fragment reuse.
-pub(crate) const CODEGEN_REV: u32 = 2;
+/// rev 3 = epilogue association unified with the dp4a family
+/// ((float)acc * weight_scale * act_scale) — the ADR 0026 Track P
+/// bit-identity contract; outputs shift at ULP level vs rev 2.
+pub(crate) const CODEGEN_REV: u32 = 3;
 
 impl CacheKey {
     /// Stable filesystem-safe string form, e.g.
@@ -577,7 +580,7 @@ mod tests {
         // driver bump invalidates the on-disk entry.
         assert_eq!(
             sample_key().to_key_string(),
-            "sm_89-i2sint8-m5-n2560-k2560-cuda13030-r2"
+            "sm_89-i2sint8-m5-n2560-k2560-cuda13030-r3"
         );
     }
 
