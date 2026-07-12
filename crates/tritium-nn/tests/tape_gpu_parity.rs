@@ -95,6 +95,12 @@ fn gpu_tape_matches_cpu_tape_on_smollm2() {
         a.n_layers,
     );
 
-    assert!(logit_rel < 5e-3, "forward logits GPU vs CPU: {logit_abs:.3e}");
-    assert!(grad_rel < 5e-3, "backward embd-grad GPU vs CPU: {grad_abs:.3e}");
+    assert!(
+        logit_rel < 5e-3,
+        "forward logits GPU vs CPU: {logit_abs:.3e}"
+    );
+    assert!(
+        grad_rel < 5e-3,
+        "backward embd-grad GPU vs CPU: {grad_abs:.3e}"
+    );
 }

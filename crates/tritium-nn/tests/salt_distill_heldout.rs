@@ -111,12 +111,35 @@ fn salt_distillation_recovers_heldout_perplexity() {
     let opt = AdamW::new(LR);
     let mut states: Vec<_> = lat.iter().map(|w| opt.init_state(w.len())).collect();
     let (mut first, mut last) = (f32::NAN, f32::NAN);
+
+    // Optional GPU student (plan 0043 Phase 1): route the tape's `dense_matmul`s to the 4090 via the
+    // bit-exact `train_grad.cu` kernels. Opt-in with `TRITIUM_DISTILL_GPU=1 --features cuda`; the
+    // teacher forward + `salt_ste` + norm/softmax glue stay on the CPU host (device-resident = P2).
+    #[cfg(feature = "cuda")]
+    let gpu: Option<std::rc::Rc<dyn tritium_train::TrainGemm>> =
+        std::env::var("TRITIUM_DISTILL_GPU").is_ok().then(|| {
+            std::rc::Rc::new(tritium_cuda::train::GpuGemm::new(0).expect("open CUDA device"))
+                as std::rc::Rc<dyn tritium_train::TrainGemm>
+        });
+    #[cfg(feature = "cuda")]
+    let backend = if gpu.is_some() { "GPU" } else { "CPU" };
+    #[cfg(not(feature = "cuda"))]
+    let backend = "CPU";
+    let mut step_ms = 0.0f64;
+
     for step in 1..=steps {
+        let t_start = std::time::Instant::now();
         let wi = ((step - 1) as usize) % windows.len();
         let toks = windows[wi];
         // Teacher soft targets for this window, computed on the fly (O(1) memory — precomputing all
         // windows' full-vocab probs is ~26GB at the 128k-token endpoint).
         let tprobs = row_softmax(&logits_of(&fp, &a, toks), a.vocab);
+        #[cfg(feature = "cuda")]
+        let mut t = match &gpu {
+            Some(e) => Tape::with_gemm(e.clone()),
+            None => Tape::new(),
+        };
+        #[cfg(not(feature = "cuda"))]
         let mut t = Tape::new();
         let mut leaf_ids = Vec::with_capacity(lat.len());
         let mut ste_ids = Vec::with_capacity(lat.len());
@@ -138,10 +161,15 @@ fn salt_distillation_recovers_heldout_perplexity() {
         for i in 0..lat.len() {
             opt.step(step, &mut lat[i], &grads[leaf_ids[i]], &mut states[i]);
         }
+        step_ms += t_start.elapsed().as_secs_f64() * 1e3;
         if step % 10 == 0 || step == 1 {
             eprintln!("  step {step}/{steps} (win {wi})  train-xent {lv:.4}");
         }
     }
+    eprintln!(
+        "  [{backend}] mean step {:.0}ms over {steps} steps (teacher+salt_ste CPU; matmuls {backend})",
+        step_ms / steps as f64
+    );
     let distilled: Vec<Vec<f32>> = lat
         .iter()
         .zip(&shapes)
