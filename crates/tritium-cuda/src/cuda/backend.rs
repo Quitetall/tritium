@@ -134,6 +134,11 @@ pub struct CudaBackend {
     pub(super) func_ew_mul_bwd: CudaFunction,
     pub(super) func_ew_add_fwd: CudaFunction,
     pub(super) func_accumulate: CudaFunction,
+    /// plan 0043 P2.3 device-resident training RMSNorm (sequential order; forward, per-row inv, grads).
+    pub(super) func_rmsnorm_train_fwd: CudaFunction,
+    pub(super) func_rmsnorm_train_inv: CudaFunction,
+    pub(super) func_rmsnorm_train_grad_x: CudaFunction,
+    pub(super) func_rmsnorm_train_grad_w: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -286,6 +291,18 @@ impl CudaBackend {
         let func_accumulate = grad_module
             .load_function(KERNEL_NAME_ACCUMULATE)
             .map_err(|e| driver_err("resolve accumulate kernel", &e))?;
+        let func_rmsnorm_train_fwd = grad_module
+            .load_function(KERNEL_NAME_RMSNORM_TRAIN_FWD)
+            .map_err(|e| driver_err("resolve rmsnorm_train_forward kernel", &e))?;
+        let func_rmsnorm_train_inv = grad_module
+            .load_function(KERNEL_NAME_RMSNORM_TRAIN_INV)
+            .map_err(|e| driver_err("resolve rmsnorm_train_inv kernel", &e))?;
+        let func_rmsnorm_train_grad_x = grad_module
+            .load_function(KERNEL_NAME_RMSNORM_TRAIN_GRAD_X)
+            .map_err(|e| driver_err("resolve rmsnorm_train_grad_x kernel", &e))?;
+        let func_rmsnorm_train_grad_w = grad_module
+            .load_function(KERNEL_NAME_RMSNORM_TRAIN_GRAD_W)
+            .map_err(|e| driver_err("resolve rmsnorm_train_grad_w kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -336,6 +353,10 @@ impl CudaBackend {
             func_ew_mul_bwd,
             func_ew_add_fwd,
             func_accumulate,
+            func_rmsnorm_train_fwd,
+            func_rmsnorm_train_inv,
+            func_rmsnorm_train_grad_x,
+            func_rmsnorm_train_grad_w,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -1077,6 +1098,131 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(n))
                 .map_err(|e| driver_err("launch accumulate_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Training RMSNorm forward on resident buffers (`ops::norm::forward`, sequential order —
+    /// distinct from the inference tree-order [`rmsnorm`](Self::rmsnorm)). `x`:[rows,cols],
+    /// `w`:[cols], `y`:[rows,cols]. One thread per row. Bit-exact vs the CPU op (only +,*,/,sqrt).
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    pub(crate) fn rmsnorm_forward_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_w: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        if d_x.len() < rows * cols || d_w.len() < cols || d_y.len() < rows * cols {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * cols,
+                got: d_y.len(),
+            });
+        }
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_rmsnorm_train_fwd);
+        launch
+            .arg(d_x)
+            .arg(d_w)
+            .arg(d_y)
+            .arg(&ri)
+            .arg(&ci)
+            .arg(&eps);
+        // SAFETY: signature `(const float* x, const float* w, float* y, int rows, int cols, float
+        // eps)`; one thread per row, guarded by `r < rows`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch rmsnorm_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Training RMSNorm backward on resident buffers (`ops::norm::vjp`): writes `gx`:[rows,cols] and
+    /// `gw`:[cols]. Allocates the per-row `inv[rows]` once (`rmsnorm_train_inv`) and shares it across
+    /// `grad_x` (thread/row) and `grad_w` (thread/col). Bit-exact vs the CPU vjp.
+    ///
+    /// # Errors
+    /// [`BackendError::ShapeMismatch`] on undersized buffer; device failure via cudarc.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)] // resident buffers + shape: a kernel-launch wrapper
+    pub(crate) fn rmsnorm_backward_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_w: &CudaSlice<f32>,
+        d_gy: &CudaSlice<f32>,
+        d_gx: &mut CudaSlice<f32>,
+        d_gw: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        if d_x.len() < rows * cols
+            || d_gy.len() < rows * cols
+            || d_gx.len() < rows * cols
+            || d_w.len() < cols
+            || d_gw.len() < cols
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: rows * cols,
+                got: d_gx.len(),
+            });
+        }
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut d_inv = self
+            .stream
+            .alloc_zeros::<f32>(rows)
+            .map_err(|e| driver_err("rmsnorm_backward_dev alloc inv", &e))?;
+        // inv[r] = 1/sqrt(mean_sq_r + eps) — one thread per row.
+        let mut l_inv = self.stream.launch_builder(&self.func_rmsnorm_train_inv);
+        l_inv.arg(d_x).arg(&mut d_inv).arg(&ri).arg(&ci).arg(&eps);
+        // SAFETY: `(const float* x, float* inv, int rows, int cols, float eps)`; one thread/row.
+        #[allow(unsafe_code)]
+        unsafe {
+            l_inv
+                .launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch rmsnorm_train_inv", &e))?;
+        }
+        // gx[r,·] — one thread per row.
+        let mut l_gx = self.stream.launch_builder(&self.func_rmsnorm_train_grad_x);
+        l_gx.arg(d_x)
+            .arg(d_w)
+            .arg(d_gy)
+            .arg(&d_inv)
+            .arg(d_gx)
+            .arg(&ri)
+            .arg(&ci);
+        // SAFETY: `(const float* x, w, gy, inv, float* gx, int rows, int cols)`; one thread/row.
+        #[allow(unsafe_code)]
+        unsafe {
+            l_gx.launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch rmsnorm_train_grad_x", &e))?;
+        }
+        // gw[i] = Σ_r … — one thread per column.
+        let mut l_gw = self.stream.launch_builder(&self.func_rmsnorm_train_grad_w);
+        l_gw.arg(d_x)
+            .arg(d_gy)
+            .arg(&d_inv)
+            .arg(d_gw)
+            .arg(&ri)
+            .arg(&ci);
+        // SAFETY: `(const float* x, gy, inv, float* gw, int rows, int cols)`; one thread/col.
+        #[allow(unsafe_code)]
+        unsafe {
+            l_gw.launch(Self::elementwise_cfg(cols))
+                .map_err(|e| driver_err("launch rmsnorm_train_grad_w", &e))?;
         }
         Ok(())
     }

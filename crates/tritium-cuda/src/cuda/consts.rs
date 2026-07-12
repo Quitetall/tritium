@@ -190,6 +190,11 @@ pub(super) const KERNEL_NAME_EW_MUL_FWD: &str = "ew_mul_forward";
 pub(super) const KERNEL_NAME_EW_MUL_BWD: &str = "ew_mul_backward";
 pub(super) const KERNEL_NAME_EW_ADD_FWD: &str = "ew_add_forward";
 pub(super) const KERNEL_NAME_ACCUMULATE: &str = "accumulate";
+/// plan 0043 P2.3 device-resident training RMSNorm (sequential order, mirrors ops::norm).
+pub(super) const KERNEL_NAME_RMSNORM_TRAIN_FWD: &str = "rmsnorm_train_forward";
+pub(super) const KERNEL_NAME_RMSNORM_TRAIN_INV: &str = "rmsnorm_train_inv";
+pub(super) const KERNEL_NAME_RMSNORM_TRAIN_GRAD_X: &str = "rmsnorm_train_grad_x";
+pub(super) const KERNEL_NAME_RMSNORM_TRAIN_GRAD_W: &str = "rmsnorm_train_grad_w";
 /// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
 pub(super) const LMHEAD_ROW_TILE: u32 = 8;
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's

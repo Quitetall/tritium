@@ -764,6 +764,60 @@ mod tests {
         eprintln!("0043 P2.2 resident glue ops (silu/mul/add/accumulate, n={n}): match CPU ops");
     }
 
+    /// Gate (plan 0043 P2.3): the device-resident TRAINING RMSNorm (forward + grad_x + grad_w)
+    /// matches `tritium-train`'s `ops::norm` — which uses a sequential sum, so (only +,*,/,sqrt, all
+    /// IEEE correctly-rounded, --fmad=false) it is BIT-EXACT, unlike silu's expf.
+    #[test]
+    fn resident_rmsnorm_matches_cpu() {
+        use tritium_train::ops::norm;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping resident_rmsnorm_matches_cpu: no CUDA device ({e})");
+                return;
+            }
+        };
+        let (rows, cols, eps) = (48usize, 576usize, 1e-5f32); // cols = SmolLM2 n_embd
+        let x = seeded_uniform(0x51, rows * cols, -2.0, 2.0);
+        let w = seeded_uniform(0x52, cols, 0.5, 1.5);
+        let gy = seeded_uniform(0x53, rows * cols, -1.0, 1.0);
+        let d_x = backend.dev_upload(&x).unwrap();
+        let d_w = backend.dev_upload(&w).unwrap();
+        let d_gy = backend.dev_upload(&gy).unwrap();
+        let download = |d: &_, n: usize| {
+            let mut h = vec![0.0f32; n];
+            backend.dev_download(d, &mut h).unwrap();
+            h
+        };
+
+        // forward
+        let mut d_y = backend.dev_alloc_zeros(rows * cols).unwrap();
+        backend
+            .rmsnorm_forward_dev(&d_x, &d_w, &mut d_y, rows, cols, eps)
+            .unwrap();
+        let cpu_y = norm::forward(&x, &w, rows, cols, eps);
+        let fwd_d = max_abs_diff(&download(&d_y, rows * cols), &cpu_y);
+
+        // backward
+        let mut d_gx = backend.dev_alloc_zeros(rows * cols).unwrap();
+        let mut d_gw = backend.dev_alloc_zeros(cols).unwrap();
+        backend
+            .rmsnorm_backward_dev(&d_x, &d_w, &d_gy, &mut d_gx, &mut d_gw, rows, cols, eps)
+            .unwrap();
+        let cpu_g = norm::vjp(&x, &w, rows, cols, eps, &gy); // [gx, gw]
+        let gx_d = max_abs_diff(&download(&d_gx, rows * cols), &cpu_g[0]);
+        let gw_d = max_abs_diff(&download(&d_gw, cols), &cpu_g[1]);
+
+        eprintln!(
+            "0043 P2.3 resident RMSNorm (rows={rows} cols={cols}): \
+             fwd max|Δ| {fwd_d:.3e} | grad_x {gx_d:.3e} | grad_w {gw_d:.3e} (0.0 = bit-exact)"
+        );
+        assert!(fwd_d < 1e-4, "rmsnorm forward: {fwd_d:.3e}");
+        assert!(gx_d < 1e-4, "rmsnorm grad_x: {gx_d:.3e}");
+        assert!(gw_d < 1e-4, "rmsnorm grad_w: {gw_d:.3e}");
+    }
+
     /// Gate: the from-scratch tiny model's loss falls well below its start over the step budget,
     /// with no non-finite loss along the way.
     #[test]

@@ -167,3 +167,76 @@ extern "C" __global__ void accumulate(
     if (i >= n) return;
     dst[i] += src[i];
 }
+
+// ───────────────────────── device-resident RMSNorm (plan 0043 P2.3) ─────────────────────────
+// The TRAINING RMSNorm (mirrors tritium_train::ops::norm — a plain SEQUENTIAL sum, NOT the
+// inference tree-order rmsnorm in decode.cu). RMSNorm uses only +,*,/,sqrt — all IEEE
+// correctly-rounded — so with --fmad=false these reproduce the host ops::norm forward/vjp
+// BIT-FOR-BIT (unlike silu's expf). x:[rows,cols], w:[cols] (shared), y/gx:[rows,cols], gw:[cols],
+// inv:[rows]. Per-row work → one thread per row (forward, inv, grad_x); grad_w reduces down rows
+// per column → one thread per column.
+//
+//   inv_r  = 1/sqrt( (Σ_i x[r,i]²)/cols + eps )
+//   y[r,i] = x[r,i]·inv_r·w[i]
+//   c_r    = Σ_i g[r,i]·w[i]·x[r,i]
+//   gx[r,k]= inv_r·g[r,k]·w[k] − (inv_r³·c_r/cols)·x[r,k]
+//   gw[i]  = Σ_r g[r,i]·x[r,i]·inv_r
+
+// Forward: one thread per row (mean_sq then y). Op order matches ops::norm::forward exactly.
+extern "C" __global__ void rmsnorm_train_forward(
+    const float* __restrict__ x, const float* __restrict__ w,
+    float* __restrict__ y, int rows, int cols, float eps)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + (long)r * cols;
+    float acc = 0.0f;
+    for (int i = 0; i < cols; ++i) acc += xr[i] * xr[i];
+    float inv = 1.0f / sqrtf(acc / (float)cols + eps);
+    float* yr = y + (long)r * cols;
+    for (int i = 0; i < cols; ++i) yr[i] = xr[i] * inv * w[i];
+}
+
+// Per-row inverse-RMS `inv[r]` — shared by grad_x and grad_w so neither recomputes it.
+extern "C" __global__ void rmsnorm_train_inv(
+    const float* __restrict__ x, float* __restrict__ inv, int rows, int cols, float eps)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + (long)r * cols;
+    float acc = 0.0f;
+    for (int i = 0; i < cols; ++i) acc += xr[i] * xr[i];
+    inv[r] = 1.0f / sqrtf(acc / (float)cols + eps);
+}
+
+// grad_x: one thread per row. c_r then gx[r,·]. Uses precomputed inv[r].
+extern "C" __global__ void rmsnorm_train_grad_x(
+    const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ gy,
+    const float* __restrict__ inv, float* __restrict__ gx, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + (long)r * cols;
+    const float* gr = gy + (long)r * cols;
+    float invr = inv[r];
+    float c = 0.0f;
+    for (int i = 0; i < cols; ++i) c += gr[i] * w[i] * xr[i];
+    float inv3_c_over_n = invr * invr * invr * c / (float)cols;
+    float* gxr = gx + (long)r * cols;
+    for (int k = 0; k < cols; ++k)
+        gxr[k] = invr * gr[k] * w[k] - inv3_c_over_n * xr[k];
+}
+
+// grad_w: one thread per column i. gw[i] = Σ_r g[r,i]·x[r,i]·inv[r] (ascending r, matches the host
+// accumulation order). Uses precomputed inv[r].
+extern "C" __global__ void rmsnorm_train_grad_w(
+    const float* __restrict__ x, const float* __restrict__ gy,
+    const float* __restrict__ inv, float* __restrict__ gw, int rows, int cols)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    float acc = 0.0f;
+    for (int r = 0; r < rows; ++r)
+        acc += gy[(long)r * cols + i] * x[(long)r * cols + i] * inv[r];
+    gw[i] = acc;
+}
