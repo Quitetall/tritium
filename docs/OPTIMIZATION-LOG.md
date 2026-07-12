@@ -1058,10 +1058,12 @@ inside the 1% bar).
 attention fast pair not authorized (its gate was rmsnorm ≥3%).** The
 refutation settles the profile conflict: rmsnorm's M=1 cost is structural
 (launch + barriers + elementwise passes), not sum-order — the flat profile's
-~32% attribution was not an optimization target. Everything recoverable from
-git history; a first bench run was discarded as contaminated (monotonic
-thermal/contention decay 302→206 tok/s — the order-alternated protocol is
-the keeper).
+~32% attribution was not an optimization target. CORRECTION: the implementation
+was built, measured and deleted without an intermediate commit — ADR 0023's
+verdict section is the durable record (design specified there in rebuild
+detail), NOT git history. A first bench run was discarded as contaminated
+(monotonic thermal/contention decay 302→206 tok/s — the order-alternated
+protocol is the keeper).
 
 Track E closed. The remaining decode headroom at M=1 per this session's
 measurements: spec decode (Track D's drafter, gated on BLUT training) ≫

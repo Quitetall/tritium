@@ -115,7 +115,9 @@ What the measurement settled: the two conflicting profiles (flat: rmsnorm
 ~32% of GPU time; per-layer counters: ~5%) are resolved in favor of the
 counters. The rmsnorm cost at M=1 is launch overhead + barriers + the
 elementwise passes — structural, not sum-order — so relaxing the reduction
-order buys only the fold's latency chain, worth ~2% e2e. The kernel and
-plumbing live in git history (this commit's parent) if a future architecture
-changes the calculus; the honest projection for any revival is bounded by
+order buys only the fold's latency chain, worth ~2% e2e. CORRECTION: the
+implementation was built, measured and deleted in the working tree without an
+intermediate commit, so it is NOT in git history — this verdict section is
+the durable record (the design is specified above in enough detail to
+rebuild in ~an hour). The honest projection for any revival is bounded by
 this measurement, not by the flat profile.
