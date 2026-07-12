@@ -127,6 +127,13 @@ pub struct CudaBackend {
     pub(super) func_grad_a: CudaFunction,
     pub(super) func_grad_w: CudaFunction,
     pub(super) func_grad_s: CudaFunction,
+    /// plan 0043 P2.2 device-resident glue: elementwise silu/mul/add fwd/bwd + grad accumulate.
+    pub(super) func_silu_fwd: CudaFunction,
+    pub(super) func_silu_bwd: CudaFunction,
+    pub(super) func_ew_mul_fwd: CudaFunction,
+    pub(super) func_ew_mul_bwd: CudaFunction,
+    pub(super) func_ew_add_fwd: CudaFunction,
+    pub(super) func_accumulate: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -260,6 +267,25 @@ impl CudaBackend {
         let func_grad_s = grad_module
             .load_function(KERNEL_NAME_GRAD_S)
             .map_err(|e| driver_err("resolve grad_s kernel", &e))?;
+        // P2.2 device-resident glue ops (same `--fmad=false` train_grad.ptx module).
+        let func_silu_fwd = grad_module
+            .load_function(KERNEL_NAME_SILU_FWD)
+            .map_err(|e| driver_err("resolve silu_forward kernel", &e))?;
+        let func_silu_bwd = grad_module
+            .load_function(KERNEL_NAME_SILU_BWD)
+            .map_err(|e| driver_err("resolve silu_backward kernel", &e))?;
+        let func_ew_mul_fwd = grad_module
+            .load_function(KERNEL_NAME_EW_MUL_FWD)
+            .map_err(|e| driver_err("resolve ew_mul_forward kernel", &e))?;
+        let func_ew_mul_bwd = grad_module
+            .load_function(KERNEL_NAME_EW_MUL_BWD)
+            .map_err(|e| driver_err("resolve ew_mul_backward kernel", &e))?;
+        let func_ew_add_fwd = grad_module
+            .load_function(KERNEL_NAME_EW_ADD_FWD)
+            .map_err(|e| driver_err("resolve ew_add_forward kernel", &e))?;
+        let func_accumulate = grad_module
+            .load_function(KERNEL_NAME_ACCUMULATE)
+            .map_err(|e| driver_err("resolve accumulate kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -304,6 +330,12 @@ impl CudaBackend {
             func_grad_a,
             func_grad_w,
             func_grad_s,
+            func_silu_fwd,
+            func_silu_bwd,
+            func_ew_mul_fwd,
+            func_ew_mul_bwd,
+            func_ew_add_fwd,
+            func_accumulate,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -691,6 +723,16 @@ impl CudaBackend {
     ) -> Result<(), BackendError> {
         let GemmShape { m, n, k } = shape;
         Self::check_grad_launch_bounds(m, n, k)?;
+        // Guard undersized resident buffers: the kernel indexes inputs unbounded and writes the
+        // whole [0, m*n) output, so a too-small buffer is device UB (OOB read / VRAM corruption),
+        // not a clean error. `CudaSlice::len()` is a host-side value — free to check. `<` (not `==`)
+        // so an oversized `s` (e.g. one shared ones buffer across shapes) is still allowed.
+        if d_a.len() < m * k || d_w.len() < n * k || d_s.len() < n || d_y.len() < m * n {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * n,
+                got: d_y.len(),
+            });
+        }
         if m * n == 0 || k == 0 {
             return Ok(()); // k==0 ⇒ Y = s·0 = 0, and d_y is caller-zeroed.
         }
@@ -736,6 +778,12 @@ impl CudaBackend {
     ) -> Result<(), BackendError> {
         let GemmShape { m, n, k } = shape;
         Self::check_grad_launch_bounds(m, n, k)?;
+        if d_gy.len() < m * n || d_w.len() < n * k || d_s.len() < n || d_ga.len() < m * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * k,
+                got: d_ga.len(),
+            });
+        }
         if m * k == 0 {
             return Ok(());
         }
@@ -781,6 +829,12 @@ impl CudaBackend {
     ) -> Result<(), BackendError> {
         let GemmShape { m, n, k } = shape;
         Self::check_grad_launch_bounds(m, n, k)?;
+        if d_gy.len() < m * n || d_a.len() < m * k || d_s.len() < n || d_gw.len() < n * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: n * k,
+                got: d_gw.len(),
+            });
+        }
         if n * k == 0 {
             return Ok(());
         }
@@ -806,6 +860,223 @@ impl CudaBackend {
             launch
                 .launch(cfg)
                 .map_err(|e| driver_err("launch grad_w_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Launch config for a 1-thread-per-element elementwise kernel over `n` f32.
+    fn elementwise_cfg(n: usize) -> LaunchConfig {
+        let threads = THREADS_PER_BLOCK;
+        LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    /// SiLU forward `y[i] = x[i]·σ(x[i])` on resident buffers (`ops::act::silu_forward`).
+    /// `expf` may differ from host libm by ~1 ULP ⇒ gated device==CPU within rel 1e-4.
+    ///
+    /// # Errors
+    /// Device failure via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn silu_forward_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if d_x.len() < n || d_y.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: d_y.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i32;
+        let mut launch = self.stream.launch_builder(&self.func_silu_fwd);
+        launch.arg(d_x).arg(d_y).arg(&ni);
+        // SAFETY: signature `(const float* x, float* y, int n)`; one thread per element, `i < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch silu_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// SiLU backward `gx[i] = gy[i]·(s + x·s·(1−s))`, `s=σ(x[i])` (`ops::act::silu_vjp`).
+    ///
+    /// # Errors
+    /// Device failure via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn silu_backward_dev(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_gy: &CudaSlice<f32>,
+        d_gx: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if d_x.len() < n || d_gy.len() < n || d_gx.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: d_gx.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i32;
+        let mut launch = self.stream.launch_builder(&self.func_silu_bwd);
+        launch.arg(d_x).arg(d_gy).arg(d_gx).arg(&ni);
+        // SAFETY: signature `(const float* x, const float* gy, float* gx, int n)`; `i < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch silu_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Elementwise multiply forward `y[i] = a[i]·b[i]` on resident buffers
+    /// (`ops::elementwise::mul_forward`; bit-exact).
+    ///
+    /// # Errors
+    /// Device failure via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn ew_mul_forward_dev(
+        &self,
+        d_a: &CudaSlice<f32>,
+        d_b: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if d_a.len() < n || d_b.len() < n || d_y.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: d_y.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i32;
+        let mut launch = self.stream.launch_builder(&self.func_ew_mul_fwd);
+        launch.arg(d_a).arg(d_b).arg(d_y).arg(&ni);
+        // SAFETY: signature `(const float* a, const float* b, float* y, int n)`; `i < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch ew_mul_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Elementwise multiply backward, one factor: `g_out[i] = gy[i]·other[i]` (`ops::elementwise::mul_vjp`;
+    /// bit-exact). Call with `other = b` for `gA`, then `other = a` for `gB`.
+    ///
+    /// # Errors
+    /// Device failure via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn ew_mul_backward_dev(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        d_other: &CudaSlice<f32>,
+        d_gout: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if d_gy.len() < n || d_other.len() < n || d_gout.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: d_gout.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i32;
+        let mut launch = self.stream.launch_builder(&self.func_ew_mul_bwd);
+        launch.arg(d_gy).arg(d_other).arg(d_gout).arg(&ni);
+        // SAFETY: signature `(const float* gy, const float* other, float* g_out, int n)`; `i < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch ew_mul_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Elementwise add forward `y[i] = a[i]+b[i]` on resident buffers (`ops::elementwise::add_forward`;
+    /// bit-exact). Its backward is just [`accumulate_dev`] of `gy` into each input's grad.
+    ///
+    /// # Errors
+    /// Device failure via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn ew_add_forward_dev(
+        &self,
+        d_a: &CudaSlice<f32>,
+        d_b: &CudaSlice<f32>,
+        d_y: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if d_a.len() < n || d_b.len() < n || d_y.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: d_y.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i32;
+        let mut launch = self.stream.launch_builder(&self.func_ew_add_fwd);
+        launch.arg(d_a).arg(d_b).arg(d_y).arg(&ni);
+        // SAFETY: signature `(const float* a, const float* b, float* y, int n)`; `i < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch ew_add_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// In-place gradient accumulate `dst[i] += src[i]` on resident buffers — how the device tape sums
+    /// a value's grad across its consumers (residuals, tied embedding), matching `grads[id] += v`.
+    ///
+    /// # Errors
+    /// Device failure via the cudarc mapping.
+    #[allow(dead_code)]
+    pub(crate) fn accumulate_dev(
+        &self,
+        d_dst: &mut CudaSlice<f32>,
+        d_src: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if d_dst.len() < n || d_src.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: d_dst.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i32;
+        let mut launch = self.stream.launch_builder(&self.func_accumulate);
+        launch.arg(d_dst).arg(d_src).arg(&ni);
+        // SAFETY: signature `(float* dst, const float* src, int n)`; in-place read+write, `i < n`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch accumulate_dev", &e))?;
         }
         Ok(())
     }

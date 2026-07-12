@@ -90,3 +90,80 @@ extern "C" __global__ void ternary_matmul_grad_s(
     }
     gs[ni] = acc;
 }
+
+// ───────────────────────── device-resident glue ops (plan 0043 P2.2) ─────────────────────────
+// Elementwise forward/backward for the tape's non-matmul ops, run on the resident activation
+// buffers so a whole block chains fwd→bwd without host round-trips. One thread per element.
+//
+// add/mul use only +/* and (--fmad=false) reproduce the host ops::elementwise rounding BIT-FOR-BIT.
+// silu uses expf, whose device implementation may differ from host libm by ~1 ULP — so silu is
+// gated device==CPU within rel 1e-4 (not bit-exact), unlike the pure +/* kernels.
+
+// σ(x) = 1/(1+e^{-x})  — matches ops::act::sigmoid (saturates cleanly, no NaN at large |x|).
+__device__ __forceinline__ float sigmoidf(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// SiLU forward: y[i] = x[i]·σ(x[i]).   (ops::act::silu_forward)
+extern "C" __global__ void silu_forward(
+    const float* __restrict__ x, float* __restrict__ y, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = x[i] * sigmoidf(x[i]);
+}
+
+// SiLU backward: gx[i] = gy[i]·(s + x·s·(1−s)),  s = σ(x[i]).   (ops::act::silu_vjp)
+// Same operation order as the host: s + x*s*(1-s).
+extern "C" __global__ void silu_backward(
+    const float* __restrict__ x, const float* __restrict__ gy,
+    float* __restrict__ gx, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float s = sigmoidf(x[i]);
+    gx[i] = gy[i] * (s + x[i] * s * (1.0f - s));
+}
+
+// Elementwise multiply forward: y[i] = a[i]·b[i].   (ops::elementwise::mul_forward)
+extern "C" __global__ void ew_mul_forward(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ y, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = a[i] * b[i];
+}
+
+// Elementwise multiply backward, one factor: g_out[i] = gy[i]·other[i].
+// mul_vjp gives gA = gY⊙B and gB = gY⊙A — call twice with other = b, then other = a.
+extern "C" __global__ void ew_mul_backward(
+    const float* __restrict__ gy, const float* __restrict__ other,
+    float* __restrict__ g_out, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    g_out[i] = gy[i] * other[i];
+}
+
+// Elementwise add forward: y[i] = a[i] + b[i].   (ops::elementwise::add_forward)
+extern "C" __global__ void ew_add_forward(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ y, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = a[i] + b[i];
+}
+
+// In-place gradient accumulate: dst[i] += src[i]. The device tape zeroes each leaf/activation grad
+// buffer, then every vjp accumulates its contribution here — so a value consumed by multiple ops
+// (residual adds, the tied embedding) sums its grads exactly like the CPU tape's `grads[id] += v`.
+// (add's backward is just this: accumulate gy into each input's grad.)
+extern "C" __global__ void accumulate(
+    float* __restrict__ dst, const float* __restrict__ src, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] += src[i];
+}

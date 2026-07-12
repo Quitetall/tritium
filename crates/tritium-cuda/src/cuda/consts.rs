@@ -183,6 +183,13 @@ pub(super) const KERNEL_NAME_TRAIN_FWD: &str = "ternary_matmul_forward";
 pub(super) const KERNEL_NAME_GRAD_A: &str = "ternary_matmul_grad_a";
 pub(super) const KERNEL_NAME_GRAD_W: &str = "ternary_matmul_grad_w";
 pub(super) const KERNEL_NAME_GRAD_S: &str = "ternary_matmul_grad_s";
+/// plan 0043 P2.2 device-resident glue ops (elementwise fwd/bwd + grad accumulate).
+pub(super) const KERNEL_NAME_SILU_FWD: &str = "silu_forward";
+pub(super) const KERNEL_NAME_SILU_BWD: &str = "silu_backward";
+pub(super) const KERNEL_NAME_EW_MUL_FWD: &str = "ew_mul_forward";
+pub(super) const KERNEL_NAME_EW_MUL_BWD: &str = "ew_mul_backward";
+pub(super) const KERNEL_NAME_EW_ADD_FWD: &str = "ew_add_forward";
+pub(super) const KERNEL_NAME_ACCUMULATE: &str = "accumulate";
 /// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
 pub(super) const LMHEAD_ROW_TILE: u32 = 8;
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's

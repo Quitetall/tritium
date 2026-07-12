@@ -681,6 +681,89 @@ mod tests {
         );
     }
 
+    /// Gate (plan 0043 P2.2): the device-resident glue kernels (silu, elementwise mul/add, grad
+    /// accumulate) match their `tritium-train` CPU ops. The pure `+`/`*` ops are BIT-EXACT; silu
+    /// carries `expf` (device vs host libm ~1 ULP) so it is gated device==CPU within 1e-4.
+    #[test]
+    fn resident_glue_ops_match_cpu() {
+        use tritium_train::ops::{act, elementwise};
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping resident_glue_ops_match_cpu: no CUDA device ({e})");
+                return;
+            }
+        };
+        let n = 4096;
+        let x = seeded_uniform(0xAA, n, -4.0, 4.0); // wide range → exercise sigmoid saturation
+        let gy = seeded_uniform(0xBB, n, -1.0, 1.0);
+        let b = seeded_uniform(0xCC, n, -2.0, 2.0);
+        let d_x = backend.dev_upload(&x).unwrap();
+        let d_gy = backend.dev_upload(&gy).unwrap();
+        let d_b = backend.dev_upload(&b).unwrap();
+        let download = |d: &_| {
+            let mut h = vec![0.0f32; n];
+            backend.dev_download(d, &mut h).unwrap();
+            h
+        };
+
+        // silu forward + backward — expf ⇒ within 1e-4, not bit-exact.
+        let mut d_y = backend.dev_alloc_zeros(n).unwrap();
+        backend.silu_forward_dev(&d_x, &mut d_y, n).unwrap();
+        assert!(
+            max_abs_diff(&download(&d_y), &act::silu_forward(&x)) < 1e-4,
+            "silu forward"
+        );
+        let mut d_gx = backend.dev_alloc_zeros(n).unwrap();
+        backend
+            .silu_backward_dev(&d_x, &d_gy, &mut d_gx, n)
+            .unwrap();
+        assert!(
+            max_abs_diff(&download(&d_gx), &act::silu_vjp(&x, &gy)[0]) < 1e-4,
+            "silu backward"
+        );
+
+        // mul forward/backward — bit-exact.
+        let mut d_m = backend.dev_alloc_zeros(n).unwrap();
+        backend.ew_mul_forward_dev(&d_x, &d_b, &mut d_m, n).unwrap();
+        assert_eq!(
+            max_abs_diff(&download(&d_m), &elementwise::mul_forward(&x, &b)),
+            0.0,
+            "mul forward"
+        );
+        let mul_g = elementwise::mul_vjp(&x, &b, &gy); // [gA = gy⊙b, gB = gy⊙x]
+        let mut d_ga = backend.dev_alloc_zeros(n).unwrap();
+        backend
+            .ew_mul_backward_dev(&d_gy, &d_b, &mut d_ga, n)
+            .unwrap();
+        assert_eq!(max_abs_diff(&download(&d_ga), &mul_g[0]), 0.0, "mul grad a");
+        let mut d_gb = backend.dev_alloc_zeros(n).unwrap();
+        backend
+            .ew_mul_backward_dev(&d_gy, &d_x, &mut d_gb, n)
+            .unwrap();
+        assert_eq!(max_abs_diff(&download(&d_gb), &mul_g[1]), 0.0, "mul grad b");
+
+        // add forward + grad accumulate — bit-exact.
+        let mut d_add = backend.dev_alloc_zeros(n).unwrap();
+        backend
+            .ew_add_forward_dev(&d_x, &d_b, &mut d_add, n)
+            .unwrap();
+        assert_eq!(
+            max_abs_diff(&download(&d_add), &elementwise::add_forward(&x, &b)),
+            0.0,
+            "add forward"
+        );
+        let mut d_acc = backend.dev_upload(&x).unwrap(); // dst = x; dst += b ⇒ x + b
+        backend.accumulate_dev(&mut d_acc, &d_b, n).unwrap();
+        assert_eq!(
+            max_abs_diff(&download(&d_acc), &elementwise::add_forward(&x, &b)),
+            0.0,
+            "accumulate"
+        );
+        eprintln!("0043 P2.2 resident glue ops (silu/mul/add/accumulate, n={n}): match CPU ops");
+    }
+
     /// Gate: the from-scratch tiny model's loss falls well below its start over the step budget,
     /// with no non-finite loss along the way.
     #[test]
