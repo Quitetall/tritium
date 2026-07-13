@@ -6,6 +6,42 @@ use tritium_spec::BackendError;
 
 static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+struct CurrentPoolGuard {
+    device: cudarc::driver::sys::CUdevice,
+    original: cudarc::driver::sys::CUmemoryPool,
+    alternate: cudarc::driver::sys::CUmemoryPool,
+    active: bool,
+}
+
+impl CurrentPoolGuard {
+    fn restore(mut self) {
+        use cudarc::driver::result;
+
+        // SAFETY: both pool handles came from CUDA for `device`; restore the
+        // retained original before destroying the unused alternate exactly once.
+        unsafe {
+            result::device::set_mem_pool(self.device, self.original)
+                .expect("restore original CUDA pool");
+            result::mem_pool::destroy(self.alternate).expect("destroy alternate CUDA pool");
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for CurrentPoolGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        // SAFETY: best-effort panic cleanup uses the same live handles retained
+        // by this guard. Errors cannot be reported safely from `Drop`.
+        unsafe {
+            let _ = cudarc::driver::result::device::set_mem_pool(self.device, self.original);
+            let _ = cudarc::driver::result::mem_pool::destroy(self.alternate);
+        }
+    }
+}
+
 fn backend_or_skip(test: &str) -> Option<CudaBackend> {
     match CudaBackend::new(0) {
         Ok(backend) => Some(backend),
@@ -143,21 +179,20 @@ fn public_memory_telemetry_fails_if_the_process_switches_current_pool() {
 
     // SAFETY: `device` is retained by `context`; the properties describe a
     // device-local pinned allocation pool and remain live for the call.
-    let (original, alternate) = unsafe {
+    let guard = unsafe {
         let original = result::device::get_mem_pool(device).expect("query original CUDA pool");
         let alternate = result::mem_pool::create(&properties).expect("create alternate CUDA pool");
         result::device::set_mem_pool(device, alternate).expect("switch current CUDA pool");
-        (original, alternate)
+        CurrentPoolGuard {
+            device,
+            original,
+            alternate,
+            active: true,
+        }
     };
 
     let sample = telemetry.sample_synchronized();
-
-    // SAFETY: restore the retained device's original current pool before
-    // destroying the unused alternate pool exactly once.
-    unsafe {
-        result::device::set_mem_pool(device, original).expect("restore original CUDA pool");
-        result::mem_pool::destroy(alternate).expect("destroy alternate CUDA pool");
-    }
+    guard.restore();
 
     let error = sample.expect_err("pool drift must invalidate scoped telemetry");
     assert!(error.to_string().contains("current memory pool changed"));
