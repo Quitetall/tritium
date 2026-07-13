@@ -107,6 +107,172 @@ fn train_backward_matches_cpu_vjp() {
     }
 }
 
+/// ADR 0027 Track D: the compact training-specific SALT planes must preserve
+/// Track A's per-row greedy quantizer while eliminating the dense quantized
+/// weight. Exercise every supported plane count, TQ2 tails, and the K>8192
+/// fallback-sized regime for both forward and activation-gradient contractions.
+#[test]
+fn packed_training_salt_matches_dense_resident_oracle() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping packed training SALT parity: no device ({e})");
+            return;
+        }
+    };
+    let tol = Tolerance::relative(1e-4);
+    let (m, n) = (2usize, 3usize);
+
+    for k in [7usize, 257, 576, 8193] {
+        let mut master = seeded_f32(0x5100 + k as u64, n * k, -1.25, 1.25);
+        // An exact-zero row gates the zero-scale/code path. The other rows and
+        // all tail shapes retain mixed signs and non-integral residuals.
+        master[..k].fill(0.0);
+        let act = seeded_f32(0xA000 + k as u64, m * k, -0.75, 0.75);
+        let gy = seeded_f32(0xB000 + k as u64, m * n, -0.5, 0.5);
+
+        let d_master = cuda.dev_upload(&master).expect("upload master");
+        let mut d_residual = cuda.dev_alloc_zeros(n * k).expect("residual scratch");
+        let d_act = cuda.dev_upload(&act).expect("upload act");
+        let d_gy = cuda.dev_upload(&gy).expect("upload gy");
+
+        for planes in 1..=3 {
+            let packed = cuda
+                .pack_training_salt(&d_master, &mut d_residual, n, k, planes)
+                .expect("pack resident SALT");
+            let row_bytes = k.div_ceil(tritium_format::QK_K) * (tritium_format::QK_K / 4);
+            assert_eq!(packed.packed_bytes(), planes * n * row_bytes);
+            assert_eq!(
+                packed.scale_bytes(),
+                planes * n * core::mem::size_of::<f32>()
+            );
+            assert_eq!(
+                packed.resident_bytes(),
+                packed.packed_bytes() + packed.scale_bytes()
+            );
+
+            let dense = tritium_train::ops::ste::salt_quantize_forward(&master, n, k, planes);
+            let want_y = tritium_train::ops::dense::forward(&act, &dense, m, n, k);
+            let want_ga = tritium_train::ops::dense::vjp(&act, &dense, m, n, k, &gy)[0].clone();
+
+            let mut d_y = cuda.dev_alloc_zeros(m * n).expect("alloc y");
+            cuda.training_salt_forward(&d_act, &packed, m, &mut d_y)
+                .expect("packed SALT forward");
+            let mut got_y = vec![0.0f32; m * n];
+            cuda.dev_download(&d_y, &mut got_y).expect("download y");
+
+            let mut d_ga = cuda.dev_alloc_zeros(m * k).expect("alloc ga");
+            cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_ga)
+                .expect("packed SALT grad_a");
+            let mut got_ga = vec![0.0f32; m * k];
+            cuda.dev_download(&d_ga, &mut got_ga).expect("download ga");
+
+            for (i, (&got, &want)) in got_y.iter().zip(&want_y).enumerate() {
+                assert!(
+                    tol.accepts(got, want),
+                    "forward[{i}] T={planes} {m}x{n}x{k}: packed {got} vs dense {want}"
+                );
+            }
+            for (i, (&got, &want)) in got_ga.iter().zip(&want_ga).enumerate() {
+                assert!(
+                    tol.accepts(got, want),
+                    "grad_a[{i}] T={planes} {m}x{n}x{k}: packed {got} vs dense {want}"
+                );
+            }
+        }
+    }
+
+    let d_master = cuda.dev_upload(&[1.0f32; 8]).unwrap();
+    let mut d_residual = cuda.dev_alloc_zeros(8).unwrap();
+    assert!(matches!(
+        cuda.pack_training_salt(&d_master, &mut d_residual, 2, 4, 0),
+        Err(BackendError::InvalidInput(_))
+    ));
+    let packed = cuda
+        .pack_training_salt(&d_master, &mut d_residual, 2, 4, 1)
+        .unwrap();
+    let short_act = cuda.dev_upload(&[1.0f32; 3]).unwrap();
+    let mut out = cuda.dev_alloc_zeros(2).unwrap();
+    assert!(matches!(
+        cuda.training_salt_forward(&short_act, &packed, 1, &mut out),
+        Err(BackendError::ShapeMismatch { .. })
+    ));
+}
+
+/// Manual Track D microbenchmark. It times the full per-step weight path
+/// (requantize + forward) with fixed resident allocations and prints both
+/// latency and weight bytes. Hardware-sensitive, so correctness is gated above
+/// while this remains opt-in evidence (`--ignored --nocapture`).
+#[test]
+#[ignore = "4090 Track D performance probe"]
+fn bench_packed_training_salt_vs_dense_materialization() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping packed training SALT bench: no device ({e})");
+            return;
+        }
+    };
+    let (m, n, k, planes) = (32usize, 576usize, 576usize, 3usize);
+    let iters = 100u32;
+    let master = seeded_f32(0x5A17, n * k, -1.25, 1.25);
+    let act = seeded_f32(0xAC71, m * k, -0.75, 0.75);
+    let d_master = cuda.dev_upload(&master).unwrap();
+    let d_act = cuda.dev_upload(&act).unwrap();
+    let d_ones = cuda.dev_upload(&vec![1.0f32; n]).unwrap();
+    let mut d_residual = cuda.dev_alloc_zeros(n * k).unwrap();
+    let mut d_dense = cuda.dev_alloc_zeros(n * k).unwrap();
+    let mut d_dense_y = cuda.dev_alloc_zeros(m * n).unwrap();
+    let mut packed = cuda
+        .pack_training_salt(&d_master, &mut d_residual, n, k, planes)
+        .unwrap();
+    let mut d_packed_y = cuda.dev_alloc_zeros(m * n).unwrap();
+    let shape = GemmShape::new(m, n, k);
+
+    for _ in 0..10 {
+        cuda.salt_quantize_forward_dev(&d_master, &mut d_residual, &mut d_dense, n, k, planes)
+            .unwrap();
+        cuda.matmul_forward_dev(&d_act, &d_dense, &d_ones, shape, &mut d_dense_y)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let dense_start = std::time::Instant::now();
+    for _ in 0..iters {
+        cuda.salt_quantize_forward_dev(&d_master, &mut d_residual, &mut d_dense, n, k, planes)
+            .unwrap();
+        cuda.matmul_forward_dev(&d_act, &d_dense, &d_ones, shape, &mut d_dense_y)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let dense_us = dense_start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+
+    for _ in 0..10 {
+        cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
+            .unwrap();
+        cuda.training_salt_forward(&d_act, &packed, m, &mut d_packed_y)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let packed_start = std::time::Instant::now();
+    for _ in 0..iters {
+        cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
+            .unwrap();
+        cuda.training_salt_forward(&d_act, &packed, m, &mut d_packed_y)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let packed_us = packed_start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+
+    println!(
+        "Track D resident SALT {m}x{n}x{k} T={planes}: dense={dense_us:.1}us/step, \
+         packed={packed_us:.1}us/step, speedup={:.2}x; dense weight={} B, packed={} B ({:.1}%)",
+        dense_us / packed_us,
+        n * k * core::mem::size_of::<f32>(),
+        packed.resident_bytes(),
+        packed.resident_bytes() as f64 / (n * k * core::mem::size_of::<f32>()) as f64 * 100.0,
+    );
+}
+
 #[test]
 fn cuda_matches_reference_within_tolerance() {
     // Skip cleanly when no GPU is present (cpu-only dev box / wrong CI lane).

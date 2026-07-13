@@ -4,6 +4,10 @@
 
 use super::*;
 
+/// Compact Track D rows keep only TQ2's 2-bit `qs` payload; scales are f32 sidecars.
+const TRAINING_SALT_QK: usize = tritium_format::QK_K;
+const TRAINING_SALT_QS_BYTES: usize = TRAINING_SALT_QK / 4;
+
 /// A SALT multi-plane projection, resident in VRAM: the plane-major TQ2_0 planes
 /// uploaded once, plus the geometry the `salt_mpgemm_tiled_f32` kernel needs.
 ///
@@ -26,6 +30,53 @@ pub struct SaltResidentLinear {
     pub(super) row_bytes: usize,
     /// Realized plane count `T` (max over rows; ragged rows zero-padded on upload).
     pub(super) t_planes: usize,
+}
+
+/// Training-specific resident SALT planes produced directly from a latent f32
+/// master. Codes use TQ2's canonical 2-bit addressing but omit its per-block
+/// f16 scale; Track A's exact f32 AbsMean lives in the separate `scales` buffer.
+/// This is intentionally distinct from [`SaltResidentLinear`]'s inference and
+/// on-disk-compatible 66-byte blocks.
+#[derive(Debug)]
+pub(crate) struct TrainingSaltLinear {
+    codes: CudaSlice<u8>,
+    scales: CudaSlice<f32>,
+    n: usize,
+    k: usize,
+    row_bytes: usize,
+    planes: usize,
+}
+
+#[allow(dead_code)] // accounting is load-bearing in the Track D GPU gate before tape wiring
+impl TrainingSaltLinear {
+    /// Compact 2-bit code payload bytes, excluding external scales.
+    pub(crate) fn packed_bytes(&self) -> usize {
+        self.codes.len()
+    }
+
+    /// External Track A f32 scale bytes.
+    pub(crate) fn scale_bytes(&self) -> usize {
+        self.scales.len() * core::mem::size_of::<f32>()
+    }
+
+    /// Total resident bytes owned by this packed handle.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.packed_bytes() + self.scale_bytes()
+    }
+
+    fn kernel_dims(&self, m: usize) -> Result<(i32, i32, i32, i32, i32), BackendError> {
+        let convert = |name: &str, value: usize| {
+            i32::try_from(value)
+                .map_err(|_| BackendError::InvalidInput(format!("SALT {name} exceeds i32::MAX")))
+        };
+        Ok((
+            convert("batch", m)?,
+            convert("rows", self.n)?,
+            convert("cols", self.k)?,
+            convert("planes", self.planes)?,
+            convert("row bytes", self.row_bytes)?,
+        ))
+    }
 }
 
 /// Device metadata for deterministic segmented embedding gradients. Equal
@@ -142,6 +193,13 @@ pub struct CudaBackend {
     /// ADR 0027 Track A: fused AdamW update on resident master/moment buffers.
     #[allow(dead_code)] // consumed by DeviceTrainer in the next Track A slice
     pub(super) func_adamw_step: CudaFunction,
+    /// ADR 0027 Track D: compact SALT pack, forward, and activation gradient.
+    #[allow(dead_code)] // consumed by the Track D backend entry points below
+    pub(super) func_salt_pack_training: CudaFunction,
+    #[allow(dead_code)]
+    pub(super) func_salt_training_forward: CudaFunction,
+    #[allow(dead_code)]
+    pub(super) func_salt_training_grad_a: CudaFunction,
     /// plan 0043 P2.2 device-resident glue: elementwise silu/mul/add fwd/bwd + grad accumulate.
     pub(super) func_silu_fwd: CudaFunction,
     pub(super) func_silu_bwd: CudaFunction,
@@ -308,6 +366,15 @@ impl CudaBackend {
         let func_adamw_step = grad_module
             .load_function(KERNEL_NAME_ADAMW_STEP)
             .map_err(|e| driver_err("resolve adamw_step kernel", &e))?;
+        let func_salt_pack_training = grad_module
+            .load_function(KERNEL_NAME_SALT_PACK_TRAINING)
+            .map_err(|e| driver_err("resolve salt_pack_training kernel", &e))?;
+        let func_salt_training_forward = grad_module
+            .load_function(KERNEL_NAME_SALT_TRAINING_FORWARD)
+            .map_err(|e| driver_err("resolve salt_training_forward kernel", &e))?;
+        let func_salt_training_grad_a = grad_module
+            .load_function(KERNEL_NAME_SALT_TRAINING_GRAD_A)
+            .map_err(|e| driver_err("resolve salt_training_grad_a kernel", &e))?;
         // P2.2 device-resident glue ops (same `--fmad=false` train_grad.ptx module).
         let func_silu_fwd = grad_module
             .load_function(KERNEL_NAME_SILU_FWD)
@@ -424,6 +491,9 @@ impl CudaBackend {
             func_grad_s,
             func_salt_quantize_fwd,
             func_adamw_step,
+            func_salt_pack_training,
+            func_salt_training_forward,
+            func_salt_training_grad_a,
             func_silu_fwd,
             func_silu_bwd,
             func_ew_mul_fwd,
@@ -903,6 +973,277 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(rows))
                 .map_err(|e| driver_err("launch salt_quantize_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Quantize a resident latent master into compact training-only SALT planes.
+    /// The returned handle owns plane-major TQ2-addressed codes and external f32
+    /// per-row scales; `d_residual` is reusable caller-owned scratch.
+    ///
+    /// # Errors
+    /// Invalid plane counts, dimensions, cross-context buffers, allocation or
+    /// launch failures, and undersized master/scratch buffers are typed errors.
+    #[allow(dead_code)] // Track D gate precedes DeviceTape's SaltMatmul wiring
+    pub(crate) fn pack_training_salt(
+        &self,
+        d_master: &CudaSlice<f32>,
+        d_residual: &mut CudaSlice<f32>,
+        n: usize,
+        k: usize,
+        planes: usize,
+    ) -> Result<TrainingSaltLinear, BackendError> {
+        if !(1..=3).contains(&planes) {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT plane count must be in 1..=3, got {planes}"
+            )));
+        }
+        Self::check_grad_launch_bounds(1, n, k)?;
+        if !self.same_context(d_master) || !self.same_context(d_residual) {
+            return Err(BackendError::InvalidInput(
+                "SALT pack buffer belongs to a different CUDA context".into(),
+            ));
+        }
+        let dense_len = n
+            .checked_mul(k)
+            .ok_or_else(|| BackendError::InvalidInput("SALT shape overflows usize".into()))?;
+        if d_master.len() < dense_len || d_residual.len() < dense_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: dense_len,
+                got: d_master.len().min(d_residual.len()),
+            });
+        }
+        let row_bytes = k
+            .div_ceil(TRAINING_SALT_QK)
+            .checked_mul(TRAINING_SALT_QS_BYTES)
+            .ok_or_else(|| BackendError::InvalidInput("SALT row bytes overflow usize".into()))?;
+        let packed_len = planes
+            .checked_mul(n)
+            .and_then(|v| v.checked_mul(row_bytes))
+            .ok_or_else(|| BackendError::InvalidInput("SALT packed bytes overflow usize".into()))?;
+        let scale_len = planes
+            .checked_mul(n)
+            .ok_or_else(|| BackendError::InvalidInput("SALT scale count overflows usize".into()))?;
+        let codes = self
+            .stream
+            .alloc_zeros::<u8>(packed_len)
+            .map_err(|e| driver_err("alloc compact SALT codes", &e))?;
+        let scales = self
+            .stream
+            .alloc_zeros::<f32>(scale_len)
+            .map_err(|e| driver_err("alloc compact SALT scales", &e))?;
+        let mut weight = TrainingSaltLinear {
+            codes,
+            scales,
+            n,
+            k,
+            row_bytes,
+            planes,
+        };
+        self.repack_training_salt(d_master, d_residual, &mut weight)?;
+        Ok(weight)
+    }
+
+    /// Refresh an existing compact SALT handle after its latent master changes.
+    /// No allocation occurs; code and scale buffers are overwritten in place.
+    ///
+    /// # Errors
+    /// Shape/context violations and device launch failures are typed errors.
+    #[allow(dead_code)] // Track D gate precedes DeviceTrainer's step wiring
+    pub(crate) fn repack_training_salt(
+        &self,
+        d_master: &CudaSlice<f32>,
+        d_residual: &mut CudaSlice<f32>,
+        weight: &mut TrainingSaltLinear,
+    ) -> Result<(), BackendError> {
+        Self::check_grad_launch_bounds(1, weight.n, weight.k)?;
+        self.validate_training_salt(weight)?;
+        if !self.same_context(d_master) || !self.same_context(d_residual) {
+            return Err(BackendError::InvalidInput(
+                "SALT pack buffer belongs to a different CUDA context".into(),
+            ));
+        }
+        let dense_len = weight.n * weight.k;
+        if d_master.len() < dense_len || d_residual.len() < dense_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: dense_len,
+                got: d_master.len().min(d_residual.len()),
+            });
+        }
+        if dense_len == 0 {
+            return Ok(());
+        }
+        let (_, ni, ki, pi, rbi) = weight.kernel_dims(1)?;
+        let mut launch = self.stream.launch_builder(&self.func_salt_pack_training);
+        launch
+            .arg(d_master)
+            .arg(d_residual)
+            .arg(&mut weight.codes)
+            .arg(&mut weight.scales)
+            .arg(&ni)
+            .arg(&ki)
+            .arg(&pi)
+            .arg(&rbi);
+        // SAFETY: one thread owns each row; all flat products and scalar
+        // dimensions were checked, and every buffer covers the full shape.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(weight.n))
+                .map_err(|e| driver_err("launch salt_pack_training", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Fused packed SALT forward: add/subtract activations from the resident
+    /// planes, then apply one f32 scale multiply per plane/output.
+    ///
+    /// # Errors
+    /// Shape/context violations and device launch failures are typed errors.
+    #[allow(dead_code)] // Track D gate precedes DeviceTape's SaltMatmul wiring
+    pub(crate) fn training_salt_forward(
+        &self,
+        d_a: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_y: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        Self::check_grad_launch_bounds(m, weight.n, weight.k)?;
+        self.validate_training_salt(weight)?;
+        if !self.same_context(d_a) || !self.same_context(d_y) {
+            return Err(BackendError::InvalidInput(
+                "SALT forward buffer belongs to a different CUDA context".into(),
+            ));
+        }
+        let act_len = m * weight.k;
+        let out_len = m * weight.n;
+        if d_a.len() < act_len || d_y.len() < out_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: if d_a.len() < act_len {
+                    act_len
+                } else {
+                    out_len
+                },
+                got: if d_a.len() < act_len {
+                    d_a.len()
+                } else {
+                    d_y.len()
+                },
+            });
+        }
+        if out_len == 0 {
+            return Ok(());
+        }
+        let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
+        let mut launch = self.stream.launch_builder(&self.func_salt_training_forward);
+        launch
+            .arg(d_a)
+            .arg(&weight.codes)
+            .arg(&weight.scales)
+            .arg(d_y)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki)
+            .arg(&pi)
+            .arg(&rbi);
+        // SAFETY: validated handle/input/output buffers cover MxK, packed
+        // TxNxrow_bytes, TxN and MxN; flat indices fit the kernel ABI.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(out_len))
+                .map_err(|e| driver_err("launch salt_training_forward", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Activation VJP through fused packed SALT planes. The latent-master
+    /// weight gradient remains the ordinary fp STE path and is intentionally
+    /// not stored in this packed handle.
+    ///
+    /// # Errors
+    /// Shape/context violations and device launch failures are typed errors.
+    #[allow(dead_code)] // Track D gate precedes DeviceTape's SaltMatmul wiring
+    pub(crate) fn training_salt_grad_a(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_ga: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        Self::check_grad_launch_bounds(m, weight.n, weight.k)?;
+        self.validate_training_salt(weight)?;
+        if !self.same_context(d_gy) || !self.same_context(d_ga) {
+            return Err(BackendError::InvalidInput(
+                "SALT grad_a buffer belongs to a different CUDA context".into(),
+            ));
+        }
+        let gy_len = m * weight.n;
+        let ga_len = m * weight.k;
+        if d_gy.len() < gy_len || d_ga.len() < ga_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: if d_gy.len() < gy_len { gy_len } else { ga_len },
+                got: if d_gy.len() < gy_len {
+                    d_gy.len()
+                } else {
+                    d_ga.len()
+                },
+            });
+        }
+        if ga_len == 0 {
+            return Ok(());
+        }
+        let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
+        let mut launch = self.stream.launch_builder(&self.func_salt_training_grad_a);
+        launch
+            .arg(d_gy)
+            .arg(&weight.codes)
+            .arg(&weight.scales)
+            .arg(d_ga)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki)
+            .arg(&pi)
+            .arg(&rbi);
+        // SAFETY: validated buffers cover MxN, packed TxNxrow_bytes, TxN and
+        // MxK; one thread writes each activation-gradient element.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(ga_len))
+                .map_err(|e| driver_err("launch salt_training_grad_a", &e))?;
+        }
+        Ok(())
+    }
+
+    fn validate_training_salt(&self, weight: &TrainingSaltLinear) -> Result<(), BackendError> {
+        if !self.same_context(&weight.codes) || !self.same_context(&weight.scales) {
+            return Err(BackendError::InvalidInput(
+                "packed SALT handle belongs to a different CUDA context".into(),
+            ));
+        }
+        let expected_row_bytes = weight
+            .k
+            .div_ceil(TRAINING_SALT_QK)
+            .checked_mul(TRAINING_SALT_QS_BYTES)
+            .ok_or_else(|| BackendError::InvalidInput("SALT row bytes overflow usize".into()))?;
+        let expected_codes = weight
+            .planes
+            .checked_mul(weight.n)
+            .and_then(|v| v.checked_mul(expected_row_bytes))
+            .ok_or_else(|| BackendError::InvalidInput("SALT packed bytes overflow usize".into()))?;
+        let expected_scales = weight
+            .planes
+            .checked_mul(weight.n)
+            .ok_or_else(|| BackendError::InvalidInput("SALT scale count overflows usize".into()))?;
+        if !(1..=3).contains(&weight.planes)
+            || weight.row_bytes != expected_row_bytes
+            || weight.codes.len() != expected_codes
+            || weight.scales.len() != expected_scales
+        {
+            return Err(BackendError::InvalidInput(
+                "packed SALT handle metadata does not match its buffers".into(),
+            ));
         }
         Ok(())
     }

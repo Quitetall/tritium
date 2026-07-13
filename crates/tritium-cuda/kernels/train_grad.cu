@@ -130,6 +130,151 @@ extern "C" __global__ void salt_quantize_forward(
     }
 }
 
+// ADR 0027 Track D: compact training-only SALT representation. Each plane keeps
+// the canonical TQ2 2-bit address mapping but omits the inference format's f16
+// block scale. Track A has one f32 AbsMean per (plane,row), so storing those
+// scales externally is both exact and smaller: ceil(K/256)*64 code bytes/row.
+#define TRAIN_SALT_QK 256
+#define TRAIN_SALT_QS_BYTES 64
+
+__device__ __forceinline__ long train_salt_code_offset(
+    int plane, int row, int col, int rows, int row_bytes)
+{
+    int block = col / TRAIN_SALT_QK;
+    int e = col - block * TRAIN_SALT_QK;
+    int c = e >> 7;
+    int mm = e & 31;
+    return ((long)plane * rows + row) * row_bytes
+        + block * TRAIN_SALT_QS_BYTES + c * 32 + mm;
+}
+
+__device__ __forceinline__ unsigned int train_salt_code(
+    const unsigned char* __restrict__ codes,
+    int plane, int row, int col, int rows, int row_bytes)
+{
+    int e = col & (TRAIN_SALT_QK - 1);
+    int l = (e & 127) >> 5;
+    long off = train_salt_code_offset(plane, row, col, rows, row_bytes);
+    return ((unsigned int)codes[off] >> (2 * l)) & 3u;
+}
+
+// Pack the resident latent master directly into compact planes. One thread owns
+// a row, preserving Track A's ascending-column f32 AbsMean and residual order.
+extern "C" __global__ void salt_pack_training(
+    const float* __restrict__ master,       // [rows, cols]
+    float* __restrict__ residual,           // [rows, cols] scratch
+    unsigned char* __restrict__ codes,      // [planes, rows, row_bytes]
+    float* __restrict__ scales,             // [planes, rows]
+    int rows, int cols, int planes, int row_bytes)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    long base = (long)row * cols;
+
+    for (int col = 0; col < cols; ++col) {
+        residual[base + col] = master[base + col];
+    }
+
+    for (int plane = 0; plane < planes; ++plane) {
+        long plane_row = ((long)plane * rows + row) * row_bytes;
+        // TQ2 code 1 is zero; 0x55 initializes four zero trits per byte,
+        // including padding in the final partial 256-trit block.
+        for (int byte = 0; byte < row_bytes; ++byte) {
+            codes[plane_row + byte] = 0x55u;
+        }
+
+        float sum = 0.0f;
+        for (int col = 0; col < cols; ++col) {
+            sum += fabsf(residual[base + col]);
+        }
+        float scale = sum / (float)cols;
+        scales[(long)plane * rows + row] = scale;
+        if (scale == 0.0f) continue;
+
+        for (int col = 0; col < cols; ++col) {
+            long idx = base + col;
+            float trit = roundf(residual[idx] / scale);
+            trit = fminf(1.0f, fmaxf(-1.0f, trit));
+            float contribution = scale * trit;
+            residual[idx] -= contribution;
+
+            int e = col & (TRAIN_SALT_QK - 1);
+            int l = (e & 127) >> 5;
+            long off = train_salt_code_offset(
+                plane, row, col, rows, row_bytes);
+            unsigned int shift = 2u * (unsigned int)l;
+            unsigned int code = (unsigned int)((int)trit + 1);
+            unsigned int old = codes[off];
+            codes[off] = (unsigned char)(
+                (old & ~(3u << shift)) | (code << shift));
+        }
+    }
+}
+
+// Y[M,N] = sum_p scale[p,n] * (A[M,K] dot trit[p,n,K]). The
+// contraction is add/sub/skip; only one scale multiply is paid per plane/output.
+extern "C" __global__ void salt_training_forward(
+    const float* __restrict__ a,             // [M, K]
+    const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
+    const float* __restrict__ scales,        // [planes, N]
+    float* __restrict__ y,                   // [M, N]
+    int m, int n, int k, int planes, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)m * n) return;
+    int mi = idx / n;
+    int ni = idx % n;
+    const float* arow = a + (long)mi * k;
+    float out = 0.0f;
+
+    for (int plane = 0; plane < planes; ++plane) {
+        float acc = 0.0f;
+        for (int ki = 0; ki < k; ++ki) {
+            unsigned int code = train_salt_code(
+                codes, plane, ni, ki, n, row_bytes);
+            if (code == 2u) {
+                acc += arow[ki];
+            } else if (code == 0u) {
+                acc -= arow[ki];
+            }
+        }
+        out += acc * scales[(long)plane * n + ni];
+    }
+    y[idx] = out;
+}
+
+// gA[M,K] = sum_n,p gy[M,N] * scale[p,n] * trit[p,n,K]. A row scale
+// is multiplied into gy once per plane/output-row, then the packed trit selects
+// add/sub/skip; no dense quantized weight is materialized.
+extern "C" __global__ void salt_training_grad_a(
+    const float* __restrict__ gy,            // [M, N]
+    const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
+    const float* __restrict__ scales,        // [planes, N]
+    float* __restrict__ ga,                  // [M, K]
+    int m, int n, int k, int planes, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)m * k) return;
+    int mi = idx / k;
+    int ki = idx % k;
+    float acc = 0.0f;
+
+    for (int ni = 0; ni < n; ++ni) {
+        float g = gy[(long)mi * n + ni];
+        for (int plane = 0; plane < planes; ++plane) {
+            float scaled = g * scales[(long)plane * n + ni];
+            unsigned int code = train_salt_code(
+                codes, plane, ni, ki, n, row_bytes);
+            if (code == 2u) {
+                acc += scaled;
+            } else if (code == 0u) {
+                acc -= scaled;
+            }
+        }
+    }
+    ga[idx] = acc;
+}
+
 // ADR 0027 Track A: fused elementwise AdamW update over resident buffers.
 // Host code computes bias correction with the CPU oracle's `powi` contract;
 // this kernel preserves optim::AdamW::step's per-element operation order.

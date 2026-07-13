@@ -225,10 +225,11 @@ impl CudaBuffer {
 mod backend;
 // Lib code no longer references backend items directly (post-P2a/A2 churn),
 // but cuda::tests reaches them through `use super::*` via this glob.
-pub(crate) use backend::EmbedSegments;
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;
 pub use backend::{CudaBackend, SaltResidentLinear};
+#[allow(unused_imports)] // TrainingSaltLinear is the Track D tape seam.
+pub(crate) use backend::{EmbedSegments, TrainingSaltLinear};
 
 // ===========================================================================
 // v0.3.1 (ADR 0013): the device-resident M=1 decode forward.

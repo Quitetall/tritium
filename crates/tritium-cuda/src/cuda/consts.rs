@@ -187,6 +187,10 @@ pub(super) const KERNEL_NAME_GRAD_S: &str = "ternary_matmul_grad_s";
 pub(super) const KERNEL_NAME_SALT_QUANTIZE_FWD: &str = "salt_quantize_forward";
 /// ADR 0027 Track A: fused resident AdamW parameter/moment update.
 pub(super) const KERNEL_NAME_ADAMW_STEP: &str = "adamw_step";
+/// ADR 0027 Track D: master-to-compact-plane pack and fused packed contractions.
+pub(super) const KERNEL_NAME_SALT_PACK_TRAINING: &str = "salt_pack_training";
+pub(super) const KERNEL_NAME_SALT_TRAINING_FORWARD: &str = "salt_training_forward";
+pub(super) const KERNEL_NAME_SALT_TRAINING_GRAD_A: &str = "salt_training_grad_a";
 /// plan 0043 P2.2 device-resident glue ops (elementwise fwd/bwd + grad accumulate).
 pub(super) const KERNEL_NAME_SILU_FWD: &str = "silu_forward";
 pub(super) const KERNEL_NAME_SILU_BWD: &str = "silu_backward";
