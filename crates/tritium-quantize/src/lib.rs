@@ -48,8 +48,9 @@ pub use architecture::{
     CapabilityGap, CapabilitySet, TensorDescriptor, TensorDisposition, TensorRole,
 };
 pub use campaign::{
-    CalibrationProvenance, CampaignError, CampaignLedger, CampaignMetrics, CampaignObjective,
-    CampaignPoint, EvaluationProvenance,
+    CalibrationId, CalibrationProvenance, CampaignError, CampaignId, CampaignLedger,
+    CampaignMetrics, CampaignObjective, CampaignPoint, EvaluationId, EvaluationProvenance,
+    MeasuredPackage, RecipeId, RecipeProvenance,
 };
 pub use conversion::{
     CONVERSION_STATE_MAGIC, CONVERSION_STATE_VERSION, ConversionError, ConversionRun,

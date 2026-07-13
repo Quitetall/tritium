@@ -6,12 +6,121 @@ use tritium_format::{ModelId, PackageId};
 const CALIBRATION_MAGIC: [u8; 4] = *b"TCAL";
 const CAMPAIGN_MAGIC: [u8; 4] = *b"TCMP";
 const EVALUATION_MAGIC: [u8; 4] = *b"TEVL";
+const RECIPE_MAGIC: [u8; 4] = *b"TRCP";
+const CAMPAIGN_VERSION: u8 = 2;
 const PROVENANCE_VERSION: u8 = 1;
+const RECIPE_VERSION: u8 = 1;
+const CALIBRATION_ID_CONTEXT: &str = "tritium calibration provenance id v1";
+const CAMPAIGN_ID_CONTEXT: &str = "tritium campaign ledger id v1";
+const EVALUATION_ID_CONTEXT: &str = "tritium evaluation provenance id v1";
+const RECIPE_ID_CONTEXT: &str = "tritium conversion recipe id v1";
+
+fn domain_hash(context: &'static str, bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(context);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+fn fmt_id(f: &mut fmt::Formatter<'_>, prefix: &str, digest: &[u8; 32]) -> fmt::Result {
+    f.write_str(prefix)?;
+    for byte in digest {
+        write!(f, "{byte:02x}")?;
+    }
+    Ok(())
+}
 
 fn write_string(out: &mut Vec<u8>, value: &str) {
     let len = u32::try_from(value.len()).expect("provenance constructor validates string length");
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(value.as_bytes());
+}
+
+fn write_optional_f64(out: &mut Vec<u8>, value: Option<f64>) {
+    match value {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+    }
+}
+
+fn write_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+/// Content identity of an exact calibration provenance record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CalibrationId([u8; 32]);
+
+impl CalibrationId {
+    /// Return the raw domain-separated digest.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for CalibrationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_id(f, "trc1_", &self.0)
+    }
+}
+
+/// Content identity of an exact evaluation provenance record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EvaluationId([u8; 32]);
+
+impl EvaluationId {
+    /// Return the raw domain-separated digest.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for EvaluationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_id(f, "tre1_", &self.0)
+    }
+}
+
+/// Content identity of an exact conversion recipe record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RecipeId([u8; 32]);
+
+impl RecipeId {
+    /// Return the raw domain-separated digest.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for RecipeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_id(f, "trr1_", &self.0)
+    }
+}
+
+/// Content identity of an exact canonical campaign ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CampaignId([u8; 32]);
+
+impl CampaignId {
+    /// Return the raw domain-separated digest.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for CampaignId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_id(f, "trl1_", &self.0)
+    }
 }
 
 /// Exact calibration-corpus and tokenizer selection used by a conversion run.
@@ -122,8 +231,8 @@ impl CalibrationProvenance {
     }
 
     /// Exact content identity of this calibration record.
-    pub fn id(&self) -> PackageId {
-        PackageId::from_package_bytes(&self.canonical_bytes())
+    pub fn id(&self) -> CalibrationId {
+        CalibrationId(domain_hash(CALIBRATION_ID_CONTEXT, &self.canonical_bytes()))
     }
 }
 
@@ -143,7 +252,9 @@ impl EvaluationProvenance {
     /// Build a validated evaluation provenance record.
     ///
     /// `sample_digest` covers ordered, rendered model inputs and targets;
-    /// `harness_digest` covers scoring code and metric configuration.
+    /// `harness_digest` covers scoring code, metric configuration, and captured
+    /// runtime environment (GPU, driver, clocks, and contention) when system
+    /// metrics are recorded.
     ///
     /// # Errors
     /// Returns [`CampaignError`] for empty/oversized identifiers or zero counts.
@@ -194,7 +305,7 @@ impl EvaluationProvenance {
         &self.tokenizer_digest
     }
 
-    /// Digest of evaluation code and metric configuration.
+    /// Digest of evaluation code, metric configuration, and runtime environment.
     pub fn harness_digest(&self) -> &[u8; 32] {
         &self.harness_digest
     }
@@ -225,8 +336,129 @@ impl EvaluationProvenance {
     }
 
     /// Exact content identity of this evaluation record.
-    pub fn id(&self) -> PackageId {
-        PackageId::from_package_bytes(&self.canonical_bytes())
+    pub fn id(&self) -> EvaluationId {
+        EvaluationId(domain_hash(EVALUATION_ID_CONTEXT, &self.canonical_bytes()))
+    }
+}
+
+/// Conversion implementation, immutable revision, configuration, and replay command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipeProvenance {
+    implementation: String,
+    revision: String,
+    canonical_config: Vec<u8>,
+    command: String,
+}
+
+impl RecipeProvenance {
+    /// Build a self-contained conversion recipe record.
+    ///
+    /// `canonical_config` must be the exact portable configuration consumed by
+    /// `command`. `revision` should identify a clean source checkout.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError`] for empty/oversized fields.
+    pub fn new(
+        implementation: impl Into<String>,
+        revision: impl Into<String>,
+        canonical_config: Vec<u8>,
+        command: impl Into<String>,
+    ) -> Result<Self, CampaignError> {
+        let implementation = implementation.into();
+        let revision = revision.into();
+        let command = command.into();
+        validate_string("implementation", &implementation)?;
+        validate_string("revision", &revision)?;
+        validate_string("command", &command)?;
+        if canonical_config.len() > u32::MAX as usize {
+            return Err(CampaignError::FieldTooLong("canonical_config"));
+        }
+        if canonical_config.is_empty() {
+            return Err(CampaignError::EmptyField("canonical_config"));
+        }
+        Ok(Self {
+            implementation,
+            revision,
+            canonical_config,
+            command,
+        })
+    }
+
+    /// Conversion implementation or binary name.
+    pub fn implementation(&self) -> &str {
+        &self.implementation
+    }
+
+    /// Immutable implementation revision.
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// Exact portable conversion configuration.
+    pub fn canonical_config(&self) -> &[u8] {
+        &self.canonical_config
+    }
+
+    /// Command that consumes the embedded configuration.
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// Versioned canonical recipe bytes.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&RECIPE_MAGIC);
+        out.push(RECIPE_VERSION);
+        write_string(&mut out, &self.implementation);
+        write_string(&mut out, &self.revision);
+        let config_len = u32::try_from(self.canonical_config.len())
+            .expect("recipe constructor validates config length");
+        out.extend_from_slice(&config_len.to_le_bytes());
+        out.extend_from_slice(&self.canonical_config);
+        write_string(&mut out, &self.command);
+        out
+    }
+
+    /// Exact content identity of this recipe record.
+    pub fn id(&self) -> RecipeId {
+        RecipeId(domain_hash(RECIPE_ID_CONTEXT, &self.canonical_bytes()))
+    }
+}
+
+/// Exact identity and physical size derived from serialized inference bytes.
+///
+/// Construction intentionally requires the complete byte slice so callers cannot
+/// pair an artifact digest with a separately claimed byte count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MeasuredPackage {
+    id: PackageId,
+    physical_bytes: u64,
+}
+
+impl MeasuredPackage {
+    /// Hash and count an exact serialized inference artifact.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError`] when the artifact is empty or its length cannot
+    /// be represented by the version-2 campaign record.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CampaignError> {
+        let physical_bytes =
+            u64::try_from(bytes.len()).map_err(|_| CampaignError::RecordTooLarge("package"))?;
+        validate_nonzero("physical_bytes", physical_bytes)?;
+        Ok(Self {
+            id: PackageId::from_package_bytes(bytes),
+            physical_bytes,
+        })
+    }
+
+    /// Content identity of the exact serialized artifact.
+    pub fn id(self) -> PackageId {
+        self.id
+    }
+
+    /// Exact serialized artifact length.
+    pub fn physical_bytes(self) -> u64 {
+        self.physical_bytes
     }
 }
 
@@ -240,31 +472,41 @@ pub enum CampaignObjective {
     LogicalBpw,
     /// Minimize held-out perplexity.
     Perplexity,
+    /// Minimize source-vs-converted reconstruction mean squared error.
+    ReconstructionMse,
+    /// Maximize a pinned end-task score.
+    TaskScore,
+    /// Maximize measured decode throughput.
+    TokensPerSecond,
+    /// Minimize peak resident device memory during inference.
+    PeakVramBytes,
 }
 
 /// Required storage metrics plus optional quality measurements for one artifact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CampaignMetrics {
-    physical_bytes: u64,
     logical_bpw: f64,
     perplexity: Option<f64>,
+    reconstruction_mse: Option<f64>,
+    task_score: Option<f64>,
+    tokens_per_second: Option<f64>,
+    peak_vram_bytes: Option<u64>,
 }
 
 impl CampaignMetrics {
-    /// Build metrics with exact artifact bytes and logical allocator rate.
+    /// Build metrics with the logical allocator rate.
     ///
     /// # Errors
-    /// Returns [`CampaignError::InvalidMetric`] for zero bytes, or for a
-    /// non-finite/non-positive logical rate.
-    pub fn new(physical_bytes: u64, logical_bpw: f64) -> Result<Self, CampaignError> {
-        if physical_bytes == 0 {
-            return Err(CampaignError::InvalidMetric("physical_bytes"));
-        }
+    /// Returns [`CampaignError::InvalidMetric`] for a non-finite/non-positive rate.
+    pub fn new(logical_bpw: f64) -> Result<Self, CampaignError> {
         validate_positive_finite("logical_bpw", logical_bpw)?;
         Ok(Self {
-            physical_bytes,
             logical_bpw,
             perplexity: None,
+            reconstruction_mse: None,
+            task_score: None,
+            tokens_per_second: None,
+            peak_vram_bytes: None,
         })
     }
 
@@ -278,9 +520,46 @@ impl CampaignMetrics {
         Ok(self)
     }
 
-    /// Exact serialized inference-artifact size.
-    pub fn physical_bytes(&self) -> u64 {
-        self.physical_bytes
+    /// Add source-vs-converted reconstruction mean squared error.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError::InvalidMetric`] unless MSE is finite and non-negative.
+    pub fn with_reconstruction_mse(mut self, mse: f64) -> Result<Self, CampaignError> {
+        validate_nonnegative_finite("reconstruction_mse", mse)?;
+        self.reconstruction_mse = Some(canonicalize_zero(mse));
+        Ok(self)
+    }
+
+    /// Add a pinned end-task score. Higher values are better.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError::InvalidMetric`] unless the score is finite.
+    pub fn with_task_score(mut self, score: f64) -> Result<Self, CampaignError> {
+        validate_finite("task_score", score)?;
+        self.task_score = Some(canonicalize_zero(score));
+        Ok(self)
+    }
+
+    /// Add measured decode throughput. Higher values are better.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError::InvalidMetric`] unless throughput is finite and positive.
+    pub fn with_tokens_per_second(mut self, throughput: f64) -> Result<Self, CampaignError> {
+        validate_positive_finite("tokens_per_second", throughput)?;
+        self.tokens_per_second = Some(throughput);
+        Ok(self)
+    }
+
+    /// Add measured peak inference device memory.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError::InvalidMetric`] when the measurement is zero.
+    pub fn with_peak_vram_bytes(mut self, bytes: u64) -> Result<Self, CampaignError> {
+        if bytes == 0 {
+            return Err(CampaignError::InvalidMetric("peak_vram_bytes"));
+        }
+        self.peak_vram_bytes = Some(bytes);
+        Ok(self)
     }
 
     /// Logical bits per source weight assigned by the allocator.
@@ -292,6 +571,26 @@ impl CampaignMetrics {
     pub fn perplexity(&self) -> Option<f64> {
         self.perplexity
     }
+
+    /// Reconstruction MSE, when measured.
+    pub fn reconstruction_mse(&self) -> Option<f64> {
+        self.reconstruction_mse
+    }
+
+    /// Pinned end-task score, when measured.
+    pub fn task_score(&self) -> Option<f64> {
+        self.task_score
+    }
+
+    /// Decode throughput, when measured.
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        self.tokens_per_second
+    }
+
+    /// Peak inference device memory, when measured.
+    pub fn peak_vram_bytes(&self) -> Option<u64> {
+        self.peak_vram_bytes
+    }
 }
 
 /// One immutable converted artifact and its measured campaign metrics.
@@ -299,10 +598,10 @@ impl CampaignMetrics {
 pub struct CampaignPoint {
     source_model_id: ModelId,
     model_id: ModelId,
-    package_id: PackageId,
-    recipe_id: [u8; 32],
-    calibration_id: PackageId,
-    evaluation_id: PackageId,
+    package: MeasuredPackage,
+    recipe: RecipeProvenance,
+    calibration_id: CalibrationId,
+    evaluation_id: EvaluationId,
     metrics: CampaignMetrics,
 }
 
@@ -315,17 +614,17 @@ impl CampaignPoint {
     pub fn new(
         source_model_id: ModelId,
         model_id: ModelId,
-        package_id: PackageId,
-        recipe_id: [u8; 32],
-        calibration_id: PackageId,
-        evaluation_id: PackageId,
+        package: MeasuredPackage,
+        recipe: RecipeProvenance,
+        calibration_id: CalibrationId,
+        evaluation_id: EvaluationId,
         metrics: CampaignMetrics,
     ) -> Self {
         Self {
             source_model_id,
             model_id,
-            package_id,
-            recipe_id,
+            package,
+            recipe,
             calibration_id,
             evaluation_id,
             metrics,
@@ -344,21 +643,31 @@ impl CampaignPoint {
 
     /// Exact converted package identity.
     pub fn package_id(&self) -> PackageId {
-        self.package_id
+        self.package.id()
+    }
+
+    /// Exact serialized inference-artifact size.
+    pub fn physical_bytes(&self) -> u64 {
+        self.package.physical_bytes()
+    }
+
+    /// Embedded conversion recipe.
+    pub fn recipe(&self) -> &RecipeProvenance {
+        &self.recipe
     }
 
     /// Conversion recipe identity.
-    pub fn recipe_id(&self) -> &[u8; 32] {
-        &self.recipe_id
+    pub fn recipe_id(&self) -> RecipeId {
+        self.recipe.id()
     }
 
     /// Calibration provenance identity.
-    pub fn calibration_id(&self) -> PackageId {
+    pub fn calibration_id(&self) -> CalibrationId {
         self.calibration_id
     }
 
     /// Evaluation provenance identity.
-    pub fn evaluation_id(&self) -> PackageId {
+    pub fn evaluation_id(&self) -> EvaluationId {
         self.evaluation_id
     }
 
@@ -373,9 +682,9 @@ impl CampaignPoint {
 pub struct CampaignLedger {
     source_model_id: ModelId,
     calibration: CalibrationProvenance,
-    calibration_id: PackageId,
+    calibration_id: CalibrationId,
     evaluation: EvaluationProvenance,
-    evaluation_id: PackageId,
+    evaluation_id: EvaluationId,
     points: Vec<CampaignPoint>,
 }
 
@@ -409,7 +718,7 @@ impl CampaignLedger {
     }
 
     /// Cached identity of pinned calibration provenance.
-    pub fn calibration_id(&self) -> PackageId {
+    pub fn calibration_id(&self) -> CalibrationId {
         self.calibration_id
     }
 
@@ -419,7 +728,7 @@ impl CampaignLedger {
     }
 
     /// Cached identity of pinned evaluation provenance.
-    pub fn evaluation_id(&self) -> PackageId {
+    pub fn evaluation_id(&self) -> EvaluationId {
         self.evaluation_id
     }
 
@@ -447,9 +756,9 @@ impl CampaignLedger {
         if self
             .points
             .iter()
-            .any(|existing| existing.package_id == point.package_id)
+            .any(|existing| existing.package_id() == point.package_id())
         {
-            return Err(CampaignError::DuplicatePackage(point.package_id));
+            return Err(CampaignError::DuplicatePackage(point.package_id()));
         }
         self.points.push(point);
         Ok(())
@@ -457,9 +766,10 @@ impl CampaignLedger {
 
     /// Return non-dominated measured points in deterministic objective order.
     ///
-    /// All current objectives are minimized. A point dominates another when it
-    /// is no worse on every requested objective and strictly better on at least
-    /// one. No interpolation or extrapolation is performed. General
+    /// Storage, error, perplexity, and VRAM are minimized; task score and
+    /// throughput are maximized. A point dominates another when it is no worse
+    /// on every requested objective and strictly better on at least one. No
+    /// interpolation or extrapolation is performed. General
     /// multi-objective selection is `O(points² × objectives)`; campaign sweeps
     /// should persist raw points and compute larger frontiers offline if needed.
     ///
@@ -480,9 +790,9 @@ impl CampaignLedger {
         }
         for point in &self.points {
             for &objective in objectives {
-                if !has_objective(&point.metrics, objective) {
+                if !has_objective(point, objective) {
                     return Err(CampaignError::MissingObjective {
-                        package_id: point.package_id,
+                        package_id: point.package_id(),
                         objective,
                     });
                 }
@@ -494,19 +804,21 @@ impl CampaignLedger {
             .iter()
             .filter(|candidate| {
                 !self.points.iter().any(|other| {
-                    other.package_id != candidate.package_id
-                        && dominates(&other.metrics, &candidate.metrics, objectives)
+                    other.package_id() != candidate.package_id()
+                        && dominates(other, candidate, objectives)
                 })
             })
             .collect();
         frontier.sort_by(|left, right| {
             for &objective in objectives {
-                let ordering = objective_cmp(&left.metrics, &right.metrics, objective);
+                let ordering = objective_cmp(left, right, objective);
                 if ordering != Ordering::Equal {
                     return ordering;
                 }
             }
-            left.package_id.as_bytes().cmp(right.package_id.as_bytes())
+            left.package_id()
+                .as_bytes()
+                .cmp(right.package_id().as_bytes())
         });
         Ok(frontier)
     }
@@ -515,11 +827,11 @@ impl CampaignLedger {
     ///
     /// Points are ordered by exact [`PackageId`]. Calibration and evaluation
     /// records are embedded, making the artifact self-contained for audit. This
-    /// version-1 encoding is a stable hash target, not yet an interchange format;
+    /// version-2 encoding is a stable hash target, not yet an interchange format;
     /// no public decoder is provided.
     ///
     /// # Errors
-    /// Returns [`CampaignError::RecordTooLarge`] if a version-1 u32 count or
+    /// Returns [`CampaignError::RecordTooLarge`] if a version-2 u32 count or
     /// embedded-record length would overflow.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, CampaignError> {
         let calibration = self.calibration.canonical_bytes();
@@ -533,11 +845,15 @@ impl CampaignLedger {
 
         let mut points: Vec<_> = self.points.iter().collect();
         // Raw fixed-size digest bytes avoid display-format coupling.
-        points.sort_by(|left, right| left.package_id.as_bytes().cmp(right.package_id.as_bytes()));
+        points.sort_by(|left, right| {
+            left.package_id()
+                .as_bytes()
+                .cmp(right.package_id().as_bytes())
+        });
 
         let mut out = Vec::new();
         out.extend_from_slice(&CAMPAIGN_MAGIC);
-        out.push(PROVENANCE_VERSION);
+        out.push(CAMPAIGN_VERSION);
         out.extend_from_slice(self.source_model_id.as_bytes());
         out.extend_from_slice(&calibration_len.to_le_bytes());
         out.extend_from_slice(&calibration);
@@ -546,17 +862,19 @@ impl CampaignLedger {
         out.extend_from_slice(&point_count.to_le_bytes());
         for point in points {
             out.extend_from_slice(point.model_id.as_bytes());
-            out.extend_from_slice(point.package_id.as_bytes());
-            out.extend_from_slice(&point.recipe_id);
-            out.extend_from_slice(&point.metrics.physical_bytes.to_le_bytes());
+            out.extend_from_slice(point.package_id().as_bytes());
+            out.extend_from_slice(&point.physical_bytes().to_le_bytes());
+            let recipe = point.recipe.canonical_bytes();
+            let recipe_len =
+                u32::try_from(recipe.len()).map_err(|_| CampaignError::RecordTooLarge("recipe"))?;
+            out.extend_from_slice(&recipe_len.to_le_bytes());
+            out.extend_from_slice(&recipe);
             out.extend_from_slice(&point.metrics.logical_bpw.to_bits().to_le_bytes());
-            match point.metrics.perplexity {
-                None => out.push(0),
-                Some(perplexity) => {
-                    out.push(1);
-                    out.extend_from_slice(&perplexity.to_bits().to_le_bytes());
-                }
-            }
+            write_optional_f64(&mut out, point.metrics.perplexity);
+            write_optional_f64(&mut out, point.metrics.reconstruction_mse);
+            write_optional_f64(&mut out, point.metrics.task_score);
+            write_optional_f64(&mut out, point.metrics.tokens_per_second);
+            write_optional_u64(&mut out, point.metrics.peak_vram_bytes);
         }
         Ok(out)
     }
@@ -565,36 +883,94 @@ impl CampaignLedger {
     ///
     /// # Errors
     /// Returns the same errors as [`Self::canonical_bytes`].
-    pub fn id(&self) -> Result<PackageId, CampaignError> {
-        Ok(PackageId::from_package_bytes(&self.canonical_bytes()?))
+    pub fn id(&self) -> Result<CampaignId, CampaignError> {
+        Ok(CampaignId(domain_hash(
+            CAMPAIGN_ID_CONTEXT,
+            &self.canonical_bytes()?,
+        )))
     }
 }
 
-fn has_objective(metrics: &CampaignMetrics, objective: CampaignObjective) -> bool {
+fn has_objective(point: &CampaignPoint, objective: CampaignObjective) -> bool {
     match objective {
         CampaignObjective::PhysicalBytes | CampaignObjective::LogicalBpw => true,
-        CampaignObjective::Perplexity => metrics.perplexity.is_some(),
+        CampaignObjective::Perplexity => point.metrics.perplexity.is_some(),
+        CampaignObjective::ReconstructionMse => point.metrics.reconstruction_mse.is_some(),
+        CampaignObjective::TaskScore => point.metrics.task_score.is_some(),
+        CampaignObjective::TokensPerSecond => point.metrics.tokens_per_second.is_some(),
+        CampaignObjective::PeakVramBytes => point.metrics.peak_vram_bytes.is_some(),
     }
 }
 
 fn objective_cmp(
-    left: &CampaignMetrics,
-    right: &CampaignMetrics,
+    left: &CampaignPoint,
+    right: &CampaignPoint,
     objective: CampaignObjective,
 ) -> Ordering {
     match objective {
-        CampaignObjective::PhysicalBytes => left.physical_bytes.cmp(&right.physical_bytes),
-        CampaignObjective::LogicalBpw => left.logical_bpw.total_cmp(&right.logical_bpw),
+        CampaignObjective::PhysicalBytes => left.physical_bytes().cmp(&right.physical_bytes()),
+        CampaignObjective::LogicalBpw => left
+            .metrics
+            .logical_bpw
+            .total_cmp(&right.metrics.logical_bpw),
         CampaignObjective::Perplexity => left
+            .metrics
             .perplexity
             .expect("objective presence validated")
-            .total_cmp(&right.perplexity.expect("objective presence validated")),
+            .total_cmp(
+                &right
+                    .metrics
+                    .perplexity
+                    .expect("objective presence validated"),
+            ),
+        CampaignObjective::ReconstructionMse => left
+            .metrics
+            .reconstruction_mse
+            .expect("objective presence validated")
+            .total_cmp(
+                &right
+                    .metrics
+                    .reconstruction_mse
+                    .expect("objective presence validated"),
+            ),
+        // Inverted ordering: higher task scores are better.
+        CampaignObjective::TaskScore => right
+            .metrics
+            .task_score
+            .expect("objective presence validated")
+            .total_cmp(
+                &left
+                    .metrics
+                    .task_score
+                    .expect("objective presence validated"),
+            ),
+        // Inverted ordering: higher throughput is better.
+        CampaignObjective::TokensPerSecond => right
+            .metrics
+            .tokens_per_second
+            .expect("objective presence validated")
+            .total_cmp(
+                &left
+                    .metrics
+                    .tokens_per_second
+                    .expect("objective presence validated"),
+            ),
+        CampaignObjective::PeakVramBytes => left
+            .metrics
+            .peak_vram_bytes
+            .expect("objective presence validated")
+            .cmp(
+                &right
+                    .metrics
+                    .peak_vram_bytes
+                    .expect("objective presence validated"),
+            ),
     }
 }
 
 fn dominates(
-    left: &CampaignMetrics,
-    right: &CampaignMetrics,
+    left: &CampaignPoint,
+    right: &CampaignPoint,
     objectives: &[CampaignObjective],
 ) -> bool {
     let mut strictly_better = false;
@@ -634,6 +1010,26 @@ fn validate_positive_finite(field: &'static str, value: f64) -> Result<(), Campa
     }
 }
 
+fn validate_nonnegative_finite(field: &'static str, value: f64) -> Result<(), CampaignError> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(CampaignError::InvalidMetric(field))
+    }
+}
+
+fn validate_finite(field: &'static str, value: f64) -> Result<(), CampaignError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(CampaignError::InvalidMetric(field))
+    }
+}
+
+fn canonicalize_zero(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
 /// Why campaign provenance or measurements were rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -644,7 +1040,7 @@ pub enum CampaignError {
     FieldTooLong(&'static str),
     /// Required numeric field was zero.
     ZeroValue(&'static str),
-    /// Metric was missing physical support or was non-finite/non-positive.
+    /// Metric violated its finite, sign, or non-zero constraint.
     InvalidMetric(&'static str),
     /// Point did not use the ledger's pinned comparison identity.
     ProvenanceMismatch(&'static str),
@@ -661,7 +1057,7 @@ pub enum CampaignError {
         /// Requested metric.
         objective: CampaignObjective,
     },
-    /// Version-1 campaign record exceeded a u32 count or embedded length.
+    /// Version-2 campaign record exceeded a u32 count or embedded length.
     RecordTooLarge(&'static str),
 }
 
@@ -690,7 +1086,7 @@ impl fmt::Display for CampaignError {
                 "campaign package `{package_id}` lacks objective {objective:?}"
             ),
             Self::RecordTooLarge(field) => {
-                write!(f, "campaign record `{field}` exceeds version-1 capacity")
+                write!(f, "campaign record `{field}` exceeds version-2 capacity")
             }
         }
     }
@@ -737,6 +1133,16 @@ mod tests {
         .expect("evaluation")
     }
 
+    fn recipe(seed: u8) -> RecipeProvenance {
+        RecipeProvenance::new(
+            "tritium-cli",
+            "67f7256",
+            vec![seed],
+            "tritium convert --recipe recipe.json",
+        )
+        .expect("recipe")
+    }
+
     #[test]
     fn calibration_identity_binds_exact_sample_set() {
         let first = CalibrationProvenance::new(
@@ -767,6 +1173,14 @@ mod tests {
     }
 
     #[test]
+    fn measured_package_binds_exact_bytes_and_length() {
+        let bytes = b"exact serialized ternary package";
+        let measured = MeasuredPackage::from_bytes(bytes).expect("measured package");
+        assert_eq!(measured.id(), PackageId::from_package_bytes(bytes));
+        assert_eq!(measured.physical_bytes(), bytes.len() as u64);
+    }
+
+    #[test]
     fn evaluation_identity_binds_harness_and_samples() {
         let first = EvaluationProvenance::new(
             "wikitext-2-ppl",
@@ -793,21 +1207,144 @@ mod tests {
     }
 
     #[test]
+    fn recipe_identity_binds_revision_config_and_command() {
+        let first = RecipeProvenance::new(
+            "tritium-cli",
+            "67f7256",
+            br#"{"passes":2}"#.to_vec(),
+            "tritium convert --recipe recipe.json",
+        )
+        .expect("recipe");
+        let equivalent = RecipeProvenance::new(
+            "tritium-cli",
+            "67f7256",
+            br#"{"passes":2}"#.to_vec(),
+            "tritium convert --recipe recipe.json",
+        )
+        .expect("recipe");
+        let changed_config = RecipeProvenance::new(
+            "tritium-cli",
+            "67f7256",
+            br#"{"passes":3}"#.to_vec(),
+            "tritium convert --recipe recipe.json",
+        )
+        .expect("recipe");
+        let changed_command = RecipeProvenance::new(
+            "tritium-cli",
+            "67f7256",
+            br#"{"passes":2}"#.to_vec(),
+            "tritium convert --recipe other.json",
+        )
+        .expect("recipe");
+        let changed_revision = RecipeProvenance::new(
+            "tritium-cli",
+            "bf7ab42",
+            br#"{"passes":2}"#.to_vec(),
+            "tritium convert --recipe recipe.json",
+        )
+        .expect("recipe");
+
+        assert_ne!(first.id(), changed_config.id());
+        assert_ne!(first.id(), changed_command.id());
+        assert_ne!(first.id(), changed_revision.id());
+        assert_eq!(first.id(), equivalent.id());
+        assert_eq!(first.canonical_bytes(), equivalent.canonical_bytes());
+        assert!(first.id().to_string().starts_with("trr1_"));
+    }
+
+    #[test]
+    fn metrics_normalize_signed_zero() {
+        let positive = CampaignMetrics::new(2.0)
+            .expect("metrics")
+            .with_reconstruction_mse(0.0)
+            .expect("mse")
+            .with_task_score(0.0)
+            .expect("task score");
+        let negative = CampaignMetrics::new(2.0)
+            .expect("metrics")
+            .with_reconstruction_mse(-0.0)
+            .expect("mse")
+            .with_task_score(-0.0)
+            .expect("task score");
+
+        assert_eq!(positive, negative);
+        assert_eq!(negative.reconstruction_mse().expect("mse").to_bits(), 0);
+        assert_eq!(negative.task_score().expect("task score").to_bits(), 0);
+    }
+
+    #[test]
+    fn pareto_frontier_honors_quality_and_system_directions() {
+        let source = model_id(1);
+        let calibration = calibration([1; 32]);
+        let evaluation = evaluation();
+        let mut ledger = CampaignLedger::new(source, calibration.clone(), evaluation.clone());
+        let make_point = |seed: u8, package_len: usize, task_score: f64, throughput: f64| {
+            let package_bytes = vec![seed; package_len];
+            CampaignPoint::new(
+                source,
+                model_id(seed),
+                MeasuredPackage::from_bytes(&package_bytes).expect("package"),
+                RecipeProvenance::new(
+                    "tritium-cli",
+                    "67f7256",
+                    vec![seed],
+                    "tritium convert --recipe recipe.json",
+                )
+                .expect("recipe"),
+                calibration.id(),
+                evaluation.id(),
+                CampaignMetrics::new(2.0)
+                    .expect("metrics")
+                    .with_reconstruction_mse(0.01 + f64::from(seed) / 100.0)
+                    .expect("mse")
+                    .with_task_score(task_score)
+                    .expect("task score")
+                    .with_tokens_per_second(throughput)
+                    .expect("throughput")
+                    .with_peak_vram_bytes(u64::from(seed) * 1_000)
+                    .expect("vram"),
+            )
+        };
+        let compact = make_point(2, 7, 0.70, 100.0);
+        let capable = make_point(3, 8, 0.75, 120.0);
+        let dominated = make_point(4, 9, 0.72, 90.0);
+        for point in [dominated, capable.clone(), compact.clone()] {
+            ledger.add(point).expect("add point");
+        }
+
+        let frontier = ledger
+            .pareto_frontier(&[
+                CampaignObjective::PhysicalBytes,
+                CampaignObjective::TaskScore,
+                CampaignObjective::TokensPerSecond,
+                CampaignObjective::PeakVramBytes,
+            ])
+            .expect("frontier");
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|point| point.package_id())
+                .collect::<Vec<_>>(),
+            vec![compact.package_id(), capable.package_id()]
+        );
+    }
+
+    #[test]
     fn ledger_rejects_mixed_provenance_and_duplicate_packages() {
         let source = model_id(1);
         let calibration_provenance = calibration([1; 32]);
         let evaluation = evaluation();
         let mut ledger =
             CampaignLedger::new(source, calibration_provenance.clone(), evaluation.clone());
-        let metrics = CampaignMetrics::new(4_000_000_000, 2.1)
+        let metrics = CampaignMetrics::new(2.1)
             .expect("valid metrics")
             .with_perplexity(8.2)
             .expect("valid perplexity");
         let wrong_calibration = CampaignPoint::new(
             source,
             model_id(2),
-            PackageId::from_package_bytes(b"candidate-a"),
-            [9; 32],
+            MeasuredPackage::from_bytes(b"candidate-a").expect("package"),
+            recipe(9),
             calibration([9; 32]).id(),
             evaluation.id(),
             metrics.clone(),
@@ -817,12 +1354,12 @@ mod tests {
             Err(CampaignError::ProvenanceMismatch("calibration"))
         ));
 
-        let package = PackageId::from_package_bytes(b"candidate-b");
+        let package = MeasuredPackage::from_bytes(b"candidate-b").expect("package");
         let point = CampaignPoint::new(
             source,
             model_id(3),
             package,
-            [8; 32],
+            recipe(8),
             calibration_provenance.id(),
             evaluation.id(),
             metrics,
@@ -830,7 +1367,7 @@ mod tests {
         ledger.add(point.clone()).expect("first package");
         assert!(matches!(
             ledger.add(point),
-            Err(CampaignError::DuplicatePackage(id)) if id == package
+            Err(CampaignError::DuplicatePackage(id)) if id == package.id()
         ));
     }
 
@@ -840,24 +1377,25 @@ mod tests {
         let calibration = calibration([1; 32]);
         let evaluation = evaluation();
         let mut ledger = CampaignLedger::new(source, calibration.clone(), evaluation.clone());
-        let make_point = |seed: u8, bytes: u64, perplexity: f64| {
+        let make_point = |seed: u8, package_len: usize, perplexity: f64| {
+            let package_bytes = vec![seed; package_len];
             CampaignPoint::new(
                 source,
                 model_id(seed),
-                PackageId::from_package_bytes(&[seed]),
-                [seed; 32],
+                MeasuredPackage::from_bytes(&package_bytes).expect("package"),
+                recipe(seed),
                 calibration.id(),
                 evaluation.id(),
-                CampaignMetrics::new(bytes, 2.0)
+                CampaignMetrics::new(2.0)
                     .expect("metrics")
                     .with_perplexity(perplexity)
                     .expect("perplexity"),
             )
         };
-        let compact = make_point(2, 70_000_000, 10.5);
-        let accurate = make_point(3, 80_000_000, 9.8);
-        let dominated = make_point(4, 100_000_000, 11.0);
-        let fp_sized = make_point(5, 540_000_000, 10.0);
+        let compact = make_point(2, 7, 10.5);
+        let accurate = make_point(3, 8, 9.8);
+        let dominated = make_point(4, 10, 11.0);
+        let fp_sized = make_point(5, 54, 10.0);
         for point in [fp_sized, dominated, accurate.clone(), compact.clone()] {
             ledger.add(point).expect("add point");
         }
@@ -883,14 +1421,15 @@ mod tests {
         let calibration = calibration([1; 32]);
         let evaluation = evaluation();
         let make_point = |seed: u8| {
+            let package_bytes = vec![seed; usize::from(seed)];
             CampaignPoint::new(
                 source,
                 model_id(seed),
-                PackageId::from_package_bytes(&[seed]),
-                [seed; 32],
+                MeasuredPackage::from_bytes(&package_bytes).expect("package"),
+                recipe(seed),
                 calibration.id(),
                 evaluation.id(),
-                CampaignMetrics::new(u64::from(seed) * 1_000_000, 2.0)
+                CampaignMetrics::new(2.0)
                     .expect("metrics")
                     .with_perplexity(10.0 - f64::from(seed))
                     .expect("perplexity"),
@@ -912,7 +1451,7 @@ mod tests {
         assert_eq!(forward.id().expect("id"), reverse.id().expect("id"));
         assert_eq!(
             forward.id().expect("id").to_string(),
-            "trp1_f6ff8a4a2e98622f1b21bc77441fece6e8946ab02a18345785414b4d8507bf14"
+            "trl1_c536022c10e224592e9817fe7664a644a66828a7ddc002fc4c69adecb2aefad2"
         );
     }
 }
