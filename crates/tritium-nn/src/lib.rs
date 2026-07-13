@@ -21,6 +21,7 @@ mod model;
 mod ops;
 mod teacher_cache;
 mod tensor;
+mod training;
 
 pub use config::{ArchSpec, MlpKind, ModelConfig};
 pub use error::NnError;
@@ -43,3 +44,9 @@ pub use teacher_cache::{
     hash_teacher_weights,
 };
 pub use tensor::f16_bytes_to_f32;
+#[cfg(feature = "cuda")]
+pub use training::{PackedTrainingForward, packed_device_forward};
+pub use training::{
+    TiedSwiGluTrainingArchitecture, TiedSwiGluTrainingModel, TrainingAdapterError,
+    TrainingParameter,
+};

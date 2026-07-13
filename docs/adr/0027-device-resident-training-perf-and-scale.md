@@ -335,7 +335,11 @@ does not mark the ADR or its scale campaign complete.
   not materialize a dense weight and leaves the reassociated plane-grouped/tiled
   kernels available only as an explicit fast path.
 - **Track F substrate:** deterministic intermediate-width Net2Wider transforms and
-  quality/bytes selection (`e4b8f5b`).
+  quality/bytes selection (`e4b8f5b`). A production tied-SwiGLU training adapter
+  now owns the canonical HuggingFace parameter map (`embed`, then per-layer
+  `q/k/v/o/gate/up/down`), fixed norm state, and packed device graph builder.
+  It validates the SmolLM2 135M, 360M, and 1.7B geometries and rejects QKV bias,
+  QK norm, untied heads, and tensor-shape drift before allocating a campaign.
 
 ### Green local gates and measurements
 
