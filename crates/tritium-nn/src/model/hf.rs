@@ -647,6 +647,16 @@ mod tests {
             "logits must be finite"
         );
 
+        // Keep the legacy v1 bundle on the positive runtime path too: both encodings must
+        // reconstruct the same SALT rows and therefore produce exactly the same logits.
+        let legacy_path = dir.join("legacy.tslb");
+        std::fs::write(&legacy_path, write_salt_bundle(&bundle_refs).unwrap()).unwrap();
+        let legacy_backend = Box::new(tritium_cpu::CpuBackend::new());
+        let mut legacy_runner =
+            ModelRunner::from_salt(&dir, &legacy_path, legacy_backend).expect("from_salt v1");
+        let legacy_logits = legacy_runner.forward(&[0u32], &[0]).expect("forward v1");
+        assert_eq!(legacy_logits, logits, "v1 and v2 runtime logits must match");
+
         // Negative: a bundle MISSING a 2D weight must error — never silently load the fp master.
         let partial: Vec<(&str, &[SaltRow])> = salt
             .iter()

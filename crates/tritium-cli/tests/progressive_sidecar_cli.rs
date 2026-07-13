@@ -1,12 +1,30 @@
 //! End-to-end gate for progressive sparse SALT sidecar emission.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tritium_format::{SALT_MAGIC, SALT_PROGRESSIVE_VERSION, read_salt_bundle};
 
 const ROWS: usize = 8;
 const K: usize = 8;
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("tritium-progressive-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("mkdir");
+        Self(path)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn tritium_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tritium"))
@@ -29,50 +47,60 @@ fn build_safetensors(values: &[f32]) -> Vec<u8> {
     bytes
 }
 
+fn run_quantize(input: &Path, output: &Path, format: &str) {
+    let result = Command::new(tritium_bin())
+        .args([
+            "quantize",
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--bpw",
+            "3.0",
+            "--format",
+            format,
+        ])
+        .output()
+        .expect("run quantize");
+    assert!(
+        result.status.success(),
+        "{format} quantize failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 #[test]
 fn progressive_sidecar_emits_v2_rows_that_roundtrip() {
-    let dir = std::env::temp_dir().join(format!("tritium-progressive-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let weight_path = dir.join("w.safetensors");
-    let output_path = dir.join("w-progressive.tslb");
+    let dir = TestDir::new();
+    let weight_path = dir.0.join("w.safetensors");
+    let progressive_path = dir.0.join("w-progressive.tslb");
+    let legacy_path = dir.0.join("w-legacy.tslb");
     let weights: Vec<f32> = (0..ROWS * K)
         .map(|i| ((i as f32 + 0.5) * 0.37).sin())
         .collect();
     std::fs::write(&weight_path, build_safetensors(&weights)).expect("write weights");
 
-    let output = Command::new(tritium_bin())
-        .args([
-            "quantize",
-            "--input",
-            weight_path.to_str().unwrap(),
-            "--output",
-            output_path.to_str().unwrap(),
-            "--bpw",
-            "3.0",
-            "--format",
-            "sidecar-progressive",
-        ])
-        .output()
-        .expect("run progressive quantize");
-    assert!(
-        output.status.success(),
-        "progressive quantize failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    run_quantize(&weight_path, &progressive_path, "sidecar-progressive");
+    run_quantize(&weight_path, &legacy_path, "sidecar");
 
-    let bytes = std::fs::read(&output_path).expect("read progressive bundle");
-    let row_header = bytes
+    let progressive_bytes = std::fs::read(&progressive_path).expect("read progressive bundle");
+    let legacy_bytes = std::fs::read(&legacy_path).expect("read legacy bundle");
+    assert_ne!(
+        progressive_bytes, legacy_bytes,
+        "progressive output must use distinct row framing"
+    );
+    let row_header = progressive_bytes
         .windows(SALT_MAGIC.len())
         .position(|window| window == SALT_MAGIC)
         .expect("embedded SALT row");
     assert_eq!(
-        bytes[row_header + SALT_MAGIC.len()],
+        progressive_bytes[row_header + SALT_MAGIC.len()],
         SALT_PROGRESSIVE_VERSION
     );
-    let tensors = read_salt_bundle(&bytes).expect("read progressive bundle");
-    assert_eq!(tensors.len(), 1);
-    assert_eq!(tensors[0].name, "w");
-    assert_eq!(tensors[0].salt_rows.len(), ROWS);
-
-    let _ = std::fs::remove_dir_all(&dir);
+    let progressive = read_salt_bundle(&progressive_bytes).expect("read progressive bundle");
+    let legacy = read_salt_bundle(&legacy_bytes).expect("read legacy bundle");
+    assert_eq!(progressive, legacy, "v1 and v2 must decode identically");
+    assert_eq!(progressive.len(), 1);
+    assert_eq!(progressive[0].name, "w");
+    assert_eq!(progressive[0].salt_rows.len(), ROWS);
 }
