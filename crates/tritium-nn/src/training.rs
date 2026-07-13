@@ -152,6 +152,94 @@ impl TiedSwiGluTrainingModel {
             .collect()
     }
 
+    /// Deterministically widen every SwiGLU intermediate axis in place.
+    ///
+    /// One [`tritium_train::Net2WiderPlan`] is shared by all transformer layers:
+    /// gate and up rows are copied from the selected source units, while down
+    /// columns are copied and divided by each source unit's replication count.
+    /// This preserves the dense fp32 SwiGLU function before SALT quantization.
+    /// Canonical parameter names and order are unchanged.
+    ///
+    /// The model is fully preflighted before mutation. During mutation, only one
+    /// source tensor and its expanded replacement are live at a time, so temporary
+    /// storage is bounded by the largest individual MLP tensor rather than model
+    /// depth.
+    ///
+    /// # Errors
+    /// Returns [`TrainingAdapterError::InvalidInput`] when `new_width` narrows the
+    /// model, a size overflows, parameter geometry is inconsistent, or latent
+    /// masters have already moved into an optimizer.
+    pub fn widen_intermediate(
+        &mut self,
+        new_width: usize,
+        seed: u64,
+    ) -> Result<tritium_train::Net2WiderPlan, TrainingAdapterError> {
+        let old_width = self.arch.n_ff;
+        let expected_parameters = self
+            .arch
+            .n_layers
+            .checked_mul(7)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| invalid_input("parameter count overflows usize"))?;
+        if self.parameters.len() != expected_parameters {
+            return Err(tensor_mismatch(
+                "canonical training parameter count",
+                expected_parameters,
+                self.parameters.len(),
+            ));
+        }
+
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            if parameter.master.len() != parameter.elements() {
+                return Err(invalid_input(&format!(
+                    "{} master at canonical index {index} is drained or shape-inconsistent",
+                    parameter.name
+                )));
+            }
+        }
+        for layer_index in 0..self.arch.n_layers {
+            let base = 1 + 7 * layer_index;
+            validate_parameter_geometry(&self.parameters[base + 4], old_width, self.arch.n_embd)?;
+            validate_parameter_geometry(&self.parameters[base + 5], old_width, self.arch.n_embd)?;
+            validate_parameter_geometry(&self.parameters[base + 6], self.arch.n_embd, old_width)?;
+        }
+        new_width
+            .checked_mul(self.arch.n_embd)
+            .ok_or_else(|| invalid_input("widened incoming projection overflows usize"))?;
+        self.arch
+            .n_embd
+            .checked_mul(new_width)
+            .ok_or_else(|| invalid_input("widened outgoing projection overflows usize"))?;
+        let plan = tritium_train::Net2WiderPlan::seeded(old_width, new_width, seed)
+            .map_err(|error| invalid_input(&error.to_string()))?;
+        if new_width == old_width {
+            return Ok(plan);
+        }
+
+        for layer_index in 0..self.arch.n_layers {
+            let base = 1 + 7 * layer_index;
+            let gate = &mut self.parameters[base + 4];
+            gate.master = plan
+                .expand_incoming_rows(&gate.master, self.arch.n_embd)
+                .map_err(|error| invalid_input(&error.to_string()))?;
+            gate.rows = new_width;
+
+            let up = &mut self.parameters[base + 5];
+            up.master = plan
+                .expand_incoming_rows(&up.master, self.arch.n_embd)
+                .map_err(|error| invalid_input(&error.to_string()))?;
+            up.rows = new_width;
+
+            let down = &mut self.parameters[base + 6];
+            down.master = plan
+                .expand_outgoing_columns(&down.master, self.arch.n_embd)
+                .map_err(|error| invalid_input(&error.to_string()))?;
+            down.cols = new_width;
+        }
+        self.arch.n_ff = new_width;
+        Ok(plan)
+    }
+
     /// Validate that an HF architecture can use the packed training graph.
     ///
     /// This is a cheap preflight that can run immediately after parsing
@@ -539,6 +627,21 @@ fn validate_vector(
     }
 }
 
+fn validate_parameter_geometry(
+    parameter: &TrainingParameter,
+    expected_rows: usize,
+    expected_cols: usize,
+) -> Result<(), TrainingAdapterError> {
+    if parameter.rows == expected_rows && parameter.cols == expected_cols {
+        Ok(())
+    } else {
+        Err(invalid_input(&format!(
+            "{} is [{}, {}], expected [{expected_rows}, {expected_cols}]",
+            parameter.name, parameter.rows, parameter.cols
+        )))
+    }
+}
+
 fn usize_from_u32(value: u32, name: &str) -> Result<usize, TrainingAdapterError> {
     usize::try_from(value).map_err(|_| unsupported(&format!("{name} exceeds usize")))
 }
@@ -560,7 +663,6 @@ fn tensor_mismatch(name: &str, expected: usize, got: usize) -> TrainingAdapterEr
     }
 }
 
-#[cfg(feature = "cuda")]
 fn invalid_input(reason: &str) -> TrainingAdapterError {
     TrainingAdapterError::InvalidInput(reason.to_owned())
 }

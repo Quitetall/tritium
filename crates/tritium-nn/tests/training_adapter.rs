@@ -68,6 +68,97 @@ fn weights() -> ModelWeights {
     }
 }
 
+fn ramp_dense(rows: usize, cols: usize, start: f32) -> Projection {
+    let values = (0..rows * cols).map(|index| start + index as f32).collect();
+    Projection::Dense(DenseLinear::new_exact(values, rows, cols).unwrap())
+}
+
+fn widening_weights() -> ModelWeights {
+    let mut weights = weights();
+    for (layer_index, layer) in weights.layers.iter_mut().enumerate() {
+        let Mlp::SwiGlu(mlp) = &mut layer.mlp else {
+            unreachable!("test fixture is SwiGLU")
+        };
+        let layer_offset = 1_000.0 * layer_index as f32;
+        mlp.gate = ramp_dense(6, 4, 100.0 + layer_offset);
+        mlp.up = ramp_dense(6, 4, 200.0 + layer_offset);
+        mlp.down = ramp_dense(4, 6, 300.0 + layer_offset);
+    }
+    weights
+}
+
+fn patterned_dense(rows: usize, cols: usize, seed: usize) -> Projection {
+    let values = (0..rows * cols)
+        .map(|index| {
+            let centered = ((index * 7 + seed * 3) % 19) as f32 - 9.0;
+            centered / 32.0
+        })
+        .collect();
+    Projection::Dense(DenseLinear::new_exact(values, rows, cols).unwrap())
+}
+
+fn equivalence_weights() -> ModelWeights {
+    let mut weights = weights();
+    for (layer_index, layer) in weights.layers.iter_mut().enumerate() {
+        layer.ffn_norm = vec![0.75 + 0.125 * layer_index as f32, 1.0, 1.25, 0.875];
+        let Mlp::SwiGlu(mlp) = &mut layer.mlp else {
+            unreachable!("test fixture is SwiGLU")
+        };
+        mlp.gate = patterned_dense(6, 4, 10 + layer_index);
+        mlp.up = patterned_dense(6, 4, 20 + layer_index);
+        mlp.down = patterned_dense(4, 6, 30 + layer_index);
+    }
+    weights
+}
+
+fn dense_swiglu_stack(model: &TiedSwiGluTrainingModel, input: &[f32]) -> Vec<f32> {
+    let arch = model.architecture();
+    assert_eq!(input.len() % arch.n_embd, 0);
+    let mut hidden = input.to_vec();
+    for layer_index in 0..arch.n_layers {
+        let base = 1 + 7 * layer_index;
+        let gate = &model.parameters()[base + 4];
+        let up = &model.parameters()[base + 5];
+        let down = &model.parameters()[base + 6];
+        for row in hidden.chunks_exact_mut(arch.n_embd) {
+            let mean_square =
+                row.iter().map(|value| value * value).sum::<f32>() / arch.n_embd as f32;
+            let inverse_rms = (mean_square + arch.rms_eps).sqrt().recip();
+            let normalized: Vec<_> = row
+                .iter()
+                .zip(&arch.ffn_norms[layer_index])
+                .map(|(&value, &norm)| value * inverse_rms * norm)
+                .collect();
+            let intermediate: Vec<_> = gate
+                .master
+                .chunks_exact(arch.n_embd)
+                .zip(up.master.chunks_exact(arch.n_embd))
+                .map(|(gate_row, up_row)| {
+                    let gate_value = gate_row
+                        .iter()
+                        .zip(&normalized)
+                        .map(|(&weight, &value)| weight * value)
+                        .sum::<f32>();
+                    let up_value = up_row
+                        .iter()
+                        .zip(&normalized)
+                        .map(|(&weight, &value)| weight * value)
+                        .sum::<f32>();
+                    (gate_value / (1.0 + (-gate_value).exp())) * up_value
+                })
+                .collect();
+            for (output, down_row) in row.iter_mut().zip(down.master.chunks_exact(arch.n_ff)) {
+                *output += down_row
+                    .iter()
+                    .zip(&intermediate)
+                    .map(|(&weight, &value)| weight * value)
+                    .sum::<f32>();
+            }
+        }
+    }
+    hidden
+}
+
 #[test]
 fn extraction_preserves_canonical_hf_parameter_order_names_and_shapes() {
     let model = TiedSwiGluTrainingModel::extract(&config(), &spec(), &weights()).unwrap();
@@ -176,6 +267,126 @@ fn parameter_masters_can_move_to_optimizer_without_losing_graph_metadata() {
             .collect::<Vec<_>>(),
         expected_elements
     );
+}
+
+#[test]
+fn intermediate_growth_applies_one_mapping_to_every_layer_without_reordering_parameters() {
+    let mut model =
+        TiedSwiGluTrainingModel::extract(&config(), &spec(), &widening_weights()).unwrap();
+    let names_before: Vec<_> = model
+        .parameters()
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect();
+
+    let plan = model.widen_intermediate(9, 0).unwrap();
+
+    assert_eq!(plan.source_indices(), [0, 1, 2, 3, 4, 5, 1, 0, 1]);
+    assert_eq!(plan.replication_counts(), [2, 3, 1, 1, 1, 1]);
+    assert_eq!(model.architecture().n_ff, 9);
+    assert_eq!(
+        model
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>(),
+        names_before
+    );
+
+    for layer_index in 0..2 {
+        let base = 1 + 7 * layer_index;
+        let gate = &model.parameters()[base + 4];
+        let up = &model.parameters()[base + 5];
+        let down = &model.parameters()[base + 6];
+        assert_eq!((gate.rows, gate.cols), (9, 4));
+        assert_eq!((up.rows, up.cols), (9, 4));
+        assert_eq!((down.rows, down.cols), (4, 9));
+
+        let layer_offset = 1_000.0 * layer_index as f32;
+        assert_eq!(
+            gate.master
+                .chunks_exact(4)
+                .map(|row| row[0])
+                .collect::<Vec<_>>(),
+            [
+                100.0 + layer_offset,
+                104.0 + layer_offset,
+                108.0 + layer_offset,
+                112.0 + layer_offset,
+                116.0 + layer_offset,
+                120.0 + layer_offset,
+                104.0 + layer_offset,
+                100.0 + layer_offset,
+                104.0 + layer_offset,
+            ]
+        );
+        assert_eq!(&gate.master[24..28], &gate.master[4..8]);
+        assert_eq!(&gate.master[28..32], &gate.master[0..4]);
+        assert_eq!(&up.master[24..28], &up.master[4..8]);
+        assert_eq!(&up.master[28..32], &up.master[0..4]);
+
+        let source_row_start = 300.0 + layer_offset;
+        assert_eq!(
+            &down.master[..9],
+            &[
+                source_row_start / 2.0,
+                (source_row_start + 1.0) / 3.0,
+                source_row_start + 2.0,
+                source_row_start + 3.0,
+                source_row_start + 4.0,
+                source_row_start + 5.0,
+                (source_row_start + 1.0) / 3.0,
+                source_row_start / 2.0,
+                (source_row_start + 1.0) / 3.0,
+            ]
+        );
+    }
+}
+
+#[test]
+fn intermediate_growth_preserves_the_whole_multilayer_swiglu_function_before_salt() {
+    let mut model =
+        TiedSwiGluTrainingModel::extract(&config(), &spec(), &equivalence_weights()).unwrap();
+    let input = [
+        0.25, -0.5, 0.75, -1.0, // token 0
+        -0.125, 0.375, 0.625, -0.875, // token 1
+        1.0, -0.25, -0.75, 0.5, // token 2
+    ];
+    let original = dense_swiglu_stack(&model, &input);
+
+    model.widen_intermediate(11, 0x0027).unwrap();
+    let widened = dense_swiglu_stack(&model, &input);
+
+    assert_eq!(widened.len(), original.len());
+    let max_absolute_error = original
+        .iter()
+        .zip(&widened)
+        .map(|(&expected, &actual)| (expected - actual).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_absolute_error <= 2e-6,
+        "Net2Wider changed the two-layer SwiGLU function by {max_absolute_error:e}"
+    );
+}
+
+#[test]
+fn intermediate_growth_rejects_narrowing_and_drained_masters_before_mutation() {
+    let mut model = TiedSwiGluTrainingModel::extract(&config(), &spec(), &weights()).unwrap();
+    let original = model.clone();
+
+    let error = model.widen_intermediate(5, 7).unwrap_err();
+    assert!(error.to_string().contains("6 -> 5"), "{error}");
+    assert_eq!(model, original);
+
+    let masters = model.take_parameter_masters();
+    assert!(masters.iter().all(|master| !master.is_empty()));
+    let error = model.widen_intermediate(9, 7).unwrap_err();
+    assert!(error.to_string().contains("drained"), "{error}");
+    assert_eq!(model.architecture().n_ff, 6);
+    assert!(model.parameters().iter().all(|parameter| {
+        parameter.master.is_empty()
+            && parameter.elements() == parameter.rows.saturating_mul(parameter.cols)
+    }));
 }
 
 #[test]
