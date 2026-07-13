@@ -1,6 +1,6 @@
 # ADR 0027 — Device-resident training: resident optimizer, ternary compute, and scale to 32B
 
-Status: **PROPOSED** (2026-07-12)
+Status: **PARTIALLY IMPLEMENTED / IN PROGRESS** (2026-07-12)
 
 - **Deciders:** Brian Lam
 - **Relates:** completes the plan-0043 GPU training path
@@ -295,3 +295,106 @@ A (resident optimizer — unlocks the real per-step win) → B (embed hotspot) �
 (checkpointing — unlocks 1.7B) → D (fused ternary GEMM — memory+compute for 32B) → F.1–2
 (1.7B + grow-then-ternarize on the 4090) → E + F.3–4 (32B on rented multi-GPU, fenced).**
 Each track is done when its gate is green, benched, reviewed, and pushed.
+
+---
+
+## Implementation Results (2026-07-12)
+
+This section records implementation through `1133211`. It does not mark the ADR or
+its scale campaign complete.
+
+### Landed work
+
+- **Track A:** strict CUDA lint baseline (`a6ac90b`); resident SALT quantization
+  (`4b702fa`); resident AdamW (`18dd879`); `DeviceTensor`, resident gradients, and
+  `DeviceTrainer` (`20aea05`, `0171d0e`). The CUDA and CPU SALT gates use the
+  authoritative `tritium-train::ops::ste::salt_quantize_forward` oracle, whose
+  AbsMean scale is **per row and per plane**. The earlier per-256-block wording in
+  Track A was inaccurate and must not be used to reinterpret the landed numerical
+  contract.
+- **Track B:** deterministic segmented embedding gradients (`aac4f9a`), preserving
+  ascending token-position accumulation and bit-exact CPU parity.
+- **Training data and memory substrate:** bounded offline teacher-cache I/O
+  (`fdc4f44`, with lockfile repair `bf7ab42`); lazy gradient-slot liveness
+  (`fbd76b8`); streaming distributed checkpoints (`644c338`, `9926622`); resident
+  NCCL collectives (`15defb3`); and sqrt-depth activation checkpointing with
+  explicit fail-closed frontiers (`3769ea9`).
+- **Tracks D and E:** compact training SALT planes (`8d7daef`); correctness-first
+  per-parameter host Adam offload (`10c6e22`); packed `salt_embed`, `salt_matmul`,
+  packed attention, activation VJP, dense identity-STE master gradients,
+  tied-weight accumulation, and checkpoint replay (`6fe264c`, `1db88a8`,
+  `49b36b2`). Finalized leaf gradients now stream directly into host Adam and are
+  released immediately (`c55ac8e`); the 40-step packed recovery gates are retained
+  in `88fa8c4` and `cf4a258`. Host masters and moments round-trip through bounded
+  DCP v1 sources and sinks (`1133211`).
+- **Track F substrate:** deterministic intermediate-width Net2Wider transforms and
+  quality/bytes selection (`e4b8f5b`).
+
+### Green local gates and measurements
+
+- Resident SALT matches the per-row CPU oracle for `T in {1,2,3}` within `1e-4`;
+  resident AdamW matches CPU master and moment updates within `1e-5` across
+  multiple steps.
+- Segmented embedding gradients are bit-exact across repeated tokens, boundary
+  dimensions, untouched rows, and invalid-token guards.
+- Lazy gradients, checkpoint replay, and sqrt-depth logical activation bounds are
+  green on branched, multi-block, and full GQA transformer-block graphs; replayed
+  gradients remain within the `1e-4` contract.
+- Host-offloaded Adam state matches the fully resident optimizer within `1e-5` and
+  stages `3 * largest_parameter` f32 elements rather than `3 * model_parameters`.
+- Packed SALT forward, activation gradients, dense master gradients, tied
+  embedding/head accumulation, repack-after-offload, and checkpoint replay are
+  green against the dense SALT oracle. The `T=3`, `576 x 576` packed representation
+  is about `25.5%` of the dense f32 weight bytes.
+- The full packed/checkpointed SmolLM2-135M path at `T=2` uses `86,866,944` weight
+  bytes versus `537,919,488` dense bytes (`0.1615x`). Its logical checkpoint
+  activation peak is `3,133,440 / 16,908,288` elements (`0.1853x`), with `2,911`
+  recomputed operations per step.
+- The 40-step packed plus streamed-offload campaign recovers held-out quality by
+  `963x` versus PTQ (fp PPL `19.729`, PTQ `2.125e6`, distilled `2207.241`), clearing
+  the unchanged `900x` quality gate. Streaming lowers requested-gradient peak to
+  `116,785,152` bytes from a `537,919,488`-byte materialized collection (`0.2171x`)
+  and emits all 211 parameters exactly once in a stable reverse order.
+- **Open numerical gate:** packed whole-model parity remains just outside the strict
+  `1e-4` threshold: logits `1.698e-4`, tied-embedding gradient `2.508e-4`, and
+  layer-0 down gradient `6.714e-5` on the recorded 4090 run.
+- **Negative performance result:** the scalar Track D microbenchmark measured
+  `0.93x` the dense materialize-plus-matmul path. The full streamed packed campaign
+  averages `1771 ms/step`, missing the unchanged `1123 ms` Track-0 gate despite the
+  memory and quality wins. A tiled packed kernel and transfer overlap are required
+  before claiming a compute win.
+
+### Remaining local implementation and validation
+
+- Close the strict packed whole-model `1e-4` numerical gate without falling back to
+  dense quantized-weight materialization.
+- Replace the correctness-first scalar packed contraction with a tiled kernel, add
+  pinned double buffering and copy/compute overlap, and rerun the `1123 ms` gate.
+  Current checkpoint and gradient evidence is deterministic logical accounting;
+  actual synchronized peak CUDA VRAM still needs measurement.
+- Integrate resident NCCL reduction into the trainer. The device collective and
+  gradient-reference gates exist, but the new resident training path has not run
+  on multiple GPUs.
+- Add the production training/campaign driver: teacher-cache generation, model
+  tensor mapping, resume/checkpoint orchestration, grown-model export, exact
+  artifact-byte collection, and persisted campaign reports.
+- Run an architecture-capable 360M/1.7B packed/offload campaign before the 32B
+  rental. The current real packed builder is validated only for tied-head SmolLM2.
+- Re-run the ignored 4090 performance and strict parity gates after optimization.
+  Do not infer completion from the green quality and memory gates.
+
+### Hardware and data fences
+
+- **1.7B / local 4090:** no compatible local 1.7B training artifact or recovery,
+  step-time, and measured VRAM result has been recorded. The packed/offload engine
+  substrate now exists, but the architecture-capable builder and model campaign do
+  not; the original dense resident layout still cannot fit a 24 GB device.
+- **New resident multi-GPU path:** requires a >=2-GPU run. The older 2xA100 v0.60
+  ProcessGroup result does not validate the new device-buffer trainer integration.
+- **32B capstone:** remains rented-hardware and data fenced. Host master plus two
+  Adam moments alone require about 384 GB decimal before teacher, checkpoint, and
+  runtime overhead; use a host with at least 512 GiB RAM and suitable multi-GPU
+  capacity.
+- **Paper endpoint:** no measured 135M-to-1.7B-to-32B quality-versus-bytes curve or
+  grown-model Pareto result exists yet. The committed report and ledger types are
+  schemas, not experimental evidence.
