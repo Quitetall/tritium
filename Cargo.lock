@@ -4278,6 +4278,7 @@ name = "tritium-cli"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "half",
  "memmap2",
@@ -4292,6 +4293,7 @@ dependencies = [
  "tritium-quantize",
  "tritium-runtime",
  "tritium-spec",
+ "tritium-train",
  "ureq",
 ]
 

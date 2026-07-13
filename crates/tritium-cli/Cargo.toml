@@ -24,6 +24,7 @@ tritium-spec = { workspace = true }
 tritium-cpu = { workspace = true }
 # The `generate` subcommand loads a model and decodes tokens through `ModelRunner`.
 tritium-nn = { workspace = true }
+tritium-train = { workspace = true, optional = true }
 # Optional CUDA backend linkage for `report --backend cuda` / parity reports.
 tritium-cuda = { workspace = true, optional = true }
 tritium-quantize = { workspace = true }
@@ -38,6 +39,7 @@ ureq = { version = "3.3", features = ["json"] }
 serde = { workspace = true }
 # `generate` reads input token IDs from a reproducible JSON file.
 serde_json = { workspace = true }
+blake3 = { workspace = true }
 # `report salt-model` mmaps each (possibly sharded) safetensors file so a 50GB+ master is
 # never read fully into RAM.
 memmap2 = { workspace = true }
@@ -54,7 +56,7 @@ tritium-format = { workspace = true }
 
 [features]
 default = []
-cuda = ["dep:tritium-cuda", "tritium-nn/cuda"]
+cuda = ["dep:tritium-cuda", "dep:tritium-train", "tritium-nn/cuda"]
 
 [lints]
 workspace = true

@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod backends;
+mod campaign;
 mod generate;
 mod inspect;
 mod pull;
@@ -56,6 +57,12 @@ enum Command {
     },
     /// List every backend the runtime discovered, with its capabilities.
     ListBackends,
+    /// Build offline teacher targets or run a resumable packed-SALT campaign.
+    Campaign {
+        /// Campaign operation.
+        #[command(subcommand)]
+        campaign: campaign::CampaignCommand,
+    },
     /// Download a GGUF model from the HuggingFace hub into the local cache
     /// (~/.cache/tritium-models, override with TRITIUM_MODEL_CACHE). Resumes
     /// partial downloads on re-run.
@@ -315,6 +322,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Inspect { path } => inspect::run(&path)?,
         Command::ListBackends => backends::run(),
+        Command::Campaign { campaign: command } => campaign::run(command)?,
         Command::Pull {
             repo,
             file,
@@ -433,4 +441,47 @@ fn main() -> anyhow::Result<()> {
         )?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn campaign_teacher_cache_cli_parses_fixed_window_inputs() {
+        let cli = Cli::try_parse_from([
+            "tritium",
+            "campaign",
+            "teacher-cache",
+            "--model-dir",
+            "model",
+            "--corpus",
+            "tokens.json",
+            "--seq-len",
+            "32",
+            "--output",
+            "teacher.ttpr",
+        ])
+        .expect("teacher-cache CLI");
+
+        assert!(matches!(
+            cli.command,
+            Command::Campaign {
+                campaign: campaign::CampaignCommand::TeacherCache { seq_len: 32, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn campaign_run_cli_parses_config() {
+        let cli = Cli::try_parse_from(["tritium", "campaign", "run", "--config", "campaign.json"])
+            .expect("campaign run CLI");
+
+        assert!(matches!(
+            cli.command,
+            Command::Campaign {
+                campaign: campaign::CampaignCommand::Run { config }
+            } if config == std::path::Path::new("campaign.json")
+        ));
+    }
 }
