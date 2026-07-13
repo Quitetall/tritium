@@ -4376,6 +4376,7 @@ dependencies = [
 name = "tritium-nn"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "half",
  "proptest",
  "rayon",
