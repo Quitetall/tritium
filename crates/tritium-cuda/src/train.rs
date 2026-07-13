@@ -30,6 +30,7 @@ use std::rc::Rc;
 use cudarc::driver::CudaSlice;
 use tritium_core::GemmShape;
 use tritium_spec::BackendError;
+use tritium_train::dcp::{DcpError, StatePlane};
 use tritium_train::ops::{act, loss, matmul, ste};
 use tritium_train::{AdamState, AdamW, LrSchedule, Optimizer, TrainGemm};
 
@@ -1131,6 +1132,50 @@ struct HostOffloadParam {
     optimizer: AdamW,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum HostOffloadStatePlane {
+    Parameter,
+    FirstMoment,
+    SecondMoment,
+}
+
+#[derive(Clone, Debug)]
+struct HostOffloadLoadState {
+    step: u64,
+    total: usize,
+    next_offsets: [usize; 3],
+}
+
+fn host_offload_state(param: &HostOffloadParam, plane: HostOffloadStatePlane) -> &[f32] {
+    match plane {
+        HostOffloadStatePlane::Parameter => &param.master,
+        HostOffloadStatePlane::FirstMoment => &param.m,
+        HostOffloadStatePlane::SecondMoment => &param.v,
+    }
+}
+
+fn host_offload_state_mut(
+    param: &mut HostOffloadParam,
+    plane: HostOffloadStatePlane,
+) -> &mut [f32] {
+    match plane {
+        HostOffloadStatePlane::Parameter => &mut param.master,
+        HostOffloadStatePlane::FirstMoment => &mut param.m,
+        HostOffloadStatePlane::SecondMoment => &mut param.v,
+    }
+}
+
+fn host_offload_dcp_plane(plane: StatePlane) -> Result<(HostOffloadStatePlane, usize), DcpError> {
+    match plane {
+        StatePlane::Parameter => Ok((HostOffloadStatePlane::Parameter, 0)),
+        StatePlane::Optimizer(0) => Ok((HostOffloadStatePlane::FirstMoment, 1)),
+        StatePlane::Optimizer(1) => Ok((HostOffloadStatePlane::SecondMoment, 2)),
+        StatePlane::Optimizer(_) => Err(DcpError::InvalidState(
+            "host offload AdamW has exactly two optimizer planes",
+        )),
+    }
+}
+
 /// Matrix and SALT packing metadata retained with an offloaded parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostOffloadParamMetadata {
@@ -1171,15 +1216,20 @@ pub struct HostOffloadStats {
 pub struct HostOffloadTrainer<'a> {
     backend: &'a CudaBackend,
     params: Vec<HostOffloadParam>,
+    leaf_lens: Vec<usize>,
+    completed_step: u64,
     stats: HostOffloadStats,
     poisoned: bool,
+    loading: Option<HostOffloadLoadState>,
 }
 
 impl core::fmt::Debug for HostOffloadTrainer<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("HostOffloadTrainer")
             .field("parameter_count", &self.params.len())
+            .field("completed_step", &self.completed_step)
             .field("stats", &self.stats)
+            .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
 }
@@ -1192,6 +1242,7 @@ impl<'a> HostOffloadTrainer<'a> {
         params: &[DeviceTrainParam<'_>],
     ) -> Result<Self, BackendError> {
         let mut host_params = Vec::with_capacity(params.len());
+        let mut leaf_lens = Vec::with_capacity(params.len());
         let mut total_parameter_elements = 0usize;
         let mut largest_parameter_elements = 0usize;
         for (index, param) in params.iter().enumerate() {
@@ -1214,6 +1265,7 @@ impl<'a> HostOffloadTrainer<'a> {
                     BackendError::InvalidInput("total parameter elements overflow usize".into())
                 })?;
             largest_parameter_elements = largest_parameter_elements.max(len);
+            leaf_lens.push(len);
             host_params.push(HostOffloadParam {
                 master: param.master.to_vec(),
                 m: vec![0.0; len],
@@ -1230,6 +1282,8 @@ impl<'a> HostOffloadTrainer<'a> {
         Ok(Self {
             backend,
             params: host_params,
+            leaf_lens,
+            completed_step: 0,
             stats: HostOffloadStats {
                 host_optimizer_elements,
                 largest_parameter_elements,
@@ -1237,6 +1291,7 @@ impl<'a> HostOffloadTrainer<'a> {
                 resident_input_gradient_elements: 0,
             },
             poisoned: false,
+            loading: None,
         })
     }
 
@@ -1252,8 +1307,32 @@ impl<'a> HostOffloadTrainer<'a> {
         self.params.is_empty()
     }
 
+    /// Completed optimizer step represented by the current master and moments.
+    #[must_use]
+    pub fn completed_step(&self) -> u64 {
+        self.completed_step
+    }
+
+    /// Stable per-parameter flattened lengths used by streaming checkpoints.
+    #[must_use]
+    pub fn leaf_lens(&self) -> &[usize] {
+        &self.leaf_lens
+    }
+
+    fn ensure_usable(&self) -> Result<(), BackendError> {
+        if self.poisoned {
+            Err(BackendError::InvalidInput(
+                "host offload trainer is poisoned; complete a fresh checkpoint reload before reuse"
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Borrow one host-resident latent master.
     pub fn master(&self, index: usize) -> Result<&[f32], BackendError> {
+        self.ensure_usable()?;
         self.params
             .get(index)
             .map(|param| param.master.as_slice())
@@ -1264,6 +1343,7 @@ impl<'a> HostOffloadTrainer<'a> {
 
     /// Borrow one host-resident pair of Adam moments.
     pub fn moments(&self, index: usize) -> Result<(&[f32], &[f32]), BackendError> {
+        self.ensure_usable()?;
         self.params
             .get(index)
             .map(|param| (param.m.as_slice(), param.v.as_slice()))
@@ -1278,6 +1358,7 @@ impl<'a> HostOffloadTrainer<'a> {
         &self,
         index: usize,
     ) -> Result<HostOffloadParamMetadata, BackendError> {
+        self.ensure_usable()?;
         self.params
             .get(index)
             .map(|param| HostOffloadParamMetadata {
@@ -1355,6 +1436,7 @@ impl<'a> HostOffloadTrainer<'a> {
             mutation_completed = true;
         }
         self.stats.resident_input_gradient_elements = resident_input_gradient_elements;
+        self.completed_step = step;
         Ok(())
     }
 
@@ -1408,6 +1490,175 @@ impl<'a> HostOffloadTrainer<'a> {
             self.poisoned = true;
         }
         update
+    }
+}
+
+impl tritium_train::dcp::StateSource for HostOffloadTrainer<'_> {
+    fn step(&self) -> u64 {
+        self.completed_step
+    }
+
+    fn leaf_lens(&self) -> &[usize] {
+        &self.leaf_lens
+    }
+
+    fn plane_count(&self) -> usize {
+        2
+    }
+
+    fn read_chunk(
+        &mut self,
+        plane: StatePlane,
+        offset: usize,
+        out: &mut [f32],
+    ) -> Result<(), DcpError> {
+        if self.poisoned {
+            return Err(DcpError::InvalidState(
+                "cannot checkpoint a poisoned host offload trainer",
+            ));
+        }
+        let (plane, _) = host_offload_dcp_plane(plane)?;
+        let total = self
+            .leaf_lens
+            .iter()
+            .try_fold(0usize, |sum, &len| sum.checked_add(len))
+            .ok_or(DcpError::InvalidState(
+                "host offload layout overflows usize",
+            ))?;
+        let end = offset
+            .checked_add(out.len())
+            .ok_or(DcpError::InvalidState("source range overflows usize"))?;
+        if end > total {
+            return Err(DcpError::InvalidState("source range out of bounds"));
+        }
+
+        let mut global_start = 0usize;
+        let mut copied = 0usize;
+        let mut position = offset;
+        for param in &self.params {
+            let state = host_offload_state(param, plane);
+            let global_end = global_start + state.len();
+            if position < global_end && copied < out.len() {
+                let local_start = position.saturating_sub(global_start);
+                let count = (state.len() - local_start).min(out.len() - copied);
+                out[copied..copied + count]
+                    .copy_from_slice(&state[local_start..local_start + count]);
+                copied += count;
+                position += count;
+            }
+            global_start = global_end;
+        }
+        if copied != out.len() {
+            return Err(DcpError::InvalidState(
+                "source range was not fully supplied",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl tritium_train::dcp::StateSink for HostOffloadTrainer<'_> {
+    fn begin(
+        &mut self,
+        step: u64,
+        leaf_lens: &[usize],
+        plane_count: usize,
+    ) -> Result<(), DcpError> {
+        // A load is transactional only at the trainer-availability boundary:
+        // partial bytes may overwrite host vectors, but poison prevents their use.
+        self.poisoned = true;
+        self.loading = None;
+        if leaf_lens != self.leaf_lens {
+            return Err(DcpError::InvalidState(
+                "checkpoint leaf layout does not match host offload trainer",
+            ));
+        }
+        if plane_count != 2 {
+            return Err(DcpError::InvalidState(
+                "host offload AdamW requires exactly two optimizer planes",
+            ));
+        }
+        let total = self
+            .leaf_lens
+            .iter()
+            .try_fold(0usize, |sum, &len| sum.checked_add(len))
+            .ok_or(DcpError::InvalidState(
+                "host offload layout overflows usize",
+            ))?;
+        self.loading = Some(HostOffloadLoadState {
+            step,
+            total,
+            next_offsets: [0; 3],
+        });
+        Ok(())
+    }
+
+    fn write_chunk(
+        &mut self,
+        plane: StatePlane,
+        offset: usize,
+        values: &[f32],
+    ) -> Result<(), DcpError> {
+        self.poisoned = true;
+        let (plane, plane_index) = host_offload_dcp_plane(plane)?;
+        let loading = self.loading.as_ref().ok_or(DcpError::InvalidState(
+            "host offload checkpoint load has not begun",
+        ))?;
+        if offset != loading.next_offsets[plane_index] {
+            return Err(DcpError::InvalidState(
+                "checkpoint chunks must be contiguous and ordered per plane",
+            ));
+        }
+        let end = offset
+            .checked_add(values.len())
+            .ok_or(DcpError::InvalidState("sink range overflows usize"))?;
+        if end > loading.total {
+            return Err(DcpError::InvalidState("sink range out of bounds"));
+        }
+
+        let mut global_start = 0usize;
+        let mut copied = 0usize;
+        let mut position = offset;
+        for param in &mut self.params {
+            let state = host_offload_state_mut(param, plane);
+            let global_end = global_start + state.len();
+            if position < global_end && copied < values.len() {
+                let local_start = position.saturating_sub(global_start);
+                let count = (state.len() - local_start).min(values.len() - copied);
+                state[local_start..local_start + count]
+                    .copy_from_slice(&values[copied..copied + count]);
+                copied += count;
+                position += count;
+            }
+            global_start = global_end;
+        }
+        if copied != values.len() {
+            return Err(DcpError::InvalidState("sink range was not fully stored"));
+        }
+        self.loading
+            .as_mut()
+            .expect("load state was validated above")
+            .next_offsets[plane_index] = end;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), DcpError> {
+        self.poisoned = true;
+        let loading = self.loading.take().ok_or(DcpError::InvalidState(
+            "host offload checkpoint load has not begun",
+        ))?;
+        if loading
+            .next_offsets
+            .iter()
+            .any(|&offset| offset != loading.total)
+        {
+            return Err(DcpError::InvalidState(
+                "host offload checkpoint load is incomplete",
+            ));
+        }
+        self.completed_step = loading.step;
+        self.poisoned = false;
+        Ok(())
     }
 }
 
@@ -3460,6 +3711,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         }
         stream.trainer.stats.resident_input_gradient_elements =
             stream.plan.materialized_collection_elements;
+        stream.trainer.completed_step = step;
         Ok(GradientStreamReport {
             emissions: stream.emissions,
             materialized_collection_elements: stream.plan.materialized_collection_elements,
@@ -4879,6 +5131,253 @@ mod tests {
         }
     }
 
+    fn host_offload_dcp_dir(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tritium-host-offload-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn host_offload_streaming_dcp_roundtrips_unequal_leaves_across_worlds() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping host_offload_streaming_dcp_roundtrips_unequal_leaves_across_worlds: \
+                     no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let masters = [
+            seeded_uniform(0xD270, 3, -1.0, 1.0),
+            seeded_uniform(0xD271, 17, -1.0, 1.0),
+            seeded_uniform(0xD272, 5, -1.0, 1.0),
+        ];
+        let optimizer = AdamW {
+            lr: 0.03,
+            beta1: 0.8,
+            beta2: 0.9,
+            eps: 0.2,
+            weight_decay: 0.01,
+        };
+        let specs = [
+            DeviceTrainParam {
+                master: &masters[0],
+                rows: 1,
+                cols: 3,
+                salt_planes: 1,
+                optimizer,
+            },
+            DeviceTrainParam {
+                master: &masters[1],
+                rows: 1,
+                cols: 17,
+                salt_planes: 2,
+                optimizer,
+            },
+            DeviceTrainParam {
+                master: &masters[2],
+                rows: 1,
+                cols: 5,
+                salt_planes: 3,
+                optimizer,
+            },
+        ];
+        let grads: Vec<Vec<f32>> = masters
+            .iter()
+            .enumerate()
+            .map(|(index, master)| seeded_uniform(0xD280 + index as u64, master.len(), -0.25, 0.25))
+            .collect();
+        let mut source = HostOffloadTrainer::new(&backend, &specs).unwrap();
+        source
+            .step(upload_test_gradients(&backend, &grads), 7)
+            .unwrap();
+        assert_eq!(source.completed_step(), 7);
+        assert_eq!(source.leaf_lens(), &[3, 17, 5]);
+
+        let first = host_offload_dcp_dir("world3");
+        let second = host_offload_dcp_dir("world2");
+        tritium_train::dcp::save_from(&first, &mut source, 3).unwrap();
+
+        let zeros = [vec![0.0; 3], vec![0.0; 17], vec![0.0; 5]];
+        let restore_specs = [
+            DeviceTrainParam {
+                master: &zeros[0],
+                ..specs[0]
+            },
+            DeviceTrainParam {
+                master: &zeros[1],
+                ..specs[1]
+            },
+            DeviceTrainParam {
+                master: &zeros[2],
+                ..specs[2]
+            },
+        ];
+        let mut restored = HostOffloadTrainer::new(&backend, &restore_specs).unwrap();
+        tritium_train::dcp::load_into(&first, &mut restored).unwrap();
+        assert_eq!(restored.completed_step(), 7);
+        assert!(!restored.is_poisoned());
+        for index in 0..masters.len() {
+            assert_eq!(
+                restored.master(index).unwrap(),
+                source.master(index).unwrap()
+            );
+            assert_eq!(
+                restored.moments(index).unwrap(),
+                source.moments(index).unwrap()
+            );
+        }
+
+        let packed_source =
+            DevicePackedSaltWeight::from_host(&backend, source.master(1).unwrap(), 1, 17, 2)
+                .unwrap();
+        let mut packed_restored =
+            DevicePackedSaltWeight::from_host(&backend, &zeros[1], 1, 17, 2).unwrap();
+        packed_restored.mark_stale();
+        packed_restored
+            .repack_from_host(&backend, restored.master(1).unwrap())
+            .unwrap();
+        let input = seeded_uniform(0xD290, 2 * 17, -0.5, 0.5);
+        let packed_output = |packed: &DevicePackedSaltWeight| {
+            let mut tape = DeviceTape::new(&backend, 1).unwrap();
+            let x = tape.leaf(&input).unwrap();
+            let master = tape.gradient_leaf(17).unwrap();
+            let out = tape.salt_matmul(x, master, packed, 2).unwrap();
+            tape.value(out).unwrap()
+        };
+        assert_eq!(
+            packed_output(&packed_restored),
+            packed_output(&packed_source),
+            "restored host masters must deterministically rebuild packed SALT state"
+        );
+
+        tritium_train::dcp::save_from(&second, &mut restored, 2).unwrap();
+        let mut resharded = HostOffloadTrainer::new(&backend, &restore_specs).unwrap();
+        tritium_train::dcp::load_into(&second, &mut resharded).unwrap();
+        for index in 0..masters.len() {
+            assert_eq!(
+                resharded.master(index).unwrap(),
+                source.master(index).unwrap()
+            );
+            assert_eq!(
+                resharded.moments(index).unwrap(),
+                source.moments(index).unwrap()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn host_offload_dcp_chunks_cross_leaves_and_failed_loads_stay_poisoned() {
+        use tritium_train::dcp::{StateSink, StateSource};
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping host_offload_dcp_chunks_cross_leaves_and_failed_loads_stay_poisoned: \
+                     no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let masters = [
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0],
+            vec![6.0, 7.0, 8.0, 9.0],
+        ];
+        let specs = [
+            DeviceTrainParam {
+                master: &masters[0],
+                rows: 1,
+                cols: 3,
+                salt_planes: 1,
+                optimizer: AdamW::new(0.01),
+            },
+            DeviceTrainParam {
+                master: &masters[1],
+                rows: 1,
+                cols: 2,
+                salt_planes: 1,
+                optimizer: AdamW::new(0.01),
+            },
+            DeviceTrainParam {
+                master: &masters[2],
+                rows: 1,
+                cols: 4,
+                salt_planes: 1,
+                optimizer: AdamW::new(0.01),
+            },
+        ];
+        let mut trainer = HostOffloadTrainer::new(&backend, &specs).unwrap();
+        let mut crossing = [0.0; 6];
+        StateSource::read_chunk(&mut trainer, StatePlane::Parameter, 2, &mut crossing).unwrap();
+        assert_eq!(crossing, [3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert!(matches!(
+            StateSource::read_chunk(
+                &mut trainer,
+                StatePlane::Optimizer(2),
+                0,
+                &mut crossing[..1],
+            ),
+            Err(DcpError::InvalidState(_))
+        ));
+
+        assert!(matches!(
+            StateSink::begin(&mut trainer, 4, &[3, 3, 3], 2),
+            Err(DcpError::InvalidState(_))
+        ));
+        assert!(trainer.is_poisoned());
+        assert!(trainer.master(0).is_err());
+
+        StateSink::begin(&mut trainer, 5, &[3, 2, 4], 2).unwrap();
+        StateSink::write_chunk(
+            &mut trainer,
+            StatePlane::Parameter,
+            0,
+            &[11.0, 12.0, 13.0, 14.0],
+        )
+        .unwrap();
+        assert!(matches!(
+            StateSink::finish(&mut trainer),
+            Err(DcpError::InvalidState(_))
+        ));
+        assert!(trainer.is_poisoned());
+
+        StateSink::begin(&mut trainer, 6, &[3, 2, 4], 2).unwrap();
+        assert!(matches!(
+            StateSink::write_chunk(&mut trainer, StatePlane::Optimizer(2), 0, &[1.0]),
+            Err(DcpError::InvalidState(_))
+        ));
+        assert!(trainer.is_poisoned());
+
+        let parameters = [21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0];
+        let first_moment = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let second_moment = [1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9];
+        StateSink::begin(&mut trainer, 7, &[3, 2, 4], 2).unwrap();
+        StateSink::write_chunk(&mut trainer, StatePlane::Parameter, 0, &parameters[..5]).unwrap();
+        StateSink::write_chunk(&mut trainer, StatePlane::Parameter, 5, &parameters[5..]).unwrap();
+        StateSink::write_chunk(&mut trainer, StatePlane::Optimizer(0), 0, &first_moment).unwrap();
+        StateSink::write_chunk(&mut trainer, StatePlane::Optimizer(1), 0, &second_moment).unwrap();
+        StateSink::finish(&mut trainer).unwrap();
+        assert!(!trainer.is_poisoned());
+        assert_eq!(trainer.completed_step(), 7);
+        assert_eq!(trainer.master(0).unwrap(), &parameters[..3]);
+        assert_eq!(trainer.master(1).unwrap(), &parameters[3..5]);
+        assert_eq!(trainer.master(2).unwrap(), &parameters[5..]);
+        assert_eq!(trainer.moments(1).unwrap().0, &first_moment[3..5]);
+        assert_eq!(trainer.moments(1).unwrap().1, &second_moment[3..5]);
+    }
+
     #[test]
     fn streamed_host_offload_emits_without_collecting_device_gradients() {
         let backend = match CudaBackend::new(0) {
@@ -4927,6 +5426,7 @@ mod tests {
         assert_eq!(report.emissions.len(), 1);
         assert_eq!(report.peak_live_requested_gradient_elements, master.len());
         assert!(!trainer.is_poisoned());
+        assert_eq!(trainer.completed_step(), 1);
     }
 
     #[test]
@@ -5069,6 +5569,8 @@ mod tests {
                 assert!(max_abs_diff(collected_v, streamed_v) < 1e-5);
             }
         }
+        assert_eq!(collected.completed_step(), 3);
+        assert_eq!(streamed.completed_step(), 3);
     }
 
     #[test]
