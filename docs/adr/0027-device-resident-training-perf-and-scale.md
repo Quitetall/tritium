@@ -352,7 +352,9 @@ its scale campaign complete.
   recomputed operations per step.
 - The 40-step packed plus streamed-offload campaign recovers held-out quality by
   `963x` versus PTQ (fp PPL `19.729`, PTQ `2.125e6`, distilled `2207.241`), clearing
-  the unchanged `900x` quality gate. Streaming lowers requested-gradient peak to
+  this ADR's approximately `960x` measured target. The executable test retains a
+  `900x` regression floor for run-to-run noise; that floor is not the measured
+  result. Streaming lowers requested-gradient peak to
   `116,785,152` bytes from a `537,919,488`-byte materialized collection (`0.2171x`)
   and emits all 211 parameters exactly once in a stable reverse order.
 - **Open numerical gate:** packed whole-model parity remains just outside the strict
@@ -380,8 +382,9 @@ its scale campaign complete.
   artifact-byte collection, and persisted campaign reports.
 - Run an architecture-capable 360M/1.7B packed/offload campaign before the 32B
   rental. The current real packed builder is validated only for tied-head SmolLM2.
-- Re-run the ignored 4090 performance and strict parity gates after optimization.
-  Do not infer completion from the green quality and memory gates.
+- Re-run the opt-in 4090 performance and strict parity gates after the tiled-kernel
+  work they currently defer. Do not infer completion from the green quality and
+  memory gates.
 
 ### Hardware and data fences
 
