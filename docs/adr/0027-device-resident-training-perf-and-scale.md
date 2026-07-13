@@ -1,6 +1,6 @@
 # ADR 0027 — Device-resident training: resident optimizer, ternary compute, and scale to 32B
 
-Status: **PARTIALLY IMPLEMENTED / IN PROGRESS** (2026-07-12)
+Status: **SINGLE-GPU HOST-OFFLOAD CAMPAIGN IMPLEMENTED / COMPUTE AND SCALE GATES OPEN** (2026-07-13)
 
 - **Deciders:** Brian Lam
 - **Relates:** completes the plan-0043 GPU training path
@@ -300,8 +300,11 @@ Each track is done when its gate is green, benched, reviewed, and pushed.
 
 ## Implementation Results (updated 2026-07-13)
 
-This section records implementation through the packed exact-numerics slice. It
-does not mark the ADR or its scale campaign complete.
+This section records the implemented engine and production host-offload single-GPU
+campaign. Remaining software includes the Track-D production compute path, a
+resident/offload campaign policy, and multi-rank orchestration. Green software tests
+are not substitutes for the still-open performance, physical-VRAM, 1.7B, 32B, and
+paper-result gates on repaired or rented hardware.
 
 ### Landed work
 
@@ -328,24 +331,48 @@ does not mark the ADR or its scale campaign complete.
   `49b36b2`). Finalized leaf gradients now stream directly into host Adam and are
   released immediately (`c55ac8e`); the 40-step packed recovery gates are retained
   in `88fa8c4` and `cf4a258`. Host masters and moments round-trip through bounded
-  DCP v1 sources and sinks (`1133211`). Packed forward and activation-gradient
-  contractions now have tiled kernels with conservative scalar fallbacks
-  (`5aefb1a`). The semantic packed path now reconstructs each scalar weight in
-  ascending plane order inside the dense-order contraction. This exact twin does
-  not materialize a dense weight and leaves the reassociated plane-grouped/tiled
-  kernels available only as an explicit fast path. Host-offloaded Adam now uses
+  distributed checkpoint (DCP) v1 sources and sinks (`1133211`). Packed forward
+  and activation-gradient contractions now have tiled kernels with conservative
+  scalar fallbacks (`5aefb1a`). The semantic packed path now reconstructs each
+  scalar weight in ascending plane order inside the dense-order contraction. This
+  exact twin does not materialize a dense weight and leaves the reassociated
+  plane-grouped/tiled kernels available only as an explicit fast path. Host-offloaded
+  Adam now uses
   two persistent page-locked/device staging slots and a dedicated transfer stream;
   cudarc events order next-leaf H2D, current Adam, and prior-leaf D2H without a
   host synchronization between leaves. Public step exits drain both streams and
   poison the trainer after any post-enqueue failure.
 - **Track F substrate:** deterministic intermediate-width Net2Wider transforms and
-  quality/bytes selection (`e4b8f5b`). A production tied-SwiGLU training adapter
-  now owns the canonical HuggingFace parameter map (`embed`, then per-layer
-  `q/k/v/o/gate/up/down`), fixed norm state, and packed device graph builder.
+  quality/bytes selection (`e4b8f5b`, `f1a4e3c`). A production tied-SwiGLU
+  training adapter now owns the canonical HuggingFace parameter map (`embed`, then
+  per-layer `q/k/v/o/gate/up/down`), fixed norm state, and packed device graph
+  builder.
   It validates the SmolLM2 135M, 360M, and 1.7B geometries and rejects QKV bias,
   QK norm, untied heads, and tensor-shape drift before allocating a campaign.
+- **Distributed gradient primitive:** `NcclProcessGroup::xent_backward_into`
+  reduces each finalized resident gradient before host Adam (`afd5871`). World-1
+  identity and gated two-or-more-GPU full-batch gradient-reference tests cover the
+  primitive. The production campaign remains one process and one CUDA device; its
+  multi-rank rendezvous, data sharding, barriers, and rank-0 ownership are open.
+- **Production campaign and evidence:** the CUDA CLI campaign (`5ded216`,
+  `2f90cb4`, `81ae5c7`) now acquires an exclusive lock before model or cache I/O,
+  binds source/config/corpus/cache/evaluation/growth/hardware identities into an
+  immutable plan, resumes bounded DCP state, marks warmup timings after every
+  resume, and records exact CUDA async-pool high-water plus point-in-time,
+  device-wide NVML framebuffer-used samples. The campaign requires a separate
+  held-out corpus and rejects any exact training-window overlap. It persists each
+  source-fp and reloaded-artifact NLL accumulator's exact f64 bit pattern after
+  every window; the report records both PPL values and their relative delta.
+- **Terminal artifact:** streamed training-SALT GGUF export and exact package
+  hashing (`c3d3347`, `b51e56c`, `afd6cfb`, `d0ba9aa`, `a74945c`) produce a
+  deterministic, self-contained artifact. Existing output is never overwritten:
+  publication is an atomic same-directory no-replace link. Resume deterministically
+  rebuilds the expected package through a bounded hasher. Evaluation rehashes the
+  exact opened inode, validates plan/source/growth provenance, drops host optimizer
+  state before dense CPU reload, and uses the strict training-SALT loader and scorer
+  (`09ef4f6`).
 
-### Green local gates and measurements
+### Local gate results and measurements
 
 - Resident SALT matches the per-row CPU oracle for `T in {1,2,3}` within `1e-4`;
   resident AdamW matches CPU master and moment updates within `1e-5` across
@@ -384,6 +411,12 @@ does not mark the ADR or its scale campaign complete.
   tied-embedding gradient, and layer-0 down gradient (`0.000e0` max-absolute
   delta for all three). Low-level forward and activation-gradient gates are also
   bitwise equal for `T in {1,2,3}` and `K in {7,257,576,8193}`.
+- Campaign-focused tests cover plan immutability, path aliases, early locking,
+  report/checkpoint crash ordering, exact-window holdout contamination, complete
+  and partial evaluation resume, artifact determinism/corruption/loadability,
+  no-replace publication, and fail-closed NVML parsing and identity checks. Strict
+  CUDA-feature CLI clippy is green under `-D warnings` with the pre-existing
+  crate-wide `too_many_arguments` lint allowed; formatting is green.
 - **Negative performance result:** the exact semantic twin measured `0.80x` the
   dense materialize-plus-matmul full path and the explicit tiled fast twin measured
   `0.86x` on the diagnostic 4090 run. The full streamed packed campaign still
@@ -391,33 +424,54 @@ does not mark the ADR or its scale campaign complete.
   the memory and quality wins. Profiling-driven fast-kernel work and transfer
   overlap are still required before claiming a compute win.
 
-### Remaining local implementation and validation
+### Remaining implementation and validation
 
+- Replace the production `DeviceTape::salt_matmul` exact semantic twin, which
+  reconstructs each scalar weight and performs floating-point multiplication, with
+  a production multiply-free packed contraction that stays inside the `1e-4`
+  dense-oracle contract. The plane-grouped/tiled fast twins remain explicit
+  test/benchmark paths and have not produced a compute win. Track D is therefore an
+  open software and performance gate, not only a hardware rerun.
+- Add an explicit resident/host-offload campaign state policy. The current CLI
+  campaign always constructs `HostOffloadTrainer`; it cannot run the landed
+  `DeviceTrainer` resident path or measure Track A's no-model-round-trip timing gate
+  through the production orchestration.
 - Profile and deepen the correctness-proven tiled packed contractions until the
   combined path beats dense materialization; then measure the landed pinned
-  double-buffer overlap and rerun the `1123 ms` gate on an uncontended GPU. Current
-  checkpoint and gradient evidence is deterministic logical accounting; actual
-  synchronized peak CUDA VRAM still needs measurement.
-- Integrate resident NCCL reduction into the trainer. The device collective and
-  gradient-reference gates exist, but the new resident training path has not run
-  on multiple GPUs.
-- Add the production training/campaign driver: teacher-cache generation, model
-  tensor mapping, resume/checkpoint orchestration, grown-model export, exact
-  artifact-byte collection, and persisted campaign reports.
-- Run an architecture-capable 360M/1.7B packed/offload campaign before the 32B
-  rental. The current real packed builder is validated only for tied-head SmolLM2.
-- Re-run the opt-in 4090 performance and strict parity gates after the next packed
-  optimization pass. Do not infer completion from the green quality and memory
-  gates.
+  double-buffer overlap and rerun the `1123 ms` gate on an uncontended GPU. Also
+  rerun the retained `vocab=49152, dim=576` Track-B microbenchmark. Current CUDA
+  evidence gives exact allocator-pool high-water and point-in-time, device-wide
+  NVML framebuffer-used samples, not synchronized campaign peak usage.
+- Add production multi-rank campaign orchestration around the landed NCCL gradient
+  primitive: rendezvous, per-rank data windows, manifest agreement, barriers, and
+  rank-0 checkpoint/report/artifact ownership. Then run its gated gradient reference
+  and crash/recovery path on at least two GPUs.
+- Run the production campaign first on the cached 360M model, then on a compatible
+  1.7B tied-SwiGLU artifact. Record recovery, warmed step time, checkpoint recovery,
+  artifact reload PPL, exact package bytes, and device-wide sampled NVML plus exact
+  allocator-pool evidence before authorizing the 32B rental.
+- The campaign records evidence but does not declare the `1123 ms` or `<=1%` quality
+  gates passed. Acceptance remains an explicit comparison against the ADR thresholds.
+  Do not infer completion from green unit, quality, or logical-memory gates.
 
 ### Hardware and data fences
 
+- **Local NVIDIA runtime:** the running open kernel module is `610.43.02`, while
+  the installed NVML userspace library is `610.43.03`; `nvidia-smi` currently fails
+  with `Driver/library version mismatch`. The running kernel is
+  `7.1.3-1-cachyos`; the installed `linux-cachyos` package is `7.1.3-2`. Reboot into
+  the installed kernel/driver pair before collecting NVML, NCCL, performance, or
+  physical-VRAM evidence. After removing a false-green skip (`98127e9`), all five
+  NCCL world-1 tests fail at communicator initialization with `NcclError`; none
+  supplies NCCL execution evidence. Active GPU users make a reboot unsafe for this
+  session.
 - **1.7B / local 4090:** no compatible local 1.7B training artifact or recovery,
-  step-time, and measured VRAM result has been recorded. The packed/offload engine
-  substrate now exists, but the architecture-capable builder and model campaign do
-  not; the original dense resident layout still cannot fit a 24 GB device.
-- **New resident multi-GPU path:** requires a >=2-GPU run. The older 2xA100 v0.60
-  ProcessGroup result does not validate the new device-buffer trainer integration.
+  warmed step-time, checkpoint-recovery, or physical-VRAM result has been recorded.
+  The adapter and bounded packed/offload campaign support the geometry; the missing
+  model artifact and repaired runtime are now the local gates.
+- **New resident multi-GPU path:** requires a ≥2-GPU run. The older 2×A100 v0.60
+  ProcessGroup result and the gated resident-gradient primitive do not validate the
+  still-missing production multi-rank campaign orchestration.
 - **32B capstone:** remains rented-hardware and data fenced. Host master plus two
   Adam moments alone require about 384 GB decimal before teacher, checkpoint, and
   runtime overhead; use a host with at least 512 GiB RAM and suitable multi-GPU
