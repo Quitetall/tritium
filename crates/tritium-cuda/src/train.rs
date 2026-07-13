@@ -561,6 +561,25 @@ impl DevOp<'_> {
             | Self::Concat { out, .. } => *out,
         }
     }
+
+    fn gradient_inputs(&self) -> Vec<usize> {
+        match self {
+            Self::Matmul { x, w, .. } => vec![*x, *w],
+            Self::SaltMatmul { x, master, .. } => vec![*x, *master],
+            Self::Rmsnorm { x, w, .. } => vec![*x, *w],
+            Self::Silu { x, .. }
+            | Self::Rope { x, .. }
+            | Self::SliceCols { x, .. }
+            | Self::ScaleConst { x, .. }
+            | Self::CausalMask { x, .. }
+            | Self::Softmax { x, .. }
+            | Self::Transpose { x, .. } => vec![*x],
+            Self::Mul { a, b, .. } | Self::Add { a, b, .. } => vec![*a, *b],
+            Self::Embed { w, .. } => vec![*w],
+            Self::SaltEmbed { master, .. } => vec![*master],
+            Self::Concat { parts, .. } => parts.clone(),
+        }
+    }
 }
 
 /// Activation retention policy for [`DeviceTape`].
@@ -907,6 +926,40 @@ impl DeviceGradients {
     }
 }
 
+/// Map one requested tape leaf to one [`HostOffloadTrainer`] parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GradientLeafBinding {
+    pub leaf_id: usize,
+    pub parameter_index: usize,
+}
+
+/// One finalized leaf gradient emitted during reverse traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GradientEmission {
+    pub sequence: usize,
+    pub leaf_id: usize,
+    pub parameter_index: usize,
+    pub elements: usize,
+}
+
+/// Result of a streamed backward-and-offload step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradientStreamReport {
+    pub emissions: Vec<GradientEmission>,
+    pub materialized_collection_elements: usize,
+    pub peak_live_requested_gradient_elements: usize,
+    pub backward_stats: DeviceBackwardStats,
+}
+
+struct GradientCompletionPlan {
+    bindings: Vec<GradientLeafBinding>,
+    binding_by_leaf: Vec<Option<usize>>,
+    complete_at: Vec<Vec<usize>>,
+    unused: Vec<usize>,
+    remaining_edges: Vec<usize>,
+    materialized_collection_elements: usize,
+}
+
 /// Host description of one trainable SALT weight used by [`DeviceTrainer`] or
 /// [`HostOffloadTrainer`].
 #[derive(Clone, Copy, Debug)]
@@ -1112,13 +1165,14 @@ pub struct HostOffloadStats {
 /// those temporary allocations before advancing to the next parameter.
 ///
 /// This bounds optimizer-state staging to three times the largest leaf. It does
-/// not yet stream gradient production: the input [`DeviceGradients`] remains a
-/// resident collection and is accounted separately in [`HostOffloadStats`]. A
-/// gradient sink and transfer overlap are deliberately separate follow-ups.
+/// not overlap transfers. [`Self::step`] accepts a fully materialized
+/// [`DeviceGradients`] collection, while [`DeviceTape::xent_backward_into`]
+/// emits finalized leaf gradients directly and drops each after its update.
 pub struct HostOffloadTrainer<'a> {
     backend: &'a CudaBackend,
     params: Vec<HostOffloadParam>,
     stats: HostOffloadStats,
+    poisoned: bool,
 }
 
 impl core::fmt::Debug for HostOffloadTrainer<'_> {
@@ -1182,6 +1236,7 @@ impl<'a> HostOffloadTrainer<'a> {
                 peak_optimizer_device_elements: 0,
                 resident_input_gradient_elements: 0,
             },
+            poisoned: false,
         })
     }
 
@@ -1241,12 +1296,23 @@ impl<'a> HostOffloadTrainer<'a> {
         self.stats
     }
 
+    /// Whether a streamed step failed after device optimizer mutation began.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Apply one 1-based AdamW step while staging one parameter's optimizer
     /// state at a time. All gradient metadata is validated before any master or
     /// moment is changed. A device failure during the update loop can leave
     /// earlier leaves updated; reconstruct or reload the trainer before retrying.
     /// Reported step statistics are meaningful only after a successful return.
     pub fn step(&mut self, grads: DeviceGradients, step: u64) -> Result<(), BackendError> {
+        if self.poisoned {
+            return Err(BackendError::InvalidInput(
+                "host offload trainer is poisoned; reconstruct or reload it before reuse".into(),
+            ));
+        }
         if step == 0 {
             return Err(BackendError::InvalidInput(
                 "AdamW step is 1-based; got step 0".into(),
@@ -1278,20 +1344,56 @@ impl<'a> HostOffloadTrainer<'a> {
                 })?;
         }
 
-        for (param, grad) in self.params.iter_mut().zip(grads.bufs) {
-            let mut d_master = self.backend.dev_upload(&param.master)?;
-            let mut d_m = self.backend.dev_upload(&param.m)?;
-            let mut d_v = self.backend.dev_upload(&param.v)?;
-            let staged_elements = param.master.len().checked_mul(3).ok_or_else(|| {
-                BackendError::InvalidInput("staged optimizer elements overflow usize".into())
-            })?;
-            self.stats.peak_optimizer_device_elements = self
-                .stats
-                .peak_optimizer_device_elements
-                .max(staged_elements);
+        let mut mutation_completed = false;
+        for (parameter_index, grad) in grads.bufs.into_iter().enumerate() {
+            if let Err(error) = self.apply_streamed_gradient(parameter_index, &grad, step) {
+                if mutation_completed {
+                    self.poisoned = true;
+                }
+                return Err(error);
+            }
+            mutation_completed = true;
+        }
+        self.stats.resident_input_gradient_elements = resident_input_gradient_elements;
+        Ok(())
+    }
+
+    fn apply_streamed_gradient(
+        &mut self,
+        parameter_index: usize,
+        grad: &CudaSlice<f32>,
+        step: u64,
+    ) -> Result<(), BackendError> {
+        let param = self.params.get_mut(parameter_index).ok_or_else(|| {
+            BackendError::InvalidInput(format!(
+                "streamed parameter index {parameter_index} is out of range"
+            ))
+        })?;
+        if !self.backend.same_context(grad) {
+            return Err(BackendError::InvalidInput(format!(
+                "streamed gradient {parameter_index} belongs to a different CUDA context"
+            )));
+        }
+        if grad.len() != param.master.len() {
+            return Err(BackendError::ShapeMismatch {
+                expected: param.master.len(),
+                got: grad.len(),
+            });
+        }
+        let mut d_master = self.backend.dev_upload(&param.master)?;
+        let mut d_m = self.backend.dev_upload(&param.m)?;
+        let mut d_v = self.backend.dev_upload(&param.v)?;
+        let staged_elements = param.master.len().checked_mul(3).ok_or_else(|| {
+            BackendError::InvalidInput("staged optimizer elements overflow usize".into())
+        })?;
+        self.stats.peak_optimizer_device_elements = self
+            .stats
+            .peak_optimizer_device_elements
+            .max(staged_elements);
+        let update = (|| {
             self.backend.adamw_step_dev(
                 &mut d_master,
-                &grad,
+                grad,
                 &mut d_m,
                 &mut d_v,
                 step,
@@ -1300,8 +1402,141 @@ impl<'a> HostOffloadTrainer<'a> {
             self.backend.dev_download(&d_master, &mut param.master)?;
             self.backend.dev_download(&d_m, &mut param.m)?;
             self.backend.dev_download(&d_v, &mut param.v)?;
+            Ok(())
+        })();
+        if update.is_err() {
+            self.poisoned = true;
         }
-        self.stats.resident_input_gradient_elements = resident_input_gradient_elements;
+        update
+    }
+}
+
+struct HostGradientStream<'trainer, 'backend> {
+    trainer: &'trainer mut HostOffloadTrainer<'backend>,
+    plan: GradientCompletionPlan,
+    step: u64,
+    emissions: Vec<GradientEmission>,
+    peak_live_requested_gradient_elements: usize,
+    mutation_started: bool,
+}
+
+impl HostGradientStream<'_, '_> {
+    fn observe_requested(&mut self, grads: &[Option<CudaSlice<f32>>], lens: &[usize]) {
+        let live = self
+            .plan
+            .bindings
+            .iter()
+            .filter(|binding| grads[binding.leaf_id].is_some())
+            .fold(0usize, |total, binding| {
+                total.saturating_add(lens[binding.leaf_id])
+            });
+        self.peak_live_requested_gradient_elements =
+            self.peak_live_requested_gradient_elements.max(live);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        binding_index: usize,
+        backend: &CudaBackend,
+        grads: &mut [Option<CudaSlice<f32>>],
+        lens: &[usize],
+        live_elements: &mut usize,
+        peak_elements: &mut usize,
+    ) -> Result<(), BackendError> {
+        let binding = self.plan.bindings[binding_index];
+        let len = lens[binding.leaf_id];
+        let grad = if let Some(grad) = grads[binding.leaf_id].take() {
+            grad
+        } else {
+            let grad = backend.dev_alloc_zeros(len)?;
+            *live_elements = live_elements.saturating_add(len);
+            *peak_elements = (*peak_elements).max(*live_elements);
+            self.peak_live_requested_gradient_elements =
+                self.peak_live_requested_gradient_elements.max(len);
+            grad
+        };
+        if let Err(error) =
+            self.trainer
+                .apply_streamed_gradient(binding.parameter_index, &grad, self.step)
+        {
+            self.trainer.poisoned = true;
+            return Err(error);
+        }
+        self.mutation_started = true;
+        *live_elements = live_elements.saturating_sub(len);
+        drop(grad);
+        self.emissions.push(GradientEmission {
+            sequence: self.emissions.len(),
+            leaf_id: binding.leaf_id,
+            parameter_index: binding.parameter_index,
+            elements: len,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn after_op(
+        &mut self,
+        op_index: usize,
+        gradient_inputs: &[usize],
+        backend: &CudaBackend,
+        grads: &mut [Option<CudaSlice<f32>>],
+        lens: &[usize],
+        live_elements: &mut usize,
+        peak_elements: &mut usize,
+    ) -> Result<(), BackendError> {
+        for &input in gradient_inputs {
+            if let Some(binding_index) = self.plan.binding_by_leaf[input] {
+                let remaining = &mut self.plan.remaining_edges[binding_index];
+                *remaining = remaining.checked_sub(1).ok_or_else(|| {
+                    BackendError::InvalidInput(format!(
+                        "gradient completion edge underflow for leaf {input}"
+                    ))
+                })?;
+            }
+        }
+        self.observe_requested(grads, lens);
+        let completed = self.plan.complete_at[op_index].clone();
+        for binding_index in completed {
+            if self.plan.remaining_edges[binding_index] != 0 {
+                return Err(BackendError::InvalidInput(format!(
+                    "gradient leaf {} reached completion with {} pending edges",
+                    self.plan.bindings[binding_index].leaf_id,
+                    self.plan.remaining_edges[binding_index]
+                )));
+            }
+            self.emit(
+                binding_index,
+                backend,
+                grads,
+                lens,
+                live_elements,
+                peak_elements,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_unused(
+        &mut self,
+        backend: &CudaBackend,
+        grads: &mut [Option<CudaSlice<f32>>],
+        lens: &[usize],
+        live_elements: &mut usize,
+        peak_elements: &mut usize,
+    ) -> Result<(), BackendError> {
+        let unused = self.plan.unused.clone();
+        for binding_index in unused {
+            self.emit(
+                binding_index,
+                backend,
+                grads,
+                lens,
+                live_elements,
+                peak_elements,
+            )?;
+        }
         Ok(())
     }
 }
@@ -2405,6 +2640,132 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         Ok(segments)
     }
 
+    fn gradient_completion_plan(
+        &self,
+        bindings: &[GradientLeafBinding],
+        trainer: &HostOffloadTrainer<'_>,
+        step: u64,
+    ) -> Result<GradientCompletionPlan, BackendError> {
+        if step == 0 {
+            return Err(BackendError::InvalidInput(
+                "AdamW step is 1-based; got step 0".into(),
+            ));
+        }
+        if trainer.poisoned {
+            return Err(BackendError::InvalidInput(
+                "host offload trainer is poisoned; reconstruct or reload it before reuse".into(),
+            ));
+        }
+        if !trainer.backend.same_context(&self.ones) {
+            return Err(BackendError::InvalidInput(
+                "host offload trainer belongs to a different CUDA context".into(),
+            ));
+        }
+        if bindings.len() != trainer.params.len() {
+            return Err(BackendError::ShapeMismatch {
+                expected: trainer.params.len(),
+                got: bindings.len(),
+            });
+        }
+        // Validate checkpoint marker completeness before a sink can mutate.
+        self.backward_segments()?;
+
+        let mut binding_by_leaf = vec![None; self.vals.len()];
+        let mut parameter_seen = vec![false; trainer.params.len()];
+        let mut materialized_collection_elements = 0usize;
+        for (binding_index, &binding) in bindings.iter().enumerate() {
+            if binding.leaf_id >= self.vals.len() {
+                return Err(BackendError::InvalidInput(format!(
+                    "gradient leaf id {} is out of range",
+                    binding.leaf_id
+                )));
+            }
+            if !self.leaves[binding.leaf_id] {
+                return Err(BackendError::InvalidInput(format!(
+                    "gradient value id {} is not a leaf",
+                    binding.leaf_id
+                )));
+            }
+            if binding_by_leaf[binding.leaf_id]
+                .replace(binding_index)
+                .is_some()
+            {
+                return Err(BackendError::InvalidInput(format!(
+                    "gradient leaf id {} is duplicated",
+                    binding.leaf_id
+                )));
+            }
+            let param = trainer.params.get(binding.parameter_index).ok_or_else(|| {
+                BackendError::InvalidInput(format!(
+                    "streamed parameter index {} is out of range",
+                    binding.parameter_index
+                ))
+            })?;
+            if parameter_seen[binding.parameter_index] {
+                return Err(BackendError::InvalidInput(format!(
+                    "streamed parameter index {} is duplicated",
+                    binding.parameter_index
+                )));
+            }
+            parameter_seen[binding.parameter_index] = true;
+            if self.lens[binding.leaf_id] != param.master.len() {
+                return Err(BackendError::ShapeMismatch {
+                    expected: param.master.len(),
+                    got: self.lens[binding.leaf_id],
+                });
+            }
+            materialized_collection_elements = materialized_collection_elements
+                .checked_add(self.lens[binding.leaf_id])
+                .ok_or_else(|| {
+                    BackendError::InvalidInput(
+                        "materialized gradient elements overflow usize".into(),
+                    )
+                })?;
+        }
+
+        let mut remaining_edges = vec![0usize; bindings.len()];
+        let mut first_consumer = vec![None; bindings.len()];
+        for (op_index, op) in self.ops.iter().enumerate() {
+            for input in op.gradient_inputs() {
+                if let Some(binding_index) = binding_by_leaf[input] {
+                    remaining_edges[binding_index] = remaining_edges[binding_index]
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            BackendError::InvalidInput(
+                                "gradient consumer edge count overflows usize".into(),
+                            )
+                        })?;
+                    first_consumer[binding_index] = Some(
+                        first_consumer[binding_index]
+                            .map_or(op_index, |earlier: usize| earlier.min(op_index)),
+                    );
+                }
+            }
+        }
+        let mut complete_at = vec![Vec::new(); self.ops.len()];
+        let mut unused = Vec::new();
+        for (binding_index, completion) in first_consumer.into_iter().enumerate() {
+            if let Some(op_index) = completion {
+                complete_at[op_index].push(binding_index);
+            } else {
+                unused.push(binding_index);
+            }
+        }
+        let by_parameter = |&binding_index: &usize| bindings[binding_index].parameter_index;
+        for group in &mut complete_at {
+            group.sort_unstable_by_key(by_parameter);
+        }
+        unused.sort_unstable_by_key(by_parameter);
+        Ok(GradientCompletionPlan {
+            bindings: bindings.to_vec(),
+            binding_by_leaf,
+            complete_at,
+            unused,
+            remaining_edges,
+            materialized_collection_elements,
+        })
+    }
+
     fn accumulate_grad_slot(
         &self,
         grads: &mut [Option<CudaSlice<f32>>],
@@ -2434,14 +2795,12 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         )
     }
 
-    /// Reverse pass with lazy gradient slots. `retain_ids` are returned in
-    /// their value-id slots; all other gradients are released once their
-    /// producing op has consumed them.
-    fn backward_retain(
+    fn backward_core(
         &mut self,
         seed_id: usize,
         seed: &CudaSlice<f32>,
         retain_ids: &[usize],
+        mut stream: Option<&mut HostGradientStream<'_, '_>>,
     ) -> Result<DeviceBackwardResult, BackendError> {
         if seed_id >= self.vals.len() {
             return Err(BackendError::InvalidInput(format!(
@@ -2502,6 +2861,9 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             &mut live_elements,
             &mut peak_persistent_grad_elements,
         )?;
+        if let Some(stream) = stream.as_deref_mut() {
+            stream.observe_requested(&grads, &self.lens);
+        }
         for segment in backward_segments.iter().rev() {
             if segment.evicted {
                 for id in segment.value_start..segment.value_end {
@@ -2514,10 +2876,22 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             for op_index in (segment.op_start..segment.op_end).rev() {
                 let op = &self.ops[op_index];
                 let out_id = op.output();
+                let gradient_inputs = op.gradient_inputs();
                 let Some(grad_out) = grads[out_id].take() else {
                     // This op is not on a path from the seed, but its activation
                     // is still dead once reverse replay reaches its producer.
                     self.evict_activation(out_id)?;
+                    if let Some(stream) = stream.as_deref_mut() {
+                        stream.after_op(
+                            op_index,
+                            &gradient_inputs,
+                            self.b,
+                            &mut grads,
+                            &self.lens,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
                     continue;
                 };
                 match *op {
@@ -2896,16 +3270,40 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     drop(grad_out);
                 }
                 self.evict_activation(out_id)?;
+                if let Some(stream) = stream.as_deref_mut() {
+                    stream.after_op(
+                        op_index,
+                        &gradient_inputs,
+                        self.b,
+                        &mut grads,
+                        &self.lens,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
+                }
             }
+        }
+
+        if let Some(stream) = stream.as_deref_mut() {
+            stream.emit_unused(
+                self.b,
+                &mut grads,
+                &self.lens,
+                &mut live_elements,
+                &mut peak_persistent_grad_elements,
+            )?;
         }
 
         // Preserve the old API's zero-gradient behavior for requested values
         // that are disconnected from the seed.
-        for &id in retain_ids {
-            if grads[id].is_none() {
-                grads[id] = Some(self.b.dev_alloc_zeros(self.lens[id])?);
-                live_elements = live_elements.saturating_add(self.lens[id]);
-                peak_persistent_grad_elements = peak_persistent_grad_elements.max(live_elements);
+        if stream.is_none() {
+            for &id in retain_ids {
+                if grads[id].is_none() {
+                    grads[id] = Some(self.b.dev_alloc_zeros(self.lens[id])?);
+                    live_elements = live_elements.saturating_add(self.lens[id]);
+                    peak_persistent_grad_elements =
+                        peak_persistent_grad_elements.max(live_elements);
+                }
             }
         }
         for (id, slot) in grads.iter_mut().enumerate() {
@@ -2917,14 +3315,16 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             self.live_activation_elements, 0,
             "all non-leaf activations must be released after reverse replay"
         );
-        debug_assert_eq!(
-            live_elements,
+        let expected_live = if stream.is_some() {
+            0
+        } else {
             retain
                 .iter()
                 .zip(&self.lens)
                 .filter(|(keep, _)| **keep)
                 .fold(0usize, |total, (_, &len)| total.saturating_add(len))
-        );
+        };
+        debug_assert_eq!(live_elements, expected_live);
         Ok(DeviceBackwardResult {
             grads,
             stats: DeviceBackwardStats {
@@ -2936,6 +3336,18 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 recomputed_ops: self.recomputed_ops,
             },
         })
+    }
+
+    /// Reverse pass with lazy gradient slots. `retain_ids` are returned in
+    /// their value-id slots; all other gradients are released once their
+    /// producing op has consumed them.
+    fn backward_retain(
+        &mut self,
+        seed_id: usize,
+        seed: &CudaSlice<f32>,
+        retain_ids: &[usize],
+    ) -> Result<DeviceBackwardResult, BackendError> {
+        self.backward_core(seed_id, seed, retain_ids, None)
     }
 
     /// One distillation-step gradient, host in / host out: seed the softmax-xent loss grad at the
@@ -2965,6 +3377,95 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 Ok(h)
             })
             .collect()
+    }
+
+    /// Run a resident softmax-xent reverse pass and stream each requested leaf
+    /// gradient into a host-offloaded AdamW parameter as soon as all of that
+    /// leaf's reverse-topological consumer edges are complete.
+    #[allow(clippy::too_many_arguments)]
+    pub fn xent_backward_into(
+        mut self,
+        logits: usize,
+        target: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        bindings: &[GradientLeafBinding],
+        trainer: &mut HostOffloadTrainer<'_>,
+        step: u64,
+    ) -> Result<GradientStreamReport, BackendError> {
+        if rows == 0 || cols == 0 {
+            return Err(BackendError::InvalidInput(
+                "softmax-xent rows and cols must be non-zero".into(),
+            ));
+        }
+        let expected = rows.checked_mul(cols).ok_or_else(|| {
+            BackendError::InvalidInput("softmax-xent shape overflows usize".into())
+        })?;
+        if logits >= self.vals.len() {
+            return Err(BackendError::InvalidInput(format!(
+                "logits value id {logits} is out of range"
+            )));
+        }
+        if self.lens[logits] != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: self.lens[logits],
+            });
+        }
+        if target.len() != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: target.len(),
+            });
+        }
+        if !self.b.same_context(&target.buf) {
+            return Err(BackendError::InvalidInput(
+                "target tensor belongs to a different CUDA context".into(),
+            ));
+        }
+        let plan = self.gradient_completion_plan(bindings, trainer, step)?;
+        let retain_ids: Vec<usize> = plan
+            .bindings
+            .iter()
+            .map(|binding| binding.leaf_id)
+            .collect();
+        let seed = self.softmax_xent_grad_device(logits, &target.buf, rows, cols)?;
+        let mut stream = HostGradientStream {
+            trainer,
+            plan,
+            step,
+            emissions: Vec::with_capacity(bindings.len()),
+            peak_live_requested_gradient_elements: 0,
+            mutation_started: false,
+        };
+        let backward = self.backward_core(logits, &seed, &retain_ids, Some(&mut stream));
+        let result = match backward {
+            Ok(result) => result,
+            Err(error) => {
+                if stream.mutation_started {
+                    stream.trainer.poisoned = true;
+                }
+                return Err(error);
+            }
+        };
+        if stream.emissions.len() != bindings.len()
+            || stream.plan.remaining_edges.iter().any(|&count| count != 0)
+        {
+            if stream.mutation_started {
+                stream.trainer.poisoned = true;
+            }
+            return Err(BackendError::InvalidInput(
+                "gradient stream finished before every binding was emitted".into(),
+            ));
+        }
+        stream.trainer.stats.resident_input_gradient_elements =
+            stream.plan.materialized_collection_elements;
+        Ok(GradientStreamReport {
+            emissions: stream.emissions,
+            materialized_collection_elements: stream.plan.materialized_collection_elements,
+            peak_live_requested_gradient_elements: stream.peak_live_requested_gradient_elements,
+            backward_stats: result.stats,
+        })
     }
 
     /// One fully resident distillation backward pass. The tape is consumed so
@@ -4070,6 +4571,41 @@ mod tests {
             Err(BackendError::InvalidInput(message)) if message.contains("1-based")
         ));
         assert_eq!(trainer.master(0).unwrap(), before);
+        assert!(!trainer.is_poisoned());
+    }
+
+    #[test]
+    fn host_offload_poison_refuses_reuse_after_device_update_failure() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping host_offload_poison_refuses_reuse_after_device_update_failure: \
+                     no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let master = seeded_uniform(0xE275, 35, -1.0, 1.0);
+        let spec = DeviceTrainParam {
+            master: &master,
+            rows: 5,
+            cols: 7,
+            salt_planes: 1,
+            optimizer: AdamW::new(1e-3),
+        };
+        let mut trainer = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+        let grad = backend.dev_alloc_zeros(master.len()).unwrap();
+        assert!(trainer.apply_streamed_gradient(0, &grad, 0).is_err());
+        assert!(trainer.is_poisoned());
+        let grads = DeviceGradients {
+            bufs: vec![backend.dev_alloc_zeros(master.len()).unwrap()],
+            stats: DeviceBackwardStats::default(),
+        };
+        assert!(matches!(
+            trainer.step(grads, 1),
+            Err(BackendError::InvalidInput(message)) if message.contains("poisoned")
+        ));
     }
 
     fn upload_test_gradients(backend: &CudaBackend, grads: &[Vec<f32>]) -> DeviceGradients {
@@ -4341,6 +4877,449 @@ mod tests {
             ));
             assert_eq!(trainer.master(0).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn streamed_host_offload_emits_without_collecting_device_gradients() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping streamed_host_offload_emits_without_collecting_device_gradients: \
+                     no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let (rows, cols, batch) = (5usize, 7usize, 3usize);
+        let input = seeded_uniform(0xE400, batch * cols, -1.0, 1.0);
+        let master = seeded_uniform(0xE401, rows * cols, -1.0, 1.0);
+        let target =
+            DeviceTensor::upload(&backend, &vec![1.0 / rows as f32; batch * rows]).unwrap();
+        let spec = DeviceTrainParam {
+            master: &master,
+            rows,
+            cols,
+            salt_planes: 1,
+            optimizer: AdamW::new(1e-3),
+        };
+        let mut trainer = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+        let mut tape = DeviceTape::new(&backend, rows).unwrap();
+        let x = tape.leaf(&input).unwrap();
+        let w = tape.leaf(&master).unwrap();
+        let logits = tape.matmul(x, w, batch, rows, cols).unwrap();
+
+        let report = tape
+            .xent_backward_into(
+                logits,
+                &target,
+                batch,
+                rows,
+                &[GradientLeafBinding {
+                    leaf_id: w,
+                    parameter_index: 0,
+                }],
+                &mut trainer,
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(report.emissions.len(), 1);
+        assert_eq!(report.peak_live_requested_gradient_elements, master.len());
+        assert!(!trainer.is_poisoned());
+    }
+
+    #[test]
+    fn streamed_host_offload_matches_collected_across_steps_and_checkpointing() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping streamed_host_offload_matches_collected_across_steps_and_checkpointing: \
+                     no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let (batch, input_dim, hidden_dim, output_dim) = (3usize, 5usize, 7usize, 4usize);
+        let input = seeded_uniform(0xE410, batch * input_dim, -0.5, 0.5);
+        let target =
+            DeviceTensor::upload(&backend, &vec![1.0 / output_dim as f32; batch * output_dim])
+                .unwrap();
+        let initial_w1 = seeded_uniform(0xE411, hidden_dim * input_dim, -0.3, 0.3);
+        let initial_w2 = seeded_uniform(0xE412, output_dim * hidden_dim, -0.3, 0.3);
+        let optimizer = AdamW {
+            lr: 0.02,
+            beta1: 0.8,
+            beta2: 0.9,
+            eps: 0.2,
+            weight_decay: 0.01,
+        };
+        let specs = [
+            DeviceTrainParam {
+                master: &initial_w1,
+                rows: hidden_dim,
+                cols: input_dim,
+                salt_planes: 1,
+                optimizer,
+            },
+            DeviceTrainParam {
+                master: &initial_w2,
+                rows: output_dim,
+                cols: hidden_dim,
+                salt_planes: 1,
+                optimizer,
+            },
+        ];
+        let mut collected = HostOffloadTrainer::new(&backend, &specs).unwrap();
+        let mut streamed = HostOffloadTrainer::new(&backend, &specs).unwrap();
+
+        for step in 1..=3u64 {
+            let collected_w1 = collected.master(0).unwrap().to_vec();
+            let collected_w2 = collected.master(1).unwrap().to_vec();
+            let mut tape = DeviceTape::new(&backend, hidden_dim.max(output_dim)).unwrap();
+            let x = tape.leaf(&input).unwrap();
+            let w1 = tape.leaf(&collected_w1).unwrap();
+            let w2 = tape.leaf(&collected_w2).unwrap();
+            let hidden = tape.matmul(x, w1, batch, hidden_dim, input_dim).unwrap();
+            let hidden = tape.silu(hidden).unwrap();
+            let logits = tape
+                .matmul(hidden, w2, batch, output_dim, hidden_dim)
+                .unwrap();
+            let grads = tape
+                .xent_backward_device(logits, &target, batch, output_dim, &[w1, w2])
+                .unwrap();
+            collected.step(grads, step).unwrap();
+
+            let streamed_w1 = streamed.master(0).unwrap().to_vec();
+            let streamed_w2 = streamed.master(1).unwrap().to_vec();
+            let mut tape = DeviceTape::new_with_checkpoint_policy(
+                &backend,
+                hidden_dim.max(output_dim),
+                CheckpointPolicy::EveryBlocks(1),
+            )
+            .unwrap();
+            let x = tape.leaf(&input).unwrap();
+            let w1 = tape.leaf(&streamed_w1).unwrap();
+            let w2 = tape.leaf(&streamed_w2).unwrap();
+            let hidden = tape.matmul(x, w1, batch, hidden_dim, input_dim).unwrap();
+            let hidden = tape.silu(hidden).unwrap();
+            tape.checkpoint_keep(&[hidden]).unwrap();
+            let logits = tape
+                .matmul(hidden, w2, batch, output_dim, hidden_dim)
+                .unwrap();
+            let report = tape
+                .xent_backward_into(
+                    logits,
+                    &target,
+                    batch,
+                    output_dim,
+                    &[
+                        GradientLeafBinding {
+                            leaf_id: w1,
+                            parameter_index: 0,
+                        },
+                        GradientLeafBinding {
+                            leaf_id: w2,
+                            parameter_index: 1,
+                        },
+                    ],
+                    &mut streamed,
+                    step,
+                )
+                .unwrap();
+            assert_eq!(
+                report
+                    .emissions
+                    .iter()
+                    .map(|emission| emission.parameter_index)
+                    .collect::<Vec<_>>(),
+                vec![1, 0]
+            );
+            assert!(report.backward_stats.recomputed_ops > 0);
+            assert!(
+                report.peak_live_requested_gradient_elements
+                    < report.materialized_collection_elements,
+                "stream must reduce requested-gradient peak: {report:?}"
+            );
+            if step == 1 {
+                eprintln!(
+                    "0027 streamed gradients: requested peak {}/{} elements, emission order {:?}",
+                    report.peak_live_requested_gradient_elements,
+                    report.materialized_collection_elements,
+                    report
+                        .emissions
+                        .iter()
+                        .map(|emission| emission.parameter_index)
+                        .collect::<Vec<_>>()
+                );
+            }
+
+            for index in 0..2 {
+                assert!(
+                    max_abs_diff(
+                        collected.master(index).unwrap(),
+                        streamed.master(index).unwrap()
+                    ) < 1e-5,
+                    "master {index} diverged at step {step}"
+                );
+                let (collected_m, collected_v) = collected.moments(index).unwrap();
+                let (streamed_m, streamed_v) = streamed.moments(index).unwrap();
+                assert!(max_abs_diff(collected_m, streamed_m) < 1e-5);
+                assert!(max_abs_diff(collected_v, streamed_v) < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_tied_packed_master_emits_once() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping streamed_tied_packed_master_emits_once: no CUDA ({e})");
+                return;
+            }
+        };
+        let (seq, vocab, dim, planes) = (4usize, 5usize, 7usize, 2usize);
+        let tokens = [4i32, 0, 4, 2];
+        let master = seeded_uniform(0xE420, vocab * dim, -1.0, 1.0);
+        let target =
+            DeviceTensor::upload(&backend, &vec![1.0 / vocab as f32; seq * vocab]).unwrap();
+        let spec = DeviceTrainParam {
+            master: &master,
+            rows: vocab,
+            cols: dim,
+            salt_planes: planes,
+            optimizer: AdamW::new(0.01),
+        };
+        let mut collected = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+        let mut streamed = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+
+        let packed = DevicePackedSaltWeight::from_host(
+            &backend,
+            collected.master(0).unwrap(),
+            vocab,
+            dim,
+            planes,
+        )
+        .unwrap();
+        let mut tape = DeviceTape::new(&backend, vocab).unwrap();
+        let master_id = tape.gradient_leaf(vocab * dim).unwrap();
+        let emb = tape.salt_embed(master_id, &packed, &tokens).unwrap();
+        let logits = tape.salt_matmul(emb, master_id, &packed, seq).unwrap();
+        let grads = tape
+            .xent_backward_device(logits, &target, seq, vocab, &[master_id])
+            .unwrap();
+        collected.step(grads, 1).unwrap();
+
+        let packed = DevicePackedSaltWeight::from_host(
+            &backend,
+            streamed.master(0).unwrap(),
+            vocab,
+            dim,
+            planes,
+        )
+        .unwrap();
+        let mut tape = DeviceTape::new(&backend, vocab).unwrap();
+        let master_id = tape.gradient_leaf(vocab * dim).unwrap();
+        let emb = tape.salt_embed(master_id, &packed, &tokens).unwrap();
+        let logits = tape.salt_matmul(emb, master_id, &packed, seq).unwrap();
+        let report = tape
+            .xent_backward_into(
+                logits,
+                &target,
+                seq,
+                vocab,
+                &[GradientLeafBinding {
+                    leaf_id: master_id,
+                    parameter_index: 0,
+                }],
+                &mut streamed,
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(report.emissions.len(), 1);
+        assert_eq!(report.emissions[0].leaf_id, master_id);
+        assert!(max_abs_diff(collected.master(0).unwrap(), streamed.master(0).unwrap()) < 1e-5);
+        let (collected_m, collected_v) = collected.moments(0).unwrap();
+        let (streamed_m, streamed_v) = streamed.moments(0).unwrap();
+        assert!(max_abs_diff(collected_m, streamed_m) < 1e-5);
+        assert!(max_abs_diff(collected_v, streamed_v) < 1e-5);
+    }
+
+    #[test]
+    fn streamed_completion_handles_duplicate_edges_and_unused_leaf() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping streamed_completion_handles_duplicate_edges_and_unused_leaf: \
+                     no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let p = seeded_uniform(0xE430, 4, -0.5, 0.5);
+        let q = seeded_uniform(0xE431, 4, -0.5, 0.5);
+        let unused = seeded_uniform(0xE432, 3, -0.5, 0.5);
+        let specs = [
+            DeviceTrainParam {
+                master: &p,
+                rows: 1,
+                cols: 4,
+                salt_planes: 1,
+                optimizer: AdamW::new(0.01),
+            },
+            DeviceTrainParam {
+                master: &q,
+                rows: 1,
+                cols: 4,
+                salt_planes: 1,
+                optimizer: AdamW::new(0.01),
+            },
+            DeviceTrainParam {
+                master: &unused,
+                rows: 1,
+                cols: 3,
+                salt_planes: 1,
+                optimizer: AdamW::new(0.01),
+            },
+        ];
+        let target = DeviceTensor::upload(&backend, &[1.0 / 12.0; 12]).unwrap();
+        let build = |p: &[f32], q: &[f32], unused: &[f32]| {
+            let mut tape = DeviceTape::new(&backend, 12).unwrap();
+            let p_id = tape.leaf(p).unwrap();
+            let q_id = tape.leaf(q).unwrap();
+            let unused_id = tape.leaf(unused).unwrap();
+            let duplicate_concat = tape.concat(&[p_id, p_id], 1, &[4, 4]).unwrap();
+            let duplicate_add = tape.add(q_id, q_id).unwrap();
+            let logits = tape
+                .concat(&[duplicate_concat, duplicate_add], 1, &[8, 4])
+                .unwrap();
+            (tape, [p_id, q_id, unused_id], logits)
+        };
+
+        let mut collected = HostOffloadTrainer::new(&backend, &specs).unwrap();
+        let (tape, ids, logits) = build(&p, &q, &unused);
+        let grads = tape
+            .xent_backward_device(logits, &target, 1, 12, &ids)
+            .unwrap();
+        collected.step(grads, 1).unwrap();
+
+        let mut streamed = HostOffloadTrainer::new(&backend, &specs).unwrap();
+        let (tape, ids, logits) = build(&p, &q, &unused);
+        let report = tape
+            .xent_backward_into(
+                logits,
+                &target,
+                1,
+                12,
+                &[
+                    GradientLeafBinding {
+                        leaf_id: ids[0],
+                        parameter_index: 0,
+                    },
+                    GradientLeafBinding {
+                        leaf_id: ids[1],
+                        parameter_index: 1,
+                    },
+                    GradientLeafBinding {
+                        leaf_id: ids[2],
+                        parameter_index: 2,
+                    },
+                ],
+                &mut streamed,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            report
+                .emissions
+                .iter()
+                .map(|emission| emission.parameter_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 2]
+        );
+        for index in 0..3 {
+            assert!(
+                max_abs_diff(
+                    collected.master(index).unwrap(),
+                    streamed.master(index).unwrap()
+                ) < 1e-5
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_plan_errors_precede_host_mutation() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping streamed_plan_errors_precede_host_mutation: no CUDA ({e})");
+                return;
+            }
+        };
+        let master = seeded_uniform(0xE440, 35, -0.5, 0.5);
+        let input = seeded_uniform(0xE441, 21, -0.5, 0.5);
+        let target = DeviceTensor::upload(&backend, &[0.2; 15]).unwrap();
+        let spec = DeviceTrainParam {
+            master: &master,
+            rows: 5,
+            cols: 7,
+            salt_planes: 1,
+            optimizer: AdamW::new(0.01),
+        };
+        let mut trainer = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+        let before = trainer.master(0).unwrap().to_vec();
+        let build = || {
+            let mut tape = DeviceTape::new(&backend, 5).unwrap();
+            let x = tape.leaf(&input).unwrap();
+            let w = tape.leaf(&master).unwrap();
+            let logits = tape.matmul(x, w, 3, 5, 7).unwrap();
+            (tape, w, logits)
+        };
+
+        let (tape, w, logits) = build();
+        assert!(matches!(
+            tape.xent_backward_into(
+                logits,
+                &target,
+                3,
+                5,
+                &[GradientLeafBinding {
+                    leaf_id: w,
+                    parameter_index: 0,
+                }],
+                &mut trainer,
+                0,
+            ),
+            Err(BackendError::InvalidInput(message)) if message.contains("1-based")
+        ));
+        let (tape, _, logits) = build();
+        assert!(matches!(
+            tape.xent_backward_into(logits, &target, 3, 5, &[], &mut trainer, 1),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+        let (tape, _, logits) = build();
+        assert!(matches!(
+            tape.xent_backward_into(
+                logits,
+                &target,
+                3,
+                5,
+                &[GradientLeafBinding {
+                    leaf_id: logits,
+                    parameter_index: 0,
+                }],
+                &mut trainer,
+                1,
+            ),
+            Err(BackendError::InvalidInput(message)) if message.contains("not a leaf")
+        ));
+        assert_eq!(trainer.master(0).unwrap(), before);
+        assert!(!trainer.is_poisoned());
+        assert_eq!(trainer.stats().peak_optimizer_device_elements, 0);
     }
 
     /// Two backend handles retaining the same CUDA primary context may share a
