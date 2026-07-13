@@ -891,6 +891,8 @@ fn read_plane_into<R: Read>(
 /// Manifest layout plus every shard header and exact file length are validated before `sink.begin`.
 /// Payload chunks are then delivered in global-offset order, with DCP padding omitted. The sink owns
 /// transactional publication: [`StateSink::finish`] is called only after the full payload succeeds.
+/// If payload I/O or a sink write fails after `begin`, the sink may contain partial state and must
+/// discard it; `finish` is not called.
 ///
 /// # Errors
 /// Returns [`DcpError`] for missing, truncated, trailing, stale, or inconsistent checkpoint files, or
@@ -898,15 +900,15 @@ fn read_plane_into<R: Read>(
 pub fn load_into(dir: &Path, sink: &mut (impl StateSink + ?Sized)) -> Result<(), DcpError> {
     let (manifest, plan) = validated_manifest(dir)?;
 
-    // First pass prevents known structural/truncation failures from partially mutating the sink.
-    for rank in 0..manifest.world {
-        open_validated_shard(dir, &manifest, rank)?;
-    }
+    // Retain the exact files that passed validation. Reopening by path below would introduce a
+    // TOCTOU window where a shard could be replaced between validation and payload streaming.
+    let files = (0..manifest.world)
+        .map(|rank| open_validated_shard(dir, &manifest, rank))
+        .collect::<Result<Vec<_>, _>>()?;
 
     sink.begin(manifest.step, &manifest.leaf_lens, manifest.n_planes)?;
     let mut scratch = Vec::with_capacity(STREAM_BUFFER_ELEMENTS);
-    for rank in 0..manifest.world {
-        let file = open_validated_shard(dir, &manifest, rank)?;
+    for (rank, file) in files.into_iter().enumerate() {
         let mut reader = BufReader::new(file);
         let (lo, hi) = plan.shard_range(rank);
         read_plane_into(
