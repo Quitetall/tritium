@@ -275,6 +275,42 @@ extern "C" __global__ void salt_training_grad_a(
     ga[idx] = acc;
 }
 
+// Tied-token embedding gather directly from the same compact Track D planes
+// used by salt_training_forward. One thread reconstructs one requested table
+// cell; code ±1 adds/subtracts the external f32 row scale, code 0 skips.
+extern "C" __global__ void salt_training_embed_gather(
+    const unsigned char* __restrict__ codes, // [planes, vocab, row_bytes]
+    const float* __restrict__ scales,        // [planes, vocab]
+    const int* __restrict__ tokens,          // [seq]
+    float* __restrict__ out,                 // [seq, dim]
+    int seq, int vocab, int dim, int planes, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)seq * dim) return;
+    int position = idx / dim;
+    int col = idx % dim;
+    int row = tokens[position];
+    // Public host entry points validate token ids before upload. Keep the
+    // device guard as defence in depth against any future resident-token path.
+    if (row < 0 || row >= vocab) {
+        out[idx] = 0.0f;
+        return;
+    }
+
+    float value = 0.0f;
+    for (int plane = 0; plane < planes; ++plane) {
+        unsigned int code = train_salt_code(
+            codes, plane, row, col, vocab, row_bytes);
+        float scale = scales[(long)plane * vocab + row];
+        if (code == 2u) {
+            value += scale;
+        } else if (code == 0u) {
+            value -= scale;
+        }
+    }
+    out[idx] = value;
+}
+
 // ADR 0027 Track A: fused elementwise AdamW update over resident buffers.
 // Host code computes bias correction with the CPU oracle's `powi` contract;
 // this kernel preserves optim::AdamW::step's per-element operation order.

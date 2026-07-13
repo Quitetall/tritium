@@ -33,7 +33,7 @@ use tritium_spec::BackendError;
 use tritium_train::ops::{act, loss, matmul, ste};
 use tritium_train::{AdamState, AdamW, LrSchedule, Optimizer, TrainGemm};
 
-use crate::cuda::{CudaBackend, EmbedSegments};
+use crate::cuda::{CudaBackend, EmbedSegments, TrainingSaltLinear};
 
 /// `(g_a[M,K], g_w[N,K], g_s[N])` — the three matmul gradients returned together by
 /// [`GemmEngine::backward`].
@@ -430,10 +430,19 @@ fn seeded_uniform(seed: u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
 // Test-exercised (`device_tape_mlp_stack_matches_cpu_tape`) until the distillation loop drives the
 // DeviceTape on a real model (plan 0043 P2.5b onward).
 #[allow(dead_code)]
-enum DevOp {
+enum DevOp<'leaf> {
     Matmul {
         x: usize,
         w: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        out: usize,
+    },
+    SaltMatmul {
+        x: usize,
+        master: usize,
+        weight: &'leaf DevicePackedSaltWeight,
         m: usize,
         n: usize,
         k: usize,
@@ -466,6 +475,16 @@ enum DevOp {
     },
     Embed {
         w: usize,
+        tokens: CudaSlice<i32>,
+        segments: EmbedSegments,
+        seq: usize,
+        dim: usize,
+        vocab: usize,
+        out: usize,
+    },
+    SaltEmbed {
+        master: usize,
+        weight: &'leaf DevicePackedSaltWeight,
         tokens: CudaSlice<i32>,
         segments: EmbedSegments,
         seq: usize,
@@ -522,15 +541,17 @@ enum DevOp {
     },
 }
 
-impl DevOp {
+impl DevOp<'_> {
     fn output(&self) -> usize {
         match self {
             Self::Matmul { out, .. }
+            | Self::SaltMatmul { out, .. }
             | Self::Rmsnorm { out, .. }
             | Self::Silu { out, .. }
             | Self::Mul { out, .. }
             | Self::Add { out, .. }
             | Self::Embed { out, .. }
+            | Self::SaltEmbed { out, .. }
             | Self::Rope { out, .. }
             | Self::SliceCols { out, .. }
             | Self::ScaleConst { out, .. }
@@ -638,9 +659,143 @@ impl DeviceTensor {
     }
 }
 
+/// Opaque device-resident SALT weight for training-time packed execution.
+///
+/// The handle owns compact TQ2-addressed plane codes plus external f32 per-row
+/// scales. It never owns a dense quantized reconstruction. Latent masters and
+/// optimizer state remain separate; callers explicitly repack after updating a
+/// host-resident master.
+pub struct DevicePackedSaltWeight {
+    inner: TrainingSaltLinear,
+    prepared: bool,
+}
+
+impl core::fmt::Debug for DevicePackedSaltWeight {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DevicePackedSaltWeight")
+            .field("rows", &self.rows())
+            .field("cols", &self.cols())
+            .field("planes", &self.planes())
+            .field("resident_bytes", &self.resident_bytes())
+            .field("prepared", &self.prepared)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DevicePackedSaltWeight {
+    /// Upload and greedily SALT-pack one latent host matrix.
+    pub fn from_host(
+        backend: &CudaBackend,
+        master: &[f32],
+        rows: usize,
+        cols: usize,
+        planes: usize,
+    ) -> Result<Self, BackendError> {
+        let expected = rows.checked_mul(cols).ok_or_else(|| {
+            BackendError::InvalidInput("packed SALT shape overflows usize".into())
+        })?;
+        if master.len() != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: master.len(),
+            });
+        }
+        let d_master = backend.dev_upload(master)?;
+        let mut scratch = backend.dev_alloc_zeros(expected)?;
+        let inner = backend.pack_training_salt(&d_master, &mut scratch, rows, cols, planes)?;
+        Ok(Self {
+            inner,
+            prepared: true,
+        })
+    }
+
+    /// Replace all packed codes/scales from a new host master with the same
+    /// geometry. The handle becomes stale before validation or device work and
+    /// becomes prepared again only after a successful pack.
+    pub fn repack_from_host(
+        &mut self,
+        backend: &CudaBackend,
+        master: &[f32],
+    ) -> Result<(), BackendError> {
+        self.prepared = false;
+        let expected = self.rows().checked_mul(self.cols()).ok_or_else(|| {
+            BackendError::InvalidInput("packed SALT shape overflows usize".into())
+        })?;
+        if master.len() != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: master.len(),
+            });
+        }
+        let d_master = backend.dev_upload(master)?;
+        let mut scratch = backend.dev_alloc_zeros(expected)?;
+        backend.repack_training_salt(&d_master, &mut scratch, &mut self.inner)?;
+        self.prepared = true;
+        Ok(())
+    }
+
+    /// Mark codes/scales stale before an out-of-band master update.
+    pub fn mark_stale(&mut self) {
+        self.prepared = false;
+    }
+
+    /// Whether the handle may be inserted into a new device tape.
+    #[must_use]
+    pub fn is_prepared(&self) -> bool {
+        self.prepared
+    }
+
+    /// Output rows (`N`, or vocabulary size for a tied embedding).
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.inner.rows()
+    }
+
+    /// Contraction columns (`K`, or embedding dimension).
+    #[must_use]
+    pub fn cols(&self) -> usize {
+        self.inner.cols()
+    }
+
+    /// Number of residual ternary planes.
+    #[must_use]
+    pub fn planes(&self) -> usize {
+        self.inner.planes()
+    }
+
+    /// Compact 2-bit code bytes, excluding f32 scales.
+    #[must_use]
+    pub fn packed_bytes(&self) -> usize {
+        self.inner.packed_bytes()
+    }
+
+    /// External f32 scale bytes.
+    #[must_use]
+    pub fn scale_bytes(&self) -> usize {
+        self.inner.scale_bytes()
+    }
+
+    /// Total device bytes owned by codes and scales.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.inner.resident_bytes()
+    }
+
+    fn ensure_prepared(&self) -> Result<(), BackendError> {
+        if self.prepared {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidInput(
+                "packed SALT weight is stale; repack from the updated master".into(),
+            ))
+        }
+    }
+}
+
 enum DeviceValue<'a> {
     Owned(CudaSlice<f32>),
     Borrowed(&'a CudaSlice<f32>),
+    GradientOnly,
 }
 
 impl DeviceValue<'_> {
@@ -648,6 +803,7 @@ impl DeviceValue<'_> {
         match self {
             Self::Owned(buf) => buf,
             Self::Borrowed(buf) => buf,
+            Self::GradientOnly => unreachable!("gradient-only leaves have no forward buffer"),
         }
     }
 }
@@ -1087,7 +1243,9 @@ impl<'a> HostOffloadTrainer<'a> {
 
     /// Apply one 1-based AdamW step while staging one parameter's optimizer
     /// state at a time. All gradient metadata is validated before any master or
-    /// moment is changed.
+    /// moment is changed. A device failure during the update loop can leave
+    /// earlier leaves updated; reconstruct or reload the trainer before retrying.
+    /// Reported step statistics are meaningful only after a successful return.
     pub fn step(&mut self, grads: DeviceGradients, step: u64) -> Result<(), BackendError> {
         if step == 0 {
             return Err(BackendError::InvalidInput(
@@ -1159,7 +1317,7 @@ pub struct DeviceTape<'backend, 'leaf> {
     vals: Vec<Option<DeviceValue<'leaf>>>,
     lens: Vec<usize>,
     leaves: Vec<bool>,
-    ops: Vec<DevOp>,
+    ops: Vec<DevOp<'leaf>>,
     ones: CudaSlice<f32>,
     checkpoint_policy: CheckpointPolicy,
     checkpoint_interval: Option<usize>,
@@ -1233,11 +1391,15 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let value = self.vals.get(id).ok_or_else(|| {
             BackendError::InvalidInput(format!("device tape value id {id} is out of range"))
         })?;
-        value.as_ref().map(DeviceValue::as_slice).ok_or_else(|| {
-            BackendError::InvalidInput(format!(
+        match value {
+            Some(DeviceValue::GradientOnly) => Err(BackendError::InvalidInput(format!(
+                "device tape value id {id} is a gradient-only leaf with no forward value"
+            ))),
+            Some(value) => Ok(value.as_slice()),
+            None => Err(BackendError::InvalidInput(format!(
                 "device tape value id {id} was evicted; include it in checkpoint_keep frontier"
-            ))
-        })
+            ))),
+        }
     }
 
     fn evict_activation(&mut self, id: usize) -> Result<bool, BackendError> {
@@ -1261,6 +1423,9 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     "non-leaf device tape value id {id} cannot borrow checkpoint storage"
                 )))
             }
+            Some(DeviceValue::GradientOnly) => Err(BackendError::InvalidInput(format!(
+                "non-leaf device tape value id {id} cannot be gradient-only"
+            ))),
             None => Ok(false),
         }
     }
@@ -1288,6 +1453,48 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         self.lens.push(tensor.buf.len());
         self.leaves.push(true);
         Ok(id)
+    }
+
+    /// Create a leaf that receives gradients but owns no forward f32 buffer.
+    /// This is the latent-master identity used by packed SALT ops: their
+    /// forward reads compact planes while their STE VJP targets this value id.
+    pub fn gradient_leaf(&mut self, len: usize) -> Result<usize, BackendError> {
+        if len == 0 {
+            return Err(BackendError::InvalidInput(
+                "gradient-only leaf length must be non-zero".into(),
+            ));
+        }
+        let id = self.vals.len();
+        self.vals.push(Some(DeviceValue::GradientOnly));
+        self.lens.push(len);
+        self.leaves.push(true);
+        Ok(id)
+    }
+
+    fn validate_packed_master(
+        &self,
+        master: usize,
+        weight: &DevicePackedSaltWeight,
+    ) -> Result<(), BackendError> {
+        weight.ensure_prepared()?;
+        let expected = weight.rows().checked_mul(weight.cols()).ok_or_else(|| {
+            BackendError::InvalidInput("packed SALT master shape overflows usize".into())
+        })?;
+        let value = self.vals.get(master).ok_or_else(|| {
+            BackendError::InvalidInput(format!("packed SALT master id {master} is out of range"))
+        })?;
+        if !matches!(value, Some(DeviceValue::GradientOnly)) || !self.leaves[master] {
+            return Err(BackendError::InvalidInput(format!(
+                "packed SALT master id {master} must be a gradient-only leaf"
+            )));
+        }
+        if self.lens[master] != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: self.lens[master],
+            });
+        }
+        Ok(())
     }
 
     /// Mark a logical block boundary and explicitly name every non-leaf value
@@ -1448,6 +1655,49 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         Ok(id)
     }
 
+    /// Packed SALT matrix multiply. Forward reads only compact planes; the
+    /// ordinary dense `grad_w` VJP is routed to `master` as the identity STE.
+    pub fn salt_matmul(
+        &mut self,
+        x: usize,
+        master: usize,
+        weight: &'leaf DevicePackedSaltWeight,
+        m: usize,
+    ) -> Result<usize, BackendError> {
+        self.validate_packed_master(master, weight)?;
+        let n = weight.rows();
+        let k = weight.cols();
+        let x_len = m.checked_mul(k).ok_or_else(|| {
+            BackendError::InvalidInput("packed SALT activation shape overflows usize".into())
+        })?;
+        let out_len = m.checked_mul(n).ok_or_else(|| {
+            BackendError::InvalidInput("packed SALT output shape overflows usize".into())
+        })?;
+        let got_x = *self.lens.get(x).ok_or_else(|| {
+            BackendError::InvalidInput(format!("device tape value id {x} is out of range"))
+        })?;
+        if got_x != x_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: x_len,
+                got: got_x,
+            });
+        }
+        let mut out = self.b.dev_alloc_zeros(out_len)?;
+        self.b
+            .training_salt_forward(self.value_slice(x)?, &weight.inner, m, &mut out)?;
+        let id = self.push_activation(out, out_len);
+        self.ops.push(DevOp::SaltMatmul {
+            x,
+            master,
+            weight,
+            m,
+            n,
+            k,
+            out: id,
+        });
+        Ok(id)
+    }
+
     pub fn rmsnorm(
         &mut self,
         x: usize,
@@ -1532,6 +1782,41 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         self.ops.push(DevOp::Embed {
             w,
             tokens: d_tok,
+            segments,
+            seq,
+            dim,
+            vocab,
+            out: id,
+        });
+        Ok(id)
+    }
+
+    /// Gather token rows directly from packed SALT planes. The deterministic
+    /// segmented embedding VJP accumulates into the same identity-STE master
+    /// leaf that a tied [`Self::salt_matmul`] head uses.
+    pub fn salt_embed(
+        &mut self,
+        master: usize,
+        weight: &'leaf DevicePackedSaltWeight,
+        tokens: &[i32],
+    ) -> Result<usize, BackendError> {
+        self.validate_packed_master(master, weight)?;
+        let seq = tokens.len();
+        let vocab = weight.rows();
+        let dim = weight.cols();
+        let out_len = seq.checked_mul(dim).ok_or_else(|| {
+            BackendError::InvalidInput("packed SALT embedding shape overflows usize".into())
+        })?;
+        let segments = self.b.prepare_embed_segments(tokens, seq, vocab)?;
+        let d_tokens = self.b.dev_upload_i32(tokens)?;
+        let mut out = self.b.dev_alloc_zeros(out_len)?;
+        self.b
+            .training_salt_embed_forward(&weight.inner, &d_tokens, seq, &mut out)?;
+        let id = self.push_activation(out, out_len);
+        self.ops.push(DevOp::SaltEmbed {
+            master,
+            weight,
+            tokens: d_tokens,
             segments,
             seq,
             dim,
@@ -1773,6 +2058,25 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 )?;
                 output
             }
+            DevOp::SaltMatmul {
+                x,
+                master: _,
+                weight,
+                m,
+                n,
+                k: _,
+                out: _,
+            } => {
+                weight.ensure_prepared()?;
+                let mut output = self.b.dev_alloc_zeros(m * n)?;
+                self.b.training_salt_forward(
+                    self.value_slice(x)?,
+                    &weight.inner,
+                    m,
+                    &mut output,
+                )?;
+                output
+            }
             DevOp::Rmsnorm {
                 x,
                 w,
@@ -1835,6 +2139,22 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     seq,
                     dim,
                 )?;
+                output
+            }
+            DevOp::SaltEmbed {
+                master: _,
+                weight,
+                ref tokens,
+                segments: _,
+                seq,
+                dim,
+                vocab: _,
+                out: _,
+            } => {
+                weight.ensure_prepared()?;
+                let mut output = self.b.dev_alloc_zeros(seq * dim)?;
+                self.b
+                    .training_salt_embed_forward(&weight.inner, tokens, seq, &mut output)?;
                 output
             }
             DevOp::Rope {
@@ -2138,6 +2458,48 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                             &mut peak_persistent_grad_elements,
                         )?;
                     }
+                    DevOp::SaltMatmul {
+                        x,
+                        master,
+                        weight,
+                        m,
+                        n,
+                        k,
+                        out: _,
+                    } => {
+                        weight.ensure_prepared()?;
+                        let shape = GemmShape { m, n, k };
+                        let mut gx = self.b.dev_alloc_zeros(m * k)?;
+                        self.b
+                            .training_salt_grad_a(&grad_out, &weight.inner, m, &mut gx)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                        // Identity SALT STE: dQ/dMaster := I. The master VJP is
+                        // therefore the ordinary dense weight gradient X^T·gy;
+                        // no dense quantized weight is read or materialized.
+                        let mut gmaster = self.b.dev_alloc_zeros(n * k)?;
+                        self.b.grad_w_dev(
+                            &grad_out,
+                            self.value_slice(x)?,
+                            &self.ones,
+                            shape,
+                            &mut gmaster,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            master,
+                            &gmaster,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
                     DevOp::Rmsnorm {
                         x,
                         w,
@@ -2248,6 +2610,34 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                             &retain,
                             w,
                             &gw,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::SaltEmbed {
+                        master,
+                        weight: _,
+                        tokens: _,
+                        ref segments,
+                        seq,
+                        dim,
+                        vocab,
+                        out: _,
+                    } => {
+                        let mut gmaster = self.b.dev_alloc_zeros(vocab * dim)?;
+                        self.b.embed_gather_backward_segmented_prepared_dev(
+                            &grad_out,
+                            segments,
+                            &mut gmaster,
+                            seq,
+                            dim,
+                            vocab,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            master,
+                            &gmaster,
                             &mut live_elements,
                             &mut peak_persistent_grad_elements,
                         )?;
@@ -3240,6 +3630,213 @@ mod tests {
         ));
     }
 
+    fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs() / x.abs().max(y.abs()).max(1.0))
+            .fold(0.0f32, f32::max)
+    }
+
+    /// ADR 0027 Track D tape gate: one compact handle serves both tied embedding
+    /// gather and LM-head matmul, while their two identity-STE contributions
+    /// accumulate into one zero-storage latent-master leaf.
+    #[test]
+    fn packed_salt_tied_embed_head_matches_dense_oracle() {
+        use tritium_train::ops::{dense, embed};
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping packed_salt_tied_embed_head_matches_dense_oracle: {e}");
+                return;
+            }
+        };
+        let (seq, vocab) = (4usize, 5usize);
+        let tokens_i32 = [4i32, 0, 4, 2];
+        let tokens_u32 = [4u32, 0, 4, 2];
+
+        for dim in [7usize, 257, 576] {
+            let mut master = seeded_uniform(0xD000 + dim as u64, vocab * dim, -1.25, 1.25);
+            master[..dim].fill(0.0);
+            let seed = seeded_uniform(0xD100 + dim as u64, seq * vocab, -0.5, 0.5);
+            for planes in 1..=3 {
+                let packed =
+                    DevicePackedSaltWeight::from_host(&backend, &master, vocab, dim, planes)
+                        .unwrap();
+                assert_eq!(packed.rows(), vocab);
+                assert_eq!(packed.cols(), dim);
+                assert_eq!(packed.planes(), planes);
+                assert_eq!(
+                    packed.packed_bytes(),
+                    planes
+                        * vocab
+                        * dim.div_ceil(tritium_format::QK_K)
+                        * (tritium_format::QK_K / 4)
+                );
+                assert_eq!(
+                    packed.scale_bytes(),
+                    planes * vocab * core::mem::size_of::<f32>()
+                );
+                if dim >= tritium_format::QK_K {
+                    assert!(packed.resident_bytes() < master.len() * core::mem::size_of::<f32>());
+                }
+
+                let dense_w = ste::salt_quantize_forward(&master, vocab, dim, planes);
+                let want_emb = embed::gather_forward(&dense_w, &tokens_u32, dim);
+                let want_logits = dense::forward(&want_emb, &dense_w, seq, vocab, dim);
+                let dense_grads = dense::vjp(&want_emb, &dense_w, seq, vocab, dim, &seed);
+                let mut want_master = dense_grads[1].clone();
+                let embed_grad = embed::gather_vjp(vocab, &tokens_u32, dim, &dense_grads[0]);
+                for (dst, src) in want_master.iter_mut().zip(embed_grad) {
+                    *dst += src;
+                }
+
+                let mut tape = DeviceTape::new(&backend, vocab).unwrap();
+                let master_id = tape.gradient_leaf(vocab * dim).unwrap();
+                assert!(matches!(
+                    tape.vals[master_id],
+                    Some(DeviceValue::GradientOnly)
+                ));
+                let emb = tape.salt_embed(master_id, &packed, &tokens_i32).unwrap();
+                assert!(max_rel_diff(&tape.value(emb).unwrap(), &want_emb) < 1e-4);
+                let logits = tape.salt_matmul(emb, master_id, &packed, seq).unwrap();
+                assert!(max_rel_diff(&tape.value(logits).unwrap(), &want_logits) < 1e-4);
+                let d_seed = backend.dev_upload(&seed).unwrap();
+                let result = tape.backward_retain(logits, &d_seed, &[master_id]).unwrap();
+                let mut got_master = vec![0.0; vocab * dim];
+                backend
+                    .dev_download(result.grads[master_id].as_ref().unwrap(), &mut got_master)
+                    .unwrap();
+                assert!(
+                    max_rel_diff(&got_master, &want_master) < 1e-4,
+                    "tied master gradient T={planes} dim={dim}"
+                );
+            }
+        }
+    }
+
+    fn run_packed_checkpoint_graph(
+        backend: &CudaBackend,
+        packed: &DevicePackedSaltWeight,
+        tokens: &[i32],
+        policy: CheckpointPolicy,
+    ) -> (Vec<f32>, Vec<f32>, DeviceBackwardStats) {
+        let seq = tokens.len();
+        let mut tape =
+            DeviceTape::new_with_checkpoint_policy(backend, packed.rows(), policy).unwrap();
+        let master = tape.gradient_leaf(packed.rows() * packed.cols()).unwrap();
+        let emb = tape.salt_embed(master, packed, tokens).unwrap();
+        let hidden = tape.salt_matmul(emb, master, packed, seq).unwrap();
+        tape.checkpoint_keep(&[hidden]).unwrap();
+        let hidden = tape.silu(hidden).unwrap();
+        let logits = tape.salt_matmul(hidden, master, packed, seq).unwrap();
+        let output = tape.value(logits).unwrap();
+        let seed = seeded_uniform(0xD271, output.len(), -0.25, 0.25);
+        let d_seed = backend.dev_upload(&seed).unwrap();
+        let result = tape.backward_retain(logits, &d_seed, &[master]).unwrap();
+        let mut grad = vec![0.0; packed.rows() * packed.cols()];
+        backend
+            .dev_download(result.grads[master].as_ref().unwrap(), &mut grad)
+            .unwrap();
+        (output, grad, result.stats)
+    }
+
+    #[test]
+    fn packed_salt_ops_replay_through_checkpoint() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping packed_salt_ops_replay_through_checkpoint: {e}");
+                return;
+            }
+        };
+        // Square so the same tied handle can feed both consecutive matmuls;
+        // tail-block coverage lives in the dense-oracle gate above.
+        let (vocab, dim) = (5usize, 5usize);
+        let master = seeded_uniform(0xD270, vocab * dim, -1.0, 1.0);
+        let packed = DevicePackedSaltWeight::from_host(&backend, &master, vocab, dim, 3).unwrap();
+        let tokens = [4, 0, 4, 2];
+        let keep =
+            run_packed_checkpoint_graph(&backend, &packed, &tokens, CheckpointPolicy::KeepAll);
+        let replay = run_packed_checkpoint_graph(
+            &backend,
+            &packed,
+            &tokens,
+            CheckpointPolicy::EveryBlocks(1),
+        );
+        assert!(max_rel_diff(&keep.0, &replay.0) < 1e-6);
+        assert!(max_rel_diff(&keep.1, &replay.1) < 1e-6);
+        assert!(
+            replay.2.recomputed_ops >= 2,
+            "packed ops must replay: {:?}",
+            replay.2
+        );
+    }
+
+    #[test]
+    fn packed_salt_tape_validation_fails_closed() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping packed_salt_tape_validation_fails_closed: {e}");
+                return;
+            }
+        };
+        let mut packed = DevicePackedSaltWeight::from_host(&backend, &[0.5; 35], 5, 7, 2).unwrap();
+        assert!(matches!(
+            packed.repack_from_host(&backend, &[0.0; 34]),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+        assert!(!packed.is_prepared());
+        assert!(packed.repack_from_host(&backend, &[0.25; 35]).is_ok());
+
+        let mut tape = DeviceTape::new(&backend, 5).unwrap();
+        let data = tape.leaf(&[1.0; 7]).unwrap();
+        let wrong_master = tape.leaf(&[0.0; 35]).unwrap();
+        assert!(matches!(
+            tape.salt_matmul(data, wrong_master, &packed, 1),
+            Err(BackendError::InvalidInput(_))
+        ));
+        let short_master = tape.gradient_leaf(34).unwrap();
+        assert!(matches!(
+            tape.salt_matmul(data, short_master, &packed, 1),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+        let master = tape.gradient_leaf(35).unwrap();
+        assert!(matches!(
+            tape.value(master),
+            Err(BackendError::InvalidInput(message)) if message.contains("gradient-only")
+        ));
+        assert!(matches!(
+            tape.salt_embed(master, &packed, &[0, -1]),
+            Err(BackendError::InvalidInput(_))
+        ));
+        packed.mark_stale();
+        let mut tape = DeviceTape::new(&backend, 5).unwrap();
+        let master = tape.gradient_leaf(35).unwrap();
+        let data = tape.leaf(&[1.0; 7]).unwrap();
+        assert!(matches!(
+            tape.salt_matmul(data, master, &packed, 1),
+            Err(BackendError::InvalidInput(message)) if message.contains("stale")
+        ));
+        drop(tape);
+
+        // A second physical device, when present, must reject this device-0
+        // packed handle before launch. Single-GPU developer machines skip only
+        // this conditional branch; all other validation above remains active.
+        if let Ok(other) = CudaBackend::new(1) {
+            packed.repack_from_host(&backend, &[0.25; 35]).unwrap();
+            let mut tape = DeviceTape::new(&other, 5).unwrap();
+            let master = tape.gradient_leaf(35).unwrap();
+            let data = tape.leaf(&[1.0; 7]).unwrap();
+            assert!(matches!(
+                tape.salt_matmul(data, master, &packed, 1),
+                Err(BackendError::InvalidInput(message)) if message.contains("context")
+            ));
+        }
+    }
+
     /// ADR 0027 Track A exit seam: masters, quantized weights, optimizer
     /// moments, targets, and returned gradients remain resident for a complete
     /// training step.  The final master must match the CPU SALT + AdamW oracle.
@@ -3500,6 +4097,77 @@ mod tests {
             stats.largest_parameter_elements,
             stats.resident_input_gradient_elements
         );
+    }
+
+    #[test]
+    fn packed_salt_repack_tracks_host_offload_updates() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping packed_salt_repack_tracks_host_offload_updates: {e}");
+                return;
+            }
+        };
+        let (batch, rows, cols, planes) = (3usize, 5usize, 7usize, 2usize);
+        let input = seeded_uniform(0xD380, batch * cols, -1.0, 1.0);
+        let target = vec![1.0 / rows as f32; batch * rows];
+        let initial = seeded_uniform(0xD381, rows * cols, -1.25, 1.25);
+        let optimizer = AdamW {
+            lr: 0.03,
+            beta1: 0.8,
+            beta2: 0.9,
+            eps: 0.2,
+            weight_decay: 0.01,
+        };
+        let spec = DeviceTrainParam {
+            master: &initial,
+            rows,
+            cols,
+            salt_planes: planes,
+            optimizer,
+        };
+        let mut offload = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+        let mut packed =
+            DevicePackedSaltWeight::from_host(&backend, &initial, rows, cols, planes).unwrap();
+        let d_input = DeviceTensor::upload(&backend, &input).unwrap();
+        let d_target = DeviceTensor::upload(&backend, &target).unwrap();
+        let mut expected = initial.clone();
+        let mut expected_state = optimizer.init_state(expected.len());
+
+        for step in 1..=3u64 {
+            let dense_w = ste::salt_quantize_forward(&expected, rows, cols, planes);
+            let logits = matmul::forward(&input, &dense_w, &vec![1.0; rows], batch, rows, cols);
+            let g_logits = loss::softmax_xent_vjp(&logits, &target, batch, rows, &[1.0]).remove(0);
+            let grad = matmul::vjp(
+                &input,
+                &dense_w,
+                &vec![1.0; rows],
+                batch,
+                rows,
+                cols,
+                &g_logits,
+            )
+            .remove(1);
+            optimizer.step(step, &mut expected, &grad, &mut expected_state);
+
+            let grads = {
+                let mut tape = DeviceTape::new(&backend, rows).unwrap();
+                let x = tape.leaf_device(&d_input).unwrap();
+                let master = tape.gradient_leaf(rows * cols).unwrap();
+                let logits = tape.salt_matmul(x, master, &packed, batch).unwrap();
+                tape.xent_backward_device(logits, &d_target, batch, rows, &[master])
+                    .unwrap()
+            };
+            offload.step(grads, step).unwrap();
+            assert!(
+                max_abs_diff(offload.master(0).unwrap(), &expected) < 1e-5,
+                "offloaded master diverged at step {step}"
+            );
+            packed.mark_stale();
+            packed
+                .repack_from_host(&backend, offload.master(0).unwrap())
+                .unwrap();
+        }
     }
 
     #[test]

@@ -49,6 +49,18 @@ pub(crate) struct TrainingSaltLinear {
 
 #[allow(dead_code)] // accounting is load-bearing in the Track D GPU gate before tape wiring
 impl TrainingSaltLinear {
+    pub(crate) fn rows(&self) -> usize {
+        self.n
+    }
+
+    pub(crate) fn cols(&self) -> usize {
+        self.k
+    }
+
+    pub(crate) fn planes(&self) -> usize {
+        self.planes
+    }
+
     /// Compact 2-bit code payload bytes, excluding external scales.
     pub(crate) fn packed_bytes(&self) -> usize {
         self.codes.len()
@@ -200,6 +212,8 @@ pub struct CudaBackend {
     pub(super) func_salt_training_forward: CudaFunction,
     #[allow(dead_code)]
     pub(super) func_salt_training_grad_a: CudaFunction,
+    #[allow(dead_code)]
+    pub(super) func_salt_training_embed: CudaFunction,
     /// plan 0043 P2.2 device-resident glue: elementwise silu/mul/add fwd/bwd + grad accumulate.
     pub(super) func_silu_fwd: CudaFunction,
     pub(super) func_silu_bwd: CudaFunction,
@@ -375,6 +389,10 @@ impl CudaBackend {
         let func_salt_training_grad_a = grad_module
             .load_function(KERNEL_NAME_SALT_TRAINING_GRAD_A)
             .map_err(|e| driver_err("resolve salt_training_grad_a kernel", &e))?;
+        let func_salt_training_embed =
+            grad_module
+                .load_function(KERNEL_NAME_SALT_TRAINING_EMBED)
+                .map_err(|e| driver_err("resolve salt_training_embed_gather kernel", &e))?;
         // P2.2 device-resident glue ops (same `--fmad=false` train_grad.ptx module).
         let func_silu_fwd = grad_module
             .load_function(KERNEL_NAME_SILU_FWD)
@@ -494,6 +512,7 @@ impl CudaBackend {
             func_salt_pack_training,
             func_salt_training_forward,
             func_salt_training_grad_a,
+            func_salt_training_embed,
             func_silu_fwd,
             func_silu_bwd,
             func_ew_mul_fwd,
@@ -1212,6 +1231,65 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(ga_len))
                 .map_err(|e| driver_err("launch salt_training_grad_a", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Gather token rows directly from compact training SALT planes. Token ids
+    /// must already have been host-validated against `weight.rows()`; the
+    /// kernel retains a defensive bounds guard before any packed-row read.
+    ///
+    /// # Errors
+    /// Shape/context violations and device launch failures are typed errors.
+    pub(crate) fn training_salt_embed_forward(
+        &self,
+        weight: &TrainingSaltLinear,
+        d_tokens: &CudaSlice<i32>,
+        seq: usize,
+        d_out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        Self::check_grad_launch_bounds(seq, weight.n, weight.k)?;
+        self.validate_training_salt(weight)?;
+        if !self.same_context(d_tokens) || !self.same_context(d_out) {
+            return Err(BackendError::InvalidInput(
+                "SALT embedding buffer belongs to a different CUDA context".into(),
+            ));
+        }
+        let out_len = seq.checked_mul(weight.k).ok_or_else(|| {
+            BackendError::InvalidInput("SALT embedding shape overflows usize".into())
+        })?;
+        if d_tokens.len() < seq || d_out.len() < out_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: if d_tokens.len() < seq { seq } else { out_len },
+                got: if d_tokens.len() < seq {
+                    d_tokens.len()
+                } else {
+                    d_out.len()
+                },
+            });
+        }
+        if out_len == 0 {
+            return Ok(());
+        }
+        let (seq_i, vocab_i, dim_i, planes_i, row_bytes_i) = weight.kernel_dims(seq)?;
+        let mut launch = self.stream.launch_builder(&self.func_salt_training_embed);
+        launch
+            .arg(&weight.codes)
+            .arg(&weight.scales)
+            .arg(d_tokens)
+            .arg(d_out)
+            .arg(&seq_i)
+            .arg(&vocab_i)
+            .arg(&dim_i)
+            .arg(&planes_i)
+            .arg(&row_bytes_i);
+        // SAFETY: validated buffers cover the packed handle, seq token ids and
+        // seq*dim outputs; the kernel guards each token before row addressing.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(out_len))
+                .map_err(|e| driver_err("launch salt_training_embed_gather", &e))?;
         }
         Ok(())
     }
