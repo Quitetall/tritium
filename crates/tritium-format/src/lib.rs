@@ -138,13 +138,13 @@ pub enum FormatError {
     SaltTooManyPlanes(usize),
     /// A [`SaltRow`]'s `k` did not fit the sidecar's `u32` length field.
     SaltRowTooLong(usize),
-    /// Sparse plane indices were duplicated or not strictly increasing.
     /// A progressive SALT row used an unknown plane representation tag.
     SaltInvalidPlaneTag(u8),
     /// A progressive SALT row attempted to store its base plane sparsely.
     SaltSparseBasePlane,
     /// Sparse residual density threshold was non-finite or outside `[0, 1]`.
     InvalidSparseDensity,
+    /// Sparse plane indices were duplicated or not strictly increasing.
     SaltNonCanonicalSparseIndices,
     /// A partial dense TQ2_0 block had non-zero trits beyond the logical row length.
     SaltNonZeroPadding,
@@ -220,7 +220,6 @@ impl fmt::Display for FormatError {
                     "SALT sidecar: row length {k} exceeds the u32 length field"
                 )
             }
-            FormatError::SaltNonCanonicalSparseIndices => {
             FormatError::SaltInvalidPlaneTag(tag) => {
                 write!(f, "SALT sidecar: invalid plane representation tag {tag}")
             }
@@ -233,6 +232,7 @@ impl fmt::Display for FormatError {
                     "SALT sidecar: sparse density must be finite and in [0, 1]"
                 )
             }
+            FormatError::SaltNonCanonicalSparseIndices => {
                 write!(
                     f,
                     "SALT sidecar: sparse indices must be strictly increasing"
