@@ -4,9 +4,9 @@
 //! reuse the one validated forward instead of copying it.
 
 use tritium_nn::{Mlp, ModelRunner, Projection};
-use tritium_train::Tape;
 use tritium_train::nn::attention;
 use tritium_train::tape::ValueId;
+use tritium_train::Tape;
 
 /// Dims + fp 1D norms for the tape forward (the parts held fp, not quantized/trained).
 pub struct Arch {
@@ -116,24 +116,52 @@ pub fn forward(t: &mut Tape, wids: &[ValueId], a: &Arch, tokens: &[u32]) -> Valu
 /// downloaded grads straight back to the master weights). The op sequence is identical to
 /// [`forward`], so the device tape reproduces it within 1e-4.
 #[cfg(feature = "cuda")]
-pub fn device_forward(
-    dt: &mut tritium_cuda::train::DeviceTape<'_>,
+pub fn device_forward<'backend, 'leaf>(
+    dt: &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
     a: &Arch,
     weights: &[Vec<f32>],
     tokens_i32: &[i32],
     seq: usize,
 ) -> (usize, Vec<usize>) {
-    let embd = dt.leaf(&weights[0]).unwrap();
+    device_forward_with(dt, a, tokens_i32, seq, |dt, index| {
+        dt.leaf(&weights[index]).unwrap()
+    })
+}
+
+/// The zero-copy variant of [`device_forward`]: each trainable weight is an
+/// already-resident tensor borrowed from `DeviceTrainer`.
+#[cfg(feature = "cuda")]
+pub fn device_forward_resident<'backend, 'leaf>(
+    dt: &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
+    a: &Arch,
+    weights: &[&'leaf tritium_cuda::train::DeviceTensor],
+    tokens_i32: &[i32],
+    seq: usize,
+) -> (usize, Vec<usize>) {
+    device_forward_with(dt, a, tokens_i32, seq, |dt, index| {
+        dt.leaf_device(weights[index]).unwrap()
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn device_forward_with<'backend, 'leaf>(
+    dt: &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
+    a: &Arch,
+    tokens_i32: &[i32],
+    seq: usize,
+    mut weight_leaf: impl FnMut(&mut tritium_cuda::train::DeviceTape<'backend, 'leaf>, usize) -> usize,
+) -> (usize, Vec<usize>) {
+    let embd = weight_leaf(dt, 0);
     let mut wids = vec![embd];
     let mut hidden = dt.embed(embd, tokens_i32, seq, a.n_embd, a.vocab).unwrap();
     for li in 0..a.n_layers {
         let base = 1 + 7 * li;
         let an = dt.leaf(&a.attn_norms[li]).unwrap();
         let xn = dt.rmsnorm(hidden, an, seq, a.n_embd, a.eps).unwrap();
-        let wq = dt.leaf(&weights[base]).unwrap();
-        let wk = dt.leaf(&weights[base + 1]).unwrap();
-        let wv = dt.leaf(&weights[base + 2]).unwrap();
-        let wo = dt.leaf(&weights[base + 3]).unwrap();
+        let wq = weight_leaf(dt, base);
+        let wk = weight_leaf(dt, base + 1);
+        let wv = weight_leaf(dt, base + 2);
+        let wo = weight_leaf(dt, base + 3);
         let attn = dt
             .attention(
                 xn,
@@ -152,9 +180,9 @@ pub fn device_forward(
         hidden = dt.add(hidden, attn).unwrap();
         let fnw = dt.leaf(&a.ffn_norms[li]).unwrap();
         let hn = dt.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps).unwrap();
-        let wg = dt.leaf(&weights[base + 4]).unwrap();
-        let wu = dt.leaf(&weights[base + 5]).unwrap();
-        let wd = dt.leaf(&weights[base + 6]).unwrap();
+        let wg = weight_leaf(dt, base + 4);
+        let wu = weight_leaf(dt, base + 5);
+        let wd = weight_leaf(dt, base + 6);
         let g = dt.matmul(hn, wg, seq, a.ff, a.n_embd).unwrap();
         let u = dt.matmul(hn, wu, seq, a.ff, a.n_embd).unwrap();
         let ga = dt.silu(g).unwrap();

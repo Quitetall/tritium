@@ -214,8 +214,8 @@ fn salt_distillation_device_tape_recovers_heldout() {
     use std::time::Instant;
 
     use common::device_forward;
-    use tritium_cuda::CudaBackend;
     use tritium_cuda::train::DeviceTape;
+    use tritium_cuda::CudaBackend;
 
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {
@@ -306,5 +306,132 @@ fn salt_distillation_device_tape_recovers_heldout() {
     assert!(
         ppl_distilled < 0.5 * ppl_ptq,
         "device distillation must recover held-out ppl vs PTQ: {ppl_distilled:.3} vs {ppl_ptq:.3e}"
+    );
+}
+
+/// ADR 0027 Track A exit gate: the student master's SALT reconstruction,
+/// forward/backward gradients, and AdamW state remain in VRAM for every step.
+/// Only teacher probabilities and token ids cross the host boundary.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "slow resident-trainer distillation; needs SmolLM2-135M + CUDA; run explicitly"]
+fn salt_distillation_device_trainer_recovers_heldout() {
+    use std::time::Instant;
+
+    use common::{device_forward, device_forward_resident};
+    use tritium_cuda::train::{DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer};
+    use tritium_cuda::CudaBackend;
+
+    const TRACK0_STEP_MS: f64 = 1123.0;
+
+    let dir = model_dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: {} absent", dir.display());
+        return;
+    }
+    let steps: u64 = std::env::var("TRITIUM_DISTILL_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(STEPS);
+    let runner =
+        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+    let (a, fp, shapes) = extract(&runner);
+    let (mut train_ids, eval_ids) = corpus();
+    if let Some(n) = std::env::var("TRITIUM_TRAIN_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        train_ids.truncate(n);
+    }
+    let windows: Vec<&[u32]> = train_ids.chunks_exact(TRAIN_SEQ).collect();
+    assert!(!windows.is_empty(), "train corpus shorter than one window");
+
+    let backend = CudaBackend::new(0).expect("open CUDA device");
+    let ppl_fp = perplexity(&logits_of(&fp, &a, &eval_ids), &eval_ids, a.vocab);
+    let ptq: Vec<Vec<f32>> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
+        .collect();
+    let ppl_ptq = perplexity(&logits_of(&ptq, &a, &eval_ids), &eval_ids, a.vocab);
+
+    let opt = AdamW::new(LR);
+    let specs: Vec<_> = fp
+        .iter()
+        .zip(&shapes)
+        .map(|(master, &(rows, cols))| DeviceTrainParam {
+            master,
+            rows,
+            cols,
+            salt_planes: T,
+            optimizer: opt,
+        })
+        .collect();
+    let mut trainer = DeviceTrainer::new(&backend, &specs).expect("upload resident state");
+
+    let mut step_ms = 0.0f64;
+    for step in 1..=steps {
+        let t0 = Instant::now();
+        let wi = ((step - 1) as usize) % windows.len();
+        let toks = windows[wi];
+        let tokens_i32: Vec<i32> = toks.iter().map(|&t| t as i32).collect();
+
+        // The fp teacher is unchanged from Track 0, keeping the before/after
+        // timing comparison scoped to the student training-state path.
+        let tprobs = {
+            let mut tape = DeviceTape::new(&backend, a.vocab).unwrap();
+            let (logits, _) = device_forward(&mut tape, &a, &fp, &tokens_i32, TRAIN_SEQ);
+            row_softmax(&tape.value(logits).unwrap(), a.vocab)
+        };
+        let target = DeviceTensor::upload(&backend, &tprobs).unwrap();
+
+        trainer.prepare_quantized().unwrap();
+        let resident: Vec<_> = (0..fp.len())
+            .map(|i| trainer.quantized(i).unwrap())
+            .collect();
+        let grads = {
+            let mut tape = DeviceTape::new(&backend, a.vocab).unwrap();
+            let (logits, wids) =
+                device_forward_resident(&mut tape, &a, &resident, &tokens_i32, TRAIN_SEQ);
+            tape.xent_backward_device(logits, &target, TRAIN_SEQ, a.vocab, &wids)
+                .unwrap()
+        };
+        drop(resident);
+        trainer.step(grads, step).unwrap();
+
+        step_ms += t0.elapsed().as_secs_f64() * 1e3;
+        if step % 10 == 0 || step == 1 {
+            eprintln!("  resident step {step}/{steps} (win {wi})");
+        }
+    }
+
+    let lat: Vec<Vec<f32>> = (0..fp.len())
+        .map(|i| trainer.download_master(i).unwrap())
+        .collect();
+    let distilled: Vec<Vec<f32>> = lat
+        .iter()
+        .zip(&shapes)
+        .map(|(wf, &(n, k))| ste::salt_quantize_forward(wf, n, k, T))
+        .collect();
+    let ppl_distilled = perplexity(&logits_of(&distilled, &a, &eval_ids), &eval_ids, a.vocab);
+    let recovery = ppl_ptq / ppl_distilled;
+    let mean_ms = step_ms / steps as f64;
+    let host_mib =
+        (2 * TRAIN_SEQ * a.vocab * std::mem::size_of::<f32>()) as f64 / (1024.0 * 1024.0);
+    println!(
+        "0027 A RESIDENT SALT distillation (T={T}, {steps} steps): fp ppl {ppl_fp:.3} | \
+         PTQ ppl {ppl_ptq:.3e} | distilled ppl {ppl_distilled:.3} | recovers {recovery:.0}x. \
+         Mean step {mean_ms:.0}ms vs Track-0 {TRACK0_STEP_MS:.0}ms; student parameter path 100% \
+         device-resident, remaining teacher probability traffic {host_mib:.1} MiB/step."
+    );
+
+    assert!(ppl_ptq > ppl_fp, "PTQ must degrade held-out ppl");
+    assert!(
+        recovery >= 900.0,
+        "resident trainer recovered only {recovery:.0}x vs PTQ (expected about 960x)"
+    );
+    assert!(
+        mean_ms < TRACK0_STEP_MS,
+        "resident mean step {mean_ms:.0}ms did not beat Track-0 {TRACK0_STEP_MS:.0}ms"
     );
 }

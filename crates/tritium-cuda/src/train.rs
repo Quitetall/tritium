@@ -521,21 +521,272 @@ enum DevOp {
     },
 }
 
+/// An opaque f32 tensor owned by one CUDA context.
+///
+/// The allocation can be borrowed by [`DeviceTape::leaf_device`] without a
+/// device-to-device copy.  Its contents remain private so callers cannot mix
+/// contexts or mutate a tensor while a tape borrows it.
+pub struct DeviceTensor {
+    buf: CudaSlice<f32>,
+}
+
+impl core::fmt::Debug for DeviceTensor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceTensor")
+            .field("len", &self.buf.len())
+            .field("device", &self.buf.ordinal())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeviceTensor {
+    /// Upload one tensor into `backend`'s CUDA context.
+    pub fn upload(backend: &CudaBackend, host: &[f32]) -> Result<Self, BackendError> {
+        Ok(Self {
+            buf: backend.dev_upload(host)?,
+        })
+    }
+
+    /// Number of f32 elements in this tensor.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Whether this tensor has no elements.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Copy this tensor to host memory for evaluation or checkpointing.
+    pub fn download(&self, backend: &CudaBackend) -> Result<Vec<f32>, BackendError> {
+        if !backend.same_context(&self.buf) {
+            return Err(BackendError::InvalidInput(
+                "device tensor belongs to a different CUDA context".into(),
+            ));
+        }
+        let mut host = vec![0.0; self.buf.len()];
+        backend.dev_download(&self.buf, &mut host)?;
+        Ok(host)
+    }
+}
+
+enum DeviceValue<'a> {
+    Owned(CudaSlice<f32>),
+    Borrowed(&'a CudaSlice<f32>),
+}
+
+impl DeviceValue<'_> {
+    fn as_slice(&self) -> &CudaSlice<f32> {
+        match self {
+            Self::Owned(buf) => buf,
+            Self::Borrowed(buf) => buf,
+        }
+    }
+}
+
+/// Device-resident gradients returned in the exact order requested from
+/// [`DeviceTape::xent_backward_device`].
+pub struct DeviceGradients {
+    bufs: Vec<CudaSlice<f32>>,
+}
+
+impl core::fmt::Debug for DeviceGradients {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceGradients")
+            .field("count", &self.bufs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeviceGradients {
+    /// Number of requested gradient tensors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bufs.len()
+    }
+
+    /// Whether no gradients were requested.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bufs.is_empty()
+    }
+
+    /// Download one gradient for validation or diagnostics.
+    pub fn download(&self, backend: &CudaBackend, index: usize) -> Result<Vec<f32>, BackendError> {
+        let buf = self.bufs.get(index).ok_or_else(|| {
+            BackendError::InvalidInput(format!("gradient index {index} is out of range"))
+        })?;
+        if !backend.same_context(buf) {
+            return Err(BackendError::InvalidInput(
+                "device gradient belongs to a different CUDA context".into(),
+            ));
+        }
+        let mut host = vec![0.0; buf.len()];
+        backend.dev_download(buf, &mut host)?;
+        Ok(host)
+    }
+}
+
+/// Host description of one trainable SALT weight uploaded into a
+/// [`DeviceTrainer`].
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceTrainParam<'a> {
+    /// Initial latent f32 master.
+    pub master: &'a [f32],
+    /// Matrix geometry (`master.len() == rows * cols`).
+    pub rows: usize,
+    pub cols: usize,
+    /// Number of residual ternary planes (`1..=3`).
+    pub salt_planes: usize,
+    /// Per-parameter AdamW configuration.
+    pub optimizer: AdamW,
+}
+
+struct ResidentTrainParam {
+    master: DeviceTensor,
+    residual: CudaSlice<f32>,
+    quantized: DeviceTensor,
+    m: CudaSlice<f32>,
+    v: CudaSlice<f32>,
+    rows: usize,
+    cols: usize,
+    salt_planes: usize,
+    optimizer: AdamW,
+}
+
+/// Owns latent masters, SALT reconstructions, and AdamW moments in VRAM across
+/// training steps.  The autograd graph remains the separate [`DeviceTape`].
+pub struct DeviceTrainer<'a> {
+    backend: &'a CudaBackend,
+    params: Vec<ResidentTrainParam>,
+}
+
+impl core::fmt::Debug for DeviceTrainer<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceTrainer")
+            .field("parameter_count", &self.params.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> DeviceTrainer<'a> {
+    /// Upload all masters once and allocate resident quantized and optimizer
+    /// state buffers.
+    pub fn new(
+        backend: &'a CudaBackend,
+        params: &[DeviceTrainParam<'_>],
+    ) -> Result<Self, BackendError> {
+        let mut resident = Vec::with_capacity(params.len());
+        for (index, param) in params.iter().enumerate() {
+            let len = param.rows.checked_mul(param.cols).ok_or_else(|| {
+                BackendError::InvalidInput(format!("parameter {index} shape overflows usize"))
+            })?;
+            if param.master.len() != len {
+                return Err(BackendError::ShapeMismatch {
+                    expected: len,
+                    got: param.master.len(),
+                });
+            }
+            if !(1..=3).contains(&param.salt_planes) {
+                return Err(BackendError::InvalidInput(format!(
+                    "parameter {index} SALT planes must be in 1..=3"
+                )));
+            }
+            resident.push(ResidentTrainParam {
+                master: DeviceTensor::upload(backend, param.master)?,
+                residual: backend.dev_alloc_zeros(len)?,
+                quantized: DeviceTensor {
+                    buf: backend.dev_alloc_zeros(len)?,
+                },
+                m: backend.dev_alloc_zeros(len)?,
+                v: backend.dev_alloc_zeros(len)?,
+                rows: param.rows,
+                cols: param.cols,
+                salt_planes: param.salt_planes,
+                optimizer: param.optimizer,
+            });
+        }
+        Ok(Self {
+            backend,
+            params: resident,
+        })
+    }
+
+    /// Reconstruct every resident master into its dense f32 SALT tensor.
+    pub fn prepare_quantized(&mut self) -> Result<(), BackendError> {
+        for param in &mut self.params {
+            self.backend.salt_quantize_forward_dev(
+                &param.master.buf,
+                &mut param.residual,
+                &mut param.quantized.buf,
+                param.rows,
+                param.cols,
+                param.salt_planes,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Borrow a prepared quantized weight for zero-copy insertion into a tape.
+    pub fn quantized(&self, index: usize) -> Result<&DeviceTensor, BackendError> {
+        self.params.get(index).map(|p| &p.quantized).ok_or_else(|| {
+            BackendError::InvalidInput(format!("parameter index {index} is out of range"))
+        })
+    }
+
+    /// Apply one 1-based resident AdamW step. Gradients must be in parameter
+    /// order, as returned by requesting weight leaf ids in that order.
+    pub fn step(&mut self, grads: DeviceGradients, step: u64) -> Result<(), BackendError> {
+        if grads.bufs.len() != self.params.len() {
+            return Err(BackendError::ShapeMismatch {
+                expected: self.params.len(),
+                got: grads.bufs.len(),
+            });
+        }
+        for (param, grad) in self.params.iter_mut().zip(grads.bufs) {
+            if !self.backend.same_context(&grad) {
+                return Err(BackendError::InvalidInput(
+                    "device gradient belongs to a different CUDA context".into(),
+                ));
+            }
+            self.backend.adamw_step_dev(
+                &mut param.master.buf,
+                &grad,
+                &mut param.m,
+                &mut param.v,
+                step,
+                &param.optimizer,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Download one latent master for evaluation or checkpointing.
+    pub fn download_master(&self, index: usize) -> Result<Vec<f32>, BackendError> {
+        let param = self.params.get(index).ok_or_else(|| {
+            BackendError::InvalidInput(format!("parameter index {index} is out of range"))
+        })?;
+        param.master.download(self.backend)
+    }
+}
+
 /// A device-resident autograd tape (plan 0043 P2.5): the GPU analogue of [`tritium_train::Tape`].
 /// Every activation and gradient lives in VRAM across the whole fwd+bwd step — leaves upload once,
 /// results download once, and the recorded ops chain the resident kernels ([`super`]'s `*_dev`
 /// methods) with no host round-trips. Forward ops append a device buffer to `vals` and record a
 /// [`DevOp`]; [`backward`](Self::backward) replays them in reverse, accumulating grads on-device.
 /// A `dense_matmul` uses `s = ones`; the shared `ones` buffer is sized once at construction.
-pub struct DeviceTape<'a> {
-    b: &'a CudaBackend,
-    vals: Vec<CudaSlice<f32>>,
+pub struct DeviceTape<'backend, 'leaf> {
+    b: &'backend CudaBackend,
+    vals: Vec<DeviceValue<'leaf>>,
     lens: Vec<usize>,
     ops: Vec<DevOp>,
     ones: CudaSlice<f32>,
 }
 
-impl core::fmt::Debug for DeviceTape<'_> {
+impl core::fmt::Debug for DeviceTape<'_, '_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DeviceTape")
             .field("n_values", &self.vals.len())
@@ -544,10 +795,10 @@ impl core::fmt::Debug for DeviceTape<'_> {
     }
 }
 
-impl<'a> DeviceTape<'a> {
+impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     /// New empty tape on `b`. `ones_max` must be ≥ the largest matmul output width `n` used (the
     /// per-row unit scale buffer is allocated once to this size).
-    pub fn new(b: &'a CudaBackend, ones_max: usize) -> Result<Self, BackendError> {
+    pub fn new(b: &'backend CudaBackend, ones_max: usize) -> Result<Self, BackendError> {
         let ones = b.dev_upload(&vec![1.0f32; ones_max.max(1)])?;
         Ok(Self {
             b,
@@ -560,7 +811,7 @@ impl<'a> DeviceTape<'a> {
 
     fn push(&mut self, buf: CudaSlice<f32>, len: usize) -> usize {
         let id = self.vals.len();
-        self.vals.push(buf);
+        self.vals.push(DeviceValue::Owned(buf));
         self.lens.push(len);
         id
     }
@@ -571,10 +822,24 @@ impl<'a> DeviceTape<'a> {
         Ok(self.push(buf, host.len()))
     }
 
+    /// Borrow an existing resident tensor as a leaf without allocating or
+    /// copying it. The tensor must belong to this tape's CUDA context.
+    pub fn leaf_device(&mut self, tensor: &'leaf DeviceTensor) -> Result<usize, BackendError> {
+        if !self.b.same_context(&tensor.buf) {
+            return Err(BackendError::InvalidInput(
+                "device tensor belongs to a different CUDA context".into(),
+            ));
+        }
+        let id = self.vals.len();
+        self.vals.push(DeviceValue::Borrowed(&tensor.buf));
+        self.lens.push(tensor.buf.len());
+        Ok(id)
+    }
+
     /// Download a value (e.g. the logits) to host.
     pub fn value(&self, id: usize) -> Result<Vec<f32>, BackendError> {
         let mut h = vec![0.0f32; self.lens[id]];
-        self.b.dev_download(&self.vals[id], &mut h)?;
+        self.b.dev_download(self.vals[id].as_slice(), &mut h)?;
         Ok(h)
     }
 
@@ -588,10 +853,20 @@ impl<'a> DeviceTape<'a> {
         cols: usize,
     ) -> Result<CudaSlice<f32>, BackendError> {
         let d_target = self.b.dev_upload(target)?;
+        self.softmax_xent_grad_device(logits, &d_target, rows, cols)
+    }
+
+    fn softmax_xent_grad_device(
+        &self,
+        logits: usize,
+        target: &CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<CudaSlice<f32>, BackendError> {
         let mut g = self.b.dev_alloc_zeros(rows * cols)?;
         self.b.softmax_xent_backward_dev(
-            &self.vals[logits],
-            &d_target,
+            self.vals[logits].as_slice(),
+            target,
             &mut g,
             rows,
             cols,
@@ -611,8 +886,8 @@ impl<'a> DeviceTape<'a> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(m * n)?;
         self.b.matmul_forward_dev(
-            &self.vals[x],
-            &self.vals[w],
+            self.vals[x].as_slice(),
+            self.vals[w].as_slice(),
             &self.ones,
             GemmShape { m, n, k },
             &mut out,
@@ -638,8 +913,14 @@ impl<'a> DeviceTape<'a> {
         eps: f32,
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * cols)?;
-        self.b
-            .rmsnorm_forward_dev(&self.vals[x], &self.vals[w], &mut out, rows, cols, eps)?;
+        self.b.rmsnorm_forward_dev(
+            self.vals[x].as_slice(),
+            self.vals[w].as_slice(),
+            &mut out,
+            rows,
+            cols,
+            eps,
+        )?;
         let id = self.push(out, rows * cols);
         self.ops.push(DevOp::Rmsnorm {
             x,
@@ -655,7 +936,8 @@ impl<'a> DeviceTape<'a> {
     pub fn silu(&mut self, x: usize) -> Result<usize, BackendError> {
         let n = self.lens[x];
         let mut out = self.b.dev_alloc_zeros(n)?;
-        self.b.silu_forward_dev(&self.vals[x], &mut out, n)?;
+        self.b
+            .silu_forward_dev(self.vals[x].as_slice(), &mut out, n)?;
         let id = self.push(out, n);
         self.ops.push(DevOp::Silu { x, n, out: id });
         Ok(id)
@@ -668,8 +950,12 @@ impl<'a> DeviceTape<'a> {
         );
         let n = self.lens[a];
         let mut out = self.b.dev_alloc_zeros(n)?;
-        self.b
-            .ew_mul_forward_dev(&self.vals[a], &self.vals[b], &mut out, n)?;
+        self.b.ew_mul_forward_dev(
+            self.vals[a].as_slice(),
+            self.vals[b].as_slice(),
+            &mut out,
+            n,
+        )?;
         let id = self.push(out, n);
         self.ops.push(DevOp::Mul { a, b, n, out: id });
         Ok(id)
@@ -682,8 +968,12 @@ impl<'a> DeviceTape<'a> {
         );
         let n = self.lens[a];
         let mut out = self.b.dev_alloc_zeros(n)?;
-        self.b
-            .ew_add_forward_dev(&self.vals[a], &self.vals[b], &mut out, n)?;
+        self.b.ew_add_forward_dev(
+            self.vals[a].as_slice(),
+            self.vals[b].as_slice(),
+            &mut out,
+            n,
+        )?;
         let id = self.push(out, n);
         self.ops.push(DevOp::Add { a, b, n, out: id });
         Ok(id)
@@ -701,7 +991,7 @@ impl<'a> DeviceTape<'a> {
         let d_tok = self.b.dev_upload_i32(tokens)?;
         let mut out = self.b.dev_alloc_zeros(seq * dim)?;
         self.b
-            .embed_gather_forward_dev(&self.vals[w], &d_tok, &mut out, seq, dim)?;
+            .embed_gather_forward_dev(self.vals[w].as_slice(), &d_tok, &mut out, seq, dim)?;
         let id = self.push(out, seq * dim);
         self.ops.push(DevOp::Embed {
             w,
@@ -728,7 +1018,7 @@ impl<'a> DeviceTape<'a> {
         let pos = self.b.dev_upload_i32(positions)?;
         let mut out = self.b.dev_alloc_zeros(n)?;
         self.b.rope_apply_dev(
-            &self.vals[x],
+            self.vals[x].as_slice(),
             &mut out,
             &pos,
             n_head,
@@ -761,7 +1051,7 @@ impl<'a> DeviceTape<'a> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * len)?;
         self.b
-            .slice_cols_forward_dev(&self.vals[x], &mut out, rows, cols, start, len)?;
+            .slice_cols_forward_dev(self.vals[x].as_slice(), &mut out, rows, cols, start, len)?;
         let id = self.push(out, rows * len);
         self.ops.push(DevOp::SliceCols {
             x,
@@ -778,7 +1068,8 @@ impl<'a> DeviceTape<'a> {
     pub(crate) fn scale_const(&mut self, x: usize, c: f32) -> Result<usize, BackendError> {
         let n = self.lens[x];
         let mut out = self.b.dev_alloc_zeros(n)?;
-        self.b.scale_const_dev(&self.vals[x], &mut out, c, n)?;
+        self.b
+            .scale_const_dev(self.vals[x].as_slice(), &mut out, c, n)?;
         let id = self.push(out, n);
         self.ops.push(DevOp::ScaleConst { x, c, n, out: id });
         Ok(id)
@@ -793,7 +1084,7 @@ impl<'a> DeviceTape<'a> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * cols)?;
         self.b
-            .causal_mask_forward_dev(&self.vals[x], &mut out, rows, cols)?;
+            .causal_mask_forward_dev(self.vals[x].as_slice(), &mut out, rows, cols)?;
         let id = self.push(out, rows * cols);
         self.ops.push(DevOp::CausalMask {
             x,
@@ -813,7 +1104,7 @@ impl<'a> DeviceTape<'a> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * cols)?;
         self.b
-            .softmax_forward_dev(&self.vals[x], &mut out, rows, cols)?;
+            .softmax_forward_dev(self.vals[x].as_slice(), &mut out, rows, cols)?;
         let id = self.push(out, rows * cols);
         self.ops.push(DevOp::Softmax {
             x,
@@ -833,7 +1124,7 @@ impl<'a> DeviceTape<'a> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * cols)?;
         self.b
-            .transpose_forward_dev(&self.vals[x], &mut out, rows, cols)?;
+            .transpose_forward_dev(self.vals[x].as_slice(), &mut out, rows, cols)?;
         let id = self.push(out, rows * cols);
         self.ops.push(DevOp::Transpose {
             x,
@@ -856,7 +1147,7 @@ impl<'a> DeviceTape<'a> {
         let mut off = 0;
         for (&p, &len) in parts.iter().zip(lens) {
             self.b
-                .copy_into_cols_dev(&self.vals[p], &mut out, rows, total, off, len)?;
+                .copy_into_cols_dev(self.vals[p].as_slice(), &mut out, rows, total, off, len)?;
             off += len;
         }
         let id = self.push(out, rows * total);
@@ -934,12 +1225,22 @@ impl<'a> DeviceTape<'a> {
                 DevOp::Matmul { x, w, m, n, k, out } => {
                     let shape = GemmShape { m, n, k };
                     let mut gx = self.b.dev_alloc_zeros(m * k)?;
-                    self.b
-                        .grad_a_dev(&grads[out], &self.vals[w], &self.ones, shape, &mut gx)?;
+                    self.b.grad_a_dev(
+                        &grads[out],
+                        self.vals[w].as_slice(),
+                        &self.ones,
+                        shape,
+                        &mut gx,
+                    )?;
                     self.b.accumulate_dev(&mut grads[x], &gx, m * k)?;
                     let mut gw = self.b.dev_alloc_zeros(n * k)?;
-                    self.b
-                        .grad_w_dev(&grads[out], &self.vals[x], &self.ones, shape, &mut gw)?;
+                    self.b.grad_w_dev(
+                        &grads[out],
+                        self.vals[x].as_slice(),
+                        &self.ones,
+                        shape,
+                        &mut gw,
+                    )?;
                     self.b.accumulate_dev(&mut grads[w], &gw, n * k)?;
                 }
                 DevOp::Rmsnorm {
@@ -953,8 +1254,8 @@ impl<'a> DeviceTape<'a> {
                     let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
                     let mut gw = self.b.dev_alloc_zeros(cols)?;
                     self.b.rmsnorm_backward_dev(
-                        &self.vals[x],
-                        &self.vals[w],
+                        self.vals[x].as_slice(),
+                        self.vals[w].as_slice(),
                         &grads[out],
                         &mut gx,
                         &mut gw,
@@ -968,17 +1269,17 @@ impl<'a> DeviceTape<'a> {
                 DevOp::Silu { x, n, out } => {
                     let mut gx = self.b.dev_alloc_zeros(n)?;
                     self.b
-                        .silu_backward_dev(&self.vals[x], &grads[out], &mut gx, n)?;
+                        .silu_backward_dev(self.vals[x].as_slice(), &grads[out], &mut gx, n)?;
                     self.b.accumulate_dev(&mut grads[x], &gx, n)?;
                 }
                 DevOp::Mul { a, b, n, out } => {
                     let mut ga = self.b.dev_alloc_zeros(n)?;
                     self.b
-                        .ew_mul_backward_dev(&grads[out], &self.vals[b], &mut ga, n)?;
+                        .ew_mul_backward_dev(&grads[out], self.vals[b].as_slice(), &mut ga, n)?;
                     self.b.accumulate_dev(&mut grads[a], &ga, n)?;
                     let mut gb = self.b.dev_alloc_zeros(n)?;
                     self.b
-                        .ew_mul_backward_dev(&grads[out], &self.vals[a], &mut gb, n)?;
+                        .ew_mul_backward_dev(&grads[out], self.vals[a].as_slice(), &mut gb, n)?;
                     self.b.accumulate_dev(&mut grads[b], &gb, n)?;
                 }
                 DevOp::Add { a, b, n, out } => {
@@ -1061,7 +1362,7 @@ impl<'a> DeviceTape<'a> {
                     // vjp uses the saved probabilities p = vals[out].
                     let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
                     self.b.softmax_backward_dev(
-                        &self.vals[out],
+                        self.vals[out].as_slice(),
                         &grads[out],
                         &mut gx,
                         rows,
@@ -1126,6 +1427,74 @@ impl<'a> DeviceTape<'a> {
                 Ok(h)
             })
             .collect()
+    }
+
+    /// One fully resident distillation backward pass. The tape is consumed so
+    /// all borrowed parameter tensors are released before a caller mutates
+    /// their masters or optimizer state. Requested gradients are moved into the
+    /// result without a device-to-device copy and preserve `want` order.
+    pub fn xent_backward_device(
+        self,
+        logits: usize,
+        target: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        want: &[usize],
+    ) -> Result<DeviceGradients, BackendError> {
+        if rows == 0 || cols == 0 {
+            return Err(BackendError::InvalidInput(
+                "softmax-xent rows and cols must be non-zero".into(),
+            ));
+        }
+        let expected = rows.checked_mul(cols).ok_or_else(|| {
+            BackendError::InvalidInput("softmax-xent shape overflows usize".into())
+        })?;
+        if logits >= self.vals.len() {
+            return Err(BackendError::InvalidInput(format!(
+                "logits value id {logits} is out of range"
+            )));
+        }
+        if self.lens[logits] != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: self.lens[logits],
+            });
+        }
+        if target.len() != expected {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: target.len(),
+            });
+        }
+        if !self.b.same_context(&target.buf) {
+            return Err(BackendError::InvalidInput(
+                "target tensor belongs to a different CUDA context".into(),
+            ));
+        }
+        for (position, &id) in want.iter().enumerate() {
+            if id >= self.vals.len() {
+                return Err(BackendError::InvalidInput(format!(
+                    "requested gradient value id {id} is out of range"
+                )));
+            }
+            if want[..position].contains(&id) {
+                return Err(BackendError::InvalidInput(format!(
+                    "requested gradient value id {id} is duplicated"
+                )));
+            }
+        }
+
+        let seed = self.softmax_xent_grad_device(logits, &target.buf, rows, cols)?;
+        let mut slots: Vec<Option<CudaSlice<f32>>> = self
+            .backward(logits, &seed)?
+            .into_iter()
+            .map(Some)
+            .collect();
+        let bufs = want
+            .iter()
+            .map(|&id| slots[id].take().expect("want ids were validated unique"))
+            .collect();
+        Ok(DeviceGradients { bufs })
     }
 }
 
@@ -1595,6 +1964,129 @@ mod tests {
         ));
     }
 
+    /// ADR 0027 Track A exit seam: masters, quantized weights, optimizer
+    /// moments, targets, and returned gradients remain resident for a complete
+    /// training step.  The final master must match the CPU SALT + AdamW oracle.
+    #[test]
+    fn device_trainer_step_matches_host_reference() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping device_trainer_step_matches_host_reference: no CUDA ({e})");
+                return;
+            }
+        };
+        let (batch, rows, cols, planes) = (3usize, 5usize, 7usize, 2usize);
+        let input = seeded_uniform(0xA270, batch * cols, -1.0, 1.0);
+        let target = vec![1.0 / rows as f32; batch * rows];
+        let master = seeded_uniform(0xA271, rows * cols, -1.5, 1.5);
+        let opt = AdamW {
+            lr: 0.03,
+            beta1: 0.8,
+            beta2: 0.9,
+            eps: 0.2,
+            weight_decay: 0.01,
+        };
+
+        // Independent host oracle: SALT forward, dense matmul/xent VJP, AdamW.
+        let quantized = ste::salt_quantize_forward(&master, rows, cols, planes);
+        let logits = matmul::forward(&input, &quantized, &vec![1.0; rows], batch, rows, cols);
+        let g_logits = loss::softmax_xent_vjp(&logits, &target, batch, rows, &[1.0]).remove(0);
+        let grad = matmul::vjp(
+            &input,
+            &quantized,
+            &vec![1.0; rows],
+            batch,
+            rows,
+            cols,
+            &g_logits,
+        )
+        .remove(1);
+        let mut expected = master.clone();
+        let mut expected_state = opt.init_state(expected.len());
+        opt.step(1, &mut expected, &grad, &mut expected_state);
+
+        let mut trainer = DeviceTrainer::new(
+            &backend,
+            &[DeviceTrainParam {
+                master: &master,
+                rows,
+                cols,
+                salt_planes: planes,
+                optimizer: opt,
+            }],
+        )
+        .unwrap();
+        trainer.prepare_quantized().unwrap();
+        let d_input = DeviceTensor::upload(&backend, &input).unwrap();
+        let d_target = DeviceTensor::upload(&backend, &target).unwrap();
+        let grads = {
+            let mut tape = DeviceTape::new(&backend, rows).unwrap();
+            let x = tape.leaf_device(&d_input).unwrap();
+            let w = tape.leaf_device(trainer.quantized(0).unwrap()).unwrap();
+            let logits = tape.matmul(x, w, batch, rows, cols).unwrap();
+            tape.xent_backward_device(logits, &d_target, batch, rows, &[w])
+                .unwrap()
+        };
+        trainer.step(grads, 1).unwrap();
+
+        let got = trainer.download_master(0).unwrap();
+        assert_eq!(d_input.download(&backend).unwrap(), input);
+        assert_eq!(d_target.download(&backend).unwrap(), target);
+        assert!(
+            max_abs_diff(&got, &expected) < 1e-5,
+            "resident trainer diverged from host oracle"
+        );
+    }
+
+    /// Two backend handles retaining the same CUDA primary context may share a
+    /// tensor even though their Rust `Arc`s and streams differ.
+    #[test]
+    fn device_tensor_accepts_same_primary_context() {
+        let first = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping device_tensor_accepts_same_primary_context: no CUDA ({e})");
+                return;
+            }
+        };
+        let second = CudaBackend::new(0).unwrap();
+        let tensor = DeviceTensor::upload(&first, &[1.0, 2.0, 3.0]).unwrap();
+        let mut tape = DeviceTape::new(&second, 1).unwrap();
+        let id = tape.leaf_device(&tensor).unwrap();
+        assert_eq!(tape.value(id).unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn resident_backward_rejects_invalid_gradient_requests() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping resident_backward_rejects_invalid_gradient_requests: no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let target = DeviceTensor::upload(&backend, &[1.0, 0.0]).unwrap();
+        let build = || {
+            let mut tape = DeviceTape::new(&backend, 2).unwrap();
+            let logits = tape.leaf(&[0.25, -0.5]).unwrap();
+            (tape, logits)
+        };
+
+        let (tape, logits) = build();
+        assert!(matches!(
+            tape.xent_backward_device(logits, &target, 1, 2, &[logits, logits]),
+            Err(BackendError::InvalidInput(message)) if message.contains("duplicated")
+        ));
+        let (tape, logits) = build();
+        assert!(matches!(
+            tape.xent_backward_device(logits, &target, 1, 2, &[usize::MAX]),
+            Err(BackendError::InvalidInput(message)) if message.contains("out of range")
+        ));
+    }
+
     /// Gate (plan 0043 P2.3): the device-resident TRAINING RMSNorm (forward + grad_x + grad_w)
     /// matches `tritium-train`'s `ops::norm` — which uses a sequential sum, so (only +,*,/,sqrt, all
     /// IEEE correctly-rounded, --fmad=false) it is BIT-EXACT, unlike silu's expf.
@@ -1883,8 +2375,8 @@ mod tests {
     fn device_tape_mlp_stack_matches_cpu_tape() {
         use std::time::Instant;
 
-        use tritium_train::Tape;
         use tritium_train::ops::softmax;
+        use tritium_train::Tape;
 
         let backend = match CudaBackend::new(0) {
             Ok(b) => b,
@@ -2106,8 +2598,8 @@ mod tests {
     /// n_head) is exercised.
     #[test]
     fn device_tape_transformer_block_matches_cpu_tape() {
-        use tritium_train::Tape;
         use tritium_train::nn::attention;
+        use tritium_train::Tape;
 
         let backend = match CudaBackend::new(0) {
             Ok(b) => b,

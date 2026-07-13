@@ -802,6 +802,13 @@ impl CudaBackend {
             .map_err(|e| driver_err("dev_download dtoh", &e))
     }
 
+    /// Whether `buffer` belongs to this backend's CUDA context. Context value
+    /// equality deliberately permits a different stream (or backend handle)
+    /// retaining the same primary context.
+    pub(crate) fn same_context<T>(&self, buffer: &CudaSlice<T>) -> bool {
+        self.stream.context() == buffer.context()
+    }
+
     /// Greedy multi-plane SALT reconstruction on resident f32 buffers, matching
     /// [`tritium_train::ops::ste::salt_quantize_forward`]. Scale reduction is
     /// sequential within each row; rows execute independently in parallel.
