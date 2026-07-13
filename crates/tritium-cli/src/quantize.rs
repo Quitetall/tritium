@@ -1,9 +1,10 @@
 //! `tritium quantize` — offline SALT quantization of an fp model to a SALT bundle.
 //!
 //! Reads an fp16/bf16/f32 safetensors model, SALT-quantizes every 2D weight tensor at a
-//! target bits-per-weight, and writes a single-file [`write_salt_bundle`] artifact. 1D
-//! tensors (norms, biases) are copied-through conceptually but not quantized here — the
-//! bundle holds only the quantized matrices.
+//! target bits-per-weight, and writes a single-file SALT artifact. `sidecar` preserves
+//! the dense v1 bundle; `sidecar-progressive` stores compact sparse residuals. 1D tensors
+//! (norms, biases) are copied-through conceptually but not quantized here — the bundle
+//! holds only the quantized matrices.
 //!
 //! `--scale-group tensor` uses one per-tensor AbsMean for the base plane (matches deployed
 //! BitNet b1.58 I2_S; required for a b1.58 master); `block` (default) is per-256-block, best
@@ -13,7 +14,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use tritium_format::{SafeTensors, SaltRow, write_salt_bundle, write_salt_gguf};
+use tritium_format::{
+    DEFAULT_SPARSE_RESIDUAL_DENSITY, SafeTensors, SaltRow, write_progressive_salt_bundle,
+    write_salt_bundle, write_salt_gguf,
+};
 use tritium_quantize::fisher::tile_sensitivity;
 use tritium_quantize::{BaseScaleScope, QuantConfig, Sensitivity, quantize_tensor};
 
@@ -33,6 +37,8 @@ pub(crate) enum ScaleGroupArg {
 pub(crate) enum OutputFormat {
     /// Single-file SALT bundle (`.tslb`).
     Sidecar,
+    /// Progressive SALT bundle with sparse residual planes (`.tslb`).
+    SidecarProgressive,
     /// A GGUF container holding the SALT rows (tritium-private tensor type).
     Gguf,
 }
@@ -138,6 +144,11 @@ pub(crate) fn run(
             write_salt_bundle(&refs).context("serialize SALT bundle")?,
             "SALT bundle",
         ),
+        OutputFormat::SidecarProgressive => (
+            write_progressive_salt_bundle(&refs, DEFAULT_SPARSE_RESIDUAL_DENSITY)
+                .context("serialize progressive SALT bundle")?,
+            "progressive SALT bundle",
+        ),
         OutputFormat::Gguf => (
             write_salt_gguf(&refs).context("serialize SALT GGUF")?,
             "SALT GGUF",
@@ -168,4 +179,17 @@ pub(crate) fn run(
         avg_bpw,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_format_accepts_progressive_sidecar_name() {
+        assert!(matches!(
+            OutputFormat::from_str("sidecar-progressive", true),
+            Ok(OutputFormat::SidecarProgressive)
+        ));
+    }
 }

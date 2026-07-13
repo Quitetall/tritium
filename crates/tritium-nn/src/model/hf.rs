@@ -543,7 +543,10 @@ mod tests {
     #[test]
     fn load_salt_dequants_bundle_and_runs() {
         use crate::{ModelRunner, Projection};
-        use tritium_format::{SaltRow, salt_rows_to_dense, write_salt_bundle};
+        use tritium_format::{
+            DEFAULT_SPARSE_RESIDUAL_DENSITY, SaltRow, salt_rows_to_dense,
+            write_progressive_salt_bundle, write_salt_bundle,
+        };
         use tritium_quantize::{QuantConfig, quantize_tensor};
 
         let (n_embd, n_head, n_kv, n_ff, vocab) = (8usize, 2usize, 1usize, 16usize, 10usize);
@@ -617,7 +620,11 @@ mod tests {
             .map(|(n, r)| (n.as_str(), r.as_slice()))
             .collect();
         let bundle_path = dir.join("model.tslb");
-        std::fs::write(&bundle_path, write_salt_bundle(&bundle_refs).unwrap()).unwrap();
+        std::fs::write(
+            &bundle_path,
+            write_progressive_salt_bundle(&bundle_refs, DEFAULT_SPARSE_RESIDUAL_DENSITY).unwrap(),
+        )
+        .unwrap();
 
         // Load via from_salt and run.
         let backend = Box::new(tritium_cpu::CpuBackend::new());
