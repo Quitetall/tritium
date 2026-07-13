@@ -136,6 +136,10 @@ pub enum FormatError {
     SaltTooManyPlanes(usize),
     /// A [`SaltRow`]'s `k` did not fit the sidecar's `u32` length field.
     SaltRowTooLong(usize),
+    /// Sparse plane indices were duplicated or not strictly increasing.
+    SaltNonCanonicalSparseIndices,
+    /// A partial dense TQ2_0 block had non-zero trits beyond the logical row length.
+    SaltNonZeroPadding,
     /// A GGUF container operation (read/write) failed; carries the [`GgufError`].
     Gguf(GgufError),
     /// A safetensors container operation failed; carries the [`SafeTensorsError`].
@@ -207,6 +211,15 @@ impl fmt::Display for FormatError {
                     f,
                     "SALT sidecar: row length {k} exceeds the u32 length field"
                 )
+            }
+            FormatError::SaltNonCanonicalSparseIndices => {
+                write!(
+                    f,
+                    "SALT sidecar: sparse indices must be strictly increasing"
+                )
+            }
+            FormatError::SaltNonZeroPadding => {
+                write!(f, "SALT sidecar: partial TQ2_0 block has non-zero padding")
             }
             FormatError::Gguf(e) => write!(f, "GGUF container: {e}"),
             FormatError::SafeTensors(e) => write!(f, "safetensors container: {e}"),

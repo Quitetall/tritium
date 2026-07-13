@@ -71,8 +71,9 @@ impl SparsePlane {
 /// Build a [`SparsePlane`] from one dense TQ2_0 plane (`num_blocks(k)·66` bytes).
 ///
 /// # Errors
-/// [`FormatError::SaltRowTooLong`] if `k ≥ 2^31` (no room for the packed sign bit);
-/// any [`unpack_tq2_0_row`] error on malformed input.
+/// [`FormatError::SaltRowTooLong`] if `k ≥ 2^31` (no room for the packed sign bit),
+/// [`FormatError::SaltNonZeroPadding`] if a partial final block is not canonically
+/// zero-padded, or any [`unpack_tq2_0_row`] error on malformed input.
 pub fn sparse_from_tq2_0(packed: &[u8], k: usize) -> Result<SparsePlane, FormatError> {
     if k >= SIGN_BIT as usize {
         return Err(FormatError::SaltRowTooLong(k));
@@ -91,35 +92,28 @@ pub fn sparse_from_tq2_0(packed: &[u8], k: usize) -> Result<SparsePlane, FormatE
             sign.push(v);
         }
     }
-    Ok(SparsePlane {
+    let sparse = SparsePlane {
         k,
         scales,
         idx,
         sign,
-    })
+    };
+    if sparse_to_tq2_0(&sparse)? != packed {
+        return Err(FormatError::SaltNonZeroPadding);
+    }
+    Ok(sparse)
 }
 
 /// Reconstruct the dense TQ2_0 plane bytes from a [`SparsePlane`] — the exact
 /// inverse of [`sparse_from_tq2_0`].
 ///
 /// # Errors
-/// [`FormatError::DecodedOutOfRange`] if a `sign` is not `±1`, or
-/// [`FormatError::WrongBlockLen`] if `scales` is not `num_blocks(k)` long; any
-/// [`pack_tq2_0_row`] error.
+/// [`FormatError::DecodedOutOfRange`] if a `sign` is not `±1`,
+/// [`FormatError::SaltNonCanonicalSparseIndices`] if coordinates are unsorted or
+/// duplicated, or [`FormatError::WrongBlockLen`] if internal lengths disagree;
+/// any [`pack_tq2_0_row`] error.
 pub fn sparse_to_tq2_0(plane: &SparsePlane) -> Result<Vec<u8>, FormatError> {
-    let nb = num_blocks(plane.k);
-    if plane.scales.len() != nb {
-        return Err(FormatError::WrongBlockLen {
-            expected: nb,
-            got: plane.scales.len(),
-        });
-    }
-    if plane.idx.len() != plane.sign.len() {
-        return Err(FormatError::WrongBlockLen {
-            expected: plane.idx.len(),
-            got: plane.sign.len(),
-        });
-    }
+    let nb = validate_sparse_plane(plane)?;
     let mut trits = vec![Trit::ZERO; plane.k];
     for (&c, &s) in plane.idx.iter().zip(&plane.sign) {
         let c = c as usize;
@@ -134,6 +128,26 @@ pub fn sparse_to_tq2_0(plane: &SparsePlane) -> Result<Vec<u8>, FormatError> {
     let mut out = vec![0u8; nb * TQ2_0_BLOCK_BYTES];
     pack_tq2_0_row(&trits, &plane.scales, &mut out)?;
     Ok(out)
+}
+
+fn validate_sparse_plane(plane: &SparsePlane) -> Result<usize, FormatError> {
+    let nb = num_blocks(plane.k);
+    if plane.scales.len() != nb {
+        return Err(FormatError::WrongBlockLen {
+            expected: nb,
+            got: plane.scales.len(),
+        });
+    }
+    if plane.idx.len() != plane.sign.len() {
+        return Err(FormatError::WrongBlockLen {
+            expected: plane.idx.len(),
+            got: plane.sign.len(),
+        });
+    }
+    if plane.idx.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(FormatError::SaltNonCanonicalSparseIndices);
+    }
+    Ok(nb)
 }
 
 /// Dequantize a sparse plane to `k` fp32 weights: `scales[c/QK_K]·sign` at each
@@ -203,7 +217,11 @@ pub fn choose_plane_repr(
     k: usize,
     max_density: f32,
 ) -> Result<PlaneRepr, FormatError> {
-    let sparse = sparse_from_tq2_0(packed, k)?;
+    let sparse = match sparse_from_tq2_0(packed, k) {
+        Ok(sparse) => sparse,
+        Err(FormatError::SaltNonZeroPadding) => return Ok(PlaneRepr::Dense(packed.to_vec())),
+        Err(error) => return Err(error),
+    };
     if sparse.density() < max_density {
         Ok(PlaneRepr::Sparse(sparse))
     } else {
@@ -231,25 +249,14 @@ pub fn expand_plane_repr(repr: &PlaneRepr) -> Result<Vec<u8>, FormatError> {
 ///
 /// # Errors
 /// [`FormatError::SaltRowTooLong`] if `k ≥ 2^31`; [`FormatError::WrongBlockLen`] if
-/// `scales`/`sign` lengths disagree with `k`/`nnz`; [`FormatError::DecodedOutOfRange`]
-/// for a non-`±1` sign or an out-of-range column.
+/// `scales`/`sign` lengths disagree with `k`/`nnz`;
+/// [`FormatError::SaltNonCanonicalSparseIndices`] for unsorted/duplicate coordinates;
+/// [`FormatError::DecodedOutOfRange`] for a non-`±1` sign or out-of-range column.
 pub fn pack_sparse_plane(plane: &SparsePlane) -> Result<Vec<u8>, FormatError> {
     if plane.k >= SIGN_BIT as usize {
         return Err(FormatError::SaltRowTooLong(plane.k));
     }
-    let nb = num_blocks(plane.k);
-    if plane.scales.len() != nb {
-        return Err(FormatError::WrongBlockLen {
-            expected: nb,
-            got: plane.scales.len(),
-        });
-    }
-    if plane.idx.len() != plane.sign.len() {
-        return Err(FormatError::WrongBlockLen {
-            expected: plane.idx.len(),
-            got: plane.sign.len(),
-        });
-    }
+    let nb = validate_sparse_plane(plane)?;
     let mut out = Vec::with_capacity(SPARSE_HEADER_BYTES + nb * 2 + plane.idx.len() * 4);
     out.extend_from_slice(&SPARSE_MAGIC);
     out.push(SPARSE_VERSION);
@@ -345,6 +352,9 @@ pub fn unpack_sparse_plane(bytes: &[u8]) -> Result<SparsePlane, FormatError> {
         let c = enc & !SIGN_BIT;
         if c as usize >= k {
             return Err(FormatError::DecodedOutOfRange(c as i32));
+        }
+        if idx.last().is_some_and(|previous| *previous >= c) {
+            return Err(FormatError::SaltNonCanonicalSparseIndices);
         }
         idx.push(c);
         sign.push(if enc & SIGN_BIT != 0 { -1 } else { 1 });
@@ -535,6 +545,35 @@ mod tests {
             unpack_sparse_plane(&oob),
             Err(FormatError::DecodedOutOfRange(_))
         ));
+    }
+
+    #[test]
+    fn sparse_indices_must_be_strictly_increasing() {
+        let k = 256;
+        let noncanonical = SparsePlane {
+            k,
+            scales: vec![f16::ONE],
+            idx: vec![2, 1],
+            sign: vec![1, -1],
+        };
+        assert_eq!(
+            pack_sparse_plane(&noncanonical),
+            Err(FormatError::SaltNonCanonicalSparseIndices)
+        );
+
+        let canonical = SparsePlane {
+            k,
+            scales: vec![f16::ONE],
+            idx: vec![1, 2],
+            sign: vec![1, -1],
+        };
+        let mut packed = pack_sparse_plane(&canonical).expect("canonical sparse plane");
+        let entries = SPARSE_HEADER_BYTES + 2;
+        packed[entries + 4..entries + 8].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            unpack_sparse_plane(&packed),
+            Err(FormatError::SaltNonCanonicalSparseIndices)
+        );
     }
 
     #[test]
