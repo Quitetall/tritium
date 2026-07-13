@@ -6,9 +6,12 @@
 //! sqrt-depth checkpointed `DeviceTape`; all latent masters and Adam moments
 //! live in `HostOffloadTrainer` between steps.
 //!
-//! OPEN (RTX 4090, online teacher, 40 steps): quality passes at 963x recovery
-//! (distilled perplexity 2207.241 versus 2.125e6 PTQ), but mean step time is
-//! 1855ms and misses the unchanged 1123ms Track-0 performance gate.
+//! OPEN (RTX 4090, online teacher, 40 streamed steps): quality passes at 963x
+//! recovery (distilled perplexity 2207.241 versus 2.125e6 PTQ), but mean step
+//! time is 1771ms and misses the unchanged 1123ms Track-0 performance gate.
+//! Streaming peaks at 116,785,152 gradient bytes versus a 537,919,488-byte
+//! materialized collection (0.2171x), with all 211 parameters emitted once in
+//! a stable reverse order.
 //!
 //! ```text
 //! cargo test -p tritium-nn --features cuda --release --test packed_host_offload_heldout -- --ignored --nocapture
@@ -24,7 +27,7 @@ use common::{device_forward, device_forward_packed, extract, logits_of, perplexi
 use tritium_cuda::CudaBackend;
 use tritium_cuda::train::{
     CheckpointPolicy, DevicePackedSaltWeight, DeviceTape, DeviceTensor, DeviceTrainParam,
-    HostOffloadTrainer,
+    GradientLeafBinding, HostOffloadTrainer,
 };
 use tritium_format::TeacherCacheHeader;
 use tritium_nn::{ModelRunner, TeacherCacheReader, hash_teacher_corpus, hash_teacher_weights};
@@ -114,7 +117,7 @@ fn repack_all_or_stale(
 }
 
 #[test]
-#[ignore = "OPEN: 40-step packed+HostOffload passes recovery but misses strict 1123ms gate"]
+#[ignore = "OPEN: streamed packed+HostOffload passes recovery but misses strict 1123ms gate"]
 fn packed_host_offload_recovers_heldout_within_track0_time() {
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {
@@ -212,6 +215,9 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
     let mut max_activation_peak = 0usize;
     let mut max_naive_activations = 0usize;
     let mut total_recomputed_ops = 0usize;
+    let mut max_streamed_gradient_elements = 0usize;
+    let mut materialized_gradient_elements = None;
+    let mut expected_emission_order: Option<Vec<usize>> = None;
 
     for step in 1..=steps {
         let started = Instant::now();
@@ -235,7 +241,7 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
             DeviceTensor::upload(&backend, &probabilities).expect("upload online teacher target")
         };
 
-        let (gradients, backward_stats) = {
+        let (stream_result, bindings) = {
             let mut tape = DeviceTape::new_with_checkpoint_policy(
                 &backend,
                 arch.vocab,
@@ -244,12 +250,113 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
             .expect("packed checkpointed tape");
             let (logits, master_ids) =
                 device_forward_packed(&mut tape, &arch, &packed, &tokens_i32, TRAIN_SEQ);
-            let gradients = tape
-                .xent_backward_device(logits, &target, TRAIN_SEQ, arch.vocab, &master_ids)
-                .expect("packed student backward");
-            let stats = gradients.backward_stats();
-            (gradients, stats)
+            let bindings: Vec<_> = master_ids
+                .iter()
+                .enumerate()
+                .map(|(parameter_index, &leaf_id)| GradientLeafBinding {
+                    leaf_id,
+                    parameter_index,
+                })
+                .collect();
+            let result = tape.xent_backward_into(
+                logits,
+                &target,
+                TRAIN_SEQ,
+                arch.vocab,
+                &bindings,
+                &mut trainer,
+                step,
+            );
+            (result, bindings)
         };
+        let report = match stream_result {
+            Ok(report) => {
+                for handle in &mut packed {
+                    handle.mark_stale();
+                }
+                report
+            }
+            Err(error) => {
+                for handle in &mut packed {
+                    handle.mark_stale();
+                }
+                assert!(packed.iter().all(|handle| !handle.is_prepared()));
+                panic!(
+                    "streamed host-offload step {step} failed with every packed handle stale \
+                     (trainer poisoned={}): {error}",
+                    trainer.is_poisoned()
+                );
+            }
+        };
+        assert!(
+            packed.iter().all(|handle| !handle.is_prepared()),
+            "every packed handle must be stale immediately after streamed master updates"
+        );
+
+        assert_eq!(
+            report.emissions.len(),
+            bindings.len(),
+            "stream must emit every bound master exactly once"
+        );
+        assert_eq!(
+            report.materialized_collection_elements,
+            dense_parameter_bytes / size_of::<f32>(),
+            "stream report must account for the full materialized gradient collection"
+        );
+        assert!(
+            report.peak_live_requested_gradient_elements < report.materialized_collection_elements,
+            "streaming must reduce requested-gradient peak: {report:?}"
+        );
+        let mut seen_parameters = vec![false; bindings.len()];
+        let emission_order: Vec<usize> = report
+            .emissions
+            .iter()
+            .enumerate()
+            .map(|(sequence, emission)| {
+                assert_eq!(
+                    emission.sequence, sequence,
+                    "emission sequence must be dense"
+                );
+                assert!(
+                    emission.parameter_index < bindings.len(),
+                    "emitted parameter index is out of range"
+                );
+                assert!(
+                    !seen_parameters[emission.parameter_index],
+                    "parameter {} emitted more than once",
+                    emission.parameter_index
+                );
+                seen_parameters[emission.parameter_index] = true;
+                assert_eq!(
+                    emission.leaf_id, bindings[emission.parameter_index].leaf_id,
+                    "emitted leaf must match its parameter binding"
+                );
+                let (rows, cols) = shapes[emission.parameter_index];
+                assert_eq!(
+                    emission.elements,
+                    rows * cols,
+                    "emitted gradient length must match the bound parameter"
+                );
+                emission.parameter_index
+            })
+            .collect();
+        assert!(seen_parameters.into_iter().all(|seen| seen));
+        if let Some(expected) = &expected_emission_order {
+            assert_eq!(
+                &emission_order, expected,
+                "gradient emission order changed at step {step}"
+            );
+        } else {
+            expected_emission_order = Some(emission_order);
+        }
+        max_streamed_gradient_elements =
+            max_streamed_gradient_elements.max(report.peak_live_requested_gradient_elements);
+        match materialized_gradient_elements {
+            Some(expected) => assert_eq!(report.materialized_collection_elements, expected),
+            None => materialized_gradient_elements = Some(report.materialized_collection_elements),
+        }
+
+        let backward_stats = report.backward_stats;
         assert!(
             backward_stats.recomputed_ops > 0,
             "sqrt-depth checkpoint replay did not run at step {step}"
@@ -263,18 +370,6 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
         total_recomputed_ops = total_recomputed_ops
             .checked_add(backward_stats.recomputed_ops)
             .expect("recomputed-op count overflow");
-
-        for handle in &mut packed {
-            handle.mark_stale();
-        }
-        assert!(
-            packed.iter().all(|handle| !handle.is_prepared()),
-            "every packed handle must be stale before the master update"
-        );
-        if let Err(error) = trainer.step(gradients, step) {
-            assert!(packed.iter().all(|handle| !handle.is_prepared()));
-            panic!("host-offload step {step} failed with all packed handles stale: {error}");
-        }
         repack_all_or_stale(&backend, &mut packed, &trainer);
 
         elapsed_ms += started.elapsed().as_secs_f64() * 1e3;
@@ -307,7 +402,15 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
     let offload = trainer.stats();
     let host_optimizer_bytes = offload.host_optimizer_elements * size_of::<f32>();
     let peak_optimizer_device_bytes = offload.peak_optimizer_device_elements * size_of::<f32>();
-    let resident_gradient_bytes = offload.resident_input_gradient_elements * size_of::<f32>();
+    let materialized_gradient_elements =
+        materialized_gradient_elements.expect("at least one streamed step");
+    let materialized_gradient_bytes = materialized_gradient_elements * size_of::<f32>();
+    let streamed_gradient_peak_bytes = max_streamed_gradient_elements * size_of::<f32>();
+    let streamed_gradient_ratio =
+        max_streamed_gradient_elements as f64 / materialized_gradient_elements as f64;
+    let emission_order = expected_emission_order.expect("at least one emission order");
+    let order_head = &emission_order[..emission_order.len().min(8)];
+    let order_tail = &emission_order[emission_order.len().saturating_sub(8)..];
     let teacher_source = if teacher_cache.is_some() {
         "offline cache"
     } else {
@@ -323,10 +426,14 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
          {dense_parameter_bytes} ({packed_ratio:.4}x); checkpoint peak={max_activation_peak} vs \
          naive={max_naive_activations} ({activation_ratio:.4}x), recomputed_ops total=\
          {total_recomputed_ops}; offloaded optimizer host bytes={host_optimizer_bytes}, peak device \
-         staging bytes={peak_optimizer_device_bytes}, resident gradient bytes={resident_gradient_bytes}",
+         staging bytes={peak_optimizer_device_bytes}; streamed gradient peak \
+         bytes={streamed_gradient_peak_bytes} vs materialized={materialized_gradient_bytes} \
+         ({streamed_gradient_ratio:.4}x), emissions={}, order head={order_head:?}, \
+         tail={order_tail:?}",
         train_ids.len(),
         windows.len(),
         eval_ids.len(),
+        emission_order.len(),
     );
 
     assert_eq!(
@@ -339,8 +446,8 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
         "optimizer staging must be leaf-bounded, not model-bounded: {offload:?}"
     );
     assert_eq!(
-        resident_gradient_bytes, dense_parameter_bytes,
-        "requesting every master id must return one full-model gradient collection"
+        offload.resident_input_gradient_elements, materialized_gradient_elements,
+        "trainer accounting must retain the materialized-collection reference"
     );
     assert!(ppl_ptq > ppl_fp, "PTQ must degrade held-out perplexity");
     assert!(
