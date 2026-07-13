@@ -751,8 +751,8 @@ impl DeviceGradients {
     }
 }
 
-/// Host description of one trainable SALT weight uploaded into a
-/// [`DeviceTrainer`].
+/// Host description of one trainable SALT weight used by [`DeviceTrainer`] or
+/// [`HostOffloadTrainer`].
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceTrainParam<'a> {
     /// Initial latent f32 master.
@@ -909,6 +909,242 @@ impl<'a> DeviceTrainer<'a> {
             BackendError::InvalidInput(format!("parameter index {index} is out of range"))
         })?;
         param.master.download(self.backend)
+    }
+}
+
+struct HostOffloadParam {
+    master: Vec<f32>,
+    m: Vec<f32>,
+    v: Vec<f32>,
+    rows: usize,
+    cols: usize,
+    salt_planes: usize,
+    optimizer: AdamW,
+}
+
+/// Matrix and SALT packing metadata retained with an offloaded parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostOffloadParamMetadata {
+    pub rows: usize,
+    pub cols: usize,
+    pub salt_planes: usize,
+}
+
+/// Deterministic logical memory accounting for [`HostOffloadTrainer`].
+///
+/// `peak_optimizer_device_elements` counts only the streamed master and two
+/// Adam moments. `resident_input_gradient_elements` is reported separately
+/// because [`DeviceGradients`] currently owns every requested gradient on the
+/// device before the optimizer step begins.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostOffloadStats {
+    /// Host-resident master + first moment + second moment elements.
+    pub host_optimizer_elements: usize,
+    /// Size of the largest parameter leaf.
+    pub largest_parameter_elements: usize,
+    /// Peak streamed optimizer-state elements resident on the device.
+    pub peak_optimizer_device_elements: usize,
+    /// Device gradient elements supplied to the most recent successful step.
+    pub resident_input_gradient_elements: usize,
+}
+
+/// Correctness-first CPU-offloaded AdamW state.
+///
+/// Masters and moments remain in ordinary host vectors between steps. Each
+/// parameter uploads only its master, `m`, and `v`, invokes the same device
+/// AdamW kernel as [`DeviceTrainer`], downloads the updated state, and releases
+/// those temporary allocations before advancing to the next parameter.
+///
+/// This bounds optimizer-state staging to three times the largest leaf. It does
+/// not yet stream gradient production: the input [`DeviceGradients`] remains a
+/// resident collection and is accounted separately in [`HostOffloadStats`]. A
+/// gradient sink and transfer overlap are deliberately separate follow-ups.
+pub struct HostOffloadTrainer<'a> {
+    backend: &'a CudaBackend,
+    params: Vec<HostOffloadParam>,
+    stats: HostOffloadStats,
+}
+
+impl core::fmt::Debug for HostOffloadTrainer<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HostOffloadTrainer")
+            .field("parameter_count", &self.params.len())
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> HostOffloadTrainer<'a> {
+    /// Copy initial masters to host-owned optimizer state. Parameter geometry
+    /// and SALT-plane metadata are validated identically to [`DeviceTrainer`].
+    pub fn new(
+        backend: &'a CudaBackend,
+        params: &[DeviceTrainParam<'_>],
+    ) -> Result<Self, BackendError> {
+        let mut host_params = Vec::with_capacity(params.len());
+        let mut total_parameter_elements = 0usize;
+        let mut largest_parameter_elements = 0usize;
+        for (index, param) in params.iter().enumerate() {
+            let len = param.rows.checked_mul(param.cols).ok_or_else(|| {
+                BackendError::InvalidInput(format!("parameter {index} shape overflows usize"))
+            })?;
+            if param.master.len() != len {
+                return Err(BackendError::ShapeMismatch {
+                    expected: len,
+                    got: param.master.len(),
+                });
+            }
+            if !(1..=3).contains(&param.salt_planes) {
+                return Err(BackendError::InvalidInput(format!(
+                    "parameter {index} SALT planes must be in 1..=3"
+                )));
+            }
+            total_parameter_elements =
+                total_parameter_elements.checked_add(len).ok_or_else(|| {
+                    BackendError::InvalidInput("total parameter elements overflow usize".into())
+                })?;
+            largest_parameter_elements = largest_parameter_elements.max(len);
+            host_params.push(HostOffloadParam {
+                master: param.master.to_vec(),
+                m: vec![0.0; len],
+                v: vec![0.0; len],
+                rows: param.rows,
+                cols: param.cols,
+                salt_planes: param.salt_planes,
+                optimizer: param.optimizer,
+            });
+        }
+        let host_optimizer_elements = total_parameter_elements.checked_mul(3).ok_or_else(|| {
+            BackendError::InvalidInput("host optimizer elements overflow usize".into())
+        })?;
+        Ok(Self {
+            backend,
+            params: host_params,
+            stats: HostOffloadStats {
+                host_optimizer_elements,
+                largest_parameter_elements,
+                peak_optimizer_device_elements: 0,
+                resident_input_gradient_elements: 0,
+            },
+        })
+    }
+
+    /// Number of offloaded parameter leaves.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.params.len()
+    }
+
+    /// Whether no parameter leaves are configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
+
+    /// Borrow one host-resident latent master.
+    pub fn master(&self, index: usize) -> Result<&[f32], BackendError> {
+        self.params
+            .get(index)
+            .map(|param| param.master.as_slice())
+            .ok_or_else(|| {
+                BackendError::InvalidInput(format!("parameter index {index} is out of range"))
+            })
+    }
+
+    /// Borrow one host-resident pair of Adam moments.
+    pub fn moments(&self, index: usize) -> Result<(&[f32], &[f32]), BackendError> {
+        self.params
+            .get(index)
+            .map(|param| (param.m.as_slice(), param.v.as_slice()))
+            .ok_or_else(|| {
+                BackendError::InvalidInput(format!("parameter index {index} is out of range"))
+            })
+    }
+
+    /// Geometry needed to rebuild or repack the resident SALT representation
+    /// after a streamed AdamW update.
+    pub fn parameter_metadata(
+        &self,
+        index: usize,
+    ) -> Result<HostOffloadParamMetadata, BackendError> {
+        self.params
+            .get(index)
+            .map(|param| HostOffloadParamMetadata {
+                rows: param.rows,
+                cols: param.cols,
+                salt_planes: param.salt_planes,
+            })
+            .ok_or_else(|| {
+                BackendError::InvalidInput(format!("parameter index {index} is out of range"))
+            })
+    }
+
+    /// Current logical host/offload memory accounting.
+    #[must_use]
+    pub fn stats(&self) -> HostOffloadStats {
+        self.stats
+    }
+
+    /// Apply one 1-based AdamW step while staging one parameter's optimizer
+    /// state at a time. All gradient metadata is validated before any master or
+    /// moment is changed.
+    pub fn step(&mut self, grads: DeviceGradients, step: u64) -> Result<(), BackendError> {
+        if step == 0 {
+            return Err(BackendError::InvalidInput(
+                "AdamW step is 1-based; got step 0".into(),
+            ));
+        }
+        if grads.bufs.len() != self.params.len() {
+            return Err(BackendError::ShapeMismatch {
+                expected: self.params.len(),
+                got: grads.bufs.len(),
+            });
+        }
+        let mut resident_input_gradient_elements = 0usize;
+        for (index, (param, grad)) in self.params.iter().zip(&grads.bufs).enumerate() {
+            if !self.backend.same_context(grad) {
+                return Err(BackendError::InvalidInput(format!(
+                    "gradient {index} belongs to a different CUDA context"
+                )));
+            }
+            if grad.len() != param.master.len() {
+                return Err(BackendError::ShapeMismatch {
+                    expected: param.master.len(),
+                    got: grad.len(),
+                });
+            }
+            resident_input_gradient_elements = resident_input_gradient_elements
+                .checked_add(grad.len())
+                .ok_or_else(|| {
+                    BackendError::InvalidInput("resident gradient elements overflow usize".into())
+                })?;
+        }
+
+        for (param, grad) in self.params.iter_mut().zip(grads.bufs) {
+            let mut d_master = self.backend.dev_upload(&param.master)?;
+            let mut d_m = self.backend.dev_upload(&param.m)?;
+            let mut d_v = self.backend.dev_upload(&param.v)?;
+            let staged_elements = param.master.len().checked_mul(3).ok_or_else(|| {
+                BackendError::InvalidInput("staged optimizer elements overflow usize".into())
+            })?;
+            self.stats.peak_optimizer_device_elements = self
+                .stats
+                .peak_optimizer_device_elements
+                .max(staged_elements);
+            self.backend.adamw_step_dev(
+                &mut d_master,
+                &grad,
+                &mut d_m,
+                &mut d_v,
+                step,
+                &param.optimizer,
+            )?;
+            self.backend.dev_download(&d_master, &mut param.master)?;
+            self.backend.dev_download(&d_m, &mut param.m)?;
+            self.backend.dev_download(&d_v, &mut param.v)?;
+        }
+        self.stats.resident_input_gradient_elements = resident_input_gradient_elements;
+        Ok(())
     }
 }
 
@@ -3090,6 +3326,237 @@ mod tests {
             max_abs_diff(&got, &expected) < 1e-5,
             "resident trainer diverged from host oracle"
         );
+    }
+
+    #[test]
+    fn host_offload_rejects_zero_step_before_mutation() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping host_offload_rejects_zero_step_before_mutation: no CUDA ({e})");
+                return;
+            }
+        };
+        let master = seeded_uniform(0xE270, 35, -1.0, 1.0);
+        let spec = DeviceTrainParam {
+            master: &master,
+            rows: 5,
+            cols: 7,
+            salt_planes: 1,
+            optimizer: AdamW::new(1e-3),
+        };
+        let mut trainer = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+        let before = trainer.master(0).unwrap().to_vec();
+        let grads = DeviceGradients {
+            bufs: vec![backend.dev_alloc_zeros(master.len()).unwrap()],
+            stats: DeviceBackwardStats::default(),
+        };
+
+        assert!(matches!(
+            trainer.step(grads, 0),
+            Err(BackendError::InvalidInput(message)) if message.contains("1-based")
+        ));
+        assert_eq!(trainer.master(0).unwrap(), before);
+    }
+
+    fn upload_test_gradients(backend: &CudaBackend, grads: &[Vec<f32>]) -> DeviceGradients {
+        DeviceGradients {
+            bufs: grads
+                .iter()
+                .map(|grad| backend.dev_upload(grad).unwrap())
+                .collect(),
+            stats: DeviceBackwardStats::default(),
+        }
+    }
+
+    #[test]
+    fn host_offload_matches_fully_resident_adamw_over_multiple_steps() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping host_offload_matches_fully_resident_adamw_over_multiple_steps: \
+                     no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let masters = [
+            seeded_uniform(0xE271, 17, -1.0, 1.0),
+            seeded_uniform(0xE272, 257, -1.0, 1.0),
+            seeded_uniform(0xE273, 63, -1.0, 1.0),
+        ];
+        let optimizers = [
+            AdamW {
+                lr: 0.03,
+                beta1: 0.8,
+                beta2: 0.9,
+                eps: 0.2,
+                weight_decay: 0.01,
+            },
+            AdamW {
+                lr: 0.01,
+                beta1: 0.9,
+                beta2: 0.95,
+                eps: 0.1,
+                weight_decay: 0.03,
+            },
+            AdamW::new(0.02),
+        ];
+        let specs = [
+            DeviceTrainParam {
+                master: &masters[0],
+                rows: 1,
+                cols: 17,
+                salt_planes: 1,
+                optimizer: optimizers[0],
+            },
+            DeviceTrainParam {
+                master: &masters[1],
+                rows: 1,
+                cols: 257,
+                salt_planes: 2,
+                optimizer: optimizers[1],
+            },
+            DeviceTrainParam {
+                master: &masters[2],
+                rows: 7,
+                cols: 9,
+                salt_planes: 3,
+                optimizer: optimizers[2],
+            },
+        ];
+        let mut resident = DeviceTrainer::new(&backend, &specs).unwrap();
+        let mut offload = HostOffloadTrainer::new(&backend, &specs).unwrap();
+        for (index, spec) in specs.iter().enumerate() {
+            assert_eq!(
+                offload.parameter_metadata(index).unwrap(),
+                HostOffloadParamMetadata {
+                    rows: spec.rows,
+                    cols: spec.cols,
+                    salt_planes: spec.salt_planes,
+                }
+            );
+        }
+
+        for step in 1..=4u64 {
+            let grads: Vec<Vec<f32>> = masters
+                .iter()
+                .enumerate()
+                .map(|(index, master)| {
+                    seeded_uniform(0xE300 + step * 17 + index as u64, master.len(), -0.25, 0.25)
+                })
+                .collect();
+            resident
+                .step(upload_test_gradients(&backend, &grads), step)
+                .unwrap();
+            offload
+                .step(upload_test_gradients(&backend, &grads), step)
+                .unwrap();
+
+            for (index, master) in masters.iter().enumerate() {
+                let resident_master = resident.download_master(index).unwrap();
+                assert!(
+                    max_abs_diff(&resident_master, offload.master(index).unwrap()) < 1e-5,
+                    "master {index} diverged at step {step}"
+                );
+                let resident_param = &resident.params[index];
+                let mut resident_m = vec![0.0; master.len()];
+                let mut resident_v = vec![0.0; master.len()];
+                backend
+                    .dev_download(&resident_param.m, &mut resident_m)
+                    .unwrap();
+                backend
+                    .dev_download(&resident_param.v, &mut resident_v)
+                    .unwrap();
+                let (offload_m, offload_v) = offload.moments(index).unwrap();
+                assert!(
+                    max_abs_diff(&resident_m, offload_m) < 1e-5,
+                    "first moment {index} diverged at step {step}"
+                );
+                assert!(
+                    max_abs_diff(&resident_v, offload_v) < 1e-5,
+                    "second moment {index} diverged at step {step}"
+                );
+            }
+        }
+
+        let stats = offload.stats();
+        let total_elements: usize = masters.iter().map(Vec::len).sum();
+        let largest = masters.iter().map(Vec::len).max().unwrap();
+        assert_eq!(stats.host_optimizer_elements, total_elements * 3);
+        assert_eq!(stats.largest_parameter_elements, largest);
+        assert_eq!(stats.peak_optimizer_device_elements, largest * 3);
+        assert_eq!(stats.resident_input_gradient_elements, total_elements);
+        assert!(
+            stats.peak_optimizer_device_elements < stats.host_optimizer_elements,
+            "offload staging must be leaf-bounded, not model-bounded: {stats:?}"
+        );
+        eprintln!(
+            "0027 Track E host AdamW offload: optimizer staging peak {}/{} elements; largest leaf \
+             {}; resident gradient input {} elements",
+            stats.peak_optimizer_device_elements,
+            stats.host_optimizer_elements,
+            stats.largest_parameter_elements,
+            stats.resident_input_gradient_elements
+        );
+    }
+
+    #[test]
+    fn host_offload_validates_all_gradients_before_mutation() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping host_offload_validates_all_gradients_before_mutation: no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let master = seeded_uniform(0xE274, 35, -1.0, 1.0);
+        let spec = DeviceTrainParam {
+            master: &master,
+            rows: 5,
+            cols: 7,
+            salt_planes: 1,
+            optimizer: AdamW::new(1e-3),
+        };
+        let mut trainer = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+        let before = trainer.master(0).unwrap().to_vec();
+
+        assert!(matches!(
+            trainer.step(
+                DeviceGradients {
+                    bufs: Vec::new(),
+                    stats: DeviceBackwardStats::default(),
+                },
+                1,
+            ),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+        let short = DeviceGradients {
+            bufs: vec![backend.dev_alloc_zeros(master.len() - 1).unwrap()],
+            stats: DeviceBackwardStats::default(),
+        };
+        assert!(matches!(
+            trainer.step(short, 1),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+        assert_eq!(trainer.master(0).unwrap(), before);
+        assert_eq!(trainer.stats().peak_optimizer_device_elements, 0);
+        assert_eq!(trainer.stats().resident_input_gradient_elements, 0);
+
+        if let Ok(other_backend) = CudaBackend::new(1) {
+            let foreign = DeviceGradients {
+                bufs: vec![other_backend.dev_alloc_zeros(master.len()).unwrap()],
+                stats: DeviceBackwardStats::default(),
+            };
+            assert!(matches!(
+                trainer.step(foreign, 1),
+                Err(BackendError::InvalidInput(message)) if message.contains("different CUDA context")
+            ));
+            assert_eq!(trainer.master(0).unwrap(), before);
+        }
     }
 
     /// Two backend handles retaining the same CUDA primary context may share a
