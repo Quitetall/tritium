@@ -193,6 +193,10 @@ pub(super) const KERNEL_NAME_SALT_TRAINING_FORWARD: &str = "salt_training_forwar
 pub(super) const KERNEL_NAME_SALT_TRAINING_GRAD_A: &str = "salt_training_grad_a";
 pub(super) const KERNEL_NAME_SALT_TRAINING_FORWARD_EXACT: &str = "salt_training_forward_exact";
 pub(super) const KERNEL_NAME_SALT_TRAINING_GRAD_A_EXACT: &str = "salt_training_grad_a_exact";
+pub(super) const KERNEL_NAME_SALT_TRAINING_FORWARD_EXACT_TILED: &str =
+    "salt_training_forward_exact_tiled";
+pub(super) const KERNEL_NAME_SALT_TRAINING_GRAD_A_EXACT_TILED: &str =
+    "salt_training_grad_a_exact_tiled";
 pub(super) const KERNEL_NAME_SALT_TRAINING_EMBED: &str = "salt_training_embed_gather";
 /// plan 0043 P2.2 device-resident glue ops (elementwise fwd/bwd + grad accumulate).
 pub(super) const KERNEL_NAME_SILU_FWD: &str = "silu_forward";

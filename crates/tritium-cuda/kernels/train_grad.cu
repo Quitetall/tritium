@@ -349,6 +349,153 @@ extern "C" __global__ void salt_training_grad_a_exact(
     ga[idx] = acc;
 }
 
+// Exact tiled twins of the scalar dense-order kernels above. A 32x16 block
+// reconstructs one 64x32 compact weight tile into shared memory, then reuses
+// it across sixteen activation rows. Each shared weight is reconstructed in
+// ascending plane order, and each output-owning thread contracts its reduction
+// dimension in strictly ascending order. Shared-memory staging changes where
+// operands are read from, but never reassociates the f32 arithmetic.
+#define TRAIN_SALT_EXACT_TILE_X 32
+#define TRAIN_SALT_EXACT_TILE_M 16
+#define TRAIN_SALT_EXACT_REDUCTION_TILE 64
+#define TRAIN_SALT_EXACT_TILE_STRIDE (TRAIN_SALT_EXACT_TILE_X + 1)
+
+extern "C" __global__ void salt_training_forward_exact_tiled(
+    const float* __restrict__ a,             // [M, K]
+    const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
+    const float* __restrict__ scales,        // [planes, N]
+    float* __restrict__ y,                   // [M, N]
+    int m, int n, int k, int planes, int row_bytes)
+{
+    // [K,N+1] lets neighboring output columns read neighboring banks while
+    // the padding avoids a 32-way alias between successive K rows.
+    __shared__ float weight_tile
+        [TRAIN_SALT_EXACT_REDUCTION_TILE][TRAIN_SALT_EXACT_TILE_STRIDE];
+    __shared__ float activation_tile
+        [TRAIN_SALT_EXACT_TILE_M][TRAIN_SALT_EXACT_REDUCTION_TILE];
+
+    int ni = (int)blockIdx.x * TRAIN_SALT_EXACT_TILE_X + (int)threadIdx.x;
+    int mi = (int)blockIdx.y * TRAIN_SALT_EXACT_TILE_M + (int)threadIdx.y;
+    int lane = (int)threadIdx.y * TRAIN_SALT_EXACT_TILE_X + (int)threadIdx.x;
+    int threads = TRAIN_SALT_EXACT_TILE_X * TRAIN_SALT_EXACT_TILE_M;
+    float acc = 0.0f;
+
+    for (int k_base = 0; k_base < k;
+         k_base += TRAIN_SALT_EXACT_REDUCTION_TILE) {
+        for (int load = lane;
+             load < TRAIN_SALT_EXACT_TILE_M * TRAIN_SALT_EXACT_REDUCTION_TILE;
+             load += threads) {
+            int tile_m = load / TRAIN_SALT_EXACT_REDUCTION_TILE;
+            int tile_k = load - tile_m * TRAIN_SALT_EXACT_REDUCTION_TILE;
+            int global_m = (int)blockIdx.y * TRAIN_SALT_EXACT_TILE_M + tile_m;
+            int global_k = k_base + tile_k;
+            activation_tile[tile_m][tile_k] =
+                global_m < m && global_k < k
+                    ? a[(long)global_m * k + global_k]
+                    : 0.0f;
+        }
+        for (int load = lane;
+             load < TRAIN_SALT_EXACT_TILE_X * TRAIN_SALT_EXACT_REDUCTION_TILE;
+             load += threads) {
+            int tile_n = load / TRAIN_SALT_EXACT_REDUCTION_TILE;
+            int tile_k = load - tile_n * TRAIN_SALT_EXACT_REDUCTION_TILE;
+            int global_n = (int)blockIdx.x * TRAIN_SALT_EXACT_TILE_X + tile_n;
+            int global_k = k_base + tile_k;
+            float weight = 0.0f;
+            if (global_n < n && global_k < k) {
+                weight = train_salt_reconstruct_weight(
+                    codes, scales, global_n, global_k, n, planes, row_bytes);
+            }
+            weight_tile[tile_k][tile_n] = weight;
+        }
+        __syncthreads();
+
+        if (mi < m && ni < n) {
+            int tile_k_count = k - k_base;
+            if (tile_k_count > TRAIN_SALT_EXACT_REDUCTION_TILE) {
+                tile_k_count = TRAIN_SALT_EXACT_REDUCTION_TILE;
+            }
+            for (int tile_k = 0; tile_k < tile_k_count; ++tile_k) {
+                acc += activation_tile[threadIdx.y][tile_k]
+                    * weight_tile[tile_k][threadIdx.x];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (mi < m && ni < n) {
+        y[(long)mi * n + ni] = acc;
+    }
+}
+
+extern "C" __global__ void salt_training_grad_a_exact_tiled(
+    const float* __restrict__ gy,            // [M, N]
+    const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
+    const float* __restrict__ scales,        // [planes, N]
+    float* __restrict__ ga,                  // [M, K]
+    int m, int n, int k, int planes, int row_bytes)
+{
+    // [N,K+1] gives each warp a conflict-free row when neighboring K output
+    // columns consume the same reconstructed N row.
+    __shared__ float weight_tile
+        [TRAIN_SALT_EXACT_REDUCTION_TILE][TRAIN_SALT_EXACT_TILE_STRIDE];
+    __shared__ float gy_tile
+        [TRAIN_SALT_EXACT_TILE_M][TRAIN_SALT_EXACT_REDUCTION_TILE];
+
+    int ki = (int)blockIdx.x * TRAIN_SALT_EXACT_TILE_X + (int)threadIdx.x;
+    int mi = (int)blockIdx.y * TRAIN_SALT_EXACT_TILE_M + (int)threadIdx.y;
+    int lane = (int)threadIdx.y * TRAIN_SALT_EXACT_TILE_X + (int)threadIdx.x;
+    int threads = TRAIN_SALT_EXACT_TILE_X * TRAIN_SALT_EXACT_TILE_M;
+    float acc = 0.0f;
+
+    for (int n_base = 0; n_base < n;
+         n_base += TRAIN_SALT_EXACT_REDUCTION_TILE) {
+        for (int load = lane;
+             load < TRAIN_SALT_EXACT_TILE_M * TRAIN_SALT_EXACT_REDUCTION_TILE;
+             load += threads) {
+            int tile_m = load / TRAIN_SALT_EXACT_REDUCTION_TILE;
+            int tile_n = load - tile_m * TRAIN_SALT_EXACT_REDUCTION_TILE;
+            int global_m = (int)blockIdx.y * TRAIN_SALT_EXACT_TILE_M + tile_m;
+            int global_n = n_base + tile_n;
+            gy_tile[tile_m][tile_n] =
+                global_m < m && global_n < n
+                    ? gy[(long)global_m * n + global_n]
+                    : 0.0f;
+        }
+        for (int load = lane;
+             load < TRAIN_SALT_EXACT_TILE_X * TRAIN_SALT_EXACT_REDUCTION_TILE;
+             load += threads) {
+            int tile_n = load / TRAIN_SALT_EXACT_TILE_X;
+            int tile_k = load - tile_n * TRAIN_SALT_EXACT_TILE_X;
+            int global_n = n_base + tile_n;
+            int global_k = (int)blockIdx.x * TRAIN_SALT_EXACT_TILE_X + tile_k;
+            float weight = 0.0f;
+            if (global_n < n && global_k < k) {
+                weight = train_salt_reconstruct_weight(
+                    codes, scales, global_n, global_k, n, planes, row_bytes);
+            }
+            weight_tile[tile_n][tile_k] = weight;
+        }
+        __syncthreads();
+
+        if (mi < m && ki < k) {
+            int tile_n_count = n - n_base;
+            if (tile_n_count > TRAIN_SALT_EXACT_REDUCTION_TILE) {
+                tile_n_count = TRAIN_SALT_EXACT_REDUCTION_TILE;
+            }
+            for (int tile_n = 0; tile_n < tile_n_count; ++tile_n) {
+                acc += gy_tile[threadIdx.y][tile_n]
+                    * weight_tile[tile_n][threadIdx.x];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (mi < m && ki < k) {
+        ga[(long)mi * k + ki] = acc;
+    }
+}
+
 // Tiled Track D contractions. One thread still owns one output and visits its
 // reduction dimension in strictly ascending order; tiling only shares repeated
 // activation/gy reads across neighboring outputs. This preserves the scalar

@@ -61,6 +61,7 @@ const TRAINING_SALT_QK: usize = tritium_format::QK_K;
 const TRAINING_SALT_QS_BYTES: usize = TRAINING_SALT_QK / 4;
 const TRAINING_SALT_TILE_X: u32 = 32;
 const TRAINING_SALT_TILE_M: u32 = 4;
+const TRAINING_SALT_EXACT_TILE_M: u32 = 16;
 const KERNEL_NAME_SALT_TRAINING_FORWARD_TILED: &str = "salt_training_forward_tiled";
 const KERNEL_NAME_SALT_TRAINING_GRAD_A_TILED: &str = "salt_training_grad_a_tiled";
 
@@ -68,6 +69,8 @@ const KERNEL_NAME_SALT_TRAINING_GRAD_A_TILED: &str = "salt_training_grad_a_tiled
 enum TrainingSaltDispatch {
     Exact,
     Fast,
+    #[allow(dead_code)]
+    ScalarExact,
     #[cfg(test)]
     ScalarFast,
 }
@@ -281,6 +284,10 @@ pub struct CudaBackend {
     #[allow(dead_code)]
     pub(super) func_salt_training_grad_a_exact: CudaFunction,
     #[allow(dead_code)]
+    pub(super) func_salt_training_forward_exact_tiled: CudaFunction,
+    #[allow(dead_code)]
+    pub(super) func_salt_training_grad_a_exact_tiled: CudaFunction,
+    #[allow(dead_code)]
     pub(super) func_salt_training_forward_tiled: CudaFunction,
     #[allow(dead_code)]
     pub(super) func_salt_training_grad_a_tiled: CudaFunction,
@@ -467,6 +474,12 @@ impl CudaBackend {
         let func_salt_training_grad_a_exact = grad_module
             .load_function(KERNEL_NAME_SALT_TRAINING_GRAD_A_EXACT)
             .map_err(|e| driver_err("resolve salt_training_grad_a_exact kernel", &e))?;
+        let func_salt_training_forward_exact_tiled = grad_module
+            .load_function(KERNEL_NAME_SALT_TRAINING_FORWARD_EXACT_TILED)
+            .map_err(|e| driver_err("resolve salt_training_forward_exact_tiled kernel", &e))?;
+        let func_salt_training_grad_a_exact_tiled = grad_module
+            .load_function(KERNEL_NAME_SALT_TRAINING_GRAD_A_EXACT_TILED)
+            .map_err(|e| driver_err("resolve salt_training_grad_a_exact_tiled kernel", &e))?;
         let func_salt_training_forward_tiled = grad_module
             .load_function(KERNEL_NAME_SALT_TRAINING_FORWARD_TILED)
             .map_err(|e| driver_err("resolve salt_training_forward_tiled kernel", &e))?;
@@ -598,6 +611,8 @@ impl CudaBackend {
             func_salt_training_grad_a,
             func_salt_training_forward_exact,
             func_salt_training_grad_a_exact,
+            func_salt_training_forward_exact_tiled,
+            func_salt_training_grad_a_exact_tiled,
             func_salt_training_forward_tiled,
             func_salt_training_grad_a_tiled,
             func_salt_training_embed,
@@ -1328,6 +1343,18 @@ impl CudaBackend {
         self.training_salt_forward_impl(d_a, weight, m, d_y, TrainingSaltDispatch::Fast)
     }
 
+    /// Scalar dense-order oracle for the shared-memory exact kernel.
+    #[cfg(test)]
+    pub(crate) fn training_salt_forward_exact_scalar(
+        &self,
+        d_a: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_y: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        self.training_salt_forward_impl(d_a, weight, m, d_y, TrainingSaltDispatch::ScalarExact)
+    }
+
     #[cfg(test)]
     pub(crate) fn training_salt_forward_scalar(
         &self,
@@ -1343,6 +1370,17 @@ impl CudaBackend {
         // Four M rows amortize the cooperative activation/code load. Keep
         // skinny and sub-block contractions on the scalar oracle.
         m >= TRAINING_SALT_TILE_M as usize && n >= TRAINING_SALT_TILE_X as usize && k >= 256
+    }
+
+    pub(super) fn training_salt_forward_exact_tiled_supported(
+        _m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        // Cooperative reconstruction wins once K spans half a reduction tile
+        // and either N fills a warp or the long K reduction amortizes a tail
+        // block. Tiny contractions retain the scalar oracle.
+        k >= TRAINING_SALT_TILE_X as usize && (n >= TRAINING_SALT_TILE_X as usize || k >= 256)
     }
 
     fn training_salt_forward_impl(
@@ -1380,24 +1418,36 @@ impl CudaBackend {
             return Ok(());
         }
         let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
-        let use_exact = matches!(dispatch, TrainingSaltDispatch::Exact);
-        let use_tiled = matches!(dispatch, TrainingSaltDispatch::Fast)
+        let use_exact = matches!(
+            dispatch,
+            TrainingSaltDispatch::Exact | TrainingSaltDispatch::ScalarExact
+        );
+        let use_exact_tiled = matches!(dispatch, TrainingSaltDispatch::Exact)
+            && Self::training_salt_forward_exact_tiled_supported(m, weight.n, weight.k);
+        let use_fast_tiled = matches!(dispatch, TrainingSaltDispatch::Fast)
             && Self::training_salt_forward_tiled_supported(m, weight.n, weight.k);
-        let function = if use_exact {
+        let function = if use_exact_tiled {
+            &self.func_salt_training_forward_exact_tiled
+        } else if use_exact {
             &self.func_salt_training_forward_exact
-        } else if use_tiled {
+        } else if use_fast_tiled {
             &self.func_salt_training_forward_tiled
         } else {
             &self.func_salt_training_forward
         };
-        let cfg = if use_tiled {
+        let cfg = if use_exact_tiled || use_fast_tiled {
+            let tile_m = if use_exact_tiled {
+                TRAINING_SALT_EXACT_TILE_M
+            } else {
+                TRAINING_SALT_TILE_M
+            };
             LaunchConfig {
                 grid_dim: (
                     (weight.n as u32).div_ceil(TRAINING_SALT_TILE_X),
-                    (m as u32).div_ceil(TRAINING_SALT_TILE_M),
+                    (m as u32).div_ceil(tile_m),
                     1,
                 ),
-                block_dim: (TRAINING_SALT_TILE_X, TRAINING_SALT_TILE_M, 1),
+                block_dim: (TRAINING_SALT_TILE_X, tile_m, 1),
                 shared_mem_bytes: 0,
             }
         } else {
@@ -1420,9 +1470,11 @@ impl CudaBackend {
         unsafe {
             launch.launch(cfg).map_err(|e| {
                 driver_err(
-                    if use_exact {
+                    if use_exact_tiled {
+                        "launch salt_training_forward_exact_tiled"
+                    } else if use_exact {
                         "launch salt_training_forward_exact"
-                    } else if use_tiled {
+                    } else if use_fast_tiled {
                         "launch salt_training_forward_tiled"
                     } else {
                         "launch salt_training_forward"
@@ -1465,6 +1517,18 @@ impl CudaBackend {
         self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, TrainingSaltDispatch::Fast)
     }
 
+    /// Scalar dense-order oracle for the shared-memory exact kernel.
+    #[cfg(test)]
+    pub(crate) fn training_salt_grad_a_exact_scalar(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_ga: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, TrainingSaltDispatch::ScalarExact)
+    }
+
     #[cfg(test)]
     pub(crate) fn training_salt_grad_a_scalar(
         &self,
@@ -1478,6 +1542,14 @@ impl CudaBackend {
 
     pub(super) fn training_salt_grad_a_tiled_supported(m: usize, n: usize, k: usize) -> bool {
         m >= TRAINING_SALT_TILE_M as usize && n >= TRAINING_SALT_TILE_X as usize && k >= 128
+    }
+
+    pub(super) fn training_salt_grad_a_exact_tiled_supported(
+        _m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        n >= TRAINING_SALT_TILE_X as usize && k > 0
     }
 
     fn training_salt_grad_a_impl(
@@ -1511,24 +1583,36 @@ impl CudaBackend {
             return Ok(());
         }
         let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
-        let use_exact = matches!(dispatch, TrainingSaltDispatch::Exact);
-        let use_tiled = matches!(dispatch, TrainingSaltDispatch::Fast)
+        let use_exact = matches!(
+            dispatch,
+            TrainingSaltDispatch::Exact | TrainingSaltDispatch::ScalarExact
+        );
+        let use_exact_tiled = matches!(dispatch, TrainingSaltDispatch::Exact)
+            && Self::training_salt_grad_a_exact_tiled_supported(m, weight.n, weight.k);
+        let use_fast_tiled = matches!(dispatch, TrainingSaltDispatch::Fast)
             && Self::training_salt_grad_a_tiled_supported(m, weight.n, weight.k);
-        let function = if use_exact {
+        let function = if use_exact_tiled {
+            &self.func_salt_training_grad_a_exact_tiled
+        } else if use_exact {
             &self.func_salt_training_grad_a_exact
-        } else if use_tiled {
+        } else if use_fast_tiled {
             &self.func_salt_training_grad_a_tiled
         } else {
             &self.func_salt_training_grad_a
         };
-        let cfg = if use_tiled {
+        let cfg = if use_exact_tiled || use_fast_tiled {
+            let tile_m = if use_exact_tiled {
+                TRAINING_SALT_EXACT_TILE_M
+            } else {
+                TRAINING_SALT_TILE_M
+            };
             LaunchConfig {
                 grid_dim: (
                     (weight.k as u32).div_ceil(TRAINING_SALT_TILE_X),
-                    (m as u32).div_ceil(TRAINING_SALT_TILE_M),
+                    (m as u32).div_ceil(tile_m),
                     1,
                 ),
-                block_dim: (TRAINING_SALT_TILE_X, TRAINING_SALT_TILE_M, 1),
+                block_dim: (TRAINING_SALT_TILE_X, tile_m, 1),
                 shared_mem_bytes: 0,
             }
         } else {
@@ -1551,9 +1635,11 @@ impl CudaBackend {
         unsafe {
             launch.launch(cfg).map_err(|e| {
                 driver_err(
-                    if use_exact {
+                    if use_exact_tiled {
+                        "launch salt_training_grad_a_exact_tiled"
+                    } else if use_exact {
                         "launch salt_training_grad_a_exact"
-                    } else if use_tiled {
+                    } else if use_fast_tiled {
                         "launch salt_training_grad_a_tiled"
                     } else {
                         "launch salt_training_grad_a"
