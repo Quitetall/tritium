@@ -19,6 +19,7 @@ mod kv_cache;
 mod layers;
 mod model;
 mod ops;
+mod teacher_cache;
 mod tensor;
 
 pub use config::{ArchSpec, MlpKind, ModelConfig};
@@ -36,5 +37,9 @@ pub use model::{ForwardDump, LayerWeights, ModelRunner, ModelWeights, Tokenizer}
 pub use ops::{
     QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_categorical,
     sample_greedy, sample_top_k, sample_top_p, softmax_rows, truncated_top_k, truncated_top_p,
+};
+pub use teacher_cache::{
+    TeacherCacheError, TeacherCacheReader, TeacherCacheWriter, hash_teacher_corpus,
+    hash_teacher_weights,
 };
 pub use tensor::f16_bytes_to_f32;

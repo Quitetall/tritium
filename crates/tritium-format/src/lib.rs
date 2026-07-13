@@ -48,6 +48,7 @@ mod salt_bundle;
 mod salt_gguf;
 mod sparse;
 mod tb1;
+mod teacher_cache;
 mod tq1;
 mod tq2;
 mod tqbin;
@@ -85,6 +86,10 @@ pub use sparse::{
     sparse_to_tq2_0, unpack_sparse_plane,
 };
 pub use tb1::{TB1_PRESENCE_BYTES, pack_tb1_row, tb1_row_bytes, unpack_tb1_row};
+pub use teacher_cache::{
+    TEACHER_CACHE_HEADER_BYTES, TEACHER_CACHE_MAGIC, TEACHER_CACHE_VERSION, TeacherCacheHeader,
+    read_teacher_cache_header, write_teacher_cache_header,
+};
 pub use tq1::{pack_tq1_0_block, unpack_tq1_0_block};
 pub use tq2::{compute_zero_bitmap, compute_zero_bitmaps, pack_tq2_0_block, unpack_tq2_0_block};
 pub use tqbin::{TQBIN_HEADER_BYTES, TQBIN_MAGIC, TQBIN_VERSION, read_tqbin, write_tqbin};
@@ -149,6 +154,12 @@ pub enum FormatError {
     TqNameTooLong(usize),
     /// A `.tqidx` shard name was not valid UTF-8.
     TqBadName,
+    /// A teacher-probability cache did not start with its expected magic.
+    TeacherCacheBadMagic,
+    /// A teacher-probability cache declared an unsupported version.
+    UnsupportedTeacherCacheVersion(u8),
+    /// A teacher cache declared a zero or overflowing shape.
+    TeacherCacheInvalidShape,
 }
 
 impl From<GgufError> for FormatError {
@@ -214,6 +225,13 @@ impl fmt::Display for FormatError {
                 )
             }
             FormatError::TqBadName => write!(f, "tq manifest: shard name is not valid UTF-8"),
+            FormatError::TeacherCacheBadMagic => write!(f, "teacher cache: bad magic"),
+            FormatError::UnsupportedTeacherCacheVersion(version) => {
+                write!(f, "teacher cache: unsupported version {version}")
+            }
+            FormatError::TeacherCacheInvalidShape => {
+                write!(f, "teacher cache: invalid or overflowing shape")
+            }
         }
     }
 }

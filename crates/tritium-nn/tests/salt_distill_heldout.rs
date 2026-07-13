@@ -214,8 +214,8 @@ fn salt_distillation_device_tape_recovers_heldout() {
     use std::time::Instant;
 
     use common::device_forward;
-    use tritium_cuda::train::DeviceTape;
     use tritium_cuda::CudaBackend;
+    use tritium_cuda::train::DeviceTape;
 
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {
@@ -319,8 +319,10 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     use std::time::Instant;
 
     use common::{device_forward, device_forward_resident};
-    use tritium_cuda::train::{DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer};
     use tritium_cuda::CudaBackend;
+    use tritium_cuda::train::{DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer};
+    use tritium_format::TeacherCacheHeader;
+    use tritium_nn::{TeacherCacheReader, hash_teacher_corpus, hash_teacher_weights};
 
     const TRACK0_STEP_MS: f64 = 1123.0;
 
@@ -368,6 +370,17 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         })
         .collect();
     let mut trainer = DeviceTrainer::new(&backend, &specs).expect("upload resident state");
+    let mut teacher_cache = std::env::var_os("TRITIUM_TEACHER_CACHE").map(|path| {
+        let expected = TeacherCacheHeader {
+            seq_len: TRAIN_SEQ as u32,
+            vocab: a.vocab as u32,
+            windows: windows.len() as u64,
+            model_hash: hash_teacher_weights(fp.iter().map(Vec::as_slice)),
+            corpus_hash: hash_teacher_corpus(&train_ids, TRAIN_SEQ as u32),
+        };
+        TeacherCacheReader::open(path, &expected).expect("open matching teacher cache")
+    });
+    let mut cached_target = vec![0.0; TRAIN_SEQ * a.vocab];
 
     let mut step_ms = 0.0f64;
     for step in 1..=steps {
@@ -376,14 +389,18 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         let toks = windows[wi];
         let tokens_i32: Vec<i32> = toks.iter().map(|&t| t as i32).collect();
 
-        // The fp teacher is unchanged from Track 0, keeping the before/after
-        // timing comparison scoped to the student training-state path.
-        let tprobs = {
-            let mut tape = DeviceTape::new(&backend, a.vocab).unwrap();
-            let (logits, _) = device_forward(&mut tape, &a, &fp, &tokens_i32, TRAIN_SEQ);
-            row_softmax(&tape.value(logits).unwrap(), a.vocab)
+        let target = if let Some(cache) = teacher_cache.as_mut() {
+            cache.read_window(wi as u64, &mut cached_target).unwrap();
+            DeviceTensor::upload(&backend, &cached_target).unwrap()
+        } else {
+            // Keep the online teacher as the Track-0-compatible fallback.
+            let tprobs = {
+                let mut tape = DeviceTape::new(&backend, a.vocab).unwrap();
+                let (logits, _) = device_forward(&mut tape, &a, &fp, &tokens_i32, TRAIN_SEQ);
+                row_softmax(&tape.value(logits).unwrap(), a.vocab)
+            };
+            DeviceTensor::upload(&backend, &tprobs).unwrap()
         };
-        let target = DeviceTensor::upload(&backend, &tprobs).unwrap();
 
         trainer.prepare_quantized().unwrap();
         let resident: Vec<_> = (0..fp.len())
@@ -416,13 +433,21 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     let ppl_distilled = perplexity(&logits_of(&distilled, &a, &eval_ids), &eval_ids, a.vocab);
     let recovery = ppl_ptq / ppl_distilled;
     let mean_ms = step_ms / steps as f64;
-    let host_mib =
-        (2 * TRAIN_SEQ * a.vocab * std::mem::size_of::<f32>()) as f64 / (1024.0 * 1024.0);
+    let host_probability_copies = if teacher_cache.is_some() { 1 } else { 2 };
+    let host_mib = (host_probability_copies * TRAIN_SEQ * a.vocab * std::mem::size_of::<f32>())
+        as f64
+        / (1024.0 * 1024.0);
+    let teacher_source = if teacher_cache.is_some() {
+        "offline cache"
+    } else {
+        "online device teacher"
+    };
     println!(
         "0027 A RESIDENT SALT distillation (T={T}, {steps} steps): fp ppl {ppl_fp:.3} | \
          PTQ ppl {ppl_ptq:.3e} | distilled ppl {ppl_distilled:.3} | recovers {recovery:.0}x. \
          Mean step {mean_ms:.0}ms vs Track-0 {TRACK0_STEP_MS:.0}ms; student parameter path 100% \
-         device-resident, remaining teacher probability traffic {host_mib:.1} MiB/step."
+         device-resident, {teacher_source}, remaining teacher probability traffic {host_mib:.1} \
+         MiB/step."
     );
 
     assert!(ppl_ptq > ppl_fp, "PTQ must degrade held-out ppl");
@@ -434,4 +459,63 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         mean_ms < TRACK0_STEP_MS,
         "resident mean step {mean_ms:.0}ms did not beat Track-0 {TRACK0_STEP_MS:.0}ms"
     );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "CUDA teacher-cache I/O benchmark; run explicitly with --ignored --nocapture"]
+fn teacher_cache_fetch_and_upload_is_bounded() {
+    use std::time::Instant;
+
+    use tritium_cuda::CudaBackend;
+    use tritium_cuda::train::DeviceTensor;
+    use tritium_format::TeacherCacheHeader;
+    use tritium_nn::{TeacherCacheReader, TeacherCacheWriter};
+
+    let backend = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping teacher_cache_fetch_and_upload_is_bounded: no CUDA ({error})");
+            return;
+        }
+    };
+    let header = TeacherCacheHeader {
+        seq_len: TRAIN_SEQ as u32,
+        vocab: 49_152,
+        windows: 1,
+        model_hash: [0x11; 32],
+        corpus_hash: [0x22; 32],
+    };
+    let path = std::env::temp_dir().join(format!(
+        "tritium-teacher-cache-bench-{}.ttpr",
+        std::process::id()
+    ));
+    let probabilities = vec![1.0 / header.vocab as f32; header.window_elements().unwrap()];
+    let mut writer = TeacherCacheWriter::create(&path, header).unwrap();
+    writer.write_window(&probabilities).unwrap();
+    writer.finish().unwrap();
+    let mut reader = TeacherCacheReader::open(&path, &header).unwrap();
+    let mut host = vec![0.0; probabilities.len()];
+    let mut sample = || {
+        let start = Instant::now();
+        reader.read_window(0, &mut host).unwrap();
+        let tensor = DeviceTensor::upload(&backend, &host).unwrap();
+        drop(tensor);
+        start.elapsed().as_secs_f64() * 1e3
+    };
+    for _ in 0..5 {
+        sample();
+    }
+    let mut samples: Vec<_> = (0..21).map(|_| sample()).collect();
+    samples.sort_by(f64::total_cmp);
+    let median_ms = samples[10];
+    eprintln!(
+        "0027 Phase-0 dense teacher cache: {:.1} MiB fetch+CUDA upload median {median_ms:.2}ms",
+        probabilities.len() as f64 * 4.0 / (1024.0 * 1024.0)
+    );
+    assert!(
+        median_ms < 50.0,
+        "teacher cache fetch+upload {median_ms:.2}ms exceeds 50ms hot-step budget"
+    );
+    std::fs::remove_file(path).unwrap();
 }

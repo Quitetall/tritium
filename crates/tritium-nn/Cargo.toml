@@ -16,6 +16,7 @@ tritium-spec = { workspace = true }
 tritium-format = { workspace = true }
 tritium-runtime = { workspace = true }
 half = { workspace = true }
+blake3 = { workspace = true }
 # Data-parallel host matmul for DenseLinear (the SALT/fp accuracy-eval projection).
 rayon = { workspace = true }
 # The CUDA backend, as an OPTIONAL dependency gated by the `cuda` feature (off by
