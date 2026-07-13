@@ -1421,6 +1421,129 @@ pub struct HostOffloadParamMetadata {
     pub salt_planes: usize,
 }
 
+/// Static byte geometry for a packed-SALT [`HostOffloadTrainer`] campaign.
+///
+/// This estimate is independent of a CUDA device and covers the persistent
+/// packed representation, host-resident AdamW state, the two optimizer staging
+/// slots, and the dense-gradient baseline. Runtime activation and streamed
+/// gradient peaks are intentionally excluded because they depend on the graph
+/// executed by each training step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostOffloadMemoryGeometry {
+    /// Packed codes plus external per-row scale bytes resident on the device.
+    pub packed_parameter_bytes: usize,
+    /// Two-bit SALT code payload bytes, excluding external scales.
+    pub packed_code_bytes: usize,
+    /// External f32 per-row SALT scale bytes.
+    pub packed_scale_bytes: usize,
+    /// Dense f32 latent-master bytes across every parameter leaf.
+    pub dense_parameter_bytes: usize,
+    /// Host master plus first and second Adam moment bytes.
+    pub host_optimizer_bytes: usize,
+    /// Device staging bytes for two master/moment slots; pinned host staging is equal.
+    pub peak_optimizer_staging_bytes: usize,
+    /// Full dense-gradient collection baseline used to compare streamed gradients.
+    pub materialized_gradient_bytes: usize,
+}
+
+/// Compute the static memory geometry for packed-SALT host-offloaded training.
+///
+/// Packed codes use the resident training layout (two bits per trit, padded to
+/// [`tritium_format::QK_K`] columns) and retain one f32 row scale per residual
+/// plane. Host AdamW owns the latent master plus two moments. Device and
+/// pinned-host optimizer staging are each double buffered, so each class owns
+/// six f32 copies of the largest parameter leaf at its measured peak. The
+/// returned staging field records the device class; pinned-host staging is equal.
+///
+/// # Errors
+/// Returns [`BackendError::InvalidInput`] for an unsupported SALT plane count or
+/// any shape, packed-layout, or byte-count overflow.
+pub fn host_offload_memory_geometry(
+    parameters: &[HostOffloadParamMetadata],
+) -> Result<HostOffloadMemoryGeometry, BackendError> {
+    let mut dense_elements = 0usize;
+    let mut largest_parameter_elements = 0usize;
+    let mut packed_code_bytes = 0usize;
+    let mut packed_scale_bytes = 0usize;
+
+    for (index, parameter) in parameters.iter().enumerate() {
+        if !(1..=3).contains(&parameter.salt_planes) {
+            return Err(BackendError::InvalidInput(format!(
+                "parameter {index} SALT planes must be in 1..=3"
+            )));
+        }
+        let elements = parameter.rows.checked_mul(parameter.cols).ok_or_else(|| {
+            BackendError::InvalidInput(format!("parameter {index} dense shape overflows usize"))
+        })?;
+        dense_elements = dense_elements.checked_add(elements).ok_or_else(|| {
+            BackendError::InvalidInput("dense parameter elements overflow usize".into())
+        })?;
+        largest_parameter_elements = largest_parameter_elements.max(elements);
+
+        let blocks_per_row = parameter.cols.div_ceil(tritium_format::QK_K);
+        let parameter_code_bytes = parameter
+            .salt_planes
+            .checked_mul(parameter.rows)
+            .and_then(|count| count.checked_mul(blocks_per_row))
+            .and_then(|count| count.checked_mul(tritium_format::QK_K / 4))
+            .ok_or_else(|| {
+                BackendError::InvalidInput(format!(
+                    "parameter {index} packed SALT code bytes overflow usize"
+                ))
+            })?;
+        packed_code_bytes = packed_code_bytes
+            .checked_add(parameter_code_bytes)
+            .ok_or_else(|| {
+                BackendError::InvalidInput("packed SALT code bytes overflow usize".into())
+            })?;
+        let parameter_scale_bytes = parameter
+            .salt_planes
+            .checked_mul(parameter.rows)
+            .and_then(|count| count.checked_mul(core::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                BackendError::InvalidInput(format!(
+                    "parameter {index} packed SALT scale bytes overflow usize"
+                ))
+            })?;
+        packed_scale_bytes = packed_scale_bytes
+            .checked_add(parameter_scale_bytes)
+            .ok_or_else(|| {
+                BackendError::InvalidInput("packed SALT scale bytes overflow usize".into())
+            })?;
+    }
+
+    let f32_bytes = |elements: usize, label: &'static str| {
+        elements
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or_else(|| BackendError::InvalidInput(format!("{label} bytes overflow usize")))
+    };
+    let dense_parameter_bytes = f32_bytes(dense_elements, "dense parameter")?;
+    let host_optimizer_bytes = dense_parameter_bytes
+        .checked_mul(3)
+        .ok_or_else(|| BackendError::InvalidInput("host optimizer bytes overflow usize".into()))?;
+    let peak_optimizer_staging_bytes =
+        f32_bytes(largest_parameter_elements, "largest parameter staging")?
+            .checked_mul(6)
+            .ok_or_else(|| {
+                BackendError::InvalidInput("optimizer staging bytes overflow usize".into())
+            })?;
+    let packed_parameter_bytes = packed_code_bytes
+        .checked_add(packed_scale_bytes)
+        .ok_or_else(|| {
+            BackendError::InvalidInput("packed SALT parameter bytes overflow usize".into())
+        })?;
+
+    Ok(HostOffloadMemoryGeometry {
+        packed_parameter_bytes,
+        packed_code_bytes,
+        packed_scale_bytes,
+        dense_parameter_bytes,
+        host_optimizer_bytes,
+        peak_optimizer_staging_bytes,
+        materialized_gradient_bytes: dense_parameter_bytes,
+    })
+}
+
 /// Deterministic logical memory accounting for [`HostOffloadTrainer`].
 ///
 /// The two persistent slots each hold master plus two Adam moments on both the
@@ -4366,6 +4489,61 @@ mod tests {
             .zip(b)
             .map(|(&x, &y)| (x - y).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn host_offload_memory_geometry_covers_packing_optimizer_and_gradients() {
+        let parameters = [
+            HostOffloadParamMetadata {
+                rows: 2,
+                cols: 257,
+                salt_planes: 2,
+            },
+            HostOffloadParamMetadata {
+                rows: 3,
+                cols: 1,
+                salt_planes: 2,
+            },
+        ];
+
+        assert_eq!(
+            host_offload_memory_geometry(&parameters).unwrap(),
+            HostOffloadMemoryGeometry {
+                packed_parameter_bytes: 936,
+                packed_code_bytes: 896,
+                packed_scale_bytes: 40,
+                dense_parameter_bytes: 2_068,
+                host_optimizer_bytes: 6_204,
+                peak_optimizer_staging_bytes: 12_336,
+                materialized_gradient_bytes: 2_068,
+            }
+        );
+    }
+
+    #[test]
+    fn host_offload_memory_geometry_rejects_invalid_planes() {
+        for salt_planes in [0, 4] {
+            let error = host_offload_memory_geometry(&[HostOffloadParamMetadata {
+                rows: 1,
+                cols: 1,
+                salt_planes,
+            }])
+            .unwrap_err();
+            assert!(
+                matches!(error, BackendError::InvalidInput(message) if message.contains("planes"))
+            );
+        }
+    }
+
+    #[test]
+    fn host_offload_memory_geometry_rejects_shape_overflow() {
+        let error = host_offload_memory_geometry(&[HostOffloadParamMetadata {
+            rows: usize::MAX,
+            cols: 2,
+            salt_planes: 1,
+        }])
+        .unwrap_err();
+        assert!(matches!(error, BackendError::InvalidInput(message) if message.contains("shape")));
     }
 
     #[test]

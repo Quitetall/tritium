@@ -29,10 +29,11 @@ use tritium_cuda::CudaBackend;
 #[cfg(feature = "cuda")]
 use tritium_cuda::train::{
     CheckpointPolicy, DevicePackedSaltWeight, DeviceTape, DeviceTensor, GradientLeafBinding,
-    HostOffloadTrainParam, HostOffloadTrainer,
+    HostOffloadMemoryGeometry, HostOffloadParamMetadata, HostOffloadTrainParam, HostOffloadTrainer,
+    host_offload_memory_geometry,
 };
 #[cfg(feature = "cuda")]
-use tritium_nn::{TeacherCacheReader, TrainingParameter, packed_device_forward};
+use tritium_nn::{TeacherCacheReader, packed_device_forward};
 #[cfg(feature = "cuda")]
 use tritium_spec::TernaryBackend;
 #[cfg(feature = "cuda")]
@@ -982,7 +983,17 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     // This comparison/creation happens before DCP load can mutate trainer state.
     ensure_plan_sidecar(&campaign.checkpoint_dir, &plan)?;
 
-    let static_memory = expected_static_memory(model.parameters(), campaign.salt_planes)?;
+    let parameter_geometry: Vec<_> = model
+        .parameters()
+        .iter()
+        .map(|parameter| HostOffloadParamMetadata {
+            rows: parameter.rows,
+            cols: parameter.cols,
+            salt_planes: campaign.salt_planes,
+        })
+        .collect();
+    let static_memory = host_offload_memory_geometry(&parameter_geometry)
+        .context("compute static SALT host-offload memory geometry")?;
     let optimizer = AdamW {
         lr: campaign.adam.lr,
         beta1: campaign.adam.beta1,
@@ -1341,69 +1352,6 @@ fn repack_all_or_stale(
 }
 
 #[cfg(feature = "cuda")]
-fn expected_static_memory(
-    parameters: &[TrainingParameter],
-    salt_planes: usize,
-) -> anyhow::Result<StaticMemoryExpectations> {
-    if !(1..=3).contains(&salt_planes) {
-        bail!("SALT plane count must be in 1..=3");
-    }
-    let mut dense_elements = 0usize;
-    let mut largest_parameter_elements = 0usize;
-    let mut packed_code_bytes = 0usize;
-    let mut packed_scale_bytes = 0usize;
-    for parameter in parameters {
-        let elements = parameter
-            .rows
-            .checked_mul(parameter.cols)
-            .context("dense parameter shape overflow")?;
-        dense_elements = dense_elements
-            .checked_add(elements)
-            .context("dense parameter element count overflow")?;
-        largest_parameter_elements = largest_parameter_elements.max(elements);
-
-        let blocks_per_row = parameter.cols.div_ceil(tritium_format::QK_K);
-        let parameter_code_bytes = salt_planes
-            .checked_mul(parameter.rows)
-            .and_then(|count| count.checked_mul(blocks_per_row))
-            .and_then(|count| count.checked_mul(tritium_format::QK_K / 4))
-            .context("packed SALT code byte count overflow")?;
-        packed_code_bytes = packed_code_bytes
-            .checked_add(parameter_code_bytes)
-            .context("packed SALT code byte total overflow")?;
-        let parameter_scale_bytes = salt_planes
-            .checked_mul(parameter.rows)
-            .and_then(|count| count.checked_mul(size_of::<f32>()))
-            .context("packed SALT scale byte count overflow")?;
-        packed_scale_bytes = packed_scale_bytes
-            .checked_add(parameter_scale_bytes)
-            .context("packed SALT scale byte total overflow")?;
-    }
-
-    let dense_parameter_bytes = elements_to_bytes(dense_elements)?;
-    let host_optimizer_bytes = dense_parameter_bytes
-        .checked_mul(3)
-        .context("host optimizer byte count overflow")?;
-    let peak_optimizer_staging_bytes = elements_to_bytes(largest_parameter_elements)?
-        .checked_mul(6)
-        .context("optimizer staging byte count overflow")?;
-    let packed_parameter_bytes = packed_code_bytes
-        .checked_add(packed_scale_bytes)
-        .context("packed parameter byte count overflow")?;
-    Ok(StaticMemoryExpectations {
-        packed_parameter_bytes,
-        packed_code_bytes,
-        packed_scale_bytes,
-        dense_parameter_bytes,
-        host_optimizer_bytes,
-        host_adapter_master_bytes: 0,
-        logical_host_training_state_bytes: host_optimizer_bytes,
-        peak_optimizer_staging_bytes,
-        materialized_gradient_bytes: dense_parameter_bytes,
-    })
-}
-
-#[cfg(feature = "cuda")]
 fn elements_to_bytes(elements: usize) -> anyhow::Result<usize> {
     elements
         .checked_mul(size_of::<f32>())
@@ -1463,20 +1411,6 @@ struct CampaignReport {
 }
 
 #[cfg(feature = "cuda")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct StaticMemoryExpectations {
-    packed_parameter_bytes: usize,
-    packed_code_bytes: usize,
-    packed_scale_bytes: usize,
-    dense_parameter_bytes: usize,
-    host_optimizer_bytes: usize,
-    host_adapter_master_bytes: usize,
-    logical_host_training_state_bytes: usize,
-    peak_optimizer_staging_bytes: usize,
-    materialized_gradient_bytes: usize,
-}
-
-#[cfg(feature = "cuda")]
 #[derive(Clone, Copy)]
 struct ReportExpectations<'a> {
     plan_fingerprint: &'a str,
@@ -1487,14 +1421,14 @@ struct ReportExpectations<'a> {
     cuda_device: usize,
     cuda_device_name: &'a str,
     input_hashes: &'a CampaignInputHashes,
-    static_memory: StaticMemoryExpectations,
+    static_memory: HostOffloadMemoryGeometry,
 }
 
 #[cfg(feature = "cuda")]
 fn validate_report_memory(
     path: &Path,
     memory: &CampaignMemoryReport,
-    expected: StaticMemoryExpectations,
+    expected: HostOffloadMemoryGeometry,
     completed_step: u64,
 ) -> anyhow::Result<()> {
     for (label, actual, expected) in [
@@ -1523,15 +1457,11 @@ fn validate_report_memory(
             memory.host_optimizer_bytes,
             expected.host_optimizer_bytes,
         ),
-        (
-            "host adapter master",
-            memory.host_adapter_master_bytes,
-            expected.host_adapter_master_bytes,
-        ),
+        ("host adapter master", memory.host_adapter_master_bytes, 0),
         (
             "logical host training-state",
             memory.logical_host_training_state_bytes,
-            expected.logical_host_training_state_bytes,
+            expected.host_optimizer_bytes,
         ),
         (
             "optimizer staging",
@@ -2083,40 +2013,6 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn static_memory_expectations_cover_packed_geometry_and_optimizer_state() {
-        let parameters = vec![
-            TrainingParameter {
-                name: "wide".into(),
-                master: vec![0.0; 2 * 257],
-                rows: 2,
-                cols: 257,
-            },
-            TrainingParameter {
-                name: "narrow".into(),
-                master: vec![0.0; 3],
-                rows: 3,
-                cols: 1,
-            },
-        ];
-
-        assert_eq!(
-            expected_static_memory(&parameters, 2).unwrap(),
-            StaticMemoryExpectations {
-                packed_parameter_bytes: 936,
-                packed_code_bytes: 896,
-                packed_scale_bytes: 40,
-                dense_parameter_bytes: 2_068,
-                host_optimizer_bytes: 6_204,
-                host_adapter_master_bytes: 0,
-                logical_host_training_state_bytes: 6_204,
-                peak_optimizer_staging_bytes: 12_336,
-                materialized_gradient_bytes: 2_068,
-            }
-        );
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
     fn resume_validates_timing_coverage_before_truncating_orphan_report() {
         let directory = temp_path("orphan-report");
         let checkpoint_dir = directory.join("checkpoint");
@@ -2144,14 +2040,12 @@ mod tests {
             logical_peak_activation_bytes: 12,
             logical_naive_activation_bytes: 20,
         };
-        let static_memory = StaticMemoryExpectations {
+        let static_memory = HostOffloadMemoryGeometry {
             packed_parameter_bytes: 6,
             packed_code_bytes: 2,
             packed_scale_bytes: 4,
             dense_parameter_bytes: 16,
             host_optimizer_bytes: 48,
-            host_adapter_master_bytes: 0,
-            logical_host_training_state_bytes: 48,
             peak_optimizer_staging_bytes: 24,
             materialized_gradient_bytes: 16,
         };
