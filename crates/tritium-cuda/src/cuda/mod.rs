@@ -17,6 +17,8 @@
 //! - **graph_raw.rs**: `cuLaunchKernel` capture plumbing + `BatchKv`.
 //! - **consts.rs / kv.rs**: kernel symbols + launch geometry + embedded PTX;
 //!   the `KvDtype` rung ladder and its single `pick` dispatch point.
+//! - **telemetry.rs**: synchronized device-memory samples and async-pool
+//!   high-water evidence tied to one backend and CUDA device identity.
 //! - **tests.rs**: the GPU conformance/parity suite.
 //!
 //! ## cudarc 0.19 API
@@ -230,6 +232,8 @@ use backend::*;
 pub use backend::{CudaBackend, SaltResidentLinear};
 #[allow(unused_imports)] // TrainingSaltLinear is the Track D tape seam.
 pub(crate) use backend::{EmbedSegments, TrainingSaltLinear};
+mod telemetry;
+pub use telemetry::{CudaDeviceIdentity, CudaMemorySnapshot, CudaMemoryTelemetry};
 
 // ===========================================================================
 // v0.3.1 (ADR 0013): the device-resident M=1 decode forward.

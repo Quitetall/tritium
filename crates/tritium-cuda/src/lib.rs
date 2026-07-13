@@ -39,7 +39,7 @@
 mod cuda;
 
 #[cfg(feature = "cuda")]
-pub use cuda::CudaBackend;
+pub use cuda::{CudaBackend, CudaDeviceIdentity, CudaMemorySnapshot, CudaMemoryTelemetry};
 
 // v0.3.1 (ADR 0013): the device-resident M=1 decode forward. The runner downcasts
 // its `dyn TernaryBackend` to `CudaBackend`, builds a `CudaDecodeModel` once from a
