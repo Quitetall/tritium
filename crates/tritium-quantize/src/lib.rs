@@ -35,6 +35,7 @@
 
 mod allocate;
 mod architecture;
+mod campaign;
 mod conversion;
 pub mod fisher;
 mod plane;
@@ -45,6 +46,10 @@ pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, a
 pub use architecture::{
     AdapterError, ArchitectureAdapter, ArchitectureFeature, ArchitectureRequirements,
     CapabilityGap, CapabilitySet, TensorDescriptor, TensorDisposition, TensorRole,
+};
+pub use campaign::{
+    CalibrationProvenance, CampaignError, CampaignLedger, CampaignMetrics, CampaignObjective,
+    CampaignPoint, EvaluationProvenance,
 };
 pub use conversion::{
     CONVERSION_STATE_MAGIC, CONVERSION_STATE_VERSION, ConversionError, ConversionRun,
