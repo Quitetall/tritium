@@ -1673,6 +1673,12 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let out_len = m.checked_mul(n).ok_or_else(|| {
             BackendError::InvalidInput("packed SALT output shape overflows usize".into())
         })?;
+        if self.ones.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: self.ones.len(),
+            });
+        }
         let got_x = *self.lens.get(x).ok_or_else(|| {
             BackendError::InvalidInput(format!("device tape value id {x} is out of range"))
         })?;
@@ -3790,6 +3796,17 @@ mod tests {
         ));
         assert!(!packed.is_prepared());
         assert!(packed.repack_from_host(&backend, &[0.25; 35]).is_ok());
+
+        let mut short_ones = DeviceTape::new(&backend, 1).unwrap();
+        let short_ones_master = short_ones.gradient_leaf(35).unwrap();
+        let short_ones_data = short_ones.leaf(&[1.0; 7]).unwrap();
+        assert!(matches!(
+            short_ones.salt_matmul(short_ones_data, short_ones_master, &packed, 1),
+            Err(BackendError::ShapeMismatch {
+                expected: 5,
+                got: 1
+            })
+        ));
 
         let mut tape = DeviceTape::new(&backend, 5).unwrap();
         let data = tape.leaf(&[1.0; 7]).unwrap();
