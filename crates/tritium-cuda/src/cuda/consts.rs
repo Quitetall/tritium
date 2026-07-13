@@ -183,6 +183,8 @@ pub(super) const KERNEL_NAME_TRAIN_FWD: &str = "ternary_matmul_forward";
 pub(super) const KERNEL_NAME_GRAD_A: &str = "ternary_matmul_grad_a";
 pub(super) const KERNEL_NAME_GRAD_W: &str = "ternary_matmul_grad_w";
 pub(super) const KERNEL_NAME_GRAD_S: &str = "ternary_matmul_grad_s";
+/// ADR 0027 Track A: resident per-row multi-plane SALT quantization.
+pub(super) const KERNEL_NAME_SALT_QUANTIZE_FWD: &str = "salt_quantize_forward";
 /// plan 0043 P2.2 device-resident glue ops (elementwise fwd/bwd + grad accumulate).
 pub(super) const KERNEL_NAME_SILU_FWD: &str = "silu_forward";
 pub(super) const KERNEL_NAME_SILU_BWD: &str = "silu_backward";

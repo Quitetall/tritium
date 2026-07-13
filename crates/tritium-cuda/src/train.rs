@@ -1471,6 +1471,74 @@ mod tests {
         eprintln!("0043 P2.2 resident glue ops (silu/mul/add/accumulate, n={n}): match CPU ops");
     }
 
+    /// ADR 0027 Track A: device SALT quantization preserves the existing
+    /// per-row f32 AbsMean oracle for every supported plane count. The
+    /// 257-column case guards against accidentally switching this first
+    /// resident path to the deployed per-256-block format from Track D.
+    #[test]
+    fn resident_salt_quantize_matches_cpu() {
+        use tritium_train::ops::ste;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping resident_salt_quantize_matches_cpu: no CUDA device ({e})");
+                return;
+            }
+        };
+
+        for &(rows, cols) in &[(5usize, 7usize), (3, 257), (576, 576)] {
+            let mut master =
+                seeded_uniform(0x2700 ^ rows as u64 ^ cols as u64, rows * cols, -2.0, 2.0);
+            master[..cols].fill(0.0); // zero-scale row and early-stop behavior
+            let d_master = backend.dev_upload(&master).unwrap();
+            let mut d_residual = backend.dev_alloc_zeros(rows * cols).unwrap();
+            let mut d_quantized = backend.dev_alloc_zeros(rows * cols).unwrap();
+
+            for planes in 1..=3 {
+                backend
+                    .salt_quantize_forward_dev(
+                        &d_master,
+                        &mut d_residual,
+                        &mut d_quantized,
+                        rows,
+                        cols,
+                        planes,
+                    )
+                    .unwrap();
+                let mut got = vec![0.0f32; rows * cols];
+                backend.dev_download(&d_quantized, &mut got).unwrap();
+                let want = ste::salt_quantize_forward(&master, rows, cols, planes);
+                let delta = max_abs_diff(&got, &want);
+                assert!(
+                    delta < 1e-4,
+                    "rows={rows} cols={cols} planes={planes}: max|delta|={delta:.3e}"
+                );
+            }
+        }
+
+        let d_master = backend.dev_upload(&[1.0, -1.0]).unwrap();
+        let mut d_residual = backend.dev_alloc_zeros(2).unwrap();
+        let mut d_quantized = backend.dev_alloc_zeros(2).unwrap();
+        assert!(matches!(
+            backend.salt_quantize_forward_dev(
+                &d_master,
+                &mut d_residual,
+                &mut d_quantized,
+                1,
+                2,
+                0,
+            ),
+            Err(BackendError::InvalidInput(_))
+        ));
+        let mut undersized = backend.dev_alloc_zeros(1).unwrap();
+        assert!(matches!(
+            backend
+                .salt_quantize_forward_dev(&d_master, &mut d_residual, &mut undersized, 1, 2, 1,),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+    }
+
     /// Gate (plan 0043 P2.3): the device-resident TRAINING RMSNorm (forward + grad_x + grad_w)
     /// matches `tritium-train`'s `ops::norm` — which uses a sequential sum, so (only +,*,/,sqrt, all
     /// IEEE correctly-rounded, --fmad=false) it is BIT-EXACT, unlike silu's expf.

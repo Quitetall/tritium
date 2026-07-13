@@ -127,6 +127,9 @@ pub struct CudaBackend {
     pub(super) func_grad_a: CudaFunction,
     pub(super) func_grad_w: CudaFunction,
     pub(super) func_grad_s: CudaFunction,
+    /// ADR 0027 Track A: per-row SALT residual quantization on resident f32 buffers.
+    #[allow(dead_code)] // consumed by DeviceTrainer in the next Track A slice
+    pub(super) func_salt_quantize_fwd: CudaFunction,
     /// plan 0043 P2.2 device-resident glue: elementwise silu/mul/add fwd/bwd + grad accumulate.
     pub(super) func_silu_fwd: CudaFunction,
     pub(super) func_silu_bwd: CudaFunction,
@@ -285,6 +288,9 @@ impl CudaBackend {
         let func_grad_s = grad_module
             .load_function(KERNEL_NAME_GRAD_S)
             .map_err(|e| driver_err("resolve grad_s kernel", &e))?;
+        let func_salt_quantize_fwd = grad_module
+            .load_function(KERNEL_NAME_SALT_QUANTIZE_FWD)
+            .map_err(|e| driver_err("resolve salt_quantize_forward kernel", &e))?;
         // P2.2 device-resident glue ops (same `--fmad=false` train_grad.ptx module).
         let func_silu_fwd = grad_module
             .load_function(KERNEL_NAME_SILU_FWD)
@@ -396,6 +402,7 @@ impl CudaBackend {
             func_grad_a,
             func_grad_w,
             func_grad_s,
+            func_salt_quantize_fwd,
             func_silu_fwd,
             func_silu_bwd,
             func_ew_mul_fwd,
@@ -786,6 +793,68 @@ impl CudaBackend {
         self.stream
             .memcpy_dtoh(d, out)
             .map_err(|e| driver_err("dev_download dtoh", &e))
+    }
+
+    /// Greedy multi-plane SALT reconstruction on resident f32 buffers, matching
+    /// [`tritium_train::ops::ste::salt_quantize_forward`]. Scale reduction is
+    /// sequential within each row; rows execute independently in parallel.
+    /// `d_residual` is caller-owned scratch and is fully overwritten.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] for unsupported plane counts or dimensions;
+    /// [`BackendError::ShapeMismatch`] for undersized buffers; device failures
+    /// through the cudarc mapping.
+    #[allow(dead_code)] // kernel parity gate lands before DeviceTrainer wiring
+    pub(crate) fn salt_quantize_forward_dev(
+        &self,
+        d_master: &CudaSlice<f32>,
+        d_residual: &mut CudaSlice<f32>,
+        d_quantized: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        planes: usize,
+    ) -> Result<(), BackendError> {
+        if !(1..=3).contains(&planes) {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT plane count must be in 1..=3, got {planes}"
+            )));
+        }
+        let len = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("SALT shape overflows usize".into()))?;
+        let rows_i = i32::try_from(rows)
+            .map_err(|_| BackendError::InvalidInput("SALT rows exceed i32::MAX".into()))?;
+        let cols_i = i32::try_from(cols)
+            .map_err(|_| BackendError::InvalidInput("SALT cols exceed i32::MAX".into()))?;
+        let planes_i = i32::try_from(planes)
+            .map_err(|_| BackendError::InvalidInput("SALT planes exceed i32::MAX".into()))?;
+        if d_master.len() < len || d_residual.len() < len || d_quantized.len() < len {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: d_master.len().min(d_residual.len()).min(d_quantized.len()),
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+
+        let mut launch = self.stream.launch_builder(&self.func_salt_quantize_fwd);
+        launch
+            .arg(d_master)
+            .arg(d_residual)
+            .arg(d_quantized)
+            .arg(&rows_i)
+            .arg(&cols_i)
+            .arg(&planes_i);
+        // SAFETY: kernel receives three buffers of at least rows*cols and one
+        // thread per row; all dimensions fit its signed 32-bit ABI.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch salt_quantize_forward_dev", &e))?;
+        }
+        Ok(())
     }
 
     /// `Y[m,n] = s[n]·Σ_k A[m,k]·W[n,k]` on ALREADY-RESIDENT buffers — the device-resident companion

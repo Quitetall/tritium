@@ -91,6 +91,45 @@ extern "C" __global__ void ternary_matmul_grad_s(
     gs[ni] = acc;
 }
 
+// ADR 0027 Track A: greedy per-row multi-plane SALT reconstruction.
+// Mirrors tritium_train::ops::ste::salt_quantize_forward exactly: each row's
+// AbsMean is accumulated in ascending-column order, then its residual is
+// updated elementwise before fitting the next plane. One thread owns one row,
+// so no reduction can reorder. `residual` is caller-owned reusable scratch.
+extern "C" __global__ void salt_quantize_forward(
+    const float* __restrict__ master,       // [rows, cols]
+    float* __restrict__ residual,           // [rows, cols] scratch
+    float* __restrict__ quantized,          // [rows, cols]
+    int rows, int cols, int planes)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    long base = (long)row * cols;
+
+    for (int col = 0; col < cols; ++col) {
+        residual[base + col] = master[base + col];
+        quantized[base + col] = 0.0f;
+    }
+
+    for (int plane = 0; plane < planes; ++plane) {
+        float sum = 0.0f;
+        for (int col = 0; col < cols; ++col) {
+            sum += fabsf(residual[base + col]);
+        }
+        float scale = sum / (float)cols;
+        if (scale == 0.0f) continue;
+
+        for (int col = 0; col < cols; ++col) {
+            long idx = base + col;
+            float trit = roundf(residual[idx] / scale);
+            trit = fminf(1.0f, fmaxf(-1.0f, trit));
+            float contribution = scale * trit;
+            quantized[idx] += contribution;
+            residual[idx] -= contribution;
+        }
+    }
+}
+
 // ───────────────────────── device-resident glue ops (plan 0043 P2.2) ─────────────────────────
 // Elementwise forward/backward for the tape's non-matmul ops, run on the resident activation
 // buffers so a whole block chains fwd→bwd without host round-trips. One thread per element.
