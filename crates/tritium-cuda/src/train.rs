@@ -678,6 +678,11 @@ impl DeviceTensor {
         backend.dev_download(&self.buf, &mut host)?;
         Ok(host)
     }
+
+    #[cfg(feature = "nccl")]
+    pub(crate) fn resident_buffer(&self) -> &CudaSlice<f32> {
+        &self.buf
+    }
 }
 
 /// Opaque device-resident SALT weight for training-time packed execution.
@@ -944,6 +949,33 @@ pub struct GradientEmission {
     pub elements: usize,
 }
 
+/// In-place transform applied to each finalized resident leaf gradient before
+/// the host-offloaded optimizer consumes it.
+///
+/// Implementations must preserve the allocation length and CUDA context. The
+/// NCCL training path uses this seam for an `Avg` all-reduce; local training
+/// uses the identity transform.
+pub(crate) trait FinalizedGradientTransform {
+    /// Transform one gradient in deterministic stream-manifest order.
+    fn transform(
+        &mut self,
+        emission: GradientEmission,
+        gradient: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError>;
+}
+
+struct IdentityGradientTransform;
+
+impl FinalizedGradientTransform for IdentityGradientTransform {
+    fn transform(
+        &mut self,
+        _emission: GradientEmission,
+        _gradient: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+}
+
 /// Result of a streamed backward-and-offload step.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradientStreamReport {
@@ -962,12 +994,57 @@ struct GradientCompletionPlan {
     materialized_collection_elements: usize,
 }
 
+impl GradientCompletionPlan {
+    fn manifest(&self, lens: &[usize]) -> Vec<GradientEmission> {
+        let mut manifest = Vec::with_capacity(self.bindings.len());
+        for group in self.complete_at.iter().rev() {
+            for &binding_index in group {
+                let binding = self.bindings[binding_index];
+                manifest.push(GradientEmission {
+                    sequence: manifest.len(),
+                    leaf_id: binding.leaf_id,
+                    parameter_index: binding.parameter_index,
+                    elements: lens[binding.leaf_id],
+                });
+            }
+        }
+        for &binding_index in &self.unused {
+            let binding = self.bindings[binding_index];
+            manifest.push(GradientEmission {
+                sequence: manifest.len(),
+                leaf_id: binding.leaf_id,
+                parameter_index: binding.parameter_index,
+                elements: lens[binding.leaf_id],
+            });
+        }
+        manifest
+    }
+}
+
 /// Host description of one trainable SALT weight used by [`DeviceTrainer`] or
 /// [`HostOffloadTrainer`].
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceTrainParam<'a> {
     /// Initial latent f32 master.
     pub master: &'a [f32],
+    /// Matrix geometry (`master.len() == rows * cols`).
+    pub rows: usize,
+    pub cols: usize,
+    /// Number of residual ternary planes (`1..=3`).
+    pub salt_planes: usize,
+    /// Per-parameter AdamW configuration.
+    pub optimizer: AdamW,
+}
+
+/// Owned host description of one trainable SALT weight.
+///
+/// Passing this to [`HostOffloadTrainer::new_owned`] moves the latent master
+/// directly into optimizer state. Large campaigns use this seam to avoid an
+/// otherwise permanent full-model adapter copy.
+#[derive(Debug)]
+pub struct HostOffloadTrainParam {
+    /// Initial latent f32 master.
+    pub master: Vec<f32>,
     /// Matrix geometry (`master.len() == rows * cols`).
     pub rows: usize,
     pub cols: usize,
@@ -1411,11 +1488,33 @@ impl<'a> HostOffloadTrainer<'a> {
         backend: &'a CudaBackend,
         params: &[DeviceTrainParam<'_>],
     ) -> Result<Self, BackendError> {
+        let owned = params
+            .iter()
+            .map(|param| HostOffloadTrainParam {
+                master: param.master.to_vec(),
+                rows: param.rows,
+                cols: param.cols,
+                salt_planes: param.salt_planes,
+                optimizer: param.optimizer,
+            })
+            .collect();
+        Self::new_owned(backend, owned)
+    }
+
+    /// Move initial masters into host-owned optimizer state without cloning.
+    ///
+    /// This is the production scale path. The borrowed [`Self::new`] remains
+    /// available for small callers and tests that need to retain their source
+    /// masters.
+    pub fn new_owned(
+        backend: &'a CudaBackend,
+        params: Vec<HostOffloadTrainParam>,
+    ) -> Result<Self, BackendError> {
         let mut host_params = Vec::with_capacity(params.len());
         let mut leaf_lens = Vec::with_capacity(params.len());
         let mut total_parameter_elements = 0usize;
         let mut largest_parameter_elements = 0usize;
-        for (index, param) in params.iter().enumerate() {
+        for (index, param) in params.into_iter().enumerate() {
             let len = param.rows.checked_mul(param.cols).ok_or_else(|| {
                 BackendError::InvalidInput(format!("parameter {index} shape overflows usize"))
             })?;
@@ -1437,7 +1536,7 @@ impl<'a> HostOffloadTrainer<'a> {
             largest_parameter_elements = largest_parameter_elements.max(len);
             leaf_lens.push(len);
             host_params.push(HostOffloadParam {
-                master: param.master.to_vec(),
+                master: param.master,
                 m: vec![0.0; len],
                 v: vec![0.0; len],
                 rows: param.rows,
@@ -1558,6 +1657,24 @@ impl<'a> HostOffloadTrainer<'a> {
             .ok_or_else(|| {
                 BackendError::InvalidInput(format!("parameter index {index} is out of range"))
             })
+    }
+
+    #[cfg(feature = "nccl")]
+    pub(crate) fn distributed_optimizer_manifest(&self) -> Vec<u64> {
+        let mut manifest = Vec::with_capacity(self.params.len().saturating_mul(8));
+        for param in &self.params {
+            manifest.extend([
+                param.rows as u64,
+                param.cols as u64,
+                param.salt_planes as u64,
+                u64::from(param.optimizer.lr.to_bits()),
+                u64::from(param.optimizer.beta1.to_bits()),
+                u64::from(param.optimizer.beta2.to_bits()),
+                u64::from(param.optimizer.eps.to_bits()),
+                u64::from(param.optimizer.weight_decay.to_bits()),
+            ]);
+        }
+        manifest
     }
 
     /// Current logical host/offload memory accounting.
@@ -2021,8 +2138,9 @@ impl tritium_train::dcp::StateSink for HostOffloadTrainer<'_> {
     }
 }
 
-struct HostGradientStream<'trainer, 'backend> {
+struct HostGradientStream<'trainer, 'backend, 'transform> {
     trainer: &'trainer mut HostOffloadTrainer<'backend>,
+    transform: &'transform mut dyn FinalizedGradientTransform,
     plan: GradientCompletionPlan,
     step: u64,
     emissions: Vec<GradientEmission>,
@@ -2030,7 +2148,7 @@ struct HostGradientStream<'trainer, 'backend> {
     mutation_started: bool,
 }
 
-impl HostGradientStream<'_, '_> {
+impl HostGradientStream<'_, '_, '_> {
     fn observe_requested(&mut self, grads: &[Option<CudaSlice<f32>>], lens: &[usize]) {
         let live = self
             .plan
@@ -2056,7 +2174,7 @@ impl HostGradientStream<'_, '_> {
     ) -> Result<(), BackendError> {
         let binding = self.plan.bindings[binding_index];
         let len = lens[binding.leaf_id];
-        let grad = if let Some(grad) = grads[binding.leaf_id].take() {
+        let mut grad = if let Some(grad) = grads[binding.leaf_id].take() {
             grad
         } else {
             let grad = backend.dev_alloc_zeros(len)?;
@@ -2066,6 +2184,13 @@ impl HostGradientStream<'_, '_> {
                 self.peak_live_requested_gradient_elements.max(len);
             grad
         };
+        let emission = GradientEmission {
+            sequence: self.emissions.len(),
+            leaf_id: binding.leaf_id,
+            parameter_index: binding.parameter_index,
+            elements: len,
+        };
+        self.transform.transform(emission, &mut grad)?;
         if let Err(error) =
             self.trainer
                 .apply_streamed_gradient(binding.parameter_index, &grad, self.step)
@@ -2076,12 +2201,7 @@ impl HostGradientStream<'_, '_> {
         self.mutation_started = true;
         *live_elements = live_elements.saturating_sub(len);
         drop(grad);
-        self.emissions.push(GradientEmission {
-            sequence: self.emissions.len(),
-            leaf_id: binding.leaf_id,
-            parameter_index: binding.parameter_index,
-            elements: len,
-        });
+        self.emissions.push(emission);
         Ok(())
     }
 
@@ -3410,7 +3530,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         seed_id: usize,
         seed: &CudaSlice<f32>,
         retain_ids: &[usize],
-        mut stream: Option<&mut HostGradientStream<'_, '_>>,
+        mut stream: Option<&mut HostGradientStream<'_, '_, '_>>,
     ) -> Result<DeviceBackwardResult, BackendError> {
         if seed_id >= self.vals.len() {
             return Err(BackendError::InvalidInput(format!(
@@ -3994,7 +4114,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     /// leaf's reverse-topological consumer edges are complete.
     #[allow(clippy::too_many_arguments)]
     pub fn xent_backward_into(
-        mut self,
+        self,
         logits: usize,
         target: &DeviceTensor,
         rows: usize,
@@ -4003,6 +4123,65 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         trainer: &mut HostOffloadTrainer<'_>,
         step: u64,
     ) -> Result<GradientStreamReport, BackendError> {
+        let mut transform = IdentityGradientTransform;
+        self.xent_backward_into_with_transform(
+            logits,
+            target,
+            rows,
+            cols,
+            bindings,
+            trainer,
+            step,
+            &mut transform,
+        )
+    }
+
+    /// Compute the exact finalized-gradient emission sequence without running
+    /// backward or mutating optimizer state.
+    ///
+    /// Distributed callers preflight this fixed manifest across ranks before
+    /// entering any variable-length gradient collective.
+    #[cfg(feature = "nccl")]
+    pub(crate) fn gradient_stream_manifest(
+        &self,
+        bindings: &[GradientLeafBinding],
+        trainer: &HostOffloadTrainer<'_>,
+        step: u64,
+    ) -> Result<Vec<GradientEmission>, BackendError> {
+        Ok(self
+            .gradient_completion_plan(bindings, trainer, step)?
+            .manifest(&self.lens))
+    }
+
+    /// Validate the complete streamed softmax-xent call and return its exact
+    /// gradient manifest without launching any kernels or mutating the trainer.
+    ///
+    /// NCCL callers exchange this result with a fixed-size preflight before any
+    /// rank enters backward, so a local shape/configuration error cannot strand
+    /// peers inside a gradient collective.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "nccl")]
+    pub(crate) fn xent_gradient_stream_manifest(
+        &self,
+        logits: usize,
+        target: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        bindings: &[GradientLeafBinding],
+        trainer: &HostOffloadTrainer<'_>,
+        step: u64,
+    ) -> Result<Vec<GradientEmission>, BackendError> {
+        self.validate_xent_stream_inputs(logits, target, rows, cols)?;
+        self.gradient_stream_manifest(bindings, trainer, step)
+    }
+
+    fn validate_xent_stream_inputs(
+        &self,
+        logits: usize,
+        target: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
         if rows == 0 || cols == 0 {
             return Err(BackendError::InvalidInput(
                 "softmax-xent rows and cols must be non-zero".into(),
@@ -4033,7 +4212,26 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 "target tensor belongs to a different CUDA context".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Stream finalized gradients through an in-place transform before each
+    /// host-offloaded AdamW update.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn xent_backward_into_with_transform(
+        mut self,
+        logits: usize,
+        target: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        bindings: &[GradientLeafBinding],
+        trainer: &mut HostOffloadTrainer<'_>,
+        step: u64,
+        transform: &mut dyn FinalizedGradientTransform,
+    ) -> Result<GradientStreamReport, BackendError> {
+        self.validate_xent_stream_inputs(logits, target, rows, cols)?;
         let plan = self.gradient_completion_plan(bindings, trainer, step)?;
+        let expected_manifest = plan.manifest(&self.lens);
         let retain_ids: Vec<usize> = plan
             .bindings
             .iter()
@@ -4042,6 +4240,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let seed = self.softmax_xent_grad_device(logits, &target.buf, rows, cols)?;
         let mut stream = HostGradientStream {
             trainer,
+            transform,
             plan,
             step,
             emissions: Vec::with_capacity(bindings.len()),
@@ -4058,7 +4257,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 return Err(error);
             }
         };
-        if stream.emissions.len() != bindings.len()
+        if stream.emissions != expected_manifest
             || stream.plan.remaining_edges.iter().any(|&count| count != 0)
         {
             if stream.mutation_started {
@@ -5227,6 +5426,36 @@ mod tests {
         ));
         assert_eq!(trainer.master(0).unwrap(), before);
         assert!(!trainer.is_poisoned());
+    }
+
+    #[test]
+    fn host_offload_accepts_owned_masters_without_a_clone_at_the_api_seam() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping host_offload_accepts_owned_masters_without_a_clone_at_the_api_seam: no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let master = seeded_uniform(0xE271, 35, -1.0, 1.0);
+        let expected = master.clone();
+
+        let trainer = HostOffloadTrainer::new_owned(
+            &backend,
+            vec![HostOffloadTrainParam {
+                master,
+                rows: 5,
+                cols: 7,
+                salt_planes: 2,
+                optimizer: AdamW::new(1e-3),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(trainer.master(0).unwrap(), expected);
+        assert_eq!(trainer.stats().host_optimizer_elements, 3 * 35);
     }
 
     #[test]

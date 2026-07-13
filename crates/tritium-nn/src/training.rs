@@ -106,10 +106,14 @@ pub struct TrainingParameter {
 }
 
 impl TrainingParameter {
-    /// Number of scalar elements in this matrix.
+    /// Number of logical scalar elements in this matrix.
+    ///
+    /// This remains available after the owned master has moved into an
+    /// optimizer; the canonical matrix geometry, rather than `master.len()`, is
+    /// the graph contract.
     #[must_use]
     pub fn elements(&self) -> usize {
-        self.master.len()
+        self.rows.saturating_mul(self.cols)
     }
 }
 
@@ -131,6 +135,21 @@ impl TiedSwiGluTrainingModel {
     #[must_use]
     pub fn parameters(&self) -> &[TrainingParameter] {
         &self.parameters
+    }
+
+    /// Move every latent master out in canonical parameter order while
+    /// retaining names and matrix geometry for packed graph construction.
+    ///
+    /// This is the scale-safe handoff to a host-offloaded optimizer: it avoids
+    /// retaining a fourth full fp32 model plane beside master, first moment,
+    /// and second moment. After this call, [`Self::parameters`] still describes
+    /// the complete graph, but each `TrainingParameter::master` is empty.
+    #[must_use]
+    pub fn take_parameter_masters(&mut self) -> Vec<Vec<f32>> {
+        self.parameters
+            .iter_mut()
+            .map(|parameter| core::mem::take(&mut parameter.master))
+            .collect()
     }
 
     /// Validate that an HF architecture can use the packed training graph.

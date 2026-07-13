@@ -147,6 +147,38 @@ fn extraction_preserves_canonical_hf_parameter_order_names_and_shapes() {
 }
 
 #[test]
+fn parameter_masters_can_move_to_optimizer_without_losing_graph_metadata() {
+    let mut model = TiedSwiGluTrainingModel::extract(&config(), &spec(), &weights()).unwrap();
+    let expected_elements: Vec<_> = model
+        .parameters()
+        .iter()
+        .map(|parameter| parameter.rows * parameter.cols)
+        .collect();
+
+    let masters = model.take_parameter_masters();
+
+    assert_eq!(masters.len(), expected_elements.len());
+    assert_eq!(
+        masters.iter().map(Vec::len).collect::<Vec<_>>(),
+        expected_elements
+    );
+    assert!(
+        model
+            .parameters()
+            .iter()
+            .all(|parameter| parameter.master.is_empty())
+    );
+    assert_eq!(
+        model
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.elements())
+            .collect::<Vec<_>>(),
+        expected_elements
+    );
+}
+
+#[test]
 fn official_smollm2_135m_360m_and_1_7b_configs_are_supported() {
     let cases = [
         (
