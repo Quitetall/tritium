@@ -333,7 +333,11 @@ does not mark the ADR or its scale campaign complete.
   (`5aefb1a`). The semantic packed path now reconstructs each scalar weight in
   ascending plane order inside the dense-order contraction. This exact twin does
   not materialize a dense weight and leaves the reassociated plane-grouped/tiled
-  kernels available only as an explicit fast path.
+  kernels available only as an explicit fast path. Host-offloaded Adam now uses
+  two persistent page-locked/device staging slots and a dedicated transfer stream;
+  cudarc events order next-leaf H2D, current Adam, and prior-leaf D2H without a
+  host synchronization between leaves. Public step exits drain both streams and
+  poison the trainer after any post-enqueue failure.
 - **Track F substrate:** deterministic intermediate-width Net2Wider transforms and
   quality/bytes selection (`e4b8f5b`). A production tied-SwiGLU training adapter
   now owns the canonical HuggingFace parameter map (`embed`, then per-layer
@@ -352,7 +356,9 @@ does not mark the ADR or its scale campaign complete.
   green on branched, multi-block, and full GQA transformer-block graphs; replayed
   gradients remain within the `1e-4` contract.
 - Host-offloaded Adam state matches the fully resident optimizer within `1e-5` and
-  stages `3 * largest_parameter` f32 elements rather than `3 * model_parameters`.
+  keeps both device and pinned staging bounded at `6 * largest_parameter` f32
+  elements (two slots, each holding master plus two moments), with at most two
+  updates in flight rather than staging proportional to model size.
 - Packed SALT forward, activation gradients, dense master gradients, tied
   embedding/head accumulation, repack-after-offload, and checkpoint replay are
   green against the dense SALT oracle. The `T=3`, `576 x 576` packed representation
@@ -388,8 +394,8 @@ does not mark the ADR or its scale campaign complete.
 ### Remaining local implementation and validation
 
 - Profile and deepen the correctness-proven tiled packed contractions until the
-  combined path beats dense materialization; add pinned double buffering and
-  copy/compute overlap, then rerun the `1123 ms` gate on an uncontended GPU. Current
+  combined path beats dense materialization; then measure the landed pinned
+  double-buffer overlap and rerun the `1123 ms` gate on an uncontended GPU. Current
   checkpoint and gradient evidence is deterministic logical accounting; actual
   synchronized peak CUDA VRAM still needs measurement.
 - Integrate resident NCCL reduction into the trainer. The device collective and

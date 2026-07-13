@@ -3,6 +3,58 @@
 //! (P2a split: move-only from `cuda/mod.rs`).
 
 use super::*;
+use cudarc::driver::{HostSlice, PinnedHostSlice, SyncOnDrop};
+
+/// A logical prefix of cudarc page-locked memory.
+///
+/// cudarc 0.19 does not expose pinned host views. Delegating the synchronization
+/// guard to the owner keeps the page-locked allocation's event semantics while
+/// allowing bounded copies for unequal parameter leaves.
+struct PinnedPrefix<'a, T> {
+    owner: &'a mut PinnedHostSlice<T>,
+    len: usize,
+}
+
+#[allow(unsafe_code)]
+// SAFETY: both methods delegate to the owning `PinnedHostSlice`, retain its
+// `SyncOnDrop`, and only narrow the returned slice to a validated prefix.
+impl<T> HostSlice<T> for PinnedPrefix<'_, T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    unsafe fn stream_synced_slice<'a>(
+        &'a self,
+        stream: &'a CudaStream,
+    ) -> (&'a [T], SyncOnDrop<'a>) {
+        // SAFETY: the delegated slice is used only with `stream`; `new`
+        // validates that `len` is within the owner allocation.
+        let (slice, sync) = unsafe { self.owner.stream_synced_slice(stream) };
+        (&slice[..self.len], sync)
+    }
+
+    unsafe fn stream_synced_mut_slice<'a>(
+        &'a mut self,
+        stream: &'a CudaStream,
+    ) -> (&'a mut [T], SyncOnDrop<'a>) {
+        // SAFETY: the delegated slice is used only with `stream`; `new`
+        // validates that `len` is within the owner allocation.
+        let (slice, sync) = unsafe { self.owner.stream_synced_mut_slice(stream) };
+        (&mut slice[..self.len], sync)
+    }
+}
+
+impl<'a, T> PinnedPrefix<'a, T> {
+    fn new(owner: &'a mut PinnedHostSlice<T>, len: usize) -> Result<Self, BackendError> {
+        if len > owner.len() {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: owner.len(),
+            });
+        }
+        Ok(Self { owner, len })
+    }
+}
 
 /// Compact Track D rows keep only TQ2's 2-bit `qs` payload; scales are f32 sidecars.
 const TRAINING_SALT_QK: usize = tritium_format::QK_K;
@@ -916,6 +968,102 @@ impl CudaBackend {
             .map_err(|e| driver_err("dev_upload htod", &e))
     }
 
+    /// Create the non-blocking transfer stream used by host-offloaded AdamW.
+    /// This must happen before its persistent device slots are allocated so
+    /// cudarc installs per-buffer event tracking for cross-stream ordering.
+    pub(crate) fn offload_transfer_stream(&self) -> Result<Arc<CudaStream>, BackendError> {
+        self.stream
+            .context()
+            .new_stream()
+            .map_err(|e| driver_err("create host-offload transfer stream", &e))
+    }
+
+    /// Allocate initialized page-locked staging memory.
+    #[allow(unsafe_code)]
+    pub(crate) fn offload_alloc_pinned_zeros(
+        &self,
+        len: usize,
+    ) -> Result<PinnedHostSlice<f32>, BackendError> {
+        // SAFETY: every `f32` bit pattern is valid and the full allocation is
+        // initialized immediately, before it can be observed by a copy.
+        let mut pinned = unsafe { self.stream.context().alloc_pinned::<f32>(len) }
+            .map_err(|e| driver_err("allocate host-offload pinned staging", &e))?;
+        pinned
+            .as_mut_slice()
+            .map_err(|e| driver_err("initialize host-offload pinned staging", &e))?
+            .fill(0.0);
+        Ok(pinned)
+    }
+
+    /// Enqueue one logical pinned-host prefix on the transfer stream.
+    pub(crate) fn offload_htod_prefix(
+        &self,
+        transfer: &Arc<CudaStream>,
+        host: &mut PinnedHostSlice<f32>,
+        len: usize,
+        device: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        if transfer.context() != self.stream.context() || !self.same_context(device) {
+            return Err(BackendError::InvalidInput(
+                "host-offload transfer buffers belong to a different CUDA context".into(),
+            ));
+        }
+        if len > device.len() {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: device.len(),
+            });
+        }
+        let prefix = PinnedPrefix::new(host, len)?;
+        transfer
+            .memcpy_htod(&prefix, device)
+            .map_err(|e| driver_err("enqueue host-offload htod", &e))
+    }
+
+    /// Enqueue one logical device prefix into page-locked host staging.
+    pub(crate) fn offload_dtoh_prefix(
+        &self,
+        transfer: &Arc<CudaStream>,
+        device: &CudaSlice<f32>,
+        len: usize,
+        host: &mut PinnedHostSlice<f32>,
+    ) -> Result<(), BackendError> {
+        if transfer.context() != self.stream.context() || !self.same_context(device) {
+            return Err(BackendError::InvalidInput(
+                "host-offload transfer buffers belong to a different CUDA context".into(),
+            ));
+        }
+        if len > device.len() {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: device.len(),
+            });
+        }
+        let source = device.slice(..len);
+        let mut prefix = PinnedPrefix::new(host, len)?;
+        transfer
+            .memcpy_dtoh(&source, &mut prefix)
+            .map_err(|e| driver_err("enqueue host-offload dtoh", &e))
+    }
+
+    /// Drain both streams before exposing updated host state.
+    pub(crate) fn offload_synchronize(
+        &self,
+        transfer: &Arc<CudaStream>,
+    ) -> Result<(), BackendError> {
+        if transfer.context() != self.stream.context() {
+            return Err(BackendError::InvalidInput(
+                "host-offload transfer stream belongs to a different CUDA context".into(),
+            ));
+        }
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("synchronize host-offload compute stream", &e))?;
+        transfer
+            .synchronize()
+            .map_err(|e| driver_err("synchronize host-offload transfer stream", &e))
+    }
+
     /// Allocate a zeroed resident device buffer of `n` f32 (fresh activation / grad accumulator).
     ///
     /// # Errors
@@ -1573,6 +1721,87 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(len))
                 .map_err(|e| driver_err("launch adamw_step_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Apply AdamW to a logical prefix of persistent offload slots. The views
+    /// retain the parent buffers' cudarc events, so the default compute stream
+    /// waits for the transfer-stream H2D and a later D2H waits for this kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adamw_step_dev_prefix(
+        &self,
+        d_param: &mut CudaSlice<f32>,
+        d_grad: &CudaSlice<f32>,
+        d_m: &mut CudaSlice<f32>,
+        d_v: &mut CudaSlice<f32>,
+        len: usize,
+        step: u64,
+        opt: &tritium_train::AdamW,
+    ) -> Result<(), BackendError> {
+        if step == 0 {
+            return Err(BackendError::InvalidInput(
+                "AdamW step index is 1-based".into(),
+            ));
+        }
+        if d_grad.len() != len {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: d_grad.len(),
+            });
+        }
+        for got in [d_param.len(), d_m.len(), d_v.len()] {
+            if got < len {
+                return Err(BackendError::ShapeMismatch { expected: len, got });
+            }
+        }
+        if !self.same_context(d_param)
+            || !self.same_context(d_grad)
+            || !self.same_context(d_m)
+            || !self.same_context(d_v)
+        {
+            return Err(BackendError::InvalidInput(
+                "host-offload AdamW buffers belong to a different CUDA context".into(),
+            ));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let len_i = i32::try_from(len)
+            .map_err(|_| BackendError::InvalidInput("AdamW length exceeds i32::MAX".into()))?;
+        let exp = i32::try_from(step).unwrap_or(i32::MAX);
+        let bc1 = 1.0 - opt.beta1.powi(exp);
+        let bc2 = 1.0 - opt.beta2.powi(exp);
+        let shrink = 1.0 - opt.lr * opt.weight_decay;
+        let one_minus_beta1 = 1.0 - opt.beta1;
+        let one_minus_beta2 = 1.0 - opt.beta2;
+        let mut param = d_param.slice_mut(..len);
+        let mut first_moment = d_m.slice_mut(..len);
+        let mut second_moment = d_v.slice_mut(..len);
+
+        let mut launch = self.stream.launch_builder(&self.func_adamw_step);
+        launch
+            .arg(&mut param)
+            .arg(d_grad)
+            .arg(&mut first_moment)
+            .arg(&mut second_moment)
+            .arg(&len_i)
+            .arg(&opt.lr)
+            .arg(&opt.beta1)
+            .arg(&opt.beta2)
+            .arg(&one_minus_beta1)
+            .arg(&one_minus_beta2)
+            .arg(&bc1)
+            .arg(&bc2)
+            .arg(&opt.eps)
+            .arg(&shrink);
+        // SAFETY: each view covers exactly `len` initialized elements and the
+        // gradient has the same length; one thread owns one element.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(len))
+                .map_err(|e| driver_err("launch host-offload adamw prefix", &e))?;
         }
         Ok(())
     }

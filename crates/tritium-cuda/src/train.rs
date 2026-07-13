@@ -26,8 +26,9 @@
 //! resident training engine.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, CudaStream, PinnedHostSlice};
 use tritium_core::GemmShape;
 use tritium_spec::BackendError;
 use tritium_train::dcp::{DcpError, StatePlane};
@@ -1159,6 +1160,138 @@ struct HostOffloadParam {
     optimizer: AdamW,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingOffload {
+    parameter_index: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OffloadSlotPhase {
+    Free,
+    Computing(PendingOffload),
+    Downloading(PendingOffload),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OffloadTransition {
+    target_slot: usize,
+    reclaim: Option<PendingOffload>,
+    download_slot: Option<usize>,
+}
+
+/// Pure two-slot state machine shared by collected and streamed gradients.
+/// CUDA operations execute in the transition order documented by
+/// [`HostOffloadTrainer`]; any failed transition resets and poisons the owner.
+#[derive(Debug)]
+struct DoubleBufferSchedule {
+    phases: [OffloadSlotPhase; 2],
+    active_compute: Option<usize>,
+    next_slot: usize,
+    peak_in_flight: usize,
+}
+
+impl Default for DoubleBufferSchedule {
+    fn default() -> Self {
+        Self {
+            phases: [OffloadSlotPhase::Free; 2],
+            active_compute: None,
+            next_slot: 0,
+            peak_in_flight: 0,
+        }
+    }
+}
+
+impl DoubleBufferSchedule {
+    fn enqueue(&mut self, pending: PendingOffload) -> Result<OffloadTransition, BackendError> {
+        let target_slot = self.next_slot;
+        let reclaim = match self.phases[target_slot] {
+            OffloadSlotPhase::Free => None,
+            OffloadSlotPhase::Downloading(pending) => Some(pending),
+            OffloadSlotPhase::Computing(_) => {
+                return Err(BackendError::InvalidInput(
+                    "host-offload double buffer attempted to reuse an active compute slot".into(),
+                ));
+            }
+        };
+        let download_slot = self.active_compute.take();
+        if let Some(slot) = download_slot {
+            let OffloadSlotPhase::Computing(previous) = self.phases[slot] else {
+                return Err(BackendError::InvalidInput(
+                    "host-offload active slot is not computing".into(),
+                ));
+            };
+            self.phases[slot] = OffloadSlotPhase::Downloading(previous);
+        }
+        self.phases[target_slot] = OffloadSlotPhase::Computing(pending);
+        self.active_compute = Some(target_slot);
+        self.next_slot ^= 1;
+        self.peak_in_flight = self.peak_in_flight.max(
+            self.phases
+                .iter()
+                .filter(|phase| !matches!(phase, OffloadSlotPhase::Free))
+                .count(),
+        );
+        Ok(OffloadTransition {
+            target_slot,
+            reclaim,
+            download_slot,
+        })
+    }
+
+    fn begin_finish(&mut self) -> Result<Option<usize>, BackendError> {
+        let Some(slot) = self.active_compute.take() else {
+            return Ok(None);
+        };
+        let OffloadSlotPhase::Computing(pending) = self.phases[slot] else {
+            return Err(BackendError::InvalidInput(
+                "host-offload finish found an invalid active slot".into(),
+            ));
+        };
+        self.phases[slot] = OffloadSlotPhase::Downloading(pending);
+        Ok(Some(slot))
+    }
+
+    fn pending_downloads(&self) -> impl Iterator<Item = (usize, PendingOffload)> + '_ {
+        self.phases
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(slot, phase)| match phase {
+                OffloadSlotPhase::Downloading(pending) => Some((slot, pending)),
+                OffloadSlotPhase::Free | OffloadSlotPhase::Computing(_) => None,
+            })
+    }
+
+    fn reset(&mut self) {
+        self.phases = [OffloadSlotPhase::Free; 2];
+        self.active_compute = None;
+        self.next_slot = 0;
+    }
+}
+
+struct HostOffloadSlot {
+    host_master: PinnedHostSlice<f32>,
+    host_m: PinnedHostSlice<f32>,
+    host_v: PinnedHostSlice<f32>,
+    device_master: CudaSlice<f32>,
+    device_m: CudaSlice<f32>,
+    device_v: CudaSlice<f32>,
+}
+
+impl HostOffloadSlot {
+    fn new(backend: &CudaBackend, capacity: usize) -> Result<Self, BackendError> {
+        Ok(Self {
+            host_master: backend.offload_alloc_pinned_zeros(capacity)?,
+            host_m: backend.offload_alloc_pinned_zeros(capacity)?,
+            host_v: backend.offload_alloc_pinned_zeros(capacity)?,
+            device_master: backend.dev_alloc_zeros(capacity)?,
+            device_m: backend.dev_alloc_zeros(capacity)?,
+            device_v: backend.dev_alloc_zeros(capacity)?,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum HostOffloadStatePlane {
     Parameter,
@@ -1213,37 +1346,47 @@ pub struct HostOffloadParamMetadata {
 
 /// Deterministic logical memory accounting for [`HostOffloadTrainer`].
 ///
-/// `peak_optimizer_device_elements` counts only the streamed master and two
-/// Adam moments. `resident_input_gradient_elements` is reported separately
-/// because [`DeviceGradients`] currently owns every requested gradient on the
-/// device before the optimizer step begins.
+/// The two persistent slots each hold master plus two Adam moments on both the
+/// device and page-locked host memory: each staging count is therefore exactly
+/// `6 * largest_parameter_elements`. `resident_input_gradient_elements` is
+/// reported separately because [`DeviceGradients`] may own every requested
+/// gradient before the optimizer step begins.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HostOffloadStats {
     /// Host-resident master + first moment + second moment elements.
     pub host_optimizer_elements: usize,
     /// Size of the largest parameter leaf.
     pub largest_parameter_elements: usize,
-    /// Peak streamed optimizer-state elements resident on the device.
+    /// Persistent double-buffered optimizer-state elements on the device.
     pub peak_optimizer_device_elements: usize,
+    /// Persistent page-locked optimizer-state staging elements.
+    pub pinned_optimizer_host_elements: usize,
+    /// Peak parameter updates concurrently computing or downloading.
+    pub peak_in_flight_parameters: usize,
     /// Device gradient elements supplied to the most recent successful step.
     pub resident_input_gradient_elements: usize,
 }
 
-/// Correctness-first CPU-offloaded AdamW state.
+/// Double-buffered CPU-offloaded AdamW state.
 ///
 /// Masters and moments remain in ordinary host vectors between steps. Each
-/// parameter uploads only its master, `m`, and `v`, invokes the same device
-/// AdamW kernel as [`DeviceTrainer`], downloads the updated state, and releases
-/// those temporary allocations before advancing to the next parameter.
+/// parameter fills one of two persistent page-locked/device slots. A dedicated
+/// transfer stream uploads the next leaf while the default stream computes the
+/// prior AdamW update, then downloads that prior leaf while compute advances.
+/// cudarc buffer events fence every cross-stream dependency and slot reuse.
 ///
-/// This bounds optimizer-state staging to three times the largest leaf. It does
-/// not overlap transfers. [`Self::step`] accepts a fully materialized
-/// [`DeviceGradients`] collection, while [`DeviceTape::xent_backward_into`]
-/// emits finalized leaf gradients directly and drops each after its update.
+/// This bounds both device and pinned staging to six times the largest leaf.
+/// [`Self::step`] accepts a fully materialized [`DeviceGradients`] collection,
+/// while [`DeviceTape::xent_backward_into`] emits finalized leaf gradients
+/// directly and drops each after its update. Both public paths drain the
+/// pipeline before returning, so host masters and moments are always coherent.
 pub struct HostOffloadTrainer<'a> {
     backend: &'a CudaBackend,
     params: Vec<HostOffloadParam>,
     leaf_lens: Vec<usize>,
+    transfer_stream: Arc<CudaStream>,
+    slots: Option<[HostOffloadSlot; 2]>,
+    schedule: DoubleBufferSchedule,
     completed_step: u64,
     stats: HostOffloadStats,
     poisoned: bool,
@@ -1306,15 +1449,34 @@ impl<'a> HostOffloadTrainer<'a> {
         let host_optimizer_elements = total_parameter_elements.checked_mul(3).ok_or_else(|| {
             BackendError::InvalidInput("host optimizer elements overflow usize".into())
         })?;
+        let staging_elements = largest_parameter_elements.checked_mul(6).ok_or_else(|| {
+            BackendError::InvalidInput("host offload staging elements overflow usize".into())
+        })?;
+        // Creating the auxiliary stream switches cudarc into event-tracked
+        // multi-stream mode before any persistent staging buffer is allocated.
+        let transfer_stream = backend.offload_transfer_stream()?;
+        let slots = if largest_parameter_elements == 0 {
+            None
+        } else {
+            Some([
+                HostOffloadSlot::new(backend, largest_parameter_elements)?,
+                HostOffloadSlot::new(backend, largest_parameter_elements)?,
+            ])
+        };
         Ok(Self {
             backend,
             params: host_params,
             leaf_lens,
+            transfer_stream,
+            slots,
+            schedule: DoubleBufferSchedule::default(),
             completed_step: 0,
             stats: HostOffloadStats {
                 host_optimizer_elements,
                 largest_parameter_elements,
-                peak_optimizer_device_elements: 0,
+                peak_optimizer_device_elements: staging_elements,
+                pinned_optimizer_host_elements: staging_elements,
+                peak_in_flight_parameters: 0,
                 resident_input_gradient_elements: 0,
             },
             poisoned: false,
@@ -1452,16 +1614,10 @@ impl<'a> HostOffloadTrainer<'a> {
                 })?;
         }
 
-        let mut mutation_completed = false;
         for (parameter_index, grad) in grads.bufs.into_iter().enumerate() {
-            if let Err(error) = self.apply_streamed_gradient(parameter_index, &grad, step) {
-                if mutation_completed {
-                    self.poisoned = true;
-                }
-                return Err(error);
-            }
-            mutation_completed = true;
+            self.apply_streamed_gradient(parameter_index, &grad, step)?;
         }
+        self.finish_offload_pipeline()?;
         self.stats.resident_input_gradient_elements = resident_input_gradient_elements;
         self.completed_step = step;
         Ok(())
@@ -1473,7 +1629,7 @@ impl<'a> HostOffloadTrainer<'a> {
         grad: &CudaSlice<f32>,
         step: u64,
     ) -> Result<(), BackendError> {
-        let param = self.params.get_mut(parameter_index).ok_or_else(|| {
+        let param = self.params.get(parameter_index).ok_or_else(|| {
             BackendError::InvalidInput(format!(
                 "streamed parameter index {parameter_index} is out of range"
             ))
@@ -1489,34 +1645,210 @@ impl<'a> HostOffloadTrainer<'a> {
                 got: grad.len(),
             });
         }
-        let mut d_master = self.backend.dev_upload(&param.master)?;
-        let mut d_m = self.backend.dev_upload(&param.m)?;
-        let mut d_v = self.backend.dev_upload(&param.v)?;
-        let staged_elements = param.master.len().checked_mul(3).ok_or_else(|| {
-            BackendError::InvalidInput("staged optimizer elements overflow usize".into())
-        })?;
-        self.stats.peak_optimizer_device_elements = self
-            .stats
-            .peak_optimizer_device_elements
-            .max(staged_elements);
+        let pending = PendingOffload {
+            parameter_index,
+            len: param.master.len(),
+        };
+        // Preserve the pre-existing zero-sized leaf contract without requiring
+        // a zero-byte pinned allocation. AdamW is an elementwise no-op here.
+        if pending.len == 0 {
+            return Ok(());
+        }
+        let transition = match self.schedule.enqueue(pending) {
+            Ok(transition) => transition,
+            Err(error) => {
+                self.abort_offload_pipeline();
+                return Err(error);
+            }
+        };
         let update = (|| {
-            self.backend.adamw_step_dev(
-                &mut d_master,
-                grad,
-                &mut d_m,
-                &mut d_v,
-                step,
-                &param.optimizer,
-            )?;
-            self.backend.dev_download(&d_master, &mut param.master)?;
-            self.backend.dev_download(&d_m, &mut param.m)?;
-            self.backend.dev_download(&d_v, &mut param.v)?;
+            if let Some(reclaim) = transition.reclaim {
+                self.commit_slot(transition.target_slot, reclaim)?;
+            }
+            self.fill_slot(transition.target_slot, pending)?;
+            self.enqueue_slot_upload(transition.target_slot, pending.len)?;
+            if let Some(previous) = transition.download_slot {
+                self.enqueue_slot_download(previous)?;
+            }
+            self.enqueue_slot_adam(transition.target_slot, pending, grad, step)
+        })();
+        if let Err(error) = update {
+            self.abort_offload_pipeline();
+            return Err(error);
+        }
+        self.stats.peak_in_flight_parameters = self
+            .stats
+            .peak_in_flight_parameters
+            .max(self.schedule.peak_in_flight);
+        Ok(())
+    }
+
+    fn slot_mut(&mut self, slot: usize) -> Result<&mut HostOffloadSlot, BackendError> {
+        self.slots
+            .as_mut()
+            .and_then(|slots| slots.get_mut(slot))
+            .ok_or_else(|| {
+                BackendError::InvalidInput("host-offload staging slot is unavailable".into())
+            })
+    }
+
+    fn commit_slot(
+        &mut self,
+        slot_index: usize,
+        pending: PendingOffload,
+    ) -> Result<(), BackendError> {
+        let HostOffloadTrainer { slots, params, .. } = self;
+        let slot = slots
+            .as_mut()
+            .and_then(|slots| slots.get_mut(slot_index))
+            .ok_or_else(|| {
+                BackendError::InvalidInput("host-offload staging slot is unavailable".into())
+            })?;
+        let param = params.get_mut(pending.parameter_index).ok_or_else(|| {
+            BackendError::InvalidInput(format!(
+                "streamed parameter index {} is out of range",
+                pending.parameter_index
+            ))
+        })?;
+        if param.master.len() != pending.len {
+            return Err(BackendError::ShapeMismatch {
+                expected: param.master.len(),
+                got: pending.len,
+            });
+        }
+        param.master.copy_from_slice(
+            &slot.host_master.as_slice().map_err(|e| {
+                BackendError::Backend(format!("read host-offload master staging: {e}"))
+            })?[..pending.len],
+        );
+        param.m.copy_from_slice(
+            &slot.host_m.as_slice().map_err(|e| {
+                BackendError::Backend(format!("read host-offload first moment staging: {e}"))
+            })?[..pending.len],
+        );
+        param.v.copy_from_slice(
+            &slot.host_v.as_slice().map_err(|e| {
+                BackendError::Backend(format!("read host-offload second moment staging: {e}"))
+            })?[..pending.len],
+        );
+        Ok(())
+    }
+
+    fn fill_slot(
+        &mut self,
+        slot_index: usize,
+        pending: PendingOffload,
+    ) -> Result<(), BackendError> {
+        let HostOffloadTrainer { slots, params, .. } = self;
+        let slot = slots
+            .as_mut()
+            .and_then(|slots| slots.get_mut(slot_index))
+            .ok_or_else(|| {
+                BackendError::InvalidInput("host-offload staging slot is unavailable".into())
+            })?;
+        let param = params.get(pending.parameter_index).ok_or_else(|| {
+            BackendError::InvalidInput(format!(
+                "streamed parameter index {} is out of range",
+                pending.parameter_index
+            ))
+        })?;
+        slot.host_master
+            .as_mut_slice()
+            .map_err(|e| BackendError::Backend(format!("fill host-offload master staging: {e}")))?
+            [..pending.len]
+            .copy_from_slice(&param.master);
+        slot.host_m.as_mut_slice().map_err(|e| {
+            BackendError::Backend(format!("fill host-offload first moment staging: {e}"))
+        })?[..pending.len]
+            .copy_from_slice(&param.m);
+        slot.host_v.as_mut_slice().map_err(|e| {
+            BackendError::Backend(format!("fill host-offload second moment staging: {e}"))
+        })?[..pending.len]
+            .copy_from_slice(&param.v);
+        Ok(())
+    }
+
+    fn enqueue_slot_upload(&mut self, slot_index: usize, len: usize) -> Result<(), BackendError> {
+        let backend = self.backend;
+        let transfer = Arc::clone(&self.transfer_stream);
+        let slot = self.slot_mut(slot_index)?;
+        backend.offload_htod_prefix(
+            &transfer,
+            &mut slot.host_master,
+            len,
+            &mut slot.device_master,
+        )?;
+        backend.offload_htod_prefix(&transfer, &mut slot.host_m, len, &mut slot.device_m)?;
+        backend.offload_htod_prefix(&transfer, &mut slot.host_v, len, &mut slot.device_v)
+    }
+
+    fn enqueue_slot_download(&mut self, slot_index: usize) -> Result<(), BackendError> {
+        let pending = match self.schedule.phases[slot_index] {
+            OffloadSlotPhase::Downloading(pending) => pending,
+            OffloadSlotPhase::Free | OffloadSlotPhase::Computing(_) => {
+                return Err(BackendError::InvalidInput(
+                    "host-offload download slot is not ready".into(),
+                ));
+            }
+        };
+        let backend = self.backend;
+        let transfer = Arc::clone(&self.transfer_stream);
+        let slot = self.slot_mut(slot_index)?;
+        backend.offload_dtoh_prefix(
+            &transfer,
+            &slot.device_master,
+            pending.len,
+            &mut slot.host_master,
+        )?;
+        backend.offload_dtoh_prefix(&transfer, &slot.device_m, pending.len, &mut slot.host_m)?;
+        backend.offload_dtoh_prefix(&transfer, &slot.device_v, pending.len, &mut slot.host_v)
+    }
+
+    fn enqueue_slot_adam(
+        &mut self,
+        slot_index: usize,
+        pending: PendingOffload,
+        grad: &CudaSlice<f32>,
+        step: u64,
+    ) -> Result<(), BackendError> {
+        let optimizer = self.params[pending.parameter_index].optimizer;
+        let backend = self.backend;
+        let slot = self.slot_mut(slot_index)?;
+        backend.adamw_step_dev_prefix(
+            &mut slot.device_master,
+            grad,
+            &mut slot.device_m,
+            &mut slot.device_v,
+            pending.len,
+            step,
+            &optimizer,
+        )
+    }
+
+    fn finish_offload_pipeline(&mut self) -> Result<(), BackendError> {
+        let finish = (|| {
+            if let Some(slot) = self.schedule.begin_finish()? {
+                self.enqueue_slot_download(slot)?;
+            }
+            self.backend.offload_synchronize(&self.transfer_stream)?;
+            let pending: Vec<_> = self.schedule.pending_downloads().collect();
+            for (slot, pending) in pending {
+                self.commit_slot(slot, pending)?;
+            }
+            self.schedule.reset();
             Ok(())
         })();
-        if update.is_err() {
-            self.poisoned = true;
+        if let Err(error) = finish {
+            self.abort_offload_pipeline();
+            return Err(error);
         }
-        update
+        Ok(())
+    }
+
+    fn abort_offload_pipeline(&mut self) {
+        let _ = self.backend.offload_synchronize(&self.transfer_stream);
+        self.schedule.reset();
+        self.poisoned = true;
     }
 }
 
@@ -1738,7 +2070,7 @@ impl HostGradientStream<'_, '_> {
             self.trainer
                 .apply_streamed_gradient(binding.parameter_index, &grad, self.step)
         {
-            self.trainer.poisoned = true;
+            self.trainer.abort_offload_pipeline();
             return Err(error);
         }
         self.mutation_started = true;
@@ -3721,7 +4053,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             Ok(result) => result,
             Err(error) => {
                 if stream.mutation_started {
-                    stream.trainer.poisoned = true;
+                    stream.trainer.abort_offload_pipeline();
                 }
                 return Err(error);
             }
@@ -3730,12 +4062,13 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             || stream.plan.remaining_edges.iter().any(|&count| count != 0)
         {
             if stream.mutation_started {
-                stream.trainer.poisoned = true;
+                stream.trainer.abort_offload_pipeline();
             }
             return Err(BackendError::InvalidInput(
                 "gradient stream finished before every binding was emitted".into(),
             ));
         }
+        stream.trainer.finish_offload_pipeline()?;
         stream.trainer.stats.resident_input_gradient_elements =
             stream.plan.materialized_collection_elements;
         stream.trainer.completed_step = step;
@@ -3834,6 +4167,49 @@ mod tests {
             .zip(b)
             .map(|(&x, &y)| (x - y).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn host_offload_scheduler_overlaps_two_slots_and_drains() {
+        let pending = |parameter_index, len| PendingOffload {
+            parameter_index,
+            len,
+        };
+        let mut schedule = DoubleBufferSchedule::default();
+
+        assert_eq!(
+            schedule.enqueue(pending(4, 17)).unwrap(),
+            OffloadTransition {
+                target_slot: 0,
+                reclaim: None,
+                download_slot: None,
+            }
+        );
+        assert_eq!(
+            schedule.enqueue(pending(2, 257)).unwrap(),
+            OffloadTransition {
+                target_slot: 1,
+                reclaim: None,
+                download_slot: Some(0),
+            }
+        );
+        assert_eq!(
+            schedule.enqueue(pending(9, 63)).unwrap(),
+            OffloadTransition {
+                target_slot: 0,
+                reclaim: Some(pending(4, 17)),
+                download_slot: Some(1),
+            }
+        );
+        assert_eq!(schedule.peak_in_flight, 2);
+        assert_eq!(schedule.begin_finish().unwrap(), Some(0));
+        assert_eq!(
+            schedule.pending_downloads().collect::<Vec<_>>(),
+            vec![(0, pending(9, 63)), (1, pending(2, 257))]
+        );
+        schedule.reset();
+        assert!(schedule.pending_downloads().next().is_none());
+        assert_eq!(schedule.active_compute, None);
     }
 
     #[test]
@@ -4854,6 +5230,39 @@ mod tests {
     }
 
     #[test]
+    fn host_offload_zero_sized_leaf_is_a_noop() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping host_offload_zero_sized_leaf_is_a_noop: no CUDA ({e})");
+                return;
+            }
+        };
+        let master = Vec::new();
+        let spec = DeviceTrainParam {
+            master: &master,
+            rows: 0,
+            cols: 7,
+            salt_planes: 1,
+            optimizer: AdamW::new(1e-3),
+        };
+        let mut trainer = HostOffloadTrainer::new(&backend, &[spec]).unwrap();
+        let grads = DeviceGradients {
+            bufs: vec![backend.dev_alloc_zeros(0).unwrap()],
+            stats: DeviceBackwardStats::default(),
+        };
+
+        trainer.step(grads, 1).unwrap();
+
+        assert_eq!(trainer.completed_step(), 1);
+        assert!(trainer.master(0).unwrap().is_empty());
+        assert!(!trainer.is_poisoned());
+        assert_eq!(trainer.stats().peak_optimizer_device_elements, 0);
+        assert_eq!(trainer.stats().pinned_optimizer_host_elements, 0);
+        assert_eq!(trainer.stats().peak_in_flight_parameters, 0);
+    }
+
+    #[test]
     fn host_offload_poison_refuses_reuse_after_device_update_failure() {
         let backend = match CudaBackend::new(0) {
             Ok(b) => b,
@@ -5075,18 +5484,18 @@ mod tests {
         let largest = masters.iter().map(Vec::len).max().unwrap();
         assert_eq!(stats.host_optimizer_elements, total_elements * 3);
         assert_eq!(stats.largest_parameter_elements, largest);
-        assert_eq!(stats.peak_optimizer_device_elements, largest * 3);
+        assert_eq!(stats.peak_optimizer_device_elements, largest * 6);
+        assert_eq!(stats.pinned_optimizer_host_elements, largest * 6);
+        assert_eq!(stats.peak_in_flight_parameters, 2);
         assert_eq!(stats.resident_input_gradient_elements, total_elements);
-        assert!(
-            stats.peak_optimizer_device_elements < stats.host_optimizer_elements,
-            "offload staging must be leaf-bounded, not model-bounded: {stats:?}"
-        );
         eprintln!(
-            "0027 Track E host AdamW offload: optimizer staging peak {}/{} elements; largest leaf \
-             {}; resident gradient input {} elements",
+            "0027 Track E host AdamW offload: device/pinned staging {}/{} elements; host state {}; \
+             largest leaf {}; peak in-flight {}; resident gradient input {} elements",
             stats.peak_optimizer_device_elements,
+            stats.pinned_optimizer_host_elements,
             stats.host_optimizer_elements,
             stats.largest_parameter_elements,
+            stats.peak_in_flight_parameters,
             stats.resident_input_gradient_elements
         );
     }
@@ -5203,7 +5612,11 @@ mod tests {
             Err(BackendError::ShapeMismatch { .. })
         ));
         assert_eq!(trainer.master(0).unwrap(), before);
-        assert_eq!(trainer.stats().peak_optimizer_device_elements, 0);
+        assert_eq!(
+            trainer.stats().peak_optimizer_device_elements,
+            master.len() * 6
+        );
+        assert_eq!(trainer.stats().peak_in_flight_parameters, 0);
         assert_eq!(trainer.stats().resident_input_gradient_elements, 0);
 
         if let Ok(other_backend) = CudaBackend::new(1) {
@@ -5909,7 +6322,11 @@ mod tests {
         ));
         assert_eq!(trainer.master(0).unwrap(), before);
         assert!(!trainer.is_poisoned());
-        assert_eq!(trainer.stats().peak_optimizer_device_elements, 0);
+        assert_eq!(
+            trainer.stats().peak_optimizer_device_elements,
+            master.len() * 6
+        );
+        assert_eq!(trainer.stats().peak_in_flight_parameters, 0);
     }
 
     /// Two backend handles retaining the same CUDA primary context may share a
