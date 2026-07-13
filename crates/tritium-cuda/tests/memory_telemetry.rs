@@ -10,29 +10,10 @@ struct CurrentPoolGuard {
     device: cudarc::driver::sys::CUdevice,
     original: cudarc::driver::sys::CUmemoryPool,
     alternate: cudarc::driver::sys::CUmemoryPool,
-    active: bool,
-}
-
-impl CurrentPoolGuard {
-    fn restore(mut self) {
-        use cudarc::driver::result;
-
-        // SAFETY: both pool handles came from CUDA for `device`; restore the
-        // retained original before destroying the unused alternate exactly once.
-        unsafe {
-            result::device::set_mem_pool(self.device, self.original)
-                .expect("restore original CUDA pool");
-            result::mem_pool::destroy(self.alternate).expect("destroy alternate CUDA pool");
-        }
-        self.active = false;
-    }
 }
 
 impl Drop for CurrentPoolGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
         // SAFETY: best-effort panic cleanup uses the same live handles retained
         // by this guard. Errors cannot be reported safely from `Drop`.
         unsafe {
@@ -187,12 +168,11 @@ fn public_memory_telemetry_fails_if_the_process_switches_current_pool() {
             device,
             original,
             alternate,
-            active: true,
         }
     };
 
     let sample = telemetry.sample_synchronized();
-    guard.restore();
+    drop(guard);
 
     let error = sample.expect_err("pool drift must invalidate scoped telemetry");
     assert!(error.to_string().contains("current memory pool changed"));
