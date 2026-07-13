@@ -10,9 +10,13 @@
 //! metadata map and tensor set the reader accepts,
 //! `read_gguf(write_gguf(..)) == (metadata, tensors)`.
 
+use core::fmt;
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 
 use crate::gguf::{DEFAULT_ALIGNMENT, GgufError, GgufValue};
+
+const STREAM_WRITE_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Append a GGUF string: `u64` little-endian byte-length, then the UTF-8 bytes.
 fn push_gguf_string(out: &mut Vec<u8>, s: &str) {
@@ -117,6 +121,356 @@ pub struct TensorOut<'a> {
     pub data: &'a [u8],
 }
 
+/// Tensor metadata for a streaming GGUF payload whose exact byte length is known.
+///
+/// Specs are emitted in slice order. [`GgufStreamWriter`] requires payload chunks
+/// to use the corresponding zero-based tensor index and writes the same tensor-info
+/// table and aligned offsets as [`write_gguf`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GgufTensorSpec {
+    /// Tensor name (written as a GGUF string).
+    pub name: String,
+    /// Shape, fastest-varying dimension first.
+    pub dims: Vec<u64>,
+    /// ggml type-id (e.g. [`crate::GGML_TYPE_TQ2_0`]).
+    pub ggml_type: u32,
+    /// Exact number of payload bytes the stream must provide.
+    pub data_len: u64,
+}
+
+/// Errors raised while constructing or writing a streaming GGUF container.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum GgufWriteError {
+    /// GGUF metadata, version, or layout was invalid.
+    Gguf(GgufError),
+    /// The destination writer failed.
+    Io(io::Error),
+    /// A payload chunk named a tensor other than the next tensor in stream order.
+    TensorOutOfOrder {
+        /// Tensor index required by the stream state.
+        expected: usize,
+        /// Tensor index supplied by the caller.
+        got: usize,
+    },
+    /// A payload chunk was supplied after every declared tensor was complete.
+    StreamComplete {
+        /// Tensor index supplied by the caller.
+        got: usize,
+    },
+    /// A tensor payload chunk would exceed its declared byte length.
+    TensorTooLong {
+        /// Tensor index being written.
+        tensor: usize,
+        /// Declared payload length.
+        expected: u64,
+        /// Total bytes that would have been written after accepting the chunk.
+        attempted: u64,
+    },
+    /// [`GgufStreamWriter::finish`] was called before a payload reached its length.
+    TensorTooShort {
+        /// Tensor index that remains incomplete.
+        tensor: usize,
+        /// Declared payload length.
+        expected: u64,
+        /// Payload bytes successfully written.
+        written: u64,
+    },
+    /// An earlier destination failure may have left a partial stream.
+    Poisoned,
+}
+
+impl fmt::Display for GgufWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gguf(error) => write!(f, "GGUF layout: {error}"),
+            Self::Io(error) => write!(f, "GGUF destination: {error}"),
+            Self::TensorOutOfOrder { expected, got } => write!(
+                f,
+                "GGUF tensor payload out of order: expected index {expected}, got {got}"
+            ),
+            Self::StreamComplete { got } => write!(
+                f,
+                "GGUF tensor payload index {got} supplied after the stream was complete"
+            ),
+            Self::TensorTooLong {
+                tensor,
+                expected,
+                attempted,
+            } => write!(
+                f,
+                "GGUF tensor {tensor} payload exceeds {expected} bytes (attempted {attempted})"
+            ),
+            Self::TensorTooShort {
+                tensor,
+                expected,
+                written,
+            } => write!(
+                f,
+                "GGUF tensor {tensor} payload is short: expected {expected} bytes, wrote {written}"
+            ),
+            Self::Poisoned => f.write_str("GGUF stream is poisoned after a destination failure"),
+        }
+    }
+}
+
+impl std::error::Error for GgufWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Gguf(error) => Some(error),
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<GgufError> for GgufWriteError {
+    fn from(error: GgufError) -> Self {
+        Self::Gguf(error)
+    }
+}
+
+impl From<io::Error> for GgufWriteError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+struct GgufLayout {
+    header: Vec<u8>,
+    tensor_data_offset: u64,
+    offsets: Vec<u64>,
+}
+
+fn build_layout(
+    version: u32,
+    metadata: &BTreeMap<String, GgufValue>,
+    tensors: &[GgufTensorSpec],
+) -> Result<GgufLayout, GgufError> {
+    if version != 2 && version != 3 {
+        return Err(GgufError::UnsupportedVersion(version));
+    }
+
+    let alignment = metadata
+        .get("general.alignment")
+        .and_then(GgufValue::as_u64)
+        .filter(|&value| value != 0)
+        .unwrap_or(DEFAULT_ALIGNMENT);
+
+    let mut offsets = Vec::with_capacity(tensors.len());
+    let mut relative_end = 0u64;
+    for tensor in tensors {
+        let offset = align_up(relative_end, alignment)?;
+        offsets.push(offset);
+        relative_end = offset
+            .checked_add(tensor.data_len)
+            .ok_or(GgufError::DimsOverflow)?;
+    }
+
+    let mut header = Vec::new();
+    header.extend_from_slice(b"GGUF");
+    header.extend_from_slice(&version.to_le_bytes());
+    header.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    header.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+    for (key, value) in metadata {
+        push_gguf_string(&mut header, key);
+        push_value(&mut header, value)?;
+    }
+    for (tensor, &offset) in tensors.iter().zip(&offsets) {
+        push_gguf_string(&mut header, &tensor.name);
+        header.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
+        for &dimension in &tensor.dims {
+            header.extend_from_slice(&dimension.to_le_bytes());
+        }
+        header.extend_from_slice(&tensor.ggml_type.to_le_bytes());
+        header.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    let header_end = u64::try_from(header.len()).map_err(|_| GgufError::DimsOverflow)?;
+    let tensor_data_offset = align_up(header_end, alignment)?;
+    tensor_data_offset
+        .checked_add(relative_end)
+        .ok_or(GgufError::DimsOverflow)?;
+    Ok(GgufLayout {
+        header,
+        tensor_data_offset,
+        offsets,
+    })
+}
+
+fn write_all_bounded<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
+    for chunk in bytes.chunks(STREAM_WRITE_CHUNK_BYTES) {
+        writer.write_all(chunk)?;
+    }
+    Ok(())
+}
+
+/// Stateful exact-length GGUF v2/v3 writer.
+///
+/// Construction writes the deterministic metadata and tensor-info header. Call
+/// [`write_tensor_chunk`](Self::write_tensor_chunk) with monotonically increasing
+/// tensor indices; each tensor may be split into any number of chunks. Alignment
+/// padding is emitted as bounded zero-filled writes. [`finish`](Self::finish)
+/// succeeds only after every declared payload byte has been written.
+#[derive(Debug)]
+pub struct GgufStreamWriter<W: Write> {
+    writer: W,
+    tensor_lengths: Vec<u64>,
+    offsets: Vec<u64>,
+    tensor_data_offset: u64,
+    position: u64,
+    next_tensor: usize,
+    tensor_written: u64,
+    poisoned: bool,
+}
+
+impl<W: Write> GgufStreamWriter<W> {
+    /// Write a GGUF header and prepare to receive exact-length tensor payloads.
+    ///
+    /// # Errors
+    /// Returns [`GgufWriteError::Gguf`] for an invalid version, metadata value, or
+    /// overflowing layout, and [`GgufWriteError::Io`] if the header cannot be written.
+    pub fn new(
+        mut writer: W,
+        version: u32,
+        metadata: &BTreeMap<String, GgufValue>,
+        tensors: &[GgufTensorSpec],
+    ) -> Result<Self, GgufWriteError> {
+        let layout = build_layout(version, metadata, tensors)?;
+        write_all_bounded(&mut writer, &layout.header)?;
+        let position = u64::try_from(layout.header.len())
+            .map_err(|_| GgufWriteError::Gguf(GgufError::DimsOverflow))?;
+        let mut stream = Self {
+            writer,
+            tensor_lengths: tensors.iter().map(|tensor| tensor.data_len).collect(),
+            offsets: layout.offsets,
+            tensor_data_offset: layout.tensor_data_offset,
+            position,
+            next_tensor: 0,
+            tensor_written: 0,
+            poisoned: false,
+        };
+        stream.pad_to(stream.tensor_data_offset)?;
+        stream.prepare_next_tensor()?;
+        Ok(stream)
+    }
+
+    /// Append one chunk of the indexed tensor's payload.
+    ///
+    /// Chunks for a tensor must be contiguous, and tensors must be written in spec
+    /// order. A chunk that would exceed the declared payload length is rejected
+    /// before any of its bytes reach the destination.
+    ///
+    /// # Errors
+    /// Returns a typed ordering/length error, [`GgufWriteError::Io`] on destination
+    /// failure, or [`GgufWriteError::Poisoned`] after an earlier I/O failure.
+    pub fn write_tensor_chunk(
+        &mut self,
+        tensor_index: usize,
+        chunk: &[u8],
+    ) -> Result<(), GgufWriteError> {
+        if self.poisoned {
+            return Err(GgufWriteError::Poisoned);
+        }
+        if self.next_tensor == self.tensor_lengths.len() {
+            return Err(GgufWriteError::StreamComplete { got: tensor_index });
+        }
+        if tensor_index != self.next_tensor {
+            return Err(GgufWriteError::TensorOutOfOrder {
+                expected: self.next_tensor,
+                got: tensor_index,
+            });
+        }
+        let chunk_len = u64::try_from(chunk.len())
+            .map_err(|_| GgufWriteError::Gguf(GgufError::DimsOverflow))?;
+        let attempted =
+            self.tensor_written
+                .checked_add(chunk_len)
+                .ok_or(GgufWriteError::TensorTooLong {
+                    tensor: tensor_index,
+                    expected: self.tensor_lengths[tensor_index],
+                    attempted: u64::MAX,
+                })?;
+        let expected = self.tensor_lengths[tensor_index];
+        if attempted > expected {
+            return Err(GgufWriteError::TensorTooLong {
+                tensor: tensor_index,
+                expected,
+                attempted,
+            });
+        }
+        if let Err(error) = write_all_bounded(&mut self.writer, chunk) {
+            self.poisoned = true;
+            return Err(GgufWriteError::Io(error));
+        }
+        self.position = self
+            .position
+            .checked_add(chunk_len)
+            .ok_or(GgufWriteError::Gguf(GgufError::DimsOverflow))?;
+        self.tensor_written = attempted;
+        if attempted == expected {
+            self.next_tensor += 1;
+            self.tensor_written = 0;
+            self.prepare_next_tensor()?;
+        }
+        Ok(())
+    }
+
+    /// Finish the container and return the destination writer.
+    ///
+    /// # Errors
+    /// Returns [`GgufWriteError::TensorTooShort`] if any payload is incomplete,
+    /// [`GgufWriteError::Poisoned`] after a prior destination failure, or
+    /// [`GgufWriteError::Io`] if flushing the exact stream fails.
+    pub fn finish(mut self) -> Result<W, GgufWriteError> {
+        if self.poisoned {
+            return Err(GgufWriteError::Poisoned);
+        }
+        if self.next_tensor < self.tensor_lengths.len() {
+            return Err(GgufWriteError::TensorTooShort {
+                tensor: self.next_tensor,
+                expected: self.tensor_lengths[self.next_tensor],
+                written: self.tensor_written,
+            });
+        }
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+
+    fn prepare_next_tensor(&mut self) -> Result<(), GgufWriteError> {
+        while self.next_tensor < self.tensor_lengths.len() {
+            let target = self
+                .tensor_data_offset
+                .checked_add(self.offsets[self.next_tensor])
+                .ok_or(GgufWriteError::Gguf(GgufError::DimsOverflow))?;
+            self.pad_to(target)?;
+            if self.tensor_lengths[self.next_tensor] != 0 {
+                break;
+            }
+            self.next_tensor += 1;
+        }
+        Ok(())
+    }
+
+    fn pad_to(&mut self, target: u64) -> Result<(), GgufWriteError> {
+        const ZEROES: [u8; STREAM_WRITE_CHUNK_BYTES] = [0; STREAM_WRITE_CHUNK_BYTES];
+        let mut remaining = target
+            .checked_sub(self.position)
+            .ok_or(GgufWriteError::Gguf(GgufError::DimsOverflow))?;
+        while remaining != 0 {
+            let count = usize::try_from(remaining.min(ZEROES.len() as u64))
+                .expect("bounded zero-padding chunk fits usize");
+            if let Err(error) = self.writer.write_all(&ZEROES[..count]) {
+                self.poisoned = true;
+                return Err(GgufWriteError::Io(error));
+            }
+            self.position += count as u64;
+            remaining -= count as u64;
+        }
+        Ok(())
+    }
+}
+
 /// Serialize a GGUF v2/v3 container.
 ///
 /// `version` must be 2 or 3. Tensor offsets are assigned sequentially, each
@@ -131,68 +485,32 @@ pub fn write_gguf(
     metadata: &BTreeMap<String, GgufValue>,
     tensors: &[TensorOut<'_>],
 ) -> Result<Vec<u8>, GgufError> {
-    if version != 2 && version != 3 {
-        return Err(GgufError::UnsupportedVersion(version));
-    }
-
-    // Effective alignment: `general.alignment` if present and non-zero, else default.
-    let alignment = metadata
-        .get("general.alignment")
-        .and_then(GgufValue::as_u64)
-        .filter(|&a| a != 0)
-        .unwrap_or(DEFAULT_ALIGNMENT);
-
-    // Assign each tensor a data-section-relative offset, sequential and aligned.
-    // `rel` tracks the running end of the data section.
-    let mut offsets = Vec::with_capacity(tensors.len());
-    let mut rel: u64 = 0;
-    for t in tensors {
-        let off = align_up(rel, alignment)?;
-        offsets.push(off);
-        rel = off
-            .checked_add(t.data.len() as u64)
-            .ok_or(GgufError::DimsOverflow)?;
-    }
-
-    // Header.
-    let mut out = Vec::new();
-    out.extend_from_slice(b"GGUF");
-    out.extend_from_slice(&version.to_le_bytes());
-    out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-    out.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
-
-    // Metadata table — BTreeMap iterates in key order; the reader re-inserts into
-    // a BTreeMap, so any order round-trips, and key order keeps output deterministic.
-    for (key, value) in metadata {
-        push_gguf_string(&mut out, key);
-        push_value(&mut out, value)?;
-    }
-
-    // Tensor-info table.
-    for (t, &off) in tensors.iter().zip(&offsets) {
-        push_gguf_string(&mut out, &t.name);
-        out.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
-        for &d in &t.dims {
-            out.extend_from_slice(&d.to_le_bytes());
-        }
-        out.extend_from_slice(&t.ggml_type.to_le_bytes());
-        out.extend_from_slice(&off.to_le_bytes());
-    }
-
-    // Pad up to the aligned data-section start.
-    let header_end = out.len() as u64;
-    let tensor_data_offset = align_up(header_end, alignment)?;
-    out.resize(tensor_data_offset as usize, 0);
+    let specs: Vec<GgufTensorSpec> = tensors
+        .iter()
+        .map(|tensor| GgufTensorSpec {
+            name: tensor.name.clone(),
+            dims: tensor.dims.clone(),
+            ggml_type: tensor.ggml_type,
+            data_len: tensor.data.len() as u64,
+        })
+        .collect();
+    let layout = build_layout(version, metadata, &specs)?;
+    let mut out = layout.header;
+    let tensor_data_offset =
+        usize::try_from(layout.tensor_data_offset).map_err(|_| GgufError::DimsOverflow)?;
+    out.resize(tensor_data_offset, 0);
 
     // Data section: each payload at `tensor_data_offset + offset`, zero-padding gaps.
-    for (t, &off) in tensors.iter().zip(&offsets) {
-        let abs = tensor_data_offset
-            .checked_add(off)
-            .ok_or(GgufError::DimsOverflow)? as usize;
-        if out.len() < abs {
-            out.resize(abs, 0);
+    for (tensor, &offset) in tensors.iter().zip(&layout.offsets) {
+        let absolute = layout
+            .tensor_data_offset
+            .checked_add(offset)
+            .ok_or(GgufError::DimsOverflow)?;
+        let absolute = usize::try_from(absolute).map_err(|_| GgufError::DimsOverflow)?;
+        if out.len() < absolute {
+            out.resize(absolute, 0);
         }
-        out.extend_from_slice(t.data);
+        out.extend_from_slice(tensor.data);
     }
 
     Ok(out)
@@ -336,5 +654,259 @@ mod tests {
             GgufValue::Array(vec![GgufValue::Array(vec![GgufValue::U8(1)])]),
         );
         assert!(write_gguf(3, &meta, &[]).is_err());
+    }
+
+    #[test]
+    fn streaming_bytes_match_in_memory_writer() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        );
+        metadata.insert("general.alignment".into(), GgufValue::U32(64));
+        metadata.insert(
+            "test.array".into(),
+            GgufValue::Array(vec![GgufValue::U32(3), GgufValue::U32(5)]),
+        );
+        let first: Vec<u8> = (0..66u8).collect();
+        let second: Vec<u8> = (0..131u8).map(|byte| byte ^ 0xA5).collect();
+        let tensors = vec![
+            TensorOut {
+                name: "blk.0.weight".into(),
+                dims: vec![256],
+                ggml_type: GGML_TYPE_TQ2_0,
+                data: &first,
+            },
+            TensorOut {
+                name: "blk.1.weight".into(),
+                dims: vec![512],
+                ggml_type: GGML_TYPE_TQ2_0,
+                data: &second,
+            },
+        ];
+        let specs = vec![
+            GgufTensorSpec {
+                name: "blk.0.weight".into(),
+                dims: vec![256],
+                ggml_type: GGML_TYPE_TQ2_0,
+                data_len: first.len() as u64,
+            },
+            GgufTensorSpec {
+                name: "blk.1.weight".into(),
+                dims: vec![512],
+                ggml_type: GGML_TYPE_TQ2_0,
+                data_len: second.len() as u64,
+            },
+        ];
+
+        for version in [2, 3] {
+            let expected = write_gguf(version, &metadata, &tensors).expect("in-memory write");
+            let mut writer =
+                GgufStreamWriter::new(Vec::new(), version, &metadata, &specs).expect("stream");
+            writer.write_tensor_chunk(0, &first).expect("first tensor");
+            writer
+                .write_tensor_chunk(1, &second)
+                .expect("second tensor");
+            let actual = writer.finish().expect("finish");
+            assert_eq!(actual, expected, "version {version}");
+        }
+    }
+
+    #[test]
+    fn streaming_accepts_chunked_tensor_payloads() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("general.alignment".into(), GgufValue::U32(16));
+        let first = b"abcdefg";
+        let second = b"012345678";
+        let tensors = vec![
+            TensorOut {
+                name: "first".into(),
+                dims: vec![first.len() as u64],
+                ggml_type: 169,
+                data: first,
+            },
+            TensorOut {
+                name: "second".into(),
+                dims: vec![second.len() as u64],
+                ggml_type: 169,
+                data: second,
+            },
+        ];
+        let specs = vec![
+            GgufTensorSpec {
+                name: "first".into(),
+                dims: vec![first.len() as u64],
+                ggml_type: 169,
+                data_len: first.len() as u64,
+            },
+            GgufTensorSpec {
+                name: "second".into(),
+                dims: vec![second.len() as u64],
+                ggml_type: 169,
+                data_len: second.len() as u64,
+            },
+        ];
+        let expected = write_gguf(3, &metadata, &tensors).expect("in-memory write");
+
+        let mut writer = GgufStreamWriter::new(Vec::new(), 3, &metadata, &specs).expect("stream");
+        for chunk in first.chunks(2) {
+            writer.write_tensor_chunk(0, chunk).expect("first chunk");
+        }
+        for chunk in second.chunks(4) {
+            writer.write_tensor_chunk(1, chunk).expect("second chunk");
+        }
+
+        assert_eq!(writer.finish().expect("finish"), expected);
+    }
+
+    #[test]
+    fn streaming_rejects_short_long_and_out_of_order_payloads() {
+        let metadata = BTreeMap::new();
+        let specs = vec![
+            GgufTensorSpec {
+                name: "first".into(),
+                dims: vec![4],
+                ggml_type: 169,
+                data_len: 4,
+            },
+            GgufTensorSpec {
+                name: "second".into(),
+                dims: vec![2],
+                ggml_type: 169,
+                data_len: 2,
+            },
+        ];
+
+        let mut short = GgufStreamWriter::new(Vec::new(), 3, &metadata, &specs).expect("stream");
+        short
+            .write_tensor_chunk(0, &[1, 2, 3])
+            .expect("partial payload");
+        assert!(matches!(
+            short.finish(),
+            Err(GgufWriteError::TensorTooShort {
+                tensor: 0,
+                expected: 4,
+                written: 3,
+            })
+        ));
+
+        let mut recoverable =
+            GgufStreamWriter::new(Vec::new(), 3, &metadata, &specs).expect("stream");
+        assert!(matches!(
+            recoverable.write_tensor_chunk(1, &[9]),
+            Err(GgufWriteError::TensorOutOfOrder {
+                expected: 0,
+                got: 1,
+            })
+        ));
+        assert!(matches!(
+            recoverable.write_tensor_chunk(0, &[1, 2, 3, 4, 5]),
+            Err(GgufWriteError::TensorTooLong {
+                tensor: 0,
+                expected: 4,
+                attempted: 5,
+            })
+        ));
+        recoverable
+            .write_tensor_chunk(0, &[1, 2, 3, 4])
+            .expect("exact first payload after rejected calls");
+        recoverable
+            .write_tensor_chunk(1, &[5, 6])
+            .expect("exact second payload");
+        assert!(matches!(
+            recoverable.write_tensor_chunk(2, &[7]),
+            Err(GgufWriteError::StreamComplete { got: 2 })
+        ));
+        assert!(recoverable.finish().is_ok());
+    }
+
+    #[test]
+    fn streaming_padding_is_deterministic_and_zero_filled() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("general.alignment".into(), GgufValue::U32(64));
+        let specs = vec![
+            GgufTensorSpec {
+                name: "first".into(),
+                dims: vec![3],
+                ggml_type: 169,
+                data_len: 3,
+            },
+            GgufTensorSpec {
+                name: "second".into(),
+                dims: vec![2],
+                ggml_type: 169,
+                data_len: 2,
+            },
+        ];
+        let write = || {
+            let mut writer =
+                GgufStreamWriter::new(Vec::new(), 3, &metadata, &specs).expect("stream");
+            writer
+                .write_tensor_chunk(0, &[1, 2, 3])
+                .expect("first payload");
+            writer
+                .write_tensor_chunk(1, &[4, 5])
+                .expect("second payload");
+            writer.finish().expect("finish")
+        };
+
+        let first = write();
+        let second = write();
+        assert_eq!(first, second);
+        let parsed = read_gguf(&first).expect("parse");
+        assert_eq!(parsed.tensors[0].offset, 0);
+        assert_eq!(parsed.tensors[1].offset, 64);
+        let data = parsed.tensor_data_offset as usize;
+        assert_eq!(&first[data..data + 3], &[1, 2, 3]);
+        assert!(first[data + 3..data + 64].iter().all(|&byte| byte == 0));
+        assert_eq!(&first[data + 64..data + 66], &[4, 5]);
+    }
+
+    #[derive(Default)]
+    struct InstrumentedWriter {
+        bytes: Vec<u8>,
+        max_write: usize,
+        calls: usize,
+    }
+
+    impl Write for InstrumentedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.max_write = self.max_write.max(bytes.len());
+            self.calls += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streaming_bounds_destination_writes_for_large_padding_and_payload_chunks() {
+        const MAX_WRITE_BYTES: usize = 8192;
+        const PAYLOAD_BYTES: usize = 256 * 1024;
+        let mut metadata = BTreeMap::new();
+        metadata.insert("general.alignment".into(), GgufValue::U32(1024 * 1024));
+        let specs = vec![GgufTensorSpec {
+            name: "large".into(),
+            dims: vec![PAYLOAD_BYTES as u64],
+            ggml_type: 169,
+            data_len: PAYLOAD_BYTES as u64,
+        }];
+        let mut writer = GgufStreamWriter::new(InstrumentedWriter::default(), 3, &metadata, &specs)
+            .expect("stream");
+        let payload = vec![0xA5; PAYLOAD_BYTES];
+        writer
+            .write_tensor_chunk(0, &payload)
+            .expect("bounded payload");
+        let destination = writer.finish().expect("finish");
+
+        assert!(destination.calls > PAYLOAD_BYTES / MAX_WRITE_BYTES);
+        assert!(destination.max_write <= MAX_WRITE_BYTES);
+        assert_eq!(
+            &destination.bytes[destination.bytes.len() - PAYLOAD_BYTES..],
+            &payload
+        );
     }
 }
