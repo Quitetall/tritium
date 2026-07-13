@@ -70,8 +70,10 @@ pub use i2s_int8::{
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use safetensors::{SafeTensors, SafeTensorsError, read_safetensors};
 pub use salt::{
-    SALT_HEADER_BYTES, SALT_MAGIC, SALT_VERSION, SaltRow, dequant_salt_row, pack_salt_row,
-    read_legacy_as_salt, salt_rows_to_dense, unpack_salt_row,
+    DEFAULT_SPARSE_RESIDUAL_DENSITY, SALT_HEADER_BYTES, SALT_MAGIC, SALT_PROGRESSIVE_VERSION,
+    SALT_VERSION, SaltRow, dequant_salt_row, pack_progressive_salt_row, pack_salt_row,
+    packed_salt_row_len, read_legacy_as_salt, salt_rows_to_dense, unpack_salt_row,
+    unpack_salt_row_prefix,
 };
 pub use salt_bundle::{
     SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltTensor, read_salt_bundle, write_salt_bundle,
@@ -137,6 +139,12 @@ pub enum FormatError {
     /// A [`SaltRow`]'s `k` did not fit the sidecar's `u32` length field.
     SaltRowTooLong(usize),
     /// Sparse plane indices were duplicated or not strictly increasing.
+    /// A progressive SALT row used an unknown plane representation tag.
+    SaltInvalidPlaneTag(u8),
+    /// A progressive SALT row attempted to store its base plane sparsely.
+    SaltSparseBasePlane,
+    /// Sparse residual density threshold was non-finite or outside `[0, 1]`.
+    InvalidSparseDensity,
     SaltNonCanonicalSparseIndices,
     /// A partial dense TQ2_0 block had non-zero trits beyond the logical row length.
     SaltNonZeroPadding,
@@ -213,6 +221,18 @@ impl fmt::Display for FormatError {
                 )
             }
             FormatError::SaltNonCanonicalSparseIndices => {
+            FormatError::SaltInvalidPlaneTag(tag) => {
+                write!(f, "SALT sidecar: invalid plane representation tag {tag}")
+            }
+            FormatError::SaltSparseBasePlane => {
+                write!(f, "SALT sidecar: base plane must use dense representation")
+            }
+            FormatError::InvalidSparseDensity => {
+                write!(
+                    f,
+                    "SALT sidecar: sparse density must be finite and in [0, 1]"
+                )
+            }
                 write!(
                     f,
                     "SALT sidecar: sparse indices must be strictly increasing"

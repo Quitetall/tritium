@@ -9,9 +9,10 @@
 //! granularity is therefore one 256-block: a plane's per-group AbsMean scale is
 //! exactly that block's `f16` scale.
 //!
-//! Layout (little-endian): a 10-byte header — magic `b"TSLT"`, `u8` version,
-//! `u8` plane count `T`, `u32` row length `K` — then the `T` planes back to back,
-//! each `num_blocks(K) · `[`TQ2_0_BLOCK_BYTES`] bytes, plane 0 (dense base) first.
+//! Both row versions start with a 10-byte little-endian header: magic `b"TSLT"`,
+//! `u8` version, `u8` plane count `T`, and `u32` row length `K`. Legacy v1 then
+//! stores `T` dense TQ2_0 planes back to back. Progressive v2 adds one tag/length
+//! descriptor per plane and may encode residuals sparsely; plane 0 stays dense.
 //!
 //! Back-compat is explicit, not sniffed: a caller that knows (from the tensor's
 //! declared type) it holds legacy plain-TQ2 calls [`read_legacy_as_salt`] to wrap
@@ -20,16 +21,29 @@
 use half::f16;
 use tritium_core::Trit;
 
-use crate::{FormatError, QK_K, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq2_0_row};
+use crate::{
+    FormatError, PlaneRepr, QK_K, TQ2_0_BLOCK_BYTES, choose_plane_repr, expand_plane_repr,
+    num_blocks, pack_sparse_plane, unpack_sparse_plane, unpack_tq2_0_row,
+};
 
 /// Sidecar magic: `b"TSLT"` (Tritium SALT).
 pub const SALT_MAGIC: [u8; 4] = *b"TSLT";
 
-/// Current sidecar format version.
+/// Legacy dense row version written by [`pack_salt_row`].
 pub const SALT_VERSION: u8 = 1;
+
+/// Progressive row version: framed dense base plus dense-or-sparse residual payloads.
+pub const SALT_PROGRESSIVE_VERSION: u8 = 2;
+
+/// Default residual-density cutoff used by the progressive bundle writer.
+pub const DEFAULT_SPARSE_RESIDUAL_DENSITY: f32 = 0.10;
 
 /// Header size: magic(4) + version(1) + plane-count(1) + K as `u32`(4) = 10.
 pub const SALT_HEADER_BYTES: usize = 4 + 1 + 1 + 4;
+
+const PLANE_TAG_DENSE: u8 = 0;
+const PLANE_TAG_SPARSE: u8 = 1;
+const PLANE_DESCRIPTOR_BYTES: usize = 1 + 4;
 
 /// One SALT-quantized row: `T` ternary planes that sum to the dequantized weight.
 ///
@@ -65,21 +79,7 @@ impl SaltRow {
 /// [`FormatError::SaltTooManyPlanes`] if `T` does not fit a `u8`;
 /// [`FormatError::SaltRowTooLong`] if `k` does not fit a `u32`.
 pub fn pack_salt_row(row: &SaltRow) -> Result<Vec<u8>, FormatError> {
-    if row.planes.len() > u8::MAX as usize {
-        return Err(FormatError::SaltTooManyPlanes(row.planes.len()));
-    }
-    if row.k > u32::MAX as usize {
-        return Err(FormatError::SaltRowTooLong(row.k));
-    }
-    let plane_bytes = row.plane_bytes();
-    for plane in &row.planes {
-        if plane.len() != plane_bytes {
-            return Err(FormatError::WrongBlockLen {
-                expected: plane_bytes,
-                got: plane.len(),
-            });
-        }
-    }
+    let plane_bytes = validate_salt_row(row)?;
     let mut out = Vec::with_capacity(SALT_HEADER_BYTES + row.planes.len() * plane_bytes);
     out.extend_from_slice(&SALT_MAGIC);
     out.push(SALT_VERSION);
@@ -91,13 +91,214 @@ pub fn pack_salt_row(row: &SaltRow) -> Result<Vec<u8>, FormatError> {
     Ok(out)
 }
 
-/// Parse a [`SaltRow`] from sidecar bytes, enforcing magic, version, and length.
+/// Serialize a progressive SALT row with a dense base and compact residual planes.
+///
+/// Residual planes below `max_sparse_density` use [`crate::SparsePlane`] only when
+/// its encoded payload is also smaller than dense TQ2_0. Other residuals remain
+/// dense. Plane order stays unchanged, so decoding all planes is byte-identical to
+/// the source row and decoding a prefix yields an additive lower-memory tier.
 ///
 /// # Errors
-/// [`FormatError::SaltBadMagic`] if the magic does not match;
-/// [`FormatError::UnsupportedSaltVersion`] on a version this build can't read;
-/// [`FormatError::WrongBlockLen`] if the buffer length disagrees with the header.
-pub fn unpack_salt_row(bytes: &[u8]) -> Result<SaltRow, FormatError> {
+/// Same shape/size errors as [`pack_salt_row`], plus
+/// [`FormatError::InvalidSparseDensity`] when threshold is non-finite or outside
+/// `[0, 1]`, and sparse-codec errors for malformed plane bytes.
+pub fn pack_progressive_salt_row(
+    row: &SaltRow,
+    max_sparse_density: f32,
+) -> Result<Vec<u8>, FormatError> {
+    if !max_sparse_density.is_finite() || !(0.0..=1.0).contains(&max_sparse_density) {
+        return Err(FormatError::InvalidSparseDensity);
+    }
+    let plane_bytes = validate_salt_row(row)?;
+    let mut encoded = Vec::with_capacity(row.planes.len());
+    for (index, plane) in row.planes.iter().enumerate() {
+        if index == 0 {
+            encoded.push((PLANE_TAG_DENSE, plane.clone()));
+            continue;
+        }
+        match choose_plane_repr(plane, row.k, max_sparse_density)? {
+            PlaneRepr::Dense(bytes) => encoded.push((PLANE_TAG_DENSE, bytes)),
+            PlaneRepr::Sparse(sparse) => {
+                let bytes = pack_sparse_plane(&sparse)?;
+                if bytes.len() < plane_bytes {
+                    encoded.push((PLANE_TAG_SPARSE, bytes));
+                } else {
+                    encoded.push((PLANE_TAG_DENSE, plane.clone()));
+                }
+            }
+        }
+    }
+
+    let descriptor_bytes = encoded
+        .len()
+        .checked_mul(PLANE_DESCRIPTOR_BYTES)
+        .ok_or(FormatError::SaltTooManyPlanes(encoded.len()))?;
+    let payload_bytes = encoded.iter().try_fold(0usize, |total, (_, bytes)| {
+        total
+            .checked_add(bytes.len())
+            .ok_or(FormatError::WrongBlockLen {
+                expected: usize::MAX,
+                got: total,
+            })
+    })?;
+    let capacity = SALT_HEADER_BYTES
+        .checked_add(descriptor_bytes)
+        .and_then(|n| n.checked_add(payload_bytes))
+        .ok_or(FormatError::WrongBlockLen {
+            expected: usize::MAX,
+            got: payload_bytes,
+        })?;
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(&SALT_MAGIC);
+    out.push(SALT_PROGRESSIVE_VERSION);
+    out.push(encoded.len() as u8);
+    out.extend_from_slice(&(row.k as u32).to_le_bytes());
+    for (tag, bytes) in &encoded {
+        let len = u32::try_from(bytes.len()).map_err(|_| FormatError::WrongBlockLen {
+            expected: u32::MAX as usize,
+            got: bytes.len(),
+        })?;
+        out.push(*tag);
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    for (_, bytes) in encoded {
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
+fn validate_salt_row(row: &SaltRow) -> Result<usize, FormatError> {
+    if row.planes.len() > u8::MAX as usize {
+        return Err(FormatError::SaltTooManyPlanes(row.planes.len()));
+    }
+    if row.k > u32::MAX as usize {
+        return Err(FormatError::SaltRowTooLong(row.k));
+    }
+    let plane_bytes = row.plane_bytes();
+    for plane in &row.planes {
+        validate_dense_plane(plane, plane_bytes)?;
+    }
+    Ok(plane_bytes)
+}
+
+#[derive(Clone, Copy)]
+struct SaltRowLayout {
+    version: u8,
+    planes: usize,
+    k: usize,
+    plane_bytes: usize,
+    payload_start: usize,
+    encoded_len: usize,
+}
+
+fn read_plane_descriptor(bytes: &[u8], index: usize) -> (u8, usize) {
+    let offset = SALT_HEADER_BYTES + index * PLANE_DESCRIPTOR_BYTES;
+    let len = u32::from_le_bytes(
+        bytes[offset + 1..offset + PLANE_DESCRIPTOR_BYTES]
+            .try_into()
+            .expect("descriptor bounds validated"),
+    ) as usize;
+    (bytes[offset], len)
+}
+
+fn parse_salt_row_layout(bytes: &[u8]) -> Result<SaltRowLayout, FormatError> {
+    let (version, planes, k) = read_header(bytes)?;
+    let plane_bytes =
+        num_blocks(k)
+            .checked_mul(TQ2_0_BLOCK_BYTES)
+            .ok_or(FormatError::WrongBlockLen {
+                expected: usize::MAX,
+                got: bytes.len(),
+            })?;
+    let (payload_start, encoded_len) =
+        match version {
+            SALT_VERSION => {
+                let payload_bytes =
+                    planes
+                        .checked_mul(plane_bytes)
+                        .ok_or(FormatError::WrongBlockLen {
+                            expected: usize::MAX,
+                            got: bytes.len(),
+                        })?;
+                let encoded_len = SALT_HEADER_BYTES.checked_add(payload_bytes).ok_or(
+                    FormatError::WrongBlockLen {
+                        expected: usize::MAX,
+                        got: bytes.len(),
+                    },
+                )?;
+                (SALT_HEADER_BYTES, encoded_len)
+            }
+            SALT_PROGRESSIVE_VERSION => {
+                let descriptor_bytes = planes.checked_mul(PLANE_DESCRIPTOR_BYTES).ok_or(
+                    FormatError::WrongBlockLen {
+                        expected: usize::MAX,
+                        got: bytes.len(),
+                    },
+                )?;
+                let payload_start = SALT_HEADER_BYTES.checked_add(descriptor_bytes).ok_or(
+                    FormatError::WrongBlockLen {
+                        expected: usize::MAX,
+                        got: bytes.len(),
+                    },
+                )?;
+                if payload_start > bytes.len() {
+                    return Err(FormatError::WrongBlockLen {
+                        expected: payload_start,
+                        got: bytes.len(),
+                    });
+                }
+                let mut payload_bytes = 0usize;
+                for index in 0..planes {
+                    let (tag, len) = read_plane_descriptor(bytes, index);
+                    validate_plane_tag(tag, index)?;
+                    payload_bytes =
+                        payload_bytes
+                            .checked_add(len)
+                            .ok_or(FormatError::WrongBlockLen {
+                                expected: usize::MAX,
+                                got: bytes.len(),
+                            })?;
+                }
+                let encoded_len =
+                    payload_start
+                        .checked_add(payload_bytes)
+                        .ok_or(FormatError::WrongBlockLen {
+                            expected: usize::MAX,
+                            got: bytes.len(),
+                        })?;
+                (payload_start, encoded_len)
+            }
+            other => return Err(FormatError::UnsupportedSaltVersion(other)),
+        };
+    if encoded_len > bytes.len() {
+        return Err(FormatError::WrongBlockLen {
+            expected: encoded_len,
+            got: bytes.len(),
+        });
+    }
+    Ok(SaltRowLayout {
+        version,
+        planes,
+        k,
+        plane_bytes,
+        payload_start,
+        encoded_len,
+    })
+}
+
+/// Return encoded length of first SALT row in `bytes` without consuming later rows.
+///
+/// Supports legacy dense v1 and progressive framed v2. Returned length is bounded
+/// by `bytes.len()`, making this safe for walking concatenated bundle payloads.
+///
+/// # Errors
+/// Returns typed format errors for bad magic/version, invalid representation tags,
+/// arithmetic overflow, or truncated descriptors/payloads.
+pub fn packed_salt_row_len(bytes: &[u8]) -> Result<usize, FormatError> {
+    Ok(parse_salt_row_layout(bytes)?.encoded_len)
+}
+
+fn read_header(bytes: &[u8]) -> Result<(u8, usize, usize), FormatError> {
     if bytes.len() < SALT_HEADER_BYTES {
         return Err(FormatError::WrongBlockLen {
             expected: SALT_HEADER_BYTES,
@@ -108,29 +309,112 @@ pub fn unpack_salt_row(bytes: &[u8]) -> Result<SaltRow, FormatError> {
         return Err(FormatError::SaltBadMagic);
     }
     let version = bytes[4];
-    if version != SALT_VERSION {
-        return Err(FormatError::UnsupportedSaltVersion(version));
-    }
-    let t = bytes[5] as usize;
+    let planes = bytes[5] as usize;
     let k = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
-    let plane_bytes = num_blocks(k) * TQ2_0_BLOCK_BYTES;
-    // 64-bit-safe: t ≤ 255 and plane_bytes ≤ (u32::MAX/256 + 1)·66 ≈ 1.1 GB, so
-    // `need` ≤ ~280 GB ≪ usize::MAX. The exact-length check below then bounds
-    // every slice, so even a maliciously large header can only error, not OOB.
-    let need = SALT_HEADER_BYTES + t * plane_bytes;
-    if bytes.len() != need {
+    Ok((version, planes, k))
+}
+
+fn validate_plane_tag(tag: u8, index: usize) -> Result<(), FormatError> {
+    match tag {
+        PLANE_TAG_DENSE => Ok(()),
+        PLANE_TAG_SPARSE if index == 0 => Err(FormatError::SaltSparseBasePlane),
+        PLANE_TAG_SPARSE => Ok(()),
+        other => Err(FormatError::SaltInvalidPlaneTag(other)),
+    }
+}
+
+fn validate_dense_plane(payload: &[u8], expected_len: usize) -> Result<(), FormatError> {
+    if payload.len() != expected_len {
         return Err(FormatError::WrongBlockLen {
-            expected: need,
+            expected: expected_len,
+            got: payload.len(),
+        });
+    }
+    for block in payload.chunks_exact(TQ2_0_BLOCK_BYTES) {
+        for packed in &block[..QK_K / 4] {
+            for shift in [0, 2, 4, 6] {
+                if (packed >> shift) & 0b11 == 0b11 {
+                    return Err(FormatError::DecodedOutOfRange(2));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a [`SaltRow`] from sidecar bytes, enforcing magic, version, and length.
+///
+/// # Errors
+/// [`FormatError::SaltBadMagic`] if the magic does not match;
+/// [`FormatError::UnsupportedSaltVersion`] on a version this build can't read;
+/// [`FormatError::WrongBlockLen`] if the buffer length disagrees with the header.
+pub fn unpack_salt_row(bytes: &[u8]) -> Result<SaltRow, FormatError> {
+    unpack_salt_row_prefix(bytes, usize::MAX)
+}
+
+/// Parse a SALT row while materializing at most `max_planes` additive planes.
+///
+/// All descriptors and payloads are still validated. Legacy v1 rows and progressive
+/// v2 rows share the same returned dense [`SaltRow`] runtime representation.
+///
+/// # Errors
+/// Same errors as [`packed_salt_row_len`], plus malformed dense/sparse payload errors.
+pub fn unpack_salt_row_prefix(bytes: &[u8], max_planes: usize) -> Result<SaltRow, FormatError> {
+    let layout = parse_salt_row_layout(bytes)?;
+    if bytes.len() != layout.encoded_len {
+        return Err(FormatError::WrongBlockLen {
+            expected: layout.encoded_len,
             got: bytes.len(),
         });
     }
-    let planes = (0..t)
-        .map(|p| {
-            let off = SALT_HEADER_BYTES + p * plane_bytes;
-            bytes[off..off + plane_bytes].to_vec()
-        })
-        .collect();
-    Ok(SaltRow { k, planes })
+    let keep = layout.planes.min(max_planes);
+    let mut planes = Vec::with_capacity(keep);
+    match layout.version {
+        SALT_VERSION => {
+            for index in 0..layout.planes {
+                let offset = layout.payload_start + index * layout.plane_bytes;
+                let payload = &bytes[offset..offset + layout.plane_bytes];
+                validate_dense_plane(payload, layout.plane_bytes)?;
+                if index < keep {
+                    planes.push(payload.to_vec());
+                }
+            }
+        }
+        SALT_PROGRESSIVE_VERSION => {
+            let mut payload_off = layout.payload_start;
+            for index in 0..layout.planes {
+                let (tag, len) = read_plane_descriptor(bytes, index);
+                let payload = &bytes[payload_off..payload_off + len];
+                match tag {
+                    PLANE_TAG_DENSE => {
+                        validate_dense_plane(payload, layout.plane_bytes)?;
+                        if index < keep {
+                            planes.push(payload.to_vec());
+                        }
+                    }
+                    PLANE_TAG_SPARSE => {
+                        let sparse = unpack_sparse_plane(payload)?;
+                        if sparse.k != layout.k {
+                            return Err(FormatError::WrongBlockLen {
+                                expected: layout.k,
+                                got: sparse.k,
+                            });
+                        }
+                        if index < keep {
+                            planes.push(expand_plane_repr(&PlaneRepr::Sparse(sparse))?);
+                        }
+                    }
+                    _ => unreachable!("plane tag validated"),
+                }
+                payload_off += len;
+            }
+        }
+        _ => unreachable!("row version validated"),
+    }
+    Ok(SaltRow {
+        k: layout.k,
+        planes,
+    })
 }
 
 /// Wrap a legacy plain-TQ2 row (no SALT header) as a one-plane [`SaltRow`].
@@ -224,6 +508,185 @@ mod tests {
             })
             .collect();
         SaltRow { k, planes }
+    }
+
+    fn make_sparse_residual(k: usize, stride: usize) -> Vec<u8> {
+        let trits: Vec<Trit> = (0..k)
+            .map(|i| {
+                if i % stride == 0 {
+                    Trit::from_i8(if (i / stride).is_multiple_of(2) {
+                        1
+                    } else {
+                        -1
+                    })
+                    .unwrap()
+                } else {
+                    Trit::ZERO
+                }
+            })
+            .collect();
+        let scales = vec![f16::from_f32(0.125); num_blocks(k)];
+        let mut packed = vec![0u8; num_blocks(k) * TQ2_0_BLOCK_BYTES];
+        pack_tq2_0_row(&trits, &scales, &mut packed).unwrap();
+        packed
+    }
+
+    #[test]
+    fn progressive_row_is_smaller_exact_and_prefix_loadable() {
+        let k = 4096;
+        let mut row = make_salt_row(k, 1);
+        row.planes.push(make_sparse_residual(k, 64));
+        row.planes.push(make_sparse_residual(k, 2));
+
+        let legacy = pack_salt_row(&row).expect("legacy row");
+        let progressive = pack_progressive_salt_row(&row, 0.10).expect("progressive row");
+
+        assert!(progressive.len() < legacy.len());
+        assert_eq!(progressive[SALT_HEADER_BYTES], PLANE_TAG_DENSE);
+        assert_eq!(
+            progressive[SALT_HEADER_BYTES + PLANE_DESCRIPTOR_BYTES],
+            PLANE_TAG_SPARSE
+        );
+        assert_eq!(
+            progressive[SALT_HEADER_BYTES + 2 * PLANE_DESCRIPTOR_BYTES],
+            PLANE_TAG_DENSE
+        );
+        assert_eq!(
+            packed_salt_row_len(&progressive).expect("framed length"),
+            progressive.len()
+        );
+        assert_eq!(unpack_salt_row(&progressive).expect("full row"), row);
+        for max_planes in [0, 1, 2, 3, usize::MAX] {
+            let expected = SaltRow {
+                k,
+                planes: row.planes[..row.plane_count().min(max_planes)].to_vec(),
+            };
+            assert_eq!(
+                unpack_salt_row_prefix(&progressive, max_planes).expect("plane prefix"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_v1_row_layout_stays_byte_stable() {
+        let row = SaltRow {
+            k: 1,
+            planes: vec![vec![0xA5; TQ2_0_BLOCK_BYTES]],
+        };
+        let packed = pack_salt_row(&row).expect("legacy row");
+
+        assert_eq!(&packed[..SALT_HEADER_BYTES], b"TSLT\x01\x01\x01\0\0\0");
+        assert_eq!(&packed[SALT_HEADER_BYTES..], &[0xA5; TQ2_0_BLOCK_BYTES]);
+    }
+
+    #[test]
+    fn progressive_row_rejects_malformed_framing() {
+        let k = 4096;
+        let mut row = make_salt_row(k, 1);
+        row.planes.push(make_sparse_residual(k, 64));
+        let packed = pack_progressive_salt_row(&row, 0.10).expect("progressive row");
+
+        let mut sparse_base = packed.clone();
+        sparse_base[SALT_HEADER_BYTES] = PLANE_TAG_SPARSE;
+        assert_eq!(
+            unpack_salt_row(&sparse_base),
+            Err(FormatError::SaltSparseBasePlane)
+        );
+
+        let mut bad_tag = packed.clone();
+        bad_tag[SALT_HEADER_BYTES + PLANE_DESCRIPTOR_BYTES] = 9;
+        assert_eq!(
+            unpack_salt_row(&bad_tag),
+            Err(FormatError::SaltInvalidPlaneTag(9))
+        );
+
+        let payload_start = SALT_HEADER_BYTES + 2 * PLANE_DESCRIPTOR_BYTES;
+        let sparse_start = payload_start + row.planes[0].len();
+        let mut wrong_k = packed.clone();
+        wrong_k[sparse_start + 6..sparse_start + 10]
+            .copy_from_slice(&((k - 1) as u32).to_le_bytes());
+        assert!(matches!(
+            unpack_salt_row(&wrong_k),
+            Err(FormatError::WrongBlockLen { .. })
+        ));
+
+        assert!(matches!(
+            unpack_salt_row(&packed[..packed.len() - 1]),
+            Err(FormatError::WrongBlockLen { .. })
+        ));
+        let mut trailing = packed.clone();
+        trailing.push(0);
+        assert!(matches!(
+            unpack_salt_row(&trailing),
+            Err(FormatError::WrongBlockLen { .. })
+        ));
+    }
+
+    #[test]
+    fn prefix_reader_validates_omitted_dense_payloads() {
+        let row = make_salt_row(256, 1);
+        let mut progressive = pack_progressive_salt_row(&row, 0.10).expect("progressive row");
+        let payload_start = SALT_HEADER_BYTES + PLANE_DESCRIPTOR_BYTES;
+        progressive[payload_start] = 0xff; // four reserved TQ2_0 codes
+        assert!(matches!(
+            unpack_salt_row_prefix(&progressive, 0),
+            Err(FormatError::DecodedOutOfRange(2))
+        ));
+
+        let mut legacy = pack_salt_row(&row).expect("legacy row");
+        legacy[SALT_HEADER_BYTES] = 0xff;
+        assert!(matches!(
+            unpack_salt_row_prefix(&legacy, 0),
+            Err(FormatError::DecodedOutOfRange(2))
+        ));
+    }
+
+    #[test]
+    fn progressive_row_preserves_nonzero_partial_padding_as_dense() {
+        let k = 257;
+        let mut row = make_salt_row(k, 1);
+        let mut residual = make_sparse_residual(k, 64);
+        let padded_code = &mut residual[TQ2_0_BLOCK_BYTES + 1];
+        *padded_code = (*padded_code & !0b11) | 0b10;
+        row.planes.push(residual);
+
+        let progressive = pack_progressive_salt_row(&row, 1.0).expect("progressive row");
+        assert_eq!(
+            progressive[SALT_HEADER_BYTES + PLANE_DESCRIPTOR_BYTES],
+            PLANE_TAG_DENSE
+        );
+        assert_eq!(unpack_salt_row(&progressive).expect("roundtrip"), row);
+    }
+
+    #[test]
+    fn progressive_row_never_uses_larger_sparse_payload() {
+        let k = 4096;
+        let mut row = make_salt_row(k, 1);
+        row.planes.push(make_sparse_residual(k, 12)); // ~8.3%: below 10%, above byte break-even
+
+        let progressive = pack_progressive_salt_row(&row, 0.10).expect("progressive row");
+        assert_eq!(
+            progressive[SALT_HEADER_BYTES + PLANE_DESCRIPTOR_BYTES],
+            PLANE_TAG_DENSE
+        );
+        assert_eq!(
+            progressive.len(),
+            pack_salt_row(&row).expect("legacy row").len()
+                + row.plane_count() * PLANE_DESCRIPTOR_BYTES
+        );
+        assert_eq!(
+            pack_progressive_salt_row(&row, f32::NAN),
+            Err(FormatError::InvalidSparseDensity)
+        );
+        assert_eq!(
+            pack_progressive_salt_row(&row, -0.01),
+            Err(FormatError::InvalidSparseDensity)
+        );
+        assert_eq!(
+            pack_progressive_salt_row(&row, 1.01),
+            Err(FormatError::InvalidSparseDensity)
+        );
     }
 
     #[test]
