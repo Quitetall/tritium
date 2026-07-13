@@ -18,7 +18,10 @@
 
 use half::f16;
 
-use crate::{FormatError, QK_K, TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row, unpack_tq2_0_row};
+use crate::{
+    FormatError, QK_K, TQ2_0_BLOCK_BYTES, num_blocks, pack_tq2_0_row, unpack_tq2_0_block,
+    unpack_tq2_0_row,
+};
 use tritium_core::Trit;
 
 /// Sparse-plane container magic: `b"TSSP"` (Tritium Sparse Sidecar Plane).
@@ -82,6 +85,7 @@ pub fn sparse_from_tq2_0(packed: &[u8], k: usize) -> Result<SparsePlane, FormatE
     let mut trits = vec![Trit::ZERO; k];
     let mut scales = vec![f16::ZERO; nb];
     unpack_tq2_0_row(packed, &mut trits, &mut scales)?;
+    validate_zero_padding(packed, k)?;
 
     let mut idx = Vec::new();
     let mut sign = Vec::new();
@@ -98,10 +102,29 @@ pub fn sparse_from_tq2_0(packed: &[u8], k: usize) -> Result<SparsePlane, FormatE
         idx,
         sign,
     };
-    if sparse_to_tq2_0(&sparse)? != packed {
+    Ok(sparse)
+}
+
+fn validate_zero_padding(packed: &[u8], k: usize) -> Result<(), FormatError> {
+    let used_in_last_block = k % QK_K;
+    if used_in_last_block == 0 {
+        return Ok(());
+    }
+    let last_block_offset = (num_blocks(k) - 1) * TQ2_0_BLOCK_BYTES;
+    let mut trits = [Trit::ZERO; QK_K];
+    let mut scale = f16::ZERO;
+    unpack_tq2_0_block(
+        &packed[last_block_offset..last_block_offset + TQ2_0_BLOCK_BYTES],
+        &mut trits,
+        &mut scale,
+    )?;
+    if trits[used_in_last_block..]
+        .iter()
+        .any(|trit| *trit != Trit::ZERO)
+    {
         return Err(FormatError::SaltNonZeroPadding);
     }
-    Ok(sparse)
+    Ok(())
 }
 
 /// Reconstruct the dense TQ2_0 plane bytes from a [`SparsePlane`] — the exact
