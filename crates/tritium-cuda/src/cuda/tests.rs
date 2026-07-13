@@ -1476,12 +1476,12 @@ fn rmsnorm_bit_matches_host() {
     fn sum_squares_canonical(x: &[f32]) -> f32 {
         let mut part = [0.0f32; 256];
         for (i, &v) in x.iter().enumerate() {
-            part[i % 256] = part[i % 256] + v * v;
+            part[i % 256] += v * v;
         }
         let mut off = 128;
         while off > 0 {
             for t in 0..off {
-                part[t] = part[t] + part[t + off];
+                part[t] += part[t + off];
             }
             off >>= 1;
         }
@@ -1980,12 +1980,12 @@ fn rmsnorm_quant_bit_matches_host() {
         // Canonical tree sum-of-squares (ADR 0018), as in the rmsnorm test.
         let mut part = [0.0f32; 256];
         for (i, &v) in x.iter().enumerate() {
-            part[i % 256] = part[i % 256] + v * v;
+            part[i % 256] += v * v;
         }
         let mut off = 128;
         while off > 0 {
             for t in 0..off {
-                part[t] = part[t] + part[t + off];
+                part[t] += part[t + off];
             }
             off >>= 1;
         }
@@ -2746,6 +2746,7 @@ fn mixed_trits(n: usize, k: usize, seed: u64) -> Vec<tritium_core::Trit> {
 /// A4 harness: upload TB1 rows (concatenated variable-length + offsets) and
 /// launch the prototype kernel.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn run_tb1(
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     f: &cudarc::driver::CudaFunction,
@@ -3032,6 +3033,8 @@ fn tb1_tq1_tq2_gateup_bench() {
                     .arg(&k_i),
             };
             #[allow(unsafe_code)]
+            // SAFETY: each branch above pushes the exact argument list for its
+            // selected kernel; all device buffers cover the configured shape.
             unsafe {
                 l.launch(cfg).unwrap()
             };

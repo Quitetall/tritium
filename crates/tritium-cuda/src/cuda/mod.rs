@@ -357,7 +357,7 @@ fn maybe_bitmap_from_host(
     n: usize,
     k: usize,
 ) -> Result<Option<CudaSlice<u32>>, BackendError> {
-    let row_bytes = if n == 0 { 0 } else { host.len() / n };
+    let row_bytes = host.len().checked_div(n).unwrap_or(0);
     let bm = tritium_format::compute_zero_bitmaps(host, n, k, row_bytes)
         .map_err(|e| BackendError::InvalidInput(format!("zero bitmap: {e}")))?;
     // Counting over n*words_per_row words vs blocks = n*nb is exact because
@@ -584,9 +584,6 @@ struct ResidentLayer {
     gateup: ResidentLinear,
 }
 
-/// A fully device-resident BitNet decoder. One [`step`](CudaDecodeModel::step) is a
-/// single-token (M=1) forward run entirely on the GPU. See the section banner above.
-#[allow(missing_debug_implementations)]
 /// Reusable device scratch for [`CudaDecodeModel::tree_verify_greedy`] —
 /// allocated on first use for the requested node count (and re-grown if a
 /// later tree is larger), then reused: a spec-decode loop calls verify every
@@ -641,6 +638,8 @@ struct TreeGraphs {
     raw_keepalive: Option<Arc<BatchRawKernels>>,
 }
 
+/// A fully device-resident BitNet decoder. One [`step`](CudaDecodeModel::step) is a
+/// single-token (M=1) forward run entirely on the GPU. See the section banner above.
 pub struct CudaDecodeModel {
     stream: Arc<CudaStream>,
     // Decode kernels (loaded from the resident modules at build).
@@ -788,6 +787,23 @@ pub struct CudaDecodeModel {
     /// Prefill M at/above which the IMMA path dispatches
     /// (`TRITIUM_IMMA_MIN_M`, default 32 — the tuned dp4a/IMMA crossover).
     imma_min_m: usize,
+}
+
+impl core::fmt::Debug for CudaDecodeModel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CudaDecodeModel")
+            .field("n_embd", &self.n_embd)
+            .field("n_head", &self.n_head)
+            .field("n_head_kv", &self.n_head_kv)
+            .field("head_dim", &self.head_dim)
+            .field("n_ff", &self.n_ff)
+            .field("vocab", &self.vocab)
+            .field("max_ctx", &self.max_ctx)
+            .field("cache_len", &self.cache_len)
+            .field("layers", &self.layers.len())
+            .field("kv_dtype", &self.kv_dtype)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CudaDecodeModel {
@@ -2427,7 +2443,6 @@ impl CudaDecodeModel {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Debug/test access: drop every build-time-resolved IMMA tile function
     /// so `matmul_m` falls back to dp4a — the bit-identity gate prefills the
     /// same prompt with and without the dispatch on ONE model (no env games,
@@ -2455,26 +2470,27 @@ impl CudaDecodeModel {
         m: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
-        if m >= self.imma_min_m && !lin.tq1 {
-            if let Some(shadow) = lin.imma.as_ref() {
-                // floor(log2(m)), clamped to the resolved bucket range.
-                let bucket = (usize::BITS - 1 - m.leading_zeros()).clamp(5, 11);
-                if let Some((tile, func)) = self.imma_funcs.get(&(lin.n, lin.k, bucket)) {
-                    return backend::launch_imma_tile_on(
-                        s,
-                        func,
-                        *tile,
-                        qact,
-                        &shadow.device,
-                        scale,
-                        &lin.scales,
-                        out,
-                        m as i32,
-                        lin.n as i32,
-                        lin.k as i32,
-                        shadow.num_ktiles,
-                    );
-                }
+        if m >= self.imma_min_m
+            && !lin.tq1
+            && let Some(shadow) = lin.imma.as_ref()
+        {
+            // floor(log2(m)), clamped to the resolved bucket range.
+            let bucket = (usize::BITS - 1 - m.leading_zeros()).clamp(5, 11);
+            if let Some((tile, func)) = self.imma_funcs.get(&(lin.n, lin.k, bucket)) {
+                return backend::launch_imma_tile_on(
+                    s,
+                    func,
+                    *tile,
+                    qact,
+                    &shadow.device,
+                    scale,
+                    &lin.scales,
+                    out,
+                    m as i32,
+                    lin.n as i32,
+                    lin.k as i32,
+                    shadow.num_ktiles,
+                );
             }
         }
         Self::bl_matmul(
@@ -2489,6 +2505,7 @@ impl CudaDecodeModel {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bl_matmul(
         s: &Arc<CudaStream>,
         f_tiled_scaled: &CudaFunction,

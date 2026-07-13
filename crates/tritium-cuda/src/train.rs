@@ -1821,6 +1821,7 @@ mod tests {
         let cg = t.backward(c_loss);
 
         // ── Device tape ──
+        #[allow(clippy::type_complexity)]
         let build_device = || -> Result<(Vec<f32>, Vec<CudaSlice<f32>>, Vec<(usize, usize, usize, usize)>, usize, usize), BackendError> {
             let mut dt = DeviceTape::new(&backend, vocab)?;
             let d_embd = dt.leaf(&embd)?;
@@ -1861,13 +1862,13 @@ mod tests {
         };
 
         // Compare logits + every weight grad (incl. the tied embedding + norms).
-        let mut worst = rel(&dev_logits, &t.value(c_logits));
+        let mut worst = rel(&dev_logits, t.value(c_logits));
         let mut worst_name = "logits";
-        let mut check = |dev: &[f32],
-                         cpu: &[f32],
-                         name: &'static str,
-                         worst: &mut f32,
-                         wn: &mut &'static str| {
+        let check = |dev: &[f32],
+                     cpu: &[f32],
+                     name: &'static str,
+                     worst: &mut f32,
+                     wn: &mut &'static str| {
             let r = rel(dev, cpu);
             if r > *worst {
                 *worst = r;
@@ -2086,11 +2087,11 @@ mod tests {
         };
         let mut worst = rel(&dev_out, &cpu_out);
         let mut wn = "out";
-        let mut ck = |dev: &[f32],
-                      cpu: &[f32],
-                      name: &'static str,
-                      worst: &mut f32,
-                      wn: &mut &'static str| {
+        let ck = |dev: &[f32],
+                  cpu: &[f32],
+                  name: &'static str,
+                  worst: &mut f32,
+                  wn: &mut &'static str| {
             let r = rel(dev, cpu);
             if r > *worst {
                 *worst = r;
@@ -2246,6 +2247,7 @@ mod tests {
             k: ff,
         }; // down:    [seq,ff]·[d,ff]ᵀ
         let ones = vec![1.0f32; ff.max(d)];
+        #[allow(clippy::type_complexity)]
         let resident_block = || -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
             let up = |v: &[f32]| backend.dev_upload(v).unwrap();
             let z = |n: usize| backend.dev_alloc_zeros(n).unwrap();
