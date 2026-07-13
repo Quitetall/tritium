@@ -160,6 +160,23 @@ impl ModelRunner {
         Ok(Self::from_weights(config, weights, backend))
     }
 
+    /// Load a self-contained tied-SwiGLU training-SALT GGUF artifact.
+    ///
+    /// This reference-evaluation path dequantizes the artifact's private SALT
+    /// tensors into exact-fp dense projections and requires all config, norms,
+    /// weights, and provenance to live in the supplied bytes. It never falls back
+    /// to a model directory.
+    ///
+    /// # Errors
+    /// Propagates [`ModelWeights::load_training_salt_gguf`] validation errors.
+    pub fn from_training_salt_gguf(
+        bytes: &[u8],
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Self, NnError> {
+        let (config, weights) = ModelWeights::load_training_salt_gguf(bytes)?;
+        Ok(Self::from_weights(config, weights, backend))
+    }
+
     /// (cuda) Borrow the lazily-built device-resident decoder, building it first if
     /// needed (returns `None` on a non-CUDA backend). TEST access — production
     /// callers (tritium-serve) go through the typed facade below
