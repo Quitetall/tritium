@@ -275,6 +275,165 @@ extern "C" __global__ void salt_training_grad_a(
     ga[idx] = acc;
 }
 
+// Tiled Track D contractions. One thread still owns one output and visits its
+// reduction dimension in strictly ascending order; tiling only shares repeated
+// activation/gy reads across neighboring outputs. This preserves the scalar
+// kernels' f32 accumulation contract while mapping threadIdx.x to contiguous
+// output columns. Forward stores and grad-A packed-code reads are coalesced;
+// the activation/gy tiles remove the corresponding repeated global reads.
+#define TRAIN_SALT_TILE_X 32
+#define TRAIN_SALT_TILE_M 4
+#define TRAIN_SALT_FORWARD_K_TILE TRAIN_SALT_QK
+#define TRAIN_SALT_GRAD_N_TILE 64
+#define TRAIN_SALT_CODE_N_STRIDE (TRAIN_SALT_TILE_X + 1)
+
+extern "C" __global__ void salt_training_forward_tiled(
+    const float* __restrict__ a,             // [M, K]
+    const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
+    const float* __restrict__ scales,        // [planes, N]
+    float* __restrict__ y,                   // [M, N]
+    int m, int n, int k, int planes, int row_bytes)
+{
+    __shared__ float activation_tile
+        [TRAIN_SALT_TILE_M][TRAIN_SALT_FORWARD_K_TILE];
+    // Transpose [N,byte] global rows to [byte,N+1] shared rows. Cooperative
+    // loads are contiguous in each packed row; the +1 avoids shared-bank
+    // aliasing when output threads read the same byte from adjacent N rows.
+    __shared__ unsigned char code_tile
+        [3][TRAIN_SALT_QS_BYTES][TRAIN_SALT_CODE_N_STRIDE];
+
+    int ni = (int)blockIdx.x * TRAIN_SALT_TILE_X + (int)threadIdx.x;
+    int mi = (int)blockIdx.y * TRAIN_SALT_TILE_M + (int)threadIdx.y;
+    int lane = (int)threadIdx.y * TRAIN_SALT_TILE_X + (int)threadIdx.x;
+    int threads = TRAIN_SALT_TILE_X * TRAIN_SALT_TILE_M;
+    float plane_acc[3] = {0.0f, 0.0f, 0.0f};
+
+    for (int k_base = 0; k_base < k; k_base += TRAIN_SALT_FORWARD_K_TILE) {
+        for (int load = lane;
+             load < TRAIN_SALT_TILE_M * TRAIN_SALT_FORWARD_K_TILE;
+             load += threads) {
+            int tile_m = load / TRAIN_SALT_FORWARD_K_TILE;
+            int tile_k = load - tile_m * TRAIN_SALT_FORWARD_K_TILE;
+            int global_m = (int)blockIdx.y * TRAIN_SALT_TILE_M + tile_m;
+            int global_k = k_base + tile_k;
+            activation_tile[tile_m][tile_k] =
+                global_m < m && global_k < k
+                    ? a[(long)global_m * k + global_k]
+                    : 0.0f;
+        }
+        int code_values = planes * TRAIN_SALT_TILE_X * TRAIN_SALT_QS_BYTES;
+        for (int load = lane; load < code_values; load += threads) {
+            int plane_stride = TRAIN_SALT_TILE_X * TRAIN_SALT_QS_BYTES;
+            int plane = load / plane_stride;
+            int plane_offset = load - plane * plane_stride;
+            int tile_n = plane_offset / TRAIN_SALT_QS_BYTES;
+            int byte = plane_offset - tile_n * TRAIN_SALT_QS_BYTES;
+            int global_n = (int)blockIdx.x * TRAIN_SALT_TILE_X + tile_n;
+            long global_offset = ((long)plane * n + global_n) * row_bytes
+                + (long)(k_base / TRAIN_SALT_QK) * TRAIN_SALT_QS_BYTES + byte;
+            code_tile[plane][byte][tile_n] = global_n < n
+                ? codes[global_offset]
+                : 0x55u;
+        }
+        __syncthreads();
+
+        if (mi < m && ni < n) {
+            int tile_k_count = k - k_base;
+            if (tile_k_count > TRAIN_SALT_FORWARD_K_TILE) {
+                tile_k_count = TRAIN_SALT_FORWARD_K_TILE;
+            }
+            for (int tile_k = 0; tile_k < tile_k_count; ++tile_k) {
+                float value = activation_tile[threadIdx.y][tile_k];
+                int c = tile_k >> 7;
+                int mm = tile_k & 31;
+                int l = (tile_k & 127) >> 5;
+                int byte = c * 32 + mm;
+                for (int plane = 0; plane < planes; ++plane) {
+                    unsigned int code =
+                        ((unsigned int)code_tile[plane][byte][threadIdx.x]
+                            >> (2 * l)) & 3u;
+                    if (code == 2u) {
+                        plane_acc[plane] += value;
+                    } else if (code == 0u) {
+                        plane_acc[plane] -= value;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (mi < m && ni < n) {
+        float out = 0.0f;
+        for (int plane = 0; plane < planes; ++plane) {
+            out += plane_acc[plane] * scales[(long)plane * n + ni];
+        }
+        y[(long)mi * n + ni] = out;
+    }
+}
+
+extern "C" __global__ void salt_training_grad_a_tiled(
+    const float* __restrict__ gy,            // [M, N]
+    const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
+    const float* __restrict__ scales,        // [planes, N]
+    float* __restrict__ ga,                  // [M, K]
+    int m, int n, int k, int planes, int row_bytes)
+{
+    __shared__ float scaled_gy_tile
+        [3][TRAIN_SALT_TILE_M][TRAIN_SALT_GRAD_N_TILE];
+
+    int ki = (int)blockIdx.x * TRAIN_SALT_TILE_X + (int)threadIdx.x;
+    int mi = (int)blockIdx.y * TRAIN_SALT_TILE_M + (int)threadIdx.y;
+    int lane = (int)threadIdx.y * TRAIN_SALT_TILE_X + (int)threadIdx.x;
+    int threads = TRAIN_SALT_TILE_X * TRAIN_SALT_TILE_M;
+    float acc = 0.0f;
+
+    for (int n_base = 0; n_base < n; n_base += TRAIN_SALT_GRAD_N_TILE) {
+        for (int load = lane;
+             load < planes * TRAIN_SALT_TILE_M * TRAIN_SALT_GRAD_N_TILE;
+             load += threads) {
+            int plane_stride = TRAIN_SALT_TILE_M * TRAIN_SALT_GRAD_N_TILE;
+            int plane = load / plane_stride;
+            int plane_offset = load - plane * plane_stride;
+            int tile_m = plane_offset / TRAIN_SALT_GRAD_N_TILE;
+            int tile_n = plane_offset - tile_m * TRAIN_SALT_GRAD_N_TILE;
+            int global_m = (int)blockIdx.y * TRAIN_SALT_TILE_M + tile_m;
+            int global_n = n_base + tile_n;
+            scaled_gy_tile[plane][tile_m][tile_n] =
+                global_m < m && global_n < n
+                    ? gy[(long)global_m * n + global_n]
+                        * scales[(long)plane * n + global_n]
+                    : 0.0f;
+        }
+        __syncthreads();
+
+        if (mi < m && ki < k) {
+            int tile_n_count = n - n_base;
+            if (tile_n_count > TRAIN_SALT_GRAD_N_TILE) {
+                tile_n_count = TRAIN_SALT_GRAD_N_TILE;
+            }
+            for (int tile_n = 0; tile_n < tile_n_count; ++tile_n) {
+                int ni = n_base + tile_n;
+                for (int plane = 0; plane < planes; ++plane) {
+                    float scaled = scaled_gy_tile[plane][threadIdx.y][tile_n];
+                    unsigned int code = train_salt_code(
+                        codes, plane, ni, ki, n, row_bytes);
+                    if (code == 2u) {
+                        acc += scaled;
+                    } else if (code == 0u) {
+                        acc -= scaled;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (mi < m && ki < k) {
+        ga[(long)mi * k + ki] = acc;
+    }
+}
+
 // Tied-token embedding gather directly from the same compact Track D planes
 // used by salt_training_forward. One thread reconstructs one requested table
 // cell; code ±1 adds/subtracts the external f32 row scale, code 0 skips.

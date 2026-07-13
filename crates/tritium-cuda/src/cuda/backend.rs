@@ -7,6 +7,10 @@ use super::*;
 /// Compact Track D rows keep only TQ2's 2-bit `qs` payload; scales are f32 sidecars.
 const TRAINING_SALT_QK: usize = tritium_format::QK_K;
 const TRAINING_SALT_QS_BYTES: usize = TRAINING_SALT_QK / 4;
+const TRAINING_SALT_TILE_X: u32 = 32;
+const TRAINING_SALT_TILE_M: u32 = 4;
+const KERNEL_NAME_SALT_TRAINING_FORWARD_TILED: &str = "salt_training_forward_tiled";
+const KERNEL_NAME_SALT_TRAINING_GRAD_A_TILED: &str = "salt_training_grad_a_tiled";
 
 /// A SALT multi-plane projection, resident in VRAM: the plane-major TQ2_0 planes
 /// uploaded once, plus the geometry the `salt_mpgemm_tiled_f32` kernel needs.
@@ -213,6 +217,10 @@ pub struct CudaBackend {
     #[allow(dead_code)]
     pub(super) func_salt_training_grad_a: CudaFunction,
     #[allow(dead_code)]
+    pub(super) func_salt_training_forward_tiled: CudaFunction,
+    #[allow(dead_code)]
+    pub(super) func_salt_training_grad_a_tiled: CudaFunction,
+    #[allow(dead_code)]
     pub(super) func_salt_training_embed: CudaFunction,
     /// plan 0043 P2.2 device-resident glue: elementwise silu/mul/add fwd/bwd + grad accumulate.
     pub(super) func_silu_fwd: CudaFunction,
@@ -389,6 +397,12 @@ impl CudaBackend {
         let func_salt_training_grad_a = grad_module
             .load_function(KERNEL_NAME_SALT_TRAINING_GRAD_A)
             .map_err(|e| driver_err("resolve salt_training_grad_a kernel", &e))?;
+        let func_salt_training_forward_tiled = grad_module
+            .load_function(KERNEL_NAME_SALT_TRAINING_FORWARD_TILED)
+            .map_err(|e| driver_err("resolve salt_training_forward_tiled kernel", &e))?;
+        let func_salt_training_grad_a_tiled = grad_module
+            .load_function(KERNEL_NAME_SALT_TRAINING_GRAD_A_TILED)
+            .map_err(|e| driver_err("resolve salt_training_grad_a_tiled kernel", &e))?;
         let func_salt_training_embed =
             grad_module
                 .load_function(KERNEL_NAME_SALT_TRAINING_EMBED)
@@ -512,6 +526,8 @@ impl CudaBackend {
             func_salt_pack_training,
             func_salt_training_forward,
             func_salt_training_grad_a,
+            func_salt_training_forward_tiled,
+            func_salt_training_grad_a_tiled,
             func_salt_training_embed,
             func_silu_fwd,
             func_silu_bwd,
@@ -1127,6 +1143,34 @@ impl CudaBackend {
         m: usize,
         d_y: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
+        self.training_salt_forward_impl(d_a, weight, m, d_y, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn training_salt_forward_scalar(
+        &self,
+        d_a: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_y: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        self.training_salt_forward_impl(d_a, weight, m, d_y, true)
+    }
+
+    pub(super) fn training_salt_forward_tiled_supported(m: usize, n: usize, k: usize) -> bool {
+        // Four M rows amortize the cooperative activation/code load. Keep
+        // skinny and sub-block contractions on the scalar oracle.
+        m >= TRAINING_SALT_TILE_M as usize && n >= TRAINING_SALT_TILE_X as usize && k >= 256
+    }
+
+    fn training_salt_forward_impl(
+        &self,
+        d_a: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_y: &mut CudaSlice<f32>,
+        force_scalar: bool,
+    ) -> Result<(), BackendError> {
         Self::check_grad_launch_bounds(m, weight.n, weight.k)?;
         self.validate_training_salt(weight)?;
         if !self.same_context(d_a) || !self.same_context(d_y) {
@@ -1154,7 +1198,27 @@ impl CudaBackend {
             return Ok(());
         }
         let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
-        let mut launch = self.stream.launch_builder(&self.func_salt_training_forward);
+        let use_tiled =
+            !force_scalar && Self::training_salt_forward_tiled_supported(m, weight.n, weight.k);
+        let function = if use_tiled {
+            &self.func_salt_training_forward_tiled
+        } else {
+            &self.func_salt_training_forward
+        };
+        let cfg = if use_tiled {
+            LaunchConfig {
+                grid_dim: (
+                    (weight.n as u32).div_ceil(TRAINING_SALT_TILE_X),
+                    (m as u32).div_ceil(TRAINING_SALT_TILE_M),
+                    1,
+                ),
+                block_dim: (TRAINING_SALT_TILE_X, TRAINING_SALT_TILE_M, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            Self::elementwise_cfg(out_len)
+        };
+        let mut launch = self.stream.launch_builder(function);
         launch
             .arg(d_a)
             .arg(&weight.codes)
@@ -1169,9 +1233,16 @@ impl CudaBackend {
         // TxNxrow_bytes, TxN and MxN; flat indices fit the kernel ABI.
         #[allow(unsafe_code)]
         unsafe {
-            launch
-                .launch(Self::elementwise_cfg(out_len))
-                .map_err(|e| driver_err("launch salt_training_forward", &e))?;
+            launch.launch(cfg).map_err(|e| {
+                driver_err(
+                    if use_tiled {
+                        "launch salt_training_forward_tiled"
+                    } else {
+                        "launch salt_training_forward"
+                    },
+                    &e,
+                )
+            })?;
         }
         Ok(())
     }
@@ -1189,6 +1260,32 @@ impl CudaBackend {
         weight: &TrainingSaltLinear,
         m: usize,
         d_ga: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn training_salt_grad_a_scalar(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_ga: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, true)
+    }
+
+    pub(super) fn training_salt_grad_a_tiled_supported(m: usize, n: usize, k: usize) -> bool {
+        m >= TRAINING_SALT_TILE_M as usize && n >= TRAINING_SALT_TILE_X as usize && k >= 128
+    }
+
+    fn training_salt_grad_a_impl(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_ga: &mut CudaSlice<f32>,
+        force_scalar: bool,
     ) -> Result<(), BackendError> {
         Self::check_grad_launch_bounds(m, weight.n, weight.k)?;
         self.validate_training_salt(weight)?;
@@ -1213,7 +1310,27 @@ impl CudaBackend {
             return Ok(());
         }
         let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
-        let mut launch = self.stream.launch_builder(&self.func_salt_training_grad_a);
+        let use_tiled =
+            !force_scalar && Self::training_salt_grad_a_tiled_supported(m, weight.n, weight.k);
+        let function = if use_tiled {
+            &self.func_salt_training_grad_a_tiled
+        } else {
+            &self.func_salt_training_grad_a
+        };
+        let cfg = if use_tiled {
+            LaunchConfig {
+                grid_dim: (
+                    (weight.k as u32).div_ceil(TRAINING_SALT_TILE_X),
+                    (m as u32).div_ceil(TRAINING_SALT_TILE_M),
+                    1,
+                ),
+                block_dim: (TRAINING_SALT_TILE_X, TRAINING_SALT_TILE_M, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            Self::elementwise_cfg(ga_len)
+        };
+        let mut launch = self.stream.launch_builder(function);
         launch
             .arg(d_gy)
             .arg(&weight.codes)
@@ -1228,9 +1345,16 @@ impl CudaBackend {
         // MxK; one thread writes each activation-gradient element.
         #[allow(unsafe_code)]
         unsafe {
-            launch
-                .launch(Self::elementwise_cfg(ga_len))
-                .map_err(|e| driver_err("launch salt_training_grad_a", &e))?;
+            launch.launch(cfg).map_err(|e| {
+                driver_err(
+                    if use_tiled {
+                        "launch salt_training_grad_a_tiled"
+                    } else {
+                        "launch salt_training_grad_a"
+                    },
+                    &e,
+                )
+            })?;
         }
         Ok(())
     }
