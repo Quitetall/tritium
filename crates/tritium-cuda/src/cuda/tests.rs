@@ -121,9 +121,9 @@ fn packed_training_salt_matches_dense_resident_oracle() {
         }
     };
     let tol = Tolerance::relative(1e-4);
-    // M/N are deliberately not tile multiples. K=7 exercises the scalar
-    // fallback; larger K values dispatch the tiled kernels, including the
-    // 8193-column regime and its final one-element reduction tail.
+    // M/N are deliberately not tile multiples. K=7 exercises the fast twin's
+    // scalar fallback; larger K values dispatch its tiled kernels, including
+    // the 8193-column regime and its final one-element reduction tail.
     let (m, n) = (5usize, 35usize);
 
     for k in [7usize, 257, 576, 8193] {
@@ -138,6 +138,11 @@ fn packed_training_salt_matches_dense_resident_oracle() {
         let mut d_residual = cuda.dev_alloc_zeros(n * k).expect("residual scratch");
         let d_act = cuda.dev_upload(&act).expect("upload act");
         let d_gy = cuda.dev_upload(&gy).expect("upload gy");
+        let d_ones = cuda.dev_upload(&vec![1.0f32; n]).expect("upload scales");
+        let mut d_dense = cuda.dev_alloc_zeros(n * k).expect("alloc dense weight");
+        let mut d_dense_y = cuda.dev_alloc_zeros(m * n).expect("alloc dense y");
+        let mut d_dense_ga = cuda.dev_alloc_zeros(m * k).expect("alloc dense ga");
+        let shape = GemmShape::new(m, n, k);
 
         for planes in 1..=3 {
             let packed = cuda
@@ -158,26 +163,51 @@ fn packed_training_salt_matches_dense_resident_oracle() {
             let want_y = tritium_train::ops::dense::forward(&act, &dense, m, n, k);
             let want_ga = tritium_train::ops::dense::vjp(&act, &dense, m, n, k, &gy)[0].clone();
 
+            cuda.salt_quantize_forward_dev(&d_master, &mut d_residual, &mut d_dense, n, k, planes)
+                .expect("materialize dense device SALT");
+            cuda.matmul_forward_dev(&d_act, &d_dense, &d_ones, shape, &mut d_dense_y)
+                .expect("dense device SALT forward");
+            cuda.grad_a_dev(&d_gy, &d_dense, &d_ones, shape, &mut d_dense_ga)
+                .expect("dense device SALT grad_a");
+            let mut dense_device_y = vec![0.0f32; m * n];
+            cuda.dev_download(&d_dense_y, &mut dense_device_y)
+                .expect("download dense device y");
+            let mut dense_device_ga = vec![0.0f32; m * k];
+            cuda.dev_download(&d_dense_ga, &mut dense_device_ga)
+                .expect("download dense device ga");
+
             let mut d_y = cuda.dev_alloc_zeros(m * n).expect("alloc y");
             cuda.training_salt_forward(&d_act, &packed, m, &mut d_y)
-                .expect("packed SALT forward");
+                .expect("exact packed SALT forward");
             let mut got_y = vec![0.0f32; m * n];
             cuda.dev_download(&d_y, &mut got_y).expect("download y");
+            let mut d_fast_y = cuda.dev_alloc_zeros(m * n).expect("alloc fast y");
+            cuda.training_salt_forward_fast(&d_act, &packed, m, &mut d_fast_y)
+                .expect("fast packed SALT forward");
+            let mut fast_y = vec![0.0f32; m * n];
+            cuda.dev_download(&d_fast_y, &mut fast_y)
+                .expect("download fast y");
             let mut d_scalar_y = cuda.dev_alloc_zeros(m * n).expect("alloc scalar y");
             cuda.training_salt_forward_scalar(&d_act, &packed, m, &mut d_scalar_y)
-                .expect("scalar packed SALT forward");
+                .expect("scalar-fast packed SALT forward");
             let mut scalar_y = vec![0.0f32; m * n];
             cuda.dev_download(&d_scalar_y, &mut scalar_y)
                 .expect("download scalar y");
 
             let mut d_ga = cuda.dev_alloc_zeros(m * k).expect("alloc ga");
             cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_ga)
-                .expect("packed SALT grad_a");
+                .expect("exact packed SALT grad_a");
             let mut got_ga = vec![0.0f32; m * k];
             cuda.dev_download(&d_ga, &mut got_ga).expect("download ga");
+            let mut d_fast_ga = cuda.dev_alloc_zeros(m * k).expect("alloc fast ga");
+            cuda.training_salt_grad_a_fast(&d_gy, &packed, m, &mut d_fast_ga)
+                .expect("fast packed SALT grad_a");
+            let mut fast_ga = vec![0.0f32; m * k];
+            cuda.dev_download(&d_fast_ga, &mut fast_ga)
+                .expect("download fast ga");
             let mut d_scalar_ga = cuda.dev_alloc_zeros(m * k).expect("alloc scalar ga");
             cuda.training_salt_grad_a_scalar(&d_gy, &packed, m, &mut d_scalar_ga)
-                .expect("scalar packed SALT grad_a");
+                .expect("scalar-fast packed SALT grad_a");
             let mut scalar_ga = vec![0.0f32; m * k];
             cuda.dev_download(&d_scalar_ga, &mut scalar_ga)
                 .expect("download scalar ga");
@@ -194,24 +224,48 @@ fn packed_training_salt_matches_dense_resident_oracle() {
             for (i, (&got, &want)) in got_y.iter().zip(&want_y).enumerate() {
                 assert!(
                     tol.accepts(got, want),
-                    "forward[{i}] T={planes} {m}x{n}x{k}: packed {got} vs dense {want}"
+                    "forward[{i}] T={planes} {m}x{n}x{k}: exact {got} vs CPU dense {want}"
                 );
                 assert_eq!(
                     got.to_bits(),
+                    dense_device_y[i].to_bits(),
+                    "forward[{i}] T={planes} {m}x{n}x{k}: exact {got} vs device dense {}",
+                    dense_device_y[i],
+                );
+                assert!(
+                    tol.accepts(fast_y[i], want),
+                    "forward[{i}] T={planes} {m}x{n}x{k}: fast {} vs CPU dense {want}",
+                    fast_y[i],
+                );
+                assert_eq!(
+                    fast_y[i].to_bits(),
                     scalar_y[i].to_bits(),
-                    "forward[{i}] T={planes} {m}x{n}x{k}: tiled {got} vs scalar {}",
+                    "forward[{i}] T={planes} {m}x{n}x{k}: tiled-fast {} vs scalar-fast {}",
+                    fast_y[i],
                     scalar_y[i],
                 );
             }
             for (i, (&got, &want)) in got_ga.iter().zip(&want_ga).enumerate() {
                 assert!(
                     tol.accepts(got, want),
-                    "grad_a[{i}] T={planes} {m}x{n}x{k}: packed {got} vs dense {want}"
+                    "grad_a[{i}] T={planes} {m}x{n}x{k}: exact {got} vs CPU dense {want}"
                 );
                 assert_eq!(
                     got.to_bits(),
+                    dense_device_ga[i].to_bits(),
+                    "grad_a[{i}] T={planes} {m}x{n}x{k}: exact {got} vs device dense {}",
+                    dense_device_ga[i],
+                );
+                assert!(
+                    tol.accepts(fast_ga[i], want),
+                    "grad_a[{i}] T={planes} {m}x{n}x{k}: fast {} vs CPU dense {want}",
+                    fast_ga[i],
+                );
+                assert_eq!(
+                    fast_ga[i].to_bits(),
                     scalar_ga[i].to_bits(),
-                    "grad_a[{i}] T={planes} {m}x{n}x{k}: tiled {got} vs scalar {}",
+                    "grad_a[{i}] T={planes} {m}x{n}x{k}: tiled-fast {} vs scalar-fast {}",
+                    fast_ga[i],
                     scalar_ga[i],
                 );
             }
@@ -244,10 +298,11 @@ fn packed_training_salt_matches_dense_resident_oracle() {
     assert_eq!(got_sentinel, [17.0]);
 }
 
-/// Manual Track D microbenchmark. It times requantize plus forward, activation
-/// gradient, and their combined path with fixed resident allocations, then
-/// prints latency and weight bytes. Hardware-sensitive, so correctness is gated
-/// above while this remains opt-in evidence (`--ignored --nocapture`).
+/// Manual Track D microbenchmark. It times requantize plus exact and fast
+/// forward, activation gradient, and their combined paths with fixed resident
+/// allocations, then prints latency and weight bytes. Hardware-sensitive, so
+/// correctness is gated above while this remains opt-in evidence
+/// (`--ignored --nocapture`).
 #[test]
 #[ignore = "4090 Track D performance probe"]
 fn bench_packed_training_salt_vs_dense_materialization() {
@@ -274,6 +329,8 @@ fn bench_packed_training_salt_vs_dense_materialization() {
     let mut packed = cuda
         .pack_training_salt(&d_master, &mut d_residual, n, k, planes)
         .unwrap();
+    let mut d_exact_y = cuda.dev_alloc_zeros(m * n).unwrap();
+    let mut d_exact_ga = cuda.dev_alloc_zeros(m * k).unwrap();
     let mut d_packed_y = cuda.dev_alloc_zeros(m * n).unwrap();
     let mut d_packed_ga = cuda.dev_alloc_zeros(m * k).unwrap();
     let mut d_scalar_y = cuda.dev_alloc_zeros(m * n).unwrap();
@@ -317,7 +374,24 @@ fn bench_packed_training_salt_vs_dense_materialization() {
     for _ in 0..10 {
         cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
             .unwrap();
-        cuda.training_salt_forward(&d_act, &packed, m, &mut d_packed_y)
+        cuda.training_salt_forward(&d_act, &packed, m, &mut d_exact_y)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let exact_start = std::time::Instant::now();
+    for _ in 0..iters {
+        cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
+            .unwrap();
+        cuda.training_salt_forward(&d_act, &packed, m, &mut d_exact_y)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let exact_us = exact_start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+
+    for _ in 0..10 {
+        cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
+            .unwrap();
+        cuda.training_salt_forward_fast(&d_act, &packed, m, &mut d_packed_y)
             .unwrap();
     }
     cuda.dev_synchronize().unwrap();
@@ -325,7 +399,7 @@ fn bench_packed_training_salt_vs_dense_materialization() {
     for _ in 0..iters {
         cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
             .unwrap();
-        cuda.training_salt_forward(&d_act, &packed, m, &mut d_packed_y)
+        cuda.training_salt_forward_fast(&d_act, &packed, m, &mut d_packed_y)
             .unwrap();
     }
     cuda.dev_synchronize().unwrap();
@@ -345,13 +419,26 @@ fn bench_packed_training_salt_vs_dense_materialization() {
     let scalar_grad_us = scalar_grad_start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
 
     for _ in 0..10 {
-        cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_packed_ga)
+        cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_exact_ga)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let exact_grad_start = std::time::Instant::now();
+    for _ in 0..iters {
+        cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_exact_ga)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let exact_grad_us = exact_grad_start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+
+    for _ in 0..10 {
+        cuda.training_salt_grad_a_fast(&d_gy, &packed, m, &mut d_packed_ga)
             .unwrap();
     }
     cuda.dev_synchronize().unwrap();
     let tiled_grad_start = std::time::Instant::now();
     for _ in 0..iters {
-        cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_packed_ga)
+        cuda.training_salt_grad_a_fast(&d_gy, &packed, m, &mut d_packed_ga)
             .unwrap();
     }
     cuda.dev_synchronize().unwrap();
@@ -381,9 +468,30 @@ fn bench_packed_training_salt_vs_dense_materialization() {
     for _ in 0..10 {
         cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
             .unwrap();
-        cuda.training_salt_forward(&d_act, &packed, m, &mut d_packed_y)
+        cuda.training_salt_forward(&d_act, &packed, m, &mut d_exact_y)
             .unwrap();
-        cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_packed_ga)
+        cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_exact_ga)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let exact_full_start = std::time::Instant::now();
+    for _ in 0..iters {
+        cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
+            .unwrap();
+        cuda.training_salt_forward(&d_act, &packed, m, &mut d_exact_y)
+            .unwrap();
+        cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_exact_ga)
+            .unwrap();
+    }
+    cuda.dev_synchronize().unwrap();
+    let exact_full_us = exact_full_start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+
+    for _ in 0..10 {
+        cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
+            .unwrap();
+        cuda.training_salt_forward_fast(&d_act, &packed, m, &mut d_packed_y)
+            .unwrap();
+        cuda.training_salt_grad_a_fast(&d_gy, &packed, m, &mut d_packed_ga)
             .unwrap();
     }
     cuda.dev_synchronize().unwrap();
@@ -391,9 +499,9 @@ fn bench_packed_training_salt_vs_dense_materialization() {
     for _ in 0..iters {
         cuda.repack_training_salt(&d_master, &mut d_residual, &mut packed)
             .unwrap();
-        cuda.training_salt_forward(&d_act, &packed, m, &mut d_packed_y)
+        cuda.training_salt_forward_fast(&d_act, &packed, m, &mut d_packed_y)
             .unwrap();
-        cuda.training_salt_grad_a(&d_gy, &packed, m, &mut d_packed_ga)
+        cuda.training_salt_grad_a_fast(&d_gy, &packed, m, &mut d_packed_ga)
             .unwrap();
     }
     cuda.dev_synchronize().unwrap();
@@ -401,14 +509,18 @@ fn bench_packed_training_salt_vs_dense_materialization() {
 
     println!(
         "Track D resident SALT {m}x{n}x{k} T={planes} repack+forward: \
-         dense={dense_us:.1}us, packed-scalar={scalar_us:.1}us, packed-tiled={packed_us:.1}us; \
-         tiled speedup={:.2}x dense / {:.2}x scalar. grad_a: scalar={scalar_grad_us:.1}us, \
-         tiled={tiled_grad_us:.1}us ({:.2}x). full repack+forward+grad_a: \
-         dense={dense_full_us:.1}us, packed-tiled={packed_full_us:.1}us ({:.2}x); \
+         dense={dense_us:.1}us, packed-exact={exact_us:.1}us, \
+         packed-scalar-fast={scalar_us:.1}us, packed-tiled-fast={packed_us:.1}us; \
+         tiled-fast speedup={:.2}x dense / {:.2}x scalar. grad_a: \
+         exact={exact_grad_us:.1}us, scalar-fast={scalar_grad_us:.1}us, \
+         tiled-fast={tiled_grad_us:.1}us ({:.2}x). full repack+forward+grad_a: \
+         dense={dense_full_us:.1}us, packed-exact={exact_full_us:.1}us ({:.2}x), \
+         packed-tiled-fast={packed_full_us:.1}us ({:.2}x); \
          dense weight={} B, packed={} B ({:.1}%)",
         dense_us / packed_us,
         scalar_us / packed_us,
         scalar_grad_us / tiled_grad_us,
+        dense_full_us / exact_full_us,
         dense_full_us / packed_full_us,
         n * k * core::mem::size_of::<f32>(),
         packed.resident_bytes(),

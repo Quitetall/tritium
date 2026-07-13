@@ -12,6 +12,14 @@ const TRAINING_SALT_TILE_M: u32 = 4;
 const KERNEL_NAME_SALT_TRAINING_FORWARD_TILED: &str = "salt_training_forward_tiled";
 const KERNEL_NAME_SALT_TRAINING_GRAD_A_TILED: &str = "salt_training_grad_a_tiled";
 
+#[derive(Clone, Copy)]
+enum TrainingSaltDispatch {
+    Exact,
+    Fast,
+    #[cfg(test)]
+    ScalarFast,
+}
+
 /// A SALT multi-plane projection, resident in VRAM: the plane-major TQ2_0 planes
 /// uploaded once, plus the geometry the `salt_mpgemm_tiled_f32` kernel needs.
 ///
@@ -217,6 +225,10 @@ pub struct CudaBackend {
     #[allow(dead_code)]
     pub(super) func_salt_training_grad_a: CudaFunction,
     #[allow(dead_code)]
+    pub(super) func_salt_training_forward_exact: CudaFunction,
+    #[allow(dead_code)]
+    pub(super) func_salt_training_grad_a_exact: CudaFunction,
+    #[allow(dead_code)]
     pub(super) func_salt_training_forward_tiled: CudaFunction,
     #[allow(dead_code)]
     pub(super) func_salt_training_grad_a_tiled: CudaFunction,
@@ -397,6 +409,12 @@ impl CudaBackend {
         let func_salt_training_grad_a = grad_module
             .load_function(KERNEL_NAME_SALT_TRAINING_GRAD_A)
             .map_err(|e| driver_err("resolve salt_training_grad_a kernel", &e))?;
+        let func_salt_training_forward_exact = grad_module
+            .load_function(KERNEL_NAME_SALT_TRAINING_FORWARD_EXACT)
+            .map_err(|e| driver_err("resolve salt_training_forward_exact kernel", &e))?;
+        let func_salt_training_grad_a_exact = grad_module
+            .load_function(KERNEL_NAME_SALT_TRAINING_GRAD_A_EXACT)
+            .map_err(|e| driver_err("resolve salt_training_grad_a_exact kernel", &e))?;
         let func_salt_training_forward_tiled = grad_module
             .load_function(KERNEL_NAME_SALT_TRAINING_FORWARD_TILED)
             .map_err(|e| driver_err("resolve salt_training_forward_tiled kernel", &e))?;
@@ -526,6 +544,8 @@ impl CudaBackend {
             func_salt_pack_training,
             func_salt_training_forward,
             func_salt_training_grad_a,
+            func_salt_training_forward_exact,
+            func_salt_training_grad_a_exact,
             func_salt_training_forward_tiled,
             func_salt_training_grad_a_tiled,
             func_salt_training_embed,
@@ -1130,8 +1150,9 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Fused packed SALT forward: add/subtract activations from the resident
-    /// planes, then apply one f32 scale multiply per plane/output.
+    /// Exact packed SALT forward. It reconstructs one weight in plane order,
+    /// then contracts in K order, matching dense SALT materialization without
+    /// allocating a dense `[N,K]` buffer.
     ///
     /// # Errors
     /// Shape/context violations and device launch failures are typed errors.
@@ -1143,7 +1164,20 @@ impl CudaBackend {
         m: usize,
         d_y: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
-        self.training_salt_forward_impl(d_a, weight, m, d_y, false)
+        self.training_salt_forward_impl(d_a, weight, m, d_y, TrainingSaltDispatch::Exact)
+    }
+
+    /// Plane-order packed SALT forward optimized for throughput. This may
+    /// differ from dense-order arithmetic by ordinary f32 reassociation.
+    #[allow(dead_code)] // explicit fast twin; campaign wiring lands separately
+    pub(crate) fn training_salt_forward_fast(
+        &self,
+        d_a: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_y: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        self.training_salt_forward_impl(d_a, weight, m, d_y, TrainingSaltDispatch::Fast)
     }
 
     #[cfg(test)]
@@ -1154,7 +1188,7 @@ impl CudaBackend {
         m: usize,
         d_y: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
-        self.training_salt_forward_impl(d_a, weight, m, d_y, true)
+        self.training_salt_forward_impl(d_a, weight, m, d_y, TrainingSaltDispatch::ScalarFast)
     }
 
     pub(super) fn training_salt_forward_tiled_supported(m: usize, n: usize, k: usize) -> bool {
@@ -1169,7 +1203,7 @@ impl CudaBackend {
         weight: &TrainingSaltLinear,
         m: usize,
         d_y: &mut CudaSlice<f32>,
-        force_scalar: bool,
+        dispatch: TrainingSaltDispatch,
     ) -> Result<(), BackendError> {
         Self::check_grad_launch_bounds(m, weight.n, weight.k)?;
         self.validate_training_salt(weight)?;
@@ -1198,9 +1232,12 @@ impl CudaBackend {
             return Ok(());
         }
         let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
-        let use_tiled =
-            !force_scalar && Self::training_salt_forward_tiled_supported(m, weight.n, weight.k);
-        let function = if use_tiled {
+        let use_exact = matches!(dispatch, TrainingSaltDispatch::Exact);
+        let use_tiled = matches!(dispatch, TrainingSaltDispatch::Fast)
+            && Self::training_salt_forward_tiled_supported(m, weight.n, weight.k);
+        let function = if use_exact {
+            &self.func_salt_training_forward_exact
+        } else if use_tiled {
             &self.func_salt_training_forward_tiled
         } else {
             &self.func_salt_training_forward
@@ -1235,7 +1272,9 @@ impl CudaBackend {
         unsafe {
             launch.launch(cfg).map_err(|e| {
                 driver_err(
-                    if use_tiled {
+                    if use_exact {
+                        "launch salt_training_forward_exact"
+                    } else if use_tiled {
                         "launch salt_training_forward_tiled"
                     } else {
                         "launch salt_training_forward"
@@ -1247,9 +1286,10 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Activation VJP through fused packed SALT planes. The latent-master
-    /// weight gradient remains the ordinary fp STE path and is intentionally
-    /// not stored in this packed handle.
+    /// Exact activation VJP through packed SALT planes. Each weight is
+    /// reconstructed in plane order before the N-order contraction. The
+    /// latent-master weight gradient remains the ordinary fp STE path and is
+    /// intentionally not stored in this packed handle.
     ///
     /// # Errors
     /// Shape/context violations and device launch failures are typed errors.
@@ -1261,7 +1301,20 @@ impl CudaBackend {
         m: usize,
         d_ga: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
-        self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, false)
+        self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, TrainingSaltDispatch::Exact)
+    }
+
+    /// Plane-order packed SALT activation VJP optimized for throughput. This
+    /// may differ from dense-order arithmetic by ordinary f32 reassociation.
+    #[allow(dead_code)] // explicit fast twin; campaign wiring lands separately
+    pub(crate) fn training_salt_grad_a_fast(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        weight: &TrainingSaltLinear,
+        m: usize,
+        d_ga: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, TrainingSaltDispatch::Fast)
     }
 
     #[cfg(test)]
@@ -1272,7 +1325,7 @@ impl CudaBackend {
         m: usize,
         d_ga: &mut CudaSlice<f32>,
     ) -> Result<(), BackendError> {
-        self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, true)
+        self.training_salt_grad_a_impl(d_gy, weight, m, d_ga, TrainingSaltDispatch::ScalarFast)
     }
 
     pub(super) fn training_salt_grad_a_tiled_supported(m: usize, n: usize, k: usize) -> bool {
@@ -1285,7 +1338,7 @@ impl CudaBackend {
         weight: &TrainingSaltLinear,
         m: usize,
         d_ga: &mut CudaSlice<f32>,
-        force_scalar: bool,
+        dispatch: TrainingSaltDispatch,
     ) -> Result<(), BackendError> {
         Self::check_grad_launch_bounds(m, weight.n, weight.k)?;
         self.validate_training_salt(weight)?;
@@ -1310,9 +1363,12 @@ impl CudaBackend {
             return Ok(());
         }
         let (mi, ni, ki, pi, rbi) = weight.kernel_dims(m)?;
-        let use_tiled =
-            !force_scalar && Self::training_salt_grad_a_tiled_supported(m, weight.n, weight.k);
-        let function = if use_tiled {
+        let use_exact = matches!(dispatch, TrainingSaltDispatch::Exact);
+        let use_tiled = matches!(dispatch, TrainingSaltDispatch::Fast)
+            && Self::training_salt_grad_a_tiled_supported(m, weight.n, weight.k);
+        let function = if use_exact {
+            &self.func_salt_training_grad_a_exact
+        } else if use_tiled {
             &self.func_salt_training_grad_a_tiled
         } else {
             &self.func_salt_training_grad_a
@@ -1347,7 +1403,9 @@ impl CudaBackend {
         unsafe {
             launch.launch(cfg).map_err(|e| {
                 driver_err(
-                    if use_tiled {
+                    if use_exact {
+                        "launch salt_training_grad_a_exact"
+                    } else if use_tiled {
                         "launch salt_training_grad_a_tiled"
                     } else {
                         "launch salt_training_grad_a"

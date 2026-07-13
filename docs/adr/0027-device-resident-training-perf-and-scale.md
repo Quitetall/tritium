@@ -298,10 +298,10 @@ Each track is done when its gate is green, benched, reviewed, and pushed.
 
 ---
 
-## Implementation Results (2026-07-12)
+## Implementation Results (updated 2026-07-13)
 
-This section records implementation through `7a51fa6`. It does not mark the ADR or
-its scale campaign complete.
+This section records implementation through the packed exact-numerics slice. It
+does not mark the ADR or its scale campaign complete.
 
 ### Landed work
 
@@ -330,7 +330,10 @@ its scale campaign complete.
   in `88fa8c4` and `cf4a258`. Host masters and moments round-trip through bounded
   DCP v1 sources and sinks (`1133211`). Packed forward and activation-gradient
   contractions now have tiled kernels with conservative scalar fallbacks
-  (`5aefb1a`).
+  (`5aefb1a`). The semantic packed path now reconstructs each scalar weight in
+  ascending plane order inside the dense-order contraction. This exact twin does
+  not materialize a dense weight and leaves the reassociated plane-grouped/tiled
+  kernels available only as an explicit fast path.
 - **Track F substrate:** deterministic intermediate-width Net2Wider transforms and
   quality/bytes selection (`e4b8f5b`).
 
@@ -366,21 +369,20 @@ its scale campaign complete.
   floor is not the measured result. Streaming lowers requested-gradient peak to
   `116,785,152` bytes from a `537,919,488`-byte materialized collection (`0.2171x`)
   and emits all 211 parameters exactly once in a stable reverse order.
-- **Open numerical gate:** packed whole-model parity remains just outside the strict
-  `1e-4` threshold: logits `1.698e-4`, tied-embedding gradient `2.508e-4`, and
-  layer-0 down gradient `6.714e-5` on the recorded 4090 run.
-- **Negative performance result:** the original scalar Track D microbenchmark
-  measured `0.93x` the dense materialize-plus-matmul path. The tiled diagnostic
-  combined path remained slower at `0.85x` dense while the desktop GPU was
-  contended, so it is not headline performance evidence. The full streamed packed
-  campaign averages `1771 ms/step`, missing the unchanged `1123 ms` Track-0 gate
-  despite the memory and quality wins. Profiling-driven packed-kernel work and
-  transfer overlap are still required before claiming a compute win.
+- The strict packed whole-model numerical gate is green. On SmolLM2-135M, the
+  exact packed path is bitwise equal to the dense CUDA path at the checked logits,
+  tied-embedding gradient, and layer-0 down gradient (`0.000e0` max-absolute
+  delta for all three). Low-level forward and activation-gradient gates are also
+  bitwise equal for `T in {1,2,3}` and `K in {7,257,576,8193}`.
+- **Negative performance result:** the exact semantic twin measured `0.80x` the
+  dense materialize-plus-matmul full path and the explicit tiled fast twin measured
+  `0.86x` on the diagnostic 4090 run. The full streamed packed campaign still
+  averages `1771 ms/step`, missing the unchanged `1123 ms` Track-0 gate despite
+  the memory and quality wins. Profiling-driven fast-kernel work and transfer
+  overlap are still required before claiming a compute win.
 
 ### Remaining local implementation and validation
 
-- Close the strict packed whole-model `1e-4` numerical gate without falling back to
-  dense quantized-weight materialization.
 - Profile and deepen the correctness-proven tiled packed contractions until the
   combined path beats dense materialization; add pinned double buffering and
   copy/compute overlap, then rerun the `1123 ms` gate on an uncontended GPU. Current

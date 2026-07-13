@@ -158,6 +158,30 @@ __device__ __forceinline__ unsigned int train_salt_code(
     return ((unsigned int)codes[off] >> (2 * l)) & 3u;
 }
 
+// Reconstruct one compact SALT weight in the same plane order as
+// salt_quantize_forward's dense quantized buffer. Keeping this helper scalar
+// and compiling the module with --fmad=false makes the exact contractions
+// below reproduce the dense materialize-then-contract arithmetic order without
+// allocating the dense [N,K] weight.
+__device__ __forceinline__ float train_salt_reconstruct_weight(
+    const unsigned char* __restrict__ codes,
+    const float* __restrict__ scales,
+    int row, int col, int rows, int planes, int row_bytes)
+{
+    float weight = 0.0f;
+    for (int plane = 0; plane < planes; ++plane) {
+        unsigned int code = train_salt_code(
+            codes, plane, row, col, rows, row_bytes);
+        float scale = scales[(long)plane * rows + row];
+        if (code == 2u) {
+            weight += scale;
+        } else if (code == 0u) {
+            weight -= scale;
+        }
+    }
+    return weight;
+}
+
 // Pack the resident latent master directly into compact planes. One thread owns
 // a row, preserving Track A's ascending-column f32 AbsMean and residual order.
 extern "C" __global__ void salt_pack_training(
@@ -271,6 +295,56 @@ extern "C" __global__ void salt_training_grad_a(
                 acc -= scaled;
             }
         }
+    }
+    ga[idx] = acc;
+}
+
+// Numerically exact compact twin of dense SALT materialization followed by
+// ternary_matmul_forward with an all-ones external scale. Each weight is first
+// reconstructed in ascending plane order, then contracted in ascending K
+// order. No dense [N,K] buffer is materialized.
+extern "C" __global__ void salt_training_forward_exact(
+    const float* __restrict__ a,             // [M, K]
+    const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
+    const float* __restrict__ scales,        // [planes, N]
+    float* __restrict__ y,                   // [M, N]
+    int m, int n, int k, int planes, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)m * n) return;
+    int mi = idx / n;
+    int ni = idx % n;
+    const float* arow = a + (long)mi * k;
+    float acc = 0.0f;
+
+    for (int ki = 0; ki < k; ++ki) {
+        float weight = train_salt_reconstruct_weight(
+            codes, scales, ni, ki, n, planes, row_bytes);
+        acc += arow[ki] * weight;
+    }
+    y[idx] = acc;
+}
+
+// Numerically exact compact twin of ternary_matmul_grad_a over a dense SALT
+// reconstruction with an all-ones external scale. Reconstruction follows
+// ascending plane order and the contraction follows ascending N order.
+extern "C" __global__ void salt_training_grad_a_exact(
+    const float* __restrict__ gy,            // [M, N]
+    const unsigned char* __restrict__ codes, // [planes, N, row_bytes]
+    const float* __restrict__ scales,        // [planes, N]
+    float* __restrict__ ga,                  // [M, K]
+    int m, int n, int k, int planes, int row_bytes)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)m * k) return;
+    int mi = idx / k;
+    int ki = idx % k;
+    float acc = 0.0f;
+
+    for (int ni = 0; ni < n; ++ni) {
+        float weight = train_salt_reconstruct_weight(
+            codes, scales, ni, ki, n, planes, row_bytes);
+        acc += gy[(long)mi * n + ni] * weight;
     }
     ga[idx] = acc;
 }

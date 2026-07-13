@@ -1,13 +1,12 @@
 //! Real-model gate for compact SALT training execution. It compares the
 //! ordinary dense T=2 SALT device tape against packed projections plus
 //! sqrt-depth activation checkpointing on the local SmolLM2-135M weights.
-//! OPEN (RTX 4090, seq 8): the strict whole-model max-absolute parity gate is
-//! still negative at logits 1.698e-4, tied-embedding gradient 2.508e-4, and
-//! layer-0 down gradient 6.714e-5. Compact residency is 0.1615x dense and the
-//! measured checkpoint activation peak is 0.1846x naive residency.
+//! The exact compact twin is bitwise-equal to the dense CUDA path at logits and
+//! selected gradients on the RTX 4090 gate (seq 8). Compact residency is
+//! 0.1615x dense and the measured checkpoint activation peak is 0.1846x naive.
 //!
 //! ```text
-//! cargo test -p tritium-nn --features cuda --release --test packed_device_tape_real_model -- --ignored --nocapture
+//! cargo test -p tritium-nn --features cuda --release --test packed_device_tape_real_model -- --nocapture
 //! ```
 #![cfg(feature = "cuda")]
 
@@ -77,7 +76,6 @@ struct PathResult {
 }
 
 #[test]
-#[ignore = "OPEN: packed whole-model parity misses strict 1e-4; needs local SmolLM2-135M + CUDA"]
 fn packed_salt_checkpointed_smollm2_matches_dense_salt() {
     let dir = model_dir();
     if !dir.join("model.safetensors").exists() {
