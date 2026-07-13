@@ -23,8 +23,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod backends;
 mod campaign;
+#[cfg(feature = "cuda")]
+mod campaign_artifact;
 mod generate;
 mod inspect;
+#[cfg(feature = "cuda")]
+mod nvml_probe;
 mod pull;
 mod quantize;
 mod repack;
