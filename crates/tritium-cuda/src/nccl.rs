@@ -26,10 +26,12 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaStream, DriverError};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DriverError};
 use cudarc::nccl::result::NcclError;
 use cudarc::nccl::{Comm, Id, ReduceOp as NcclOp};
 use tritium_train::dist::{DistError, ProcessGroup, ReduceOp};
+
+use crate::CudaBackend;
 
 /// The NCCL rendezvous token. Rank 0 creates one with [`NcclId::new`] and ships its [`bytes`](Self::bytes)
 /// to every other rank (channel / file / env); each rank passes it to [`NcclProcessGroup::init`].
@@ -102,6 +104,139 @@ impl NcclProcessGroup {
         let comm =
             Comm::from_rank(stream, rank, world_size, Id::uninit(id.bytes)).map_err(nccl_err)?;
         Ok(Self { comm })
+    }
+
+    /// Join a communicator on the CUDA backend's own stream.
+    ///
+    /// Resident training buffers and subsequent optimizer launches therefore
+    /// share one ordered stream: the collective neither stages through host
+    /// memory nor needs a host-side synchronization between reduction and use.
+    /// Every rank must call this concurrently, as for [`Self::init`].
+    ///
+    /// # Errors
+    /// [`DistError::Backend`] if the NCCL rendezvous fails.
+    pub fn init_on_backend(
+        backend: &CudaBackend,
+        rank: usize,
+        world_size: usize,
+        id: &NcclId,
+    ) -> Result<Self, DistError> {
+        let comm = Comm::from_rank(
+            backend.nccl_stream(),
+            rank,
+            world_size,
+            Id::uninit(id.bytes),
+        )
+        .map_err(nccl_err)?;
+        Ok(Self { comm })
+    }
+
+    /// Enqueue an in-place all-reduce over a resident f32 buffer.
+    ///
+    /// `logical_len` must equal the allocation length. Making that contract
+    /// explicit prevents an oversized reusable arena from silently reducing
+    /// unrelated trailing values. All ranks must provide the same length; as
+    /// with the host NCCL path, cross-rank disagreement is an NCCL contract
+    /// violation that cannot be checked locally without another collective.
+    ///
+    /// # Errors
+    /// [`DistError::LengthMismatch`] if `logical_len` differs from the buffer;
+    /// [`DistError::Backend`] if the buffer belongs to another CUDA context or
+    /// NCCL rejects the operation.
+    pub fn all_reduce_f32_in_place(
+        &self,
+        buffer: &mut CudaSlice<f32>,
+        logical_len: usize,
+        op: ReduceOp,
+    ) -> Result<(), DistError> {
+        self.validate_device_buffer(buffer, logical_len)?;
+        if logical_len == 0 {
+            return Ok(());
+        }
+        self.comm
+            .all_reduce_in_place(buffer, &to_nccl(op))
+            .map_err(nccl_err)?;
+        Ok(())
+    }
+
+    /// Enqueue an in-place broadcast over a resident f32 buffer.
+    ///
+    /// # Errors
+    /// [`DistError::InvalidRoot`] for a root outside the group;
+    /// [`DistError::LengthMismatch`] if `logical_len` differs from the buffer;
+    /// [`DistError::Backend`] for context or NCCL failures.
+    pub fn broadcast_f32_in_place(
+        &self,
+        buffer: &mut CudaSlice<f32>,
+        logical_len: usize,
+        root: usize,
+    ) -> Result<(), DistError> {
+        self.broadcast_device_in_place(buffer, logical_len, root)
+    }
+
+    /// Enqueue an in-place broadcast over resident packed bytes.
+    ///
+    /// This is the plane/metadata companion to [`Self::broadcast_f32_in_place`].
+    ///
+    /// # Errors
+    /// Same contract as [`Self::broadcast_f32_in_place`].
+    pub fn broadcast_u8_in_place(
+        &self,
+        buffer: &mut CudaSlice<u8>,
+        logical_len: usize,
+        root: usize,
+    ) -> Result<(), DistError> {
+        self.broadcast_device_in_place(buffer, logical_len, root)
+    }
+
+    fn broadcast_device_in_place<T: cudarc::nccl::NcclType>(
+        &self,
+        buffer: &mut CudaSlice<T>,
+        logical_len: usize,
+        root: usize,
+    ) -> Result<(), DistError> {
+        let root_i32 = self.validate_root(root)?;
+        self.validate_device_buffer(buffer, logical_len)?;
+        if logical_len == 0 {
+            return Ok(());
+        }
+        self.comm
+            .broadcast_in_place(buffer, root_i32)
+            .map_err(nccl_err)?;
+        Ok(())
+    }
+
+    fn validate_device_buffer<T>(
+        &self,
+        buffer: &CudaSlice<T>,
+        logical_len: usize,
+    ) -> Result<(), DistError> {
+        if buffer.len() != logical_len {
+            return Err(DistError::LengthMismatch {
+                expected: logical_len,
+                got: buffer.len(),
+            });
+        }
+        if self.comm.context() != buffer.context() {
+            return Err(DistError::Backend(
+                "device collective buffer belongs to a different CUDA context".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_root(&self, root: usize) -> Result<i32, DistError> {
+        let world = self.comm.world_size();
+        if root >= world {
+            return Err(DistError::InvalidRoot {
+                root,
+                world_size: world,
+            });
+        }
+        i32::try_from(root).map_err(|_| DistError::InvalidRoot {
+            root,
+            world_size: world,
+        })
     }
 
     fn stream(&self) -> Arc<CudaStream> {
@@ -342,6 +477,100 @@ mod tests {
         ));
     }
 
+    /// The resident seam must stay on the backend's stream/context and must not
+    /// round-trip through host memory. World size one gives an exact identity
+    /// oracle while exercising the real NCCL device-buffer call.
+    #[test]
+    fn world1_device_all_reduce_is_local_identity() {
+        if device_count() == 0 {
+            eprintln!("skip world1_device_all_reduce_is_local_identity: no CUDA device");
+            return;
+        }
+        let backend = CudaBackend::new(0).expect("cuda backend");
+        let id = NcclId::new().expect("nccl id");
+        let pg = NcclProcessGroup::init_on_backend(&backend, 0, 1, &id).expect("nccl init");
+        let expected = vec![-3.5f32, 0.0, 2.25, 17.0];
+        let mut device = backend.dev_upload(&expected).expect("upload");
+
+        pg.all_reduce_f32_in_place(&mut device, expected.len(), ReduceOp::Sum)
+            .expect("resident all reduce");
+
+        let mut got = vec![0.0f32; expected.len()];
+        backend.dev_download(&device, &mut got).expect("download");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn world1_device_broadcasts_are_local_identity() {
+        if device_count() == 0 {
+            eprintln!("skip world1_device_broadcasts_are_local_identity: no CUDA device");
+            return;
+        }
+        let backend = CudaBackend::new(0).expect("cuda backend");
+        let id = NcclId::new().expect("nccl id");
+        let pg = NcclProcessGroup::init_on_backend(&backend, 0, 1, &id).expect("nccl init");
+
+        let f32_expected = vec![1.25f32, -9.0, 4.5];
+        let mut f32_device = backend.dev_upload(&f32_expected).expect("upload f32");
+        pg.broadcast_f32_in_place(&mut f32_device, f32_expected.len(), 0)
+            .expect("resident f32 broadcast");
+        let mut f32_got = vec![0.0f32; f32_expected.len()];
+        backend
+            .dev_download(&f32_device, &mut f32_got)
+            .expect("download f32");
+        assert_eq!(f32_got, f32_expected);
+
+        let u8_expected = vec![0u8, 1, 127, 128, 255];
+        let stream = pg.stream();
+        let mut u8_device = stream.clone_htod(&u8_expected).expect("upload u8");
+        pg.broadcast_u8_in_place(&mut u8_device, u8_expected.len(), 0)
+            .expect("resident u8 broadcast");
+        let mut u8_got = vec![0u8; u8_expected.len()];
+        stream
+            .memcpy_dtoh(&u8_device, &mut u8_got)
+            .expect("download u8");
+        assert_eq!(u8_got, u8_expected);
+    }
+
+    #[test]
+    fn device_collective_rejects_logical_length_mismatch() {
+        if device_count() == 0 {
+            eprintln!("skip device_collective_rejects_logical_length_mismatch: no CUDA device");
+            return;
+        }
+        let backend = CudaBackend::new(0).expect("cuda backend");
+        let id = NcclId::new().expect("nccl id");
+        let pg = NcclProcessGroup::init_on_backend(&backend, 0, 1, &id).expect("nccl init");
+        let mut device = backend.dev_upload(&[1.0f32, 2.0, 3.0]).expect("upload");
+
+        assert!(matches!(
+            pg.all_reduce_f32_in_place(&mut device, 2, ReduceOp::Sum),
+            Err(DistError::LengthMismatch {
+                expected: 2,
+                got: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn device_collective_rejects_foreign_context() {
+        if device_count() < 2 {
+            eprintln!("skip device_collective_rejects_foreign_context: needs >=2 GPUs");
+            return;
+        }
+        let backend = CudaBackend::new(0).expect("cuda backend 0");
+        let foreign = CudaBackend::new(1).expect("cuda backend 1");
+        let id = NcclId::new().expect("nccl id");
+        let pg = NcclProcessGroup::init_on_backend(&backend, 0, 1, &id).expect("nccl init");
+        let mut device = foreign.dev_upload(&[1.0f32, 2.0]).expect("upload");
+
+        assert!(matches!(
+            pg.all_reduce_f32_in_place(&mut device, 2, ReduceOp::Sum),
+            Err(DistError::Backend(message))
+                if message.contains("different CUDA context")
+        ));
+    }
+
     // ── The ≥2-GPU wall gates (plan 0017). Self-skip on a single-GPU box; the real run is on the
     //    rented 2×GPU machine. NCCL reductions reorder float adds, so the comparison to the
     //    single-process reference is within a tolerance (like the 0015 data-parallel gate). ──
@@ -501,6 +730,82 @@ mod tests {
         let loss = t.value(lid)[0];
         let grads = t.backward(lid);
         (loss, vec![grads[w1].clone(), grads[w2].clone()])
+    }
+
+    /// The scale-sensitive distributed gate: average the per-rank gradients
+    /// while they are resident and compare the reduced values directly with a
+    /// full-batch CPU reference. Unlike an AdamW loss curve, this catches Sum
+    /// accidentally substituted for Avg.
+    #[test]
+    fn device_all_reduce_gradient_matches_full_batch_reference_multi_gpu() {
+        let visible = device_count();
+        if visible < 2 {
+            eprintln!(
+                "skip device_all_reduce_gradient_matches_full_batch_reference_multi_gpu: \
+                 needs >=2 GPUs, have {visible}"
+            );
+            return;
+        }
+        let world = largest_divisor_le(B, visible);
+        let leaves = vec![
+            seeded(1, H * D_IN, -0.3, 0.3),
+            seeded(2, D_OUT * H, -0.3, 0.3),
+        ];
+        let (x, y) = data();
+        let (_, full_grad_parts) = forward_backward(&leaves, &x, &y, B);
+        let full_grad: Vec<f32> = full_grad_parts.into_iter().flatten().collect();
+        let id = NcclId::new().expect("nccl id");
+
+        let reduced: Vec<Vec<f32>> = std::thread::scope(|scope| {
+            let leaves = &leaves;
+            let x = &x;
+            let y = &y;
+            let handles: Vec<_> = (0..world)
+                .map(|rank| {
+                    scope.spawn(move || {
+                        let backend = CudaBackend::new(rank).expect("cuda backend");
+                        let pg = NcclProcessGroup::init_on_backend(&backend, rank, world, &id)
+                            .expect("nccl init");
+                        let local_batch = B / world;
+                        let x_start = rank * local_batch * D_IN;
+                        let y_start = rank * local_batch * D_OUT;
+                        let (_, grad_parts) = forward_backward(
+                            &leaves,
+                            &x[x_start..x_start + local_batch * D_IN],
+                            &y[y_start..y_start + local_batch * D_OUT],
+                            local_batch,
+                        );
+                        let local_grad: Vec<f32> = grad_parts.into_iter().flatten().collect();
+                        let grad_len = local_grad.len();
+                        let mut device = backend.dev_upload(&local_grad).expect("upload gradient");
+                        pg.all_reduce_f32_in_place(&mut device, grad_len, ReduceOp::Avg)
+                            .expect("resident gradient all reduce");
+                        let mut host = vec![0.0f32; grad_len];
+                        backend
+                            .dev_download(&device, &mut host)
+                            .expect("download gradient");
+                        host
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("rank thread"))
+                .collect()
+        });
+
+        for (rank, got) in reduced.iter().enumerate() {
+            assert_eq!(got.len(), full_grad.len());
+            for (index, (&actual, &expected)) in got.iter().zip(&full_grad).enumerate() {
+                let abs = (actual - expected).abs();
+                let rel = abs / expected.abs().max(1e-6);
+                assert!(
+                    abs <= 1e-5 || rel <= 1e-4,
+                    "rank {rank} gradient[{index}]: reduced {actual} vs full-batch {expected} \
+                     (abs {abs}, rel {rel})"
+                );
+            }
+        }
     }
 
     fn reference_curve() -> Vec<f32> {

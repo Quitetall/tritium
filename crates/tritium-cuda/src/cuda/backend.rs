@@ -824,6 +824,15 @@ impl CudaBackend {
         self.stream.context() == buffer.context()
     }
 
+    /// The backend stream used to join an NCCL communicator. Keeping this
+    /// accessor crate-private prevents callers from bypassing the backend's
+    /// stream ordering while allowing the sibling NCCL module to enqueue
+    /// collectives directly against resident training buffers.
+    #[cfg(feature = "nccl")]
+    pub(crate) fn nccl_stream(&self) -> Arc<CudaStream> {
+        Arc::clone(&self.stream)
+    }
+
     #[cfg(test)]
     pub(crate) fn dev_synchronize(&self) -> Result<(), BackendError> {
         self.stream
