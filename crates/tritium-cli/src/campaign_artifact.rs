@@ -213,6 +213,10 @@ impl CampaignArtifactSummary {
     }
 
     pub(crate) fn reconstruction_mse(self) -> f64 {
+        assert!(
+            self.reconstruction_element_count > 0,
+            "validated campaign artifacts contain at least one trained weight"
+        );
         self.reconstruction_squared_error_sum / self.reconstruction_element_count as f64
     }
 }
@@ -1045,8 +1049,20 @@ impl AtomicArtifact {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(io_error("inspect output", &self.destination, source)),
         }
-        std::fs::rename(&self.temporary, &self.destination)
-            .map_err(|source| io_error("atomically publish", &self.destination, source))?;
+        // A same-directory hard link is an atomic no-replace publication: unlike
+        // `rename`, it fails if another process creates the destination after the
+        // preflight check. Both names reference the already-fsynced inode until
+        // the private temporary name is removed.
+        std::fs::hard_link(&self.temporary, &self.destination).map_err(|source| {
+            io_error(
+                "atomically publish without replacement",
+                &self.destination,
+                source,
+            )
+        })?;
+        std::fs::remove_file(&self.temporary).map_err(|source| {
+            io_error("remove published temporary link", &self.temporary, source)
+        })?;
         self.committed = true;
         #[cfg(unix)]
         File::open(output_parent(&self.destination))

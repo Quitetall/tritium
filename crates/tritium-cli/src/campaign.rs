@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(any(feature = "cuda", test))]
+use std::collections::BTreeSet;
+
+#[cfg(any(feature = "cuda", test))]
 use std::fs::OpenOptions;
 #[cfg(any(feature = "cuda", test))]
 use std::io::Write;
@@ -25,19 +28,30 @@ use tritium_nn::{
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 #[cfg(feature = "cuda")]
-use tritium_cuda::CudaBackend;
-#[cfg(feature = "cuda")]
 use tritium_cuda::train::{
     CheckpointPolicy, DevicePackedSaltWeight, DeviceTape, DeviceTensor, GradientLeafBinding,
-    HostOffloadMemoryGeometry, HostOffloadParamMetadata, HostOffloadTrainParam, HostOffloadTrainer,
-    host_offload_memory_geometry,
+    HostOffloadMemoryGeometry, HostOffloadParamMetadata, HostOffloadStats, HostOffloadTrainParam,
+    HostOffloadTrainer, host_offload_memory_geometry,
 };
 #[cfg(feature = "cuda")]
-use tritium_nn::{TeacherCacheReader, packed_device_forward};
+use tritium_cuda::{CudaBackend, CudaDeviceIdentity, CudaMemorySnapshot};
 #[cfg(feature = "cuda")]
-use tritium_spec::TernaryBackend;
+use tritium_nn::{
+    TeacherCacheReader, TeacherForcedPerplexity, packed_device_forward,
+    parse_training_salt_artifact_metadata, teacher_forced_perplexity_windows,
+};
+#[cfg(feature = "cuda")]
+use tritium_quantize::MeasuredPackage;
 #[cfg(feature = "cuda")]
 use tritium_train::AdamW;
+
+#[cfg(feature = "cuda")]
+use crate::campaign_artifact::{
+    ArtifactProvenance, CampaignArtifactSummary, GrowthReceipt, export_campaign_artifact,
+    verify_campaign_artifact,
+};
+#[cfg(feature = "cuda")]
+use crate::nvml_probe::{NvmlGpuSnapshot, probe_cuda_device};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -62,9 +76,10 @@ pub(crate) enum CampaignCommand {
     /// Run or resume an offline-teacher packed-SALT campaign on CUDA.
     Run {
         /// JSON campaign configuration. Required keys: model_dir, corpus,
-        /// teacher_cache, checkpoint_dir, report, seq_len, steps, and
-        /// checkpoint_every. Optional keys: salt_planes, cuda_device,
-        /// checkpoint_shards, and adam. Relative paths resolve beside this file.
+        /// evaluation_corpus, teacher_cache, checkpoint_dir, report, artifact,
+        /// seq_len, steps, and checkpoint_every. Optional keys: growth,
+        /// salt_planes, cuda_device, timing_warmup_steps, checkpoint_shards, and
+        /// adam. Relative paths resolve beside this file.
         #[arg(long)]
         config: PathBuf,
     },
@@ -130,6 +145,53 @@ fn validate_windows(
         bail!("corpus token {token} at position {position} is outside vocabulary 0..{vocab}");
     }
     u64::try_from(tokens.len() / seq_len).context("window count exceeds u64")
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn validate_held_out_corpus(
+    training_tokens: &[u32],
+    training_digest: [u8; 32],
+    evaluation_tokens: &[u32],
+    evaluation_digest: [u8; 32],
+    seq_len: usize,
+) -> anyhow::Result<()> {
+    if seq_len == 0
+        || training_tokens.is_empty()
+        || evaluation_tokens.is_empty()
+        || !training_tokens.len().is_multiple_of(seq_len)
+        || !evaluation_tokens.len().is_multiple_of(seq_len)
+    {
+        bail!("held-out overlap validation requires non-empty exact windows");
+    }
+    if training_digest == evaluation_digest {
+        bail!(
+            "training and evaluation corpora have identical semantic token content; held-out evidence would be contaminated"
+        );
+    }
+    let training_windows: BTreeSet<_> = training_tokens
+        .chunks_exact(seq_len)
+        .map(hash_token_window)
+        .collect();
+    if let Some(index) = evaluation_tokens
+        .chunks_exact(seq_len)
+        .map(hash_token_window)
+        .position(|digest| training_windows.contains(&digest))
+    {
+        bail!(
+            "evaluation window {index} is also present in the training corpus; held-out evidence would be contaminated"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn hash_token_window(tokens: &[u32]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tritium-held-out-token-window-v1");
+    for token in tokens {
+        hash.update(&token.to_le_bytes());
+    }
+    *hash.finalize().as_bytes()
 }
 
 fn teacher_cache(
@@ -499,12 +561,32 @@ fn validate_teacher_cache_paths(
 #[cfg(feature = "cuda")]
 fn validate_campaign_paths(config_path: &Path, config: &CampaignConfig) -> anyhow::Result<()> {
     validate_existing_output_type(&config.report, "campaign report")?;
+    validate_existing_output_type(&config.artifact, "campaign artifact")?;
+    let artifact_parent = output_parent(&config.artifact);
+    let artifact_parent_metadata =
+        std::fs::symlink_metadata(artifact_parent).with_context(|| {
+            format!(
+                "inspect campaign artifact parent {}",
+                artifact_parent.display()
+            )
+        })?;
+    if !artifact_parent_metadata.file_type().is_dir() {
+        bail!(
+            "campaign artifact parent {} must be an existing real directory",
+            artifact_parent.display()
+        );
+    }
     let report = path_identity(&config.report)?;
+    let artifact = path_identity(&config.artifact)?;
     let checkpoint = path_identity(&config.checkpoint_dir)?;
     let model_dir = path_identity(&config.model_dir)?;
     let protected_files = [
         ("campaign config", path_identity(config_path)?),
-        ("corpus", path_identity(&config.corpus)?),
+        ("training corpus", path_identity(&config.corpus)?),
+        (
+            "evaluation corpus",
+            path_identity(&config.evaluation_corpus)?,
+        ),
         ("teacher cache", path_identity(&config.teacher_cache)?),
         (
             "model config",
@@ -512,19 +594,35 @@ fn validate_campaign_paths(config_path: &Path, config: &CampaignConfig) -> anyho
         ),
     ];
 
-    if report.starts_with(&checkpoint) || checkpoint.starts_with(&report) {
-        bail!(
-            "campaign report {} and checkpoint directory {} must not contain one another",
-            config.report.display(),
-            config.checkpoint_dir.display()
-        );
+    for (left_label, left, right_label, right) in [
+        (
+            "campaign report",
+            &report,
+            "checkpoint directory",
+            &checkpoint,
+        ),
+        (
+            "campaign artifact",
+            &artifact,
+            "checkpoint directory",
+            &checkpoint,
+        ),
+        ("campaign report", &report, "campaign artifact", &artifact),
+    ] {
+        if left.starts_with(right) || right.starts_with(left) {
+            bail!("{left_label} and {right_label} must not alias or contain one another");
+        }
     }
-    if report.starts_with(&model_dir) {
-        bail!(
-            "campaign report {} must be outside model directory {}",
-            config.report.display(),
-            config.model_dir.display()
-        );
+    for (label, output) in [
+        ("campaign report", &report),
+        ("campaign artifact", &artifact),
+    ] {
+        if output.starts_with(&model_dir) {
+            bail!(
+                "{label} must be outside model directory {}",
+                config.model_dir.display()
+            );
+        }
     }
     if checkpoint.starts_with(&model_dir) || model_dir.starts_with(&checkpoint) {
         bail!(
@@ -534,11 +632,13 @@ fn validate_campaign_paths(config_path: &Path, config: &CampaignConfig) -> anyho
         );
     }
     for (label, protected) in protected_files {
-        if report == protected {
-            bail!(
-                "campaign report {} aliases the {label}",
-                config.report.display()
-            );
+        for (output_label, output) in [
+            ("campaign report", &report),
+            ("campaign artifact", &artifact),
+        ] {
+            if *output == protected {
+                bail!("{output_label} aliases the {label}");
+            }
         }
         if protected.starts_with(&checkpoint) {
             bail!(
@@ -546,6 +646,9 @@ fn validate_campaign_paths(config_path: &Path, config: &CampaignConfig) -> anyho
                 config.checkpoint_dir.display()
             );
         }
+    }
+    if path_identity(&config.corpus)? == path_identity(&config.evaluation_corpus)? {
+        bail!("training and evaluation corpora must be distinct files");
     }
     Ok(())
 }
@@ -666,6 +769,10 @@ const fn default_planes() -> usize {
 const fn default_checkpoint_shards() -> usize {
     1
 }
+#[cfg(feature = "cuda")]
+const fn default_timing_warmup_steps() -> usize {
+    1
+}
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Deserialize)]
@@ -673,9 +780,11 @@ const fn default_checkpoint_shards() -> usize {
 struct CampaignConfig {
     model_dir: PathBuf,
     corpus: PathBuf,
+    evaluation_corpus: PathBuf,
     teacher_cache: PathBuf,
     checkpoint_dir: PathBuf,
     report: PathBuf,
+    artifact: PathBuf,
     seq_len: usize,
     steps: u64,
     #[serde(default = "default_planes")]
@@ -683,10 +792,59 @@ struct CampaignConfig {
     #[serde(default)]
     cuda_device: usize,
     checkpoint_every: u64,
+    #[serde(default = "default_timing_warmup_steps")]
+    timing_warmup_steps: usize,
     #[serde(default = "default_checkpoint_shards")]
     checkpoint_shards: usize,
     #[serde(default)]
     adam: CampaignAdam,
+    #[serde(default)]
+    growth: Option<CampaignGrowth>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignGrowth {
+    intermediate_size: usize,
+    seed: u64,
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignGrowthReceipt {
+    algorithm: String,
+    old_width: u64,
+    new_width: u64,
+    seed: u64,
+    source_indices: Vec<u64>,
+    replication_counts: Vec<u64>,
+}
+
+#[cfg(feature = "cuda")]
+fn campaign_growth_receipt(
+    plan: &tritium_train::Net2WiderPlan,
+    seed: u64,
+) -> anyhow::Result<CampaignGrowthReceipt> {
+    Ok(CampaignGrowthReceipt {
+        algorithm: "net2wider.intermediate-swiglu.splitmix64.v1".to_owned(),
+        old_width: u64::try_from(plan.replication_counts().len())
+            .context("growth old width exceeds u64")?,
+        new_width: u64::try_from(plan.source_indices().len())
+            .context("growth new width exceeds u64")?,
+        seed,
+        source_indices: plan
+            .source_indices()
+            .iter()
+            .map(|&value| u64::try_from(value).context("growth source index exceeds u64"))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        replication_counts: plan
+            .replication_counts()
+            .iter()
+            .map(|&value| u64::try_from(value).context("growth replication count exceeds u64"))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -696,9 +854,11 @@ impl CampaignConfig {
         for path in [
             &mut self.model_dir,
             &mut self.corpus,
+            &mut self.evaluation_corpus,
             &mut self.teacher_cache,
             &mut self.checkpoint_dir,
             &mut self.report,
+            &mut self.artifact,
         ] {
             if path.is_relative() {
                 *path = base.join(&*path);
@@ -719,17 +879,64 @@ struct ParameterIdentity {
 #[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CampaignHardwareIdentity {
+    cuda_ordinal: usize,
+    device_name: String,
+    pci_bus_id: String,
+    cuda_driver_version: u32,
+    nvidia_driver_version: String,
+    nvml_cuda_driver_version: u32,
+    total_memory_bytes: u64,
+}
+
+#[cfg(feature = "cuda")]
+fn campaign_hardware_identity(
+    cuda: &CudaDeviceIdentity,
+    nvml: &NvmlGpuSnapshot,
+) -> CampaignHardwareIdentity {
+    CampaignHardwareIdentity {
+        cuda_ordinal: cuda.ordinal,
+        device_name: cuda.device_name.clone(),
+        pci_bus_id: cuda.pci_bus_id.clone(),
+        cuda_driver_version: cuda.cuda_driver_version,
+        nvidia_driver_version: nvml.driver_version.clone(),
+        nvml_cuda_driver_version: nvml.nvml_cuda_driver_version,
+        total_memory_bytes: nvml.total_memory_bytes,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn sample_nvml_used_memory(
+    cuda: &CudaDeviceIdentity,
+    expected: &CampaignHardwareIdentity,
+) -> anyhow::Result<u64> {
+    let sample = probe_cuda_device(cuda).context("sample physical GPU memory through NVML")?;
+    if campaign_hardware_identity(cuda, &sample) != *expected {
+        bail!("CUDA/NVML hardware identity changed during the campaign");
+    }
+    Ok(sample.used_memory_bytes)
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PlanSidecar {
     version: u32,
     fingerprint: String,
-    cuda_device: usize,
-    cuda_device_name: String,
+    hardware: CampaignHardwareIdentity,
     campaign_config_file_digest: String,
     model_config_file_digest: String,
-    model_digest: String,
+    source_model_digest: String,
+    initial_student_digest: String,
     corpus_digest: String,
     corpus_file_digest: String,
     teacher_cache_digest: String,
+    evaluation_corpus_path: String,
+    evaluation_corpus_digest: String,
+    evaluation_corpus_file_digest: String,
+    evaluation_windows: u64,
+    artifact_path: String,
+    growth: CampaignGrowthReceipt,
     seq_len: usize,
     windows: u64,
     total_steps: u64,
@@ -737,6 +944,7 @@ struct PlanSidecar {
     adam_f32_bits: [u32; 5],
     activation_checkpoint_policy: String,
     checkpoint_every: u64,
+    timing_warmup_steps: usize,
     checkpoint_shards: usize,
     parameters: Vec<ParameterIdentity>,
 }
@@ -744,14 +952,20 @@ struct PlanSidecar {
 #[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy)]
 struct PlanInputs<'a> {
-    cuda_device: usize,
-    cuda_device_name: &'a str,
+    hardware: &'a CampaignHardwareIdentity,
     campaign_config_file_digest: [u8; 32],
     model_config_file_digest: [u8; 32],
-    model_digest: [u8; 32],
+    source_model_digest: [u8; 32],
+    initial_student_digest: [u8; 32],
     corpus_digest: [u8; 32],
     corpus_file_digest: [u8; 32],
     teacher_cache_digest: [u8; 32],
+    evaluation_corpus_path: &'a Path,
+    evaluation_corpus_digest: [u8; 32],
+    evaluation_corpus_file_digest: [u8; 32],
+    evaluation_windows: u64,
+    artifact_path: &'a Path,
+    growth: &'a CampaignGrowthReceipt,
     seq_len: usize,
     windows: u64,
     total_steps: u64,
@@ -759,6 +973,7 @@ struct PlanInputs<'a> {
     adam: CampaignAdam,
     depth: usize,
     checkpoint_every: u64,
+    timing_warmup_steps: usize,
     checkpoint_shards: usize,
     parameters: &'a [tritium_nn::TrainingParameter],
 }
@@ -766,15 +981,31 @@ struct PlanInputs<'a> {
 #[cfg(any(feature = "cuda", test))]
 fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"tritium-packed-campaign-plan-v3");
-    hash.update(&(inputs.cuda_device as u64).to_le_bytes());
-    hash_bytes(&mut hash, inputs.cuda_device_name.as_bytes());
+    hash.update(b"tritium-packed-campaign-plan-v4");
+    let hardware_json = serde_json::to_vec(inputs.hardware)
+        .expect("serializing campaign hardware identity cannot fail");
+    hash_bytes(&mut hash, &hardware_json);
     hash.update(&inputs.campaign_config_file_digest);
     hash.update(&inputs.model_config_file_digest);
-    hash.update(&inputs.model_digest);
+    hash.update(&inputs.source_model_digest);
+    hash.update(&inputs.initial_student_digest);
     hash.update(&inputs.corpus_digest);
     hash.update(&inputs.corpus_file_digest);
     hash.update(&inputs.teacher_cache_digest);
+    hash_bytes(
+        &mut hash,
+        inputs.evaluation_corpus_path.as_os_str().as_encoded_bytes(),
+    );
+    hash.update(&inputs.evaluation_corpus_digest);
+    hash.update(&inputs.evaluation_corpus_file_digest);
+    hash.update(&inputs.evaluation_windows.to_le_bytes());
+    hash_bytes(
+        &mut hash,
+        inputs.artifact_path.as_os_str().as_encoded_bytes(),
+    );
+    let growth_json =
+        serde_json::to_vec(inputs.growth).expect("serializing growth receipt cannot fail");
+    hash_bytes(&mut hash, &growth_json);
     hash.update(&(inputs.seq_len as u64).to_le_bytes());
     hash.update(&inputs.windows.to_le_bytes());
     hash.update(&inputs.total_steps.to_le_bytes());
@@ -792,6 +1023,7 @@ fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
     hash.update(b"sqrt_depth");
     hash.update(&(inputs.depth as u64).to_le_bytes());
     hash.update(&inputs.checkpoint_every.to_le_bytes());
+    hash.update(&(inputs.timing_warmup_steps as u64).to_le_bytes());
     hash.update(&(inputs.checkpoint_shards as u64).to_le_bytes());
     let parameters = inputs
         .parameters
@@ -809,16 +1041,22 @@ fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
         .collect();
     let fingerprint = hex_digest(*hash.finalize().as_bytes());
     PlanSidecar {
-        version: 3,
+        version: 4,
         fingerprint,
-        cuda_device: inputs.cuda_device,
-        cuda_device_name: inputs.cuda_device_name.to_owned(),
+        hardware: inputs.hardware.clone(),
         campaign_config_file_digest: hex_digest(inputs.campaign_config_file_digest),
         model_config_file_digest: hex_digest(inputs.model_config_file_digest),
-        model_digest: hex_digest(inputs.model_digest),
+        source_model_digest: hex_digest(inputs.source_model_digest),
+        initial_student_digest: hex_digest(inputs.initial_student_digest),
         corpus_digest: hex_digest(inputs.corpus_digest),
         corpus_file_digest: hex_digest(inputs.corpus_file_digest),
         teacher_cache_digest: hex_digest(inputs.teacher_cache_digest),
+        evaluation_corpus_path: inputs.evaluation_corpus_path.display().to_string(),
+        evaluation_corpus_digest: hex_digest(inputs.evaluation_corpus_digest),
+        evaluation_corpus_file_digest: hex_digest(inputs.evaluation_corpus_file_digest),
+        evaluation_windows: inputs.evaluation_windows,
+        artifact_path: inputs.artifact_path.display().to_string(),
+        growth: inputs.growth.clone(),
         seq_len: inputs.seq_len,
         windows: inputs.windows,
         total_steps: inputs.total_steps,
@@ -826,6 +1064,7 @@ fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
         adam_f32_bits: adam_bits,
         activation_checkpoint_policy: format!("sqrt_depth:{}", inputs.depth),
         checkpoint_every: inputs.checkpoint_every,
+        timing_warmup_steps: inputs.timing_warmup_steps,
         checkpoint_shards: inputs.checkpoint_shards,
         parameters,
     }
@@ -915,15 +1154,24 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     let _campaign_lock = CampaignLock::acquire(&campaign.checkpoint_dir)?;
     let backend = CudaBackend::new(campaign.cuda_device)
         .with_context(|| format!("open CUDA device {}", campaign.cuda_device))?;
-    let cuda_device_name = backend.capabilities().device_name;
-
+    let (cuda_identity, telemetry) = backend
+        .start_memory_telemetry()
+        .context("start exact CUDA allocator telemetry")?;
+    let nvml = probe_cuda_device(&cuda_identity).context("validate CUDA device through NVML")?;
+    let hardware = campaign_hardware_identity(&cuda_identity, &nvml);
+    let telemetry_baseline = telemetry
+        .reset_synchronized()
+        .context("reset CUDA allocator telemetry after hardware validation")?;
+    let raw_model_config = std::fs::read(campaign.model_dir.join("config.json"))
+        .with_context(|| format!("read model config from {}", campaign.model_dir.display()))?;
+    let raw_model_config_json =
+        std::str::from_utf8(&raw_model_config).context("model config.json is not UTF-8")?;
     let (model_config, spec, weights) = ModelWeights::load_hf(&campaign.model_dir)
         .with_context(|| format!("load HuggingFace model {}", campaign.model_dir.display()))?;
     let mut model = TiedSwiGluTrainingModel::extract(&model_config, &spec, &weights)
         .context("validate tied-SwiGLU training adapter")?;
-    drop(weights);
-    let model_digest = semantic_model_digest(&model_config, &spec, &model);
-    let model_config_file_digest = hash_file(&campaign.model_dir.join("config.json"))?;
+    let source_model_digest = semantic_model_digest(&model_config, &spec, &model);
+    let model_config_file_digest = blake3_digest(&raw_model_config);
     let (tokens, corpus_file_digest) = read_corpus(&campaign.corpus)?;
     let windows = validate_windows(
         &tokens,
@@ -937,7 +1185,7 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         seq_len: seq_len_u32,
         vocab: u32::try_from(model.architecture().vocab).context("vocabulary exceeds u32")?,
         windows,
-        model_hash: model_digest,
+        model_hash: source_model_digest,
         corpus_hash: corpus_digest,
     };
     let window_elements = expected_cache
@@ -953,15 +1201,76 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             )
         })?;
 
+    let (evaluation_tokens, evaluation_corpus_file_digest) =
+        read_corpus(&campaign.evaluation_corpus)?;
+    let evaluation_windows = validate_windows(
+        &evaluation_tokens,
+        campaign.seq_len,
+        model.architecture().vocab,
+        model.architecture().n_ctx,
+    )?;
+    let evaluation_corpus_digest = hash_teacher_corpus(&evaluation_tokens, seq_len_u32);
+    validate_held_out_corpus(
+        &tokens,
+        corpus_digest,
+        &evaluation_tokens,
+        evaluation_corpus_digest,
+        campaign.seq_len,
+    )?;
+    let source_evaluation_path = campaign
+        .checkpoint_dir
+        .join("source-evaluation-progress.json");
+    let source_runner_config = model_config.clone();
+    let source_score = resumable_teacher_forced_score(
+        &source_evaluation_path,
+        "source-fp",
+        &hex_digest(source_model_digest),
+        &evaluation_tokens,
+        campaign.seq_len,
+        evaluation_corpus_file_digest,
+        evaluation_corpus_digest,
+        move || {
+            Ok(ModelRunner::from_weights(
+                source_runner_config,
+                weights,
+                Box::new(tritium_cpu::CpuBackend::new()),
+            ))
+        },
+    )
+    .context("score source fp model on the held-out evaluation corpus")?;
+
+    let old_width = model.architecture().n_ff;
+    let (new_width, growth_seed) = campaign.growth.map_or((old_width, 0), |growth| {
+        (growth.intermediate_size, growth.seed)
+    });
+    let widening = model
+        .widen_intermediate(new_width, growth_seed)
+        .context("apply deterministic intermediate-width growth")?;
+    let growth = campaign_growth_receipt(&widening, growth_seed)?;
+    let artifact_growth = GrowthReceipt::from_plan(&widening, growth_seed)
+        .context("build artifact growth receipt")?;
+    let mut student_config = model_config.clone();
+    student_config.n_ff =
+        u32::try_from(new_width).context("grown intermediate width exceeds u32")?;
+    let initial_student_digest = semantic_model_digest(&student_config, &spec, &model);
+    let evaluation_corpus_path = path_identity(&campaign.evaluation_corpus)?;
+    let artifact_path = path_identity(&campaign.artifact)?;
+
     let plan = build_plan_sidecar(&PlanInputs {
-        cuda_device: campaign.cuda_device,
-        cuda_device_name: &cuda_device_name,
+        hardware: &hardware,
         campaign_config_file_digest: config_file_digest,
         model_config_file_digest,
-        model_digest,
+        source_model_digest,
+        initial_student_digest,
         corpus_digest,
         corpus_file_digest,
         teacher_cache_digest,
+        evaluation_corpus_path: &evaluation_corpus_path,
+        evaluation_corpus_digest,
+        evaluation_corpus_file_digest,
+        evaluation_windows,
+        artifact_path: &artifact_path,
+        growth: &growth,
         seq_len: campaign.seq_len,
         windows,
         total_steps: campaign.steps,
@@ -969,16 +1278,20 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         adam: campaign.adam,
         depth: model.architecture().n_layers,
         checkpoint_every: campaign.checkpoint_every,
+        timing_warmup_steps: campaign.timing_warmup_steps,
         checkpoint_shards: campaign.checkpoint_shards,
         parameters: model.parameters(),
     });
     let input_hashes = CampaignInputHashes {
         campaign_config_file: hex_digest(config_file_digest),
         model_config_file: hex_digest(model_config_file_digest),
-        model: hex_digest(model_digest),
+        source_model: hex_digest(source_model_digest),
+        initial_student_model: hex_digest(initial_student_digest),
         corpus_file: hex_digest(corpus_file_digest),
         corpus: hex_digest(corpus_digest),
         teacher_cache: hex_digest(teacher_cache_digest),
+        evaluation_corpus_file: hex_digest(evaluation_corpus_file_digest),
+        evaluation_corpus: hex_digest(evaluation_corpus_digest),
     };
     // This comparison/creation happens before DCP load can mutate trainer state.
     ensure_plan_sidecar(&campaign.checkpoint_dir, &plan)?;
@@ -1038,40 +1351,20 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         checkpoint_dir: &campaign.checkpoint_dir,
         windows,
         configured_steps: campaign.steps,
-        cuda_device: campaign.cuda_device,
-        cuda_device_name: &cuda_device_name,
+        timing_warmup_steps: campaign.timing_warmup_steps,
+        hardware: &hardware,
         input_hashes: &input_hashes,
         static_memory,
     };
     let previous_report = load_existing_report(&campaign.report, &report_expectations)?;
-    if trainer.completed_step() == campaign.steps
-        && let Some(report) = previous_report.as_ref()
-        && report.completed_step == campaign.steps
-    {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
-    }
-
-    let mut packed = build_packed_weights(&backend, &trainer)?;
-    let packed_parameter_bytes = packed.iter().try_fold(0usize, |sum, weight| {
-        sum.checked_add(weight.resident_bytes())
-            .context("packed parameter byte count overflow")
-    })?;
-    let packed_code_bytes = packed.iter().try_fold(0usize, |sum, weight| {
-        sum.checked_add(weight.packed_bytes())
-            .context("packed code byte count overflow")
-    })?;
-    let packed_scale_bytes = packed.iter().try_fold(0usize, |sum, weight| {
-        sum.checked_add(weight.scale_bytes())
-            .context("packed scale byte count overflow")
-    })?;
-
-    let mut target_host = vec![0.0f32; window_elements];
-    let timing_fence =
-        DeviceTensor::upload(&backend, &[0.0]).context("allocate training-stream timing fence")?;
     let previous_memory = previous_report.as_ref().map(|report| report.memory.clone());
     let mut timings = previous_report
-        .map(|report| report.step_timings)
+        .as_ref()
+        .map(|report| report.step_timings.clone())
+        .unwrap_or_default();
+    let mut memory_segments = previous_report
+        .as_ref()
+        .map(|report| report.cuda_memory_segments.clone())
         .unwrap_or_default();
     let mut max_gradient_elements = 0usize;
     let mut materialized_gradient_elements = 0usize;
@@ -1079,63 +1372,85 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     let mut naive_activation_elements = 0usize;
     let mut stable_bindings: Option<Vec<GradientLeafBinding>> = None;
     let resumed_from_step = trainer.completed_step();
-    let host_adapter_master_bytes = model
-        .parameters()
-        .iter()
-        .try_fold(0usize, |sum, parameter| {
-            sum.checked_add(parameter.master.len())
-                .context("adapter master element count overflow")
-        })
-        .and_then(elements_to_bytes)?;
-    let previous_peak =
-        |select: fn(&CampaignMemoryReport) -> usize| previous_memory.as_ref().map_or(0, select);
-    let build_report = |trainer: &HostOffloadTrainer<'_>,
-                        step_timings: &[StepTiming],
-                        max_gradient_elements: usize,
-                        materialized_gradient_elements: usize,
-                        max_activation_elements: usize,
-                        naive_activation_elements: usize|
-     -> anyhow::Result<CampaignReport> {
-        let stats = trainer.stats();
-        let host_optimizer_bytes = elements_to_bytes(stats.host_optimizer_elements)?;
-        let logical_host_training_state_bytes = host_optimizer_bytes
-            .checked_add(host_adapter_master_bytes)
-            .context("logical host training-state byte count overflow")?;
-        Ok(CampaignReport {
-            schema_version: 3,
-            plan_fingerprint: plan.fingerprint.clone(),
-            cuda_device: campaign.cuda_device,
-            cuda_device_name: cuda_device_name.clone(),
-            input_hashes: input_hashes.clone(),
-            completed_step: trainer.completed_step(),
-            resumed_from_step,
-            configured_steps: campaign.steps,
-            checkpoint_path: campaign.checkpoint_dir.display().to_string(),
-            step_timings: step_timings.to_vec(),
-            memory: CampaignMemoryReport {
-                packed_parameter_bytes,
-                packed_code_bytes,
-                packed_scale_bytes,
-                dense_parameter_bytes: static_memory.dense_parameter_bytes,
-                host_optimizer_bytes,
-                host_adapter_master_bytes,
-                logical_host_training_state_bytes,
-                peak_optimizer_staging_bytes: elements_to_bytes(
-                    stats.peak_optimizer_device_elements,
-                )?
-                .max(previous_peak(|memory| memory.peak_optimizer_staging_bytes)),
-                peak_streamed_gradient_bytes: elements_to_bytes(max_gradient_elements)?
-                    .max(previous_peak(|memory| memory.peak_streamed_gradient_bytes)),
-                materialized_gradient_bytes: elements_to_bytes(materialized_gradient_elements)?
-                    .max(previous_peak(|memory| memory.materialized_gradient_bytes)),
-                logical_peak_activation_bytes: elements_to_bytes(max_activation_elements)?
-                    .max(previous_peak(|memory| memory.logical_peak_activation_bytes)),
-                logical_naive_activation_bytes: elements_to_bytes(naive_activation_elements)?.max(
-                    previous_peak(|memory| memory.logical_naive_activation_bytes),
-                ),
-            },
-        })
+    let baseline = CampaignCudaMemorySnapshot::from(telemetry_baseline);
+    let mut current_segment = CampaignCudaMemorySegment {
+        resumed_from_step,
+        completed_step: resumed_from_step,
+        nvml_used_memory_bytes_at_launch: nvml.used_memory_bytes,
+        nvml_used_memory_latest_sample_bytes: nvml.used_memory_bytes,
+        nvml_used_memory_sample_high_water_bytes: nvml.used_memory_bytes,
+        baseline,
+        post_setup: None,
+        latest_or_terminal: baseline,
     };
+
+    if trainer.completed_step() == campaign.steps {
+        current_segment.latest_or_terminal = telemetry
+            .sample_synchronized()
+            .context("sample CUDA memory before terminal artifact verification")?
+            .into();
+        current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &hardware)?);
+        memory_segments.push(current_segment);
+        let artifact = prepare_terminal_artifact(
+            &campaign,
+            raw_model_config_json,
+            &model,
+            &trainer,
+            &plan,
+            source_model_digest,
+            initial_student_digest,
+            &artifact_growth,
+        )?;
+        let completed_step = trainer.completed_step();
+        let trainer_stats = trainer.stats();
+        drop(trainer);
+        let evaluation = evaluate_terminal_artifact(
+            &campaign,
+            &artifact,
+            &plan,
+            source_model_digest,
+            initial_student_digest,
+            &growth,
+            &evaluation_tokens,
+            source_score,
+            evaluation_corpus_file_digest,
+            evaluation_corpus_digest,
+        )?;
+        let report = build_campaign_report(
+            &campaign,
+            &plan,
+            &hardware,
+            &input_hashes,
+            completed_step,
+            trainer_stats,
+            resumed_from_step,
+            &timings,
+            static_memory,
+            previous_memory.as_ref(),
+            0,
+            0,
+            0,
+            0,
+            memory_segments,
+            Some(artifact),
+            Some(evaluation),
+        )?;
+        atomic_write(&campaign.report, &serde_json::to_vec_pretty(&report)?)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    let mut packed = build_packed_weights(&backend, &trainer)?;
+    let mut target_host = vec![0.0f32; window_elements];
+    let timing_fence =
+        DeviceTensor::upload(&backend, &[0.0]).context("allocate training-stream timing fence")?;
+    current_segment.post_setup = Some(
+        telemetry
+            .sample_synchronized()
+            .context("sample CUDA memory after campaign setup")?
+            .into(),
+    );
+    current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &hardware)?);
     let first_step = trainer
         .completed_step()
         .checked_add(1)
@@ -1228,17 +1543,39 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         timings.push(StepTiming {
             step,
             window_index,
+            warmup: step - first_step
+                < u64::try_from(campaign.timing_warmup_steps)
+                    .context("timing warmup step count exceeds u64")?,
             training_elapsed_ms_excluding_checkpoint: elapsed_ms,
         });
+        current_segment.completed_step = step;
+        current_segment.latest_or_terminal = telemetry
+            .sample_synchronized()
+            .with_context(|| format!("sample CUDA allocator memory after step {step}"))?
+            .into();
+        current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &hardware)?);
 
         if step.is_multiple_of(campaign.checkpoint_every) || step == campaign.steps {
-            let progress = build_report(
-                &trainer,
+            let mut progress_segments = memory_segments.clone();
+            progress_segments.push(current_segment.clone());
+            let progress = build_campaign_report(
+                &campaign,
+                &plan,
+                &hardware,
+                &input_hashes,
+                trainer.completed_step(),
+                trainer.stats(),
+                resumed_from_step,
                 &timings,
+                static_memory,
+                previous_memory.as_ref(),
                 max_gradient_elements,
                 materialized_gradient_elements,
                 max_activation_elements,
                 naive_activation_elements,
+                progress_segments,
+                None,
+                None,
             )?;
             atomic_write(&campaign.report, &serde_json::to_vec_pretty(&progress)?)?;
             // Publish evidence before DCP's manifest commit. If saving stops
@@ -1252,13 +1589,51 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    let report = build_report(
+    memory_segments.push(current_segment);
+    let artifact = prepare_terminal_artifact(
+        &campaign,
+        raw_model_config_json,
+        &model,
         &trainer,
+        &plan,
+        source_model_digest,
+        initial_student_digest,
+        &artifact_growth,
+    )?;
+    let completed_step = trainer.completed_step();
+    let trainer_stats = trainer.stats();
+    drop(packed);
+    drop(trainer);
+    let evaluation = evaluate_terminal_artifact(
+        &campaign,
+        &artifact,
+        &plan,
+        source_model_digest,
+        initial_student_digest,
+        &growth,
+        &evaluation_tokens,
+        source_score,
+        evaluation_corpus_file_digest,
+        evaluation_corpus_digest,
+    )?;
+    let report = build_campaign_report(
+        &campaign,
+        &plan,
+        &hardware,
+        &input_hashes,
+        completed_step,
+        trainer_stats,
+        resumed_from_step,
         &timings,
+        static_memory,
+        previous_memory.as_ref(),
         max_gradient_elements,
         materialized_gradient_elements,
         max_activation_elements,
         naive_activation_elements,
+        memory_segments,
+        Some(artifact),
+        Some(evaluation),
     )?;
     atomic_write(&campaign.report, &serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1267,6 +1642,9 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
 
 #[cfg(feature = "cuda")]
 fn validate_campaign_config(config: &CampaignConfig) -> anyhow::Result<()> {
+    if config.seq_len < 2 {
+        bail!("campaign seq_len must be at least 2 for held-out next-token scoring");
+    }
     if config.steps == 0 {
         bail!("campaign steps must be non-zero");
     }
@@ -1276,8 +1654,17 @@ fn validate_campaign_config(config: &CampaignConfig) -> anyhow::Result<()> {
     if config.checkpoint_every == 0 {
         bail!("checkpoint_every must be non-zero");
     }
+    if u64::try_from(config.timing_warmup_steps).map_or(true, |warmup| warmup > config.steps) {
+        bail!("timing_warmup_steps must not exceed configured steps");
+    }
     if config.checkpoint_shards == 0 {
         bail!("checkpoint_shards must be non-zero");
+    }
+    if config
+        .growth
+        .is_some_and(|growth| growth.intermediate_size == 0)
+    {
+        bail!("growth intermediate_size must be non-zero");
     }
     let adam = config.adam;
     if !adam.lr.is_finite() || adam.lr <= 0.0 {
@@ -1359,10 +1746,408 @@ fn elements_to_bytes(elements: usize) -> anyhow::Result<usize> {
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn build_campaign_report(
+    campaign: &CampaignConfig,
+    plan: &PlanSidecar,
+    hardware: &CampaignHardwareIdentity,
+    input_hashes: &CampaignInputHashes,
+    completed_step: u64,
+    trainer_stats: HostOffloadStats,
+    resumed_from_step: u64,
+    step_timings: &[StepTiming],
+    static_memory: HostOffloadMemoryGeometry,
+    previous_memory: Option<&CampaignMemoryReport>,
+    max_gradient_elements: usize,
+    materialized_gradient_elements: usize,
+    max_activation_elements: usize,
+    naive_activation_elements: usize,
+    cuda_memory_segments: Vec<CampaignCudaMemorySegment>,
+    artifact: Option<CampaignArtifactReport>,
+    evaluation: Option<CampaignEvaluationReport>,
+) -> anyhow::Result<CampaignReport> {
+    let host_optimizer_bytes = elements_to_bytes(trainer_stats.host_optimizer_elements)?;
+    let previous_peak =
+        |select: fn(&CampaignMemoryReport) -> usize| previous_memory.map_or(0, select);
+    Ok(CampaignReport {
+        schema_version: 4,
+        plan_fingerprint: plan.fingerprint.clone(),
+        hardware: hardware.clone(),
+        input_hashes: input_hashes.clone(),
+        completed_step,
+        resumed_from_step,
+        configured_steps: campaign.steps,
+        timing_warmup_steps: campaign.timing_warmup_steps,
+        checkpoint_path: campaign.checkpoint_dir.display().to_string(),
+        step_timings: step_timings.to_vec(),
+        memory: CampaignMemoryReport {
+            packed_parameter_bytes: static_memory.packed_parameter_bytes,
+            packed_code_bytes: static_memory.packed_code_bytes,
+            packed_scale_bytes: static_memory.packed_scale_bytes,
+            dense_parameter_bytes: static_memory.dense_parameter_bytes,
+            host_optimizer_bytes,
+            host_adapter_master_bytes: 0,
+            logical_host_training_state_bytes: host_optimizer_bytes,
+            peak_optimizer_staging_bytes: elements_to_bytes(
+                trainer_stats.peak_optimizer_device_elements,
+            )?
+            .max(previous_peak(|memory| memory.peak_optimizer_staging_bytes)),
+            peak_streamed_gradient_bytes: elements_to_bytes(max_gradient_elements)?
+                .max(previous_peak(|memory| memory.peak_streamed_gradient_bytes)),
+            materialized_gradient_bytes: elements_to_bytes(materialized_gradient_elements)?
+                .max(previous_peak(|memory| memory.materialized_gradient_bytes)),
+            logical_peak_activation_bytes: elements_to_bytes(max_activation_elements)?
+                .max(previous_peak(|memory| memory.logical_peak_activation_bytes)),
+            logical_naive_activation_bytes: elements_to_bytes(naive_activation_elements)?.max(
+                previous_peak(|memory| memory.logical_naive_activation_bytes),
+            ),
+        },
+        cuda_memory_segments,
+        artifact,
+        evaluation,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn artifact_report(path: &Path, summary: CampaignArtifactSummary) -> CampaignArtifactReport {
+    let package = summary.package();
+    CampaignArtifactReport {
+        path: path.display().to_string(),
+        package_id: package.id().to_string(),
+        physical_bytes: package.physical_bytes(),
+        scale_max_abs_error: summary.scale_max_abs_error(),
+        reconstruction_max_abs_delta: summary.reconstruction_max_abs_delta(),
+        reconstruction_squared_error_sum: summary.reconstruction_squared_error_sum(),
+        reconstruction_element_count: summary.reconstruction_element_count(),
+        reconstruction_mse: summary.reconstruction_mse(),
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_terminal_artifact(
+    campaign: &CampaignConfig,
+    raw_hf_config_json: &str,
+    model: &TiedSwiGluTrainingModel,
+    trainer: &HostOffloadTrainer<'_>,
+    plan: &PlanSidecar,
+    source_model_digest: [u8; 32],
+    initial_student_digest: [u8; 32],
+    artifact_growth: &GrowthReceipt,
+) -> anyhow::Result<CampaignArtifactReport> {
+    if trainer.completed_step() != campaign.steps {
+        bail!(
+            "cannot finalize artifact at step {}; configured terminal step is {}",
+            trainer.completed_step(),
+            campaign.steps
+        );
+    }
+    let provenance = ArtifactProvenance::new(
+        &plan.fingerprint,
+        source_model_digest,
+        initial_student_digest,
+        trainer.completed_step(),
+    )
+    .context("construct artifact provenance")?;
+    let exists = campaign
+        .artifact
+        .try_exists()
+        .with_context(|| format!("inspect campaign artifact {}", campaign.artifact.display()))?;
+    let summary = if exists {
+        verify_campaign_artifact(
+            &campaign.artifact,
+            raw_hf_config_json,
+            model,
+            trainer,
+            campaign.salt_planes,
+            provenance,
+            artifact_growth,
+        )
+        .context("verify existing terminal campaign artifact")?
+    } else {
+        export_campaign_artifact(
+            &campaign.artifact,
+            raw_hf_config_json,
+            model,
+            trainer,
+            campaign.salt_planes,
+            provenance,
+            artifact_growth,
+        )
+        .context("export terminal campaign artifact")?
+    };
+    Ok(artifact_report(&campaign.artifact, summary))
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn evaluate_terminal_artifact(
+    campaign: &CampaignConfig,
+    artifact: &CampaignArtifactReport,
+    plan: &PlanSidecar,
+    source_model_digest: [u8; 32],
+    initial_student_digest: [u8; 32],
+    growth: &CampaignGrowthReceipt,
+    evaluation_tokens: &[u32],
+    source_score: TeacherForcedPerplexity,
+    evaluation_corpus_file_digest: [u8; 32],
+    evaluation_corpus_digest: [u8; 32],
+) -> anyhow::Result<CampaignEvaluationReport> {
+    let file = File::open(&campaign.artifact)
+        .with_context(|| format!("open campaign artifact {}", campaign.artifact.display()))?;
+    if !file
+        .metadata()
+        .with_context(|| format!("inspect opened artifact {}", campaign.artifact.display()))?
+        .is_file()
+    {
+        bail!("opened campaign artifact is not a regular file");
+    }
+    // SAFETY: the mapping retains this single opened file description. Any later
+    // pathname replacement cannot change the inode used for hashing and evaluation.
+    let mapped = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("map campaign artifact {}", campaign.artifact.display()))?;
+    let opened_package =
+        MeasuredPackage::from_bytes(&mapped).context("measure the exact opened artifact handle")?;
+    if opened_package.id().to_string() != artifact.package_id
+        || opened_package.physical_bytes() != artifact.physical_bytes
+    {
+        bail!(
+            "campaign artifact changed between deterministic verification and opening; refusing mixed package/evaluation evidence"
+        );
+    }
+    let metadata = parse_training_salt_artifact_metadata(&mapped)
+        .context("parse terminal artifact provenance")?;
+    let expected_plan = parse_lower_hex_digest(&plan.fingerprint)?;
+    if metadata.plan_fingerprint != expected_plan
+        || metadata.source_model_digest != source_model_digest
+        || metadata.initial_student_digest != initial_student_digest
+        || metadata.completed_step != campaign.steps
+        || metadata.salt_planes != campaign.salt_planes as u32
+    {
+        bail!("terminal artifact provenance does not match the immutable campaign plan");
+    }
+    if metadata.growth.algorithm != growth.algorithm
+        || metadata.growth.old_width != growth.old_width
+        || metadata.growth.new_width != growth.new_width
+        || metadata.growth.seed != growth.seed
+        || metadata.growth.source_indices != growth.source_indices
+        || metadata.growth.replication_counts != growth.replication_counts
+    {
+        bail!("terminal artifact growth receipt does not match the immutable campaign plan");
+    }
+    let artifact_evaluation_path = campaign
+        .checkpoint_dir
+        .join("artifact-evaluation-progress.json");
+    let score = resumable_teacher_forced_score(
+        &artifact_evaluation_path,
+        "training-salt-artifact",
+        &artifact.package_id,
+        evaluation_tokens,
+        campaign.seq_len,
+        evaluation_corpus_file_digest,
+        evaluation_corpus_digest,
+        || {
+            ModelRunner::from_training_salt_gguf(&mapped, Box::new(tritium_cpu::CpuBackend::new()))
+                .context("freshly reload terminal artifact on the CPU reference backend")
+        },
+    )
+    .context("score held-out evaluation corpus from the reloaded artifact")?;
+    let evaluation = evaluation_report(
+        campaign,
+        artifact,
+        source_score,
+        score,
+        evaluation_corpus_file_digest,
+        evaluation_corpus_digest,
+    );
+    Ok(evaluation)
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TeacherForcedEvaluationProgress {
+    schema_version: u32,
+    evaluation_kind: String,
+    model_identity: String,
+    corpus_file_digest: String,
+    corpus_digest: String,
+    seq_len: usize,
+    total_windows: u64,
+    completed_windows: u64,
+    token_count: u64,
+    negative_log_likelihood_f64_bits: u64,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn resumable_teacher_forced_score(
+    progress_path: &Path,
+    evaluation_kind: &str,
+    model_identity: &str,
+    tokens: &[u32],
+    seq_len: usize,
+    corpus_file_digest: [u8; 32],
+    corpus_digest: [u8; 32],
+    build_runner: impl FnOnce() -> anyhow::Result<ModelRunner>,
+) -> anyhow::Result<TeacherForcedPerplexity> {
+    if evaluation_kind.is_empty() || model_identity.is_empty() || seq_len < 2 {
+        bail!("resumable evaluation identity and window geometry must be non-empty");
+    }
+    if tokens.is_empty() || !tokens.len().is_multiple_of(seq_len) {
+        bail!("resumable evaluation requires non-empty exact token windows");
+    }
+    let total_windows =
+        u64::try_from(tokens.len() / seq_len).context("evaluation window count exceeds u64")?;
+    let corpus_file_digest = hex_digest(corpus_file_digest);
+    let corpus_digest = hex_digest(corpus_digest);
+    let mut progress = match std::fs::read(progress_path) {
+        Ok(bytes) => serde_json::from_slice::<TeacherForcedEvaluationProgress>(&bytes)
+            .with_context(|| format!("parse evaluation progress {}", progress_path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            TeacherForcedEvaluationProgress {
+                schema_version: 1,
+                evaluation_kind: evaluation_kind.to_owned(),
+                model_identity: model_identity.to_owned(),
+                corpus_file_digest: corpus_file_digest.clone(),
+                corpus_digest: corpus_digest.clone(),
+                seq_len,
+                total_windows,
+                completed_windows: 0,
+                token_count: 0,
+                negative_log_likelihood_f64_bits: 0.0_f64.to_bits(),
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read evaluation progress {}", progress_path.display()));
+        }
+    };
+    if progress.schema_version != 1
+        || progress.evaluation_kind != evaluation_kind
+        || progress.model_identity != model_identity
+        || progress.corpus_file_digest != corpus_file_digest
+        || progress.corpus_digest != corpus_digest
+        || progress.seq_len != seq_len
+        || progress.total_windows != total_windows
+    {
+        bail!(
+            "evaluation progress {} does not match the immutable model/corpus contract",
+            progress_path.display()
+        );
+    }
+    let scored_per_window = u64::try_from(seq_len - 1).context("sequence length exceeds u64")?;
+    let expected_token_count = progress
+        .completed_windows
+        .checked_mul(scored_per_window)
+        .context("evaluation progress token count overflow")?;
+    let mut negative_log_likelihood = f64::from_bits(progress.negative_log_likelihood_f64_bits);
+    if progress.completed_windows > total_windows
+        || progress.token_count != expected_token_count
+        || !negative_log_likelihood.is_finite()
+        || negative_log_likelihood < 0.0
+    {
+        bail!(
+            "evaluation progress {} has inconsistent accumulated evidence",
+            progress_path.display()
+        );
+    }
+    if progress.completed_windows < total_windows {
+        let mut runner = build_runner()?;
+        for window_index in progress.completed_windows..total_windows {
+            let start = usize::try_from(window_index)
+                .context("evaluation window index exceeds usize")?
+                .checked_mul(seq_len)
+                .context("evaluation window offset overflow")?;
+            let end = start
+                .checked_add(seq_len)
+                .context("evaluation window end overflow")?;
+            let score =
+                teacher_forced_perplexity_windows(&mut runner, &tokens[start..end], seq_len)
+                    .with_context(|| format!("score evaluation window {window_index}"))?;
+            if score.window_count != 1 || score.token_count != scored_per_window {
+                bail!("single-window evaluation returned inconsistent counts");
+            }
+            negative_log_likelihood += score.negative_log_likelihood;
+            if !negative_log_likelihood.is_finite() {
+                bail!("evaluation negative log likelihood became non-finite");
+            }
+            progress.completed_windows = window_index
+                .checked_add(1)
+                .context("evaluation completed-window count overflow")?;
+            progress.token_count = progress
+                .completed_windows
+                .checked_mul(scored_per_window)
+                .context("evaluation token count overflow")?;
+            progress.negative_log_likelihood_f64_bits = negative_log_likelihood.to_bits();
+            atomic_write(progress_path, &serde_json::to_vec_pretty(&progress)?)?;
+        }
+    }
+    if progress.token_count == 0 {
+        bail!("completed evaluation progress has no scored tokens");
+    }
+    let mean = negative_log_likelihood / progress.token_count as f64;
+    let perplexity = mean.exp();
+    if !mean.is_finite() || !perplexity.is_finite() {
+        bail!("completed evaluation progress has invalid perplexity evidence");
+    }
+    Ok(TeacherForcedPerplexity {
+        perplexity,
+        negative_log_likelihood,
+        token_count: progress.token_count,
+        window_count: progress.completed_windows,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn evaluation_report(
+    campaign: &CampaignConfig,
+    artifact: &CampaignArtifactReport,
+    source_score: TeacherForcedPerplexity,
+    score: TeacherForcedPerplexity,
+    corpus_file_digest: [u8; 32],
+    corpus_digest: [u8; 32],
+) -> CampaignEvaluationReport {
+    CampaignEvaluationReport {
+        artifact_package_id: artifact.package_id.clone(),
+        corpus_path: campaign.evaluation_corpus.display().to_string(),
+        corpus_file_digest: hex_digest(corpus_file_digest),
+        corpus_digest: hex_digest(corpus_digest),
+        seq_len: campaign.seq_len,
+        window_count: score.window_count,
+        token_count: score.token_count,
+        source_fp_negative_log_likelihood: source_score.negative_log_likelihood,
+        source_fp_perplexity: source_score.perplexity,
+        negative_log_likelihood: score.negative_log_likelihood,
+        perplexity: score.perplexity,
+        relative_perplexity_delta_percent: (score.perplexity / source_score.perplexity - 1.0)
+            * 100.0,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn parse_lower_hex_digest(value: &str) -> anyhow::Result<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("campaign plan fingerprint is not lowercase 64-hex");
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = core::str::from_utf8(pair).expect("validated ASCII hex");
+        digest[index] = u8::from_str_radix(pair, 16).expect("validated lowercase hex");
+    }
+    Ok(digest)
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StepTiming {
     step: u64,
     window_index: u64,
+    warmup: bool,
     training_elapsed_ms_excluding_checkpoint: f64,
 }
 
@@ -1371,10 +2156,93 @@ struct StepTiming {
 struct CampaignInputHashes {
     campaign_config_file: String,
     model_config_file: String,
-    model: String,
+    source_model: String,
+    initial_student_model: String,
     corpus_file: String,
     corpus: String,
     teacher_cache: String,
+    evaluation_corpus_file: String,
+    evaluation_corpus: String,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct CampaignCudaMemorySnapshot {
+    device_free_bytes: u64,
+    device_total_bytes: u64,
+    device_used_sample_bytes: u64,
+    pool_used_current_bytes: u64,
+    pool_used_high_water_bytes: u64,
+    pool_reserved_current_bytes: u64,
+    pool_reserved_high_water_bytes: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl From<CudaMemorySnapshot> for CampaignCudaMemorySnapshot {
+    fn from(snapshot: CudaMemorySnapshot) -> Self {
+        Self {
+            device_free_bytes: snapshot.device_free_bytes,
+            device_total_bytes: snapshot.device_total_bytes,
+            device_used_sample_bytes: snapshot.device_used_sample_bytes,
+            pool_used_current_bytes: snapshot.pool_used_current_bytes,
+            pool_used_high_water_bytes: snapshot.pool_used_high_water_bytes,
+            pool_reserved_current_bytes: snapshot.pool_reserved_current_bytes,
+            pool_reserved_high_water_bytes: snapshot.pool_reserved_high_water_bytes,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct CampaignCudaMemorySegment {
+    resumed_from_step: u64,
+    completed_step: u64,
+    nvml_used_memory_bytes_at_launch: u64,
+    nvml_used_memory_latest_sample_bytes: u64,
+    nvml_used_memory_sample_high_water_bytes: u64,
+    baseline: CampaignCudaMemorySnapshot,
+    post_setup: Option<CampaignCudaMemorySnapshot>,
+    latest_or_terminal: CampaignCudaMemorySnapshot,
+}
+
+#[cfg(feature = "cuda")]
+impl CampaignCudaMemorySegment {
+    fn observe_nvml(&mut self, used_memory_bytes: u64) {
+        self.nvml_used_memory_latest_sample_bytes = used_memory_bytes;
+        self.nvml_used_memory_sample_high_water_bytes = self
+            .nvml_used_memory_sample_high_water_bytes
+            .max(used_memory_bytes);
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+struct CampaignArtifactReport {
+    path: String,
+    package_id: String,
+    physical_bytes: u64,
+    scale_max_abs_error: f64,
+    reconstruction_max_abs_delta: f64,
+    reconstruction_squared_error_sum: f64,
+    reconstruction_element_count: u64,
+    reconstruction_mse: f64,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+struct CampaignEvaluationReport {
+    artifact_package_id: String,
+    corpus_path: String,
+    corpus_file_digest: String,
+    corpus_digest: String,
+    seq_len: usize,
+    window_count: u64,
+    token_count: u64,
+    source_fp_negative_log_likelihood: f64,
+    source_fp_perplexity: f64,
+    negative_log_likelihood: f64,
+    perplexity: f64,
+    relative_perplexity_delta_percent: f64,
 }
 
 #[cfg(feature = "cuda")]
@@ -1399,15 +2267,18 @@ struct CampaignMemoryReport {
 struct CampaignReport {
     schema_version: u32,
     plan_fingerprint: String,
-    cuda_device: usize,
-    cuda_device_name: String,
+    hardware: CampaignHardwareIdentity,
     input_hashes: CampaignInputHashes,
     completed_step: u64,
     resumed_from_step: u64,
     configured_steps: u64,
+    timing_warmup_steps: usize,
     checkpoint_path: String,
     step_timings: Vec<StepTiming>,
     memory: CampaignMemoryReport,
+    cuda_memory_segments: Vec<CampaignCudaMemorySegment>,
+    artifact: Option<CampaignArtifactReport>,
+    evaluation: Option<CampaignEvaluationReport>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1418,8 +2289,8 @@ struct ReportExpectations<'a> {
     checkpoint_dir: &'a Path,
     windows: u64,
     configured_steps: u64,
-    cuda_device: usize,
-    cuda_device_name: &'a str,
+    timing_warmup_steps: usize,
+    hardware: &'a CampaignHardwareIdentity,
     input_hashes: &'a CampaignInputHashes,
     static_memory: HostOffloadMemoryGeometry,
 }
@@ -1600,6 +2471,152 @@ fn validate_report_timing_coverage(
 }
 
 #[cfg(feature = "cuda")]
+fn validate_cuda_memory_segments(
+    path: &Path,
+    report: &CampaignReport,
+    hardware: &CampaignHardwareIdentity,
+) -> anyhow::Result<()> {
+    if report.cuda_memory_segments.is_empty() {
+        bail!("prior report {} has no CUDA memory segment", path.display());
+    }
+    let mut prior_completed = 0_u64;
+    for (index, segment) in report.cuda_memory_segments.iter().enumerate() {
+        if segment.resumed_from_step != prior_completed {
+            bail!(
+                "prior report {} CUDA memory segment {index} resumes at {}, expected {prior_completed}",
+                path.display(),
+                segment.resumed_from_step
+            );
+        }
+        if segment.completed_step < segment.resumed_from_step
+            || segment.completed_step > report.completed_step
+        {
+            bail!(
+                "prior report {} CUDA memory segment {index} has invalid step range {}..={}",
+                path.display(),
+                segment.resumed_from_step,
+                segment.completed_step
+            );
+        }
+        if segment.nvml_used_memory_bytes_at_launch > hardware.total_memory_bytes
+            || segment.nvml_used_memory_latest_sample_bytes > hardware.total_memory_bytes
+            || segment.nvml_used_memory_sample_high_water_bytes > hardware.total_memory_bytes
+            || segment.nvml_used_memory_sample_high_water_bytes
+                < segment.nvml_used_memory_bytes_at_launch
+            || segment.nvml_used_memory_sample_high_water_bytes
+                < segment.nvml_used_memory_latest_sample_bytes
+        {
+            bail!(
+                "prior report {} CUDA memory segment {index} has inconsistent NVML samples",
+                path.display()
+            );
+        }
+        for (label, snapshot) in [
+            ("baseline", Some(segment.baseline)),
+            ("post-setup", segment.post_setup),
+            ("latest", Some(segment.latest_or_terminal)),
+        ] {
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+            if snapshot.device_total_bytes == 0
+                || snapshot.device_total_bytes > hardware.total_memory_bytes
+                || snapshot
+                    .device_free_bytes
+                    .checked_add(snapshot.device_used_sample_bytes)
+                    != Some(snapshot.device_total_bytes)
+                || snapshot.pool_used_high_water_bytes < snapshot.pool_used_current_bytes
+                || snapshot.pool_reserved_high_water_bytes < snapshot.pool_reserved_current_bytes
+                || snapshot.pool_reserved_current_bytes < snapshot.pool_used_current_bytes
+                || snapshot.pool_reserved_high_water_bytes < snapshot.pool_used_high_water_bytes
+            {
+                bail!(
+                    "prior report {} CUDA memory segment {index} has inconsistent {label} accounting",
+                    path.display()
+                );
+            }
+        }
+        if segment.completed_step > segment.resumed_from_step && segment.post_setup.is_none() {
+            bail!(
+                "prior report {} CUDA memory segment {index} trained without a post-setup sample",
+                path.display()
+            );
+        }
+        prior_completed = segment.completed_step;
+    }
+    if prior_completed != report.completed_step {
+        bail!(
+            "prior report {} CUDA memory segments end at step {prior_completed}, expected {}",
+            path.display(),
+            report.completed_step
+        );
+    }
+    let warmup_steps = u64::try_from(report.timing_warmup_steps)
+        .context("campaign report timing warmup count exceeds u64")?;
+    for timing in &report.step_timings {
+        let segment = report
+            .cuda_memory_segments
+            .iter()
+            .find(|segment| {
+                timing.step > segment.resumed_from_step && timing.step <= segment.completed_step
+            })
+            .with_context(|| {
+                format!(
+                    "prior report {} timing step {} belongs to no CUDA memory segment",
+                    path.display(),
+                    timing.step
+                )
+            })?;
+        let expected_warmup = timing.step - segment.resumed_from_step <= warmup_steps;
+        if timing.warmup != expected_warmup {
+            bail!(
+                "prior report {} timing step {} has warmup={}, expected {expected_warmup}",
+                path.display(),
+                timing.step,
+                timing.warmup
+            );
+        }
+    }
+    if report.artifact.is_some() != report.evaluation.is_some() {
+        bail!(
+            "prior report {} has only one of artifact and evaluation evidence",
+            path.display()
+        );
+    }
+    if report.completed_step < report.configured_steps
+        && (report.artifact.is_some() || report.evaluation.is_some())
+    {
+        bail!(
+            "prior report {} records terminal artifact evidence before its configured final step",
+            path.display()
+        );
+    }
+    if let (Some(artifact), Some(evaluation)) = (&report.artifact, &report.evaluation)
+        && (artifact.package_id != evaluation.artifact_package_id
+            || artifact.physical_bytes == 0
+            || !artifact.scale_max_abs_error.is_finite()
+            || !artifact.reconstruction_max_abs_delta.is_finite()
+            || !artifact.reconstruction_squared_error_sum.is_finite()
+            || !artifact.reconstruction_mse.is_finite()
+            || !evaluation.source_fp_negative_log_likelihood.is_finite()
+            || !evaluation.source_fp_perplexity.is_finite()
+            || !evaluation.negative_log_likelihood.is_finite()
+            || !evaluation.perplexity.is_finite()
+            || !evaluation.relative_perplexity_delta_percent.is_finite()
+            || evaluation.source_fp_perplexity <= 0.0
+            || evaluation.perplexity <= 0.0
+            || evaluation.token_count == 0
+            || evaluation.window_count == 0)
+    {
+        bail!(
+            "prior report {} has inconsistent artifact/evaluation evidence",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn load_existing_report(
     path: &Path,
     expected: &ReportExpectations<'_>,
@@ -1624,7 +2641,7 @@ fn load_existing_report(
     };
     let mut report: CampaignReport = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse prior report {}", path.display()))?;
-    if report.schema_version != 3 {
+    if report.schema_version != 4 {
         bail!(
             "prior report {} uses unsupported schema version {}",
             path.display(),
@@ -1637,16 +2654,10 @@ fn load_existing_report(
             path.display()
         );
     }
-    if report.cuda_device != expected.cuda_device
-        || report.cuda_device_name != expected.cuda_device_name
-    {
+    if report.hardware != *expected.hardware {
         bail!(
-            "prior report {} records CUDA device {} ({:?}), expected {} ({:?})",
+            "prior report {} records different stable CUDA/NVML hardware identity",
             path.display(),
-            report.cuda_device,
-            report.cuda_device_name,
-            expected.cuda_device,
-            expected.cuda_device_name
         );
     }
     if report.configured_steps != expected.configured_steps {
@@ -1655,6 +2666,14 @@ fn load_existing_report(
             path.display(),
             report.configured_steps,
             expected.configured_steps
+        );
+    }
+    if report.timing_warmup_steps != expected.timing_warmup_steps {
+        bail!(
+            "prior report {} records {} timing warmup steps, expected {}",
+            path.display(),
+            report.timing_warmup_steps,
+            expected.timing_warmup_steps
         );
     }
     if report.input_hashes != *expected.input_hashes {
@@ -1698,6 +2717,7 @@ fn load_existing_report(
         report.completed_step,
     )?;
     validate_report_timing_coverage(path, &report, expected.windows)?;
+    validate_cuda_memory_segments(path, &report, expected.hardware)?;
     if report.completed_step < expected.checkpoint_step {
         bail!(
             "prior report {} covers completed step {}, but committed checkpoint is step {}; refusing resume with an evidence gap",
@@ -1713,7 +2733,15 @@ fn load_existing_report(
         report
             .step_timings
             .retain(|timing| timing.step <= expected.checkpoint_step);
+        report
+            .cuda_memory_segments
+            .retain(|segment| segment.resumed_from_step <= expected.checkpoint_step);
+        if let Some(segment) = report.cuda_memory_segments.last_mut() {
+            segment.completed_step = expected.checkpoint_step;
+        }
         report.completed_step = expected.checkpoint_step;
+        report.artifact = None;
+        report.evaluation = None;
     }
     Ok(Some(report))
 }
@@ -1729,6 +2757,67 @@ mod tests {
             "tritium-campaign-{name}-{}-{sequence}",
             std::process::id()
         ))
+    }
+
+    fn test_hardware() -> CampaignHardwareIdentity {
+        CampaignHardwareIdentity {
+            cuda_ordinal: 0,
+            device_name: "NVIDIA test GPU".into(),
+            pci_bus_id: "0000:01:00.0".into(),
+            cuda_driver_version: 13_010,
+            nvidia_driver_version: "610.1".into(),
+            nvml_cuda_driver_version: 13_010,
+            total_memory_bytes: 100,
+        }
+    }
+
+    fn test_growth() -> CampaignGrowthReceipt {
+        CampaignGrowthReceipt {
+            algorithm: "net2wider.intermediate-swiglu.splitmix64.v1".into(),
+            old_width: 3,
+            new_width: 3,
+            seed: 0,
+            source_indices: vec![0, 1, 2],
+            replication_counts: vec![1, 1, 1],
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn test_memory_snapshot() -> CampaignCudaMemorySnapshot {
+        CampaignCudaMemorySnapshot {
+            device_free_bytes: 80,
+            device_total_bytes: 100,
+            device_used_sample_bytes: 20,
+            pool_used_current_bytes: 4,
+            pool_used_high_water_bytes: 8,
+            pool_reserved_current_bytes: 8,
+            pool_reserved_high_water_bytes: 12,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn evaluation_test_runner() -> ModelRunner {
+        let config = ModelConfig {
+            arch: "llama".into(),
+            n_layers: 0,
+            n_embd: 2,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 2,
+            n_ff: 2,
+            n_ctx: 8,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        };
+        let weights = ModelWeights {
+            token_embd: vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.5],
+            vocab: 3,
+            n_embd: 2,
+            layers: Vec::new(),
+            output_norm: vec![1.0, 1.0],
+            lm_head: None,
+        };
+        ModelRunner::from_weights(config, weights, Box::new(tritium_cpu::CpuBackend::new()))
     }
 
     fn fixture() -> (
@@ -1818,6 +2907,17 @@ mod tests {
     }
 
     #[test]
+    fn held_out_corpus_rejects_semantic_training_content() {
+        assert!(
+            validate_held_out_corpus(&[1, 2, 3, 4], [1; 32], &[1, 2, 3, 4], [1; 32], 2).is_err()
+        );
+        assert!(
+            validate_held_out_corpus(&[1, 2, 3, 4], [1; 32], &[8, 9, 3, 4], [2; 32], 2).is_err()
+        );
+        validate_held_out_corpus(&[1, 2, 3, 4], [1; 32], &[8, 9, 10, 11], [2; 32], 2).unwrap();
+    }
+
+    #[test]
     fn teacher_row_softmax_normalizes_and_rejects_non_finite_logits() {
         let mut row = [1.0, 2.0, 3.0];
         row_softmax_in_place(&mut row).unwrap();
@@ -1895,8 +2995,10 @@ mod tests {
         let mut config: CampaignConfig = serde_json::from_str(
             r#"{
                 "model_dir":"model", "corpus":"corpus.json",
+                "evaluation_corpus":"evaluation.json",
                 "teacher_cache":"teacher.ttpr", "checkpoint_dir":"checkpoints",
-                "report":"report.json", "seq_len":32, "steps":40,
+                "report":"report.json", "artifact":"model.gguf",
+                "seq_len":32, "steps":40,
                 "checkpoint_every":5
             }"#,
         )
@@ -1904,17 +3006,165 @@ mod tests {
         config.resolve_paths(Path::new("/campaign/config.json"));
         assert_eq!(config.model_dir, Path::new("/campaign/model"));
         assert_eq!(config.report, Path::new("/campaign/report.json"));
+        assert_eq!(config.artifact, Path::new("/campaign/model.gguf"));
+        assert_eq!(
+            config.evaluation_corpus,
+            Path::new("/campaign/evaluation.json")
+        );
+        assert_eq!(config.growth, None);
         assert_eq!(config.salt_planes, 2);
         assert_eq!(config.checkpoint_every, 5);
+        assert_eq!(config.timing_warmup_steps, 1);
         assert_eq!(config.checkpoint_shards, 1);
         assert_eq!(config.adam.lr.to_bits(), default_lr().to_bits());
 
         let missing_cadence = r#"{
             "model_dir":"model", "corpus":"corpus.json",
+            "evaluation_corpus":"evaluation.json",
             "teacher_cache":"teacher.ttpr", "checkpoint_dir":"checkpoints",
-            "report":"report.json", "seq_len":32, "steps":40
+            "report":"report.json", "artifact":"model.gguf",
+            "seq_len":32, "steps":40
         }"#;
         assert!(serde_json::from_str::<CampaignConfig>(missing_cadence).is_err());
+        config.seq_len = 1;
+        assert!(validate_campaign_config(&config).is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn completed_evaluation_progress_resumes_without_reloading_model() {
+        let directory = temp_path("evaluation-progress");
+        std::fs::create_dir_all(&directory).unwrap();
+        let progress_path = directory.join("source-evaluation-progress.json");
+        let tokens = [1_u32, 2, 3, 4, 5, 6];
+        let negative_log_likelihood = 4.0 * 2.0_f64.ln();
+        let progress = TeacherForcedEvaluationProgress {
+            schema_version: 1,
+            evaluation_kind: "source-fp".into(),
+            model_identity: "model-id".into(),
+            corpus_file_digest: hex_digest([1; 32]),
+            corpus_digest: hex_digest([2; 32]),
+            seq_len: 3,
+            total_windows: 2,
+            completed_windows: 2,
+            token_count: 4,
+            negative_log_likelihood_f64_bits: negative_log_likelihood.to_bits(),
+        };
+        std::fs::write(&progress_path, serde_json::to_vec(&progress).unwrap()).unwrap();
+
+        let score = resumable_teacher_forced_score(
+            &progress_path,
+            "source-fp",
+            "model-id",
+            &tokens,
+            3,
+            [1; 32],
+            [2; 32],
+            || -> anyhow::Result<ModelRunner> { bail!("completed resume rebuilt the model") },
+        )
+        .unwrap();
+        assert_eq!(score.window_count, 2);
+        assert_eq!(score.token_count, 4);
+        assert_eq!(
+            score.negative_log_likelihood.to_bits(),
+            negative_log_likelihood.to_bits()
+        );
+        assert!((score.perplexity - 2.0).abs() < f64::EPSILON);
+
+        assert!(
+            resumable_teacher_forced_score(
+                &progress_path,
+                "source-fp",
+                "different-model-id",
+                &tokens,
+                3,
+                [1; 32],
+                [2; 32],
+                || -> anyhow::Result<ModelRunner> { bail!("mismatch rebuilt the model") },
+            )
+            .is_err()
+        );
+
+        let mut corrupt = progress;
+        corrupt.token_count = 3;
+        std::fs::write(&progress_path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+        assert!(
+            resumable_teacher_forced_score(
+                &progress_path,
+                "source-fp",
+                "model-id",
+                &tokens,
+                3,
+                [1; 32],
+                [2; 32],
+                || -> anyhow::Result<ModelRunner> { bail!("corruption rebuilt the model") },
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn partial_evaluation_progress_scores_only_remaining_windows() {
+        use std::cell::Cell;
+
+        let directory = temp_path("partial-evaluation-progress");
+        std::fs::create_dir_all(&directory).unwrap();
+        let progress_path = directory.join("artifact-evaluation-progress.json");
+        let tokens = [0_u32, 1, 2, 2, 1, 0];
+        let first =
+            teacher_forced_perplexity_windows(&mut evaluation_test_runner(), &tokens[..3], 3)
+                .unwrap();
+        let second =
+            teacher_forced_perplexity_windows(&mut evaluation_test_runner(), &tokens[3..], 3)
+                .unwrap();
+        let progress = TeacherForcedEvaluationProgress {
+            schema_version: 1,
+            evaluation_kind: "training-salt-artifact".into(),
+            model_identity: "package-id".into(),
+            corpus_file_digest: hex_digest([3; 32]),
+            corpus_digest: hex_digest([4; 32]),
+            seq_len: 3,
+            total_windows: 2,
+            completed_windows: 1,
+            token_count: first.token_count,
+            negative_log_likelihood_f64_bits: first.negative_log_likelihood.to_bits(),
+        };
+        std::fs::write(&progress_path, serde_json::to_vec(&progress).unwrap()).unwrap();
+        let builds = Cell::new(0_u32);
+
+        let score = resumable_teacher_forced_score(
+            &progress_path,
+            "training-salt-artifact",
+            "package-id",
+            &tokens,
+            3,
+            [3; 32],
+            [4; 32],
+            || {
+                builds.set(builds.get() + 1);
+                Ok(evaluation_test_runner())
+            },
+        )
+        .unwrap();
+        let expected_nll = first.negative_log_likelihood + second.negative_log_likelihood;
+        assert_eq!(builds.get(), 1);
+        assert_eq!(score.window_count, 2);
+        assert_eq!(score.token_count, 4);
+        assert_eq!(
+            score.negative_log_likelihood.to_bits(),
+            expected_nll.to_bits()
+        );
+        let persisted: TeacherForcedEvaluationProgress =
+            serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
+        assert_eq!(persisted.completed_windows, 2);
+        assert_eq!(persisted.token_count, 4);
+        assert_eq!(
+            persisted.negative_log_likelihood_f64_bits,
+            expected_nll.to_bits()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(feature = "cuda")]
@@ -1928,10 +3178,12 @@ mod tests {
         let config = serde_json::json!({
             "model_dir": directory.join("missing-model"),
             "corpus": directory.join("missing-corpus.json"),
+            "evaluation_corpus": directory.join("missing-evaluation.json"),
             "teacher_cache": directory.join("missing-teacher.ttpr"),
             "checkpoint_dir": checkpoint_dir,
             "report": directory.join("report.json"),
-            "seq_len": 1,
+            "artifact": directory.join("artifact.gguf"),
+            "seq_len": 2,
             "steps": 1,
             "checkpoint_every": 1
         });
@@ -1954,33 +3206,46 @@ mod tests {
         std::fs::write(model_dir.join("config.json"), b"{}").unwrap();
         let config_path = directory.join("campaign.json");
         let corpus = directory.join("corpus.json");
+        let evaluation_corpus = directory.join("evaluation.json");
         let teacher_cache = directory.join("teacher.ttpr");
         std::fs::write(&config_path, b"{}").unwrap();
         std::fs::write(&corpus, b"[]").unwrap();
+        std::fs::write(&evaluation_corpus, b"[1,2]").unwrap();
         std::fs::write(&teacher_cache, b"cache").unwrap();
         let checkpoint_dir = directory.join("checkpoints");
         let mut config = CampaignConfig {
             model_dir: model_dir.clone(),
             corpus: corpus.clone(),
+            evaluation_corpus: evaluation_corpus.clone(),
             teacher_cache: teacher_cache.clone(),
             checkpoint_dir: checkpoint_dir.clone(),
             report: directory.join("report.json"),
-            seq_len: 1,
+            artifact: directory.join("artifact.gguf"),
+            seq_len: 2,
             steps: 1,
             salt_planes: 2,
             cuda_device: 0,
             checkpoint_every: 1,
+            timing_warmup_steps: 1,
             checkpoint_shards: 1,
             adam: CampaignAdam::default(),
+            growth: None,
         };
         validate_campaign_paths(&config_path, &config).unwrap();
 
         config.report = checkpoint_dir.join("manifest.tdcp");
         assert!(validate_campaign_paths(&config_path, &config).is_err());
-        config.report = corpus;
+        config.report = corpus.clone();
         assert!(validate_campaign_paths(&config_path, &config).is_err());
         config.report = model_dir.join("campaign-report.json");
         assert!(validate_campaign_paths(&config_path, &config).is_err());
+
+        config.report = directory.join("report.json");
+        config.artifact = evaluation_corpus.clone();
+        assert!(validate_campaign_paths(&config_path, &config).is_err());
+        config.artifact = checkpoint_dir.join("artifact.gguf");
+        assert!(validate_campaign_paths(&config_path, &config).is_err());
+        config.artifact = directory.join("artifact.gguf");
 
         let report_container = directory.join("report-container");
         config.report = report_container.clone();
@@ -2021,11 +3286,15 @@ mod tests {
         let input_hashes = CampaignInputHashes {
             campaign_config_file: "config".into(),
             model_config_file: "model-config".into(),
-            model: "model".into(),
+            source_model: "source-model".into(),
+            initial_student_model: "student-model".into(),
             corpus_file: "corpus-file".into(),
             corpus: "corpus".into(),
             teacher_cache: "teacher".into(),
+            evaluation_corpus_file: "evaluation-file".into(),
+            evaluation_corpus: "evaluation".into(),
         };
+        let hardware = test_hardware();
         let memory = CampaignMemoryReport {
             packed_parameter_bytes: 6,
             packed_code_bytes: 2,
@@ -2050,23 +3319,36 @@ mod tests {
             materialized_gradient_bytes: 16,
         };
         let report = CampaignReport {
-            schema_version: 3,
+            schema_version: 4,
             plan_fingerprint: "plan".into(),
-            cuda_device: 0,
-            cuda_device_name: "test cuda".into(),
+            hardware: hardware.clone(),
             input_hashes: input_hashes.clone(),
             completed_step: 5,
             resumed_from_step: 0,
             configured_steps: 5,
+            timing_warmup_steps: 1,
             checkpoint_path: checkpoint_dir.display().to_string(),
             step_timings: (1..=5)
                 .map(|step| StepTiming {
                     step,
                     window_index: step - 1,
+                    warmup: step == 1,
                     training_elapsed_ms_excluding_checkpoint: step as f64,
                 })
                 .collect(),
             memory,
+            cuda_memory_segments: vec![CampaignCudaMemorySegment {
+                resumed_from_step: 0,
+                completed_step: 5,
+                nvml_used_memory_bytes_at_launch: 10,
+                nvml_used_memory_latest_sample_bytes: 10,
+                nvml_used_memory_sample_high_water_bytes: 10,
+                baseline: test_memory_snapshot(),
+                post_setup: Some(test_memory_snapshot()),
+                latest_or_terminal: test_memory_snapshot(),
+            }],
+            artifact: None,
+            evaluation: None,
         };
         std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
         let expected = ReportExpectations {
@@ -2075,8 +3357,8 @@ mod tests {
             checkpoint_dir: &checkpoint_dir,
             windows: 5,
             configured_steps: 5,
-            cuda_device: 0,
-            cuda_device_name: "test cuda",
+            timing_warmup_steps: 1,
+            hardware: &hardware,
             input_hashes: &input_hashes,
             static_memory,
         };
@@ -2095,21 +3377,13 @@ mod tests {
             )
             .is_err()
         );
+        let mut other_hardware = hardware.clone();
+        other_hardware.cuda_ordinal = 1;
         assert!(
             load_existing_report(
                 &path,
                 &ReportExpectations {
-                    cuda_device: 1,
-                    ..expected
-                }
-            )
-            .is_err()
-        );
-        assert!(
-            load_existing_report(
-                &path,
-                &ReportExpectations {
-                    cuda_device_name: "other cuda",
+                    hardware: &other_hardware,
                     ..expected
                 }
             )
@@ -2131,7 +3405,7 @@ mod tests {
                 .contains("points at checkpoint")
         );
         let mut corrupt = report.clone();
-        corrupt.input_hashes.model.push_str("-different");
+        corrupt.input_hashes.source_model.push_str("-different");
         assert!(rejects(&corrupt).to_string().contains("input hashes"));
         let mut corrupt = report.clone();
         corrupt.resumed_from_step = 6;
@@ -2199,15 +3473,23 @@ mod tests {
     fn plan_fingerprint_is_stable_and_changes_with_optimizer_or_geometry() {
         let (config, spec, architecture, parameters) = fixture();
         let model_digest = semantic_model_digest_parts(&config, &spec, &architecture, &parameters);
+        let hardware = test_hardware();
+        let growth = test_growth();
         let base = PlanInputs {
-            cuda_device: 0,
-            cuda_device_name: "NVIDIA test GPU",
+            hardware: &hardware,
             campaign_config_file_digest: [5; 32],
             model_config_file_digest: [6; 32],
-            model_digest,
+            source_model_digest: model_digest,
+            initial_student_digest: [9; 32],
             corpus_digest: [2; 32],
             corpus_file_digest: [3; 32],
             teacher_cache_digest: [4; 32],
+            evaluation_corpus_path: Path::new("/campaign/evaluation.json"),
+            evaluation_corpus_digest: [10; 32],
+            evaluation_corpus_file_digest: [11; 32],
+            evaluation_windows: 2,
+            artifact_path: Path::new("/campaign/model.gguf"),
+            growth: &growth,
             seq_len: 4,
             windows: 2,
             total_steps: 20,
@@ -2215,6 +3497,7 @@ mod tests {
             adam: CampaignAdam::default(),
             depth: 1,
             checkpoint_every: 5,
+            timing_warmup_steps: 1,
             checkpoint_shards: 1,
             parameters: &parameters,
         };
@@ -2233,13 +3516,10 @@ mod tests {
             ..base
         };
         assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let mut changed_hardware = hardware.clone();
+        changed_hardware.cuda_ordinal = 1;
         let changed = PlanInputs {
-            cuda_device: 1,
-            ..base
-        };
-        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
-        let changed = PlanInputs {
-            cuda_device_name: "different GPU",
+            hardware: &changed_hardware,
             ..base
         };
         assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
@@ -2253,8 +3533,25 @@ mod tests {
             ..base
         };
         assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
-        assert_eq!(first.cuda_device, 0);
-        assert_eq!(first.cuda_device_name, "NVIDIA test GPU");
+        let changed = PlanInputs {
+            evaluation_corpus_digest: [12; 32],
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let changed = PlanInputs {
+            artifact_path: Path::new("/campaign/other.gguf"),
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let mut changed_growth = growth.clone();
+        changed_growth.seed = 1;
+        let changed = PlanInputs {
+            growth: &changed_growth,
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        assert_eq!(first.hardware, hardware);
+        assert_eq!(first.version, 4);
         assert_eq!(first.campaign_config_file_digest, hex_digest([5; 32]));
         assert_eq!(first.model_config_file_digest, hex_digest([6; 32]));
     }
@@ -2263,15 +3560,28 @@ mod tests {
     fn immutable_plan_sidecar_rejects_mismatch_and_missing_sidecar_for_checkpoint() {
         let directory = temp_path("plan-sidecar");
         let (config, spec, architecture, parameters) = fixture();
+        let hardware = test_hardware();
+        let growth = test_growth();
         let expected = build_plan_sidecar(&PlanInputs {
-            cuda_device: 0,
-            cuda_device_name: "NVIDIA test GPU",
+            hardware: &hardware,
             campaign_config_file_digest: [5; 32],
             model_config_file_digest: [6; 32],
-            model_digest: semantic_model_digest_parts(&config, &spec, &architecture, &parameters),
+            source_model_digest: semantic_model_digest_parts(
+                &config,
+                &spec,
+                &architecture,
+                &parameters,
+            ),
+            initial_student_digest: [9; 32],
             corpus_digest: [2; 32],
             corpus_file_digest: [3; 32],
             teacher_cache_digest: [4; 32],
+            evaluation_corpus_path: Path::new("/campaign/evaluation.json"),
+            evaluation_corpus_digest: [10; 32],
+            evaluation_corpus_file_digest: [11; 32],
+            evaluation_windows: 2,
+            artifact_path: Path::new("/campaign/model.gguf"),
+            growth: &growth,
             seq_len: 4,
             windows: 2,
             total_steps: 20,
@@ -2279,6 +3589,7 @@ mod tests {
             adam: CampaignAdam::default(),
             depth: 1,
             checkpoint_every: 5,
+            timing_warmup_steps: 1,
             checkpoint_shards: 1,
             parameters: &parameters,
         });
