@@ -463,3 +463,192 @@ fn extraction_rejects_hidden_bias_qk_norm_and_untied_weight_mismatches() {
     let error = TiedSwiGluTrainingModel::extract(&config(), &spec(), &untied).unwrap_err();
     assert!(error.to_string().contains("untied LM head"), "{error}");
 }
+
+#[cfg(feature = "cuda")]
+fn cuda_backend_or_skip(test: &str) -> Option<tritium_cuda::CudaBackend> {
+    match tritium_cuda::CudaBackend::new(0) {
+        Ok(backend) => Some(backend),
+        Err(error) => {
+            eprintln!("skipping {test}: CUDA device unavailable: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn upload_resident_parameters(
+    backend: &tritium_cuda::CudaBackend,
+    model: &TiedSwiGluTrainingModel,
+) -> Vec<tritium_cuda::train::DeviceTensor> {
+    model
+        .parameters()
+        .iter()
+        .map(|parameter| {
+            tritium_cuda::train::DeviceTensor::upload(backend, &parameter.master)
+                .expect("upload resident parameter")
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn resident_forward_borrows_canonical_leaves_and_backpropagates_tied_model() {
+    use tritium_cuda::train::{
+        CheckpointPolicy, DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer,
+    };
+    use tritium_nn::resident_device_forward;
+    use tritium_train::AdamW;
+
+    let Some(backend) = cuda_backend_or_skip(
+        "resident_forward_borrows_canonical_leaves_and_backpropagates_tied_model",
+    ) else {
+        return;
+    };
+    let model = TiedSwiGluTrainingModel::extract(&config(), &spec(), &weights()).unwrap();
+    let parameter_specs: Vec<_> = model
+        .parameters()
+        .iter()
+        .map(|parameter| DeviceTrainParam {
+            master: &parameter.master,
+            rows: parameter.rows,
+            cols: parameter.cols,
+            salt_planes: 2,
+            optimizer: AdamW::new(1e-3),
+        })
+        .collect();
+    let mut trainer = DeviceTrainer::new(&backend, &parameter_specs).expect("resident trainer");
+    trainer
+        .prepare_quantized()
+        .expect("prepare resident SALT weights");
+    let resident_refs: Vec<_> = (0..model.parameters().len())
+        .map(|index| trainer.quantized(index).expect("prepared resident weight"))
+        .collect();
+    let tokens = [0_i32, 1, 4];
+    let arch = model.architecture();
+    let ones_max = arch.vocab.max(arch.n_ff).max(tokens.len());
+    let mut tape = DeviceTape::new_with_checkpoint_policy(
+        &backend,
+        ones_max,
+        CheckpointPolicy::SqrtDepth(arch.n_layers),
+    )
+    .expect("resident checkpointed tape");
+
+    let forward = resident_device_forward(&mut tape, &model, &resident_refs, &tokens)
+        .expect("resident forward");
+
+    assert_eq!(forward.master_leaves.len(), model.parameters().len());
+    let mut unique_leaves = forward.master_leaves.clone();
+    unique_leaves.sort_unstable();
+    unique_leaves.dedup();
+    assert_eq!(unique_leaves.len(), model.parameters().len());
+    let logits = tape
+        .value(forward.logits)
+        .expect("download resident logits");
+    assert_eq!(logits.len(), tokens.len() * arch.vocab);
+    assert!(logits.iter().all(|value| value.is_finite()));
+
+    let target = DeviceTensor::upload(
+        &backend,
+        &vec![1.0 / arch.vocab as f32; tokens.len() * arch.vocab],
+    )
+    .expect("upload target");
+    let gradients = tape
+        .xent_backward_device(
+            forward.logits,
+            &target,
+            tokens.len(),
+            arch.vocab,
+            &forward.master_leaves,
+        )
+        .expect("resident backward");
+    assert_eq!(gradients.len(), model.parameters().len());
+    for (index, parameter) in model.parameters().iter().enumerate() {
+        let gradient = gradients
+            .download(&backend, index)
+            .expect("download resident gradient");
+        assert_eq!(gradient.len(), parameter.elements(), "{}", parameter.name);
+        assert!(
+            gradient.iter().all(|value| value.is_finite()),
+            "{} produced a non-finite gradient",
+            parameter.name
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn resident_forward_rejects_invalid_inputs_and_parameter_lengths() {
+    use tritium_cuda::train::{DeviceTape, DeviceTensor};
+    use tritium_nn::{TrainingAdapterError, resident_device_forward};
+
+    let Some(backend) =
+        cuda_backend_or_skip("resident_forward_rejects_invalid_inputs_and_parameter_lengths")
+    else {
+        return;
+    };
+    let model = TiedSwiGluTrainingModel::extract(&config(), &spec(), &weights()).unwrap();
+    let resident = upload_resident_parameters(&backend, &model);
+    let resident_refs: Vec<_> = resident.iter().collect();
+
+    let mut tape = DeviceTape::new(&backend, model.architecture().vocab).expect("device tape");
+    let expected_parameters = model.parameters().len();
+    let got_parameters = expected_parameters - 1;
+    let error = resident_device_forward(&mut tape, &model, &resident_refs[..got_parameters], &[0])
+        .unwrap_err();
+    assert_eq!(
+        error,
+        TrainingAdapterError::TensorShape {
+            name: "resident parameter count".to_owned(),
+            expected: expected_parameters,
+            got: got_parameters,
+        }
+    );
+
+    let expected_embedding_elements = model.parameters()[0].elements();
+    let got_embedding_elements = expected_embedding_elements - 1;
+    let short_embedding = DeviceTensor::upload(
+        &backend,
+        &model.parameters()[0].master[..got_embedding_elements],
+    )
+    .expect("upload short embedding");
+    let short_refs: Vec<_> = core::iter::once(&short_embedding)
+        .chain(resident.iter().skip(1))
+        .collect();
+    let error = resident_device_forward(&mut tape, &model, &short_refs, &[0]).unwrap_err();
+    assert_eq!(
+        error,
+        TrainingAdapterError::TensorShape {
+            name: "resident model.embed_tokens.weight".to_owned(),
+            expected: expected_embedding_elements,
+            got: got_embedding_elements,
+        }
+    );
+
+    let arch = model.architecture();
+    for (tokens, message) in [
+        (Vec::new(), "training sequence must be non-empty"),
+        (vec![0; arch.n_ctx + 1], "exceeds max_position_embeddings"),
+        (vec![-1], "outside the vocabulary"),
+        (vec![arch.vocab as i32], "outside the vocabulary"),
+    ] {
+        let error =
+            resident_device_forward(&mut tape, &model, &resident_refs, &tokens).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    if let Ok(other_backend) = tritium_cuda::CudaBackend::new(1) {
+        let foreign_embedding = DeviceTensor::upload(&other_backend, &model.parameters()[0].master)
+            .expect("upload foreign embedding");
+        let foreign_refs: Vec<_> = core::iter::once(&foreign_embedding)
+            .chain(resident.iter().skip(1))
+            .collect();
+        let mut context_tape =
+            DeviceTape::new(&backend, model.architecture().vocab).expect("context tape");
+        let error =
+            resident_device_forward(&mut context_tape, &model, &foreign_refs, &[0]).unwrap_err();
+        assert!(
+            error.to_string().contains("different CUDA context"),
+            "{error}"
+        );
+    }
+}

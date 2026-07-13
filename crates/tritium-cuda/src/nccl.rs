@@ -136,6 +136,75 @@ impl NcclProcessGroup {
         Ok(Self { comm })
     }
 
+    /// Synchronize every rank at a campaign lifecycle boundary.
+    ///
+    /// NCCL has no standalone barrier operation. A one-word all-gather is a
+    /// stream-synchronized barrier here and also verifies that the communicator
+    /// reports every rank exactly once in rank order.
+    ///
+    /// # Errors
+    /// [`DistError::Backend`] if the collective fails or the communicator rank
+    /// map is inconsistent.
+    pub fn barrier(&self) -> Result<(), DistError> {
+        let local_rank = u64::try_from(self.comm.rank())
+            .map_err(|_| DistError::Backend("NCCL rank exceeds u64".into()))?;
+        let gathered = self.all_gather_u64(&[local_rank])?;
+        for (rank, &reported) in gathered.iter().enumerate() {
+            let expected = u64::try_from(rank)
+                .map_err(|_| DistError::Backend("NCCL rank exceeds u64".into()))?;
+            if reported != expected {
+                return Err(DistError::Backend(format!(
+                    "NCCL barrier rank map differs: slot {rank} reported rank {reported}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail symmetrically when immutable campaign contract words differ.
+    ///
+    /// The fixed-size length exchange happens before the value exchange. Ranks
+    /// may therefore supply independently constructed slices without violating
+    /// NCCL's equal-count requirement: a length disagreement returns on every
+    /// rank before any variably sized collective is entered. Callers should
+    /// encode the plan/input/growth/job identities into stable `u64` words.
+    ///
+    /// # Errors
+    /// [`DistError::LengthMismatch`] if contract lengths differ;
+    /// [`DistError::Backend`] if values differ or a collective fails.
+    pub fn verify_u64_consensus(&self, local: &[u64]) -> Result<(), DistError> {
+        let local_len = u64::try_from(local.len())
+            .map_err(|_| DistError::Backend("campaign contract length exceeds u64".into()))?;
+        let lengths = self.all_gather_u64(&[local_len])?;
+        let canonical_len = lengths
+            .first()
+            .copied()
+            .ok_or_else(|| DistError::Backend("NCCL communicator has no ranks".into()))?;
+        if let Some(&different) = lengths.iter().find(|&&length| length != canonical_len) {
+            return Err(DistError::LengthMismatch {
+                expected: usize::try_from(canonical_len).unwrap_or(usize::MAX),
+                got: usize::try_from(different).unwrap_or(usize::MAX),
+            });
+        }
+        if local.is_empty() {
+            return Ok(());
+        }
+        let gathered = self.all_gather_u64(local)?;
+        let canonical = gathered.get(..local.len()).ok_or_else(|| {
+            DistError::Backend("NCCL contract gather returned a short buffer".into())
+        })?;
+        if let Some((rank, _)) = gathered
+            .chunks_exact(local.len())
+            .enumerate()
+            .find(|(_, contract)| *contract != canonical)
+        {
+            return Err(DistError::Backend(format!(
+                "immutable campaign contract differs on NCCL rank {rank}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Enqueue an in-place all-reduce over a resident f32 buffer.
     ///
     /// `logical_len` must equal the allocation length. Making that contract
@@ -336,7 +405,11 @@ impl NcclProcessGroup {
         Ok(())
     }
 
-    fn all_gather_u64(&self, input: &[u64]) -> Result<Vec<u64>, DistError> {
+    /// Gather an equal-length u64 record from every rank in rank order.
+    ///
+    /// Campaign orchestration uses this for bounded control-plane evidence;
+    /// tensor gradients continue through the resident f32 collectives.
+    pub fn all_gather_u64(&self, input: &[u64]) -> Result<Vec<u64>, DistError> {
         let world = self.comm.world_size();
         let output_len = world
             .checked_mul(input.len())
@@ -652,6 +725,22 @@ mod tests {
             vec![10.0, 11.0],
             "broadcast root=0 world=1 must be identity"
         );
+    }
+
+    #[test]
+    fn world1_campaign_consensus_and_barrier_smoke() {
+        if device_count() == 0 {
+            eprintln!("skip world1_campaign_consensus_and_barrier_smoke: no CUDA device");
+            return;
+        }
+        let id = NcclId::new().expect("nccl id");
+        let pg = NcclProcessGroup::init(0, 0, 1, &id).expect("nccl init");
+
+        pg.verify_u64_consensus(&[0xfeed_beef, 17, 99])
+            .expect("world-one contract consensus");
+        pg.verify_u64_consensus(&[])
+            .expect("empty contract consensus");
+        pg.barrier().expect("world-one barrier");
     }
 
     /// world=1 size-contract errors mirror the sim exactly (no panic).

@@ -54,7 +54,9 @@ pub use teacher_cache::{
 };
 pub use tensor::f16_bytes_to_f32;
 #[cfg(feature = "cuda")]
-pub use training::{PackedTrainingForward, packed_device_forward};
+pub use training::{
+    PackedTrainingForward, ResidentTrainingForward, packed_device_forward, resident_device_forward,
+};
 pub use training::{
     TiedSwiGluTrainingArchitecture, TiedSwiGluTrainingModel, TrainingAdapterError,
     TrainingParameter,

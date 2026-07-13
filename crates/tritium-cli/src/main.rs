@@ -25,6 +25,8 @@ mod backends;
 mod campaign;
 #[cfg(feature = "cuda")]
 mod campaign_artifact;
+#[cfg(feature = "nccl")]
+mod campaign_world;
 mod generate;
 mod inspect;
 #[cfg(feature = "cuda")]

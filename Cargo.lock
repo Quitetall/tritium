@@ -4281,6 +4281,7 @@ dependencies = [
  "blake3",
  "clap",
  "half",
+ "libc",
  "memmap2",
  "rayon",
  "serde",

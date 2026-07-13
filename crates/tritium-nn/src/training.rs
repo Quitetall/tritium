@@ -475,6 +475,16 @@ pub struct PackedTrainingForward {
     pub master_leaves: Vec<usize>,
 }
 
+/// Outputs from one dense resident device forward graph.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResidentTrainingForward {
+    /// DeviceTape value id for `[sequence, vocabulary]` logits.
+    pub logits: usize,
+    /// Borrowed master leaf ids in [`TiedSwiGluTrainingModel::parameters`] order.
+    pub master_leaves: Vec<usize>,
+}
+
 /// Build the tied-SwiGLU packed-SALT forward on a CUDA
 /// [`DeviceTape`](tritium_cuda::train::DeviceTape).
 ///
@@ -494,21 +504,7 @@ pub fn packed_device_forward<'backend, 'leaf>(
     tokens: &[i32],
 ) -> Result<PackedTrainingForward, TrainingAdapterError> {
     let arch = &model.arch;
-    if tokens.is_empty() {
-        return Err(invalid_input("training sequence must be non-empty"));
-    }
-    if tokens.len() > arch.n_ctx {
-        return Err(invalid_input(
-            "training sequence exceeds max_position_embeddings",
-        ));
-    }
-    for (position, &token) in tokens.iter().enumerate() {
-        if token < 0 || usize::try_from(token).map_or(true, |token| token >= arch.vocab) {
-            return Err(invalid_input(&format!(
-                "token at position {position} is outside the vocabulary"
-            )));
-        }
-    }
+    validate_training_tokens(arch, tokens)?;
     if weights.len() != model.parameters.len() {
         return Err(tensor_mismatch(
             "packed parameter count",
@@ -581,6 +577,131 @@ pub fn packed_device_forward<'backend, 'leaf>(
         logits,
         master_leaves: masters,
     })
+}
+
+/// Build the tied-SwiGLU dense forward from already-resident CUDA tensors.
+///
+/// Every tensor is length-checked before any leaf is added. The tensors are then
+/// borrowed through [`tritium_cuda::train::DeviceTape::leaf_device`], which also
+/// rejects CUDA-context mismatches without allocating or copying trainable
+/// weights. Parameter leaves retain [`TiedSwiGluTrainingModel::parameters`] order,
+/// and leaf zero is shared by the embedding gather and tied LM head.
+/// Transformer-block boundaries match [`packed_device_forward`] activation-
+/// checkpoint frontiers.
+///
+/// # Errors
+/// Returns [`TrainingAdapterError::InvalidInput`] for invalid tokens,
+/// [`TrainingAdapterError::TensorShape`] for parameter count or length
+/// disagreement, and [`TrainingAdapterError::Backend`] for CUDA-context,
+/// allocation, or kernel errors.
+#[cfg(feature = "cuda")]
+pub fn resident_device_forward<'backend, 'leaf>(
+    tape: &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
+    model: &TiedSwiGluTrainingModel,
+    weights: &[&'leaf tritium_cuda::train::DeviceTensor],
+    tokens: &[i32],
+) -> Result<ResidentTrainingForward, TrainingAdapterError> {
+    let arch = &model.arch;
+    validate_training_tokens(arch, tokens)?;
+    if weights.len() != model.parameters.len() {
+        return Err(tensor_mismatch(
+            "resident parameter count",
+            model.parameters.len(),
+            weights.len(),
+        ));
+    }
+    for (parameter, weight) in model.parameters.iter().zip(weights) {
+        if weight.len() != parameter.elements() {
+            return Err(tensor_mismatch(
+                &format!("resident {}", parameter.name),
+                parameter.elements(),
+                weight.len(),
+            ));
+        }
+    }
+
+    // Borrow every trainable tensor before constructing the graph. Besides
+    // preserving canonical order, leaf_device validates that each allocation
+    // belongs to this tape's CUDA context.
+    let masters = weights
+        .iter()
+        .map(|weight| tape.leaf_device(weight).map_err(TrainingAdapterError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sequence = tokens.len();
+    let mut hidden = tape.embed(masters[0], tokens, sequence, arch.n_embd, arch.vocab)?;
+
+    for layer_index in 0..arch.n_layers {
+        let base = 1 + 7 * layer_index;
+        let attn_norm = tape.leaf(&arch.attn_norms[layer_index])?;
+        let normalized = tape.rmsnorm(hidden, attn_norm, sequence, arch.n_embd, arch.rms_eps)?;
+        let attention = tape.attention(
+            normalized,
+            masters[base],
+            masters[base + 1],
+            masters[base + 2],
+            masters[base + 3],
+            sequence,
+            arch.n_embd,
+            arch.n_head,
+            arch.n_head_kv,
+            arch.head_dim,
+            arch.rope_theta,
+        )?;
+        hidden = tape.add(hidden, attention)?;
+
+        let ffn_norm = tape.leaf(&arch.ffn_norms[layer_index])?;
+        let normalized = tape.rmsnorm(hidden, ffn_norm, sequence, arch.n_embd, arch.rms_eps)?;
+        let gate = tape.matmul(
+            normalized,
+            masters[base + 4],
+            sequence,
+            arch.n_ff,
+            arch.n_embd,
+        )?;
+        let up = tape.matmul(
+            normalized,
+            masters[base + 5],
+            sequence,
+            arch.n_ff,
+            arch.n_embd,
+        )?;
+        let activated_gate = tape.silu(gate)?;
+        let gated = tape.mul(activated_gate, up)?;
+        let down = tape.matmul(gated, masters[base + 6], sequence, arch.n_embd, arch.n_ff)?;
+        hidden = tape.add(hidden, down)?;
+        tape.checkpoint_keep(&[hidden])?;
+    }
+
+    let output_norm = tape.leaf(&arch.output_norm)?;
+    let normalized = tape.rmsnorm(hidden, output_norm, sequence, arch.n_embd, arch.rms_eps)?;
+    let logits = tape.matmul(normalized, masters[0], sequence, arch.vocab, arch.n_embd)?;
+    Ok(ResidentTrainingForward {
+        logits,
+        master_leaves: masters,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn validate_training_tokens(
+    arch: &TiedSwiGluTrainingArchitecture,
+    tokens: &[i32],
+) -> Result<(), TrainingAdapterError> {
+    if tokens.is_empty() {
+        return Err(invalid_input("training sequence must be non-empty"));
+    }
+    if tokens.len() > arch.n_ctx {
+        return Err(invalid_input(
+            "training sequence exceeds max_position_embeddings",
+        ));
+    }
+    for (position, &token) in tokens.iter().enumerate() {
+        if token < 0 || usize::try_from(token).map_or(true, |token| token >= arch.vocab) {
+            return Err(invalid_input(&format!(
+                "token at position {position} is outside the vocabulary"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn extract_dense(

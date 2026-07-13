@@ -19,11 +19,16 @@ use common::{device_forward, device_forward_packed, extract};
 use tritium_cuda::CudaBackend;
 use tritium_cuda::train::{
     CheckpointPolicy, DeviceBackwardStats, DevicePackedSaltWeight, DeviceTape, DeviceTensor,
+    PackedSaltComputePolicy,
 };
 use tritium_nn::ModelRunner;
 use tritium_train::ops::ste;
 
 const PLANES: usize = 2;
+// Each fast contraction retains the repository's 1e-4 relative fp32-matmul
+// contract. Permit one additional factor of two after 30 transformer layers;
+// the recovery gate separately checks that this accumulated drift still trains.
+const FAST_WHOLE_MODEL_TOLERANCE: f32 = 2e-4;
 
 fn model_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -64,6 +69,15 @@ fn max_abs_diff(reference: &[f32], actual: &[f32]) -> f32 {
         .iter()
         .zip(actual)
         .map(|(&expected, &got)| (expected - got).abs())
+        .fold(0.0, f32::max)
+}
+
+fn max_scaled_diff(reference: &[f32], actual: &[f32]) -> f32 {
+    assert_eq!(reference.len(), actual.len());
+    reference
+        .iter()
+        .zip(actual)
+        .map(|(&expected, &got)| (expected - got).abs() / expected.abs().max(1.0))
         .fold(0.0, f32::max)
 }
 
@@ -156,12 +170,13 @@ fn packed_salt_checkpointed_smollm2_matches_dense_salt() {
         .sum();
     assert_eq!(packed_bytes, packed_code_bytes + packed_scale_bytes);
 
-    let packed = {
+    let run_packed = |compute| {
         let started = Instant::now();
-        let mut tape = DeviceTape::new_with_checkpoint_policy(
+        let mut tape = DeviceTape::new_with_policies(
             &backend,
             arch.vocab,
             CheckpointPolicy::SqrtDepth(arch.n_layers),
+            compute,
         )
         .expect("packed checkpointed device tape");
         let (logits_id, master_ids) =
@@ -188,11 +203,22 @@ fn packed_salt_checkpointed_smollm2_matches_dense_salt() {
             elapsed_ms: started.elapsed().as_secs_f64() * 1e3,
         }
     };
+    let packed = run_packed(PackedSaltComputePolicy::Exact);
+    let fast = run_packed(PackedSaltComputePolicy::Fast);
 
     let logits_error = max_abs_diff(&dense.logits, &packed.logits);
     let tied_embedding_grad_error =
         max_abs_diff(&dense.tied_embedding_grad, &packed.tied_embedding_grad);
     let layer0_down_grad_error = max_abs_diff(&dense.layer0_down_grad, &packed.layer0_down_grad);
+    let fast_logits_error = max_abs_diff(&dense.logits, &fast.logits);
+    let fast_tied_embedding_grad_error =
+        max_abs_diff(&dense.tied_embedding_grad, &fast.tied_embedding_grad);
+    let fast_layer0_down_grad_error = max_abs_diff(&dense.layer0_down_grad, &fast.layer0_down_grad);
+    let fast_logits_scaled_error = max_scaled_diff(&dense.logits, &fast.logits);
+    let fast_tied_embedding_grad_scaled_error =
+        max_scaled_diff(&dense.tied_embedding_grad, &fast.tied_embedding_grad);
+    let fast_layer0_down_grad_scaled_error =
+        max_scaled_diff(&dense.layer0_down_grad, &fast.layer0_down_grad);
     let byte_ratio = packed_bytes as f64 / dense_bytes as f64;
     let activation_ratio = packed.stats.peak_live_activation_elements as f64
         / packed.stats.naive_activation_elements as f64;
@@ -204,13 +230,20 @@ fn packed_salt_checkpointed_smollm2_matches_dense_salt() {
          layer0_down_grad={layer0_down_grad_error:.3e}; packed bytes={packed_bytes} \
          (codes={packed_code_bytes}, scales={packed_scale_bytes}) vs dense bytes={dense_bytes} \
          ({byte_ratio:.4}x); checkpoint activations peak={} vs naive={} ({activation_ratio:.4}x), \
-         recomputed_ops={}; elapsed dense={:.0}ms packed={:.0}ms",
+         recomputed_ops={}; fast deltas logits={fast_logits_error:.3e}, \
+         tied_embedding_grad={fast_tied_embedding_grad_error:.3e}, \
+         layer0_down_grad={fast_layer0_down_grad_error:.3e}; fast scaled deltas \
+         logits={fast_logits_scaled_error:.3e}, \
+         tied_embedding_grad={fast_tied_embedding_grad_scaled_error:.3e}, \
+         layer0_down_grad={fast_layer0_down_grad_scaled_error:.3e}; \
+         elapsed dense={:.0}ms exact={:.0}ms fast={:.0}ms",
         arch.n_layers,
         packed.stats.peak_live_activation_elements,
         packed.stats.naive_activation_elements,
         packed.stats.recomputed_ops,
         dense.elapsed_ms,
         packed.elapsed_ms,
+        fast.elapsed_ms,
     );
 
     assert!(
@@ -224,6 +257,18 @@ fn packed_salt_checkpointed_smollm2_matches_dense_salt() {
     assert!(
         layer0_down_grad_error < 1e-4,
         "packed layer-0 down gradient max-abs error {layer0_down_grad_error:.3e}"
+    );
+    assert!(
+        fast_logits_scaled_error < FAST_WHOLE_MODEL_TOLERANCE,
+        "fast packed logits scaled error {fast_logits_scaled_error:.3e}"
+    );
+    assert!(
+        fast_tied_embedding_grad_scaled_error < FAST_WHOLE_MODEL_TOLERANCE,
+        "fast packed tied-embedding gradient scaled error {fast_tied_embedding_grad_scaled_error:.3e}"
+    );
+    assert!(
+        fast_layer0_down_grad_scaled_error < FAST_WHOLE_MODEL_TOLERANCE,
+        "fast packed layer-0 down gradient scaled error {fast_layer0_down_grad_scaled_error:.3e}"
     );
     assert!(
         packed.stats.recomputed_ops > 0,

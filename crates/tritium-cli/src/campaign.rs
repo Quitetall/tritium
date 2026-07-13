@@ -13,6 +13,10 @@ use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 #[cfg(any(feature = "cuda", test))]
 use std::io::Write;
+#[cfg(all(feature = "cuda", unix))]
+use std::os::unix::fs::MetadataExt as _;
+#[cfg(all(feature = "cuda", windows))]
+use std::os::windows::fs::MetadataExt as _;
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
@@ -25,13 +29,19 @@ use tritium_nn::{
     TiedSwiGluTrainingModel, hash_teacher_corpus,
 };
 
+#[cfg(feature = "nccl")]
+use std::time::Duration;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
+#[cfg(feature = "nccl")]
+use tritium_cuda::NcclProcessGroup;
 #[cfg(feature = "cuda")]
 use tritium_cuda::train::{
-    CheckpointPolicy, DevicePackedSaltWeight, DeviceTape, DeviceTensor, GradientLeafBinding,
+    CheckpointPolicy, DevicePackedSaltWeight, DeviceTape, DeviceTensor, DeviceTrainParam,
+    DeviceTrainer, DeviceTrainerWeightStorage, GradientLeafBinding, GradientStreamReport,
     HostOffloadMemoryGeometry, HostOffloadParamMetadata, HostOffloadStats, HostOffloadTrainParam,
-    HostOffloadTrainer, host_offload_memory_geometry,
+    HostOffloadTrainer, PackedSaltComputePolicy, ResidentTrainerStats,
+    host_offload_memory_geometry,
 };
 #[cfg(feature = "cuda")]
 use tritium_cuda::{CudaBackend, CudaDeviceIdentity, CudaMemorySnapshot};
@@ -47,8 +57,12 @@ use tritium_train::AdamW;
 
 #[cfg(feature = "cuda")]
 use crate::campaign_artifact::{
-    ArtifactProvenance, CampaignArtifactSummary, GrowthReceipt, export_campaign_artifact,
-    verify_campaign_artifact,
+    ArtifactProvenance, CampaignArtifactSummary, GrowthReceipt, MasterSource,
+    ResidentMasterSnapshot, export_campaign_artifact, verify_campaign_artifact,
+};
+#[cfg(feature = "nccl")]
+use crate::campaign_world::{
+    DeviceFleet, DistributedConfig, WindowPartition, WorkerRendezvous, supervise_current_exe,
 };
 #[cfg(feature = "cuda")]
 use crate::nvml_probe::{NvmlGpuSnapshot, probe_cuda_device};
@@ -78,8 +92,9 @@ pub(crate) enum CampaignCommand {
         /// JSON campaign configuration. Required keys: model_dir, corpus,
         /// evaluation_corpus, teacher_cache, checkpoint_dir, report, artifact,
         /// seq_len, steps, and checkpoint_every. Optional keys: growth,
-        /// salt_planes, cuda_device, timing_warmup_steps, checkpoint_shards, and
-        /// adam. Relative paths resolve beside this file.
+        /// salt_planes, cuda_device, distributed, state_policy, packed_compute,
+        /// timing_warmup_steps, checkpoint_shards, and adam. Relative paths
+        /// resolve beside this file.
         #[arg(long)]
         config: PathBuf,
     },
@@ -662,38 +677,236 @@ impl Drop for AtomicPath {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Debug)]
 struct CampaignLock {
-    path: PathBuf,
     _file: File,
 }
 
 #[cfg(feature = "cuda")]
 impl CampaignLock {
-    fn acquire(checkpoint_dir: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(checkpoint_dir)
-            .with_context(|| format!("create checkpoint directory {}", checkpoint_dir.display()))?;
-        let path = checkpoint_dir.join("campaign.lock");
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "acquire exclusive campaign lock {}; if no campaign is running, remove this stale lock after verifying the prior process exited",
-                    path.display()
-                )
-            })?;
-        writeln!(file, "pid={}", std::process::id())?;
-        file.sync_all()?;
-        Ok(Self { path, _file: file })
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        let file = open_campaign_lock(path)?;
+        file.try_lock().with_context(|| {
+            format!(
+                "acquire exclusive campaign lock {}; another campaign process holds it",
+                path.display()
+            )
+        })?;
+        Ok(Self { _file: file })
     }
 }
 
 #[cfg(feature = "cuda")]
-impl Drop for CampaignLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+#[derive(Debug)]
+struct CampaignLocks {
+    _locks: Vec<CampaignLock>,
+}
+
+#[cfg(feature = "cuda")]
+impl CampaignLocks {
+    fn acquire(checkpoint_dir: &Path, report: &Path, artifact: &Path) -> anyhow::Result<Self> {
+        let paths = campaign_lock_paths(checkpoint_dir, report, artifact)?;
+        let report_identity = path_identity(report)?;
+        let artifact_identity = path_identity(artifact)?;
+        for path in &paths {
+            if path == &report_identity || path == &artifact_identity {
+                bail!(
+                    "campaign lock sidecar {} aliases a campaign output",
+                    path.display()
+                );
+            }
+        }
+        let locks = paths
+            .iter()
+            .map(|path| CampaignLock::acquire(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self { _locks: locks })
     }
+}
+
+#[cfg(feature = "cuda")]
+fn campaign_lock_paths(
+    checkpoint_dir: &Path,
+    report: &Path,
+    artifact: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(checkpoint_dir)
+        .with_context(|| format!("create checkpoint directory {}", checkpoint_dir.display()))?;
+    let checkpoint_dir = std::fs::canonicalize(checkpoint_dir).with_context(|| {
+        format!(
+            "canonicalize checkpoint directory {}",
+            checkpoint_dir.display()
+        )
+    })?;
+    let mut paths = vec![
+        checkpoint_dir.join("campaign.lock"),
+        campaign_output_lock_path(report)?,
+        campaign_output_lock_path(artifact)?,
+    ];
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+#[cfg(feature = "cuda")]
+fn campaign_output_lock_path(output: &Path) -> anyhow::Result<PathBuf> {
+    let parent = output_parent(output);
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create campaign output directory {}", parent.display()))?;
+    let parent = std::fs::canonicalize(parent).with_context(|| {
+        format!(
+            "canonicalize campaign output directory {}",
+            parent.display()
+        )
+    })?;
+    let mut name = output
+        .file_name()
+        .context("campaign output path has no file name")?
+        .to_os_string();
+    name.push(".campaign.lock");
+    Ok(parent.join(name))
+}
+
+#[cfg(feature = "cuda")]
+fn open_campaign_lock(path: &Path) -> anyhow::Result<File> {
+    const MAX_OPEN_ATTEMPTS: usize = 4;
+
+    for _ in 0..MAX_OPEN_ATTEMPTS {
+        match std::fs::symlink_metadata(path) {
+            Ok(before) => {
+                validate_campaign_lock_metadata(path, &before)?;
+                let file = match OpenOptions::new().read(true).write(true).open(path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("open campaign lock {}", path.display()));
+                    }
+                };
+                let opened = file
+                    .metadata()
+                    .with_context(|| format!("inspect opened campaign lock {}", path.display()))?;
+                validate_campaign_lock_metadata(path, &opened)?;
+                if !same_campaign_lock_file(&before, &opened) {
+                    bail!("campaign lock {} changed while opening", path.display());
+                }
+                validate_open_campaign_lock_path(path, &opened)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                {
+                    Ok(file) => {
+                        let opened = file.metadata().with_context(|| {
+                            format!("inspect created campaign lock {}", path.display())
+                        })?;
+                        validate_campaign_lock_metadata(path, &opened)?;
+                        validate_open_campaign_lock_path(path, &opened)?;
+                        return Ok(file);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("create campaign lock {}", path.display()));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect campaign lock {}", path.display()));
+            }
+        }
+    }
+    bail!(
+        "campaign lock {} changed repeatedly while opening",
+        path.display()
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn validate_open_campaign_lock_path(path: &Path, opened: &std::fs::Metadata) -> anyhow::Result<()> {
+    let current = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reinspect campaign lock {}", path.display()))?;
+    validate_campaign_lock_metadata(path, &current)?;
+    if !same_campaign_lock_file(opened, &current) {
+        bail!("campaign lock {} changed while opening", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn validate_campaign_lock_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    if !metadata.file_type().is_file() {
+        bail!(
+            "campaign lock {} must be a regular file, not a symlink or special file",
+            path.display()
+        );
+    }
+    validate_campaign_lock_link_count(path, metadata)
+}
+
+#[cfg(all(feature = "cuda", unix))]
+fn validate_campaign_lock_link_count(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    if metadata.nlink() != 1 {
+        bail!(
+            "campaign lock {} must not be a hard-linked inode",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", windows))]
+fn validate_campaign_lock_link_count(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    if metadata.number_of_links() != Some(1) {
+        bail!(
+            "campaign lock {} must not be a hard-linked inode",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", not(any(unix, windows))))]
+fn validate_campaign_lock_link_count(
+    path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    bail!(
+        "campaign locking on this platform cannot verify hard-link safety for {}",
+        path.display()
+    )
+}
+
+#[cfg(all(feature = "cuda", unix))]
+fn same_campaign_lock_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(all(feature = "cuda", windows))]
+fn same_campaign_lock_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+        && left.volume_serial_number().is_some()
+        && left.file_index().is_some()
+}
+
+#[cfg(all(feature = "cuda", not(any(unix, windows))))]
+fn same_campaign_lock_file(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -773,6 +986,67 @@ const fn default_checkpoint_shards() -> usize {
 const fn default_timing_warmup_steps() -> usize {
     1
 }
+#[cfg(any(feature = "cuda", test))]
+const fn default_worker_timeout_seconds() -> u64 {
+    86_400
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CampaignStatePolicy {
+    #[default]
+    Resident,
+    HostOffload,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl CampaignStatePolicy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::HostOffload => "host-offload",
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CampaignPackedComputePolicy {
+    #[default]
+    Exact,
+    Fast,
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignDistributed {
+    devices: Vec<usize>,
+    #[serde(default = "default_worker_timeout_seconds")]
+    worker_timeout_seconds: u64,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl CampaignPackedComputePolicy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Fast => "fast",
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<CampaignPackedComputePolicy> for PackedSaltComputePolicy {
+    fn from(policy: CampaignPackedComputePolicy) -> Self {
+        match policy {
+            CampaignPackedComputePolicy::Exact => Self::Exact,
+            CampaignPackedComputePolicy::Fast => Self::Fast,
+        }
+    }
+}
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Deserialize)]
@@ -790,7 +1064,13 @@ struct CampaignConfig {
     #[serde(default = "default_planes")]
     salt_planes: usize,
     #[serde(default)]
-    cuda_device: usize,
+    cuda_device: Option<usize>,
+    #[serde(default)]
+    distributed: Option<CampaignDistributed>,
+    #[serde(default)]
+    state_policy: CampaignStatePolicy,
+    #[serde(default)]
+    packed_compute: CampaignPackedComputePolicy,
     checkpoint_every: u64,
     #[serde(default = "default_timing_warmup_steps")]
     timing_warmup_steps: usize,
@@ -867,6 +1147,257 @@ impl CampaignConfig {
     }
 }
 
+#[cfg(feature = "cuda")]
+enum CampaignWorld {
+    Single,
+    #[cfg(feature = "nccl")]
+    Distributed {
+        rendezvous: Box<WorkerRendezvous>,
+        process_group: Box<NcclProcessGroup>,
+    },
+}
+
+#[cfg(feature = "cuda")]
+impl CampaignWorld {
+    fn single() -> Self {
+        Self::Single
+    }
+
+    #[cfg(feature = "nccl")]
+    fn distributed(rendezvous: WorkerRendezvous, backend: &CudaBackend) -> anyhow::Result<Self> {
+        let process_group = rendezvous
+            .join(backend)
+            .context("join supervised NCCL campaign world")?;
+        Ok(Self::Distributed {
+            rendezvous: Box::new(rendezvous),
+            process_group: Box::new(process_group),
+        })
+    }
+
+    fn rank(&self) -> usize {
+        match self {
+            Self::Single => 0,
+            #[cfg(feature = "nccl")]
+            Self::Distributed { rendezvous, .. } => rendezvous.slot().rank().get(),
+        }
+    }
+
+    fn world_size(&self) -> usize {
+        match self {
+            Self::Single => 1,
+            #[cfg(feature = "nccl")]
+            Self::Distributed { rendezvous, .. } => rendezvous.world_size().get(),
+        }
+    }
+
+    fn is_owner(&self) -> bool {
+        match self {
+            Self::Single => true,
+            #[cfg(feature = "nccl")]
+            Self::Distributed { rendezvous, .. } => rendezvous.owns_campaign_lock(),
+        }
+    }
+
+    fn window_index(&self, step: u64, windows: u64) -> anyhow::Result<u64> {
+        match self {
+            Self::Single => Ok((step - 1) % windows),
+            #[cfg(feature = "nccl")]
+            Self::Distributed { rendezvous, .. } => {
+                let partition = WindowPartition::new(
+                    usize::try_from(windows).context("window count exceeds usize")?,
+                    rendezvous.world_size().get(),
+                )?;
+                u64::try_from(partition.window_for_step(rendezvous.slot().rank(), step)?)
+                    .context("partitioned window index exceeds u64")
+            }
+        }
+    }
+
+    fn barrier(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Single => Ok(()),
+            #[cfg(feature = "nccl")]
+            Self::Distributed { process_group, .. } => {
+                process_group.barrier().context("NCCL campaign barrier")
+            }
+        }
+    }
+
+    fn verify_contract_digest(&self, digest: [u8; 32]) -> anyhow::Result<()> {
+        match self {
+            Self::Single => {
+                let _ = digest;
+                Ok(())
+            }
+            #[cfg(feature = "nccl")]
+            Self::Distributed { process_group, .. } => {
+                let words = digest
+                    .chunks_exact(8)
+                    .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk")))
+                    .collect::<Vec<_>>();
+                process_group
+                    .verify_u64_consensus(&words)
+                    .context("verify immutable campaign plan across ranks")
+            }
+        }
+    }
+
+    fn verify_completed_step(&self, step: u64) -> anyhow::Result<()> {
+        match self {
+            Self::Single => {
+                let _ = step;
+                Ok(())
+            }
+            #[cfg(feature = "nccl")]
+            Self::Distributed { process_group, .. } => process_group
+                .verify_u64_consensus(&[step])
+                .context("verify checkpoint completed step across ranks"),
+        }
+    }
+
+    fn gather_hardware(
+        &self,
+        local: &CampaignHardwareIdentity,
+    ) -> anyhow::Result<Vec<CampaignHardwareIdentity>> {
+        match self {
+            Self::Single => Ok(vec![local.clone()]),
+            #[cfg(feature = "nccl")]
+            Self::Distributed { process_group, .. } => {
+                const MAX_BYTES: usize = 1024;
+                const WORDS: usize = 1 + MAX_BYTES / 8;
+                let encoded = serde_json::to_vec(local)?;
+                if encoded.len() > MAX_BYTES {
+                    bail!("serialized campaign hardware identity exceeds {MAX_BYTES} bytes");
+                }
+                let mut record = vec![0_u64; WORDS];
+                record[0] =
+                    u64::try_from(encoded.len()).context("hardware JSON length exceeds u64")?;
+                for (index, chunk) in encoded.chunks(8).enumerate() {
+                    let mut word = [0_u8; 8];
+                    word[..chunk.len()].copy_from_slice(chunk);
+                    record[index + 1] = u64::from_le_bytes(word);
+                }
+                let gathered = process_group
+                    .all_gather_u64(&record)
+                    .context("gather campaign hardware identities")?;
+                if gathered.len() != self.world_size() * WORDS {
+                    bail!("NCCL hardware gather returned an invalid record count");
+                }
+                let fleet: Vec<CampaignHardwareIdentity> = gathered
+                    .chunks_exact(WORDS)
+                    .enumerate()
+                    .map(|(rank, record)| {
+                        let len = usize::try_from(record[0])
+                            .context("gathered hardware JSON length exceeds usize")?;
+                        if len > MAX_BYTES {
+                            bail!("rank {rank} reported oversized hardware identity");
+                        }
+                        let mut bytes = Vec::with_capacity(MAX_BYTES);
+                        for word in &record[1..] {
+                            bytes.extend_from_slice(&word.to_le_bytes());
+                        }
+                        bytes.truncate(len);
+                        serde_json::from_slice(&bytes)
+                            .with_context(|| format!("decode rank {rank} hardware identity"))
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                let unique_pci: BTreeSet<_> = fleet
+                    .iter()
+                    .map(|hardware| hardware.pci_bus_id.as_str())
+                    .collect();
+                if unique_pci.len() != fleet.len() {
+                    bail!("distributed ranks resolved to duplicate physical PCI devices");
+                }
+                Ok(fleet)
+            }
+        }
+    }
+
+    fn gather_step_evidence(
+        &self,
+        local: RankStepEvidence,
+    ) -> anyhow::Result<Vec<RankStepEvidence>> {
+        match self {
+            Self::Single => Ok(vec![local]),
+            #[cfg(feature = "nccl")]
+            Self::Distributed { process_group, .. } => {
+                let snapshot = local.cuda_memory;
+                let record = [
+                    u64::try_from(local.rank).context("rank exceeds u64")?,
+                    local.window_index,
+                    local.training_elapsed_ms.to_bits(),
+                    local.nvml_used_memory_bytes,
+                    snapshot.device_free_bytes,
+                    snapshot.device_total_bytes,
+                    snapshot.device_used_sample_bytes,
+                    snapshot.pool_used_current_bytes,
+                    snapshot.pool_used_high_water_bytes,
+                    snapshot.pool_reserved_current_bytes,
+                    snapshot.pool_reserved_high_water_bytes,
+                ];
+                let gathered = process_group
+                    .all_gather_u64(&record)
+                    .context("gather per-rank campaign step evidence")?;
+                if gathered.len() != self.world_size() * record.len() {
+                    bail!("NCCL step-evidence gather returned an invalid record count");
+                }
+                let evidence: Vec<RankStepEvidence> = gathered
+                    .chunks_exact(record.len())
+                    .map(|rank| {
+                        Ok(RankStepEvidence {
+                            rank: usize::try_from(rank[0])
+                                .context("gathered rank exceeds usize")?,
+                            window_index: rank[1],
+                            training_elapsed_ms: f64::from_bits(rank[2]),
+                            nvml_used_memory_bytes: rank[3],
+                            cuda_memory: CampaignCudaMemorySnapshot {
+                                device_free_bytes: rank[4],
+                                device_total_bytes: rank[5],
+                                device_used_sample_bytes: rank[6],
+                                pool_used_current_bytes: rank[7],
+                                pool_used_high_water_bytes: rank[8],
+                                pool_reserved_current_bytes: rank[9],
+                                pool_reserved_high_water_bytes: rank[10],
+                            },
+                        })
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                if evidence
+                    .iter()
+                    .enumerate()
+                    .any(|(rank, evidence)| evidence.rank != rank)
+                {
+                    bail!("NCCL step evidence rank ordering is inconsistent");
+                }
+                Ok(evidence)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn backward_into<'backend, 'leaf>(
+        &self,
+        tape: DeviceTape<'backend, 'leaf>,
+        logits: usize,
+        target: &DeviceTensor,
+        rows: usize,
+        cols: usize,
+        bindings: &[GradientLeafBinding],
+        trainer: &mut HostOffloadTrainer<'backend>,
+        step: u64,
+    ) -> anyhow::Result<GradientStreamReport> {
+        match self {
+            Self::Single => tape
+                .xent_backward_into(logits, target, rows, cols, bindings, trainer, step)
+                .map_err(anyhow::Error::from),
+            #[cfg(feature = "nccl")]
+            Self::Distributed { process_group, .. } => process_group
+                .xent_backward_into(tape, logits, target, rows, cols, bindings, trainer, step)
+                .map_err(anyhow::Error::from),
+        }
+    }
+}
+
 #[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -923,7 +1454,7 @@ fn sample_nvml_used_memory(
 struct PlanSidecar {
     version: u32,
     fingerprint: String,
-    hardware: CampaignHardwareIdentity,
+    hardware: Vec<CampaignHardwareIdentity>,
     campaign_config_file_digest: String,
     model_config_file_digest: String,
     source_model_digest: String,
@@ -941,6 +1472,10 @@ struct PlanSidecar {
     windows: u64,
     total_steps: u64,
     salt_planes: usize,
+    state_policy: CampaignStatePolicy,
+    packed_compute: CampaignPackedComputePolicy,
+    world_size: usize,
+    window_partition: String,
     adam_f32_bits: [u32; 5],
     activation_checkpoint_policy: String,
     checkpoint_every: u64,
@@ -952,7 +1487,7 @@ struct PlanSidecar {
 #[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy)]
 struct PlanInputs<'a> {
-    hardware: &'a CampaignHardwareIdentity,
+    hardware: &'a [CampaignHardwareIdentity],
     campaign_config_file_digest: [u8; 32],
     model_config_file_digest: [u8; 32],
     source_model_digest: [u8; 32],
@@ -970,6 +1505,9 @@ struct PlanInputs<'a> {
     windows: u64,
     total_steps: u64,
     salt_planes: usize,
+    state_policy: CampaignStatePolicy,
+    packed_compute: CampaignPackedComputePolicy,
+    world_size: usize,
     adam: CampaignAdam,
     depth: usize,
     checkpoint_every: u64,
@@ -981,7 +1519,7 @@ struct PlanInputs<'a> {
 #[cfg(any(feature = "cuda", test))]
 fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"tritium-packed-campaign-plan-v4");
+    hash.update(b"tritium-packed-campaign-plan-v5");
     let hardware_json = serde_json::to_vec(inputs.hardware)
         .expect("serializing campaign hardware identity cannot fail");
     hash_bytes(&mut hash, &hardware_json);
@@ -1010,6 +1548,10 @@ fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
     hash.update(&inputs.windows.to_le_bytes());
     hash.update(&inputs.total_steps.to_le_bytes());
     hash.update(&(inputs.salt_planes as u64).to_le_bytes());
+    hash_bytes(&mut hash, inputs.state_policy.as_str().as_bytes());
+    hash_bytes(&mut hash, inputs.packed_compute.as_str().as_bytes());
+    hash.update(&(inputs.world_size as u64).to_le_bytes());
+    hash.update(b"contiguous-modulo-v1");
     let adam_bits = [
         inputs.adam.lr.to_bits(),
         inputs.adam.beta1.to_bits(),
@@ -1041,9 +1583,9 @@ fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
         .collect();
     let fingerprint = hex_digest(*hash.finalize().as_bytes());
     PlanSidecar {
-        version: 4,
+        version: 5,
         fingerprint,
-        hardware: inputs.hardware.clone(),
+        hardware: inputs.hardware.to_vec(),
         campaign_config_file_digest: hex_digest(inputs.campaign_config_file_digest),
         model_config_file_digest: hex_digest(inputs.model_config_file_digest),
         source_model_digest: hex_digest(inputs.source_model_digest),
@@ -1061,6 +1603,10 @@ fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
         windows: inputs.windows,
         total_steps: inputs.total_steps,
         salt_planes: inputs.salt_planes,
+        state_policy: inputs.state_policy,
+        packed_compute: inputs.packed_compute,
+        world_size: inputs.world_size,
+        window_partition: "contiguous-modulo-v1".to_owned(),
         adam_f32_bits: adam_bits,
         activation_checkpoint_policy: format!("sqrt_depth:{}", inputs.depth),
         checkpoint_every: inputs.checkpoint_every,
@@ -1151,14 +1697,98 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     campaign.resolve_paths(config_path);
     validate_campaign_config(&campaign)?;
     validate_campaign_paths(config_path, &campaign)?;
-    let _campaign_lock = CampaignLock::acquire(&campaign.checkpoint_dir)?;
-    let backend = CudaBackend::new(campaign.cuda_device)
-        .with_context(|| format!("open CUDA device {}", campaign.cuda_device))?;
+
+    #[cfg(feature = "nccl")]
+    let worker_rendezvous = {
+        let inherited =
+            WorkerRendezvous::from_env().context("decode campaign worker rendezvous")?;
+        match (&campaign.distributed, inherited) {
+            (None, None) => None,
+            (None, Some(_)) => {
+                bail!("distributed worker rendezvous is present but campaign.distributed is absent")
+            }
+            (Some(distributed), None) => {
+                let fleet = DeviceFleet::new(distributed.devices.clone(), 0)?;
+                let worker_count = fleet.world_size().get();
+                let supervisor = DistributedConfig::new(
+                    fleet,
+                    Duration::from_secs(distributed.worker_timeout_seconds),
+                )?;
+                let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+                let report = supervise_current_exe(&supervisor, &arguments)
+                    .context("supervise distributed campaign workers")?;
+                if report.workers().len() != worker_count
+                    || report.workers().iter().enumerate().any(|(rank, worker)| {
+                        worker.rank().get() != rank || !worker.status().success()
+                    })
+                {
+                    bail!("distributed supervisor returned incomplete worker evidence");
+                }
+                eprintln!(
+                    "distributed campaign {} completed {} ranks in {:.3}s",
+                    report.job_nonce().as_str(),
+                    report.workers().len(),
+                    report.elapsed().as_secs_f64()
+                );
+                return Ok(());
+            }
+            (Some(distributed), Some(worker)) => {
+                let fleet = DeviceFleet::new(distributed.devices.clone(), 0)?;
+                if worker.world_size() != fleet.world_size() {
+                    bail!("worker world size differs from campaign distributed device count");
+                }
+                let rank = worker.slot().rank().get();
+                let expected_slot = fleet.slot(rank)?;
+                if worker.slot().device_ordinal() != expected_slot.device_ordinal()
+                    || worker.lock_owner().get() != 0
+                    || worker.owns_campaign_lock() != (rank == 0)
+                {
+                    bail!("worker rendezvous disagrees with immutable distributed topology");
+                }
+                Some(worker)
+            }
+        }
+    };
+
+    #[cfg(feature = "nccl")]
+    let owns_campaign_lock = worker_rendezvous
+        .as_ref()
+        .is_none_or(WorkerRendezvous::owns_campaign_lock);
+    #[cfg(not(feature = "nccl"))]
+    let owns_campaign_lock = true;
+    let _campaign_locks = owns_campaign_lock
+        .then(|| {
+            CampaignLocks::acquire(
+                &campaign.checkpoint_dir,
+                &campaign.report,
+                &campaign.artifact,
+            )
+        })
+        .transpose()?;
+
+    #[cfg(feature = "nccl")]
+    let cuda_device = worker_rendezvous
+        .as_ref()
+        .map(|worker| worker.slot().device_ordinal())
+        .or(campaign.cuda_device)
+        .unwrap_or(0);
+    #[cfg(not(feature = "nccl"))]
+    let cuda_device = campaign.cuda_device.unwrap_or(0);
+    let backend =
+        CudaBackend::new(cuda_device).with_context(|| format!("open CUDA device {cuda_device}"))?;
+    #[cfg(feature = "nccl")]
+    let world = match worker_rendezvous {
+        Some(worker) => CampaignWorld::distributed(worker, &backend)?,
+        None => CampaignWorld::single(),
+    };
+    #[cfg(not(feature = "nccl"))]
+    let world = CampaignWorld::single();
     let (cuda_identity, telemetry) = backend
         .start_memory_telemetry()
         .context("start exact CUDA allocator telemetry")?;
     let nvml = probe_cuda_device(&cuda_identity).context("validate CUDA device through NVML")?;
-    let hardware = campaign_hardware_identity(&cuda_identity, &nvml);
+    let local_hardware = campaign_hardware_identity(&cuda_identity, &nvml);
+    let hardware = world.gather_hardware(&local_hardware)?;
     let telemetry_baseline = telemetry
         .reset_synchronized()
         .context("reset CUDA allocator telemetry after hardware validation")?;
@@ -1179,6 +1809,12 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         model.architecture().vocab,
         model.architecture().n_ctx,
     )?;
+    if windows < u64::try_from(world.world_size()).context("world size exceeds u64")? {
+        bail!(
+            "training corpus has {windows} windows, fewer than distributed world size {}",
+            world.world_size()
+        );
+    }
     let seq_len_u32 = u32::try_from(campaign.seq_len).context("sequence length exceeds u32")?;
     let corpus_digest = hash_teacher_corpus(&tokens, seq_len_u32);
     let expected_cache = TeacherCacheHeader {
@@ -1220,24 +1856,31 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     let source_evaluation_path = campaign
         .checkpoint_dir
         .join("source-evaluation-progress.json");
-    let source_runner_config = model_config.clone();
-    let source_score = resumable_teacher_forced_score(
-        &source_evaluation_path,
-        "source-fp",
-        &hex_digest(source_model_digest),
-        &evaluation_tokens,
-        campaign.seq_len,
-        evaluation_corpus_file_digest,
-        evaluation_corpus_digest,
-        move || {
-            Ok(ModelRunner::from_weights(
-                source_runner_config,
-                weights,
-                Box::new(tritium_cpu::CpuBackend::new()),
-            ))
-        },
-    )
-    .context("score source fp model on the held-out evaluation corpus")?;
+    let source_score = if world.is_owner() {
+        let source_runner_config = model_config.clone();
+        Some(
+            resumable_teacher_forced_score(
+                &source_evaluation_path,
+                "source-fp",
+                &hex_digest(source_model_digest),
+                &evaluation_tokens,
+                campaign.seq_len,
+                evaluation_corpus_file_digest,
+                evaluation_corpus_digest,
+                move || {
+                    Ok(ModelRunner::from_weights(
+                        source_runner_config,
+                        weights,
+                        Box::new(tritium_cpu::CpuBackend::new()),
+                    ))
+                },
+            )
+            .context("score source fp model on the held-out evaluation corpus")?,
+        )
+    } else {
+        drop(weights);
+        None
+    };
 
     let old_width = model.architecture().n_ff;
     let (new_width, growth_seed) = campaign.growth.map_or((old_width, 0), |growth| {
@@ -1275,6 +1918,9 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         windows,
         total_steps: campaign.steps,
         salt_planes: campaign.salt_planes,
+        state_policy: campaign.state_policy,
+        packed_compute: campaign.packed_compute,
+        world_size: world.world_size(),
         adam: campaign.adam,
         depth: model.architecture().n_layers,
         checkpoint_every: campaign.checkpoint_every,
@@ -1294,7 +1940,14 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         evaluation_corpus: hex_digest(evaluation_corpus_digest),
     };
     // This comparison/creation happens before DCP load can mutate trainer state.
-    ensure_plan_sidecar(&campaign.checkpoint_dir, &plan)?;
+    if world.is_owner() {
+        ensure_plan_sidecar(&campaign.checkpoint_dir, &plan)?;
+    }
+    world.barrier()?;
+    if !world.is_owner() {
+        ensure_plan_sidecar(&campaign.checkpoint_dir, &plan)?;
+    }
+    world.verify_contract_digest(parse_lower_hex_digest(&plan.fingerprint)?)?;
 
     let parameter_geometry: Vec<_> = model
         .parameters()
@@ -1305,8 +1958,9 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             salt_planes: campaign.salt_planes,
         })
         .collect();
-    let static_memory = host_offload_memory_geometry(&parameter_geometry)
-        .context("compute static SALT host-offload memory geometry")?;
+    let host_geometry = host_offload_memory_geometry(&parameter_geometry)
+        .context("compute static SALT training memory geometry")?;
+    let static_memory = campaign_static_memory(campaign.state_policy, host_geometry)?;
     let optimizer = AdamW {
         lr: campaign.adam.lr,
         beta1: campaign.adam.beta1,
@@ -1327,16 +1981,31 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             optimizer,
         })
         .collect();
-    let mut trainer = HostOffloadTrainer::new_owned(&backend, specs)
-        .context("construct host-offloaded AdamW trainer")?;
+    if campaign.state_policy == CampaignStatePolicy::Resident {
+        let resident_floor = static_memory
+            .resident_training_state_bytes
+            .checked_add(static_memory.packed_parameter_bytes)
+            .context("resident state plus packed-weight bytes overflow")?;
+        if u64::try_from(resident_floor).context("resident byte floor exceeds u64")?
+            > local_hardware.total_memory_bytes
+        {
+            bail!(
+                "resident training state plus packed weights require at least {resident_floor} bytes, exceeding device capacity {}; use state_policy=\"host-offload\"",
+                local_hardware.total_memory_bytes
+            );
+        }
+    }
+    let mut trainer = CampaignTrainer::new(&backend, specs, campaign.state_policy)?;
     let manifest = campaign.checkpoint_dir.join("manifest.tdcp");
     if manifest
         .try_exists()
         .with_context(|| format!("inspect DCP manifest {}", manifest.display()))?
     {
-        tritium_train::dcp::load_into(&campaign.checkpoint_dir, &mut trainer).with_context(
-            || format!("load DCP checkpoint {}", campaign.checkpoint_dir.display()),
-        )?;
+        trainer
+            .load_checkpoint(&campaign.checkpoint_dir)
+            .with_context(|| {
+                format!("load DCP checkpoint {}", campaign.checkpoint_dir.display())
+            })?;
     }
     if trainer.completed_step() > campaign.steps {
         bail!(
@@ -1345,8 +2014,11 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             campaign.steps
         );
     }
+    world.verify_completed_step(trainer.completed_step())?;
     let report_expectations = ReportExpectations {
         plan_fingerprint: &plan.fingerprint,
+        state_policy: campaign.state_policy,
+        packed_compute: campaign.packed_compute,
         checkpoint_step: trainer.completed_step(),
         checkpoint_dir: &campaign.checkpoint_dir,
         windows,
@@ -1356,7 +2028,11 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         input_hashes: &input_hashes,
         static_memory,
     };
-    let previous_report = load_existing_report(&campaign.report, &report_expectations)?;
+    let previous_report = if world.is_owner() {
+        load_existing_report(&campaign.report, &report_expectations)?
+    } else {
+        None
+    };
     let previous_memory = previous_report.as_ref().map(|report| report.memory.clone());
     let mut timings = previous_report
         .as_ref()
@@ -1370,7 +2046,6 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     let mut materialized_gradient_elements = 0usize;
     let mut max_activation_elements = 0usize;
     let mut naive_activation_elements = 0usize;
-    let mut stable_bindings: Option<Vec<GradientLeafBinding>> = None;
     let resumed_from_step = trainer.completed_step();
     let baseline = CampaignCudaMemorySnapshot::from(telemetry_baseline);
     let mut current_segment = CampaignCudaMemorySegment {
@@ -1389,21 +2064,28 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             .sample_synchronized()
             .context("sample CUDA memory before terminal artifact verification")?
             .into();
-        current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &hardware)?);
+        current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &local_hardware)?);
+        world.barrier()?;
+        if !world.is_owner() {
+            drop(trainer);
+            world.barrier()?;
+            return Ok(());
+        }
         memory_segments.push(current_segment);
+        let completed_step = trainer.completed_step();
+        let trainer_stats = trainer.stats();
+        let master_source = trainer.into_master_source()?;
         let artifact = prepare_terminal_artifact(
             &campaign,
             raw_model_config_json,
             &model,
-            &trainer,
+            master_source.as_ref(),
             &plan,
             source_model_digest,
             initial_student_digest,
             &artifact_growth,
         )?;
-        let completed_step = trainer.completed_step();
-        let trainer_stats = trainer.stats();
-        drop(trainer);
+        drop(master_source);
         let evaluation = evaluate_terminal_artifact(
             &campaign,
             &artifact,
@@ -1412,7 +2094,7 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             initial_student_digest,
             &growth,
             &evaluation_tokens,
-            source_score,
+            source_score.context("rank 0 source evaluation evidence is missing")?,
             evaluation_corpus_file_digest,
             evaluation_corpus_digest,
         )?;
@@ -1437,10 +2119,11 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         )?;
         atomic_write(&campaign.report, &serde_json::to_vec_pretty(&report)?)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
+        world.barrier()?;
         return Ok(());
     }
 
-    let mut packed = build_packed_weights(&backend, &trainer)?;
+    trainer.prepare_execution(&backend)?;
     let mut target_host = vec![0.0f32; window_elements];
     let timing_fence =
         DeviceTensor::upload(&backend, &[0.0]).context("allocate training-stream timing fence")?;
@@ -1450,7 +2133,7 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             .context("sample CUDA memory after campaign setup")?
             .into(),
     );
-    current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &hardware)?);
+    current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &local_hardware)?);
     let first_step = trainer
         .completed_step()
         .checked_add(1)
@@ -1458,7 +2141,7 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
 
     for step in first_step..=campaign.steps {
         let started = Instant::now();
-        let window_index = (step - 1) % windows;
+        let window_index = world.window_index(step, windows)?;
         teacher
             .read_window(window_index, &mut target_host)
             .with_context(|| format!("read teacher window {window_index}"))?;
@@ -1482,128 +2165,114 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             .map(|&token| i32::try_from(token).context("token id exceeds i32"))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let stream_result = {
-            let mut tape = DeviceTape::new_with_checkpoint_policy(
-                &backend,
-                model.architecture().vocab,
-                CheckpointPolicy::SqrtDepth(model.architecture().n_layers),
-            )
-            .context("create sqrt-depth device tape")?;
-            let forward = packed_device_forward(&mut tape, &model, &packed, &tokens_i32)
-                .context("build packed tied-SwiGLU forward")?;
-            let bindings: Vec<_> = forward
-                .master_leaves
-                .iter()
-                .enumerate()
-                .map(|(parameter_index, &leaf_id)| GradientLeafBinding {
-                    leaf_id,
-                    parameter_index,
-                })
-                .collect();
-            if let Some(expected) = &stable_bindings {
-                if expected != &bindings {
-                    bail!("packed gradient leaf bindings changed between steps");
-                }
-            } else {
-                stable_bindings = Some(bindings.clone());
-            }
-            tape.xent_backward_into(
-                forward.logits,
-                &target,
-                campaign.seq_len,
-                model.architecture().vocab,
-                &bindings,
-                &mut trainer,
-                step,
-            )
-        };
-        // Any attempted update invalidates every packed generation. A success
-        // repacks all weights; a failure returns with all handles visibly stale.
-        for weight in &mut packed {
-            weight.mark_stale();
-        }
-        let stream = stream_result.with_context(|| format!("training step {step}"))?;
-        repack_all_or_stale(&backend, &mut packed, &trainer)
-            .with_context(|| format!("repack every parameter after step {step}"))?;
-        // A tiny same-stream round trip fences every queued repack kernel so its
-        // cost is charged to this step rather than leaking into the next one.
-        timing_fence
-            .download(&backend)
-            .with_context(|| format!("synchronize packed repack at step {step}"))?;
+        let evidence = trainer.run_step(
+            &world,
+            &backend,
+            &model,
+            &target,
+            &tokens_i32,
+            step,
+            &timing_fence,
+            campaign.packed_compute,
+        )?;
 
         max_gradient_elements =
-            max_gradient_elements.max(stream.peak_live_requested_gradient_elements);
+            max_gradient_elements.max(evidence.peak_live_requested_gradient_elements);
         materialized_gradient_elements =
-            materialized_gradient_elements.max(stream.materialized_collection_elements);
+            materialized_gradient_elements.max(evidence.materialized_gradient_elements);
         max_activation_elements =
-            max_activation_elements.max(stream.backward_stats.peak_live_activation_elements);
+            max_activation_elements.max(evidence.peak_live_activation_elements);
         naive_activation_elements =
-            naive_activation_elements.max(stream.backward_stats.naive_activation_elements);
+            naive_activation_elements.max(evidence.naive_activation_elements);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
-        timings.push(StepTiming {
-            step,
-            window_index,
-            warmup: step - first_step
-                < u64::try_from(campaign.timing_warmup_steps)
-                    .context("timing warmup step count exceeds u64")?,
-            training_elapsed_ms_excluding_checkpoint: elapsed_ms,
-        });
         current_segment.completed_step = step;
         current_segment.latest_or_terminal = telemetry
             .sample_synchronized()
             .with_context(|| format!("sample CUDA allocator memory after step {step}"))?
             .into();
-        current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &hardware)?);
+        current_segment.observe_nvml(sample_nvml_used_memory(&cuda_identity, &local_hardware)?);
+        let rank_evidence = world.gather_step_evidence(RankStepEvidence {
+            rank: world.rank(),
+            window_index,
+            training_elapsed_ms: elapsed_ms,
+            nvml_used_memory_bytes: current_segment.nvml_used_memory_latest_sample_bytes,
+            cuda_memory: current_segment.latest_or_terminal,
+        })?;
+        if world.is_owner() {
+            let max_elapsed = rank_evidence
+                .iter()
+                .map(|evidence| evidence.training_elapsed_ms)
+                .fold(0.0_f64, f64::max);
+            let owner_window = rank_evidence
+                .first()
+                .context("distributed step evidence has no rank 0 record")?
+                .window_index;
+            timings.push(StepTiming {
+                step,
+                window_index: owner_window,
+                warmup: step - first_step
+                    < u64::try_from(campaign.timing_warmup_steps)
+                        .context("timing warmup step count exceeds u64")?,
+                training_elapsed_ms_excluding_checkpoint: max_elapsed,
+                rank_evidence,
+            });
+        }
 
         if step.is_multiple_of(campaign.checkpoint_every) || step == campaign.steps {
-            let mut progress_segments = memory_segments.clone();
-            progress_segments.push(current_segment.clone());
-            let progress = build_campaign_report(
-                &campaign,
-                &plan,
-                &hardware,
-                &input_hashes,
-                trainer.completed_step(),
-                trainer.stats(),
-                resumed_from_step,
-                &timings,
-                static_memory,
-                previous_memory.as_ref(),
-                max_gradient_elements,
-                materialized_gradient_elements,
-                max_activation_elements,
-                naive_activation_elements,
-                progress_segments,
-                None,
-                None,
-            )?;
-            atomic_write(&campaign.report, &serde_json::to_vec_pretty(&progress)?)?;
-            // Publish evidence before DCP's manifest commit. If saving stops
-            // early, resume treats timings beyond the prior manifest as orphaned.
-            tritium_train::dcp::save_from(
-                &campaign.checkpoint_dir,
-                &mut trainer,
-                campaign.checkpoint_shards,
-            )
-            .with_context(|| format!("save DCP at completed step {step}"))?;
+            world.verify_completed_step(trainer.completed_step())?;
+            if world.is_owner() {
+                let mut progress_segments = memory_segments.clone();
+                progress_segments.push(current_segment.clone());
+                let progress = build_campaign_report(
+                    &campaign,
+                    &plan,
+                    &hardware,
+                    &input_hashes,
+                    trainer.completed_step(),
+                    trainer.stats(),
+                    resumed_from_step,
+                    &timings,
+                    static_memory,
+                    previous_memory.as_ref(),
+                    max_gradient_elements,
+                    materialized_gradient_elements,
+                    max_activation_elements,
+                    naive_activation_elements,
+                    progress_segments,
+                    None,
+                    None,
+                )?;
+                atomic_write(&campaign.report, &serde_json::to_vec_pretty(&progress)?)?;
+                // Publish evidence before DCP's manifest commit. If saving
+                // stops early, resume truncates timings beyond the manifest.
+                trainer
+                    .save_checkpoint(&campaign.checkpoint_dir, campaign.checkpoint_shards)
+                    .with_context(|| format!("save DCP at completed step {step}"))?;
+            }
+            world.barrier()?;
         }
     }
 
+    if !world.is_owner() {
+        drop(trainer);
+        world.barrier()?;
+        return Ok(());
+    }
     memory_segments.push(current_segment);
+    let completed_step = trainer.completed_step();
+    let trainer_stats = trainer.stats();
+    let master_source = trainer.into_master_source()?;
     let artifact = prepare_terminal_artifact(
         &campaign,
         raw_model_config_json,
         &model,
-        &trainer,
+        master_source.as_ref(),
         &plan,
         source_model_digest,
         initial_student_digest,
         &artifact_growth,
     )?;
-    let completed_step = trainer.completed_step();
-    let trainer_stats = trainer.stats();
-    drop(packed);
-    drop(trainer);
+    drop(master_source);
     let evaluation = evaluate_terminal_artifact(
         &campaign,
         &artifact,
@@ -1612,7 +2281,7 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         initial_student_digest,
         &growth,
         &evaluation_tokens,
-        source_score,
+        source_score.context("rank 0 source evaluation evidence is missing")?,
         evaluation_corpus_file_digest,
         evaluation_corpus_digest,
     )?;
@@ -1637,6 +2306,7 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     )?;
     atomic_write(&campaign.report, &serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
+    world.barrier()?;
     Ok(())
 }
 
@@ -1650,6 +2320,26 @@ fn validate_campaign_config(config: &CampaignConfig) -> anyhow::Result<()> {
     }
     if !(1..=3).contains(&config.salt_planes) {
         bail!("salt_planes must be in 1..=3");
+    }
+    if let Some(distributed) = &config.distributed {
+        if config.cuda_device.is_some() {
+            bail!("cuda_device and distributed.devices are mutually exclusive");
+        }
+        if distributed.devices.len() < 2 {
+            bail!("distributed.devices must contain at least two CUDA ordinals");
+        }
+        if distributed.worker_timeout_seconds == 0 {
+            bail!("distributed.worker_timeout_seconds must be non-zero");
+        }
+        let unique: BTreeSet<_> = distributed.devices.iter().copied().collect();
+        if unique.len() != distributed.devices.len() {
+            bail!("distributed.devices must not contain duplicate CUDA ordinals");
+        }
+        if config.state_policy != CampaignStatePolicy::HostOffload {
+            bail!("distributed campaigns currently require state_policy=\"host-offload\"");
+        }
+        #[cfg(not(feature = "nccl"))]
+        bail!("distributed campaigns require rebuilding tritium-cli with --features nccl");
     }
     if config.checkpoint_every == 0 {
         bail!("checkpoint_every must be non-zero");
@@ -1739,6 +2429,308 @@ fn repack_all_or_stale(
 }
 
 #[cfg(feature = "cuda")]
+struct CampaignStepEvidence {
+    peak_live_requested_gradient_elements: usize,
+    materialized_gradient_elements: usize,
+    peak_live_activation_elements: usize,
+    naive_activation_elements: usize,
+}
+
+#[cfg(feature = "cuda")]
+enum CampaignTrainer<'a> {
+    Resident {
+        trainer: Box<DeviceTrainer<'a>>,
+        packed: Vec<DevicePackedSaltWeight>,
+        stable_bindings: Option<Vec<GradientLeafBinding>>,
+    },
+    HostOffload {
+        trainer: Box<HostOffloadTrainer<'a>>,
+        packed: Vec<DevicePackedSaltWeight>,
+        stable_bindings: Option<Vec<GradientLeafBinding>>,
+    },
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> CampaignTrainer<'a> {
+    fn new(
+        backend: &'a CudaBackend,
+        specs: Vec<HostOffloadTrainParam>,
+        policy: CampaignStatePolicy,
+    ) -> anyhow::Result<Self> {
+        match policy {
+            CampaignStatePolicy::Resident => {
+                let borrowed: Vec<_> = specs
+                    .iter()
+                    .map(|parameter| DeviceTrainParam {
+                        master: &parameter.master,
+                        rows: parameter.rows,
+                        cols: parameter.cols,
+                        salt_planes: parameter.salt_planes,
+                        optimizer: parameter.optimizer,
+                    })
+                    .collect();
+                DeviceTrainer::new_with_weight_storage(
+                    backend,
+                    &borrowed,
+                    DeviceTrainerWeightStorage::Packed,
+                )
+                    .map(|trainer| Self::Resident {
+                        trainer: Box::new(trainer),
+                        packed: Vec::new(),
+                        stable_bindings: None,
+                    })
+                    .context(
+                        "construct resident AdamW trainer; use state_policy=\"host-offload\" if resident CUDA memory is insufficient",
+                    )
+            }
+            CampaignStatePolicy::HostOffload => HostOffloadTrainer::new_owned(backend, specs)
+                .map(|trainer| Self::HostOffload {
+                    trainer: Box::new(trainer),
+                    packed: Vec::new(),
+                    stable_bindings: None,
+                })
+                .context("construct host-offloaded AdamW trainer"),
+        }
+    }
+
+    fn completed_step(&self) -> u64 {
+        match self {
+            Self::Resident { trainer, .. } => trainer.completed_step(),
+            Self::HostOffload { trainer, .. } => trainer.completed_step(),
+        }
+    }
+
+    fn stats(&self) -> CampaignTrainerStats {
+        match self {
+            Self::Resident { trainer, .. } => trainer.resident_stats().into(),
+            Self::HostOffload { trainer, .. } => trainer.stats().into(),
+        }
+    }
+
+    fn load_checkpoint(&mut self, checkpoint_dir: &Path) -> anyhow::Result<()> {
+        match self {
+            Self::Resident { trainer, .. } => {
+                tritium_train::dcp::load_into(checkpoint_dir, trainer.as_mut())
+            }
+            Self::HostOffload { trainer, .. } => {
+                tritium_train::dcp::load_into(checkpoint_dir, trainer.as_mut())
+            }
+        }
+        .map_err(anyhow::Error::from)
+    }
+
+    fn save_checkpoint(&mut self, checkpoint_dir: &Path, shard_count: usize) -> anyhow::Result<()> {
+        match self {
+            Self::Resident { trainer, .. } => {
+                tritium_train::dcp::save_from(checkpoint_dir, trainer.as_mut(), shard_count)
+            }
+            Self::HostOffload { trainer, .. } => {
+                tritium_train::dcp::save_from(checkpoint_dir, trainer.as_mut(), shard_count)
+            }
+        }
+        .map_err(anyhow::Error::from)
+    }
+
+    fn prepare_execution(&mut self, backend: &CudaBackend) -> anyhow::Result<()> {
+        match self {
+            Self::Resident {
+                trainer, packed, ..
+            } => {
+                if !packed.is_empty() {
+                    bail!("campaign packed execution state was prepared more than once");
+                }
+                *packed = (0..trainer.len())
+                    .map(|index| trainer.packed_weight(index).map_err(anyhow::Error::from))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+            }
+            Self::HostOffload {
+                trainer, packed, ..
+            } => {
+                if !packed.is_empty() {
+                    bail!("campaign packed execution state was prepared more than once");
+                }
+                *packed = build_packed_weights(backend, trainer)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_step(
+        &mut self,
+        world: &CampaignWorld,
+        backend: &'a CudaBackend,
+        model: &TiedSwiGluTrainingModel,
+        target: &DeviceTensor,
+        tokens: &[i32],
+        step: u64,
+        timing_fence: &DeviceTensor,
+        packed_compute: CampaignPackedComputePolicy,
+    ) -> anyhow::Result<CampaignStepEvidence> {
+        match self {
+            Self::Resident {
+                trainer,
+                packed,
+                stable_bindings,
+            } => {
+                if packed.len() != trainer.len() {
+                    bail!("resident packed execution state is not prepared");
+                }
+                let stream_result = {
+                    let mut tape = DeviceTape::new_with_policies(
+                        backend,
+                        model.architecture().vocab,
+                        CheckpointPolicy::SqrtDepth(model.architecture().n_layers),
+                        packed_compute.into(),
+                    )
+                    .context("create sqrt-depth resident packed device tape")?;
+                    let forward = packed_device_forward(&mut tape, model, packed, tokens)
+                        .context("build resident packed tied-SwiGLU forward")?;
+                    let bindings: Vec<_> = forward
+                        .master_leaves
+                        .iter()
+                        .enumerate()
+                        .map(|(parameter_index, &leaf_id)| GradientLeafBinding {
+                            leaf_id,
+                            parameter_index,
+                        })
+                        .collect();
+                    if let Some(expected) = stable_bindings.as_ref() {
+                        if expected != &bindings {
+                            bail!("resident packed gradient leaf bindings changed between steps");
+                        }
+                    } else {
+                        *stable_bindings = Some(bindings.clone());
+                    }
+                    tape.xent_backward_into_resident(
+                        forward.logits,
+                        target,
+                        tokens.len(),
+                        model.architecture().vocab,
+                        &bindings,
+                        trainer,
+                        step,
+                    )
+                    .with_context(|| format!("resident packed training step {step}"))
+                };
+                for weight in packed.iter_mut() {
+                    weight.mark_stale();
+                }
+                let stream = stream_result?;
+                for index in 0..packed.len() {
+                    if let Err(error) = trainer.repack_packed_weight(index, &mut packed[index]) {
+                        for weight in packed.iter_mut() {
+                            weight.mark_stale();
+                        }
+                        return Err(error).with_context(|| {
+                            format!("resident repack parameter {index} at step {step}")
+                        });
+                    }
+                }
+                timing_fence
+                    .download(backend)
+                    .with_context(|| format!("synchronize resident packed step {step}"))?;
+                Ok(CampaignStepEvidence {
+                    peak_live_requested_gradient_elements: stream
+                        .peak_live_requested_gradient_elements,
+                    materialized_gradient_elements: stream.materialized_collection_elements,
+                    peak_live_activation_elements: stream
+                        .backward_stats
+                        .peak_live_activation_elements,
+                    naive_activation_elements: stream.backward_stats.naive_activation_elements,
+                })
+            }
+            Self::HostOffload {
+                trainer,
+                packed,
+                stable_bindings,
+            } => {
+                if packed.len() != trainer.len() {
+                    bail!("host-offload packed execution state is not prepared");
+                }
+                let stream_result = {
+                    let mut tape = DeviceTape::new_with_policies(
+                        backend,
+                        model.architecture().vocab,
+                        CheckpointPolicy::SqrtDepth(model.architecture().n_layers),
+                        packed_compute.into(),
+                    )
+                    .context("create sqrt-depth packed device tape")?;
+                    let forward = packed_device_forward(&mut tape, model, packed, tokens)
+                        .context("build packed tied-SwiGLU forward")?;
+                    let bindings: Vec<_> = forward
+                        .master_leaves
+                        .iter()
+                        .enumerate()
+                        .map(|(parameter_index, &leaf_id)| GradientLeafBinding {
+                            leaf_id,
+                            parameter_index,
+                        })
+                        .collect();
+                    if let Some(expected) = stable_bindings.as_ref() {
+                        if expected != &bindings {
+                            bail!("packed gradient leaf bindings changed between steps");
+                        }
+                    } else {
+                        *stable_bindings = Some(bindings.clone());
+                    }
+                    world.backward_into(
+                        tape,
+                        forward.logits,
+                        target,
+                        tokens.len(),
+                        model.architecture().vocab,
+                        &bindings,
+                        trainer,
+                        step,
+                    )
+                };
+                for weight in packed.iter_mut() {
+                    weight.mark_stale();
+                }
+                let stream = stream_result.with_context(|| format!("training step {step}"))?;
+                repack_all_or_stale(backend, packed, trainer)
+                    .with_context(|| format!("repack every parameter after step {step}"))?;
+                timing_fence
+                    .download(backend)
+                    .with_context(|| format!("synchronize packed repack at step {step}"))?;
+                Ok(CampaignStepEvidence {
+                    peak_live_requested_gradient_elements: stream
+                        .peak_live_requested_gradient_elements,
+                    materialized_gradient_elements: stream.materialized_collection_elements,
+                    peak_live_activation_elements: stream
+                        .backward_stats
+                        .peak_live_activation_elements,
+                    naive_activation_elements: stream.backward_stats.naive_activation_elements,
+                })
+            }
+        }
+    }
+
+    fn into_master_source(self) -> anyhow::Result<Box<dyn MasterSource + 'a>> {
+        match self {
+            Self::HostOffload { trainer, .. } => Ok(trainer),
+            Self::Resident { trainer, .. } => {
+                let completed_step = trainer.completed_step();
+                let geometry = (0..trainer.len())
+                    .map(|index| -> anyhow::Result<_> {
+                        let metadata = trainer
+                            .parameter_metadata(index)
+                            .with_context(|| format!("read resident parameter {index} metadata"))?;
+                        Ok((metadata.rows, metadata.cols, metadata.salt_planes))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let masters = (0..trainer.len())
+                    .map(|index| trainer.download_master(index).map_err(anyhow::Error::from))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let snapshot = ResidentMasterSnapshot::new(completed_step, masters, geometry)?;
+                Ok(Box::new(snapshot))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn elements_to_bytes(elements: usize) -> anyhow::Result<usize> {
     elements
         .checked_mul(size_of::<f32>())
@@ -1746,17 +2738,47 @@ fn elements_to_bytes(elements: usize) -> anyhow::Result<usize> {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CampaignTrainerStats {
+    host_optimizer_elements: usize,
+    resident_training_state_elements: usize,
+    peak_optimizer_device_elements: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl From<HostOffloadStats> for CampaignTrainerStats {
+    fn from(stats: HostOffloadStats) -> Self {
+        Self {
+            host_optimizer_elements: stats.host_optimizer_elements,
+            resident_training_state_elements: 0,
+            peak_optimizer_device_elements: stats.peak_optimizer_device_elements,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<ResidentTrainerStats> for CampaignTrainerStats {
+    fn from(stats: ResidentTrainerStats) -> Self {
+        Self {
+            host_optimizer_elements: 0,
+            resident_training_state_elements: stats.resident_elements,
+            peak_optimizer_device_elements: 0,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn build_campaign_report(
     campaign: &CampaignConfig,
     plan: &PlanSidecar,
-    hardware: &CampaignHardwareIdentity,
+    hardware: &[CampaignHardwareIdentity],
     input_hashes: &CampaignInputHashes,
     completed_step: u64,
-    trainer_stats: HostOffloadStats,
+    trainer_stats: CampaignTrainerStats,
     resumed_from_step: u64,
     step_timings: &[StepTiming],
-    static_memory: HostOffloadMemoryGeometry,
+    static_memory: CampaignStaticMemory,
     previous_memory: Option<&CampaignMemoryReport>,
     max_gradient_elements: usize,
     materialized_gradient_elements: usize,
@@ -1767,12 +2789,54 @@ fn build_campaign_report(
     evaluation: Option<CampaignEvaluationReport>,
 ) -> anyhow::Result<CampaignReport> {
     let host_optimizer_bytes = elements_to_bytes(trainer_stats.host_optimizer_elements)?;
+    let resident_training_state_bytes =
+        elements_to_bytes(trainer_stats.resident_training_state_elements)?;
+    let optimizer_staging_bytes = elements_to_bytes(trainer_stats.peak_optimizer_device_elements)?;
+    for (label, actual, expected) in [
+        (
+            "host optimizer",
+            host_optimizer_bytes,
+            static_memory.host_optimizer_bytes,
+        ),
+        (
+            "resident training state",
+            resident_training_state_bytes,
+            static_memory.resident_training_state_bytes,
+        ),
+        (
+            "optimizer staging",
+            optimizer_staging_bytes,
+            static_memory.peak_optimizer_staging_bytes,
+        ),
+    ] {
+        if actual != expected {
+            bail!(
+                "runtime {label} bytes {actual} do not match static campaign geometry {expected}"
+            );
+        }
+    }
     let previous_peak =
         |select: fn(&CampaignMemoryReport) -> usize| previous_memory.map_or(0, select);
+    let peak_optimizer_staging_bytes =
+        optimizer_staging_bytes.max(previous_peak(|memory| memory.peak_optimizer_staging_bytes));
+    let fleet_host_optimizer_bytes = host_optimizer_bytes
+        .checked_mul(plan.world_size)
+        .context("fleet host optimizer bytes overflow")?;
+    let fleet_peak_optimizer_staging_bytes = peak_optimizer_staging_bytes
+        .checked_mul(plan.world_size)
+        .context("fleet optimizer staging bytes overflow")?;
+    let optimizer_state_device_fraction = match campaign.state_policy {
+        CampaignStatePolicy::Resident => 1.0,
+        CampaignStatePolicy::HostOffload => 0.0,
+    };
     Ok(CampaignReport {
-        schema_version: 4,
+        schema_version: 5,
         plan_fingerprint: plan.fingerprint.clone(),
-        hardware: hardware.clone(),
+        state_policy: campaign.state_policy,
+        packed_compute: campaign.packed_compute,
+        world_size: plan.world_size,
+        window_partition: plan.window_partition.clone(),
+        hardware: hardware.to_vec(),
         input_hashes: input_hashes.clone(),
         completed_step,
         resumed_from_step,
@@ -1785,15 +2849,17 @@ fn build_campaign_report(
             packed_code_bytes: static_memory.packed_code_bytes,
             packed_scale_bytes: static_memory.packed_scale_bytes,
             dense_parameter_bytes: static_memory.dense_parameter_bytes,
-            host_optimizer_bytes,
+            host_optimizer_bytes: static_memory.host_optimizer_bytes,
+            fleet_host_optimizer_bytes,
             host_adapter_master_bytes: 0,
-            logical_host_training_state_bytes: host_optimizer_bytes,
-            peak_optimizer_staging_bytes: elements_to_bytes(
-                trainer_stats.peak_optimizer_device_elements,
-            )?
-            .max(previous_peak(|memory| memory.peak_optimizer_staging_bytes)),
-            peak_streamed_gradient_bytes: elements_to_bytes(max_gradient_elements)?
-                .max(previous_peak(|memory| memory.peak_streamed_gradient_bytes)),
+            logical_host_training_state_bytes: static_memory.host_optimizer_bytes,
+            resident_training_state_bytes: static_memory.resident_training_state_bytes,
+            optimizer_state_device_fraction,
+            peak_optimizer_staging_bytes,
+            fleet_peak_optimizer_staging_bytes,
+            peak_live_requested_gradient_bytes: elements_to_bytes(max_gradient_elements)?.max(
+                previous_peak(|memory| memory.peak_live_requested_gradient_bytes),
+            ),
             materialized_gradient_bytes: elements_to_bytes(materialized_gradient_elements)?
                 .max(previous_peak(|memory| memory.materialized_gradient_bytes)),
             logical_peak_activation_bytes: elements_to_bytes(max_activation_elements)?
@@ -1829,7 +2895,7 @@ fn prepare_terminal_artifact(
     campaign: &CampaignConfig,
     raw_hf_config_json: &str,
     model: &TiedSwiGluTrainingModel,
-    trainer: &HostOffloadTrainer<'_>,
+    trainer: &dyn MasterSource,
     plan: &PlanSidecar,
     source_model_digest: [u8; 32],
     initial_student_digest: [u8; 32],
@@ -2144,11 +3210,22 @@ fn parse_lower_hex_digest(value: &str) -> anyhow::Result<[u8; 32]> {
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct RankStepEvidence {
+    rank: usize,
+    window_index: u64,
+    training_elapsed_ms: f64,
+    nvml_used_memory_bytes: u64,
+    cuda_memory: CampaignCudaMemorySnapshot,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct StepTiming {
     step: u64,
     window_index: u64,
     warmup: bool,
     training_elapsed_ms_excluding_checkpoint: f64,
+    rank_evidence: Vec<RankStepEvidence>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2252,11 +3329,19 @@ struct CampaignMemoryReport {
     packed_code_bytes: usize,
     packed_scale_bytes: usize,
     dense_parameter_bytes: usize,
+    /// Complete master plus Adam moments held by one rank.
     host_optimizer_bytes: usize,
+    /// Physical host optimizer allocation across all replicated ranks.
+    fleet_host_optimizer_bytes: usize,
     host_adapter_master_bytes: usize,
     logical_host_training_state_bytes: usize,
+    resident_training_state_bytes: usize,
+    /// Fraction of persistent master plus Adam moment bytes resident on CUDA.
+    optimizer_state_device_fraction: f64,
     peak_optimizer_staging_bytes: usize,
-    peak_streamed_gradient_bytes: usize,
+    /// Sum of the per-rank peak optimizer staging allocation.
+    fleet_peak_optimizer_staging_bytes: usize,
+    peak_live_requested_gradient_bytes: usize,
     materialized_gradient_bytes: usize,
     logical_peak_activation_bytes: usize,
     logical_naive_activation_bytes: usize,
@@ -2267,7 +3352,11 @@ struct CampaignMemoryReport {
 struct CampaignReport {
     schema_version: u32,
     plan_fingerprint: String,
-    hardware: CampaignHardwareIdentity,
+    state_policy: CampaignStatePolicy,
+    packed_compute: CampaignPackedComputePolicy,
+    world_size: usize,
+    window_partition: String,
+    hardware: Vec<CampaignHardwareIdentity>,
     input_hashes: CampaignInputHashes,
     completed_step: u64,
     resumed_from_step: u64,
@@ -2282,26 +3371,83 @@ struct CampaignReport {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CampaignStaticMemory {
+    packed_parameter_bytes: usize,
+    packed_code_bytes: usize,
+    packed_scale_bytes: usize,
+    dense_parameter_bytes: usize,
+    host_optimizer_bytes: usize,
+    resident_training_state_bytes: usize,
+    peak_optimizer_staging_bytes: usize,
+    materialized_gradient_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+fn campaign_static_memory(
+    policy: CampaignStatePolicy,
+    host: HostOffloadMemoryGeometry,
+) -> anyhow::Result<CampaignStaticMemory> {
+    match policy {
+        CampaignStatePolicy::HostOffload => Ok(CampaignStaticMemory {
+            packed_parameter_bytes: host.packed_parameter_bytes,
+            packed_code_bytes: host.packed_code_bytes,
+            packed_scale_bytes: host.packed_scale_bytes,
+            dense_parameter_bytes: host.dense_parameter_bytes,
+            host_optimizer_bytes: host.host_optimizer_bytes,
+            resident_training_state_bytes: 0,
+            peak_optimizer_staging_bytes: host.peak_optimizer_staging_bytes,
+            materialized_gradient_bytes: host.materialized_gradient_bytes,
+        }),
+        CampaignStatePolicy::Resident => Ok(CampaignStaticMemory {
+            packed_parameter_bytes: host.packed_parameter_bytes,
+            packed_code_bytes: host.packed_code_bytes,
+            packed_scale_bytes: host.packed_scale_bytes,
+            dense_parameter_bytes: host.dense_parameter_bytes,
+            host_optimizer_bytes: 0,
+            resident_training_state_bytes: host
+                .host_optimizer_bytes
+                .checked_add(host.largest_parameter_bytes)
+                .context("resident training-state bytes overflow")?,
+            peak_optimizer_staging_bytes: 0,
+            materialized_gradient_bytes: host.materialized_gradient_bytes,
+        }),
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy)]
 struct ReportExpectations<'a> {
     plan_fingerprint: &'a str,
+    state_policy: CampaignStatePolicy,
+    packed_compute: CampaignPackedComputePolicy,
     checkpoint_step: u64,
     checkpoint_dir: &'a Path,
     windows: u64,
     configured_steps: u64,
     timing_warmup_steps: usize,
-    hardware: &'a CampaignHardwareIdentity,
+    hardware: &'a [CampaignHardwareIdentity],
     input_hashes: &'a CampaignInputHashes,
-    static_memory: HostOffloadMemoryGeometry,
+    static_memory: CampaignStaticMemory,
 }
 
 #[cfg(feature = "cuda")]
 fn validate_report_memory(
     path: &Path,
     memory: &CampaignMemoryReport,
-    expected: HostOffloadMemoryGeometry,
+    expected: CampaignStaticMemory,
     completed_step: u64,
+    world_size: usize,
+    state_policy: CampaignStatePolicy,
 ) -> anyhow::Result<()> {
+    let expected_fleet_host_optimizer_bytes = expected
+        .host_optimizer_bytes
+        .checked_mul(world_size)
+        .context("expected fleet host optimizer bytes overflow")?;
+    let expected_fleet_optimizer_staging_bytes = expected
+        .peak_optimizer_staging_bytes
+        .checked_mul(world_size)
+        .context("expected fleet optimizer staging bytes overflow")?;
     for (label, actual, expected) in [
         (
             "packed code",
@@ -2328,6 +3474,11 @@ fn validate_report_memory(
             memory.host_optimizer_bytes,
             expected.host_optimizer_bytes,
         ),
+        (
+            "fleet host optimizer",
+            memory.fleet_host_optimizer_bytes,
+            expected_fleet_host_optimizer_bytes,
+        ),
         ("host adapter master", memory.host_adapter_master_bytes, 0),
         (
             "logical host training-state",
@@ -2335,9 +3486,19 @@ fn validate_report_memory(
             expected.host_optimizer_bytes,
         ),
         (
+            "resident training-state",
+            memory.resident_training_state_bytes,
+            expected.resident_training_state_bytes,
+        ),
+        (
             "optimizer staging",
             memory.peak_optimizer_staging_bytes,
             expected.peak_optimizer_staging_bytes,
+        ),
+        (
+            "fleet optimizer staging",
+            memory.fleet_peak_optimizer_staging_bytes,
+            expected_fleet_optimizer_staging_bytes,
         ),
     ] {
         if actual != expected {
@@ -2377,9 +3538,20 @@ fn validate_report_memory(
             path.display()
         );
     }
-    if memory.peak_streamed_gradient_bytes > memory.materialized_gradient_bytes {
+    let expected_device_fraction = match state_policy {
+        CampaignStatePolicy::Resident => 1.0_f64,
+        CampaignStatePolicy::HostOffload => 0.0_f64,
+    };
+    if memory.optimizer_state_device_fraction.to_bits() != expected_device_fraction.to_bits() {
         bail!(
-            "prior report {} has streamed-gradient peak larger than its materialized-gradient baseline",
+            "prior report {} has optimizer-state device fraction {}, expected {expected_device_fraction}",
+            path.display(),
+            memory.optimizer_state_device_fraction
+        );
+    }
+    if memory.peak_live_requested_gradient_bytes > memory.materialized_gradient_bytes {
+        bail!(
+            "prior report {} has live requested-gradient peak larger than its materialized-gradient baseline",
             path.display()
         );
     }
@@ -2393,13 +3565,25 @@ fn validate_report_memory(
         ("packed scales", memory.packed_scale_bytes),
         ("dense parameters", memory.dense_parameter_bytes),
         ("host optimizer", memory.host_optimizer_bytes),
+        ("fleet host optimizer", memory.fleet_host_optimizer_bytes),
         ("host adapter masters", memory.host_adapter_master_bytes),
         (
             "logical host training state",
             memory.logical_host_training_state_bytes,
         ),
+        (
+            "resident training state",
+            memory.resident_training_state_bytes,
+        ),
         ("optimizer staging", memory.peak_optimizer_staging_bytes),
-        ("streamed gradients", memory.peak_streamed_gradient_bytes),
+        (
+            "fleet optimizer staging",
+            memory.fleet_peak_optimizer_staging_bytes,
+        ),
+        (
+            "live requested gradients",
+            memory.peak_live_requested_gradient_bytes,
+        ),
         ("materialized gradients", memory.materialized_gradient_bytes),
         (
             "checkpointed activations",
@@ -2422,10 +3606,15 @@ fn validate_report_timing_coverage(
     path: &Path,
     report: &CampaignReport,
     windows: u64,
+    hardware: &[CampaignHardwareIdentity],
 ) -> anyhow::Result<()> {
     if windows == 0 {
         bail!("cannot validate campaign timings against zero windows");
     }
+    if hardware.is_empty() {
+        bail!("cannot validate campaign timings against an empty hardware fleet");
+    }
+    let world_size = u64::try_from(hardware.len()).context("hardware fleet exceeds u64")?;
     let timing_count = u64::try_from(report.step_timings.len())
         .context("campaign report timing count exceeds u64")?;
     if timing_count != report.completed_step {
@@ -2449,7 +3638,10 @@ fn validate_report_timing_coverage(
                 timing.step
             );
         }
-        let expected_window_index = (expected_step - 1) % windows;
+        let expected_window_index = (expected_step - 1)
+            .checked_mul(world_size)
+            .context("campaign timing window cursor overflow")?
+            % windows;
         if timing.window_index != expected_window_index {
             bail!(
                 "prior report {} step {expected_step} records window {}, expected {expected_window_index}",
@@ -2464,6 +3656,75 @@ fn validate_report_timing_coverage(
                 "prior report {} step {expected_step} has invalid elapsed time {}",
                 path.display(),
                 timing.training_elapsed_ms_excluding_checkpoint
+            );
+        }
+        if timing.rank_evidence.len() != hardware.len() {
+            bail!(
+                "prior report {} step {expected_step} has {} rank evidence records, expected {}",
+                path.display(),
+                timing.rank_evidence.len(),
+                hardware.len()
+            );
+        }
+        let mut max_elapsed = 0.0_f64;
+        for (rank, (evidence, rank_hardware)) in
+            timing.rank_evidence.iter().zip(hardware).enumerate()
+        {
+            if evidence.rank != rank {
+                bail!(
+                    "prior report {} step {expected_step} rank evidence {} identifies rank {}",
+                    path.display(),
+                    rank,
+                    evidence.rank
+                );
+            }
+            let rank_u64 = u64::try_from(rank).context("campaign rank exceeds u64")?;
+            let expected_rank_window = expected_window_index
+                .checked_add(rank_u64)
+                .context("rank window index overflow")?
+                % windows;
+            if evidence.window_index != expected_rank_window {
+                bail!(
+                    "prior report {} step {expected_step} rank {rank} records window {}, expected {expected_rank_window}",
+                    path.display(),
+                    evidence.window_index
+                );
+            }
+            if !evidence.training_elapsed_ms.is_finite() || evidence.training_elapsed_ms < 0.0 {
+                bail!(
+                    "prior report {} step {expected_step} rank {rank} has invalid elapsed time {}",
+                    path.display(),
+                    evidence.training_elapsed_ms
+                );
+            }
+            max_elapsed = max_elapsed.max(evidence.training_elapsed_ms);
+            if evidence.nvml_used_memory_bytes > rank_hardware.total_memory_bytes
+                || evidence.cuda_memory.device_total_bytes == 0
+                || evidence.cuda_memory.device_total_bytes > rank_hardware.total_memory_bytes
+                || evidence
+                    .cuda_memory
+                    .device_free_bytes
+                    .checked_add(evidence.cuda_memory.device_used_sample_bytes)
+                    != Some(evidence.cuda_memory.device_total_bytes)
+                || evidence.cuda_memory.pool_used_high_water_bytes
+                    < evidence.cuda_memory.pool_used_current_bytes
+                || evidence.cuda_memory.pool_reserved_high_water_bytes
+                    < evidence.cuda_memory.pool_reserved_current_bytes
+                || evidence.cuda_memory.pool_reserved_current_bytes
+                    < evidence.cuda_memory.pool_used_current_bytes
+                || evidence.cuda_memory.pool_reserved_high_water_bytes
+                    < evidence.cuda_memory.pool_used_high_water_bytes
+            {
+                bail!(
+                    "prior report {} step {expected_step} rank {rank} has invalid memory evidence",
+                    path.display()
+                );
+            }
+        }
+        if timing.training_elapsed_ms_excluding_checkpoint.to_bits() != max_elapsed.to_bits() {
+            bail!(
+                "prior report {} step {expected_step} max-rank elapsed time is inconsistent",
+                path.display()
             );
         }
     }
@@ -2641,7 +3902,7 @@ fn load_existing_report(
     };
     let mut report: CampaignReport = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse prior report {}", path.display()))?;
-    if report.schema_version != 4 {
+    if report.schema_version != 5 {
         bail!(
             "prior report {} uses unsupported schema version {}",
             path.display(),
@@ -2654,7 +3915,23 @@ fn load_existing_report(
             path.display()
         );
     }
-    if report.hardware != *expected.hardware {
+    if report.state_policy != expected.state_policy
+        || report.packed_compute != expected.packed_compute
+    {
+        bail!(
+            "prior report {} records a different training or packed-compute policy",
+            path.display()
+        );
+    }
+    if report.world_size != expected.hardware.len()
+        || report.window_partition != "contiguous-modulo-v1"
+    {
+        bail!(
+            "prior report {} records a different distributed topology",
+            path.display()
+        );
+    }
+    if report.hardware != expected.hardware {
         bail!(
             "prior report {} records different stable CUDA/NVML hardware identity",
             path.display(),
@@ -2715,9 +3992,15 @@ fn load_existing_report(
         &report.memory,
         expected.static_memory,
         report.completed_step,
+        expected.hardware.len(),
+        expected.state_policy,
     )?;
-    validate_report_timing_coverage(path, &report, expected.windows)?;
-    validate_cuda_memory_segments(path, &report, expected.hardware)?;
+    validate_report_timing_coverage(path, &report, expected.windows, expected.hardware)?;
+    let owner_hardware = expected
+        .hardware
+        .first()
+        .context("campaign hardware fleet is empty")?;
+    validate_cuda_memory_segments(path, &report, owner_hardware)?;
     if report.completed_step < expected.checkpoint_step {
         bail!(
             "prior report {} covers completed step {}, but committed checkpoint is step {}; refusing resume with an evidence gap",
@@ -2749,7 +4032,10 @@ fn load_existing_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tritium_nn::{TiedSwiGluTrainingArchitecture, TrainingParameter};
+    use tritium_nn::{
+        DenseLinear, Mlp, Projection, SwiGluMlp, TiedSwiGluTrainingArchitecture, TrainingParameter,
+        TransformerBlock,
+    };
 
     fn temp_path(name: &str) -> PathBuf {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -2818,6 +4104,63 @@ mod tests {
             lm_head: None,
         };
         ModelRunner::from_weights(config, weights, Box::new(tritium_cpu::CpuBackend::new()))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn resident_campaign_test_model() -> TiedSwiGluTrainingModel {
+        let config = ModelConfig {
+            arch: "llama".into(),
+            n_layers: 1,
+            n_embd: 4,
+            n_head: 2,
+            n_head_kv: 1,
+            head_dim: 2,
+            n_ff: 6,
+            n_ctx: 8,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        };
+        let spec = ArchSpec {
+            mlp: MlpKind::SwiGlu,
+            attn_sub_norm: false,
+            ffn_sub_norm: false,
+            qk_norm: false,
+            qkv_bias: false,
+            tied_embeddings: true,
+        };
+        let dense = |rows: usize, cols: usize, seed: usize| {
+            let values = (0..rows * cols)
+                .map(|index| ((index * 7 + seed * 5) % 23) as f32 / 32.0 - 0.35)
+                .collect();
+            Projection::Dense(DenseLinear::new_exact(values, rows, cols).unwrap())
+        };
+        let weights = ModelWeights {
+            token_embd: (0..32).map(|index| index as f32 / 64.0 - 0.2).collect(),
+            vocab: 8,
+            n_embd: 4,
+            layers: vec![TransformerBlock {
+                attn_norm: vec![1.0; 4],
+                q_proj: dense(4, 4, 1),
+                k_proj: dense(2, 4, 2),
+                v_proj: dense(2, 4, 3),
+                o_proj: dense(4, 4, 4),
+                attn_sub_norm: Vec::new(),
+                q_bias: Vec::new(),
+                k_bias: Vec::new(),
+                v_bias: Vec::new(),
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
+                ffn_norm: vec![1.0; 4],
+                mlp: Mlp::SwiGlu(SwiGluMlp {
+                    gate: dense(6, 4, 5),
+                    up: dense(6, 4, 6),
+                    down: dense(4, 6, 7),
+                }),
+            }],
+            output_norm: vec![1.0; 4],
+            lm_head: None,
+        };
+        TiedSwiGluTrainingModel::extract(&config, &spec, &weights).unwrap()
     }
 
     fn fixture() -> (
@@ -3012,7 +4355,11 @@ mod tests {
             Path::new("/campaign/evaluation.json")
         );
         assert_eq!(config.growth, None);
+        assert_eq!(config.cuda_device, None);
+        assert_eq!(config.distributed, None);
         assert_eq!(config.salt_planes, 2);
+        assert_eq!(config.state_policy, CampaignStatePolicy::Resident);
+        assert_eq!(config.packed_compute, CampaignPackedComputePolicy::Exact);
         assert_eq!(config.checkpoint_every, 5);
         assert_eq!(config.timing_warmup_steps, 1);
         assert_eq!(config.checkpoint_shards, 1);
@@ -3028,6 +4375,119 @@ mod tests {
         assert!(serde_json::from_str::<CampaignConfig>(missing_cadence).is_err());
         config.seq_len = 1;
         assert!(validate_campaign_config(&config).is_err());
+
+        let host_offload: CampaignConfig = serde_json::from_str(
+            r#"{
+                "model_dir":"model", "corpus":"corpus.json",
+                "evaluation_corpus":"evaluation.json",
+                "teacher_cache":"teacher.ttpr", "checkpoint_dir":"checkpoints",
+                "report":"report.json", "artifact":"model.gguf",
+                "seq_len":32, "steps":40, "checkpoint_every":5,
+                "state_policy":"host-offload", "packed_compute":"fast"
+            }"#,
+        )
+        .unwrap();
+        validate_campaign_config(&host_offload).unwrap();
+        assert_eq!(host_offload.state_policy, CampaignStatePolicy::HostOffload);
+        assert_eq!(
+            host_offload.packed_compute,
+            CampaignPackedComputePolicy::Fast
+        );
+        let resident_fast: CampaignConfig = serde_json::from_str(
+            r#"{
+                "model_dir":"model", "corpus":"corpus.json",
+                "evaluation_corpus":"evaluation.json",
+                "teacher_cache":"teacher.ttpr", "checkpoint_dir":"checkpoints",
+                "report":"report.json", "artifact":"model.gguf",
+                "seq_len":32, "steps":40, "checkpoint_every":5,
+                "state_policy":"resident", "packed_compute":"fast"
+            }"#,
+        )
+        .unwrap();
+        validate_campaign_config(&resident_fast).unwrap();
+
+        #[cfg(feature = "nccl")]
+        {
+            let mut distributed: CampaignConfig = serde_json::from_str(
+                r#"{
+                    "model_dir":"model", "corpus":"corpus.json",
+                    "evaluation_corpus":"evaluation.json",
+                    "teacher_cache":"teacher.ttpr", "checkpoint_dir":"checkpoints",
+                    "report":"report.json", "artifact":"model.gguf",
+                    "seq_len":32, "steps":40, "checkpoint_every":5,
+                    "state_policy":"host-offload",
+                    "distributed":{"devices":[0,1],"worker_timeout_seconds":30}
+                }"#,
+            )
+            .unwrap();
+            validate_campaign_config(&distributed).unwrap();
+            distributed.cuda_device = Some(0);
+            assert!(validate_campaign_config(&distributed).is_err());
+            distributed.cuda_device = None;
+            distributed.distributed.as_mut().unwrap().devices = vec![0, 0];
+            assert!(validate_campaign_config(&distributed).is_err());
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn resident_campaign_runs_exact_and_fast_packed_steps_to_terminal_snapshot() {
+        let backend = match CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping resident campaign packed-step gate: {error}");
+                return;
+            }
+        };
+        for packed_compute in [
+            CampaignPackedComputePolicy::Exact,
+            CampaignPackedComputePolicy::Fast,
+        ] {
+            let mut model = resident_campaign_test_model();
+            let masters = model.take_parameter_masters();
+            let specs = model
+                .parameters()
+                .iter()
+                .zip(masters)
+                .map(|(parameter, master)| HostOffloadTrainParam {
+                    master,
+                    rows: parameter.rows,
+                    cols: parameter.cols,
+                    salt_planes: 2,
+                    optimizer: AdamW::new(1e-3),
+                })
+                .collect();
+            let mut trainer =
+                CampaignTrainer::new(&backend, specs, CampaignStatePolicy::Resident).unwrap();
+            trainer.prepare_execution(&backend).unwrap();
+            let target = DeviceTensor::upload(&backend, &[0.125; 16]).unwrap();
+            let timing_fence = DeviceTensor::upload(&backend, &[0.0]).unwrap();
+            let evidence = trainer
+                .run_step(
+                    &CampaignWorld::single(),
+                    &backend,
+                    &model,
+                    &target,
+                    &[0, 1],
+                    1,
+                    &timing_fence,
+                    packed_compute,
+                )
+                .unwrap();
+            assert!(evidence.peak_live_requested_gradient_elements > 0);
+            assert!(evidence.peak_live_activation_elements < evidence.naive_activation_elements);
+            assert_eq!(trainer.completed_step(), 1);
+            let terminal = trainer.into_master_source().unwrap();
+            assert_eq!(terminal.completed_step(), 1);
+            assert_eq!(terminal.len(), model.parameters().len());
+            assert!(
+                terminal
+                    .master(0)
+                    .unwrap()
+                    .iter()
+                    .all(|value| value.is_finite())
+            );
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -3173,7 +4633,14 @@ mod tests {
         let directory = temp_path("early-lock");
         let checkpoint_dir = directory.join("checkpoints");
         std::fs::create_dir_all(&checkpoint_dir).unwrap();
-        std::fs::write(checkpoint_dir.join("campaign.lock"), b"pid=test\n").unwrap();
+        let lock_holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(checkpoint_dir.join("campaign.lock"))
+            .unwrap();
+        lock_holder.lock().unwrap();
         let config_path = directory.join("campaign.json");
         let config = serde_json::json!({
             "model_dir": directory.join("missing-model"),
@@ -3194,6 +4661,151 @@ mod tests {
         assert!(message.contains("acquire exclusive campaign lock"));
         assert!(!message.contains("load HuggingFace model"));
         assert!(!message.contains("teacher cache"));
+        drop(lock_holder);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn campaign_lock_reuses_an_unlocked_sentinel_after_process_exit() {
+        let directory = temp_path("stale-advisory-lock");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("campaign.lock");
+        let stale_contents = b"pid=dead\n";
+        std::fs::write(&path, stale_contents).unwrap();
+
+        let first = CampaignLock::acquire(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), stale_contents);
+        assert!(CampaignLock::acquire(&path).is_err());
+        drop(first);
+        let second = CampaignLock::acquire(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), stale_contents);
+        drop(second);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn campaign_lock_rejects_a_non_regular_path() {
+        let directory = temp_path("non-regular-advisory-lock");
+        let path = directory.join("campaign.lock");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let error = CampaignLock::acquire(&path).unwrap_err();
+        assert!(error.to_string().contains("must be a regular file"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(feature = "cuda", unix))]
+    #[test]
+    fn campaign_lock_rejects_a_symlink_without_mutating_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temp_path("symlink-advisory-lock");
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("protected.json");
+        let contents = b"do-not-truncate";
+        std::fs::write(&target, contents).unwrap();
+        let path = directory.join("campaign.lock");
+        symlink(&target, &path).unwrap();
+
+        let error = CampaignLock::acquire(&path).unwrap_err();
+        assert!(error.to_string().contains("must be a regular file"));
+        assert_eq!(std::fs::read(&target).unwrap(), contents);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(feature = "cuda", unix))]
+    #[test]
+    fn campaign_lock_rejects_a_hard_link_without_mutating_its_target() {
+        let directory = temp_path("hardlink-advisory-lock");
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("protected.json");
+        let contents = b"do-not-truncate";
+        std::fs::write(&target, contents).unwrap();
+        let path = directory.join("campaign.lock");
+        std::fs::hard_link(&target, &path).unwrap();
+
+        let error = CampaignLock::acquire(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must not be a hard-linked inode")
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), contents);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn campaign_lock_set_serializes_shared_report_and_artifact_outputs() {
+        let directory = temp_path("output-advisory-locks");
+        std::fs::create_dir_all(&directory).unwrap();
+        let checkpoint_a = directory.join("checkpoint-a");
+        let checkpoint_b = directory.join("checkpoint-b");
+        let report_a = directory.join("report-a.json");
+        let report_b = directory.join("report-b.json");
+        let artifact_a = directory.join("artifact-a.gguf");
+        let artifact_b = directory.join("artifact-b.gguf");
+
+        let report_holder = CampaignLocks::acquire(&checkpoint_a, &report_a, &artifact_a).unwrap();
+        let report_error =
+            CampaignLocks::acquire(&checkpoint_b, &report_a, &artifact_b).unwrap_err();
+        assert!(
+            report_error
+                .to_string()
+                .contains("report-a.json.campaign.lock")
+        );
+        drop(report_holder);
+        drop(CampaignLocks::acquire(&checkpoint_b, &report_a, &artifact_b).unwrap());
+
+        let artifact_holder =
+            CampaignLocks::acquire(&checkpoint_a, &report_a, &artifact_a).unwrap();
+        let artifact_error =
+            CampaignLocks::acquire(&checkpoint_b, &report_b, &artifact_a).unwrap_err();
+        assert!(
+            artifact_error
+                .to_string()
+                .contains("artifact-a.gguf.campaign.lock")
+        );
+        drop(artifact_holder);
+        drop(CampaignLocks::acquire(&checkpoint_b, &report_b, &artifact_a).unwrap());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn campaign_lock_paths_are_sorted_and_deduplicated() {
+        let directory = temp_path("ordered-advisory-locks");
+        std::fs::create_dir_all(&directory).unwrap();
+        let checkpoint = directory.join("z-checkpoint");
+        let output = directory.join("a-output.json");
+
+        let paths = campaign_lock_paths(&checkpoint, &output, &output).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn campaign_lock_sidecar_must_not_alias_an_output() {
+        let directory = temp_path("advisory-lock-output-alias");
+        std::fs::create_dir_all(&directory).unwrap();
+        let report = directory.join("result");
+        let artifact = directory.join("result.campaign.lock");
+
+        let error =
+            CampaignLocks::acquire(&directory.join("checkpoint"), &report, &artifact).unwrap_err();
+        assert!(error.to_string().contains("aliases a campaign output"));
+        assert!(!artifact.exists());
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3224,7 +4836,10 @@ mod tests {
             seq_len: 2,
             steps: 1,
             salt_planes: 2,
-            cuda_device: 0,
+            cuda_device: Some(0),
+            distributed: None,
+            state_policy: CampaignStatePolicy::Resident,
+            packed_compute: CampaignPackedComputePolicy::Exact,
             checkpoint_every: 1,
             timing_warmup_steps: 1,
             checkpoint_shards: 1,
@@ -3294,33 +4909,42 @@ mod tests {
             evaluation_corpus_file: "evaluation-file".into(),
             evaluation_corpus: "evaluation".into(),
         };
-        let hardware = test_hardware();
+        let hardware = vec![test_hardware()];
         let memory = CampaignMemoryReport {
             packed_parameter_bytes: 6,
             packed_code_bytes: 2,
             packed_scale_bytes: 4,
             dense_parameter_bytes: 16,
             host_optimizer_bytes: 48,
+            fleet_host_optimizer_bytes: 48,
             host_adapter_master_bytes: 0,
             logical_host_training_state_bytes: 48,
+            resident_training_state_bytes: 0,
+            optimizer_state_device_fraction: 0.0,
             peak_optimizer_staging_bytes: 24,
-            peak_streamed_gradient_bytes: 8,
+            fleet_peak_optimizer_staging_bytes: 24,
+            peak_live_requested_gradient_bytes: 8,
             materialized_gradient_bytes: 16,
             logical_peak_activation_bytes: 12,
             logical_naive_activation_bytes: 20,
         };
-        let static_memory = HostOffloadMemoryGeometry {
+        let static_memory = CampaignStaticMemory {
             packed_parameter_bytes: 6,
             packed_code_bytes: 2,
             packed_scale_bytes: 4,
             dense_parameter_bytes: 16,
             host_optimizer_bytes: 48,
+            resident_training_state_bytes: 0,
             peak_optimizer_staging_bytes: 24,
             materialized_gradient_bytes: 16,
         };
         let report = CampaignReport {
-            schema_version: 4,
+            schema_version: 5,
             plan_fingerprint: "plan".into(),
+            state_policy: CampaignStatePolicy::HostOffload,
+            packed_compute: CampaignPackedComputePolicy::Exact,
+            world_size: 1,
+            window_partition: "contiguous-modulo-v1".into(),
             hardware: hardware.clone(),
             input_hashes: input_hashes.clone(),
             completed_step: 5,
@@ -3334,6 +4958,13 @@ mod tests {
                     window_index: step - 1,
                     warmup: step == 1,
                     training_elapsed_ms_excluding_checkpoint: step as f64,
+                    rank_evidence: vec![RankStepEvidence {
+                        rank: 0,
+                        window_index: step - 1,
+                        training_elapsed_ms: step as f64,
+                        nvml_used_memory_bytes: 10,
+                        cuda_memory: test_memory_snapshot(),
+                    }],
                 })
                 .collect(),
             memory,
@@ -3353,6 +4984,8 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
         let expected = ReportExpectations {
             plan_fingerprint: "plan",
+            state_policy: CampaignStatePolicy::HostOffload,
+            packed_compute: CampaignPackedComputePolicy::Exact,
             checkpoint_step: 3,
             checkpoint_dir: &checkpoint_dir,
             windows: 5,
@@ -3378,7 +5011,7 @@ mod tests {
             .is_err()
         );
         let mut other_hardware = hardware.clone();
-        other_hardware.cuda_ordinal = 1;
+        other_hardware[0].cuda_ordinal = 1;
         assert!(
             load_existing_report(
                 &path,
@@ -3439,6 +5072,20 @@ mod tests {
                 .contains("optimizer staging bytes")
         );
         let mut corrupt = report.clone();
+        corrupt.memory.fleet_host_optimizer_bytes += size_of::<f32>();
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("fleet host optimizer bytes")
+        );
+        let mut corrupt = report.clone();
+        corrupt.memory.optimizer_state_device_fraction = 1.0;
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("optimizer-state device fraction")
+        );
+        let mut corrupt = report.clone();
         corrupt.memory.materialized_gradient_bytes += size_of::<f32>();
         assert!(
             rejects(&corrupt)
@@ -3456,16 +5103,78 @@ mod tests {
 
         let mut corrupt = report.clone();
         corrupt.step_timings.pop();
-        assert!(validate_report_timing_coverage(&path, &corrupt, 5).is_err());
+        assert!(validate_report_timing_coverage(&path, &corrupt, 5, &hardware).is_err());
         let mut corrupt = report.clone();
         corrupt.step_timings[2].window_index = 4;
-        assert!(validate_report_timing_coverage(&path, &corrupt, 5).is_err());
+        assert!(validate_report_timing_coverage(&path, &corrupt, 5, &hardware).is_err());
         let mut corrupt = report.clone();
         corrupt.step_timings[2].training_elapsed_ms_excluding_checkpoint = f64::NAN;
-        assert!(validate_report_timing_coverage(&path, &corrupt, 5).is_err());
+        assert!(validate_report_timing_coverage(&path, &corrupt, 5, &hardware).is_err());
+
+        let mut distributed_hardware = hardware.clone();
+        let mut peer_hardware = test_hardware();
+        peer_hardware.cuda_ordinal = 1;
+        peer_hardware.pci_bus_id = "0000:02:00.0".into();
+        distributed_hardware.push(peer_hardware);
+        let mut distributed_report = report.clone();
+        distributed_report.world_size = 2;
+        distributed_report.memory.fleet_host_optimizer_bytes = 96;
+        distributed_report.memory.fleet_peak_optimizer_staging_bytes = 48;
+        for timing in &mut distributed_report.step_timings {
+            let owner_window = ((timing.step - 1) * 2) % 5;
+            timing.window_index = owner_window;
+            timing.rank_evidence[0].window_index = owner_window;
+            let peer_elapsed = timing.training_elapsed_ms_excluding_checkpoint + 0.5;
+            timing.rank_evidence.push(RankStepEvidence {
+                rank: 1,
+                window_index: (owner_window + 1) % 5,
+                training_elapsed_ms: peer_elapsed,
+                nvml_used_memory_bytes: 10,
+                cuda_memory: test_memory_snapshot(),
+            });
+            timing.training_elapsed_ms_excluding_checkpoint = peer_elapsed;
+        }
+        validate_report_timing_coverage(&path, &distributed_report, 5, &distributed_hardware)
+            .unwrap();
+        validate_report_memory(
+            &path,
+            &distributed_report.memory,
+            static_memory,
+            distributed_report.completed_step,
+            2,
+            CampaignStatePolicy::HostOffload,
+        )
+        .unwrap();
+        let mut underreported_fleet_memory = distributed_report.memory.clone();
+        underreported_fleet_memory.fleet_host_optimizer_bytes = 48;
+        assert!(
+            validate_report_memory(
+                &path,
+                &underreported_fleet_memory,
+                static_memory,
+                distributed_report.completed_step,
+                2,
+                CampaignStatePolicy::HostOffload,
+            )
+            .is_err()
+        );
+        let mut invalid_peer_memory = distributed_report.clone();
+        invalid_peer_memory.step_timings[0].rank_evidence[1]
+            .cuda_memory
+            .pool_reserved_current_bytes = 0;
+        assert!(
+            validate_report_timing_coverage(&path, &invalid_peer_memory, 5, &distributed_hardware,)
+                .is_err()
+        );
+        distributed_report.step_timings[0].rank_evidence[1].window_index = 4;
+        assert!(
+            validate_report_timing_coverage(&path, &distributed_report, 5, &distributed_hardware,)
+                .is_err()
+        );
+
         let mut corrupt = report;
         corrupt.step_timings[2].training_elapsed_ms_excluding_checkpoint = -1.0;
-        assert!(validate_report_timing_coverage(&path, &corrupt, 5).is_err());
+        assert!(validate_report_timing_coverage(&path, &corrupt, 5, &hardware).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3473,7 +5182,7 @@ mod tests {
     fn plan_fingerprint_is_stable_and_changes_with_optimizer_or_geometry() {
         let (config, spec, architecture, parameters) = fixture();
         let model_digest = semantic_model_digest_parts(&config, &spec, &architecture, &parameters);
-        let hardware = test_hardware();
+        let hardware = vec![test_hardware()];
         let growth = test_growth();
         let base = PlanInputs {
             hardware: &hardware,
@@ -3494,6 +5203,9 @@ mod tests {
             windows: 2,
             total_steps: 20,
             salt_planes: 2,
+            state_policy: CampaignStatePolicy::Resident,
+            packed_compute: CampaignPackedComputePolicy::Exact,
+            world_size: 1,
             adam: CampaignAdam::default(),
             depth: 1,
             checkpoint_every: 5,
@@ -3516,8 +5228,23 @@ mod tests {
             ..base
         };
         assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let changed = PlanInputs {
+            state_policy: CampaignStatePolicy::HostOffload,
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let changed = PlanInputs {
+            packed_compute: CampaignPackedComputePolicy::Fast,
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let changed = PlanInputs {
+            world_size: 2,
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
         let mut changed_hardware = hardware.clone();
-        changed_hardware.cuda_ordinal = 1;
+        changed_hardware[0].cuda_ordinal = 1;
         let changed = PlanInputs {
             hardware: &changed_hardware,
             ..base
@@ -3551,7 +5278,7 @@ mod tests {
         };
         assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
         assert_eq!(first.hardware, hardware);
-        assert_eq!(first.version, 4);
+        assert_eq!(first.version, 5);
         assert_eq!(first.campaign_config_file_digest, hex_digest([5; 32]));
         assert_eq!(first.model_config_file_digest, hex_digest([6; 32]));
     }
@@ -3560,7 +5287,7 @@ mod tests {
     fn immutable_plan_sidecar_rejects_mismatch_and_missing_sidecar_for_checkpoint() {
         let directory = temp_path("plan-sidecar");
         let (config, spec, architecture, parameters) = fixture();
-        let hardware = test_hardware();
+        let hardware = vec![test_hardware()];
         let growth = test_growth();
         let expected = build_plan_sidecar(&PlanInputs {
             hardware: &hardware,
@@ -3586,6 +5313,9 @@ mod tests {
             windows: 2,
             total_steps: 20,
             salt_planes: 2,
+            state_policy: CampaignStatePolicy::Resident,
+            packed_compute: CampaignPackedComputePolicy::Exact,
+            world_size: 1,
             adam: CampaignAdam::default(),
             depth: 1,
             checkpoint_every: 5,

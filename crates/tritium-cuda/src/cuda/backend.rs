@@ -1321,7 +1321,6 @@ impl CudaBackend {
     ///
     /// # Errors
     /// Shape/context violations and device launch failures are typed errors.
-    #[allow(dead_code)] // Track D gate precedes DeviceTape's SaltMatmul wiring
     pub(crate) fn training_salt_forward(
         &self,
         d_a: &CudaSlice<f32>,
@@ -1334,7 +1333,6 @@ impl CudaBackend {
 
     /// Plane-order packed SALT forward optimized for throughput. This may
     /// differ from dense-order arithmetic by ordinary f32 reassociation.
-    #[allow(dead_code)] // explicit fast twin; campaign wiring lands separately
     pub(crate) fn training_salt_forward_fast(
         &self,
         d_a: &CudaSlice<f32>,
@@ -1495,7 +1493,6 @@ impl CudaBackend {
     ///
     /// # Errors
     /// Shape/context violations and device launch failures are typed errors.
-    #[allow(dead_code)] // Track D gate precedes DeviceTape's SaltMatmul wiring
     pub(crate) fn training_salt_grad_a(
         &self,
         d_gy: &CudaSlice<f32>,
@@ -1508,7 +1505,6 @@ impl CudaBackend {
 
     /// Plane-order packed SALT activation VJP optimized for throughput. This
     /// may differ from dense-order arithmetic by ordinary f32 reassociation.
-    #[allow(dead_code)] // explicit fast twin; campaign wiring lands separately
     pub(crate) fn training_salt_grad_a_fast(
         &self,
         d_gy: &CudaSlice<f32>,

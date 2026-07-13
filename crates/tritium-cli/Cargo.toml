@@ -47,6 +47,9 @@ memmap2 = { workspace = true }
 # minutes instead of an hour. Bounded pool keeps the transient f32 buffers in check.
 rayon = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
+
 [dev-dependencies]
 # `salt_model_cli` parses the report's JSON output to assert fidelity invariants.
 serde_json = { workspace = true }
@@ -57,6 +60,7 @@ tritium-format = { workspace = true }
 [features]
 default = []
 cuda = ["dep:tritium-cuda", "dep:tritium-train", "tritium-nn/cuda"]
+nccl = ["cuda", "tritium-cuda/nccl", "dep:libc"]
 
 [lints]
 workspace = true

@@ -571,11 +571,84 @@ impl<'a> ArtifactExportPlan<'a> {
     }
 }
 
-trait MasterSource {
+pub(crate) trait MasterSource {
     fn len(&self) -> usize;
     fn completed_step(&self) -> u64;
     fn geometry(&self, index: usize) -> Result<(usize, usize, usize), CampaignArtifactError>;
     fn master(&self, index: usize) -> Result<&[f32], CampaignArtifactError>;
+}
+
+/// Host snapshot of device-resident latent masters used only at terminal
+/// artifact publication. Constructing the snapshot validates every matrix so
+/// the exporter never observes a partially downloaded resident trainer.
+#[derive(Debug)]
+pub(crate) struct ResidentMasterSnapshot {
+    completed_step: u64,
+    masters: Vec<Vec<f32>>,
+    geometry: Vec<(usize, usize, usize)>,
+}
+
+impl ResidentMasterSnapshot {
+    pub(crate) fn new(
+        completed_step: u64,
+        masters: Vec<Vec<f32>>,
+        geometry: Vec<(usize, usize, usize)>,
+    ) -> Result<Self, CampaignArtifactError> {
+        if masters.len() != geometry.len() {
+            return Err(invalid(format!(
+                "resident master snapshot has {} masters but {} geometries",
+                masters.len(),
+                geometry.len()
+            )));
+        }
+        for (index, (master, &(rows, cols, planes))) in masters.iter().zip(&geometry).enumerate() {
+            let expected = rows.checked_mul(cols).ok_or_else(|| {
+                invalid(format!(
+                    "resident master snapshot parameter {index} shape overflows usize"
+                ))
+            })?;
+            if master.len() != expected {
+                return Err(invalid(format!(
+                    "resident master snapshot parameter {index} has {} elements, expected {expected}",
+                    master.len()
+                )));
+            }
+            if !(1..=3).contains(&planes) {
+                return Err(invalid(format!(
+                    "resident master snapshot parameter {index} SALT planes must be in 1..=3"
+                )));
+            }
+        }
+        Ok(Self {
+            completed_step,
+            masters,
+            geometry,
+        })
+    }
+}
+
+impl MasterSource for ResidentMasterSnapshot {
+    fn len(&self) -> usize {
+        self.masters.len()
+    }
+
+    fn completed_step(&self) -> u64 {
+        self.completed_step
+    }
+
+    fn geometry(&self, index: usize) -> Result<(usize, usize, usize), CampaignArtifactError> {
+        self.geometry
+            .get(index)
+            .copied()
+            .ok_or_else(|| invalid(format!("resident snapshot geometry {index} is missing")))
+    }
+
+    fn master(&self, index: usize) -> Result<&[f32], CampaignArtifactError> {
+        self.masters
+            .get(index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| invalid(format!("resident snapshot master {index} is missing")))
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -606,7 +679,7 @@ pub(crate) fn export_campaign_artifact(
     output: &Path,
     raw_hf_config_json: &str,
     model: &TiedSwiGluTrainingModel,
-    trainer: &HostOffloadTrainer<'_>,
+    trainer: &dyn MasterSource,
     salt_planes: usize,
     provenance: ArtifactProvenance,
     growth: &GrowthReceipt,
@@ -627,7 +700,7 @@ pub(crate) fn verify_campaign_artifact(
     existing: &Path,
     raw_hf_config_json: &str,
     model: &TiedSwiGluTrainingModel,
-    trainer: &HostOffloadTrainer<'_>,
+    trainer: &dyn MasterSource,
     salt_planes: usize,
     provenance: ArtifactProvenance,
     growth: &GrowthReceipt,
@@ -641,7 +714,7 @@ pub(crate) fn verify_campaign_artifact(
 fn export_from_source(
     output: &Path,
     plan: &ArtifactExportPlan<'_>,
-    source: &impl MasterSource,
+    source: &(impl MasterSource + ?Sized),
 ) -> Result<CampaignArtifactSummary, CampaignArtifactError> {
     validate_source(plan, source)?;
     let mut publish = AtomicArtifact::create(output)?;
@@ -660,7 +733,7 @@ fn export_from_source(
 fn verify_from_source(
     existing: &Path,
     plan: &ArtifactExportPlan<'_>,
-    source: &impl MasterSource,
+    source: &(impl MasterSource + ?Sized),
 ) -> Result<CampaignArtifactSummary, CampaignArtifactError> {
     let measured = MeasuredPackage::from_file(existing)?;
     let rebuilt = write_artifact(CountingPackageWriter::default(), plan, source)?;
@@ -715,7 +788,7 @@ impl Write for CountingPackageWriter {
 
 fn validate_source(
     plan: &ArtifactExportPlan<'_>,
-    source: &impl MasterSource,
+    source: &(impl MasterSource + ?Sized),
 ) -> Result<(), CampaignArtifactError> {
     if source.completed_step() != plan.completed_step {
         return Err(invalid(format!(
@@ -762,7 +835,7 @@ struct WriteResult<W> {
 fn write_artifact<W: Write>(
     writer: W,
     plan: &ArtifactExportPlan<'_>,
-    source: &impl MasterSource,
+    source: &(impl MasterSource + ?Sized),
 ) -> Result<WriteResult<W>, CampaignArtifactError> {
     validate_source(plan, source)?;
     let mut writer =
@@ -1370,6 +1443,45 @@ mod tests {
             &first.writer[start..start + 8],
             &[3.0f32.to_le_bytes(), 4.0f32.to_le_bytes()].concat()
         );
+    }
+
+    #[test]
+    fn resident_snapshot_matches_borrowed_source_bytes() {
+        let plan = plan();
+        let source = source();
+        let snapshot = ResidentMasterSnapshot::new(
+            source.step,
+            source.masters.clone(),
+            source.geometry.clone(),
+        )
+        .expect("resident snapshot");
+        let borrowed = write_artifact(Vec::new(), &plan, &source).expect("borrowed export");
+        let resident = write_artifact(Vec::new(), &plan, &snapshot).expect("resident export");
+        assert_eq!(resident.writer, borrowed.writer);
+        assert_eq!(resident.stats, borrowed.stats);
+    }
+
+    #[test]
+    fn resident_snapshot_rejects_incomplete_or_invalid_geometry() {
+        let source = source();
+        assert!(
+            ResidentMasterSnapshot::new(
+                source.step,
+                source.masters[..source.masters.len() - 1].to_vec(),
+                source.geometry.clone(),
+            )
+            .is_err()
+        );
+
+        let mut wrong_shape = source.geometry.clone();
+        wrong_shape[0].0 += 1;
+        assert!(
+            ResidentMasterSnapshot::new(source.step, source.masters.clone(), wrong_shape,).is_err()
+        );
+
+        let mut invalid_planes = source.geometry;
+        invalid_planes[0].2 = 0;
+        assert!(ResidentMasterSnapshot::new(source.step, source.masters, invalid_planes).is_err());
     }
 
     #[test]

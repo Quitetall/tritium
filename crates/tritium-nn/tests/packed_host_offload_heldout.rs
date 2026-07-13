@@ -27,7 +27,7 @@ use common::{device_forward, device_forward_packed, extract, logits_of, perplexi
 use tritium_cuda::CudaBackend;
 use tritium_cuda::train::{
     CheckpointPolicy, DevicePackedSaltWeight, DeviceTape, DeviceTensor, DeviceTrainParam,
-    GradientLeafBinding, HostOffloadTrainer,
+    GradientLeafBinding, HostOffloadTrainer, PackedSaltComputePolicy,
 };
 use tritium_format::TeacherCacheHeader;
 use tritium_nn::{ModelRunner, TeacherCacheReader, hash_teacher_corpus, hash_teacher_weights};
@@ -129,6 +129,11 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(STEPS);
     assert!(steps > 0, "distillation needs at least one step");
+    let packed_compute = match std::env::var("TRITIUM_PACKED_COMPUTE").as_deref() {
+        Ok("fast") => PackedSaltComputePolicy::Fast,
+        Ok("exact") | Err(_) => PackedSaltComputePolicy::Exact,
+        Ok(value) => panic!("TRITIUM_PACKED_COMPUTE must be exact or fast, got {value:?}"),
+    };
 
     let runner =
         ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
@@ -242,10 +247,11 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
         };
 
         let (stream_result, bindings) = {
-            let mut tape = DeviceTape::new_with_checkpoint_policy(
+            let mut tape = DeviceTape::new_with_policies(
                 &backend,
                 arch.vocab,
                 CheckpointPolicy::SqrtDepth(arch.n_layers),
+                packed_compute,
             )
             .expect("packed checkpointed tape");
             let (logits, master_ids) =
@@ -418,7 +424,7 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
     };
 
     println!(
-        "packed+HostOffload held-out SmolLM2-135M (T={PLANES}, {steps} steps, {} train tokens / \
+        "packed+HostOffload held-out SmolLM2-135M ({packed_compute:?}, T={PLANES}, {steps} steps, {} train tokens / \
          {} windows, {} eval tokens): fp ppl={ppl_fp:.3}, PTQ ppl={ppl_ptq:.3e}, distilled \
          ppl={ppl_distilled:.3}, recovery={recovery:.0}x; mean step={mean_step_ms:.0}ms vs \
          Track-0 {TRACK0_STEP_MS:.0}ms ({teacher_source}); packed bytes={packed_parameter_bytes} \
@@ -438,8 +444,8 @@ fn packed_host_offload_recovers_heldout_within_track0_time() {
 
     assert_eq!(
         offload.peak_optimizer_device_elements,
-        offload.largest_parameter_elements * 3,
-        "optimizer staging must remain bounded by one master plus two moments"
+        offload.largest_parameter_elements * 6,
+        "two optimizer slots must remain bounded by two masters plus four moments"
     );
     assert!(
         offload.peak_optimizer_device_elements < offload.host_optimizer_elements,
