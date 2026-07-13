@@ -300,7 +300,7 @@ Each track is done when its gate is green, benched, reviewed, and pushed.
 
 ## Implementation Results (2026-07-12)
 
-This section records implementation through `1133211`. It does not mark the ADR or
+This section records implementation through `5aefb1a`. It does not mark the ADR or
 its scale campaign complete.
 
 ### Landed work
@@ -326,7 +326,9 @@ its scale campaign complete.
   `49b36b2`). Finalized leaf gradients now stream directly into host Adam and are
   released immediately (`c55ac8e`); the 40-step packed recovery gates are retained
   in `88fa8c4` and `cf4a258`. Host masters and moments round-trip through bounded
-  DCP v1 sources and sinks (`1133211`).
+  DCP v1 sources and sinks (`1133211`). Packed forward and activation-gradient
+  contractions now have tiled kernels with conservative scalar fallbacks
+  (`5aefb1a`).
 - **Track F substrate:** deterministic intermediate-width Net2Wider transforms and
   quality/bytes selection (`e4b8f5b`).
 
@@ -346,6 +348,11 @@ its scale campaign complete.
   embedding/head accumulation, repack-after-offload, and checkpoint replay are
   green against the dense SALT oracle. The `T=3`, `576 x 576` packed representation
   is about `25.5%` of the dense f32 weight bytes.
+- The tiled packed contractions are bit-exact to the scalar packed oracle for
+  `T in {1,2,3}`, tail shapes, zero-work launches, and `K=8193`; both remain within
+  the `1e-4` dense-oracle contract. On a GPU-contended diagnostic 4090 run, tiled
+  activation-gradient improved `1.42x` over scalar, while repack plus forward was
+  effectively flat (`1.00x` scalar, `1.01x` dense).
 - The full packed/checkpointed SmolLM2-135M path at `T=2` uses `86,866,944` weight
   bytes versus `537,919,488` dense bytes (`0.1615x`). Its logical checkpoint
   activation peak is `3,133,440 / 16,908,288` elements (`0.1853x`), with `2,911`
@@ -360,20 +367,23 @@ its scale campaign complete.
 - **Open numerical gate:** packed whole-model parity remains just outside the strict
   `1e-4` threshold: logits `1.698e-4`, tied-embedding gradient `2.508e-4`, and
   layer-0 down gradient `6.714e-5` on the recorded 4090 run.
-- **Negative performance result:** the scalar Track D microbenchmark measured
-  `0.93x` the dense materialize-plus-matmul path. The full streamed packed campaign
-  averages `1771 ms/step`, missing the unchanged `1123 ms` Track-0 gate despite the
-  memory and quality wins. A tiled packed kernel and transfer overlap are required
-  before claiming a compute win.
+- **Negative performance result:** the original scalar Track D microbenchmark
+  measured `0.93x` the dense materialize-plus-matmul path. The tiled diagnostic
+  combined path remained slower at `0.85x` dense while the desktop GPU was
+  contended, so it is not headline performance evidence. The full streamed packed
+  campaign averages `1771 ms/step`, missing the unchanged `1123 ms` Track-0 gate
+  despite the memory and quality wins. Profiling-driven packed-kernel work and
+  transfer overlap are still required before claiming a compute win.
 
 ### Remaining local implementation and validation
 
 - Close the strict packed whole-model `1e-4` numerical gate without falling back to
   dense quantized-weight materialization.
-- Replace the correctness-first scalar packed contraction with a tiled kernel, add
-  pinned double buffering and copy/compute overlap, and rerun the `1123 ms` gate.
-  Current checkpoint and gradient evidence is deterministic logical accounting;
-  actual synchronized peak CUDA VRAM still needs measurement.
+- Profile and deepen the correctness-proven tiled packed contractions until the
+  combined path beats dense materialization; add pinned double buffering and
+  copy/compute overlap, then rerun the `1123 ms` gate on an uncontended GPU. Current
+  checkpoint and gradient evidence is deterministic logical accounting; actual
+  synchronized peak CUDA VRAM still needs measurement.
 - Integrate resident NCCL reduction into the trainer. The device collective and
   gradient-reference gates exist, but the new resident training path has not run
   on multiple GPUs.
@@ -382,9 +392,9 @@ its scale campaign complete.
   artifact-byte collection, and persisted campaign reports.
 - Run an architecture-capable 360M/1.7B packed/offload campaign before the 32B
   rental. The current real packed builder is validated only for tied-head SmolLM2.
-- Re-run the opt-in 4090 performance and strict parity gates after the tiled-kernel
-  work they currently defer. Do not infer completion from the green quality and
-  memory gates.
+- Re-run the opt-in 4090 performance and strict parity gates after the next packed
+  optimization pass. Do not infer completion from the green quality and memory
+  gates.
 
 ### Hardware and data fences
 
