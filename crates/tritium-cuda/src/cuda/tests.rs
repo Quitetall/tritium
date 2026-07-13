@@ -236,9 +236,10 @@ fn packed_training_salt_matches_dense_resident_oracle() {
                 CudaBackend::training_salt_forward_exact_tiled_supported(m, n, k),
                 k >= 32
             );
-            assert!(CudaBackend::training_salt_grad_a_exact_tiled_supported(
-                m, n, k
-            ));
+            assert_eq!(
+                CudaBackend::training_salt_grad_a_exact_tiled_supported(m, n, k),
+                k >= 32
+            );
 
             for (i, (&got, &want)) in got_y.iter().zip(&want_y).enumerate() {
                 assert!(

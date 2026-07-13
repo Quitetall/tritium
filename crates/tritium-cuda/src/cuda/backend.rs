@@ -69,6 +69,8 @@ const KERNEL_NAME_SALT_TRAINING_GRAD_A_TILED: &str = "salt_training_grad_a_tiled
 enum TrainingSaltDispatch {
     Exact,
     Fast,
+    // Referenced by non-test dispatch selection even though only tests request
+    // it directly; cfg(test) would remove a variant needed by production code.
     #[allow(dead_code)]
     ScalarExact,
     #[cfg(test)]
@@ -1549,7 +1551,7 @@ impl CudaBackend {
         n: usize,
         k: usize,
     ) -> bool {
-        n >= TRAINING_SALT_TILE_X as usize && k > 0
+        n >= TRAINING_SALT_TILE_X as usize && k >= TRAINING_SALT_TILE_X as usize
     }
 
     fn training_salt_grad_a_impl(
