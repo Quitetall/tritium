@@ -76,7 +76,8 @@ pub use salt::{
     unpack_salt_row_prefix,
 };
 pub use salt_bundle::{
-    SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltTensor, read_salt_bundle, write_salt_bundle,
+    SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltTensor, read_salt_bundle, read_salt_bundle_prefix,
+    write_progressive_salt_bundle, write_salt_bundle,
 };
 pub use salt_gguf::{
     GGML_TYPE_TRITIUM_SALT, SALT_GGUF_FORMAT_KEY, SALT_GGUF_FORMAT_VALUE, read_salt_gguf,
