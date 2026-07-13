@@ -463,6 +463,26 @@ extern "C" __global__ void embed_gather_backward(
     gw[idx] = acc;
 }
 
+// Segmented embedding backward. Host metadata groups equal token ids while
+// preserving ascending original position inside each group. One thread owns
+// one (unique vocab row, dimension), so its additions exactly match the CPU
+// scatter order without atomics. Untouched gw rows are zeroed by the caller.
+extern "C" __global__ void embed_gather_backward_segmented(
+    const float* __restrict__ gy, const int* __restrict__ metadata,
+    float* __restrict__ gw, int unique_rows, int dim)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)unique_rows * dim) return;
+    int u = idx / dim, d = idx % dim;
+    const int* rows = metadata;
+    const int* offsets = rows + unique_rows;
+    const int* positions = offsets + unique_rows + 1;
+    float acc = 0.0f;
+    for (int j = offsets[u]; j < offsets[u + 1]; ++j)
+        acc += gy[(long)positions[j] * dim + d];
+    gw[(long)rows[u] * dim + d] = acc;
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(

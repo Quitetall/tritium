@@ -33,7 +33,7 @@ use tritium_spec::BackendError;
 use tritium_train::ops::{act, loss, matmul, ste};
 use tritium_train::{AdamState, AdamW, LrSchedule, Optimizer, TrainGemm};
 
-use crate::cuda::CudaBackend;
+use crate::cuda::{CudaBackend, EmbedSegments};
 
 /// `(g_a[M,K], g_w[N,K], g_s[N])` — the three matmul gradients returned together by
 /// [`GemmEngine::backward`].
@@ -467,6 +467,7 @@ enum DevOp {
     Embed {
         w: usize,
         tokens: CudaSlice<i32>,
+        segments: EmbedSegments,
         seq: usize,
         dim: usize,
         vocab: usize,
@@ -1012,6 +1013,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         dim: usize,
         vocab: usize,
     ) -> Result<usize, BackendError> {
+        let segments = self.b.prepare_embed_segments(tokens, seq, vocab)?;
         let d_tok = self.b.dev_upload_i32(tokens)?;
         let mut out = self.b.dev_alloc_zeros(seq * dim)?;
         self.b
@@ -1020,6 +1022,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         self.ops.push(DevOp::Embed {
             w,
             tokens: d_tok,
+            segments,
             seq,
             dim,
             vocab,
@@ -1316,16 +1319,17 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 }
                 DevOp::Embed {
                     w,
-                    ref tokens,
+                    tokens: _,
+                    ref segments,
                     seq,
                     dim,
                     vocab,
                     out,
                 } => {
                     let mut gw = self.b.dev_alloc_zeros(vocab * dim)?;
-                    self.b.embed_gather_backward_dev(
+                    self.b.embed_gather_backward_segmented_prepared_dev(
                         &grads[out],
-                        tokens,
+                        segments,
                         &mut gw,
                         seq,
                         dim,
@@ -2132,6 +2136,143 @@ mod tests {
         ));
     }
 
+    /// ADR 0027 Track B performance gate. Timings include stable host grouping,
+    /// metadata upload, output zeroing, kernel execution, and synchronization.
+    #[test]
+    #[ignore = "4090 performance gate; run explicitly with --ignored --nocapture"]
+    fn embed_gather_segmented_is_five_times_faster() {
+        use std::time::Instant;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping embed_gather_segmented_is_five_times_faster: no CUDA ({e})");
+                return;
+            }
+        };
+        // seq=512 is the scale where the reference O(vocab*seq*dim) scan is a
+        // material training bottleneck; Track A separately reports seq=32.
+        let (vocab, dim, seq) = (49_152usize, 576usize, 512usize);
+        let tokens: Vec<i32> = (0..seq).map(|i| ((i * 1531) % vocab) as i32).collect();
+        let gy = seeded_uniform(0xB270, seq * dim, -1.0, 1.0);
+        let d_gy = backend.dev_upload(&gy).unwrap();
+        let d_tokens = backend.dev_upload_i32(&tokens).unwrap();
+        let mut d_reference = backend.dev_alloc_zeros(vocab * dim).unwrap();
+        let mut d_segmented = backend.dev_alloc_zeros(vocab * dim).unwrap();
+
+        let mut reference = || {
+            let start = Instant::now();
+            backend
+                .embed_gather_backward_dev(&d_gy, &d_tokens, &mut d_reference, seq, dim, vocab)
+                .unwrap();
+            backend.dev_synchronize().unwrap();
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        let mut segmented = || {
+            let start = Instant::now();
+            backend
+                .embed_gather_backward_segmented_dev(
+                    &d_gy,
+                    &tokens,
+                    &mut d_segmented,
+                    seq,
+                    dim,
+                    vocab,
+                )
+                .unwrap();
+            backend.dev_synchronize().unwrap();
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        for _ in 0..10 {
+            reference();
+            segmented();
+        }
+        let mut reference_ms = Vec::with_capacity(21);
+        let mut segmented_ms = Vec::with_capacity(21);
+        for _ in 0..21 {
+            reference_ms.push(reference());
+            segmented_ms.push(segmented());
+        }
+        reference_ms.sort_by(f64::total_cmp);
+        segmented_ms.sort_by(f64::total_cmp);
+        let (reference_ms, segmented_ms) = (reference_ms[10], segmented_ms[10]);
+        let speedup = reference_ms / segmented_ms;
+        eprintln!(
+            "0027 B embedding backward on {} ({vocab}x{dim}, seq {seq}, {seq} unique): reference \
+             {reference_ms:.3}ms | segmented-total {segmented_ms:.3}ms | {speedup:.1}x faster",
+            backend.dev_name()
+        );
+        if backend.dev_name().contains("4090") {
+            assert!(
+                speedup >= 5.0,
+                "segmented embedding backward speedup {speedup:.2}x is below 5x gate"
+            );
+        }
+    }
+
+    #[test]
+    fn embed_gather_segmented_edge_matrix_is_bit_exact() {
+        use tritium_train::ops::embed;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping embed_gather_segmented_edge_matrix_is_bit_exact: no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let vocab = 8usize;
+        let token_cases: &[&[i32]] = &[&[], &[3, 3, 3], &[0, 7], &[0, 2, 4, 6], &[5, 1, 5, 1, 5]];
+        for &dim in &[1usize, 255, 256, 257, 576] {
+            for &tokens in token_cases {
+                let seq = tokens.len();
+                let mut gy = seeded_uniform(0xB271 ^ dim as u64 ^ seq as u64, seq * dim, -1.0, 1.0);
+                if tokens == [3, 3, 3] {
+                    for d in 0..dim {
+                        gy[d] = 1e20;
+                        gy[dim + d] = -1e20;
+                        gy[2 * dim + d] = 3.25;
+                    }
+                }
+                let d_gy = backend.dev_upload(&gy).unwrap();
+                let mut d_gw = backend.dev_upload(&vec![7.0; vocab * dim]).unwrap();
+                for _ in 0..2 {
+                    backend
+                        .embed_gather_backward_segmented_dev(
+                            &d_gy, tokens, &mut d_gw, seq, dim, vocab,
+                        )
+                        .unwrap();
+                    let mut got = vec![0.0; vocab * dim];
+                    backend.dev_download(&d_gw, &mut got).unwrap();
+                    let tokens_u32: Vec<u32> = tokens.iter().map(|&token| token as u32).collect();
+                    let expected = embed::gather_vjp(vocab, &tokens_u32, dim, &gy);
+                    assert!(
+                        got.iter()
+                            .zip(&expected)
+                            .all(|(&a, &b)| a.to_bits() == b.to_bits()),
+                        "segmented mismatch for dim={dim}, tokens={tokens:?}"
+                    );
+                }
+            }
+        }
+
+        let d_gy = backend.dev_alloc_zeros(1).unwrap();
+        let mut d_gw = backend.dev_alloc_zeros(vocab).unwrap();
+        for invalid in [&[-1][..], &[vocab as i32][..]] {
+            assert!(matches!(
+                backend
+                    .embed_gather_backward_segmented_dev(&d_gy, invalid, &mut d_gw, 1, 1, vocab,),
+                Err(BackendError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            backend.embed_gather_backward_segmented_dev(&d_gy, &[], &mut d_gw, 1, 1, vocab,),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+    }
+
     /// Gate (plan 0043 P2.3): the device-resident TRAINING RMSNorm (forward + grad_x + grad_w)
     /// matches `tritium-train`'s `ops::norm` — which uses a sequential sum, so (only +,*,/,sqrt, all
     /// IEEE correctly-rounded, --fmad=false) it is BIT-EXACT, unlike silu's expf.
@@ -2373,7 +2514,12 @@ mod tests {
             0.0,
             "gather fwd"
         );
-        let egy = seeded_uniform(0x8B, seq * dim, -1.0, 1.0);
+        let mut egy = seeded_uniform(0x8B, seq * dim, -1.0, 1.0);
+        for d in 0..dim {
+            egy[d] = 1e20;
+            egy[3 * dim + d] = -1e20;
+            egy[7 * dim + d] = 3.25;
+        }
         let d_egy = backend.dev_upload(&egy).unwrap();
         let mut d_egw = backend.dev_alloc_zeros(vocab * dim).unwrap();
         backend
@@ -2386,6 +2532,26 @@ mod tests {
             ),
             0.0,
             "gather bwd (repeated tokens accumulate)"
+        );
+        let mut d_egw_segmented = backend.dev_upload(&vec![7.0; vocab * dim]).unwrap();
+        backend
+            .embed_gather_backward_segmented_dev(
+                &d_egy,
+                &tok_i32,
+                &mut d_egw_segmented,
+                seq,
+                dim,
+                vocab,
+            )
+            .unwrap();
+        let segmented = dl(&d_egw_segmented, vocab * dim);
+        let cpu = embed::gather_vjp(vocab, &tokens, dim, &egy);
+        assert!(
+            segmented
+                .iter()
+                .zip(&cpu)
+                .all(|(&device, &host)| device.to_bits() == host.to_bits()),
+            "segmented gather bwd must preserve exact ascending-position additions and zero untouched rows"
         );
 
         // ── softmax cross-entropy backward (expf ⇒ 1e-4) ──
@@ -2420,8 +2586,8 @@ mod tests {
     fn device_tape_mlp_stack_matches_cpu_tape() {
         use std::time::Instant;
 
-        use tritium_train::ops::softmax;
         use tritium_train::Tape;
+        use tritium_train::ops::softmax;
 
         let backend = match CudaBackend::new(0) {
             Ok(b) => b,
@@ -2643,8 +2809,8 @@ mod tests {
     /// n_head) is exercised.
     #[test]
     fn device_tape_transformer_block_matches_cpu_tape() {
-        use tritium_train::nn::attention;
         use tritium_train::Tape;
+        use tritium_train::nn::attention;
 
         let backend = match CudaBackend::new(0) {
             Ok(b) => b,

@@ -28,6 +28,15 @@ pub struct SaltResidentLinear {
     pub(super) t_planes: usize,
 }
 
+/// Device metadata for deterministic segmented embedding gradients. Equal
+/// token ids are grouped while `positions` stays ascending inside each group.
+#[derive(Debug)]
+pub(crate) struct EmbedSegments {
+    metadata: CudaSlice<i32>,
+    unique_rows: usize,
+    seq: usize,
+}
+
 /// A CUDA execution backend bound to a single device ordinal.
 ///
 /// Construct with [`CudaBackend::new`]; it opens the context, loads the PTX module,
@@ -156,6 +165,8 @@ pub struct CudaBackend {
     pub(super) func_transpose_fwd: CudaFunction,
     pub(super) func_embed_gather_fwd: CudaFunction,
     pub(super) func_embed_gather_bwd: CudaFunction,
+    /// ADR 0027 Track B: deterministic segmented embedding gradient.
+    pub(super) func_embed_gather_bwd_segmented: CudaFunction,
     pub(super) func_softmax_xent_bwd: CudaFunction,
     pub(super) func_scale_const: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
@@ -358,6 +369,9 @@ impl CudaBackend {
         let func_embed_gather_bwd = grad_module
             .load_function(KERNEL_NAME_EMBED_GATHER_BWD)
             .map_err(|e| driver_err("resolve embed_gather_backward kernel", &e))?;
+        let func_embed_gather_bwd_segmented = grad_module
+            .load_function(KERNEL_NAME_EMBED_GATHER_BWD_SEGMENTED)
+            .map_err(|e| driver_err("resolve embed_gather_backward_segmented kernel", &e))?;
         let func_softmax_xent_bwd = grad_module
             .load_function(KERNEL_NAME_SOFTMAX_XENT_BWD)
             .map_err(|e| driver_err("resolve softmax_xent_backward kernel", &e))?;
@@ -430,6 +444,7 @@ impl CudaBackend {
             func_transpose_fwd,
             func_embed_gather_fwd,
             func_embed_gather_bwd,
+            func_embed_gather_bwd_segmented,
             func_softmax_xent_bwd,
             func_scale_const,
             device_id: format!("cuda:{ordinal}"),
@@ -807,6 +822,18 @@ impl CudaBackend {
     /// retaining the same primary context.
     pub(crate) fn same_context<T>(&self, buffer: &CudaSlice<T>) -> bool {
         self.stream.context() == buffer.context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dev_synchronize(&self) -> Result<(), BackendError> {
+        self.stream
+            .synchronize()
+            .map_err(|e| driver_err("synchronize resident training stream", &e))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dev_name(&self) -> &str {
+        &self.device_name
     }
 
     /// Greedy multi-plane SALT reconstruction on resident f32 buffers, matching
@@ -1879,6 +1906,138 @@ impl CudaBackend {
                 .map_err(|e| driver_err("launch embed_gather_backward_dev", &e))?;
         }
         Ok(())
+    }
+
+    /// Validate, stably group, and upload embedding segment metadata once for
+    /// reuse by the tape's backward pass.
+    pub(crate) fn prepare_embed_segments(
+        &self,
+        tokens: &[i32],
+        seq: usize,
+        vocab: usize,
+    ) -> Result<EmbedSegments, BackendError> {
+        if tokens.len() != seq {
+            return Err(BackendError::ShapeMismatch {
+                expected: seq,
+                got: tokens.len(),
+            });
+        }
+        let _ = i32::try_from(seq)
+            .map_err(|_| BackendError::InvalidInput("embedding seq exceeds i32::MAX".into()))?;
+        let vocab_i = i32::try_from(vocab)
+            .map_err(|_| BackendError::InvalidInput("embedding vocab exceeds i32::MAX".into()))?;
+        for (position, &token) in tokens.iter().enumerate() {
+            if token < 0 || token >= vocab_i {
+                return Err(BackendError::InvalidInput(format!(
+                    "token {token} at position {position} is outside 0..{vocab}"
+                )));
+            }
+        }
+        // Stable sort: equal token ids retain ascending original position.
+        let mut order: Vec<usize> = (0..seq).collect();
+        order.sort_by_key(|&position| tokens[position]);
+        let mut rows = Vec::new();
+        let mut offsets = vec![0i32];
+        let mut positions = Vec::with_capacity(seq);
+        for position in order {
+            let token = tokens[position];
+            if rows.last().copied() != Some(token) {
+                if !rows.is_empty() {
+                    offsets.push(positions.len() as i32);
+                }
+                rows.push(token);
+            }
+            positions.push(position as i32);
+        }
+        offsets.push(seq as i32);
+
+        let unique_rows = rows.len();
+        rows.extend(offsets);
+        rows.extend(positions);
+        Ok(EmbedSegments {
+            unique_rows,
+            metadata: self.dev_upload_i32(&rows)?,
+            seq,
+        })
+    }
+
+    /// Deterministic segmented embedding backward using metadata already
+    /// uploaded by [`Self::prepare_embed_segments`].
+    pub(crate) fn embed_gather_backward_segmented_prepared_dev(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        segments: &EmbedSegments,
+        d_gw: &mut CudaSlice<f32>,
+        seq: usize,
+        dim: usize,
+        vocab: usize,
+    ) -> Result<(), BackendError> {
+        if segments.seq != seq {
+            return Err(BackendError::ShapeMismatch {
+                expected: segments.seq,
+                got: seq,
+            });
+        }
+        let gy_len = seq.checked_mul(dim).ok_or_else(|| {
+            BackendError::InvalidInput("embedding gradient shape overflows usize".into())
+        })?;
+        let gw_len = vocab.checked_mul(dim).ok_or_else(|| {
+            BackendError::InvalidInput("embedding weight shape overflows usize".into())
+        })?;
+        if d_gy.len() < gy_len || d_gw.len() < gw_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: gw_len,
+                got: d_gw.len(),
+            });
+        }
+        let dim_i = i32::try_from(dim)
+            .map_err(|_| BackendError::InvalidInput("embedding dim exceeds i32::MAX".into()))?;
+        let unique_i = i32::try_from(segments.unique_rows).map_err(|_| {
+            BackendError::InvalidInput("unique embedding rows exceed i32::MAX".into())
+        })?;
+        self.stream
+            .memset_zeros(d_gw)
+            .map_err(|e| driver_err("zero segmented embedding gradient", &e))?;
+        if segments.unique_rows == 0 || dim == 0 || vocab == 0 {
+            return Ok(());
+        }
+        let work = segments.unique_rows.checked_mul(dim).ok_or_else(|| {
+            BackendError::InvalidInput("segmented embedding work size overflows usize".into())
+        })?;
+        let mut launch = self
+            .stream
+            .launch_builder(&self.func_embed_gather_bwd_segmented);
+        launch
+            .arg(d_gy)
+            .arg(&segments.metadata)
+            .arg(d_gw)
+            .arg(&unique_i)
+            .arg(&dim_i);
+        // SAFETY: kernel args match the declaration; metadata was validated
+        // and constructed by `prepare_embed_segments`.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(work))
+                .map_err(|e| driver_err("launch embed_gather_backward_segmented_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Total-cost wrapper used by the correctness/performance gate: host
+    /// grouping, metadata upload, zeroing, and segmented kernel.
+    #[allow(dead_code)]
+    pub(crate) fn embed_gather_backward_segmented_dev(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        tokens: &[i32],
+        d_gw: &mut CudaSlice<f32>,
+        seq: usize,
+        dim: usize,
+        vocab: usize,
+    ) -> Result<(), BackendError> {
+        let segments = self.prepare_embed_segments(tokens, seq, vocab)?;
+        self.embed_gather_backward_segmented_prepared_dev(d_gy, &segments, d_gw, seq, dim, vocab)
     }
 
     /// Softmax cross-entropy backward on resident logits (`ops::loss::softmax_xent_vjp`; expf ⇒ within

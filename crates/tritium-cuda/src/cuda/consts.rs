@@ -210,6 +210,7 @@ pub(super) const KERNEL_NAME_COPY_INTO_COLS: &str = "copy_into_cols";
 pub(super) const KERNEL_NAME_TRANSPOSE_FWD: &str = "transpose_forward";
 pub(super) const KERNEL_NAME_EMBED_GATHER_FWD: &str = "embed_gather_forward";
 pub(super) const KERNEL_NAME_EMBED_GATHER_BWD: &str = "embed_gather_backward";
+pub(super) const KERNEL_NAME_EMBED_GATHER_BWD_SEGMENTED: &str = "embed_gather_backward_segmented";
 pub(super) const KERNEL_NAME_SOFTMAX_XENT_BWD: &str = "softmax_xent_backward";
 pub(super) const KERNEL_NAME_SCALE_CONST: &str = "scale_const";
 /// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
