@@ -452,7 +452,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
 
     assert!(ppl_ptq > ppl_fp, "PTQ must degrade held-out ppl");
     assert!(
-        recovery >= 900.0,
+        recovery >= 950.0,
         "resident trainer recovered only {recovery:.0}x vs PTQ (expected about 960x)"
     );
     assert!(

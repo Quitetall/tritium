@@ -994,12 +994,14 @@ pub struct DeviceTrainer<'a> {
     backend: &'a CudaBackend,
     params: Vec<ResidentTrainParam>,
     quantized_prepared: bool,
+    poisoned: bool,
 }
 
 impl core::fmt::Debug for DeviceTrainer<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DeviceTrainer")
             .field("parameter_count", &self.params.len())
+            .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
 }
@@ -1045,11 +1047,29 @@ impl<'a> DeviceTrainer<'a> {
             backend,
             params: resident,
             quantized_prepared: false,
+            poisoned: false,
         })
+    }
+
+    fn ensure_usable(&self) -> Result<(), BackendError> {
+        if self.poisoned {
+            Err(BackendError::InvalidInput(
+                "resident trainer is poisoned; reconstruct it before reuse".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether an optimizer failure may have left parameter generations mixed.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Reconstruct every resident master into its dense f32 SALT tensor.
     pub fn prepare_quantized(&mut self) -> Result<(), BackendError> {
+        self.ensure_usable()?;
         self.quantized_prepared = false;
         for param in &mut self.params {
             self.backend.salt_quantize_forward_dev(
@@ -1067,6 +1087,7 @@ impl<'a> DeviceTrainer<'a> {
 
     /// Borrow a prepared quantized weight for zero-copy insertion into a tape.
     pub fn quantized(&self, index: usize) -> Result<&DeviceTensor, BackendError> {
+        self.ensure_usable()?;
         if !self.quantized_prepared {
             return Err(BackendError::InvalidInput(
                 "quantized weights are stale; call prepare_quantized first".into(),
@@ -1078,8 +1099,11 @@ impl<'a> DeviceTrainer<'a> {
     }
 
     /// Apply one 1-based resident AdamW step. Gradients must be in parameter
-    /// order, as returned by requesting weight leaf ids in that order.
+    /// order, as returned by requesting weight leaf ids in that order. A device
+    /// failure after mutation begins poisons the trainer because earlier leaves
+    /// may already represent the new generation.
     pub fn step(&mut self, grads: DeviceGradients, step: u64) -> Result<(), BackendError> {
+        self.ensure_usable()?;
         if grads.bufs.len() != self.params.len() {
             return Err(BackendError::ShapeMismatch {
                 expected: self.params.len(),
@@ -1100,6 +1124,7 @@ impl<'a> DeviceTrainer<'a> {
             }
         }
         self.quantized_prepared = false;
+        self.poisoned = true;
         for (param, grad) in self.params.iter_mut().zip(grads.bufs) {
             self.backend.adamw_step_dev(
                 &mut param.master.buf,
@@ -1110,11 +1135,13 @@ impl<'a> DeviceTrainer<'a> {
                 &param.optimizer,
             )?;
         }
+        self.poisoned = false;
         Ok(())
     }
 
     /// Download one latent master for evaluation or checkpointing.
     pub fn download_master(&self, index: usize) -> Result<Vec<f32>, BackendError> {
+        self.ensure_usable()?;
         let param = self.params.get(index).ok_or_else(|| {
             BackendError::InvalidInput(format!("parameter index {index} is out of range"))
         })?;
@@ -4868,6 +4895,67 @@ mod tests {
                 .collect(),
             stats: DeviceBackwardStats::default(),
         }
+    }
+
+    #[test]
+    fn device_trainer_poisoned_after_partial_optimizer_failure() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping device_trainer_poisoned_after_partial_optimizer_failure: no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let masters = [vec![0.5f32; 8], vec![-0.25f32; 8]];
+        let specs = [
+            DeviceTrainParam {
+                master: &masters[0],
+                rows: 2,
+                cols: 4,
+                salt_planes: 1,
+                optimizer: AdamW::new(1e-2),
+            },
+            DeviceTrainParam {
+                master: &masters[1],
+                rows: 2,
+                cols: 4,
+                salt_planes: 1,
+                optimizer: AdamW::new(1e-2),
+            },
+        ];
+        let mut trainer = DeviceTrainer::new(&backend, &specs).unwrap();
+        let before = trainer.params[0].master.download(&backend).unwrap();
+        // Corrupt only the second private moment buffer after construction. All
+        // public gradient metadata still prevalidates, so leaf 0 is launched
+        // before leaf 1 reports the injected optimizer-state shape failure.
+        trainer.params[1].m = backend.dev_alloc_zeros(0).unwrap();
+        let grads = vec![vec![0.25f32; 8], vec![0.25f32; 8]];
+
+        assert!(matches!(
+            trainer.step(upload_test_gradients(&backend, &grads), 1),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+        assert!(trainer.is_poisoned());
+        let after = trainer.params[0].master.download(&backend).unwrap();
+        assert!(max_abs_diff(&before, &after) > 0.0);
+        assert!(matches!(
+            trainer.prepare_quantized(),
+            Err(BackendError::InvalidInput(message)) if message.contains("poisoned")
+        ));
+        assert!(matches!(
+            trainer.quantized(0),
+            Err(BackendError::InvalidInput(message)) if message.contains("poisoned")
+        ));
+        assert!(matches!(
+            trainer.download_master(0),
+            Err(BackendError::InvalidInput(message)) if message.contains("poisoned")
+        ));
+        assert!(matches!(
+            trainer.step(upload_test_gradients(&backend, &grads), 2),
+            Err(BackendError::InvalidInput(message)) if message.contains("poisoned")
+        ));
     }
 
     #[test]

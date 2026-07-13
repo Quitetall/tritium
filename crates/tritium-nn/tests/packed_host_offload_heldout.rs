@@ -38,7 +38,7 @@ const PLANES: usize = 2;
 const TRAIN_SEQ: usize = 32;
 const STEPS: u64 = 40;
 const LR: f32 = 2e-3;
-const MIN_RECOVERY: f64 = 900.0;
+const MIN_RECOVERY: f64 = 950.0;
 const TRACK0_STEP_MS: f64 = 1123.0;
 
 fn model_dir() -> PathBuf {
