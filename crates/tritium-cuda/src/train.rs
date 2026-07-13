@@ -661,6 +661,7 @@ struct ResidentTrainParam {
 pub struct DeviceTrainer<'a> {
     backend: &'a CudaBackend,
     params: Vec<ResidentTrainParam>,
+    quantized_prepared: bool,
 }
 
 impl core::fmt::Debug for DeviceTrainer<'_> {
@@ -711,11 +712,13 @@ impl<'a> DeviceTrainer<'a> {
         Ok(Self {
             backend,
             params: resident,
+            quantized_prepared: false,
         })
     }
 
     /// Reconstruct every resident master into its dense f32 SALT tensor.
     pub fn prepare_quantized(&mut self) -> Result<(), BackendError> {
+        self.quantized_prepared = false;
         for param in &mut self.params {
             self.backend.salt_quantize_forward_dev(
                 &param.master.buf,
@@ -726,11 +729,17 @@ impl<'a> DeviceTrainer<'a> {
                 param.salt_planes,
             )?;
         }
+        self.quantized_prepared = true;
         Ok(())
     }
 
     /// Borrow a prepared quantized weight for zero-copy insertion into a tape.
     pub fn quantized(&self, index: usize) -> Result<&DeviceTensor, BackendError> {
+        if !self.quantized_prepared {
+            return Err(BackendError::InvalidInput(
+                "quantized weights are stale; call prepare_quantized first".into(),
+            ));
+        }
         self.params.get(index).map(|p| &p.quantized).ok_or_else(|| {
             BackendError::InvalidInput(format!("parameter index {index} is out of range"))
         })
@@ -745,12 +754,21 @@ impl<'a> DeviceTrainer<'a> {
                 got: grads.bufs.len(),
             });
         }
-        for (param, grad) in self.params.iter_mut().zip(grads.bufs) {
-            if !self.backend.same_context(&grad) {
+        for (param, grad) in self.params.iter().zip(&grads.bufs) {
+            if !self.backend.same_context(grad) {
                 return Err(BackendError::InvalidInput(
                     "device gradient belongs to a different CUDA context".into(),
                 ));
             }
+            if grad.len() != param.master.len() {
+                return Err(BackendError::ShapeMismatch {
+                    expected: param.master.len(),
+                    got: grad.len(),
+                });
+            }
+        }
+        self.quantized_prepared = false;
+        for (param, grad) in self.params.iter_mut().zip(grads.bufs) {
             self.backend.adamw_step_dev(
                 &mut param.master.buf,
                 &grad,
@@ -782,6 +800,7 @@ pub struct DeviceTape<'backend, 'leaf> {
     b: &'backend CudaBackend,
     vals: Vec<DeviceValue<'leaf>>,
     lens: Vec<usize>,
+    leaves: Vec<bool>,
     ops: Vec<DevOp>,
     ones: CudaSlice<f32>,
 }
@@ -804,6 +823,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             b,
             vals: Vec::new(),
             lens: Vec::new(),
+            leaves: Vec::new(),
             ops: Vec::new(),
             ones,
         })
@@ -813,13 +833,16 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let id = self.vals.len();
         self.vals.push(DeviceValue::Owned(buf));
         self.lens.push(len);
+        self.leaves.push(false);
         id
     }
 
     /// Upload a weight/input leaf; returns its value id.
     pub fn leaf(&mut self, host: &[f32]) -> Result<usize, BackendError> {
         let buf = self.b.dev_upload(host)?;
-        Ok(self.push(buf, host.len()))
+        let id = self.push(buf, host.len());
+        self.leaves[id] = true;
+        Ok(id)
     }
 
     /// Borrow an existing resident tensor as a leaf without allocating or
@@ -833,6 +856,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let id = self.vals.len();
         self.vals.push(DeviceValue::Borrowed(&tensor.buf));
         self.lens.push(tensor.buf.len());
+        self.leaves.push(true);
         Ok(id)
     }
 
@@ -1482,6 +1506,11 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     "requested gradient value id {id} is duplicated"
                 )));
             }
+            if !self.leaves[id] {
+                return Err(BackendError::InvalidInput(format!(
+                    "requested gradient value id {id} is not a leaf"
+                )));
+            }
         }
 
         let seed = self.softmax_xent_grad_device(logits, &target.buf, rows, cols)?;
@@ -2017,6 +2046,10 @@ mod tests {
             }],
         )
         .unwrap();
+        assert!(matches!(
+            trainer.quantized(0),
+            Err(BackendError::InvalidInput(message)) if message.contains("prepare_quantized")
+        ));
         trainer.prepare_quantized().unwrap();
         let d_input = DeviceTensor::upload(&backend, &input).unwrap();
         let d_target = DeviceTensor::upload(&backend, &target).unwrap();
@@ -2029,6 +2062,10 @@ mod tests {
                 .unwrap()
         };
         trainer.step(grads, 1).unwrap();
+        assert!(matches!(
+            trainer.quantized(0),
+            Err(BackendError::InvalidInput(message)) if message.contains("stale")
+        ));
 
         let got = trainer.download_master(0).unwrap();
         assert_eq!(d_input.download(&backend).unwrap(), input);
@@ -2084,6 +2121,14 @@ mod tests {
         assert!(matches!(
             tape.xent_backward_device(logits, &target, 1, 2, &[usize::MAX]),
             Err(BackendError::InvalidInput(message)) if message.contains("out of range")
+        ));
+        let mut tape = DeviceTape::new(&backend, 2).unwrap();
+        let x = tape.leaf(&[1.0, -1.0]).unwrap();
+        let w = tape.leaf(&[0.5, 0.25, -0.5, 0.75]).unwrap();
+        let logits = tape.matmul(x, w, 1, 2, 2).unwrap();
+        assert!(matches!(
+            tape.xent_backward_device(logits, &target, 1, 2, &[logits]),
+            Err(BackendError::InvalidInput(message)) if message.contains("not a leaf")
         ));
     }
 
