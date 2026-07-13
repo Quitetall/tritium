@@ -542,6 +542,51 @@ impl DevOp {
     }
 }
 
+/// Activation retention policy for [`DeviceTape`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointPolicy {
+    /// Retain every forward activation until its VJP runs.
+    KeepAll,
+    /// Materialize one checkpoint after each non-zero number of block markers.
+    EveryBlocks(usize),
+    /// Choose `ceil(sqrt(total_blocks))` as the checkpoint interval.
+    SqrtDepth(usize),
+}
+
+impl CheckpointPolicy {
+    fn interval(self) -> Result<Option<usize>, BackendError> {
+        match self {
+            Self::KeepAll => Ok(None),
+            Self::EveryBlocks(0) => Err(BackendError::InvalidInput(
+                "checkpoint interval must be non-zero".into(),
+            )),
+            Self::EveryBlocks(interval) => Ok(Some(interval)),
+            Self::SqrtDepth(0) => Err(BackendError::InvalidInput(
+                "checkpoint depth must be non-zero".into(),
+            )),
+            Self::SqrtDepth(total_blocks) => {
+                let floor = (total_blocks as f64).sqrt() as usize;
+                let interval = if floor.saturating_mul(floor) < total_blocks {
+                    floor + 1
+                } else {
+                    floor
+                };
+                Ok(Some(interval))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CheckpointSegment {
+    op_start: usize,
+    op_end: usize,
+    value_start: usize,
+    value_end: usize,
+    frontier: Vec<usize>,
+    evicted: bool,
+}
+
 /// An opaque f32 tensor owned by one CUDA context.
 ///
 /// The allocation can be borrowed by [`DeviceTape::leaf_device`] without a
@@ -621,6 +666,16 @@ pub struct DeviceBackwardStats {
     /// Maximum simultaneously live persistent gradient elements with lazy
     /// slots and output-gradient release.
     pub peak_persistent_grad_elements: usize,
+    /// Non-leaf activation elements retained by a naive keep-all tape.
+    pub naive_activation_elements: usize,
+    /// Maximum simultaneously resident non-leaf activation elements across
+    /// the original forward, replay, and reverse pass.
+    pub peak_live_activation_elements: usize,
+    /// Activation elements held at materialized checkpoint frontiers when the
+    /// reverse pass began.
+    pub retained_checkpoint_elements: usize,
+    /// Forward operations recomputed while replaying evicted segments.
+    pub recomputed_ops: usize,
 }
 
 impl DeviceBackwardStats {
@@ -629,6 +684,13 @@ impl DeviceBackwardStats {
     pub fn saved_grad_elements(self) -> usize {
         self.naive_all_value_grad_elements
             .saturating_sub(self.peak_persistent_grad_elements)
+    }
+
+    /// Non-leaf activation elements avoided at the measured peak.
+    #[must_use]
+    pub fn saved_activation_elements(self) -> usize {
+        self.naive_activation_elements
+            .saturating_sub(self.peak_live_activation_elements)
     }
 }
 
@@ -853,16 +915,26 @@ impl<'a> DeviceTrainer<'a> {
 /// A device-resident autograd tape (plan 0043 P2.5): the GPU analogue of [`tritium_train::Tape`].
 /// Leaves upload once, results download once, and the recorded ops chain the resident kernels
 /// ([`super`]'s `*_dev` methods) with no host round-trips. Forward ops append a device buffer to
-/// `vals` and record a [`DevOp`]. Reverse replay allocates input-gradient slots lazily, retains only
+/// `vals` and record a `DevOp`. Reverse replay allocates input-gradient slots lazily, retains only
 /// requested leaves, and releases each output gradient after its VJP. A `dense_matmul` uses
 /// `s = ones`; the shared `ones` buffer is sized once at construction.
 pub struct DeviceTape<'backend, 'leaf> {
     b: &'backend CudaBackend,
-    vals: Vec<DeviceValue<'leaf>>,
+    vals: Vec<Option<DeviceValue<'leaf>>>,
     lens: Vec<usize>,
     leaves: Vec<bool>,
     ops: Vec<DevOp>,
     ones: CudaSlice<f32>,
+    checkpoint_policy: CheckpointPolicy,
+    checkpoint_interval: Option<usize>,
+    checkpoint_markers: usize,
+    last_checkpoint_op: usize,
+    segments: Vec<CheckpointSegment>,
+    segment_op_start: usize,
+    segment_value_start: usize,
+    live_activation_elements: usize,
+    peak_live_activation_elements: usize,
+    recomputed_ops: usize,
 }
 
 impl core::fmt::Debug for DeviceTape<'_, '_> {
@@ -878,6 +950,16 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     /// New empty tape on `b`. `ones_max` must be ≥ the largest matmul output width `n` used (the
     /// per-row unit scale buffer is allocated once to this size).
     pub fn new(b: &'backend CudaBackend, ones_max: usize) -> Result<Self, BackendError> {
+        Self::new_with_checkpoint_policy(b, ones_max, CheckpointPolicy::KeepAll)
+    }
+
+    /// New tape with explicit activation-checkpoint scheduling.
+    pub fn new_with_checkpoint_policy(
+        b: &'backend CudaBackend,
+        ones_max: usize,
+        checkpoint_policy: CheckpointPolicy,
+    ) -> Result<Self, BackendError> {
+        let checkpoint_interval = checkpoint_policy.interval()?;
         let ones = b.dev_upload(&vec![1.0f32; ones_max.max(1)])?;
         Ok(Self {
             b,
@@ -886,22 +968,74 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             leaves: Vec::new(),
             ops: Vec::new(),
             ones,
+            checkpoint_policy,
+            checkpoint_interval,
+            checkpoint_markers: 0,
+            last_checkpoint_op: 0,
+            segments: Vec::new(),
+            segment_op_start: 0,
+            segment_value_start: 0,
+            live_activation_elements: 0,
+            peak_live_activation_elements: 0,
+            recomputed_ops: 0,
         })
     }
 
-    fn push(&mut self, buf: CudaSlice<f32>, len: usize) -> usize {
+    fn push_activation(&mut self, buf: CudaSlice<f32>, len: usize) -> usize {
         let id = self.vals.len();
-        self.vals.push(DeviceValue::Owned(buf));
+        self.vals.push(Some(DeviceValue::Owned(buf)));
         self.lens.push(len);
         self.leaves.push(false);
+        self.live_activation_elements = self.live_activation_elements.saturating_add(len);
+        self.peak_live_activation_elements = self
+            .peak_live_activation_elements
+            .max(self.live_activation_elements);
         id
+    }
+
+    fn value_slice(&self, id: usize) -> Result<&CudaSlice<f32>, BackendError> {
+        let value = self.vals.get(id).ok_or_else(|| {
+            BackendError::InvalidInput(format!("device tape value id {id} is out of range"))
+        })?;
+        value.as_ref().map(DeviceValue::as_slice).ok_or_else(|| {
+            BackendError::InvalidInput(format!(
+                "device tape value id {id} was evicted; include it in checkpoint_keep frontier"
+            ))
+        })
+    }
+
+    fn evict_activation(&mut self, id: usize) -> Result<bool, BackendError> {
+        if id >= self.vals.len() {
+            return Err(BackendError::InvalidInput(format!(
+                "device tape value id {id} is out of range"
+            )));
+        }
+        if self.leaves[id] || self.vals[id].is_none() {
+            return Ok(false);
+        }
+        match self.vals[id].take() {
+            Some(DeviceValue::Owned(_)) => {
+                self.live_activation_elements =
+                    self.live_activation_elements.saturating_sub(self.lens[id]);
+                Ok(true)
+            }
+            Some(value @ DeviceValue::Borrowed(_)) => {
+                self.vals[id] = Some(value);
+                Err(BackendError::InvalidInput(format!(
+                    "non-leaf device tape value id {id} cannot borrow checkpoint storage"
+                )))
+            }
+            None => Ok(false),
+        }
     }
 
     /// Upload a weight/input leaf; returns its value id.
     pub fn leaf(&mut self, host: &[f32]) -> Result<usize, BackendError> {
         let buf = self.b.dev_upload(host)?;
-        let id = self.push(buf, host.len());
-        self.leaves[id] = true;
+        let id = self.vals.len();
+        self.vals.push(Some(DeviceValue::Owned(buf)));
+        self.lens.push(host.len());
+        self.leaves.push(true);
         Ok(id)
     }
 
@@ -914,21 +1048,111 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             ));
         }
         let id = self.vals.len();
-        self.vals.push(DeviceValue::Borrowed(&tensor.buf));
+        self.vals.push(Some(DeviceValue::Borrowed(&tensor.buf)));
         self.lens.push(tensor.buf.len());
         self.leaves.push(true);
         Ok(id)
     }
 
+    /// Mark a logical block boundary and explicitly name every non-leaf value
+    /// that may be used after it. Leaves are retained implicitly. When the
+    /// configured interval materializes this boundary, other owned values in
+    /// the completed segment are released immediately.
+    pub fn checkpoint_keep(&mut self, frontier: &[usize]) -> Result<(), BackendError> {
+        if frontier.is_empty() {
+            return Err(BackendError::InvalidInput(
+                "checkpoint frontier must contain at least one value".into(),
+            ));
+        }
+        for (position, &id) in frontier.iter().enumerate() {
+            if id >= self.vals.len() {
+                return Err(BackendError::InvalidInput(format!(
+                    "checkpoint frontier value id {id} is out of range"
+                )));
+            }
+            if frontier[..position].contains(&id) {
+                return Err(BackendError::InvalidInput(format!(
+                    "checkpoint frontier value id {id} is duplicated"
+                )));
+            }
+            if self.leaves[id] {
+                return Err(BackendError::InvalidInput(format!(
+                    "checkpoint frontier value id {id} is a leaf; leaves are retained implicitly"
+                )));
+            }
+            self.value_slice(id)?;
+        }
+
+        if self.last_checkpoint_op == self.ops.len() {
+            return Err(BackendError::InvalidInput(
+                "checkpoint block contains no forward operations".into(),
+            ));
+        }
+        let next_marker = self.checkpoint_markers.checked_add(1).ok_or_else(|| {
+            BackendError::InvalidInput("checkpoint marker count overflows usize".into())
+        })?;
+        if let CheckpointPolicy::SqrtDepth(total_blocks) = self.checkpoint_policy
+            && next_marker > total_blocks
+        {
+            return Err(BackendError::InvalidInput(format!(
+                "checkpoint marker count {} exceeds configured depth {total_blocks}",
+                next_marker
+            )));
+        }
+        self.checkpoint_markers = next_marker;
+        self.last_checkpoint_op = self.ops.len();
+        let Some(interval) = self.checkpoint_interval else {
+            return Ok(());
+        };
+        if !self.checkpoint_markers.is_multiple_of(interval) {
+            return Ok(());
+        }
+        if self.segment_op_start == self.ops.len() {
+            return Err(BackendError::InvalidInput(
+                "checkpoint segment contains no forward operations".into(),
+            ));
+        }
+
+        let mut keep = vec![false; self.vals.len()];
+        for &id in frontier {
+            keep[id] = true;
+        }
+        let value_end = self.vals.len();
+        for (id, should_keep) in keep
+            .iter()
+            .enumerate()
+            .take(value_end)
+            .skip(self.segment_value_start)
+        {
+            if !should_keep {
+                self.evict_activation(id)?;
+            }
+        }
+        self.segments.push(CheckpointSegment {
+            op_start: self.segment_op_start,
+            op_end: self.ops.len(),
+            value_start: self.segment_value_start,
+            value_end,
+            frontier: frontier.to_vec(),
+            evicted: true,
+        });
+        self.segment_op_start = self.ops.len();
+        self.segment_value_start = value_end;
+        Ok(())
+    }
+
     /// Download a value (e.g. the logits) to host.
     pub fn value(&self, id: usize) -> Result<Vec<f32>, BackendError> {
-        let mut h = vec![0.0f32; self.lens[id]];
-        self.b.dev_download(self.vals[id].as_slice(), &mut h)?;
+        let len = *self.lens.get(id).ok_or_else(|| {
+            BackendError::InvalidInput(format!("device tape value id {id} is out of range"))
+        })?;
+        let mut h = vec![0.0f32; len];
+        self.b.dev_download(self.value_slice(id)?, &mut h)?;
         Ok(h)
     }
 
-    /// `g_logits` of `L = mean_row softmax-xent(logits, target)` — the seed for [`backward`](Self::backward)
-    /// when the loss is distillation cross-entropy (`grad_out = 1`, so `gscale = 1/rows`).
+    /// `g_logits` of `L = mean_row softmax-xent(logits, target)` — the reverse seed when the loss is
+    /// distillation cross-entropy (`grad_out = 1`, so `gscale = 1/rows`).
     pub(crate) fn softmax_xent_grad(
         &self,
         logits: usize,
@@ -949,7 +1173,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     ) -> Result<CudaSlice<f32>, BackendError> {
         let mut g = self.b.dev_alloc_zeros(rows * cols)?;
         self.b.softmax_xent_backward_dev(
-            self.vals[logits].as_slice(),
+            self.value_slice(logits)?,
             target,
             &mut g,
             rows,
@@ -970,13 +1194,13 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(m * n)?;
         self.b.matmul_forward_dev(
-            self.vals[x].as_slice(),
-            self.vals[w].as_slice(),
+            self.value_slice(x)?,
+            self.value_slice(w)?,
             &self.ones,
             GemmShape { m, n, k },
             &mut out,
         )?;
-        let id = self.push(out, m * n);
+        let id = self.push_activation(out, m * n);
         self.ops.push(DevOp::Matmul {
             x,
             w,
@@ -998,14 +1222,14 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * cols)?;
         self.b.rmsnorm_forward_dev(
-            self.vals[x].as_slice(),
-            self.vals[w].as_slice(),
+            self.value_slice(x)?,
+            self.value_slice(w)?,
             &mut out,
             rows,
             cols,
             eps,
         )?;
-        let id = self.push(out, rows * cols);
+        let id = self.push_activation(out, rows * cols);
         self.ops.push(DevOp::Rmsnorm {
             x,
             w,
@@ -1020,9 +1244,8 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     pub fn silu(&mut self, x: usize) -> Result<usize, BackendError> {
         let n = self.lens[x];
         let mut out = self.b.dev_alloc_zeros(n)?;
-        self.b
-            .silu_forward_dev(self.vals[x].as_slice(), &mut out, n)?;
-        let id = self.push(out, n);
+        self.b.silu_forward_dev(self.value_slice(x)?, &mut out, n)?;
+        let id = self.push_activation(out, n);
         self.ops.push(DevOp::Silu { x, n, out: id });
         Ok(id)
     }
@@ -1034,13 +1257,9 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         );
         let n = self.lens[a];
         let mut out = self.b.dev_alloc_zeros(n)?;
-        self.b.ew_mul_forward_dev(
-            self.vals[a].as_slice(),
-            self.vals[b].as_slice(),
-            &mut out,
-            n,
-        )?;
-        let id = self.push(out, n);
+        self.b
+            .ew_mul_forward_dev(self.value_slice(a)?, self.value_slice(b)?, &mut out, n)?;
+        let id = self.push_activation(out, n);
         self.ops.push(DevOp::Mul { a, b, n, out: id });
         Ok(id)
     }
@@ -1052,13 +1271,9 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         );
         let n = self.lens[a];
         let mut out = self.b.dev_alloc_zeros(n)?;
-        self.b.ew_add_forward_dev(
-            self.vals[a].as_slice(),
-            self.vals[b].as_slice(),
-            &mut out,
-            n,
-        )?;
-        let id = self.push(out, n);
+        self.b
+            .ew_add_forward_dev(self.value_slice(a)?, self.value_slice(b)?, &mut out, n)?;
+        let id = self.push_activation(out, n);
         self.ops.push(DevOp::Add { a, b, n, out: id });
         Ok(id)
     }
@@ -1076,8 +1291,8 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let d_tok = self.b.dev_upload_i32(tokens)?;
         let mut out = self.b.dev_alloc_zeros(seq * dim)?;
         self.b
-            .embed_gather_forward_dev(self.vals[w].as_slice(), &d_tok, &mut out, seq, dim)?;
-        let id = self.push(out, seq * dim);
+            .embed_gather_forward_dev(self.value_slice(w)?, &d_tok, &mut out, seq, dim)?;
+        let id = self.push_activation(out, seq * dim);
         self.ops.push(DevOp::Embed {
             w,
             tokens: d_tok,
@@ -1104,7 +1319,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let pos = self.b.dev_upload_i32(positions)?;
         let mut out = self.b.dev_alloc_zeros(n)?;
         self.b.rope_apply_dev(
-            self.vals[x].as_slice(),
+            self.value_slice(x)?,
             &mut out,
             &pos,
             n_head,
@@ -1113,7 +1328,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             n_token,
             1.0,
         )?;
-        let id = self.push(out, n);
+        let id = self.push_activation(out, n);
         self.ops.push(DevOp::Rope {
             x,
             pos,
@@ -1137,8 +1352,8 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * len)?;
         self.b
-            .slice_cols_forward_dev(self.vals[x].as_slice(), &mut out, rows, cols, start, len)?;
-        let id = self.push(out, rows * len);
+            .slice_cols_forward_dev(self.value_slice(x)?, &mut out, rows, cols, start, len)?;
+        let id = self.push_activation(out, rows * len);
         self.ops.push(DevOp::SliceCols {
             x,
             rows,
@@ -1155,8 +1370,8 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let n = self.lens[x];
         let mut out = self.b.dev_alloc_zeros(n)?;
         self.b
-            .scale_const_dev(self.vals[x].as_slice(), &mut out, c, n)?;
-        let id = self.push(out, n);
+            .scale_const_dev(self.value_slice(x)?, &mut out, c, n)?;
+        let id = self.push_activation(out, n);
         self.ops.push(DevOp::ScaleConst { x, c, n, out: id });
         Ok(id)
     }
@@ -1170,8 +1385,8 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * cols)?;
         self.b
-            .causal_mask_forward_dev(self.vals[x].as_slice(), &mut out, rows, cols)?;
-        let id = self.push(out, rows * cols);
+            .causal_mask_forward_dev(self.value_slice(x)?, &mut out, rows, cols)?;
+        let id = self.push_activation(out, rows * cols);
         self.ops.push(DevOp::CausalMask {
             x,
             rows,
@@ -1190,8 +1405,8 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * cols)?;
         self.b
-            .softmax_forward_dev(self.vals[x].as_slice(), &mut out, rows, cols)?;
-        let id = self.push(out, rows * cols);
+            .softmax_forward_dev(self.value_slice(x)?, &mut out, rows, cols)?;
+        let id = self.push_activation(out, rows * cols);
         self.ops.push(DevOp::Softmax {
             x,
             rows,
@@ -1210,8 +1425,8 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(rows * cols)?;
         self.b
-            .transpose_forward_dev(self.vals[x].as_slice(), &mut out, rows, cols)?;
-        let id = self.push(out, rows * cols);
+            .transpose_forward_dev(self.value_slice(x)?, &mut out, rows, cols)?;
+        let id = self.push_activation(out, rows * cols);
         self.ops.push(DevOp::Transpose {
             x,
             rows,
@@ -1233,10 +1448,10 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         let mut off = 0;
         for (&p, &len) in parts.iter().zip(lens) {
             self.b
-                .copy_into_cols_dev(self.vals[p].as_slice(), &mut out, rows, total, off, len)?;
+                .copy_into_cols_dev(self.value_slice(p)?, &mut out, rows, total, off, len)?;
             off += len;
         }
-        let id = self.push(out, rows * total);
+        let id = self.push_activation(out, rows * total);
         self.ops.push(DevOp::Concat {
             parts: parts.to_vec(),
             rows,
@@ -1292,6 +1507,243 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         self.matmul(cat, wo, seq, n_embd, qd)
     }
 
+    fn replay_op(&mut self, op_index: usize) -> Result<(), BackendError> {
+        let op = self.ops.get(op_index).ok_or_else(|| {
+            BackendError::InvalidInput(format!("replay op index {op_index} is out of range"))
+        })?;
+        let out_id = op.output();
+        if self.vals[out_id].is_some() {
+            return Err(BackendError::InvalidInput(format!(
+                "replay output value id {out_id} is already resident"
+            )));
+        }
+
+        let output = match *op {
+            DevOp::Matmul {
+                x,
+                w,
+                m,
+                n,
+                k,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(m * n)?;
+                self.b.matmul_forward_dev(
+                    self.value_slice(x)?,
+                    self.value_slice(w)?,
+                    &self.ones,
+                    GemmShape { m, n, k },
+                    &mut output,
+                )?;
+                output
+            }
+            DevOp::Rmsnorm {
+                x,
+                w,
+                rows,
+                cols,
+                eps,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(rows * cols)?;
+                self.b.rmsnorm_forward_dev(
+                    self.value_slice(x)?,
+                    self.value_slice(w)?,
+                    &mut output,
+                    rows,
+                    cols,
+                    eps,
+                )?;
+                output
+            }
+            DevOp::Silu { x, n, out: _ } => {
+                let mut output = self.b.dev_alloc_zeros(n)?;
+                self.b
+                    .silu_forward_dev(self.value_slice(x)?, &mut output, n)?;
+                output
+            }
+            DevOp::Mul { a, b, n, out: _ } => {
+                let mut output = self.b.dev_alloc_zeros(n)?;
+                self.b.ew_mul_forward_dev(
+                    self.value_slice(a)?,
+                    self.value_slice(b)?,
+                    &mut output,
+                    n,
+                )?;
+                output
+            }
+            DevOp::Add { a, b, n, out: _ } => {
+                let mut output = self.b.dev_alloc_zeros(n)?;
+                self.b.ew_add_forward_dev(
+                    self.value_slice(a)?,
+                    self.value_slice(b)?,
+                    &mut output,
+                    n,
+                )?;
+                output
+            }
+            DevOp::Embed {
+                w,
+                ref tokens,
+                segments: _,
+                seq,
+                dim,
+                vocab: _,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(seq * dim)?;
+                self.b.embed_gather_forward_dev(
+                    self.value_slice(w)?,
+                    tokens,
+                    &mut output,
+                    seq,
+                    dim,
+                )?;
+                output
+            }
+            DevOp::Rope {
+                x,
+                ref pos,
+                n_head,
+                head_dim,
+                theta,
+                n_token,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(self.lens[out_id])?;
+                self.b.rope_apply_dev(
+                    self.value_slice(x)?,
+                    &mut output,
+                    pos,
+                    n_head,
+                    head_dim,
+                    theta,
+                    n_token,
+                    1.0,
+                )?;
+                output
+            }
+            DevOp::SliceCols {
+                x,
+                rows,
+                cols,
+                start,
+                len,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(rows * len)?;
+                self.b.slice_cols_forward_dev(
+                    self.value_slice(x)?,
+                    &mut output,
+                    rows,
+                    cols,
+                    start,
+                    len,
+                )?;
+                output
+            }
+            DevOp::ScaleConst { x, c, n, out: _ } => {
+                let mut output = self.b.dev_alloc_zeros(n)?;
+                self.b
+                    .scale_const_dev(self.value_slice(x)?, &mut output, c, n)?;
+                output
+            }
+            DevOp::CausalMask {
+                x,
+                rows,
+                cols,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(rows * cols)?;
+                self.b
+                    .causal_mask_forward_dev(self.value_slice(x)?, &mut output, rows, cols)?;
+                output
+            }
+            DevOp::Softmax {
+                x,
+                rows,
+                cols,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(rows * cols)?;
+                self.b
+                    .softmax_forward_dev(self.value_slice(x)?, &mut output, rows, cols)?;
+                output
+            }
+            DevOp::Transpose {
+                x,
+                rows,
+                cols,
+                out: _,
+            } => {
+                let mut output = self.b.dev_alloc_zeros(rows * cols)?;
+                self.b
+                    .transpose_forward_dev(self.value_slice(x)?, &mut output, rows, cols)?;
+                output
+            }
+            DevOp::Concat {
+                ref parts,
+                rows,
+                ref lens,
+                out: _,
+            } => {
+                let total: usize = lens.iter().sum();
+                let mut output = self.b.dev_alloc_zeros(rows * total)?;
+                let mut offset = 0;
+                for (&part, &len) in parts.iter().zip(lens) {
+                    self.b.copy_into_cols_dev(
+                        self.value_slice(part)?,
+                        &mut output,
+                        rows,
+                        total,
+                        offset,
+                        len,
+                    )?;
+                    offset += len;
+                }
+                output
+            }
+        };
+        if output.len() != self.lens[out_id] {
+            return Err(BackendError::ShapeMismatch {
+                expected: self.lens[out_id],
+                got: output.len(),
+            });
+        }
+        self.vals[out_id] = Some(DeviceValue::Owned(output));
+        self.live_activation_elements = self
+            .live_activation_elements
+            .saturating_add(self.lens[out_id]);
+        self.peak_live_activation_elements = self
+            .peak_live_activation_elements
+            .max(self.live_activation_elements);
+        self.recomputed_ops = self.recomputed_ops.saturating_add(1);
+        Ok(())
+    }
+
+    fn backward_segments(&self) -> Result<Vec<CheckpointSegment>, BackendError> {
+        if let CheckpointPolicy::SqrtDepth(total_blocks) = self.checkpoint_policy
+            && self.checkpoint_markers != total_blocks
+        {
+            return Err(BackendError::InvalidInput(format!(
+                "checkpoint marker count {} does not match configured depth {total_blocks}",
+                self.checkpoint_markers
+            )));
+        }
+        let mut segments = self.segments.clone();
+        if self.segment_op_start < self.ops.len() {
+            segments.push(CheckpointSegment {
+                op_start: self.segment_op_start,
+                op_end: self.ops.len(),
+                value_start: self.segment_value_start,
+                value_end: self.vals.len(),
+                frontier: Vec::new(),
+                evicted: false,
+            });
+        }
+        Ok(segments)
+    }
+
     fn accumulate_grad_slot(
         &self,
         grads: &mut [Option<CudaSlice<f32>>],
@@ -1325,7 +1777,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     /// their value-id slots; all other gradients are released once their
     /// producing op has consumed them.
     fn backward_retain(
-        &self,
+        &mut self,
         seed_id: usize,
         seed: &CudaSlice<f32>,
         retain_ids: &[usize],
@@ -1360,6 +1812,24 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             .lens
             .iter()
             .fold(0usize, |total, &len| total.saturating_add(len));
+        let naive_activation_elements = self
+            .lens
+            .iter()
+            .zip(&self.leaves)
+            .filter(|(_, leaf)| !**leaf)
+            .fold(0usize, |total, (&len, _)| total.saturating_add(len));
+        let mut checkpoint_seen = vec![false; self.vals.len()];
+        let retained_checkpoint_elements = self
+            .segments
+            .iter()
+            .flat_map(|segment| segment.frontier.iter().copied())
+            .filter(|&id| {
+                let first = !checkpoint_seen[id];
+                checkpoint_seen[id] = true;
+                first && !self.leaves[id] && self.vals[id].is_some()
+            })
+            .fold(0usize, |total, id| total.saturating_add(self.lens[id]));
+        let backward_segments = self.backward_segments()?;
         let mut grads: Vec<Option<CudaSlice<f32>>> = (0..self.vals.len()).map(|_| None).collect();
         let mut live_elements = 0usize;
         let mut peak_persistent_grad_elements = 0usize;
@@ -1371,315 +1841,330 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             &mut live_elements,
             &mut peak_persistent_grad_elements,
         )?;
-        for op in self.ops.iter().rev() {
-            let out_id = op.output();
-            let Some(grad_out) = grads[out_id].take() else {
-                // This op is not on a path from the seed.
-                continue;
-            };
-            match *op {
-                DevOp::Matmul {
-                    x,
-                    w,
-                    m,
-                    n,
-                    k,
-                    out: _,
-                } => {
-                    let shape = GemmShape { m, n, k };
-                    let mut gx = self.b.dev_alloc_zeros(m * k)?;
-                    self.b.grad_a_dev(
-                        &grad_out,
-                        self.vals[w].as_slice(),
-                        &self.ones,
-                        shape,
-                        &mut gx,
-                    )?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
+        for segment in backward_segments.iter().rev() {
+            if segment.evicted {
+                for id in segment.value_start..segment.value_end {
+                    self.evict_activation(id)?;
+                }
+                for op_index in segment.op_start..segment.op_end {
+                    self.replay_op(op_index)?;
+                }
+            }
+            for op_index in (segment.op_start..segment.op_end).rev() {
+                let op = &self.ops[op_index];
+                let out_id = op.output();
+                let Some(grad_out) = grads[out_id].take() else {
+                    // This op is not on a path from the seed, but its activation
+                    // is still dead once reverse replay reaches its producer.
+                    self.evict_activation(out_id)?;
+                    continue;
+                };
+                match *op {
+                    DevOp::Matmul {
                         x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                    let mut gw = self.b.dev_alloc_zeros(n * k)?;
-                    self.b.grad_w_dev(
-                        &grad_out,
-                        self.vals[x].as_slice(),
-                        &self.ones,
-                        shape,
-                        &mut gw,
-                    )?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
                         w,
-                        &gw,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Rmsnorm {
-                    x,
-                    w,
-                    rows,
-                    cols,
-                    eps,
-                    out: _,
-                } => {
-                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
-                    let mut gw = self.b.dev_alloc_zeros(cols)?;
-                    self.b.rmsnorm_backward_dev(
-                        self.vals[x].as_slice(),
-                        self.vals[w].as_slice(),
-                        &grad_out,
-                        &mut gx,
-                        &mut gw,
-                        rows,
-                        cols,
-                        eps,
-                    )?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        w,
-                        &gw,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Silu { x, n, out: _ } => {
-                    let mut gx = self.b.dev_alloc_zeros(n)?;
-                    self.b
-                        .silu_backward_dev(self.vals[x].as_slice(), &grad_out, &mut gx, n)?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Mul { a, b, n, out: _ } => {
-                    let mut ga = self.b.dev_alloc_zeros(n)?;
-                    self.b
-                        .ew_mul_backward_dev(&grad_out, self.vals[b].as_slice(), &mut ga, n)?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        a,
-                        &ga,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                    let mut gb = self.b.dev_alloc_zeros(n)?;
-                    self.b
-                        .ew_mul_backward_dev(&grad_out, self.vals[a].as_slice(), &mut gb, n)?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        b,
-                        &gb,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Add { a, b, n: _, out: _ } => {
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        a,
-                        &grad_out,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        b,
-                        &grad_out,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Embed {
-                    w,
-                    tokens: _,
-                    ref segments,
-                    seq,
-                    dim,
-                    vocab,
-                    out: _,
-                } => {
-                    let mut gw = self.b.dev_alloc_zeros(vocab * dim)?;
-                    self.b.embed_gather_backward_segmented_prepared_dev(
-                        &grad_out, segments, &mut gw, seq, dim, vocab,
-                    )?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        w,
-                        &gw,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Rope {
-                    x,
-                    ref pos,
-                    n_head,
-                    head_dim,
-                    theta,
-                    n_token,
-                    out,
-                } => {
-                    // vjp = inverse rotation (sign = -1) of the output grad.
-                    let n = self.lens[out];
-                    let mut gx = self.b.dev_alloc_zeros(n)?;
-                    self.b.rope_apply_dev(
-                        &grad_out, &mut gx, pos, n_head, head_dim, theta, n_token, -1.0,
-                    )?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::SliceCols {
-                    x,
-                    rows,
-                    cols,
-                    start,
-                    len,
-                    out: _,
-                } => {
-                    // vjp = scatter the [rows,len] grad back into a zeroed [rows,cols] at [start,+len).
-                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
-                    self.b
-                        .copy_into_cols_dev(&grad_out, &mut gx, rows, cols, start, len)?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::ScaleConst { x, c, n, out: _ } => {
-                    let mut gx = self.b.dev_alloc_zeros(n)?;
-                    self.b.scale_const_dev(&grad_out, &mut gx, c, n)?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::CausalMask {
-                    x,
-                    rows,
-                    cols,
-                    out: _,
-                } => {
-                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
-                    self.b
-                        .causal_mask_backward_dev(&grad_out, &mut gx, rows, cols)?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Softmax { x, rows, cols, out } => {
-                    // vjp uses the saved probabilities p = vals[out].
-                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
-                    self.b.softmax_backward_dev(
-                        self.vals[out].as_slice(),
-                        &grad_out,
-                        &mut gx,
-                        rows,
-                        cols,
-                    )?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Transpose {
-                    x,
-                    rows,
-                    cols,
-                    out: _,
-                } => {
-                    // vjp = transpose the [cols,rows] output grad back to [rows,cols].
-                    let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
-                    self.b
-                        .transpose_forward_dev(&grad_out, &mut gx, cols, rows)?;
-                    self.accumulate_grad_slot(
-                        &mut grads,
-                        &retain,
-                        x,
-                        &gx,
-                        &mut live_elements,
-                        &mut peak_persistent_grad_elements,
-                    )?;
-                }
-                DevOp::Concat {
-                    ref parts,
-                    rows,
-                    ref lens,
-                    out: _,
-                } => {
-                    // vjp = slice each part's column range back out of the concatenated grad.
-                    let total: usize = lens.iter().sum();
-                    let mut off = 0;
-                    for (&p, &len) in parts.iter().zip(lens) {
-                        let mut gp = self.b.dev_alloc_zeros(rows * len)?;
-                        self.b
-                            .slice_cols_forward_dev(&grad_out, &mut gp, rows, total, off, len)?;
+                        m,
+                        n,
+                        k,
+                        out: _,
+                    } => {
+                        let shape = GemmShape { m, n, k };
+                        let mut gx = self.b.dev_alloc_zeros(m * k)?;
+                        self.b.grad_a_dev(
+                            &grad_out,
+                            self.value_slice(w)?,
+                            &self.ones,
+                            shape,
+                            &mut gx,
+                        )?;
                         self.accumulate_grad_slot(
                             &mut grads,
                             &retain,
-                            p,
-                            &gp,
+                            x,
+                            &gx,
                             &mut live_elements,
                             &mut peak_persistent_grad_elements,
                         )?;
-                        off += len;
+                        let mut gw = self.b.dev_alloc_zeros(n * k)?;
+                        self.b.grad_w_dev(
+                            &grad_out,
+                            self.value_slice(x)?,
+                            &self.ones,
+                            shape,
+                            &mut gw,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            w,
+                            &gw,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Rmsnorm {
+                        x,
+                        w,
+                        rows,
+                        cols,
+                        eps,
+                        out: _,
+                    } => {
+                        let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                        let mut gw = self.b.dev_alloc_zeros(cols)?;
+                        self.b.rmsnorm_backward_dev(
+                            self.value_slice(x)?,
+                            self.value_slice(w)?,
+                            &grad_out,
+                            &mut gx,
+                            &mut gw,
+                            rows,
+                            cols,
+                            eps,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            w,
+                            &gw,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Silu { x, n, out: _ } => {
+                        let mut gx = self.b.dev_alloc_zeros(n)?;
+                        self.b
+                            .silu_backward_dev(self.value_slice(x)?, &grad_out, &mut gx, n)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Mul { a, b, n, out: _ } => {
+                        let mut ga = self.b.dev_alloc_zeros(n)?;
+                        self.b
+                            .ew_mul_backward_dev(&grad_out, self.value_slice(b)?, &mut ga, n)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            a,
+                            &ga,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                        let mut gb = self.b.dev_alloc_zeros(n)?;
+                        self.b
+                            .ew_mul_backward_dev(&grad_out, self.value_slice(a)?, &mut gb, n)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            b,
+                            &gb,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Add { a, b, n: _, out: _ } => {
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            a,
+                            &grad_out,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            b,
+                            &grad_out,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Embed {
+                        w,
+                        tokens: _,
+                        ref segments,
+                        seq,
+                        dim,
+                        vocab,
+                        out: _,
+                    } => {
+                        let mut gw = self.b.dev_alloc_zeros(vocab * dim)?;
+                        self.b.embed_gather_backward_segmented_prepared_dev(
+                            &grad_out, segments, &mut gw, seq, dim, vocab,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            w,
+                            &gw,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Rope {
+                        x,
+                        ref pos,
+                        n_head,
+                        head_dim,
+                        theta,
+                        n_token,
+                        out,
+                    } => {
+                        // vjp = inverse rotation (sign = -1) of the output grad.
+                        let n = self.lens[out];
+                        let mut gx = self.b.dev_alloc_zeros(n)?;
+                        self.b.rope_apply_dev(
+                            &grad_out, &mut gx, pos, n_head, head_dim, theta, n_token, -1.0,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::SliceCols {
+                        x,
+                        rows,
+                        cols,
+                        start,
+                        len,
+                        out: _,
+                    } => {
+                        // vjp = scatter the [rows,len] grad back into a zeroed [rows,cols] at [start,+len).
+                        let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                        self.b
+                            .copy_into_cols_dev(&grad_out, &mut gx, rows, cols, start, len)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::ScaleConst { x, c, n, out: _ } => {
+                        let mut gx = self.b.dev_alloc_zeros(n)?;
+                        self.b.scale_const_dev(&grad_out, &mut gx, c, n)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::CausalMask {
+                        x,
+                        rows,
+                        cols,
+                        out: _,
+                    } => {
+                        let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                        self.b
+                            .causal_mask_backward_dev(&grad_out, &mut gx, rows, cols)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Softmax { x, rows, cols, out } => {
+                        // vjp uses the saved probabilities p = vals[out].
+                        let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                        self.b.softmax_backward_dev(
+                            self.value_slice(out)?,
+                            &grad_out,
+                            &mut gx,
+                            rows,
+                            cols,
+                        )?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Transpose {
+                        x,
+                        rows,
+                        cols,
+                        out: _,
+                    } => {
+                        // vjp = transpose the [cols,rows] output grad back to [rows,cols].
+                        let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
+                        self.b
+                            .transpose_forward_dev(&grad_out, &mut gx, cols, rows)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            x,
+                            &gx,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
+                        )?;
+                    }
+                    DevOp::Concat {
+                        ref parts,
+                        rows,
+                        ref lens,
+                        out: _,
+                    } => {
+                        // vjp = slice each part's column range back out of the concatenated grad.
+                        let total: usize = lens.iter().sum();
+                        let mut off = 0;
+                        for (&p, &len) in parts.iter().zip(lens) {
+                            let mut gp = self.b.dev_alloc_zeros(rows * len)?;
+                            self.b.slice_cols_forward_dev(
+                                &grad_out, &mut gp, rows, total, off, len,
+                            )?;
+                            self.accumulate_grad_slot(
+                                &mut grads,
+                                &retain,
+                                p,
+                                &gp,
+                                &mut live_elements,
+                                &mut peak_persistent_grad_elements,
+                            )?;
+                            off += len;
+                        }
                     }
                 }
-            }
 
-            if retain[out_id] {
-                grads[out_id] = Some(grad_out);
-            } else {
-                // `grad_out` remains alive for the entire VJP above. Account for
-                // its release only after all input slots have been accumulated.
-                live_elements = live_elements.saturating_sub(self.lens[out_id]);
-                drop(grad_out);
+                if retain[out_id] {
+                    grads[out_id] = Some(grad_out);
+                } else {
+                    // `grad_out` remains alive for the entire VJP above. Account for
+                    // its release only after all input slots have been accumulated.
+                    live_elements = live_elements.saturating_sub(self.lens[out_id]);
+                    drop(grad_out);
+                }
+                self.evict_activation(out_id)?;
             }
         }
 
@@ -1698,6 +2183,10 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             }
         }
         debug_assert_eq!(
+            self.live_activation_elements, 0,
+            "all non-leaf activations must be released after reverse replay"
+        );
+        debug_assert_eq!(
             live_elements,
             retain
                 .iter()
@@ -1710,6 +2199,10 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             stats: DeviceBackwardStats {
                 naive_all_value_grad_elements,
                 peak_persistent_grad_elements,
+                naive_activation_elements,
+                peak_live_activation_elements: self.peak_live_activation_elements,
+                retained_checkpoint_elements,
+                recomputed_ops: self.recomputed_ops,
             },
         })
     }
@@ -1720,7 +2213,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     /// works in host `Vec<f32>` and never touches a `CudaSlice`. `want` is typically the weight-leaf
     /// ids; the returned grads are in `want` order.
     pub fn xent_backward(
-        &self,
+        &mut self,
         logits: usize,
         target: &[f32],
         rows: usize,
@@ -1748,7 +2241,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     /// their masters or optimizer state. Requested gradients are moved into the
     /// result without a device-to-device copy and preserve `want` order.
     pub fn xent_backward_device(
-        self,
+        mut self,
         logits: usize,
         target: &DeviceTensor,
         rows: usize,
@@ -1860,6 +2353,201 @@ mod tests {
             "lazy gradient slots must beat one persistent gradient per value: {:?}",
             result.stats
         );
+    }
+
+    #[test]
+    fn checkpoint_policy_rejects_zero_interval() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping checkpoint_policy_rejects_zero_interval: no CUDA ({e})");
+                return;
+            }
+        };
+        assert!(matches!(
+            DeviceTape::new_with_checkpoint_policy(&backend, 1, CheckpointPolicy::EveryBlocks(0)),
+            Err(BackendError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            DeviceTape::new_with_checkpoint_policy(&backend, 1, CheckpointPolicy::SqrtDepth(0)),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_frontier_fails_closed() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping checkpoint_frontier_fails_closed: no CUDA ({e})");
+                return;
+            }
+        };
+        let mut tape =
+            DeviceTape::new_with_checkpoint_policy(&backend, 1, CheckpointPolicy::EveryBlocks(1))
+                .unwrap();
+        let x = tape.leaf(&[0.25; 32]).unwrap();
+        let internal = tape.silu(x).unwrap();
+        let frontier = tape.silu(internal).unwrap();
+        tape.checkpoint_keep(&[frontier]).unwrap();
+
+        assert!(matches!(
+            tape.value(internal),
+            Err(BackendError::InvalidInput(message)) if message.contains("was evicted")
+        ));
+        assert!(matches!(
+            tape.silu(internal),
+            Err(BackendError::InvalidInput(message)) if message.contains("was evicted")
+        ));
+        assert!(matches!(
+            tape.checkpoint_keep(&[usize::MAX]),
+            Err(BackendError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            tape.checkpoint_keep(&[frontier, frontier]),
+            Err(BackendError::InvalidInput(message)) if message.contains("duplicated")
+        ));
+        assert!(matches!(
+            tape.checkpoint_keep(&[x]),
+            Err(BackendError::InvalidInput(message)) if message.contains("leaf")
+        ));
+        assert!(matches!(
+            tape.checkpoint_keep(&[frontier]),
+            Err(BackendError::InvalidInput(message)) if message.contains("no forward operations")
+        ));
+
+        let mut incomplete =
+            DeviceTape::new_with_checkpoint_policy(&backend, 1, CheckpointPolicy::SqrtDepth(4))
+                .unwrap();
+        let input = incomplete.leaf(&[0.1; 32]).unwrap();
+        let output = incomplete.silu(input).unwrap();
+        incomplete.checkpoint_keep(&[output]).unwrap();
+        let seed = backend.dev_upload(&[1.0; 32]).unwrap();
+        assert!(matches!(
+            incomplete.backward_retain(output, &seed, &[input]),
+            Err(BackendError::InvalidInput(message)) if message.contains("marker count")
+        ));
+    }
+
+    fn run_checkpoint_chain(
+        backend: &CudaBackend,
+        policy: CheckpointPolicy,
+        depth: usize,
+        width: usize,
+    ) -> (Vec<f32>, Vec<f32>, DeviceBackwardStats) {
+        let input = seeded_uniform(0xC027, width, -0.05, 0.05);
+        let seed = seeded_uniform(0xC028, width, -0.25, 0.25);
+        let mut tape = DeviceTape::new_with_checkpoint_policy(backend, 1, policy).unwrap();
+        let input_id = tape.leaf(&input).unwrap();
+        let mut hidden = input_id;
+        for _ in 0..depth {
+            hidden = tape.silu(hidden).unwrap();
+            hidden = tape.add(hidden, input_id).unwrap();
+            tape.checkpoint_keep(&[hidden]).unwrap();
+        }
+        let output = tape.value(hidden).unwrap();
+        let d_seed = backend.dev_upload(&seed).unwrap();
+        let result = tape.backward_retain(hidden, &d_seed, &[input_id]).unwrap();
+        let mut gradient = vec![0.0; width];
+        backend
+            .dev_download(
+                result.grads[input_id]
+                    .as_ref()
+                    .expect("input gradient retained"),
+                &mut gradient,
+            )
+            .unwrap();
+        (output, gradient, result.stats)
+    }
+
+    #[test]
+    fn multi_block_checkpoint_recompute_matches_keep_all() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping multi_block_checkpoint_recompute_matches_keep_all: no CUDA ({e})"
+                );
+                return;
+            }
+        };
+        let (depth, width) = (9usize, 1024usize);
+        let (keep_output, keep_gradient, keep_stats) =
+            run_checkpoint_chain(&backend, CheckpointPolicy::KeepAll, depth, width);
+        let (checkpoint_output, checkpoint_gradient, checkpoint_stats) =
+            run_checkpoint_chain(&backend, CheckpointPolicy::SqrtDepth(depth), depth, width);
+
+        assert!(max_abs_diff(&keep_output, &checkpoint_output) < 1e-6);
+        assert!(max_abs_diff(&keep_gradient, &checkpoint_gradient) < 1e-6);
+        assert_eq!(keep_stats.recomputed_ops, 0);
+        assert_eq!(checkpoint_stats.recomputed_ops, depth * 2);
+        assert_eq!(
+            checkpoint_stats.naive_activation_elements,
+            keep_stats.naive_activation_elements
+        );
+        assert!(
+            checkpoint_stats.peak_live_activation_elements
+                < checkpoint_stats.naive_activation_elements,
+            "checkpointing must reduce logical activation peak: {checkpoint_stats:?}"
+        );
+        assert!(
+            checkpoint_stats.peak_live_activation_elements
+                < keep_stats.peak_live_activation_elements,
+            "checkpointing must beat KeepAll: checkpoint={checkpoint_stats:?}, \
+             keep={keep_stats:?}"
+        );
+        eprintln!(
+            "0027 Track C multi-block checkpoint: activation peak {}/{} elements, retained {}, \
+             recomputed {} ops",
+            checkpoint_stats.peak_live_activation_elements,
+            checkpoint_stats.naive_activation_elements,
+            checkpoint_stats.retained_checkpoint_elements,
+            checkpoint_stats.recomputed_ops
+        );
+    }
+
+    #[test]
+    fn sqrt_depth_checkpoint_peak_scales_sublinearly() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping sqrt_depth_checkpoint_peak_scales_sublinearly: no CUDA ({e})");
+                return;
+            }
+        };
+        let width = 256usize;
+        for depth in [4usize, 16, 64] {
+            let input = seeded_uniform(0xD000 + depth as u64, width, -0.1, 0.1);
+            let mut tape = DeviceTape::new_with_checkpoint_policy(
+                &backend,
+                1,
+                CheckpointPolicy::SqrtDepth(depth),
+            )
+            .unwrap();
+            let input_id = tape.leaf(&input).unwrap();
+            let mut hidden = input_id;
+            for _ in 0..depth {
+                hidden = tape.silu(hidden).unwrap();
+                tape.checkpoint_keep(&[hidden]).unwrap();
+            }
+            let seed = backend.dev_upload(&vec![1.0; width]).unwrap();
+            let stats = tape
+                .backward_retain(hidden, &seed, &[input_id])
+                .unwrap()
+                .stats;
+            let interval = (depth as f64).sqrt().ceil() as usize;
+            let materialized = depth.div_ceil(interval);
+            let upper_bound = (materialized + interval) * width;
+            assert!(
+                stats.peak_live_activation_elements <= upper_bound,
+                "depth {depth} exceeds O(depth/k + k) bound {upper_bound}: {stats:?}"
+            );
+            assert!(
+                stats.peak_live_activation_elements < stats.naive_activation_elements,
+                "depth {depth} did not reduce activation peak: {stats:?}"
+            );
+            assert_eq!(stats.recomputed_ops, depth);
+        }
     }
 
     /// Set each row's scale to `1.25·max|w_row|` so every `|w/s| ≤ 0.8` — i.e. the clamp surrogate
@@ -2974,7 +3662,11 @@ mod tests {
         // ── Device tape ──
         #[allow(clippy::type_complexity)]
         let build_device = || -> Result<(Vec<f32>, Vec<Option<CudaSlice<f32>>>, DeviceBackwardStats, Vec<(usize, usize, usize, usize)>, usize, usize), BackendError> {
-            let mut dt = DeviceTape::new(&backend, vocab)?;
+            let mut dt = DeviceTape::new_with_checkpoint_policy(
+                &backend,
+                vocab,
+                CheckpointPolicy::SqrtDepth(layers),
+            )?;
             let d_embd = dt.leaf(&embd)?;
             let mut d_hidden = dt.embed(d_embd, &tokens_i32, seq, dim, vocab)?;
             let mut d_w = Vec::new();
@@ -2988,6 +3680,7 @@ mod tests {
                 let gated = dt.mul(ga, u)?;
                 let down = dt.matmul(gated, did, seq, dim, ff)?;
                 d_hidden = dt.add(d_hidden, down)?;
+                dt.checkpoint_keep(&[d_hidden])?;
                 d_w.push((fnid, gid, uid, did));
             }
             let d_on = dt.leaf(&out_norm)?;
@@ -3084,6 +3777,11 @@ mod tests {
             liveness.peak_persistent_grad_elements < liveness.naive_all_value_grad_elements,
             "full-stack lazy gradient slots must reduce persistent VRAM: {liveness:?}"
         );
+        assert!(
+            liveness.peak_live_activation_elements < liveness.naive_activation_elements,
+            "full-stack checkpointing must reduce activation VRAM: {liveness:?}"
+        );
+        assert!(liveness.recomputed_ops > 0);
 
         // Bench: device tape vs CPU tape (full rebuild + fwd + bwd).
         let cpu_step = || {
@@ -3131,10 +3829,15 @@ mod tests {
             "0043 P2.5a DeviceTape MLP stack ({layers} layers, vocab={vocab} dim={dim} ff={ff} seq={seq}): \
              matches CPU tape (worst grad rel {worst:.2e} at {worst_name}). \
              gradient slots peak {}/{} elements (saved {}). \
+             activation peak {}/{} elements; retained checkpoints {}; replayed {} ops. \
              fwd+bwd step: device-resident {dev_ms:.2}ms | CPU tape {cpu_ms:.2}ms ({:.1}× faster)",
             liveness.peak_persistent_grad_elements,
             liveness.naive_all_value_grad_elements,
             liveness.saved_grad_elements(),
+            liveness.peak_live_activation_elements,
+            liveness.naive_activation_elements,
+            liveness.retained_checkpoint_elements,
+            liveness.recomputed_ops,
             cpu_ms / dev_ms.max(1e-9)
         );
     }
@@ -3207,7 +3910,12 @@ mod tests {
 
         // ── Device tape ──
         let ones_max = n_embd.max(ff).max(qd);
-        let mut dt = DeviceTape::new(&backend, ones_max).unwrap();
+        let mut dt = DeviceTape::new_with_checkpoint_policy(
+            &backend,
+            ones_max,
+            CheckpointPolicy::EveryBlocks(1),
+        )
+        .unwrap();
         let dh = dt.leaf(&hidden).unwrap();
         let dan = dt.leaf(&attn_norm).unwrap();
         let dxn = dt.rmsnorm(dh, dan, seq, n_embd, eps).unwrap();
@@ -3236,6 +3944,7 @@ mod tests {
         let dgated = dt.mul(dga, du).unwrap();
         let ddown = dt.matmul(dgated, dwd, seq, n_embd, ff).unwrap();
         let dout = dt.add(dh1, ddown).unwrap();
+        dt.checkpoint_keep(&[dout]).unwrap();
         let dev_out = dt.value(dout).unwrap();
         // L = Σ out·cot ⇒ dL/dout = cot; seed the block output's grad and backprop.
         let seed = backend.dev_upload(&cot).unwrap();
@@ -3347,14 +4056,19 @@ mod tests {
             liveness.peak_persistent_grad_elements < liveness.naive_all_value_grad_elements,
             "transformer-block lazy gradient slots must reduce persistent VRAM: {liveness:?}"
         );
+        assert!(
+            liveness.recomputed_ops > 0,
+            "checkpointed transformer block must replay every current DevOp: {liveness:?}"
+        );
         eprintln!(
             "0043 P2.5b DeviceTape transformer block (GQA n_head={n_head} n_kv={n_kv_head} \
              head_dim={head_dim} seq={seq} n_embd={n_embd} ff={ff}): full attention+MLP fwd+bwd \
              matches CPU tape (worst grad rel {worst:.2e} at {wn}); gradient slots peak {}/{} \
-             elements (saved {})",
+             elements (saved {}); replayed {} ops",
             liveness.peak_persistent_grad_elements,
             liveness.naive_all_value_grad_elements,
-            liveness.saved_grad_elements()
+            liveness.saved_grad_elements(),
+            liveness.recomputed_ops
         );
     }
 
