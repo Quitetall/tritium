@@ -130,6 +130,9 @@ pub struct CudaBackend {
     /// ADR 0027 Track A: per-row SALT residual quantization on resident f32 buffers.
     #[allow(dead_code)] // consumed by DeviceTrainer in the next Track A slice
     pub(super) func_salt_quantize_fwd: CudaFunction,
+    /// ADR 0027 Track A: fused AdamW update on resident master/moment buffers.
+    #[allow(dead_code)] // consumed by DeviceTrainer in the next Track A slice
+    pub(super) func_adamw_step: CudaFunction,
     /// plan 0043 P2.2 device-resident glue: elementwise silu/mul/add fwd/bwd + grad accumulate.
     pub(super) func_silu_fwd: CudaFunction,
     pub(super) func_silu_bwd: CudaFunction,
@@ -291,6 +294,9 @@ impl CudaBackend {
         let func_salt_quantize_fwd = grad_module
             .load_function(KERNEL_NAME_SALT_QUANTIZE_FWD)
             .map_err(|e| driver_err("resolve salt_quantize_forward kernel", &e))?;
+        let func_adamw_step = grad_module
+            .load_function(KERNEL_NAME_ADAMW_STEP)
+            .map_err(|e| driver_err("resolve adamw_step kernel", &e))?;
         // P2.2 device-resident glue ops (same `--fmad=false` train_grad.ptx module).
         let func_silu_fwd = grad_module
             .load_function(KERNEL_NAME_SILU_FWD)
@@ -403,6 +409,7 @@ impl CudaBackend {
             func_grad_w,
             func_grad_s,
             func_salt_quantize_fwd,
+            func_adamw_step,
             func_silu_fwd,
             func_silu_bwd,
             func_ew_mul_fwd,
@@ -853,6 +860,75 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(rows))
                 .map_err(|e| driver_err("launch salt_quantize_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Apply one fused AdamW update to resident parameter and moment buffers.
+    /// Bias-correction scalars are computed on the host with the CPU optimizer's
+    /// exact `powi`/saturating-step contract; the kernel only performs the
+    /// independent element updates in matching operation order.
+    ///
+    /// # Errors
+    /// [`BackendError::InvalidInput`] when `step == 0` or the element count
+    /// exceeds the kernel ABI; [`BackendError::ShapeMismatch`] when buffer
+    /// lengths differ; device failures through the cudarc mapping.
+    #[allow(dead_code)] // kernel parity gate lands before DeviceTrainer wiring
+    pub(crate) fn adamw_step_dev(
+        &self,
+        d_param: &mut CudaSlice<f32>,
+        d_grad: &CudaSlice<f32>,
+        d_m: &mut CudaSlice<f32>,
+        d_v: &mut CudaSlice<f32>,
+        step: u64,
+        opt: &tritium_train::AdamW,
+    ) -> Result<(), BackendError> {
+        if step == 0 {
+            return Err(BackendError::InvalidInput(
+                "AdamW step index is 1-based".into(),
+            ));
+        }
+        let len = d_param.len();
+        for got in [d_grad.len(), d_m.len(), d_v.len()] {
+            if got != len {
+                return Err(BackendError::ShapeMismatch { expected: len, got });
+            }
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let len_i = i32::try_from(len)
+            .map_err(|_| BackendError::InvalidInput("AdamW length exceeds i32::MAX".into()))?;
+        let exp = i32::try_from(step).unwrap_or(i32::MAX);
+        let bc1 = 1.0 - opt.beta1.powi(exp);
+        let bc2 = 1.0 - opt.beta2.powi(exp);
+        let shrink = 1.0 - opt.lr * opt.weight_decay;
+        let one_minus_beta1 = 1.0 - opt.beta1;
+        let one_minus_beta2 = 1.0 - opt.beta2;
+
+        let mut launch = self.stream.launch_builder(&self.func_adamw_step);
+        launch
+            .arg(d_param)
+            .arg(d_grad)
+            .arg(d_m)
+            .arg(d_v)
+            .arg(&len_i)
+            .arg(&opt.lr)
+            .arg(&opt.beta1)
+            .arg(&opt.beta2)
+            .arg(&one_minus_beta1)
+            .arg(&one_minus_beta2)
+            .arg(&bc1)
+            .arg(&bc2)
+            .arg(&opt.eps)
+            .arg(&shrink);
+        // SAFETY: every device buffer has exactly `len` elements and every
+        // scalar matches the kernel ABI; one thread owns one element.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(len))
+                .map_err(|e| driver_err("launch adamw_step_dev", &e))?;
         }
         Ok(())
     }

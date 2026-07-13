@@ -130,6 +130,35 @@ extern "C" __global__ void salt_quantize_forward(
     }
 }
 
+// ADR 0027 Track A: fused elementwise AdamW update over resident buffers.
+// Host code computes bias correction with the CPU oracle's `powi` contract;
+// this kernel preserves optim::AdamW::step's per-element operation order.
+extern "C" __global__ void adamw_step(
+    float* __restrict__ param,
+    const float* __restrict__ grad,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    int n,
+    float lr,
+    float beta1,
+    float beta2,
+    float one_minus_beta1,
+    float one_minus_beta2,
+    float bc1,
+    float bc2,
+    float eps,
+    float shrink)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = grad[i];
+    float mi = beta1 * m[i] + one_minus_beta1 * g;
+    float vi = beta2 * v[i] + one_minus_beta2 * g * g;
+    m[i] = mi;
+    v[i] = vi;
+    param[i] = param[i] * shrink - lr * (mi / bc1 / (sqrtf(vi / bc2) + eps));
+}
+
 // ───────────────────────── device-resident glue ops (plan 0043 P2.2) ─────────────────────────
 // Elementwise forward/backward for the tape's non-matmul ops, run on the resident activation
 // buffers so a whole block chains fwd→bwd without host round-trips. One thread per element.

@@ -1539,6 +1539,62 @@ mod tests {
         ));
     }
 
+    /// ADR 0027 Track A: resident AdamW keeps master and moment buffers on
+    /// device while preserving the CPU optimizer's operation order, bias
+    /// correction, epsilon placement, and decoupled weight decay.
+    #[test]
+    fn resident_adamw_matches_cpu() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping resident_adamw_matches_cpu: no CUDA device ({e})");
+                return;
+            }
+        };
+        let opt = AdamW {
+            lr: 0.1,
+            beta1: 0.8,
+            beta2: 0.9,
+            eps: 0.5,
+            weight_decay: 0.03,
+        };
+        let mut param = seeded_uniform(0xA27, 4099, -1.0, 1.0);
+        let mut state = opt.init_state(param.len());
+        let mut d_param = backend.dev_upload(&param).unwrap();
+        let mut d_m = backend.dev_alloc_zeros(param.len()).unwrap();
+        let mut d_v = backend.dev_alloc_zeros(param.len()).unwrap();
+
+        for step in 1..=4 {
+            let grad = seeded_uniform(0xB27 + step, param.len(), -0.25, 0.25);
+            opt.step(step, &mut param, &grad, &mut state);
+            let d_grad = backend.dev_upload(&grad).unwrap();
+            backend
+                .adamw_step_dev(&mut d_param, &d_grad, &mut d_m, &mut d_v, step, &opt)
+                .unwrap();
+
+            let mut got_param = vec![0.0; param.len()];
+            let mut got_m = vec![0.0; param.len()];
+            let mut got_v = vec![0.0; param.len()];
+            backend.dev_download(&d_param, &mut got_param).unwrap();
+            backend.dev_download(&d_m, &mut got_m).unwrap();
+            backend.dev_download(&d_v, &mut got_v).unwrap();
+            assert!(max_abs_diff(&got_param, &param) < 1e-5, "param step {step}");
+            assert!(max_abs_diff(&got_m, &state.m) < 1e-5, "m step {step}");
+            assert!(max_abs_diff(&got_v, &state.v) < 1e-5, "v step {step}");
+        }
+
+        let grad = backend.dev_alloc_zeros(param.len()).unwrap();
+        assert!(matches!(
+            backend.adamw_step_dev(&mut d_param, &grad, &mut d_m, &mut d_v, 0, &opt),
+            Err(BackendError::InvalidInput(_))
+        ));
+        let short_grad = backend.dev_alloc_zeros(param.len() - 1).unwrap();
+        assert!(matches!(
+            backend.adamw_step_dev(&mut d_param, &short_grad, &mut d_m, &mut d_v, 1, &opt,),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+    }
+
     /// Gate (plan 0043 P2.3): the device-resident TRAINING RMSNorm (forward + grad_x + grad_w)
     /// matches `tritium-train`'s `ops::norm` — which uses a sequential sum, so (only +,*,/,sqrt, all
     /// IEEE correctly-rounded, --fmad=false) it is BIT-EXACT, unlike silu's expf.
