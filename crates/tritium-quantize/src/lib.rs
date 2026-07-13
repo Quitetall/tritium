@@ -41,6 +41,7 @@ pub mod fisher;
 mod plane;
 mod quantize;
 mod recon;
+mod training_export;
 
 pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
 pub use architecture::{
@@ -63,3 +64,6 @@ pub use quantize::{
     BaseScaleScope, QuantConfig, QuantError, QuantizedTensor, Sensitivity, quantize_tensor,
 };
 pub use recon::{ReconAccum, ReconError, ReconStats, reconstruction_stats};
+pub use training_export::{
+    TrainingSaltExportError, TrainingSaltExportStats, export_training_salt_row,
+};
