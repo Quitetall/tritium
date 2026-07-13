@@ -54,7 +54,9 @@ mod tq2;
 mod tqbin;
 mod tqidx;
 
-pub use artifact::{ArtifactError, ModelId, PackageId, SemanticModelManifest, SemanticTensor};
+pub use artifact::{
+    ArtifactError, ModelId, PackageHasher, PackageId, SemanticModelManifest, SemanticTensor,
+};
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
     TensorInfo, read_gguf,

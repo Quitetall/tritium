@@ -119,12 +119,45 @@ pub struct PackageId([u8; 32]);
 impl PackageId {
     /// Hash exact package bytes using the versioned transport-ID domain.
     pub fn from_package_bytes(bytes: &[u8]) -> Self {
-        Self(domain_hash(PACKAGE_ID_CONTEXT, bytes))
+        let mut hasher = PackageHasher::new();
+        hasher.update(bytes);
+        hasher.finalize()
     }
 
     /// Return the raw 256-bit digest.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// Incremental exact-byte hasher for a [`PackageId`].
+///
+/// Splitting an artifact across any number of [`update`](Self::update) calls
+/// produces the same identity as [`PackageId::from_package_bytes`]. This lets
+/// streaming writers identify large artifacts without retaining them in memory.
+#[derive(Clone, Debug)]
+pub struct PackageHasher(blake3::Hasher);
+
+impl PackageHasher {
+    /// Start hashing an exact transport package with the current package-ID domain.
+    pub fn new() -> Self {
+        Self(blake3::Hasher::new_derive_key(PACKAGE_ID_CONTEXT))
+    }
+
+    /// Add the next exact, ordered package-byte chunk.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Finish hashing and return the package identity.
+    pub fn finalize(self) -> PackageId {
+        PackageId(*self.0.finalize().as_bytes())
+    }
+}
+
+impl Default for PackageHasher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -524,5 +557,24 @@ mod tests {
         let a = PackageId::from_package_bytes(b"package-a");
         let b = PackageId::from_package_bytes(b"package-b");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn incremental_package_identity_matches_one_shot_for_any_chunking() {
+        let bytes = b"exact package bytes spanning several deliberately uneven chunks";
+        let expected = PackageId::from_package_bytes(bytes);
+
+        for chunk_len in [1, 2, 3, 7, 16, bytes.len()] {
+            let mut hasher = PackageHasher::new();
+            for chunk in bytes.chunks(chunk_len) {
+                hasher.update(chunk);
+            }
+            assert_eq!(hasher.finalize(), expected);
+        }
+
+        assert_eq!(
+            PackageHasher::default().finalize(),
+            PackageId::from_package_bytes(&[])
+        );
     }
 }

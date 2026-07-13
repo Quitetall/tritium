@@ -1,7 +1,12 @@
 //! Reproducible calibration, evaluation, and multi-objective campaign records.
 
 use core::{cmp::Ordering, fmt};
-use tritium_format::{ModelId, PackageId};
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::Path,
+};
+use tritium_format::{ModelId, PackageHasher, PackageId};
 
 const CALIBRATION_MAGIC: [u8; 4] = *b"TCAL";
 const CAMPAIGN_MAGIC: [u8; 4] = *b"TCMP";
@@ -427,8 +432,9 @@ impl RecipeProvenance {
 
 /// Exact identity and physical size derived from serialized inference bytes.
 ///
-/// Construction intentionally requires the complete byte slice so callers cannot
-/// pair an artifact digest with a separately claimed byte count.
+/// Construction derives the digest and byte count together, so callers cannot
+/// pair an artifact digest with a separately claimed byte count. Large packages
+/// can be measured incrementally with [`Self::from_reader`] or [`Self::from_file`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MeasuredPackage {
     id: PackageId,
@@ -449,6 +455,57 @@ impl MeasuredPackage {
             id: PackageId::from_package_bytes(bytes),
             physical_bytes,
         })
+    }
+
+    /// Hash and count an exact serialized inference artifact from a bounded stream.
+    ///
+    /// The reader is consumed once in order, using a fixed-size buffer. The
+    /// resulting identity is byte-for-byte equivalent to passing the same stream
+    /// contents to [`Self::from_bytes`].
+    ///
+    /// # Errors
+    /// Returns [`CampaignError::PackageIo`] when the reader fails,
+    /// [`CampaignError::ZeroValue`] when it is empty, or
+    /// [`CampaignError::RecordTooLarge`] if the exact byte count exceeds `u64`.
+    pub fn from_reader(mut reader: impl Read) -> Result<Self, CampaignError> {
+        const BUFFER_BYTES: usize = 64 * 1024;
+
+        let mut hasher = PackageHasher::new();
+        let mut physical_bytes = 0_u64;
+        let mut buffer = [0_u8; BUFFER_BYTES];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(CampaignError::PackageIo {
+                        operation: "read",
+                        kind: error.kind(),
+                    });
+                }
+            };
+            physical_bytes = checked_package_length(physical_bytes, read)?;
+            hasher.update(&buffer[..read]);
+        }
+        validate_nonzero("physical_bytes", physical_bytes)?;
+        Ok(Self {
+            id: hasher.finalize(),
+            physical_bytes,
+        })
+    }
+
+    /// Open, hash, and count an exact serialized inference artifact file.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError::PackageIo`] when the file cannot be opened or
+    /// read, and the same validation errors as [`Self::from_reader`].
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, CampaignError> {
+        let file = File::open(path).map_err(|error| CampaignError::PackageIo {
+            operation: "open",
+            kind: error.kind(),
+        })?;
+        Self::from_reader(file)
     }
 
     /// Content identity of the exact serialized artifact.
@@ -994,6 +1051,13 @@ fn validate_string(field: &'static str, value: &str) -> Result<(), CampaignError
     Ok(())
 }
 
+fn checked_package_length(current: u64, read: usize) -> Result<u64, CampaignError> {
+    let read = u64::try_from(read).map_err(|_| CampaignError::RecordTooLarge("package"))?;
+    current
+        .checked_add(read)
+        .ok_or(CampaignError::RecordTooLarge("package"))
+}
+
 fn validate_nonzero(field: &'static str, value: u64) -> Result<(), CampaignError> {
     if value == 0 {
         Err(CampaignError::ZeroValue(field))
@@ -1059,6 +1123,13 @@ pub enum CampaignError {
     },
     /// Version-2 campaign record exceeded a u32 count or embedded length.
     RecordTooLarge(&'static str),
+    /// Exact package measurement could not open or read its byte stream.
+    PackageIo {
+        /// I/O operation that failed.
+        operation: &'static str,
+        /// Portable category of the underlying I/O failure.
+        kind: io::ErrorKind,
+    },
 }
 
 impl fmt::Display for CampaignError {
@@ -1087,6 +1158,9 @@ impl fmt::Display for CampaignError {
             ),
             Self::RecordTooLarge(field) => {
                 write!(f, "campaign record `{field}` exceeds version-2 capacity")
+            }
+            Self::PackageIo { operation, kind } => {
+                write!(f, "package {operation} failed: {kind}")
             }
         }
     }
@@ -1178,6 +1252,62 @@ mod tests {
         let measured = MeasuredPackage::from_bytes(bytes).expect("measured package");
         assert_eq!(measured.id(), PackageId::from_package_bytes(bytes));
         assert_eq!(measured.physical_bytes(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn measured_package_stream_matches_one_shot_across_read_boundaries() {
+        struct ShortReader<'a> {
+            bytes: &'a [u8],
+            chunk_bytes: usize,
+        }
+
+        impl Read for ShortReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.bytes.len().min(self.chunk_bytes).min(buffer.len());
+                buffer[..read].copy_from_slice(&self.bytes[..read]);
+                self.bytes = &self.bytes[read..];
+                Ok(read)
+            }
+        }
+
+        let bytes = b"streamed package identity must bind every exact byte";
+        let streamed = MeasuredPackage::from_reader(ShortReader {
+            bytes,
+            chunk_bytes: 3,
+        })
+        .expect("streamed package");
+        assert_eq!(streamed, MeasuredPackage::from_bytes(bytes).expect("slice"));
+    }
+
+    #[test]
+    fn streamed_package_rejects_empty_and_reports_io_kind() {
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt source"))
+            }
+        }
+
+        assert_eq!(
+            MeasuredPackage::from_reader(io::empty()),
+            Err(CampaignError::ZeroValue("physical_bytes"))
+        );
+        assert_eq!(
+            MeasuredPackage::from_reader(FailingReader),
+            Err(CampaignError::PackageIo {
+                operation: "read",
+                kind: io::ErrorKind::InvalidData,
+            })
+        );
+    }
+
+    #[test]
+    fn streamed_package_length_overflow_is_typed() {
+        assert_eq!(
+            checked_package_length(u64::MAX, 1),
+            Err(CampaignError::RecordTooLarge("package"))
+        );
     }
 
     #[test]
