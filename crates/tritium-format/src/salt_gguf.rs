@@ -9,15 +9,15 @@
 //! A `tritium.salt.format` metadata marker identifies the container.
 //!
 //! This is a *tritium* SALT container, not a drop-in llama.cpp model: the private
-//! type id signals "not standard ggml", and a safetensors source carries none of
-//! the architecture metadata a runnable GGUF needs. The round-trip
-//! `read_salt_gguf(write_salt_gguf(..)) == input` is exact.
+//! type id signals "not standard ggml". Readers also accept self-contained tritium
+//! model GGUFs that mix private SALT matrices with sized standard tensors such as
+//! F32 norms. The round-trip `read_salt_gguf(write_salt_gguf(..)) == input` is exact.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    FormatError, GgufValue, SALT_HEADER_BYTES, SaltRow, SaltTensor, TQ2_0_BLOCK_BYTES, TensorOut,
-    num_blocks, read_gguf, unpack_salt_row, write_gguf,
+    FormatError, GgufFile, GgufValue, SALT_HEADER_BYTES, SaltRow, SaltTensor, TensorInfo,
+    TensorOut, packed_salt_row_len, read_gguf, unpack_salt_row, write_gguf,
 };
 
 /// tritium-private ggml type-id for a SALT tensor (per-row TQ2_0 planes). Standard
@@ -96,13 +96,18 @@ fn pack_salt_row_checked(row: &SaltRow, k: usize) -> Result<Vec<u8>, FormatError
 ///
 /// Reads the GGUF envelope, verifies the [`SALT_GGUF_FORMAT_KEY`] marker, then for
 /// each [`GGML_TYPE_TRITIUM_SALT`] tensor walks its `rows` self-describing packed
-/// rows. Non-SALT tensors are ignored. Every field is bounds-checked; corrupt or
-/// truncated input errors rather than panicking.
+/// rows. Sized non-SALT tensors are validated and ignored. Tensor names must be
+/// unique; table offsets must match the canonical aligned layout; SALT walks are
+/// bounded by the next tensor offset (EOF only for the final tensor); and every
+/// inter-tensor padding byte must be zero. Corrupt or truncated input errors rather
+/// than panicking.
 ///
 /// # Errors
 /// [`FormatError::Gguf`] on a malformed GGUF envelope; [`FormatError::SaltGgufBadFormat`]
-/// if the marker is absent/wrong or a SALT tensor has other than 2 dims;
-/// [`FormatError::WrongBlockLen`] on a truncated payload, or any [`unpack_salt_row`] error.
+/// if the marker is absent/wrong, a SALT tensor has other than 2 dims, tensor layout
+/// is non-canonical, or an unsized non-SALT private type is present;
+/// [`FormatError::WrongBlockLen`] on a truncated or length-mismatched payload, or
+/// any [`unpack_salt_row`] error.
 pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
     let f = read_gguf(bytes)?;
     if f.get_metadata(SALT_GGUF_FORMAT_KEY)
@@ -112,9 +117,13 @@ pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
         return Err(FormatError::SaltGgufBadFormat);
     }
 
+    validate_tensor_names_and_offsets(bytes, &f)?;
+
     let mut out = Vec::new();
-    for t in &f.tensors {
+    for (index, t) in f.tensors.iter().enumerate() {
+        let blob = tensor_payload_interval(bytes, &f, index)?;
         if t.ggml_type != GGML_TYPE_TRITIUM_SALT {
+            validate_sized_tensor_payload(&f, index, t, blob)?;
             continue;
         }
         if t.dims.len() != 2 {
@@ -122,54 +131,40 @@ pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
         }
         let k = usize::try_from(t.dims[0]).map_err(|_| FormatError::SaltGgufBadFormat)?;
         let rows = usize::try_from(t.dims[1]).map_err(|_| FormatError::SaltGgufBadFormat)?;
-
-        // The payload lives at `tensor_data_offset + offset`; its length is not in
-        // the reader (private type sizes to 0), so we walk the `rows` self-describing
-        // rows from there, bounds-checking each against the buffer end.
-        let start = f
-            .tensor_data_offset
-            .checked_add(t.offset)
-            .and_then(|s| usize::try_from(s).ok())
-            .ok_or(FormatError::SaltGgufBadFormat)?;
-        let blob = bytes.get(start..).ok_or(FormatError::SaltGgufBadFormat)?;
-
-        // `k` comes from a u64 GGUF dim (uncapped on 64-bit, unlike the bundle's
-        // u32 `k`). `num_blocks(k) = ⌈k/256⌉ ≤ k/256`, so `·66` cannot wrap usize
-        // for any u64 `k` — but check it anyway so the guard stays sound if the
-        // block constant or `k` source ever changes (the bundle relies on its u32
-        // cap for the same invariant).
-        let plane_bytes = num_blocks(k)
-            .checked_mul(TQ2_0_BLOCK_BYTES)
-            .ok_or(FormatError::SaltGgufBadFormat)?;
         let mut off = 0usize;
         // Each row is ≥ SALT_HEADER_BYTES; cap the reserve so a crafted `rows` cannot
         // preallocate unboundedly before the per-row bounds check below errors.
         let mut salt_rows = Vec::with_capacity(rows.min(blob.len() / SALT_HEADER_BYTES + 1));
         for _ in 0..rows {
-            if off + SALT_HEADER_BYTES > blob.len() {
+            let remaining = blob.get(off..).ok_or(FormatError::WrongBlockLen {
+                expected: off,
+                got: blob.len(),
+            })?;
+            if remaining.len() < SALT_HEADER_BYTES {
                 return Err(FormatError::WrongBlockLen {
                     expected: off + SALT_HEADER_BYTES,
                     got: blob.len(),
                 });
             }
-            // Plane count `T` sits at header byte 5 (magic[4] + version[1]).
-            let t_planes = blob[off + 5] as usize;
-            let row_len = t_planes
-                .checked_mul(plane_bytes)
-                .and_then(|p| p.checked_add(SALT_HEADER_BYTES))
-                .ok_or(FormatError::WrongBlockLen {
-                    expected: usize::MAX,
-                    got: blob.len(),
-                })?;
-            if off + row_len > blob.len() {
+            let row_len = packed_salt_row_len(remaining)?;
+            let end = off
+                .checked_add(row_len)
+                .ok_or(FormatError::SaltGgufBadFormat)?;
+            let encoded = blob.get(off..end).ok_or(FormatError::WrongBlockLen {
+                expected: end,
+                got: blob.len(),
+            })?;
+            let row = unpack_salt_row(encoded)?;
+            if row.k != k {
                 return Err(FormatError::WrongBlockLen {
-                    expected: off + row_len,
-                    got: blob.len(),
+                    expected: k,
+                    got: row.k,
                 });
             }
-            salt_rows.push(unpack_salt_row(&blob[off..off + row_len])?);
-            off += row_len;
+            salt_rows.push(row);
+            off = end;
         }
+        validate_payload_tail(&f, index, blob, off)?;
         out.push(SaltTensor {
             name: t.name.clone(),
             rows,
@@ -180,12 +175,213 @@ pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
     Ok(out)
 }
 
+/// Round `value` up to `alignment`, rejecting arithmetic overflow.
+fn align_up(value: u64, alignment: u64) -> Result<u64, FormatError> {
+    let bumped = value
+        .checked_add(alignment - 1)
+        .ok_or(FormatError::SaltGgufBadFormat)?;
+    Ok(bumped - bumped % alignment)
+}
+
+/// Enforce the deterministic tensor table layout emitted by both GGUF writers.
+///
+/// Names are unique, the first tensor starts at relative offset zero, and every
+/// subsequent offset is aligned and strictly after the preceding non-empty
+/// payload. Exact adjacency is checked after the private SALT lengths are known.
+fn validate_tensor_names_and_offsets(bytes: &[u8], f: &GgufFile) -> Result<(), FormatError> {
+    let data_start =
+        usize::try_from(f.tensor_data_offset).map_err(|_| FormatError::SaltGgufBadFormat)?;
+    let data = bytes
+        .get(data_start..)
+        .ok_or(FormatError::SaltGgufBadFormat)?;
+    if f.tensors.is_empty() {
+        return if data.is_empty() {
+            Ok(())
+        } else {
+            Err(FormatError::SaltGgufBadFormat)
+        };
+    }
+
+    let alignment = f.alignment();
+    let data_len = u64::try_from(data.len()).map_err(|_| FormatError::SaltGgufBadFormat)?;
+    let mut names = BTreeSet::new();
+    let mut previous = None;
+    for t in &f.tensors {
+        if !names.insert(t.name.as_str()) || t.offset % alignment != 0 || t.offset > data_len {
+            return Err(FormatError::SaltGgufBadFormat);
+        }
+        if let Some(previous) = previous {
+            if t.offset <= previous {
+                return Err(FormatError::SaltGgufBadFormat);
+            }
+        } else if t.offset != 0 {
+            return Err(FormatError::SaltGgufBadFormat);
+        }
+        previous = Some(t.offset);
+    }
+    Ok(())
+}
+
+/// Borrow exactly one table entry's physical interval. A non-final tensor ends
+/// at the next table offset; only the final tensor is allowed to end at EOF.
+fn tensor_payload_interval<'a>(
+    bytes: &'a [u8],
+    f: &GgufFile,
+    index: usize,
+) -> Result<&'a [u8], FormatError> {
+    let tensor = f.tensors.get(index).ok_or(FormatError::SaltGgufBadFormat)?;
+    let relative_end = f
+        .tensors
+        .get(index + 1)
+        .map_or_else(
+            || {
+                u64::try_from(bytes.len())
+                    .ok()
+                    .and_then(|len| len.checked_sub(f.tensor_data_offset))
+            },
+            |next| Some(next.offset),
+        )
+        .ok_or(FormatError::SaltGgufBadFormat)?;
+    let start = f
+        .tensor_data_offset
+        .checked_add(tensor.offset)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(FormatError::SaltGgufBadFormat)?;
+    let end = f
+        .tensor_data_offset
+        .checked_add(relative_end)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(FormatError::SaltGgufBadFormat)?;
+    bytes.get(start..end).ok_or(FormatError::SaltGgufBadFormat)
+}
+
+/// Sized standard tensors use the generic reader's exact byte count. Unknown
+/// private types cannot be validated safely in a SALT model and are rejected.
+fn validate_sized_tensor_payload(
+    f: &GgufFile,
+    index: usize,
+    tensor: &TensorInfo,
+    blob: &[u8],
+) -> Result<(), FormatError> {
+    let used = usize::try_from(tensor.n_bytes).map_err(|_| FormatError::SaltGgufBadFormat)?;
+    if used == 0 {
+        return Err(FormatError::SaltGgufBadFormat);
+    }
+    validate_payload_tail(f, index, blob, used)
+}
+
+/// Check one parsed SALT payload's exact end and its canonical alignment gap.
+fn validate_payload_tail(
+    f: &GgufFile,
+    index: usize,
+    blob: &[u8],
+    used: usize,
+) -> Result<(), FormatError> {
+    if index + 1 == f.tensors.len() {
+        if used != blob.len() {
+            return Err(FormatError::WrongBlockLen {
+                expected: used,
+                got: blob.len(),
+            });
+        }
+        return Ok(());
+    }
+
+    let tensor = &f.tensors[index];
+    let used = u64::try_from(used).map_err(|_| FormatError::SaltGgufBadFormat)?;
+    let payload_end = tensor
+        .offset
+        .checked_add(used)
+        .ok_or(FormatError::SaltGgufBadFormat)?;
+    let expected_next = align_up(payload_end, f.alignment())?;
+    if f.tensors[index + 1].offset != expected_next {
+        return Err(FormatError::SaltGgufBadFormat);
+    }
+    validate_payload_tail_for_alignment(
+        blob,
+        usize::try_from(used).map_err(|_| FormatError::SaltGgufBadFormat)?,
+    )
+}
+
+/// Alignment bytes are canonical zeroes; they are never part of a tensor.
+fn validate_payload_tail_for_alignment(blob: &[u8], used: usize) -> Result<(), FormatError> {
+    let padding = blob.get(used..).ok_or(FormatError::WrongBlockLen {
+        expected: used,
+        got: blob.len(),
+    })?;
+    if padding.iter().any(|&byte| byte != 0) {
+        return Err(FormatError::SaltGgufBadFormat);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{dequant_salt_row, pack_tq2_0_row};
+    use crate::{TQ2_0_BLOCK_BYTES, dequant_salt_row, num_blocks, pack_salt_row, pack_tq2_0_row};
     use half::f16;
     use tritium_core::Trit;
+
+    fn metadata(alignment: u32) -> BTreeMap<String, GgufValue> {
+        BTreeMap::from([
+            ("general.alignment".to_owned(), GgufValue::U32(alignment)),
+            (
+                SALT_GGUF_FORMAT_KEY.to_owned(),
+                GgufValue::String(SALT_GGUF_FORMAT_VALUE.to_owned()),
+            ),
+        ])
+    }
+
+    fn f32_payload(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    /// Locate tensor offset fields in a writer-produced fixture. This deliberately
+    /// understands only the two metadata value kinds emitted by `metadata` above.
+    fn tensor_offset_fields(bytes: &[u8]) -> Vec<usize> {
+        fn u32_at(bytes: &[u8], position: &mut usize) -> u32 {
+            let end = *position + 4;
+            let value = u32::from_le_bytes(bytes[*position..end].try_into().unwrap());
+            *position = end;
+            value
+        }
+        fn u64_at(bytes: &[u8], position: &mut usize) -> u64 {
+            let end = *position + 8;
+            let value = u64::from_le_bytes(bytes[*position..end].try_into().unwrap());
+            *position = end;
+            value
+        }
+        fn skip_string(bytes: &[u8], position: &mut usize) {
+            let len = usize::try_from(u64_at(bytes, position)).unwrap();
+            *position += len;
+        }
+
+        let tensor_count =
+            usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().unwrap())).unwrap();
+        let metadata_count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let mut position = 24;
+        for _ in 0..metadata_count {
+            skip_string(bytes, &mut position);
+            match u32_at(bytes, &mut position) {
+                4 => position += 4,
+                8 => skip_string(bytes, &mut position),
+                other => panic!("unexpected fixture metadata type {other}"),
+            }
+        }
+        let mut fields = Vec::with_capacity(tensor_count);
+        for _ in 0..tensor_count {
+            skip_string(bytes, &mut position);
+            let dims = usize::try_from(u32_at(bytes, &mut position)).unwrap();
+            position += dims * 8;
+            position += 4;
+            fields.push(position);
+            position += 8;
+        }
+        fields
+    }
 
     /// A SALT row of `t` planes over `k` trits (deterministic dummy data).
     fn row(k: usize, t: usize, seed: u8) -> SaltRow {
@@ -254,6 +450,259 @@ mod tests {
         for (r, w) in got[0].salt_rows.iter().zip(&want) {
             assert_eq!(&dequant_salt_row(r).unwrap(), w);
         }
+    }
+
+    #[test]
+    fn mixed_salt_and_f32_tensors_use_disjoint_bounded_payloads() {
+        let salt_row = row(256, 1, 9);
+        let salt = pack_salt_row(&salt_row).unwrap();
+        let norm_a = f32_payload(&[1.0, 2.0, 3.0, 4.0]);
+        let norm_b = f32_payload(&[5.0, 6.0]);
+        let tensors = [
+            TensorOut {
+                name: "input_norm.weight".to_owned(),
+                dims: vec![4],
+                ggml_type: 0,
+                data: &norm_a,
+            },
+            TensorOut {
+                name: "model.layers.0.mlp.up_proj.weight".to_owned(),
+                dims: vec![256, 1],
+                ggml_type: GGML_TYPE_TRITIUM_SALT,
+                data: &salt,
+            },
+            TensorOut {
+                name: "output_norm.weight".to_owned(),
+                dims: vec![2],
+                ggml_type: 0,
+                data: &norm_b,
+            },
+        ];
+        let bytes = write_gguf(3, &metadata(32), &tensors).unwrap();
+
+        let got = read_salt_gguf(&bytes).expect("mixed self-contained model");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "model.layers.0.mlp.up_proj.weight");
+        assert_eq!(got[0].salt_rows, vec![salt_row]);
+    }
+
+    #[test]
+    fn salt_row_count_cannot_consume_a_following_f32_tensor() {
+        let first = pack_salt_row(&row(256, 1, 1)).unwrap();
+        // A valid encoded SALT row is also a multiple of four bytes. Present those
+        // bytes as an F32 tensor so an EOF-bounded SALT walk would accept it as the
+        // forged second row. The table boundary must stop that walk first.
+        let disguised_following = pack_salt_row(&row(256, 1, 2)).unwrap();
+        assert!(disguised_following.len().is_multiple_of(4));
+        let tensors = [
+            TensorOut {
+                name: "salt".to_owned(),
+                dims: vec![256, 2],
+                ggml_type: GGML_TYPE_TRITIUM_SALT,
+                data: &first,
+            },
+            TensorOut {
+                name: "norm".to_owned(),
+                dims: vec![(disguised_following.len() / 4) as u64],
+                ggml_type: 0,
+                data: &disguised_following,
+            },
+        ];
+        let bytes = write_gguf(3, &metadata(1), &tensors).unwrap();
+
+        assert!(read_gguf(&bytes).is_ok(), "generic envelope remains valid");
+        assert!(read_salt_gguf(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_row_k_that_disagrees_with_tensor_shape() {
+        let encoded = pack_salt_row(&row(256, 1, 1)).unwrap();
+        let tensors = [TensorOut {
+            name: "salt".to_owned(),
+            dims: vec![255, 1],
+            ggml_type: GGML_TYPE_TRITIUM_SALT,
+            data: &encoded,
+        }];
+        let bytes = write_gguf(3, &metadata(32), &tensors).unwrap();
+
+        assert_eq!(
+            read_salt_gguf(&bytes).unwrap_err(),
+            FormatError::WrongBlockLen {
+                expected: 255,
+                got: 256,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_names() {
+        let encoded = pack_salt_row(&row(256, 1, 1)).unwrap();
+        let norm = f32_payload(&[1.0]);
+        let tensors = [
+            TensorOut {
+                name: "duplicate".to_owned(),
+                dims: vec![256, 1],
+                ggml_type: GGML_TYPE_TRITIUM_SALT,
+                data: &encoded,
+            },
+            TensorOut {
+                name: "duplicate".to_owned(),
+                dims: vec![1],
+                ggml_type: 0,
+                data: &norm,
+            },
+        ];
+        let bytes = write_gguf(3, &metadata(32), &tensors).unwrap();
+
+        assert_eq!(
+            read_salt_gguf(&bytes).unwrap_err(),
+            FormatError::SaltGgufBadFormat
+        );
+    }
+
+    #[test]
+    fn rejects_overlapping_or_non_monotonic_tensor_offsets() {
+        let encoded = pack_salt_row(&row(256, 1, 1)).unwrap();
+        let norm = f32_payload(&[1.0, 2.0]);
+        let tensors = [
+            TensorOut {
+                name: "salt".to_owned(),
+                dims: vec![256, 1],
+                ggml_type: GGML_TYPE_TRITIUM_SALT,
+                data: &encoded,
+            },
+            TensorOut {
+                name: "norm".to_owned(),
+                dims: vec![2],
+                ggml_type: 0,
+                data: &norm,
+            },
+        ];
+        let mut bytes = write_gguf(3, &metadata(32), &tensors).unwrap();
+        let fields = tensor_offset_fields(&bytes);
+        bytes[fields[1]..fields[1] + 8].copy_from_slice(&0u64.to_le_bytes());
+
+        assert!(
+            read_gguf(&bytes).is_ok(),
+            "generic reader does not own overlap policy"
+        );
+        assert_eq!(
+            read_salt_gguf(&bytes).unwrap_err(),
+            FormatError::SaltGgufBadFormat
+        );
+    }
+
+    #[test]
+    fn rejects_unaligned_tensor_offsets_even_when_payload_is_in_bounds() {
+        let encoded = pack_salt_row(&row(256, 1, 1)).unwrap();
+        let norm = f32_payload(&[1.0, 2.0]);
+        let tensors = [
+            TensorOut {
+                name: "salt".to_owned(),
+                dims: vec![256, 1],
+                ggml_type: GGML_TYPE_TRITIUM_SALT,
+                data: &encoded,
+            },
+            TensorOut {
+                name: "norm".to_owned(),
+                dims: vec![2],
+                ggml_type: 0,
+                data: &norm,
+            },
+        ];
+        let mut bytes = write_gguf(3, &metadata(32), &tensors).unwrap();
+        let parsed = read_gguf(&bytes).unwrap();
+        let original_offset = parsed.tensors[1].offset;
+        let original_start = usize::try_from(parsed.tensor_data_offset + original_offset).unwrap();
+        bytes.insert(original_start, 0);
+        let fields = tensor_offset_fields(&bytes);
+        bytes[fields[1]..fields[1] + 8].copy_from_slice(&(original_offset + 1).to_le_bytes());
+
+        assert!(read_gguf(&bytes).is_ok());
+        assert_eq!(
+            read_salt_gguf(&bytes).unwrap_err(),
+            FormatError::SaltGgufBadFormat
+        );
+    }
+
+    #[test]
+    fn rejects_aligned_but_noncanonical_extra_gap() {
+        let encoded = pack_salt_row(&row(256, 1, 1)).unwrap();
+        let norm = f32_payload(&[1.0, 2.0]);
+        let tensors = [
+            TensorOut {
+                name: "salt".to_owned(),
+                dims: vec![256, 1],
+                ggml_type: GGML_TYPE_TRITIUM_SALT,
+                data: &encoded,
+            },
+            TensorOut {
+                name: "norm".to_owned(),
+                dims: vec![2],
+                ggml_type: 0,
+                data: &norm,
+            },
+        ];
+        let mut bytes = write_gguf(3, &metadata(32), &tensors).unwrap();
+        let parsed = read_gguf(&bytes).unwrap();
+        let original_offset = parsed.tensors[1].offset;
+        let original_start = usize::try_from(parsed.tensor_data_offset + original_offset).unwrap();
+        bytes.splice(original_start..original_start, [0; 32]);
+        let fields = tensor_offset_fields(&bytes);
+        bytes[fields[1]..fields[1] + 8].copy_from_slice(&(original_offset + 32).to_le_bytes());
+
+        assert!(read_gguf(&bytes).is_ok());
+        assert_eq!(
+            read_salt_gguf(&bytes).unwrap_err(),
+            FormatError::SaltGgufBadFormat
+        );
+    }
+
+    #[test]
+    fn rejects_nonzero_inter_tensor_padding() {
+        let encoded = pack_salt_row(&row(256, 1, 1)).unwrap();
+        let norm = f32_payload(&[1.0]);
+        let tensors = [
+            TensorOut {
+                name: "salt".to_owned(),
+                dims: vec![256, 1],
+                ggml_type: GGML_TYPE_TRITIUM_SALT,
+                data: &encoded,
+            },
+            TensorOut {
+                name: "norm".to_owned(),
+                dims: vec![1],
+                ggml_type: 0,
+                data: &norm,
+            },
+        ];
+        let mut bytes = write_gguf(3, &metadata(32), &tensors).unwrap();
+        let f = read_gguf(&bytes).unwrap();
+        let padding_byte = usize::try_from(f.tensor_data_offset).unwrap() + encoded.len();
+        assert!(
+            padding_byte < usize::try_from(f.tensor_data_offset + f.tensors[1].offset).unwrap()
+        );
+        bytes[padding_byte] = 1;
+
+        assert_eq!(
+            read_salt_gguf(&bytes).unwrap_err(),
+            FormatError::SaltGgufBadFormat
+        );
+    }
+
+    #[test]
+    fn rejects_bytes_after_the_final_tensor() {
+        let rows = vec![row(256, 1, 1)];
+        let mut bytes = write_salt_gguf(&[("salt", &rows)]).unwrap();
+        bytes.push(0);
+
+        assert_eq!(
+            read_salt_gguf(&bytes).unwrap_err(),
+            FormatError::WrongBlockLen {
+                expected: pack_salt_row(&rows[0]).unwrap().len(),
+                got: pack_salt_row(&rows[0]).unwrap().len() + 1,
+            }
+        );
     }
 
     #[test]
