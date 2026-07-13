@@ -32,7 +32,7 @@ use tritium_cuda::train::{
     HostOffloadTrainParam, HostOffloadTrainer,
 };
 #[cfg(feature = "cuda")]
-use tritium_nn::{TeacherCacheReader, packed_device_forward};
+use tritium_nn::{TeacherCacheReader, TrainingParameter, packed_device_forward};
 #[cfg(feature = "cuda")]
 use tritium_spec::TernaryBackend;
 #[cfg(feature = "cuda")]
@@ -61,8 +61,8 @@ pub(crate) enum CampaignCommand {
     /// Run or resume an offline-teacher packed-SALT campaign on CUDA.
     Run {
         /// JSON campaign configuration. Required keys: model_dir, corpus,
-        /// teacher_cache, checkpoint_dir, report, seq_len, and steps. Optional
-        /// keys: salt_planes, cuda_device, checkpoint_every,
+        /// teacher_cache, checkpoint_dir, report, seq_len, steps, and
+        /// checkpoint_every. Optional keys: salt_planes, cuda_device,
         /// checkpoint_shards, and adam. Relative paths resolve beside this file.
         #[arg(long)]
         config: PathBuf,
@@ -458,11 +458,24 @@ fn path_identity(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(identity)
 }
 
+fn validate_existing_output_type(path: &Path, label: &str) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => bail!(
+            "{label} {} exists but is not a regular file",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect {label} {}", path.display())),
+    }
+}
+
 fn validate_teacher_cache_paths(
     model_dir: &Path,
     corpus: &Path,
     output: &Path,
 ) -> anyhow::Result<()> {
+    validate_existing_output_type(output, "teacher-cache output")?;
     let output_identity = path_identity(output)?;
     let corpus_identity = path_identity(corpus)?;
     let model_identity = path_identity(model_dir)?;
@@ -484,6 +497,7 @@ fn validate_teacher_cache_paths(
 
 #[cfg(feature = "cuda")]
 fn validate_campaign_paths(config_path: &Path, config: &CampaignConfig) -> anyhow::Result<()> {
+    validate_existing_output_type(&config.report, "campaign report")?;
     let report = path_identity(&config.report)?;
     let checkpoint = path_identity(&config.checkpoint_dir)?;
     let model_dir = path_identity(&config.model_dir)?;
@@ -497,9 +511,9 @@ fn validate_campaign_paths(config_path: &Path, config: &CampaignConfig) -> anyho
         ),
     ];
 
-    if report.starts_with(&checkpoint) {
+    if report.starts_with(&checkpoint) || checkpoint.starts_with(&report) {
         bail!(
-            "campaign report {} must be outside checkpoint directory {}",
+            "campaign report {} and checkpoint directory {} must not contain one another",
             config.report.display(),
             config.checkpoint_dir.display()
         );
@@ -648,10 +662,6 @@ const fn default_planes() -> usize {
     2
 }
 #[cfg(feature = "cuda")]
-const fn default_checkpoint_every() -> u64 {
-    1
-}
-#[cfg(feature = "cuda")]
 const fn default_checkpoint_shards() -> usize {
     1
 }
@@ -671,7 +681,6 @@ struct CampaignConfig {
     salt_planes: usize,
     #[serde(default)]
     cuda_device: usize,
-    #[serde(default = "default_checkpoint_every")]
     checkpoint_every: u64,
     #[serde(default = "default_checkpoint_shards")]
     checkpoint_shards: usize,
@@ -714,6 +723,8 @@ struct PlanSidecar {
     fingerprint: String,
     cuda_device: usize,
     cuda_device_name: String,
+    campaign_config_file_digest: String,
+    model_config_file_digest: String,
     model_digest: String,
     corpus_digest: String,
     corpus_file_digest: String,
@@ -734,6 +745,8 @@ struct PlanSidecar {
 struct PlanInputs<'a> {
     cuda_device: usize,
     cuda_device_name: &'a str,
+    campaign_config_file_digest: [u8; 32],
+    model_config_file_digest: [u8; 32],
     model_digest: [u8; 32],
     corpus_digest: [u8; 32],
     corpus_file_digest: [u8; 32],
@@ -752,9 +765,11 @@ struct PlanInputs<'a> {
 #[cfg(any(feature = "cuda", test))]
 fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"tritium-packed-campaign-plan-v2");
+    hash.update(b"tritium-packed-campaign-plan-v3");
     hash.update(&(inputs.cuda_device as u64).to_le_bytes());
     hash_bytes(&mut hash, inputs.cuda_device_name.as_bytes());
+    hash.update(&inputs.campaign_config_file_digest);
+    hash.update(&inputs.model_config_file_digest);
     hash.update(&inputs.model_digest);
     hash.update(&inputs.corpus_digest);
     hash.update(&inputs.corpus_file_digest);
@@ -793,10 +808,12 @@ fn build_plan_sidecar(inputs: &PlanInputs<'_>) -> PlanSidecar {
         .collect();
     let fingerprint = hex_digest(*hash.finalize().as_bytes());
     PlanSidecar {
-        version: 2,
+        version: 3,
         fingerprint,
         cuda_device: inputs.cuda_device,
         cuda_device_name: inputs.cuda_device_name.to_owned(),
+        campaign_config_file_digest: hex_digest(inputs.campaign_config_file_digest),
+        model_config_file_digest: hex_digest(inputs.model_config_file_digest),
         model_digest: hex_digest(inputs.model_digest),
         corpus_digest: hex_digest(inputs.corpus_digest),
         corpus_file_digest: hex_digest(inputs.corpus_file_digest),
@@ -938,6 +955,8 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     let plan = build_plan_sidecar(&PlanInputs {
         cuda_device: campaign.cuda_device,
         cuda_device_name: &cuda_device_name,
+        campaign_config_file_digest: config_file_digest,
+        model_config_file_digest,
         model_digest,
         corpus_digest,
         corpus_file_digest,
@@ -952,9 +971,18 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         checkpoint_shards: campaign.checkpoint_shards,
         parameters: model.parameters(),
     });
+    let input_hashes = CampaignInputHashes {
+        campaign_config_file: hex_digest(config_file_digest),
+        model_config_file: hex_digest(model_config_file_digest),
+        model: hex_digest(model_digest),
+        corpus_file: hex_digest(corpus_file_digest),
+        corpus: hex_digest(corpus_digest),
+        teacher_cache: hex_digest(teacher_cache_digest),
+    };
     // This comparison/creation happens before DCP load can mutate trainer state.
     ensure_plan_sidecar(&campaign.checkpoint_dir, &plan)?;
 
+    let static_memory = expected_static_memory(model.parameters(), campaign.salt_planes)?;
     let optimizer = AdamW {
         lr: campaign.adam.lr,
         beta1: campaign.adam.beta1,
@@ -962,7 +990,6 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         eps: campaign.adam.eps,
         weight_decay: campaign.adam.weight_decay,
     };
-    let dense_parameter_bytes = checked_parameter_bytes(&model)?;
     let masters = model.take_parameter_masters();
     let specs: Vec<_> = model
         .parameters()
@@ -994,14 +1021,18 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             campaign.steps
         );
     }
-    let previous_report = load_existing_report(
-        &campaign.report,
-        &plan.fingerprint,
-        trainer.completed_step(),
+    let report_expectations = ReportExpectations {
+        plan_fingerprint: &plan.fingerprint,
+        checkpoint_step: trainer.completed_step(),
+        checkpoint_dir: &campaign.checkpoint_dir,
         windows,
-        campaign.cuda_device,
-        &cuda_device_name,
-    )?;
+        configured_steps: campaign.steps,
+        cuda_device: campaign.cuda_device,
+        cuda_device_name: &cuda_device_name,
+        input_hashes: &input_hashes,
+        static_memory,
+    };
+    let previous_report = load_existing_report(&campaign.report, &report_expectations)?;
     if trainer.completed_step() == campaign.steps
         && let Some(report) = previous_report.as_ref()
         && report.completed_step == campaign.steps
@@ -1060,18 +1091,11 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             .checked_add(host_adapter_master_bytes)
             .context("logical host training-state byte count overflow")?;
         Ok(CampaignReport {
-            schema_version: 2,
+            schema_version: 3,
             plan_fingerprint: plan.fingerprint.clone(),
             cuda_device: campaign.cuda_device,
             cuda_device_name: cuda_device_name.clone(),
-            input_hashes: CampaignInputHashes {
-                campaign_config_file: hex_digest(config_file_digest),
-                model_config_file: hex_digest(model_config_file_digest),
-                model: hex_digest(model_digest),
-                corpus_file: hex_digest(corpus_file_digest),
-                corpus: hex_digest(corpus_digest),
-                teacher_cache: hex_digest(teacher_cache_digest),
-            },
+            input_hashes: input_hashes.clone(),
             completed_step: trainer.completed_step(),
             resumed_from_step,
             configured_steps: campaign.steps,
@@ -1081,7 +1105,7 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
                 packed_parameter_bytes,
                 packed_code_bytes,
                 packed_scale_bytes,
-                dense_parameter_bytes,
+                dense_parameter_bytes: static_memory.dense_parameter_bytes,
                 host_optimizer_bytes,
                 host_adapter_master_bytes,
                 logical_host_training_state_bytes,
@@ -1317,15 +1341,66 @@ fn repack_all_or_stale(
 }
 
 #[cfg(feature = "cuda")]
-fn checked_parameter_bytes(model: &TiedSwiGluTrainingModel) -> anyhow::Result<usize> {
-    let elements = model
-        .parameters()
-        .iter()
-        .try_fold(0usize, |sum, parameter| {
-            sum.checked_add(parameter.elements())
-                .context("dense parameter element count overflow")
-        })?;
-    elements_to_bytes(elements)
+fn expected_static_memory(
+    parameters: &[TrainingParameter],
+    salt_planes: usize,
+) -> anyhow::Result<StaticMemoryExpectations> {
+    if !(1..=3).contains(&salt_planes) {
+        bail!("SALT plane count must be in 1..=3");
+    }
+    let mut dense_elements = 0usize;
+    let mut largest_parameter_elements = 0usize;
+    let mut packed_code_bytes = 0usize;
+    let mut packed_scale_bytes = 0usize;
+    for parameter in parameters {
+        let elements = parameter
+            .rows
+            .checked_mul(parameter.cols)
+            .context("dense parameter shape overflow")?;
+        dense_elements = dense_elements
+            .checked_add(elements)
+            .context("dense parameter element count overflow")?;
+        largest_parameter_elements = largest_parameter_elements.max(elements);
+
+        let blocks_per_row = parameter.cols.div_ceil(tritium_format::QK_K);
+        let parameter_code_bytes = salt_planes
+            .checked_mul(parameter.rows)
+            .and_then(|count| count.checked_mul(blocks_per_row))
+            .and_then(|count| count.checked_mul(tritium_format::QK_K / 4))
+            .context("packed SALT code byte count overflow")?;
+        packed_code_bytes = packed_code_bytes
+            .checked_add(parameter_code_bytes)
+            .context("packed SALT code byte total overflow")?;
+        let parameter_scale_bytes = salt_planes
+            .checked_mul(parameter.rows)
+            .and_then(|count| count.checked_mul(size_of::<f32>()))
+            .context("packed SALT scale byte count overflow")?;
+        packed_scale_bytes = packed_scale_bytes
+            .checked_add(parameter_scale_bytes)
+            .context("packed SALT scale byte total overflow")?;
+    }
+
+    let dense_parameter_bytes = elements_to_bytes(dense_elements)?;
+    let host_optimizer_bytes = dense_parameter_bytes
+        .checked_mul(3)
+        .context("host optimizer byte count overflow")?;
+    let peak_optimizer_staging_bytes = elements_to_bytes(largest_parameter_elements)?
+        .checked_mul(6)
+        .context("optimizer staging byte count overflow")?;
+    let packed_parameter_bytes = packed_code_bytes
+        .checked_add(packed_scale_bytes)
+        .context("packed parameter byte count overflow")?;
+    Ok(StaticMemoryExpectations {
+        packed_parameter_bytes,
+        packed_code_bytes,
+        packed_scale_bytes,
+        dense_parameter_bytes,
+        host_optimizer_bytes,
+        host_adapter_master_bytes: 0,
+        logical_host_training_state_bytes: host_optimizer_bytes,
+        peak_optimizer_staging_bytes,
+        materialized_gradient_bytes: dense_parameter_bytes,
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -1344,7 +1419,7 @@ struct StepTiming {
 }
 
 #[cfg(feature = "cuda")]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 struct CampaignInputHashes {
     campaign_config_file: String,
     model_config_file: String,
@@ -1385,6 +1460,160 @@ struct CampaignReport {
     checkpoint_path: String,
     step_timings: Vec<StepTiming>,
     memory: CampaignMemoryReport,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticMemoryExpectations {
+    packed_parameter_bytes: usize,
+    packed_code_bytes: usize,
+    packed_scale_bytes: usize,
+    dense_parameter_bytes: usize,
+    host_optimizer_bytes: usize,
+    host_adapter_master_bytes: usize,
+    logical_host_training_state_bytes: usize,
+    peak_optimizer_staging_bytes: usize,
+    materialized_gradient_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct ReportExpectations<'a> {
+    plan_fingerprint: &'a str,
+    checkpoint_step: u64,
+    checkpoint_dir: &'a Path,
+    windows: u64,
+    configured_steps: u64,
+    cuda_device: usize,
+    cuda_device_name: &'a str,
+    input_hashes: &'a CampaignInputHashes,
+    static_memory: StaticMemoryExpectations,
+}
+
+#[cfg(feature = "cuda")]
+fn validate_report_memory(
+    path: &Path,
+    memory: &CampaignMemoryReport,
+    expected: StaticMemoryExpectations,
+    completed_step: u64,
+) -> anyhow::Result<()> {
+    for (label, actual, expected) in [
+        (
+            "packed code",
+            memory.packed_code_bytes,
+            expected.packed_code_bytes,
+        ),
+        (
+            "packed scales",
+            memory.packed_scale_bytes,
+            expected.packed_scale_bytes,
+        ),
+        (
+            "packed parameter",
+            memory.packed_parameter_bytes,
+            expected.packed_parameter_bytes,
+        ),
+        (
+            "dense parameter",
+            memory.dense_parameter_bytes,
+            expected.dense_parameter_bytes,
+        ),
+        (
+            "host optimizer",
+            memory.host_optimizer_bytes,
+            expected.host_optimizer_bytes,
+        ),
+        (
+            "host adapter master",
+            memory.host_adapter_master_bytes,
+            expected.host_adapter_master_bytes,
+        ),
+        (
+            "logical host training-state",
+            memory.logical_host_training_state_bytes,
+            expected.logical_host_training_state_bytes,
+        ),
+        (
+            "optimizer staging",
+            memory.peak_optimizer_staging_bytes,
+            expected.peak_optimizer_staging_bytes,
+        ),
+    ] {
+        if actual != expected {
+            bail!(
+                "prior report {} has {actual} {label} bytes, expected {expected}",
+                path.display()
+            );
+        }
+    }
+    if completed_step > 0
+        && memory.materialized_gradient_bytes != expected.materialized_gradient_bytes
+    {
+        bail!(
+            "prior report {} has {} materialized gradient bytes, expected {} after completed training",
+            path.display(),
+            memory.materialized_gradient_bytes,
+            expected.materialized_gradient_bytes
+        );
+    }
+    let packed_parameter_bytes = memory
+        .packed_code_bytes
+        .checked_add(memory.packed_scale_bytes)
+        .context("campaign report packed byte count overflow")?;
+    if memory.packed_parameter_bytes != packed_parameter_bytes {
+        bail!(
+            "prior report {} has inconsistent packed parameter bytes",
+            path.display()
+        );
+    }
+    let logical_host_training_state_bytes = memory
+        .host_optimizer_bytes
+        .checked_add(memory.host_adapter_master_bytes)
+        .context("campaign report host training-state byte count overflow")?;
+    if memory.logical_host_training_state_bytes != logical_host_training_state_bytes {
+        bail!(
+            "prior report {} has inconsistent host training-state bytes",
+            path.display()
+        );
+    }
+    if memory.peak_streamed_gradient_bytes > memory.materialized_gradient_bytes {
+        bail!(
+            "prior report {} has streamed-gradient peak larger than its materialized-gradient baseline",
+            path.display()
+        );
+    }
+    if memory.logical_peak_activation_bytes > memory.logical_naive_activation_bytes {
+        bail!(
+            "prior report {} has checkpointed activation peak larger than its naive activation baseline",
+            path.display()
+        );
+    }
+    for (label, bytes) in [
+        ("packed scales", memory.packed_scale_bytes),
+        ("dense parameters", memory.dense_parameter_bytes),
+        ("host optimizer", memory.host_optimizer_bytes),
+        ("host adapter masters", memory.host_adapter_master_bytes),
+        (
+            "logical host training state",
+            memory.logical_host_training_state_bytes,
+        ),
+        ("optimizer staging", memory.peak_optimizer_staging_bytes),
+        ("streamed gradients", memory.peak_streamed_gradient_bytes),
+        ("materialized gradients", memory.materialized_gradient_bytes),
+        (
+            "checkpointed activations",
+            memory.logical_peak_activation_bytes,
+        ),
+        ("naive activations", memory.logical_naive_activation_bytes),
+    ] {
+        if !bytes.is_multiple_of(size_of::<f32>()) {
+            bail!(
+                "prior report {} has non-f32-aligned {label} byte count {bytes}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -1443,20 +1672,19 @@ fn validate_report_timing_coverage(
 #[cfg(feature = "cuda")]
 fn load_existing_report(
     path: &Path,
-    plan_fingerprint: &str,
-    checkpoint_step: u64,
-    windows: u64,
-    cuda_device: usize,
-    cuda_device_name: &str,
+    expected: &ReportExpectations<'_>,
 ) -> anyhow::Result<Option<CampaignReport>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && checkpoint_step == 0 => {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && expected.checkpoint_step == 0 =>
+        {
             return Ok(None);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             bail!(
-                "committed checkpoint step {checkpoint_step} has no matching campaign report {}; refusing resume with incomplete evidence",
+                "committed checkpoint step {} has no matching campaign report {}; refusing resume with incomplete evidence",
+                expected.checkpoint_step,
                 path.display()
             );
         }
@@ -1466,47 +1694,96 @@ fn load_existing_report(
     };
     let mut report: CampaignReport = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse prior report {}", path.display()))?;
-    if report.schema_version != 2 {
+    if report.schema_version != 3 {
         bail!(
             "prior report {} uses unsupported schema version {}",
             path.display(),
             report.schema_version
         );
     }
-    if report.plan_fingerprint != plan_fingerprint {
+    if report.plan_fingerprint != expected.plan_fingerprint {
         bail!(
             "prior report {} belongs to a different immutable campaign plan",
             path.display()
         );
     }
-    if report.cuda_device != cuda_device || report.cuda_device_name != cuda_device_name {
+    if report.cuda_device != expected.cuda_device
+        || report.cuda_device_name != expected.cuda_device_name
+    {
         bail!(
             "prior report {} records CUDA device {} ({:?}), expected {} ({:?})",
             path.display(),
             report.cuda_device,
             report.cuda_device_name,
-            cuda_device,
-            cuda_device_name
+            expected.cuda_device,
+            expected.cuda_device_name
+        );
+    }
+    if report.configured_steps != expected.configured_steps {
+        bail!(
+            "prior report {} records {} configured steps, expected {}",
+            path.display(),
+            report.configured_steps,
+            expected.configured_steps
+        );
+    }
+    if report.input_hashes != *expected.input_hashes {
+        bail!(
+            "prior report {} input hashes do not match the current campaign inputs",
+            path.display()
+        );
+    }
+    let reported_checkpoint = path_identity(Path::new(&report.checkpoint_path))?;
+    let expected_checkpoint = path_identity(expected.checkpoint_dir)?;
+    if reported_checkpoint != expected_checkpoint {
+        bail!(
+            "prior report {} points at checkpoint {}, expected {}",
+            path.display(),
+            report.checkpoint_path,
+            expected.checkpoint_dir.display()
+        );
+    }
+    if report.completed_step > report.configured_steps {
+        bail!(
+            "prior report {} completed step {} exceeds configured step {}",
+            path.display(),
+            report.completed_step,
+            report.configured_steps
+        );
+    }
+    if report.resumed_from_step > report.completed_step {
+        bail!(
+            "prior report {} resumed from step {} after its completed step {}",
+            path.display(),
+            report.resumed_from_step,
+            report.completed_step
         );
     }
     // Validate the full persisted report before either a terminal shortcut or
     // truncating evidence that ran ahead of DCP's manifest commit.
-    validate_report_timing_coverage(path, &report, windows)?;
-    if report.completed_step < checkpoint_step {
+    validate_report_memory(
+        path,
+        &report.memory,
+        expected.static_memory,
+        report.completed_step,
+    )?;
+    validate_report_timing_coverage(path, &report, expected.windows)?;
+    if report.completed_step < expected.checkpoint_step {
         bail!(
-            "prior report {} covers completed step {}, but committed checkpoint is step {checkpoint_step}; refusing resume with an evidence gap",
+            "prior report {} covers completed step {}, but committed checkpoint is step {}; refusing resume with an evidence gap",
             path.display(),
-            report.completed_step
+            report.completed_step,
+            expected.checkpoint_step
         );
     }
-    if report.completed_step > checkpoint_step {
+    if report.completed_step > expected.checkpoint_step {
         // Reports precede DCP manifest commits. A crash can leave evidence for
         // optimizer work whose state did not commit; replay only the timings
         // covered by the live manifest. Peak-memory values remain conservative.
         report
             .step_timings
-            .retain(|timing| timing.step <= checkpoint_step);
-        report.completed_step = checkpoint_step;
+            .retain(|timing| timing.step <= expected.checkpoint_step);
+        report.completed_step = expected.checkpoint_step;
     }
     Ok(Some(report))
 }
@@ -1634,6 +1911,19 @@ mod tests {
             validate_teacher_cache_paths(&model_dir, &corpus, &model_dir.join("teacher.ttpr"))
                 .is_err()
         );
+        let output_directory = directory.join("output-directory");
+        std::fs::create_dir_all(&output_directory).unwrap();
+        assert!(validate_teacher_cache_paths(&model_dir, &corpus, &output_directory).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let regular = directory.join("regular-output-target");
+            let special = directory.join("special-output");
+            std::fs::write(&regular, b"old").unwrap();
+            symlink(&regular, &special).unwrap();
+            assert!(validate_teacher_cache_paths(&model_dir, &corpus, &special).is_err());
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1671,12 +1961,13 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn campaign_config_defaults_and_resolves_relative_paths_beside_config() {
+    fn campaign_config_requires_checkpoint_cadence_and_resolves_paths() {
         let mut config: CampaignConfig = serde_json::from_str(
             r#"{
                 "model_dir":"model", "corpus":"corpus.json",
                 "teacher_cache":"teacher.ttpr", "checkpoint_dir":"checkpoints",
-                "report":"report.json", "seq_len":32, "steps":40
+                "report":"report.json", "seq_len":32, "steps":40,
+                "checkpoint_every":5
             }"#,
         )
         .unwrap();
@@ -1684,9 +1975,16 @@ mod tests {
         assert_eq!(config.model_dir, Path::new("/campaign/model"));
         assert_eq!(config.report, Path::new("/campaign/report.json"));
         assert_eq!(config.salt_planes, 2);
-        assert_eq!(config.checkpoint_every, 1);
+        assert_eq!(config.checkpoint_every, 5);
         assert_eq!(config.checkpoint_shards, 1);
         assert_eq!(config.adam.lr.to_bits(), default_lr().to_bits());
+
+        let missing_cadence = r#"{
+            "model_dir":"model", "corpus":"corpus.json",
+            "teacher_cache":"teacher.ttpr", "checkpoint_dir":"checkpoints",
+            "report":"report.json", "seq_len":32, "steps":40
+        }"#;
+        assert!(serde_json::from_str::<CampaignConfig>(missing_cadence).is_err());
     }
 
     #[cfg(feature = "cuda")]
@@ -1704,7 +2002,8 @@ mod tests {
             "checkpoint_dir": checkpoint_dir,
             "report": directory.join("report.json"),
             "seq_len": 1,
-            "steps": 1
+            "steps": 1,
+            "checkpoint_every": 1
         });
         std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
 
@@ -1753,6 +2052,29 @@ mod tests {
         config.report = model_dir.join("campaign-report.json");
         assert!(validate_campaign_paths(&config_path, &config).is_err());
 
+        let report_container = directory.join("report-container");
+        config.report = report_container.clone();
+        config.checkpoint_dir = report_container.join("checkpoints");
+        assert!(validate_campaign_paths(&config_path, &config).is_err());
+
+        let report_directory = directory.join("report-directory");
+        std::fs::create_dir_all(&report_directory).unwrap();
+        config.report = report_directory;
+        config.checkpoint_dir = checkpoint_dir;
+        assert!(validate_campaign_paths(&config_path, &config).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let regular = directory.join("regular-report-target");
+            let special = directory.join("special-report");
+            std::fs::write(&regular, b"{}").unwrap();
+            symlink(&regular, &special).unwrap();
+            config.report = special;
+            assert!(validate_campaign_paths(&config_path, &config).is_err());
+        }
+
         config.report = directory.join("report.json");
         config.checkpoint_dir = directory;
         assert!(validate_campaign_paths(&config_path, &config).is_err());
@@ -1761,39 +2083,88 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn static_memory_expectations_cover_packed_geometry_and_optimizer_state() {
+        let parameters = vec![
+            TrainingParameter {
+                name: "wide".into(),
+                master: vec![0.0; 2 * 257],
+                rows: 2,
+                cols: 257,
+            },
+            TrainingParameter {
+                name: "narrow".into(),
+                master: vec![0.0; 3],
+                rows: 3,
+                cols: 1,
+            },
+        ];
+
+        assert_eq!(
+            expected_static_memory(&parameters, 2).unwrap(),
+            StaticMemoryExpectations {
+                packed_parameter_bytes: 936,
+                packed_code_bytes: 896,
+                packed_scale_bytes: 40,
+                dense_parameter_bytes: 2_068,
+                host_optimizer_bytes: 6_204,
+                host_adapter_master_bytes: 0,
+                logical_host_training_state_bytes: 6_204,
+                peak_optimizer_staging_bytes: 12_336,
+                materialized_gradient_bytes: 2_068,
+            }
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn resume_validates_timing_coverage_before_truncating_orphan_report() {
-        let path = temp_path("orphan-report");
+        let directory = temp_path("orphan-report");
+        let checkpoint_dir = directory.join("checkpoint");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        let path = directory.join("report.json");
+        let input_hashes = CampaignInputHashes {
+            campaign_config_file: "config".into(),
+            model_config_file: "model-config".into(),
+            model: "model".into(),
+            corpus_file: "corpus-file".into(),
+            corpus: "corpus".into(),
+            teacher_cache: "teacher".into(),
+        };
         let memory = CampaignMemoryReport {
-            packed_parameter_bytes: 1,
+            packed_parameter_bytes: 6,
             packed_code_bytes: 2,
-            packed_scale_bytes: 3,
-            dense_parameter_bytes: 4,
-            host_optimizer_bytes: 5,
+            packed_scale_bytes: 4,
+            dense_parameter_bytes: 16,
+            host_optimizer_bytes: 48,
             host_adapter_master_bytes: 0,
-            logical_host_training_state_bytes: 5,
-            peak_optimizer_staging_bytes: 6,
-            peak_streamed_gradient_bytes: 7,
-            materialized_gradient_bytes: 8,
-            logical_peak_activation_bytes: 9,
-            logical_naive_activation_bytes: 10,
+            logical_host_training_state_bytes: 48,
+            peak_optimizer_staging_bytes: 24,
+            peak_streamed_gradient_bytes: 8,
+            materialized_gradient_bytes: 16,
+            logical_peak_activation_bytes: 12,
+            logical_naive_activation_bytes: 20,
+        };
+        let static_memory = StaticMemoryExpectations {
+            packed_parameter_bytes: 6,
+            packed_code_bytes: 2,
+            packed_scale_bytes: 4,
+            dense_parameter_bytes: 16,
+            host_optimizer_bytes: 48,
+            host_adapter_master_bytes: 0,
+            logical_host_training_state_bytes: 48,
+            peak_optimizer_staging_bytes: 24,
+            materialized_gradient_bytes: 16,
         };
         let report = CampaignReport {
-            schema_version: 2,
+            schema_version: 3,
             plan_fingerprint: "plan".into(),
             cuda_device: 0,
             cuda_device_name: "test cuda".into(),
-            input_hashes: CampaignInputHashes {
-                campaign_config_file: "config".into(),
-                model_config_file: "model-config".into(),
-                model: "model".into(),
-                corpus_file: "corpus-file".into(),
-                corpus: "corpus".into(),
-                teacher_cache: "teacher".into(),
-            },
+            input_hashes: input_hashes.clone(),
             completed_step: 5,
             resumed_from_step: 0,
             configured_steps: 5,
-            checkpoint_path: "checkpoint".into(),
+            checkpoint_path: checkpoint_dir.display().to_string(),
             step_timings: (1..=5)
                 .map(|step| StepTiming {
                     step,
@@ -1804,21 +2175,112 @@ mod tests {
             memory,
         };
         std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+        let expected = ReportExpectations {
+            plan_fingerprint: "plan",
+            checkpoint_step: 3,
+            checkpoint_dir: &checkpoint_dir,
+            windows: 5,
+            configured_steps: 5,
+            cuda_device: 0,
+            cuda_device_name: "test cuda",
+            input_hashes: &input_hashes,
+            static_memory,
+        };
 
-        let resumed = load_existing_report(&path, "plan", 3, 5, 0, "test cuda")
-            .unwrap()
-            .unwrap();
+        let resumed = load_existing_report(&path, &expected).unwrap().unwrap();
         assert_eq!(resumed.completed_step, 3);
         assert_eq!(resumed.step_timings.len(), 3);
-        assert_eq!(resumed.memory.peak_optimizer_staging_bytes, 6);
-        assert!(load_existing_report(&path, "plan", 6, 5, 0, "test cuda").is_err());
-        assert!(load_existing_report(&path, "plan", 3, 5, 1, "test cuda").is_err());
-        assert!(load_existing_report(&path, "plan", 3, 5, 0, "other cuda").is_err());
+        assert_eq!(resumed.memory.peak_optimizer_staging_bytes, 24);
+        assert!(
+            load_existing_report(
+                &path,
+                &ReportExpectations {
+                    checkpoint_step: 6,
+                    ..expected
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            load_existing_report(
+                &path,
+                &ReportExpectations {
+                    cuda_device: 1,
+                    ..expected
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            load_existing_report(
+                &path,
+                &ReportExpectations {
+                    cuda_device_name: "other cuda",
+                    ..expected
+                }
+            )
+            .is_err()
+        );
+
+        let rejects = |candidate: &CampaignReport| {
+            std::fs::write(&path, serde_json::to_vec(candidate).unwrap()).unwrap();
+            load_existing_report(&path, &expected).unwrap_err()
+        };
+        let mut corrupt = report.clone();
+        corrupt.configured_steps = 6;
+        assert!(rejects(&corrupt).to_string().contains("configured steps"));
+        let mut corrupt = report.clone();
+        corrupt.checkpoint_path = directory.join("other-checkpoint").display().to_string();
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("points at checkpoint")
+        );
+        let mut corrupt = report.clone();
+        corrupt.input_hashes.model.push_str("-different");
+        assert!(rejects(&corrupt).to_string().contains("input hashes"));
+        let mut corrupt = report.clone();
+        corrupt.resumed_from_step = 6;
+        assert!(rejects(&corrupt).to_string().contains("resumed from step"));
+        let mut corrupt = report.clone();
+        corrupt.memory.logical_host_training_state_bytes += size_of::<f32>();
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("training-state bytes")
+        );
+        let mut corrupt = report.clone();
+        corrupt.memory.packed_code_bytes += 64;
+        corrupt.memory.packed_parameter_bytes += 64;
+        assert!(rejects(&corrupt).to_string().contains("packed code bytes"));
+        let mut corrupt = report.clone();
+        corrupt.memory.dense_parameter_bytes += size_of::<f32>();
+        corrupt.memory.host_optimizer_bytes = corrupt.memory.dense_parameter_bytes * 3;
+        corrupt.memory.logical_host_training_state_bytes = corrupt.memory.host_optimizer_bytes;
+        corrupt.memory.materialized_gradient_bytes = corrupt.memory.dense_parameter_bytes;
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("dense parameter bytes")
+        );
+        let mut corrupt = report.clone();
+        corrupt.memory.peak_optimizer_staging_bytes += size_of::<f32>();
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("optimizer staging bytes")
+        );
+        let mut corrupt = report.clone();
+        corrupt.memory.materialized_gradient_bytes += size_of::<f32>();
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("materialized gradient bytes")
+        );
 
         let mut corrupt = report.clone();
         corrupt.step_timings[4].step = 4;
-        std::fs::write(&path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
-        let error = load_existing_report(&path, "plan", 3, 5, 0, "test cuda").unwrap_err();
+        let error = rejects(&corrupt);
         assert!(
             error.to_string().contains("expected ordered unique step 5"),
             "orphan rows must be validated before truncation: {error:#}"
@@ -1836,7 +2298,7 @@ mod tests {
         let mut corrupt = report;
         corrupt.step_timings[2].training_elapsed_ms_excluding_checkpoint = -1.0;
         assert!(validate_report_timing_coverage(&path, &corrupt, 5).is_err());
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1846,6 +2308,8 @@ mod tests {
         let base = PlanInputs {
             cuda_device: 0,
             cuda_device_name: "NVIDIA test GPU",
+            campaign_config_file_digest: [5; 32],
+            model_config_file_digest: [6; 32],
             model_digest,
             corpus_digest: [2; 32],
             corpus_file_digest: [3; 32],
@@ -1885,8 +2349,20 @@ mod tests {
             ..base
         };
         assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let changed = PlanInputs {
+            campaign_config_file_digest: [7; 32],
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let changed = PlanInputs {
+            model_config_file_digest: [8; 32],
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
         assert_eq!(first.cuda_device, 0);
         assert_eq!(first.cuda_device_name, "NVIDIA test GPU");
+        assert_eq!(first.campaign_config_file_digest, hex_digest([5; 32]));
+        assert_eq!(first.model_config_file_digest, hex_digest([6; 32]));
     }
 
     #[test]
@@ -1896,6 +2372,8 @@ mod tests {
         let expected = build_plan_sidecar(&PlanInputs {
             cuda_device: 0,
             cuda_device_name: "NVIDIA test GPU",
+            campaign_config_file_digest: [5; 32],
+            model_config_file_digest: [6; 32],
             model_digest: semantic_model_digest_parts(&config, &spec, &architecture, &parameters),
             corpus_digest: [2; 32],
             corpus_file_digest: [3; 32],
