@@ -728,16 +728,7 @@ mod tests {
 
         let backend = CudaBackend::new(0).expect("cuda backend");
         let id = NcclId::new().expect("nccl id");
-        let pg = match NcclProcessGroup::init_on_backend(&backend, 0, 1, &id) {
-            Ok(group) => group,
-            Err(error) => {
-                eprintln!(
-                    "skip world1_streamed_trainer_reduces_each_finalized_gradient_before_adam: \
-                     NCCL unavailable ({error})"
-                );
-                return;
-            }
-        };
+        let pg = NcclProcessGroup::init_on_backend(&backend, 0, 1, &id).expect("nccl init");
         let (batch, rows, cols) = (2usize, 2usize, 3usize);
         let input = vec![0.5f32, -1.0, 0.25, -0.75, 0.4, 1.2];
         let target = vec![1.0f32, 0.0, 0.0, 1.0];
