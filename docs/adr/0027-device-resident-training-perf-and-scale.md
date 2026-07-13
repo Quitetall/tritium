@@ -300,14 +300,16 @@ Each track is done when its gate is green, benched, reviewed, and pushed.
 
 ## Implementation Results (2026-07-12)
 
-This section records implementation through `5aefb1a`. It does not mark the ADR or
+This section records implementation through `7a51fa6`. It does not mark the ADR or
 its scale campaign complete.
 
 ### Landed work
 
 - **Track A:** strict CUDA lint baseline (`a6ac90b`); resident SALT quantization
   (`4b702fa`); resident AdamW (`18dd879`); `DeviceTensor`, resident gradients, and
-  `DeviceTrainer` (`20aea05`, `0171d0e`). The CUDA and CPU SALT gates use the
+  `DeviceTrainer` (`20aea05`, `0171d0e`), with fail-closed poisoning if a resident
+  optimizer failure could leave mixed parameter generations (`7a51fa6`). The CUDA
+  and CPU SALT gates use the
   authoritative `tritium-train::ops::ste::salt_quantize_forward` oracle, whose
   AbsMean scale is **per row and per plane**. The earlier per-256-block wording in
   Track A was inaccurate and must not be used to reinterpret the landed numerical
@@ -360,8 +362,8 @@ its scale campaign complete.
 - The 40-step packed plus streamed-offload campaign recovers held-out quality by
   `963x` versus PTQ (fp PPL `19.729`, PTQ `2.125e6`, distilled `2207.241`), clearing
   this ADR's approximately `960x` measured target. The executable test retains a
-  `900x` regression floor for run-to-run noise; that floor is not the measured
-  result. Streaming lowers requested-gradient peak to
+  `950x` regression floor to keep accepted variation near the measured result; that
+  floor is not the measured result. Streaming lowers requested-gradient peak to
   `116,785,152` bytes from a `537,919,488`-byte materialized collection (`0.2171x`)
   and emits all 211 parameters exactly once in a stable reverse order.
 - **Open numerical gate:** packed whole-model parity remains just outside the strict
