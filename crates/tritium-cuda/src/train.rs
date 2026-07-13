@@ -522,6 +522,26 @@ enum DevOp {
     },
 }
 
+impl DevOp {
+    fn output(&self) -> usize {
+        match self {
+            Self::Matmul { out, .. }
+            | Self::Rmsnorm { out, .. }
+            | Self::Silu { out, .. }
+            | Self::Mul { out, .. }
+            | Self::Add { out, .. }
+            | Self::Embed { out, .. }
+            | Self::Rope { out, .. }
+            | Self::SliceCols { out, .. }
+            | Self::ScaleConst { out, .. }
+            | Self::CausalMask { out, .. }
+            | Self::Softmax { out, .. }
+            | Self::Transpose { out, .. }
+            | Self::Concat { out, .. } => *out,
+        }
+    }
+}
+
 /// An opaque f32 tensor owned by one CUDA context.
 ///
 /// The allocation can be borrowed by [`DeviceTape::leaf_device`] without a
@@ -587,16 +607,48 @@ impl DeviceValue<'_> {
     }
 }
 
+/// Gradient-slot memory observed during a device reverse pass.
+///
+/// Both values count f32 elements in graph-owned gradient slots. Temporary
+/// buffers local to one VJP kernel are excluded. The peak includes the current
+/// output gradient until its VJP completes, even though that buffer has been
+/// taken out of its slot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeviceBackwardStats {
+    /// Elements needed by the old strategy: one persistent gradient buffer for
+    /// every value recorded on the tape.
+    pub naive_all_value_grad_elements: usize,
+    /// Maximum simultaneously live persistent gradient elements with lazy
+    /// slots and output-gradient release.
+    pub peak_persistent_grad_elements: usize,
+}
+
+impl DeviceBackwardStats {
+    /// Persistent gradient elements avoided at the measured peak.
+    #[must_use]
+    pub fn saved_grad_elements(self) -> usize {
+        self.naive_all_value_grad_elements
+            .saturating_sub(self.peak_persistent_grad_elements)
+    }
+}
+
+struct DeviceBackwardResult {
+    grads: Vec<Option<CudaSlice<f32>>>,
+    stats: DeviceBackwardStats,
+}
+
 /// Device-resident gradients returned in the exact order requested from
 /// [`DeviceTape::xent_backward_device`].
 pub struct DeviceGradients {
     bufs: Vec<CudaSlice<f32>>,
+    stats: DeviceBackwardStats,
 }
 
 impl core::fmt::Debug for DeviceGradients {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DeviceGradients")
             .field("count", &self.bufs.len())
+            .field("backward_stats", &self.stats)
             .finish_non_exhaustive()
     }
 }
@@ -612,6 +664,13 @@ impl DeviceGradients {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bufs.is_empty()
+    }
+
+    /// Gradient-slot liveness diagnostics for the reverse pass that produced
+    /// these tensors.
+    #[must_use]
+    pub fn backward_stats(&self) -> DeviceBackwardStats {
+        self.stats
     }
 
     /// Download one gradient for validation or diagnostics.
@@ -792,11 +851,11 @@ impl<'a> DeviceTrainer<'a> {
 }
 
 /// A device-resident autograd tape (plan 0043 P2.5): the GPU analogue of [`tritium_train::Tape`].
-/// Every activation and gradient lives in VRAM across the whole fwd+bwd step — leaves upload once,
-/// results download once, and the recorded ops chain the resident kernels ([`super`]'s `*_dev`
-/// methods) with no host round-trips. Forward ops append a device buffer to `vals` and record a
-/// [`DevOp`]; [`backward`](Self::backward) replays them in reverse, accumulating grads on-device.
-/// A `dense_matmul` uses `s = ones`; the shared `ones` buffer is sized once at construction.
+/// Leaves upload once, results download once, and the recorded ops chain the resident kernels
+/// ([`super`]'s `*_dev` methods) with no host round-trips. Forward ops append a device buffer to
+/// `vals` and record a [`DevOp`]. Reverse replay allocates input-gradient slots lazily, retains only
+/// requested leaves, and releases each output gradient after its VJP. A `dense_matmul` uses
+/// `s = ones`; the shared `ones` buffer is sized once at construction.
 pub struct DeviceTape<'backend, 'leaf> {
     b: &'backend CudaBackend,
     vals: Vec<DeviceValue<'leaf>>,
@@ -1233,42 +1292,133 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         self.matmul(cat, wo, seq, n_embd, qd)
     }
 
-    /// Reverse pass: seed `grads[seed_id] += seed` (e.g. the xent `g_logits`), then replay the ops in
-    /// reverse, accumulating each input's grad on-device. Returns the grad buffer per value id.
-    pub(crate) fn backward(
+    fn accumulate_grad_slot(
+        &self,
+        grads: &mut [Option<CudaSlice<f32>>],
+        retain: &[bool],
+        id: usize,
+        source: &CudaSlice<f32>,
+        live_elements: &mut usize,
+        peak_elements: &mut usize,
+    ) -> Result<(), BackendError> {
+        // An unrequested leaf has no producer to replay, so its gradient can be
+        // discarded instead of consuming a persistent slot. Shared/tied leaves
+        // that are requested still accumulate every consumer contribution.
+        if self.leaves[id] && !retain[id] {
+            return Ok(());
+        }
+        if grads[id].is_none() {
+            grads[id] = Some(self.b.dev_alloc_zeros(self.lens[id])?);
+            *live_elements = live_elements.saturating_add(self.lens[id]);
+            *peak_elements = (*peak_elements).max(*live_elements);
+        }
+        self.b.accumulate_dev(
+            grads[id]
+                .as_mut()
+                .expect("gradient slot was allocated above"),
+            source,
+            self.lens[id],
+        )
+    }
+
+    /// Reverse pass with lazy gradient slots. `retain_ids` are returned in
+    /// their value-id slots; all other gradients are released once their
+    /// producing op has consumed them.
+    fn backward_retain(
         &self,
         seed_id: usize,
         seed: &CudaSlice<f32>,
-    ) -> Result<Vec<CudaSlice<f32>>, BackendError> {
-        let mut grads: Vec<CudaSlice<f32>> = self
+        retain_ids: &[usize],
+    ) -> Result<DeviceBackwardResult, BackendError> {
+        if seed_id >= self.vals.len() {
+            return Err(BackendError::InvalidInput(format!(
+                "gradient seed value id {seed_id} is out of range"
+            )));
+        }
+        if seed.len() != self.lens[seed_id] {
+            return Err(BackendError::ShapeMismatch {
+                expected: self.lens[seed_id],
+                got: seed.len(),
+            });
+        }
+        if !self.b.same_context(seed) {
+            return Err(BackendError::InvalidInput(
+                "gradient seed belongs to a different CUDA context".into(),
+            ));
+        }
+        let mut retain = vec![false; self.vals.len()];
+        for &id in retain_ids {
+            if id >= self.vals.len() {
+                return Err(BackendError::InvalidInput(format!(
+                    "retained gradient value id {id} is out of range"
+                )));
+            }
+            retain[id] = true;
+        }
+
+        let naive_all_value_grad_elements = self
             .lens
             .iter()
-            .map(|&l| self.b.dev_alloc_zeros(l))
-            .collect::<Result<_, _>>()?;
-        self.b
-            .accumulate_dev(&mut grads[seed_id], seed, self.lens[seed_id])?;
+            .fold(0usize, |total, &len| total.saturating_add(len));
+        let mut grads: Vec<Option<CudaSlice<f32>>> = (0..self.vals.len()).map(|_| None).collect();
+        let mut live_elements = 0usize;
+        let mut peak_persistent_grad_elements = 0usize;
+        self.accumulate_grad_slot(
+            &mut grads,
+            &retain,
+            seed_id,
+            seed,
+            &mut live_elements,
+            &mut peak_persistent_grad_elements,
+        )?;
         for op in self.ops.iter().rev() {
+            let out_id = op.output();
+            let Some(grad_out) = grads[out_id].take() else {
+                // This op is not on a path from the seed.
+                continue;
+            };
             match *op {
-                DevOp::Matmul { x, w, m, n, k, out } => {
+                DevOp::Matmul {
+                    x,
+                    w,
+                    m,
+                    n,
+                    k,
+                    out: _,
+                } => {
                     let shape = GemmShape { m, n, k };
                     let mut gx = self.b.dev_alloc_zeros(m * k)?;
                     self.b.grad_a_dev(
-                        &grads[out],
+                        &grad_out,
                         self.vals[w].as_slice(),
                         &self.ones,
                         shape,
                         &mut gx,
                     )?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, m * k)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                     let mut gw = self.b.dev_alloc_zeros(n * k)?;
                     self.b.grad_w_dev(
-                        &grads[out],
+                        &grad_out,
                         self.vals[x].as_slice(),
                         &self.ones,
                         shape,
                         &mut gw,
                     )?;
-                    self.b.accumulate_dev(&mut grads[w], &gw, n * k)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        w,
+                        &gw,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
                 DevOp::Rmsnorm {
                     x,
@@ -1276,46 +1426,91 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     rows,
                     cols,
                     eps,
-                    out,
+                    out: _,
                 } => {
                     let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
                     let mut gw = self.b.dev_alloc_zeros(cols)?;
                     self.b.rmsnorm_backward_dev(
                         self.vals[x].as_slice(),
                         self.vals[w].as_slice(),
-                        &grads[out],
+                        &grad_out,
                         &mut gx,
                         &mut gw,
                         rows,
                         cols,
                         eps,
                     )?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
-                    self.b.accumulate_dev(&mut grads[w], &gw, cols)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        w,
+                        &gw,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
-                DevOp::Silu { x, n, out } => {
+                DevOp::Silu { x, n, out: _ } => {
                     let mut gx = self.b.dev_alloc_zeros(n)?;
                     self.b
-                        .silu_backward_dev(self.vals[x].as_slice(), &grads[out], &mut gx, n)?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, n)?;
+                        .silu_backward_dev(self.vals[x].as_slice(), &grad_out, &mut gx, n)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
-                DevOp::Mul { a, b, n, out } => {
+                DevOp::Mul { a, b, n, out: _ } => {
                     let mut ga = self.b.dev_alloc_zeros(n)?;
                     self.b
-                        .ew_mul_backward_dev(&grads[out], self.vals[b].as_slice(), &mut ga, n)?;
-                    self.b.accumulate_dev(&mut grads[a], &ga, n)?;
+                        .ew_mul_backward_dev(&grad_out, self.vals[b].as_slice(), &mut ga, n)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        a,
+                        &ga,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                     let mut gb = self.b.dev_alloc_zeros(n)?;
                     self.b
-                        .ew_mul_backward_dev(&grads[out], self.vals[a].as_slice(), &mut gb, n)?;
-                    self.b.accumulate_dev(&mut grads[b], &gb, n)?;
+                        .ew_mul_backward_dev(&grad_out, self.vals[a].as_slice(), &mut gb, n)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        b,
+                        &gb,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
-                DevOp::Add { a, b, n, out } => {
-                    // out = a + b ⇒ grad flows unchanged to both. Copy grad_out into a temp first
-                    // (accumulate into a zeroed buffer) so the two accumulates don't alias grads[out].
-                    let mut t = self.b.dev_alloc_zeros(n)?;
-                    self.b.accumulate_dev(&mut t, &grads[out], n)?;
-                    self.b.accumulate_dev(&mut grads[a], &t, n)?;
-                    self.b.accumulate_dev(&mut grads[b], &t, n)?;
+                DevOp::Add { a, b, n: _, out: _ } => {
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        a,
+                        &grad_out,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        b,
+                        &grad_out,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
                 DevOp::Embed {
                     w,
@@ -1324,18 +1519,20 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     seq,
                     dim,
                     vocab,
-                    out,
+                    out: _,
                 } => {
                     let mut gw = self.b.dev_alloc_zeros(vocab * dim)?;
                     self.b.embed_gather_backward_segmented_prepared_dev(
-                        &grads[out],
-                        segments,
-                        &mut gw,
-                        seq,
-                        dim,
-                        vocab,
+                        &grad_out, segments, &mut gw, seq, dim, vocab,
                     )?;
-                    self.b.accumulate_dev(&mut grads[w], &gw, vocab * dim)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        w,
+                        &gw,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
                 DevOp::Rope {
                     x,
@@ -1350,16 +1547,16 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     let n = self.lens[out];
                     let mut gx = self.b.dev_alloc_zeros(n)?;
                     self.b.rope_apply_dev(
-                        &grads[out],
-                        &mut gx,
-                        pos,
-                        n_head,
-                        head_dim,
-                        theta,
-                        n_token,
-                        -1.0,
+                        &grad_out, &mut gx, pos, n_head, head_dim, theta, n_token, -1.0,
                     )?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, n)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
                 DevOp::SliceCols {
                     x,
@@ -1367,70 +1564,154 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     cols,
                     start,
                     len,
-                    out,
+                    out: _,
                 } => {
                     // vjp = scatter the [rows,len] grad back into a zeroed [rows,cols] at [start,+len).
                     let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
                     self.b
-                        .copy_into_cols_dev(&grads[out], &mut gx, rows, cols, start, len)?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                        .copy_into_cols_dev(&grad_out, &mut gx, rows, cols, start, len)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
-                DevOp::ScaleConst { x, c, n, out } => {
+                DevOp::ScaleConst { x, c, n, out: _ } => {
                     let mut gx = self.b.dev_alloc_zeros(n)?;
-                    self.b.scale_const_dev(&grads[out], &mut gx, c, n)?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, n)?;
+                    self.b.scale_const_dev(&grad_out, &mut gx, c, n)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
-                DevOp::CausalMask { x, rows, cols, out } => {
+                DevOp::CausalMask {
+                    x,
+                    rows,
+                    cols,
+                    out: _,
+                } => {
                     let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
                     self.b
-                        .causal_mask_backward_dev(&grads[out], &mut gx, rows, cols)?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                        .causal_mask_backward_dev(&grad_out, &mut gx, rows, cols)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
                 DevOp::Softmax { x, rows, cols, out } => {
                     // vjp uses the saved probabilities p = vals[out].
                     let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
                     self.b.softmax_backward_dev(
                         self.vals[out].as_slice(),
-                        &grads[out],
+                        &grad_out,
                         &mut gx,
                         rows,
                         cols,
                     )?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
-                DevOp::Transpose { x, rows, cols, out } => {
+                DevOp::Transpose {
+                    x,
+                    rows,
+                    cols,
+                    out: _,
+                } => {
                     // vjp = transpose the [cols,rows] output grad back to [rows,cols].
                     let mut gx = self.b.dev_alloc_zeros(rows * cols)?;
                     self.b
-                        .transpose_forward_dev(&grads[out], &mut gx, cols, rows)?;
-                    self.b.accumulate_dev(&mut grads[x], &gx, rows * cols)?;
+                        .transpose_forward_dev(&grad_out, &mut gx, cols, rows)?;
+                    self.accumulate_grad_slot(
+                        &mut grads,
+                        &retain,
+                        x,
+                        &gx,
+                        &mut live_elements,
+                        &mut peak_persistent_grad_elements,
+                    )?;
                 }
                 DevOp::Concat {
                     ref parts,
                     rows,
                     ref lens,
-                    out,
+                    out: _,
                 } => {
                     // vjp = slice each part's column range back out of the concatenated grad.
                     let total: usize = lens.iter().sum();
                     let mut off = 0;
                     for (&p, &len) in parts.iter().zip(lens) {
                         let mut gp = self.b.dev_alloc_zeros(rows * len)?;
-                        self.b.slice_cols_forward_dev(
-                            &grads[out],
-                            &mut gp,
-                            rows,
-                            total,
-                            off,
-                            len,
+                        self.b
+                            .slice_cols_forward_dev(&grad_out, &mut gp, rows, total, off, len)?;
+                        self.accumulate_grad_slot(
+                            &mut grads,
+                            &retain,
+                            p,
+                            &gp,
+                            &mut live_elements,
+                            &mut peak_persistent_grad_elements,
                         )?;
-                        self.b.accumulate_dev(&mut grads[p], &gp, rows * len)?;
                         off += len;
                     }
                 }
             }
+
+            if retain[out_id] {
+                grads[out_id] = Some(grad_out);
+            } else {
+                // `grad_out` remains alive for the entire VJP above. Account for
+                // its release only after all input slots have been accumulated.
+                live_elements = live_elements.saturating_sub(self.lens[out_id]);
+                drop(grad_out);
+            }
         }
-        Ok(grads)
+
+        // Preserve the old API's zero-gradient behavior for requested values
+        // that are disconnected from the seed.
+        for &id in retain_ids {
+            if grads[id].is_none() {
+                grads[id] = Some(self.b.dev_alloc_zeros(self.lens[id])?);
+                live_elements = live_elements.saturating_add(self.lens[id]);
+                peak_persistent_grad_elements = peak_persistent_grad_elements.max(live_elements);
+            }
+        }
+        for (id, slot) in grads.iter_mut().enumerate() {
+            if !retain[id] && slot.take().is_some() {
+                live_elements = live_elements.saturating_sub(self.lens[id]);
+            }
+        }
+        debug_assert_eq!(
+            live_elements,
+            retain
+                .iter()
+                .zip(&self.lens)
+                .filter(|(keep, _)| **keep)
+                .fold(0usize, |total, (_, &len)| total.saturating_add(len))
+        );
+        Ok(DeviceBackwardResult {
+            grads,
+            stats: DeviceBackwardStats {
+                naive_all_value_grad_elements,
+                peak_persistent_grad_elements,
+            },
+        })
     }
 
     /// One distillation-step gradient, host in / host out: seed the softmax-xent loss grad at the
@@ -1447,11 +1728,16 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         want: &[usize],
     ) -> Result<Vec<Vec<f32>>, BackendError> {
         let seed = self.softmax_xent_grad(logits, target, rows, cols)?;
-        let grads = self.backward(logits, &seed)?;
+        let result = self.backward_retain(logits, &seed, want)?;
         want.iter()
             .map(|&id| {
                 let mut h = vec![0.0f32; self.lens[id]];
-                self.b.dev_download(&grads[id], &mut h)?;
+                self.b.dev_download(
+                    result.grads[id]
+                        .as_ref()
+                        .expect("requested gradient is retained"),
+                    &mut h,
+                )?;
                 Ok(h)
             })
             .collect()
@@ -1518,16 +1804,19 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         }
 
         let seed = self.softmax_xent_grad_device(logits, &target.buf, rows, cols)?;
-        let mut slots: Vec<Option<CudaSlice<f32>>> = self
-            .backward(logits, &seed)?
-            .into_iter()
-            .map(Some)
-            .collect();
+        let mut result = self.backward_retain(logits, &seed, want)?;
         let bufs = want
             .iter()
-            .map(|&id| slots[id].take().expect("want ids were validated unique"))
+            .map(|&id| {
+                result.grads[id]
+                    .take()
+                    .expect("want ids were validated unique and retained")
+            })
             .collect();
-        Ok(DeviceGradients { bufs })
+        Ok(DeviceGradients {
+            bufs,
+            stats: result.stats,
+        })
     }
 }
 
@@ -1541,6 +1830,36 @@ mod tests {
             .zip(b)
             .map(|(&x, &y)| (x - y).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn device_tape_gradient_slots_are_lazy() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping device_tape_gradient_slots_are_lazy: no CUDA device ({e})");
+                return;
+            }
+        };
+        let n = 4096;
+        let x = seeded_uniform(0xC001, n, -1.0, 1.0);
+        let seed = seeded_uniform(0xC002, n, -0.5, 0.5);
+        let mut tape = DeviceTape::new(&backend, 1).unwrap();
+        let x_id = tape.leaf(&x).unwrap();
+        let mut out = x_id;
+        for _ in 0..16 {
+            out = tape.silu(out).unwrap();
+        }
+        let d_seed = backend.dev_upload(&seed).unwrap();
+
+        let result = tape.backward_retain(out, &d_seed, &[x_id]).unwrap();
+
+        assert!(result.grads[x_id].is_some());
+        assert!(
+            result.stats.peak_persistent_grad_elements < result.stats.naive_all_value_grad_elements,
+            "lazy gradient slots must beat one persistent gradient per value: {:?}",
+            result.stats
+        );
     }
 
     /// Set each row's scale to `1.25·max|w_row|` so every `|w/s| ≤ 0.8` — i.e. the clamp surrogate
@@ -2065,6 +2384,11 @@ mod tests {
             tape.xent_backward_device(logits, &d_target, batch, rows, &[w])
                 .unwrap()
         };
+        let liveness = grads.backward_stats();
+        assert!(
+            liveness.peak_persistent_grad_elements < liveness.naive_all_value_grad_elements,
+            "resident xent exposes lazy-slot diagnostics: {liveness:?}"
+        );
         trainer.step(grads, 1).unwrap();
         assert!(matches!(
             trainer.quantized(0),
@@ -2649,7 +2973,7 @@ mod tests {
 
         // ── Device tape ──
         #[allow(clippy::type_complexity)]
-        let build_device = || -> Result<(Vec<f32>, Vec<CudaSlice<f32>>, Vec<(usize, usize, usize, usize)>, usize, usize), BackendError> {
+        let build_device = || -> Result<(Vec<f32>, Vec<Option<CudaSlice<f32>>>, DeviceBackwardStats, Vec<(usize, usize, usize, usize)>, usize, usize), BackendError> {
             let mut dt = DeviceTape::new(&backend, vocab)?;
             let d_embd = dt.leaf(&embd)?;
             let mut d_hidden = dt.embed(d_embd, &tokens_i32, seq, dim, vocab)?;
@@ -2671,15 +2995,22 @@ mod tests {
             let d_logits = dt.matmul(d_fn, d_embd, seq, vocab, dim)?;
             let logits_h = dt.value(d_logits)?;
             let seed = dt.softmax_xent_grad(d_logits, &target, seq, vocab)?;
-            let grads = dt.backward(d_logits, &seed)?;
-            Ok((logits_h, grads, d_w, d_embd, d_on))
+            let mut retain = vec![d_embd, d_on];
+            retain.extend(
+                d_w.iter()
+                    .flat_map(|&(ffn_norm, gate, up, down)| [ffn_norm, gate, up, down]),
+            );
+            let result = dt.backward_retain(d_logits, &seed, &retain)?;
+            Ok((logits_h, result.grads, result.stats, d_w, d_embd, d_on))
         };
-        let (dev_logits, grads, d_w, d_embd, d_on) = build_device().expect("device tape");
+        let (dev_logits, grads, liveness, d_w, d_embd, d_on) = build_device().expect("device tape");
 
         // download a device grad buffer
-        let dl = |g: &CudaSlice<f32>, n: usize| {
+        let dl = |g: &Option<CudaSlice<f32>>, n: usize| {
             let mut h = vec![0.0f32; n];
-            backend.dev_download(g, &mut h).unwrap();
+            backend
+                .dev_download(g.as_ref().expect("gradient retained"), &mut h)
+                .unwrap();
             h
         };
         let rel = |dev: &[f32], cpu: &[f32]| {
@@ -2749,6 +3080,10 @@ mod tests {
             );
         }
         assert!(worst < 1e-4, "worst grad rel {worst:.3e} at {worst_name}");
+        assert!(
+            liveness.peak_persistent_grad_elements < liveness.naive_all_value_grad_elements,
+            "full-stack lazy gradient slots must reduce persistent VRAM: {liveness:?}"
+        );
 
         // Bench: device tape vs CPU tape (full rebuild + fwd + bwd).
         let cpu_step = || {
@@ -2795,7 +3130,11 @@ mod tests {
         eprintln!(
             "0043 P2.5a DeviceTape MLP stack ({layers} layers, vocab={vocab} dim={dim} ff={ff} seq={seq}): \
              matches CPU tape (worst grad rel {worst:.2e} at {worst_name}). \
+             gradient slots peak {}/{} elements (saved {}). \
              fwd+bwd step: device-resident {dev_ms:.2}ms | CPU tape {cpu_ms:.2}ms ({:.1}× faster)",
+            liveness.peak_persistent_grad_elements,
+            liveness.naive_all_value_grad_elements,
+            liveness.saved_grad_elements(),
             cpu_ms / dev_ms.max(1e-9)
         );
     }
@@ -2900,11 +3239,16 @@ mod tests {
         let dev_out = dt.value(dout).unwrap();
         // L = Σ out·cot ⇒ dL/dout = cot; seed the block output's grad and backprop.
         let seed = backend.dev_upload(&cot).unwrap();
-        let grads = dt.backward(dout, &seed).unwrap();
+        let retain = [dh, dan, dfn, dwq, dwk, dwv, dwo, dwg, dwu, dwd];
+        let result = dt.backward_retain(dout, &seed, &retain).unwrap();
+        let grads = result.grads;
+        let liveness = result.stats;
 
-        let dl = |g: &CudaSlice<f32>, n: usize| {
+        let dl = |g: &Option<CudaSlice<f32>>, n: usize| {
             let mut hbuf = vec![0.0f32; n];
-            backend.dev_download(g, &mut hbuf).unwrap();
+            backend
+                .dev_download(g.as_ref().expect("gradient retained"), &mut hbuf)
+                .unwrap();
             hbuf
         };
         let rel = |dev: &[f32], cpu: &[f32]| {
@@ -2999,10 +3343,18 @@ mod tests {
             worst < 1e-4,
             "transformer block worst grad rel {worst:.3e} at {wn}"
         );
+        assert!(
+            liveness.peak_persistent_grad_elements < liveness.naive_all_value_grad_elements,
+            "transformer-block lazy gradient slots must reduce persistent VRAM: {liveness:?}"
+        );
         eprintln!(
             "0043 P2.5b DeviceTape transformer block (GQA n_head={n_head} n_kv={n_kv_head} \
              head_dim={head_dim} seq={seq} n_embd={n_embd} ff={ff}): full attention+MLP fwd+bwd \
-             matches CPU tape (worst grad rel {worst:.2e} at {wn})"
+             matches CPU tape (worst grad rel {worst:.2e} at {wn}); gradient slots peak {}/{} \
+             elements (saved {})",
+            liveness.peak_persistent_grad_elements,
+            liveness.naive_all_value_grad_elements,
+            liveness.saved_grad_elements()
         );
     }
 
