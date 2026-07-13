@@ -2034,6 +2034,105 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         self.matmul(cat, wo, seq, n_embd, qd)
     }
 
+    /// Multi-head causal self-attention whose four trainable projections read
+    /// compact SALT planes and route identity-STE gradients to their separate
+    /// gradient-only master ids. All attention glue remains the same resident
+    /// implementation used by [`Self::attention`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn salt_attention(
+        &mut self,
+        x: usize,
+        wq_master: usize,
+        wq: &'leaf DevicePackedSaltWeight,
+        wk_master: usize,
+        wk: &'leaf DevicePackedSaltWeight,
+        wv_master: usize,
+        wv: &'leaf DevicePackedSaltWeight,
+        wo_master: usize,
+        wo: &'leaf DevicePackedSaltWeight,
+        seq: usize,
+        n_embd: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> Result<usize, BackendError> {
+        if n_head == 0 || n_kv_head == 0 || head_dim == 0 {
+            return Err(BackendError::InvalidInput(
+                "packed attention head counts and head dimension must be non-zero".into(),
+            ));
+        }
+        let qd = n_head.checked_mul(head_dim).ok_or_else(|| {
+            BackendError::InvalidInput("packed attention Q width overflows usize".into())
+        })?;
+        let kvd = n_kv_head.checked_mul(head_dim).ok_or_else(|| {
+            BackendError::InvalidInput("packed attention KV width overflows usize".into())
+        })?;
+        if !n_head.is_multiple_of(n_kv_head) {
+            return Err(BackendError::InvalidInput(format!(
+                "packed attention heads {n_head} must be divisible by KV heads {n_kv_head}"
+            )));
+        }
+        let input_len = seq.checked_mul(n_embd).ok_or_else(|| {
+            BackendError::InvalidInput("packed attention input shape overflows usize".into())
+        })?;
+        let got_input_len = *self.lens.get(x).ok_or_else(|| {
+            BackendError::InvalidInput(format!("device tape value id {x} is out of range"))
+        })?;
+        if got_input_len != input_len {
+            return Err(BackendError::ShapeMismatch {
+                expected: input_len,
+                got: got_input_len,
+            });
+        }
+        for (name, master, weight, rows, cols) in [
+            ("q", wq_master, wq, qd, n_embd),
+            ("k", wk_master, wk, kvd, n_embd),
+            ("v", wv_master, wv, kvd, n_embd),
+            ("o", wo_master, wo, n_embd, qd),
+        ] {
+            self.validate_packed_master(master, weight)?;
+            if weight.rows() != rows || weight.cols() != cols {
+                return Err(BackendError::InvalidInput(format!(
+                    "packed attention {name} projection is [{}, {}], expected [{rows}, {cols}]",
+                    weight.rows(),
+                    weight.cols()
+                )));
+            }
+        }
+        let group = n_head / n_kv_head;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let pos: Vec<i32> = (0..seq)
+            .map(|position| {
+                i32::try_from(position).map_err(|_| {
+                    BackendError::InvalidInput("attention position exceeds i32::MAX".into())
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let q = self.salt_matmul(x, wq_master, wq, seq)?;
+        let k = self.salt_matmul(x, wk_master, wk, seq)?;
+        let v = self.salt_matmul(x, wv_master, wv, seq)?;
+        let q = self.rope(q, &pos, n_head, head_dim, theta, seq)?;
+        let k = self.rope(k, &pos, n_kv_head, head_dim, theta, seq)?;
+
+        let mut head_outs = Vec::with_capacity(n_head);
+        for h in 0..n_head {
+            let kv = h / group;
+            let qh = self.slice_cols(q, seq, qd, h * head_dim, head_dim)?;
+            let kh = self.slice_cols(k, seq, kvd, kv * head_dim, head_dim)?;
+            let vh = self.slice_cols(v, seq, kvd, kv * head_dim, head_dim)?;
+            let scores = self.matmul(qh, kh, seq, seq, head_dim)?;
+            let scores = self.scale_const(scores, scale)?;
+            let scores = self.causal_mask(scores, seq, seq)?;
+            let probabilities = self.softmax(scores, seq, seq)?;
+            let vt = self.transpose(vh, seq, head_dim)?;
+            head_outs.push(self.matmul(probabilities, vt, seq, head_dim, seq)?);
+        }
+        let cat = self.concat(&head_outs, seq, &vec![head_dim; n_head])?;
+        self.salt_matmul(cat, wo_master, wo, seq)
+    }
+
     fn replay_op(&mut self, op_index: usize) -> Result<(), BackendError> {
         let op = self.ops.get(op_index).ok_or_else(|| {
             BackendError::InvalidInput(format!("replay op index {op_index} is out of range"))

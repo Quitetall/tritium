@@ -143,6 +143,80 @@ pub fn device_forward_resident<'backend, 'leaf>(
     })
 }
 
+/// Packed-SALT device forward used by the real-model training gate. Each
+/// compact weight gets exactly one gradient-only latent-master leaf; the tied
+/// embedding/head deliberately reuse master zero. Block boundaries expose only
+/// the residual stream so checkpoint policies can evict and replay internals.
+#[cfg(feature = "cuda")]
+pub fn device_forward_packed<'backend, 'leaf>(
+    dt: &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
+    a: &Arch,
+    weights: &'leaf [tritium_cuda::train::DevicePackedSaltWeight],
+    tokens_i32: &[i32],
+    seq: usize,
+) -> (usize, Vec<usize>) {
+    assert_eq!(seq, tokens_i32.len());
+    assert_eq!(weights.len(), 1 + 7 * a.n_layers);
+    let masters: Vec<usize> = weights
+        .iter()
+        .map(|weight| {
+            let len = weight
+                .rows()
+                .checked_mul(weight.cols())
+                .expect("packed master shape overflow");
+            dt.gradient_leaf(len).unwrap()
+        })
+        .collect();
+
+    let mut hidden = dt.salt_embed(masters[0], &weights[0], tokens_i32).unwrap();
+    for li in 0..a.n_layers {
+        let base = 1 + 7 * li;
+        let an = dt.leaf(&a.attn_norms[li]).unwrap();
+        let xn = dt.rmsnorm(hidden, an, seq, a.n_embd, a.eps).unwrap();
+        let attn = dt
+            .salt_attention(
+                xn,
+                masters[base],
+                &weights[base],
+                masters[base + 1],
+                &weights[base + 1],
+                masters[base + 2],
+                &weights[base + 2],
+                masters[base + 3],
+                &weights[base + 3],
+                seq,
+                a.n_embd,
+                a.n_head,
+                a.n_head_kv,
+                a.head_dim,
+                a.theta,
+            )
+            .unwrap();
+        hidden = dt.add(hidden, attn).unwrap();
+
+        let fnw = dt.leaf(&a.ffn_norms[li]).unwrap();
+        let hn = dt.rmsnorm(hidden, fnw, seq, a.n_embd, a.eps).unwrap();
+        let gate = dt
+            .salt_matmul(hn, masters[base + 4], &weights[base + 4], seq)
+            .unwrap();
+        let up = dt
+            .salt_matmul(hn, masters[base + 5], &weights[base + 5], seq)
+            .unwrap();
+        let activated_gate = dt.silu(gate).unwrap();
+        let gated = dt.mul(activated_gate, up).unwrap();
+        let down = dt
+            .salt_matmul(gated, masters[base + 6], &weights[base + 6], seq)
+            .unwrap();
+        hidden = dt.add(hidden, down).unwrap();
+        dt.checkpoint_keep(&[hidden]).unwrap();
+    }
+
+    let onw = dt.leaf(&a.out_norm).unwrap();
+    let fnorm = dt.rmsnorm(hidden, onw, seq, a.n_embd, a.eps).unwrap();
+    let logits = dt.salt_matmul(fnorm, masters[0], &weights[0], seq).unwrap();
+    (logits, masters)
+}
+
 #[cfg(feature = "cuda")]
 fn device_forward_with<'backend, 'leaf>(
     dt: &mut tritium_cuda::train::DeviceTape<'backend, 'leaf>,
