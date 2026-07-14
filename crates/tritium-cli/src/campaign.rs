@@ -24,12 +24,12 @@ use serde::{Deserialize, Serialize};
 use tritium_format::TeacherCacheHeader;
 #[cfg(feature = "cuda")]
 use tritium_format::write_teacher_cache_header;
-use tritium_nn::{
-    ArchSpec, ModelConfig, ModelRunner, ModelWeights, TeacherCacheWriter,
-    TiedSwiGluTrainingModel, hash_teacher_corpus, semantic_training_model_digest,
-};
 #[cfg(test)]
 use tritium_nn::MlpKind;
+use tritium_nn::{
+    ArchSpec, ModelConfig, ModelRunner, ModelWeights, TeacherCacheWriter, TiedSwiGluTrainingModel,
+    hash_teacher_corpus, semantic_training_model_digest,
+};
 
 #[cfg(feature = "nccl")]
 use std::time::Duration;
