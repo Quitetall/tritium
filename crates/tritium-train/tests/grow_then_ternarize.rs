@@ -488,3 +488,19 @@ fn equal_width_plan_is_an_identity_transform() {
         outgoing
     );
 }
+
+#[test]
+fn legacy_v1_replay_preserves_equal_share_growth() {
+    let plan = Net2WiderPlan::replay_v1(2, 3, 99).expect("legacy v1 plan");
+
+    assert_eq!(plan.algorithm(), NET2WIDER_ALGORITHM_V1);
+    assert_eq!(plan.source_indices(), [0, 1, 1]);
+    assert_eq!(plan.replication_counts(), [1, 2]);
+    assert_eq!(plan.split_denominator_log2(), None);
+    assert_eq!(plan.split_numerators(), None);
+    assert_eq!(
+        plan.expand_outgoing_columns(&[6.0, 12.0], 1)
+            .expect("legacy outgoing projection"),
+        [6.0, 6.0, 6.0]
+    );
+}

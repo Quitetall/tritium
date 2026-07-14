@@ -371,10 +371,12 @@ software tests are not substitutes for those measurements.
   equal outgoing shares with deterministic positive, pairwise-unequal dyadic shares
   whose integer numerators sum to `2^24` per source unit. The immutable plan and GGUF
   receipt bind the algorithm, denominator, and every numerator; identity growth keeps
-  byte-compatible v1 receipts. Replay and tamper tests cover the full receipt, the
-  dense oracle proves function preservation, and a three-step non-collinear AdamW
-  test proves duplicated incoming rows break optimizer symmetry. The production
-  bias-free SwiGLU training adapter owns the canonical HuggingFace parameter map:
+  byte-compatible v1 receipts, while the loader retains deterministic equal-share
+  replay for legacy widened v1 artifacts. Replay and tamper tests cover the full
+  receipt, the dense oracle proves function preservation, and a three-step
+  non-collinear AdamW test proves duplicated incoming rows break optimizer symmetry.
+  The production bias-free SwiGLU training adapter owns the canonical HuggingFace
+  parameter map:
   `embed`, seven matrices per layer (`q/k/v/o/gate/up/down`), and an optional final
   `lm_head.weight` for untied models. Packed and resident forwards use that distinct
   final head leaf when present. Export and reload use strict `tied-swiglu.v1` and

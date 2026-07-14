@@ -518,8 +518,12 @@ fn parse_growth_receipt(file: &GgufFile) -> Result<TrainingSaltGrowthReceipt, Nn
             "growth replication counts disagree with source mapping".to_owned(),
         ));
     }
-    let replay = Net2WiderPlan::seeded(old, new, seed)
-        .map_err(|error| NnError::MissingConfig(format!("growth receipt replay: {error}")))?;
+    let replay = match algorithm.as_str() {
+        NET2WIDER_ALGORITHM_V1 => Net2WiderPlan::replay_v1(old, new, seed),
+        NET2WIDER_ALGORITHM_V2 => Net2WiderPlan::seeded(old, new, seed),
+        _ => unreachable!("algorithm was validated above"),
+    }
+    .map_err(|error| NnError::MissingConfig(format!("growth receipt replay: {error}")))?;
     let replay_sources = replay
         .source_indices()
         .iter()
@@ -1030,6 +1034,43 @@ mod tests {
                 4_194_304, 16_777_216, 16_777_216, 4_194_304, 12_582_912, 12_582_912
             ])
         );
+    }
+
+    #[test]
+    fn parses_legacy_v1_widened_growth_receipt() {
+        const RECEIPT: &str = concat!(
+            "{\"algorithm\":\"net2wider.intermediate-swiglu.splitmix64.v1\",",
+            "\"old_width\":4,\"new_width\":6,\"seed\":99,",
+            "\"source_indices\":[0,1,2,3,3,0],",
+            "\"replication_counts\":[2,1,1,2]}"
+        );
+        let mut legacy_fixture = fixture();
+        legacy_fixture.metadata.insert(
+            TRAINING_SALT_GROWTH_RECEIPT_KEY.to_owned(),
+            GgufValue::String(RECEIPT.to_owned()),
+        );
+
+        let bytes = legacy_fixture.bytes();
+        let metadata =
+            parse_training_salt_artifact_metadata(&bytes).expect("legacy v1 widened metadata");
+        assert_eq!(metadata.growth.algorithm, NET2WIDER_ALGORITHM_V1);
+        assert_eq!(metadata.growth.old_width, 4);
+        assert_eq!(metadata.growth.new_width, 6);
+        assert_eq!(metadata.growth.source_indices, [0, 1, 2, 3, 3, 0]);
+        assert_eq!(metadata.growth.replication_counts, [2, 1, 1, 2]);
+        assert_eq!(metadata.growth.split_denominator_log2, None);
+        assert_eq!(metadata.growth.split_numerators, None);
+        ModelRunner::from_training_salt_gguf(&bytes, Box::new(tritium_cpu::CpuBackend::new()))
+            .expect("load legacy v1 widened artifact");
+
+        let mut tampered = fixture();
+        tampered.metadata.insert(
+            TRAINING_SALT_GROWTH_RECEIPT_KEY.to_owned(),
+            GgufValue::String(RECEIPT.replace("\"seed\":99", "\"seed\":98")),
+        );
+        let error = parse_training_salt_artifact_metadata(&tampered.bytes())
+            .expect_err("legacy v1 replay must bind the seed");
+        assert!(error.to_string().contains("deterministic replay"));
     }
 
     #[test]

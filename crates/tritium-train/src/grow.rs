@@ -249,29 +249,7 @@ impl Net2WiderPlan {
     /// [`GrowError::InvalidWidths`] if `old_width == 0` or `new_width < old_width`;
     /// [`GrowError::UnsupportedWidth`] on a target whose `usize` exceeds 64 bits.
     pub fn seeded(old_width: usize, new_width: usize, seed: u64) -> Result<Self, GrowError> {
-        if old_width == 0 || new_width < old_width {
-            return Err(GrowError::InvalidWidths {
-                old_width,
-                new_width,
-            });
-        }
-        let old_width_u64 =
-            u64::try_from(old_width).map_err(|_| GrowError::UnsupportedWidth(old_width))?;
-
-        let mut source_for_new: Vec<usize> = (0..old_width).collect();
-        let mut state = seed;
-        source_for_new.reserve(new_width - old_width);
-        for _ in old_width..new_width {
-            let source_u64 = splitmix64(&mut state) % old_width_u64;
-            let source = usize::try_from(source_u64)
-                .expect("source index is modulo an existing usize width");
-            source_for_new.push(source);
-        }
-
-        let mut copies_per_source = vec![0usize; old_width];
-        for &source in &source_for_new {
-            copies_per_source[source] += 1;
-        }
+        let (source_for_new, copies_per_source) = seeded_mapping(old_width, new_width, seed)?;
 
         let split_numerators = if new_width == old_width {
             None
@@ -289,6 +267,26 @@ impl Net2WiderPlan {
             source_for_new,
             copies_per_source,
             split_numerators,
+        })
+    }
+
+    /// Replay the original v1 equal-share widening algorithm.
+    ///
+    /// This constructor exists only to validate and interpret persisted v1 growth
+    /// receipts. New growth must use [`Self::seeded`], whose actual-growth plans
+    /// carry the v2 unequal dyadic split metadata.
+    ///
+    /// # Errors
+    /// [`GrowError::InvalidWidths`] if `old_width == 0` or `new_width < old_width`;
+    /// [`GrowError::UnsupportedWidth`] on a target whose `usize` exceeds 64 bits.
+    pub fn replay_v1(old_width: usize, new_width: usize, seed: u64) -> Result<Self, GrowError> {
+        let (source_for_new, copies_per_source) = seeded_mapping(old_width, new_width, seed)?;
+        Ok(Self {
+            old_width,
+            new_width,
+            source_for_new,
+            copies_per_source,
+            split_numerators: None,
         })
     }
 
@@ -421,6 +419,37 @@ impl Net2WiderPlan {
         }
         Ok(expanded)
     }
+}
+
+fn seeded_mapping(
+    old_width: usize,
+    new_width: usize,
+    seed: u64,
+) -> Result<(Vec<usize>, Vec<usize>), GrowError> {
+    if old_width == 0 || new_width < old_width {
+        return Err(GrowError::InvalidWidths {
+            old_width,
+            new_width,
+        });
+    }
+    let old_width_u64 =
+        u64::try_from(old_width).map_err(|_| GrowError::UnsupportedWidth(old_width))?;
+
+    let mut source_for_new: Vec<usize> = (0..old_width).collect();
+    let mut state = seed;
+    source_for_new.reserve(new_width - old_width);
+    for _ in old_width..new_width {
+        let source_u64 = splitmix64(&mut state) % old_width_u64;
+        let source =
+            usize::try_from(source_u64).expect("source index is modulo an existing usize width");
+        source_for_new.push(source);
+    }
+
+    let mut copies_per_source = vec![0usize; old_width];
+    for &source in &source_for_new {
+        copies_per_source[source] += 1;
+    }
+    Ok((source_for_new, copies_per_source))
 }
 
 fn unequal_split_numerators(

@@ -349,10 +349,12 @@ fn physical_checkpoint_keep_all_vs_sqrt_depth_uses_less_pool_memory() {
     }
 
     let dir = model_dir();
-    if !dir.join("model.safetensors").exists() {
-        eprintln!("skipping: {} absent", dir.display());
-        return;
-    }
+    let weights = dir.join("model.safetensors");
+    assert!(
+        weights.is_file(),
+        "ADR 0027 physical checkpoint gate requires regular model weights at {}; install SmolLM2-135M before running the ignored gate",
+        weights.display()
+    );
 
     // Fresh processes make allocator/JIT state policy-local; reversing the
     // launch order supplies a second observation against temporal drift.
