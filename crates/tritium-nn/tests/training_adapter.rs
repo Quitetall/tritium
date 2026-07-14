@@ -1,6 +1,6 @@
 use tritium_nn::{
     ArchSpec, DenseLinear, Mlp, MlpKind, ModelConfig, ModelWeights, Projection, SwiGluMlp,
-    TiedSwiGluTrainingModel, TransformerBlock,
+    SwiGluTrainingModel, TiedSwiGluTrainingModel, TransformerBlock,
 };
 
 fn dense(rows: usize, cols: usize, marker: f32) -> Projection {
@@ -66,6 +66,18 @@ fn weights() -> ModelWeights {
         output_norm: vec![300.0; 4],
         lm_head: None,
     }
+}
+
+fn untied_spec() -> ArchSpec {
+    let mut spec = spec();
+    spec.tied_embeddings = false;
+    spec
+}
+
+fn untied_weights(marker: f32) -> ModelWeights {
+    let mut weights = weights();
+    weights.lm_head = Some(dense(5, 4, marker));
+    weights
 }
 
 fn ramp_dense(rows: usize, cols: usize, start: f32) -> Projection {
@@ -235,6 +247,25 @@ fn extraction_preserves_canonical_hf_parameter_order_names_and_shapes() {
         [vec![200.0; 4], vec![210.0; 4]]
     );
     assert_eq!(model.architecture().output_norm, vec![300.0; 4]);
+    assert!(model.is_lm_head_tied());
+}
+
+#[test]
+fn untied_extraction_appends_head_without_reordering_existing_parameters() {
+    let tied = SwiGluTrainingModel::extract(&config(), &spec(), &weights()).unwrap();
+    let untied =
+        SwiGluTrainingModel::extract(&config(), &untied_spec(), &untied_weights(9.0)).unwrap();
+
+    assert!(!untied.is_lm_head_tied());
+    assert_eq!(untied.parameters().len(), tied.parameters().len() + 1);
+    assert_eq!(
+        &untied.parameters()[..tied.parameters().len()],
+        tied.parameters()
+    );
+    let head = untied.parameters().last().expect("untied head");
+    assert_eq!(head.name, "lm_head.weight");
+    assert_eq!((head.rows, head.cols), (5, 4));
+    assert_eq!(head.master, vec![9.0; 20]);
 }
 
 #[test]
@@ -344,6 +375,20 @@ fn intermediate_growth_applies_one_mapping_to_every_layer_without_reordering_par
 }
 
 #[test]
+fn intermediate_growth_keeps_the_untied_head_final_and_unchanged() {
+    let mut weights = widening_weights();
+    weights.lm_head = Some(patterned_dense(5, 4, 91));
+    let mut model =
+        SwiGluTrainingModel::extract(&config(), &untied_spec(), &weights).expect("untied model");
+    let head_before = model.parameters().last().expect("head").clone();
+
+    model.widen_intermediate(9, 0x27).expect("widen");
+
+    assert_eq!(model.parameters().last(), Some(&head_before));
+    assert_eq!(model.parameters().last().unwrap().name, "lm_head.weight");
+}
+
+#[test]
 fn intermediate_growth_preserves_the_whole_multilayer_swiglu_function_before_salt() {
     let mut model =
         TiedSwiGluTrainingModel::extract(&config(), &spec(), &equivalence_weights()).unwrap();
@@ -439,11 +484,9 @@ fn config_validation_rejects_qk_norm() {
 }
 
 #[test]
-fn config_validation_rejects_untied_lm_head() {
-    let mut unsupported = spec();
-    unsupported.tied_embeddings = false;
-    let error = TiedSwiGluTrainingModel::validate_config(&config(), &unsupported).unwrap_err();
-    assert!(error.to_string().contains("tied embeddings"), "{error}");
+fn config_validation_accepts_tied_and_untied_lm_heads() {
+    TiedSwiGluTrainingModel::validate_config(&config(), &spec()).unwrap();
+    TiedSwiGluTrainingModel::validate_config(&config(), &untied_spec()).unwrap();
 }
 
 #[test]
@@ -458,10 +501,22 @@ fn extraction_rejects_hidden_bias_qk_norm_and_untied_weight_mismatches() {
     let error = TiedSwiGluTrainingModel::extract(&config(), &spec(), &qk_normalized).unwrap_err();
     assert!(error.to_string().contains("QK norm"), "{error}");
 
-    let mut untied = weights();
-    untied.lm_head = Some(dense(5, 4, 9.0));
-    let error = TiedSwiGluTrainingModel::extract(&config(), &spec(), &untied).unwrap_err();
-    assert!(error.to_string().contains("untied LM head"), "{error}");
+    let error =
+        TiedSwiGluTrainingModel::extract(&config(), &spec(), &untied_weights(9.0)).unwrap_err();
+    assert!(
+        error.to_string().contains("requires no separate"),
+        "{error}"
+    );
+
+    let error =
+        TiedSwiGluTrainingModel::extract(&config(), &untied_spec(), &weights()).unwrap_err();
+    assert!(error.to_string().contains("requires a separate"), "{error}");
+
+    let mut wrong_head = untied_weights(9.0);
+    wrong_head.lm_head = Some(dense(4, 4, 9.0));
+    let error =
+        TiedSwiGluTrainingModel::extract(&config(), &untied_spec(), &wrong_head).unwrap_err();
+    assert!(error.to_string().contains("lm_head.weight"), "{error}");
 }
 
 #[cfg(feature = "cuda")]
@@ -486,6 +541,27 @@ fn upload_resident_parameters(
         .map(|parameter| {
             tritium_cuda::train::DeviceTensor::upload(backend, &parameter.master)
                 .expect("upload resident parameter")
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn upload_packed_parameters(
+    backend: &tritium_cuda::CudaBackend,
+    model: &TiedSwiGluTrainingModel,
+) -> Vec<tritium_cuda::train::DevicePackedSaltWeight> {
+    model
+        .parameters()
+        .iter()
+        .map(|parameter| {
+            tritium_cuda::train::DevicePackedSaltWeight::from_host(
+                backend,
+                &parameter.master,
+                parameter.rows,
+                parameter.cols,
+                2,
+            )
+            .expect("upload packed parameter")
         })
         .collect()
 }
@@ -573,6 +649,100 @@ fn resident_forward_borrows_canonical_leaves_and_backpropagates_tied_model() {
             parameter.name
         );
     }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn resident_forward_uses_appended_untied_head() {
+    use tritium_cuda::train::DeviceTape;
+    use tritium_nn::resident_device_forward;
+
+    let Some(backend) = cuda_backend_or_skip("resident_forward_uses_appended_untied_head") else {
+        return;
+    };
+    let tokens = [0_i32, 1, 4];
+
+    let mut zero_head_weights = weights();
+    zero_head_weights.lm_head = Some(dense(5, 4, 0.0));
+    let zero_head =
+        SwiGluTrainingModel::extract(&config(), &untied_spec(), &zero_head_weights).unwrap();
+    let zero_resident = upload_resident_parameters(&backend, &zero_head);
+    let zero_refs: Vec<_> = zero_resident.iter().collect();
+    let arch = zero_head.architecture();
+    let mut zero_tape =
+        DeviceTape::new(&backend, arch.vocab.max(arch.n_ff).max(tokens.len())).unwrap();
+    let zero_forward = resident_device_forward(&mut zero_tape, &zero_head, &zero_refs, &tokens)
+        .expect("zero-head forward");
+    let zero_logits = zero_tape.value(zero_forward.logits).expect("zero logits");
+    assert!(zero_logits.iter().all(|value| *value == 0.0));
+
+    let mut patterned_head_weights = weights();
+    patterned_head_weights.lm_head = Some(patterned_dense(5, 4, 77));
+    let patterned =
+        SwiGluTrainingModel::extract(&config(), &untied_spec(), &patterned_head_weights).unwrap();
+    let patterned_resident = upload_resident_parameters(&backend, &patterned);
+    let patterned_refs: Vec<_> = patterned_resident.iter().collect();
+    let mut patterned_tape =
+        DeviceTape::new(&backend, arch.vocab.max(arch.n_ff).max(tokens.len())).unwrap();
+    let patterned_forward =
+        resident_device_forward(&mut patterned_tape, &patterned, &patterned_refs, &tokens)
+            .expect("patterned-head forward");
+    let patterned_logits = patterned_tape
+        .value(patterned_forward.logits)
+        .expect("patterned logits");
+
+    assert_eq!(
+        patterned_forward.master_leaves.len(),
+        patterned.parameters().len()
+    );
+    assert!(patterned_logits.iter().all(|value| value.is_finite()));
+    assert!(patterned_logits.iter().any(|value| value.abs() > 1e-6));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn packed_forward_uses_appended_untied_head() {
+    use tritium_cuda::train::DeviceTape;
+    use tritium_nn::packed_device_forward;
+
+    let Some(backend) = cuda_backend_or_skip("packed_forward_uses_appended_untied_head") else {
+        return;
+    };
+    let tokens = [0_i32, 1, 4];
+
+    let mut zero_head_weights = weights();
+    zero_head_weights.lm_head = Some(dense(5, 4, 0.0));
+    let zero_head =
+        SwiGluTrainingModel::extract(&config(), &untied_spec(), &zero_head_weights).unwrap();
+    let zero_packed = upload_packed_parameters(&backend, &zero_head);
+    let arch = zero_head.architecture();
+    let mut zero_tape =
+        DeviceTape::new(&backend, arch.vocab.max(arch.n_ff).max(tokens.len())).unwrap();
+    let zero_forward = packed_device_forward(&mut zero_tape, &zero_head, &zero_packed, &tokens)
+        .expect("zero packed-head forward");
+    let zero_logits = zero_tape.value(zero_forward.logits).expect("zero logits");
+    assert!(zero_logits.iter().all(|value| *value == 0.0));
+
+    let mut patterned_head_weights = weights();
+    patterned_head_weights.lm_head = Some(patterned_dense(5, 4, 77));
+    let patterned =
+        SwiGluTrainingModel::extract(&config(), &untied_spec(), &patterned_head_weights).unwrap();
+    let patterned_packed = upload_packed_parameters(&backend, &patterned);
+    let mut patterned_tape =
+        DeviceTape::new(&backend, arch.vocab.max(arch.n_ff).max(tokens.len())).unwrap();
+    let patterned_forward =
+        packed_device_forward(&mut patterned_tape, &patterned, &patterned_packed, &tokens)
+            .expect("patterned packed-head forward");
+    let patterned_logits = patterned_tape
+        .value(patterned_forward.logits)
+        .expect("patterned logits");
+
+    assert_eq!(
+        patterned_forward.master_leaves.len(),
+        patterned.parameters().len()
+    );
+    assert!(patterned_logits.iter().all(|value| value.is_finite()));
+    assert!(patterned_logits.iter().any(|value| value.abs() > 1e-6));
 }
 
 #[cfg(feature = "cuda")]

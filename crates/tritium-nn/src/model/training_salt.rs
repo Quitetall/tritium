@@ -3,7 +3,7 @@
 //! Unlike [`ModelWeights::load_salt`](super::ModelWeights::load_salt), this path
 //! has no model-directory fallback. The one GGUF v3 artifact contains its
 //! canonical HuggingFace configuration, every quantized two-dimensional weight,
-//! and every fp32 norm needed by the tied SwiGLU inference graph.
+//! and every fp32 norm needed by the SwiGLU inference graph.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -12,17 +12,19 @@ use tritium_format::{
     SaltTensor, read_gguf, read_salt_gguf, salt_rows_to_dense,
 };
 
-use crate::config::{MlpKind, ModelConfig};
+use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
 use crate::layers::{DenseLinear, Projection};
 use crate::model::ModelWeights;
 use crate::model::hf::{NameSchema, build_standard_model};
 use crate::training::TiedSwiGluTrainingModel;
 
-/// Metadata key marking a self-contained tied-SwiGLU training-SALT model.
+/// Metadata key marking a self-contained SwiGLU training-SALT model.
 pub const TRAINING_SALT_FORMAT_KEY: &str = "tritium.training_salt.format";
-/// Versioned self-contained training-SALT model format.
+/// Versioned self-contained tied-head training-SALT model format.
 pub const TRAINING_SALT_FORMAT_VALUE: &str = "tied-swiglu.v1";
+/// Versioned self-contained untied-head training-SALT model format.
+pub const TRAINING_SALT_UNTIED_FORMAT_VALUE: &str = "untied-swiglu.v1";
 /// Canonical compact HuggingFace configuration JSON embedded in the artifact.
 pub const TRAINING_SALT_HF_CONFIG_KEY: &str = "tritium.training_salt.hf_config_json";
 /// Fixed number of SALT planes in every quantized row.
@@ -97,8 +99,8 @@ impl ModelWeights {
     /// Load a self-contained training-SALT model from one GGUF v3 byte buffer.
     ///
     /// The loader is intentionally strict: both format markers and every
-    /// provenance field are required; the embedded HF config must be canonical,
-    /// tied, and SwiGLU; and the tensor table must exactly equal the canonical HF
+    /// provenance field are required; the embedded HF config must be canonical
+    /// SwiGLU and agree with the tied/untied format marker; the tensor table must equal the canonical HF
     /// tensor set implied by that config. Quantized rows are dequantized once into
     /// exact-fp [`DenseLinear`] projections, providing a deterministic reference
     /// evaluator without consulting a model directory.
@@ -110,31 +112,10 @@ impl ModelWeights {
         let file = read_gguf(bytes)
             .map_err(|error| NnError::Backend(format!("parse training SALT GGUF: {error}")))?;
         let metadata = parse_metadata(&file)?;
+        let lm_head_tied = training_salt_head_tied(&file)?;
         let config_value: serde_json::Value = serde_json::from_str(&metadata.hf_config_json)
             .map_err(|error| NnError::MissingConfig(format!("embedded HF config: {error}")))?;
-        let (config, spec) = ModelConfig::from_hf_config(&metadata.hf_config_json)?;
-        if spec.mlp != MlpKind::SwiGlu || !spec.tied_embeddings {
-            return Err(NnError::MissingConfig(
-                "training SALT v1 requires tied SwiGLU (`hidden_act=silu`, `tie_word_embeddings=true`)"
-                    .to_owned(),
-            ));
-        }
-        if config_value
-            .get("hidden_act")
-            .and_then(serde_json::Value::as_str)
-            != Some("silu")
-            || config_value
-                .get("tie_word_embeddings")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-        {
-            return Err(NnError::MissingConfig(
-                "training SALT v1 requires explicit hidden_act=silu and tie_word_embeddings=true"
-                    .to_owned(),
-            ));
-        }
-        TiedSwiGluTrainingModel::validate_config(&config, &spec)
-            .map_err(|error| NnError::MissingConfig(error.to_string()))?;
+        let (config, spec) = validate_embedded_config(&metadata.hf_config_json, lm_head_tied)?;
         if metadata.architecture != config.arch {
             return Err(NnError::MissingConfig(format!(
                 "general.architecture={} differs from embedded config architecture {}",
@@ -156,7 +137,7 @@ impl ModelWeights {
 
         let planes = metadata.salt_planes as usize;
 
-        let expected = expected_tensors(&config, vocab)?;
+        let expected = expected_tensors(&config, vocab, spec.tied_embeddings)?;
         validate_tensor_table(&file, &expected)?;
 
         let parsed_salt = read_salt_gguf(bytes).map_err(|error| {
@@ -237,6 +218,51 @@ fn require_marker(file: &GgufFile, key: &str, value: &str) -> Result<(), NnError
     }
 }
 
+fn training_salt_head_tied(file: &GgufFile) -> Result<bool, NnError> {
+    match file
+        .get_metadata(TRAINING_SALT_FORMAT_KEY)
+        .and_then(GgufValue::as_str)
+    {
+        Some(TRAINING_SALT_FORMAT_VALUE) => Ok(true),
+        Some(TRAINING_SALT_UNTIED_FORMAT_VALUE) => Ok(false),
+        _ => Err(NnError::MissingMetadata(
+            TRAINING_SALT_FORMAT_KEY.to_owned(),
+        )),
+    }
+}
+
+fn validate_embedded_config(
+    hf_config_json: &str,
+    marker_tied: bool,
+) -> Result<(ModelConfig, ArchSpec), NnError> {
+    let value: serde_json::Value = serde_json::from_str(hf_config_json)
+        .map_err(|error| NnError::MissingConfig(format!("embedded HF config: {error}")))?;
+    let explicit_tie = value
+        .get("tie_word_embeddings")
+        .and_then(serde_json::Value::as_bool);
+    if value.get("hidden_act").and_then(serde_json::Value::as_str) != Some("silu")
+        || explicit_tie != Some(marker_tied)
+    {
+        let marker = if marker_tied {
+            TRAINING_SALT_FORMAT_VALUE
+        } else {
+            TRAINING_SALT_UNTIED_FORMAT_VALUE
+        };
+        return Err(NnError::MissingConfig(format!(
+            "training SALT {marker} requires explicit hidden_act=silu and tie_word_embeddings={marker_tied}"
+        )));
+    }
+    let (config, spec) = ModelConfig::from_hf_config(hf_config_json)?;
+    if spec.mlp != MlpKind::SwiGlu || spec.tied_embeddings != marker_tied {
+        return Err(NnError::MissingConfig(
+            "training SALT format marker and embedded architecture disagree".to_owned(),
+        ));
+    }
+    TiedSwiGluTrainingModel::validate_config(&config, &spec)
+        .map_err(|error| NnError::MissingConfig(error.to_string()))?;
+    Ok((config, spec))
+}
+
 fn require_string<'a>(file: &'a GgufFile, key: &str) -> Result<&'a str, NnError> {
     file.get_metadata(key)
         .and_then(GgufValue::as_str)
@@ -270,7 +296,7 @@ fn parse_metadata(file: &GgufFile) -> Result<TrainingSaltArtifactMetadata, NnErr
         )));
     }
     require_marker(file, SALT_GGUF_FORMAT_KEY, SALT_GGUF_FORMAT_VALUE)?;
-    require_marker(file, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE)?;
+    let lm_head_tied = training_salt_head_tied(file)?;
     if !matches!(
         file.get_metadata("general.alignment"),
         Some(GgufValue::U32(32))
@@ -281,25 +307,7 @@ fn parse_metadata(file: &GgufFile) -> Result<TrainingSaltArtifactMetadata, NnErr
     }
     let architecture = require_string(file, "general.architecture")?.to_owned();
     let hf_config_json = require_canonical_json(file, TRAINING_SALT_HF_CONFIG_KEY)?;
-    let config_value: serde_json::Value = serde_json::from_str(&hf_config_json)
-        .map_err(|error| NnError::MissingConfig(format!("embedded HF config: {error}")))?;
-    if config_value
-        .get("hidden_act")
-        .and_then(serde_json::Value::as_str)
-        != Some("silu")
-        || config_value
-            .get("tie_word_embeddings")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-    {
-        return Err(NnError::MissingConfig(
-            "training SALT v1 requires explicit hidden_act=silu and tie_word_embeddings=true"
-                .to_owned(),
-        ));
-    }
-    let (config, spec) = ModelConfig::from_hf_config(&hf_config_json)?;
-    TiedSwiGluTrainingModel::validate_config(&config, &spec)
-        .map_err(|error| NnError::MissingConfig(error.to_string()))?;
+    let (config, _) = validate_embedded_config(&hf_config_json, lm_head_tied)?;
     if architecture != config.arch {
         return Err(NnError::MissingConfig(format!(
             "general.architecture={architecture} differs from embedded config architecture {}",
@@ -489,7 +497,11 @@ fn parse_growth_receipt(file: &GgufFile) -> Result<TrainingSaltGrowthReceipt, Nn
     })
 }
 
-fn expected_tensors(config: &ModelConfig, vocab: usize) -> Result<Vec<ExpectedTensor>, NnError> {
+fn expected_tensors(
+    config: &ModelConfig,
+    vocab: usize,
+    lm_head_tied: bool,
+) -> Result<Vec<ExpectedTensor>, NnError> {
     let embd = usize::try_from(config.n_embd)
         .map_err(|_| NnError::MissingConfig("hidden_size overflows usize".to_owned()))?;
     let head_dim = usize::try_from(config.head_dim())
@@ -526,6 +538,7 @@ fn expected_tensors(config: &ModelConfig, vocab: usize) -> Result<Vec<ExpectedTe
     let tensor_count = layer_count
         .checked_mul(9)
         .and_then(|count| count.checked_add(2))
+        .and_then(|count| count.checked_add(usize::from(!lm_head_tied)))
         .ok_or_else(|| NnError::MissingConfig("tensor count overflow".to_owned()))?;
     let mut tensors = Vec::with_capacity(tensor_count);
     tensors.push(salt("model.embed_tokens.weight".to_owned(), vocab, embd)?);
@@ -546,6 +559,9 @@ fn expected_tensors(config: &ModelConfig, vocab: usize) -> Result<Vec<ExpectedTe
         tensors.push(salt(format!("{p}.mlp.gate_proj.weight"), ff, embd)?);
         tensors.push(salt(format!("{p}.mlp.up_proj.weight"), ff, embd)?);
         tensors.push(salt(format!("{p}.mlp.down_proj.weight"), embd, ff)?);
+    }
+    if !lm_head_tied {
+        tensors.push(salt("lm_head.weight".to_owned(), vocab, embd)?);
     }
     for layer in 0..layer_count {
         let p = format!("model.layers.{layer}");
@@ -672,6 +688,14 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_tie(true)
+    }
+
+    fn untied_fixture() -> Fixture {
+        fixture_with_tie(false)
+    }
+
+    fn fixture_with_tie(lm_head_tied: bool) -> Fixture {
         let config_json = serde_json::to_string(&json!({
             "hidden_act": "silu",
             "hidden_size": 4,
@@ -683,31 +707,35 @@ mod tests {
             "num_key_value_heads": 1,
             "rms_norm_eps": 0.00001,
             "rope_theta": 10000.0,
-            "tie_word_embeddings": true,
+            "tie_word_embeddings": lm_head_tied,
             "vocab_size": 5
         }))
         .expect("config JSON");
         let (config, spec) = ModelConfig::from_hf_config(&config_json).expect("config");
-        let expected = expected_tensors(&config, 5).expect("expected tensors");
-        assert_eq!(
-            expected
-                .iter()
-                .map(|tensor| tensor.name.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "model.embed_tokens.weight",
-                "model.layers.0.self_attn.q_proj.weight",
-                "model.layers.0.self_attn.k_proj.weight",
-                "model.layers.0.self_attn.v_proj.weight",
-                "model.layers.0.self_attn.o_proj.weight",
-                "model.layers.0.mlp.gate_proj.weight",
-                "model.layers.0.mlp.up_proj.weight",
-                "model.layers.0.mlp.down_proj.weight",
-                "model.layers.0.input_layernorm.weight",
-                "model.layers.0.post_attention_layernorm.weight",
-                "model.norm.weight",
-            ]
-        );
+        let expected = expected_tensors(&config, 5, lm_head_tied).expect("expected tensors");
+        let names = expected
+            .iter()
+            .map(|tensor| tensor.name.as_str())
+            .collect::<Vec<_>>();
+        let mut expected_names = vec![
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ];
+        if !lm_head_tied {
+            expected_names.push("lm_head.weight");
+        }
+        expected_names.extend([
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.norm.weight",
+        ]);
+        assert_eq!(names, expected_names);
 
         let mut tensors = Vec::new();
         let mut dense = HashMap::new();
@@ -780,7 +808,14 @@ mod tests {
             ),
             (
                 TRAINING_SALT_FORMAT_KEY.to_owned(),
-                GgufValue::String(TRAINING_SALT_FORMAT_VALUE.to_owned()),
+                GgufValue::String(
+                    if lm_head_tied {
+                        TRAINING_SALT_FORMAT_VALUE
+                    } else {
+                        TRAINING_SALT_UNTIED_FORMAT_VALUE
+                    }
+                    .to_owned(),
+                ),
             ),
             (
                 TRAINING_SALT_HF_CONFIG_KEY.to_owned(),
@@ -879,7 +914,33 @@ mod tests {
                     .expect("q dense")
                     .as_slice()
             ),
-            Projection::Ternary(_) => panic!("reference loader must dequantize to exact dense"),
+            Projection::Ternary(_) => {
+                panic!("reference loader must dequantize to exact dense")
+            }
+        }
+    }
+
+    #[test]
+    fn untied_format_loads_a_separate_exact_head() {
+        let fixture = untied_fixture();
+        let bytes = fixture.bytes();
+        parse_training_salt_artifact_metadata(&bytes).expect("metadata");
+
+        let (_, weights) =
+            ModelWeights::load_training_salt_gguf(&bytes).expect("load untied artifact");
+        let head = weights.lm_head.as_ref().expect("separate LM head");
+        match head {
+            Projection::Dense(dense) => assert_eq!(
+                dense.weights.as_slice(),
+                fixture
+                    .dense
+                    .get("lm_head.weight")
+                    .expect("head dense")
+                    .as_slice()
+            ),
+            Projection::Ternary(_) => {
+                panic!("reference loader must dequantize the head to exact dense")
+            }
         }
     }
 
@@ -945,6 +1006,63 @@ mod tests {
             GgufValue::String(serde_json::to_string(&config).expect("config JSON")),
         );
         assert!(ModelWeights::load_training_salt_gguf(&untied.bytes()).is_err());
+
+        let mut marker_mismatch = untied_fixture();
+        marker_mismatch.metadata.insert(
+            TRAINING_SALT_FORMAT_KEY.to_owned(),
+            GgufValue::String(TRAINING_SALT_FORMAT_VALUE.to_owned()),
+        );
+        assert!(ModelWeights::load_training_salt_gguf(&marker_mismatch.bytes()).is_err());
+
+        let mut missing_head = untied_fixture();
+        missing_head
+            .tensors
+            .retain(|tensor| tensor.name != "lm_head.weight");
+        assert!(ModelWeights::load_training_salt_gguf(&missing_head.bytes()).is_err());
+
+        let mut reordered_head = untied_fixture();
+        reordered_head.tensors.swap(7, 8);
+        assert!(ModelWeights::load_training_salt_gguf(&reordered_head.bytes()).is_err());
+
+        let mut wrong_head_type = untied_fixture();
+        let head = wrong_head_type
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "lm_head.weight")
+            .expect("head");
+        head.ggml_type = GGML_TYPE_F32;
+        assert!(matches!(
+            ModelWeights::load_training_salt_gguf(&wrong_head_type.bytes()),
+            Err(NnError::UnsupportedTensorType(_))
+        ));
+
+        let mut wrong_head_shape = untied_fixture();
+        wrong_head_shape
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "lm_head.weight")
+            .expect("head")
+            .dims[1] += 1;
+        assert!(ModelWeights::load_training_salt_gguf(&wrong_head_shape.bytes()).is_err());
+
+        let mut wrong_head_planes = untied_fixture();
+        let one_plane_rows = wrong_head_planes
+            .dense
+            .get("lm_head.weight")
+            .expect("head dense")
+            .chunks_exact(4)
+            .flat_map(|row| {
+                let (salt, _) = export_training_salt_row(row, 1).expect("one-plane head row");
+                pack_salt_row(&salt).expect("pack one-plane head row")
+            })
+            .collect();
+        wrong_head_planes
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "lm_head.weight")
+            .expect("head")
+            .data = one_plane_rows;
+        assert!(ModelWeights::load_training_salt_gguf(&wrong_head_planes.bytes()).is_err());
 
         let mut reordered = fixture();
         reordered.tensors.swap(1, 2);

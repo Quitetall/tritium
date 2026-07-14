@@ -26,7 +26,7 @@ use tritium_nn::{
     TRAINING_SALT_FORMAT_VALUE, TRAINING_SALT_GROWTH_RECEIPT_KEY, TRAINING_SALT_HF_CONFIG_KEY,
     TRAINING_SALT_INITIAL_STUDENT_DIGEST_KEY, TRAINING_SALT_PLAN_FINGERPRINT_KEY,
     TRAINING_SALT_PLANES_KEY, TRAINING_SALT_SOURCE_MODEL_DIGEST_KEY,
-    TiedSwiGluTrainingArchitecture, TiedSwiGluTrainingModel,
+    TRAINING_SALT_UNTIED_FORMAT_VALUE, TiedSwiGluTrainingArchitecture, TiedSwiGluTrainingModel,
 };
 use tritium_quantize::{
     CampaignError, MeasuredPackage, TrainingSaltExportError, TrainingSaltExportStats,
@@ -313,6 +313,7 @@ struct ArchitectureLayout {
     vocab: usize,
     rope_theta: f32,
     rms_eps: f32,
+    lm_head_tied: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -340,6 +341,7 @@ impl<'a> ModelLayout<'a> {
             .n_layers
             .checked_mul(7)
             .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(usize::from(!model.is_lm_head_tied())))
             .ok_or_else(|| invalid("canonical parameter count overflows usize"))?;
         if model.parameters().len() != expected_parameters {
             return Err(invalid(format!(
@@ -361,9 +363,15 @@ impl<'a> ModelLayout<'a> {
                     "parameter name at canonical index {index} is empty or duplicated"
                 )));
             }
-            if parameter.name.contains("lm_head") {
+            let is_untied_head = !model.is_lm_head_tied() && index + 1 == expected_parameters;
+            if is_untied_head && parameter.name != "lm_head.weight" {
                 return Err(invalid(
-                    "tied output head must not be stored separately from token embeddings",
+                    "final untied output-head parameter is not lm_head.weight",
+                ));
+            }
+            if !is_untied_head && parameter.name.contains("lm_head") {
+                return Err(invalid(
+                    "lm_head.weight must be the final canonical parameter only for untied models",
                 ));
             }
             matrices.push(MatrixLayout {
@@ -377,6 +385,19 @@ impl<'a> ModelLayout<'a> {
             return Err(invalid(
                 "first canonical parameter is not model.embed_tokens.weight",
             ));
+        }
+        if matrices[0].rows != architecture.vocab || matrices[0].cols != architecture.n_embd {
+            return Err(invalid(
+                "token embedding geometry disagrees with the training architecture",
+            ));
+        }
+        if !model.is_lm_head_tied() {
+            let head = matrices.last().expect("validated nonempty parameter set");
+            if head.rows != architecture.vocab || head.cols != architecture.n_embd {
+                return Err(invalid(
+                    "untied output-head geometry disagrees with the training architecture",
+                ));
+            }
         }
 
         let mut norms = Vec::with_capacity(architecture.n_layers * 2 + 1);
@@ -407,6 +428,7 @@ impl<'a> ModelLayout<'a> {
                 vocab: architecture.vocab,
                 rope_theta: architecture.rope_theta,
                 rms_eps: architecture.rms_eps,
+                lm_head_tied: model.is_lm_head_tied(),
             },
             matrices,
             norms,
@@ -506,7 +528,14 @@ impl<'a> ArtifactExportPlan<'a> {
         );
         metadata.insert(
             TRAINING_SALT_FORMAT_KEY.to_owned(),
-            GgufValue::String(TRAINING_SALT_FORMAT_VALUE.to_owned()),
+            GgufValue::String(
+                if layout.architecture.lm_head_tied {
+                    TRAINING_SALT_FORMAT_VALUE
+                } else {
+                    TRAINING_SALT_UNTIED_FORMAT_VALUE
+                }
+                .to_owned(),
+            ),
         );
         metadata.insert(
             TRAINING_SALT_HF_CONFIG_KEY.to_owned(),
@@ -924,6 +953,16 @@ fn canonical_patched_config(
         "intermediate_size".to_owned(),
         Value::from(growth.new_width),
     );
+    if object.get("tie_word_embeddings").and_then(Value::as_bool) != Some(architecture.lm_head_tied)
+    {
+        return Err(invalid(
+            "source config must explicitly match the trained model tie_word_embeddings",
+        ));
+    }
+    object.insert(
+        "tie_word_embeddings".to_owned(),
+        Value::Bool(architecture.lm_head_tied),
+    );
     let vocab = object
         .get("vocab_size")
         .and_then(Value::as_u64)
@@ -944,9 +983,10 @@ fn canonical_patched_config(
             "patched HuggingFace config is unsupported: {error}"
         ))
     })?;
-    if !spec.tied_embeddings || spec.mlp != tritium_nn::MlpKind::SwiGlu {
+    if spec.tied_embeddings != architecture.lm_head_tied || spec.mlp != tritium_nn::MlpKind::SwiGlu
+    {
         return Err(invalid(
-            "patched HuggingFace config must use tied embeddings and SwiGLU",
+            "patched HuggingFace config must use SwiGLU and match the trained model head tying",
         ));
     }
     let parsed = [
@@ -1303,6 +1343,7 @@ mod tests {
                 vocab: 2,
                 rope_theta: 10_000.0,
                 rms_eps: 0.00001,
+                lm_head_tied: true,
             },
             matrices,
             norms: vec![
@@ -1324,6 +1365,21 @@ mod tests {
 
     fn plan() -> ArtifactExportPlan<'static> {
         ArtifactExportPlan::build(config(), layout(), 2, provenance(), &growth()).expect("plan")
+    }
+
+    fn untied_plan() -> ArtifactExportPlan<'static> {
+        let mut layout = layout();
+        layout.architecture.lm_head_tied = false;
+        layout.matrices.push(MatrixLayout {
+            name: "lm_head.weight".to_owned(),
+            rows: 2,
+            cols: 2,
+        });
+        let config = config().replace(
+            "\"tie_word_embeddings\": true",
+            "\"tie_word_embeddings\": false",
+        );
+        ArtifactExportPlan::build(&config, layout, 2, provenance(), &growth()).expect("untied plan")
     }
 
     fn source() -> FakeSource {
@@ -1351,6 +1407,13 @@ mod tests {
             masters,
             geometry,
         }
+    }
+
+    fn untied_source() -> FakeSource {
+        let mut source = source();
+        source.geometry.push((2, 2, 2));
+        source.masters.push(vec![-0.75, -0.25, 0.5, 1.0]);
+        source
     }
 
     #[test]
@@ -1496,6 +1559,37 @@ mod tests {
     }
 
     #[test]
+    fn untied_export_uses_distinct_marker_head_and_round_trips() {
+        let plan = untied_plan();
+        assert_eq!(
+            plan.metadata.get(TRAINING_SALT_FORMAT_KEY),
+            Some(&GgufValue::String(
+                TRAINING_SALT_UNTIED_FORMAT_VALUE.to_owned()
+            ))
+        );
+        let config = plan
+            .metadata
+            .get(TRAINING_SALT_HF_CONFIG_KEY)
+            .and_then(GgufValue::as_str)
+            .expect("embedded config");
+        assert!(config.contains(r#""tie_word_embeddings":false"#));
+        assert_eq!(
+            plan.tensor_specs[8].name, "lm_head.weight",
+            "untied head follows all canonical layer matrices"
+        );
+
+        let source = untied_source();
+        let written = write_artifact(Vec::new(), &plan, &source).expect("export untied artifact");
+        let repeated = write_artifact(Vec::new(), &plan, &source).expect("repeat untied export");
+        assert_eq!(written.writer, repeated.writer);
+        assert_eq!(written.stats, repeated.stats);
+        assert_eq!(written.stats.reconstruction_element_count, 42);
+        let (_, weights) = tritium_nn::ModelWeights::load_training_salt_gguf(&written.writer)
+            .expect("load untied artifact");
+        assert!(weights.lm_head.is_some(), "untied head must round trip");
+    }
+
+    #[test]
     fn rejects_provenance_growth_config_and_source_mismatches() {
         assert!(ArtifactProvenance::new(&"00".repeat(32), [2; 32], [3; 32], 0).is_err());
         assert!(ArtifactProvenance::new(&"AA".repeat(32), [2; 32], [3; 32], 0).is_err());
@@ -1504,6 +1598,10 @@ mod tests {
         let bad_config = config().replace("\"intermediate_size\": 2", "\"intermediate_size\": 4");
         assert!(
             ArtifactExportPlan::build(&bad_config, layout(), 2, provenance(), &growth()).is_err()
+        );
+        let missing_tie = config().replace("\"tie_word_embeddings\": true,", "");
+        assert!(
+            ArtifactExportPlan::build(&missing_tie, layout(), 2, provenance(), &growth()).is_err()
         );
         assert!(ArtifactExportPlan::build(config(), layout(), 0, provenance(), &growth()).is_err());
 

@@ -31,8 +31,8 @@ pub use error::ResidentOpError;
 pub use evaluation::{TeacherForcedPerplexity, teacher_forced_perplexity_windows};
 pub use kv_cache::KvCache;
 pub use layers::{
-    BlockDump, BlockScratch, DenseLinear, Mlp, Projection, Relu2Mlp, SwiGluMlp, TernaryLinear,
-    TransformerBlock,
+    BlockDump, BlockScratch, DenseLinear, Mlp, Projection, Relu2Mlp, SwiGluMlp,
+    TernaryLinear, TransformerBlock,
 };
 #[cfg(feature = "tokenizer")]
 pub use model::GgufBpeTokenizer;
@@ -41,8 +41,9 @@ pub use model::{
     TRAINING_SALT_COMPLETED_STEP_KEY, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE,
     TRAINING_SALT_GROWTH_RECEIPT_KEY, TRAINING_SALT_HF_CONFIG_KEY,
     TRAINING_SALT_INITIAL_STUDENT_DIGEST_KEY, TRAINING_SALT_PLAN_FINGERPRINT_KEY,
-    TRAINING_SALT_PLANES_KEY, TRAINING_SALT_SOURCE_MODEL_DIGEST_KEY, TrainingSaltArtifactMetadata,
-    TrainingSaltGrowthReceipt, parse_training_salt_artifact_metadata,
+    TRAINING_SALT_PLANES_KEY, TRAINING_SALT_SOURCE_MODEL_DIGEST_KEY,
+    TRAINING_SALT_UNTIED_FORMAT_VALUE, TrainingSaltArtifactMetadata, TrainingSaltGrowthReceipt,
+    parse_training_salt_artifact_metadata,
 };
 pub use ops::{
     QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_categorical,
@@ -58,6 +59,6 @@ pub use training::{
     PackedTrainingForward, ResidentTrainingForward, packed_device_forward, resident_device_forward,
 };
 pub use training::{
-    TiedSwiGluTrainingArchitecture, TiedSwiGluTrainingModel, TrainingAdapterError,
-    TrainingParameter,
+    SwiGluTrainingArchitecture, SwiGluTrainingModel, TiedSwiGluTrainingArchitecture,
+    TiedSwiGluTrainingModel, TrainingAdapterError, TrainingParameter,
 };

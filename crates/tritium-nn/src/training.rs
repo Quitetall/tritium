@@ -1,9 +1,10 @@
-//! Production model adapter for tied-head, bias-free SwiGLU training campaigns.
+//! Production model adapter for bias-free SwiGLU training campaigns.
 //!
 //! The adapter turns the inference model representation into the stable parameter
 //! order consumed by the device-resident training stack:
 //!
-//! `embed`, then `q, k, v, o, gate, up, down` for each layer.
+//! `embed`, then `q, k, v, o, gate, up, down` for each layer, followed by an
+//! optional untied `lm_head.weight`.
 //!
 //! It validates every architecture axis and tensor shape before cloning a host
 //! master. Unsupported variants fail explicitly instead of being run through a
@@ -11,7 +12,7 @@
 
 use crate::{ArchSpec, Mlp, MlpKind, ModelConfig, ModelWeights, Projection};
 
-/// Failure to adapt or execute a tied-SwiGLU training model.
+/// Failure to adapt or execute a SwiGLU training model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TrainingAdapterError {
@@ -117,11 +118,12 @@ impl TrainingParameter {
     }
 }
 
-/// Validated, owned inputs for a tied-SwiGLU device-training campaign.
+/// Validated, owned inputs for a SwiGLU device-training campaign.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TiedSwiGluTrainingModel {
     arch: TiedSwiGluTrainingArchitecture,
     parameters: Vec<TrainingParameter>,
+    lm_head_tied: bool,
 }
 
 impl TiedSwiGluTrainingModel {
@@ -135,6 +137,21 @@ impl TiedSwiGluTrainingModel {
     #[must_use]
     pub fn parameters(&self) -> &[TrainingParameter] {
         &self.parameters
+    }
+
+    /// Whether the output projection shares the embedding parameter.
+    #[must_use]
+    pub const fn is_lm_head_tied(&self) -> bool {
+        self.lm_head_tied
+    }
+
+    #[cfg(feature = "cuda")]
+    fn lm_head_parameter_index(&self) -> usize {
+        if self.lm_head_tied {
+            0
+        } else {
+            self.parameters.len() - 1
+        }
     }
 
     /// Move every latent master out in canonical parameter order while
@@ -180,6 +197,7 @@ impl TiedSwiGluTrainingModel {
             .n_layers
             .checked_mul(7)
             .and_then(|count| count.checked_add(1))
+            .and_then(|count| count.checked_add(usize::from(!self.lm_head_tied)))
             .ok_or_else(|| invalid_input("parameter count overflows usize"))?;
         if self.parameters.len() != expected_parameters {
             return Err(tensor_mismatch(
@@ -257,7 +275,7 @@ impl TiedSwiGluTrainingModel {
         }
         if spec.attn_sub_norm || spec.ffn_sub_norm {
             return Err(unsupported(
-                "attention/FFN sub-norms are not supported by the tied-SwiGLU graph",
+                "attention/FFN sub-norms are not supported by the SwiGLU graph",
             ));
         }
         if spec.qkv_bias {
@@ -265,9 +283,6 @@ impl TiedSwiGluTrainingModel {
         }
         if spec.qk_norm {
             return Err(unsupported("QK norm is not supported"));
-        }
-        if !spec.tied_embeddings {
-            return Err(unsupported("tied embeddings are required"));
         }
         if config.n_layers == 0 {
             return Err(unsupported("num_hidden_layers must be non-zero"));
@@ -307,7 +322,8 @@ impl TiedSwiGluTrainingModel {
     ///
     /// Parameter order is stable: `model.embed_tokens.weight`, followed by each
     /// layer's `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, and
-    /// `down_proj` tensors. This is the order returned as gradient-only leaves by
+    /// `down_proj` tensors. An untied `lm_head.weight`, when configured, is
+    /// appended last. This is the order returned as gradient-only leaves by
     /// `packed_device_forward` when CUDA is enabled.
     ///
     /// # Errors
@@ -358,14 +374,17 @@ impl TiedSwiGluTrainingModel {
             ));
         }
         validate_vector("model.norm.weight", &weights.output_norm, n_embd)?;
-        if weights.lm_head.is_some() {
-            return Err(unsupported(
-                "loaded weights contain an untied LM head; tied embedding/head storage is required",
-            ));
+        if spec.tied_embeddings != weights.lm_head.is_none() {
+            return Err(unsupported(if spec.tied_embeddings {
+                "tie_word_embeddings=true requires no separate lm_head.weight"
+            } else {
+                "tie_word_embeddings=false requires a separate lm_head.weight"
+            }));
         }
 
         let parameter_capacity = checked_mul(n_layers, 7, "parameter count")?
             .checked_add(1)
+            .and_then(|count| count.checked_add(usize::from(!spec.tied_embeddings)))
             .ok_or_else(|| unsupported("parameter count overflows usize"))?;
         let mut parameters = Vec::with_capacity(parameter_capacity);
         parameters.push(TrainingParameter {
@@ -444,6 +463,15 @@ impl TiedSwiGluTrainingModel {
             ffn_norms.push(layer.ffn_norm.clone());
         }
 
+        if let Some(lm_head) = &weights.lm_head {
+            parameters.push(extract_dense(
+                "lm_head.weight".to_owned(),
+                lm_head,
+                weights.vocab,
+                n_embd,
+            )?);
+        }
+
         Ok(Self {
             arch: TiedSwiGluTrainingArchitecture {
                 attn_norms,
@@ -461,9 +489,20 @@ impl TiedSwiGluTrainingModel {
                 n_ctx,
             },
             parameters,
+            lm_head_tied: spec.tied_embeddings,
         })
     }
 }
+
+/// Architecture descriptor for a bias-free SwiGLU training campaign.
+///
+/// This alias keeps callers using the original tied-head name source compatible.
+pub type SwiGluTrainingArchitecture = TiedSwiGluTrainingArchitecture;
+
+/// Validated SwiGLU training model with a tied or untied output projection.
+///
+/// This alias keeps callers using the original tied-head name source compatible.
+pub type SwiGluTrainingModel = TiedSwiGluTrainingModel;
 
 /// Outputs from one packed device forward graph.
 #[cfg(feature = "cuda")]
@@ -485,12 +524,13 @@ pub struct ResidentTrainingForward {
     pub master_leaves: Vec<usize>,
 }
 
-/// Build the tied-SwiGLU packed-SALT forward on a CUDA
+/// Build the SwiGLU packed-SALT forward on a CUDA
 /// [`DeviceTape`](tritium_cuda::train::DeviceTape).
 ///
 /// Every packed weight is shape-checked against the canonical parameter map
-/// before the tape is changed. The tied embedding and LM head share master leaf
-/// zero. Transformer-block boundaries become activation-checkpoint frontiers.
+/// before the tape is changed. A tied head shares master leaf zero; an untied
+/// head uses the final canonical leaf. Transformer-block boundaries become
+/// activation-checkpoint frontiers.
 ///
 /// # Errors
 /// Returns [`TrainingAdapterError::InvalidInput`] for invalid tokens or packed-model
@@ -572,20 +612,21 @@ pub fn packed_device_forward<'backend, 'leaf>(
 
     let output_norm = tape.leaf(&arch.output_norm)?;
     let normalized = tape.rmsnorm(hidden, output_norm, sequence, arch.n_embd, arch.rms_eps)?;
-    let logits = tape.salt_matmul(normalized, masters[0], &weights[0], sequence)?;
+    let head = model.lm_head_parameter_index();
+    let logits = tape.salt_matmul(normalized, masters[head], &weights[head], sequence)?;
     Ok(PackedTrainingForward {
         logits,
         master_leaves: masters,
     })
 }
 
-/// Build the tied-SwiGLU dense forward from already-resident CUDA tensors.
+/// Build the SwiGLU dense forward from already-resident CUDA tensors.
 ///
 /// Every tensor is length-checked before any leaf is added. The tensors are then
 /// borrowed through [`tritium_cuda::train::DeviceTape::leaf_device`], which also
 /// rejects CUDA-context mismatches without allocating or copying trainable
-/// weights. Parameter leaves retain [`TiedSwiGluTrainingModel::parameters`] order,
-/// and leaf zero is shared by the embedding gather and tied LM head.
+/// weights. Parameter leaves retain [`TiedSwiGluTrainingModel::parameters`] order.
+/// A tied head shares leaf zero; an untied head uses the final canonical leaf.
 /// Transformer-block boundaries match [`packed_device_forward`] activation-
 /// checkpoint frontiers.
 ///
@@ -674,7 +715,8 @@ pub fn resident_device_forward<'backend, 'leaf>(
 
     let output_norm = tape.leaf(&arch.output_norm)?;
     let normalized = tape.rmsnorm(hidden, output_norm, sequence, arch.n_embd, arch.rms_eps)?;
-    let logits = tape.matmul(normalized, masters[0], sequence, arch.vocab, arch.n_embd)?;
+    let head = model.lm_head_parameter_index();
+    let logits = tape.matmul(normalized, masters[head], sequence, arch.vocab, arch.n_embd)?;
     Ok(ResidentTrainingForward {
         logits,
         master_leaves: masters,
