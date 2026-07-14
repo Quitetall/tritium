@@ -954,12 +954,62 @@ mod tests {
                 assert!(matches!(projection, Projection::Salt(_)));
             }
         }
-        assert!(
-            untied_runner
-                .forward(&[0u32], &[0])
-                .expect("untied GGUF forward")
-                .iter()
-                .all(|value| value.is_finite())
+        let gguf_logits = untied_runner
+            .forward(&tokens, &positions)
+            .expect("untied GGUF forward");
+
+        let tslb_path = untied_dir.join("model.tslb");
+        std::fs::write(&tslb_path, write_salt_bundle(&untied_refs).unwrap()).unwrap();
+        let mut tslb_runner = ModelRunner::from_salt(
+            &untied_dir,
+            &tslb_path,
+            Box::new(tritium_cpu::CpuBackend::new()),
+        )
+        .expect("untied TSLB");
+        let tslb_logits = tslb_runner
+            .forward(&tokens, &positions)
+            .expect("untied TSLB forward");
+
+        let head_dense = salt_rows_to_dense(&head_rows).unwrap();
+        let untied_dense_provider = |name: &str| -> Result<Vec<f32>, NnError> {
+            if name == "lm_head.weight" {
+                Ok(head_dense.clone())
+            } else {
+                dense_provider(name)
+            }
+        };
+        let untied_config_json = std::fs::read_to_string(untied_dir.join("config.json")).unwrap();
+        let (untied_config, untied_spec) =
+            ModelConfig::from_hf_config(&untied_config_json).unwrap();
+        let untied_oracle_weights = build_standard_model(
+            &untied_config,
+            &untied_spec,
+            NameSchema::Hf,
+            |name| untied_dense_provider(name),
+            |name, n_out, k_in| {
+                Ok(Projection::Dense(DenseLinear::new(
+                    untied_dense_provider(name)?,
+                    n_out,
+                    k_in,
+                )?))
+            },
+        )
+        .unwrap();
+        let mut untied_oracle = ModelRunner::from_weights(
+            untied_config,
+            untied_oracle_weights,
+            Box::new(tritium_cpu::CpuBackend::new()),
+        );
+        let oracle_logits = untied_oracle
+            .forward(&tokens, &positions)
+            .expect("untied dense SALT oracle");
+        assert_eq!(
+            gguf_logits, oracle_logits,
+            "untied GGUF must preserve exact named SALT wiring"
+        );
+        assert_eq!(
+            tslb_logits, oracle_logits,
+            "untied TSLB must preserve exact named SALT wiring"
         );
 
         let missing_head_path = untied_dir.join("missing-head.salt.gguf");

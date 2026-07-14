@@ -322,7 +322,10 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     use tritium_cuda::CudaBackend;
     use tritium_cuda::train::{DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer};
     use tritium_format::TeacherCacheHeader;
-    use tritium_nn::{TeacherCacheReader, hash_teacher_corpus, hash_teacher_weights};
+    use tritium_nn::{
+        ModelWeights, TeacherCacheReader, TiedSwiGluTrainingModel, hash_teacher_corpus,
+        semantic_training_model_digest,
+    };
 
     const TRACK0_STEP_MS: f64 = 1123.0;
 
@@ -335,8 +338,12 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(STEPS);
+    let (config, spec, weights) = ModelWeights::load_hf(&dir).expect("load_hf");
+    let training_model =
+        TiedSwiGluTrainingModel::extract(&config, &spec, &weights).expect("training model");
+    let teacher_model_digest = semantic_training_model_digest(&config, &spec, &training_model);
     let runner =
-        ModelRunner::from_hf(&dir, Box::new(tritium_cpu::CpuBackend::new())).expect("from_hf");
+        ModelRunner::from_weights(config, weights, Box::new(tritium_cpu::CpuBackend::new()));
     let (a, fp, shapes) = extract(&runner);
     let (mut train_ids, eval_ids) = corpus();
     if let Some(n) = std::env::var("TRITIUM_TRAIN_TOKENS")
@@ -375,7 +382,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
             seq_len: TRAIN_SEQ as u32,
             vocab: a.vocab as u32,
             windows: windows.len() as u64,
-            model_hash: hash_teacher_weights(fp.iter().map(Vec::as_slice)),
+            model_hash: teacher_model_digest,
             corpus_hash: hash_teacher_corpus(&train_ids, TRAIN_SEQ as u32),
         };
         TeacherCacheReader::open(path, &expected).expect("open matching teacher cache")

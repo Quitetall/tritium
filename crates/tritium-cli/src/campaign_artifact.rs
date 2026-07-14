@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use tritium_format::{
     GGML_TYPE_TRITIUM_SALT, GgufStreamWriter, GgufTensorSpec, GgufValue, GgufWriteError,
@@ -39,7 +39,6 @@ use tritium_cuda::train::HostOffloadTrainer;
 const GGUF_VERSION: u32 = 3;
 const GGML_TYPE_F32: u32 = 0;
 const GGUF_ALIGNMENT: u32 = 32;
-const GROWTH_ALGORITHM: &str = "net2wider.intermediate-swiglu.splitmix64.v1";
 const TEMP_ATTEMPTS: usize = 32;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -80,7 +79,7 @@ impl ArtifactProvenance {
 }
 
 /// Replayable receipt for the one Net2Wider transform applied before training.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct GrowthReceipt {
     algorithm: String,
     old_width: u64,
@@ -88,6 +87,10 @@ pub(crate) struct GrowthReceipt {
     seed: u64,
     source_indices: Vec<u64>,
     replication_counts: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    split_denominator_log2: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    split_numerators: Option<Vec<u32>>,
 }
 
 impl GrowthReceipt {
@@ -113,66 +116,15 @@ impl GrowthReceipt {
                 u64::try_from(value).map_err(|_| invalid("growth replication count exceeds u64"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::new(
-            old_width,
-            new_width,
-            seed,
-            source_indices,
-            replication_counts,
-        )
-    }
-
-    fn new(
-        old_width: u64,
-        new_width: u64,
-        seed: u64,
-        source_indices: Vec<u64>,
-        replication_counts: Vec<u64>,
-    ) -> Result<Self, CampaignArtifactError> {
-        if old_width == 0 || new_width < old_width {
-            return Err(invalid(format!(
-                "growth widths must satisfy 0 < old <= new, got {old_width} -> {new_width}"
-            )));
-        }
-        if source_indices.len() as u128 != u128::from(new_width) {
-            return Err(invalid(
-                "growth source-index count does not equal new width",
-            ));
-        }
-        if replication_counts.len() as u128 != u128::from(old_width) {
-            return Err(invalid(
-                "growth replication-count count does not equal old width",
-            ));
-        }
-        let old_width_usize = usize::try_from(old_width)
-            .map_err(|_| invalid("growth old width exceeds this target"))?;
-        let mut actual_counts = vec![0_u64; old_width_usize];
-        for (index, &source) in source_indices.iter().enumerate() {
-            if source >= old_width {
-                return Err(invalid(format!(
-                    "growth source index {source} at position {index} exceeds old width {old_width}"
-                )));
-            }
-            if index < old_width_usize && source != index as u64 {
-                return Err(invalid("growth mapping does not have an identity prefix"));
-            }
-            let count = &mut actual_counts[source as usize];
-            *count = count
-                .checked_add(1)
-                .ok_or_else(|| invalid("growth replication count overflows u64"))?;
-        }
-        if actual_counts != replication_counts {
-            return Err(invalid(
-                "growth replication counts disagree with source mapping",
-            ));
-        }
         Ok(Self {
-            algorithm: GROWTH_ALGORITHM.to_owned(),
+            algorithm: plan.algorithm().to_owned(),
             old_width,
             new_width,
             seed,
             source_indices,
             replication_counts,
+            split_denominator_log2: plan.split_denominator_log2(),
+            split_numerators: plan.split_numerators().map(<[u32]>::to_vec),
         })
     }
 
@@ -1291,7 +1243,30 @@ mod tests {
     }
 
     fn growth() -> GrowthReceipt {
-        GrowthReceipt::new(2, 3, 99, vec![0, 1, 0], vec![2, 1]).expect("growth")
+        let plan = tritium_train::Net2WiderPlan::seeded(2, 3, 99).expect("growth plan");
+        GrowthReceipt::from_plan(&plan, 99).expect("growth receipt")
+    }
+
+    #[test]
+    fn growth_receipt_uses_canonical_v2_split_metadata() {
+        let plan = tritium_train::Net2WiderPlan::seeded(2, 3, 99).expect("growth plan");
+        let receipt = GrowthReceipt::from_plan(&plan, 99).expect("growth receipt");
+
+        assert_eq!(
+            receipt.canonical_json().expect("canonical receipt"),
+            r#"{"algorithm":"net2wider.intermediate-swiglu.splitmix64.dyadic-unequal.v2","old_width":2,"new_width":3,"seed":99,"source_indices":[0,1,1],"replication_counts":[1,2],"split_denominator_log2":24,"split_numerators":[16777216,4194304,12582912]}"#
+        );
+    }
+
+    #[test]
+    fn identity_growth_receipt_preserves_exact_v1_json() {
+        let plan = tritium_train::Net2WiderPlan::seeded(2, 2, 99).expect("identity plan");
+        let receipt = GrowthReceipt::from_plan(&plan, 99).expect("identity receipt");
+
+        assert_eq!(
+            receipt.canonical_json().expect("canonical receipt"),
+            r#"{"algorithm":"net2wider.intermediate-swiglu.splitmix64.v1","old_width":2,"new_width":2,"seed":99,"source_indices":[0,1],"replication_counts":[1,1]}"#
+        );
     }
 
     fn config() -> &'static str {
@@ -1442,7 +1417,7 @@ mod tests {
         assert_eq!(
             plan.metadata.get(TRAINING_SALT_GROWTH_RECEIPT_KEY),
             Some(&GgufValue::String(
-                r#"{"algorithm":"net2wider.intermediate-swiglu.splitmix64.v1","old_width":2,"new_width":3,"seed":99,"source_indices":[0,1,0],"replication_counts":[2,1]}"#
+                r#"{"algorithm":"net2wider.intermediate-swiglu.splitmix64.dyadic-unequal.v2","old_width":2,"new_width":3,"seed":99,"source_indices":[0,1,1],"replication_counts":[1,2],"split_denominator_log2":24,"split_numerators":[16777216,4194304,12582912]}"#
                     .to_owned()
             ))
         );
@@ -1593,7 +1568,6 @@ mod tests {
     fn rejects_provenance_growth_config_and_source_mismatches() {
         assert!(ArtifactProvenance::new(&"00".repeat(32), [2; 32], [3; 32], 0).is_err());
         assert!(ArtifactProvenance::new(&"AA".repeat(32), [2; 32], [3; 32], 0).is_err());
-        assert!(GrowthReceipt::new(2, 3, 0, vec![0, 1, 0], vec![1, 2]).is_err());
 
         let bad_config = config().replace("\"intermediate_size\": 2", "\"intermediate_size\": 4");
         assert!(

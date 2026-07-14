@@ -61,4 +61,5 @@ pub use training::{
 pub use training::{
     SwiGluTrainingArchitecture, SwiGluTrainingModel, TiedSwiGluTrainingArchitecture,
     TiedSwiGluTrainingModel, TrainingAdapterError, TrainingParameter,
+    semantic_training_model_digest,
 };

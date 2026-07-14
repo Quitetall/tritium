@@ -18,16 +18,18 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(all(feature = "cuda", windows))]
 use std::os::windows::fs::MetadataExt as _;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use tritium_format::TeacherCacheHeader;
 #[cfg(feature = "cuda")]
 use tritium_format::write_teacher_cache_header;
 use tritium_nn::{
-    ArchSpec, MlpKind, ModelConfig, ModelRunner, ModelWeights, TeacherCacheWriter,
-    TiedSwiGluTrainingModel, hash_teacher_corpus,
+    ArchSpec, ModelConfig, ModelRunner, ModelWeights, TeacherCacheWriter,
+    TiedSwiGluTrainingModel, hash_teacher_corpus, semantic_training_model_digest,
 };
+#[cfg(test)]
+use tritium_nn::MlpKind;
 
 #[cfg(feature = "nccl")]
 use std::time::Duration;
@@ -338,9 +340,35 @@ fn semantic_model_digest(
     spec: &ArchSpec,
     model: &TiedSwiGluTrainingModel,
 ) -> [u8; 32] {
-    semantic_model_digest_parts(config, spec, model.architecture(), model.parameters())
+    semantic_training_model_digest(config, spec, model)
 }
 
+fn training_parameter_count(model: &TiedSwiGluTrainingModel) -> anyhow::Result<u64> {
+    let matrix_count = model
+        .parameters()
+        .iter()
+        .try_fold(0_u64, |total, parameter| {
+            let elements = u64::try_from(parameter.elements())
+                .with_context(|| format!("{} element count exceeds u64", parameter.name))?;
+            total
+                .checked_add(elements)
+                .with_context(|| format!("parameter count overflows at {}", parameter.name))
+        })?;
+    model
+        .architecture()
+        .attn_norms
+        .iter()
+        .chain(&model.architecture().ffn_norms)
+        .chain(core::iter::once(&model.architecture().output_norm))
+        .try_fold(matrix_count, |total, norm| {
+            let elements = u64::try_from(norm.len()).context("norm element count exceeds u64")?;
+            total
+                .checked_add(elements)
+                .context("parameter count overflows")
+        })
+}
+
+#[cfg(test)]
 fn semantic_model_digest_parts(
     config: &ModelConfig,
     spec: &ArchSpec,
@@ -1105,6 +1133,10 @@ struct CampaignGrowthReceipt {
     seed: u64,
     source_indices: Vec<u64>,
     replication_counts: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split_denominator_log2: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split_numerators: Option<Vec<u32>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1113,7 +1145,7 @@ fn campaign_growth_receipt(
     seed: u64,
 ) -> anyhow::Result<CampaignGrowthReceipt> {
     Ok(CampaignGrowthReceipt {
-        algorithm: "net2wider.intermediate-swiglu.splitmix64.v1".to_owned(),
+        algorithm: plan.algorithm().to_owned(),
         old_width: u64::try_from(plan.replication_counts().len())
             .context("growth old width exceeds u64")?,
         new_width: u64::try_from(plan.source_indices().len())
@@ -1129,6 +1161,8 @@ fn campaign_growth_receipt(
             .iter()
             .map(|&value| u64::try_from(value).context("growth replication count exceeds u64"))
             .collect::<anyhow::Result<Vec<_>>>()?,
+        split_denominator_log2: plan.split_denominator_log2(),
+        split_numerators: plan.split_numerators().map(<[u32]>::to_vec),
     })
 }
 
@@ -1805,6 +1839,8 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("load HuggingFace model {}", campaign.model_dir.display()))?;
     let mut model = TiedSwiGluTrainingModel::extract(&model_config, &spec, &weights)
         .context("validate tied-SwiGLU training adapter")?;
+    let source_parameter_count =
+        training_parameter_count(&model).context("count source model parameters")?;
     let source_model_digest = semantic_model_digest(&model_config, &spec, &model);
     let model_config_file_digest = blake3_digest(&raw_model_config);
     let (tokens, corpus_file_digest) = read_corpus(&campaign.corpus)?;
@@ -1900,6 +1936,8 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     let mut student_config = model_config.clone();
     student_config.n_ff =
         u32::try_from(new_width).context("grown intermediate width exceeds u32")?;
+    let grown_parameter_count =
+        training_parameter_count(&model).context("count initial student parameters")?;
     let initial_student_digest = semantic_model_digest(&student_config, &spec, &model);
     let evaluation_corpus_path = path_identity(&campaign.evaluation_corpus)?;
     let artifact_path = path_identity(&campaign.artifact)?;
@@ -1954,12 +1992,43 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     }
     world.verify_contract_digest(parse_lower_hex_digest(&plan.fingerprint)?)?;
 
+    let initial_student_model_identity = hex_digest(initial_student_digest);
+    let grown_fp_score = if world.is_owner() && new_width > old_width {
+        let grown_runner_config = student_config.clone();
+        Some(
+            resumable_teacher_forced_score(
+                &campaign
+                    .checkpoint_dir
+                    .join("grown-fp-evaluation-progress.json"),
+                "grown-fp",
+                &initial_student_model_identity,
+                &evaluation_tokens,
+                campaign.seq_len,
+                evaluation_corpus_file_digest,
+                evaluation_corpus_digest,
+                || {
+                    let dense_weights = model
+                        .to_dense_weights()
+                        .context("reconstruct widened dense-fp evaluation weights")?;
+                    Ok(ModelRunner::from_weights(
+                        grown_runner_config,
+                        dense_weights,
+                        Box::new(tritium_cpu::CpuBackend::new()),
+                    ))
+                },
+            )
+            .context("score grown fp model on the held-out evaluation corpus")?,
+        )
+    } else {
+        None
+    };
+
     // Score the immutable, widened student before optimizer ownership drains or
     // mutates any master. Only rank 0 owns durable evaluation evidence. Packing
     // is lazy, so a completed progress sidecar resumes without rebuilding the
     // compact PTQ model.
     let naive_salt_ptq_model_identity =
-        naive_salt_ptq_model_identity(&hex_digest(initial_student_digest), campaign.salt_planes)?;
+        naive_salt_ptq_model_identity(&initial_student_model_identity, campaign.salt_planes)?;
     let naive_salt_ptq_score = if world.is_owner() {
         Some(
             resumable_naive_salt_ptq_score(
@@ -2067,6 +2136,8 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         input_hashes: &input_hashes,
         static_memory,
         salt_planes: campaign.salt_planes,
+        source_parameter_count,
+        grown_parameter_count,
     };
     let previous_report = if world.is_owner() {
         load_existing_report(&campaign.report, &report_expectations)?
@@ -2135,6 +2206,9 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             &growth,
             &evaluation_tokens,
             source_score.context("rank 0 source evaluation evidence is missing")?,
+            grown_fp_score,
+            source_parameter_count,
+            grown_parameter_count,
             naive_salt_ptq_score.context("rank 0 naive SALT PTQ evidence is missing")?,
             &naive_salt_ptq_model_identity,
             evaluation_corpus_file_digest,
@@ -2324,6 +2398,9 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         &growth,
         &evaluation_tokens,
         source_score.context("rank 0 source evaluation evidence is missing")?,
+        grown_fp_score,
+        source_parameter_count,
+        grown_parameter_count,
         naive_salt_ptq_score.context("rank 0 naive SALT PTQ evidence is missing")?,
         &naive_salt_ptq_model_identity,
         evaluation_corpus_file_digest,
@@ -3000,6 +3077,9 @@ fn evaluate_terminal_artifact(
     growth: &CampaignGrowthReceipt,
     evaluation_tokens: &[u32],
     source_score: TeacherForcedPerplexity,
+    grown_fp_score: Option<TeacherForcedPerplexity>,
+    source_parameter_count: u64,
+    grown_parameter_count: u64,
     naive_salt_ptq_score: TeacherForcedPerplexity,
     naive_salt_ptq_model_identity: &str,
     evaluation_corpus_file_digest: [u8; 32],
@@ -3044,6 +3124,8 @@ fn evaluate_terminal_artifact(
         || metadata.growth.seed != growth.seed
         || metadata.growth.source_indices != growth.source_indices
         || metadata.growth.replication_counts != growth.replication_counts
+        || metadata.growth.split_denominator_log2 != growth.split_denominator_log2
+        || metadata.growth.split_numerators != growth.split_numerators
     {
         bail!("terminal artifact growth receipt does not match the immutable campaign plan");
     }
@@ -3067,8 +3149,12 @@ fn evaluate_terminal_artifact(
     let evaluation = evaluation_report(
         campaign,
         artifact,
+        &plan.initial_student_digest,
         naive_salt_ptq_model_identity,
         source_score,
+        grown_fp_score,
+        source_parameter_count,
+        grown_parameter_count,
         naive_salt_ptq_score,
         score,
         evaluation_corpus_file_digest,
@@ -3418,8 +3504,12 @@ fn teacher_forced_score_from_full_logits(
 fn evaluation_report(
     campaign: &CampaignConfig,
     artifact: &CampaignArtifactReport,
+    grown_fp_model_identity: &str,
     naive_salt_ptq_model_identity: &str,
     source_score: TeacherForcedPerplexity,
+    grown_fp_score: Option<TeacherForcedPerplexity>,
+    source_parameter_count: u64,
+    grown_parameter_count: u64,
     naive_salt_ptq_score: TeacherForcedPerplexity,
     score: TeacherForcedPerplexity,
     corpus_file_digest: [u8; 32],
@@ -3429,12 +3519,41 @@ fn evaluation_report(
         || source_score.token_count != score.token_count
         || naive_salt_ptq_score.window_count != score.window_count
         || naive_salt_ptq_score.token_count != score.token_count
+        || grown_fp_score.is_some_and(|grown| {
+            grown.window_count != score.window_count || grown.token_count != score.token_count
+        })
     {
-        bail!("source, naive PTQ, and artifact evaluation coverage differ");
+        bail!("source, grown-fp, naive PTQ, and artifact evaluation coverage differ");
     }
     if naive_salt_ptq_model_identity.is_empty() {
         bail!("naive SALT PTQ model identity is empty");
     }
+    let grown_fp = match grown_fp_score {
+        Some(grown) => {
+            if grown_fp_model_identity.is_empty()
+                || source_parameter_count == 0
+                || grown_parameter_count <= source_parameter_count
+            {
+                bail!("grown-fp evidence has invalid identity or parameter geometry");
+            }
+            Some(CampaignGrownFpReport {
+                model_identity: grown_fp_model_identity.to_owned(),
+                source_parameter_count,
+                grown_parameter_count,
+                negative_log_likelihood: grown.negative_log_likelihood,
+                perplexity: grown.perplexity,
+                relative_perplexity_delta_percent: (grown.perplexity / source_score.perplexity
+                    - 1.0)
+                    * 100.0,
+            })
+        }
+        None => {
+            if grown_parameter_count != source_parameter_count {
+                bail!("missing grown-fp score for a widened parameter geometry");
+            }
+            None
+        }
+    };
     Ok(CampaignEvaluationReport {
         artifact_package_id: artifact.package_id.clone(),
         corpus_path: path_identity(&campaign.evaluation_corpus)?
@@ -3459,6 +3578,7 @@ fn evaluation_report(
         relative_perplexity_delta_percent: (score.perplexity / source_score.perplexity - 1.0)
             * 100.0,
         recovery_vs_naive_salt_ptq: naive_salt_ptq_score.perplexity / score.perplexity,
+        grown_fp,
     })
 }
 
@@ -3590,6 +3710,18 @@ struct CampaignPtqBaselineReport {
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct CampaignGrownFpReport {
+    model_identity: String,
+    source_parameter_count: u64,
+    grown_parameter_count: u64,
+    negative_log_likelihood: f64,
+    perplexity: f64,
+    relative_perplexity_delta_percent: f64,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CampaignEvaluationReport {
     artifact_package_id: String,
     corpus_path: String,
@@ -3605,6 +3737,8 @@ struct CampaignEvaluationReport {
     perplexity: f64,
     relative_perplexity_delta_percent: f64,
     recovery_vs_naive_salt_ptq: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grown_fp: Option<CampaignGrownFpReport>,
 }
 
 #[cfg(feature = "cuda")]
@@ -3718,6 +3852,8 @@ struct ReportExpectations<'a> {
     input_hashes: &'a CampaignInputHashes,
     static_memory: CampaignStaticMemory,
     salt_planes: usize,
+    source_parameter_count: u64,
+    grown_parameter_count: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -4029,6 +4165,8 @@ fn validate_cuda_memory_segments(
     evaluation_seq_len: usize,
     evaluation_windows: u64,
     evaluation_corpus_path: &Path,
+    source_parameter_count: u64,
+    grown_parameter_count: u64,
 ) -> anyhow::Result<()> {
     if report.cuda_memory_segments.is_empty() {
         bail!("prior report {} has no CUDA memory segment", path.display());
@@ -4169,6 +4307,28 @@ fn validate_cuda_memory_segments(
         let expected_relative_delta =
             (evaluation.perplexity / evaluation.source_fp_perplexity - 1.0) * 100.0;
         let expected_recovery = evaluation.naive_salt_ptq.perplexity / evaluation.perplexity;
+        let expects_growth = grown_parameter_count > source_parameter_count;
+        let valid_grown_fp = match &evaluation.grown_fp {
+            Some(grown) => {
+                let expected_perplexity =
+                    (grown.negative_log_likelihood / evaluation.token_count as f64).exp();
+                let expected_relative_delta =
+                    (grown.perplexity / evaluation.source_fp_perplexity - 1.0) * 100.0;
+                expects_growth
+                    && grown.model_identity == report.input_hashes.initial_student_model
+                    && grown.source_parameter_count == source_parameter_count
+                    && grown.grown_parameter_count == grown_parameter_count
+                    && grown.negative_log_likelihood.is_finite()
+                    && grown.negative_log_likelihood >= 0.0
+                    && grown.perplexity.is_finite()
+                    && grown.perplexity > 0.0
+                    && grown.relative_perplexity_delta_percent.is_finite()
+                    && expected_perplexity.to_bits() == grown.perplexity.to_bits()
+                    && expected_relative_delta.to_bits()
+                        == grown.relative_perplexity_delta_percent.to_bits()
+            }
+            None => !expects_growth && grown_parameter_count == source_parameter_count,
+        };
         if artifact.package_id != evaluation.artifact_package_id
             || artifact.physical_bytes == 0
             || !artifact.scale_max_abs_error.is_finite()
@@ -4211,6 +4371,7 @@ fn validate_cuda_memory_segments(
             || expected_relative_delta.to_bits()
                 != evaluation.relative_perplexity_delta_percent.to_bits()
             || expected_recovery.to_bits() != evaluation.recovery_vs_naive_salt_ptq.to_bits()
+            || !valid_grown_fp
         {
             bail!(
                 "prior report {} has inconsistent artifact/evaluation evidence",
@@ -4244,15 +4405,52 @@ fn load_existing_report(
             return Err(error).with_context(|| format!("read prior report {}", path.display()));
         }
     };
-    let mut report: CampaignReport = serde_json::from_slice(&bytes)
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse prior report {}", path.display()))?;
-    if report.schema_version != 6 {
-        bail!(
-            "prior report {} uses unsupported schema version {}",
-            path.display(),
-            report.schema_version
-        );
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .with_context(|| {
+            format!(
+                "prior report {} has a missing or invalid schema version",
+                path.display()
+            )
+        })?;
+    match schema_version {
+        6 => {}
+        5 => {
+            let object = value
+                .as_object_mut()
+                .with_context(|| format!("prior report {} is not a JSON object", path.display()))?;
+            let has_artifact = object
+                .get("artifact")
+                .is_some_and(|artifact| !artifact.is_null());
+            let has_evaluation = object
+                .get("evaluation")
+                .is_some_and(|evaluation| !evaluation.is_null());
+            ensure!(
+                has_artifact == has_evaluation,
+                "prior schema-5 report {} has unpaired artifact/evaluation evidence",
+                path.display()
+            );
+            // Schema 6 adds independently persisted naive-PTQ evidence. Preserve and
+            // validate all common checkpoint/timing/memory fields, but discard legacy
+            // terminal evidence: the terminal path deterministically rebuilds and
+            // re-evaluates the artifact against the persisted PTQ accumulator.
+            object.insert("schema_version".into(), serde_json::Value::from(6));
+            object.insert("artifact".into(), serde_json::Value::Null);
+            object.insert("evaluation".into(), serde_json::Value::Null);
+        }
+        unsupported => {
+            bail!(
+                "prior report {} uses unsupported schema version {unsupported}",
+                path.display()
+            );
+        }
     }
+    let mut report: CampaignReport = serde_json::from_value(value)
+        .with_context(|| format!("decode prior report {}", path.display()))?;
     if report.plan_fingerprint != expected.plan_fingerprint {
         bail!(
             "prior report {} belongs to a different immutable campaign plan",
@@ -4352,6 +4550,8 @@ fn load_existing_report(
         expected.evaluation_seq_len,
         expected.evaluation_windows,
         expected.evaluation_corpus_path,
+        expected.source_parameter_count,
+        expected.grown_parameter_count,
     )?;
     if report.completed_step < expected.checkpoint_step {
         bail!(
@@ -4417,7 +4617,17 @@ mod tests {
             seed: 0,
             source_indices: vec![0, 1, 2],
             replication_counts: vec![1, 1, 1],
+            split_denominator_log2: None,
+            split_numerators: None,
         }
+    }
+
+    #[test]
+    fn identity_growth_receipt_keeps_canonical_v1_json() {
+        assert_eq!(
+            serde_json::to_string(&test_growth()).unwrap(),
+            r#"{"algorithm":"net2wider.intermediate-swiglu.splitmix64.v1","old_width":3,"new_width":3,"seed":0,"source_indices":[0,1,2],"replication_counts":[1,1,1]}"#
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -5166,7 +5376,11 @@ mod tests {
             &campaign,
             &artifact,
             "immutable-plan",
+            "immutable-plan",
             score(2.0),
+            Some(score(2.0)),
+            100,
+            200,
             score(900.0),
             score(3.0),
             [7; 32],
@@ -5183,6 +5397,12 @@ mod tests {
             report.recovery_vs_naive_salt_ptq.to_bits(),
             300.0_f64.to_bits()
         );
+        let grown_fp = report.grown_fp.expect("grown fp evidence");
+        assert_eq!(grown_fp.model_identity, "immutable-plan");
+        assert_eq!(grown_fp.source_parameter_count, 100);
+        assert_eq!(grown_fp.grown_parameter_count, 200);
+        assert_eq!(grown_fp.perplexity.to_bits(), 2.0_f64.to_bits());
+        assert_eq!(grown_fp.relative_perplexity_delta_percent, 0.0);
     }
 
     #[cfg(feature = "cuda")]
@@ -5556,6 +5776,8 @@ mod tests {
             input_hashes: &input_hashes,
             static_memory,
             salt_planes: 2,
+            source_parameter_count: 100,
+            grown_parameter_count: 100,
         };
 
         let resumed = load_existing_report(&path, &expected).unwrap().unwrap();
@@ -5635,11 +5857,67 @@ mod tests {
             perplexity: artifact_ppl,
             relative_perplexity_delta_percent: (artifact_ppl / source_ppl - 1.0) * 100.0,
             recovery_vs_naive_salt_ptq: ptq_ppl / artifact_ppl,
+            grown_fp: None,
         });
         std::fs::write(&path, serde_json::to_vec(&terminal).unwrap()).unwrap();
         let resumed_terminal = load_existing_report(&path, &expected).unwrap().unwrap();
         assert!(resumed_terminal.artifact.is_none());
         assert!(resumed_terminal.evaluation.is_none());
+
+        let grown_expected = ReportExpectations {
+            grown_parameter_count: 200,
+            ..expected
+        };
+        let mut grown_terminal = terminal.clone();
+        grown_terminal.evaluation.as_mut().unwrap().grown_fp = Some(CampaignGrownFpReport {
+            model_identity: input_hashes.initial_student_model.clone(),
+            source_parameter_count: 100,
+            grown_parameter_count: 200,
+            negative_log_likelihood: source_nll,
+            perplexity: source_ppl,
+            relative_perplexity_delta_percent: 0.0,
+        });
+        std::fs::write(&path, serde_json::to_vec(&grown_terminal).unwrap()).unwrap();
+        load_existing_report(&path, &grown_expected)
+            .expect("grown report validation")
+            .expect("grown report exists");
+        let mut corrupt_grown = grown_terminal;
+        corrupt_grown
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .grown_fp
+            .as_mut()
+            .unwrap()
+            .relative_perplexity_delta_percent = 1.0;
+        std::fs::write(&path, serde_json::to_vec(&corrupt_grown).unwrap()).unwrap();
+        assert!(
+            load_existing_report(&path, &grown_expected)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent artifact/evaluation evidence")
+        );
+
+        let mut legacy_terminal = serde_json::to_value(&terminal).unwrap();
+        legacy_terminal["schema_version"] = serde_json::Value::from(5);
+        let legacy_evaluation = legacy_terminal["evaluation"].as_object_mut().unwrap();
+        legacy_evaluation.remove("naive_salt_ptq");
+        legacy_evaluation.remove("recovery_vs_naive_salt_ptq");
+        std::fs::write(&path, serde_json::to_vec(&legacy_terminal).unwrap()).unwrap();
+        let migrated_terminal = load_existing_report(&path, &expected).unwrap().unwrap();
+        assert_eq!(migrated_terminal.schema_version, 6);
+        assert_eq!(migrated_terminal.completed_step, 3);
+        assert!(migrated_terminal.artifact.is_none());
+        assert!(migrated_terminal.evaluation.is_none());
+        let mut unpaired_legacy = legacy_terminal;
+        unpaired_legacy["evaluation"] = serde_json::Value::Null;
+        std::fs::write(&path, serde_json::to_vec(&unpaired_legacy).unwrap()).unwrap();
+        assert!(
+            load_existing_report(&path, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("unpaired artifact/evaluation")
+        );
 
         let mut corrupt = terminal.clone();
         corrupt
@@ -5673,8 +5951,14 @@ mod tests {
                 .contains("inconsistent artifact/evaluation evidence")
         );
 
+        let mut legacy = report.clone();
+        legacy.schema_version = 5;
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let migrated = load_existing_report(&path, &expected).unwrap().unwrap();
+        assert_eq!(migrated.schema_version, 6);
+        assert_eq!(migrated.completed_step, 3);
         let mut corrupt = report.clone();
-        corrupt.schema_version = 5;
+        corrupt.schema_version = 4;
         assert!(rejects(&corrupt).to_string().contains("unsupported schema"));
         let mut corrupt = report.clone();
         corrupt.configured_steps = 6;
@@ -5921,6 +6205,20 @@ mod tests {
         assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
         let mut changed_growth = growth.clone();
         changed_growth.seed = 1;
+        let changed = PlanInputs {
+            growth: &changed_growth,
+            ..base
+        };
+        assert_ne!(first.fingerprint, build_plan_sidecar(&changed).fingerprint);
+        let mut changed_growth = growth.clone();
+        changed_growth.algorithm = tritium_train::grow::NET2WIDER_ALGORITHM_V2.into();
+        changed_growth.old_width = 2;
+        changed_growth.new_width = 3;
+        changed_growth.seed = 99;
+        changed_growth.source_indices = vec![0, 1, 1];
+        changed_growth.replication_counts = vec![1, 2];
+        changed_growth.split_denominator_log2 = Some(24);
+        changed_growth.split_numerators = Some(vec![16_777_216, 4_194_304, 12_582_912]);
         let changed = PlanInputs {
             growth: &changed_growth,
             ..base

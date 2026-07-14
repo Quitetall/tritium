@@ -10,7 +10,10 @@
 //! master. Unsupported variants fail explicitly instead of being run through a
 //! silently incomplete training graph.
 
-use crate::{ArchSpec, Mlp, MlpKind, ModelConfig, ModelWeights, Projection};
+use crate::{
+    ArchSpec, DenseLinear, Mlp, MlpKind, ModelConfig, ModelWeights, Projection, SwiGluMlp,
+    TransformerBlock,
+};
 
 /// Failure to adapt or execute a SwiGLU training model.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,6 +129,76 @@ pub struct TiedSwiGluTrainingModel {
     lm_head_tied: bool,
 }
 
+/// Hash every semantic input consumed by a SwiGLU training graph.
+///
+/// The digest binds the HuggingFace configuration, supported architecture flags,
+/// canonical parameter names/shapes/masters, and fixed norm vectors. It is the
+/// authoritative teacher-cache and campaign model identity; callers must not
+/// substitute a value-only weight hash because that omits graph semantics.
+#[must_use]
+pub fn semantic_training_model_digest(
+    config: &ModelConfig,
+    spec: &ArchSpec,
+    model: &TiedSwiGluTrainingModel,
+) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tritium-tied-swiglu-training-model-v1");
+    digest_bytes(&mut hash, config.arch.as_bytes());
+    for value in [
+        config.n_layers,
+        config.n_embd,
+        config.n_head,
+        config.n_head_kv,
+        config.head_dim,
+        config.n_ff,
+        config.n_ctx,
+    ] {
+        hash.update(&(value as u64).to_le_bytes());
+    }
+    hash.update(&config.rope_theta.to_bits().to_le_bytes());
+    hash.update(&config.rms_eps.to_bits().to_le_bytes());
+    hash.update(&[match spec.mlp {
+        MlpKind::Relu2 => 0,
+        MlpKind::SwiGlu => 1,
+    }]);
+    hash.update(&[
+        u8::from(spec.attn_sub_norm),
+        u8::from(spec.ffn_sub_norm),
+        u8::from(spec.qk_norm),
+        u8::from(spec.qkv_bias),
+        u8::from(spec.tied_embeddings),
+    ]);
+    hash.update(&(model.parameters.len() as u64).to_le_bytes());
+    for parameter in &model.parameters {
+        digest_bytes(&mut hash, parameter.name.as_bytes());
+        hash.update(&(parameter.rows as u64).to_le_bytes());
+        hash.update(&(parameter.cols as u64).to_le_bytes());
+        digest_f32s(&mut hash, &parameter.master);
+    }
+    hash.update(&(model.arch.attn_norms.len() as u64).to_le_bytes());
+    for norm in &model.arch.attn_norms {
+        digest_f32s(&mut hash, norm);
+    }
+    hash.update(&(model.arch.ffn_norms.len() as u64).to_le_bytes());
+    for norm in &model.arch.ffn_norms {
+        digest_f32s(&mut hash, norm);
+    }
+    digest_f32s(&mut hash, &model.arch.output_norm);
+    *hash.finalize().as_bytes()
+}
+
+fn digest_bytes(hash: &mut blake3::Hasher, bytes: &[u8]) {
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+fn digest_f32s(hash: &mut blake3::Hasher, values: &[f32]) {
+    hash.update(&(values.len() as u64).to_le_bytes());
+    for value in values {
+        hash.update(&value.to_bits().to_le_bytes());
+    }
+}
+
 impl TiedSwiGluTrainingModel {
     /// Fixed architecture and fp32 norm weights used by the training graph.
     #[must_use]
@@ -169,12 +242,154 @@ impl TiedSwiGluTrainingModel {
             .collect()
     }
 
+    /// Reconstruct exact-fp inference weights from the canonical latent masters.
+    ///
+    /// Every trainable projection uses [`DenseLinear::new_exact`], so a caller can
+    /// score the current student through [`crate::ModelRunner`] without activation
+    /// quantization. The current architecture is authoritative, including a widened
+    /// [`Self::architecture`]'s `n_ff`; callers must pair the returned weights with a
+    /// [`ModelConfig`] carrying that same intermediate width. Tied heads remain
+    /// tied to the embedding, while an untied final `lm_head.weight` is reconstructed
+    /// as its own dense projection.
+    ///
+    /// This method clones every master and all fixed norm vectors. It therefore
+    /// temporarily retains one additional full dense fp32 model plane and is meant
+    /// for bounded evaluation before [`Self::take_parameter_masters`] hands ownership
+    /// to an optimizer. It intentionally fails after that scale-safe handoff instead
+    /// of silently building incomplete weights.
+    ///
+    /// # Errors
+    /// Returns [`TrainingAdapterError::InvalidInput`] if canonical parameter
+    /// geometry is inconsistent or any latent master has been drained, and
+    /// [`TrainingAdapterError::TensorShape`] if fixed norm geometry is invalid.
+    pub fn to_dense_weights(&self) -> Result<ModelWeights, TrainingAdapterError> {
+        let arch = &self.arch;
+        let expected_parameters = arch
+            .n_layers
+            .checked_mul(7)
+            .and_then(|count| count.checked_add(1))
+            .and_then(|count| count.checked_add(usize::from(!self.lm_head_tied)))
+            .ok_or_else(|| invalid_input("parameter count overflows usize"))?;
+        if self.parameters.len() != expected_parameters {
+            return Err(tensor_mismatch(
+                "canonical training parameter count",
+                expected_parameters,
+                self.parameters.len(),
+            ));
+        }
+        if arch.attn_norms.len() != arch.n_layers {
+            return Err(tensor_mismatch(
+                "attention norm count",
+                arch.n_layers,
+                arch.attn_norms.len(),
+            ));
+        }
+        if arch.ffn_norms.len() != arch.n_layers {
+            return Err(tensor_mismatch(
+                "FFN norm count",
+                arch.n_layers,
+                arch.ffn_norms.len(),
+            ));
+        }
+        validate_vector("model.norm.weight", &arch.output_norm, arch.n_embd)?;
+        for layer_index in 0..arch.n_layers {
+            validate_vector(
+                &format!("model.layers.{layer_index}.input_layernorm.weight"),
+                &arch.attn_norms[layer_index],
+                arch.n_embd,
+            )?;
+            validate_vector(
+                &format!("model.layers.{layer_index}.post_attention_layernorm.weight"),
+                &arch.ffn_norms[layer_index],
+                arch.n_embd,
+            )?;
+        }
+
+        let q_width = arch
+            .n_head
+            .checked_mul(arch.head_dim)
+            .ok_or_else(|| invalid_input("query projection width overflows usize"))?;
+        let kv_width = arch
+            .n_head_kv
+            .checked_mul(arch.head_dim)
+            .ok_or_else(|| invalid_input("key/value projection width overflows usize"))?;
+        let expected_geometry = core::iter::once((arch.vocab, arch.n_embd))
+            .chain((0..arch.n_layers).flat_map(|_| {
+                [
+                    (q_width, arch.n_embd),
+                    (kv_width, arch.n_embd),
+                    (kv_width, arch.n_embd),
+                    (arch.n_embd, q_width),
+                    (arch.n_ff, arch.n_embd),
+                    (arch.n_ff, arch.n_embd),
+                    (arch.n_embd, arch.n_ff),
+                ]
+            }))
+            .chain((!self.lm_head_tied).then_some((arch.vocab, arch.n_embd)));
+        for (index, (parameter, (rows, cols))) in
+            self.parameters.iter().zip(expected_geometry).enumerate()
+        {
+            validate_parameter_geometry(parameter, rows, cols)?;
+            if parameter.master.len() != parameter.elements() {
+                return Err(invalid_input(&format!(
+                    "{} master at canonical index {index} is drained or shape-inconsistent",
+                    parameter.name
+                )));
+            }
+        }
+
+        let dense = |index: usize| -> Result<Projection, TrainingAdapterError> {
+            let parameter = &self.parameters[index];
+            DenseLinear::new_exact(parameter.master.clone(), parameter.rows, parameter.cols)
+                .map(Projection::Dense)
+                .map_err(|error| invalid_input(&format!("{}: {error}", parameter.name)))
+        };
+        let mut layers = Vec::with_capacity(arch.n_layers);
+        for layer_index in 0..arch.n_layers {
+            let base = 1 + 7 * layer_index;
+            layers.push(TransformerBlock {
+                attn_norm: arch.attn_norms[layer_index].clone(),
+                q_proj: dense(base)?,
+                k_proj: dense(base + 1)?,
+                v_proj: dense(base + 2)?,
+                o_proj: dense(base + 3)?,
+                attn_sub_norm: Vec::new(),
+                q_bias: Vec::new(),
+                k_bias: Vec::new(),
+                v_bias: Vec::new(),
+                q_norm: Vec::new(),
+                k_norm: Vec::new(),
+                ffn_norm: arch.ffn_norms[layer_index].clone(),
+                mlp: Mlp::SwiGlu(SwiGluMlp {
+                    gate: dense(base + 4)?,
+                    up: dense(base + 5)?,
+                    down: dense(base + 6)?,
+                }),
+            });
+        }
+        let lm_head = if self.lm_head_tied {
+            None
+        } else {
+            Some(dense(self.parameters.len() - 1)?)
+        };
+
+        Ok(ModelWeights {
+            token_embd: self.parameters[0].master.clone(),
+            vocab: arch.vocab,
+            n_embd: arch.n_embd,
+            layers,
+            output_norm: arch.output_norm.clone(),
+            lm_head,
+        })
+    }
+
     /// Deterministically widen every SwiGLU intermediate axis in place.
     ///
     /// One [`tritium_train::Net2WiderPlan`] is shared by all transformer layers:
     /// gate and up rows are copied from the selected source units, while down
-    /// columns are copied and divided by each source unit's replication count.
-    /// This preserves the dense fp32 SwiGLU function before SALT quantization.
+    /// columns receive the plan's positive unequal dyadic shares. Those shares
+    /// sum to one per source unit, preserving the dense fp32 SwiGLU function
+    /// before SALT quantization while breaking clone permutation symmetry.
     /// Canonical parameter names and order are unchanged.
     ///
     /// The model is fully preflighted before mutation. During mutation, only one

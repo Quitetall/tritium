@@ -1,5 +1,11 @@
+use tritium_train::grow::{
+    NET2WIDER_ALGORITHM_V1, NET2WIDER_ALGORITHM_V2, NET2WIDER_MAX_REPLICATIONS_PER_SOURCE,
+    NET2WIDER_SPLIT_DENOMINATOR_LOG2,
+};
 use tritium_train::ops::{act, dense, elementwise};
-use tritium_train::{GrowError, Net2WiderPlan, QualityBytesPoint, QualityBytesReport};
+use tritium_train::{
+    AdamW, GrowError, Net2WiderPlan, Optimizer, QualityBytesPoint, QualityBytesReport, Tape,
+};
 
 fn dense_mlp_forward(
     x: &[f32],
@@ -30,6 +36,47 @@ fn swiglu_forward(
     let up = dense::forward(x, up, rows, hidden_width, model_width);
     let hidden = elementwise::mul_forward(&gate, &up);
     dense::forward(&hidden, down, rows, model_width, hidden_width)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn swiglu_mse_gradients(
+    x: &[f32],
+    target: &[f32],
+    rows: usize,
+    model_width: usize,
+    hidden_width: usize,
+    gate: &[f32],
+    up: &[f32],
+    down: &[f32],
+) -> [Vec<f32>; 3] {
+    let mut tape = Tape::new();
+    let x_id = tape.leaf(x.to_vec());
+    let gate_id = tape.leaf(gate.to_vec());
+    let up_id = tape.leaf(up.to_vec());
+    let down_id = tape.leaf(down.to_vec());
+    let target_id = tape.leaf(target.to_vec());
+
+    let gate_projection = tape.dense_matmul(x_id, gate_id, rows, hidden_width, model_width);
+    let gate_activation = tape.silu(gate_projection);
+    let up_projection = tape.dense_matmul(x_id, up_id, rows, hidden_width, model_width);
+    let hidden = tape.mul(gate_activation, up_projection);
+    let output = tape.dense_matmul(hidden, down_id, rows, model_width, hidden_width);
+    let loss = tape.mse(output, target_id);
+    let gradients = tape.backward(loss);
+
+    [
+        gradients[gate_id].clone(),
+        gradients[up_id].clone(),
+        gradients[down_id].clone(),
+    ]
+}
+
+fn row_max_abs_delta(values: &[f32], width: usize, left: usize, right: usize) -> f32 {
+    values[left * width..(left + 1) * width]
+        .iter()
+        .zip(&values[right * width..(right + 1) * width])
+        .map(|(&left, &right)| (left - right).abs())
+        .fold(0.0, f32::max)
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
@@ -147,6 +194,148 @@ fn one_plan_preserves_transformer_swiglu_forward_before_salt() {
 }
 
 #[test]
+fn grown_plan_uses_replayable_unequal_dyadic_splits_without_changing_the_function() {
+    const INPUT: usize = 3;
+    const HIDDEN: usize = 2;
+    const WIDE_HIDDEN: usize = 8;
+    const DENOMINATOR: u32 = 1 << NET2WIDER_SPLIT_DENOMINATOR_LOG2;
+
+    let plan = Net2WiderPlan::seeded(HIDDEN, WIDE_HIDDEN, 0x27).unwrap();
+    let replay = Net2WiderPlan::seeded(HIDDEN, WIDE_HIDDEN, 0x27).unwrap();
+    assert_eq!(plan.algorithm(), NET2WIDER_ALGORITHM_V2);
+    assert_eq!(plan.split_denominator_log2(), Some(24));
+    assert_eq!(plan, replay);
+
+    let numerators = plan.split_numerators().expect("grown plan split metadata");
+    assert_eq!(
+        numerators,
+        &[
+            2_516_583, 5_592_405, 4_194_303, 1_677_724, 5_033_163, 8_388_607, 3_355_443, 2_796_204
+        ]
+    );
+    for source in 0..HIDDEN {
+        let source_numerators: Vec<_> = plan
+            .source_indices()
+            .iter()
+            .zip(numerators)
+            .filter_map(|(&candidate, &numerator)| (candidate == source).then_some(numerator))
+            .collect();
+        assert_eq!(source_numerators.iter().copied().sum::<u32>(), DENOMINATOR);
+        assert!(source_numerators.iter().all(|&numerator| numerator > 0));
+        for (index, &numerator) in source_numerators.iter().enumerate() {
+            assert!(
+                source_numerators[index + 1..]
+                    .iter()
+                    .all(|&other| numerator != other)
+            );
+        }
+    }
+
+    let x = [0.25, -0.50, 0.75, -0.20, 0.30, 0.40];
+    let incoming = [0.20, -0.30, 0.10, -0.40, 0.25, 0.60];
+    let outgoing = [0.80, -0.40];
+    let original = dense_mlp_forward(&x, 2, INPUT, HIDDEN, 1, &incoming, &outgoing);
+    let wide_incoming = plan.expand_incoming_rows(&incoming, INPUT).unwrap();
+    let wide_outgoing = plan.expand_outgoing_columns(&outgoing, 1).unwrap();
+    for source in 0..HIDDEN {
+        let source_columns: Vec<_> = plan
+            .source_indices()
+            .iter()
+            .zip(&wide_outgoing)
+            .filter_map(|(&candidate, &weight)| (candidate == source).then_some(weight))
+            .collect();
+        for (index, &weight) in source_columns.iter().enumerate() {
+            assert!(
+                source_columns[index + 1..]
+                    .iter()
+                    .all(|&other| weight != other)
+            );
+        }
+    }
+    let widened = dense_mlp_forward(&x, 2, INPUT, WIDE_HIDDEN, 1, &wide_incoming, &wide_outgoing);
+    assert_close(&widened, &original, 2e-6);
+}
+
+#[test]
+fn unequal_splits_break_adamw_symmetry_after_three_non_collinear_steps() {
+    const ROWS: usize = 2;
+    const MODEL: usize = 3;
+    const HIDDEN: usize = 2;
+    const WIDE_HIDDEN: usize = 6;
+
+    let gate = [0.20, -0.30, 0.10, -0.40, 0.25, 0.60];
+    let up = [-0.10, 0.35, 0.20, 0.60, -0.25, 0.10];
+    let down = [0.40, -0.25, 0.20, -0.35, 0.55, -0.10];
+    let batches = [
+        (
+            [0.25, -0.50, 0.75, -0.20, 0.30, 0.40],
+            [0.10, -0.20, 0.30, -0.40, 0.15, 0.05],
+        ),
+        (
+            [-0.60, 0.10, 0.35, 0.45, -0.25, 0.80],
+            [-0.30, 0.25, 0.10, 0.20, -0.35, 0.45],
+        ),
+        (
+            [0.15, 0.70, -0.45, -0.55, 0.20, 0.65],
+            [0.40, 0.05, -0.25, -0.15, 0.30, -0.10],
+        ),
+    ];
+
+    let plan = Net2WiderPlan::seeded(HIDDEN, WIDE_HIDDEN, 0x27).unwrap();
+    let mut wide_gate = plan.expand_incoming_rows(&gate, MODEL).unwrap();
+    let mut wide_up = plan.expand_incoming_rows(&up, MODEL).unwrap();
+    let mut wide_down = plan.expand_outgoing_columns(&down, MODEL).unwrap();
+
+    let original = swiglu_forward(&batches[0].0, ROWS, MODEL, HIDDEN, &gate, &up, &down);
+    let widened = swiglu_forward(
+        &batches[0].0,
+        ROWS,
+        MODEL,
+        WIDE_HIDDEN,
+        &wide_gate,
+        &wide_up,
+        &wide_down,
+    );
+    assert_close(&widened, &original, 2e-6);
+
+    let replicas: Vec<_> = plan
+        .source_indices()
+        .iter()
+        .enumerate()
+        .filter_map(|(wide, &source)| (source == 0).then_some(wide))
+        .collect();
+    assert!(replicas.len() >= 2);
+    let (left, right) = (replicas[0], replicas[1]);
+    assert_eq!(row_max_abs_delta(&wide_gate, MODEL, left, right), 0.0);
+    assert_eq!(row_max_abs_delta(&wide_up, MODEL, left, right), 0.0);
+
+    let optimizer = AdamW::new(0.01);
+    let mut gate_state = optimizer.init_state(wide_gate.len());
+    let mut up_state = optimizer.init_state(wide_up.len());
+    let mut down_state = optimizer.init_state(wide_down.len());
+    for (index, (x, target)) in batches.iter().enumerate() {
+        let [gate_grad, up_grad, down_grad] = swiglu_mse_gradients(
+            x,
+            target,
+            ROWS,
+            MODEL,
+            WIDE_HIDDEN,
+            &wide_gate,
+            &wide_up,
+            &wide_down,
+        );
+        let step = u64::try_from(index + 1).unwrap();
+        optimizer.step(step, &mut wide_gate, &gate_grad, &mut gate_state);
+        optimizer.step(step, &mut wide_up, &up_grad, &mut up_state);
+        optimizer.step(step, &mut wide_down, &down_grad, &mut down_state);
+    }
+
+    assert!(row_max_abs_delta(&wide_gate, MODEL, left, right) > 1e-6);
+    assert!(row_max_abs_delta(&wide_up, MODEL, left, right) > 1e-6);
+    assert!(row_max_abs_delta(&gate_state.m, MODEL, left, right) > 1e-6);
+}
+
+#[test]
 fn seeded_mapping_is_reproducible_and_covers_every_source_unit() {
     let first = Net2WiderPlan::seeded(4, 11, 1234).unwrap();
     let replay = Net2WiderPlan::seeded(4, 11, 1234).unwrap();
@@ -246,6 +435,14 @@ fn net2wider_rejects_narrowing_and_misshaped_tensors() {
             new_width: 3,
         })
     );
+    assert_eq!(
+        Net2WiderPlan::seeded(1, NET2WIDER_MAX_REPLICATIONS_PER_SOURCE + 1, 0),
+        Err(GrowError::UnsafeMultiplicity {
+            source: 0,
+            copies: NET2WIDER_MAX_REPLICATIONS_PER_SOURCE + 1,
+            maximum: NET2WIDER_MAX_REPLICATIONS_PER_SOURCE,
+        })
+    );
 
     let plan = Net2WiderPlan::seeded(3, 5, 0).unwrap();
     assert_eq!(
@@ -281,6 +478,9 @@ fn equal_width_plan_is_an_identity_transform() {
     let outgoing = [0.4, -0.25, 0.15, -0.35, 0.2, 0.55]; // [2, 3]
     let plan = Net2WiderPlan::seeded(3, 3, u64::MAX).unwrap();
 
+    assert_eq!(plan.algorithm(), NET2WIDER_ALGORITHM_V1);
+    assert_eq!(plan.split_denominator_log2(), None);
+    assert_eq!(plan.split_numerators(), None);
     assert_eq!(plan.expand_incoming_rows(&incoming, 2).unwrap(), incoming);
     assert_eq!(plan.expand_hidden_vector(&hidden).unwrap(), hidden);
     assert_eq!(

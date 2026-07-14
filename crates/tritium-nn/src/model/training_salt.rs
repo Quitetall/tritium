@@ -11,6 +11,7 @@ use tritium_format::{
     GGML_TYPE_TRITIUM_SALT, GgufFile, GgufValue, SALT_GGUF_FORMAT_KEY, SALT_GGUF_FORMAT_VALUE,
     SaltTensor, read_gguf, read_salt_gguf, salt_rows_to_dense,
 };
+use tritium_train::grow::{NET2WIDER_ALGORITHM_V1, NET2WIDER_ALGORITHM_V2, Net2WiderPlan};
 
 use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
@@ -42,7 +43,6 @@ pub const TRAINING_SALT_COMPLETED_STEP_KEY: &str = "tritium.training_salt.comple
 pub const TRAINING_SALT_GROWTH_RECEIPT_KEY: &str = "tritium.training_salt.growth_receipt_json";
 
 const GGML_TYPE_F32: u32 = 0;
-const GROWTH_ALGORITHM: &str = "net2wider.intermediate-swiglu.splitmix64.v1";
 
 /// Replayable Net2Wider receipt embedded in a training-SALT artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +59,10 @@ pub struct TrainingSaltGrowthReceipt {
     pub source_indices: Vec<u64>,
     /// Exact number of copies of each original unit.
     pub replication_counts: Vec<u64>,
+    /// Base-two denominator exponent for v2 outgoing split coefficients.
+    pub split_denominator_log2: Option<u32>,
+    /// V2 outgoing split numerator for each widened unit.
+    pub split_numerators: Option<Vec<u32>>,
 }
 
 /// Validated metadata and provenance from a self-contained training-SALT artifact.
@@ -397,26 +401,42 @@ fn parse_growth_receipt(file: &GgufFile) -> Result<TrainingSaltGrowthReceipt, Nn
     let object = value
         .as_object()
         .ok_or_else(|| NnError::MissingConfig("growth receipt object".to_owned()))?;
-    let actual_keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
-    let expected_keys = BTreeSet::from([
-        "algorithm",
-        "new_width",
-        "old_width",
-        "replication_counts",
-        "seed",
-        "source_indices",
-    ]);
-    if actual_keys != expected_keys {
-        return Err(NnError::MissingConfig(
-            "growth receipt keys do not match tied-swiglu.v1".to_owned(),
-        ));
-    }
     let algorithm = object
         .get("algorithm")
         .and_then(serde_json::Value::as_str)
-        .filter(|value| *value == GROWTH_ALGORITHM)
         .ok_or_else(|| NnError::MissingConfig("growth receipt algorithm".to_owned()))?
         .to_owned();
+    let expected_keys = match algorithm.as_str() {
+        NET2WIDER_ALGORITHM_V1 => BTreeSet::from([
+            "algorithm",
+            "new_width",
+            "old_width",
+            "replication_counts",
+            "seed",
+            "source_indices",
+        ]),
+        NET2WIDER_ALGORITHM_V2 => BTreeSet::from([
+            "algorithm",
+            "new_width",
+            "old_width",
+            "replication_counts",
+            "seed",
+            "source_indices",
+            "split_denominator_log2",
+            "split_numerators",
+        ]),
+        _ => {
+            return Err(NnError::MissingConfig(
+                "growth receipt algorithm".to_owned(),
+            ));
+        }
+    };
+    let actual_keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    if actual_keys != expected_keys {
+        return Err(NnError::MissingConfig(format!(
+            "growth receipt keys do not match {algorithm}"
+        )));
+    }
     let get_u64 = |key: &str| {
         object
             .get(key)
@@ -446,6 +466,29 @@ fn parse_growth_receipt(file: &GgufFile) -> Result<TrainingSaltGrowthReceipt, Nn
     };
     let source_indices = get_array("source_indices")?;
     let replication_counts = get_array("replication_counts")?;
+    let (split_denominator_log2, split_numerators) = match algorithm.as_str() {
+        NET2WIDER_ALGORITHM_V1 => (None, None),
+        NET2WIDER_ALGORITHM_V2 => {
+            let denominator_log2 =
+                u32::try_from(get_u64("split_denominator_log2")?).map_err(|_| {
+                    NnError::MissingConfig(
+                        "growth receipt split_denominator_log2 overflows u32".to_owned(),
+                    )
+                })?;
+            let numerators = get_array("split_numerators")?
+                .into_iter()
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        NnError::MissingConfig(
+                            "growth receipt split_numerators value overflows u32".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (Some(denominator_log2), Some(numerators))
+        }
+        _ => unreachable!("algorithm was validated above"),
+    };
     let old = usize::try_from(old_width)
         .map_err(|_| NnError::MissingConfig("growth old_width overflows usize".to_owned()))?;
     let new = usize::try_from(new_width)
@@ -475,17 +518,49 @@ fn parse_growth_receipt(file: &GgufFile) -> Result<TrainingSaltGrowthReceipt, Nn
             "growth replication counts disagree with source mapping".to_owned(),
         ));
     }
+    let replay = Net2WiderPlan::seeded(old, new, seed)
+        .map_err(|error| NnError::MissingConfig(format!("growth receipt replay: {error}")))?;
+    let replay_sources = replay
+        .source_indices()
+        .iter()
+        .map(|&value| u64::try_from(value).expect("replayed source index originated from u64"))
+        .collect::<Vec<_>>();
+    let replay_counts = replay
+        .replication_counts()
+        .iter()
+        .map(|&value| u64::try_from(value).expect("replayed count is bounded by a u64 width"))
+        .collect::<Vec<_>>();
+    if algorithm != replay.algorithm()
+        || source_indices != replay_sources
+        || replication_counts != replay_counts
+        || split_denominator_log2 != replay.split_denominator_log2()
+        || split_numerators.as_deref() != replay.split_numerators()
+    {
+        return Err(NnError::MissingConfig(
+            "growth receipt does not match deterministic replay".to_owned(),
+        ));
+    }
     let canonical_source = serde_json::to_string(&source_indices)
         .map_err(|error| NnError::MissingConfig(format!("growth receipt: {error}")))?;
     let canonical_counts = serde_json::to_string(&replication_counts)
         .map_err(|error| NnError::MissingConfig(format!("growth receipt: {error}")))?;
-    let canonical = format!(
-        "{{\"algorithm\":\"{algorithm}\",\"old_width\":{old_width},\"new_width\":{new_width},\"seed\":{seed},\"source_indices\":{canonical_source},\"replication_counts\":{canonical_counts}}}"
-    );
+    let canonical = match (&split_denominator_log2, &split_numerators) {
+        (None, None) => format!(
+            "{{\"algorithm\":\"{algorithm}\",\"old_width\":{old_width},\"new_width\":{new_width},\"seed\":{seed},\"source_indices\":{canonical_source},\"replication_counts\":{canonical_counts}}}"
+        ),
+        (Some(denominator_log2), Some(numerators)) => {
+            let canonical_numerators = serde_json::to_string(numerators)
+                .map_err(|error| NnError::MissingConfig(format!("growth receipt: {error}")))?;
+            format!(
+                "{{\"algorithm\":\"{algorithm}\",\"old_width\":{old_width},\"new_width\":{new_width},\"seed\":{seed},\"source_indices\":{canonical_source},\"replication_counts\":{canonical_counts},\"split_denominator_log2\":{denominator_log2},\"split_numerators\":{canonical_numerators}}}"
+            )
+        }
+        _ => unreachable!("split metadata is parsed as an all-or-nothing pair"),
+    };
     if receipt != canonical {
-        return Err(NnError::MissingConfig(
-            "growth receipt is not canonical tied-swiglu.v1 JSON".to_owned(),
-        ));
+        return Err(NnError::MissingConfig(format!(
+            "growth receipt is not canonical {algorithm} JSON"
+        )));
     }
     Ok(TrainingSaltGrowthReceipt {
         algorithm,
@@ -494,6 +569,8 @@ fn parse_growth_receipt(file: &GgufFile) -> Result<TrainingSaltGrowthReceipt, Nn
         seed,
         source_indices,
         replication_counts,
+        split_denominator_log2,
+        split_numerators,
     })
 }
 
@@ -792,9 +869,9 @@ mod tests {
 
         let receipt = concat!(
             "{\"algorithm\":\"net2wider.intermediate-swiglu.splitmix64.v1\",",
-            "\"old_width\":4,\"new_width\":6,\"seed\":99,",
-            "\"source_indices\":[0,1,2,3,0,1],",
-            "\"replication_counts\":[2,2,1,1]}"
+            "\"old_width\":6,\"new_width\":6,\"seed\":99,",
+            "\"source_indices\":[0,1,2,3,4,5],",
+            "\"replication_counts\":[1,1,1,1,1,1]}"
         );
         let metadata = BTreeMap::from([
             ("general.alignment".to_owned(), GgufValue::U32(32)),
@@ -862,8 +939,10 @@ mod tests {
         assert_eq!(metadata.source_model_digest, [0x22; 32]);
         assert_eq!(metadata.initial_student_digest, [0x33; 32]);
         assert_eq!(metadata.completed_step, 17);
-        assert_eq!(metadata.growth.old_width, 4);
+        assert_eq!(metadata.growth.old_width, 6);
         assert_eq!(metadata.growth.new_width, 6);
+        assert_eq!(metadata.growth.split_denominator_log2, None);
+        assert_eq!(metadata.growth.split_numerators, None);
 
         let loaded_backend = Box::new(tritium_cpu::CpuBackend::new());
         let mut loaded =
@@ -917,6 +996,106 @@ mod tests {
             Projection::Salt(_) | Projection::Ternary(_) => {
                 panic!("reference loader must dequantize to exact dense")
             }
+        }
+    }
+
+    #[test]
+    fn parses_replayable_v2_growth_receipt() {
+        let mut fixture = fixture();
+        fixture.metadata.insert(
+            TRAINING_SALT_GROWTH_RECEIPT_KEY.to_owned(),
+            GgufValue::String(
+                concat!(
+                    "{\"algorithm\":\"net2wider.intermediate-swiglu.splitmix64.dyadic-unequal.v2\",",
+                    "\"old_width\":4,\"new_width\":6,\"seed\":99,",
+                    "\"source_indices\":[0,1,2,3,3,0],",
+                    "\"replication_counts\":[2,1,1,2],",
+                    "\"split_denominator_log2\":24,",
+                    "\"split_numerators\":[4194304,16777216,16777216,4194304,12582912,12582912]}"
+                )
+                .to_owned(),
+            ),
+        );
+
+        let metadata =
+            parse_training_salt_artifact_metadata(&fixture.bytes()).expect("v2 metadata");
+        assert_eq!(
+            metadata.growth.algorithm,
+            "net2wider.intermediate-swiglu.splitmix64.dyadic-unequal.v2"
+        );
+        assert_eq!(metadata.growth.split_denominator_log2, Some(24));
+        assert_eq!(
+            metadata.growth.split_numerators,
+            Some(vec![
+                4_194_304, 16_777_216, 16_777_216, 4_194_304, 12_582_912, 12_582_912
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_v2_growth_receipt_tampering_and_noncanonical_json() {
+        const RECEIPT: &str = concat!(
+            "{\"algorithm\":\"net2wider.intermediate-swiglu.splitmix64.dyadic-unequal.v2\",",
+            "\"old_width\":4,\"new_width\":6,\"seed\":99,",
+            "\"source_indices\":[0,1,2,3,3,0],",
+            "\"replication_counts\":[2,1,1,2],",
+            "\"split_denominator_log2\":24,",
+            "\"split_numerators\":[4194304,16777216,16777216,4194304,12582912,12582912]}"
+        );
+        let cases = [
+            (
+                "seed replay",
+                RECEIPT.replace("\"seed\":99", "\"seed\":98"),
+                "deterministic replay",
+            ),
+            (
+                "coefficient replay",
+                RECEIPT.replace(
+                    "[4194304,16777216,16777216,4194304,12582912,12582912]",
+                    "[4194305,16777216,16777216,4194304,12582912,12582911]",
+                ),
+                "deterministic replay",
+            ),
+            (
+                "denominator",
+                RECEIPT.replace(
+                    "\"split_denominator_log2\":24",
+                    "\"split_denominator_log2\":23",
+                ),
+                "deterministic replay",
+            ),
+            (
+                "missing split field",
+                RECEIPT.replace(",\"split_denominator_log2\":24", ""),
+                "keys do not match",
+            ),
+            (
+                "u32 overflow",
+                RECEIPT.replacen("4194304", "4294967296", 1),
+                "overflows u32",
+            ),
+            (
+                "noncanonical key order",
+                RECEIPT.replace(
+                    "\"split_denominator_log2\":24,\"split_numerators\":[4194304,16777216,16777216,4194304,12582912,12582912]",
+                    "\"split_numerators\":[4194304,16777216,16777216,4194304,12582912,12582912],\"split_denominator_log2\":24",
+                ),
+                "not canonical",
+            ),
+        ];
+
+        for (name, receipt, expected_error) in cases {
+            let mut fixture = fixture();
+            fixture.metadata.insert(
+                TRAINING_SALT_GROWTH_RECEIPT_KEY.to_owned(),
+                GgufValue::String(receipt),
+            );
+            let error = parse_training_salt_artifact_metadata(&fixture.bytes())
+                .expect_err("tampered receipt must fail");
+            assert!(
+                error.to_string().contains(expected_error),
+                "{name}: expected {expected_error:?}, got {error}"
+            );
         }
     }
 

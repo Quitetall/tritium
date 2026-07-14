@@ -1,18 +1,20 @@
 //! Function-preserving width growth before SALT distillation (ADR 0027, Track F.2).
 //!
 //! [`Net2WiderPlan`] widens a hidden axis without changing the represented function:
-//! every new hidden unit copies one old unit, while every corresponding outgoing
-//! weight is divided by the number of copies of that old unit. For an input
-//! projection `W_in: [hidden, input]` and output projection
+//! every new hidden unit copies one old unit, while the corresponding outgoing
+//! weights receive positive unequal dyadic shares whose exact integer sum is one.
+//! The unequal shares break the permutation symmetry of cloned units without
+//! perturbing the pre-training function. For an input projection
+//! `W_in: [hidden, input]` and output projection
 //! `W_out: [output, hidden]`, the transformed tensors are therefore
 //! `W_in': [wide_hidden, input]` and `W_out': [output, wide_hidden]`.
 //!
 //! A transformer SwiGLU block applies the same plan to the rows of both `gate` and
 //! `up`, and once to the columns of `down`. Because all hidden operations between
-//! them are pointwise, duplicate units remain equal and the divided `down` columns
-//! sum to the original contribution. Width-dependent operations such as an
-//! intermediate RMSNorm need a separate, architecture-specific transform and are
-//! intentionally outside this prototype.
+//! them are pointwise, duplicate units initially produce equal activations and the
+//! split `down` columns sum to the original contribution. Width-dependent operations
+//! such as an intermediate RMSNorm need a separate, architecture-specific transform
+//! and are intentionally outside this prototype.
 //! This is specifically an `n_ff`/intermediate-width expansion: `n_embd`, attention,
 //! embeddings, residual paths, and transformer depth stay unchanged. Expanding the
 //! residual-stream width would require a coupled transform across those components.
@@ -23,6 +25,23 @@
 //! rented multi-GPU 32B quality/VRAM/step-time campaign remain hardware gates; this
 //! pure CPU layout transform does not claim those results.
 
+/// Receipt algorithm retained for an identity/no-growth plan.
+pub const NET2WIDER_ALGORITHM_V1: &str = "net2wider.intermediate-swiglu.splitmix64.v1";
+
+/// Receipt algorithm for unequal dyadic outgoing splits on an actual growth plan.
+pub const NET2WIDER_ALGORITHM_V2: &str =
+    "net2wider.intermediate-swiglu.splitmix64.dyadic-unequal.v2";
+
+/// Base-two denominator exponent shared by every v2 outgoing split coefficient.
+pub const NET2WIDER_SPLIT_DENOMINATOR_LOG2: u32 = 24;
+
+/// Conservative per-source replication limit for the v2 unequal split construction.
+pub const NET2WIDER_MAX_REPLICATIONS_PER_SOURCE: usize = 2_048;
+
+const NET2WIDER_SPLIT_DENOMINATOR: u32 = 1 << NET2WIDER_SPLIT_DENOMINATOR_LOG2;
+const SPLIT_RANK_DOMAIN: u64 = 0x4e32_575f_5350_4c54;
+const SPLIT_SOURCE_MIX: u64 = 0xd6e8_feb8_6659_fd93;
+
 /// A deterministic Net2Wider transform for one hidden axis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Net2WiderPlan {
@@ -30,6 +49,7 @@ pub struct Net2WiderPlan {
     new_width: usize,
     source_for_new: Vec<usize>,
     copies_per_source: Vec<usize>,
+    split_numerators: Option<Vec<u32>>,
 }
 
 /// Why a [`Net2WiderPlan`] could not be built or applied.
@@ -44,6 +64,15 @@ pub enum GrowError {
     },
     /// The source width cannot be represented by the deterministic 64-bit mapper.
     UnsupportedWidth(usize),
+    /// One source unit was replicated too many times for the unequal dyadic split.
+    UnsafeMultiplicity {
+        /// Source hidden-unit index.
+        source: usize,
+        /// Number of widened units copied from the source.
+        copies: usize,
+        /// Largest supported copy count.
+        maximum: usize,
+    },
     /// A tensor length did not match the documented row-major shape.
     ShapeMismatch {
         /// Logical tensor role.
@@ -73,6 +102,14 @@ impl core::fmt::Display for GrowError {
             GrowError::UnsupportedWidth(width) => {
                 write!(f, "source width {width} exceeds the 64-bit mapping domain")
             }
+            GrowError::UnsafeMultiplicity {
+                source,
+                copies,
+                maximum,
+            } => write!(
+                f,
+                "source unit {source} has {copies} copies; unequal dyadic splits support at most {maximum}"
+            ),
             GrowError::ShapeMismatch {
                 tensor,
                 expected,
@@ -236,12 +273,57 @@ impl Net2WiderPlan {
             copies_per_source[source] += 1;
         }
 
+        let split_numerators = if new_width == old_width {
+            None
+        } else {
+            Some(unequal_split_numerators(
+                &source_for_new,
+                &copies_per_source,
+                seed,
+            )?)
+        };
+
         Ok(Self {
             old_width,
             new_width,
             source_for_new,
             copies_per_source,
+            split_numerators,
         })
+    }
+
+    /// Versioned receipt algorithm for this plan.
+    ///
+    /// Identity/no-growth plans retain the original v1 receipt exactly. Actual
+    /// growth plans use v2 and carry unequal dyadic split metadata.
+    #[must_use]
+    pub fn algorithm(&self) -> &'static str {
+        if self.split_numerators.is_some() {
+            NET2WIDER_ALGORITHM_V2
+        } else {
+            NET2WIDER_ALGORITHM_V1
+        }
+    }
+
+    /// Base-two denominator exponent for v2 split numerators.
+    ///
+    /// Returns `None` for a v1 identity/no-growth plan so its persisted receipt
+    /// remains byte-compatible with the original schema.
+    #[must_use]
+    pub fn split_denominator_log2(&self) -> Option<u32> {
+        self.split_numerators
+            .as_ref()
+            .map(|_| NET2WIDER_SPLIT_DENOMINATOR_LOG2)
+    }
+
+    /// Numerator for each widened outgoing column, parallel to [`Self::source_indices`].
+    ///
+    /// Every coefficient is `numerator / 2^24`. Numerators for copies of one
+    /// source are positive and pairwise unequal, and sum exactly to `2^24`.
+    /// Returns `None` for a v1 identity/no-growth plan.
+    #[must_use]
+    pub fn split_numerators(&self) -> Option<&[u32]> {
+        self.split_numerators.as_deref()
     }
 
     /// Source hidden-unit index for each unit in the widened tensor.
@@ -312,8 +394,9 @@ impl Net2WiderPlan {
     /// Duplicate and rescale columns of an output projection.
     ///
     /// `weights` must be row-major `[output_width, old_width]`. The returned tensor
-    /// is row-major `[output_width, new_width]`. Each copied column is divided by
-    /// the number of copies of its source, so their sum is the original column.
+    /// is row-major `[output_width, new_width]`. Actual growth uses the v2 unequal
+    /// dyadic shares; an identity/no-growth plan retains the v1 equal-count rule.
+    /// In either case, shares for one source sum to the original column.
     ///
     /// # Errors
     /// [`GrowError::ShapeMismatch`] if the input length is not
@@ -328,12 +411,80 @@ impl Net2WiderPlan {
         let output_len = checked_len("expanded outgoing projection", output_width, self.new_width)?;
         let mut expanded = Vec::with_capacity(output_len);
         for row in weights.chunks_exact(self.old_width) {
-            for &source in &self.source_for_new {
-                expanded.push(row[source] / self.copies_per_source[source] as f32);
+            for (new_index, &source) in self.source_for_new.iter().enumerate() {
+                let coefficient = self.split_numerators.as_ref().map_or_else(
+                    || 1.0 / self.copies_per_source[source] as f32,
+                    |numerators| numerators[new_index] as f32 / NET2WIDER_SPLIT_DENOMINATOR as f32,
+                );
+                expanded.push(row[source] * coefficient);
             }
         }
         Ok(expanded)
     }
+}
+
+fn unequal_split_numerators(
+    source_for_new: &[usize],
+    copies_per_source: &[usize],
+    seed: u64,
+) -> Result<Vec<u32>, GrowError> {
+    let mut positions = vec![Vec::new(); copies_per_source.len()];
+    for (new_index, &source) in source_for_new.iter().enumerate() {
+        positions[source].push(new_index);
+    }
+
+    let mut numerators = vec![0; source_for_new.len()];
+    for (source, source_positions) in positions.iter().enumerate() {
+        let copies = source_positions.len();
+        if copies > NET2WIDER_MAX_REPLICATIONS_PER_SOURCE {
+            return Err(GrowError::UnsafeMultiplicity {
+                source,
+                copies,
+                maximum: NET2WIDER_MAX_REPLICATIONS_PER_SOURCE,
+            });
+        }
+
+        let copies_u32 =
+            u32::try_from(copies).expect("the configured Net2Wider replication limit fits u32");
+        let base = NET2WIDER_SPLIT_DENOMINATOR / copies_u32;
+        let remainder = NET2WIDER_SPLIT_DENOMINATOR % copies_u32;
+        let step = if copies == 1 {
+            0
+        } else {
+            base / (2 * (copies_u32 - 1))
+        };
+        if copies > 1 && step == 0 {
+            return Err(GrowError::UnsafeMultiplicity {
+                source,
+                copies,
+                maximum: NET2WIDER_MAX_REPLICATIONS_PER_SOURCE,
+            });
+        }
+
+        let mut ranks: Vec<usize> = (0..copies).collect();
+        let source_u64 = u64::try_from(source)
+            .expect("source index belongs to a width previously validated as u64");
+        let mut state = seed ^ SPLIT_RANK_DOMAIN ^ source_u64.wrapping_mul(SPLIT_SOURCE_MIX);
+        for upper in (1..copies).rev() {
+            let modulus = u64::try_from(upper + 1)
+                .expect("the configured Net2Wider replication limit fits u64");
+            let selected = usize::try_from(splitmix64(&mut state) % modulus)
+                .expect("selected rank is bounded by a usize replication count");
+            ranks.swap(upper, selected);
+        }
+
+        for (&new_index, rank) in source_positions.iter().zip(ranks) {
+            let rank_u32 =
+                u32::try_from(rank).expect("the configured Net2Wider replication limit fits u32");
+            let centered_rank = i64::from(2 * rank_u32) - i64::from(copies_u32 - 1);
+            let numerator = i64::from(base)
+                + i64::from(u32::from(rank_u32 < remainder))
+                + i64::from(step) * centered_rank;
+            numerators[new_index] = u32::try_from(numerator)
+                .expect("the bounded unequal dyadic construction stays positive and below u32");
+        }
+    }
+    Ok(numerators)
 }
 
 fn splitmix64(state: &mut u64) -> u64 {

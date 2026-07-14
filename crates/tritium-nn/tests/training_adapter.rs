@@ -314,6 +314,26 @@ fn intermediate_growth_applies_one_mapping_to_every_layer_without_reordering_par
 
     assert_eq!(plan.source_indices(), [0, 1, 2, 3, 4, 5, 1, 0, 1]);
     assert_eq!(plan.replication_counts(), [2, 3, 1, 1, 1, 1]);
+    let split_numerators = plan
+        .split_numerators()
+        .expect("actual growth uses unequal dyadic splits");
+    let split_denominator = 1_u32 << plan.split_denominator_log2().expect("v2 denominator");
+    for source in 0..plan.replication_counts().len() {
+        let source_numerators: Vec<_> = plan
+            .source_indices()
+            .iter()
+            .zip(split_numerators)
+            .filter_map(|(&candidate, &numerator)| (candidate == source).then_some(numerator))
+            .collect();
+        assert_eq!(source_numerators.iter().sum::<u32>(), split_denominator);
+        for (index, &numerator) in source_numerators.iter().enumerate() {
+            assert!(
+                source_numerators[index + 1..]
+                    .iter()
+                    .all(|&other| numerator != other)
+            );
+        }
+    }
     assert_eq!(model.architecture().n_ff, 9);
     assert_eq!(
         model
@@ -357,20 +377,15 @@ fn intermediate_growth_applies_one_mapping_to_every_layer_without_reordering_par
         assert_eq!(&up.master[28..32], &up.master[0..4]);
 
         let source_row_start = 300.0 + layer_offset;
-        assert_eq!(
-            &down.master[..9],
-            &[
-                source_row_start / 2.0,
-                (source_row_start + 1.0) / 3.0,
-                source_row_start + 2.0,
-                source_row_start + 3.0,
-                source_row_start + 4.0,
-                source_row_start + 5.0,
-                (source_row_start + 1.0) / 3.0,
-                source_row_start / 2.0,
-                (source_row_start + 1.0) / 3.0,
-            ]
-        );
+        let expected_down_row: Vec<_> = plan
+            .source_indices()
+            .iter()
+            .zip(split_numerators)
+            .map(|(&source, &numerator)| {
+                (source_row_start + source as f32) * (numerator as f32 / split_denominator as f32)
+            })
+            .collect();
+        assert_eq!(&down.master[..9], expected_down_row.as_slice());
     }
 }
 
