@@ -13,6 +13,8 @@ const GPU_QUERY_ARGS: [&str; 2] = [
     "--query-gpu=pci.bus_id,name,driver_version,memory.total,memory.used",
     "--format=csv,noheader,nounits",
 ];
+const DRIVER_VERSION_LABELS: [&str; 2] = ["Driver Version:", "KMD Version:"];
+const CUDA_VERSION_LABELS: [&str; 2] = ["CUDA Version:", "CUDA UMD Version:"];
 
 /// NVML-backed physical-device identity and memory evidence for one CUDA device.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -231,10 +233,10 @@ fn parse_gpu_query(stdout: &[u8]) -> anyhow::Result<Vec<QueriedGpu>> {
 
 fn parse_system_versions(stdout: &[u8]) -> anyhow::Result<SmiSystemVersions> {
     let text = std::str::from_utf8(stdout).context("NVML system summary is not UTF-8")?;
-    let driver = labeled_token(text, "Driver Version:")?;
+    let driver = labeled_token(text, &DRIVER_VERSION_LABELS)?;
     let driver_version = parse_nvidia_driver_version(driver)
         .context("parse driver version from NVML system summary")?;
-    let cuda = labeled_token(text, "CUDA Version:")?;
+    let cuda = labeled_token(text, &CUDA_VERSION_LABELS)?;
     let cuda_driver_version = parse_cuda_version_text(cuda)
         .context("parse CUDA Driver API version from NVML system summary")?;
     Ok(SmiSystemVersions {
@@ -243,16 +245,25 @@ fn parse_system_versions(stdout: &[u8]) -> anyhow::Result<SmiSystemVersions> {
     })
 }
 
-fn labeled_token<'a>(text: &'a str, label: &str) -> anyhow::Result<&'a str> {
-    let mut matches = text.match_indices(label);
-    let (_, suffix) = matches
-        .next()
-        .map(|(index, _)| (index, &text[index + label.len()..]))
-        .with_context(|| format!("NVML system summary is missing {label:?}"))?;
-    ensure!(
-        matches.next().is_none(),
-        "NVML system summary contains {label:?} more than once"
-    );
+fn labeled_token<'a>(text: &'a str, labels: &[&str]) -> anyhow::Result<&'a str> {
+    let mut matched = None;
+    for &label in labels {
+        let mut matches = text.match_indices(label);
+        if let Some((index, _)) = matches.next() {
+            ensure!(
+                matches.next().is_none(),
+                "NVML system summary contains {label:?} more than once"
+            );
+            ensure!(
+                matched.is_none(),
+                "NVML system summary contains more than one accepted version label from {labels:?}"
+            );
+            matched = Some((label, index));
+        }
+    }
+    let (label, index) =
+        matched.with_context(|| format!("NVML system summary is missing one of {labels:?}"))?;
+    let suffix = &text[index + label.len()..];
     let token = suffix
         .trim_start()
         .split(|character: char| character.is_whitespace() || character == '|')
@@ -528,6 +539,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_nvidia_610_kmd_and_cuda_umd_version_labels() {
+        let versions = parse_system_versions(
+            b"| NVIDIA-SMI 610.43.03  KMD Version: 610.43.03  CUDA UMD Version: 13.3 |\n",
+        )
+        .unwrap();
+        assert_eq!(
+            versions,
+            SmiSystemVersions {
+                driver_version: "610.43.03".to_owned(),
+                cuda_driver_version: 13_030,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_missing_duplicate_and_name_mismatched_cuda_identity() {
         let missing = successful("0000:02:00.0, NVIDIA GeForce RTX 4090, 610.43.03, 2, 1\n");
         assert!(
@@ -602,5 +628,11 @@ mod tests {
             .is_err()
         );
         assert!(parse_system_versions(b"Driver Version: 610.43.03 CUDA Version: 13.1.1").is_err());
+        assert!(
+            parse_system_versions(
+                b"Driver Version: 610.43.03 KMD Version: 610.43.03 CUDA UMD Version: 13.3"
+            )
+            .is_err()
+        );
     }
 }
