@@ -69,6 +69,11 @@ use crate::nvml_probe::{NvmlGpuSnapshot, probe_cuda_device};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "cuda")]
+const NAIVE_SALT_PTQ_EVALUATION_KIND: &str = "naive-salt-ptq";
+#[cfg(feature = "cuda")]
+const NAIVE_SALT_PTQ_METHOD: &str = "whole-row-absmean-f32-scales-exact-v1";
+
 /// Production training-campaign operations.
 #[derive(Debug, Subcommand)]
 pub(crate) enum CampaignCommand {
@@ -1789,7 +1794,7 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     let nvml = probe_cuda_device(&cuda_identity).context("validate CUDA device through NVML")?;
     let local_hardware = campaign_hardware_identity(&cuda_identity, &nvml);
     let hardware = world.gather_hardware(&local_hardware)?;
-    let telemetry_baseline = telemetry
+    telemetry
         .reset_synchronized()
         .context("reset CUDA allocator telemetry after hardware validation")?;
     let raw_model_config = std::fs::read(campaign.model_dir.join("config.json"))
@@ -1949,6 +1954,37 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
     }
     world.verify_contract_digest(parse_lower_hex_digest(&plan.fingerprint)?)?;
 
+    // Score the immutable, widened student before optimizer ownership drains or
+    // mutates any master. Only rank 0 owns durable evaluation evidence. Packing
+    // is lazy, so a completed progress sidecar resumes without rebuilding the
+    // compact PTQ model.
+    let naive_salt_ptq_model_identity =
+        naive_salt_ptq_model_identity(&hex_digest(initial_student_digest), campaign.salt_planes)?;
+    let naive_salt_ptq_score = if world.is_owner() {
+        Some(
+            resumable_naive_salt_ptq_score(
+                &campaign
+                    .checkpoint_dir
+                    .join("naive-salt-ptq-evaluation-progress.json"),
+                &backend,
+                &model,
+                &naive_salt_ptq_model_identity,
+                &evaluation_tokens,
+                campaign.seq_len,
+                evaluation_corpus_file_digest,
+                evaluation_corpus_digest,
+                campaign.salt_planes,
+            )
+            .context("score naive SALT PTQ on the held-out evaluation corpus")?,
+        )
+    } else {
+        None
+    };
+    world.barrier()?;
+    let telemetry_baseline = telemetry
+        .reset_synchronized()
+        .context("reset CUDA allocator telemetry after PTQ baseline evaluation")?;
+
     let parameter_geometry: Vec<_> = model
         .parameters()
         .iter()
@@ -2024,9 +2060,13 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         windows,
         configured_steps: campaign.steps,
         timing_warmup_steps: campaign.timing_warmup_steps,
+        evaluation_seq_len: campaign.seq_len,
+        evaluation_windows,
+        evaluation_corpus_path: &evaluation_corpus_path,
         hardware: &hardware,
         input_hashes: &input_hashes,
         static_memory,
+        salt_planes: campaign.salt_planes,
     };
     let previous_report = if world.is_owner() {
         load_existing_report(&campaign.report, &report_expectations)?
@@ -2095,6 +2135,8 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
             &growth,
             &evaluation_tokens,
             source_score.context("rank 0 source evaluation evidence is missing")?,
+            naive_salt_ptq_score.context("rank 0 naive SALT PTQ evidence is missing")?,
+            &naive_salt_ptq_model_identity,
             evaluation_corpus_file_digest,
             evaluation_corpus_digest,
         )?;
@@ -2282,6 +2324,8 @@ fn run_campaign(config_path: &Path) -> anyhow::Result<()> {
         &growth,
         &evaluation_tokens,
         source_score.context("rank 0 source evaluation evidence is missing")?,
+        naive_salt_ptq_score.context("rank 0 naive SALT PTQ evidence is missing")?,
+        &naive_salt_ptq_model_identity,
         evaluation_corpus_file_digest,
         evaluation_corpus_digest,
     )?;
@@ -2830,7 +2874,7 @@ fn build_campaign_report(
         CampaignStatePolicy::HostOffload => 0.0,
     };
     Ok(CampaignReport {
-        schema_version: 5,
+        schema_version: 6,
         plan_fingerprint: plan.fingerprint.clone(),
         state_policy: campaign.state_policy,
         packed_compute: campaign.packed_compute,
@@ -2956,6 +3000,8 @@ fn evaluate_terminal_artifact(
     growth: &CampaignGrowthReceipt,
     evaluation_tokens: &[u32],
     source_score: TeacherForcedPerplexity,
+    naive_salt_ptq_score: TeacherForcedPerplexity,
+    naive_salt_ptq_model_identity: &str,
     evaluation_corpus_file_digest: [u8; 32],
     evaluation_corpus_digest: [u8; 32],
 ) -> anyhow::Result<CampaignEvaluationReport> {
@@ -3021,11 +3067,13 @@ fn evaluate_terminal_artifact(
     let evaluation = evaluation_report(
         campaign,
         artifact,
+        naive_salt_ptq_model_identity,
         source_score,
+        naive_salt_ptq_score,
         score,
         evaluation_corpus_file_digest,
         evaluation_corpus_digest,
-    );
+    )?;
     Ok(evaluation)
 }
 
@@ -3056,6 +3104,45 @@ fn resumable_teacher_forced_score(
     corpus_file_digest: [u8; 32],
     corpus_digest: [u8; 32],
     build_runner: impl FnOnce() -> anyhow::Result<ModelRunner>,
+) -> anyhow::Result<TeacherForcedPerplexity> {
+    let mut runner = None;
+    let mut build_runner = Some(build_runner);
+    resumable_teacher_forced_score_with(
+        progress_path,
+        evaluation_kind,
+        model_identity,
+        tokens,
+        seq_len,
+        corpus_file_digest,
+        corpus_digest,
+        |window| {
+            if runner.is_none() {
+                let build_runner = build_runner
+                    .take()
+                    .context("evaluation runner builder was already consumed")?;
+                runner = Some(build_runner()?);
+            }
+            teacher_forced_perplexity_windows(
+                runner.as_mut().expect("runner initialized above"),
+                window,
+                seq_len,
+            )
+            .context("score teacher-forced evaluation window")
+        },
+    )
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn resumable_teacher_forced_score_with(
+    progress_path: &Path,
+    evaluation_kind: &str,
+    model_identity: &str,
+    tokens: &[u32],
+    seq_len: usize,
+    corpus_file_digest: [u8; 32],
+    corpus_digest: [u8; 32],
+    mut score_window: impl FnMut(&[u32]) -> anyhow::Result<TeacherForcedPerplexity>,
 ) -> anyhow::Result<TeacherForcedPerplexity> {
     if evaluation_kind.is_empty() || model_identity.is_empty() || seq_len < 2 {
         bail!("resumable evaluation identity and window geometry must be non-empty");
@@ -3119,7 +3206,6 @@ fn resumable_teacher_forced_score(
         );
     }
     if progress.completed_windows < total_windows {
-        let mut runner = build_runner()?;
         for window_index in progress.completed_windows..total_windows {
             let start = usize::try_from(window_index)
                 .context("evaluation window index exceeds usize")?
@@ -3128,11 +3214,16 @@ fn resumable_teacher_forced_score(
             let end = start
                 .checked_add(seq_len)
                 .context("evaluation window end overflow")?;
-            let score =
-                teacher_forced_perplexity_windows(&mut runner, &tokens[start..end], seq_len)
-                    .with_context(|| format!("score evaluation window {window_index}"))?;
-            if score.window_count != 1 || score.token_count != scored_per_window {
-                bail!("single-window evaluation returned inconsistent counts");
+            let score = score_window(&tokens[start..end])
+                .with_context(|| format!("score evaluation window {window_index}"))?;
+            if score.window_count != 1
+                || score.token_count != scored_per_window
+                || !score.negative_log_likelihood.is_finite()
+                || score.negative_log_likelihood < 0.0
+                || !score.perplexity.is_finite()
+                || score.perplexity <= 0.0
+            {
+                bail!("single-window evaluation returned inconsistent evidence");
             }
             negative_log_likelihood += score.negative_log_likelihood;
             if !negative_log_likelihood.is_finite() {
@@ -3166,17 +3257,189 @@ fn resumable_teacher_forced_score(
 }
 
 #[cfg(feature = "cuda")]
+fn naive_salt_ptq_model_identity(
+    initial_student_model_digest: &str,
+    salt_planes: usize,
+) -> anyhow::Result<String> {
+    let initial_student_model_digest = parse_lower_hex_digest(initial_student_model_digest)?;
+    let salt_planes = u64::try_from(salt_planes).context("SALT plane count exceeds u64")?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"tritium-naive-salt-ptq-model-v1");
+    hash.update(NAIVE_SALT_PTQ_METHOD.as_bytes());
+    hash.update(&initial_student_model_digest);
+    hash.update(&salt_planes.to_le_bytes());
+    Ok(hex_digest(*hash.finalize().as_bytes()))
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn resumable_naive_salt_ptq_score(
+    progress_path: &Path,
+    backend: &CudaBackend,
+    model: &TiedSwiGluTrainingModel,
+    model_identity: &str,
+    tokens: &[u32],
+    seq_len: usize,
+    corpus_file_digest: [u8; 32],
+    corpus_digest: [u8; 32],
+    salt_planes: usize,
+) -> anyhow::Result<TeacherForcedPerplexity> {
+    let mut packed_weights = None;
+    resumable_teacher_forced_score_with(
+        progress_path,
+        NAIVE_SALT_PTQ_EVALUATION_KIND,
+        model_identity,
+        tokens,
+        seq_len,
+        corpus_file_digest,
+        corpus_digest,
+        |window| {
+            if packed_weights.is_none() {
+                let mut weights = Vec::with_capacity(model.parameters().len());
+                for (index, parameter) in model.parameters().iter().enumerate() {
+                    weights.push(
+                        DevicePackedSaltWeight::from_host(
+                            backend,
+                            &parameter.master,
+                            parameter.rows,
+                            parameter.cols,
+                            salt_planes,
+                        )
+                        .with_context(|| format!("pack naive SALT PTQ parameter {index}"))?,
+                    );
+                }
+                packed_weights = Some(weights);
+            }
+            score_packed_salt_window(
+                backend,
+                model,
+                packed_weights
+                    .as_ref()
+                    .expect("packed PTQ weights initialized above"),
+                window,
+            )
+        },
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn score_packed_salt_window(
+    backend: &CudaBackend,
+    model: &TiedSwiGluTrainingModel,
+    packed_weights: &[DevicePackedSaltWeight],
+    tokens: &[u32],
+) -> anyhow::Result<TeacherForcedPerplexity> {
+    let tokens_i32: Vec<i32> = tokens
+        .iter()
+        .copied()
+        .map(|token| i32::try_from(token).context("PTQ evaluation token exceeds i32"))
+        .collect::<Result<_, _>>()?;
+    let mut tape = DeviceTape::new_with_policies(
+        backend,
+        model.architecture().vocab,
+        CheckpointPolicy::SqrtDepth(model.architecture().n_layers),
+        PackedSaltComputePolicy::Exact,
+    )
+    .context("create exact packed PTQ evaluation tape")?;
+    let forward = packed_device_forward(&mut tape, model, packed_weights, &tokens_i32)
+        .context("run exact packed PTQ evaluation forward")?;
+    let logits = tape
+        .value(forward.logits)
+        .context("download exact packed PTQ evaluation logits")?;
+    teacher_forced_score_from_full_logits(tokens, model.architecture().vocab, &logits)
+}
+
+#[cfg(feature = "cuda")]
+fn teacher_forced_score_from_full_logits(
+    tokens: &[u32],
+    vocab: usize,
+    logits: &[f32],
+) -> anyhow::Result<TeacherForcedPerplexity> {
+    if tokens.len() < 2 || vocab == 0 {
+        bail!("PTQ evaluation window requires at least two tokens and a non-zero vocabulary");
+    }
+    let expected_logits = tokens
+        .len()
+        .checked_mul(vocab)
+        .context("PTQ evaluation logit geometry overflow")?;
+    if logits.len() != expected_logits {
+        bail!(
+            "PTQ evaluation returned {} logits, expected {expected_logits}",
+            logits.len()
+        );
+    }
+    let mut negative_log_likelihood = 0.0_f64;
+    for position in 0..tokens.len() - 1 {
+        let target =
+            usize::try_from(tokens[position + 1]).context("PTQ evaluation target exceeds usize")?;
+        if target >= vocab {
+            bail!("PTQ evaluation target {target} is outside vocabulary 0..{vocab}");
+        }
+        let row_start = position
+            .checked_mul(vocab)
+            .context("PTQ evaluation row offset overflow")?;
+        let row = &logits[row_start..row_start + vocab];
+        if row.iter().any(|value| !value.is_finite()) {
+            bail!("PTQ evaluation logits contain a non-finite value");
+        }
+        let max = row
+            .iter()
+            .copied()
+            .map(f64::from)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let sum_exp: f64 = row
+            .iter()
+            .map(|&value| (f64::from(value) - max).exp())
+            .sum();
+        let loss = max + sum_exp.ln() - f64::from(row[target]);
+        if !loss.is_finite() || loss < 0.0 {
+            bail!("PTQ evaluation log probability is invalid");
+        }
+        negative_log_likelihood += loss;
+        if !negative_log_likelihood.is_finite() {
+            bail!("PTQ evaluation negative log likelihood became non-finite");
+        }
+    }
+    let token_count = u64::try_from(tokens.len() - 1).context("PTQ token count exceeds u64")?;
+    let perplexity = (negative_log_likelihood / token_count as f64).exp();
+    if !perplexity.is_finite() {
+        bail!("PTQ evaluation perplexity is non-finite");
+    }
+    Ok(TeacherForcedPerplexity {
+        perplexity,
+        negative_log_likelihood,
+        token_count,
+        window_count: 1,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn evaluation_report(
     campaign: &CampaignConfig,
     artifact: &CampaignArtifactReport,
+    naive_salt_ptq_model_identity: &str,
     source_score: TeacherForcedPerplexity,
+    naive_salt_ptq_score: TeacherForcedPerplexity,
     score: TeacherForcedPerplexity,
     corpus_file_digest: [u8; 32],
     corpus_digest: [u8; 32],
-) -> CampaignEvaluationReport {
-    CampaignEvaluationReport {
+) -> anyhow::Result<CampaignEvaluationReport> {
+    if source_score.window_count != score.window_count
+        || source_score.token_count != score.token_count
+        || naive_salt_ptq_score.window_count != score.window_count
+        || naive_salt_ptq_score.token_count != score.token_count
+    {
+        bail!("source, naive PTQ, and artifact evaluation coverage differ");
+    }
+    if naive_salt_ptq_model_identity.is_empty() {
+        bail!("naive SALT PTQ model identity is empty");
+    }
+    Ok(CampaignEvaluationReport {
         artifact_package_id: artifact.package_id.clone(),
-        corpus_path: campaign.evaluation_corpus.display().to_string(),
+        corpus_path: path_identity(&campaign.evaluation_corpus)?
+            .display()
+            .to_string(),
         corpus_file_digest: hex_digest(corpus_file_digest),
         corpus_digest: hex_digest(corpus_digest),
         seq_len: campaign.seq_len,
@@ -3184,11 +3447,19 @@ fn evaluation_report(
         token_count: score.token_count,
         source_fp_negative_log_likelihood: source_score.negative_log_likelihood,
         source_fp_perplexity: source_score.perplexity,
+        naive_salt_ptq: CampaignPtqBaselineReport {
+            method: NAIVE_SALT_PTQ_METHOD.into(),
+            model_identity: naive_salt_ptq_model_identity.into(),
+            salt_planes: campaign.salt_planes,
+            negative_log_likelihood: naive_salt_ptq_score.negative_log_likelihood,
+            perplexity: naive_salt_ptq_score.perplexity,
+        },
         negative_log_likelihood: score.negative_log_likelihood,
         perplexity: score.perplexity,
         relative_perplexity_delta_percent: (score.perplexity / source_score.perplexity - 1.0)
             * 100.0,
-    }
+        recovery_vs_naive_salt_ptq: naive_salt_ptq_score.perplexity / score.perplexity,
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -3307,6 +3578,18 @@ struct CampaignArtifactReport {
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignPtqBaselineReport {
+    method: String,
+    model_identity: String,
+    salt_planes: usize,
+    negative_log_likelihood: f64,
+    perplexity: f64,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CampaignEvaluationReport {
     artifact_package_id: String,
     corpus_path: String,
@@ -3317,9 +3600,11 @@ struct CampaignEvaluationReport {
     token_count: u64,
     source_fp_negative_log_likelihood: f64,
     source_fp_perplexity: f64,
+    naive_salt_ptq: CampaignPtqBaselineReport,
     negative_log_likelihood: f64,
     perplexity: f64,
     relative_perplexity_delta_percent: f64,
+    recovery_vs_naive_salt_ptq: f64,
 }
 
 #[cfg(feature = "cuda")]
@@ -3426,9 +3711,13 @@ struct ReportExpectations<'a> {
     windows: u64,
     configured_steps: u64,
     timing_warmup_steps: usize,
+    evaluation_seq_len: usize,
+    evaluation_windows: u64,
+    evaluation_corpus_path: &'a Path,
     hardware: &'a [CampaignHardwareIdentity],
     input_hashes: &'a CampaignInputHashes,
     static_memory: CampaignStaticMemory,
+    salt_planes: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -3736,6 +4025,10 @@ fn validate_cuda_memory_segments(
     path: &Path,
     report: &CampaignReport,
     hardware: &CampaignHardwareIdentity,
+    salt_planes: usize,
+    evaluation_seq_len: usize,
+    evaluation_windows: u64,
+    evaluation_corpus_path: &Path,
 ) -> anyhow::Result<()> {
     if report.cuda_memory_segments.is_empty() {
         bail!("prior report {} has no CUDA memory segment", path.display());
@@ -3852,27 +4145,78 @@ fn validate_cuda_memory_segments(
             path.display()
         );
     }
-    if let (Some(artifact), Some(evaluation)) = (&report.artifact, &report.evaluation)
-        && (artifact.package_id != evaluation.artifact_package_id
+    if let (Some(artifact), Some(evaluation)) = (&report.artifact, &report.evaluation) {
+        let scored_per_window = evaluation.seq_len.checked_sub(1).and_then(|count| {
+            u64::try_from(count)
+                .ok()?
+                .checked_mul(evaluation.window_count)
+        });
+        let expected_ptq_identity =
+            naive_salt_ptq_model_identity(&report.input_hashes.initial_student_model, salt_planes)
+                .with_context(|| {
+                    format!(
+                        "prior report {} has invalid naive PTQ provenance",
+                        path.display()
+                    )
+                })?;
+        let expected_source_perplexity =
+            (evaluation.source_fp_negative_log_likelihood / evaluation.token_count as f64).exp();
+        let expected_ptq_perplexity = (evaluation.naive_salt_ptq.negative_log_likelihood
+            / evaluation.token_count as f64)
+            .exp();
+        let expected_artifact_perplexity =
+            (evaluation.negative_log_likelihood / evaluation.token_count as f64).exp();
+        let expected_relative_delta =
+            (evaluation.perplexity / evaluation.source_fp_perplexity - 1.0) * 100.0;
+        let expected_recovery = evaluation.naive_salt_ptq.perplexity / evaluation.perplexity;
+        if artifact.package_id != evaluation.artifact_package_id
             || artifact.physical_bytes == 0
             || !artifact.scale_max_abs_error.is_finite()
             || !artifact.reconstruction_max_abs_delta.is_finite()
             || !artifact.reconstruction_squared_error_sum.is_finite()
+            || artifact.reconstruction_element_count == 0
             || !artifact.reconstruction_mse.is_finite()
+            || evaluation.corpus_file_digest != report.input_hashes.evaluation_corpus_file
+            || evaluation.corpus_digest != report.input_hashes.evaluation_corpus
+            || Path::new(&evaluation.corpus_path) != evaluation_corpus_path
+            || evaluation.seq_len != evaluation_seq_len
+            || evaluation.window_count != evaluation_windows
+            || evaluation.naive_salt_ptq.method != NAIVE_SALT_PTQ_METHOD
+            || evaluation.naive_salt_ptq.model_identity != expected_ptq_identity
+            || evaluation.naive_salt_ptq.salt_planes != salt_planes
             || !evaluation.source_fp_negative_log_likelihood.is_finite()
+            || evaluation.source_fp_negative_log_likelihood < 0.0
             || !evaluation.source_fp_perplexity.is_finite()
-            || !evaluation.negative_log_likelihood.is_finite()
-            || !evaluation.perplexity.is_finite()
-            || !evaluation.relative_perplexity_delta_percent.is_finite()
             || evaluation.source_fp_perplexity <= 0.0
+            || !evaluation
+                .naive_salt_ptq
+                .negative_log_likelihood
+                .is_finite()
+            || evaluation.naive_salt_ptq.negative_log_likelihood < 0.0
+            || !evaluation.naive_salt_ptq.perplexity.is_finite()
+            || evaluation.naive_salt_ptq.perplexity <= 0.0
+            || !evaluation.negative_log_likelihood.is_finite()
+            || evaluation.negative_log_likelihood < 0.0
+            || !evaluation.perplexity.is_finite()
             || evaluation.perplexity <= 0.0
+            || !evaluation.relative_perplexity_delta_percent.is_finite()
+            || !evaluation.recovery_vs_naive_salt_ptq.is_finite()
+            || evaluation.recovery_vs_naive_salt_ptq <= 0.0
             || evaluation.token_count == 0
-            || evaluation.window_count == 0)
-    {
-        bail!(
-            "prior report {} has inconsistent artifact/evaluation evidence",
-            path.display()
-        );
+            || evaluation.window_count == 0
+            || scored_per_window != Some(evaluation.token_count)
+            || expected_source_perplexity.to_bits() != evaluation.source_fp_perplexity.to_bits()
+            || expected_ptq_perplexity.to_bits() != evaluation.naive_salt_ptq.perplexity.to_bits()
+            || expected_artifact_perplexity.to_bits() != evaluation.perplexity.to_bits()
+            || expected_relative_delta.to_bits()
+                != evaluation.relative_perplexity_delta_percent.to_bits()
+            || expected_recovery.to_bits() != evaluation.recovery_vs_naive_salt_ptq.to_bits()
+        {
+            bail!(
+                "prior report {} has inconsistent artifact/evaluation evidence",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -3902,7 +4246,7 @@ fn load_existing_report(
     };
     let mut report: CampaignReport = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse prior report {}", path.display()))?;
-    if report.schema_version != 5 {
+    if report.schema_version != 6 {
         bail!(
             "prior report {} uses unsupported schema version {}",
             path.display(),
@@ -4000,7 +4344,15 @@ fn load_existing_report(
         .hardware
         .first()
         .context("campaign hardware fleet is empty")?;
-    validate_cuda_memory_segments(path, &report, owner_hardware)?;
+    validate_cuda_memory_segments(
+        path,
+        &report,
+        owner_hardware,
+        expected.salt_planes,
+        expected.evaluation_seq_len,
+        expected.evaluation_windows,
+        expected.evaluation_corpus_path,
+    )?;
     if report.completed_step < expected.checkpoint_step {
         bail!(
             "prior report {} covers completed step {}, but committed checkpoint is step {}; refusing resume with an evidence gap",
@@ -4492,6 +4844,46 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn naive_ptq_evaluation_runs_packed_exact_path_and_persists_complete_progress() {
+        let backend = match CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping packed PTQ campaign gate: {error}");
+                return;
+            }
+        };
+        let model = resident_campaign_test_model();
+        let directory = temp_path("packed-ptq-evaluation");
+        std::fs::create_dir_all(&directory).unwrap();
+        let progress_path = directory.join("naive-salt-ptq-evaluation-progress.json");
+        let model_identity = naive_salt_ptq_model_identity(&hex_digest([9; 32]), 2).unwrap();
+        let score = resumable_naive_salt_ptq_score(
+            &progress_path,
+            &backend,
+            &model,
+            &model_identity,
+            &[0, 1, 2, 3, 4, 5],
+            3,
+            [7; 32],
+            [8; 32],
+            2,
+        )
+        .unwrap();
+        assert_eq!(score.window_count, 2);
+        assert_eq!(score.token_count, 4);
+        assert!(score.negative_log_likelihood.is_finite());
+        assert!(score.perplexity.is_finite());
+        let progress: TeacherForcedEvaluationProgress =
+            serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
+        assert_eq!(progress.evaluation_kind, NAIVE_SALT_PTQ_EVALUATION_KIND);
+        assert_eq!(progress.model_identity, model_identity);
+        assert_eq!(progress.completed_windows, 2);
+        assert_eq!(progress.token_count, 4);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn completed_evaluation_progress_resumes_without_reloading_model() {
         let directory = temp_path("evaluation-progress");
         std::fs::create_dir_all(&directory).unwrap();
@@ -4625,6 +5017,172 @@ mod tests {
             expected_nll.to_bits()
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn completed_naive_ptq_progress_resumes_without_scoring_or_accepting_new_provenance() {
+        let directory = temp_path("naive-ptq-evaluation-progress");
+        std::fs::create_dir_all(&directory).unwrap();
+        let progress_path = directory.join("naive-salt-ptq-evaluation-progress.json");
+        let tokens = [1_u32, 2, 3, 4, 5, 6];
+        let negative_log_likelihood = 4.0 * 3.0_f64.ln();
+        let progress = TeacherForcedEvaluationProgress {
+            schema_version: 1,
+            evaluation_kind: NAIVE_SALT_PTQ_EVALUATION_KIND.into(),
+            model_identity: "immutable-plan".into(),
+            corpus_file_digest: hex_digest([5; 32]),
+            corpus_digest: hex_digest([6; 32]),
+            seq_len: 3,
+            total_windows: 2,
+            completed_windows: 2,
+            token_count: 4,
+            negative_log_likelihood_f64_bits: negative_log_likelihood.to_bits(),
+        };
+        std::fs::write(&progress_path, serde_json::to_vec(&progress).unwrap()).unwrap();
+
+        let score = resumable_teacher_forced_score_with(
+            &progress_path,
+            NAIVE_SALT_PTQ_EVALUATION_KIND,
+            "immutable-plan",
+            &tokens,
+            3,
+            [5; 32],
+            [6; 32],
+            |_| -> anyhow::Result<TeacherForcedPerplexity> {
+                bail!("completed PTQ resume rescored a window")
+            },
+        )
+        .unwrap();
+        assert!((score.perplexity - 3.0).abs() < 1e-12);
+
+        assert!(
+            resumable_teacher_forced_score_with(
+                &progress_path,
+                NAIVE_SALT_PTQ_EVALUATION_KIND,
+                "different-plan",
+                &tokens,
+                3,
+                [5; 32],
+                [6; 32],
+                |_| -> anyhow::Result<TeacherForcedPerplexity> {
+                    bail!("provenance mismatch scored a window")
+                },
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn packed_ptq_logits_score_exact_next_tokens_and_fail_closed() {
+        let score = teacher_forced_score_from_full_logits(
+            &[0, 1, 0],
+            2,
+            &[0.0, 0.0, 0.0, 0.0, f32::NAN, f32::NAN],
+        )
+        .unwrap();
+        assert_eq!(score.window_count, 1);
+        assert_eq!(score.token_count, 2);
+        assert!((score.negative_log_likelihood - 2.0_f64.ln() * 2.0).abs() < 1e-12);
+        assert!((score.perplexity - 2.0).abs() < 1e-12);
+
+        assert!(teacher_forced_score_from_full_logits(&[0, 2], 2, &[0.0; 4]).is_err());
+        assert!(teacher_forced_score_from_full_logits(&[0, 1], 2, &[0.0; 3]).is_err());
+        assert!(
+            teacher_forced_score_from_full_logits(&[0, 1], 2, &[f32::NAN, 0.0, 0.0, 0.0]).is_err()
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn resumable_evaluation_rejects_invalid_window_evidence_before_persisting() {
+        let progress_path = temp_path("invalid-window-evidence");
+        let error = resumable_teacher_forced_score_with(
+            &progress_path,
+            NAIVE_SALT_PTQ_EVALUATION_KIND,
+            "model-id",
+            &[0, 1, 2],
+            3,
+            [1; 32],
+            [2; 32],
+            |_| {
+                Ok(TeacherForcedPerplexity {
+                    perplexity: 1.0,
+                    negative_log_likelihood: -0.5,
+                    token_count: 2,
+                    window_count: 1,
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("inconsistent evidence"));
+        assert!(!progress_path.exists());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn evaluation_report_records_naive_ptq_recovery_and_provenance() {
+        let campaign = CampaignConfig {
+            model_dir: PathBuf::from("model"),
+            corpus: PathBuf::from("train.json"),
+            evaluation_corpus: PathBuf::from("held-out.json"),
+            teacher_cache: PathBuf::from("teacher.ttpr"),
+            checkpoint_dir: PathBuf::from("checkpoints"),
+            report: PathBuf::from("report.json"),
+            artifact: PathBuf::from("artifact.gguf"),
+            seq_len: 3,
+            steps: 5,
+            salt_planes: 2,
+            cuda_device: Some(0),
+            distributed: None,
+            state_policy: CampaignStatePolicy::HostOffload,
+            packed_compute: CampaignPackedComputePolicy::Exact,
+            checkpoint_every: 5,
+            timing_warmup_steps: 1,
+            checkpoint_shards: 1,
+            adam: CampaignAdam::default(),
+            growth: None,
+        };
+        let artifact = CampaignArtifactReport {
+            path: "artifact.gguf".into(),
+            package_id: "package-id".into(),
+            physical_bytes: 1,
+            scale_max_abs_error: 0.0,
+            reconstruction_max_abs_delta: 0.0,
+            reconstruction_squared_error_sum: 0.0,
+            reconstruction_element_count: 1,
+            reconstruction_mse: 0.0,
+        };
+        let score = |perplexity| TeacherForcedPerplexity {
+            perplexity,
+            negative_log_likelihood: 4.0 * perplexity.ln(),
+            token_count: 4,
+            window_count: 2,
+        };
+
+        let report = evaluation_report(
+            &campaign,
+            &artifact,
+            "immutable-plan",
+            score(2.0),
+            score(900.0),
+            score(3.0),
+            [7; 32],
+            [8; 32],
+        )
+        .unwrap();
+        assert_eq!(report.naive_salt_ptq.method, NAIVE_SALT_PTQ_METHOD);
+        assert_eq!(report.naive_salt_ptq.model_identity, "immutable-plan");
+        assert_eq!(
+            report.naive_salt_ptq.perplexity.to_bits(),
+            900.0_f64.to_bits()
+        );
+        assert_eq!(
+            report.recovery_vs_naive_salt_ptq.to_bits(),
+            300.0_f64.to_bits()
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -4902,12 +5460,12 @@ mod tests {
             campaign_config_file: "config".into(),
             model_config_file: "model-config".into(),
             source_model: "source-model".into(),
-            initial_student_model: "student-model".into(),
+            initial_student_model: hex_digest([9; 32]),
             corpus_file: "corpus-file".into(),
             corpus: "corpus".into(),
             teacher_cache: "teacher".into(),
-            evaluation_corpus_file: "evaluation-file".into(),
-            evaluation_corpus: "evaluation".into(),
+            evaluation_corpus_file: hex_digest([7; 32]),
+            evaluation_corpus: hex_digest([8; 32]),
         };
         let hardware = vec![test_hardware()];
         let memory = CampaignMemoryReport {
@@ -4939,7 +5497,7 @@ mod tests {
             materialized_gradient_bytes: 16,
         };
         let report = CampaignReport {
-            schema_version: 5,
+            schema_version: 6,
             plan_fingerprint: "plan".into(),
             state_policy: CampaignStatePolicy::HostOffload,
             packed_compute: CampaignPackedComputePolicy::Exact,
@@ -4991,9 +5549,13 @@ mod tests {
             windows: 5,
             configured_steps: 5,
             timing_warmup_steps: 1,
+            evaluation_seq_len: 3,
+            evaluation_windows: 2,
+            evaluation_corpus_path: Path::new("evaluation.json"),
             hardware: &hardware,
             input_hashes: &input_hashes,
             static_memory,
+            salt_planes: 2,
         };
 
         let resumed = load_existing_report(&path, &expected).unwrap().unwrap();
@@ -5027,6 +5589,93 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(candidate).unwrap()).unwrap();
             load_existing_report(&path, &expected).unwrap_err()
         };
+        let score = |perplexity: f64| {
+            let negative_log_likelihood = 4.0 * perplexity.ln();
+            (
+                negative_log_likelihood,
+                (negative_log_likelihood / 4.0).exp(),
+            )
+        };
+        let (source_nll, source_ppl) = score(2.0);
+        let (ptq_nll, ptq_ppl) = score(900.0);
+        let (artifact_nll, artifact_ppl) = score(3.0);
+        let mut terminal = report.clone();
+        terminal.artifact = Some(CampaignArtifactReport {
+            path: "artifact.gguf".into(),
+            package_id: "package-id".into(),
+            physical_bytes: 1,
+            scale_max_abs_error: 0.0,
+            reconstruction_max_abs_delta: 0.0,
+            reconstruction_squared_error_sum: 0.0,
+            reconstruction_element_count: 1,
+            reconstruction_mse: 0.0,
+        });
+        terminal.evaluation = Some(CampaignEvaluationReport {
+            artifact_package_id: "package-id".into(),
+            corpus_path: "evaluation.json".into(),
+            corpus_file_digest: input_hashes.evaluation_corpus_file.clone(),
+            corpus_digest: input_hashes.evaluation_corpus.clone(),
+            seq_len: 3,
+            window_count: 2,
+            token_count: 4,
+            source_fp_negative_log_likelihood: source_nll,
+            source_fp_perplexity: source_ppl,
+            naive_salt_ptq: CampaignPtqBaselineReport {
+                method: NAIVE_SALT_PTQ_METHOD.into(),
+                model_identity: naive_salt_ptq_model_identity(
+                    &input_hashes.initial_student_model,
+                    2,
+                )
+                .unwrap(),
+                salt_planes: 2,
+                negative_log_likelihood: ptq_nll,
+                perplexity: ptq_ppl,
+            },
+            negative_log_likelihood: artifact_nll,
+            perplexity: artifact_ppl,
+            relative_perplexity_delta_percent: (artifact_ppl / source_ppl - 1.0) * 100.0,
+            recovery_vs_naive_salt_ptq: ptq_ppl / artifact_ppl,
+        });
+        std::fs::write(&path, serde_json::to_vec(&terminal).unwrap()).unwrap();
+        let resumed_terminal = load_existing_report(&path, &expected).unwrap().unwrap();
+        assert!(resumed_terminal.artifact.is_none());
+        assert!(resumed_terminal.evaluation.is_none());
+
+        let mut corrupt = terminal.clone();
+        corrupt
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .recovery_vs_naive_salt_ptq = 299.0;
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("inconsistent artifact/evaluation evidence")
+        );
+        let mut corrupt = terminal.clone();
+        corrupt.evaluation.as_mut().unwrap().corpus_path = "other-evaluation.json".into();
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("inconsistent artifact/evaluation evidence")
+        );
+        let mut corrupt = terminal;
+        corrupt
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .naive_salt_ptq
+            .model_identity
+            .push_str("-different");
+        assert!(
+            rejects(&corrupt)
+                .to_string()
+                .contains("inconsistent artifact/evaluation evidence")
+        );
+
+        let mut corrupt = report.clone();
+        corrupt.schema_version = 5;
+        assert!(rejects(&corrupt).to_string().contains("unsupported schema"));
         let mut corrupt = report.clone();
         corrupt.configured_steps = 6;
         assert!(rejects(&corrupt).to_string().contains("configured steps"));
