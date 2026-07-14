@@ -9,10 +9,12 @@ mod dense;
 mod linear;
 mod mlp;
 mod projection;
+mod salt;
 mod transformer_block;
 
 pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::{Mlp, Relu2Mlp, SwiGluMlp};
 pub use projection::Projection;
+pub use salt::SaltLinear;
 pub use transformer_block::{BlockDump, BlockScratch, TransformerBlock};

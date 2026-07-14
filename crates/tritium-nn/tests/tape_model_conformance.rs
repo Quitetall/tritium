@@ -25,7 +25,9 @@ fn model_dir() -> PathBuf {
 fn dense(p: &Projection) -> (&[f32], usize, usize) {
     match p {
         Projection::Dense(d) => (&d.weights, d.n_out, d.k_in),
-        Projection::Ternary(_) => panic!("from_hf builds Dense projections"),
+        Projection::Salt(_) | Projection::Ternary(_) => {
+            panic!("from_hf builds Dense projections")
+        }
     }
 }
 

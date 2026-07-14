@@ -15,6 +15,8 @@
 //! Each row is self-describing (its own [`SALT_HEADER_BYTES`] header carries `T` and `k`),
 //! so the reader walks a tensor's `rows` packed rows without per-row offsets.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::{
     FormatError, SALT_HEADER_BYTES, SaltRow, pack_progressive_salt_row, pack_salt_row,
     packed_salt_row_len, unpack_salt_row_prefix,
@@ -37,6 +39,182 @@ pub struct SaltTensor {
     pub k: usize,
     /// One [`SaltRow`] per output channel; `rows.len() == rows`.
     pub salt_rows: Vec<SaltRow>,
+}
+
+/// Validated, zero-copy view of one tensor inside a [`SaltBundleIndex`].
+///
+/// The view owns no decoded rows. Call [`decode`](Self::decode) or
+/// [`decode_prefix`](Self::decode_prefix) only for tensors the runtime needs.
+#[derive(Clone, Copy, Debug)]
+pub struct SaltTensorView<'a> {
+    name: &'a str,
+    rows: usize,
+    k: usize,
+    blob: &'a [u8],
+}
+
+impl<'a> SaltTensorView<'a> {
+    /// Tensor name from the bundle index.
+    #[must_use]
+    pub fn name(self) -> &'a str {
+        self.name
+    }
+
+    /// `(rows, k)` matrix shape.
+    #[must_use]
+    pub fn shape(self) -> (usize, usize) {
+        (self.rows, self.k)
+    }
+
+    /// Encoded row-payload bytes occupied by this tensor.
+    #[must_use]
+    pub fn encoded_len(self) -> usize {
+        self.blob.len()
+    }
+
+    /// Decode every additive plane for this tensor.
+    ///
+    /// # Errors
+    /// Returns [`FormatError`] if row framing, shape, or payload validation fails.
+    pub fn decode(self) -> Result<SaltTensor, FormatError> {
+        self.decode_prefix(usize::MAX)
+    }
+
+    /// Decode at most `max_planes` additive planes per row.
+    ///
+    /// All omitted payloads remain validated by [`SaltBundleIndex::new`].
+    ///
+    /// # Errors
+    /// Returns [`FormatError`] if row framing, shape, or payload validation fails.
+    pub fn decode_prefix(self, max_planes: usize) -> Result<SaltTensor, FormatError> {
+        let mut salt_rows = Vec::with_capacity(
+            self.rows
+                .min(self.blob.len() / SALT_HEADER_BYTES + usize::from(!self.blob.is_empty())),
+        );
+        walk_tensor_rows(self.blob, self.rows, |encoded| {
+            let row = unpack_salt_row_prefix(encoded, max_planes)?;
+            if row.k != self.k {
+                return Err(FormatError::WrongBlockLen {
+                    expected: self.k,
+                    got: row.k,
+                });
+            }
+            salt_rows.push(row);
+            Ok(())
+        })?;
+        Ok(SaltTensor {
+            name: self.name.to_owned(),
+            rows: self.rows,
+            k: self.k,
+            salt_rows,
+        })
+    }
+}
+
+/// Structural index over a whole-model SALT bundle.
+///
+/// Construction validates every tensor and row, including progressive sparse payloads,
+/// but retains only borrowed names and encoded tensor slices. Runtimes can then decode
+/// one named tensor at a time instead of materializing the entire model concurrently.
+#[derive(Debug)]
+pub struct SaltBundleIndex<'a> {
+    tensors: Vec<SaltTensorView<'a>>,
+    by_name: HashMap<&'a str, usize>,
+}
+
+impl<'a> SaltBundleIndex<'a> {
+    /// Parse and fully validate a SALT bundle without retaining decoded rows.
+    ///
+    /// # Errors
+    /// Same malformed-input errors as [`read_salt_bundle`].
+    pub fn new(bytes: &'a [u8]) -> Result<Self, FormatError> {
+        let mut c = Cursor { b: bytes, o: 0 };
+        if c.take(4)? != SALT_BUNDLE_MAGIC {
+            return Err(FormatError::SaltBadMagic);
+        }
+        let version = c.take(1)?[0];
+        if version != SALT_BUNDLE_VERSION {
+            return Err(FormatError::UnsupportedSaltVersion(version));
+        }
+        let _reserved = c.take(1)?;
+        let tensor_count = c.u32()?;
+
+        struct Entry<'a> {
+            name: &'a str,
+            rows: usize,
+            k: usize,
+            data_len: usize,
+        }
+
+        let capacity = tensor_count.min(bytes.len() / 18);
+        let mut entries = Vec::with_capacity(capacity);
+        for _ in 0..tensor_count {
+            let name_len = c.u16()?;
+            let name = core::str::from_utf8(c.take(name_len)?)
+                .map_err(|_| FormatError::SaltInvalidTensorName)?;
+            entries.push(Entry {
+                name,
+                rows: c.u32()?,
+                k: c.u32()?,
+                data_len: c.u64()?,
+            });
+        }
+
+        let mut tensors = Vec::with_capacity(capacity);
+        let mut by_name = HashMap::with_capacity(capacity);
+        for entry in entries {
+            let blob = c.take(entry.data_len)?;
+            walk_tensor_rows(blob, entry.rows, |encoded| {
+                let row = unpack_salt_row_prefix(encoded, 0)?;
+                if row.k != entry.k {
+                    return Err(FormatError::WrongBlockLen {
+                        expected: entry.k,
+                        got: row.k,
+                    });
+                }
+                Ok(())
+            })?;
+            if by_name.insert(entry.name, tensors.len()).is_some() {
+                return Err(FormatError::SaltDuplicateTensor(entry.name.to_owned()));
+            }
+            tensors.push(SaltTensorView {
+                name: entry.name,
+                rows: entry.rows,
+                k: entry.k,
+                blob,
+            });
+        }
+        if c.o != bytes.len() {
+            return Err(FormatError::WrongBlockLen {
+                expected: c.o,
+                got: bytes.len(),
+            });
+        }
+        Ok(Self { tensors, by_name })
+    }
+
+    /// Number of indexed tensors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    /// Whether the bundle contains no tensors.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+
+    /// Tensor names in serialized order.
+    pub fn tensor_names(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.tensors.iter().map(|tensor| tensor.name)
+    }
+
+    /// Find a named tensor without decoding its rows.
+    #[must_use]
+    pub fn tensor(&self, name: &str) -> Option<SaltTensorView<'a>> {
+        self.by_name.get(name).map(|&index| self.tensors[index])
+    }
 }
 
 /// Serialize a whole model to a SALT bundle. Each entry is `(name, salt_rows)`; the row
@@ -88,7 +266,11 @@ where
     })?;
     // Pack each tensor's rows into one contiguous blob first (so we know its data_len).
     let mut packed_tensors = Vec::with_capacity(tensors.len());
+    let mut names = HashSet::with_capacity(tensors.len());
     for (name, rows) in tensors {
+        if !names.insert(*name) {
+            return Err(FormatError::SaltDuplicateTensor((*name).to_owned()));
+        }
         let name_len = u16::try_from(name.len()).map_err(|_| FormatError::WrongBlockLen {
             expected: u16::MAX as usize,
             got: name.len(),
@@ -177,8 +359,49 @@ impl<'a> Cursor<'a> {
     }
     fn u64(&mut self) -> Result<usize, FormatError> {
         let s = self.take(8)?;
-        Ok(u64::from_le_bytes(s.try_into().expect("8 bytes")) as usize)
+        let value = u64::from_le_bytes(s.try_into().expect("8 bytes"));
+        usize::try_from(value).map_err(|_| FormatError::SaltLengthOverflow(value))
     }
+}
+
+fn walk_tensor_rows(
+    blob: &[u8],
+    rows: usize,
+    mut visit: impl FnMut(&[u8]) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
+    let mut off = 0usize;
+    for _ in 0..rows {
+        let header_end = off
+            .checked_add(SALT_HEADER_BYTES)
+            .ok_or(FormatError::WrongBlockLen {
+                expected: SALT_HEADER_BYTES,
+                got: blob.len(),
+            })?;
+        if header_end > blob.len() {
+            return Err(FormatError::WrongBlockLen {
+                expected: header_end,
+                got: blob.len(),
+            });
+        }
+        let row_len = packed_salt_row_len(&blob[off..])?;
+        let end = off.checked_add(row_len).ok_or(FormatError::WrongBlockLen {
+            expected: row_len,
+            got: blob.len(),
+        })?;
+        let encoded = blob.get(off..end).ok_or(FormatError::WrongBlockLen {
+            expected: end,
+            got: blob.len(),
+        })?;
+        visit(encoded)?;
+        off = end;
+    }
+    if off != blob.len() {
+        return Err(FormatError::WrongBlockLen {
+            expected: off,
+            got: blob.len(),
+        });
+    }
+    Ok(())
 }
 
 /// Parse a SALT bundle into its tensors, enforcing magic + version and bounds-checking
@@ -203,90 +426,13 @@ pub fn read_salt_bundle_prefix(
     bytes: &[u8],
     max_planes: usize,
 ) -> Result<Vec<SaltTensor>, FormatError> {
-    let mut c = Cursor { b: bytes, o: 0 };
-    if c.take(4)? != SALT_BUNDLE_MAGIC {
-        return Err(FormatError::SaltBadMagic);
-    }
-    let version = c.take(1)?[0];
-    if version != SALT_BUNDLE_VERSION {
-        return Err(FormatError::UnsupportedSaltVersion(version));
-    }
-    let _reserved = c.take(1)?;
-    let tensor_count = c.u32()?;
-
-    // Index, then a data region whose layout the index pins down.
-    struct Entry {
-        name: String,
-        rows: usize,
-        k: usize,
-        data_len: usize,
-    }
-    // Cap the reservation by what the buffer could actually hold (each index entry is
-    // ≥18 bytes: name_len 2 + rows 4 + k 4 + data_len 8). A crafted `tensor_count` of
-    // u32::MAX on a tiny file must not reserve gigabytes before the per-entry `take` errors.
-    let mut index = Vec::with_capacity(tensor_count.min(bytes.len() / 18));
-    for _ in 0..tensor_count {
-        let name_len = c.u16()?;
-        let name = core::str::from_utf8(c.take(name_len)?)
-            .map_err(|_| FormatError::SaltBadMagic)?
-            .to_owned();
-        let rows = c.u32()?;
-        let k = c.u32()?;
-        let data_len = c.u64()?;
-        index.push(Entry {
-            name,
-            rows,
-            k,
-            data_len,
-        });
-    }
-
-    let mut out = Vec::with_capacity(tensor_count.min(bytes.len() / 18));
-    for e in index {
-        let blob = c.take(e.data_len)?;
-        // Walk the blob's `rows` self-describing packed rows.
-        let mut off = 0usize;
-        // Cap by the blob (each row is ≥SALT_HEADER_BYTES) so a huge `e.rows` can't reserve
-        // unboundedly before the per-row bounds check below errors.
-        let mut salt_rows = Vec::with_capacity(e.rows.min(blob.len() / SALT_HEADER_BYTES + 1));
-        for _ in 0..e.rows {
-            if off + SALT_HEADER_BYTES > blob.len() {
-                return Err(FormatError::WrongBlockLen {
-                    expected: off + SALT_HEADER_BYTES,
-                    got: blob.len(),
-                });
-            }
-            let row_len = packed_salt_row_len(&blob[off..])?;
-            let row = unpack_salt_row_prefix(&blob[off..off + row_len], max_planes)?;
-            if row.k != e.k {
-                return Err(FormatError::WrongBlockLen {
-                    expected: e.k,
-                    got: row.k,
-                });
-            }
-            salt_rows.push(row);
-            off += row_len;
-        }
-        if off != blob.len() {
-            return Err(FormatError::WrongBlockLen {
-                expected: off,
-                got: blob.len(),
-            });
-        }
-        out.push(SaltTensor {
-            name: e.name,
-            rows: e.rows,
-            k: e.k,
-            salt_rows,
-        });
-    }
-    if c.o != bytes.len() {
-        return Err(FormatError::WrongBlockLen {
-            expected: c.o,
-            got: bytes.len(),
-        });
-    }
-    Ok(out)
+    let index = SaltBundleIndex::new(bytes)?;
+    index
+        .tensors
+        .iter()
+        .copied()
+        .map(|tensor| tensor.decode_prefix(max_planes))
+        .collect()
 }
 
 #[cfg(test)]
@@ -383,6 +529,93 @@ mod tests {
         assert_eq!(got[0].salt_rows, t_a);
         assert_eq!(got[1].salt_rows, t_b);
         assert_eq!(got[2].salt_rows, t_c);
+    }
+
+    #[test]
+    fn bundle_index_decodes_selected_tensor_and_validates_all_payloads() {
+        let t_a = vec![row(256, 2, 1), row(256, 1, 2)];
+        let mut sparse = row(4096, 1, 3);
+        sparse.planes.push(sparse_residual(4096, 64));
+        let t_b = vec![sparse];
+        let tensors: Vec<(&str, &[SaltRow])> = vec![("a", &t_a), ("b", &t_b)];
+        let packed = write_progressive_salt_bundle(&tensors, 0.10).unwrap();
+        let legacy = write_salt_bundle(&tensors).unwrap();
+
+        let index = SaltBundleIndex::new(&packed).expect("index bundle");
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.tensor_names().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(index.tensor("a").map(SaltTensorView::shape), Some((2, 256)));
+        assert!(index.tensor("missing").is_none());
+
+        let selected = index.tensor("b").unwrap().decode().expect("decode b");
+        assert_eq!(selected.name, "b");
+        assert_eq!(selected.salt_rows, t_b);
+        let prefix = index
+            .tensor("b")
+            .unwrap()
+            .decode_prefix(1)
+            .expect("decode b prefix");
+        assert_eq!(prefix.salt_rows[0].planes, vec![t_b[0].planes[0].clone()]);
+        assert_eq!(
+            SaltBundleIndex::new(&legacy)
+                .unwrap()
+                .tensor("b")
+                .unwrap()
+                .decode()
+                .unwrap()
+                .salt_rows,
+            t_b
+        );
+
+        // Index construction validates every row without retaining decoded tensors. Corruption
+        // in an unselected tensor must therefore fail before `tensor("a")` can hide it.
+        let index_bytes = 10 + (2 + 1 + 4 + 4 + 8) * 2;
+        let a_bytes: usize = t_a
+            .iter()
+            .map(|r| pack_progressive_salt_row(r, 0.10).unwrap().len())
+            .sum();
+        let mut corrupt = packed.clone();
+        let b_row = index_bytes + a_bytes;
+        let b_base_payload = b_row + SALT_HEADER_BYTES + 2 * 5;
+        corrupt[b_base_payload] = 0xff; // four reserved TQ2_0 codes
+        assert!(matches!(
+            SaltBundleIndex::new(&corrupt),
+            Err(FormatError::DecodedOutOfRange(2))
+        ));
+
+        let mut corrupt_sparse = packed;
+        let dense_plane_bytes = t_b[0].planes[0].len();
+        let b_sparse_payload = b_base_payload + dense_plane_bytes;
+        corrupt_sparse[b_sparse_payload] = 0; // corrupt the sparse TSSP magic
+        assert!(matches!(
+            SaltBundleIndex::new(&corrupt_sparse),
+            Err(FormatError::SaltBadMagic)
+        ));
+    }
+
+    #[test]
+    fn bundle_rejects_duplicate_and_invalid_names() {
+        let rows = vec![row(256, 1, 1)];
+        assert!(matches!(
+            write_salt_bundle(&[("w", &rows), ("w", &rows)]),
+            Err(FormatError::SaltDuplicateTensor(name)) if name == "w"
+        ));
+
+        let mut duplicate = write_salt_bundle(&[("a", &rows), ("b", &rows)]).unwrap();
+        let first_entry_bytes = 2 + 1 + 4 + 4 + 8;
+        let second_name = 10 + first_entry_bytes + 2;
+        duplicate[second_name] = b'a';
+        assert!(matches!(
+            SaltBundleIndex::new(&duplicate),
+            Err(FormatError::SaltDuplicateTensor(name)) if name == "a"
+        ));
+
+        let mut invalid_utf8 = write_salt_bundle(&[("w", &rows)]).unwrap();
+        invalid_utf8[12] = 0xff;
+        assert!(matches!(
+            SaltBundleIndex::new(&invalid_utf8),
+            Err(FormatError::SaltInvalidTensorName)
+        ));
     }
 
     #[test]

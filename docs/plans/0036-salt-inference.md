@@ -37,3 +37,21 @@ No `load_hf`/BitNet regression (SmolLM2 conformance still 16/16); fmt + clippy `
   the VRAM win; matters at 32B → plan 0040. CPU dequant-to-dense proves correctness now.
 - **Self-contained bundle** (quantize also emits norms + config) → `from_salt` needs only the bundle.
 - **Eager dequant** of all bundle tensors into RAM — fine for small models; 32B streaming is plan 0040.
+
+## Post-plan hardening (2026-07-14)
+
+The CPU inference baseline now retains projection weights as packed additive planes instead of
+keeping an `N × K` fp32 matrix:
+
+- `SaltBundleIndex` validates the complete TSLB once, provides O(1) named lookup, and decodes only
+  the requested tensor. Duplicate names, invalid UTF-8, overflowing lengths, and corrupt payloads
+  in unselected tensors fail closed.
+- `SaltLinear` reconstructs one 256-weight block at a time and contracts through the existing A8
+  activation path. Its output is bit-exact to `salt_rows_to_dense → DenseLinear::new`, including
+  ragged rows and zero-plane rows, while retaining only packed planes.
+- `ModelWeights::load_salt` uses `Projection::Salt` for every attention/MLP projection and an
+  untied LM head for both TSLB and SALT-GGUF. The embedding and tied head remain dense.
+
+This does not yet make 32B loading or serving production-ready. The loader still reads the whole
+bundle and fp master shards, SALT-GGUF decoding is eager, progressive sparse planes expand into the
+dense TQ2 runtime representation, and SALT projections do not enter the resident CUDA decoder.

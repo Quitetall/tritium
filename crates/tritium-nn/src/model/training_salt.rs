@@ -914,7 +914,7 @@ mod tests {
                     .expect("q dense")
                     .as_slice()
             ),
-            Projection::Ternary(_) => {
+            Projection::Salt(_) | Projection::Ternary(_) => {
                 panic!("reference loader must dequantize to exact dense")
             }
         }
@@ -938,7 +938,7 @@ mod tests {
                     .expect("head dense")
                     .as_slice()
             ),
-            Projection::Ternary(_) => {
+            Projection::Salt(_) | Projection::Ternary(_) => {
                 panic!("reference loader must dequantize the head to exact dense")
             }
         }

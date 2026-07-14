@@ -3,9 +3,8 @@
 //! - [`ModelWeights::load_hf`] (plan 0035): fp model from `config.json` + safetensors —
 //!   exact-fp dense projections ([`DenseLinear::new_exact`]).
 //! - [`ModelWeights::load_salt`] (plan 0036): a **SALT-quantized** model — ternary 2D weights
-//!   from a SALT bundle via dequant-to-dense + the A8 int8-activation `DenseLinear` (a CPU/eval
-//!   path — numerically ≈ the native multi-plane ternary GEMM within ~1e-4, not bit-identical),
-//!   with 1D norms + config from the original model dir.
+//!   retained as packed additive planes and contracted through the A8 activation path, with 1D
+//!   norms + config from the original model dir. The embedding/tied head remains dense for now.
 //!
 //! All loading paths — these two AND the BitNet GGUF path
 //! ([`ModelWeights::load`], P2e) — share [`build_standard_model`], the one
@@ -15,14 +14,19 @@
 //! QKV-bias are rejected (plan 0037); SSM/MoE are later still. Weights are read eagerly (fine
 //! for the small conformance model); streaming/mmap for 50GB+ masters is plan 0040.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use tritium_format::{SafeTensors, read_salt_bundle, read_salt_gguf, salt_rows_to_dense};
+use tritium_format::{
+    SafeTensors, SaltBundleIndex, SaltTensor, read_salt_gguf, salt_rows_to_dense,
+};
 
 use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
-use crate::layers::{DenseLinear, Mlp, Projection, Relu2Mlp, SwiGluMlp, TransformerBlock};
+use crate::layers::{
+    DenseLinear, Mlp, Projection, Relu2Mlp, SaltLinear, SwiGluMlp, TransformerBlock,
+};
 use crate::model::ModelWeights;
 
 impl ModelWeights {
@@ -92,11 +96,10 @@ impl ModelWeights {
     }
 
     /// Load a **SALT-quantized** standard-transformer model: the ternary 2D weights come from a
-    /// SALT bundle (`.tslb` or SALT-GGUF) via dequant-to-dense (numerically ≈ the native
-    /// multi-plane ternary GEMM within ~1e-4, a CPU/eval path — not bit-identical), while the 1D
-    /// norms + `config.json` come from `model_dir` (bundles carry neither). A 2D weight missing
-    /// from the bundle is a **hard error** (never a silent fp fallback). Runs a degraded-but-working
-    /// ternary model.
+    /// SALT bundle (`.tslb` or SALT-GGUF) as packed additive projections. Projection weights never
+    /// materialize as retained fp32 matrices; only the token embedding remains dense because gather
+    /// and tied-head execution still use the legacy table. 1D norms + `config.json` come from
+    /// `model_dir` (bundles carry neither). A 2D weight missing from the bundle is a **hard error**.
     ///
     /// # Errors
     /// [`NnError::MissingConfig`] (bad config / unsupported arch), [`NnError::MissingTensor`]
@@ -109,23 +112,45 @@ impl ModelWeights {
         let cfg_json = std::fs::read_to_string(&cfg_path)
             .map_err(|e| NnError::MissingConfig(format!("read {}: {e}", cfg_path.display())))?;
         let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
+        let config_value: serde_json::Value = serde_json::from_str(&cfg_json)
+            .map_err(|e| NnError::MissingConfig(format!("invalid config.json: {e}")))?;
+        let declared_vocab = match config_value.get("vocab_size") {
+            None => None,
+            Some(value) => {
+                let raw = value
+                    .as_u64()
+                    .ok_or_else(|| NnError::MissingConfig("vocab_size".to_owned()))?;
+                Some(
+                    usize::try_from(raw)
+                        .map_err(|_| NnError::MissingConfig("vocab_size overflows usize".into()))?,
+                )
+            }
+        };
 
-        // Dequantize every bundle tensor (the 2D ternary weights + the embedding) to dense fp32.
+        // TSLB uses a validated borrowed index so each requested tensor decodes directly into its
+        // final packed projection. SALT-GGUF already owns a tensor index, but its current public
+        // reader returns owned tensors; retain those packed rows without fp32 projection clones.
         let bundle_bytes = std::fs::read(bundle)
             .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", bundle.display())))?;
-        // Sniff by magic, not filename: GGUF starts with `b"GGUF"`, a SALT bundle with `b"TSLB"`.
-        let tensors = if bundle_bytes.starts_with(b"GGUF") {
-            read_salt_gguf(&bundle_bytes)
+        let source = if bundle_bytes.starts_with(b"GGUF") {
+            let tensors = read_salt_gguf(&bundle_bytes)
+                .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?;
+            let mut by_name = HashMap::with_capacity(tensors.len());
+            for tensor in tensors {
+                let name = tensor.name.clone();
+                if by_name.insert(name.clone(), tensor).is_some() {
+                    return Err(NnError::MissingTensor(format!(
+                        "duplicate SALT tensor `{name}`"
+                    )));
+                }
+            }
+            SaltTensorSource::Gguf(RefCell::new(by_name))
         } else {
-            read_salt_bundle(&bundle_bytes)
-        }
-        .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?;
-        let mut dequant: HashMap<String, Vec<f32>> = HashMap::new();
-        for t in &tensors {
-            let d = salt_rows_to_dense(&t.salt_rows)
-                .map_err(|e| NnError::MissingTensor(format!("dequant {}: {e}", t.name)))?;
-            dequant.insert(t.name.clone(), d);
-        }
+            SaltTensorSource::Bundle(
+                SaltBundleIndex::new(&bundle_bytes)
+                    .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?,
+            )
+        };
 
         // The 1D norms (and any tensor the bundle lacks) come from the original safetensors.
         let shard_bytes: Vec<Vec<u8>> = resolve_shards(model_dir)?
@@ -161,18 +186,35 @@ impl ModelWeights {
             ));
         }
 
-        // 2D weights (in the bundle) → dequanted ternary; 1D norms → the original safetensors.
+        // Embedding (in bundle) remains dense for gather/tied-head; 1D norms come from master.
         let provider = |name: &str| -> Result<Vec<f32>, NnError> {
-            if let Some(d) = dequant.get(name) {
-                return Ok(d.clone());
-            }
-            // Only the 1D norms come from the fp master. A 2D weight (any non-`*norm.weight`
-            // name — projections, embedding, lm_head) absent from the bundle must NOT silently
-            // fall back to fp: that would load a secretly-unquantized weight. Fail loudly.
             if !name.ends_with("norm.weight") {
-                return Err(NnError::MissingTensor(format!(
-                    "`{name}` absent from the SALT bundle (a 2D weight must be quantized, not read fp)"
-                )));
+                let tensor = source.tensor(name)?;
+                if name == NameSchema::Hf.top("token_embd") {
+                    let n_embd = config.n_embd as usize;
+                    if tensor.k != n_embd {
+                        return Err(NnError::Shape {
+                            expected: n_embd,
+                            got: tensor.k,
+                        });
+                    }
+                    if let Some(vocab) = declared_vocab
+                        && tensor.rows != vocab
+                    {
+                        return Err(NnError::Shape {
+                            expected: vocab,
+                            got: tensor.rows,
+                        });
+                    }
+                    if tensor.salt_rows.len() != tensor.rows {
+                        return Err(NnError::Shape {
+                            expected: tensor.rows,
+                            got: tensor.salt_rows.len(),
+                        });
+                    }
+                }
+                return salt_rows_to_dense(&tensor.salt_rows)
+                    .map_err(|e| NnError::MissingTensor(format!("dequant {name}: {e}")));
             }
             let i = *loc
                 .get(name)
@@ -181,18 +223,15 @@ impl ModelWeights {
                 .tensor_f32(name)
                 .map_err(|e| NnError::MissingTensor(format!("{name}: {e}")))
         };
-        // `exact_fp = false` ⇒ the A8 int8-activation `DenseLinear`. dequant-to-dense is
-        // *numerically* equivalent to the native multi-plane ternary GEMM (within the ~1e-4
-        // kernel tolerance) but not bit-identical — a CPU/eval path; the GPU native path (plan
-        // 0040) is the deployed one.
         let weights = build_standard_model(
             &config,
             &spec,
             NameSchema::Hf,
             |n| provider(n),
             |name, n_out, k_in| {
-                Ok(Projection::Dense(DenseLinear::new(
-                    provider(name)?,
+                let tensor = source.tensor(name)?;
+                Ok(Projection::Salt(SaltLinear::new(
+                    tensor.salt_rows,
                     n_out,
                     k_in,
                 )?))
@@ -200,6 +239,35 @@ impl ModelWeights {
         )?;
         Ok((config, weights))
     }
+}
+
+enum SaltTensorSource<'a> {
+    Bundle(SaltBundleIndex<'a>),
+    Gguf(RefCell<HashMap<String, SaltTensor>>),
+}
+
+impl SaltTensorSource<'_> {
+    fn tensor(&self, name: &str) -> Result<SaltTensor, NnError> {
+        match self {
+            Self::Bundle(index) => index
+                .tensor(name)
+                .ok_or_else(|| missing_salt_tensor(name))?
+                .decode()
+                .map_err(|error| {
+                    NnError::MissingTensor(format!("decode SALT tensor `{name}`: {error}"))
+                }),
+            Self::Gguf(tensors) => tensors
+                .borrow_mut()
+                .remove(name)
+                .ok_or_else(|| missing_salt_tensor(name)),
+        }
+    }
+}
+
+fn missing_salt_tensor(name: &str) -> NnError {
+    NnError::MissingTensor(format!(
+        "`{name}` absent from the SALT bundle (a 2D weight must be quantized, not read fp)"
+    ))
 }
 
 /// Tensor-name schema: which source names fill the canonical model slots.
@@ -297,6 +365,12 @@ pub(crate) fn build_standard_model(
     let n_ff = config.n_ff as usize;
 
     let token_embd = dense(schema.top("token_embd"))?;
+    if n_embd == 0 || token_embd.is_empty() || token_embd.len() % n_embd != 0 {
+        return Err(NnError::Shape {
+            expected: n_embd,
+            got: token_embd.len(),
+        });
+    }
     let vocab = token_embd.len() / n_embd;
     let output_norm = dense(schema.top("output_norm"))?;
 
@@ -442,8 +516,11 @@ fn resolve_shards(dir: &Path) -> Result<Vec<PathBuf>, NnError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::MlpKind;
+    use std::collections::HashMap;
+
+    use super::{NameSchema, build_standard_model};
     use crate::model::ModelWeights;
+    use crate::{DenseLinear, MlpKind, ModelConfig, NnError};
 
     /// Build a minimal F32 safetensors blob: `[u64 header_len][JSON header][f32 data]`.
     fn safetensors(tensors: &[(&str, &[usize], Vec<f32>)]) -> Vec<u8> {
@@ -514,7 +591,7 @@ mod tests {
             r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
                 "num_attention_heads":2,"num_key_value_heads":1,"intermediate_size":16,
                 "rms_norm_eps":1e-5,"hidden_act":"silu","tie_word_embeddings":true,
-                "rope_theta":10000.0}"#,
+                "rope_theta":10000.0,"vocab_size":10}"#,
         )
         .unwrap();
 
@@ -541,22 +618,23 @@ mod tests {
     }
 
     #[test]
-    fn load_salt_dequants_bundle_and_runs() {
-        use crate::{ModelRunner, Projection};
+    fn load_salt_retains_packed_projections_and_runs() {
+        use crate::{Mlp, ModelRunner, Projection};
         use tritium_format::{
             DEFAULT_SPARSE_RESIDUAL_DENSITY, SaltRow, salt_rows_to_dense,
-            write_progressive_salt_bundle, write_salt_bundle,
+            write_progressive_salt_bundle, write_salt_bundle, write_salt_gguf,
         };
         use tritium_quantize::{QuantConfig, quantize_tensor};
 
         let (n_embd, n_head, n_kv, n_ff, vocab) = (8usize, 2usize, 1usize, 16usize, 10usize);
         let hd = n_embd / n_head;
         let (qw, kw) = (n_head * hd, n_kv * hd);
-        let fill = |n: usize| {
+        let fill_seeded = |n: usize, seed: usize| {
             (0..n)
-                .map(|i| (i as f32 * 0.017).sin() * 0.5)
+                .map(|i| ((i + seed * 37) as f32 * 0.017).sin() * 0.5)
                 .collect::<Vec<f32>>()
         };
+        let fill = |n: usize| fill_seeded(n, 0);
         // The 2D weights SALT quantizes: (name, n_out, k_in).
         let w2d: Vec<(&str, usize, usize)> = vec![
             ("model.embed_tokens.weight", vocab, n_embd),
@@ -576,8 +654,8 @@ mod tests {
 
         // Original fp safetensors (2D weights + 1D norms).
         let mut st: Vec<(&str, Vec<usize>, Vec<f32>)> = Vec::new();
-        for &(n, no, ki) in &w2d {
-            st.push((n, vec![no, ki], fill(no * ki)));
+        for (seed, &(n, no, ki)) in w2d.iter().enumerate() {
+            st.push((n, vec![no, ki], fill_seeded(no * ki, seed + 1)));
         }
         for &n in &norms {
             st.push((n, vec![n_embd], fill(n_embd)));
@@ -596,7 +674,7 @@ mod tests {
             r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
                 "num_attention_heads":2,"num_key_value_heads":1,"intermediate_size":16,
                 "rms_norm_eps":1e-5,"hidden_act":"silu","tie_word_embeddings":true,
-                "rope_theta":10000.0}"#,
+                "rope_theta":10000.0,"vocab_size":10}"#,
         )
         .unwrap();
 
@@ -630,21 +708,79 @@ mod tests {
         let backend = Box::new(tritium_cpu::CpuBackend::new());
         let mut runner = ModelRunner::from_salt(&dir, &bundle_path, backend).expect("from_salt");
 
-        // Wiring: the loaded q_proj weights equal the bundle's dequant (bundle → read → dequant).
-        let q = "model.layers.0.self_attn.q_proj.weight";
-        let q_expect = salt_rows_to_dense(&salt.iter().find(|(n, _)| n == q).unwrap().1).unwrap();
+        // Wiring: every attention/MLP projection retains packed SALT planes.
         match &runner.weights.layers[0].q_proj {
-            Projection::Dense(d) => assert_eq!(d.weights, q_expect, "q_proj = bundle dequant"),
-            Projection::Ternary(_) => panic!("expected a Dense (dequant-to-dense) projection"),
+            Projection::Salt(linear) => {
+                assert_eq!((linear.n_out(), linear.k_in()), (qw, n_embd));
+                assert!(linear.packed_bytes() > 0);
+            }
+            Projection::Dense(_) | Projection::Ternary(_) => {
+                panic!("SALT loader must retain packed additive planes")
+            }
+        }
+        for layer in &runner.weights.layers {
+            for projection in [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
+                assert!(matches!(projection, Projection::Salt(_)));
+            }
+            let Mlp::SwiGlu(mlp) = &layer.mlp else {
+                panic!("Llama fixture must build a SwiGLU MLP");
+            };
+            for projection in [&mlp.gate, &mlp.up, &mlp.down] {
+                assert!(matches!(projection, Projection::Salt(_)));
+            }
         }
         assert!(runner.weights.lm_head.is_none(), "tied ⇒ no lm_head");
 
         // Runs: a forward yields finite, vocab-length logits.
-        let logits = runner.forward(&[0u32], &[0]).expect("forward");
+        let tokens = [0u32, 1u32];
+        let positions = [0usize, 1usize];
+        let logits = runner.forward(&tokens, &positions).expect("forward");
         assert_eq!(logits.len(), vocab);
         assert!(
             logits.iter().all(|x| x.is_finite()),
             "logits must be finite"
+        );
+
+        // Exact end-to-end oracle: dequantize the same named rows into the former A8 dense
+        // representation. This catches equal-shaped q/k/v tensors being wired under the wrong
+        // names, which representation/shape checks and v1/v2 equality alone cannot detect.
+        let dequant: HashMap<&str, Vec<f32>> = salt
+            .iter()
+            .map(|(name, rows)| (name.as_str(), salt_rows_to_dense(rows).unwrap()))
+            .collect();
+        let dense_provider = |name: &str| -> Result<Vec<f32>, NnError> {
+            if let Some(weight) = dequant.get(name) {
+                return Ok(weight.clone());
+            }
+            st.iter()
+                .find(|(candidate, _, _)| *candidate == name)
+                .map(|(_, _, values)| values.clone())
+                .ok_or_else(|| NnError::MissingTensor(name.to_owned()))
+        };
+        let cfg_json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        let (oracle_config, oracle_spec) = ModelConfig::from_hf_config(&cfg_json).unwrap();
+        let oracle_weights = build_standard_model(
+            &oracle_config,
+            &oracle_spec,
+            NameSchema::Hf,
+            |name| dense_provider(name),
+            |name, n_out, k_in| {
+                Ok(Projection::Dense(DenseLinear::new(
+                    dense_provider(name)?,
+                    n_out,
+                    k_in,
+                )?))
+            },
+        )
+        .unwrap();
+        let oracle_backend = Box::new(tritium_cpu::CpuBackend::new());
+        let mut oracle = ModelRunner::from_weights(oracle_config, oracle_weights, oracle_backend);
+        assert_eq!(
+            logits,
+            oracle
+                .forward(&tokens, &positions)
+                .expect("dense SALT oracle"),
+            "packed loader must preserve exact named SALT wiring"
         );
 
         // Keep the legacy v1 bundle on the positive runtime path too: both encodings must
@@ -654,7 +790,9 @@ mod tests {
         let legacy_backend = Box::new(tritium_cpu::CpuBackend::new());
         let mut legacy_runner =
             ModelRunner::from_salt(&dir, &legacy_path, legacy_backend).expect("from_salt v1");
-        let legacy_logits = legacy_runner.forward(&[0u32], &[0]).expect("forward v1");
+        let legacy_logits = legacy_runner
+            .forward(&tokens, &positions)
+            .expect("forward v1");
         assert_eq!(legacy_logits, logits, "v1 and v2 runtime logits must match");
 
         // Negative: a bundle MISSING a 2D weight must error — never silently load the fp master.
@@ -672,6 +810,79 @@ mod tests {
             matches!(err, crate::NnError::MissingTensor(_)),
             "missing 2D weight must error, got {err:?}"
         );
+
+        // Negative: embedding rows may not be silently flattened across the model width.
+        let bad_embedding = quantize_tensor(&fill(vocab * (n_embd + 1)), vocab, n_embd + 1, &cfg)
+            .unwrap()
+            .salt_rows;
+        let malformed_embedding: Vec<(&str, &[SaltRow])> = salt
+            .iter()
+            .map(|(name, rows)| {
+                if name == "model.embed_tokens.weight" {
+                    (name.as_str(), bad_embedding.as_slice())
+                } else {
+                    (name.as_str(), rows.as_slice())
+                }
+            })
+            .collect();
+        let malformed_embedding_path = dir.join("bad-embedding.tslb");
+        std::fs::write(
+            &malformed_embedding_path,
+            write_salt_bundle(&malformed_embedding).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ModelWeights::load_salt(&dir, &malformed_embedding_path),
+            Err(NnError::Shape { .. })
+        ));
+
+        // Negative: correct embedding width with the wrong declared vocabulary is also invalid.
+        let short_embedding = quantize_tensor(&fill((vocab - 1) * n_embd), vocab - 1, n_embd, &cfg)
+            .unwrap()
+            .salt_rows;
+        let wrong_vocab: Vec<(&str, &[SaltRow])> = salt
+            .iter()
+            .map(|(name, rows)| {
+                if name == "model.embed_tokens.weight" {
+                    (name.as_str(), short_embedding.as_slice())
+                } else {
+                    (name.as_str(), rows.as_slice())
+                }
+            })
+            .collect();
+        let wrong_vocab_path = dir.join("wrong-vocab.tslb");
+        std::fs::write(&wrong_vocab_path, write_salt_bundle(&wrong_vocab).unwrap()).unwrap();
+        assert!(matches!(
+            ModelWeights::load_salt(&dir, &wrong_vocab_path),
+            Err(NnError::Shape { .. })
+        ));
+
+        // Negative: a crafted zero-row embedding may not construct a vocab=0 model.
+        let mut zero_embedding = write_salt_bundle(&bundle_refs).unwrap();
+        let embedding_name = "model.embed_tokens.weight";
+        let embedding_rows_offset = 10 + 2 + embedding_name.len();
+        let embedding_data_len_offset = embedding_rows_offset + 4 + 4;
+        let embedding_data_len = u64::from_le_bytes(
+            zero_embedding[embedding_data_len_offset..embedding_data_len_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        zero_embedding[embedding_rows_offset..embedding_rows_offset + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        zero_embedding[embedding_data_len_offset..embedding_data_len_offset + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let data_start = 10
+            + bundle_refs
+                .iter()
+                .map(|(name, _)| 2 + name.len() + 4 + 4 + 8)
+                .sum::<usize>();
+        zero_embedding.drain(data_start..data_start + embedding_data_len);
+        let zero_embedding_path = dir.join("zero-embedding.tslb");
+        std::fs::write(&zero_embedding_path, zero_embedding).unwrap();
+        assert!(matches!(
+            ModelWeights::load_salt(&dir, &zero_embedding_path),
+            Err(NnError::Shape { .. })
+        ));
 
         // Negative: a master carrying a QKV bias (Qwen) → SALT inference rejected, not silently
         // built bias-less. (load_salt detects bias/QK-norm from the master weights, like load_hf.)
@@ -696,6 +907,68 @@ mod tests {
             "Qwen SALT must be rejected, got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&qdir);
+
+        // The GGUF source branch and untied-head path must also retain packed rows.
+        let untied_dir =
+            std::env::temp_dir().join(format!("tritium-salt-untied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&untied_dir);
+        std::fs::create_dir_all(&untied_dir).unwrap();
+        std::fs::copy(
+            dir.join("model.safetensors"),
+            untied_dir.join("model.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(
+            untied_dir.join("config.json"),
+            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"num_key_value_heads":1,"intermediate_size":16,
+                "rms_norm_eps":1e-5,"hidden_act":"silu","tie_word_embeddings":false,
+                "rope_theta":10000.0,"vocab_size":10}"#,
+        )
+        .unwrap();
+        let head_rows = quantize_tensor(&fill(vocab * n_embd), vocab, n_embd, &cfg)
+            .unwrap()
+            .salt_rows;
+        let mut untied_refs = bundle_refs.clone();
+        untied_refs.push(("lm_head.weight", &head_rows));
+        let gguf_path = untied_dir.join("model.salt.gguf");
+        std::fs::write(&gguf_path, write_salt_gguf(&untied_refs).unwrap()).unwrap();
+        let mut untied_runner = ModelRunner::from_salt(
+            &untied_dir,
+            &gguf_path,
+            Box::new(tritium_cpu::CpuBackend::new()),
+        )
+        .expect("untied SALT-GGUF");
+        assert!(matches!(
+            &untied_runner.weights.lm_head,
+            Some(Projection::Salt(_))
+        ));
+        for layer in &untied_runner.weights.layers {
+            for projection in [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
+                assert!(matches!(projection, Projection::Salt(_)));
+            }
+            let Mlp::SwiGlu(mlp) = &layer.mlp else {
+                panic!("Llama fixture must build a SwiGLU MLP");
+            };
+            for projection in [&mlp.gate, &mlp.up, &mlp.down] {
+                assert!(matches!(projection, Projection::Salt(_)));
+            }
+        }
+        assert!(
+            untied_runner
+                .forward(&[0u32], &[0])
+                .expect("untied GGUF forward")
+                .iter()
+                .all(|value| value.is_finite())
+        );
+
+        let missing_head_path = untied_dir.join("missing-head.salt.gguf");
+        std::fs::write(&missing_head_path, write_salt_gguf(&bundle_refs).unwrap()).unwrap();
+        assert!(matches!(
+            ModelWeights::load_salt(&untied_dir, &missing_head_path),
+            Err(NnError::MissingTensor(_))
+        ));
+        let _ = std::fs::remove_dir_all(&untied_dir);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

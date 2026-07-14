@@ -27,7 +27,9 @@ pub struct Arch {
 pub fn dense(p: &Projection) -> (Vec<f32>, usize, usize) {
     match p {
         Projection::Dense(d) => (d.weights.clone(), d.n_out, d.k_in),
-        Projection::Ternary(_) => panic!("from_hf builds Dense projections"),
+        Projection::Salt(_) | Projection::Ternary(_) => {
+            panic!("from_hf builds Dense projections")
+        }
     }
 }
 

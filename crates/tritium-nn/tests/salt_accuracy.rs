@@ -429,7 +429,7 @@ fn salt_fp_vs_gguf_stage_dump() {
     let absmean = |w: &[f32]| w.iter().map(|x| f64::from(x.abs())).sum::<f64>() / w.len() as f64;
     let hf_w = |p: &Projection| match p {
         Projection::Dense(d) => d.weights.clone(),
-        Projection::Ternary(_) => unreachable!("hf is dense"),
+        Projection::Salt(_) | Projection::Ternary(_) => unreachable!("hf is dense"),
     };
     let gg_scale = |p: &Projection| f64::from(p.as_ternary().expect("gguf ternary").scales[0]);
     println!("\nlayer-0 weight scales (hf absmean vs gguf I2_S scale):");

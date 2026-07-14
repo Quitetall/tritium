@@ -108,8 +108,8 @@ impl ModelRunner {
     /// Build a runner from already-constructed [`ModelWeights`] — e.g. an in-memory
     /// SALT / fp quantization for the accuracy harness — allocating one [`KvCache`]
     /// per layer. The model starts on the host forward path; the device-resident
-    /// decoder is built lazily and is skipped for any model carrying a dense
-    /// ([`Projection::Dense`](crate::layers::Projection)) projection.
+    /// decoder is built lazily and is skipped for any model carrying a SALT or
+    /// dense projection.
     #[must_use]
     pub fn from_weights(
         config: ModelConfig,
@@ -146,7 +146,7 @@ impl ModelRunner {
         Ok(Self::from_weights(config, weights, backend))
     }
 
-    /// Load a **SALT-quantized** model: ternary 2D weights from `bundle` (dequant-to-dense),
+    /// Load a **SALT-quantized** model: packed additive 2D projections from `bundle`,
     /// norms + `config.json` from `model_dir`. See [`ModelWeights::load_salt`].
     ///
     /// # Errors
@@ -622,7 +622,7 @@ impl ModelRunner {
         else {
             return Ok(false);
         };
-        // A model with any dense (SALT / fp) projection cannot use the TQ2_0-only
+        // A model with any SALT/dense projection cannot use the BitNet TQ2_0-only
         // resident decoder; it runs the host forward instead.
         let Some(spec) = Self::build_decode_spec(&self.weights, &self.config) else {
             return Ok(false);
@@ -646,8 +646,8 @@ impl ModelRunner {
         use tritium_cuda::{DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
 
         // The device-resident decoder is TQ2_0-only: every projection must be
-        // ternary. A model carrying any dense (SALT / fp) projection returns `None`
-        // here and runs the host-orchestrated forward instead.
+        // deployed ternary. A model carrying any SALT/dense projection returns
+        // `None` here and runs the host-orchestrated forward instead.
         fn lin(p: &Projection) -> Option<DecodeLinearSpec<'_>> {
             let tl = p.as_ternary()?;
             Some(DecodeLinearSpec {

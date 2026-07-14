@@ -78,8 +78,8 @@ pub use salt::{
     unpack_salt_row_prefix,
 };
 pub use salt_bundle::{
-    SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltTensor, read_salt_bundle, read_salt_bundle_prefix,
-    write_progressive_salt_bundle, write_salt_bundle,
+    SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltBundleIndex, SaltTensor, SaltTensorView,
+    read_salt_bundle, read_salt_bundle_prefix, write_progressive_salt_bundle, write_salt_bundle,
 };
 pub use salt_gguf::{
     GGML_TYPE_TRITIUM_SALT, SALT_GGUF_FORMAT_KEY, SALT_GGUF_FORMAT_VALUE, read_salt_gguf,
@@ -135,6 +135,12 @@ pub enum FormatError {
     InvalidI2sCode(u8),
     /// A SALT sidecar buffer did not start with the [`SALT_MAGIC`] bytes.
     SaltBadMagic,
+    /// A SALT bundle tensor name was not valid UTF-8.
+    SaltInvalidTensorName,
+    /// A SALT bundle declared the same tensor name more than once.
+    SaltDuplicateTensor(String),
+    /// A SALT bundle length cannot be represented by this platform's `usize`.
+    SaltLengthOverflow(u64),
     /// A SALT sidecar declared a format version this build cannot read.
     UnsupportedSaltVersion(u8),
     /// A [`SaltRow`] had more planes than the sidecar's `u8` plane-count field.
@@ -208,6 +214,15 @@ impl fmt::Display for FormatError {
                 write!(f, "invalid I2_S 2-bit code 0b{c:02b} (reserved)")
             }
             FormatError::SaltBadMagic => write!(f, "SALT sidecar: bad magic"),
+            FormatError::SaltInvalidTensorName => {
+                write!(f, "SALT bundle: invalid UTF-8 tensor name")
+            }
+            FormatError::SaltDuplicateTensor(name) => {
+                write!(f, "SALT bundle: duplicate tensor name `{name}`")
+            }
+            FormatError::SaltLengthOverflow(len) => {
+                write!(f, "SALT bundle: length {len} does not fit this platform")
+            }
             FormatError::UnsupportedSaltVersion(v) => {
                 write!(f, "SALT sidecar: unsupported version {v}")
             }
