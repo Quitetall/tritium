@@ -1,6 +1,9 @@
 //! Checked SALT V2 additive-coefficient growth planning.
 
-use crate::training::{TiedSwiGluTrainingModel, TrainingAdapterError};
+use crate::{
+    ArchSpec, ModelConfig,
+    training::{TiedSwiGluTrainingModel, TrainingAdapterError, semantic_training_model_digest},
+};
 use tritium_train::{GrowError, Net2WiderPlan};
 
 /// Largest additive plane count in the SALT V2 synthesis representation.
@@ -17,6 +20,39 @@ pub const WHOLE_HEAD_AND_HIDDEN_COEFFICIENT_THRESHOLD: u64 = 50_000_000_000;
 /// before calling the legacy infallible mapping constructor prevents a valid but
 /// hostile coefficient target from turning planning into a multi-gigabyte allocation.
 pub const MAX_STAGE1_RECEIPT_WIDTH: u32 = 1_048_576;
+
+/// Semantic identity of the exact source checkpoint consumed by a growth plan.
+///
+/// Callers should construct this from [`crate::semantic_training_model_digest`]
+/// after loading and validating the training model. The all-zero value is
+/// reserved for "identity not supplied" and is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GrowthSourceModelId([u8; 32]);
+
+impl GrowthSourceModelId {
+    /// Bind a nonzero semantic model digest.
+    pub fn new(digest: [u8; 32]) -> Result<Self, GrowthPlanError> {
+        if digest == [0; 32] {
+            return Err(GrowthPlanError::InvalidSourceModelId);
+        }
+        Ok(Self(digest))
+    }
+
+    /// Compute the semantic identity of a validated training checkpoint.
+    pub fn from_training_model(
+        config: &ModelConfig,
+        spec: &ArchSpec,
+        model: &TiedSwiGluTrainingModel,
+    ) -> Result<Self, GrowthPlanError> {
+        Self::new(semantic_training_model_digest(config, spec, model))
+    }
+
+    /// Canonical 32-byte semantic digest.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
 
 /// Additive ternary plane counts for every transformer core projection.
 ///
@@ -464,6 +500,7 @@ impl ProjectionGeometry {
     /// coefficient floor without narrowing the existing model.
     pub fn plan(
         &self,
+        source_model_id: GrowthSourceModelId,
         target: GrowthTarget,
         seed: u64,
     ) -> Result<IntermediateGrowthPlan, GrowthPlanError> {
@@ -499,6 +536,7 @@ impl ProjectionGeometry {
             return Err(GrowthPlanError::WholeHeadAndHiddenRequired { target: resulting });
         }
         let plan = IntermediateGrowthPlan {
+            source_model_id,
             geometry: *self,
             target,
             old_width: self.intermediate_width,
@@ -510,8 +548,8 @@ impl ProjectionGeometry {
             stage2_requirement: target.stage2_requirement(),
         };
         // A numerical width is not a usable stage-1 plan unless the existing
-        // deterministic Net2Wider implementation can issue its replay receipt.
-        plan.net2wider_receipt()?;
+        // deterministic Net2Wider implementation can build its replay mapping.
+        plan.expected_net2wider_plan()?;
         Ok(plan)
     }
 
@@ -713,6 +751,8 @@ pub enum Stage2Requirement {
 /// Replayable stage-1 intermediate-width growth plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntermediateGrowthPlan {
+    /// Exact semantic checkpoint consumed by this replayable transform.
+    source_model_id: GrowthSourceModelId,
     geometry: ProjectionGeometry,
     target: GrowthTarget,
     /// Existing uniform SwiGLU intermediate width.
@@ -732,6 +772,12 @@ pub struct IntermediateGrowthPlan {
 }
 
 impl IntermediateGrowthPlan {
+    /// Semantic source checkpoint bound into planning, application, and receipt validation.
+    #[must_use]
+    pub const fn source_model_id(&self) -> GrowthSourceModelId {
+        self.source_model_id
+    }
+
     /// Geometry bound into this plan.
     #[must_use]
     pub const fn geometry(&self) -> ProjectionGeometry {
@@ -786,8 +832,7 @@ impl IntermediateGrowthPlan {
         self.stage2_requirement
     }
 
-    /// Recreate the deterministic Net2Wider receipt for this plan.
-    pub fn net2wider_receipt(&self) -> Result<Net2WiderPlan, GrowthPlanError> {
+    fn expected_net2wider_plan(&self) -> Result<Net2WiderPlan, GrowthPlanError> {
         let old_width =
             usize::try_from(self.old_width).map_err(|_| GrowthPlanError::WidthOutOfRange {
                 axis: "old_intermediate_width",
@@ -802,10 +847,28 @@ impl IntermediateGrowthPlan {
     }
 
     /// Verify that a returned transform receipt is exactly the deterministic
-    /// receipt bound by this plan.
-    pub fn validate_receipt(&self, receipt: &Net2WiderPlan) -> Result<(), GrowthPlanError> {
-        if &self.net2wider_receipt()? != receipt {
+    /// receipt bound by this plan. Receipts can only be issued by [`Self::apply`].
+    pub fn validate_receipt(
+        &self,
+        receipt: &IntermediateGrowthReceipt,
+    ) -> Result<(), GrowthPlanError> {
+        self.validate_source_model_id(receipt.source_model_id)?;
+        if self.expected_net2wider_plan()? != receipt.net2wider {
             return Err(GrowthPlanError::ReceiptMismatch);
+        }
+        Ok(())
+    }
+
+    /// Verify an application target is the exact checkpoint bound during planning.
+    pub fn validate_source_model_id(
+        &self,
+        actual: GrowthSourceModelId,
+    ) -> Result<(), GrowthPlanError> {
+        if actual != self.source_model_id {
+            return Err(GrowthPlanError::SourceModelMismatch {
+                expected: self.source_model_id,
+                actual,
+            });
         }
         Ok(())
     }
@@ -814,10 +877,14 @@ impl IntermediateGrowthPlan {
     /// receipt returned by the existing Net2Wider transform.
     pub fn apply(
         &self,
+        config: &ModelConfig,
+        spec: &ArchSpec,
         model: &mut TiedSwiGluTrainingModel,
-    ) -> Result<Net2WiderPlan, GrowthPlanError> {
+    ) -> Result<IntermediateGrowthReceipt, GrowthPlanError> {
+        let source_model_id = GrowthSourceModelId::from_training_model(config, spec, model)?;
+        self.validate_source_model_id(source_model_id)?;
         self.validate_model_geometry(model)?;
-        let receipt = model
+        let net2wider = model
             .widen_intermediate(
                 usize::try_from(self.new_width).map_err(|_| GrowthPlanError::WidthOutOfRange {
                     axis: "new_intermediate_width",
@@ -826,6 +893,10 @@ impl IntermediateGrowthPlan {
                 self.seed,
             )
             .map_err(GrowthPlanError::TrainingAdapter)?;
+        let receipt = IntermediateGrowthReceipt {
+            source_model_id,
+            net2wider,
+        };
         self.validate_receipt(&receipt)?;
         Ok(receipt)
     }
@@ -878,9 +949,43 @@ impl IntermediateGrowthPlan {
     }
 }
 
+/// Source-bound receipt issued after one deterministic intermediate-width transform.
+///
+/// Its fields are intentionally private: callers can validate or persist a
+/// receipt returned by [`IntermediateGrowthPlan::apply`], but cannot mint one
+/// from a plan that has not been applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntermediateGrowthReceipt {
+    source_model_id: GrowthSourceModelId,
+    net2wider: Net2WiderPlan,
+}
+
+impl IntermediateGrowthReceipt {
+    /// Semantic checkpoint transformed by this receipt.
+    #[must_use]
+    pub const fn source_model_id(&self) -> GrowthSourceModelId {
+        self.source_model_id
+    }
+
+    /// Deterministic mapping and split metadata applied to the checkpoint.
+    #[must_use]
+    pub const fn net2wider(&self) -> &Net2WiderPlan {
+        &self.net2wider
+    }
+}
+
 /// Why checked SALT V2 growth planning or application failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GrowthPlanError {
+    /// A growth plan was not bound to a semantic source-checkpoint digest.
+    InvalidSourceModelId,
+    /// Application or replay named a different semantic source checkpoint.
+    SourceModelMismatch {
+        /// Checkpoint digest frozen in the plan.
+        expected: GrowthSourceModelId,
+        /// Checkpoint digest supplied by the caller or receipt.
+        actual: GrowthSourceModelId,
+    },
     /// A required geometry axis is zero.
     ZeroAxis(&'static str),
     /// A geometry axis cannot fit the portable `u32` receipt domain.
@@ -972,6 +1077,15 @@ pub enum GrowthPlanError {
 impl core::fmt::Display for GrowthPlanError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::InvalidSourceModelId => {
+                write!(formatter, "growth source-model digest cannot be all zero")
+            }
+            Self::SourceModelMismatch { expected, actual } => write!(
+                formatter,
+                "growth source-model digest mismatch: expected {:02x?}, got {:02x?}",
+                expected.as_bytes(),
+                actual.as_bytes()
+            ),
             Self::ZeroAxis(axis) => write!(formatter, "growth geometry axis {axis} is zero"),
             Self::AxisOutOfRange { axis, value } => {
                 write!(formatter, "growth geometry axis {axis}={value} exceeds u32")
@@ -1070,11 +1184,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_model_identity_rejects_the_unbound_zero_digest() {
+        assert_eq!(
+            GrowthSourceModelId::new([0; 32]),
+            Err(GrowthPlanError::InvalidSourceModelId)
+        );
+    }
+
+    #[test]
+    fn growth_receipt_cannot_replay_against_a_different_source_checkpoint() {
+        let source_a = source_model_id(0x11);
+        let source_b = source_model_id(0x22);
+        let target = GrowthTarget::intermediate_at_least(120).unwrap();
+        let plan_a = tiny_geometry().plan(source_a, target, 17).unwrap();
+        let plan_b = tiny_geometry().plan(source_b, target, 17).unwrap();
+        let receipt = IntermediateGrowthReceipt {
+            source_model_id: source_a,
+            net2wider: plan_a.expected_net2wider_plan().unwrap(),
+        };
+
+        assert_eq!(plan_a.source_model_id(), source_a);
+        assert_eq!(receipt.source_model_id(), source_a);
+        assert_eq!(
+            plan_a.validate_source_model_id(source_b),
+            Err(GrowthPlanError::SourceModelMismatch {
+                expected: source_a,
+                actual: source_b,
+            })
+        );
+        assert_eq!(
+            plan_b.validate_receipt(&receipt),
+            Err(GrowthPlanError::SourceModelMismatch {
+                expected: source_b,
+                actual: source_a,
+            })
+        );
+    }
+
+    #[test]
     fn identity_target_keeps_the_existing_intermediate_width() {
         let geometry = tiny_geometry();
         let target = GrowthTarget::intermediate_at_least(60).expect("valid target");
 
-        let plan = geometry.plan(target, 17).expect("identity plan");
+        let plan = geometry
+            .plan(source_model_id(0x11), target, 17)
+            .expect("identity plan");
 
         assert_eq!(plan.old_width, 3);
         assert_eq!(plan.new_width, 3);
@@ -1084,9 +1238,7 @@ mod tests {
         assert_eq!(plan.seed, 17);
         assert_eq!(plan.stage2_requirement, Stage2Requirement::NotRequested);
         assert_eq!(
-            plan.net2wider_receipt()
-                .expect("identity receipt")
-                .algorithm(),
+            plan.expected_net2wider_plan().unwrap().algorithm(),
             tritium_train::grow::NET2WIDER_ALGORITHM_V1
         );
     }
@@ -1103,6 +1255,7 @@ mod tests {
 
         let plan = geometry
             .plan(
+                source_model_id(0x11),
                 GrowthTarget::intermediate_at_least(32_000_000_000).unwrap(),
                 0x0028,
             )
@@ -1115,7 +1268,11 @@ mod tests {
     fn planned_width_is_the_minimum_width_that_meets_the_floor() {
         let geometry = tiny_geometry();
         let plan = geometry
-            .plan(GrowthTarget::intermediate_at_least(61).unwrap(), 9)
+            .plan(
+                source_model_id(0x11),
+                GrowthTarget::intermediate_at_least(61).unwrap(),
+                9,
+            )
             .unwrap();
 
         assert_eq!(plan.new_width, 4);
@@ -1148,6 +1305,7 @@ mod tests {
 
         let rounded = qwen_8b_like_geometry()
             .plan(
+                source_model_id(0x11),
                 GrowthTarget::intermediate_at_least(
                     WHOLE_HEAD_AND_HIDDEN_COEFFICIENT_THRESHOLD - 1,
                 )
@@ -1165,7 +1323,9 @@ mod tests {
     #[test]
     fn staged_target_keeps_whole_head_and_hidden_growth_explicit() {
         let target = GrowthTarget::staged(32_000_000_000, 50_000_000_000).unwrap();
-        let plan = qwen_8b_like_geometry().plan(target, 11).unwrap();
+        let plan = qwen_8b_like_geometry()
+            .plan(source_model_id(0x11), target, 11)
+            .unwrap();
 
         assert_eq!(plan.new_width, 68_925);
         assert_eq!(
@@ -1283,6 +1443,7 @@ mod tests {
         .unwrap();
         let width_error = narrow_geometry
             .plan(
+                source_model_id(0x11),
                 GrowthTarget::intermediate_at_least(49_999_999_999).unwrap(),
                 0,
             )
@@ -1297,6 +1458,7 @@ mod tests {
 
         let receipt_error = narrow_geometry
             .plan(
+                source_model_id(0x11),
                 GrowthTarget::intermediate_at_least(12_000_000_000).unwrap(),
                 0,
             )
@@ -1337,15 +1499,27 @@ mod tests {
     #[test]
     fn deterministic_receipt_is_bound_to_widths_and_seed() {
         let plan = tiny_geometry()
-            .plan(GrowthTarget::intermediate_at_least(120).unwrap(), 17)
+            .plan(
+                source_model_id(0x11),
+                GrowthTarget::intermediate_at_least(120).unwrap(),
+                17,
+            )
             .unwrap();
-        let first = plan.net2wider_receipt().unwrap();
-        let replay = plan.net2wider_receipt().unwrap();
+        let first = plan.expected_net2wider_plan().unwrap();
+        let replay = plan.expected_net2wider_plan().unwrap();
 
         assert_eq!(first, replay);
+        let first = IntermediateGrowthReceipt {
+            source_model_id: plan.source_model_id(),
+            net2wider: first,
+        };
         plan.validate_receipt(&first).unwrap();
 
         let wrong_seed = tritium_train::Net2WiderPlan::seeded(3, 8, 18).unwrap();
+        let wrong_seed = IntermediateGrowthReceipt {
+            source_model_id: plan.source_model_id(),
+            net2wider: wrong_seed,
+        };
         assert_eq!(
             plan.validate_receipt(&wrong_seed),
             Err(GrowthPlanError::ReceiptMismatch)
@@ -1364,6 +1538,10 @@ mod tests {
             FixedEmbeddingPolicy::PreservedDense { tied_lm_head: true },
         )
         .expect("valid geometry")
+    }
+
+    fn source_model_id(tag: u8) -> GrowthSourceModelId {
+        GrowthSourceModelId::new([tag; 32]).expect("nonzero source id")
     }
 
     fn qwen_8b_like_geometry() -> ProjectionGeometry {

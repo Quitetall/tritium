@@ -1,6 +1,8 @@
 use tritium_nn::{
-    ArchSpec, DenseLinear, Mlp, MlpKind, ModelConfig, ModelWeights, Projection, SwiGluMlp,
-    SwiGluTrainingModel, TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
+    ArchSpec, DenseLinear, FixedEmbeddingPolicy, GrowthPlanError, GrowthSourceModelId,
+    GrowthTarget, Mlp, MlpKind, ModelConfig, ModelWeights, Projection, ProjectionGeometry,
+    ProjectionPlaneCounts, SwiGluMlp, SwiGluTrainingModel, TiedSwiGluTrainingModel, TokenEmbedding,
+    TransformerBlock,
 };
 
 fn dense(rows: usize, cols: usize, marker: f32) -> Projection {
@@ -447,6 +449,48 @@ fn intermediate_growth_rejects_narrowing_and_drained_masters_before_mutation() {
         parameter.master.is_empty()
             && parameter.elements() == parameter.rows.saturating_mul(parameter.cols)
     }));
+}
+
+#[test]
+fn checked_growth_recomputes_source_identity_before_mutation_and_issues_receipt_after_apply() {
+    let config = config();
+    let spec = spec();
+    let mut source = TiedSwiGluTrainingModel::extract(&config, &spec, &weights()).unwrap();
+    let source_id = GrowthSourceModelId::from_training_model(&config, &spec, &source).unwrap();
+    let geometry = ProjectionGeometry::new(
+        usize::try_from(config.n_layers).unwrap(),
+        usize::try_from(config.n_embd).unwrap(),
+        usize::try_from(config.n_head * config.head_dim).unwrap(),
+        usize::try_from(config.n_head_kv * config.head_dim).unwrap(),
+        usize::try_from(config.n_ff).unwrap(),
+        weights().vocab,
+        ProjectionPlaneCounts::new(1, 1, 1, 1, 1, 1, 1).unwrap(),
+        FixedEmbeddingPolicy::PreservedDense { tied_lm_head: true },
+    )
+    .unwrap();
+    let target =
+        GrowthTarget::intermediate_at_least(geometry.core_coefficient_count(7).unwrap()).unwrap();
+    let plan = geometry.plan(source_id, target, 0x27).unwrap();
+
+    let mut other = TiedSwiGluTrainingModel::extract(&config, &spec, &widening_weights()).unwrap();
+    let other_id = GrowthSourceModelId::from_training_model(&config, &spec, &other).unwrap();
+    let other_before = other.clone();
+    assert_eq!(
+        plan.apply(&config, &spec, &mut other),
+        Err(GrowthPlanError::SourceModelMismatch {
+            expected: source_id,
+            actual: other_id,
+        })
+    );
+    assert_eq!(
+        other, other_before,
+        "identity rejection must precede mutation"
+    );
+
+    let receipt = plan.apply(&config, &spec, &mut source).unwrap();
+    assert_eq!(source.architecture().n_ff, 7);
+    assert_eq!(receipt.source_model_id(), source_id);
+    plan.validate_receipt(&receipt).unwrap();
 }
 
 #[test]

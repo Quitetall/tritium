@@ -225,6 +225,20 @@ pub enum PhysicalAllocError {
         /// Number of states that the next expansion would require.
         states: usize,
     },
+    /// The scalable equal-cost solver encountered rounded arithmetic that could
+    /// change the exact distortion ordering. Small inputs use the reference
+    /// frontier instead; model-sized inputs fail closed.
+    NumericallyAmbiguousFastPath {
+        /// Profile whose scalable solver could not certify.
+        profile: SaltV2Profile,
+    },
+    /// Exact lexicographic tie resolution would exceed its linear-time work budget.
+    ScalableTieLimit {
+        /// Profile whose scalable solver encountered the tie pattern.
+        profile: SaltV2Profile,
+        /// Number of full-vector comparisons requested.
+        comparisons: usize,
+    },
 }
 
 impl fmt::Display for PhysicalAllocError {
@@ -272,6 +286,17 @@ impl fmt::Display for PhysicalAllocError {
             Self::StateSpaceTooLarge { profile, states } => write!(
                 f,
                 "{profile:?} exact allocation frontier would require {states} states"
+            ),
+            Self::NumericallyAmbiguousFastPath { profile } => write!(
+                f,
+                "{profile:?} equal-cost allocation has non-exact floating-point reductions"
+            ),
+            Self::ScalableTieLimit {
+                profile,
+                comparisons,
+            } => write!(
+                f,
+                "{profile:?} equal-cost allocation needs {comparisons} full-vector tie comparisons"
             ),
         }
     }
@@ -506,10 +531,31 @@ fn exact_plane_counts(
     limit: ProfileBudget,
     profile: SaltV2Profile,
 ) -> Result<Vec<u8>, PhysicalAllocError> {
+    if reference_frontier_fits(floors) {
+        return bounded_exact_plane_counts(groups, floors, limit, profile);
+    }
     if let Some(plane_counts) = regular_plane_counts(groups, floors, limit, profile)? {
         return Ok(plane_counts);
     }
 
+    bounded_exact_plane_counts(groups, floors, limit, profile)
+}
+
+fn reference_frontier_fits(floors: &[u8]) -> bool {
+    floors
+        .iter()
+        .try_fold(1usize, |states, &floor| {
+            states.checked_mul(usize::from(SALT_V2_PLANES as u8 - floor + 1))
+        })
+        .is_some_and(|states| states <= MAX_EXACT_FRONTIER_STATES)
+}
+
+fn bounded_exact_plane_counts(
+    groups: &[GroupCandidates<'_>],
+    floors: &[u8],
+    limit: ProfileBudget,
+    profile: SaltV2Profile,
+) -> Result<Vec<u8>, PhysicalAllocError> {
     let metadata = limit.metadata.effective();
     let mut frontier = vec![ExactState {
         bytes: metadata,
@@ -614,6 +660,8 @@ struct RegularChoice {
     exceptional_bundle_rank: Option<usize>,
 }
 
+const MAX_SCALABLE_FULL_VECTOR_TIES: usize = 8;
+
 /// Solve the regular full-tile case without constructing a model-sized Pareto frontier.
 ///
 /// Equal effective incremental costs reduce the two physical ceilings to one
@@ -681,12 +729,18 @@ fn regular_plane_counts(
     for (group_index, group) in groups.iter().copied().enumerate() {
         match floors[group_index] {
             1 => {
-                let first_reduction = distortion_at(group, 1) - distortion_at(group, 2);
-                let second_reduction = distortion_at(group, 2) - distortion_at(group, 3);
+                let first_reduction =
+                    certified_reduction(distortion_at(group, 1), distortion_at(group, 2), profile)?;
+                let second_reduction =
+                    certified_reduction(distortion_at(group, 2), distortion_at(group, 3), profile)?;
                 if second_reduction > first_reduction {
                     bundled_upgrades.push(BundledUpgrade {
                         group: group_index,
-                        distortion_reduction: distortion_at(group, 1) - distortion_at(group, 3),
+                        distortion_reduction: certified_reduction(
+                            distortion_at(group, 1),
+                            distortion_at(group, 3),
+                            profile,
+                        )?,
                         first_plane_reduction: first_reduction,
                     });
                 } else {
@@ -707,7 +761,8 @@ fn regular_plane_counts(
                 }
             }
             2 => {
-                let reduction = distortion_at(group, 2) - distortion_at(group, 3);
+                let reduction =
+                    certified_reduction(distortion_at(group, 2), distortion_at(group, 3), profile)?;
                 if reduction > 0.0 {
                     unit_upgrades.push(UnitUpgrade {
                         group: group_index,
@@ -750,33 +805,14 @@ fn regular_plane_counts(
     let choice = best_regular_choice(
         &unit_prefix,
         &bundle_prefix,
+        &unit_upgrades,
         &bundled_upgrades,
+        floors,
         capacity,
         profile,
     )?;
-
-    let mut plane_counts = floors.to_vec();
-    for upgrade in unit_upgrades.iter().take(choice.hull.unit_count) {
-        debug_assert_eq!(plane_counts[upgrade.group] + 1, upgrade.target_planes);
-        plane_counts[upgrade.group] = upgrade.target_planes;
-    }
-    match choice.exceptional_bundle_rank {
-        None => {
-            for upgrade in bundled_upgrades.iter().take(choice.hull.bundle_count) {
-                plane_counts[upgrade.group] = 3;
-            }
-        }
-        Some(excluded_rank) => {
-            let take =
-                choice.hull.bundle_count + usize::from(choice.hull.replacement_after_exclusion);
-            for (rank, upgrade) in bundled_upgrades.iter().take(take).enumerate() {
-                if rank != excluded_rank {
-                    plane_counts[upgrade.group] = 3;
-                }
-            }
-            plane_counts[bundled_upgrades[excluded_rank].group] = 2;
-        }
-    }
+    let plane_counts =
+        materialize_regular_choice(choice, &unit_upgrades, &bundled_upgrades, floors);
     debug_assert_eq!(
         plane_counts
             .iter()
@@ -803,6 +839,9 @@ fn reduction_prefix(
         if !sum.is_finite() {
             return Err(PhysicalAllocError::AccountingOverflow { profile });
         }
+        if two_sum_error(prefix.last().copied().unwrap_or(0.0), reduction, sum) != 0.0 {
+            return Err(PhysicalAllocError::NumericallyAmbiguousFastPath { profile });
+        }
         prefix.push(sum);
     }
     Ok(prefix)
@@ -811,7 +850,9 @@ fn reduction_prefix(
 fn best_regular_choice(
     unit_prefix: &[f64],
     bundle_prefix: &[f64],
+    units: &[UnitUpgrade],
     bundles: &[BundledUpgrade],
+    floors: &[u8],
     capacity: usize,
     profile: SaltV2Profile,
 ) -> Result<RegularChoice, PhysicalAllocError> {
@@ -819,6 +860,7 @@ fn best_regular_choice(
     let bundle_count = bundle_prefix.len() - 1;
     let maximum_bundles = bundle_count.min(capacity / 2);
     let mut best = None;
+    let mut full_vector_ties = 0usize;
     for (selected_bundles, &bundle_reduction) in
         bundle_prefix.iter().take(maximum_bundles + 1).enumerate()
     {
@@ -837,7 +879,12 @@ fn best_regular_choice(
                 },
                 exceptional_bundle_rank: None,
             },
-        );
+            units,
+            bundles,
+            floors,
+            &mut full_vector_ties,
+            profile,
+        )?;
     }
 
     if capacity > 0 && !bundles.is_empty() {
@@ -860,7 +907,15 @@ fn best_regular_choice(
                 unit_count: selected_units,
                 replacement_after_exclusion: false,
             };
-            retain_better_hull_choice(&mut prefix_best, choice);
+            retain_better_hull_choice(
+                &mut prefix_best,
+                choice,
+                units,
+                bundles,
+                floors,
+                &mut full_vector_ties,
+                profile,
+            )?;
             ordinary_prefix_best.push(prefix_best.expect("current prefix choice"));
         }
 
@@ -882,7 +937,15 @@ fn best_regular_choice(
                 unit_count: selected_units,
                 replacement_after_exclusion: true,
             };
-            retain_better_hull_choice(&mut suffix_best, choice);
+            retain_better_hull_choice(
+                &mut suffix_best,
+                choice,
+                units,
+                bundles,
+                floors,
+                &mut full_vector_ties,
+                profile,
+            )?;
             replacement_suffix_best[selected_bundles] = suffix_best;
         }
 
@@ -900,13 +963,26 @@ fn best_regular_choice(
                 if !adjusted_reduction.is_finite() {
                     return Err(PhysicalAllocError::AccountingOverflow { profile });
                 }
+                if two_diff_error(
+                    replacement.distortion_reduction,
+                    bundle.distortion_reduction,
+                    adjusted_reduction,
+                ) != 0.0
+                {
+                    return Err(PhysicalAllocError::NumericallyAmbiguousFastPath { profile });
+                }
                 retain_better_hull_choice(
                     &mut best_without_bundle,
                     HullChoice {
                         distortion_reduction: adjusted_reduction,
                         ..replacement
                     },
-                );
+                    units,
+                    bundles,
+                    floors,
+                    &mut full_vector_ties,
+                    profile,
+                )?;
             }
             let mut hull = best_without_bundle.expect("ordinary zero-bundle choice");
             hull.distortion_reduction = checked_reduction_add(
@@ -920,7 +996,12 @@ fn best_regular_choice(
                     hull,
                     exceptional_bundle_rank: Some(excluded_rank),
                 },
-            );
+                units,
+                bundles,
+                floors,
+                &mut full_vector_ties,
+                profile,
+            )?;
         }
     }
 
@@ -933,50 +1014,256 @@ fn checked_reduction_add(
     profile: SaltV2Profile,
 ) -> Result<f64, PhysicalAllocError> {
     let sum = left + right;
-    if sum.is_finite() {
-        Ok(sum)
-    } else {
-        Err(PhysicalAllocError::AccountingOverflow { profile })
+    if !sum.is_finite() {
+        return Err(PhysicalAllocError::AccountingOverflow { profile });
     }
+    if two_sum_error(left, right, sum) != 0.0 {
+        return Err(PhysicalAllocError::NumericallyAmbiguousFastPath { profile });
+    }
+    Ok(sum)
 }
 
-fn retain_better_hull_choice(best: &mut Option<HullChoice>, candidate: HullChoice) {
-    if best.is_none_or(|current| hull_choice_is_better(candidate, current)) {
+fn certified_reduction(
+    from: f64,
+    to: f64,
+    profile: SaltV2Profile,
+) -> Result<f64, PhysicalAllocError> {
+    let reduction = from - to;
+    if two_diff_error(from, to, reduction) != 0.0 {
+        return Err(PhysicalAllocError::NumericallyAmbiguousFastPath { profile });
+    }
+    Ok(reduction)
+}
+
+fn two_sum_error(left: f64, right: f64, sum: f64) -> f64 {
+    let right_virtual = sum - left;
+    let left_virtual = sum - right_virtual;
+    let right_roundoff = right - right_virtual;
+    let left_roundoff = left - left_virtual;
+    left_roundoff + right_roundoff
+}
+
+fn two_diff_error(left: f64, right: f64, difference: f64) -> f64 {
+    let right_virtual = left - difference;
+    let left_virtual = difference + right_virtual;
+    let right_roundoff = right_virtual - right;
+    let left_roundoff = left - left_virtual;
+    left_roundoff + right_roundoff
+}
+
+fn retain_better_hull_choice(
+    best: &mut Option<HullChoice>,
+    candidate: HullChoice,
+    units: &[UnitUpgrade],
+    bundles: &[BundledUpgrade],
+    floors: &[u8],
+    full_vector_ties: &mut usize,
+    profile: SaltV2Profile,
+) -> Result<(), PhysicalAllocError> {
+    let replace = match *best {
+        None => true,
+        Some(current) => hull_choice_is_better(
+            candidate,
+            current,
+            units,
+            bundles,
+            floors,
+            full_vector_ties,
+            profile,
+        )?,
+    };
+    if replace {
         *best = Some(candidate);
     }
+    Ok(())
 }
 
-fn hull_choice_is_better(candidate: HullChoice, current: HullChoice) -> bool {
-    candidate
+fn hull_choice_is_better(
+    candidate: HullChoice,
+    current: HullChoice,
+    units: &[UnitUpgrade],
+    bundles: &[BundledUpgrade],
+    floors: &[u8],
+    full_vector_ties: &mut usize,
+    profile: SaltV2Profile,
+) -> Result<bool, PhysicalAllocError> {
+    match candidate
         .distortion_reduction
         .total_cmp(&current.distortion_reduction)
-        .is_gt()
-        || (candidate.distortion_reduction == current.distortion_reduction
-            && (candidate.upgrades < current.upgrades
-                || (candidate.upgrades == current.upgrades
-                    && candidate.bundle_count < current.bundle_count)))
+    {
+        core::cmp::Ordering::Greater => return Ok(true),
+        core::cmp::Ordering::Less => return Ok(false),
+        core::cmp::Ordering::Equal => {}
+    }
+    if candidate.upgrades != current.upgrades {
+        return Ok(candidate.upgrades < current.upgrades);
+    }
+    charge_full_vector_tie(full_vector_ties, profile)?;
+    Ok(materialize_hull_choice(candidate, units, bundles, floors)
+        > materialize_hull_choice(current, units, bundles, floors))
 }
 
-fn retain_better_regular_choice(best: &mut Option<RegularChoice>, candidate: RegularChoice) {
-    if best.is_none_or(|current| regular_choice_is_better(candidate, current)) {
+fn retain_better_regular_choice(
+    best: &mut Option<RegularChoice>,
+    candidate: RegularChoice,
+    units: &[UnitUpgrade],
+    bundles: &[BundledUpgrade],
+    floors: &[u8],
+    full_vector_ties: &mut usize,
+    profile: SaltV2Profile,
+) -> Result<(), PhysicalAllocError> {
+    let replace = match *best {
+        None => true,
+        Some(current) => regular_choice_is_better(
+            candidate,
+            current,
+            units,
+            bundles,
+            floors,
+            full_vector_ties,
+            profile,
+        )?,
+    };
+    if replace {
         *best = Some(candidate);
     }
+    Ok(())
 }
 
-fn regular_choice_is_better(candidate: RegularChoice, current: RegularChoice) -> bool {
+fn regular_choice_is_better(
+    candidate: RegularChoice,
+    current: RegularChoice,
+    units: &[UnitUpgrade],
+    bundles: &[BundledUpgrade],
+    floors: &[u8],
+    full_vector_ties: &mut usize,
+    profile: SaltV2Profile,
+) -> Result<bool, PhysicalAllocError> {
     let candidate_upgrades =
         candidate.hull.upgrades + usize::from(candidate.exceptional_bundle_rank.is_some());
     let current_upgrades =
         current.hull.upgrades + usize::from(current.exceptional_bundle_rank.is_some());
-    candidate
+    match candidate
         .hull
         .distortion_reduction
         .total_cmp(&current.hull.distortion_reduction)
-        .is_gt()
-        || (candidate.hull.distortion_reduction == current.hull.distortion_reduction
-            && (candidate_upgrades < current_upgrades
-                || (candidate_upgrades == current_upgrades
-                    && candidate.exceptional_bundle_rank < current.exceptional_bundle_rank)))
+    {
+        core::cmp::Ordering::Greater => return Ok(true),
+        core::cmp::Ordering::Less => return Ok(false),
+        core::cmp::Ordering::Equal => {}
+    }
+    if candidate_upgrades != current_upgrades {
+        return Ok(candidate_upgrades < current_upgrades);
+    }
+    regular_choice_lex_is_greater(
+        candidate,
+        current,
+        units,
+        bundles,
+        floors,
+        full_vector_ties,
+        profile,
+    )
+}
+
+fn regular_choice_lex_is_greater(
+    candidate: RegularChoice,
+    current: RegularChoice,
+    units: &[UnitUpgrade],
+    bundles: &[BundledUpgrade],
+    floors: &[u8],
+    full_vector_ties: &mut usize,
+    profile: SaltV2Profile,
+) -> Result<bool, PhysicalAllocError> {
+    let same_hull_shape = candidate.hull.bundle_count == current.hull.bundle_count
+        && candidate.hull.unit_count == current.hull.unit_count
+        && candidate.hull.replacement_after_exclusion == current.hull.replacement_after_exclusion;
+    if same_hull_shape
+        && let (Some(candidate_rank), Some(current_rank)) = (
+            candidate.exceptional_bundle_rank,
+            current.exceptional_bundle_rank,
+        )
+        && candidate_rank != current_rank
+    {
+        let candidate_group = bundles[candidate_rank].group;
+        let current_group = bundles[current_rank].group;
+        let first_rank = if candidate_group < current_group {
+            candidate_rank
+        } else {
+            current_rank
+        };
+        return Ok(bundle_planes_for_choice(candidate, first_rank)
+            > bundle_planes_for_choice(current, first_rank));
+    }
+    charge_full_vector_tie(full_vector_ties, profile)?;
+    Ok(
+        materialize_regular_choice(candidate, units, bundles, floors)
+            > materialize_regular_choice(current, units, bundles, floors),
+    )
+}
+
+fn charge_full_vector_tie(
+    comparisons: &mut usize,
+    profile: SaltV2Profile,
+) -> Result<(), PhysicalAllocError> {
+    *comparisons = comparisons.saturating_add(1);
+    if *comparisons > MAX_SCALABLE_FULL_VECTOR_TIES {
+        return Err(PhysicalAllocError::ScalableTieLimit {
+            profile,
+            comparisons: *comparisons,
+        });
+    }
+    Ok(())
+}
+
+fn bundle_planes_for_choice(choice: RegularChoice, rank: usize) -> u8 {
+    if choice.exceptional_bundle_rank == Some(rank) {
+        return 2;
+    }
+    let take = choice.hull.bundle_count + usize::from(choice.hull.replacement_after_exclusion);
+    if rank < take { 3 } else { 1 }
+}
+
+fn materialize_hull_choice(
+    choice: HullChoice,
+    units: &[UnitUpgrade],
+    bundles: &[BundledUpgrade],
+    floors: &[u8],
+) -> Vec<u8> {
+    let mut plane_counts = floors.to_vec();
+    apply_unit_prefix(&mut plane_counts, units, choice.unit_count);
+    let take = choice.bundle_count + usize::from(choice.replacement_after_exclusion);
+    for upgrade in bundles.iter().take(take) {
+        plane_counts[upgrade.group] = 3;
+    }
+    plane_counts
+}
+
+fn materialize_regular_choice(
+    choice: RegularChoice,
+    units: &[UnitUpgrade],
+    bundles: &[BundledUpgrade],
+    floors: &[u8],
+) -> Vec<u8> {
+    let mut plane_counts = floors.to_vec();
+    apply_unit_prefix(&mut plane_counts, units, choice.hull.unit_count);
+    let take = choice.hull.bundle_count + usize::from(choice.hull.replacement_after_exclusion);
+    for (rank, upgrade) in bundles.iter().take(take).enumerate() {
+        if choice.exceptional_bundle_rank != Some(rank) {
+            plane_counts[upgrade.group] = 3;
+        }
+    }
+    if let Some(excluded_rank) = choice.exceptional_bundle_rank {
+        plane_counts[bundles[excluded_rank].group] = 2;
+    }
+    plane_counts
+}
+
+fn apply_unit_prefix(plane_counts: &mut [u8], units: &[UnitUpgrade], unit_count: usize) {
+    for upgrade in units.iter().take(unit_count) {
+        debug_assert_eq!(plane_counts[upgrade.group] + 1, upgrade.target_planes);
+        plane_counts[upgrade.group] = upgrade.target_planes;
+    }
 }
 
 fn equal_cost_capacity(remaining: u64, cost: u64, available: usize) -> usize {
@@ -1214,6 +1501,159 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.compact.plane_counts, vec![2, 1]);
+    }
+
+    #[test]
+    fn regular_solver_does_not_drop_a_small_gain_beside_a_large_gain() {
+        let small_bundle = [
+            candidate(1, delta(1, 1), 1.0),
+            candidate(2, delta(1, 1), 1.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let large_unit = [
+            candidate(1, delta(1, 1), 9_007_199_254_740_992.0),
+            candidate(2, delta(1, 1), 0.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let groups = [group(&small_bundle), group(&large_unit)];
+        let limit = budget(5, 5, delta(0, 0));
+
+        let allocation = allocate_nested_profiles(
+            &groups,
+            &NestedProfileBudgets {
+                compact: limit,
+                near_lossless: limit,
+            },
+        )
+        .expect("exact regular allocation");
+
+        assert_eq!(allocation.compact.plane_counts, vec![3, 2]);
+        assert_eq!(allocation.compact.total_distortion, 0.0);
+    }
+
+    #[test]
+    fn scalable_regular_solver_uses_the_full_plane_vector_for_ties() {
+        let earlier_bundle = [
+            candidate(1, delta(1, 1), 10.0),
+            candidate(2, delta(1, 1), 9.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let later_units = [
+            candidate(1, delta(1, 1), 10.0),
+            candidate(2, delta(1, 1), 5.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let inert = [
+            candidate(1, delta(1, 1), 0.0),
+            candidate(2, delta(1, 1), 0.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let groups = [
+            group(&earlier_bundle),
+            group(&later_units),
+            group(&inert),
+            group(&inert),
+            group(&inert),
+            group(&inert),
+            group(&inert),
+            group(&inert),
+        ];
+        let limit = budget(10, 10, delta(0, 0));
+
+        let allocation = allocate_nested_profiles(
+            &groups,
+            &NestedProfileBudgets {
+                compact: limit,
+                near_lossless: limit,
+            },
+        )
+        .expect("scalable regular allocation");
+
+        assert_eq!(
+            allocation.compact.plane_counts,
+            vec![3, 1, 1, 1, 1, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn scalable_regular_solver_fails_closed_when_gain_addition_loses_bits() {
+        let small_bundle = [
+            candidate(1, delta(1, 1), 1.0),
+            candidate(2, delta(1, 1), 1.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let large_unit = [
+            candidate(1, delta(1, 1), 9_007_199_254_740_992.0),
+            candidate(2, delta(1, 1), 0.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let inert = [
+            candidate(1, delta(1, 1), 0.0),
+            candidate(2, delta(1, 1), 0.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let groups = [
+            group(&small_bundle),
+            group(&large_unit),
+            group(&inert),
+            group(&inert),
+            group(&inert),
+            group(&inert),
+            group(&inert),
+            group(&inert),
+        ];
+        let limit = budget(11, 11, delta(0, 0));
+
+        let error = allocate_nested_profiles(
+            &groups,
+            &NestedProfileBudgets {
+                compact: limit,
+                near_lossless: limit,
+            },
+        )
+        .expect_err("rounded model-scale gain must not be ranked approximately");
+
+        assert_eq!(
+            error,
+            PhysicalAllocError::NumericallyAmbiguousFastPath {
+                profile: SaltV2Profile::CompactV1,
+            }
+        );
+    }
+
+    #[test]
+    fn scalable_regular_solver_bounds_full_vector_tie_work() {
+        let bundled = [
+            candidate(1, delta(1, 1), 10.0),
+            candidate(2, delta(1, 1), 9.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let units = [
+            candidate(1, delta(1, 1), 10.0),
+            candidate(2, delta(1, 1), 5.0),
+            candidate(3, delta(1, 1), 0.0),
+        ];
+        let mut candidates = vec![bundled; 70];
+        candidates.extend(vec![units; 70]);
+        let groups = candidates.iter().map(group).collect::<Vec<_>>();
+        let limit = budget(280, 280, delta(0, 0));
+
+        let error = allocate_nested_profiles(
+            &groups,
+            &NestedProfileBudgets {
+                compact: limit,
+                near_lossless: limit,
+            },
+        )
+        .expect_err("pathological aggregate ties must not become quadratic");
+
+        assert!(matches!(
+            error,
+            PhysicalAllocError::ScalableTieLimit {
+                profile: SaltV2Profile::CompactV1,
+                comparisons,
+            } if comparisons == MAX_SCALABLE_FULL_VECTOR_TIES + 1
+        ));
     }
 
     #[test]
@@ -1466,6 +1906,45 @@ mod tests {
                     "case {case}, optional-plane capacity {optional_planes}"
                 );
                 assert!(allocation.compact.physical_bytes.fits_within(limit.maximum));
+            }
+        }
+    }
+
+    #[test]
+    fn scalable_uniform_cost_solver_matches_brute_force_across_mixed_marginals() {
+        let mut seed = 0xd1b5_4a32_d192_ed03_u64;
+        for case in 0..64 {
+            let mut candidates = Vec::new();
+            for group_index in 0..8_u64 {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let first_reduction = ((seed % 127) * 256 + group_index * 2 + 1) as f64 / 256.0;
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let second_reduction = ((seed % 127) * 256 + group_index * 2 + 2) as f64 / 256.0;
+                candidates.push([
+                    candidate(1, delta(1, 1), first_reduction + second_reduction),
+                    candidate(2, delta(1, 1), second_reduction),
+                    candidate(3, delta(1, 1), 0.0),
+                ]);
+            }
+            let groups: Vec<_> = candidates.iter().map(group).collect();
+
+            for optional_planes in 0..=groups.len() * 2 {
+                let maximum = (groups.len() + optional_planes) as u64;
+                let limit = budget(maximum, maximum, delta(0, 0));
+                let allocation = allocate_nested_profiles(
+                    &groups,
+                    &NestedProfileBudgets {
+                        compact: limit,
+                        near_lossless: limit,
+                    },
+                )
+                .expect("certifiable scalable allocation");
+
+                assert_eq!(
+                    allocation.compact.plane_counts,
+                    brute_force_best(&groups, limit),
+                    "case {case}, optional-plane capacity {optional_planes}"
+                );
             }
         }
     }

@@ -656,30 +656,36 @@ the exact clean revision.
 
 ## Current implementation status and gaps
 
-The software commit implements a bounded reference substrate, not the empirical
-claim. It adds the canonical zero-point-free D2/B3/S34 semantic package, exact
-serialized and indexed-runtime accounting, deterministic joint `3^P` fitting,
+The current software commits implement a bounded reference substrate, not the
+empirical claim. They add the canonical zero-point-free D2/B3/S34 semantic
+package, exact serialized and indexed-runtime accounting, deterministic joint
+`3^P` fitting,
 conditioned scale solving, activation-cache reopen validation, source-bound
 input/Fisher/Kronecker curvature primitives, standalone block-feedback and
-delta-correction primitives, a two-budget exact allocator, mixed-plane model
-fitting, typed recovery/growth controls, direct CPU/CUDA add-sub-skip execution,
-and the resumable `tritium-salt` evidence facade. Compact packages remain exact
-prefixes of their near-lossless packages. ADR 0028's 2026-07-15 amendment makes
-the ordered-master prefix curve, rather than independent per-P refits, the
-binding pricing contract.
+delta-correction primitives, a bounded exact two-budget allocator with a
+certified equal-cost scalable path, mixed-plane model fitting, source-model-bound
+recovery and G1-growth receipts, direct CPU/CUDA add-sub-skip execution, and the
+resumable `tritium-salt` evidence facade. Compact packages remain exact prefixes
+of their near-lossless packages. ADR 0028's 2026-07-15 amendment makes the
+ordered-master prefix curve, rather than independent per-P refits, the binding
+pricing contract.
 
 The following work deliberately remains open and keeps this plan in progress:
 
 - the production model driver does not yet connect block-output reconstruction,
   scale-only teacher-KL, or hard PV updates to real checkpoint tensors;
-- the model fitter does not yet invoke the standalone block-feedback/delta path,
-  and its curvature input must still be bound directly to the source model and
-  activation-cache identities at the solve boundary;
+- the model fitter does not yet invoke the standalone block-feedback/delta path;
 - package/runtime scale geometry is G128-only; the G64/G256 promotion ablations
   require a versioned format/runtime field before they can enter the grid;
-- signed-RHT execution and S34-constrained fitting fail closed; the direct exact
-  runtime is the correctness baseline, and the current `fast` CUDA entry point
-  aliases it rather than claiming a speedup;
+- model-sized equal-cost allocation fails closed when binary64 reduction or
+  prefix arithmetic cannot be certified exact, or when pathological exact ties
+  exceed the bounded full-vector comparison budget; replacing those boundaries
+  with an order-independent exact accumulator and indexed lexicographic order
+  remains production work;
+- signed-RHT execution fails closed; S34 has a constrained deterministic CPU
+  reference fitter but no campaign evidence; the direct exact runtime is the
+  correctness baseline, and the current `fast` CUDA entry point aliases it
+  rather than claiming a speedup;
 - physical component truth still requires the opened package and checked
   runtime allocation receipt; caller-provided architecture geometry alone is
   not claim evidence;
