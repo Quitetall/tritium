@@ -40,6 +40,7 @@ mod conversion;
 pub mod fisher;
 mod plane;
 mod quantize;
+mod qwen35_coverage;
 mod recon;
 mod salt_v2;
 mod salt_v2_activation;
@@ -69,6 +70,12 @@ pub use plane::{
 };
 pub use quantize::{
     BaseScaleScope, QuantConfig, QuantError, QuantizedTensor, Sensitivity, quantize_tensor,
+};
+pub use qwen35_coverage::{
+    QWEN36_27B_COVERAGE_REVISION, Qwen35CoverageDisposition, Qwen35CoverageEntry,
+    Qwen35CoverageError, Qwen35CoverageManifest, Qwen35CoverageSummary, Qwen35CoverageTotals,
+    Qwen35LanguageLayerKind, Qwen35SourceDtype, Qwen35TensorMetadata, Qwen35TensorRole,
+    Qwen35TensorScope,
 };
 pub use recon::{ReconAccum, ReconError, ReconStats, reconstruction_stats};
 pub use salt_v2::{
