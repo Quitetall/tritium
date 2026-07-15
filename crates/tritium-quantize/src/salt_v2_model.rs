@@ -22,12 +22,19 @@ use crate::salt_v2_allocator::{
     PlaneCandidate, ProfileBudget, allocate_nested_profiles,
 };
 use crate::salt_v2_curvature::CurvatureSourceId;
+use crate::salt_v2_feedback::{
+    ColumnGroup, FeedbackError, FeedbackMetric, FeedbackProblem, FeedbackRunError, GroupFitRequest,
+    fit_with_feedback,
+};
 
 const REFERENCE_SOLVER_VERSION: &str = "tritium-salt-v2-reference-model-fit-v2";
 const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 model fit receipt v2";
 const RECIPE_HASH_CONTEXT: &str = "tritium salt v2 model fit recipe v1";
 const SOURCE_TENSOR_HASH_CONTEXT: &str = "tritium salt v2 source tensor v1";
 const CURVATURE_HASH_CONTEXT: &str = "tritium salt v2 bound curvature artifact v2";
+const FEEDBACK_HASH_CONTEXT: &str = "tritium salt v2 bound feedback artifact v1";
+const FEEDBACK_RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 feedback receipt v1";
+const MASTER_HASH_CONTEXT: &str = "tritium salt v2 ordered master fit v1";
 
 /// Physical ternary codec selected for the complete SALT V2 package.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -308,6 +315,74 @@ impl<'a> CurvatureArtifact<'a> {
     }
 }
 
+/// Digest-bound full input-column inverse Hessian and deterministic column partition.
+///
+/// This evidence is deliberately separate from the per-G128 fitting curvature. The latter scores
+/// and refits additive planes; this artifact drives BlockLDLQ/GPTQ residual propagation across
+/// natural input-column groups. Both are source-bound and independently receipted.
+#[derive(Clone, Copy, Debug)]
+pub struct SaltV2FeedbackArtifact<'a> {
+    source_id: CurvatureSourceId,
+    evidence_digest: [u8; 32],
+    groups: &'a [ColumnGroup],
+    inverse_hessian: &'a [f64],
+    content_digest: [u8; 32],
+}
+
+impl<'a> SaltV2FeedbackArtifact<'a> {
+    /// Bind a dense full input-column inverse Hessian to source and calibration provenance.
+    #[must_use]
+    pub fn inverse_hessian(
+        source_id: CurvatureSourceId,
+        evidence_digest: [u8; 32],
+        groups: &'a [ColumnGroup],
+        inverse_hessian: &'a [f64],
+    ) -> Self {
+        Self {
+            source_id,
+            evidence_digest,
+            groups,
+            inverse_hessian,
+            content_digest: bound_feedback_digest(
+                source_id,
+                evidence_digest,
+                groups,
+                inverse_hessian,
+            ),
+        }
+    }
+
+    /// Immutable source-model, activation-cache, and token-stream provenance.
+    #[must_use]
+    pub const fn source_id(self) -> CurvatureSourceId {
+        self.source_id
+    }
+
+    /// Upstream inverse-Hessian evidence digest.
+    #[must_use]
+    pub const fn evidence_digest(self) -> [u8; 32] {
+        self.evidence_digest
+    }
+
+    /// Ordered natural input-column partition.
+    #[must_use]
+    pub const fn groups(self) -> &'a [ColumnGroup] {
+        self.groups
+    }
+
+    /// Dense row-major full inverse Hessian.
+    #[must_use]
+    pub const fn values(self) -> &'a [f64] {
+        self.inverse_hessian
+    }
+
+    /// Digest binding provenance, partition, dimensions, and exact binary64 values.
+    #[must_use]
+    pub const fn digest(self) -> [u8; 32] {
+        self.content_digest
+    }
+}
+
 /// One named row-major source tensor and its fitted curvature evidence.
 #[derive(Clone, Copy, Debug)]
 pub struct SaltV2TensorFitInput<'a> {
@@ -347,6 +422,15 @@ pub struct SaltV2ModelFitInput<'a> {
     pub source_model_id: ModelId,
     /// Preserved and resident model geometry outside the SALT package.
     pub physical: SaltV2ModelPhysicalInput,
+}
+
+/// Search-stage input that requires one full feedback artifact per source tensor.
+#[derive(Clone, Copy, Debug)]
+pub struct SaltV2MasterFitInput<'a> {
+    /// Ordinary source tensors, calibration cache, model identity, and physical geometry.
+    pub model: SaltV2ModelFitInput<'a>,
+    /// Feedback artifacts in exact tensor order.
+    pub feedback: &'a [SaltV2FeedbackArtifact<'a>],
 }
 
 /// Recovery track stated by a completed result.
@@ -517,6 +601,55 @@ pub struct SaltV2TensorFitReceipt {
     pub plane_counts: Vec<u8>,
 }
 
+/// Replay binding for one natural input-column feedback group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaltV2FeedbackGroupReceipt {
+    /// Stable group ordinal.
+    pub group_index: usize,
+    /// First source input column.
+    pub column_start: usize,
+    /// Exclusive source input column end.
+    pub column_end: usize,
+    /// Digest of the provisional feedback-adjusted block fitted before full refinement.
+    pub provisional_fit_input_digest: [u8; 32],
+    /// Digest of the provisional reconstruction installed into the feedback state.
+    pub provisional_reconstruction_digest: [u8; 32],
+    /// Digest of the final feedback-adjusted block consumed by the full joint refit.
+    pub final_fit_input_digest: [u8; 32],
+    /// Digest of the final additive reconstruction propagated downstream.
+    pub final_reconstruction_digest: [u8; 32],
+    /// Whether the full refit changed the installed reconstruction bits.
+    pub nonzero_delta: bool,
+}
+
+/// Detailed BlockLDLQ/delta-correction receipt for one source tensor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaltV2TensorFeedbackReceipt {
+    /// Canonical tensor name.
+    pub name: String,
+    /// Digest of the full inverse-Hessian evidence and natural group partition.
+    pub artifact_digest: [u8; 32],
+    /// Per-group provisional/refined replay bindings in propagation order.
+    pub groups: Vec<SaltV2FeedbackGroupReceipt>,
+    /// Number of full refits installed through exact residual-delta propagation.
+    pub delta_corrections: u64,
+    /// Number of those refits whose reconstruction bits changed.
+    pub nonzero_delta_corrections: u64,
+    /// Digest of the complete final feedback-adjusted working matrix.
+    pub final_working_digest: [u8; 32],
+    /// Digest of the complete final additive reconstruction.
+    pub final_reconstruction_digest: [u8; 32],
+}
+
+/// Model-wide second-order feedback receipt bound into the ordered master and final package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaltV2ModelFeedbackReceipt {
+    /// Tensor receipts in source order.
+    pub tensors: Vec<SaltV2TensorFeedbackReceipt>,
+    /// Digest over all tensor feedback receipts.
+    pub receipt_id: [u8; 32],
+}
+
 /// Deterministic content-bound receipt for one reference whole-model fit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaltV2ModelFitReceipt {
@@ -528,6 +661,8 @@ pub struct SaltV2ModelFitReceipt {
     pub activation_digest: [u8; 32],
     /// Canonical recipe identity.
     pub recipe_id: [u8; 32],
+    /// Ordered Pmax master identity from which every selected prefix was sliced.
+    pub master_id: [u8; 32],
     /// Source/curvature bindings in tensor order.
     pub tensors: Vec<SaltV2TensorFitReceipt>,
     /// Exact package-byte identity.
@@ -540,6 +675,8 @@ pub struct SaltV2ModelFitReceipt {
     pub track: SaltV2FitTrack,
     /// Whether second-order sequential feedback was applied.
     pub feedback_applied: bool,
+    /// Detailed feedback evidence; present exactly when `feedback_applied` is true.
+    pub feedback: Option<SaltV2ModelFeedbackReceipt>,
     /// Whether cached-activation output reconstruction was applied.
     pub output_reconstruction_applied: bool,
 }
@@ -646,6 +783,40 @@ pub enum SaltV2Error {
     CurvatureGeometry {
         /// Tensor ordinal.
         tensor: usize,
+    },
+    /// Feedback artifact count differed from the source tensor count.
+    FeedbackArtifactCountMismatch {
+        /// Required number of artifacts.
+        expected: usize,
+        /// Supplied number of artifacts.
+        got: usize,
+    },
+    /// Feedback evidence was produced for a different semantic source model.
+    FeedbackSourceModelMismatch {
+        /// Tensor ordinal.
+        tensor: usize,
+    },
+    /// Feedback evidence was produced from a different activation-cache artifact.
+    FeedbackActivationCacheMismatch {
+        /// Tensor ordinal.
+        tensor: usize,
+    },
+    /// Feedback evidence used a different calibration/token-stream provenance envelope.
+    FeedbackTokenStreamMismatch {
+        /// Tensor ordinal.
+        tensor: usize,
+    },
+    /// Feedback groups cannot preserve the package's row-local G128 scale geometry.
+    FeedbackScaleGeometry {
+        /// Tensor ordinal.
+        tensor: usize,
+    },
+    /// Full inverse-Hessian validation or propagation failed.
+    Feedback {
+        /// Tensor ordinal.
+        tensor: usize,
+        /// Underlying feedback error.
+        source: FeedbackError,
     },
     /// Total model parameters were smaller than the quantized coefficient count.
     InvalidTotalModelParameters,
@@ -770,6 +941,29 @@ impl fmt::Display for SaltV2Error {
                     "tensor {tensor} curvature geometry is incompatible"
                 )
             }
+            Self::FeedbackArtifactCountMismatch { expected, got } => write!(
+                formatter,
+                "feedback needs {expected} tensor artifacts, received {got}"
+            ),
+            Self::FeedbackSourceModelMismatch { tensor } => write!(
+                formatter,
+                "tensor {tensor} feedback source model does not match the fit input"
+            ),
+            Self::FeedbackActivationCacheMismatch { tensor } => write!(
+                formatter,
+                "tensor {tensor} feedback activation cache does not match the fit input"
+            ),
+            Self::FeedbackTokenStreamMismatch { tensor } => write!(
+                formatter,
+                "tensor {tensor} feedback token stream does not match the activation cache provenance"
+            ),
+            Self::FeedbackScaleGeometry { tensor } => write!(
+                formatter,
+                "tensor {tensor} feedback groups do not preserve row-local group128 scales"
+            ),
+            Self::Feedback { tensor, source } => {
+                write!(formatter, "tensor {tensor} feedback failed: {source}")
+            }
             Self::InvalidTotalModelParameters => formatter
                 .write_str("total model parameters are below the quantized coefficient count"),
             Self::AccountingOverflow => formatter.write_str("SALT V2 accounting overflow"),
@@ -842,6 +1036,42 @@ struct TensorFitWork {
     curvature_digest: [u8; 32],
 }
 
+/// Owned, content-addressed Pmax search result reusable across exact physical rate targets.
+///
+/// Candidate curves and all lower-plane packages are derived from the same ordered master planes.
+/// Allocation cannot mutate or refit this artifact.
+#[derive(Clone, Debug)]
+pub struct SaltV2MasterFit {
+    work: Vec<TensorFitWork>,
+    config: SaltV2Config,
+    quantized_parameters: u64,
+    source_model_id: ModelId,
+    activation_digest: [u8; 32],
+    physical: SaltV2ModelPhysicalInput,
+    feedback: Option<SaltV2ModelFeedbackReceipt>,
+    master_id: [u8; 32],
+}
+
+impl SaltV2MasterFit {
+    /// Content identity of source, recipe-without-rate, evidence, and exact ordered planes.
+    #[must_use]
+    pub const fn master_id(&self) -> [u8; 32] {
+        self.master_id
+    }
+
+    /// Fitting recipe. Its rate field is only the original request; allocation accepts a new rate.
+    #[must_use]
+    pub const fn config(&self) -> &SaltV2Config {
+        &self.config
+    }
+
+    /// Detailed feedback evidence, absent only for the compatibility PTQ wrapper.
+    #[must_use]
+    pub const fn feedback_receipt(&self) -> Option<&SaltV2ModelFeedbackReceipt> {
+        self.feedback.as_ref()
+    }
+}
+
 /// Fit a small whole model with the deterministic CPU reference solver.
 ///
 /// For D2/B3, every 256-coefficient allocation tile is jointly fit once at P=3 and a deterministic
@@ -867,33 +1097,143 @@ pub fn fit_salt_v2_model(
     input: SaltV2ModelFitInput<'_>,
     config: &SaltV2Config,
 ) -> Result<SaltV2ModelFitResult, SaltV2Error> {
+    let rate = config.rate;
+    let master = fit_salt_v2_master_without_feedback(input, config)?;
+    allocate_and_pack_salt_v2_master(&master, rate)
+}
+
+fn fit_salt_v2_master_without_feedback(
+    input: SaltV2ModelFitInput<'_>,
+    config: &SaltV2Config,
+) -> Result<SaltV2MasterFit, SaltV2Error> {
     validate_config(config)?;
     validate_external_stages(config)?;
     let quantized_parameters = validate_model_input(&input, config)?;
     let mut work = Vec::new();
     work.try_reserve_exact(input.tensors.len())
         .map_err(|_| SaltV2Error::AccountingOverflow)?;
-    let mut tile_candidates = Vec::new();
     for (tensor_index, tensor) in input.tensors.iter().enumerate() {
         let tensor_work = fit_tensor_candidates(tensor_index, tensor, config)?;
+        work.push(tensor_work);
+    }
+    finish_master(input, *config, quantized_parameters, work, None)
+}
+
+/// Fit one content-addressed Pmax master with full BlockLDLQ feedback and delta correction.
+///
+/// A deterministic one-sweep provisional pass first installs every group reconstruction. The full
+/// joint refit then revisits groups in natural column order through `FeedbackState::refit_suffix`;
+/// every changed reconstruction is propagated with the exact residual delta before the next group
+/// is refit. Allocation is deliberately deferred to [`allocate_and_pack_salt_v2_master`].
+///
+/// # Errors
+/// Rejects all ordinary model-fit failures plus incomplete/mismatched feedback evidence, invalid
+/// full inverse Hessians, non-G128-aligned natural groups, and failed provisional or final fits.
+pub fn fit_salt_v2_master(
+    input: SaltV2MasterFitInput<'_>,
+    config: &SaltV2Config,
+) -> Result<SaltV2MasterFit, SaltV2Error> {
+    validate_config(config)?;
+    validate_external_stages(config)?;
+    let quantized_parameters = validate_model_input(&input.model, config)?;
+    validate_feedback_artifacts(&input)?;
+
+    let mut work = Vec::new();
+    let mut feedback_receipts = Vec::new();
+    work.try_reserve_exact(input.model.tensors.len())
+        .map_err(|_| SaltV2Error::AccountingOverflow)?;
+    feedback_receipts
+        .try_reserve_exact(input.model.tensors.len())
+        .map_err(|_| SaltV2Error::AccountingOverflow)?;
+    for (tensor_index, (tensor, feedback)) in input
+        .model
+        .tensors
+        .iter()
+        .zip(input.feedback.iter())
+        .enumerate()
+    {
+        let (tensor_work, receipt) =
+            fit_tensor_candidates_with_feedback(tensor_index, tensor, *feedback, config)?;
+        work.push(tensor_work);
+        feedback_receipts.push(receipt);
+    }
+    let feedback = SaltV2ModelFeedbackReceipt {
+        receipt_id: feedback_receipt_digest(&feedback_receipts),
+        tensors: feedback_receipts,
+    };
+    finish_master(
+        input.model,
+        *config,
+        quantized_parameters,
+        work,
+        Some(feedback),
+    )
+}
+
+fn finish_master(
+    input: SaltV2ModelFitInput<'_>,
+    config: SaltV2Config,
+    quantized_parameters: u64,
+    work: Vec<TensorFitWork>,
+    feedback: Option<SaltV2ModelFeedbackReceipt>,
+) -> Result<SaltV2MasterFit, SaltV2Error> {
+    let activation_digest = input.activations.digest().into_bytes();
+    let master_id = master_digest(
+        input.source_model_id,
+        activation_digest,
+        &config,
+        input.physical,
+        &work,
+        feedback.as_ref(),
+    )?;
+    Ok(SaltV2MasterFit {
+        work,
+        config,
+        quantized_parameters,
+        source_model_id: input.source_model_id,
+        activation_digest,
+        physical: input.physical,
+        feedback,
+        master_id,
+    })
+}
+
+/// Select exact-byte prefixes from an immutable ordered master and write a canonical package.
+///
+/// The supplied target may vary across calls. No candidate is refit, so compact artifacts remain
+/// byte-exact prefixes of a less constrained package produced from the same master.
+///
+/// # Errors
+/// Rejects malformed or infeasible physical ceilings, accounting mismatches, allocator failures,
+/// and any canonical package validation failure.
+pub fn allocate_and_pack_salt_v2_master(
+    master: &SaltV2MasterFit,
+    rate: PhysicalRateTarget,
+) -> Result<SaltV2ModelFitResult, SaltV2Error> {
+    let mut config = master.config;
+    config.rate = rate;
+    validate_config(&config)?;
+    let work = &master.work;
+    let physical = master.physical;
+    let quantized_parameters = master.quantized_parameters;
+    let mut tile_candidates = Vec::new();
+    for tensor_work in work {
         for frontier in &tensor_work.candidates {
             tile_candidates.extend(frontier.iter().map(|candidate| candidate.metrics));
         }
-        work.push(tensor_work);
     }
     let (serialized_fixed_bytes, resident_fixed_bytes) =
-        fixed_package_bytes(&work, config.packing.codec())?;
+        fixed_package_bytes(work, config.packing.codec())?;
 
-    let overhead_resident = input
-        .physical
+    let overhead_resident = physical
         .preserved_resident_bytes
-        .checked_add(input.physical.required_runtime_shadow_bytes)
+        .checked_add(physical.required_runtime_shadow_bytes)
         .ok_or(SaltV2Error::AccountingOverflow)?;
     let package_artifact_ceiling = config
         .rate
         .max_artifact_bytes
-        .checked_sub(input.physical.preserved_artifact_bytes)
-        .ok_or_else(|| no_feasible(config, 0))?;
+        .checked_sub(physical.preserved_artifact_bytes)
+        .ok_or_else(|| no_feasible(&config, 0))?;
     let package_matrix_ceiling = config.rate.max_matrix_bytes.min(package_artifact_ceiling);
     let aligned_package_ceiling = package_matrix_ceiling
         / u64::try_from(SALT_V2_PACKAGE_ALIGNMENT).map_err(|_| SaltV2Error::AccountingOverflow)?
@@ -901,13 +1241,13 @@ pub fn fit_salt_v2_model(
     let package_resident_ceiling = match config.rate.max_resident_bytes {
         Some(maximum) => maximum
             .checked_sub(overhead_resident)
-            .ok_or_else(|| no_feasible(config, aligned_package_ceiling))?,
+            .ok_or_else(|| no_feasible(&config, aligned_package_ceiling))?,
         None => u64::MAX
             .checked_sub(overhead_resident)
             .ok_or(SaltV2Error::AccountingOverflow)?,
     };
 
-    let allocator_frontiers = allocator_candidates(&work, config)?;
+    let allocator_frontiers = allocator_candidates(work, &config)?;
     let group_refs = allocator_frontiers
         .iter()
         .map(|candidates| GroupCandidates {
@@ -934,14 +1274,14 @@ pub fn fit_salt_v2_model(
         },
     )
     .map_err(|error| match error {
-        PhysicalAllocError::BudgetTooSmall { .. } => no_feasible(config, aligned_package_ceiling),
+        PhysicalAllocError::BudgetTooSmall { .. } => no_feasible(&config, aligned_package_ceiling),
         other => SaltV2Error::Allocation(other),
     })?
     .near_lossless;
 
     let mut selected_plane_counts = allocation.plane_counts;
     let mut frontier_index = 0usize;
-    for tensor in &work {
+    for tensor in work {
         for frontier in &tensor.candidates {
             let selected = selected_plane_counts
                 .get_mut(frontier_index)
@@ -970,7 +1310,7 @@ pub fn fit_salt_v2_model(
     let mut predicted_raw_serialized = serialized_fixed_bytes;
     let mut predicted_resident = resident_fixed_bytes;
 
-    for tensor_work in &work {
+    for tensor_work in work {
         let mut tiles = Vec::new();
         let mut tensor_plane_counts = Vec::new();
         for (tile_index, frontier) in tensor_work.candidates.iter().enumerate() {
@@ -1043,7 +1383,7 @@ pub fn fit_salt_v2_model(
     let artifact_bytes = encoded
         .ledger
         .total_bytes
-        .checked_add(input.physical.preserved_artifact_bytes)
+        .checked_add(physical.preserved_artifact_bytes)
         .ok_or(SaltV2Error::AccountingOverflow)?;
     let resident_bytes = indexed_runtime
         .steady_resident_bytes()
@@ -1056,7 +1396,7 @@ pub fn fit_salt_v2_model(
             .max_resident_bytes
             .is_some_and(|maximum| resident_bytes > maximum)
     {
-        return Err(no_feasible(config, aligned_package_ceiling));
+        return Err(no_feasible(&config, aligned_package_ceiling));
     }
 
     let logical_trits = plane_histogram
@@ -1068,8 +1408,8 @@ pub fn fit_salt_v2_model(
         .ok_or(SaltV2Error::AccountingOverflow)?;
     let logical_bits = logical_trits as f64 * crate::TRIT_BITS;
     let matrix_bpw = exact_bpw(encoded.ledger.total_bytes, quantized_parameters)?;
-    let artifact_bpw = exact_bpw(artifact_bytes, input.physical.total_model_parameters)?;
-    let resident_bpw = exact_bpw(resident_bytes, input.physical.total_model_parameters)?;
+    let artifact_bpw = exact_bpw(artifact_bytes, physical.total_model_parameters)?;
+    let resident_bpw = exact_bpw(resident_bytes, physical.total_model_parameters)?;
     let metrics = SaltV2ModelFitMetrics {
         quantized_parameter_count: quantized_parameters,
         plane_histogram,
@@ -1092,9 +1432,9 @@ pub fn fit_salt_v2_model(
             runtime_map_bytes: indexed_runtime.allocation_map_bytes(),
             runtime_rank_prefix_bytes: indexed_runtime.rank_prefix_bytes(),
             runtime_dense_shadow_bytes: indexed_runtime.dense_shadow_bytes(),
-            preserved_artifact_bytes: input.physical.preserved_artifact_bytes,
-            preserved_resident_bytes: input.physical.preserved_resident_bytes,
-            required_runtime_shadow_bytes: input.physical.required_runtime_shadow_bytes,
+            preserved_artifact_bytes: physical.preserved_artifact_bytes,
+            preserved_resident_bytes: physical.preserved_resident_bytes,
+            required_runtime_shadow_bytes: physical.required_runtime_shadow_bytes,
         },
         logical_trits,
         logical_bits,
@@ -1108,34 +1448,37 @@ pub fn fit_salt_v2_model(
         teacher_kl: None,
     };
     let package_id = PackageId::from_package_bytes(&encoded.bytes);
-    let activation_digest = input.activations.digest().into_bytes();
-    let recipe_id = recipe_digest(config);
-    let receipt_id = receipt_digest(
-        input.source_model_id,
-        activation_digest,
+    let recipe_id = recipe_digest(&config);
+    let receipt_id = receipt_digest(ReceiptDigestInput {
+        source_model_id: master.source_model_id,
+        activation_digest: master.activation_digest,
         recipe_id,
-        &tensor_receipts,
+        master_id: master.master_id,
+        tensors: &tensor_receipts,
         package_id,
-        input.physical,
-    );
+        physical,
+        feedback: master.feedback.as_ref(),
+    });
     let receipt = SaltV2ModelFitReceipt {
         solver_version: REFERENCE_SOLVER_VERSION,
-        source_model_id: input.source_model_id,
-        activation_digest,
+        source_model_id: master.source_model_id,
+        activation_digest: master.activation_digest,
         recipe_id,
+        master_id: master.master_id,
         tensors: tensor_receipts,
         package_id,
-        physical: input.physical,
+        physical,
         receipt_id,
         track: SaltV2FitTrack::Ptq,
-        feedback_applied: false,
+        feedback_applied: master.feedback.is_some(),
+        feedback: master.feedback.clone(),
         output_reconstruction_applied: false,
     };
 
     Ok(SaltV2ModelFitResult {
         tensors,
         package_bytes: encoded.bytes,
-        config: *config,
+        config,
         metrics,
         receipt,
     })
@@ -1289,6 +1632,54 @@ fn validate_model_input(
     Ok(quantized)
 }
 
+fn validate_feedback_artifacts(input: &SaltV2MasterFitInput<'_>) -> Result<(), SaltV2Error> {
+    if input.feedback.len() != input.model.tensors.len() {
+        return Err(SaltV2Error::FeedbackArtifactCountMismatch {
+            expected: input.model.tensors.len(),
+            got: input.feedback.len(),
+        });
+    }
+    let source_model_digest = *input.model.source_model_id.as_bytes();
+    let activation_cache_digest = input.model.activations.digest().into_bytes();
+    let token_stream_digest = input.model.activations.spec().source_digest().into_bytes();
+    for (tensor_index, (tensor, feedback)) in input
+        .model
+        .tensors
+        .iter()
+        .zip(input.feedback.iter())
+        .enumerate()
+    {
+        let source = feedback.source_id();
+        if source.source_model_digest() != source_model_digest {
+            return Err(SaltV2Error::FeedbackSourceModelMismatch {
+                tensor: tensor_index,
+            });
+        }
+        if source.activation_cache_digest() != activation_cache_digest {
+            return Err(SaltV2Error::FeedbackActivationCacheMismatch {
+                tensor: tensor_index,
+            });
+        }
+        if source.token_stream_digest() != token_stream_digest {
+            return Err(SaltV2Error::FeedbackTokenStreamMismatch {
+                tensor: tensor_index,
+            });
+        }
+        let aligned_partition = tensor.cols.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE)
+            && !feedback.groups().is_empty()
+            && feedback.groups().iter().all(|group| {
+                group.start.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE)
+                    && group.end.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE)
+            });
+        if !aligned_partition {
+            return Err(SaltV2Error::FeedbackScaleGeometry {
+                tensor: tensor_index,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_curvature_geometry(
     tensor_index: usize,
     tensor: &SaltV2TensorFitInput<'_>,
@@ -1373,6 +1764,418 @@ fn fixed_package_bytes(
         .checked_sub(base_plane_resident_bytes)
         .ok_or(SaltV2Error::PhysicalAccountingMismatch)?;
     Ok((serialized_fixed, resident_fixed))
+}
+
+#[derive(Clone, Debug)]
+struct MasterTensorPlanes {
+    trits: Vec<Vec<i8>>,
+    scales: Vec<Vec<f16>>,
+    populated_groups: Vec<bool>,
+}
+
+impl MasterTensorPlanes {
+    fn new(coefficient_count: usize) -> Self {
+        let scale_count = coefficient_count / SALT_V2_SCALE_GROUP_SIZE;
+        Self {
+            trits: (0..3).map(|_| vec![0; coefficient_count]).collect(),
+            scales: (0..3)
+                .map(|_| vec![f16::from_f32(0.0); scale_count])
+                .collect(),
+            populated_groups: vec![false; scale_count],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FeedbackPlanePlacement {
+    global_start: usize,
+    trits: [Vec<i8>; 3],
+    scales: [f16; 3],
+}
+
+#[derive(Clone, Debug)]
+struct FeedbackGroupFit {
+    reconstruction: Vec<f64>,
+    placements: Vec<FeedbackPlanePlacement>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FeedbackPassRecord {
+    column_start: usize,
+    column_end: usize,
+    fit_input_digest: [u8; 32],
+    reconstruction_digest: [u8; 32],
+}
+
+fn fit_tensor_candidates_with_feedback(
+    tensor_index: usize,
+    tensor: &SaltV2TensorFitInput<'_>,
+    feedback: SaltV2FeedbackArtifact<'_>,
+    config: &SaltV2Config,
+) -> Result<(TensorFitWork, SaltV2TensorFeedbackReceipt), SaltV2Error> {
+    let weights = tensor
+        .weights
+        .iter()
+        .map(|value| f64::from(*value))
+        .collect::<Vec<_>>();
+    let problem = FeedbackProblem {
+        rows: tensor.rows,
+        columns: tensor.cols,
+        weights: &weights,
+        groups: feedback.groups(),
+        metric: FeedbackMetric::InverseHessian(feedback.values()),
+    };
+
+    let mut provisional_records = Vec::with_capacity(feedback.groups().len());
+    let mut state = fit_with_feedback(problem, |request| {
+        let fitted = fit_feedback_group(tensor_index, tensor, config, request, true)?;
+        provisional_records.push(feedback_pass_record(request, &fitted.reconstruction));
+        Ok::<_, SaltV2Error>(fitted.reconstruction)
+    })
+    .map_err(|error| map_feedback_run_error(tensor_index, error))?;
+
+    let mut master_planes = MasterTensorPlanes::new(tensor.weights.len());
+    let mut final_records = Vec::with_capacity(feedback.groups().len());
+    state
+        .refit_suffix(0, |request| {
+            let fitted = fit_feedback_group(tensor_index, tensor, config, request, false)?;
+            install_feedback_group(&mut master_planes, &fitted)?;
+            final_records.push(feedback_pass_record(request, &fitted.reconstruction));
+            Ok::<_, SaltV2Error>(fitted.reconstruction)
+        })
+        .map_err(|error| map_feedback_run_error(tensor_index, error))?;
+
+    if provisional_records.len() != feedback.groups().len()
+        || final_records.len() != feedback.groups().len()
+        || master_planes
+            .populated_groups
+            .iter()
+            .any(|populated| !*populated)
+    {
+        return Err(SaltV2Error::PhysicalAccountingMismatch);
+    }
+    let mut group_receipts = Vec::with_capacity(feedback.groups().len());
+    let mut nonzero_delta_corrections = 0u64;
+    for (group_index, ((group, provisional), final_record)) in feedback
+        .groups()
+        .iter()
+        .zip(provisional_records.iter())
+        .zip(final_records.iter())
+        .enumerate()
+    {
+        if provisional.column_start != group.start
+            || provisional.column_end != group.end
+            || final_record.column_start != group.start
+            || final_record.column_end != group.end
+        {
+            return Err(SaltV2Error::PhysicalAccountingMismatch);
+        }
+        let nonzero_delta = provisional.reconstruction_digest != final_record.reconstruction_digest;
+        nonzero_delta_corrections = nonzero_delta_corrections
+            .checked_add(u64::from(nonzero_delta))
+            .ok_or(SaltV2Error::AccountingOverflow)?;
+        group_receipts.push(SaltV2FeedbackGroupReceipt {
+            group_index,
+            column_start: group.start,
+            column_end: group.end,
+            provisional_fit_input_digest: provisional.fit_input_digest,
+            provisional_reconstruction_digest: provisional.reconstruction_digest,
+            final_fit_input_digest: final_record.fit_input_digest,
+            final_reconstruction_digest: final_record.reconstruction_digest,
+            nonzero_delta,
+        });
+    }
+    let receipt = SaltV2TensorFeedbackReceipt {
+        name: tensor.name.to_owned(),
+        artifact_digest: feedback.digest(),
+        delta_corrections: u64::try_from(group_receipts.len())
+            .map_err(|_| SaltV2Error::AccountingOverflow)?,
+        nonzero_delta_corrections,
+        groups: group_receipts,
+        final_working_digest: feedback_values_digest(3, state.working_weights()),
+        final_reconstruction_digest: feedback_values_digest(4, state.reconstruction()),
+    };
+    let work = materialize_feedback_tensor_work(tensor_index, tensor, config, master_planes)?;
+    Ok((work, receipt))
+}
+
+fn map_feedback_run_error(tensor: usize, error: FeedbackRunError<SaltV2Error>) -> SaltV2Error {
+    match error {
+        FeedbackRunError::Feedback(source) => SaltV2Error::Feedback { tensor, source },
+        FeedbackRunError::Fitter(source) => source,
+    }
+}
+
+fn feedback_pass_record(
+    request: GroupFitRequest<'_>,
+    reconstruction: &[f64],
+) -> FeedbackPassRecord {
+    FeedbackPassRecord {
+        column_start: request.column_start,
+        column_end: request.column_start + request.columns,
+        fit_input_digest: feedback_values_digest(1, request.working_weights),
+        reconstruction_digest: feedback_values_digest(2, reconstruction),
+    }
+}
+
+fn fit_feedback_group(
+    tensor_index: usize,
+    tensor: &SaltV2TensorFitInput<'_>,
+    config: &SaltV2Config,
+    request: GroupFitRequest<'_>,
+    provisional: bool,
+) -> Result<FeedbackGroupFit, SaltV2Error> {
+    const FULL_PLANES: usize = 3;
+    let mut reconstruction = vec![0.0; request.working_weights.len()];
+    let groups_per_row = request.columns / SALT_V2_SCALE_GROUP_SIZE;
+    let mut placements = Vec::with_capacity(request.rows * groups_per_row);
+    for row in 0..request.rows {
+        for local_group in 0..groups_per_row {
+            let local_start = local_group * SALT_V2_SCALE_GROUP_SIZE;
+            let compact_start = row * request.columns + local_start;
+            let compact_end = compact_start + SALT_V2_SCALE_GROUP_SIZE;
+            let global_start = row * tensor.cols + request.column_start + local_start;
+            let global_end = global_start + SALT_V2_SCALE_GROUP_SIZE;
+            let working = request.working_weights[compact_start..compact_end]
+                .iter()
+                .map(|value| *value as f32)
+                .collect::<Vec<_>>();
+            if working.iter().any(|value| !value.is_finite()) {
+                return Err(SaltV2Error::AccountingOverflow);
+            }
+            let global_group = global_start / SALT_V2_SCALE_GROUP_SIZE;
+            let tile_index = global_start / SALT_V2_ALLOCATION_TILE_SIZE;
+            let metric = curvature_metric(tensor.curvature, global_start, global_end, global_group);
+            let fit_config = JointFitConfig {
+                planes: FULL_PLANES,
+                max_iterations: if provisional {
+                    1
+                } else {
+                    config.coordinate_sweeps
+                },
+                ridge: 1e-12,
+                em_restarts: if provisional { 1 } else { config.em_restarts },
+                ridge_condition_limit: config.ridge_condition_limit,
+                scale_precision: ScalePrecision::F16,
+            };
+            let (scales, trits, order) = if config.packing == SaltV2Packing::S34 {
+                let fitted =
+                    fit_progressive_s34(&working, metric, fit_config).map_err(|source| {
+                        SaltV2Error::JointFit {
+                            tensor: tensor_index,
+                            tile: tile_index,
+                            group: global_group,
+                            planes: FULL_PLANES,
+                            source,
+                        }
+                    })?;
+                (fitted.scales, fitted.trits, [0, 1, 2])
+            } else {
+                let fitted = fit_joint_ternary(&working, metric, fit_config).map_err(|source| {
+                    SaltV2Error::JointFit {
+                        tensor: tensor_index,
+                        tile: tile_index,
+                        group: global_group,
+                        planes: FULL_PLANES,
+                        source,
+                    }
+                })?;
+                let order = progressive_plane_order(
+                    &tensor.weights[global_start..global_end],
+                    metric,
+                    &fitted.scales,
+                    &fitted.trits,
+                )
+                .ok_or(SaltV2Error::NonMonotoneCandidate {
+                    tensor: tensor_index,
+                    tile: tile_index,
+                    planes: 2,
+                })?;
+                (fitted.scales, fitted.trits, order)
+            };
+            for local in 0..SALT_V2_SCALE_GROUP_SIZE {
+                reconstruction[compact_start + local] = (0..FULL_PLANES)
+                    .map(|plane| f64::from(scales[plane]) * f64::from(trits[plane][local]))
+                    .sum();
+            }
+            placements.push(FeedbackPlanePlacement {
+                global_start,
+                trits: std::array::from_fn(|plane| trits[order[plane]].clone()),
+                scales: std::array::from_fn(|plane| f16::from_f32(scales[order[plane]])),
+            });
+        }
+    }
+    Ok(FeedbackGroupFit {
+        reconstruction,
+        placements,
+    })
+}
+
+fn install_feedback_group(
+    master: &mut MasterTensorPlanes,
+    fitted: &FeedbackGroupFit,
+) -> Result<(), SaltV2Error> {
+    for placement in &fitted.placements {
+        let group = placement.global_start / SALT_V2_SCALE_GROUP_SIZE;
+        let end = placement
+            .global_start
+            .checked_add(SALT_V2_SCALE_GROUP_SIZE)
+            .ok_or(SaltV2Error::AccountingOverflow)?;
+        let populated = master
+            .populated_groups
+            .get_mut(group)
+            .ok_or(SaltV2Error::PhysicalAccountingMismatch)?;
+        if *populated {
+            return Err(SaltV2Error::PhysicalAccountingMismatch);
+        }
+        for plane in 0..3 {
+            master.trits[plane][placement.global_start..end]
+                .copy_from_slice(&placement.trits[plane]);
+            master.scales[plane][group] = placement.scales[plane];
+        }
+        *populated = true;
+    }
+    Ok(())
+}
+
+fn materialize_feedback_tensor_work(
+    tensor_index: usize,
+    tensor: &SaltV2TensorFitInput<'_>,
+    config: &SaltV2Config,
+    master: MasterTensorPlanes,
+) -> Result<TensorFitWork, SaltV2Error> {
+    let tile_count = tensor.weights.len().div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
+    let mut candidates = Vec::with_capacity(tile_count);
+    let mut tile_lengths = Vec::with_capacity(tile_count);
+    for tile_index in 0..tile_count {
+        let start = tile_index
+            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+            .ok_or(SaltV2Error::AccountingOverflow)?;
+        let end = (start + SALT_V2_ALLOCATION_TILE_SIZE).min(tensor.weights.len());
+        let tile_len = end - start;
+        tile_lengths.push(tile_len);
+        candidates.push(materialize_feedback_tile_frontier(
+            tensor_index,
+            tile_index,
+            start,
+            end,
+            tensor,
+            config,
+            &master,
+            plane_physical_bytes(config.packing, tile_len)?,
+        )?);
+    }
+    Ok(TensorFitWork {
+        name: tensor.name.to_owned(),
+        rows: tensor.rows,
+        cols: tensor.cols,
+        tile_lengths,
+        candidates,
+        source_digest: source_tensor_digest(tensor),
+        curvature_digest: tensor.curvature.digest(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_feedback_tile_frontier(
+    tensor_index: usize,
+    tile_index: usize,
+    tile_start: usize,
+    tile_end: usize,
+    tensor: &SaltV2TensorFitInput<'_>,
+    config: &SaltV2Config,
+    master: &MasterTensorPlanes,
+    per_plane_bytes: PhysicalBytes,
+) -> Result<Vec<TileFitCandidate>, SaltV2Error> {
+    const FULL_PLANES: usize = 3;
+    let first_scale = tile_start / SALT_V2_SCALE_GROUP_SIZE;
+    let scale_end = tile_end.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+    let semantic_planes = (0..FULL_PLANES)
+        .map(|plane| {
+            SaltV2Plane::new(
+                master.trits[plane][tile_start..tile_end].to_vec(),
+                master.scales[plane][first_scale..scale_end].to_vec(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut hessian_errors = [0.0; FULL_PLANES];
+    let mut frobenius_errors = [0.0; FULL_PLANES];
+    let mut group_start = tile_start;
+    while group_start < tile_end {
+        let group_end = (group_start + SALT_V2_SCALE_GROUP_SIZE).min(tile_end);
+        let group = group_start / SALT_V2_SCALE_GROUP_SIZE;
+        let metric = curvature_metric(tensor.curvature, group_start, group_end, group);
+        let source = &tensor.weights[group_start..group_end];
+        let mut reconstruction = vec![0.0f32; source.len()];
+        for plane in 0..FULL_PLANES {
+            let scale = master.scales[plane][group].to_f32();
+            for (local, value) in reconstruction.iter_mut().enumerate() {
+                *value += scale * f32::from(master.trits[plane][group_start + local]);
+            }
+            hessian_errors[plane] += if config.packing == SaltV2Packing::S34 {
+                checked_s34_objective(source, &reconstruction, metric).map_err(|source| {
+                    SaltV2Error::JointFit {
+                        tensor: tensor_index,
+                        tile: tile_index,
+                        group,
+                        planes: plane + 1,
+                        source,
+                    }
+                })?
+            } else {
+                reconstruction_objective(source, &reconstruction, metric)
+            };
+            frobenius_errors[plane] += source
+                .iter()
+                .zip(reconstruction.iter())
+                .map(|(left, right)| {
+                    let residual = f64::from(*left) - f64::from(*right);
+                    residual * residual
+                })
+                .sum::<f64>();
+        }
+        group_start = group_end;
+    }
+
+    let mut frontier = Vec::with_capacity(config.max_planes);
+    for planes in 1..=config.max_planes {
+        if planes > 1 {
+            let prior = hessian_errors[planes - 2];
+            if config.packing == SaltV2Packing::S34 && hessian_errors[planes - 1] >= prior {
+                break;
+            }
+            let tolerance = 1e-12f64.max(prior.abs() * 1e-12);
+            if hessian_errors[planes - 1] > prior + tolerance {
+                return Err(SaltV2Error::NonMonotoneCandidate {
+                    tensor: tensor_index,
+                    tile: tile_index,
+                    planes,
+                });
+            }
+        }
+        let cumulative = PhysicalBytes {
+            serialized: per_plane_bytes
+                .serialized
+                .checked_mul(planes as u64)
+                .ok_or(SaltV2Error::AccountingOverflow)?,
+            resident: per_plane_bytes
+                .resident
+                .checked_mul(planes as u64)
+                .ok_or(SaltV2Error::AccountingOverflow)?,
+        };
+        frontier.push(TileFitCandidate {
+            tile: SaltV2Tile::new(semantic_planes[..planes].to_vec())?,
+            metrics: SaltV2TileCandidateMetrics {
+                tensor_index,
+                tile_index,
+                planes: planes as u8,
+                cumulative,
+                hessian_error: hessian_errors[planes - 1],
+                frobenius_error: frobenius_errors[planes - 1],
+            },
+        });
+    }
+    Ok(frontier)
 }
 
 fn fit_tensor_candidates(
@@ -2377,6 +3180,127 @@ fn bound_curvature_digest(
     *hasher.finalize().as_bytes()
 }
 
+fn bound_feedback_digest(
+    source_id: CurvatureSourceId,
+    evidence_digest: [u8; 32],
+    groups: &[ColumnGroup],
+    inverse_hessian: &[f64],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(FEEDBACK_HASH_CONTEXT);
+    hasher.update(&source_id.digest());
+    hasher.update(&evidence_digest);
+    write_len_hash(&mut hasher, groups.len());
+    for group in groups {
+        write_len_hash(&mut hasher, group.start);
+        write_len_hash(&mut hasher, group.end);
+    }
+    write_len_hash(&mut hasher, inverse_hessian.len());
+    for value in inverse_hessian {
+        hasher.update(&value.to_bits().to_le_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn feedback_values_digest(domain: u8, values: &[f64]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(FEEDBACK_RECEIPT_HASH_CONTEXT);
+    hasher.update(&[domain]);
+    write_len_hash(&mut hasher, values.len());
+    for value in values {
+        hasher.update(&value.to_bits().to_le_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn feedback_receipt_digest(receipts: &[SaltV2TensorFeedbackReceipt]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(FEEDBACK_RECEIPT_HASH_CONTEXT);
+    hasher.update(&[0]);
+    write_len_hash(&mut hasher, receipts.len());
+    for receipt in receipts {
+        write_len_hash(&mut hasher, receipt.name.len());
+        hasher.update(receipt.name.as_bytes());
+        hasher.update(&receipt.artifact_digest);
+        write_len_hash(&mut hasher, receipt.groups.len());
+        for group in &receipt.groups {
+            write_len_hash(&mut hasher, group.group_index);
+            write_len_hash(&mut hasher, group.column_start);
+            write_len_hash(&mut hasher, group.column_end);
+            hasher.update(&group.provisional_fit_input_digest);
+            hasher.update(&group.provisional_reconstruction_digest);
+            hasher.update(&group.final_fit_input_digest);
+            hasher.update(&group.final_reconstruction_digest);
+            hasher.update(&[u8::from(group.nonzero_delta)]);
+        }
+        hasher.update(&receipt.delta_corrections.to_le_bytes());
+        hasher.update(&receipt.nonzero_delta_corrections.to_le_bytes());
+        hasher.update(&receipt.final_working_digest);
+        hasher.update(&receipt.final_reconstruction_digest);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn master_digest(
+    source_model_id: ModelId,
+    activation_digest: [u8; 32],
+    config: &SaltV2Config,
+    physical: SaltV2ModelPhysicalInput,
+    work: &[TensorFitWork],
+    feedback: Option<&SaltV2ModelFeedbackReceipt>,
+) -> Result<[u8; 32], SaltV2Error> {
+    let mut hasher = blake3::Hasher::new_derive_key(MASTER_HASH_CONTEXT);
+    hasher.update(source_model_id.as_bytes());
+    hasher.update(&activation_digest);
+    let mut search_config = *config;
+    search_config.rate = PhysicalRateTarget::default();
+    hasher.update(&recipe_digest(&search_config));
+    hasher.update(&physical.total_model_parameters.to_le_bytes());
+    hasher.update(&physical.preserved_artifact_bytes.to_le_bytes());
+    hasher.update(&physical.preserved_resident_bytes.to_le_bytes());
+    hasher.update(&physical.required_runtime_shadow_bytes.to_le_bytes());
+    match feedback {
+        Some(receipt) => {
+            hasher.update(&[1]);
+            hasher.update(&receipt.receipt_id);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    write_len_hash(&mut hasher, work.len());
+    for tensor in work {
+        write_len_hash(&mut hasher, tensor.name.len());
+        hasher.update(tensor.name.as_bytes());
+        write_len_hash(&mut hasher, tensor.rows);
+        write_len_hash(&mut hasher, tensor.cols);
+        hasher.update(&tensor.source_digest);
+        hasher.update(&tensor.curvature_digest);
+        write_len_hash(&mut hasher, tensor.candidates.len());
+        for (tile_length, frontier) in tensor.tile_lengths.iter().zip(tensor.candidates.iter()) {
+            write_len_hash(&mut hasher, *tile_length);
+            write_len_hash(&mut hasher, frontier.len());
+            for candidate in frontier {
+                let metrics = candidate.metrics;
+                hasher.update(&[metrics.planes]);
+                hasher.update(&metrics.cumulative.serialized.to_le_bytes());
+                hasher.update(&metrics.cumulative.resident.to_le_bytes());
+                hasher.update(&metrics.hessian_error.to_bits().to_le_bytes());
+                hasher.update(&metrics.frobenius_error.to_bits().to_le_bytes());
+                write_len_hash(&mut hasher, candidate.tile.planes().len());
+                for plane in candidate.tile.planes() {
+                    write_len_hash(&mut hasher, plane.trits().len());
+                    for trit in plane.trits() {
+                        hasher.update(&trit.get().to_le_bytes());
+                    }
+                    write_len_hash(&mut hasher, plane.scales().len());
+                    for scale in plane.scales() {
+                        hasher.update(&scale.to_bits().to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
 fn recipe_digest(config: &SaltV2Config) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(RECIPE_HASH_CONTEXT);
     write_len_hash(&mut hasher, config.group_size);
@@ -2426,22 +3350,28 @@ fn recipe_digest(config: &SaltV2Config) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn receipt_digest(
+#[derive(Clone, Copy)]
+struct ReceiptDigestInput<'a> {
     source_model_id: ModelId,
     activation_digest: [u8; 32],
     recipe_id: [u8; 32],
-    tensors: &[SaltV2TensorFitReceipt],
+    master_id: [u8; 32],
+    tensors: &'a [SaltV2TensorFitReceipt],
     package_id: PackageId,
     physical: SaltV2ModelPhysicalInput,
-) -> [u8; 32] {
+    feedback: Option<&'a SaltV2ModelFeedbackReceipt>,
+}
+
+fn receipt_digest(input: ReceiptDigestInput<'_>) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(RECEIPT_HASH_CONTEXT);
     write_len_hash(&mut hasher, REFERENCE_SOLVER_VERSION.len());
     hasher.update(REFERENCE_SOLVER_VERSION.as_bytes());
-    hasher.update(source_model_id.as_bytes());
-    hasher.update(&activation_digest);
-    hasher.update(&recipe_id);
-    write_len_hash(&mut hasher, tensors.len());
-    for tensor in tensors {
+    hasher.update(input.source_model_id.as_bytes());
+    hasher.update(&input.activation_digest);
+    hasher.update(&input.recipe_id);
+    hasher.update(&input.master_id);
+    write_len_hash(&mut hasher, input.tensors.len());
+    for tensor in input.tensors {
         write_len_hash(&mut hasher, tensor.name.len());
         hasher.update(tensor.name.as_bytes());
         hasher.update(&tensor.source_digest);
@@ -2449,12 +3379,25 @@ fn receipt_digest(
         write_len_hash(&mut hasher, tensor.plane_counts.len());
         hasher.update(&tensor.plane_counts);
     }
-    hasher.update(package_id.as_bytes());
-    hasher.update(&physical.total_model_parameters.to_le_bytes());
-    hasher.update(&physical.preserved_artifact_bytes.to_le_bytes());
-    hasher.update(&physical.preserved_resident_bytes.to_le_bytes());
-    hasher.update(&physical.required_runtime_shadow_bytes.to_le_bytes());
-    hasher.update(&[SaltV2FitTrack::Ptq as u8, 0, 0]);
+    hasher.update(input.package_id.as_bytes());
+    hasher.update(&input.physical.total_model_parameters.to_le_bytes());
+    hasher.update(&input.physical.preserved_artifact_bytes.to_le_bytes());
+    hasher.update(&input.physical.preserved_resident_bytes.to_le_bytes());
+    hasher.update(&input.physical.required_runtime_shadow_bytes.to_le_bytes());
+    match input.feedback {
+        Some(receipt) => {
+            hasher.update(&[1]);
+            hasher.update(&receipt.receipt_id);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&[
+        SaltV2FitTrack::Ptq as u8,
+        u8::from(input.feedback.is_some()),
+        0,
+    ]);
     *hasher.finalize().as_bytes()
 }
 
@@ -2628,6 +3571,276 @@ mod tests {
             },
             config,
         )
+    }
+
+    fn feedback_inverse_hessian(columns: usize) -> Vec<f64> {
+        let mut inverse = vec![0.0; columns * columns];
+        for column in 0..columns {
+            inverse[column * columns + column] = 1.0;
+            if column + 1 < columns {
+                inverse[column * columns + column + 1] = 0.125;
+                inverse[(column + 1) * columns + column] = 0.125;
+            }
+        }
+        inverse
+    }
+
+    #[test]
+    fn feedback_master_is_reusable_and_compact_is_an_exact_prefix() {
+        let source_weights = weights(2);
+        let diagonal = vec![1.0; source_weights.len()];
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let curvature = CurvatureArtifact::diagonal_fisher(source_id, [31; 32], &diagonal);
+        let tensor = SaltV2TensorFitInput {
+            name: "model.layers.0.mlp.down_proj.weight",
+            weights: &source_weights,
+            rows: 2,
+            cols: 256,
+            curvature,
+        };
+        let groups = [
+            ColumnGroup { start: 0, end: 128 },
+            ColumnGroup {
+                start: 128,
+                end: 256,
+            },
+        ];
+        let inverse_hessian = feedback_inverse_hessian(256);
+        let feedback =
+            SaltV2FeedbackArtifact::inverse_hessian(source_id, [41; 32], &groups, &inverse_hessian);
+        let physical = SaltV2ModelPhysicalInput {
+            total_model_parameters: source_weights.len() as u64 + 10,
+            preserved_artifact_bytes: 97,
+            preserved_resident_bytes: 17,
+            required_runtime_shadow_bytes: 24,
+        };
+        let tensors = [tensor];
+        let feedback_artifacts = [feedback];
+        let recipe = config(10_000);
+        let master_input = SaltV2MasterFitInput {
+            model: SaltV2ModelFitInput {
+                tensors: &tensors,
+                activations: &cache,
+                source_model_id: model_id,
+                physical,
+            },
+            feedback: &feedback_artifacts,
+        };
+        let master = fit_salt_v2_master(master_input, &recipe).expect("feedback master");
+        let replay = fit_salt_v2_master(master_input, &recipe).expect("feedback master replay");
+        assert_eq!(replay.master_id(), master.master_id());
+        assert_eq!(replay.feedback_receipt(), master.feedback_receipt());
+
+        let near = allocate_and_pack_salt_v2_master(&master, recipe.rate)
+            .expect("near-lossless allocation");
+        assert!(near.receipt.feedback_applied);
+        assert_eq!(near.receipt.master_id, master.master_id());
+        let feedback_receipt = near.receipt.feedback.as_ref().expect("feedback receipt");
+        assert_eq!(feedback_receipt.tensors.len(), 1);
+        assert_eq!(feedback_receipt.tensors[0].groups.len(), 2);
+        assert_eq!(feedback_receipt.tensors[0].delta_corrections, 2);
+        assert!(feedback_receipt.tensors[0].nonzero_delta_corrections > 0);
+        assert!(feedback_receipt.tensors[0].nonzero_delta_corrections <= 2);
+
+        let one_plane_raw = near.metrics.physical.serialized_fixed_bytes
+            + near
+                .metrics
+                .tile_candidates
+                .iter()
+                .filter(|candidate| candidate.planes == 1)
+                .map(|candidate| candidate.cumulative.serialized)
+                .sum::<u64>();
+        let compact_ceiling = one_plane_raw.div_ceil(SALT_V2_PACKAGE_ALIGNMENT as u64)
+            * SALT_V2_PACKAGE_ALIGNMENT as u64;
+        let compact = allocate_and_pack_salt_v2_master(
+            &master,
+            PhysicalRateTarget {
+                max_matrix_bytes: compact_ceiling,
+                max_artifact_bytes: compact_ceiling + physical.preserved_artifact_bytes,
+                max_resident_bytes: None,
+            },
+        )
+        .expect("compact allocation");
+        assert!(
+            compact
+                .metrics
+                .selected_plane_counts
+                .iter()
+                .all(|planes| *planes == 1)
+        );
+        assert_eq!(compact.receipt.master_id, near.receipt.master_id);
+        assert_eq!(compact.receipt.feedback, near.receipt.feedback);
+
+        let near_package = SaltV2Package::new(SaltV2Codec::D2, near.tensors.clone())
+            .expect("near semantic package");
+        let requested = vec![
+            compact
+                .metrics
+                .selected_plane_counts
+                .iter()
+                .map(|planes| usize::from(*planes))
+                .collect::<Vec<_>>(),
+        ];
+        let derived = near_package
+            .derive_prefix(&requested)
+            .expect("derive exact compact prefix");
+        assert_eq!(derived.tensors(), compact.tensors.as_slice());
+    }
+
+    #[test]
+    fn feedback_artifact_digest_binds_groups_metric_and_provenance() {
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let groups = [ColumnGroup { start: 0, end: 2 }];
+        let split_groups = [
+            ColumnGroup { start: 0, end: 1 },
+            ColumnGroup { start: 1, end: 2 },
+        ];
+        let left_metric = [1.0, 0.25, 0.25, 1.0];
+        let right_metric = [1.0, 0.5, 0.5, 1.0];
+        let left =
+            SaltV2FeedbackArtifact::inverse_hessian(source_id, [51; 32], &groups, &left_metric);
+        let changed_groups = SaltV2FeedbackArtifact::inverse_hessian(
+            source_id,
+            [51; 32],
+            &split_groups,
+            &left_metric,
+        );
+        let changed_metric =
+            SaltV2FeedbackArtifact::inverse_hessian(source_id, [51; 32], &groups, &right_metric);
+        let changed_source = SaltV2FeedbackArtifact::inverse_hessian(
+            CurvatureSourceId::new(
+                source_id.source_model_digest(),
+                source_id.activation_cache_digest(),
+                different_digest(source_id.token_stream_digest()),
+            )
+            .expect("different source"),
+            [51; 32],
+            &groups,
+            &left_metric,
+        );
+
+        assert_ne!(left.digest(), changed_groups.digest());
+        assert_ne!(left.digest(), changed_metric.digest());
+        assert_ne!(left.digest(), changed_source.digest());
+    }
+
+    #[test]
+    fn feedback_master_fails_closed_on_missing_unbound_or_invalid_evidence() {
+        let source_weights = weights(1);
+        let diagonal = vec![1.0; source_weights.len()];
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let curvature = CurvatureArtifact::diagonal_fisher(source_id, [61; 32], &diagonal);
+        let tensors = [SaltV2TensorFitInput {
+            name: "model.layers.0.mlp.down_proj.weight",
+            weights: &source_weights,
+            rows: 2,
+            cols: 128,
+            curvature,
+        }];
+        let model = SaltV2ModelFitInput {
+            tensors: &tensors,
+            activations: &cache,
+            source_model_id: model_id,
+            physical: SaltV2ModelPhysicalInput {
+                total_model_parameters: source_weights.len() as u64,
+                ..SaltV2ModelPhysicalInput::default()
+            },
+        };
+        let recipe = config(10_000);
+        assert_eq!(
+            fit_salt_v2_master(
+                SaltV2MasterFitInput {
+                    model,
+                    feedback: &[],
+                },
+                &recipe,
+            )
+            .unwrap_err(),
+            SaltV2Error::FeedbackArtifactCountMismatch {
+                expected: 1,
+                got: 0,
+            }
+        );
+
+        let groups = [ColumnGroup { start: 0, end: 128 }];
+        let inverse_hessian = feedback_inverse_hessian(128);
+        let wrong_source = CurvatureSourceId::new(
+            different_digest(source_id.source_model_digest()),
+            source_id.activation_cache_digest(),
+            source_id.token_stream_digest(),
+        )
+        .expect("different source");
+        let wrong_source_feedback = [SaltV2FeedbackArtifact::inverse_hessian(
+            wrong_source,
+            [71; 32],
+            &groups,
+            &inverse_hessian,
+        )];
+        assert_eq!(
+            fit_salt_v2_master(
+                SaltV2MasterFitInput {
+                    model,
+                    feedback: &wrong_source_feedback,
+                },
+                &recipe,
+            )
+            .unwrap_err(),
+            SaltV2Error::FeedbackSourceModelMismatch { tensor: 0 }
+        );
+
+        let unaligned_groups = [
+            ColumnGroup { start: 0, end: 64 },
+            ColumnGroup {
+                start: 64,
+                end: 128,
+            },
+        ];
+        let unaligned_feedback = [SaltV2FeedbackArtifact::inverse_hessian(
+            source_id,
+            [72; 32],
+            &unaligned_groups,
+            &inverse_hessian,
+        )];
+        assert_eq!(
+            fit_salt_v2_master(
+                SaltV2MasterFitInput {
+                    model,
+                    feedback: &unaligned_feedback,
+                },
+                &recipe,
+            )
+            .unwrap_err(),
+            SaltV2Error::FeedbackScaleGeometry { tensor: 0 }
+        );
+
+        let mut invalid_inverse_hessian = inverse_hessian;
+        invalid_inverse_hessian[0] = 0.0;
+        let invalid_feedback = [SaltV2FeedbackArtifact::inverse_hessian(
+            source_id,
+            [73; 32],
+            &groups,
+            &invalid_inverse_hessian,
+        )];
+        assert_eq!(
+            fit_salt_v2_master(
+                SaltV2MasterFitInput {
+                    model,
+                    feedback: &invalid_feedback,
+                },
+                &recipe,
+            )
+            .unwrap_err(),
+            SaltV2Error::Feedback {
+                tensor: 0,
+                source: FeedbackError::NonPositiveDiagonal { index: 0 },
+            }
+        );
     }
 
     #[test]
@@ -2820,22 +4033,23 @@ mod tests {
             ..SaltV2ModelPhysicalInput::default()
         };
 
-        let left = receipt_digest(
-            model_id,
-            [51; 32],
-            [61; 32],
-            &[tensor],
+        let left_tensors = [tensor];
+        let right_tensors = [changed];
+        let base = ReceiptDigestInput {
+            source_model_id: model_id,
+            activation_digest: [51; 32],
+            recipe_id: [61; 32],
+            master_id: [71; 32],
+            tensors: &left_tensors,
             package_id,
             physical,
-        );
-        let right = receipt_digest(
-            model_id,
-            [51; 32],
-            [61; 32],
-            &[changed],
-            package_id,
-            physical,
-        );
+            feedback: None,
+        };
+        let left = receipt_digest(base);
+        let right = receipt_digest(ReceiptDigestInput {
+            tensors: &right_tensors,
+            ..base
+        });
 
         assert_ne!(left, right);
     }

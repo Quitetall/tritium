@@ -664,13 +664,18 @@ empirical claim. They add the canonical zero-point-free D2/B3/S34 semantic
 package, exact serialized and indexed-runtime accounting, deterministic joint
 `3^P` fitting, conditioned scale solving, activation-cache reopen validation,
 source-bound input/Fisher/Kronecker curvature primitives, standalone
-block-feedback and delta-correction primitives, an exact equal-cost byte
-allocator with a scalable indexed lexicographic tie path, mixed-plane model
-fitting, source/result-bound recovery and G1-growth evidence, CPU semantic-
-reference execution, CUDA direct packed add-sub-skip execution, and the
-resumable `tritium-salt` evidence facade. Legacy SALT-GGUF and TSLB consumers now
-index through `Read + Seek`, validate complete container structure and every SALT
-payload, and build final packed arenas without retaining an artifact-wide copy.
+block-feedback and delta-correction primitives, model-integrated full-inverse-
+Hessian feedback with a provisional-to-full delta-corrected refit, a content-
+addressed ordered `SaltV2MasterFit` separated from exact-byte allocation, an
+exact equal-cost byte allocator with a scalable indexed lexicographic tie path,
+mixed-plane model fitting, source/result-bound recovery and G1-growth evidence,
+CPU semantic-reference execution, CUDA direct packed add-sub-skip execution,
+and the resumable `tritium-salt` evidence facade. Feedback receipts bind every
+natural column group, both fit inputs and reconstructions, the exact number of
+nonzero deltas, and the final working/reconstruction states. Legacy SALT-GGUF
+and TSLB consumers now index through `Read + Seek`, validate complete container
+structure and every SALT payload, and build final packed arenas without retaining
+an artifact-wide copy.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
@@ -681,12 +686,14 @@ The following work deliberately remains open and keeps this plan in progress:
 
 - the production model driver does not yet connect block-output reconstruction,
   scale-only teacher-KL, or hard PV updates to real checkpoint tensors;
-- the model fitter does not yet invoke the standalone block-feedback/delta path.
-  The required integration seam is a durable Search-stage master artifact:
-  `fit_salt_v2_master(...) -> SaltV2MasterFit`, followed by
-  `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult`. It must bind
-  full input-column inverse-Hessian state, natural column groups, the source
-  model, and a detailed feedback receipt before `feedback_applied` can be true;
+- `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense
+  BlockLDLQ path, then
+  `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult` slices exact
+  prefixes without refitting. This is still a bounded CPU reference: its full
+  inverse Hessian is dense binary64, input columns and natural groups must
+  preserve row-local G128 scale geometry, and the content-addressed master is
+  owned in memory rather than reopenable from a sharded on-disk artifact. A
+  production-scale factorized/sharded master writer and reader remain open;
 - package/runtime scale geometry is G128-only; the G64/G256 promotion ablations
   require a versioned format/runtime field before they can enter the grid;
 - the equal-cost allocator is exact and scalable, including binary64 reduction
