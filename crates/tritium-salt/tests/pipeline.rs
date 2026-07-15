@@ -170,6 +170,47 @@ fn work_lock_rejects_concurrent_reconcile_before_driver_and_releases_on_drop() {
 }
 
 #[test]
+fn work_lock_survives_work_directory_replacement() {
+    let root = unique_temp_dir("work-lock-replaced-directory");
+    let spec = spec();
+    let holder = tritium_salt::SaltPipeline::start(&spec, &root).expect("first owner");
+    let work_dir = holder.work_dir().to_path_buf();
+    let displaced = root.join("displaced-work-directory");
+
+    fs::rename(&work_dir, &displaced).expect("move live work directory");
+    fs::remove_dir_all(&displaced).expect("unlink moved work directory");
+    fs::create_dir_all(&work_dir).expect("recreate work directory");
+
+    assert!(matches!(
+        tritium_salt::SaltPipeline::start(&spec, &root),
+        Err(tritium_salt::SaltError::Checkpoint(
+            "pipeline work item is already locked"
+        ))
+    ));
+    assert!(matches!(
+        tritium_salt::SaltPipeline::resume(&spec, &root),
+        Err(tritium_salt::SaltError::Checkpoint(
+            "pipeline work item is already locked"
+        ))
+    ));
+    let mut blocked_driver = FixtureDriver::default();
+    assert!(matches!(
+        SaltV2::reconcile(&spec, &root, &mut blocked_driver),
+        Err(tritium_salt::SaltError::Checkpoint(
+            "pipeline work item is already locked"
+        ))
+    ));
+    assert!(blocked_driver.stages.is_empty());
+
+    drop(holder);
+    let mut resumed_driver = FixtureDriver::default();
+    let receipt = SaltV2::reconcile(&spec, &root, &mut resumed_driver)
+        .expect("replacement work directory becomes available after drop");
+    assert!(receipt.published().is_some());
+    fs::remove_dir_all(root).expect("clean fixture");
+}
+
+#[test]
 fn work_lock_is_released_after_process_crash_and_running_stage_is_recovered() {
     use std::{
         process::{Command, Stdio},
@@ -180,21 +221,21 @@ fn work_lock_is_released_after_process_crash_and_running_stage_is_recovered() {
     let root = unique_temp_dir("work-lock-process");
     let spec = spec();
     let ready = root.join("child.ready");
-    let mut child = Command::new(std::env::current_exe().expect("integration-test executable"))
-        .arg("--exact")
-        .arg("work_lock_process_crash_helper")
-        .arg("--nocapture")
-        .env("TRITIUM_SALT_LOCK_TEST_ROOT", &root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn lock holder");
+    let mut child = ChildProcessGuard::new(
+        Command::new(std::env::current_exe().expect("integration-test executable"))
+            .arg("--exact")
+            .arg("work_lock_process_crash_helper")
+            .arg("--nocapture")
+            .env("TRITIUM_SALT_LOCK_TEST_ROOT", &root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn lock holder"),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready.exists() {
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             panic!("child did not enter a running locked stage");
         }
         thread::sleep(Duration::from_millis(5));
@@ -209,8 +250,9 @@ fn work_lock_is_released_after_process_crash_and_running_stage_is_recovered() {
     ));
     assert!(blocked_driver.stages.is_empty());
 
-    child.kill().expect("terminate lock holder");
-    child.wait().expect("reap lock holder");
+    child
+        .kill_and_wait()
+        .expect("terminate and reap lock holder");
     let mut recovery_driver = FixtureDriver::default();
     let receipt = SaltV2::reconcile(&spec, &root, &mut recovery_driver)
         .expect("crash releases lock and running stage recovers");
@@ -370,6 +412,7 @@ fn quality_evidence_for_another_package_cannot_authorize_publication() {
     let pipeline = tritium_salt::SaltPipeline::resume(&spec, &root).expect("resume evidence");
     assert!(pipeline.receipt().quality().is_none());
     assert!(pipeline.receipt().published().is_none());
+    drop(pipeline);
     fs::remove_dir_all(root).expect("clean fixture");
 }
 
@@ -394,6 +437,7 @@ fn inappropriate_evidence_is_rejected_without_promoting_it_to_the_receipt() {
     assert!(pipeline.receipt().physical().is_none());
     assert_eq!(pipeline.receipt().stage_receipts().len(), 1);
     assert!(!pipeline.receipt().stage_receipts()[0].accepted());
+    drop(pipeline);
     fs::remove_dir_all(root).expect("clean fixture");
 }
 
@@ -416,6 +460,7 @@ fn resident_core_rate_is_gated_before_validation() {
     assert!(!driver.stages.contains(&SaltStage::Validate));
     let pipeline = tritium_salt::SaltPipeline::resume(&spec, &root).expect("resume evidence");
     assert!(pipeline.receipt().physical().is_none());
+    drop(pipeline);
     fs::remove_dir_all(root).expect("clean fixture");
 }
 
@@ -692,6 +737,38 @@ struct FixtureDriver {
 
 struct CrashHoldingDriver {
     ready: PathBuf,
+}
+
+struct ChildProcessGuard {
+    child: Option<std::process::Child>,
+}
+
+impl ChildProcessGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn kill_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let child = self.child.as_mut().expect("child process is live");
+        // The helper may already have terminated between the readiness signal
+        // and teardown. Reaping is authoritative; a successful wait means no
+        // child remains even if the best-effort kill raced with its exit.
+        let _ = child.kill();
+        let wait_result = child.wait();
+        if wait_result.is_ok() {
+            self.child = None;
+        }
+        wait_result
+    }
+}
+
+impl Drop for ChildProcessGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl SaltDriver for CrashHoldingDriver {

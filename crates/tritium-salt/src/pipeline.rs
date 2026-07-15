@@ -16,7 +16,7 @@ use crate::{ContentId, SaltError, SaltProfile, SaltSpec, SaltStage, WorkId};
 const STATE_MAGIC: [u8; 4] = *b"TSV2";
 const STATE_VERSION: u8 = 4;
 const STATE_HASH_CONTEXT: &str = "tritium salt pipeline state v1";
-const WORK_LOCK_FILE: &str = "pipeline.lock";
+const WORK_LOCK_DIRECTORY: &str = ".tritium-salt-locks";
 const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const STATE_HEADER_BYTES: u64 = 4 + 1 + 8;
 const STATE_CHECKSUM_BYTES: u64 = 32;
@@ -1097,9 +1097,10 @@ pub struct SaltPipeline {
 impl SaltPipeline {
     /// Start new work or resume an existing checkpoint for the identical spec.
     pub fn start(spec: &SaltSpec, work_root: impl AsRef<Path>) -> Result<Self, SaltError> {
-        let work_dir = work_directory(work_root.as_ref(), spec.work_id());
+        let work_root = work_root.as_ref();
+        let work_lock = acquire_work_lock(work_root, spec.work_id())?;
+        let work_dir = work_directory(work_root, spec.work_id());
         fs::create_dir_all(&work_dir).map_err(|error| fs_error("create work directory", error))?;
-        let work_lock = acquire_work_lock(&work_dir)?;
         let state_path = work_dir.join("state.bin");
         if state_path.exists() {
             return Self::load_locked(spec, work_dir, work_lock);
@@ -1117,8 +1118,9 @@ impl SaltPipeline {
 
     /// Resume an existing checkpoint for the identical content-addressed spec.
     pub fn resume(spec: &SaltSpec, work_root: impl AsRef<Path>) -> Result<Self, SaltError> {
-        let work_dir = work_directory(work_root.as_ref(), spec.work_id());
-        let work_lock = acquire_work_lock(&work_dir)?;
+        let work_root = work_root.as_ref();
+        let work_lock = acquire_work_lock(work_root, spec.work_id())?;
+        let work_dir = work_directory(work_root, spec.work_id());
         Self::load_locked(spec, work_dir, work_lock)
     }
 
@@ -1885,6 +1887,15 @@ impl SaltPipeline {
     }
 }
 
+impl Drop for SaltPipeline {
+    fn drop(&mut self) {
+        // Explicitly release the shared open-file-description lock. This makes
+        // normal logical-owner teardown deterministic even if a forked child
+        // transiently inherited a duplicate descriptor.
+        let _ = self._work_lock.unlock();
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredState {
@@ -1993,13 +2004,16 @@ fn work_directory(root: &Path, work_id: WorkId) -> PathBuf {
     root.join(work_id.to_string())
 }
 
-fn acquire_work_lock(work_dir: &Path) -> Result<fs::File, SaltError> {
+fn acquire_work_lock(work_root: &Path, work_id: WorkId) -> Result<fs::File, SaltError> {
+    let lock_directory = work_root.join(WORK_LOCK_DIRECTORY);
+    fs::create_dir_all(&lock_directory)
+        .map_err(|error| fs_error("create pipeline lock directory", error))?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(work_dir.join(WORK_LOCK_FILE))
+        .open(lock_directory.join(format!("{work_id}.lock")))
         .map_err(|error| fs_error("open pipeline work lock", error))?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
