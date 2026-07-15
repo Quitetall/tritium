@@ -276,6 +276,7 @@ impl Qwen35TextRunner {
         let layer_count = axis(config.num_hidden_layers, "num_hidden_layers")?;
         let interval = axis(config.full_attention_interval, "full_attention_interval")?;
         let rms_norm_eps = config.rms_norm_eps as f32;
+        // Guard both the source value and overflow introduced by f64-to-f32 narrowing.
         if !config.rms_norm_eps.is_finite() || !rms_norm_eps.is_finite() || rms_norm_eps <= 0.0 {
             return Err(invalid_config(
                 "Qwen3.5 text RMSNorm epsilon must be a finite positive f32 value",
@@ -725,6 +726,9 @@ fn validate_mlp(
     validate_projection(&mlp.gate, intermediate_size, hidden_size)?;
     validate_projection(&mlp.up, intermediate_size, hidden_size)?;
     validate_projection(&mlp.down, hidden_size, intermediate_size)?;
+    validate_finite_projection(&mlp.gate, "SwiGLU gate")?;
+    validate_finite_projection(&mlp.up, "SwiGLU up")?;
+    validate_finite_projection(&mlp.down, "SwiGLU down")?;
     mlp.activation_mode()
 }
 
@@ -795,6 +799,7 @@ fn normalize_rows(
 }
 
 fn add_in_place(residual: &mut [f32], branch: &[f32]) {
+    debug_assert_eq!(residual.len(), branch.len());
     for (residual, &branch) in residual.iter_mut().zip(branch) {
         *residual += branch;
     }

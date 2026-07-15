@@ -472,7 +472,7 @@ pub(crate) fn build_standard_model_with_embedding(
             proj(&p("down"), n_embd, n_ff)?,
         );
         let mlp = match spec.mlp {
-            MlpKind::SwiGlu => Mlp::SwiGlu(SwiGluMlp { gate, up, down }),
+            MlpKind::SwiGlu => Mlp::SwiGlu(SwiGluMlp::new(gate, up, down)?),
             MlpKind::Relu2 => Mlp::Relu2(Relu2Mlp {
                 gate,
                 up,
@@ -645,11 +645,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        MAX_CONFIG_JSON_BYTES, NameSchema, build_standard_model, optional_config_bool,
-        read_config_json,
+        DenseTensorRequest, MAX_CONFIG_JSON_BYTES, NameSchema, build_standard_model,
+        optional_config_bool, read_config_json,
     };
     use crate::model::ModelWeights;
-    use crate::{DenseLinear, MlpKind, ModelConfig, NnError};
+    use crate::{ArchSpec, DenseLinear, MlpKind, ModelConfig, NnError, Projection};
 
     /// Build a minimal F32 safetensors blob: `[u64 header_len][JSON header][f32 data]`.
     fn safetensors(tensors: &[(&str, &[usize], Vec<f32>)]) -> Vec<u8> {
@@ -713,6 +713,54 @@ mod tests {
                 Err(NnError::MissingConfig(_))
             ));
         }
+    }
+
+    #[test]
+    fn standard_builder_rejects_nonfinite_swiglu_projection() {
+        let config = ModelConfig {
+            arch: "llama".to_owned(),
+            n_layers: 1,
+            n_embd: 2,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 2,
+            n_ff: 3,
+            n_ctx: 8,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        };
+        let spec = ArchSpec {
+            mlp: MlpKind::SwiGlu,
+            attn_sub_norm: false,
+            ffn_sub_norm: false,
+            qk_norm: false,
+            qkv_bias: false,
+            tied_embeddings: true,
+        };
+        let error = build_standard_model(
+            &config,
+            &spec,
+            NameSchema::Hf,
+            |_, request| {
+                Ok(match request {
+                    DenseTensorRequest::TokenEmbedding { columns } => vec![0.0; 2 * columns],
+                    DenseTensorRequest::Vector { len } => vec![0.0; len],
+                })
+            },
+            |name, n_out, k_in| {
+                let mut weights = vec![0.0; n_out * k_in];
+                if name.ends_with("mlp.gate_proj.weight") {
+                    weights[0] = f32::NAN;
+                }
+                Ok(Projection::Dense(DenseLinear::new_exact(
+                    weights, n_out, k_in,
+                )?))
+            },
+        )
+        .err()
+        .expect("non-finite SwiGLU weights must fail during model binding");
+
+        assert!(matches!(error, NnError::Backend(message) if message.contains("non-finite")));
     }
 
     #[test]

@@ -451,11 +451,11 @@ impl TiedSwiGluTrainingModel {
                 q_norm: Vec::new(),
                 k_norm: Vec::new(),
                 ffn_norm: arch.ffn_norms[layer_index].clone(),
-                mlp: Mlp::SwiGlu(SwiGluMlp {
-                    gate: dense(base + 4)?,
-                    up: dense(base + 5)?,
-                    down: dense(base + 6)?,
-                }),
+                mlp: Mlp::SwiGlu(
+                    SwiGluMlp::new(dense(base + 4)?, dense(base + 5)?, dense(base + 6)?).map_err(
+                        |error| invalid_input(&format!("layer {layer_index} SwiGLU: {error}")),
+                    )?,
+                ),
             });
         }
         let lm_head = if self.lm_head_tied {

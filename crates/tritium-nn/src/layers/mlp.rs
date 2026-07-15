@@ -115,9 +115,9 @@ impl SwiGluMlp {
     /// `n_ff → n_embd`. All projections must consume activations through one
     /// arithmetic mode.
     ///
-    /// Public fields remain available for checkpoint loaders that build this
-    /// struct directly. Such callers receive the same validation at
-    /// [`forward`](Self::forward).
+    /// Public fields remain available for checkpoint loaders. Model binders must
+    /// repeat the one-time parameter scan after any such mutation; forward keeps
+    /// only O(1) geometry validation on its hot path.
     ///
     /// # Errors
     /// Returns [`NnError::Shape`] for zero or contradictory projection geometry,
@@ -126,18 +126,22 @@ impl SwiGluMlp {
     pub fn new(gate: Projection, up: Projection, down: Projection) -> Result<Self, NnError> {
         let mlp = Self { gate, up, down };
         mlp.activation_mode()?;
+        validate_projection_parameters(&mlp.gate)?;
+        validate_projection_parameters(&mlp.up)?;
+        validate_projection_parameters(&mlp.down)?;
         Ok(mlp)
     }
 
     /// Validate projection geometry and return their shared activation mode.
     ///
-    /// This also validates instances assembled through public struct fields,
-    /// giving future Qwen runners one fail-closed binding seam.
+    /// This is an O(1) hot-path check. It validates retained buffer geometry but
+    /// deliberately does not rescan matrix values; constructors and model binders
+    /// perform the one-time finiteness scan.
     ///
     /// # Errors
     /// Returns [`NnError::Shape`] for zero or contradictory projection geometry,
     /// [`NnError::MissingConfig`] when activation arithmetic modes differ, or
-    /// [`NnError::Backend`] when a projection parameter is non-finite.
+    /// [`NnError::Backend`] when retained device geometry is invalid.
     pub fn activation_mode(&self) -> Result<ProjectionActivationMode, NnError> {
         let n_embd = self.gate.k_in();
         let n_ff = self.gate.n_out();
@@ -231,6 +235,10 @@ fn validate_projection(
             got: projection.k_in(),
         });
     }
+    projection.validate_retained_geometry()
+}
+
+fn validate_projection_parameters(projection: &Projection) -> Result<(), NnError> {
     projection.validate_retained_parameters()
 }
 

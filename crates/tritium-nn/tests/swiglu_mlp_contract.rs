@@ -73,6 +73,20 @@ fn binding_rejects_nonfinite_gate_parameters() {
 }
 
 #[test]
+fn activation_mode_keeps_parameter_scans_off_the_forward_hot_path() {
+    let mut mlp = SwiGluMlp::new(dense_exact(3, 2), dense_exact(3, 2), dense_exact(2, 3))
+        .expect("valid SwiGLU");
+    if let Projection::Dense(linear) = &mut mlp.gate {
+        linear.weights[1] = f32::NAN;
+    }
+
+    assert_eq!(
+        mlp.activation_mode().unwrap(),
+        ProjectionActivationMode::F32
+    );
+}
+
+#[test]
 fn binding_rejects_mutated_retained_parameter_geometry() {
     let mut dense_gate = dense_exact(3, 2);
     if let Projection::Dense(linear) = &mut dense_gate {

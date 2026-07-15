@@ -61,6 +61,17 @@ impl Projection {
         }
     }
 
+    /// Validate retained projection geometry without scanning parameter values.
+    pub(crate) fn validate_retained_geometry(&self) -> Result<(), NnError> {
+        match self {
+            Projection::Ternary(linear) => linear.validate_retained_geometry(),
+            Projection::Dense(linear) => linear.validate_retained_geometry(),
+            Projection::Salt(_) => Ok(()),
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(_) => Ok(()),
+        }
+    }
+
     /// Validate retained fp32 projection parameter geometry and finiteness.
     ///
     /// Packed SALT constructors validate every retained scale before publishing
@@ -68,9 +79,9 @@ impl Projection {
     /// when uploaded, so only dense coefficients and deployed ternary row scales
     /// require inspection here.
     pub(crate) fn validate_retained_parameters(&self) -> Result<(), NnError> {
+        self.validate_retained_geometry()?;
         match self {
             Projection::Ternary(linear) => {
-                linear.validate_retained_geometry()?;
                 if linear.scales.iter().any(|value| !value.is_finite()) {
                     return Err(NnError::Backend(
                         "ternary projection scales contain a non-finite value".to_owned(),
@@ -78,16 +89,19 @@ impl Projection {
                 }
             }
             Projection::Dense(linear) => {
-                linear.validate_retained_geometry()?;
                 if linear.weights.iter().any(|value| !value.is_finite()) {
                     return Err(NnError::Backend(
                         "dense projection weights contain a non-finite value".to_owned(),
                     ));
                 }
             }
-            Projection::Salt(_) => {}
+            Projection::Salt(_) => {
+                // The packed constructor validates every retained row scale.
+            }
             #[cfg(feature = "cuda")]
-            Projection::SaltV2(_) => {}
+            Projection::SaltV2(_) => {
+                // Upload validates the immutable resident allocation.
+            }
         }
         Ok(())
     }
