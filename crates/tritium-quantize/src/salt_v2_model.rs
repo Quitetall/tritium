@@ -1676,6 +1676,9 @@ fn validate_feedback_artifacts(input: &SaltV2MasterFitInput<'_>) -> Result<(), S
                 tensor: tensor_index,
             });
         }
+        // `fit_with_feedback` validates exact contiguity, full 0..cols coverage, dense metric
+        // geometry, finiteness, symmetry, and positive definiteness before its first callback.
+        // Keep that canonical validation in one place; this layer adds deployment-scale alignment.
     }
     Ok(())
 }
@@ -1925,6 +1928,9 @@ fn fit_feedback_group(
     request: GroupFitRequest<'_>,
     provisional: bool,
 ) -> Result<FeedbackGroupFit, SaltV2Error> {
+    // Search always constructs the complete Pmax=3 master. `config.max_planes` limits the
+    // allocation frontier later; consulting it here would make compact and near-lossless refit
+    // different masters and violate the byte-prefix contract.
     const FULL_PLANES: usize = 3;
     let mut reconstruction = vec![0.0; request.working_weights.len()];
     let groups_per_row = request.columns / SALT_V2_SCALE_GROUP_SIZE;
@@ -1986,10 +1992,10 @@ fn fit_feedback_group(
                     &fitted.scales,
                     &fitted.trits,
                 )
-                .ok_or(SaltV2Error::NonMonotoneCandidate {
+                .map_err(|planes| SaltV2Error::NonMonotoneCandidate {
                     tensor: tensor_index,
                     tile: tile_index,
-                    planes: 2,
+                    planes,
                 })?;
                 (fitted.scales, fitted.trits, order)
             };
@@ -2288,10 +2294,10 @@ fn fit_tile_frontier(
                 source,
             })?;
             let order = progressive_plane_order(weights, metric, &fitted.scales, &fitted.trits)
-                .ok_or(SaltV2Error::NonMonotoneCandidate {
+                .map_err(|planes| SaltV2Error::NonMonotoneCandidate {
                     tensor: tensor_index,
                     tile: tile_index,
-                    planes: 2,
+                    planes,
                 })?;
             (fitted.scales, fitted.trits, order)
         };
@@ -2379,7 +2385,7 @@ fn progressive_plane_order(
     metric: JointFitMetric<'_>,
     scales: &[f32],
     trits: &[Vec<i8>],
-) -> Option<[usize; 3]> {
+) -> Result<[usize; 3], usize> {
     const ORDERS: [[usize; 3]; 6] = [
         [0, 1, 2],
         [0, 2, 1],
@@ -2389,6 +2395,7 @@ fn progressive_plane_order(
         [2, 1, 0],
     ];
     let mut best = None::<([usize; 3], [f64; 3])>;
+    let mut has_monotone_two_plane_prefix = false;
     for order in ORDERS {
         let mut reconstruction = vec![0.0f32; weights.len()];
         let mut objectives = [0.0f64; 3];
@@ -2398,10 +2405,17 @@ fn progressive_plane_order(
             }
             objectives[prefix] = reconstruction_objective(weights, &reconstruction, metric);
         }
-        let monotone = objectives.windows(2).all(|pair| {
+        let monotone_two_plane_prefix = {
+            let pair = &objectives[..2];
             let tolerance = 1e-12f64.max(pair[0].abs() * 1e-12);
             pair[1] <= pair[0] + tolerance
-        });
+        };
+        has_monotone_two_plane_prefix |= monotone_two_plane_prefix;
+        let monotone = monotone_two_plane_prefix && {
+            let pair = &objectives[1..];
+            let tolerance = 1e-12f64.max(pair[0].abs() * 1e-12);
+            pair[1] <= pair[0] + tolerance
+        };
         if !monotone {
             continue;
         }
@@ -2416,6 +2430,7 @@ fn progressive_plane_order(
         }
     }
     best.map(|(order, _)| order)
+        .ok_or(if has_monotone_two_plane_prefix { 3 } else { 2 })
 }
 
 #[derive(Clone, Debug)]
@@ -3729,6 +3744,21 @@ mod tests {
     }
 
     #[test]
+    fn plane_order_failure_reports_the_earliest_impossible_prefix() {
+        let trits = vec![vec![1], vec![1], vec![1]];
+        let scales = [1.0, 1.0, 10.0];
+
+        assert_eq!(
+            progressive_plane_order(&[1.0], JointFitMetric::Identity, &scales, &trits).unwrap_err(),
+            2
+        );
+        assert_eq!(
+            progressive_plane_order(&[3.0], JointFitMetric::Identity, &scales, &trits).unwrap_err(),
+            3
+        );
+    }
+
+    #[test]
     fn feedback_master_fails_closed_on_missing_unbound_or_invalid_evidence() {
         let source_weights = weights(1);
         let diagonal = vec![1.0; source_weights.len()];
@@ -3792,6 +3822,37 @@ mod tests {
             )
             .unwrap_err(),
             SaltV2Error::FeedbackSourceModelMismatch { tensor: 0 }
+        );
+
+        let gapped_groups = [ColumnGroup {
+            start: 128,
+            end: 256,
+        }];
+        let gapped_feedback = [SaltV2FeedbackArtifact::inverse_hessian(
+            source_id,
+            [71; 32],
+            &gapped_groups,
+            &inverse_hessian,
+        )];
+        assert_eq!(
+            fit_salt_v2_master(
+                SaltV2MasterFitInput {
+                    model,
+                    feedback: &gapped_feedback,
+                },
+                &recipe,
+            )
+            .unwrap_err(),
+            SaltV2Error::Feedback {
+                tensor: 0,
+                source: FeedbackError::InvalidGroupRange {
+                    group: 0,
+                    expected_start: 0,
+                    start: 128,
+                    end: 256,
+                    columns: 128,
+                },
+            }
         );
 
         let unaligned_groups = [
