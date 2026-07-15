@@ -31,7 +31,50 @@ pub fn rope_apply(
     if head_dim == 0 {
         return validate_layout_len(x.len(), positions.len(), n_head, head_dim);
     }
-    rope_apply_partial_neox(x, positions, n_head, head_dim, head_dim, theta)
+    if !head_dim.is_multiple_of(2) {
+        return Err(NnError::Shape {
+            expected: head_dim.saturating_add(1),
+            got: head_dim,
+        });
+    }
+    validate_layout_len(x.len(), positions.len(), n_head, head_dim)?;
+    if x.is_empty() {
+        return Ok(());
+    }
+
+    // This public operation predates the Qwen path and constructed its table in
+    // f64 before narrowing cos/sin to f32. Keep that numerical contract here;
+    // `rope_apply_partial_neox` intentionally follows Transformers' fp32 path.
+    let half = head_dim / 2;
+    let table_len = checked_table_len(positions.len(), half, x.len())?;
+    let theta = f64::from(theta);
+    let inv_head_dim = 1.0 / head_dim as f64;
+    let inv_freq: Vec<f64> = (0..half)
+        .map(|j| theta.powf(-2.0 * j as f64 * inv_head_dim))
+        .collect();
+    let mut cos_table = vec![0.0f32; table_len];
+    let mut sin_table = vec![0.0f32; table_len];
+    for (token, &pos) in positions.iter().enumerate() {
+        let pos = pos as f64;
+        let ct = &mut cos_table[token * half..token * half + half];
+        let st = &mut sin_table[token * half..token * half + half];
+        for j in 0..half {
+            let (sin, cos) = (pos * inv_freq[j]).sin_cos();
+            ct[j] = cos as f32;
+            st[j] = sin as f32;
+        }
+    }
+
+    apply_rotary_table(
+        x,
+        positions.len(),
+        n_head,
+        head_dim,
+        head_dim,
+        &cos_table,
+        &sin_table,
+    );
+    Ok(())
 }
 
 /// Apply NeoX-style RoPE to the first `rotary_dim` lanes of each head.
@@ -89,17 +132,15 @@ pub fn rope_apply_partial_neox(
 
     let half = rotary_dim / 2;
     let n_pos = positions.len();
-    let table_len = n_pos.checked_mul(half).ok_or(NnError::Shape {
-        expected: usize::MAX,
-        got: x.len(),
-    })?;
-    let theta = f64::from(theta);
-    let inv_rotary_dim = 1.0 / rotary_dim as f64;
+    let table_len = checked_table_len(n_pos, half, x.len())?;
+    let rotary_dim_f32 = rotary_dim as f32;
 
-    // Precompute the per-lane inverse frequencies once; they are independent of
-    // token and head. inv_freq[j] = theta^(-2j/rotary_dim).
-    let inv_freq: Vec<f64> = (0..half)
-        .map(|j| theta.powf(-2.0 * j as f64 * inv_rotary_dim))
+    // Match Qwen3.5 Transformers table construction operation-for-operation in
+    // fp32: exponent = (2j)/rotary_dim, then reciprocal(theta.pow(exponent)).
+    // The rounding order matters at long positions because frequency error is
+    // multiplied by the absolute position before sin/cos range reduction.
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|j| 1.0 / theta.powf((2 * j) as f32 / rotary_dim_f32))
         .collect();
 
     // Precompute cos/sin table: [positions.len() × half]. For a given position
@@ -109,21 +150,44 @@ pub fn rope_apply_partial_neox(
     let mut cos_table = vec![0.0f32; table_len];
     let mut sin_table = vec![0.0f32; table_len];
     for (token, &pos) in positions.iter().enumerate() {
-        let pos = pos as f64;
+        let pos = pos as f32;
         let ct = &mut cos_table[token * half..token * half + half];
         let st = &mut sin_table[token * half..token * half + half];
         for j in 0..half {
             let angle = pos * inv_freq[j];
             let (s, c) = angle.sin_cos();
-            ct[j] = c as f32;
-            st[j] = s as f32;
+            ct[j] = c;
+            st[j] = s;
         }
     }
 
-    for (token, _) in positions.iter().enumerate() {
+    apply_rotary_table(
+        x,
+        positions.len(),
+        n_head,
+        head_dim,
+        rotary_dim,
+        &cos_table,
+        &sin_table,
+    );
+
+    Ok(())
+}
+
+fn apply_rotary_table(
+    x: &mut [f32],
+    n_token: usize,
+    n_head: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    cos_table: &[f32],
+    sin_table: &[f32],
+) {
+    let half = rotary_dim / 2;
+    for token in 0..n_token {
         let token_base = token * n_head * head_dim;
-        let ct = &cos_table[token * half..token * half + half];
-        let st = &sin_table[token * half..token * half + half];
+        let ct = &cos_table[token * half..][..half];
+        let st = &sin_table[token * half..][..half];
         for head in 0..n_head {
             let head_base = token_base + head * head_dim;
             for j in 0..half {
@@ -134,8 +198,14 @@ pub fn rope_apply_partial_neox(
             }
         }
     }
+}
 
-    Ok(())
+#[inline]
+fn checked_table_len(n_token: usize, half: usize, got: usize) -> Result<usize, NnError> {
+    n_token.checked_mul(half).ok_or(NnError::Shape {
+        expected: usize::MAX,
+        got,
+    })
 }
 
 #[inline]
