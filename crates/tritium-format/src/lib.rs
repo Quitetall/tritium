@@ -75,7 +75,9 @@ pub use i2s_int8::{
     I2sInt8Weights, IMMA_K, IMMA_N, IMMA_WTILE_BYTES, convert_i2s_to_int8, convert_i2s_to_tq2_0,
 };
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
-pub use safetensors::{SafeTensors, SafeTensorsError, SafeTensorsReader, read_safetensors};
+pub use safetensors::{
+    SafeTensors, SafeTensorsError, SafeTensorsReader, VisitTensorBytesError, read_safetensors,
+};
 pub use salt::{
     DEFAULT_SPARSE_RESIDUAL_DENSITY, PackedSaltPlaneRef, PackedSaltPlaneRefs, PackedSaltRow,
     PackedSaltRowRef, SALT_HEADER_BYTES, SALT_MAGIC, SALT_PROGRESSIVE_VERSION, SALT_VERSION,

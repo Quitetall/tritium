@@ -151,6 +151,45 @@ impl fmt::Display for SafeTensorsError {
 
 impl std::error::Error for SafeTensorsError {}
 
+/// Error from a fallible raw tensor-byte visit.
+///
+/// The variants preserve whether the safetensors source failed or the caller's
+/// byte sink stopped the visit, without erasing the sink's error type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisitTensorBytesError<E> {
+    /// Header validation, payload seeking, or payload reading failed.
+    Source(SafeTensorsError),
+    /// The caller-provided byte sink rejected a chunk.
+    Sink(E),
+}
+
+impl<E> From<SafeTensorsError> for VisitTensorBytesError<E> {
+    fn from(error: SafeTensorsError) -> Self {
+        Self::Source(error)
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for VisitTensorBytesError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(error) => write!(formatter, "safetensors source: {error}"),
+            Self::Sink(error) => write!(formatter, "safetensors byte sink: {error}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for VisitTensorBytesError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::Sink(error) => Some(error),
+        }
+    }
+}
+
 /// One tensor's header entry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -473,6 +512,41 @@ fn append_f32(output: &mut Vec<f32>, dtype: FloatDtype, raw: &[u8]) {
     }
 }
 
+fn try_visit_reader_range<R: Read + Seek, E>(
+    reader: &mut R,
+    absolute: u64,
+    byte_len: usize,
+    max_chunk_bytes: usize,
+    mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), VisitTensorBytesError<E>> {
+    if max_chunk_bytes == 0 {
+        return Err(VisitTensorBytesError::Source(
+            SafeTensorsError::InvalidChunkSize {
+                requested: max_chunk_bytes,
+            },
+        ));
+    }
+    if byte_len == 0 {
+        return Ok(());
+    }
+
+    reader.seek(SeekFrom::Start(absolute)).map_err(|error| {
+        VisitTensorBytesError::Source(io_error("seek to tensor payload", error))
+    })?;
+    let mut scratch = [0u8; READ_CHUNK_BYTES];
+    let chunk_capacity = max_chunk_bytes.min(scratch.len());
+    let mut remaining = byte_len;
+    while remaining != 0 {
+        let count = remaining.min(chunk_capacity);
+        reader.read_exact(&mut scratch[..count]).map_err(|error| {
+            VisitTensorBytesError::Source(io_error("read tensor payload", error))
+        })?;
+        visit(&scratch[..count]).map_err(VisitTensorBytesError::Sink)?;
+        remaining -= count;
+    }
+    Ok(())
+}
+
 fn visit_reader_range<R: Read + Seek>(
     reader: &mut R,
     absolute: u64,
@@ -480,30 +554,14 @@ fn visit_reader_range<R: Read + Seek>(
     max_chunk_bytes: usize,
     mut visit: impl FnMut(&[u8]),
 ) -> Result<(), SafeTensorsError> {
-    if max_chunk_bytes == 0 {
-        return Err(SafeTensorsError::InvalidChunkSize {
-            requested: max_chunk_bytes,
-        });
+    match try_visit_reader_range(reader, absolute, byte_len, max_chunk_bytes, |chunk| {
+        visit(chunk);
+        Ok::<(), std::convert::Infallible>(())
+    }) {
+        Ok(()) => Ok(()),
+        Err(VisitTensorBytesError::Source(error)) => Err(error),
+        Err(VisitTensorBytesError::Sink(never)) => match never {},
     }
-    if byte_len == 0 {
-        return Ok(());
-    }
-
-    reader
-        .seek(SeekFrom::Start(absolute))
-        .map_err(|error| io_error("seek to tensor payload", error))?;
-    let mut scratch = [0u8; READ_CHUNK_BYTES];
-    let chunk_capacity = max_chunk_bytes.min(scratch.len());
-    let mut remaining = byte_len;
-    while remaining != 0 {
-        let count = remaining.min(chunk_capacity);
-        reader
-            .read_exact(&mut scratch[..count])
-            .map_err(|error| io_error("read tensor payload", error))?;
-        visit(&scratch[..count]);
-        remaining -= count;
-    }
-    Ok(())
 }
 
 /// A parsed safetensors buffer: the header table + a borrow of the data region.
@@ -705,14 +763,48 @@ impl<R: Read + Seek> SafeTensorsReader<R> {
         &mut self,
         name: &str,
         max_chunk_bytes: usize,
-        visit: impl FnMut(&[u8]),
+        mut visit: impl FnMut(&[u8]),
     ) -> Result<(), SafeTensorsError> {
+        match self.try_visit_tensor_bytes(name, max_chunk_bytes, |chunk| {
+            visit(chunk);
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(VisitTensorBytesError::Source(error)) => Err(error),
+            Err(VisitTensorBytesError::Sink(never)) => match never {},
+        }
+    }
+
+    /// Visit one tensor's exact stored payload with a fallible byte sink.
+    ///
+    /// `visit` receives the same ordered, bounded chunks as
+    /// [`Self::visit_tensor_bytes`]. Returning `Err` stops immediately: no
+    /// further payload read is attempted after the rejected chunk. A zero-sized
+    /// tensor succeeds without invoking `visit`. Every call uses an absolute
+    /// payload seek, so a stopped visit does not make a later read cursor-
+    /// dependent.
+    ///
+    /// The source and sink are live and callbacks are nontransactional. Callers
+    /// must discard any effects from chunks delivered before either error
+    /// variant and keep identity inputs stable for the full visit.
+    ///
+    /// # Errors
+    /// Returns [`VisitTensorBytesError::Source`] for an absent or malformed
+    /// tensor, a zero `max_chunk_bytes`, or a failed absolute seek/read. Returns
+    /// [`VisitTensorBytesError::Sink`] with the caller's error when `visit`
+    /// rejects a chunk.
+    pub fn try_visit_tensor_bytes<E>(
+        &mut self,
+        name: &str,
+        max_chunk_bytes: usize,
+        visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), VisitTensorBytesError<E>> {
         let layout = raw_tensor_layout(&self.tensors, name, self.data_len)?;
         let absolute = self
             .data_start
             .checked_add(layout.offset)
             .ok_or_else(|| SafeTensorsError::OutOfBounds(name.to_owned()))?;
-        visit_reader_range(
+        try_visit_reader_range(
             &mut self.reader,
             absolute,
             layout.byte_len,
@@ -771,6 +863,10 @@ pub fn read_safetensors(bytes: &[u8]) -> Result<SafeTensors<'_>, SafeTensorsErro
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::ops::Range;
+    use std::rc::Rc;
+
     use super::*;
 
     /// Build a tiny safetensors buffer in memory for the roundtrip test.
@@ -780,6 +876,113 @@ mod tests {
         out.extend_from_slice(header.as_bytes());
         out.extend_from_slice(data);
         out
+    }
+
+    #[derive(Debug, Default)]
+    struct ShortReadTrace {
+        ranges: Vec<Range<u64>>,
+        requests: Vec<usize>,
+    }
+
+    #[derive(Debug)]
+    struct CountingShortReader {
+        inner: io::Cursor<Vec<u8>>,
+        max_read: usize,
+        trace: Rc<RefCell<ShortReadTrace>>,
+    }
+
+    impl Read for CountingShortReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let start = self.inner.position();
+            let request = buffer.len();
+            let count = self.inner.read(&mut buffer[..request.min(self.max_read)])?;
+            let mut trace = self.trace.borrow_mut();
+            trace.requests.push(request);
+            trace.ranges.push(start..start + count as u64);
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountingShortReader {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SinkStop {
+        Enough,
+    }
+
+    #[test]
+    fn fallible_visitor_stops_reads_on_sink_error_and_preserves_later_access() {
+        let header = r#"{"x":{"dtype":"U8","shape":[12],"data_offsets":[0,12]},"empty":{"dtype":"U8","shape":[0],"data_offsets":[12,12]},"tail":{"dtype":"U8","shape":[4],"data_offsets":[12,16]}}"#;
+        let mut data = (0u8..12).collect::<Vec<_>>();
+        data.extend_from_slice(&[90, 91, 92, 93]);
+        let data_start = 8 + header.len() as u64;
+        let trace = Rc::new(RefCell::new(ShortReadTrace::default()));
+        let reader = CountingShortReader {
+            inner: io::Cursor::new(build(header, &data)),
+            max_read: 2,
+            trace: Rc::clone(&trace),
+        };
+        let mut tensors = SafeTensorsReader::new(reader).unwrap();
+        *trace.borrow_mut() = ShortReadTrace::default();
+
+        let mut chunks = Vec::new();
+        let error = tensors
+            .try_visit_tensor_bytes("x", 5, |chunk| {
+                chunks.push(chunk.to_vec());
+                if chunks.len() == 2 {
+                    Err(SinkStop::Enough)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error, VisitTensorBytesError::Sink(SinkStop::Enough));
+        assert_eq!(
+            chunks,
+            vec![(0u8..5).collect::<Vec<_>>(), (5u8..10).collect()]
+        );
+        assert_eq!(
+            trace.borrow().ranges,
+            vec![
+                data_start..data_start + 2,
+                data_start + 2..data_start + 4,
+                data_start + 4..data_start + 5,
+                data_start + 5..data_start + 7,
+                data_start + 7..data_start + 9,
+                data_start + 9..data_start + 10,
+            ]
+        );
+        assert!(trace.borrow().requests.iter().all(|&request| request <= 5));
+
+        let mut empty_calls = 0;
+        tensors
+            .try_visit_tensor_bytes("empty", 3, |_| {
+                empty_calls += 1;
+                Ok::<(), SinkStop>(())
+            })
+            .unwrap();
+        assert_eq!(empty_calls, 0);
+
+        let mut tail = Vec::new();
+        tensors
+            .try_visit_tensor_bytes("tail", 3, |chunk| {
+                tail.extend_from_slice(chunk);
+                Ok::<(), SinkStop>(())
+            })
+            .unwrap();
+        assert_eq!(tail, [90, 91, 92, 93]);
+
+        let error = tensors
+            .try_visit_tensor_bytes("missing", 3, |_| Ok::<(), SinkStop>(()))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            VisitTensorBytesError::Source(SafeTensorsError::NotFound("missing".to_owned()))
+        );
     }
 
     #[test]
