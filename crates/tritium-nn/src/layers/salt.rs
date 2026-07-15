@@ -108,8 +108,9 @@ impl SaltLinear {
     /// scratch, preserving plane-order weight reconstruction and global `K` dot order.
     ///
     /// # Errors
-    /// [`NnError::Shape`] on operand/output mismatch, or [`NnError::Backend`] if a
-    /// retained packed block cannot be decoded.
+    /// [`NnError::Shape`] on operand/output mismatch, or [`NnError::Backend`] if
+    /// activation scratch cannot be allocated or a retained packed block cannot
+    /// be decoded.
     pub fn forward(&self, act: &[f32], m: usize, out: &mut [f32]) -> Result<(), NnError> {
         let act_len = m.checked_mul(self.k_in()).ok_or(NnError::Shape {
             expected: usize::MAX,
@@ -132,8 +133,8 @@ impl SaltLinear {
             });
         }
 
-        let mut q_act = vec![0.0f32; act_len];
-        let mut act_scale = vec![0.0f32; m];
+        let mut q_act = zeroed_scratch(act_len, "SALT quantized activations")?;
+        let mut act_scale = zeroed_scratch(m, "SALT activation scales")?;
         quantize_activation_int8(act, m, self.k_in(), &mut q_act, &mut act_scale)?;
 
         self.matrix.project_rows(&q_act, m, out)?;
@@ -144,4 +145,15 @@ impl SaltLinear {
         }
         Ok(())
     }
+}
+
+fn zeroed_scratch(len: usize, name: &str) -> Result<Vec<f32>, NnError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        NnError::Backend(format!(
+            "allocate {name} scratch for {len} f32 values: {error}"
+        ))
+    })?;
+    values.resize(len, 0.0);
+    Ok(values)
 }

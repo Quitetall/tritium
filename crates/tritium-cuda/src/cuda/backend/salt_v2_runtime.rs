@@ -260,7 +260,13 @@ impl CudaBackend {
                 .launch(cfg)
                 .map_err(|error| driver_err("launch SALT V2 exact forward", &error))?;
         }
-        let mut staged = vec![0.0f32; output_elements];
+        let mut staged = Vec::new();
+        staged.try_reserve_exact(output_elements).map_err(|error| {
+            BackendError::Backend(format!(
+                "allocate SALT V2 host output staging for {output_elements} f32 values: {error}"
+            ))
+        })?;
+        staged.resize(output_elements, 0.0f32);
         self.stream
             .memcpy_dtoh(&d_output, &mut staged)
             .map_err(|error| driver_err("download SALT V2 output", &error))?;

@@ -193,7 +193,7 @@ impl TernaryLinear {
     ///
     /// # Errors
     /// [`NnError::Shape`] on buffer-length mismatch, or [`NnError::Backend`] if
-    /// the backend GEMM fails.
+    /// activation scratch allocation or the backend GEMM fails.
     pub fn forward(
         &self,
         backend: &dyn TernaryBackend,
@@ -201,14 +201,14 @@ impl TernaryLinear {
         m: usize,
         out: &mut [f32],
     ) -> Result<(), NnError> {
-        let act_len = m * self.k_in;
+        let act_len = checked_buffer_len(m, self.k_in, act.len())?;
         if act.len() != act_len {
             return Err(NnError::Shape {
                 expected: act_len,
                 got: act.len(),
             });
         }
-        let out_len = m * self.n_out;
+        let out_len = checked_buffer_len(m, self.n_out, out.len())?;
         if out.len() != out_len {
             return Err(NnError::Shape {
                 expected: out_len,
@@ -219,8 +219,8 @@ impl TernaryLinear {
         // A8: per-token int8 absmax quant. `q_act` is the int8 values kept as f32
         // (the f32 mpGEMM consumes them directly); `act_scale[r]` is the per-token
         // dequant multiplier folded into the output below.
-        let mut q_act = vec![0.0f32; act_len];
-        let mut act_scale = vec![0.0f32; m];
+        let mut q_act = zeroed_scratch(act_len, "ternary quantized activations")?;
+        let mut act_scale = zeroed_scratch(m, "ternary activation scales")?;
         quantize_activation_int8(act, m, self.k_in, &mut q_act, &mut act_scale)?;
 
         // Ternary GEMM: out[r, n] = scales[n] · Σ_k q_act[r, k] · trit[n, k].
@@ -245,4 +245,22 @@ impl TernaryLinear {
 
         Ok(())
     }
+}
+
+fn checked_buffer_len(rows: usize, width: usize, got: usize) -> Result<usize, NnError> {
+    rows.checked_mul(width).ok_or(NnError::Shape {
+        expected: usize::MAX,
+        got,
+    })
+}
+
+fn zeroed_scratch(len: usize, name: &str) -> Result<Vec<f32>, NnError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        NnError::Backend(format!(
+            "allocate {name} scratch for {len} f32 values: {error}"
+        ))
+    })?;
+    values.resize(len, 0.0);
+    Ok(values)
 }

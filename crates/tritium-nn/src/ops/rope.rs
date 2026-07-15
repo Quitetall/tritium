@@ -18,7 +18,8 @@ use crate::error::NnError;
 ///
 /// # Errors
 /// [`NnError::Shape`] if `x.len()` disagrees with
-/// `positions.len() * n_head * head_dim`, or if `head_dim` is odd.
+/// `positions.len() * n_head * head_dim`, or if `head_dim` is odd;
+/// [`NnError::Backend`] if frequency-table scratch cannot be allocated.
 pub fn rope_apply(
     x: &mut [f32],
     positions: &[usize],
@@ -49,11 +50,12 @@ pub fn rope_apply(
     let table_len = checked_table_len(positions.len(), half, x.len())?;
     let theta = f64::from(theta);
     let inv_head_dim = 1.0 / head_dim as f64;
-    let inv_freq: Vec<f64> = (0..half)
-        .map(|j| theta.powf(-2.0 * j as f64 * inv_head_dim))
-        .collect();
-    let mut cos_table = vec![0.0f32; table_len];
-    let mut sin_table = vec![0.0f32; table_len];
+    let mut inv_freq = reserved_scratch(half, "legacy inverse frequencies")?;
+    for j in 0..half {
+        inv_freq.push(theta.powf(-2.0 * j as f64 * inv_head_dim));
+    }
+    let mut cos_table = zeroed_scratch(table_len, "legacy cosine table")?;
+    let mut sin_table = zeroed_scratch(table_len, "legacy sine table")?;
     for (token, &pos) in positions.iter().enumerate() {
         let pos = pos as f64;
         let ct = &mut cos_table[token * half..token * half + half];
@@ -88,7 +90,8 @@ pub fn rope_apply(
 ///
 /// # Errors
 /// [`NnError::Shape`] if the packed layout overflows or disagrees with `x`, if
-/// `head_dim` is odd, or if `rotary_dim` is zero, odd, or exceeds `head_dim`.
+/// `head_dim` is odd, or if `rotary_dim` is zero, odd, or exceeds `head_dim`;
+/// [`NnError::Backend`] if frequency-table scratch cannot be allocated.
 pub fn rope_apply_partial_neox(
     x: &mut [f32],
     positions: &[usize],
@@ -139,16 +142,17 @@ pub fn rope_apply_partial_neox(
     // fp32: exponent = (2j)/rotary_dim, then reciprocal(theta.pow(exponent)).
     // The rounding order matters at long positions because frequency error is
     // multiplied by the absolute position before sin/cos range reduction.
-    let inv_freq: Vec<f32> = (0..half)
-        .map(|j| 1.0 / theta.powf((2 * j) as f32 / rotary_dim_f32))
-        .collect();
+    let mut inv_freq = reserved_scratch(half, "partial inverse frequencies")?;
+    for j in 0..half {
+        inv_freq.push(1.0 / theta.powf((2 * j) as f32 / rotary_dim_f32));
+    }
 
     // Precompute cos/sin table: [positions.len() × half]. For a given position
     // and lane j, the (cos, sin) pair is identical across all heads — only the
     // data being rotated differs. Precomputing eliminates (n_head-1) × half
     // sin_cos calls per position.
-    let mut cos_table = vec![0.0f32; table_len];
-    let mut sin_table = vec![0.0f32; table_len];
+    let mut cos_table = zeroed_scratch(table_len, "partial cosine table")?;
+    let mut sin_table = zeroed_scratch(table_len, "partial sine table")?;
     for (token, &pos) in positions.iter().enumerate() {
         let pos = pos as f32;
         let ct = &mut cos_table[token * half..token * half + half];
@@ -206,6 +210,22 @@ fn checked_table_len(n_token: usize, half: usize, got: usize) -> Result<usize, N
         expected: usize::MAX,
         got,
     })
+}
+
+fn reserved_scratch<T>(len: usize, name: &str) -> Result<Vec<T>, NnError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        NnError::Backend(format!(
+            "allocate RoPE {name} scratch for {len} values: {error}"
+        ))
+    })?;
+    Ok(values)
+}
+
+fn zeroed_scratch(len: usize, name: &str) -> Result<Vec<f32>, NnError> {
+    let mut values = reserved_scratch(len, name)?;
+    values.resize(len, 0.0);
+    Ok(values)
 }
 
 #[inline]

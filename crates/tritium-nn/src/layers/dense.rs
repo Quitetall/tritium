@@ -57,6 +57,11 @@ impl DenseLinear {
         Self::build(weights, n_out, k_in, false)
     }
 
+    /// Whether this projection quantizes each activation row to A8 before contraction.
+    pub(crate) const fn quantizes_activations(&self) -> bool {
+        self.quantize_act
+    }
+
     fn build(
         weights: Vec<f32>,
         n_out: usize,
@@ -86,17 +91,18 @@ impl DenseLinear {
     /// (`[m, n_out]`).
     ///
     /// # Errors
-    /// [`NnError::Shape`] on buffer-length mismatch.
+    /// [`NnError::Shape`] on buffer-length mismatch, or [`NnError::Backend`] if
+    /// A8 scratch cannot be allocated.
     pub fn forward(&self, act: &[f32], m: usize, out: &mut [f32]) -> Result<(), NnError> {
         let k = self.k_in;
-        let act_len = m * k;
+        let act_len = checked_buffer_len(m, k, act.len())?;
         if act.len() != act_len {
             return Err(NnError::Shape {
                 expected: act_len,
                 got: act.len(),
             });
         }
-        let out_len = m * self.n_out;
+        let out_len = checked_buffer_len(m, self.n_out, out.len())?;
         if out.len() != out_len {
             return Err(NnError::Shape {
                 expected: out_len,
@@ -127,8 +133,8 @@ impl DenseLinear {
 
         // Same per-token int8 absmax quant as `TernaryLinear` — the apples-to-apples
         // activation path. `q_act` is the int8 values kept as f32.
-        let mut q_act = vec![0.0f32; act_len];
-        let mut act_scale = vec![0.0f32; m];
+        let mut q_act = zeroed_scratch(act_len, "dense quantized activations")?;
+        let mut act_scale = zeroed_scratch(m, "dense activation scales")?;
         quantize_activation_int8(act, m, k, &mut q_act, &mut act_scale)?;
 
         // Parallelize over output channels: each `out[r,n]` is an independent dot,
@@ -154,6 +160,24 @@ impl DenseLinear {
         }
         Ok(())
     }
+}
+
+fn checked_buffer_len(rows: usize, width: usize, got: usize) -> Result<usize, NnError> {
+    rows.checked_mul(width).ok_or(NnError::Shape {
+        expected: usize::MAX,
+        got,
+    })
+}
+
+fn zeroed_scratch(len: usize, name: &str) -> Result<Vec<f32>, NnError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        NnError::Backend(format!(
+            "allocate {name} scratch for {len} f32 values: {error}"
+        ))
+    })?;
+    values.resize(len, 0.0);
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -196,5 +220,18 @@ mod tests {
                 assert_eq!(out[r * n + nn].to_bits(), want.to_bits(), "r={r} n={nn}");
             }
         }
+    }
+
+    #[test]
+    fn forward_rejects_length_overflow_before_allocation() {
+        let lin = DenseLinear::new_exact(vec![0.0; 2], 1, 2).unwrap();
+        let mut out = [];
+        assert_eq!(
+            lin.forward(&[], usize::MAX, &mut out),
+            Err(NnError::Shape {
+                expected: usize::MAX,
+                got: 0,
+            })
+        );
     }
 }
