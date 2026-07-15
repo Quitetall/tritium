@@ -165,6 +165,45 @@ impl Qwen35FullAttentionWeights {
             k_norm,
         }
     }
+
+    /// Validate this retained weight set against one text geometry without
+    /// publishing an executable attention module.
+    pub(crate) fn validate_for_config(
+        &self,
+        config: &Qwen35TextConfig,
+    ) -> Result<ProjectionActivationMode, NnError> {
+        let spec = AttentionSpec::bind(config)?;
+        self.validate_for_spec(&spec)
+    }
+
+    fn validate_for_spec(&self, spec: &AttentionSpec) -> Result<ProjectionActivationMode, NnError> {
+        validate_projection(&self.q_proj, spec.fused_query_width, spec.hidden_size)?;
+        validate_projection(&self.k_proj, spec.key_value_width, spec.hidden_size)?;
+        validate_projection(&self.v_proj, spec.key_value_width, spec.hidden_size)?;
+        validate_projection(&self.o_proj, spec.hidden_size, spec.query_width)?;
+        let activation_mode = self.q_proj.activation_mode();
+        if [&self.k_proj, &self.v_proj, &self.o_proj]
+            .into_iter()
+            .any(|projection| projection.activation_mode() != activation_mode)
+        {
+            return Err(invalid_config(
+                "full-attention projections must use one activation arithmetic mode",
+            ));
+        }
+        validate_len(self.q_norm.len(), spec.head_dim)?;
+        validate_len(self.k_norm.len(), spec.head_dim)?;
+        if self
+            .q_norm
+            .iter()
+            .chain(&self.k_norm)
+            .any(|value| !value.is_finite())
+        {
+            return Err(NnError::Backend(
+                "Qwen3.5 Q/K norm weights contain a non-finite value".to_owned(),
+            ));
+        }
+        Ok(activation_mode)
+    }
 }
 
 /// Typed KV state for one [`Qwen35FullAttention`] stream.
@@ -279,31 +318,7 @@ impl Qwen35FullAttention {
         weights: Qwen35FullAttentionWeights,
     ) -> Result<Self, NnError> {
         let spec = AttentionSpec::bind(config)?;
-        validate_projection(&weights.q_proj, spec.fused_query_width, spec.hidden_size)?;
-        validate_projection(&weights.k_proj, spec.key_value_width, spec.hidden_size)?;
-        validate_projection(&weights.v_proj, spec.key_value_width, spec.hidden_size)?;
-        validate_projection(&weights.o_proj, spec.hidden_size, spec.query_width)?;
-        let activation_mode = weights.q_proj.activation_mode();
-        if [&weights.k_proj, &weights.v_proj, &weights.o_proj]
-            .into_iter()
-            .any(|projection| projection.activation_mode() != activation_mode)
-        {
-            return Err(invalid_config(
-                "full-attention projections must use one activation arithmetic mode",
-            ));
-        }
-        validate_len(weights.q_norm.len(), spec.head_dim)?;
-        validate_len(weights.k_norm.len(), spec.head_dim)?;
-        if weights
-            .q_norm
-            .iter()
-            .chain(&weights.k_norm)
-            .any(|v| !v.is_finite())
-        {
-            return Err(NnError::Backend(
-                "Qwen3.5 Q/K norm weights contain a non-finite value".to_owned(),
-            ));
-        }
+        let activation_mode = weights.validate_for_spec(&spec)?;
         Ok(Self {
             spec,
             identity: Arc::new(MixerIdentity),

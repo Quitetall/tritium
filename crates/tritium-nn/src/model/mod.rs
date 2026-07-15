@@ -10,6 +10,7 @@ mod hf;
 mod hf_shards;
 mod qwen35;
 mod qwen35_hf;
+mod qwen35_mtp;
 mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
@@ -24,6 +25,10 @@ pub use qwen35::{
     Qwen35TextRunner, Qwen35TextWeights,
 };
 pub use qwen35_hf::{Qwen35HfLanguageModel, Qwen35HfLanguageReceipt};
+pub use qwen35_mtp::{
+    QWEN35_MTP_UNVERIFIED_REASON, Qwen35MtpInputPlan, Qwen35MtpLayerWeights, Qwen35MtpStatus,
+    Qwen35MtpWeights, UnverifiedQwen35Mtp,
+};
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]
 pub use salt_v2::{

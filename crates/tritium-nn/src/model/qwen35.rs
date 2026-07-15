@@ -156,7 +156,7 @@ impl Qwen35TextLayerCache {
 }
 
 #[derive(Debug)]
-struct RunnerIdentity;
+pub(crate) struct RunnerIdentity;
 
 /// One exact-runner hybrid cache with a single committed language cursor.
 ///
@@ -203,19 +203,37 @@ impl Qwen35TextCache {
 /// `final_hidden_states` are after the model's final zero-centered RMSNorm and
 /// are therefore the target hidden rows consumed by Qwen3.5 MTP. They are not
 /// the pre-final residual stream.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Qwen35TextOutput {
-    sequence: usize,
+    runner_identity: Arc<RunnerIdentity>,
+    position_start: usize,
     hidden_size: usize,
+    input_token_ids: Vec<u32>,
     final_hidden_states: Vec<f32>,
     last_logits: Vec<f32>,
 }
 
+impl PartialEq for Qwen35TextOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.position_start == other.position_start
+            && self.hidden_size == other.hidden_size
+            && self.input_token_ids == other.input_token_ids
+            && self.final_hidden_states == other.final_hidden_states
+            && self.last_logits == other.last_logits
+    }
+}
+
 impl Qwen35TextOutput {
+    /// First absolute target position represented by this output.
+    #[must_use]
+    pub const fn position_start(&self) -> usize {
+        self.position_start
+    }
+
     /// Number of input token rows represented by the hidden-state buffer.
     #[must_use]
-    pub const fn sequence(&self) -> usize {
-        self.sequence
+    pub fn sequence(&self) -> usize {
+        self.input_token_ids.len()
     }
 
     /// Width of each final-normalized hidden row.
@@ -235,12 +253,21 @@ impl Qwen35TextOutput {
     pub fn last_logits(&self) -> &[f32] {
         &self.last_logits
     }
+
+    pub(crate) fn runner_identity(&self) -> &Arc<RunnerIdentity> {
+        &self.runner_identity
+    }
+
+    pub(crate) fn input_token_ids(&self) -> &[u32] {
+        &self.input_token_ids
+    }
 }
 
 /// Exact Qwen3.5/Qwen3.6 hybrid language-core runner.
 #[allow(missing_debug_implementations)]
 pub struct Qwen35TextRunner {
     identity: Arc<RunnerIdentity>,
+    config: Qwen35TextConfig,
     hidden_size: usize,
     intermediate_size: usize,
     vocab_size: usize,
@@ -331,7 +358,9 @@ impl Qwen35TextRunner {
             }
             validate_finite(&raw.input_norm, hidden_size, "input norm")?;
             validate_finite(&raw.post_attention_norm, hidden_size, "post-attention norm")?;
-            let mlp_mode = validate_mlp(&raw.mlp, hidden_size, intermediate_size)?;
+            let mlp_mode = raw
+                .mlp
+                .validate_for_geometry(hidden_size, intermediate_size)?;
             if mlp_mode != activation_mode {
                 return Err(invalid_config(
                     "Qwen3.5 language projections must use one activation arithmetic mode",
@@ -360,6 +389,7 @@ impl Qwen35TextRunner {
 
         Ok(Self {
             identity: Arc::new(RunnerIdentity),
+            config: config.clone(),
             hidden_size,
             intermediate_size,
             vocab_size,
@@ -397,6 +427,14 @@ impl Qwen35TextRunner {
     #[must_use]
     pub const fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    pub(crate) fn config(&self) -> &Qwen35TextConfig {
+        &self.config
+    }
+
+    pub(crate) fn identity(&self) -> &Arc<RunnerIdentity> {
+        &self.identity
     }
 
     /// Allocate one exact-runner hybrid cache.
@@ -473,12 +511,22 @@ impl Qwen35TextRunner {
             ))
         })?;
         positions.extend(base..new_len);
+        let mut input_token_ids = Vec::new();
+        input_token_ids
+            .try_reserve_exact(sequence)
+            .map_err(|error| {
+                NnError::Backend(format!(
+                    "allocate Qwen3.5 output token provenance for {sequence} tokens: {error}"
+                ))
+            })?;
+        input_token_ids.extend_from_slice(tokens);
         self.embedding
             .gather_with_backend(self.backend.as_ref(), tokens, &mut residual)?;
 
         let result = self.forward_provisional(
             self.backend.as_ref(),
-            sequence,
+            base,
+            input_token_ids,
             &positions,
             cache,
             &mut residual,
@@ -510,13 +558,15 @@ impl Qwen35TextRunner {
     fn forward_provisional(
         &self,
         backend: &dyn TernaryBackend,
-        sequence: usize,
+        position_start: usize,
+        input_token_ids: Vec<u32>,
         positions: &[usize],
         cache: &mut Qwen35TextCache,
         residual: &mut [f32],
         normalized: &mut [f32],
         branch: &mut [f32],
     ) -> Result<Qwen35TextOutput, NnError> {
+        let sequence = input_token_ids.len();
         for (layer, layer_cache) in self.layers.iter().zip(&mut cache.layers) {
             normalize_rows(
                 residual,
@@ -578,8 +628,10 @@ impl Qwen35TextRunner {
             ));
         }
         Ok(Qwen35TextOutput {
-            sequence,
+            runner_identity: Arc::clone(&self.identity),
+            position_start,
             hidden_size: self.hidden_size,
+            input_token_ids,
             final_hidden_states,
             last_logits,
         })
@@ -716,20 +768,6 @@ fn validate_token_table(
         ));
     }
     Ok(())
-}
-
-fn validate_mlp(
-    mlp: &SwiGluMlp,
-    hidden_size: usize,
-    intermediate_size: usize,
-) -> Result<ProjectionActivationMode, NnError> {
-    validate_projection(&mlp.gate, intermediate_size, hidden_size)?;
-    validate_projection(&mlp.up, intermediate_size, hidden_size)?;
-    validate_projection(&mlp.down, hidden_size, intermediate_size)?;
-    validate_finite_projection(&mlp.gate, "SwiGLU gate")?;
-    validate_finite_projection(&mlp.up, "SwiGLU up")?;
-    validate_finite_projection(&mlp.down, "SwiGLU down")?;
-    mlp.activation_mode()
 }
 
 fn validate_projection(

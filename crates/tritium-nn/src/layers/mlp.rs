@@ -125,11 +125,31 @@ impl SwiGluMlp {
     /// [`NnError::Backend`] when a projection parameter is non-finite.
     pub fn new(gate: Projection, up: Projection, down: Projection) -> Result<Self, NnError> {
         let mlp = Self { gate, up, down };
-        mlp.activation_mode()?;
-        validate_projection_parameters(&mlp.gate)?;
-        validate_projection_parameters(&mlp.up)?;
-        validate_projection_parameters(&mlp.down)?;
+        mlp.validate_for_geometry(mlp.gate.k_in(), mlp.gate.n_out())?;
         Ok(mlp)
+    }
+
+    /// Validate exact model geometry, common activation arithmetic, and all
+    /// retained parameters at a model-binding boundary.
+    pub(crate) fn validate_for_geometry(
+        &self,
+        n_embd: usize,
+        n_ff: usize,
+    ) -> Result<ProjectionActivationMode, NnError> {
+        if n_embd == 0 || n_ff == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: n_embd.min(n_ff),
+            });
+        }
+        validate_projection(&self.gate, n_ff, n_embd)?;
+        validate_projection(&self.up, n_ff, n_embd)?;
+        validate_projection(&self.down, n_embd, n_ff)?;
+        let mode = shared_activation_mode(self)?;
+        validate_projection_parameters(&self.gate)?;
+        validate_projection_parameters(&self.up)?;
+        validate_projection_parameters(&self.down)?;
+        Ok(mode)
     }
 
     /// Validate projection geometry and return their shared activation mode.
@@ -155,13 +175,7 @@ impl SwiGluMlp {
         validate_projection(&self.up, n_ff, n_embd)?;
         validate_projection(&self.down, n_embd, n_ff)?;
 
-        let mode = self.gate.activation_mode();
-        if self.up.activation_mode() != mode || self.down.activation_mode() != mode {
-            return Err(NnError::MissingConfig(
-                "SwiGLU projections must use one activation arithmetic mode".to_owned(),
-            ));
-        }
-        Ok(mode)
+        shared_activation_mode(self)
     }
 
     /// Forward over `m` tokens: `out = down( silu(gate(x)) ⊙ up(x) )`.
@@ -216,6 +230,16 @@ impl SwiGluMlp {
         out.copy_from_slice(&staged_out);
         Ok(())
     }
+}
+
+fn shared_activation_mode(mlp: &SwiGluMlp) -> Result<ProjectionActivationMode, NnError> {
+    let mode = mlp.gate.activation_mode();
+    if mlp.up.activation_mode() != mode || mlp.down.activation_mode() != mode {
+        return Err(NnError::MissingConfig(
+            "SwiGLU projections must use one activation arithmetic mode".to_owned(),
+        ));
+    }
+    Ok(mode)
 }
 
 fn validate_projection(
