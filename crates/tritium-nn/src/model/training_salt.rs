@@ -195,7 +195,7 @@ impl ModelWeights {
             &config,
             &spec,
             NameSchema::Hf,
-            |name| provider(name),
+            |name, _expected_len| provider(name),
             |name, n_out, k_in| {
                 Ok(Projection::Dense(DenseLinear::new_exact(
                     provider(name)?,
@@ -963,7 +963,7 @@ mod tests {
             &fixture.config,
             &fixture.spec,
             NameSchema::Hf,
-            |name| provider(name),
+            |name, _expected_len| provider(name),
             |name, rows, cols| {
                 Ok(Projection::Dense(DenseLinear::new_exact(
                     provider(name)?,

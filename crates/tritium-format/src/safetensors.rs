@@ -12,9 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::{self, Read, Seek, SeekFrom};
 
 use half::{bf16, f16};
-use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 /// Errors from parsing or reading a safetensors buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,13 @@ pub enum SafeTensorsError {
         declared: usize,
         /// Bytes actually available in the buffer after the prefix.
         available: usize,
+    },
+    /// The declared JSON header exceeds the safetensors format's 100 MB limit.
+    HeaderTooLarge {
+        /// Header length declared by the 8-byte little-endian prefix.
+        declared: u64,
+        /// Maximum accepted header length.
+        limit: usize,
     },
     /// The JSON header failed to parse.
     Json(String),
@@ -57,6 +66,22 @@ pub enum SafeTensorsError {
         /// Tensor name.
         name: String,
     },
+    /// A seek or read on a seek-backed source failed.
+    Io {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Stable I/O error category.
+        kind: io::ErrorKind,
+        /// Platform error message.
+        message: String,
+    },
+    /// A bounded header or decoded-output allocation could not be reserved.
+    AllocationFailed {
+        /// Number of bytes requested.
+        requested_bytes: usize,
+    },
+    /// Tensor offsets do not form one contiguous, complete data region.
+    InvalidLayout(String),
 }
 
 impl fmt::Display for SafeTensorsError {
@@ -74,6 +99,10 @@ impl fmt::Display for SafeTensorsError {
                     "safetensors: header len {declared} exceeds buffer ({available} bytes)"
                 )
             }
+            SafeTensorsError::HeaderTooLarge { declared, limit } => write!(
+                f,
+                "safetensors: header len {declared} exceeds the {limit}-byte limit"
+            ),
             SafeTensorsError::Json(e) => write!(f, "safetensors: header JSON: {e}"),
             SafeTensorsError::NotFound(n) => write!(f, "safetensors: tensor `{n}` not found"),
             SafeTensorsError::OutOfBounds(n) => {
@@ -96,6 +125,17 @@ impl fmt::Display for SafeTensorsError {
             SafeTensorsError::ShapeOverflow { name } => {
                 write!(f, "safetensors: tensor `{name}` shape overflows usize")
             }
+            SafeTensorsError::Io {
+                operation,
+                kind,
+                message,
+            } => write!(f, "safetensors: {operation} failed ({kind:?}): {message}"),
+            SafeTensorsError::AllocationFailed { requested_bytes } => {
+                write!(f, "safetensors: could not reserve {requested_bytes} bytes")
+            }
+            SafeTensorsError::InvalidLayout(message) => {
+                write!(f, "safetensors: invalid data layout: {message}")
+            }
         }
     }
 }
@@ -104,10 +144,314 @@ impl std::error::Error for SafeTensorsError {}
 
 /// One tensor's header entry.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTensor {
     dtype: String,
     shape: Vec<usize>,
-    data_offsets: [usize; 2],
+    data_offsets: [u64; 2],
+}
+
+struct UniqueHeader(BTreeMap<String, RawTensor>);
+
+struct UniqueMetadata;
+
+impl<'de> Deserialize<'de> for UniqueMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct UniqueMetadataVisitor;
+
+        impl<'de> Visitor<'de> for UniqueMetadataVisitor {
+            type Value = UniqueMetadata;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string-to-string metadata object with unique keys")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut keys = BTreeMap::new();
+                while let Some(key) = access.next_key::<String>()? {
+                    if keys.insert(key.clone(), ()).is_some() {
+                        return Err(de::Error::custom(format!("duplicate metadata key `{key}`")));
+                    }
+                    access.next_value::<String>()?;
+                }
+                Ok(UniqueMetadata)
+            }
+        }
+
+        deserializer.deserialize_map(UniqueMetadataVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for UniqueHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct UniqueHeaderVisitor;
+
+        impl<'de> Visitor<'de> for UniqueHeaderVisitor {
+            type Value = UniqueHeader;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a safetensors header object with unique keys")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut tensors = BTreeMap::new();
+                let mut metadata_seen = false;
+                while let Some(name) = access.next_key::<String>()? {
+                    if name == "__metadata__" {
+                        if metadata_seen {
+                            return Err(de::Error::custom("duplicate header key `__metadata__`"));
+                        }
+                        metadata_seen = true;
+                        access.next_value::<UniqueMetadata>()?;
+                    } else {
+                        if tensors.contains_key(&name) {
+                            return Err(de::Error::custom(format!(
+                                "duplicate header key `{name}`"
+                            )));
+                        }
+                        let tensor = access.next_value::<RawTensor>()?;
+                        tensors.insert(name, tensor);
+                    }
+                }
+                Ok(UniqueHeader(tensors))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueHeaderVisitor)
+    }
+}
+
+const MAX_HEADER_LEN: usize = 100_000_000;
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+enum FloatDtype {
+    Bf16,
+    F16,
+    F32,
+}
+
+impl FloatDtype {
+    const fn byte_size(self) -> usize {
+        match self {
+            Self::Bf16 | Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TensorLayout {
+    offset: u64,
+    byte_len: usize,
+    numel: usize,
+    dtype: FloatDtype,
+}
+
+fn checked_header_len(declared: u64) -> Result<usize, SafeTensorsError> {
+    if declared > MAX_HEADER_LEN as u64 {
+        return Err(SafeTensorsError::HeaderTooLarge {
+            declared,
+            limit: MAX_HEADER_LEN,
+        });
+    }
+    usize::try_from(declared).map_err(|_| SafeTensorsError::HeaderTooLarge {
+        declared,
+        limit: MAX_HEADER_LEN,
+    })
+}
+
+fn parse_header(header: &[u8]) -> Result<BTreeMap<String, RawTensor>, SafeTensorsError> {
+    if header.first() != Some(&b'{') {
+        return Err(SafeTensorsError::Json(
+            "header must begin with `{`".to_owned(),
+        ));
+    }
+    // Duplicate keys fail closed at every supported object level. The optional
+    // `__metadata__` entry is not a tensor and accepts only string values.
+    let UniqueHeader(tensors) = serde_json::from_slice(header)
+        .map_err(|error| SafeTensorsError::Json(error.to_string()))?;
+    Ok(tensors)
+}
+
+fn storage_bits(dtype: &str) -> Option<usize> {
+    match dtype {
+        "F4" => Some(4),
+        "F6_E2M3" | "F6_E3M2" => Some(6),
+        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" | "F8_E8M0" | "F8_E4M3FNUZ"
+        | "F8_E5M2FNUZ" => Some(8),
+        "I16" | "U16" | "F16" | "BF16" => Some(16),
+        "I32" | "U32" | "F32" => Some(32),
+        "I64" | "U64" | "F64" | "C64" => Some(64),
+        _ => None,
+    }
+}
+
+fn validate_layout(
+    tensors: &BTreeMap<String, RawTensor>,
+    data_len: u64,
+) -> Result<(), SafeTensorsError> {
+    let requested_bytes = tensors
+        .len()
+        .saturating_mul(size_of::<(&String, &RawTensor)>());
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(tensors.len())
+        .map_err(|_| SafeTensorsError::AllocationFailed { requested_bytes })?;
+    ordered.extend(tensors.iter());
+    ordered.sort_unstable_by_key(|(_, tensor)| tensor.data_offsets);
+
+    let mut cursor = 0u64;
+    for (name, tensor) in ordered {
+        let [start, end] = tensor.data_offsets;
+        if start != cursor || end < start {
+            return Err(SafeTensorsError::InvalidLayout(format!(
+                "tensor `{name}` starts at {start}, expected {cursor}, and ends at {end}"
+            )));
+        }
+        if end > data_len {
+            return Err(SafeTensorsError::OutOfBounds(name.clone()));
+        }
+        let bits =
+            storage_bits(&tensor.dtype).ok_or_else(|| SafeTensorsError::UnsupportedDtype {
+                name: name.clone(),
+                dtype: tensor.dtype.clone(),
+            })?;
+        let numel = tensor
+            .shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| SafeTensorsError::ShapeOverflow { name: name.clone() })?;
+        let bit_len = numel
+            .checked_mul(bits)
+            .ok_or_else(|| SafeTensorsError::ShapeOverflow { name: name.clone() })?;
+        if bit_len % 8 != 0 {
+            return Err(SafeTensorsError::InvalidLayout(format!(
+                "tensor `{name}` has a non-byte-aligned {bit_len}-bit payload"
+            )));
+        }
+        let expected = bit_len / 8;
+        let got = usize::try_from(end - start)
+            .map_err(|_| SafeTensorsError::ShapeOverflow { name: name.clone() })?;
+        if got != expected {
+            return Err(SafeTensorsError::LengthMismatch {
+                name: name.clone(),
+                expected,
+                got,
+            });
+        }
+        cursor = end;
+    }
+    if cursor != data_len {
+        return Err(SafeTensorsError::InvalidLayout(format!(
+            "tensor metadata covers {cursor} of {data_len} data bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn tensor_layout(
+    tensors: &BTreeMap<String, RawTensor>,
+    name: &str,
+    data_len: u64,
+) -> Result<TensorLayout, SafeTensorsError> {
+    let tensor = tensors
+        .get(name)
+        .ok_or_else(|| SafeTensorsError::NotFound(name.to_owned()))?;
+    let [start, end] = tensor.data_offsets;
+    if start > end || end > data_len {
+        return Err(SafeTensorsError::OutOfBounds(name.to_owned()));
+    }
+    let byte_len = usize::try_from(end - start).map_err(|_| SafeTensorsError::ShapeOverflow {
+        name: name.to_owned(),
+    })?;
+    let dtype = match tensor.dtype.as_str() {
+        "BF16" => FloatDtype::Bf16,
+        "F16" => FloatDtype::F16,
+        "F32" => FloatDtype::F32,
+        other => {
+            return Err(SafeTensorsError::UnsupportedDtype {
+                name: name.to_owned(),
+                dtype: other.to_owned(),
+            });
+        }
+    };
+    let numel = tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &dimension| acc.checked_mul(dimension))
+        .ok_or_else(|| SafeTensorsError::ShapeOverflow {
+            name: name.to_owned(),
+        })?;
+    let expected =
+        numel
+            .checked_mul(dtype.byte_size())
+            .ok_or_else(|| SafeTensorsError::ShapeOverflow {
+                name: name.to_owned(),
+            })?;
+    if byte_len != expected {
+        return Err(SafeTensorsError::LengthMismatch {
+            name: name.to_owned(),
+            expected,
+            got: byte_len,
+        });
+    }
+    // Check the widened allocation size separately. This can overflow even when
+    // the source BF16/F16 span fits in `usize`.
+    numel
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| SafeTensorsError::ShapeOverflow {
+            name: name.to_owned(),
+        })?;
+    Ok(TensorLayout {
+        offset: start,
+        byte_len,
+        numel,
+        dtype,
+    })
+}
+
+fn reserve_f32(numel: usize) -> Result<Vec<f32>, SafeTensorsError> {
+    let requested_bytes =
+        numel
+            .checked_mul(size_of::<f32>())
+            .ok_or(SafeTensorsError::AllocationFailed {
+                requested_bytes: usize::MAX,
+            })?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(numel)
+        .map_err(|_| SafeTensorsError::AllocationFailed { requested_bytes })?;
+    Ok(output)
+}
+
+fn append_f32(output: &mut Vec<f32>, dtype: FloatDtype, raw: &[u8]) {
+    match dtype {
+        FloatDtype::Bf16 => output.extend(
+            raw.chunks_exact(2)
+                .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32()),
+        ),
+        FloatDtype::F16 => output.extend(
+            raw.chunks_exact(2)
+                .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32()),
+        ),
+        FloatDtype::F32 => output.extend(
+            raw.chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+        ),
+    }
 }
 
 /// A parsed safetensors buffer: the header table + a borrow of the data region.
@@ -121,13 +465,15 @@ impl<'a> SafeTensors<'a> {
     /// Parse the header of a safetensors buffer (no tensor data is copied).
     ///
     /// # Errors
-    /// [`SafeTensorsError::TooShort`] / [`SafeTensorsError::BadHeaderLen`] on a
-    /// malformed prefix; [`SafeTensorsError::Json`] on an unparseable header.
+    /// [`SafeTensorsError::TooShort`] / [`SafeTensorsError::BadHeaderLen`] /
+    /// [`SafeTensorsError::HeaderTooLarge`] on a malformed prefix;
+    /// [`SafeTensorsError::Json`] on an unparseable header; or a typed layout,
+    /// dtype, shape, or length error for invalid tensor metadata.
     pub fn parse(buf: &'a [u8]) -> Result<Self, SafeTensorsError> {
         if buf.len() < 8 {
             return Err(SafeTensorsError::TooShort);
         }
-        let n = u64::from_le_bytes(buf[0..8].try_into().unwrap()) as usize;
+        let n = checked_header_len(u64::from_le_bytes(buf[0..8].try_into().unwrap()))?;
         let header_end = 8usize.checked_add(n).filter(|&e| e <= buf.len()).ok_or(
             SafeTensorsError::BadHeaderLen {
                 declared: n,
@@ -135,23 +481,10 @@ impl<'a> SafeTensors<'a> {
             },
         )?;
 
-        // Parse as a generic map so the optional `__metadata__` string-map entry
-        // (which is not a tensor) can be dropped before typed deserialization.
-        let mut raw: BTreeMap<String, serde_json::Value> =
-            serde_json::from_slice(&buf[8..header_end])
-                .map_err(|e| SafeTensorsError::Json(e.to_string()))?;
-        raw.remove("__metadata__");
-
-        let mut tensors = BTreeMap::new();
-        for (name, value) in raw {
-            let t: RawTensor =
-                serde_json::from_value(value).map_err(|e| SafeTensorsError::Json(e.to_string()))?;
-            tensors.insert(name, t);
-        }
-        Ok(SafeTensors {
-            tensors,
-            data: &buf[header_end..],
-        })
+        let tensors = parse_header(&buf[8..header_end])?;
+        let data = &buf[header_end..];
+        validate_layout(&tensors, data.len() as u64)?;
+        Ok(SafeTensors { tensors, data })
     }
 
     /// Tensor names, sorted.
@@ -185,63 +518,160 @@ impl<'a> SafeTensors<'a> {
     /// # Errors
     /// [`SafeTensorsError::NotFound`] / [`OutOfBounds`](SafeTensorsError::OutOfBounds)
     /// / [`LengthMismatch`](SafeTensorsError::LengthMismatch) /
-    /// [`UnsupportedDtype`](SafeTensorsError::UnsupportedDtype).
+    /// [`UnsupportedDtype`](SafeTensorsError::UnsupportedDtype) /
+    /// [`ShapeOverflow`](SafeTensorsError::ShapeOverflow) /
+    /// [`AllocationFailed`](SafeTensorsError::AllocationFailed).
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, SafeTensorsError> {
-        let t = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| SafeTensorsError::NotFound(name.to_owned()))?;
-        let [a, b] = t.data_offsets;
+        let layout = tensor_layout(&self.tensors, name, self.data.len() as u64)?;
+        let start = usize::try_from(layout.offset)
+            .map_err(|_| SafeTensorsError::OutOfBounds(name.to_owned()))?;
+        let end = start
+            .checked_add(layout.byte_len)
+            .ok_or_else(|| SafeTensorsError::OutOfBounds(name.to_owned()))?;
         let raw = self
             .data
-            .get(a..b)
+            .get(start..end)
             .ok_or_else(|| SafeTensorsError::OutOfBounds(name.to_owned()))?;
+        let mut output = reserve_f32(layout.numel)?;
+        append_f32(&mut output, layout.dtype, raw);
+        Ok(output)
+    }
+}
 
-        let dsize = match t.dtype.as_str() {
-            "BF16" | "F16" => 2usize,
-            "F32" => 4,
-            other => {
-                return Err(SafeTensorsError::UnsupportedDtype {
-                    name: name.to_owned(),
-                    dtype: other.to_owned(),
-                });
-            }
-        };
-        // Untrusted header: a crafted shape can overflow `usize`, which would make
-        // the byte-length check below meaningless. Compute `numel × dsize` with
-        // checked arithmetic and reject overflow rather than wrap.
-        let expected = t
-            .shape
-            .iter()
-            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-            .and_then(|numel| numel.checked_mul(dsize))
-            .ok_or_else(|| SafeTensorsError::ShapeOverflow {
-                name: name.to_owned(),
-            })?;
-        if raw.len() != expected {
-            return Err(SafeTensorsError::LengthMismatch {
-                name: name.to_owned(),
-                expected,
-                got: raw.len(),
+/// A seek-backed safetensors index that retains only the parsed JSON header.
+///
+/// This type itself reads only the 8-byte prefix and bounded header during
+/// construction. Tensor payloads are fetched on demand with absolute seeks and
+/// widened through a fixed-size scratch buffer. Whether `R` buffers or retains
+/// source bytes is controlled by that reader; Tritium's HF adapter uses
+/// unbuffered [`std::fs::File`] handles.
+#[derive(Debug)]
+pub struct SafeTensorsReader<R> {
+    tensors: BTreeMap<String, RawTensor>,
+    reader: R,
+    data_start: u64,
+    data_len: u64,
+}
+
+impl<R: Read + Seek> SafeTensorsReader<R> {
+    /// Index a seekable safetensors source without reading tensor payloads.
+    ///
+    /// # Errors
+    /// Returns a typed [`SafeTensorsError`] for malformed or oversized headers,
+    /// failed seeks/reads, or a failed bounded header allocation.
+    pub fn new(mut reader: R) -> Result<Self, SafeTensorsError> {
+        let file_len = reader
+            .seek(SeekFrom::End(0))
+            .map_err(|error| io_error("seek to source end", error))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_error("seek to source start", error))?;
+        if file_len < 8 {
+            return Err(SafeTensorsError::TooShort);
+        }
+
+        let mut prefix = [0u8; 8];
+        reader
+            .read_exact(&mut prefix)
+            .map_err(|error| io_error("read length prefix", error))?;
+        let header_len = checked_header_len(u64::from_le_bytes(prefix))?;
+        let available_u64 = file_len.saturating_sub(8);
+        if header_len as u64 > available_u64 {
+            return Err(SafeTensorsError::BadHeaderLen {
+                declared: header_len,
+                available: usize::try_from(available_u64).unwrap_or(usize::MAX),
             });
         }
 
-        let out = match t.dtype.as_str() {
-            "BF16" => raw
-                .chunks_exact(2)
-                .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                .collect(),
-            "F16" => raw
-                .chunks_exact(2)
-                .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                .collect(),
-            "F32" => raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            _ => unreachable!("dtype validated above"),
-        };
-        Ok(out)
+        let mut header = Vec::new();
+        header
+            .try_reserve_exact(header_len)
+            .map_err(|_| SafeTensorsError::AllocationFailed {
+                requested_bytes: header_len,
+            })?;
+        header.resize(header_len, 0);
+        reader
+            .read_exact(&mut header)
+            .map_err(|error| io_error("read JSON header", error))?;
+        let tensors = parse_header(&header)?;
+        let data_start = 8u64 + header_len as u64;
+        let data_len = file_len - data_start;
+        validate_layout(&tensors, data_len)?;
+        Ok(Self {
+            tensors,
+            reader,
+            data_start,
+            data_len,
+        })
+    }
+
+    /// Tensor names, sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
+
+    /// Number of tensors.
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    /// Whether there are no tensors.
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+
+    /// A tensor's shape, or `None` if absent.
+    pub fn shape(&self, name: &str) -> Option<&[usize]> {
+        self.tensors.get(name).map(|tensor| tensor.shape.as_slice())
+    }
+
+    /// A tensor's dtype string (for example, `"BF16"`), or `None` if absent.
+    pub fn dtype(&self, name: &str) -> Option<&str> {
+        self.tensors.get(name).map(|tensor| tensor.dtype.as_str())
+    }
+
+    /// Seek to one tensor and return its row-major values widened to `f32`.
+    /// Reads are chunked to bound raw staging memory independently of tensor size.
+    ///
+    /// # Errors
+    /// Returns a typed [`SafeTensorsError`] for an absent/malformed tensor, a
+    /// failed output reservation, or a failed absolute seek/read.
+    pub fn tensor_f32(&mut self, name: &str) -> Result<Vec<f32>, SafeTensorsError> {
+        let layout = tensor_layout(&self.tensors, name, self.data_len)?;
+        let absolute = self
+            .data_start
+            .checked_add(layout.offset)
+            .ok_or_else(|| SafeTensorsError::OutOfBounds(name.to_owned()))?;
+        let mut output = reserve_f32(layout.numel)?;
+        if layout.byte_len == 0 {
+            return Ok(output);
+        }
+
+        self.reader
+            .seek(SeekFrom::Start(absolute))
+            .map_err(|error| io_error("seek to tensor payload", error))?;
+        let mut scratch = [0u8; READ_CHUNK_BYTES];
+        let alignment = layout.dtype.byte_size();
+        let chunk_capacity = scratch.len() - scratch.len() % alignment;
+        let mut remaining = layout.byte_len;
+        while remaining != 0 {
+            let count = remaining.min(chunk_capacity);
+            self.reader
+                .read_exact(&mut scratch[..count])
+                .map_err(|error| io_error("read tensor payload", error))?;
+            append_f32(&mut output, layout.dtype, &scratch[..count]);
+            remaining -= count;
+        }
+        debug_assert_eq!(output.len(), layout.numel);
+        Ok(output)
+    }
+}
+
+fn io_error(operation: &'static str, error: io::Error) -> SafeTensorsError {
+    SafeTensorsError::Io {
+        operation,
+        kind: error.kind(),
+        message: error.to_string(),
     }
 }
 
@@ -250,8 +680,10 @@ impl<'a> SafeTensors<'a> {
 /// [`crate::read_gguf`]; equivalent to [`SafeTensors::parse`].
 ///
 /// # Errors
-/// [`SafeTensorsError::TooShort`] / [`SafeTensorsError::BadHeaderLen`] on a
-/// malformed prefix; [`SafeTensorsError::Json`] on an unparseable header.
+/// [`SafeTensorsError::TooShort`] / [`SafeTensorsError::BadHeaderLen`] /
+/// [`SafeTensorsError::HeaderTooLarge`] on a malformed prefix;
+/// [`SafeTensorsError::Json`] on an unparseable header; or a typed layout,
+/// dtype, shape, or length error for invalid tensor metadata.
 pub fn read_safetensors(bytes: &[u8]) -> Result<SafeTensors<'_>, SafeTensorsError> {
     SafeTensors::parse(bytes)
 }
@@ -335,9 +767,8 @@ mod tests {
         // shape/length mismatch: shape says 4 bf16 (8 bytes), offsets give 4
         let h3 = r#"{"x":{"dtype":"BF16","shape":[4],"data_offsets":[0,4]}}"#;
         let b3 = build(h3, &[0u8; 4]);
-        let st3 = SafeTensors::parse(&b3).unwrap();
         assert!(matches!(
-            st3.tensor_f32("x"),
+            SafeTensors::parse(&b3),
             Err(SafeTensorsError::LengthMismatch { .. })
         ));
 
@@ -345,10 +776,65 @@ mod tests {
         // (must hold in debug, where `*` would otherwise panic on overflow).
         let h4 = r#"{"x":{"dtype":"BF16","shape":[9223372036854775807,4],"data_offsets":[0,2]}}"#;
         let b4 = build(h4, &[0u8; 2]);
-        let st4 = SafeTensors::parse(&b4).unwrap();
         assert!(matches!(
-            st4.tensor_f32("x"),
+            SafeTensors::parse(&b4),
             Err(SafeTensorsError::ShapeOverflow { .. })
         ));
+    }
+
+    #[test]
+    fn whole_container_layout_and_unique_names_fail_closed() {
+        let cases = [
+            (
+                r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[1,5]}}"#,
+                5,
+            ),
+            (
+                r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+                4,
+            ),
+            (
+                r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+                8,
+            ),
+            (
+                r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"y":{"dtype":"F32","shape":[2],"data_offsets":[4,8]}}"#,
+                8,
+            ),
+        ];
+        for (header, data_len) in cases {
+            let bytes = build(header, &vec![0; data_len]);
+            assert!(SafeTensors::parse(&bytes).is_err(), "header: {header}");
+            assert!(
+                SafeTensorsReader::new(std::io::Cursor::new(bytes)).is_err(),
+                "seek header: {header}"
+            );
+        }
+
+        let duplicate = r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        assert!(matches!(
+            SafeTensors::parse(&build(duplicate, &[0; 4])),
+            Err(SafeTensorsError::Json(message)) if message.contains("duplicate header key")
+        ));
+
+        for header in [
+            r#"{"__metadata__":{"format":7}}"#,
+            r#"{"__metadata__":{"format":"pt","format":"torch"}}"#,
+            r#"{"x":{"dtype":"F32","dtype":"F16","shape":[1],"data_offsets":[0,4]}}"#,
+            r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"extra":0}}"#,
+        ] {
+            let bytes = build(header, &[0; 4]);
+            assert!(
+                matches!(SafeTensors::parse(&bytes), Err(SafeTensorsError::Json(_))),
+                "borrowed header: {header}"
+            );
+            assert!(
+                matches!(
+                    SafeTensorsReader::new(std::io::Cursor::new(bytes)),
+                    Err(SafeTensorsError::Json(_))
+                ),
+                "seek header: {header}"
+            );
+        }
     }
 }

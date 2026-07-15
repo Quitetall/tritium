@@ -7,6 +7,7 @@
 #[cfg(feature = "tokenizer")]
 mod bpe_tokenizer;
 mod hf;
+mod hf_shards;
 mod runner;
 mod tokenizer;
 mod training_salt;

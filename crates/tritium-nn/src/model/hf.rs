@@ -10,15 +10,16 @@
 //! ([`ModelWeights::load`], P2e) — share [`build_standard_model`], the one
 //! config-driven skeleton, each supplying its [`NameSchema`] dialect and
 //! projection provider.
-//! Scope: standard SwiGLU/GQA/RoPE models (Llama, SmolLM2, …). Arches needing QK-norm or
-//! QKV-bias are rejected (plan 0037); SSM/MoE are later still. Weights are read eagerly (fine
-//! for the small conformance model); streaming/mmap for 50GB+ masters is plan 0040.
+//! Scope: standard SwiGLU/GQA/RoPE models (Llama, SmolLM2, Qwen2.5, Qwen3). `load_hf` supports
+//! QKV bias and QK-norm; `load_salt` detects and rejects them until plan 0037. SSM/MoE are later.
+//! Safetensors shards are indexed by header and seek-read per requested tensor. The fp loader still
+//! retains the resulting fp32 model; the SALT loader retains only widened 1D norms from the master.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 
-use tritium_format::{PackedSaltTensor, SafeTensors, SaltBundleIndex, read_salt_gguf_packed};
+use tritium_format::{PackedSaltTensor, SaltBundleIndex, read_salt_gguf_packed};
 
 use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
@@ -26,6 +27,7 @@ use crate::layers::{
     DenseLinear, Mlp, Projection, Relu2Mlp, SaltLinear, SwiGluMlp, TokenEmbedding, TransformerBlock,
 };
 use crate::model::ModelWeights;
+use crate::model::hf_shards::HfShardSet;
 
 impl ModelWeights {
     /// Load a standard-transformer fp model from a directory holding `config.json` and
@@ -33,58 +35,40 @@ impl ModelWeights {
     /// alongside the weights.
     ///
     /// # Errors
-    /// [`NnError::MissingConfig`] (bad/absent `config.json`, or an arch needing QK-norm/
-    /// QKV-bias — not yet supported), [`NnError::MissingTensor`] (a schema tensor absent or
-    /// unreadable), or [`NnError::Shape`] (a projection shape mismatch).
+    /// [`NnError::MissingConfig`] (bad/absent `config.json`), [`NnError::MissingTensor`] (a
+    /// schema tensor absent, malformed, or unreadable), or [`NnError::Shape`] (a projection shape
+    /// mismatch).
     pub fn load_hf(dir: &Path) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
         let cfg_path = dir.join("config.json");
         let cfg_json = std::fs::read_to_string(&cfg_path)
             .map_err(|e| NnError::MissingConfig(format!("read {}: {e}", cfg_path.display())))?;
         let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
+        let config_value: serde_json::Value = serde_json::from_str(&cfg_json)
+            .map_err(|error| NnError::MissingConfig(format!("invalid config.json: {error}")))?;
+        let declared_vocab = declared_vocab_size(&config_value)?;
 
-        // Read every shard eagerly, parse each, and index tensor name → shard.
-        let shards = resolve_shards(dir)?;
-        let shard_bytes: Vec<Vec<u8>> = shards
-            .iter()
-            .map(|p| {
-                std::fs::read(p)
-                    .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", p.display())))
-            })
-            .collect::<Result<_, _>>()?;
-        let views: Vec<SafeTensors> = shard_bytes
-            .iter()
-            .map(|b| {
-                SafeTensors::parse(b)
-                    .map_err(|e| NnError::MissingTensor(format!("parse safetensors: {e}")))
-            })
-            .collect::<Result<_, _>>()?;
-        let mut loc: HashMap<&str, usize> = HashMap::new();
-        for (i, v) in views.iter().enumerate() {
-            for n in v.names() {
-                loc.insert(n, i);
-            }
-        }
+        let shards = HfShardSet::open(dir)?;
         // Detect Qwen-family features from the actual weights (config flags don't always
         // advertise them) and enable them: Qwen2/2.5 QKV bias, Qwen3 per-head QK-norm.
-        spec.qkv_bias = loc.keys().any(|k| k.ends_with(".q_proj.bias"));
-        spec.qk_norm = loc.keys().any(|k| k.ends_with(".q_norm.weight"));
-        let get = |name: &str| -> Result<Vec<f32>, NnError> {
-            let i = *loc
-                .get(name)
-                .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
-            views[i]
-                .tensor_f32(name)
-                .map_err(|e| NnError::MissingTensor(format!("{name}: {e}")))
+        (spec.qkv_bias, spec.qk_norm) =
+            resolve_optional_attention_weights(&config, &config_value, &shards);
+        let get = |name: &str, request: DenseTensorRequest| -> Result<Vec<f32>, NnError> {
+            match request {
+                DenseTensorRequest::Vector { len } => shards.tensor_f32_exact(name, &[len]),
+                DenseTensorRequest::TokenEmbedding { columns } => {
+                    shards.tensor_f32_matrix(name, declared_vocab, columns)
+                }
+            }
         };
-        // Every tensor is read from the safetensors as exact fp32.
+        // Every requested tensor is seek-read from its shard and widened exactly to fp32.
         let weights = build_standard_model(
             &config,
             &spec,
             NameSchema::Hf,
-            |n| get(n),
+            |name, request| get(name, request),
             |name, n_out, k_in| {
                 Ok(Projection::Dense(DenseLinear::new_exact(
-                    get(name)?,
+                    shards.tensor_f32_exact(name, &[n_out, k_in])?,
                     n_out,
                     k_in,
                 )?))
@@ -112,18 +96,19 @@ impl ModelWeights {
         let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
         let config_value: serde_json::Value = serde_json::from_str(&cfg_json)
             .map_err(|e| NnError::MissingConfig(format!("invalid config.json: {e}")))?;
-        let declared_vocab = match config_value.get("vocab_size") {
-            None => None,
-            Some(value) => {
-                let raw = value
-                    .as_u64()
-                    .ok_or_else(|| NnError::MissingConfig("vocab_size".to_owned()))?;
-                Some(
-                    usize::try_from(raw)
-                        .map_err(|_| NnError::MissingConfig("vocab_size overflows usize".into()))?,
-                )
-            }
-        };
+        let declared_vocab = declared_vocab_size(&config_value)?;
+
+        // Index only the master headers. Feature detection and all norm geometry checks happen
+        // before any payload is read; unsupported Qwen masters also fail before loading the SALT
+        // artifact itself.
+        let shards = HfShardSet::open(model_dir)?;
+        (spec.qkv_bias, spec.qk_norm) =
+            resolve_optional_attention_weights(&config, &config_value, &shards);
+        if spec.qkv_bias || spec.qk_norm {
+            return Err(NnError::MissingConfig(
+                "SALT inference of QKV-bias/QK-norm (Qwen) models is not yet supported".to_owned(),
+            ));
+        }
 
         // TSLB uses a validated borrowed index so only the requested tensor is decoded, then
         // flattened into final packed storage. SALT-GGUF preserves the same dense/sparse rows.
@@ -148,40 +133,6 @@ impl ModelWeights {
                     .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?,
             )
         };
-
-        // The 1D norms (and any tensor the bundle lacks) come from the original safetensors.
-        let shard_bytes: Vec<Vec<u8>> = resolve_shards(model_dir)?
-            .iter()
-            .map(|p| {
-                std::fs::read(p)
-                    .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", p.display())))
-            })
-            .collect::<Result<_, _>>()?;
-        let views: Vec<SafeTensors> = shard_bytes
-            .iter()
-            .map(|b| {
-                SafeTensors::parse(b)
-                    .map_err(|e| NnError::MissingTensor(format!("parse safetensors: {e}")))
-            })
-            .collect::<Result<_, _>>()?;
-        let mut loc: HashMap<&str, usize> = HashMap::new();
-        for (i, v) in views.iter().enumerate() {
-            for n in v.names() {
-                loc.insert(n, i);
-            }
-        }
-
-        // Detect Qwen-family features from the MASTER weights (bias/QK-norm are 1D → they live in
-        // the safetensors, not the bundle). SALT inference of those isn't supported yet — reject
-        // loudly rather than silently building a bias-less / QK-norm-less model. (load_hf runs this
-        // same detection; load_salt must too, or its guard is dead.)
-        spec.qkv_bias = loc.keys().any(|k| k.ends_with(".q_proj.bias"));
-        spec.qk_norm = loc.keys().any(|k| k.ends_with(".q_norm.weight"));
-        if spec.qkv_bias || spec.qk_norm {
-            return Err(NnError::MissingConfig(
-                "SALT inference of QKV-bias/QK-norm (Qwen) models is not yet supported".to_owned(),
-            ));
-        }
 
         // The token table is one packed allocation shared by gather and the tied head. Validate
         // its declared config geometry before any model assembly.
@@ -214,20 +165,20 @@ impl ModelWeights {
         )?;
 
         // Only 1D norms come from the fp master.
-        let provider = |name: &str| -> Result<Vec<f32>, NnError> {
-            let i = *loc
-                .get(name)
-                .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
-            views[i]
-                .tensor_f32(name)
-                .map_err(|e| NnError::MissingTensor(format!("{name}: {e}")))
+        let provider = |name: &str, request: DenseTensorRequest| -> Result<Vec<f32>, NnError> {
+            let DenseTensorRequest::Vector { len } = request else {
+                return Err(NnError::Backend(format!(
+                    "unexpected token-table request for `{name}`"
+                )));
+            };
+            shards.tensor_f32_exact(name, &[len])
         };
         let weights = build_standard_model_with_embedding(
             &config,
             &spec,
             NameSchema::Hf,
             token_embd,
-            |n| provider(n),
+            |name, request| provider(name, request),
             |name, n_out, k_in| {
                 let tensor = source.tensor(name)?;
                 Ok(Projection::Salt(SaltLinear::from_packed_rows(
@@ -344,6 +295,15 @@ impl NameSchema {
     }
 }
 
+/// Geometry requested from a model builder's dense-tensor provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenseTensorRequest {
+    /// Dense token table with a configuration-derived hidden width.
+    TokenEmbedding { columns: usize },
+    /// One-dimensional tensor with an exact configuration-derived length.
+    Vector { len: usize },
+}
+
 /// Assemble [`ModelWeights`] for a standard transformer — THE one config-driven
 /// loading skeleton (P2e). `dense` provides 1D norms + a dense embedding (name →
 /// fp32); `proj` builds each other 2D projection (name, n_out, k_in) — exact-fp
@@ -355,11 +315,14 @@ pub(crate) fn build_standard_model(
     config: &ModelConfig,
     spec: &ArchSpec,
     schema: NameSchema,
-    dense: impl Fn(&str) -> Result<Vec<f32>, NnError>,
+    dense: impl Fn(&str, DenseTensorRequest) -> Result<Vec<f32>, NnError>,
     proj: impl FnMut(&str, usize, usize) -> Result<Projection, NnError>,
 ) -> Result<ModelWeights, NnError> {
     let n_embd = config.n_embd as usize;
-    let token_values = dense(schema.top("token_embd"))?;
+    let token_values = dense(
+        schema.top("token_embd"),
+        DenseTensorRequest::TokenEmbedding { columns: n_embd },
+    )?;
     if n_embd == 0 || token_values.is_empty() || token_values.len() % n_embd != 0 {
         return Err(NnError::Shape {
             expected: n_embd,
@@ -380,7 +343,7 @@ pub(crate) fn build_standard_model_with_embedding(
     spec: &ArchSpec,
     schema: NameSchema,
     token_embd: TokenEmbedding,
-    dense: impl Fn(&str) -> Result<Vec<f32>, NnError>,
+    dense: impl Fn(&str, DenseTensorRequest) -> Result<Vec<f32>, NnError>,
     mut proj: impl FnMut(&str, usize, usize) -> Result<Projection, NnError>,
 ) -> Result<ModelWeights, NnError> {
     let n_embd = config.n_embd as usize;
@@ -395,7 +358,17 @@ pub(crate) fn build_standard_model_with_embedding(
     let q_width = config.n_head as usize * head_dim;
     let kv_width = config.n_head_kv as usize * head_dim;
     let n_ff = config.n_ff as usize;
-    let output_norm = dense(schema.top("output_norm"))?;
+    let dense_exact = |name: &str, expected: usize| -> Result<Vec<f32>, NnError> {
+        let values = dense(name, DenseTensorRequest::Vector { len: expected })?;
+        if values.len() != expected {
+            return Err(NnError::Shape {
+                expected,
+                got: values.len(),
+            });
+        }
+        Ok(values)
+    };
+    let output_norm = dense_exact(schema.top("output_norm"), n_embd)?;
 
     let mut layers = Vec::with_capacity(config.n_layers as usize);
     for i in 0..config.n_layers as usize {
@@ -412,7 +385,7 @@ pub(crate) fn build_standard_model_with_embedding(
                 up,
                 down,
                 ffn_sub_norm: if spec.ffn_sub_norm {
-                    dense(&p("ffn_sub_norm"))?
+                    dense_exact(&p("ffn_sub_norm"), n_ff)?
                 } else {
                     Vec::new()
                 },
@@ -422,15 +395,18 @@ pub(crate) fn build_standard_model_with_embedding(
         // Optional Qwen2/2.5 QKV bias and Qwen3 QK-norm (empty = absent).
         let (q_bias, k_bias, v_bias) = if spec.qkv_bias {
             (
-                dense(&p("q_bias"))?,
-                dense(&p("k_bias"))?,
-                dense(&p("v_bias"))?,
+                dense_exact(&p("q_bias"), q_width)?,
+                dense_exact(&p("k_bias"), kv_width)?,
+                dense_exact(&p("v_bias"), kv_width)?,
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
         let (q_norm, k_norm) = if spec.qk_norm {
-            (dense(&p("q_norm"))?, dense(&p("k_norm"))?)
+            (
+                dense_exact(&p("q_norm"), head_dim)?,
+                dense_exact(&p("k_norm"), head_dim)?,
+            )
         } else {
             (Vec::new(), Vec::new())
         };
@@ -453,14 +429,14 @@ pub(crate) fn build_standard_model_with_embedding(
             }
         }
         layers.push(TransformerBlock {
-            attn_norm: dense(&p("attn_norm"))?,
+            attn_norm: dense_exact(&p("attn_norm"), n_embd)?,
             q_proj: proj(&p("q"), q_width, n_embd)?,
             k_proj: proj(&p("k"), kv_width, n_embd)?,
             v_proj: proj(&p("v"), kv_width, n_embd)?,
             o_proj: proj(&p("o"), n_embd, q_width)?,
             // BitNet applies attn_sub_norm before o_proj; absent elsewhere.
             attn_sub_norm: if spec.attn_sub_norm {
-                dense(&p("attn_sub_norm"))?
+                dense_exact(&p("attn_sub_norm"), q_width)?
             } else {
                 Vec::new()
             },
@@ -469,7 +445,7 @@ pub(crate) fn build_standard_model_with_embedding(
             v_bias,
             q_norm,
             k_norm,
-            ffn_norm: dense(&p("ffn_norm"))?,
+            ffn_norm: dense_exact(&p("ffn_norm"), n_embd)?,
             mlp,
         });
     }
@@ -491,50 +467,50 @@ pub(crate) fn build_standard_model_with_embedding(
     })
 }
 
-/// Resolve a model directory to its safetensors shard files, in deterministic order:
-/// `model.safetensors.index.json` (`weight_map`) → a lone `model.safetensors` → else every
-/// `*.safetensors` in the directory, sorted.
-fn resolve_shards(dir: &Path) -> Result<Vec<PathBuf>, NnError> {
-    let idx = dir.join("model.safetensors.index.json");
-    if idx.exists() {
-        let txt = std::fs::read_to_string(&idx)
-            .map_err(|e| NnError::MissingTensor(format!("read index: {e}")))?;
-        let json: serde_json::Value = serde_json::from_str(&txt)
-            .map_err(|e| NnError::MissingTensor(format!("parse index: {e}")))?;
-        let wm = json
-            .get("weight_map")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| NnError::MissingTensor("index.json has no weight_map".to_owned()))?;
-        let mut set = BTreeSet::new();
-        for v in wm.values() {
-            if let Some(s) = v.as_str() {
-                set.insert(dir.join(s));
-            }
-        }
-        if set.is_empty() {
-            return Err(NnError::MissingTensor(
-                "index.json lists no shards".to_owned(),
-            ));
-        }
-        return Ok(set.into_iter().collect());
-    }
-    let single = dir.join("model.safetensors");
-    if single.is_file() {
-        return Ok(vec![single]);
-    }
-    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| NnError::MissingTensor(format!("read dir {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    v.sort();
-    if v.is_empty() {
-        return Err(NnError::MissingTensor(format!(
-            "no `.safetensors` in {}",
-            dir.display()
-        )));
-    }
-    Ok(v)
+fn declared_vocab_size(config: &serde_json::Value) -> Result<Option<usize>, NnError> {
+    let Some(value) = config.get("vocab_size") else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| NnError::MissingConfig("vocab_size".to_owned()))?;
+    usize::try_from(raw)
+        .map(Some)
+        .map_err(|_| NnError::MissingConfig("vocab_size overflows usize".to_owned()))
+}
+
+fn resolve_optional_attention_weights(
+    config: &ModelConfig,
+    config_value: &serde_json::Value,
+    shards: &HfShardSet,
+) -> (bool, bool) {
+    let detected_qkv_bias = shards.names().any(|name| {
+        [".q_proj.bias", ".k_proj.bias", ".v_proj.bias"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    });
+    let detected_qk_norm = shards.names().any(|name| {
+        [".q_norm.weight", ".k_norm.weight"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    });
+    let arch = config.arch.to_ascii_lowercase();
+    let architecture_requires_qkv_bias = arch.starts_with("qwen2");
+    let architecture_requires_qk_norm = arch.starts_with("qwen3");
+    let config_requires_qkv_bias = config_value
+        .get("attention_bias")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let config_requires_qk_norm = ["use_qk_norm", "qk_norm"].iter().any(|key| {
+        config_value
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
+    (
+        detected_qkv_bias || architecture_requires_qkv_bias || config_requires_qkv_bias,
+        detected_qk_norm || architecture_requires_qk_norm || config_requires_qk_norm,
+    )
 }
 
 #[cfg(test)]
@@ -600,25 +576,63 @@ mod tests {
             t("model.layers.0.mlp.up_proj.weight", &[n_ff, n_embd]),
             t("model.layers.0.mlp.down_proj.weight", &[n_embd, n_ff]),
         ];
-        let refs: Vec<(&str, &[usize], Vec<f32>)> = tensors
-            .iter()
-            .map(|(n, s, v)| (*n, s.as_slice(), v.clone()))
-            .collect();
-
         let dir = std::env::temp_dir().join(format!("tritium-hf-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("model.safetensors"), safetensors(&refs)).unwrap();
+        let shard_for = |name: &str| {
+            if name.ends_with("norm.weight") || name.ends_with("layernorm.weight") {
+                "model-00002-of-00002.safetensors"
+            } else {
+                "model-00001-of-00002.safetensors"
+            }
+        };
+        for shard in [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ] {
+            let refs: Vec<(&str, &[usize], Vec<f32>)> = tensors
+                .iter()
+                .filter(|(name, _, _)| shard_for(name) == shard)
+                .map(|(name, shape, values)| (*name, shape.as_slice(), values.clone()))
+                .collect();
+            std::fs::write(dir.join(shard), safetensors(&refs)).unwrap();
+        }
+        let weight_map = tensors
+            .iter()
+            .map(|(name, _, _)| format!(r#""{name}":"{}""#, shard_for(name)))
+            .collect::<Vec<_>>()
+            .join(",");
         std::fs::write(
-            dir.join("config.json"),
-            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
-                "num_attention_heads":2,"num_key_value_heads":1,"intermediate_size":16,
-                "rms_norm_eps":1e-5,"hidden_act":"silu","tie_word_embeddings":true,
-                "rope_theta":10000.0,"vocab_size":10}"#,
+            dir.join("model.safetensors.index.json"),
+            format!(r#"{{"weight_map":{{{weight_map}}}}}"#),
         )
         .unwrap();
+        let config_json = r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"num_key_value_heads":1,"intermediate_size":16,
+                "rms_norm_eps":1e-5,"hidden_act":"silu","tie_word_embeddings":true,
+                "rope_theta":10000.0,"vocab_size":10}"#;
+        std::fs::write(dir.join("config.json"), config_json).unwrap();
 
         let (config, spec, weights) = ModelWeights::load_hf(&dir).expect("load_hf");
+        // Architecture-required Qwen families cannot disappear completely. Header detection
+        // catches partial families; the config/architecture fallback catches total omission.
+        for (arch, expected_missing) in [("qwen2", "q_proj.bias"), ("qwen3", "q_norm.weight")] {
+            std::fs::write(
+                dir.join("config.json"),
+                config_json.replace(
+                    r#""model_type":"llama""#,
+                    &format!(r#""model_type":"{arch}""#),
+                ),
+            )
+            .unwrap();
+            let error = ModelWeights::load_hf(&dir)
+                .err()
+                .expect("Qwen optional family omission must fail");
+            assert!(
+                error.to_string().contains(expected_missing),
+                "{arch} omitted family error: {error}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(config.n_layers, 1);
@@ -792,7 +806,7 @@ mod tests {
             &oracle_config,
             &oracle_spec,
             NameSchema::Hf,
-            |name| dense_provider(name),
+            |name, _expected_len| dense_provider(name),
             |name, n_out, k_in| {
                 Ok(Projection::Dense(DenseLinear::new(
                     dense_provider(name)?,
@@ -824,6 +838,40 @@ mod tests {
             .forward(&tokens, &positions)
             .expect("forward v1");
         assert_eq!(legacy_logits, logits, "v1 and v2 runtime logits must match");
+
+        // Master norm metadata is checked before seek-reading its payload. Rank matters, not
+        // merely numel: `[1, hidden]` must not masquerade as `[hidden]`.
+        for (label, bad_shape, bad_values) in [
+            ("rank", vec![1, n_embd], fill(n_embd)),
+            ("length", vec![n_embd + 1], fill(n_embd + 1)),
+        ] {
+            let malformed = [
+                (
+                    "model.norm.weight",
+                    bad_shape.as_slice(),
+                    bad_values.clone(),
+                ),
+                (
+                    "model.layers.0.input_layernorm.weight",
+                    &[n_embd][..],
+                    fill(n_embd),
+                ),
+                (
+                    "model.layers.0.post_attention_layernorm.weight",
+                    &[n_embd][..],
+                    fill(n_embd),
+                ),
+            ];
+            std::fs::write(dir.join("model.safetensors"), safetensors(&malformed)).unwrap();
+            let error = ModelWeights::load_salt(&dir, &bundle_path)
+                .err()
+                .expect("malformed norm shape must fail");
+            assert!(
+                error.to_string().contains("has shape"),
+                "{label} error: {error}"
+            );
+        }
+        std::fs::write(dir.join("model.safetensors"), safetensors(&refs)).unwrap();
 
         // Negative: a bundle MISSING a 2D weight must error — never silently load the fp master.
         let partial: Vec<(&str, &[SaltRow])> = salt
@@ -914,28 +962,51 @@ mod tests {
             Err(NnError::Shape { .. })
         ));
 
-        // Negative: a master carrying a QKV bias (Qwen) → SALT inference rejected, not silently
-        // built bias-less. (load_salt detects bias/QK-norm from the master weights, like load_hf.)
+        // Negative: any member of an optional Qwen family must enable that family. A partial
+        // checkpoint is rejected, never silently treated as bias/QK-norm-free. This check runs
+        // before the SALT path is opened.
         let qdir = std::env::temp_dir().join(format!("tritium-salt-qwen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&qdir);
         std::fs::create_dir_all(&qdir).unwrap();
-        let qshape = [qw];
-        let bias: Vec<(&str, &[usize], Vec<f32>)> =
-            vec![("model.layers.0.self_attn.q_proj.bias", &qshape, fill(qw))];
-        std::fs::write(qdir.join("model.safetensors"), safetensors(&bias)).unwrap();
-        std::fs::copy(dir.join("config.json"), qdir.join("config.json")).unwrap();
-        std::fs::write(
-            qdir.join("model.tslb"),
-            write_salt_bundle(&bundle_refs).unwrap(),
-        )
-        .unwrap();
-        let err = ModelWeights::load_salt(&qdir, &qdir.join("model.tslb"))
-            .err()
-            .expect("load_salt must reject a QKV-bias (Qwen) master");
-        assert!(
-            matches!(err, crate::NnError::MissingConfig(_)),
-            "Qwen SALT must be rejected, got {err:?}"
-        );
+        let base_config = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        for (label, arch, name, len) in [
+            ("omitted-bias", "qwen2", "model.norm.weight", n_embd),
+            ("omitted-qk-norm", "qwen3", "model.norm.weight", n_embd),
+            (
+                "partial-bias",
+                "llama",
+                "model.layers.0.self_attn.k_proj.bias",
+                kw,
+            ),
+            (
+                "partial-qk-norm",
+                "llama",
+                "model.layers.0.self_attn.k_norm.weight",
+                hd,
+            ),
+        ] {
+            std::fs::write(
+                qdir.join("config.json"),
+                base_config.replace(
+                    r#""model_type":"llama""#,
+                    &format!(r#""model_type":"{arch}""#),
+                ),
+            )
+            .unwrap();
+            let shape = [len];
+            std::fs::write(
+                qdir.join("model.safetensors"),
+                safetensors(&[(name, &shape, fill(len))]),
+            )
+            .unwrap();
+            let error = ModelWeights::load_salt(&qdir, &qdir.join("missing.tslb"))
+                .err()
+                .expect("load_salt must reject a partial Qwen master");
+            assert!(
+                matches!(error, crate::NnError::MissingConfig(_)),
+                "Qwen SALT case {label} must be rejected, got {error:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&qdir);
 
         // The GGUF source branch and untied-head path must also retain packed rows.
@@ -1016,7 +1087,7 @@ mod tests {
             &untied_config,
             &untied_spec,
             NameSchema::Hf,
-            |name| untied_dense_provider(name),
+            |name, _expected_len| untied_dense_provider(name),
             |name, n_out, k_in| {
                 Ok(Projection::Dense(DenseLinear::new(
                     untied_dense_provider(name)?,

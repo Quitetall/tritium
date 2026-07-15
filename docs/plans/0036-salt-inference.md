@@ -19,9 +19,9 @@ student forward (0038) and 32B scale path need.
 - `tritium_format::salt_rows_to_dense(&[SaltRow]) -> Vec<f32>` (crates/tritium-format/src/salt.rs):
   row-major `[rows, k]` dense, concatenating `dequant_salt_row`. Reused for both a bundle's
   `SaltTensor` and a live `QuantizedTensor.salt_rows` (0038).
-- `build_standard_model(config, spec, provider: Fn(&str)->Vec<f32>, exact_fp)` extracted from
-  `load_hf` (crates/tritium-nn/src/model/hf.rs) — shared assembly; `exact_fp` picks
-  `DenseLinear::new_exact` (fp) vs `new` (A8 int8-activation, deployed semantics).
+- `build_standard_model(config, spec, dense, projection)` extracted from `load_hf`
+  (crates/tritium-nn/src/model/hf.rs) — shared assembly. The dense provider receives expected
+  vector lengths; the projection provider selects exact fp, A8, packed SALT, or backend storage.
 - `ModelWeights::load_salt(model_dir, bundle)` / `ModelRunner::from_salt(...)`: packed ternary 2D
   weights from the bundle and 1D norms from `model_dir`'s safetensors. Rope-scaling guards match
   `load_hf`; QK-norm and QKV-bias are detected in the master shards and rejected until the SALT
@@ -38,7 +38,7 @@ remain the end-to-end regression gate.
 - **GPU native multi-plane wiring** (`read_salt_bundle` → `upload_salt` → resident SALT projection) —
   the VRAM win; matters at 32B → plan 0040. The packed CPU reference proves correctness now.
 - **Self-contained bundle** (quantize also emits norms + config) → `from_salt` needs only the bundle.
-- **Seek-backed norm loading and mapped/streamed bundle input** — still required for 32B; plan 0040.
+- **Mapped/streamed bundle input** — still required for 32B; plan 0040.
 
 ## Post-plan hardening (2026-07-14)
 
@@ -64,9 +64,29 @@ keeping an `N × K` fp32 matrix:
 - The current resident CUDA decoder accepts only dense tied token tables and now explicitly rejects
   untied heads. Packed SALT tables remain on the correct host path until resident kernels land.
 
-This does not yet make 32B loading or serving production-ready. TSLB decoding transiently holds the
-requested packed tensor before flattening it into its final arenas; SALT-GGUF eagerly decodes all
-packed tensors. The loader also reads the whole bundle and fp master shards, and SALT
-projections/token tables do not enter the resident CUDA decoder. The next memory-floor slice is a
-seek-backed safetensors index that reads only selected 1D norms, followed by direct arena or mapped
-bundle input and resident large-K SALT CUDA execution.
+The file-backed `load_salt` fp-master userspace floor is now removed:
+
+- `SafeTensorsReader<R: Read + Seek>` parses and retains only header metadata beyond its caller-owned
+  reader. Requested BF16/F16/F32 tensors are absolute-seek-read through at most 64 KiB of raw
+  staging and widened directly into their final fp32 vector. The file-backed HF adapter therefore
+  does not retain complete master shards or request unselected payload ranges. Bounded header and
+  output reservations plus header, layout, offset, shape, seek, and short-read failures are typed;
+  JSON parser-internal allocation remains allocator-controlled.
+- Both borrowed and seek-backed parsers reject duplicate names, invalid metadata, holes, overlaps,
+  malformed unselected tensors, and trailing unindexed bytes during construction.
+- `HfShardSet` indexes actual tensor names across standard HF shard indexes and powers both
+  `load_hf` and `load_salt`. Index bytes, total tensors, tensor-name bytes, shape dimensions, rank,
+  and shard count are bounded; every index mapping is verified against the selected shard.
+  Duplicate tensor names, non-string entries, and absolute or parent-traversing shard paths fail
+  closed. Operator-provided symlinks remain trusted so standard Hugging Face cache snapshots
+  continue to work.
+- The model builder uses named dense requests carrying each vector's expected length. The HF
+  adapter checks exact metadata rank and shape before allocation or payload I/O, closing the prior
+  wrong-rank/oversized-norm hole. Projection matrices are likewise checked against `[n_out, k_in]`
+  before reading.
+
+This still does not make 32B loading or serving production-ready. The loader reads the whole SALT
+bundle; TSLB decoding transiently holds each requested packed tensor before flattening it into final
+arenas; SALT-GGUF eagerly decodes every packed tensor; and SALT projections/token tables do not enter
+the resident CUDA decoder. The next memory-floor slice is direct-arena or mapped bundle input,
+followed by resident large-K SALT CUDA execution.

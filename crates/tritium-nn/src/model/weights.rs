@@ -114,7 +114,7 @@ impl ModelWeights {
             config,
             &ArchSpec::bitnet(),
             crate::model::hf::NameSchema::Gguf,
-            |name| load_dense(file, bytes, name),
+            |name, _expected_len| load_dense(file, bytes, name),
             // Shape hints unused: load_ternary derives [N, K] from the
             // file's own dims (pre-existing behavior). TODO(non-BitNet GGUF):
             // check them against the config-derived n_out/k_in so a

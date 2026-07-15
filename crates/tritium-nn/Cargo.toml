@@ -30,6 +30,7 @@ rayon = { workspace = true }
 tritium-cuda = { workspace = true, optional = true }
 # `ModelConfig::from_hf_config` parses a HuggingFace `config.json` (library code, so a
 # regular dep, not dev-only).
+serde = { workspace = true }
 serde_json = { workspace = true }
 # Real byte-level BPE behind the `tokenizer` feature: `GgufBpeTokenizer` builds a
 # HuggingFace `tokenizers` pipeline from the vocab/merges a GGUF embeds (single-file
@@ -38,7 +39,6 @@ tokenizers = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-serde = { workspace = true }
 # A concrete backend for the layer/forward integration tests (WF-3): the layers
 # speak the `tritium-spec` contract, so the tests drive them through the CPU
 # ternary mpGEMM. Not a runtime dependency of the crate.
