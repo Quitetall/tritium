@@ -22,10 +22,10 @@ const FISHER_SAMPLE_CONTEXT: &str = "tritium salt v2 fisher curvature sample v1"
 /// Immutable identities that make a curvature sample stream auditable.
 ///
 /// `source_model_digest` binds the source checkpoint, `activation_cache_digest`
-/// binds the exact cached tensor values and shard manifest, and
-/// `token_stream_digest` binds canonical sample order, masks, boundaries, and
-/// tokenizer output. Input activations and output gradients may be paired only
-/// when all three identities agree.
+/// binds the exact cached tensor values, masks, boundaries, and shard manifest,
+/// and `token_stream_digest` binds canonical ordered calibration/token
+/// provenance and tokenizer output. Input activations and output gradients may
+/// be paired only when all three identities agree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CurvatureSourceId {
     source_model_digest: [u8; 32],
@@ -1197,6 +1197,7 @@ impl OutputFisher {
 #[derive(Clone, Debug, PartialEq)]
 pub struct KfacMetric {
     metric: DensePsdMetric,
+    source_id: CurvatureSourceId,
     output_row: usize,
     output_scalar: f64,
     damping: f64,
@@ -1210,6 +1211,12 @@ impl KfacMetric {
     #[must_use]
     pub fn metric(&self) -> &DensePsdMetric {
         &self.metric
+    }
+
+    /// Immutable source-model, activation-cache, and token-stream provenance.
+    #[must_use]
+    pub const fn source_id(&self) -> CurvatureSourceId {
+        self.source_id
     }
 
     /// Output row whose Fisher scalar scaled the input Gram.
@@ -1315,6 +1322,7 @@ pub fn build_kfac_metric(
         .map_err(|_| CurvatureError::InvalidKfacMetric)?;
     Ok(KfacMetric {
         metric,
+        source_id: input_source,
         output_row,
         output_scalar,
         damping: canonicalize_zero(damping),
@@ -1983,6 +1991,7 @@ mod tests {
             1e-4,
         )
         .expect("damping supplies positive diagonal");
+        assert_eq!(metric.source_id(), binding);
         assert_eq!(metric.metric().as_slice(), &[1e-4, 0.0, 0.0, 1e-4]);
     }
 

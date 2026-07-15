@@ -167,6 +167,37 @@ fn incompatible_source_and_evidence_fail_before_work_exists() {
 }
 
 #[test]
+fn zero_content_identities_fail_at_reference_construction() {
+    let zero = ContentId::from_digest([0; 32]);
+    let valid = ContentId::of_bytes(b"valid");
+
+    assert!(matches!(
+        SourceRef::new(zero, "fixture://source"),
+        Err(tritium_salt::SaltError::InvalidField(
+            "source content identity"
+        ))
+    ));
+    assert!(matches!(
+        EvidenceRef::new(zero, valid, "fixture://evidence"),
+        Err(tritium_salt::SaltError::InvalidField(
+            "evidence content identity"
+        ))
+    ));
+    assert!(matches!(
+        EvidenceRef::new(valid, zero, "fixture://evidence"),
+        Err(tritium_salt::SaltError::InvalidField(
+            "evidence source identity"
+        ))
+    ));
+    assert!(matches!(
+        RecipeRef::new(zero, "fixture", "rev"),
+        Err(tritium_salt::SaltError::InvalidField(
+            "recipe content identity"
+        ))
+    ));
+}
+
+#[test]
 fn failed_quality_evidence_is_retained_and_publish_never_runs() {
     let root = unique_temp_dir("quality-failure");
     let spec = spec();

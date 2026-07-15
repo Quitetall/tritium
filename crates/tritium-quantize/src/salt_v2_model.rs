@@ -21,12 +21,13 @@ use crate::salt_v2_allocator::{
     ByteDelta, GroupCandidates, NestedProfileBudgets, PhysicalAllocError, PhysicalBytes,
     PlaneCandidate, ProfileBudget, allocate_nested_profiles,
 };
+use crate::salt_v2_curvature::CurvatureSourceId;
 
-const REFERENCE_SOLVER_VERSION: &str = "tritium-salt-v2-reference-model-fit-v1";
-const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 model fit receipt v1";
+const REFERENCE_SOLVER_VERSION: &str = "tritium-salt-v2-reference-model-fit-v2";
+const RECEIPT_HASH_CONTEXT: &str = "tritium salt v2 model fit receipt v2";
 const RECIPE_HASH_CONTEXT: &str = "tritium salt v2 model fit recipe v1";
 const SOURCE_TENSOR_HASH_CONTEXT: &str = "tritium salt v2 source tensor v1";
-const CURVATURE_HASH_CONTEXT: &str = "tritium salt v2 bound curvature artifact v1";
+const CURVATURE_HASH_CONTEXT: &str = "tritium salt v2 bound curvature artifact v2";
 
 /// Physical ternary codec selected for the complete SALT V2 package.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -176,9 +177,18 @@ enum CurvatureValues<'a> {
 }
 
 /// Digest-bound, validated-at-use curvature evidence for one source tensor.
+///
+/// Construction requires immutable source-model, activation-cache, and token-stream provenance.
+/// [`fit_salt_v2_model`] rejects an artifact unless all three identities match its fit input.
+/// For that model-fit seam, construct [`CurvatureSourceId`] with the exact mapping
+/// `source_model_id.as_bytes()`, `activations.digest()`, and
+/// `activations.spec().source_digest()` respectively. The final value is the cache's canonical
+/// calibration/token-stream provenance envelope; the complete cache digest separately binds its
+/// values, masks, boundaries, and shard manifest.
 #[derive(Clone, Copy, Debug)]
 pub struct CurvatureArtifact<'a> {
     kind: SaltV2Curvature,
+    source_id: CurvatureSourceId,
     evidence_digest: [u8; 32],
     content_digest: [u8; 32],
     values: CurvatureValues<'a>,
@@ -187,13 +197,19 @@ pub struct CurvatureArtifact<'a> {
 impl<'a> CurvatureArtifact<'a> {
     /// Bind a per-weight empirical-Fisher diagonal to its canonical artifact digest.
     #[must_use]
-    pub fn diagonal_fisher(evidence_digest: [u8; 32], diagonal: &'a [f32]) -> Self {
+    pub fn diagonal_fisher(
+        source_id: CurvatureSourceId,
+        evidence_digest: [u8; 32],
+        diagonal: &'a [f32],
+    ) -> Self {
         let values = CurvatureValues::Diagonal(diagonal);
         Self {
             kind: SaltV2Curvature::DiagonalFisher,
+            source_id,
             evidence_digest,
             content_digest: bound_curvature_digest(
                 SaltV2Curvature::DiagonalFisher,
+                source_id,
                 evidence_digest,
                 values,
             ),
@@ -203,13 +219,19 @@ impl<'a> CurvatureArtifact<'a> {
 
     /// Bind groupwise dense input-Hessian blocks to their canonical artifact digest.
     #[must_use]
-    pub fn input_hessian(evidence_digest: [u8; 32], groups: &'a [DensePsdMetric]) -> Self {
+    pub fn input_hessian(
+        source_id: CurvatureSourceId,
+        evidence_digest: [u8; 32],
+        groups: &'a [DensePsdMetric],
+    ) -> Self {
         let values = CurvatureValues::DenseGroups(groups);
         Self {
             kind: SaltV2Curvature::InputHessian,
+            source_id,
             evidence_digest,
             content_digest: bound_curvature_digest(
                 SaltV2Curvature::InputHessian,
+                source_id,
                 evidence_digest,
                 values,
             ),
@@ -219,13 +241,19 @@ impl<'a> CurvatureArtifact<'a> {
 
     /// Bind groupwise dense guided-Fisher blocks to their canonical artifact digest.
     #[must_use]
-    pub fn guided_fisher(evidence_digest: [u8; 32], groups: &'a [DensePsdMetric]) -> Self {
+    pub fn guided_fisher(
+        source_id: CurvatureSourceId,
+        evidence_digest: [u8; 32],
+        groups: &'a [DensePsdMetric],
+    ) -> Self {
         let values = CurvatureValues::DenseGroups(groups);
         Self {
             kind: SaltV2Curvature::GuidedFisher,
+            source_id,
             evidence_digest,
             content_digest: bound_curvature_digest(
                 SaltV2Curvature::GuidedFisher,
+                source_id,
                 evidence_digest,
                 values,
             ),
@@ -235,13 +263,19 @@ impl<'a> CurvatureArtifact<'a> {
 
     /// Bind groupwise forward-KL Kronecker blocks to their canonical artifact digest.
     #[must_use]
-    pub fn forward_kl_kronecker(evidence_digest: [u8; 32], groups: &'a [DensePsdMetric]) -> Self {
+    pub fn forward_kl_kronecker(
+        source_id: CurvatureSourceId,
+        evidence_digest: [u8; 32],
+        groups: &'a [DensePsdMetric],
+    ) -> Self {
         let values = CurvatureValues::DenseGroups(groups);
         Self {
             kind: SaltV2Curvature::ForwardKlKronecker,
+            source_id,
             evidence_digest,
             content_digest: bound_curvature_digest(
                 SaltV2Curvature::ForwardKlKronecker,
+                source_id,
                 evidence_digest,
                 values,
             ),
@@ -253,6 +287,12 @@ impl<'a> CurvatureArtifact<'a> {
     #[must_use]
     pub const fn kind(self) -> SaltV2Curvature {
         self.kind
+    }
+
+    /// Immutable source-model, activation-cache, and token-stream provenance.
+    #[must_use]
+    pub const fn source_id(self) -> CurvatureSourceId {
+        self.source_id
     }
 
     /// Upstream evidence digest supplied by the curvature builder.
@@ -326,8 +366,6 @@ pub enum SaltV2FitTrack {
 pub enum SaltV2ExternalStage {
     /// Signed randomized Hadamard transform and its online execution contract.
     SignedRht,
-    /// S34-constrained discrete fitting.
-    StructuredS34Fit,
     /// Cached-activation block-output reconstruction.
     BlockOutputReconstruction,
     /// Fixed-trit scale-only teacher-KL refinement.
@@ -589,6 +627,21 @@ pub enum SaltV2Error {
         /// Supplied recipe.
         got: SaltV2Curvature,
     },
+    /// Curvature evidence was produced for a different semantic source model.
+    CurvatureSourceModelMismatch {
+        /// Tensor ordinal.
+        tensor: usize,
+    },
+    /// Curvature evidence was produced from a different activation-cache artifact.
+    CurvatureActivationCacheMismatch {
+        /// Tensor ordinal.
+        tensor: usize,
+    },
+    /// Curvature evidence used a different calibration/token-stream provenance envelope.
+    CurvatureTokenStreamMismatch {
+        /// Tensor ordinal.
+        tensor: usize,
+    },
     /// A curvature artifact had the wrong diagonal or dense-block geometry.
     CurvatureGeometry {
         /// Tensor ordinal.
@@ -699,6 +752,18 @@ impl fmt::Display for SaltV2Error {
                 formatter,
                 "tensor {tensor} curvature is {got:?}, expected {expected:?}"
             ),
+            Self::CurvatureSourceModelMismatch { tensor } => write!(
+                formatter,
+                "tensor {tensor} curvature source model does not match the fit input"
+            ),
+            Self::CurvatureActivationCacheMismatch { tensor } => write!(
+                formatter,
+                "tensor {tensor} curvature activation cache does not match the fit input"
+            ),
+            Self::CurvatureTokenStreamMismatch { tensor } => write!(
+                formatter,
+                "tensor {tensor} curvature token stream does not match the activation cache provenance"
+            ),
             Self::CurvatureGeometry { tensor } => {
                 write!(
                     formatter,
@@ -779,18 +844,20 @@ struct TensorFitWork {
 
 /// Fit a small whole model with the deterministic CPU reference solver.
 ///
-/// Every 256-coefficient allocation tile is jointly fit once at P=3. A deterministic progressive
-/// plane order produces exact P=1/P=2 prefixes, so separately budgeted compact and near-lossless
-/// runs slice identical trits and scales instead of refitting them. Each plane retains one
-/// non-negative f16 scale per group128. The exact Pareto dynamic program in the shared allocator
-/// selects a whole-model point under transformed integer package, artifact, and resident ceilings;
-/// the canonical package writer then remeasures and verifies every component. The returned
+/// For D2/B3, every 256-coefficient allocation tile is jointly fit once at P=3 and a deterministic
+/// plane order produces exact P=1/P=2 prefixes. S34 constructs and jointly refines one constrained
+/// nested master frontier. Separately budgeted compact and near-lossless runs therefore slice
+/// identical trits and scales instead of refitting them. Each plane retains one non-negative f16
+/// scale per group128. The exact Pareto dynamic program in the shared allocator selects a
+/// whole-model point under transformed integer package, artifact, and resident ceilings; the
+/// canonical package writer then remeasures and verifies every component. The returned
 /// representation has no zero point, bias, codebook, or floating residual.
 ///
-/// This function intentionally implements only the pure-PTQ reference seam. Signed RHT,
-/// S34-constrained assignment, cached-output reconstruction, scale-only recovery, and short PV
-/// recovery return [`SaltV2Error::ExternalStageRequired`] rather than silently falling back to a
-/// weaker algorithm. The receipt reports feedback/output reconstruction as false.
+/// This function intentionally implements only the pure-PTQ reference seam. S34 uses a
+/// deterministic constrained CPU solver that preserves exact progressive prefixes. Signed RHT,
+/// cached-output reconstruction, scale-only recovery, and short PV recovery return
+/// [`SaltV2Error::ExternalStageRequired`] rather than silently falling back to a weaker algorithm.
+/// The receipt reports feedback/output reconstruction as false.
 ///
 /// # Errors
 /// Rejects malformed recipes or tensors, missing/mismatched curvature evidence, unavailable
@@ -1130,11 +1197,6 @@ fn validate_external_stages(config: &SaltV2Config) -> Result<(), SaltV2Error> {
             stage: SaltV2ExternalStage::SignedRht,
         });
     }
-    if config.packing == SaltV2Packing::S34 {
-        return Err(SaltV2Error::ExternalStageRequired {
-            stage: SaltV2ExternalStage::StructuredS34Fit,
-        });
-    }
     match config.refinement {
         SaltV2Refinement::None => Ok(()),
         SaltV2Refinement::ScaleOnly { .. } => Err(SaltV2Error::ExternalStageRequired {
@@ -1153,6 +1215,13 @@ fn validate_model_input(
     if input.tensors.is_empty() {
         return Err(SaltV2Error::EmptyModel);
     }
+    let source_model_digest = *input.source_model_id.as_bytes();
+    let activation_cache_digest = input.activations.digest().into_bytes();
+    // ActivationCacheSpec::source_digest is the canonical calibration-provenance envelope. Its
+    // contract includes the ordered token stream, tokenizer, corpus revision, and sampling seed;
+    // the cache digest above separately binds masks and boundaries. The solve boundary treats the
+    // exact source envelope as its token-stream evidence.
+    let token_stream_digest = input.activations.spec().source_digest().into_bytes();
     let mut names = BTreeSet::new();
     let mut quantized = 0u64;
     for (tensor_index, tensor) in input.tensors.iter().enumerate() {
@@ -1182,6 +1251,22 @@ fn validate_model_input(
             return Err(SaltV2Error::NonFiniteWeight {
                 tensor: tensor_index,
                 index,
+            });
+        }
+        let curvature_source = tensor.curvature.source_id();
+        if curvature_source.source_model_digest() != source_model_digest {
+            return Err(SaltV2Error::CurvatureSourceModelMismatch {
+                tensor: tensor_index,
+            });
+        }
+        if curvature_source.activation_cache_digest() != activation_cache_digest {
+            return Err(SaltV2Error::CurvatureActivationCacheMismatch {
+                tensor: tensor_index,
+            });
+        }
+        if curvature_source.token_stream_digest() != token_stream_digest {
+            return Err(SaltV2Error::CurvatureTokenStreamMismatch {
+                tensor: tensor_index,
             });
         }
         if tensor.curvature.kind != config.curvature {
@@ -1357,41 +1442,76 @@ fn fit_tile_frontier(
         let group_end = (group_start + SALT_V2_SCALE_GROUP_SIZE).min(tile_end);
         let group_index = group_start / SALT_V2_SCALE_GROUP_SIZE;
         let metric = curvature_metric(tensor.curvature, group_start, group_end, group_index);
-        let fitted = fit_joint_ternary(
-            &tensor.weights[group_start..group_end],
-            metric,
-            JointFitConfig {
-                planes: FULL_PLANES,
-                max_iterations: config.coordinate_sweeps,
-                ridge: 1e-12,
-                em_restarts: config.em_restarts,
-                ridge_condition_limit: config.ridge_condition_limit,
-                scale_precision: ScalePrecision::F16,
-            },
-        )
-        .map_err(|source| SaltV2Error::JointFit {
-            tensor: tensor_index,
-            tile: tile_index,
-            group: group_index,
-            planes: FULL_PLANES,
-            source,
-        })?;
         let weights = &tensor.weights[group_start..group_end];
-        let order = progressive_plane_order(weights, metric, &fitted.scales, &fitted.trits).ok_or(
-            SaltV2Error::NonMonotoneCandidate {
+        let (scales, trits, order) = if config.packing == SaltV2Packing::S34 {
+            let fitted = fit_progressive_s34(
+                weights,
+                metric,
+                JointFitConfig {
+                    planes: FULL_PLANES,
+                    max_iterations: config.coordinate_sweeps,
+                    ridge: 1e-12,
+                    em_restarts: config.em_restarts,
+                    ridge_condition_limit: config.ridge_condition_limit,
+                    scale_precision: ScalePrecision::F16,
+                },
+            )
+            .map_err(|source| SaltV2Error::JointFit {
                 tensor: tensor_index,
                 tile: tile_index,
-                planes: 2,
-            },
-        )?;
+                group: group_index,
+                planes: FULL_PLANES,
+                source,
+            })?;
+            (fitted.scales, fitted.trits, [0, 1, 2])
+        } else {
+            let fitted = fit_joint_ternary(
+                weights,
+                metric,
+                JointFitConfig {
+                    planes: FULL_PLANES,
+                    max_iterations: config.coordinate_sweeps,
+                    ridge: 1e-12,
+                    em_restarts: config.em_restarts,
+                    ridge_condition_limit: config.ridge_condition_limit,
+                    scale_precision: ScalePrecision::F16,
+                },
+            )
+            .map_err(|source| SaltV2Error::JointFit {
+                tensor: tensor_index,
+                tile: tile_index,
+                group: group_index,
+                planes: FULL_PLANES,
+                source,
+            })?;
+            let order = progressive_plane_order(weights, metric, &fitted.scales, &fitted.trits)
+                .ok_or(SaltV2Error::NonMonotoneCandidate {
+                    tensor: tensor_index,
+                    tile: tile_index,
+                    planes: 2,
+                })?;
+            (fitted.scales, fitted.trits, order)
+        };
         let mut reconstruction = vec![0.0f32; weights.len()];
         for prefix in 0..FULL_PLANES {
             let source_plane = order[prefix];
-            let scale = fitted.scales[source_plane];
-            for (value, trit) in reconstruction.iter_mut().zip(&fitted.trits[source_plane]) {
+            let scale = scales[source_plane];
+            for (value, trit) in reconstruction.iter_mut().zip(&trits[source_plane]) {
                 *value += scale * f32::from(*trit);
             }
-            hessian_errors[prefix] += reconstruction_objective(weights, &reconstruction, metric);
+            hessian_errors[prefix] += if config.packing == SaltV2Packing::S34 {
+                checked_s34_objective(weights, &reconstruction, metric).map_err(|source| {
+                    SaltV2Error::JointFit {
+                        tensor: tensor_index,
+                        tile: tile_index,
+                        group: group_index,
+                        planes: prefix + 1,
+                        source,
+                    }
+                })?
+            } else {
+                reconstruction_objective(weights, &reconstruction, metric)
+            };
             frobenius_errors[prefix] += weights
                 .iter()
                 .zip(&reconstruction)
@@ -1400,7 +1520,7 @@ fn fit_tile_frontier(
                     residual * residual
                 })
                 .sum::<f64>();
-            plane_trits[prefix].extend_from_slice(&fitted.trits[source_plane]);
+            plane_trits[prefix].extend_from_slice(&trits[source_plane]);
             plane_scales[prefix].push(f16::from_f32(scale));
         }
         group_start = group_end;
@@ -1414,6 +1534,9 @@ fn fit_tile_frontier(
     for planes in 1..=config.max_planes {
         if planes > 1 {
             let prior = hessian_errors[planes - 2];
+            if config.packing == SaltV2Packing::S34 && hessian_errors[planes - 1] >= prior {
+                break;
+            }
             let tolerance = 1e-12f64.max(prior.abs() * 1e-12);
             if hessian_errors[planes - 1] > prior + tolerance {
                 return Err(SaltV2Error::NonMonotoneCandidate {
@@ -1490,6 +1613,597 @@ fn progressive_plane_order(
         }
     }
     best.map(|(order, _)| order)
+}
+
+#[derive(Clone, Debug)]
+struct ProgressiveS34Fit {
+    scales: Vec<f32>,
+    trits: Vec<Vec<i8>>,
+}
+
+#[derive(Clone, Debug)]
+struct S34PlaneFit {
+    scale: f32,
+    trits: Vec<i8>,
+    objective: f64,
+}
+
+/// Fit structured planes in their deployment order so every returned P1/P2/P3 point is an exact
+/// prefix. A sequential constrained fit establishes a monotone nested frontier, then joint
+/// plane-coordinate refinement accepts only updates that do not worsen any affected prefix. S34
+/// cannot pair a zero scale with its mandatory nonzero trits, so exhausted suffixes use the least
+/// positive f16 scale and the tile frontier stops before any non-improving suffix.
+fn fit_progressive_s34(
+    weights: &[f32],
+    metric: JointFitMetric<'_>,
+    config: JointFitConfig,
+) -> Result<ProgressiveS34Fit, JointFitError> {
+    let mut reconstruction = vec![0.0f32; weights.len()];
+    let mut scales = Vec::with_capacity(config.planes);
+    let mut trits = Vec::with_capacity(config.planes);
+
+    for _ in 0..config.planes {
+        let target = weights
+            .iter()
+            .zip(&reconstruction)
+            .map(|(weight, reconstructed)| *weight - *reconstructed)
+            .collect::<Vec<_>>();
+        // The mature unconstrained P1 solver supplies a deterministic scale basin. The S34
+        // assignment below never reuses its unconstrained trits.
+        let seed = fit_joint_ternary(
+            &target,
+            metric,
+            JointFitConfig {
+                planes: 1,
+                ..config
+            },
+        )?;
+        let fitted = fit_s34_residual_plane(
+            &target,
+            metric,
+            seed.scales[0],
+            config.max_iterations,
+            config.em_restarts,
+        )?;
+        let prior_objective = checked_s34_objective(weights, &reconstruction, metric)?;
+        let mut candidate = reconstruction.clone();
+        for (value, trit) in candidate.iter_mut().zip(&fitted.trits) {
+            *value += fitted.scale * f32::from(*trit);
+        }
+        let candidate_objective = checked_s34_objective(weights, &candidate, metric)?;
+        let tolerance = 1e-12f64.max(prior_objective.abs() * 1e-12);
+        if candidate_objective <= prior_objective + tolerance {
+            reconstruction = candidate;
+            scales.push(fitted.scale);
+            trits.push(fitted.trits);
+        } else {
+            // This is reachable only through floating accumulation disagreement between residual
+            // and full-prefix scoring. Emit a package-valid minimum-scale plane; the tile-level
+            // monotonicity gate truncates the frontier before this suffix.
+            scales.push(minimum_s34_scale());
+            trits.push(canonical_min_scale_s34(weights.len()));
+        }
+    }
+
+    refine_nested_s34(
+        weights,
+        metric,
+        &mut scales,
+        &mut trits,
+        config.max_iterations,
+    )?;
+
+    Ok(ProgressiveS34Fit { scales, trits })
+}
+
+/// Jointly revisit every structured plane while treating all other planes as fixed. The acceptance
+/// rule is Pareto-safe over the nested prefixes: an update may improve one or more affected points,
+/// but may not spend quality from P1 or P2 to improve P3.
+fn refine_nested_s34(
+    weights: &[f32],
+    metric: JointFitMetric<'_>,
+    scales: &mut [f32],
+    trits: &mut [Vec<i8>],
+    max_iterations: usize,
+) -> Result<(), JointFitError> {
+    let mut objectives = s34_prefix_objectives(weights, metric, scales, trits)?;
+    for _ in 0..max_iterations {
+        let mut improved = false;
+        for plane in 0..scales.len() {
+            let mut target = weights.to_vec();
+            for other in 0..scales.len() {
+                if other == plane {
+                    continue;
+                }
+                for (value, trit) in target.iter_mut().zip(&trits[other]) {
+                    *value -= scales[other] * f32::from(*trit);
+                }
+            }
+            let mut fitted = S34PlaneFit {
+                scale: scales[plane],
+                trits: trits[plane].clone(),
+                objective: score_s34_plane(&target, metric, scales[plane], &trits[plane])?,
+            };
+            let candidate_scale = optimal_s34_scale(&target, &fitted.trits, metric)?;
+            let scale_objective = score_s34_plane(&target, metric, candidate_scale, &fitted.trits)?;
+            if scale_objective < fitted.objective
+                || (scale_objective == fitted.objective && candidate_scale < fitted.scale)
+            {
+                fitted.scale = candidate_scale;
+                fitted.objective = scale_objective;
+            }
+            let candidate_trits =
+                coordinate_s34_assignment(&target, metric, fitted.scale, &fitted.trits)?;
+            let assignment_objective =
+                score_s34_plane(&target, metric, fitted.scale, &candidate_trits)?;
+            if assignment_objective < fitted.objective
+                || (assignment_objective == fitted.objective && candidate_trits < fitted.trits)
+            {
+                fitted.trits = candidate_trits;
+            }
+
+            let prior_scale = scales[plane];
+            let prior_trits = std::mem::replace(&mut trits[plane], fitted.trits);
+            scales[plane] = fitted.scale;
+            let candidate_objectives = s34_prefix_objectives(weights, metric, scales, trits)?;
+            if nested_s34_update_precedes(plane, &candidate_objectives, &objectives) {
+                objectives = candidate_objectives;
+                improved = true;
+            } else {
+                scales[plane] = prior_scale;
+                trits[plane] = prior_trits;
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn s34_prefix_objectives(
+    weights: &[f32],
+    metric: JointFitMetric<'_>,
+    scales: &[f32],
+    trits: &[Vec<i8>],
+) -> Result<Vec<f64>, JointFitError> {
+    let mut reconstruction = vec![0.0f32; weights.len()];
+    let mut objectives = Vec::with_capacity(scales.len());
+    for (scale, plane) in scales.iter().zip(trits) {
+        for (value, trit) in reconstruction.iter_mut().zip(plane) {
+            *value += *scale * f32::from(*trit);
+        }
+        let objective = checked_s34_objective(weights, &reconstruction, metric)?;
+        objectives.push(objective);
+    }
+    Ok(objectives)
+}
+
+fn nested_s34_update_precedes(plane: usize, candidate: &[f64], current: &[f64]) -> bool {
+    let monotone = candidate.windows(2).all(|pair| {
+        let tolerance = 1e-12f64.max(pair[0].abs() * 1e-12);
+        pair[1] <= pair[0] + tolerance
+    });
+    if !monotone {
+        return false;
+    }
+    let mut strict = false;
+    for index in plane..candidate.len() {
+        let tolerance = 1e-12f64.max(current[index].abs() * 1e-12);
+        if candidate[index] > current[index] + tolerance {
+            return false;
+        }
+        strict |= candidate[index] < current[index] - tolerance;
+    }
+    strict
+}
+
+fn fit_s34_residual_plane(
+    target: &[f32],
+    metric: JointFitMetric<'_>,
+    unconstrained_scale: f32,
+    max_iterations: usize,
+    restarts: usize,
+) -> Result<S34PlaneFit, JointFitError> {
+    let fallback_trits = canonical_min_scale_s34(target.len());
+    let fallback_scale = minimum_s34_scale();
+    let fallback_objective = score_s34_plane(target, metric, fallback_scale, &fallback_trits)?;
+    let mut best = S34PlaneFit {
+        scale: fallback_scale,
+        trits: fallback_trits,
+        objective: fallback_objective,
+    };
+
+    // One physical quartet is small enough to solve exactly. This is also the executable oracle
+    // for the general alternating constrained solver.
+    if target.len() <= 4 {
+        for pattern in s34_patterns(target.len()) {
+            let scale = optimal_s34_scale(target, &pattern, metric)?;
+            let objective = score_s34_plane(target, metric, scale, &pattern)?;
+            let candidate = S34PlaneFit {
+                scale,
+                trits: pattern,
+                objective,
+            };
+            if s34_plane_precedes(&candidate, &best) {
+                best = candidate;
+            }
+        }
+        return Ok(best);
+    }
+
+    let anchor = if unconstrained_scale > 0.0 {
+        unconstrained_scale
+    } else {
+        diagonal_weighted_abs_mean(target, metric)?
+    };
+    for restart in 0..restarts {
+        let scale = s34_restart_scale(anchor, restart, restarts)?;
+        let trits = initial_s34_assignment(target, metric, scale, restart);
+        let objective = score_s34_plane(target, metric, scale, &trits)?;
+        let mut state = S34PlaneFit {
+            scale,
+            trits,
+            objective,
+        };
+
+        for _ in 0..max_iterations {
+            let mut changed = false;
+            let scale = optimal_s34_scale(target, &state.trits, metric)?;
+            let scale_objective = score_s34_plane(target, metric, scale, &state.trits)?;
+            if scale_objective < state.objective
+                || (scale_objective == state.objective && scale < state.scale)
+            {
+                state.scale = scale;
+                state.objective = scale_objective;
+                changed = true;
+            }
+
+            let assignment = coordinate_s34_assignment(target, metric, state.scale, &state.trits)?;
+            let assignment_objective = score_s34_plane(target, metric, state.scale, &assignment)?;
+            if assignment_objective < state.objective
+                || (assignment_objective == state.objective && assignment < state.trits)
+            {
+                state.trits = assignment;
+                state.objective = assignment_objective;
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+        if s34_plane_precedes(&state, &best) {
+            best = state;
+        }
+    }
+    Ok(best)
+}
+
+fn s34_plane_precedes(candidate: &S34PlaneFit, current: &S34PlaneFit) -> bool {
+    candidate
+        .objective
+        .total_cmp(&current.objective)
+        .then_with(|| candidate.scale.total_cmp(&current.scale))
+        .then_with(|| candidate.trits.cmp(&current.trits))
+        .is_lt()
+}
+
+fn canonical_min_scale_s34(logical_len: usize) -> Vec<i8> {
+    let mut trits = vec![-1; logical_len];
+    for start in (0..logical_len).step_by(4) {
+        trits[start] = 0;
+    }
+    trits
+}
+
+/// Enumerate every logical pattern whose canonical shape completion has exactly one zero in its
+/// physical quartet. Full groups require one logical zero; ragged groups permit zero or one because
+/// the package's canonical completion inserts the missing zero before negative padding.
+fn s34_patterns(logical_len: usize) -> Vec<Vec<i8>> {
+    debug_assert!((1..=4).contains(&logical_len));
+    const TRITS: [i8; 3] = [-1, 0, 1];
+    let states = 3usize.pow(logical_len as u32);
+    let mut patterns = Vec::with_capacity(32);
+    for state in 0..states {
+        let mut encoded = state;
+        let mut pattern = Vec::with_capacity(logical_len);
+        for _ in 0..logical_len {
+            pattern.push(TRITS[encoded % 3]);
+            encoded /= 3;
+        }
+        let zeros = pattern.iter().filter(|trit| **trit == 0).count();
+        if (logical_len == 4 && zeros == 1) || (logical_len < 4 && zeros <= 1) {
+            patterns.push(pattern);
+        }
+    }
+    patterns.sort();
+    patterns
+}
+
+fn diagonal_weighted_abs_mean(
+    target: &[f32],
+    metric: JointFitMetric<'_>,
+) -> Result<f32, JointFitError> {
+    let mut numerator = 0.0f64;
+    let mut denominator = 0.0f64;
+    for (index, value) in target.iter().enumerate() {
+        let diagonal = metric_diagonal(metric, index);
+        numerator += diagonal * f64::from(value.abs());
+        denominator += diagonal;
+    }
+    if !(numerator.is_finite() && denominator.is_finite()) || denominator <= 0.0 {
+        return Err(JointFitError::ScaleSolveFailed);
+    }
+    deploy_s34_scale(numerator / denominator)
+}
+
+fn s34_restart_scale(anchor: f32, restart: usize, restarts: usize) -> Result<f32, JointFitError> {
+    if restart == 0 {
+        return deploy_s34_scale(f64::from(anchor));
+    }
+    let span = restart as f64 / restarts as f64;
+    let factor = 0.5 + span;
+    deploy_s34_scale(f64::from(anchor) * factor)
+}
+
+fn initial_s34_assignment(
+    target: &[f32],
+    metric: JointFitMetric<'_>,
+    scale: f32,
+    restart: usize,
+) -> Vec<i8> {
+    let mut trits = Vec::with_capacity(target.len());
+    for start in (0..target.len()).step_by(4) {
+        let end = (start + 4).min(target.len());
+        let mut ranked = s34_patterns(end - start)
+            .into_iter()
+            .map(|pattern| {
+                let objective = pattern
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, trit)| {
+                        let error =
+                            f64::from(target[start + offset]) - f64::from(scale) * f64::from(*trit);
+                        metric_diagonal(metric, start + offset) * error * error
+                    })
+                    .sum::<f64>();
+                (objective, pattern)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        let rank = restart.min(ranked.len() - 1);
+        trits.extend_from_slice(&ranked[rank].1);
+    }
+    trits
+}
+
+fn coordinate_s34_assignment(
+    target: &[f32],
+    metric: JointFitMetric<'_>,
+    scale: f32,
+    initial: &[i8],
+) -> Result<Vec<i8>, JointFitError> {
+    let mut trits = initial.to_vec();
+    let mut error = target
+        .iter()
+        .zip(&trits)
+        .map(|(value, trit)| f64::from(*value) - f64::from(scale) * f64::from(*trit))
+        .collect::<Vec<_>>();
+    let mut metric_error = apply_metric(metric, &error);
+    let mut objective = error
+        .iter()
+        .zip(&metric_error)
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    if !objective.is_finite() {
+        return Err(JointFitError::NonFiniteObjective);
+    }
+
+    for start in (0..target.len()).step_by(4) {
+        let end = (start + 4).min(target.len());
+        let current = trits[start..end].to_vec();
+        let mut best_pattern = current.clone();
+        let mut best_objective = objective;
+        for pattern in s34_patterns(end - start) {
+            let delta = pattern
+                .iter()
+                .zip(&current)
+                .map(|(new, old)| *new - *old)
+                .collect::<Vec<_>>();
+            let linear = delta
+                .iter()
+                .enumerate()
+                .map(|(offset, value)| f64::from(*value) * metric_error[start + offset])
+                .sum::<f64>();
+            let mut quadratic = 0.0f64;
+            for (row_offset, row_delta) in delta.iter().enumerate() {
+                for (column_offset, column_delta) in delta.iter().enumerate() {
+                    quadratic += f64::from(*row_delta)
+                        * metric_entry_local(metric, start + row_offset, start + column_offset)
+                        * f64::from(*column_delta);
+                }
+            }
+            let candidate_objective =
+                objective - 2.0 * f64::from(scale) * linear + f64::from(scale).powi(2) * quadratic;
+            if candidate_objective
+                .total_cmp(&best_objective)
+                .then_with(|| pattern.cmp(&best_pattern))
+                .is_lt()
+            {
+                best_objective = candidate_objective;
+                best_pattern = pattern;
+            }
+        }
+
+        if best_pattern != current {
+            let delta = best_pattern
+                .iter()
+                .zip(&current)
+                .map(|(new, old)| *new - *old)
+                .collect::<Vec<_>>();
+            for (offset, value) in best_pattern.iter().enumerate() {
+                trits[start + offset] = *value;
+                error[start + offset] -= f64::from(scale) * f64::from(delta[offset]);
+            }
+            for (row, metric_value) in metric_error.iter_mut().enumerate() {
+                let update = delta
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, value)| {
+                        metric_entry_local(metric, row, start + offset) * f64::from(*value)
+                    })
+                    .sum::<f64>();
+                *metric_value -= f64::from(scale) * update;
+            }
+            objective = best_objective;
+        }
+    }
+    Ok(trits)
+}
+
+fn optimal_s34_scale(
+    target: &[f32],
+    trits: &[i8],
+    metric: JointFitMetric<'_>,
+) -> Result<f32, JointFitError> {
+    let trits_f64 = trits
+        .iter()
+        .map(|trit| f64::from(*trit))
+        .collect::<Vec<_>>();
+    let target_f64 = target
+        .iter()
+        .map(|value| f64::from(*value))
+        .collect::<Vec<_>>();
+    let metric_target = apply_metric(metric, &target_f64);
+    let metric_trits = apply_metric(metric, &trits_f64);
+    let numerator = trits_f64
+        .iter()
+        .zip(metric_target)
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    let denominator = trits_f64
+        .iter()
+        .zip(metric_trits)
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    if !(numerator.is_finite() && denominator.is_finite()) {
+        return Err(JointFitError::ScaleSolveFailed);
+    }
+    let optimum = if denominator <= 0.0 || numerator <= 0.0 {
+        f64::from(minimum_s34_scale())
+    } else {
+        numerator / denominator
+    };
+    let rounded = deploy_s34_scale(optimum)?;
+    let rounded_bits = f16::from_f32(rounded).to_bits();
+    let mut best = None::<(f64, f32)>;
+    for bits in rounded_bits.saturating_sub(1)..=rounded_bits.saturating_add(1) {
+        if bits == 0 || bits > f16::MAX.to_bits() {
+            continue;
+        }
+        let scale = f16::from_bits(bits).to_f32();
+        let objective = score_s34_plane(target, metric, scale, trits)?;
+        if best.as_ref().is_none_or(|(best_objective, best_scale)| {
+            objective
+                .total_cmp(best_objective)
+                .then_with(|| scale.total_cmp(best_scale))
+                .is_lt()
+        }) {
+            best = Some((objective, scale));
+        }
+    }
+    best.map(|(_, scale)| scale)
+        .ok_or(JointFitError::ScaleNotRepresentable { plane: 0 })
+}
+
+fn deploy_s34_scale(scale: f64) -> Result<f32, JointFitError> {
+    if !scale.is_finite() || scale < 0.0 {
+        return Err(JointFitError::ScaleSolveFailed);
+    }
+    let bounded = scale.clamp(f64::from(minimum_s34_scale()), f64::from(f16::MAX.to_f32())) as f32;
+    let deployed = f16::from_f32(bounded).to_f32();
+    if deployed.is_finite() {
+        Ok(deployed)
+    } else {
+        Err(JointFitError::ScaleNotRepresentable { plane: 0 })
+    }
+}
+
+fn minimum_s34_scale() -> f32 {
+    f16::from_bits(1).to_f32()
+}
+
+fn score_s34_plane(
+    target: &[f32],
+    metric: JointFitMetric<'_>,
+    scale: f32,
+    trits: &[i8],
+) -> Result<f64, JointFitError> {
+    let reconstruction = trits
+        .iter()
+        .map(|trit| scale * f32::from(*trit))
+        .collect::<Vec<_>>();
+    checked_s34_objective(target, &reconstruction, metric)
+}
+
+fn checked_s34_objective(
+    weights: &[f32],
+    reconstruction: &[f32],
+    metric: JointFitMetric<'_>,
+) -> Result<f64, JointFitError> {
+    let objective = reconstruction_objective(weights, reconstruction, metric);
+    if !objective.is_finite() {
+        return Err(JointFitError::NonFiniteObjective);
+    }
+    // `DensePsdMetric` validates the mathematical PSD contract. A negative result can therefore
+    // only be cancellation in the direct quadratic accumulation.
+    Ok(objective.max(0.0))
+}
+
+fn apply_metric(metric: JointFitMetric<'_>, values: &[f64]) -> Vec<f64> {
+    match metric {
+        JointFitMetric::Identity => values.to_vec(),
+        JointFitMetric::Diagonal(diagonal) => values
+            .iter()
+            .zip(diagonal)
+            .map(|(value, weight)| value * f64::from(*weight))
+            .collect(),
+        JointFitMetric::Dense(dense) => {
+            let dimension = dense.dimension();
+            let matrix = dense.as_slice();
+            (0..dimension)
+                .map(|row| {
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(column, value)| matrix[row * dimension + column] * value)
+                        .sum()
+                })
+                .collect()
+        }
+    }
+}
+
+fn metric_diagonal(metric: JointFitMetric<'_>, index: usize) -> f64 {
+    metric_entry_local(metric, index, index)
+}
+
+fn metric_entry_local(metric: JointFitMetric<'_>, row: usize, column: usize) -> f64 {
+    match metric {
+        JointFitMetric::Identity => f64::from(row == column),
+        JointFitMetric::Diagonal(diagonal) => {
+            if row == column {
+                f64::from(diagonal[row])
+            } else {
+                0.0
+            }
+        }
+        JointFitMetric::Dense(dense) => dense.as_slice()[row * dense.dimension() + column],
+    }
 }
 
 fn reconstruction_objective(
@@ -1598,17 +2312,12 @@ fn allocator_candidates(
                         .ok_or(SaltV2Error::PhysicalAccountingMismatch)?
                         .metrics
                         .hessian_error;
-                    let prohibited = PhysicalBytes {
-                        serialized: config.rate.max_matrix_bytes.saturating_add(1),
-                        resident: config
-                            .rate
-                            .max_resident_bytes
-                            .unwrap_or(config.rate.max_matrix_bytes)
-                            .saturating_add(1),
-                    };
+                    // A structurally unavailable S34 suffix carries no distortion reduction and
+                    // a real positive plane cost. The exact allocator therefore Pareto-drops it
+                    // without an overflowing `u64::MAX` sentinel under unbounded recipes.
                     allocator.push(PlaneCandidate {
                         planes: (plane_index + 1) as u8,
-                        byte_delta: ByteDelta::measured(prohibited, prohibited),
+                        byte_delta: ByteDelta::measured(per_plane, per_plane),
                         distortion,
                     });
                 }
@@ -1638,11 +2347,13 @@ fn source_tensor_digest(input: &SaltV2TensorFitInput<'_>) -> [u8; 32] {
 
 fn bound_curvature_digest(
     kind: SaltV2Curvature,
+    source_id: CurvatureSourceId,
     evidence_digest: [u8; 32],
     values: CurvatureValues<'_>,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(CURVATURE_HASH_CONTEXT);
     hasher.update(&[kind.tag()]);
+    hasher.update(&source_id.digest());
     hasher.update(&evidence_digest);
     match values {
         CurvatureValues::Diagonal(diagonal) => {
@@ -1724,6 +2435,8 @@ fn receipt_digest(
     physical: SaltV2ModelPhysicalInput,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(RECEIPT_HASH_CONTEXT);
+    write_len_hash(&mut hasher, REFERENCE_SOLVER_VERSION.len());
+    hasher.update(REFERENCE_SOLVER_VERSION.as_bytes());
     hasher.update(source_model_id.as_bytes());
     hasher.update(&activation_digest);
     hasher.update(&recipe_id);
@@ -1783,13 +2496,17 @@ mod tests {
     }
 
     fn activation_cache() -> ActivationCache {
+        activation_cache_with_source([7; 32])
+    }
+
+    fn activation_cache_with_source(source_digest: [u8; 32]) -> ActivationCache {
         let spec = ActivationCacheSpec::new(
             0,
             "weight.input",
             1,
             1,
             ActivationDType::Float32,
-            ActivationDigest::from_bytes([7; 32]),
+            ActivationDigest::from_bytes(source_digest),
             1,
         )
         .expect("activation spec");
@@ -1798,6 +2515,23 @@ mod tests {
         let mut builder = ActivationCacheBuilder::new(spec);
         builder.ingest(chunk).expect("activation ingest");
         builder.finalize().expect("activation cache")
+    }
+
+    fn curvature_source(model_id: ModelId, cache: &ActivationCache) -> CurvatureSourceId {
+        CurvatureSourceId::new(
+            *model_id.as_bytes(),
+            cache.digest().into_bytes(),
+            cache.spec().source_digest().into_bytes(),
+        )
+        .expect("complete curvature provenance")
+    }
+
+    fn different_digest(mut digest: [u8; 32]) -> [u8; 32] {
+        digest[0] = digest[0].wrapping_add(1);
+        if digest == [0; 32] {
+            digest[1] = 1;
+        }
+        digest
     }
 
     fn weights(tile_count: usize) -> Vec<f32> {
@@ -1856,7 +2590,28 @@ mod tests {
         physical: SaltV2ModelPhysicalInput,
     ) -> Result<SaltV2ModelFitResult, SaltV2Error> {
         let cache = activation_cache();
-        let curvature = CurvatureArtifact::diagonal_fisher(evidence_digest, diagonal);
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        fit_with_provenance(
+            weights,
+            diagonal,
+            evidence_digest,
+            config,
+            physical,
+            (model_id, &cache, source_id),
+        )
+    }
+
+    fn fit_with_provenance(
+        weights: &[f32],
+        diagonal: &[f32],
+        evidence_digest: [u8; 32],
+        config: &SaltV2Config,
+        physical: SaltV2ModelPhysicalInput,
+        provenance: (ModelId, &ActivationCache, CurvatureSourceId),
+    ) -> Result<SaltV2ModelFitResult, SaltV2Error> {
+        let (model_id, cache, source_id) = provenance;
+        let curvature = CurvatureArtifact::diagonal_fisher(source_id, evidence_digest, diagonal);
         let tensor = SaltV2TensorFitInput {
             name: "model.layers.0.mlp.down_proj.weight",
             weights,
@@ -1867,8 +2622,8 @@ mod tests {
         fit_salt_v2_model(
             SaltV2ModelFitInput {
                 tensors: &[tensor],
-                activations: &cache,
-                source_model_id: source_model_id(),
+                activations: cache,
+                source_model_id: model_id,
                 physical,
             },
             config,
@@ -1912,6 +2667,177 @@ mod tests {
             assert_eq!(changed.package_bytes, reference.package_bytes);
             assert_ne!(changed.receipt.receipt_id, reference.receipt.receipt_id);
         }
+    }
+
+    #[test]
+    fn solve_boundary_rejects_each_curvature_provenance_mismatch() {
+        let weights = weights(1);
+        let diagonal = vec![1.0; weights.len()];
+        let recipe = config(10_000);
+        let physical = SaltV2ModelPhysicalInput {
+            total_model_parameters: weights.len() as u64,
+            ..SaltV2ModelPhysicalInput::default()
+        };
+        let model_id = source_model_id();
+        let cache = activation_cache();
+        let expected = curvature_source(model_id, &cache);
+
+        let wrong_model = CurvatureSourceId::new(
+            different_digest(expected.source_model_digest()),
+            expected.activation_cache_digest(),
+            expected.token_stream_digest(),
+        )
+        .expect("different model provenance");
+        assert_eq!(
+            fit_with_provenance(
+                &weights,
+                &diagonal,
+                [12; 32],
+                &recipe,
+                physical,
+                (model_id, &cache, wrong_model),
+            )
+            .unwrap_err(),
+            SaltV2Error::CurvatureSourceModelMismatch { tensor: 0 }
+        );
+
+        let wrong_cache = CurvatureSourceId::new(
+            expected.source_model_digest(),
+            different_digest(expected.activation_cache_digest()),
+            expected.token_stream_digest(),
+        )
+        .expect("different cache provenance");
+        assert_eq!(
+            fit_with_provenance(
+                &weights,
+                &diagonal,
+                [12; 32],
+                &recipe,
+                physical,
+                (model_id, &cache, wrong_cache),
+            )
+            .unwrap_err(),
+            SaltV2Error::CurvatureActivationCacheMismatch { tensor: 0 }
+        );
+
+        let wrong_tokens = CurvatureSourceId::new(
+            expected.source_model_digest(),
+            expected.activation_cache_digest(),
+            different_digest(expected.token_stream_digest()),
+        )
+        .expect("different token-stream provenance");
+        assert_eq!(
+            fit_with_provenance(
+                &weights,
+                &diagonal,
+                [12; 32],
+                &recipe,
+                physical,
+                (model_id, &cache, wrong_tokens),
+            )
+            .unwrap_err(),
+            SaltV2Error::CurvatureTokenStreamMismatch { tensor: 0 }
+        );
+    }
+
+    #[test]
+    fn curvature_artifact_digest_binds_source_identity() {
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let left_source = curvature_source(model_id, &cache);
+        let right_source = CurvatureSourceId::new(
+            left_source.source_model_digest(),
+            left_source.activation_cache_digest(),
+            different_digest(left_source.token_stream_digest()),
+        )
+        .expect("different token-stream provenance");
+        let diagonal = [1.0, 2.0];
+        let left = CurvatureArtifact::diagonal_fisher(left_source, [44; 32], &diagonal);
+        let right = CurvatureArtifact::diagonal_fisher(right_source, [44; 32], &diagonal);
+
+        assert_eq!(left.evidence_digest(), right.evidence_digest());
+        assert_ne!(left.source_id(), right.source_id());
+        assert_ne!(left.digest(), right.digest());
+    }
+
+    #[test]
+    fn receipt_transitively_binds_curvature_provenance() {
+        let weights = weights(1);
+        let diagonal = vec![1.0; weights.len()];
+        let recipe = config(10_000);
+        let physical = SaltV2ModelPhysicalInput {
+            total_model_parameters: weights.len() as u64,
+            ..SaltV2ModelPhysicalInput::default()
+        };
+        let model_id = source_model_id();
+        let left_cache = activation_cache_with_source([7; 32]);
+        let right_cache = activation_cache_with_source([8; 32]);
+        let left_source = curvature_source(model_id, &left_cache);
+        let right_source = curvature_source(model_id, &right_cache);
+
+        let left = fit_with_provenance(
+            &weights,
+            &diagonal,
+            [44; 32],
+            &recipe,
+            physical,
+            (model_id, &left_cache, left_source),
+        )
+        .expect("left provenance fit");
+        let right = fit_with_provenance(
+            &weights,
+            &diagonal,
+            [44; 32],
+            &recipe,
+            physical,
+            (model_id, &right_cache, right_source),
+        )
+        .expect("right provenance fit");
+
+        assert_eq!(left.package_bytes, right.package_bytes);
+        assert_ne!(
+            left.receipt.tensors[0].curvature_digest,
+            right.receipt.tensors[0].curvature_digest
+        );
+        assert_ne!(left.receipt.receipt_id, right.receipt.receipt_id);
+        assert_eq!(left.receipt.solver_version, REFERENCE_SOLVER_VERSION);
+    }
+
+    #[test]
+    fn receipt_digest_directly_binds_tensor_curvature_digest() {
+        let tensor = SaltV2TensorFitReceipt {
+            name: "model.layers.0.mlp.down_proj.weight".to_owned(),
+            source_digest: [31; 32],
+            curvature_digest: [41; 32],
+            plane_counts: vec![1],
+        };
+        let mut changed = tensor.clone();
+        changed.curvature_digest = [42; 32];
+        let model_id = source_model_id();
+        let package_id = PackageId::from_package_bytes(b"same package");
+        let physical = SaltV2ModelPhysicalInput {
+            total_model_parameters: 1,
+            ..SaltV2ModelPhysicalInput::default()
+        };
+
+        let left = receipt_digest(
+            model_id,
+            [51; 32],
+            [61; 32],
+            &[tensor],
+            package_id,
+            physical,
+        );
+        let right = receipt_digest(
+            model_id,
+            [51; 32],
+            [61; 32],
+            &[changed],
+            package_id,
+            physical,
+        );
+
+        assert_ne!(left, right);
     }
 
     #[test]
@@ -2124,15 +3050,6 @@ mod tests {
             })
         ));
 
-        let mut s34 = config(10_000);
-        s34.packing = SaltV2Packing::S34;
-        assert!(matches!(
-            fit(&weights, &diagonal, &s34),
-            Err(SaltV2Error::ExternalStageRequired {
-                stage: SaltV2ExternalStage::StructuredS34Fit
-            })
-        ));
-
         let mut transformed = config(10_000);
         transformed.transform_seed = Some(9);
         assert!(matches!(
@@ -2244,6 +3161,209 @@ mod tests {
         assert_eq!(
             decoded.ledger.payload_bytes,
             fitted.metrics.physical.trit_payload_bytes
+        );
+    }
+
+    #[test]
+    fn tiny_s34_plane_matches_exhaustive_f16_scale_and_pattern_oracle() {
+        let target = [0.9375, -0.21875, 0.40625, -1.15625];
+        let fitted =
+            fit_s34_residual_plane(&target, JointFitMetric::Identity, 0.5, 4, 3).expect("S34 fit");
+
+        let mut oracle = S34PlaneFit {
+            scale: 0.0,
+            trits: vec![0, -1, -1, -1],
+            objective: f64::INFINITY,
+        };
+        for pattern in s34_patterns(4) {
+            for bits in 1..=f16::MAX.to_bits() {
+                let scale = f16::from_bits(bits).to_f32();
+                let reconstruction = pattern
+                    .iter()
+                    .map(|trit| scale * f32::from(*trit))
+                    .collect::<Vec<_>>();
+                let objective =
+                    reconstruction_objective(&target, &reconstruction, JointFitMetric::Identity);
+                let candidate = S34PlaneFit {
+                    scale,
+                    trits: pattern.clone(),
+                    objective,
+                };
+                if s34_plane_precedes(&candidate, &oracle) {
+                    oracle = candidate;
+                }
+            }
+        }
+
+        assert_eq!(fitted.scale.to_bits(), oracle.scale.to_bits());
+        assert_eq!(fitted.trits, oracle.trits);
+        assert_eq!(fitted.objective, oracle.objective);
+    }
+
+    #[test]
+    fn s34_scale_selection_handles_midpoint_ties_and_double_rounding() {
+        let midpoint = optimal_s34_scale(&[1.001_464_8], &[1], JointFitMetric::Identity)
+            .expect("midpoint scale");
+        assert_eq!(f16::from_f32(midpoint).to_bits(), 0x3c01);
+
+        let target = [-0.500_732_4, -0.500_732_4, -0.500_732_36, 0.0];
+        let double_round = optimal_s34_scale(&target, &[-1, -1, -1, 0], JointFitMetric::Identity)
+            .expect("double-round scale");
+        assert_eq!(f16::from_f32(double_round).to_bits(), 0x3801);
+    }
+
+    #[test]
+    fn ragged_s34_solver_obeys_canonical_physical_quartet_semantics() {
+        for logical_len in 1..=3 {
+            let target = [0.75, -0.5, 0.25][..logical_len].to_vec();
+            let fitted = fit_s34_residual_plane(&target, JointFitMetric::Identity, 0.5, 4, 2)
+                .expect("ragged S34 fit");
+            let logical_zeros = fitted.trits.iter().filter(|trit| **trit == 0).count();
+            assert!(logical_zeros <= 1);
+
+            let mut physical = fitted.trits;
+            if logical_zeros == 0 {
+                physical.push(0);
+            }
+            physical.resize(4, -1);
+            assert_eq!(physical.iter().filter(|trit| **trit == 0).count(), 1);
+        }
+    }
+
+    #[test]
+    fn dense_curvature_s34_refinement_remains_monotone_and_deterministic() {
+        let target = [0.8, -0.7, 0.3, -0.2, 0.9, -0.4, 0.1, -0.6];
+        let mut matrix = vec![0.0; target.len() * target.len()];
+        for row in 0..target.len() {
+            matrix[row * target.len() + row] = 1.0;
+            if row + 1 < target.len() {
+                matrix[row * target.len() + row + 1] = 0.125;
+                matrix[(row + 1) * target.len() + row] = 0.125;
+            }
+        }
+        let dense = DensePsdMetric::new(target.len(), &matrix).expect("dense PSD metric");
+        let config = JointFitConfig {
+            planes: 3,
+            max_iterations: 4,
+            ridge: 1e-12,
+            em_restarts: 3,
+            ridge_condition_limit: 1_000_000.0,
+            scale_precision: ScalePrecision::F16,
+        };
+        let left = fit_progressive_s34(&target, JointFitMetric::Dense(&dense), config)
+            .expect("left dense S34 fit");
+        let right = fit_progressive_s34(&target, JointFitMetric::Dense(&dense), config)
+            .expect("right dense S34 fit");
+        assert_eq!(left.scales, right.scales);
+        assert_eq!(left.trits, right.trits);
+        assert!(left.trits.iter().all(|plane| {
+            plane
+                .chunks_exact(4)
+                .all(|group| group.iter().filter(|trit| **trit == 0).count() == 1)
+        }));
+        let objectives = s34_prefix_objectives(
+            &target,
+            JointFitMetric::Dense(&dense),
+            &left.scales,
+            &left.trits,
+        )
+        .expect("dense prefix objectives");
+        assert!(
+            objectives
+                .windows(2)
+                .all(|pair| { pair[1] <= pair[0] + 1e-12f64.max(pair[0].abs() * 1e-12) })
+        );
+    }
+
+    #[test]
+    fn s34_model_fit_is_deterministic_progressive_and_physically_exact() {
+        let weights = (0..258)
+            .map(|index| ((index % 29) as f32 - 14.0) / 17.0)
+            .collect::<Vec<_>>();
+        let diagonal = (0..weights.len())
+            .map(|index| 0.5 + (index % 7) as f32 / 8.0)
+            .collect::<Vec<_>>();
+        let mut recipe = config(10_000);
+        recipe.packing = SaltV2Packing::S34;
+        recipe.em_restarts = 2;
+        recipe.coordinate_sweeps = 4;
+
+        let left = fit(&weights, &diagonal, &recipe).expect("left S34 fit");
+        let right = fit(&weights, &diagonal, &recipe).expect("right S34 fit");
+        assert_eq!(left.package_bytes, right.package_bytes);
+        assert_eq!(left.metrics, right.metrics);
+        assert_eq!(left.receipt, right.receipt);
+        assert!(left.metrics.tile_candidates.chunks(3).all(|frontier| {
+            frontier
+                .windows(2)
+                .all(|pair| pair[1].hessian_error <= pair[0].hessian_error + 1e-12)
+        }));
+
+        let decoded = tritium_format::salt_v2_package::read_salt_v2_package(&left.package_bytes)
+            .expect("canonical S34 package");
+        assert_eq!(decoded.package.codec(), SaltV2Codec::S34);
+        assert_eq!(
+            decoded.ledger.total_bytes,
+            left.metrics.physical.matrix_bytes
+        );
+        assert_eq!(
+            decoded.ledger.payload_bytes,
+            left.metrics.physical.trit_payload_bytes
+        );
+        for tile in decoded.package.tensors()[0].tiles() {
+            for plane in tile.planes() {
+                for group in plane.trits().chunks(4) {
+                    let logical_zeros = group.iter().filter(|trit| trit.is_zero()).count();
+                    if group.len() == 4 {
+                        assert_eq!(logical_zeros, 1);
+                    } else {
+                        assert!(logical_zeros <= 1);
+                        let mut physical = group.iter().map(|trit| trit.get()).collect::<Vec<_>>();
+                        if logical_zeros == 0 {
+                            physical.push(0);
+                        }
+                        physical.resize(4, -1);
+                        assert_eq!(physical.iter().filter(|trit| **trit == 0).count(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_zero_s34_model_uses_only_positive_scales_and_a_valid_frontier() {
+        let weights = vec![0.0; 256];
+        let diagonal = vec![1.0; weights.len()];
+        let mut recipe = config(10_000);
+        recipe.packing = SaltV2Packing::S34;
+        let fitted = fit(&weights, &diagonal, &recipe).expect("zero S34 model fit");
+
+        assert!(
+            fitted.tensors[0].tiles()[0]
+                .planes()
+                .iter()
+                .flat_map(|plane| plane.scales())
+                .all(|scale| scale.to_f32() > 0.0)
+        );
+        assert!(fitted.metrics.tile_candidates.windows(2).all(|pair| {
+            pair[1].hessian_error < pair[0].hessian_error
+                && pair[1].cumulative.serialized > pair[0].cumulative.serialized
+        }));
+        tritium_format::salt_v2_package::read_salt_v2_package(&fitted.package_bytes)
+            .expect("deployable zero S34 package");
+
+        let unbounded = SaltV2Config {
+            packing: SaltV2Packing::S34,
+            ..SaltV2Config::default()
+        };
+        let unbounded_fit = fit(&weights, &diagonal, &unbounded)
+            .expect("unbounded zero S34 model fit must not overflow sentinels");
+        assert!(
+            unbounded_fit
+                .metrics
+                .selected_plane_counts
+                .iter()
+                .all(|planes| *planes <= 2)
         );
     }
 

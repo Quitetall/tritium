@@ -143,6 +143,7 @@ pub struct SourceRef {
 impl SourceRef {
     /// Construct a source reference with a non-empty location.
     pub fn new(id: ContentId, location: impl Into<String>) -> Result<Self, SaltError> {
+        let id = checked_content_id("source content identity", id)?;
         let location = checked_string("source location", location.into())?;
         Ok(Self { id, location })
     }
@@ -173,6 +174,8 @@ impl EvidenceRef {
         source_id: ContentId,
         location: impl Into<String>,
     ) -> Result<Self, SaltError> {
+        let id = checked_content_id("evidence content identity", id)?;
+        let source_id = checked_content_id("evidence source identity", source_id)?;
         let location = checked_string("evidence location", location.into())?;
         Ok(Self {
             id,
@@ -213,7 +216,7 @@ impl RecipeRef {
         revision: impl Into<String>,
     ) -> Result<Self, SaltError> {
         Ok(Self {
-            id,
+            id: checked_content_id("recipe content identity", id)?,
             implementation: checked_string("recipe implementation", implementation.into())?,
             revision: checked_string("recipe revision", revision.into())?,
         })
@@ -547,6 +550,13 @@ fn checked_string(field: &'static str, value: String) -> Result<String, SaltErro
         return Err(SaltError::InvalidField(field));
     }
     Ok(value)
+}
+
+fn checked_content_id(field: &'static str, id: ContentId) -> Result<ContentId, SaltError> {
+    if id.0 == [0; 32] {
+        return Err(SaltError::InvalidField(field));
+    }
+    Ok(id)
 }
 
 fn derive_work_id(
