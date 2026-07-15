@@ -768,6 +768,26 @@ mod tests {
         }
     }
 
+    fn replace_with_valid_f32_payload(tensor: &mut OwnedTensor) {
+        let elements = tensor
+            .dims
+            .iter()
+            .try_fold(1_usize, |product, &dim| product.checked_mul(dim as usize))
+            .expect("F32 fixture shape");
+        tensor.ggml_type = GGML_TYPE_F32;
+        tensor.data = vec![0; elements.checked_mul(4).expect("F32 fixture bytes")];
+    }
+
+    fn append_valid_salt_row(tensor: &mut OwnedTensor) {
+        assert_eq!(tensor.ggml_type, GGML_TYPE_TRITIUM_SALT);
+        let rows = usize::try_from(tensor.dims[1]).expect("SALT fixture rows");
+        assert!(rows > 0 && tensor.data.len().is_multiple_of(rows));
+        let row_bytes = tensor.data.len() / rows;
+        let extra_row = tensor.data[..row_bytes].to_vec();
+        tensor.data.extend_from_slice(&extra_row);
+        tensor.dims[1] += 1;
+    }
+
     fn fixture() -> Fixture {
         fixture_with_tie(true)
     }
@@ -1250,19 +1270,19 @@ mod tests {
             .iter_mut()
             .find(|tensor| tensor.name == "lm_head.weight")
             .expect("head");
-        head.ggml_type = GGML_TYPE_F32;
+        replace_with_valid_f32_payload(head);
         assert!(matches!(
             ModelWeights::load_training_salt_gguf(&wrong_head_type.bytes()),
             Err(NnError::UnsupportedTensorType(_))
         ));
 
         let mut wrong_head_shape = untied_fixture();
-        wrong_head_shape
+        let head = wrong_head_shape
             .tensors
             .iter_mut()
             .find(|tensor| tensor.name == "lm_head.weight")
-            .expect("head")
-            .dims[1] += 1;
+            .expect("head");
+        append_valid_salt_row(head);
         assert!(ModelWeights::load_training_salt_gguf(&wrong_head_shape.bytes()).is_err());
 
         let mut wrong_head_planes = untied_fixture();
@@ -1298,14 +1318,14 @@ mod tests {
         assert!(ModelWeights::load_training_salt_gguf(&extra.bytes()).is_err());
 
         let mut bad_type = fixture();
-        bad_type.tensors[1].ggml_type = GGML_TYPE_F32;
+        replace_with_valid_f32_payload(&mut bad_type.tensors[1]);
         assert!(matches!(
             ModelWeights::load_training_salt_gguf(&bad_type.bytes()),
             Err(NnError::UnsupportedTensorType(_))
         ));
 
         let mut bad_shape = fixture();
-        bad_shape.tensors[1].dims[1] += 1;
+        append_valid_salt_row(&mut bad_shape.tensors[1]);
         assert!(ModelWeights::load_training_salt_gguf(&bad_shape.bytes()).is_err());
     }
 
