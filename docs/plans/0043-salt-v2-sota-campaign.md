@@ -6,10 +6,94 @@ empirical campaign gates remain open)
 - **Decision:** [ADR 0028](../adr/0028-salt-v2-additive-ternarization.md)
 - **Research cutoff:** 2026-07-14, inclusive
 - **Claim status:** not achieved
-- **Primary proof rung:** Qwen3-8B, the fixed 8–9B-class model
-- **Confirmation rung:** Qwen3-32B
+- **Active flagship:** `Qwen/Qwen3.6-27B` revision
+  `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`
+- **Active conversion scope:** language core and bundled one-layer MTP drafter
+- **Deferred scope:** vision encoder and multimodal integration
+- **Experiment tracks:** PTQ and refined, reported separately
+- **Spend policy:** local-first; no paid run without explicit future approval
 - **Development rung:** SmolLM2-1.7B, reusing Tritium's existing model and
   campaign support
+
+## Active campaign override — 2026-07-15
+
+This section is the active execution order. It supersedes the original
+Qwen3-8B then Qwen3-32B target ordering, which remains in the ADR and git
+history; it does not mark any empirical gate complete. The original numeric
+quality, rate, parity, provenance, and publication gates transfer to the 27B
+flagship. A later confirmation model requires a new preregistration.
+
+The flagship artifact is `Qwen/Qwen3.6-27B` at immutable revision
+`6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`. The first product scope puts every
+non-vision rank-2 tensor into the additive ternary allocation domain, including
+the language embedding, untied output head, and all MTP matrices. The pinned
+checkpoint contains 506 such matrices with 27,318,026,240 coefficients. Its 360
+non-vision non-matrix tensors remain at source precision. All 333 vision tensors
+are identity-bound with disposition `ExcludedFutureVision`; they are neither
+converted nor omitted from coverage. A profile that preserves any rank-2
+language or MTP tensor must be separately preregistered and cannot support the
+unqualified language-plus-MTP ternarization claim.
+
+Vision remains the end-state product scope, but the vision encoder and
+multimodal connector are deferred until the language and MTP paths satisfy
+their architecture, identity, quality, accounting, and runtime gates.
+
+The pinned official
+[model card](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/README.md),
+[configuration](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/config.json),
+and [weight index](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/model.safetensors.index.json)
+establish the target shape. The checkpoint uses an outer `qwen3_5` multimodal
+wrapper with a nested
+`text_config`. Its dense 27B text model has 64 layers, hidden size 5120, and a
+padded vocabulary of 248,320. The layer schedule repeats three
+linear-attention/Gated DeltaNet blocks followed by one full-attention block.
+The checkpoint declares `mtp_num_hidden_layers = 1`, and the official serving
+instructions include MTP deployment configurations.
+
+Tritium's current Llama/Qwen3 model skeleton handles a conventional
+SwiGLU/GQA/RoPE transformer. It cannot ingest this outer configuration,
+Gated DeltaNet schedule, or MTP module. A Qwen3.6 architecture adapter is
+therefore ahead of the production campaign driver on the critical path.
+
+The active order is:
+
+1. Add a source-identity-bound Qwen3.6 architecture adapter: nested-config
+   parsing, tensor-name/shape validation, all 64 scheduled language layers,
+   Gated DeltaNet state semantics, full-attention blocks, and the one-layer MTP
+   module. Prove dense reference parity before accepting ternary weights.
+2. Freeze and test the language-plus-MTP coverage policy. Account for all 506
+   converted rank-2 matrices, 360 preserved non-matrix tensors, 333 deferred
+   vision tensors, and every runtime allocation; fail closed on unconsumed,
+   duplicate, or shape/dtype-mismatched tensors.
+3. Connect the measured whole-model SALT V2 receipt to
+   `PhysicalSizeReport` and the immutable campaign ledger, then land the
+   resumable production driver. No geometry-only or caller-supplied byte total
+   is claim evidence.
+4. Run local synthetic, sliced-layer, and smallest practical end-to-end gates;
+   optimize the exact/fused kernels and sharded/offloaded conversion path before
+   attempting the complete 27B checkpoint.
+5. Run the frozen 27B **PTQ track** and publish its artifact, quality, physical
+   size, resident memory, and runtime results under a PTQ label.
+6. Only after the PTQ stop gates, run the separately identified **refined
+   track** (scale-only, then hard-trit/PV refinement as admitted). Never merge
+   refined measurements into the PTQ result.
+7. Reproduce matched baselines, complete the language-plus-MTP evidence pack,
+   and only then schedule the deferred multimodal adapter and vision policy.
+
+Steps 1–4 are prerequisites for Stage 8. Steps 5 and 6 are Stage 8 and Stage 9,
+respectively; step 7 feeds Stage 11 and may only propose, not authorize, the
+deferred Stage 10 scope.
+
+Local hardware is the default for engineering, correctness, profiling, and any
+campaign rung that fits. This plan grants no cloud or rental authorization. A
+paid run requires a new explicit approval after its frozen recipe, estimated
+cost, stop gate, and resume proof are presented.
+
+Individual results may retain their narrow labels. The public umbrella claim
+"Tritium SOTA" remains forbidden until every applicable gate in both
+[ADR 0026](../adr/0026-sota-campaign.md) and
+[ADR 0028](../adr/0028-salt-v2-additive-ternarization.md) is green and the
+claim is generated from the evidence ledger.
 
 ## Outcome
 
@@ -19,12 +103,12 @@ The campaign must answer, with reproducible measurements:
 
 1. Does joint, output-aware additive ternarization beat SALT V1 and other
    ternary/additive methods at the same physical bytes?
-2. Can Qwen3-8B reach the preregistered near-zero-divergence gate at an
+2. Can Qwen3.6-27B reach the preregistered near-zero-divergence gate at an
    approximately 3.3–3.6 matrix-bpw point?
 3. Does the direct ternary kernel produce a global quality/size/runtime Pareto
    point, rather than a quality-only result with a slow decoder?
-4. If the 8B result passes, does the result reproduce on Qwen3-32B without a
-   disproportionate training bill?
+4. How much of the PTQ gap does the separately reported refined track close at
+   27B, and at what measured compute and memory cost?
 
 “No” is a valid result. A failed gate is recorded with its artifact and stops
 the dependent spend. It must not be rewritten as a qualitative SOTA claim.
@@ -63,10 +147,9 @@ the dependent spend. It must not be rewritten as a qualitative SOTA claim.
 - Recovery is evaluated A16 first, then A8, then A4. Soft optimization occupies
   at most the first 80%; the final 20% uses exported hard trits and narrowed
   scales. CE precedes conditional cached-logit KD; PV discrete polish is last.
-- The direct-model track is Qwen3-8B then Qwen3-32B. The capacity track widens
-  Qwen3-8B's SwiGLU axes toward approximately 32B coefficients, then requires a
-  distinct whole-head/hidden-width transform before the endpoint containing at
-  least 50B stored ternary coefficients.
+- The direct-model track freezes the recipe on SmolLM2-1.7B, then runs the
+  pinned Qwen3.6-27B language-plus-MTP checkpoint. No confirmation model,
+  model-growth track, or vision run is authorized by this plan.
 - Stable orchestration lives in `tritium-salt` through `SaltV2::explain` and
   `SaltV2::reconcile`. `SaltPipeline::{start, advance, resume}` is experimental
   but must execute the identical stage sequence and durable evidence contract.
@@ -78,16 +161,14 @@ the dependent spend. It must not be rewritten as a qualitative SOTA claim.
 | 0 | deterministic synthetic matrices and the existing tiny transformer | solver, accounting, and parity oracles | implementation constants only |
 | 1 | SmolLM2-135M | full-pipeline smoke and cheap negative-result discovery | no |
 | 2 | SmolLM2-1.7B | choose group size, packing, restart count, and curvature variant | yes, only from the preregistered grid |
-| 3 | Qwen3-8B | primary 8–9B quality and cost result | no; recipe frozen from rung 2 |
+| 3 | Qwen3.6-27B language plus MTP | primary quality, size, memory, and runtime result | no; recipe frozen from rung 2 |
 | 3b | Llama2-7B | literature bridge for QTIP, LLVQ, AQLM, VPTQ, and PV-Tuning | no; same frozen recipe |
-| 4 | Qwen3-32B | confirmation and scale result | no; only batch/sharding may change |
-| G1 | Qwen3-8B widened in SwiGLU intermediate axes | function-preserving capacity point near 32B stored coefficients | only the preregistered target and seed |
-| G2 | whole-head/hidden-width growth from G1 | capacity endpoint with at least 50B stored ternary coefficients | no; transform must pass exact dense-function and receipt gates |
+| 4 | Qwen3.6 multimodal | deferred end state | not authorized; requires a new preregistration |
 
-The 1.7B evaluation split is held out from pilot selection. Qwen3-8B and
-Qwen3-32B task results remain sealed until the recipe digest is frozen. If a
-Qwen-specific correctness bug requires a recipe change, invalidate the affected
-run, fix it, and rerun all methods; do not patch only SALT V2.
+The 1.7B evaluation split is held out from pilot selection. Qwen3.6-27B task
+results remain sealed until the recipe digest is frozen. If a Qwen-specific
+correctness bug requires a recipe change, invalidate the affected run, fix it,
+and rerun all methods; do not patch only SALT V2.
 
 ### Physical-rate points
 
@@ -393,8 +474,11 @@ and the relevant CPU/CUDA parity gate before the next stage depends on it.
 | Rung | Scale-only maximum | Short PV maximum |
 |---|---:|---:|
 | 1–2 | 8M tokens | 32M tokens |
-| Qwen3-8B | 32M tokens | 256M tokens |
-| Qwen3-32B | 64M tokens | 512M tokens |
+| Qwen3.6-27B | 64M tokens | 512M tokens |
+
+The 27B row inherits the former 32B upper ceilings; it is conservative planning
+policy, not a 27B measurement. The 1.7B pilot may tighten either cap before the
+recipe freezes. Increasing a cap requires a plan amendment and new provenance.
 
 Evaluate at 1/8, 1/4, 1/2, and full cap. Stop after three evaluations without
 improvement in the frozen validation aggregate. The best earlier checkpoint is
@@ -463,25 +547,34 @@ Use staged successive halving rather than the full Cartesian product:
 - At some rate, output-aware curvature improves full-model held-out perplexity
   over input-Hessian-only with the same bytes.
 - Physical accounting and native-kernel gates are green.
-- Freeze recipe, evaluation thresholds, and digests before unsealing Qwen3-8B.
+- Freeze recipe, evaluation thresholds, and digests before unsealing the pinned
+  Qwen3.6-27B checkpoint.
 
-If the freeze gate fails, publish the 1.7B negative result and stop. Do not rent
-the 8B refinement campaign.
+If the freeze gate fails, publish the 1.7B negative result and stop. Do not run
+the 27B campaign.
 
-### Stage 8 — Reproduce baselines and run the Qwen3-8B PTQ proof
+### Stage 8 — Dense parity, baselines, and Qwen3.6-27B PTQ proof
 
 **Work**
 
+- Prove dense host and CUDA parity against the pinned reference implementation
+  for all 64 hybrid text layers before accepting any ternary projection.
+- Prove the MTP token shift, concatenation order, positional alignment, and
+  cache behavior against an official serving oracle; checkpoint names and
+  shapes alone are insufficient.
+- Produce an exact 1,199-tensor coverage receipt: 506 additive-ternary matrices,
+  360 preserved non-matrix tensors, and 333 identity-bound deferred vision
+  tensors, with no unknown, duplicate, or missing tensor.
 - Reproduce required baselines at R2/R3/R4 or the largest attainable artifact
   not exceeding the ceiling. If the rate gap exceeds 0.05 artifact bpw, report
   the point for context but do not use it to establish a strict head-to-head
   win.
 - Run frozen SALT V2 PTQ once; repeat packaging and evaluation to prove
   determinism.
-- Run the same recipe on Llama2-7B for literature continuity after the primary
-  artifact exists.
+- Run any literature-continuity model only after the flagship artifact exists;
+  it cannot substitute for the 27B result.
 
-**PTQ gate before renting refinement**
+**PTQ gate before refinement**
 
 - R3 SALT V2 closes at least 50% of SALT V1's perplexity gap to bf16.
 - It is non-dominated by every reproduced additive/ternary baseline in
@@ -493,7 +586,7 @@ If this gate fails, spend at most the first one-eighth of the scale-only cap.
 Continue scale-only only when a conservative learning-curve fit projects that
 the gate is reachable within the frozen cap. Short PV stops.
 
-### Stage 9 — Qwen3-8B scale-only and short-PV proof
+### Stage 9 — Qwen3.6-27B scale-only and short-PV proof
 
 Run three seeds for the selected refinement recipe. Report all seeds and the
 predeclared aggregate; do not select the best seed as the headline.
@@ -523,53 +616,19 @@ predeclared aggregate; do not select the best seed as the headline.
 Near-zero conversion, additive-ternary SOTA, and global Pareto-SOTA are three
 independent booleans. Passing one does not imply the others.
 
-### Stage 10 — Qwen3-32B confirmation
+### Stage 10 — Deferred multimodal and confirmation work
 
-This stage is authorized only if Stage 9 passes near-zero divergence or the
-additive-ternary SOTA gate. Use ADR 0027's resident/host-offload and supervised
-multi-GPU infrastructure. The quantization recipe is unchanged; only sharding,
-batch geometry, and device count may vary. Refinement execution geometry enters
-recipe provenance because it can change the artifact; inference geometry
-enters evaluation provenance.
+Stage 10 is not authorized by this plan. It begins only after the complete 27B
+language-plus-MTP evidence pack passes its applicable gates and a new
+preregistration defines the exact vision coverage policy, dense multimodal
+oracle, evaluation suite, confirmation model if any, compute ceiling, and stop
+conditions. Language-plus-MTP results remain scoped as such and are never
+extrapolated to multimodal behavior or another model size.
 
-**Gate**
-
-- Re-run PTQ before refinement and confirm the direction and approximate
-  fraction of gap closure seen at 8B.
-- Apply the same near-zero and SOTA definitions, not relaxed 32B thresholds.
-- Run a failure-injection resume test before a paid long refinement.
-- Report wall time, billed GPU-hours, peak host/device memory, checkpoint bytes,
-  and retries, including failed attempts.
-
-If the 32B result fails, the 8B claim remains scoped to 8B. It is not
-extrapolated to 32B–50B.
-
-### Stage 10b — Grow Qwen3-8B to the 32B and >=50B coefficient frontier
-
-This track is reported separately from same-model conversion. First apply the
-existing deterministic SwiGLU Net2Wider transform until the planned stored
-ternary coefficient count is approximately 32B. The receipt binds the source
-model, target coefficient count, old/new intermediate widths, mapping, split
-weights, and seed. Dense logits before ternarization must match within the
-existing function-preservation tolerance.
-
-The >=50B endpoint may not be produced by silently stretching only the FFN.
-It requires a separately reviewed whole-head/hidden-width transform that repeats
-complete attention/head structures, handles RMSNorm and residual geometry, and
-passes a dense end-to-end function-preservation oracle before SALT fitting.
-
-**Gates**
-
-- the planner counts stored ternary coefficients, plane-for-plane, rather than
-  labeling an fp parameter count as ternary capacity;
-- G1 reaches its declared approximately 32B coefficient target with the minimum
-  valid intermediate width and a replayable receipt;
-- G2 stores at least 50B ternary coefficients and passes the independent dense
-  function oracle before any paid recovery;
-- both points report quality versus exact package/resident bytes against direct
-  Qwen3-8B and Qwen3-32B; a capacity win is not called lossless conversion;
-- failure of the whole-head transform leaves G1 publishable but blocks the >=50B
-  claim.
+The former Qwen3-8B-to-32B/50B Net2Wider experiment is no longer an active SOTA
+campaign stage. Any future model-growth experiment is reported separately from
+same-model conversion and requires its own function-preservation oracle and
+claim language.
 
 ### Stage 11 — Reproducibility package and claim generation
 
@@ -592,31 +651,26 @@ passes a dense end-to-end function-preservation oracle before SALT fitting.
 - The abstract-level claim is no broader than model family, rate, coverage,
   hardware, and refinement track actually measured.
 
-## Cost and rental ladder
+## Cost authorization and required evidence
 
-GPU-hour estimates are planning bounds, not provider quotes. Before each rental,
-replace the rate with a current written quote and record it in the campaign
-plan. Dollar examples use a blended **$3–$6 per H100-equivalent GPU-hour** and
-exclude tax, storage, and egress. Add a 10–20% contingency; never hide failed
-or preempted hours.
+This plan authorizes zero paid GPU-hours and zero rental spend. The earlier
+8B/32B estimates do not scale reliably to Qwen3.6's hybrid 27B graph and are
+superseded. Before requesting paid compute, the implementation must emit a
+measured forecast from local runs rather than extrapolating a paper's model or
+kernel:
 
-| Step | Expected compute | Example rental | Hard authorization ceiling |
-|---|---:|---:|---:|
-| Local unit, 135M smoke, kernel work | 20–80 RTX 4090 hours | $0 when local | no cloud required |
-| 1.7B pilot after local pruning | 4–16 H100-equivalent GPU-hours | $12–$96 | 24 GPU-hours |
-| One frozen 8B PTQ conversion | 8–32 GPU-hours | $24–$192 | 40 GPU-hours |
-| Complete 8B PTQ/baseline/ablation rung | 48–160 GPU-hours | $144–$960 | 192 GPU-hours |
-| 8B scale-only plus three-seed short PV | 96–384 GPU-hours | $288–$2,304 | 512 GPU-hours |
-| One 32B PTQ confirmation | 32–128 GPU-hours | $96–$768 | 160 GPU-hours |
-| 32B scale-only/short-PV confirmation | 512–2,048 GPU-hours | $1,536–$12,288 | 2,048 GPU-hours |
-| Broad paper campaign with all baselines and repeats | 2,000–5,000 additional GPU-hours | $6,000–$30,000 | separate approval |
+| Forecast input | Required evidence |
+|---|---|
+| Dense reference and SALT peak memory | allocation receipts separated into host, device-resident, and transient bytes |
+| Tensor fitting throughput | timed representative DeltaNet, full-attention, embedding, head, and MTP matrices |
+| Activation capture and evaluation throughput | token counts, sequence geometry, cache bytes, and wall time from the frozen corpus |
+| Resume overhead | injected interruption with verified content-addressed restart |
+| Baseline cost | same-box measured or independently frozen recipe, never a literature runtime estimate |
 
-The 8B proof is not expected to cost $25,000. That figure becomes plausible
-only for a broad 32B paper campaign with multiple baselines, ablations, seeds,
-and expensive on-demand rates. A single PTQ conversion should be tens of
-GPU-hours, consistent with published 7B PTQ ranges from minutes for PTQTP/BPDQ
-through approximately 8 GPU-hours for VPTQ and roughly 24 for AQLM. The short
-teacher-KL phase, not ternary packing, is the main variable cost.
+A future authorization request must state the exact hardware, measured lower
+and upper GPU-hour bounds, storage and egress, contingency, stop gate, and
+maximum spend. PTQ is estimated first. Scale-only and short-PV forecasts are
+separate and remain unauthorized until the PTQ gate passes.
 
 ### Spend controls and time reductions
 
@@ -636,8 +690,8 @@ teacher-KL phase, not ternary packing, is the main variable cost.
 - Use fp16/bf16 activation caches where the curvature parity gate permits;
   keep accumulators at the precision required by the solver oracle.
 - Reuse ADR 0027 checkpointing, resident packed storage, host offload, and
-  gradient streaming. Do not replicate 32B optimizer state without the
-  documented approximately 768 GB host-RAM geometry or a sharded alternative.
+  gradient streaming. Do not replicate 27B optimizer state; require a measured
+  sharded/offloaded admission receipt before refinement.
 - Prefer interruptible/spot instances only after resume and checkpoint
   integrity are proven; include preemption waste in billed hours.
 
@@ -701,6 +755,10 @@ outside the direct-runtime claim until it earns separate evidence.
 
 The following work deliberately remains open and keeps this plan in progress:
 
+- the active Qwen3.6-27B adapter does not exist. The current Llama/Qwen3
+  skeleton cannot parse the outer `qwen3_5` configuration with nested
+  `text_config`, execute Gated DeltaNet/linear-attention layers, reproduce the
+  mixed 3:1 layer schedule, or load and receipt the one-layer MTP drafter;
 - the production model driver does not yet connect block-output reconstruction,
   scale-only teacher-KL, or hard PV updates to real checkpoint tensors;
 - `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense
@@ -736,12 +794,8 @@ The following work deliberately remains open and keeps this plan in progress:
   measured whole-model receipt into `PhysicalSizeReport` and the immutable
   campaign ledger; caller-provided architecture geometry alone is not claim
   evidence;
-- G1 widening now has canonical source/result identities, deterministic oracle
-  evidence, transactional rollback, and a tracked-fp32-payload preflight. The
-  dense oracle still constructs infallible full-model clones, so this is not a
-  model-scale RSS/admission guarantee and remains a blocker before a 32B run;
-- the distinct whole-head/hidden-width transform, RMSNorm/residual handling,
-  and dense function-preservation oracle required for G2 do not exist;
+- legacy G1 widening has canonical source/result identities and deterministic
+  oracle evidence, but model growth is no longer on the active flagship path;
 - the eager semantic SALT V2 decoder remains as a compatibility/reference API,
   while `SaltV2PackageReader` supplies strict bounded-staging package access.
   The CUDA adapter consumes its packed-plane visitor directly into final device
@@ -752,17 +806,27 @@ The following work deliberately remains open and keeps this plan in progress:
   does not yet retain Qwen QKV biases or QK-normalization vectors. Those two
   device/training integrations must precede a Qwen refinement campaign;
 - optimized resident large-K CUDA SALT kernels, SALT V2 fused decoder/prefill
-  dispatch, and a paged fp16 or int8 KV cache with a runtime context override
-  remain required for practical 32B serving;
+  dispatch, and Qwen3.6's device-resident hybrid recurrent/KV cache remain
+  required for practical 27B serving;
 - required third-party baselines have not all been integrated or reproduced
   under one byte/evaluation boundary;
-- the 135M, 1.7B, Qwen3-8B, Llama2-7B, Qwen3-32B, and growth acceptance artifacts
-  do not exist, and no paid campaign has been run;
+- the 135M, 1.7B, optional Llama2-7B, and Qwen3.6-27B acceptance artifacts do
+  not exist, and no paid campaign has been run;
+- no Qwen3.6-27B dense-parity, PTQ, refined, language-plus-MTP, or multimodal
+  acceptance artifact exists;
 - no near-zero-divergence, additive-ternary SOTA, global Pareto, or cost result
   has been earned by this implementation alone.
 
 ## Definition of done
 
+- [ ] Qwen3.6-27B dense reference parity covers all 64 mixed-schedule language
+      layers and the bundled one-layer MTP drafter before SALT conversion.
+- [ ] The language-plus-MTP coverage and physical ledgers consume every expected
+      tensor exactly once and bind all preserved bytes and runtime allocations.
+- [ ] The Qwen3.6-27B PTQ and refined tracks produce separate artifacts,
+      provenance, metrics, costs, and claim booleans.
+- [ ] No paid run occurs without a new explicit approval, and multimodal work
+      remains deferred until the language-plus-MTP gates authorize it.
 - [ ] Stage 0 physical accounting agrees with actual artifact and resident bytes.
 - [ ] Stage 1 zero-point-free direct and radix-3 formats round-trip and fuzz clean.
 - [ ] Stage 2 output-aware curvature artifacts are deterministic and validated.
@@ -771,8 +835,12 @@ The following work deliberately remains open and keeps this plan in progress:
 - [ ] Stage 5 PTQ, scale-only, and short-PV tracks remain separately reproducible.
 - [ ] Stage 6 native exact/fast kernels pass parity, sanitizer, and no-dense-materialization gates.
 - [ ] Stage 7 freezes the recipe on 1.7B or records a terminal negative result.
-- [ ] Stage 8 reproduces baselines and completes the frozen Qwen3-8B PTQ proof.
-- [ ] Stage 9 records independent near-zero, additive-SOTA, and global-Pareto booleans.
-- [ ] Stage 10 runs only when authorized by Stage 9 and scopes any 32B failure honestly.
+- [ ] Stage 8 reproduces baselines and completes the frozen Qwen3.6-27B PTQ proof.
+- [ ] Stage 9 completes the separately labeled 27B refined proof and records
+      independent near-zero, additive-SOTA, and global-Pareto booleans.
+- [ ] Any confirmation model or multimodal stage is separately preregistered and
+      runs only when authorized by the 27B language-plus-MTP gates.
 - [ ] Stage 11 publishes hashes, commands, reports, ledger, costs, and generated claim.
+- [ ] The public "Tritium SOTA" claim is generated only after all applicable
+      ADR 0026 and ADR 0028 gates are green.
 - [ ] ADR 0028 remains Proposed until these gates, not document completion, justify a status change.

@@ -600,3 +600,61 @@ that expands to D2, B3, or S34 before execution may claim smaller artifact and I
 bytes, but its expanded fixed-codec allocation is the resident-weight boundary. It
 cannot earn a memory-capacity or direct-kernel claim. Native entropy-stream kernels
 would require a separate versioned runtime proposal and same-box Pareto evidence.
+
+## Amendment 2026-07-15 — Qwen3.6 flagship and product scope
+
+This amendment selects the active flagship and execution scope. For the active
+campaign, Qwen3.6-27B replaces the Qwen3-8B primary and Qwen3-32B confirmation
+targets above. The original text remains as decision history; its numeric
+quality, rate, parity, provenance, and publication gates transfer to the 27B
+flagship rather than being relaxed. A later confirmation model requires a new
+preregistration. This amendment marks no empirical result complete.
+
+The binding flagship is `Qwen/Qwen3.6-27B` at immutable revision
+`6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`, as defined by its pinned
+[model card](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/README.md),
+[configuration](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/config.json),
+and [weight index](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/model.safetensors.index.json).
+The first product
+artifact covers the language core and the bundled multi-token-prediction (MTP)
+drafter. PTQ and refined conversion are independent tracks with separate
+artifacts, recipes, costs, and claims. The multimodal model remains the product
+end state, but the vision encoder and multimodal integration are deferred until
+the language-plus-MTP scope passes its gates.
+
+For that first artifact, every non-vision rank-2 tensor is in the additive
+ternary allocation domain, including the language embedding, untied output
+head, and MTP matrices. The pinned checkpoint contains 506 matrices in that
+domain, totaling 27,318,026,240 coefficients. Its 360 non-vision non-matrix
+tensors remain source-precision parameters, and all 333 vision tensors are
+identity-bound with disposition `ExcludedFutureVision` rather than silently
+omitted. Preserving a rank-2
+language or MTP tensor requires a new preregistered coverage profile and cannot
+support the unqualified language-plus-MTP ternarization claim.
+
+The pinned official files above define the architecture boundary. The
+checkpoint is an outer `qwen3_5` multimodal model with a nested
+`text_config`. Its dense 27B text model has 64 layers, hidden size 5120, and a
+padded vocabulary of 248,320. The schedule repeats three
+linear-attention/Gated DeltaNet layers followed by one full-attention layer.
+The text configuration declares one MTP hidden layer, and the official serving
+instructions document MTP deployment. These are ingestion and parity
+requirements, not performance or quality evidence.
+
+Tritium's current Llama/Qwen3 skeleton implements a conventional
+SwiGLU/GQA/RoPE transformer. It does not parse this nested outer model, execute
+Gated DeltaNet layers, reproduce the mixed layer schedule, or load the bundled
+MTP module. The Qwen3.6 architecture adapter, dense reference parity, and exact
+language-plus-MTP tensor-consumption receipt therefore precede the production
+campaign driver. No 27B conversion may begin from architecture-name matching or
+unchecked tensor fallback.
+
+Engineering and evidence collection are local-first. This ADR authorizes no
+paid compute. Any rental or cloud run requires explicit future approval of a
+frozen recipe, cost ceiling, stop gate, and validated resume path.
+
+Narrow component results may be reported under their measured scope. The public
+umbrella claim "Tritium SOTA" may be emitted only when all applicable gates in
+both [ADR 0026](./0026-sota-campaign.md) and this ADR are green. Neither a PTQ
+win, a refined win, a decode-only lead, nor completion of the language-only
+scope is sufficient by itself.
