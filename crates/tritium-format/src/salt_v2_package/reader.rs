@@ -10,8 +10,9 @@ const MAX_TOTAL_NAME_BYTES: u64 = 100_000_000;
 const MAX_RANK: u64 = 4_096;
 const MAX_TOTAL_DIMENSIONS: u64 = 16_000_000;
 const MAX_PRESENCE_MAP_BYTES: u64 = 256 * 1024 * 1024;
-const IO_CHUNK_BYTES: usize = 64 * 1024;
-const MAX_BATCH_PLANES: usize = 1_024;
+const MAX_READ_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_BATCH_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_PLANES_PER_BATCH: usize = 1_024;
 
 /// Errors from strict seek-backed SALT V2 package indexing and plane visits.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,8 +207,7 @@ impl SaltV2TensorInfo {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TensorDigest {
-    metadata: [u8; 32],
+struct TensorSectionDigest {
     payload: [u8; 32],
     scales: [u8; 32],
 }
@@ -223,7 +223,8 @@ struct IndexedTensor {
     full_tile_start: usize,
     full_tile_count: usize,
     ragged_plane_count: Option<usize>,
-    digest: TensorDigest,
+    metadata_digest: [u8; 32],
+    section_digest: TensorSectionDigest,
 }
 
 #[derive(Debug)]
@@ -510,7 +511,8 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 full_tile_start,
                 full_tile_count,
                 ragged_plane_count,
-                digest: TensorDigest::default(),
+                metadata_digest: [0; 32],
+                section_digest: TensorSectionDigest::default(),
             });
         }
 
@@ -596,15 +598,14 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 })?;
             tensor.info.present_planes = present_planes;
             tensor.info.runtime_ledger = indexed_runtime_ledger(tensor, present_planes)?;
-            tensor.digest.metadata = hash_range(
+            tensor.metadata_digest = hash_range(
                 &mut source,
                 tensor.record_offset,
                 tensor.metadata_len,
                 "hash tensor metadata",
             )?;
             let section_digest = scan_tensor(&mut source, codec, &map, tensor, |_| {})?;
-            tensor.digest.payload = section_digest.payload;
-            tensor.digest.scales = section_digest.scales;
+            tensor.section_digest = section_digest;
             checked_ledger_add(
                 &mut ledger.payload_bytes,
                 usize::try_from(physical.payload_bytes)
@@ -716,7 +717,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
             tensor.metadata_len,
             "verify tensor metadata",
         )?;
-        if metadata_digest != tensor.digest.metadata {
+        if metadata_digest != tensor.metadata_digest {
             return Err(SaltV2PackageReadError::SourceChanged(name.to_owned()));
         }
         let map_range = self.map.physical_byte_range(&tensor);
@@ -729,6 +730,10 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
             return Err(SaltV2PackageReadError::SourceChanged(name.to_owned()));
         }
 
+        // Revalidation is deliberate: the digest is known only after callbacks,
+        // so canonical decode and scale checks prevent malformed mutated bytes
+        // from ever reaching a callback while the final digest catches valid
+        // same-length mutations.
         let digest = match scan_tensor(&mut self.source, self.codec, &self.map, &tensor, visitor) {
             Ok(digest) => digest,
             Err(SaltV2PackageReadError::Format(_)) => {
@@ -736,7 +741,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
             }
             Err(error) => return Err(error),
         };
-        if digest.payload != tensor.digest.payload || digest.scales != tensor.digest.scales {
+        if digest != tensor.section_digest {
             return Err(SaltV2PackageReadError::SourceChanged(name.to_owned()));
         }
         Ok(())
@@ -810,9 +815,9 @@ fn scan_tensor<R: Read + Seek>(
     map: &OwnedPresenceMap,
     tensor: &IndexedTensor,
     mut visitor: impl FnMut(PackedSaltV2PlaneRef<'_>),
-) -> Result<TensorDigest, SaltV2PackageReadError> {
+) -> Result<TensorSectionDigest, SaltV2PackageReadError> {
     let mut descriptors = Vec::new();
-    try_reserve_exact::<PlaneDescriptor>(&mut descriptors, MAX_BATCH_PLANES)?;
+    try_reserve_exact::<PlaneDescriptor>(&mut descriptors, MAX_PLANES_PER_BATCH)?;
     let mut payload = Vec::new();
     let mut scales = Vec::new();
     let mut trits = Vec::new();
@@ -828,7 +833,7 @@ fn scan_tensor<R: Read + Seek>(
         descriptors.clear();
         let mut packed_batch_len = 0usize;
         let mut scale_batch_len = 0usize;
-        while tile_index < tensor.info.tile_count && descriptors.len() < MAX_BATCH_PLANES {
+        while tile_index < tensor.info.tile_count && descriptors.len() < MAX_PLANES_PER_BATCH {
             let consumed = tile_index
                 .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
                 .ok_or(SaltV2PackageError::LengthOverflow)?;
@@ -844,7 +849,7 @@ fn scan_tensor<R: Read + Seek>(
                 && packed_batch_len
                     .checked_add(packed_len)
                     .ok_or(SaltV2PackageError::LengthOverflow)?
-                    > IO_CHUNK_BYTES
+                    > MAX_BATCH_PAYLOAD_BYTES
             {
                 break;
             }
@@ -944,8 +949,7 @@ fn scan_tensor<R: Read + Seek>(
         }
         .into());
     }
-    Ok(TensorDigest {
-        metadata: [0; 32],
+    Ok(TensorSectionDigest {
         payload: *payload_hasher.finalize().as_bytes(),
         scales: *scale_hasher.finalize().as_bytes(),
     })
@@ -1039,13 +1043,13 @@ fn hash_range<R: Read + Seek>(
     let mut scratch = Vec::new();
     reserve_and_resize(
         &mut scratch,
-        usize::try_from(len.min(IO_CHUNK_BYTES as u64)).unwrap_or(IO_CHUNK_BYTES),
+        usize::try_from(len.min(MAX_READ_CHUNK_BYTES as u64)).unwrap_or(MAX_READ_CHUNK_BYTES),
     )?;
     let mut remaining = len;
     let mut hasher = blake3::Hasher::new();
     while remaining != 0 {
-        let chunk_len =
-            usize::try_from(remaining.min(IO_CHUNK_BYTES as u64)).expect("chunk length fits usize");
+        let chunk_len = usize::try_from(remaining.min(MAX_READ_CHUNK_BYTES as u64))
+            .expect("chunk length fits usize");
         source.read_exact_chunks(&mut scratch[..chunk_len], context)?;
         hasher.update(&scratch[..chunk_len]);
         remaining -= chunk_len as u64;
@@ -1061,8 +1065,8 @@ fn range_matches<R: Read + Seek>(
 ) -> Result<bool, SaltV2PackageReadError> {
     source.seek_abs(offset, context)?;
     let mut scratch = Vec::new();
-    reserve_and_resize(&mut scratch, expected.len().min(IO_CHUNK_BYTES))?;
-    for expected_chunk in expected.chunks(IO_CHUNK_BYTES) {
+    reserve_and_resize(&mut scratch, expected.len().min(MAX_READ_CHUNK_BYTES))?;
+    for expected_chunk in expected.chunks(MAX_READ_CHUNK_BYTES) {
         source.read_exact_chunks(&mut scratch[..expected_chunk.len()], context)?;
         if &scratch[..expected_chunk.len()] != expected_chunk {
             return Ok(false);
@@ -1203,7 +1207,7 @@ impl<R: Read + Seek> Source<R> {
             }
             .into());
         }
-        for chunk in bytes.chunks_mut(IO_CHUNK_BYTES) {
+        for chunk in bytes.chunks_mut(MAX_READ_CHUNK_BYTES) {
             self.inner
                 .read_exact(chunk)
                 .map_err(|error| io_error(context, error))?;
