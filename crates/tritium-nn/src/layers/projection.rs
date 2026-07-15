@@ -17,6 +17,18 @@ use tritium_spec::TernaryBackend;
 use crate::error::NnError;
 use crate::layers::{DenseLinear, SaltLinear, TernaryLinear};
 
+/// Activation arithmetic performed before a projection's weight contraction.
+///
+/// These variants name implemented numeric paths, not campaign evidence aliases:
+/// [`F32`](Self::F32) must never be reported as the planned A16 rung.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionActivationMode {
+    /// Consume fp32 activations without per-token quantization.
+    F32,
+    /// Quantize each activation row to signed int8 with an absmax scale.
+    A8,
+}
+
 /// A linear projection: deployed ternary, additive SALT, or dense fp32.
 #[allow(missing_debug_implementations)] // `TernaryLinear` holds `&dyn DeviceBuffer`
 pub enum Projection {
@@ -32,6 +44,23 @@ pub enum Projection {
 }
 
 impl Projection {
+    /// Activation arithmetic used by this projection.
+    #[must_use]
+    pub fn activation_mode(&self) -> ProjectionActivationMode {
+        match self {
+            Projection::Ternary(_) | Projection::Salt(_) => ProjectionActivationMode::A8,
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(_) => ProjectionActivationMode::F32,
+            Projection::Dense(linear) => {
+                if linear.quantizes_activations() {
+                    ProjectionActivationMode::A8
+                } else {
+                    ProjectionActivationMode::F32
+                }
+            }
+        }
+    }
+
     /// Forward through whichever projection this is. Deployed ternary and resident
     /// SALT V2 weights use `backend`; host-packed SALT and dense weights run on the host.
     ///

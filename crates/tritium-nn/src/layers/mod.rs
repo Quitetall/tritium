@@ -10,6 +10,7 @@ mod linear;
 mod mlp;
 mod packed_salt;
 mod projection;
+mod qwen35_full_attention;
 mod salt;
 mod token_embedding;
 mod transformer_block;
@@ -19,7 +20,10 @@ pub(crate) use packed_salt::{PackedSaltMatrix, PackedSaltMatrixBuilder};
 pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::{Mlp, Relu2Mlp, SwiGluMlp};
-pub use projection::Projection;
+pub use projection::{Projection, ProjectionActivationMode};
+pub use qwen35_full_attention::{
+    Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights,
+};
 pub use salt::SaltLinear;
 pub use token_embedding::TokenEmbedding;
 pub use transformer_block::{BlockDump, BlockScratch, TransformerBlock};
