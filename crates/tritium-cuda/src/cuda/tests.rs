@@ -10,12 +10,14 @@
 
 use super::*;
 use half::f16;
+use std::io::Cursor;
 use tritium_cpu::CpuBackend;
 use tritium_cpu::salt_v2::salt_v2_matvec;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
     SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SaltV2IndexedRuntimeLedger,
-    SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, SaltV2Transform,
+    SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile, SaltV2Transform,
+    write_salt_v2_package,
 };
 use tritium_testkit::{ConformanceVector, Tolerance, generate_vectors, run_conformance};
 
@@ -125,7 +127,8 @@ fn salt_v2_dense_matmul(tensor: &SaltV2Tensor, activation: &[f32], m: usize) -> 
 
 /// Plan 0043 Stage 6: every admitted SALT V2 codec executes directly from its
 /// resident encoded payload. Mixed P=1/3/2 tiles, row-crossing macrotiles, and
-/// one-/three-column matrices cover the descriptor and codec-tail boundaries.
+/// one-/three-column matrices cover the descriptor and codec-tail boundaries;
+/// the 1025-tile case crosses repeated upload-staging and rank-prefix boundaries.
 /// The fast entry point is intentionally an exact-kernel alias in this first
 /// correctness slice and its receipt must say so.
 #[test]
@@ -138,12 +141,12 @@ fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
         }
     };
 
-    let long_plane_counts = (0..257).map(|index| 1 + index % 3).collect::<Vec<_>>();
+    let long_plane_counts = (0..1025).map(|index| 1 + index % 3).collect::<Vec<_>>();
     let cases = vec![
         salt_v2_test_tensor(3, 173, &[1, 3, 2]),
         salt_v2_test_tensor(2, 3, &[3]),
         salt_v2_test_tensor(1, 1, &[1]),
-        salt_v2_test_tensor(1, 257 * SALT_V2_ALLOCATION_TILE_SIZE, &long_plane_counts),
+        salt_v2_test_tensor(1, 1025 * SALT_V2_ALLOCATION_TILE_SIZE, &long_plane_counts),
     ];
     for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
         for tensor in &cases {
@@ -161,6 +164,12 @@ fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
             let resident = cuda
                 .upload_salt_v2(tensor, codec)
                 .expect("upload semantic SALT V2 tensor");
+            let encoded = write_salt_v2_package(&package).expect("encode SALT V2 package");
+            let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes))
+                .expect("strict seek reader");
+            let streamed = cuda
+                .upload_salt_v2_from_reader(&mut reader, tensor.name())
+                .expect("stream SALT V2 tensor from package");
 
             let exact = cuda
                 .salt_v2_forward_exact(&resident, &activation, m)
@@ -168,6 +177,9 @@ fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
             let fast = cuda
                 .salt_v2_forward_fast(&resident, &activation, m)
                 .expect("fast SALT V2 forward");
+            let streamed_exact = cuda
+                .salt_v2_forward_exact(&streamed, &activation, m)
+                .expect("streamed exact SALT V2 forward");
             let dense = salt_v2_dense_matmul(tensor, &activation, m);
             let mut cpu = Vec::with_capacity(m * rows);
             for mi in 0..m {
@@ -193,10 +205,12 @@ fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
                 );
             }
             assert_eq!(fast.output, exact.output);
+            assert_eq!(streamed_exact.output, exact.output);
             assert_eq!(exact.receipt.mode(), SaltV2ForwardMode::Exact);
             assert_eq!(fast.receipt.mode(), SaltV2ForwardMode::FastAliasesExact);
 
             let allocation = resident.allocation_receipt();
+            assert_eq!(streamed.allocation_receipt(), allocation);
             let planned = SaltV2IndexedRuntimeLedger::for_tensor(tensor, codec)
                 .expect("shared indexed-runtime plan");
             assert_eq!(allocation.runtime_ledger(), planned);
@@ -342,6 +356,18 @@ fn salt_v2_cuda_rejects_unimplemented_tensor_transform() {
         }
         other => panic!("expected InvalidInput, got {other}"),
     }
+
+    let package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).expect("valid package");
+    let encoded = write_salt_v2_package(&package).expect("encode transformed package");
+    let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes))
+        .expect("strict transformed package");
+    let error = cuda
+        .upload_salt_v2_from_reader(&mut reader, "rotated")
+        .expect_err("streamed CUDA upload must not ignore SignedRht");
+    assert!(
+        matches!(error, BackendError::InvalidInput(ref message) if message.contains("SignedRht")),
+        "unexpected streamed transform error: {error}"
+    );
 }
 
 /// Gate C on CUDA (ADR 0007): the f32 ternary-matmul backward kernels match the

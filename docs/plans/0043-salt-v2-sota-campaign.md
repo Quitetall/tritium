@@ -679,7 +679,11 @@ an artifact-wide copy. The canonical SALT V2 package now has the same strict
 seek-backed format seam: it validates every D2/B3/S34 plane and scale, retains
 only owned tensor metadata plus the compact physical presence map, reports exact
 per-tensor indexed-runtime requirements, streams named tensors in arbitrary
-order with 64 KiB payload staging, and detects same-handle source mutation.
+order with 64 KiB payload staging, and detects same-handle source mutation. The
+CUDA consumer now preallocates those exact payload/scale arenas, streams the
+reader through fixed 64 KiB host buffers, constructs only the compact map/rank
+index, and publishes the resident handle and allocation receipt only after the
+reader's terminal mutation check succeeds.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
@@ -717,9 +721,11 @@ The following work deliberately remains open and keeps this plan in progress:
 - `PhysicalSizeReport::from_salt_v2_package_bytes_with_runtime_receipts(...)`
   now rederives the complete indexed layout from canonical package bytes and
   rejects wrong-count or component-disagreeing per-tensor resident runtime
-  ledgers. The production campaign adapter must still open the immutable
-  artifact and bind independently measured preserved model allocations;
-  caller-provided architecture geometry alone is not claim evidence;
+  ledgers. The streamed CUDA tensor adapter now returns the independently
+  checked resident allocation receipt for one opened package tensor. The
+  production campaign adapter must still aggregate receipts from the complete
+  preserved model allocation set; caller-provided architecture geometry alone
+  is not claim evidence;
 - G1 widening now has canonical source/result identities, deterministic oracle
   evidence, transactional rollback, and a tracked-fp32-payload preflight. The
   dense oracle still constructs infallible full-model clones, so this is not a
@@ -728,10 +734,11 @@ The following work deliberately remains open and keeps this plan in progress:
   and dense function-preservation oracle required for G2 do not exist;
 - the eager semantic SALT V2 decoder remains as a compatibility/reference API,
   while `SaltV2PackageReader` supplies strict bounded-staging package access.
-  No model adapter yet consumes its packed-plane visitor into final CPU/CUDA
-  arenas, and the legacy model adapter rejects Qwen QK-norm and QKV-bias
-  checkpoints. That bounded runtime consumer and end-to-end target-architecture
-  integration must precede any Qwen campaign;
+  The CUDA adapter consumes its packed-plane visitor directly into final device
+  arenas, but the `tritium-nn` model assembler does not yet map a whole SALT V2
+  package plus norms/config into projections and embeddings. The legacy model
+  adapter also rejects Qwen QK-norm and QKV-bias checkpoints. That end-to-end
+  target-architecture integration must precede any Qwen campaign;
 - resident large-K CUDA SALT kernels and a paged fp16 or int8 KV cache with a
   runtime context override remain required for practical 32B serving;
 - required third-party baselines have not all been integrated or reproduced

@@ -9,6 +9,8 @@ use tritium_format::salt_v2_package::{
     SaltV2IndexedRuntimeLedger, SaltV2Tensor, SaltV2Transform, pack_salt_v2_plane,
 };
 
+mod salt_v2_reader_upload;
+
 /// A logical prefix of cudarc page-locked memory.
 ///
 /// cudarc 0.19 does not expose pinned host views. Delegating the synchronization
