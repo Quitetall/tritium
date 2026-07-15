@@ -62,7 +62,7 @@ The active order is:
    Gated DeltaNet state semantics, full-attention blocks, and the one-layer MTP
    module. Prove dense reference parity before accepting ternary weights.
 2. Freeze and test the language-plus-MTP coverage policy. Account for all 506
-   converted rank-2 matrices, 360 preserved non-matrix tensors, 333 deferred
+   in-scope rank-2 matrices, 360 preserved non-matrix tensors, 333 deferred
    vision tensors, and every runtime allocation; fail closed on unconsumed,
    duplicate, or shape/dtype-mismatched tensors.
 3. Connect the measured whole-model SALT V2 receipt to
@@ -476,9 +476,10 @@ and the relevant CPU/CUDA parity gate before the next stage depends on it.
 | 1–2 | 8M tokens | 32M tokens |
 | Qwen3.6-27B | 64M tokens | 512M tokens |
 
-The 27B row inherits the former 32B upper ceilings; it is conservative planning
-policy, not a 27B measurement. The 1.7B pilot may tighten either cap before the
-recipe freezes. Increasing a cap requires a plan amendment and new provenance.
+The 27B row inherits the former 32B hard maximums; neither value is a 27B
+measurement or a prediction of what the hybrid graph needs. The 1.7B pilot may
+tighten either cap before the recipe freezes. The caps may not increase in
+response to a 27B outcome; any later expansion requires a new preregistration.
 
 Evaluate at 1/8, 1/4, 1/2, and full cap. Stop after three evaluations without
 improvement in the frozen validation aggregate. The best earlier checkpoint is
@@ -564,7 +565,9 @@ the 27B campaign.
   shapes alone are insufficient.
 - Produce an exact 1,199-tensor coverage receipt: 506 additive-ternary matrices,
   360 preserved non-matrix tensors, and 333 identity-bound deferred vision
-  tensors, with no unknown, duplicate, or missing tensor.
+  tensors, with no unknown, duplicate, or missing tensor. Recompute these counts
+  from the pinned weight index and shard headers; the stated values are a golden
+  for the pinned revision, not constants to accept against a changed source.
 - Reproduce required baselines at R2/R3/R4 or the largest attainable artifact
   not exceeding the ceiling. If the rate gap exceeds 0.05 artifact bpw, report
   the point for context but do not use it to establish a strict head-to-head
@@ -585,6 +588,10 @@ the 27B campaign.
 If this gate fails, spend at most the first one-eighth of the scale-only cap.
 Continue scale-only only when a conservative learning-curve fit projects that
 the gate is reachable within the frozen cap. Short PV stops.
+
+The 50% gap-closure threshold is intentionally inherited and preregistered. A
+different Qwen3.6 SALT V1 gap does not relax it after measurement; failure is a
+valid negative result.
 
 ### Stage 9 — Qwen3.6-27B scale-only and short-PV proof
 
@@ -624,6 +631,9 @@ preregistration defines the exact vision coverage policy, dense multimodal
 oracle, evaluation suite, confirmation model if any, compute ceiling, and stop
 conditions. Language-plus-MTP results remain scoped as such and are never
 extrapolated to multimodal behavior or another model size.
+
+Any confirmation model belongs to its own future preregistration. It is not a
+hidden substage of this deferred multimodal stage.
 
 The former Qwen3-8B-to-32B/50B Net2Wider experiment is no longer an active SOTA
 campaign stage. Any future model-growth experiment is reported separately from

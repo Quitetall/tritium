@@ -1,7 +1,41 @@
 # Capstone cascade — ADR 0020 SALT-distillation, the full plan set
 
-The milestone map from the **keystone** (general inference) to the **binding gate** (a 27–35B
-SOTA model ternarized to ≤1% ppl vs its fp16 teacher). Strategy lives in
+> **Active execution notice (2026-07-15):** the 0035–0041 sequence below is legacy planning
+> history. [Plan 0043](./0043-salt-v2-sota-campaign.md), under
+> [ADR 0028](../adr/0028-salt-v2-additive-ternarization.md) and the 2026-07-15 amendment to
+> [ADR 0020](../adr/0020-v1x-salt-distillation-capstone.md), supersedes it for active execution.
+> A standard 32B run is optional only; it is not the current binding gate.
+
+## Active critical path
+
+The pinned target is `Qwen/Qwen3.6-27B` revision
+`6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`; the authoritative sources are its pinned
+[model card](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/README.md),
+[configuration](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/config.json),
+and [weight index](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/model.safetensors.index.json).
+Active scope is its language core plus bundled one-layer MTP drafter; vision and multimodal
+integration are deferred.
+
+1. Implement the Qwen3.6 nested-config, mixed Gated DeltaNet/full-attention, and MTP adapter;
+   prove dense parity and exact tensor consumption.
+2. Bind source, config, result, package, coverage, physical-size, and runtime identities through
+   the SALT V2 converter and native execution path.
+3. Pass local synthetic, sliced-layer, and smallest-practical end-to-end gates; then run the
+   frozen 27B PTQ track and report quality, physical bpw, memory, and runtime.
+4. Only after the PTQ stop gate, run and report the refined track separately.
+5. Reproduce matched baselines and satisfy every applicable ADR 0026/0028 claim gate before any
+   umbrella SOTA claim; schedule the deferred vision scope only afterward.
+
+No paid compute is authorized by this file. See plan 0043 for the complete active gates, stop
+conditions, and approval boundary.
+
+## Historical 0035–0041 cascade (superseded for active execution)
+
+The remainder of this document records the earlier standard-32B-first sequence. It is retained for
+traceability and for reusable completed work, not as the current operational order.
+
+The historical milestone map ran from the **keystone** (general inference) to the **binding gate**
+(a 27–35B SOTA model ternarized to ≤1% ppl vs its fp16 teacher). Strategy lives in
 [ADR 0020](../adr/0020-v1x-salt-distillation-capstone.md); this file sequences the **tactical
 plans** that execute it, with each plan's deliverable, numeric exit gate, dependencies, effort,
 and risks. Individual plans are fleshed out to executable detail **just-in-time** (0035 is

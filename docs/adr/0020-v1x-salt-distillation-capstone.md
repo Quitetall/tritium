@@ -126,3 +126,34 @@ the ≤1% point is the headline. VRAM stays **~1/5–1/8 of fp16**.
   (Thunder / Hot Aisle MI300X / RunPod, per prior fenced sessions), not just the local 4090.
 - **Qwen3.6 SSM/MoE** is a genuine research + systems lift; keeping it **off** the binding gate
   (headline, not blocker) is the schedule insurance.
+
+## Amendment 2026-07-15 — Qwen3.6-27B is the active binding capstone
+
+This amendment replaces the standard-transformer-32B-first execution order above. The earlier
+scope and cascade remain as decision history, but a standard 32B is now an optional confirmation
+model only: it is neither the active target nor a prerequisite for the public-launch gate.
+
+The active binding capstone is `Qwen/Qwen3.6-27B` at immutable revision
+`6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`, as defined by its pinned
+[model card](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/README.md),
+[configuration](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/config.json),
+and [weight index](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/model.safetensors.index.json).
+Those sources supersede the earlier Mamba/SSM/MoE shorthand: the selected checkpoint has a dense
+`qwen3_5` text core with a repeating three-Gated-DeltaNet-to-one-full-attention schedule and one
+declared MTP hidden layer.
+The first binding artifact covers the language core and bundled one-layer MTP drafter. The vision
+encoder and multimodal integration remain the product end state, but are deferred until that
+language-plus-MTP scope passes its architecture, identity, quality, accounting, and runtime gates.
+
+PTQ and refined conversion are separate experiment tracks. They must retain separate artifacts,
+recipes, costs, and claims; refined results must not be reported as PTQ. This target change does
+not relax the inherited capstone gates: the qualifying result must still demonstrate **≤ 1%
+perplexity delta** against the pinned source model, publish the full quality-versus-physical-bpw
+curve, run end to end in Tritium, and report measured matched-fp16-versus-ternary inference memory
+rather than a logical-bit estimate. All applicable provenance, parity, runtime, and publication gates in
+[ADR 0028](./0028-salt-v2-additive-ternarization.md) also apply.
+
+The active operational sequence is [plan 0043](../plans/0043-salt-v2-sota-campaign.md). Engineering
+and evidence collection are local-first. This amendment authorizes no paid compute; any rental or
+cloud run requires explicit future approval of a frozen recipe, cost ceiling, stop gate, and
+validated resume path. It marks no empirical gate complete.
