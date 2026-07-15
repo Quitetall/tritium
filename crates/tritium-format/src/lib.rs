@@ -45,6 +45,7 @@ mod rows;
 mod safetensors;
 mod salt;
 mod salt_bundle;
+mod salt_bundle_reader;
 mod salt_gguf;
 mod sparse;
 mod tb1;
@@ -72,24 +73,28 @@ pub use i2s_int8::{
 pub use rows::{num_blocks, pack_tq1_0_row, pack_tq2_0_row, unpack_tq1_0_row, unpack_tq2_0_row};
 pub use safetensors::{SafeTensors, SafeTensorsError, SafeTensorsReader, read_safetensors};
 pub use salt::{
-    DEFAULT_SPARSE_RESIDUAL_DENSITY, PackedSaltRow, SALT_HEADER_BYTES, SALT_MAGIC,
-    SALT_PROGRESSIVE_VERSION, SALT_VERSION, SaltRow, dequant_salt_row, pack_progressive_salt_row,
-    pack_salt_row, packed_salt_row_len, read_legacy_as_salt, salt_rows_to_dense,
-    unpack_packed_salt_row, unpack_packed_salt_row_prefix, unpack_salt_row, unpack_salt_row_prefix,
+    DEFAULT_SPARSE_RESIDUAL_DENSITY, PackedSaltPlaneRef, PackedSaltPlaneRefs, PackedSaltRow,
+    PackedSaltRowRef, SALT_HEADER_BYTES, SALT_MAGIC, SALT_PROGRESSIVE_VERSION, SALT_VERSION,
+    SaltRow, dequant_salt_row, pack_progressive_salt_row, pack_salt_row, packed_salt_row_len,
+    read_legacy_as_salt, salt_rows_to_dense, unpack_packed_salt_row, unpack_packed_salt_row_prefix,
+    unpack_salt_row, unpack_salt_row_prefix,
 };
 pub use salt_bundle::{
     PackedSaltTensor, SALT_BUNDLE_MAGIC, SALT_BUNDLE_VERSION, SaltBundleIndex, SaltTensor,
     SaltTensorView, read_salt_bundle, read_salt_bundle_prefix, write_progressive_salt_bundle,
     write_salt_bundle,
 };
+pub use salt_bundle_reader::{
+    PackedSaltStorageRequirements, SaltBundleReadError, SaltBundleReader, SaltBundleTensorInfo,
+};
 pub use salt_gguf::{
     GGML_TYPE_TRITIUM_SALT, SALT_GGUF_FORMAT_KEY, SALT_GGUF_FORMAT_VALUE, read_salt_gguf,
     read_salt_gguf_packed, write_salt_gguf,
 };
 pub use sparse::{
-    PlaneRepr, SPARSE_HEADER_BYTES, SPARSE_MAGIC, SPARSE_VERSION, SparsePlane, choose_plane_repr,
-    dequant_sparse_plane, expand_plane_repr, pack_sparse_plane, sparse_dot, sparse_from_tq2_0,
-    sparse_to_tq2_0, unpack_sparse_plane,
+    PlaneRepr, SPARSE_HEADER_BYTES, SPARSE_MAGIC, SPARSE_VERSION, SparsePlane, SparsePlaneRef,
+    choose_plane_repr, dequant_sparse_plane, expand_plane_repr, pack_sparse_plane, sparse_dot,
+    sparse_from_tq2_0, sparse_to_tq2_0, unpack_sparse_plane,
 };
 pub use tb1::{TB1_PRESENCE_BYTES, pack_tb1_row, tb1_row_bytes, unpack_tb1_row};
 pub use teacher_cache::{

@@ -24,8 +24,9 @@ use half::f16;
 use tritium_core::Trit;
 
 use crate::{
-    FormatError, PlaneRepr, QK_K, TQ2_0_BLOCK_BYTES, choose_plane_repr, expand_plane_repr,
-    num_blocks, pack_sparse_plane, sparse_to_tq2_0, unpack_sparse_plane, unpack_tq2_0_row,
+    FormatError, PlaneRepr, QK_K, SparsePlaneRef, TQ2_0_BLOCK_BYTES, choose_plane_repr,
+    expand_plane_repr, num_blocks, pack_sparse_plane, sparse::validate_sparse_plane,
+    sparse_to_tq2_0, unpack_tq2_0_row,
 };
 
 /// Sidecar magic: `b"TSLT"` (Tritium SALT).
@@ -121,10 +122,7 @@ impl PackedSaltRow {
                             got: sparse.k,
                         });
                     }
-                    // Reuse the canonical serializer's complete validation without retaining
-                    // its temporary framing bytes. PackedSaltRow itself stores the compact
-                    // scales and signed coordinates directly.
-                    let _ = pack_sparse_plane(sparse)?;
+                    validate_sparse_plane(sparse)?;
                 }
             }
         }
@@ -331,7 +329,7 @@ fn validate_salt_row(row: &SaltRow) -> Result<usize, FormatError> {
     Ok(plane_bytes)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct SaltRowLayout {
     version: u8,
     planes: usize,
@@ -436,6 +434,157 @@ fn parse_salt_row_layout(bytes: &[u8]) -> Result<SaltRowLayout, FormatError> {
     })
 }
 
+/// Allocation-free validated view of one dense or sparse SALT plane.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedSaltPlaneRef<'a> {
+    repr: PackedSaltPlaneRefRepr<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PackedSaltPlaneRefRepr<'a> {
+    Dense(&'a [u8]),
+    Sparse(SparsePlaneRef<'a>),
+}
+
+impl<'a> PackedSaltPlaneRef<'a> {
+    /// Dense TQ2_0 payload, or `None` when this plane is sparse.
+    #[must_use]
+    pub const fn dense_bytes(self) -> Option<&'a [u8]> {
+        match self.repr {
+            PackedSaltPlaneRefRepr::Dense(bytes) => Some(bytes),
+            PackedSaltPlaneRefRepr::Sparse(_) => None,
+        }
+    }
+
+    /// Sparse payload view, or `None` when this plane is dense.
+    #[must_use]
+    pub const fn sparse(self) -> Option<SparsePlaneRef<'a>> {
+        match self.repr {
+            PackedSaltPlaneRefRepr::Dense(_) => None,
+            PackedSaltPlaneRefRepr::Sparse(sparse) => Some(sparse),
+        }
+    }
+}
+
+/// Allocation-free validated view of one encoded SALT row.
+///
+/// Plane payloads borrow the encoded row. Callers can copy them directly into final
+/// storage while a seek-backed reader reuses one row-sized scratch allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedSaltRowRef<'a> {
+    bytes: &'a [u8],
+    layout: SaltRowLayout,
+}
+
+impl<'a> PackedSaltRowRef<'a> {
+    /// Parse and fully validate one exact encoded row without allocating.
+    ///
+    /// # Errors
+    /// Returns the same malformed-row errors as [`unpack_packed_salt_row`].
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, FormatError> {
+        let layout = parse_salt_row_layout(bytes)?;
+        if bytes.len() != layout.encoded_len {
+            return Err(FormatError::WrongBlockLen {
+                expected: layout.encoded_len,
+                got: bytes.len(),
+            });
+        }
+        let mut payload_offset = layout.payload_start;
+        for index in 0..layout.planes {
+            let (tag, len) = if layout.version == SALT_VERSION {
+                (PLANE_TAG_DENSE, layout.plane_bytes)
+            } else {
+                read_plane_descriptor(bytes, index)
+            };
+            let payload = &bytes[payload_offset..payload_offset + len];
+            if tag == PLANE_TAG_DENSE {
+                validate_dense_plane(payload, layout.plane_bytes)?;
+            } else {
+                let sparse = SparsePlaneRef::parse(payload)?;
+                if sparse.k() != layout.k {
+                    return Err(FormatError::WrongBlockLen {
+                        expected: layout.k,
+                        got: sparse.k(),
+                    });
+                }
+            }
+            payload_offset += len;
+        }
+        Ok(Self { bytes, layout })
+    }
+
+    /// Logical row length.
+    #[must_use]
+    pub const fn k(self) -> usize {
+        self.layout.k
+    }
+
+    /// Number of retained additive planes.
+    #[must_use]
+    pub const fn plane_count(self) -> usize {
+        self.layout.planes
+    }
+
+    /// Exact encoded bytes backing this validated row view.
+    #[must_use]
+    pub const fn encoded_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Validated planes in additive order.
+    pub fn planes(self) -> PackedSaltPlaneRefs<'a> {
+        PackedSaltPlaneRefs {
+            row: self,
+            index: 0,
+            payload_offset: self.layout.payload_start,
+        }
+    }
+}
+
+/// Iterator over allocation-free plane views in one [`PackedSaltRowRef`].
+#[derive(Clone, Debug)]
+pub struct PackedSaltPlaneRefs<'a> {
+    row: PackedSaltRowRef<'a>,
+    index: usize,
+    payload_offset: usize,
+}
+
+impl<'a> Iterator for PackedSaltPlaneRefs<'a> {
+    type Item = PackedSaltPlaneRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.row.layout.planes {
+            return None;
+        }
+        let (tag, len) = if self.row.layout.version == SALT_VERSION {
+            (PLANE_TAG_DENSE, self.row.layout.plane_bytes)
+        } else {
+            read_plane_descriptor(self.row.bytes, self.index)
+        };
+        let start = self.payload_offset;
+        let end = start + len;
+        self.index += 1;
+        self.payload_offset = end;
+        let payload = &self.row.bytes[start..end];
+        Some(PackedSaltPlaneRef {
+            repr: match tag {
+                PLANE_TAG_DENSE => PackedSaltPlaneRefRepr::Dense(payload),
+                PLANE_TAG_SPARSE => {
+                    PackedSaltPlaneRefRepr::Sparse(SparsePlaneRef::from_validated(payload))
+                }
+                _ => unreachable!("row validation covered plane tag"),
+            },
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.row.layout.planes - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PackedSaltPlaneRefs<'_> {}
+
 /// Return encoded length of first SALT row in `bytes` without consuming later rows.
 ///
 /// Supports legacy dense v1 and progressive framed v2. Returned length is bounded
@@ -521,58 +670,17 @@ pub fn unpack_packed_salt_row_prefix(
     bytes: &[u8],
     max_planes: usize,
 ) -> Result<PackedSaltRow, FormatError> {
-    let layout = parse_salt_row_layout(bytes)?;
-    if bytes.len() != layout.encoded_len {
-        return Err(FormatError::WrongBlockLen {
-            expected: layout.encoded_len,
-            got: bytes.len(),
-        });
-    }
-    let keep = layout.planes.min(max_planes);
+    let row = PackedSaltRowRef::parse(bytes)?;
+    let keep = row.plane_count().min(max_planes);
     let mut planes = Vec::with_capacity(keep);
-    match layout.version {
-        SALT_VERSION => {
-            for index in 0..layout.planes {
-                let offset = layout.payload_start + index * layout.plane_bytes;
-                let payload = &bytes[offset..offset + layout.plane_bytes];
-                validate_dense_plane(payload, layout.plane_bytes)?;
-                if index < keep {
-                    planes.push(PlaneRepr::Dense(payload.to_vec()));
-                }
-            }
+    for plane in row.planes().take(keep) {
+        if let Some(dense) = plane.dense_bytes() {
+            planes.push(PlaneRepr::Dense(dense.to_vec()));
+        } else if let Some(sparse) = plane.sparse() {
+            planes.push(PlaneRepr::Sparse(sparse.to_owned()));
         }
-        SALT_PROGRESSIVE_VERSION => {
-            let mut payload_off = layout.payload_start;
-            for index in 0..layout.planes {
-                let (tag, len) = read_plane_descriptor(bytes, index);
-                let payload = &bytes[payload_off..payload_off + len];
-                match tag {
-                    PLANE_TAG_DENSE => {
-                        validate_dense_plane(payload, layout.plane_bytes)?;
-                        if index < keep {
-                            planes.push(PlaneRepr::Dense(payload.to_vec()));
-                        }
-                    }
-                    PLANE_TAG_SPARSE => {
-                        let sparse = unpack_sparse_plane(payload)?;
-                        if sparse.k != layout.k {
-                            return Err(FormatError::WrongBlockLen {
-                                expected: layout.k,
-                                got: sparse.k,
-                            });
-                        }
-                        if index < keep {
-                            planes.push(PlaneRepr::Sparse(sparse));
-                        }
-                    }
-                    _ => unreachable!("plane tag validated"),
-                }
-                payload_off += len;
-            }
-        }
-        _ => unreachable!("row version validated"),
     }
-    Ok(PackedSaltRow::from_validated(layout.k, planes))
+    Ok(PackedSaltRow::from_validated(row.k(), planes))
 }
 
 /// Parse a SALT row while materializing at most `max_planes` additive planes.

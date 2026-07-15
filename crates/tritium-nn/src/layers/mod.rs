@@ -14,6 +14,8 @@ mod salt;
 mod token_embedding;
 mod transformer_block;
 
+pub(crate) use packed_salt::{PackedSaltMatrix, PackedSaltMatrixBuilder};
+
 pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::{Mlp, Relu2Mlp, SwiGluMlp};

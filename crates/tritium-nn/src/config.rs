@@ -4,6 +4,60 @@ use tritium_format::{GgufFile, GgufValue};
 
 use crate::error::NnError;
 
+const MAX_MODEL_LAYERS: u32 = 4_096;
+const MAX_MODEL_AXIS: u32 = 16_000_000;
+const MAX_CONTEXT_LENGTH: u32 = 16_000_000;
+
+fn validate_gguf_arch(arch: &str) -> Result<(), NnError> {
+    if matches!(arch, "bitnet" | "bitnet-b1.58") {
+        Ok(())
+    } else {
+        Err(NnError::MissingMetadata(format!(
+            "unsupported general.architecture `{arch}`"
+        )))
+    }
+}
+
+fn validate_model_geometry(
+    n_layers: u32,
+    n_embd: u32,
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    n_ff: u32,
+    n_ctx: u32,
+) -> Result<(), &'static str> {
+    let q_width = u64::from(n_head) * u64::from(head_dim);
+    let kv_width = u64::from(n_head_kv) * u64::from(head_dim);
+    if n_layers == 0
+        || n_embd == 0
+        || n_head == 0
+        || n_head_kv == 0
+        || head_dim == 0
+        || n_ff == 0
+        || n_ctx == 0
+        || !n_head.is_multiple_of(n_head_kv)
+        || !head_dim.is_multiple_of(2)
+        || n_layers > MAX_MODEL_LAYERS
+        || n_embd > MAX_MODEL_AXIS
+        || n_head > MAX_MODEL_AXIS
+        || n_head_kv > MAX_MODEL_AXIS
+        || head_dim > MAX_MODEL_AXIS
+        || n_ff > MAX_MODEL_AXIS
+        || n_ctx > MAX_CONTEXT_LENGTH
+        || q_width > u64::from(MAX_MODEL_AXIS)
+        || kv_width > u64::from(MAX_MODEL_AXIS)
+    {
+        Err("model dimensions are unsupported, unsafe, or do not divide evenly")
+    } else {
+        Ok(())
+    }
+}
+
+const fn finite_positive(value: f32) -> bool {
+    value.is_finite() && value > 0.0
+}
+
 /// Architecture/shape parameters needed to run a decoder model. Field names follow
 /// the GGUF `{arch}.*` metadata convention (llama-family, which BitNet reuses).
 #[derive(Debug, Clone, PartialEq)]
@@ -48,20 +102,23 @@ impl ModelConfig {
     ///
     /// # Errors
     /// [`NnError::MissingMetadata`] if `general.architecture` or any required
-    /// `{arch}.*` key is absent or the wrong type.
+    /// `{arch}.*` key is absent or the wrong type, or if the GGUF architecture is
+    /// not one of the BitNet dialects supported by the GGUF execution path.
     pub fn from_gguf(file: &GgufFile) -> Result<Self, NnError> {
         let arch = file
             .get_metadata("general.architecture")
             .and_then(GgufValue::as_str)
             .ok_or_else(|| NnError::MissingMetadata("general.architecture".to_owned()))?
             .to_owned();
+        validate_gguf_arch(&arch)?;
 
         let u32_key = |suffix: &str| -> Result<u32, NnError> {
             let key = format!("{arch}.{suffix}");
-            file.get_metadata(&key)
+            let value = file
+                .get_metadata(&key)
                 .and_then(GgufValue::as_u64)
-                .map(|v| v as u32)
-                .ok_or(NnError::MissingMetadata(key))
+                .ok_or_else(|| NnError::MissingMetadata(key.clone()))?;
+            u32::try_from(value).map_err(|_| NnError::MissingMetadata(format!("{key} exceeds u32")))
         };
         let f32_key = |suffix: &str| -> Result<f32, NnError> {
             let key = format!("{arch}.{suffix}");
@@ -73,16 +130,35 @@ impl ModelConfig {
 
         let n_embd = u32_key("embedding_length")?;
         let n_head = u32_key("attention.head_count")?;
+        let n_head_kv = u32_key("attention.head_count_kv")?;
+        let n_layers = u32_key("block_count")?;
+        let n_ff = u32_key("feed_forward_length")?;
+        let n_ctx = u32_key("context_length")?;
+        let head_dim = n_embd
+            .checked_div(n_head)
+            .filter(|_| n_embd.is_multiple_of(n_head))
+            .ok_or_else(|| {
+                NnError::MissingMetadata("embedding width must divide attention heads".to_owned())
+            })?;
+        validate_model_geometry(n_layers, n_embd, n_head, n_head_kv, head_dim, n_ff, n_ctx)
+            .map_err(|message| NnError::MissingMetadata(message.to_owned()))?;
+        let rope_theta = f32_key("rope.freq_base")?;
+        let rms_eps = f32_key("attention.layer_norm_rms_epsilon")?;
+        if !finite_positive(rope_theta) || !finite_positive(rms_eps) {
+            return Err(NnError::MissingMetadata(
+                "RoPE theta and RMS epsilon must be finite and positive".to_owned(),
+            ));
+        }
         Ok(ModelConfig {
-            n_layers: u32_key("block_count")?,
+            n_layers,
             n_embd,
             n_head,
-            n_head_kv: u32_key("attention.head_count_kv")?,
-            head_dim: n_embd / n_head,
-            n_ff: u32_key("feed_forward_length")?,
-            n_ctx: u32_key("context_length")?,
-            rope_theta: f32_key("rope.freq_base")?,
-            rms_eps: f32_key("attention.layer_norm_rms_epsilon")?,
+            n_head_kv,
+            head_dim,
+            n_ff,
+            n_ctx,
+            rope_theta,
+            rms_eps,
             arch,
         })
     }
@@ -90,16 +166,17 @@ impl ModelConfig {
     /// Read a [`ModelConfig`] + [`ArchSpec`] from a HuggingFace `config.json` value
     /// (standard transformer-family keys). `num_key_value_heads` defaults to
     /// `num_attention_heads` (MHA); `rope_theta` to `10000`; `max_position_embeddings`
-    /// to `4096`. `hidden_act == "silu"` ⇒ [`MlpKind::SwiGlu`], else [`MlpKind::Relu2`].
+    /// to `4096`. `hidden_act == "silu"` selects [`MlpKind::SwiGlu`]; `"relu2"`
+    /// selects [`MlpKind::Relu2`]. Other activation families are rejected.
     /// Sub-norms are off (a standard HF model has none); `qk_norm`/`qkv_bias` are off
     /// (descriptor flags for later plans).
     ///
     /// `config_json` is the raw `config.json` contents.
     ///
     /// # Errors
-    /// [`NnError::MissingConfig`] if `config_json` is not valid JSON, or a required key
-    /// (`hidden_size`, `num_hidden_layers`, `num_attention_heads`, `intermediate_size`,
-    /// `rms_norm_eps`) is absent or mistyped.
+    /// [`NnError::MissingConfig`] if JSON or required fields are malformed, geometry is
+    /// unsafe/unsupported, RoPE scaling or scalar values are unsupported, or the declared
+    /// model/activation family is not implemented by the shared decoder skeleton.
     pub fn from_hf_config(config_json: &str) -> Result<(ModelConfig, ArchSpec), NnError> {
         let json: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| NnError::MissingConfig(format!("invalid config.json: {e}")))?;
@@ -112,24 +189,33 @@ impl ModelConfig {
             ));
         }
         let req_u32 = |key: &str| -> Result<u32, NnError> {
-            json.get(key)
+            let value = json
+                .get(key)
                 .and_then(serde_json::Value::as_u64)
-                .map(|v| v as u32)
+                .ok_or_else(|| NnError::MissingConfig(key.to_owned()))?;
+            u32::try_from(value).map_err(|_| NnError::MissingConfig(format!("{key} exceeds u32")))
+        };
+        let opt_u32 = |key: &str, default: u32| -> Result<u32, NnError> {
+            let Some(value) = json.get(key) else {
+                return Ok(default);
+            };
+            let value = value
+                .as_u64()
+                .ok_or_else(|| NnError::MissingConfig(key.to_owned()))?;
+            u32::try_from(value).map_err(|_| NnError::MissingConfig(format!("{key} exceeds u32")))
+        };
+        let opt_f32 = |key: &str, default: f32| -> Result<f32, NnError> {
+            let Some(value) = json.get(key) else {
+                return Ok(default);
+            };
+            value
+                .as_f64()
+                .map(|value| value as f32)
                 .ok_or_else(|| NnError::MissingConfig(key.to_owned()))
-        };
-        let opt_u32 = |key: &str, default: u32| -> u32 {
-            json.get(key)
-                .and_then(serde_json::Value::as_u64)
-                .map_or(default, |v| v as u32)
-        };
-        let opt_f32 = |key: &str, default: f32| -> f32 {
-            json.get(key)
-                .and_then(serde_json::Value::as_f64)
-                .map_or(default, |v| v as f32)
         };
 
         let n_head = req_u32("num_attention_heads")?;
-        let n_head_kv = opt_u32("num_key_value_heads", n_head);
+        let n_head_kv = opt_u32("num_key_value_heads", n_head)?;
         let arch = json
             .get("model_type")
             .and_then(serde_json::Value::as_str)
@@ -148,28 +234,69 @@ impl ModelConfig {
             .ok_or_else(|| NnError::MissingConfig("rms_norm_eps".to_owned()))?;
 
         let n_embd = req_u32("hidden_size")?;
+        let n_layers = req_u32("num_hidden_layers")?;
+        let n_ff = req_u32("intermediate_size")?;
+        let n_ctx = opt_u32("max_position_embeddings", 4096)?;
+        let head_dim = match json.get("head_dim") {
+            Some(_) => opt_u32("head_dim", 0)?,
+            None => n_embd
+                .checked_div(n_head)
+                .filter(|_| n_embd.is_multiple_of(n_head))
+                .ok_or_else(|| {
+                    NnError::MissingConfig(
+                        "hidden_size must divide num_attention_heads when head_dim is absent"
+                            .to_owned(),
+                    )
+                })?,
+        };
+        validate_model_geometry(n_layers, n_embd, n_head, n_head_kv, head_dim, n_ff, n_ctx)
+            .map_err(|message| NnError::MissingConfig(message.to_owned()))?;
+        let rope_theta = opt_f32("rope_theta", 10_000.0)?;
+        if !finite_positive(rope_theta) || !finite_positive(rms_eps) {
+            return Err(NnError::MissingConfig(
+                "rope_theta and rms_norm_eps must be finite and positive".to_owned(),
+            ));
+        }
         let cfg = ModelConfig {
-            n_layers: req_u32("num_hidden_layers")?,
+            n_layers,
             n_embd,
             n_head,
             n_head_kv,
             // Qwen3 sets an explicit head_dim that need not equal n_embd/n_head.
-            head_dim: opt_u32("head_dim", n_embd / n_head),
-            n_ff: req_u32("intermediate_size")?,
-            n_ctx: opt_u32("max_position_embeddings", 4096),
-            rope_theta: opt_f32("rope_theta", 10_000.0),
+            head_dim,
+            n_ff,
+            n_ctx,
+            rope_theta,
             rms_eps,
             arch,
         };
 
-        let hidden_act = json
-            .get("hidden_act")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("silu");
-        let mlp = if hidden_act == "silu" {
-            MlpKind::SwiGlu
-        } else {
-            MlpKind::Relu2
+        if !matches!(cfg.arch.as_str(), "bitnet" | "llama" | "qwen2" | "qwen3") {
+            return Err(NnError::MissingConfig(format!(
+                "unsupported model_type `{}`",
+                cfg.arch
+            )));
+        }
+        let hidden_act = match json.get("hidden_act") {
+            None => "silu",
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| NnError::MissingConfig("hidden_act".to_owned()))?,
+        };
+        let mlp = match hidden_act {
+            "silu" => MlpKind::SwiGlu,
+            "relu2" => MlpKind::Relu2,
+            other => {
+                return Err(NnError::MissingConfig(format!(
+                    "unsupported hidden_act `{other}`"
+                )));
+            }
+        };
+        let tied_embeddings = match json.get("tie_word_embeddings") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| NnError::MissingConfig("tie_word_embeddings".to_owned()))?,
         };
         let spec = ArchSpec {
             mlp,
@@ -178,10 +305,7 @@ impl ModelConfig {
             ffn_sub_norm: false,
             qk_norm: false,
             qkv_bias: false,
-            tied_embeddings: json
-                .get("tie_word_embeddings")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
+            tied_embeddings,
         };
         Ok((cfg, spec))
     }
@@ -257,6 +381,16 @@ mod tests {
     }
 
     #[test]
+    fn gguf_path_accepts_only_bitnet_dialects() {
+        assert!(validate_gguf_arch("bitnet").is_ok());
+        assert!(validate_gguf_arch("bitnet-b1.58").is_ok());
+        assert!(matches!(
+            validate_gguf_arch("llama"),
+            Err(NnError::MissingMetadata(_))
+        ));
+    }
+
+    #[test]
     fn from_hf_config_smollm2_swiglu() {
         let (c, spec) = ModelConfig::from_hf_config(
             r#"{
@@ -286,7 +420,7 @@ mod tests {
     fn from_hf_config_defaults_kv_to_mha_and_relu2() {
         // No num_key_value_heads ⇒ MHA (kv == heads); non-silu act ⇒ Relu2; untied.
         let (c, spec) = ModelConfig::from_hf_config(
-            r#"{"model_type":"x","hidden_size":128,"num_hidden_layers":2,
+            r#"{"model_type":"bitnet","hidden_size":128,"num_hidden_layers":2,
                 "num_attention_heads":4,"intermediate_size":256,
                 "rms_norm_eps":1e-6,"hidden_act":"relu2","tie_word_embeddings":false}"#,
         )
@@ -318,5 +452,72 @@ mod tests {
         let err = ModelConfig::from_hf_config(r#"{"num_hidden_layers":2,"num_attention_heads":4}"#)
             .unwrap_err();
         assert!(matches!(err, NnError::MissingConfig(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn from_hf_config_rejects_zero_heads_and_u32_truncation() {
+        for json in [
+            r#"{"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":0,
+                "intermediate_size":16,"rms_norm_eps":1e-5}"#,
+            r#"{"hidden_size":4294967296,"num_hidden_layers":1,"num_attention_heads":2,
+                "intermediate_size":16,"rms_norm_eps":1e-5}"#,
+            r#"{"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":2,
+                "num_key_value_heads":0,"intermediate_size":16,"rms_norm_eps":1e-5}"#,
+            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":4294967295,
+                "num_attention_heads":2,"intermediate_size":16,"rms_norm_eps":1e-5}"#,
+            r#"{"model_type":"qwen3","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"head_dim":3,"intermediate_size":16,
+                "rms_norm_eps":1e-5}"#,
+        ] {
+            assert!(
+                matches!(
+                    ModelConfig::from_hf_config(json),
+                    Err(NnError::MissingConfig(_))
+                ),
+                "invalid dimensions accepted: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_hf_config_rejects_nonfinite_or_nonpositive_scalars() {
+        for tail in [
+            r#""rms_norm_eps":0"#,
+            r#""rms_norm_eps":1e-5,"rope_theta":1e400"#,
+        ] {
+            let json = format!(
+                r#"{{"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":2,
+                    "intermediate_size":16,{tail}}}"#
+            );
+            assert!(matches!(
+                ModelConfig::from_hf_config(&json),
+                Err(NnError::MissingConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn from_hf_config_rejects_mistyped_or_unsupported_semantics() {
+        for json in [
+            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"intermediate_size":16,"rms_norm_eps":1e-5,
+                "rope_theta":"100000"}"#,
+            r#"{"model_type":"gemma","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"intermediate_size":16,"rms_norm_eps":1e-5}"#,
+            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"intermediate_size":16,"rms_norm_eps":1e-5,
+                "hidden_act":"gelu"}"#,
+            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"intermediate_size":16,"rms_norm_eps":1e-5,
+                "hidden_act":17}"#,
+            r#"{"model_type":"llama","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"intermediate_size":16,"rms_norm_eps":1e-5,
+                "tie_word_embeddings":"true"}"#,
+        ] {
+            assert!(matches!(
+                ModelConfig::from_hf_config(json),
+                Err(NnError::MissingConfig(_))
+            ));
+        }
     }
 }

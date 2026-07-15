@@ -133,3 +133,15 @@ fn dense_weight_reconstruction_rejects_drained_training_masters() {
     };
     assert!(error.to_string().contains("drained"), "{error}");
 }
+
+#[test]
+fn failed_host_forward_rolls_back_every_layer_cache() {
+    let mut malformed = weights(true);
+    malformed.output_norm.pop();
+    let mut runner = ModelRunner::from_weights(config(), malformed, cpu());
+
+    assert!(runner.forward(&[0, 1], &[0, 1]).is_err());
+    assert!(runner.kv.iter().all(|cache| cache.len == 0));
+    assert!(runner.kv.iter().all(|cache| cache.k.is_empty()));
+    assert!(runner.kv.iter().all(|cache| cache.v.is_empty()));
+}

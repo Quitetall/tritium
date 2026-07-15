@@ -311,3 +311,17 @@ fn append_rejects_mismatched_lengths() {
     );
     assert_eq!(cache.view().2, 0, "no rows written on rejected append");
 }
+
+#[test]
+fn declared_max_context_is_lazy_and_row_geometry_is_fallible() {
+    let mut cache = KvCache::try_new(usize::MAX, 1, 1).expect("representable row width");
+    assert!(cache.k.is_empty());
+    assert!(cache.v.is_empty());
+    assert_eq!(cache.k.capacity(), 0);
+    assert_eq!(cache.v.capacity(), 0);
+
+    cache.append(&[1.0], &[2.0], 1).expect("first row");
+    assert_eq!(cache.view(), (&[1.0][..], &[2.0][..], 1));
+
+    assert!(KvCache::try_new(1, usize::MAX, 2).is_err());
+}

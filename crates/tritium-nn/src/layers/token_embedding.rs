@@ -27,6 +27,24 @@ pub struct TokenEmbedding {
 }
 
 impl TokenEmbedding {
+    pub(crate) fn from_packed_matrix(
+        matrix: PackedSaltMatrix,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, NnError> {
+        if matrix.n_out() != rows || matrix.k_in() != cols {
+            return Err(NnError::Shape {
+                expected: rows.saturating_mul(cols),
+                got: matrix.n_out().saturating_mul(matrix.k_in()),
+            });
+        }
+        Ok(Self {
+            rows,
+            cols,
+            storage: Storage::Salt(matrix),
+        })
+    }
+
     /// Build a dense fp32 token table.
     ///
     /// # Errors
@@ -106,6 +124,7 @@ impl TokenEmbedding {
     }
 
     /// Retained payload and metadata bytes, excluding this wrapper.
+    /// Cloned packed tables share arenas, so summing this value across clones double-counts them.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         match &self.storage {

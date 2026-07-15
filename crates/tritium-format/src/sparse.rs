@@ -71,6 +71,161 @@ impl SparsePlane {
     }
 }
 
+/// Allocation-free validated view of one encoded sparse residual plane.
+///
+/// Scales and signed column entries remain in little-endian on-disk storage. This
+/// supports streaming a SALT tensor into runtime arenas without three per-row vectors.
+#[derive(Clone, Copy, Debug)]
+pub struct SparsePlaneRef<'a> {
+    k: usize,
+    scales: &'a [u8],
+    entries: &'a [u8],
+}
+
+impl<'a> SparsePlaneRef<'a> {
+    /// Parse and fully validate an encoded sparse plane without allocating.
+    ///
+    /// # Errors
+    /// Returns the same malformed-input errors as [`unpack_sparse_plane`].
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, FormatError> {
+        if bytes.len() < SPARSE_HEADER_BYTES {
+            return Err(FormatError::WrongBlockLen {
+                expected: SPARSE_HEADER_BYTES,
+                got: bytes.len(),
+            });
+        }
+        if bytes[0..4] != SPARSE_MAGIC {
+            return Err(FormatError::SaltBadMagic);
+        }
+        let version = bytes[4];
+        if version != SPARSE_VERSION {
+            return Err(FormatError::UnsupportedSaltVersion(version));
+        }
+        let k = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+        if k >= SIGN_BIT as usize {
+            return Err(FormatError::SaltRowTooLong(k));
+        }
+        let nnz = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
+        let scale_bytes = num_blocks(k)
+            .checked_mul(2)
+            .ok_or(FormatError::WrongBlockLen {
+                expected: usize::MAX,
+                got: bytes.len(),
+            })?;
+        let entry_bytes = nnz.checked_mul(4).ok_or(FormatError::WrongBlockLen {
+            expected: usize::MAX,
+            got: bytes.len(),
+        })?;
+        let entries_start =
+            SPARSE_HEADER_BYTES
+                .checked_add(scale_bytes)
+                .ok_or(FormatError::WrongBlockLen {
+                    expected: usize::MAX,
+                    got: bytes.len(),
+                })?;
+        let required =
+            entries_start
+                .checked_add(entry_bytes)
+                .ok_or(FormatError::WrongBlockLen {
+                    expected: usize::MAX,
+                    got: bytes.len(),
+                })?;
+        if bytes.len() != required {
+            return Err(FormatError::WrongBlockLen {
+                expected: required,
+                got: bytes.len(),
+            });
+        }
+
+        let scales = &bytes[SPARSE_HEADER_BYTES..entries_start];
+        let entries = &bytes[entries_start..];
+        let mut previous = None;
+        for encoded in entries
+            .chunks_exact(4)
+            .map(|entry| u32::from_le_bytes(entry.try_into().expect("four-byte sparse entry")))
+        {
+            let column = encoded & !SIGN_BIT;
+            if column as usize >= k {
+                return Err(FormatError::DecodedOutOfRange(column as i32));
+            }
+            if previous.is_some_and(|value| value >= column) {
+                return Err(FormatError::SaltNonCanonicalSparseIndices);
+            }
+            previous = Some(column);
+        }
+        Ok(Self { k, scales, entries })
+    }
+
+    pub(crate) fn from_validated(bytes: &'a [u8]) -> Self {
+        let k =
+            u32::from_le_bytes(bytes[6..10].try_into().expect("validated sparse header")) as usize;
+        let scale_bytes = num_blocks(k) * 2;
+        let entries_start = SPARSE_HEADER_BYTES + scale_bytes;
+        Self {
+            k,
+            scales: &bytes[SPARSE_HEADER_BYTES..entries_start],
+            entries: &bytes[entries_start..],
+        }
+    }
+
+    /// Logical row length represented by this plane.
+    #[must_use]
+    pub const fn k(self) -> usize {
+        self.k
+    }
+
+    /// Number of per-256-weight scales.
+    #[must_use]
+    pub const fn scale_count(self) -> usize {
+        self.scales.len() / 2
+    }
+
+    /// Number of stored nonzero entries.
+    #[must_use]
+    pub const fn entry_count(self) -> usize {
+        self.entries.len() / 4
+    }
+
+    /// Scales in block order.
+    pub fn scales(self) -> impl ExactSizeIterator<Item = f16> + 'a {
+        self.scales.chunks_exact(2).map(|bytes| {
+            f16::from_bits(u16::from_le_bytes(
+                bytes.try_into().expect("two-byte sparse scale"),
+            ))
+        })
+    }
+
+    /// Signed entries in canonical column order.
+    ///
+    /// Top bit encodes a negative sign; remaining bits encode the column.
+    pub fn encoded_entries(self) -> impl ExactSizeIterator<Item = u32> + 'a {
+        self.entries
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte sparse entry")))
+    }
+
+    /// Materialize this view as the legacy owned sparse-plane representation.
+    #[must_use]
+    pub fn to_owned(self) -> SparsePlane {
+        let scales = self.scales().collect();
+        let (idx, sign) = self
+            .encoded_entries()
+            .map(|encoded| {
+                (
+                    encoded & !SIGN_BIT,
+                    if encoded & SIGN_BIT != 0 { -1 } else { 1 },
+                )
+            })
+            .unzip();
+        SparsePlane {
+            k: self.k,
+            scales,
+            idx,
+            sign,
+        }
+    }
+}
+
 /// Build a [`SparsePlane`] from one dense TQ2_0 plane (`num_blocks(k)·66` bytes).
 ///
 /// # Errors
@@ -153,7 +308,10 @@ pub fn sparse_to_tq2_0(plane: &SparsePlane) -> Result<Vec<u8>, FormatError> {
     Ok(out)
 }
 
-fn validate_sparse_plane(plane: &SparsePlane) -> Result<usize, FormatError> {
+pub(crate) fn validate_sparse_plane(plane: &SparsePlane) -> Result<usize, FormatError> {
+    if plane.k >= SIGN_BIT as usize {
+        return Err(FormatError::SaltRowTooLong(plane.k));
+    }
     let nb = num_blocks(plane.k);
     if plane.scales.len() != nb {
         return Err(FormatError::WrongBlockLen {
@@ -169,6 +327,14 @@ fn validate_sparse_plane(plane: &SparsePlane) -> Result<usize, FormatError> {
     }
     if plane.idx.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(FormatError::SaltNonCanonicalSparseIndices);
+    }
+    for (&column, &sign) in plane.idx.iter().zip(&plane.sign) {
+        if column as usize >= plane.k {
+            return Err(FormatError::DecodedOutOfRange(column as i32));
+        }
+        if !matches!(sign, -1 | 1) {
+            return Err(FormatError::DecodedOutOfRange(sign as i32));
+        }
     }
     Ok(nb)
 }
@@ -268,7 +434,7 @@ pub fn expand_plane_repr(repr: &PlaneRepr) -> Result<Vec<u8>, FormatError> {
 ///
 /// Layout: `magic(4) | version(1) | _pad(1) | k u32 | nnz u32 | scales[nb] f16 |
 /// entries[nnz] u32` where each entry packs the column index with the sign in the
-/// top bit ([`SIGN_BIT`]).
+/// top bit (`SIGN_BIT`).
 ///
 /// # Errors
 /// [`FormatError::SaltRowTooLong`] if `k ≥ 2^31`; [`FormatError::WrongBlockLen`] if
@@ -311,83 +477,7 @@ pub fn pack_sparse_plane(plane: &SparsePlane) -> Result<Vec<u8>, FormatError> {
 /// on an unknown version; [`FormatError::WrongBlockLen`] on truncation/length
 /// disagreement; [`FormatError::DecodedOutOfRange`] if an entry's column is `≥ k`.
 pub fn unpack_sparse_plane(bytes: &[u8]) -> Result<SparsePlane, FormatError> {
-    if bytes.len() < SPARSE_HEADER_BYTES {
-        return Err(FormatError::WrongBlockLen {
-            expected: SPARSE_HEADER_BYTES,
-            got: bytes.len(),
-        });
-    }
-    if bytes[0..4] != SPARSE_MAGIC {
-        return Err(FormatError::SaltBadMagic);
-    }
-    let version = bytes[4];
-    if version != SPARSE_VERSION {
-        return Err(FormatError::UnsupportedSaltVersion(version));
-    }
-    let k = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
-    // Reject k ≥ 2^31 up front (both write paths enforce it): such a plane is
-    // unserializable by pack_sparse_plane and would amplify this 14-byte header
-    // into a multi-MB allocation via num_blocks(k) below.
-    if k >= SIGN_BIT as usize {
-        return Err(FormatError::SaltRowTooLong(k));
-    }
-    let nnz = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
-    let nb = num_blocks(k);
-
-    // Required length is exact: header + scales + entries. Compute it overflow-safe
-    // (k/nnz are attacker-controlled u32; on 32-bit usize the product could wrap).
-    let scales_bytes = nb.checked_mul(2).ok_or(FormatError::WrongBlockLen {
-        expected: usize::MAX,
-        got: bytes.len(),
-    })?;
-    let entries_bytes = nnz.checked_mul(4).ok_or(FormatError::WrongBlockLen {
-        expected: usize::MAX,
-        got: bytes.len(),
-    })?;
-    let need = SPARSE_HEADER_BYTES
-        .checked_add(scales_bytes)
-        .and_then(|s| s.checked_add(entries_bytes))
-        .ok_or(FormatError::WrongBlockLen {
-            expected: usize::MAX,
-            got: bytes.len(),
-        })?;
-    if bytes.len() != need {
-        return Err(FormatError::WrongBlockLen {
-            expected: need,
-            got: bytes.len(),
-        });
-    }
-
-    let mut scales = Vec::with_capacity(nb);
-    let mut off = SPARSE_HEADER_BYTES;
-    for _ in 0..nb {
-        let bits = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-        scales.push(f16::from_bits(bits));
-        off += 2;
-    }
-    // nnz is bounded by the exact-length check above (need == bytes.len()), so the
-    // reserve cannot exceed the buffer.
-    let mut idx = Vec::with_capacity(nnz);
-    let mut sign = Vec::with_capacity(nnz);
-    for _ in 0..nnz {
-        let enc = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-        off += 4;
-        let c = enc & !SIGN_BIT;
-        if c as usize >= k {
-            return Err(FormatError::DecodedOutOfRange(c as i32));
-        }
-        if idx.last().is_some_and(|previous| *previous >= c) {
-            return Err(FormatError::SaltNonCanonicalSparseIndices);
-        }
-        idx.push(c);
-        sign.push(if enc & SIGN_BIT != 0 { -1 } else { 1 });
-    }
-    Ok(SparsePlane {
-        k,
-        scales,
-        idx,
-        sign,
-    })
+    Ok(SparsePlaneRef::parse(bytes)?.to_owned())
 }
 
 #[cfg(test)]

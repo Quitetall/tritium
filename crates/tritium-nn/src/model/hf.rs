@@ -17,14 +17,19 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use tritium_format::{PackedSaltTensor, SaltBundleIndex, read_salt_gguf_packed};
+use tritium_format::{
+    PackedSaltTensor, SALT_BUNDLE_MAGIC, SaltBundleReader, read_salt_gguf_packed,
+};
 
 use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
 use crate::layers::{
-    DenseLinear, Mlp, Projection, Relu2Mlp, SaltLinear, SwiGluMlp, TokenEmbedding, TransformerBlock,
+    DenseLinear, Mlp, PackedSaltMatrix, PackedSaltMatrixBuilder, Projection, Relu2Mlp, SaltLinear,
+    SwiGluMlp, TokenEmbedding, TransformerBlock,
 };
 use crate::model::ModelWeights;
 use crate::model::hf_shards::HfShardSet;
@@ -40,8 +45,7 @@ impl ModelWeights {
     /// mismatch).
     pub fn load_hf(dir: &Path) -> Result<(ModelConfig, ArchSpec, ModelWeights), NnError> {
         let cfg_path = dir.join("config.json");
-        let cfg_json = std::fs::read_to_string(&cfg_path)
-            .map_err(|e| NnError::MissingConfig(format!("read {}: {e}", cfg_path.display())))?;
+        let cfg_json = read_config_json(&cfg_path)?;
         let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
         let config_value: serde_json::Value = serde_json::from_str(&cfg_json)
             .map_err(|error| NnError::MissingConfig(format!("invalid config.json: {error}")))?;
@@ -51,7 +55,7 @@ impl ModelWeights {
         // Detect Qwen-family features from the actual weights (config flags don't always
         // advertise them) and enable them: Qwen2/2.5 QKV bias, Qwen3 per-head QK-norm.
         (spec.qkv_bias, spec.qk_norm) =
-            resolve_optional_attention_weights(&config, &config_value, &shards);
+            resolve_optional_attention_weights(&config, &config_value, &shards)?;
         let get = |name: &str, request: DenseTensorRequest| -> Result<Vec<f32>, NnError> {
             match request {
                 DenseTensorRequest::Vector { len } => shards.tensor_f32_exact(name, &[len]),
@@ -91,8 +95,7 @@ impl ModelWeights {
         bundle: &Path,
     ) -> Result<(ModelConfig, ModelWeights), NnError> {
         let cfg_path = model_dir.join("config.json");
-        let cfg_json = std::fs::read_to_string(&cfg_path)
-            .map_err(|e| NnError::MissingConfig(format!("read {}: {e}", cfg_path.display())))?;
+        let cfg_json = read_config_json(&cfg_path)?;
         let (config, mut spec) = ModelConfig::from_hf_config(&cfg_json)?;
         let config_value: serde_json::Value = serde_json::from_str(&cfg_json)
             .map_err(|e| NnError::MissingConfig(format!("invalid config.json: {e}")))?;
@@ -103,18 +106,40 @@ impl ModelWeights {
         // artifact itself.
         let shards = HfShardSet::open(model_dir)?;
         (spec.qkv_bias, spec.qk_norm) =
-            resolve_optional_attention_weights(&config, &config_value, &shards);
+            resolve_optional_attention_weights(&config, &config_value, &shards)?;
         if spec.qkv_bias || spec.qk_norm {
             return Err(NnError::MissingConfig(
                 "SALT inference of QKV-bias/QK-norm (Qwen) models is not yet supported".to_owned(),
             ));
         }
 
-        // TSLB uses a validated borrowed index so only the requested tensor is decoded, then
-        // flattened into final packed storage. SALT-GGUF preserves the same dense/sparse rows.
-        let bundle_bytes = std::fs::read(bundle)
-            .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", bundle.display())))?;
-        let source = if bundle_bytes.starts_with(b"GGUF") {
+        // Open once, pinning the source handle before format sniffing. Canonical TSLB is
+        // strict-seek scanned and then streams selected rows directly into final arenas.
+        // SALT-GGUF remains the explicit eager compatibility fallback for this slice.
+        let mut artifact = File::open(bundle)
+            .map_err(|e| NnError::MissingTensor(format!("open {}: {e}", bundle.display())))?;
+        if !artifact
+            .metadata()
+            .map_err(|e| NnError::MissingTensor(format!("stat {}: {e}", bundle.display())))?
+            .is_file()
+        {
+            return Err(NnError::MissingTensor(format!(
+                "{} is not a regular file",
+                bundle.display()
+            )));
+        }
+        let mut magic = [0u8; 4];
+        artifact
+            .read_exact(&mut magic)
+            .map_err(|e| NnError::MissingTensor(format!("read {} magic: {e}", bundle.display())))?;
+        artifact
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| NnError::MissingTensor(format!("seek {}: {e}", bundle.display())))?;
+        let source = if magic == *b"GGUF" {
+            let mut bundle_bytes = Vec::new();
+            artifact
+                .read_to_end(&mut bundle_bytes)
+                .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", bundle.display())))?;
             let tensors = read_salt_gguf_packed(&bundle_bytes)
                 .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?;
             let mut by_name = HashMap::with_capacity(tensors.len());
@@ -127,42 +152,28 @@ impl ModelWeights {
                 }
             }
             SaltTensorSource::Gguf(RefCell::new(by_name))
+        } else if magic == SALT_BUNDLE_MAGIC {
+            SaltTensorSource::Bundle(RefCell::new(
+                SaltBundleReader::new_strict(BufReader::with_capacity(64 * 1024, artifact))
+                    .map_err(|e| {
+                        NnError::MissingTensor(format!("index {}: {e}", bundle.display()))
+                    })?,
+            ))
         } else {
-            SaltTensorSource::Bundle(
-                SaltBundleIndex::new(&bundle_bytes)
-                    .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?,
-            )
+            return Err(NnError::MissingTensor(format!(
+                "{} is neither TSLB nor SALT-GGUF",
+                bundle.display()
+            )));
         };
 
         // The token table is one packed allocation shared by gather and the tied head. Validate
         // its declared config geometry before any model assembly.
-        let embedding_tensor = source.tensor(NameSchema::Hf.top("token_embd"))?;
         let n_embd = config.n_embd as usize;
-        if embedding_tensor.k != n_embd {
-            return Err(NnError::Shape {
-                expected: n_embd,
-                got: embedding_tensor.k,
-            });
-        }
-        if let Some(vocab) = declared_vocab
-            && embedding_tensor.rows != vocab
-        {
-            return Err(NnError::Shape {
-                expected: vocab,
-                got: embedding_tensor.rows,
-            });
-        }
-        if embedding_tensor.salt_rows.len() != embedding_tensor.rows {
-            return Err(NnError::Shape {
-                expected: embedding_tensor.rows,
-                got: embedding_tensor.salt_rows.len(),
-            });
-        }
-        let token_embd = TokenEmbedding::from_packed_salt(
-            embedding_tensor.salt_rows,
-            embedding_tensor.rows,
-            embedding_tensor.k,
-        )?;
+        let embedding_matrix =
+            source.matrix(NameSchema::Hf.top("token_embd"), declared_vocab, n_embd)?;
+        let embedding_rows = embedding_matrix.n_out();
+        let token_embd =
+            TokenEmbedding::from_packed_matrix(embedding_matrix, embedding_rows, n_embd)?;
 
         // Only 1D norms come from the fp master.
         let provider = |name: &str, request: DenseTensorRequest| -> Result<Vec<f32>, NnError> {
@@ -180,39 +191,97 @@ impl ModelWeights {
             token_embd,
             |name, request| provider(name, request),
             |name, n_out, k_in| {
-                let tensor = source.tensor(name)?;
-                Ok(Projection::Salt(SaltLinear::from_packed_rows(
-                    tensor.salt_rows,
-                    n_out,
-                    k_in,
-                )?))
+                Ok(Projection::Salt(SaltLinear::from_packed_matrix(
+                    source.matrix(name, Some(n_out), k_in)?,
+                )))
             },
         )?;
         Ok((config, weights))
     }
 }
 
-enum SaltTensorSource<'a> {
-    Bundle(SaltBundleIndex<'a>),
+enum SaltTensorSource {
+    Bundle(RefCell<SaltBundleReader<BufReader<File>>>),
     Gguf(RefCell<HashMap<String, PackedSaltTensor>>),
 }
 
-impl SaltTensorSource<'_> {
-    fn tensor(&self, name: &str) -> Result<PackedSaltTensor, NnError> {
+impl SaltTensorSource {
+    fn matrix(
+        &self,
+        name: &str,
+        expected_rows: Option<usize>,
+        expected_k: usize,
+    ) -> Result<PackedSaltMatrix, NnError> {
         match self {
-            Self::Bundle(index) => index
-                .tensor(name)
-                .ok_or_else(|| missing_salt_tensor(name))?
-                .decode_packed()
-                .map_err(|error| {
-                    NnError::MissingTensor(format!("decode SALT tensor `{name}`: {error}"))
-                }),
-            Self::Gguf(tensors) => tensors
-                .borrow_mut()
-                .remove(name)
-                .ok_or_else(|| missing_salt_tensor(name)),
+            Self::Bundle(reader) => {
+                let mut reader = reader.try_borrow_mut().map_err(|_| {
+                    NnError::Backend(format!("reentrant SALT tensor read for `{name}`"))
+                })?;
+                let info = reader
+                    .tensor_info(name)
+                    .cloned()
+                    .ok_or_else(|| missing_salt_tensor(name))?;
+                validate_salt_shape(name, info.shape(), expected_rows, expected_k)?;
+                let mut builder = PackedSaltMatrixBuilder::from_streamed(
+                    info.shape().0,
+                    info.shape().1,
+                    info.storage_requirements(),
+                )?;
+                let mut builder_error = None;
+                reader
+                    .visit_packed_tensor(name, |row| {
+                        if builder_error.is_none()
+                            && let Err(error) = builder.push_ref(row)
+                        {
+                            builder_error = Some(error);
+                        }
+                    })
+                    .map_err(|error| {
+                        NnError::MissingTensor(format!("read SALT tensor `{name}`: {error}"))
+                    })?;
+                if let Some(error) = builder_error {
+                    return Err(error);
+                }
+                builder.finish()
+            }
+            Self::Gguf(tensors) => {
+                let tensor = tensors
+                    .borrow_mut()
+                    .remove(name)
+                    .ok_or_else(|| missing_salt_tensor(name))?;
+                validate_salt_shape(name, (tensor.rows, tensor.k), expected_rows, expected_k)?;
+                PackedSaltMatrix::new(tensor.salt_rows, tensor.rows, tensor.k)
+            }
         }
     }
+}
+
+fn validate_salt_shape(
+    name: &str,
+    actual: (usize, usize),
+    expected_rows: Option<usize>,
+    expected_k: usize,
+) -> Result<(), NnError> {
+    if actual.1 != expected_k {
+        return Err(NnError::Shape {
+            expected: expected_k,
+            got: actual.1,
+        });
+    }
+    if let Some(rows) = expected_rows
+        && actual.0 != rows
+    {
+        return Err(NnError::Shape {
+            expected: rows,
+            got: actual.0,
+        });
+    }
+    if actual.0 == 0 {
+        return Err(NnError::MissingTensor(format!(
+            "SALT tensor `{name}` has zero rows"
+        )));
+    }
+    Ok(())
 }
 
 fn missing_salt_tensor(name: &str) -> NnError {
@@ -355,8 +424,17 @@ pub(crate) fn build_standard_model_with_embedding(
     }
     let vocab = token_embd.rows();
     let head_dim = config.head_dim() as usize;
-    let q_width = config.n_head as usize * head_dim;
-    let kv_width = config.n_head_kv as usize * head_dim;
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(NnError::Backend(
+            "attention head dimension must be nonzero and even".to_owned(),
+        ));
+    }
+    let q_width = (config.n_head as usize)
+        .checked_mul(head_dim)
+        .ok_or_else(|| NnError::Backend("query projection width overflows usize".to_owned()))?;
+    let kv_width = (config.n_head_kv as usize)
+        .checked_mul(head_dim)
+        .ok_or_else(|| NnError::Backend("KV projection width overflows usize".to_owned()))?;
     let n_ff = config.n_ff as usize;
     let dense_exact = |name: &str, expected: usize| -> Result<Vec<f32>, NnError> {
         let values = dense(name, DenseTensorRequest::Vector { len: expected })?;
@@ -370,8 +448,14 @@ pub(crate) fn build_standard_model_with_embedding(
     };
     let output_norm = dense_exact(schema.top("output_norm"), n_embd)?;
 
-    let mut layers = Vec::with_capacity(config.n_layers as usize);
-    for i in 0..config.n_layers as usize {
+    let layer_count = config.n_layers as usize;
+    let mut layers = Vec::new();
+    layers.try_reserve_exact(layer_count).map_err(|_| {
+        NnError::Backend(format!(
+            "allocate metadata for {layer_count} transformer layers"
+        ))
+    })?;
+    for i in 0..layer_count {
         let p = |s: &str| schema.layer(i, s);
         let (gate, up, down) = (
             proj(&p("gate"), n_ff, n_embd)?,
@@ -479,11 +563,41 @@ fn declared_vocab_size(config: &serde_json::Value) -> Result<Option<usize>, NnEr
         .map_err(|_| NnError::MissingConfig("vocab_size overflows usize".to_owned()))
 }
 
+const MAX_CONFIG_JSON_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_config_json(path: &Path) -> Result<String, NnError> {
+    let file = File::open(path)
+        .map_err(|error| NnError::MissingConfig(format!("open {}: {error}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| NnError::MissingConfig(format!("stat {}: {error}", path.display())))?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_JSON_BYTES {
+        return Err(NnError::MissingConfig(format!(
+            "{} must be a regular config.json no larger than {MAX_CONFIG_JSON_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let declared = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let mut text = String::new();
+    text.try_reserve_exact(declared)
+        .map_err(|_| NnError::MissingConfig(format!("allocate {} bytes", metadata.len())))?;
+    file.take(MAX_CONFIG_JSON_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| NnError::MissingConfig(format!("read {}: {error}", path.display())))?;
+    if text.len() as u64 > MAX_CONFIG_JSON_BYTES {
+        return Err(NnError::MissingConfig(format!(
+            "{} grew beyond {MAX_CONFIG_JSON_BYTES} bytes while reading",
+            path.display()
+        )));
+    }
+    Ok(text)
+}
+
 fn resolve_optional_attention_weights(
     config: &ModelConfig,
     config_value: &serde_json::Value,
     shards: &HfShardSet,
-) -> (bool, bool) {
+) -> Result<(bool, bool), NnError> {
     let detected_qkv_bias = shards.names().any(|name| {
         [".q_proj.bias", ".k_proj.bias", ".v_proj.bias"]
             .iter()
@@ -497,27 +611,34 @@ fn resolve_optional_attention_weights(
     let arch = config.arch.to_ascii_lowercase();
     let architecture_requires_qkv_bias = arch.starts_with("qwen2");
     let architecture_requires_qk_norm = arch.starts_with("qwen3");
-    let config_requires_qkv_bias = config_value
-        .get("attention_bias")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let config_requires_qk_norm = ["use_qk_norm", "qk_norm"].iter().any(|key| {
-        config_value
-            .get(key)
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    });
-    (
+    let config_requires_qkv_bias = optional_config_bool(config_value, "attention_bias")?;
+    let mut config_requires_qk_norm = false;
+    for key in ["use_qk_norm", "qk_norm"] {
+        config_requires_qk_norm |= optional_config_bool(config_value, key)?;
+    }
+    Ok((
         detected_qkv_bias || architecture_requires_qkv_bias || config_requires_qkv_bias,
         detected_qk_norm || architecture_requires_qk_norm || config_requires_qk_norm,
-    )
+    ))
+}
+
+fn optional_config_bool(config: &serde_json::Value, key: &str) -> Result<bool, NnError> {
+    match config.get(key) {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| NnError::MissingConfig(key.to_owned())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use super::{NameSchema, build_standard_model};
+    use super::{
+        MAX_CONFIG_JSON_BYTES, NameSchema, build_standard_model, optional_config_bool,
+        read_config_json,
+    };
     use crate::model::ModelWeights;
     use crate::{DenseLinear, MlpKind, ModelConfig, NnError};
 
@@ -549,6 +670,40 @@ mod tests {
         buf.extend_from_slice(&hb);
         buf.extend_from_slice(&data);
         buf
+    }
+
+    #[test]
+    fn config_reader_rejects_nonregular_and_oversized_files() {
+        let dir = std::env::temp_dir().join(format!("tritium-config-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(
+            read_config_json(&dir),
+            Err(NnError::MissingConfig(_))
+        ));
+
+        let oversized = dir.join("config.json");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_CONFIG_JSON_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            read_config_json(&oversized),
+            Err(NnError::MissingConfig(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn optional_attention_flags_reject_present_wrong_types() {
+        for key in ["attention_bias", "use_qk_norm", "qk_norm"] {
+            let config: serde_json::Value =
+                serde_json::from_str(&format!(r#"{{"{key}":"false"}}"#)).unwrap();
+            assert!(matches!(
+                optional_config_bool(&config, key),
+                Err(NnError::MissingConfig(_))
+            ));
+        }
     }
 
     #[test]

@@ -85,8 +85,61 @@ The file-backed `load_salt` fp-master userspace floor is now removed:
   wrong-rank/oversized-norm hole. Projection matrices are likewise checked against `[n_out, k_in]`
   before reading.
 
-This still does not make 32B loading or serving production-ready. The loader reads the whole SALT
-bundle; TSLB decoding transiently holds each requested packed tensor before flattening it into final
-arenas; SALT-GGUF eagerly decodes every packed tensor; and SALT projections/token tables do not enter
-the resident CUDA decoder. The next memory-floor slice is direct-arena or mapped bundle input,
-followed by resident large-K SALT CUDA execution.
+At this checkpoint, 32B loading was not production-ready: both TSLB and SALT-GGUF still had eager
+copies and SALT projections/token tables did not enter the resident CUDA decoder. The next section
+records removal of the TSLB copies; the GGUF and CUDA limitations remain.
+
+## Direct-arena TSLB loading (2026-07-15)
+
+The TSLB model path now removes both remaining host-side bundle copies:
+
+- `SaltBundleReader<R: Read + Seek>` strictly scans every tensor once, retaining only bounded owned
+  metadata, per-tensor BLAKE3 payload digests, and exact final-arena element counts. It rejects
+  duplicate names, malformed selected or unselected rows, inconsistent shape, truncation, trailing
+  bytes, arithmetic overflow, and explicit tensor/index/name/row/plane/encoded-row resource-limit
+  violations. Metadata lives in one fallibly reserved, name-sorted vector with binary search; there
+  is no infallibly growing tree index. Strict construction deliberately performs total payload I/O;
+  it is bounded-memory, not lazy-I/O. The model-safe policy permits at most eight planes per row and
+  a 16 MiB encoded row, so it can reject low-level writer output outside the inference envelope with
+  a typed `LimitExceeded` error.
+- Named tensor visits use absolute seeks and one reusable encoded-row buffer. Individual `Read`
+  requests are capped at 64 KiB; file-backed loading adds a 64 KiB `BufReader` to avoid one syscall
+  per row header. A complete visit rechecks the payload digest, detecting valid same-length mutation
+  through the already-open source handle. Visitor mutation is transactional until the method returns
+  `Ok`, because a late read or digest failure can follow earlier callbacks.
+- Allocation-free `PackedSaltRowRef` and `SparsePlaneRef` views let `PackedSaltMatrixBuilder` copy
+  each row directly into pre-sized final dense-byte, sparse-scale, sparse-entry, row-metadata, and
+  plane-metadata arenas. It preflights validation and exact element requirements before mutation,
+  requests final capacity up front, performs no per-row owned decode, and fails if construction-time
+  requirements differ from the second pass.
+- `PackedSaltMatrix` clones now share immutable arenas through `Arc`; tied or otherwise cloned views
+  do not duplicate model weights. `resident_bytes()` reports the shared backing size and therefore
+  must not be summed across clones.
+- `config.json` reads are regular-file-only and capped at 16 MiB. HF/GGUF dimension conversion,
+  bounded/even geometry, finite positive RoPE/RMS scalars, mistyped optional fields, unsupported
+  architectures, and unsupported activations fail closed. Layer metadata reserves fallibly.
+- A dedicated allocation-tracking regression strictly scans a borrowed bundle larger than 20 MB,
+  including a large unselected tensor, and requires less than 4 MiB of allocations. This catches
+  reintroduction of a whole-bundle copy; direct-builder tests separately require stable final-arena
+  pointers and shared `Arc` backing.
+
+The current dense TQ2_0 plane costs 2.0625 bits per weight, so one plane for 32 billion weights is
+about 8.25 GB of payload. With an illustrative 4.8 million rows, current row/plane metadata adds
+about 0.23 GB, for roughly 8.48 GB resident and 7.55× compression versus 64 GB FP16. Additive models
+scale with retained plane count; sparse residuals can be smaller. The current format therefore does
+not support a physical “more than 10×” claim. Crossing that threshold requires radix-3 or other
+entropy coding, better scale amortization, and compact or implicit dense-plane metadata, with quality
+measured separately.
+
+SALT-GGUF remains an explicit eager compatibility path: it still reads the whole artifact and
+materializes all packed tensors before model assembly. The next memory slice is a strict seek-backed
+GGUF metadata/tensor adapter with the same direct-arena consumer. TSLB also reads all payload bytes
+twice when every tensor is selected, and warmed file cache can appear in cgroup physical-memory
+peaks even though anonymous heap stays row-bounded.
+
+Host fp32 K/V vectors now start empty and grow fallibly in 64-row chunks, so an artifact's declared
+maximum context no longer becomes an unchecked eager allocation. The full-context physical cost is
+unchanged: for 64 layers and KV width 1024 it is 17.18 GB at 32K context and 68.72 GB at 128K.
+Production 32B serving therefore still requires, in order: seek-backed GGUF, compact SALT
+payload/metadata, resident large-K CUDA SALT kernels, and a paged fp16 or int8 KV cache with a runtime
+context override.

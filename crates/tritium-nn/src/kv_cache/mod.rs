@@ -4,11 +4,13 @@
 //! step attends over the whole context without recomputing past projections.
 //! One [`KvCache`] is held per transformer block. WF-3 proves incremental decode
 //! == full recompute across a page/chunk boundary (ADR 0002, v0.20); the cache
-//! is a flat `[max_ctx, n_head_kv · head_dim]` ring-free arena with a moving
-//! `len` watermark, so [`view`](KvCache::view) hands attention a contiguous
-//! prefix and [`append`](KvCache::append) is a bounded `memcpy`.
+//! is a flat, lazily grown `[context, n_head_kv · head_dim]` ring-free arena with
+//! a moving `len` watermark, so [`view`](KvCache::view) hands attention a
+//! contiguous prefix and [`append`](KvCache::append) is a bounded `memcpy`.
 
 use crate::error::NnError;
+
+const GROWTH_ROWS: usize = 64;
 
 /// Cached keys and values for one attention layer.
 ///
@@ -34,22 +36,37 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    /// Allocate a cache for up to `max_ctx` tokens, each a `n_head_kv · head_dim`
-    /// -wide key and value row. Starts empty (`len == 0`).
+    /// Create a cache for up to `max_ctx` tokens, each a `n_head_kv · head_dim`
+    /// -wide key and value row. Starts empty (`len == 0`) without allocating the
+    /// configured maximum context.
     ///
-    /// The full `max_ctx · row_width` backing store for `k` and `v` is reserved
-    /// up front and zero-filled, so [`append`](KvCache::append) never reallocates
-    /// and [`view`](KvCache::view) borrows are stable for the cache's lifetime.
+    /// # Panics
+    /// Panics if the row-width multiplication overflows. File-backed model loaders
+    /// use [`try_new`](Self::try_new) and return a typed error instead.
     #[must_use]
     pub fn new(max_ctx: usize, n_head_kv: usize, head_dim: usize) -> Self {
-        let row_width = n_head_kv * head_dim;
-        Self {
-            k: vec![0.0; max_ctx * row_width],
-            v: vec![0.0; max_ctx * row_width],
+        Self::try_new(max_ctx, n_head_kv, head_dim).expect("KV-cache row width overflow")
+    }
+
+    /// Fallibly create an empty, lazy cache.
+    ///
+    /// No context-sized allocation happens until [`append`](Self::append). Growth
+    /// is fallible and occurs in small row chunks, so a model's declared maximum
+    /// context does not become an eager startup allocation.
+    ///
+    /// # Errors
+    /// [`NnError::Backend`] if `n_head_kv · head_dim` overflows `usize`.
+    pub fn try_new(max_ctx: usize, n_head_kv: usize, head_dim: usize) -> Result<Self, NnError> {
+        let row_width = n_head_kv.checked_mul(head_dim).ok_or_else(|| {
+            NnError::Backend("KV-cache row-width multiplication overflow".to_owned())
+        })?;
+        Ok(Self {
+            k: Vec::new(),
+            v: Vec::new(),
             len: 0,
             max_ctx,
             row_width,
-        }
+        })
     }
 
     /// Append `n_new_tokens` new key/value rows (`k_new`/`v_new` are
@@ -70,7 +87,9 @@ impl KvCache {
         v_new: &[f32],
         n_new_tokens: usize,
     ) -> Result<(), NnError> {
-        let need = n_new_tokens * self.row_width;
+        let need = n_new_tokens.checked_mul(self.row_width).ok_or_else(|| {
+            NnError::Backend("KV-cache append length multiplication overflow".to_owned())
+        })?;
         if k_new.len() != need {
             return Err(NnError::Shape {
                 expected: need,
@@ -85,7 +104,10 @@ impl KvCache {
         }
         // Over-capacity guard: the new watermark must fit the arena. Compared in
         // token (row) units so it cannot overflow on the byte count.
-        let new_len = self.len + n_new_tokens;
+        let new_len = self.len.checked_add(n_new_tokens).ok_or(NnError::Shape {
+            expected: self.max_ctx,
+            got: usize::MAX,
+        })?;
         if new_len > self.max_ctx {
             return Err(NnError::Shape {
                 expected: self.max_ctx,
@@ -93,7 +115,25 @@ impl KvCache {
             });
         }
 
-        let start = self.len * self.row_width;
+        let required_elements = new_len.checked_mul(self.row_width).ok_or_else(|| {
+            NnError::Backend("KV-cache backing length multiplication overflow".to_owned())
+        })?;
+        let growth_rows = new_len
+            .div_ceil(GROWTH_ROWS)
+            .checked_mul(GROWTH_ROWS)
+            .unwrap_or(self.max_ctx)
+            .min(self.max_ctx);
+        let target_elements = growth_rows.checked_mul(self.row_width).ok_or_else(|| {
+            NnError::Backend("KV-cache growth length multiplication overflow".to_owned())
+        })?;
+        reserve_to(&mut self.k, target_elements, "key")?;
+        reserve_to(&mut self.v, target_elements, "value")?;
+        self.k.resize(required_elements, 0.0);
+        self.v.resize(required_elements, 0.0);
+
+        let start = self.len.checked_mul(self.row_width).ok_or_else(|| {
+            NnError::Backend("KV-cache write offset multiplication overflow".to_owned())
+        })?;
         self.k[start..start + need].copy_from_slice(k_new);
         self.v[start..start + need].copy_from_slice(v_new);
         self.len = new_len;
@@ -114,6 +154,29 @@ impl KvCache {
     /// the cache can be reused for a fresh sequence. Stale rows past the new
     /// `len` are never read, so they are left untouched.
     pub fn reset(&mut self) {
-        self.len = 0;
+        self.rollback_to(0);
     }
+
+    pub(crate) fn rollback_to(&mut self, len: usize) {
+        debug_assert!(len <= self.len);
+        let elements = len
+            .checked_mul(self.row_width)
+            .expect("previously validated KV-cache length");
+        self.k.truncate(elements);
+        self.v.truncate(elements);
+        self.len = len;
+    }
+}
+
+fn reserve_to(buffer: &mut Vec<f32>, target: usize, kind: &str) -> Result<(), NnError> {
+    if buffer.capacity() < target {
+        buffer
+            .try_reserve_exact(target.saturating_sub(buffer.len()))
+            .map_err(|error| {
+                NnError::Backend(format!(
+                    "allocate {kind} KV cache for {target} f32 values: {error}"
+                ))
+            })?;
+    }
+    Ok(())
 }

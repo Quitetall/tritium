@@ -71,8 +71,8 @@ pub struct ModelRunner {
 impl ModelRunner {
     /// Load a runner from a parsed GGUF `file` (+ its raw `bytes`) onto `backend`.
     ///
-    /// Reads [`ModelConfig::from_gguf`], loads [`ModelWeights`], and allocates one
-    /// [`KvCache`] per layer sized to the context length.
+    /// Reads [`ModelConfig::from_gguf`], loads [`ModelWeights`], and creates one
+    /// lazy [`KvCache`] per layer.
     ///
     /// # Errors
     /// [`NnError::MissingMetadata`] / [`NnError::MissingTensor`] /
@@ -85,14 +85,51 @@ impl ModelRunner {
     ) -> Result<Self, NnError> {
         let config = ModelConfig::from_gguf(file)?;
         let weights = ModelWeights::load(file, bytes, &config, backend.as_ref())?;
+        Self::try_from_weights(config, weights, backend)
+    }
 
+    /// Build a runner from already-constructed [`ModelWeights`] — e.g. an in-memory
+    /// SALT / fp quantization for the accuracy harness — creating one lazy
+    /// [`KvCache`] per layer. The model starts on the host forward path; the device-resident
+    /// decoder is built lazily and is skipped for any model carrying a SALT or
+    /// dense projection.
+    #[must_use]
+    pub fn from_weights(
+        config: ModelConfig,
+        weights: ModelWeights,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Self {
+        Self::try_from_weights(config, weights, backend)
+            .expect("validated in-memory model must have constructible KV metadata")
+    }
+
+    /// Fallible form of [`from_weights`](Self::from_weights), used by every
+    /// file-backed loader.
+    ///
+    /// This creates empty per-layer caches; key/value storage grows fallibly as
+    /// tokens are appended rather than allocating the declared maximum context.
+    ///
+    /// # Errors
+    /// [`NnError::Backend`] if cache geometry overflows or layer-metadata
+    /// reservation fails.
+    pub fn try_from_weights(
+        config: ModelConfig,
+        weights: ModelWeights,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Self, NnError> {
         let head_dim = config.head_dim() as usize;
         let n_head_kv = config.n_head_kv as usize;
         let max_ctx = config.n_ctx as usize;
-        let kv = (0..config.n_layers)
-            .map(|_| KvCache::new(max_ctx, n_head_kv, head_dim))
-            .collect();
-
+        let layer_count = config.n_layers as usize;
+        let mut kv = Vec::new();
+        kv.try_reserve_exact(layer_count).map_err(|error| {
+            NnError::Backend(format!(
+                "allocate metadata for {layer_count} KV caches: {error}"
+            ))
+        })?;
+        for _ in 0..layer_count {
+            kv.push(KvCache::try_new(max_ctx, n_head_kv, head_dim)?);
+        }
         Ok(Self {
             config,
             weights,
@@ -105,35 +142,6 @@ impl ModelRunner {
         })
     }
 
-    /// Build a runner from already-constructed [`ModelWeights`] — e.g. an in-memory
-    /// SALT / fp quantization for the accuracy harness — allocating one [`KvCache`]
-    /// per layer. The model starts on the host forward path; the device-resident
-    /// decoder is built lazily and is skipped for any model carrying a SALT or
-    /// dense projection.
-    #[must_use]
-    pub fn from_weights(
-        config: ModelConfig,
-        weights: ModelWeights,
-        backend: Box<dyn TernaryBackend>,
-    ) -> Self {
-        let head_dim = config.head_dim() as usize;
-        let n_head_kv = config.n_head_kv as usize;
-        let max_ctx = config.n_ctx as usize;
-        let kv = (0..config.n_layers)
-            .map(|_| KvCache::new(max_ctx, n_head_kv, head_dim))
-            .collect();
-        Self {
-            config,
-            weights,
-            kv,
-            backend,
-            #[cfg(feature = "cuda")]
-            resident: None,
-            #[cfg(feature = "cuda")]
-            resident_probed: false,
-        }
-    }
-
     /// Load a **standard-transformer fp** model (Llama/SmolLM2/…) from a HuggingFace
     /// directory (`config.json` + safetensors) onto `backend` — the general (non-BitNet)
     /// inference path. See [`ModelWeights::load_hf`].
@@ -143,7 +151,7 @@ impl ModelRunner {
     /// unsupported arch, shape mismatch).
     pub fn from_hf(dir: &Path, backend: Box<dyn TernaryBackend>) -> Result<Self, NnError> {
         let (config, _spec, weights) = ModelWeights::load_hf(dir)?;
-        Ok(Self::from_weights(config, weights, backend))
+        Self::try_from_weights(config, weights, backend)
     }
 
     /// Load a **SALT-quantized** model: packed additive 2D projections from `bundle`,
@@ -157,7 +165,7 @@ impl ModelRunner {
         backend: Box<dyn TernaryBackend>,
     ) -> Result<Self, NnError> {
         let (config, weights) = ModelWeights::load_salt(model_dir, bundle)?;
-        Ok(Self::from_weights(config, weights, backend))
+        Self::try_from_weights(config, weights, backend)
     }
 
     /// Load a self-contained tied-SwiGLU training-SALT GGUF artifact.
@@ -174,7 +182,7 @@ impl ModelRunner {
         backend: Box<dyn TernaryBackend>,
     ) -> Result<Self, NnError> {
         let (config, weights) = ModelWeights::load_training_salt_gguf(bytes)?;
-        Ok(Self::from_weights(config, weights, backend))
+        Self::try_from_weights(config, weights, backend)
     }
 
     /// (cuda) Borrow the lazily-built device-resident decoder, building it first if
@@ -454,85 +462,99 @@ impl ModelRunner {
         let kv_width = n_head_kv * head_dim;
         let mut scratch = BlockScratch::new(seq, n_embd, q_width, kv_width);
         let n_layers = self.weights.layers.len();
-        for li in 0..n_layers {
-            // Borrow the block and its KV cache disjointly.
-            let block = &self.weights.layers[li];
-            let kv = &mut self.kv[li];
-            if li == 0 && dump.is_some() {
-                let mut bd = BlockDump::default();
-                block.forward_dump(
-                    self.backend.as_ref(),
-                    &hidden,
-                    positions,
-                    kv,
-                    &self.config,
-                    &mut next,
-                    &mut bd,
-                )?;
-                if let Some(d) = dump.as_deref_mut() {
-                    d.layer0_attn_norm = bd.attn_norm_out;
-                    d.layer0_attn_out = bd.attn_out;
+        let mut kv_checkpoints = Vec::new();
+        kv_checkpoints
+            .try_reserve_exact(self.kv.len())
+            .map_err(|error| NnError::Backend(format!("allocate KV checkpoints: {error}")))?;
+        kv_checkpoints.extend(self.kv.iter().map(|cache| cache.len));
+
+        let result = (|| -> Result<Vec<f32>, NnError> {
+            for li in 0..n_layers {
+                // Borrow the block and its KV cache disjointly.
+                let block = &self.weights.layers[li];
+                let kv = &mut self.kv[li];
+                if li == 0 && dump.is_some() {
+                    let mut bd = BlockDump::default();
+                    block.forward_dump(
+                        self.backend.as_ref(),
+                        &hidden,
+                        positions,
+                        kv,
+                        &self.config,
+                        &mut next,
+                        &mut bd,
+                    )?;
+                    if let Some(d) = dump.as_deref_mut() {
+                        d.layer0_attn_norm = bd.attn_norm_out;
+                        d.layer0_attn_out = bd.attn_out;
+                    }
+                } else {
+                    block.forward_with_scratch(
+                        self.backend.as_ref(),
+                        &hidden,
+                        positions,
+                        kv,
+                        &self.config,
+                        &mut next,
+                        &mut scratch,
+                    )?;
                 }
+                std::mem::swap(&mut hidden, &mut next);
+                if let Some(d) = dump.as_deref_mut() {
+                    d.hidden_states.push(hidden.clone());
+                }
+            }
+
+            // Final RMSNorm: compute only the last token's norm (we only need its
+            // logits for the LM head). The dump path computes the full sequence.
+            let last = seq - 1;
+            let mut last_norm = vec![0.0f32; n_embd];
+            if let Some(d) = dump.as_deref_mut() {
+                let mut final_full = vec![0.0f32; seq * n_embd];
+                for t in 0..seq {
+                    let src = &hidden[t * n_embd..t * n_embd + n_embd];
+                    let dst = &mut final_full[t * n_embd..t * n_embd + n_embd];
+                    rmsnorm(src, &self.weights.output_norm, self.config.rms_eps, dst)?;
+                }
+                last_norm.copy_from_slice(&final_full[last * n_embd..last * n_embd + n_embd]);
+                d.final_norm = final_full;
             } else {
-                block.forward_with_scratch(
-                    self.backend.as_ref(),
-                    &hidden,
-                    positions,
-                    kv,
-                    &self.config,
-                    &mut next,
-                    &mut scratch,
+                let src = &hidden[last * n_embd..last * n_embd + n_embd];
+                rmsnorm(
+                    src,
+                    &self.weights.output_norm,
+                    self.config.rms_eps,
+                    &mut last_norm,
                 )?;
             }
-            std::mem::swap(&mut hidden, &mut next);
-            if let Some(d) = dump.as_deref_mut() {
-                d.hidden_states.push(hidden.clone());
+
+            // LM head. Untied ⇒ a dedicated `lm_head` projection; tied ⇒ the dot-product
+            // against the token embedding (BitNet). Both map `last_norm` ([n_embd]) → logits.
+            let logits = if let Some(head) = &self.weights.lm_head {
+                let mut logits = vec![0.0f32; head.n_out()];
+                head.forward(self.backend.as_ref(), &last_norm, 1, &mut logits)?;
+                logits
+            } else {
+                // Tied LM head: logits[v] = <last_norm, token_embd[v]>.
+                let vocab = self.weights.vocab;
+                let mut logits = vec![0.0f32; vocab];
+                self.weights
+                    .token_embd
+                    .unembed_exact(&last_norm, &mut logits)?;
+                logits
+            };
+            if let Some(d) = dump {
+                d.logits = logits.clone();
+            }
+
+            Ok(logits)
+        })();
+        if result.is_err() {
+            for (cache, checkpoint) in self.kv.iter_mut().zip(kv_checkpoints) {
+                cache.rollback_to(checkpoint);
             }
         }
-
-        // Final RMSNorm: compute only the last token's norm (we only need its
-        // logits for the LM head). The dump path computes the full sequence.
-        let last = seq - 1;
-        let mut last_norm = vec![0.0f32; n_embd];
-        if let Some(d) = dump.as_deref_mut() {
-            let mut final_full = vec![0.0f32; seq * n_embd];
-            for t in 0..seq {
-                let src = &hidden[t * n_embd..t * n_embd + n_embd];
-                let dst = &mut final_full[t * n_embd..t * n_embd + n_embd];
-                rmsnorm(src, &self.weights.output_norm, self.config.rms_eps, dst)?;
-            }
-            last_norm.copy_from_slice(&final_full[last * n_embd..last * n_embd + n_embd]);
-            d.final_norm = final_full;
-        } else {
-            let src = &hidden[last * n_embd..last * n_embd + n_embd];
-            rmsnorm(
-                src,
-                &self.weights.output_norm,
-                self.config.rms_eps,
-                &mut last_norm,
-            )?;
-        }
-
-        // LM head. Untied ⇒ a dedicated `lm_head` projection; tied ⇒ the dot-product
-        // against the token embedding (BitNet). Both map `last_norm` ([n_embd]) → logits.
-        let logits = if let Some(head) = &self.weights.lm_head {
-            let mut logits = vec![0.0f32; head.n_out()];
-            head.forward(self.backend.as_ref(), &last_norm, 1, &mut logits)?;
-            logits
-        } else {
-            // Tied LM head: logits[v] = <last_norm, token_embd[v]>.
-            let vocab = self.weights.vocab;
-            let mut logits = vec![0.0f32; vocab];
-            self.weights
-                .token_embd
-                .unembed_exact(&last_norm, &mut logits)?;
-            logits
-        };
-        if let Some(d) = dump {
-            d.logits = logits.clone();
-        }
-
-        Ok(logits)
+        result
     }
 
     /// (cuda) Run the forward through the device-resident decoder if the backend is

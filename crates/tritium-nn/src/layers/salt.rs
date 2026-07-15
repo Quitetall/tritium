@@ -18,6 +18,10 @@ pub struct SaltLinear {
 }
 
 impl SaltLinear {
+    pub(crate) fn from_packed_matrix(matrix: PackedSaltMatrix) -> Self {
+        Self { matrix }
+    }
+
     /// Build a projection from one packed SALT row per output channel.
     ///
     /// Validation consumes fixed one-block scratch; no dense row or matrix is materialized.
@@ -74,6 +78,7 @@ impl SaltLinear {
     }
 
     /// Total retained arena and row/plane metadata bytes, excluding the struct itself.
+    /// Cloned projections share arenas, so summing this value across clones double-counts them.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         self.matrix.resident_bytes()
