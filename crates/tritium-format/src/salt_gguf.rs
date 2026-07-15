@@ -465,14 +465,18 @@ mod tests {
     #[test]
     fn writer_rejects_scales_the_strict_reader_cannot_accept() {
         for bits in [f16::NAN.to_bits(), f16::INFINITY.to_bits(), 0xbc00, 0x8000] {
-            let mut invalid = row(256, 1, 1);
-            invalid.planes[0][TQ2_0_BLOCK_BYTES - 2..]
-                .copy_from_slice(&bits.to_le_bytes());
+            let mut invalid = row(512, 2, 1);
+            invalid.planes[1][2 * TQ2_0_BLOCK_BYTES - 2..].copy_from_slice(&bits.to_le_bytes());
             assert_eq!(
                 write_salt_gguf(&[("invalid.weight", &[invalid])]),
                 Err(FormatError::SaltInvalidScale(bits))
             );
         }
+
+        let mut positive_zero = row(512, 2, 1);
+        positive_zero.planes[1][2 * TQ2_0_BLOCK_BYTES - 2..]
+            .copy_from_slice(&f16::ZERO.to_bits().to_le_bytes());
+        assert!(write_salt_gguf(&[("zero.weight", &[positive_zero])]).is_ok());
     }
 
     #[test]
