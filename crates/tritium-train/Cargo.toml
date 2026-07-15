@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 tritium-core = { workspace = true }
 tritium-testkit = { workspace = true }
 # Row-parallel dense matmul forward/vjp — the training hot path. Parallelizing over OUTPUT rows

@@ -4509,6 +4509,7 @@ dependencies = [
 name = "tritium-train"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "proptest",
  "rayon",
  "tritium-core",
