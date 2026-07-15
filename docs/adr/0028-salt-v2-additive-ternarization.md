@@ -582,3 +582,21 @@ independently refitted `P` candidate may be described as a byte prefix.
 The first package/runtime reference remains G128-only. G64 or G256 promotion
 requires an explicit versioned scale-geometry field and parity evidence before
 either geometry can be serialized as SALT V2.
+
+## Amendment 2026-07-15 — direct codecs and entropy transport boundary
+
+The binding direct-runtime codecs are fixed-width D2, radix-3 B3, and structured
+S34. Their exact offsets, prefix lengths, and bounded decode work are part of the
+runtime contract. Codec comparisons must include byte-identical S34-valid tensors
+through all three codecs in addition to broader codec-specific distributions and
+unit-boundary cases.
+
+ANS/rANS or another entropy coder may be evaluated only as an outer artifact
+transport. An admitted transport must use independently bounded tensor or tile
+chunks, preserve seekable random access and deterministic canonical output, reject
+malformed states and lengths, and beat the fixed codec after its tables, indexes,
+checksums, padding, decode latency, and peak scratch bytes are counted. A transport
+that expands to D2, B3, or S34 before execution may claim smaller artifact and I/O
+bytes, but its expanded fixed-codec allocation is the resident-weight boundary. It
+cannot earn a memory-capacity or direct-kernel claim. Native entropy-stream kernels
+would require a separate versioned runtime proposal and same-box Pareto evidence.

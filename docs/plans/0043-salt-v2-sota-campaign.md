@@ -298,6 +298,9 @@ and the relevant CPU/CUDA parity gate before the next stage depends on it.
 - Add `SaltV2Tensor`/row descriptors in `tritium-format` with non-negative fp16
   scales and hard trits only.
 - Implement D2 first, B3 second, and structurally valid S34 third.
+- Keep D2/B3/S34 as the direct-runtime formats. Benchmark any ANS/rANS candidate
+  only as seekable outer transport, and count expanded fixed-codec bytes as
+  resident weights unless a separate native entropy-stream kernel is admitted.
 - Encode mixed plane counts without row-wide dense padding; charge every map,
   descriptor, and alignment byte.
 - Preserve the existing SALT/TQ2 reader. SALT V2 receives a new explicit
@@ -659,38 +662,62 @@ the exact clean revision.
 The current software commits implement a bounded reference substrate, not the
 empirical claim. They add the canonical zero-point-free D2/B3/S34 semantic
 package, exact serialized and indexed-runtime accounting, deterministic joint
-`3^P` fitting,
-conditioned scale solving, activation-cache reopen validation, source-bound
-input/Fisher/Kronecker curvature primitives, standalone block-feedback and
-delta-correction primitives, a bounded exact two-budget allocator with a
-certified equal-cost scalable path, mixed-plane model fitting, source-model-bound
-recovery and G1-growth receipts, direct CPU/CUDA add-sub-skip execution, and the
-resumable `tritium-salt` evidence facade. Compact packages remain exact prefixes
-of their near-lossless packages. ADR 0028's 2026-07-15 amendment makes the
-ordered-master prefix curve, rather than independent per-P refits, the binding
-pricing contract.
+`3^P` fitting, conditioned scale solving, activation-cache reopen validation,
+source-bound input/Fisher/Kronecker curvature primitives, standalone
+block-feedback and delta-correction primitives, an exact equal-cost byte
+allocator with a scalable indexed lexicographic tie path, mixed-plane model
+fitting, source/result-bound recovery and G1-growth evidence, CPU semantic-
+reference execution, CUDA direct packed add-sub-skip execution, and the
+resumable `tritium-salt` evidence facade. Legacy SALT-GGUF and TSLB consumers now
+index through `Read + Seek`, validate complete container structure and every SALT
+payload, and build final packed arenas without retaining an artifact-wide copy.
+Pipeline ownership is process-serialized through a reserved lock namespace.
+Compact packages remain exact prefixes of their near-lossless packages. ADR
+0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
+independent per-P refits, the binding pricing contract and keep entropy coding
+outside the direct-runtime claim until it earns separate evidence.
 
 The following work deliberately remains open and keeps this plan in progress:
 
 - the production model driver does not yet connect block-output reconstruction,
   scale-only teacher-KL, or hard PV updates to real checkpoint tensors;
-- the model fitter does not yet invoke the standalone block-feedback/delta path;
+- the model fitter does not yet invoke the standalone block-feedback/delta path.
+  The required integration seam is a durable Search-stage master artifact:
+  `fit_salt_v2_master(...) -> SaltV2MasterFit`, followed by
+  `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult`. It must bind
+  full input-column inverse-Hessian state, natural column groups, the source
+  model, and a detailed feedback receipt before `feedback_applied` can be true;
 - package/runtime scale geometry is G128-only; the G64/G256 promotion ablations
   require a versioned format/runtime field before they can enter the grid;
-- model-sized equal-cost allocation fails closed when binary64 reduction or
-  prefix arithmetic cannot be certified exact, or when pathological exact ties
-  exceed the bounded full-vector comparison budget; replacing those boundaries
-  with an order-independent exact accumulator and indexed lexicographic order
-  remains production work;
+- the equal-cost allocator is exact and scalable, including binary64 reduction
+  and lexicographic ties. General unequal-cost two-budget allocation remains an
+  exact bounded dynamic program and fails closed above 4096 states; a scalable
+  general solver requires a new proof or a deliberately approximate campaign
+  mode with a separately labeled lower bound;
 - signed-RHT execution fails closed; S34 has a constrained deterministic CPU
   reference fitter but no campaign evidence; the direct exact runtime is the
   correctness baseline, and the current `fast` CUDA entry point aliases it
   rather than claiming a speedup;
-- physical component truth still requires the opened package and checked
-  runtime allocation receipt; caller-provided architecture geometry alone is
-  not claim evidence;
+- B3 and S34 have matched semantic fixtures and compact-codec microbenchmarks,
+  but no ANS/rANS transport has been admitted. Any candidate must remain
+  independently seekable and win after tables, indexes, checksums, padding,
+  decode latency, and peak scratch are charged. Expansion before execution does
+  not reduce the resident-weight claim;
+- physical component truth still requires the opened immutable package and a
+  checked runtime allocation receipt; caller-provided architecture geometry
+  alone is not claim evidence;
+- G1 widening now has canonical source/result identities, deterministic oracle
+  evidence, transactional rollback, and a tracked-fp32-payload preflight. The
+  dense oracle still constructs infallible full-model clones, so this is not a
+  model-scale RSS/admission guarantee and remains a blocker before a 32B run;
 - the distinct whole-head/hidden-width transform, RMSNorm/residual handling,
   and dense function-preservation oracle required for G2 do not exist;
+- SALT V2 package opening is still eager and materializes semantic trit vectors;
+  there is no seek-indexed SALT V2 model loader, and the legacy model adapter
+  rejects Qwen QK-norm and QKV-bias checkpoints. A bounded SALT V2 consumer and
+  end-to-end target-architecture integration must precede any Qwen campaign;
+- resident large-K CUDA SALT kernels and a paged fp16 or int8 KV cache with a
+  runtime context override remain required for practical 32B serving;
 - required third-party baselines have not all been integrated or reproduced
   under one byte/evaluation boundary;
 - the 135M, 1.7B, Qwen3-8B, Llama2-7B, Qwen3-32B, and growth acceptance artifacts

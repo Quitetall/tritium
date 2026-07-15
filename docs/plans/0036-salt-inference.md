@@ -123,13 +123,15 @@ The TSLB model path now removes both remaining host-side bundle copies:
   reintroduction of a whole-bundle copy; direct-builder tests separately require stable final-arena
   pointers and shared `Arc` backing.
 
-The current dense TQ2_0 plane costs 2.0625 bits per weight, so one plane for 32 billion weights is
+The legacy dense TQ2_0 plane costs 2.0625 bits per weight, so one plane for 32 billion weights is
 about 8.25 GB of payload. With an illustrative 4.8 million rows, current row/plane metadata adds
 about 0.23 GB, for roughly 8.48 GB resident and 7.55× compression versus 64 GB FP16. Additive models
-scale with retained plane count; sparse residuals can be smaller. The current format therefore does
-not support a physical “more than 10×” claim. Crossing that threshold requires radix-3 or other
-entropy coding, better scale amortization, and compact or implicit dense-plane metadata, with quality
-measured separately.
+scale with retained plane count; sparse residuals can be smaller. This legacy format therefore does
+not support a physical “more than 10×” claim. SALT V2 now provides direct B3 radix packing and the
+constrained S34 layout: at G128, B3 is 1.75 bpw before metadata and cannot cross 10×, while a full
+S34 tile is 1.375 bpw before metadata and can cross it only after quality, opened-artifact, resident-
+allocation, and native-runtime gates pass. ANS/rANS remains an outer transport experiment and cannot
+reduce resident bytes if it expands before execution.
 
 ## Direct-arena legacy SALT-GGUF loading (2026-07-15)
 
