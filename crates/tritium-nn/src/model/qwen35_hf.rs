@@ -16,8 +16,8 @@ use crate::layers::{
     DenseLinear, Projection, Qwen35DeltaNetWeights, Qwen35FullAttentionWeights, SwiGluMlp,
     TokenEmbedding,
 };
-use crate::model::hf::read_config_json;
 use crate::model::hf_shards::HfShardSet;
+use crate::model::qwen35_hf_source::{Qwen35HfSource, Qwen35HfSourceIdentity};
 use crate::model::{
     Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextRunner, Qwen35TextWeights,
 };
@@ -30,9 +30,19 @@ enum TensorRole {
 }
 
 #[derive(Debug)]
-struct TensorSpec {
+pub(super) struct TensorSpec {
     shape: Vec<usize>,
     role: TensorRole,
+}
+
+pub(super) trait Qwen35HfTensorSource {
+    fn tensor_f32_exact(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, NnError>;
+}
+
+impl Qwen35HfTensorSource for HfShardSet {
+    fn tensor_f32_exact(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, NnError> {
+        HfShardSet::tensor_f32_exact(self, name, expected)
+    }
 }
 
 /// Non-campaign evidence emitted by the generic Qwen3.5-family language loader.
@@ -90,6 +100,7 @@ pub struct Qwen35HfLanguageModel {
     config: Qwen35CheckpointConfig,
     runner: Qwen35TextRunner,
     receipt: Qwen35HfLanguageReceipt,
+    source_identity: Qwen35HfSourceIdentity,
 }
 
 impl Qwen35HfLanguageModel {
@@ -100,6 +111,9 @@ impl Qwen35HfLanguageModel {
     /// shape. Unknown language or top-level tensors fail closed; `mtp.*` and
     /// `model.visual.*` are the only deferred namespaces. F32, F16, and BF16
     /// payloads are accepted for small family fixtures and widened to fp32.
+    /// Before assembly, all source tensors are streamed into a semantic
+    /// identity; every language tensor is then re-hashed from the exact chunks
+    /// widened by the dense loader.
     ///
     /// # Errors
     ///
@@ -107,18 +121,9 @@ impl Qwen35HfLanguageModel {
     /// [`NnError::MissingTensor`] for incomplete or contradictory source
     /// coverage, or a model-construction/backend error.
     pub fn load_family(dir: &Path, backend: Box<dyn TernaryBackend>) -> Result<Self, NnError> {
-        let config_json = read_config_json(&dir.join("config.json"))?;
-        let config = Qwen35CheckpointConfig::from_hf_config(&config_json)?;
-        let shards = HfShardSet::open(dir)?;
-        let schema = language_schema(&config.text)?;
-        let receipt = preflight_source(&shards, &schema)?;
-        let weights = load_language_weights(&shards, &config.text)?;
-        let runner = Qwen35TextRunner::new(&config.text, weights, backend)?;
-        Ok(Self {
-            config,
-            runner,
-            receipt,
-        })
+        Qwen35HfSource::open(dir)?
+            .verify_semantic_identity()?
+            .load_language(backend)
     }
 
     /// Validated family configuration used to assemble the runner.
@@ -138,9 +143,30 @@ impl Qwen35HfLanguageModel {
     pub const fn receipt(&self) -> &Qwen35HfLanguageReceipt {
         &self.receipt
     }
+
+    /// Content-derived identity of every tensor in the once-opened source.
+    #[must_use]
+    pub const fn source_identity(&self) -> &Qwen35HfSourceIdentity {
+        &self.source_identity
+    }
+
+    /// Assemble a language model after verified exact-byte source consumption.
+    pub(super) fn from_verified_source(
+        config: Qwen35CheckpointConfig,
+        runner: Qwen35TextRunner,
+        receipt: Qwen35HfLanguageReceipt,
+        source_identity: Qwen35HfSourceIdentity,
+    ) -> Self {
+        Self {
+            config,
+            runner,
+            receipt,
+            source_identity,
+        }
+    }
 }
 
-fn preflight_source(
+pub(super) fn preflight_source(
     shards: &HfShardSet,
     schema: &BTreeMap<String, TensorSpec>,
 ) -> Result<Qwen35HfLanguageReceipt, NnError> {
@@ -197,7 +223,9 @@ fn preflight_source(
     })
 }
 
-fn language_schema(config: &Qwen35TextConfig) -> Result<BTreeMap<String, TensorSpec>, NnError> {
+pub(super) fn language_schema(
+    config: &Qwen35TextConfig,
+) -> Result<BTreeMap<String, TensorSpec>, NnError> {
     let hidden = axis(config.hidden_size);
     let intermediate = axis(config.intermediate_size);
     let vocab = axis(config.vocab_size);
@@ -377,8 +405,8 @@ fn language_schema(config: &Qwen35TextConfig) -> Result<BTreeMap<String, TensorS
     Ok(schema)
 }
 
-fn load_language_weights(
-    shards: &HfShardSet,
+pub(super) fn load_language_weights<S: Qwen35HfTensorSource + ?Sized>(
+    shards: &S,
     config: &Qwen35TextConfig,
 ) -> Result<Qwen35TextWeights, NnError> {
     let hidden = axis(config.hidden_size);
@@ -446,8 +474,8 @@ fn load_language_weights(
     ))
 }
 
-fn load_delta_net(
-    shards: &HfShardSet,
+fn load_delta_net<S: Qwen35HfTensorSource + ?Sized>(
+    shards: &S,
     config: &Qwen35TextConfig,
     prefix: &str,
     hidden: usize,
@@ -511,8 +539,8 @@ fn load_delta_net(
     ))
 }
 
-fn load_full_attention(
-    shards: &HfShardSet,
+fn load_full_attention<S: Qwen35HfTensorSource + ?Sized>(
+    shards: &S,
     config: &Qwen35TextConfig,
     prefix: &str,
     hidden: usize,
@@ -553,8 +581,8 @@ fn load_full_attention(
     ))
 }
 
-fn dense(
-    shards: &HfShardSet,
+fn dense<S: Qwen35HfTensorSource + ?Sized>(
+    shards: &S,
     prefix: &str,
     suffix: &str,
     rows: usize,
@@ -568,8 +596,8 @@ fn dense(
     )?))
 }
 
-fn vector(
-    shards: &HfShardSet,
+fn vector<S: Qwen35HfTensorSource + ?Sized>(
+    shards: &S,
     prefix: &str,
     suffix: &str,
     len: usize,

@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use tritium_nn::Qwen35HfLanguageModel;
+use tritium_nn::{Qwen35HfLanguageModel, Qwen35HfSource};
 
 const H: usize = 4;
 const I: usize = 6;
@@ -194,6 +197,36 @@ fn write_fixture_tensors(dir: &Path, tensors: Vec<TensorFixture>) {
     .unwrap();
 }
 
+fn write_single_shard_fixture(dir: &Path, mut tensors: Vec<TensorFixture>) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let mut parsed: serde_json::Value = serde_json::from_str(&config_json()).unwrap();
+    parsed["transformers_version"] = json!("ignored-provenance-field");
+    parsed["text_config"]["initializer_range"] = json!(0.123);
+    parsed["vision_config"]["deferred_fixture_detail"] = json!(true);
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_string_pretty(&parsed).unwrap(),
+    )
+    .unwrap();
+    tensors.reverse();
+    std::fs::write(dir.join("model.safetensors"), safetensors(&tensors)).unwrap();
+}
+
+fn mutate_single_shard_tensor_byte(dir: &Path, name: &str) {
+    let path = dir.join("model.safetensors");
+    let bytes = std::fs::read(&path).unwrap();
+    let header_len = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap())).unwrap();
+    let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+    let relative = header[name]["data_offsets"][0].as_u64().unwrap();
+    let absolute = u64::try_from(8 + header_len).unwrap() + relative;
+    let current = bytes[usize::try_from(absolute).unwrap()];
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(absolute)).unwrap();
+    file.write_all(&[current ^ 1]).unwrap();
+    file.sync_data().unwrap();
+}
+
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -202,6 +235,134 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
             "value {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
         );
     }
+}
+
+#[test]
+fn source_identity_is_independent_of_shard_layout_and_json_formatting() {
+    let sharded_dir = fixture_dir("source-identity-sharded");
+    let single_dir = fixture_dir("source-identity-single");
+    let tensors = oracle_tensors();
+    write_fixture_tensors(&sharded_dir, tensors.clone());
+    write_single_shard_fixture(&single_dir, tensors.clone());
+
+    let sharded = Qwen35HfSource::open(&sharded_dir).unwrap();
+    let single = Qwen35HfSource::open(&single_dir).unwrap();
+    assert_eq!(sharded.metadata(), single.metadata());
+    assert_eq!(sharded.metadata().len(), tensors.len());
+    assert!(
+        sharded
+            .metadata()
+            .windows(2)
+            .all(|pair| pair[0].name() < pair[1].name())
+    );
+    let embedding = sharded
+        .metadata()
+        .iter()
+        .find(|tensor| tensor.name() == "model.language_model.embed_tokens.weight")
+        .unwrap();
+    assert_eq!(embedding.dtype(), "F32");
+    assert_eq!(embedding.shape(), &[V as u64, H as u64]);
+
+    assert_eq!(
+        sharded.canonical_config_bytes(),
+        single.canonical_config_bytes()
+    );
+    assert_eq!(
+        blake3::hash(sharded.canonical_config_bytes())
+            .to_hex()
+            .as_str(),
+        "b43c6b9e4292d976de93a0e4a4c73e91669eb9ab27cb341eefc0087d25928bf0"
+    );
+    let sharded = sharded.verify_semantic_identity().unwrap();
+    let single = single.verify_semantic_identity().unwrap();
+    let source_model_id = sharded.model_id();
+    assert_eq!(source_model_id, single.model_id());
+    assert_eq!(
+        sharded.identity().payload_bytes(),
+        tensors
+            .iter()
+            .map(|tensor| (tensor.values.len() * size_of::<f32>()) as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(sharded.identity().manifest().model_id(), source_model_id);
+
+    let model = sharded
+        .load_language(Box::new(tritium_cpu::CpuBackend::new()))
+        .unwrap();
+    assert_eq!(model.receipt().language_tensors(), 28);
+    assert_eq!(model.source_identity().model_id(), source_model_id);
+
+    let _ = std::fs::remove_dir_all(&sharded_dir);
+    let _ = std::fs::remove_dir_all(&single_dir);
+}
+
+#[test]
+fn source_identity_binds_payload_bits_not_only_metadata() {
+    let original_dir = fixture_dir("source-identity-original");
+    let mutated_dir = fixture_dir("source-identity-mutated");
+    let original = oracle_tensors();
+    let mut mutated = original.clone();
+    mutated[0].values[0] = f32::from_bits(mutated[0].values[0].to_bits() ^ 1);
+    write_single_shard_fixture(&original_dir, original);
+    write_single_shard_fixture(&mutated_dir, mutated);
+
+    let original = Qwen35HfSource::open(&original_dir).unwrap();
+    let mutated = Qwen35HfSource::open(&mutated_dir).unwrap();
+    assert_eq!(original.metadata(), mutated.metadata());
+    assert_ne!(
+        original.verify_semantic_identity().unwrap().model_id(),
+        mutated.verify_semantic_identity().unwrap().model_id()
+    );
+
+    let _ = std::fs::remove_dir_all(&original_dir);
+    let _ = std::fs::remove_dir_all(&mutated_dir);
+}
+
+#[test]
+fn source_identity_binds_canonical_execution_config() {
+    let original_dir = fixture_dir("source-config-original");
+    let changed_dir = fixture_dir("source-config-changed");
+    let tensors = oracle_tensors();
+    write_single_shard_fixture(&original_dir, tensors.clone());
+    write_single_shard_fixture(&changed_dir, tensors);
+    let config_path = changed_dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["text_config"]["max_position_embeddings"] = json!(64);
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let original = Qwen35HfSource::open(&original_dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap();
+    let changed = Qwen35HfSource::open(&changed_dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap();
+    assert_ne!(original.model_id(), changed.model_id());
+
+    let _ = std::fs::remove_dir_all(&original_dir);
+    let _ = std::fs::remove_dir_all(&changed_dir);
+}
+
+#[test]
+fn verified_load_rejects_in_place_payload_mutation() {
+    let dir = fixture_dir("source-identity-toctou");
+    write_single_shard_fixture(&dir, oracle_tensors());
+    let verified = Qwen35HfSource::open(&dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap();
+    mutate_single_shard_tensor_byte(&dir, "model.language_model.embed_tokens.weight");
+
+    let result = verified.load_language(Box::new(tritium_cpu::CpuBackend::new()));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(
+        result,
+        Err(tritium_nn::NnError::MissingTensor(reason))
+            if reason.contains("embed_tokens.weight")
+                && reason.contains("changed after semantic identity verification")
+    ));
 }
 
 #[test]

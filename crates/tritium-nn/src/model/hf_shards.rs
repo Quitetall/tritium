@@ -145,7 +145,7 @@ pub(super) struct HfTensorMetadata<'a> {
     pub(super) shard_path: &'a Path,
 }
 
-/// Error from streaming a tensor out of an indexed Hugging Face shard.
+/// Error from streaming or widening a tensor out of an indexed Hugging Face shard.
 #[allow(dead_code, reason = "consumed by the source-bound Qwen adapter seam")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum HfTensorBytesError<E> {
@@ -157,6 +157,13 @@ pub(super) enum HfTensorBytesError<E> {
     InvalidShardId { name: String, shard_id: usize },
     /// The canonical metadata index and its originating reader disagree.
     MetadataMismatch { name: String, shard_path: PathBuf },
+    /// The indexed tensor shape does not match the caller's exact requirement.
+    ShapeMismatch {
+        name: String,
+        shard_path: PathBuf,
+        actual: Vec<usize>,
+        expected: Vec<usize>,
+    },
     /// The already-open safetensors source failed.
     Source {
         name: String,
@@ -189,6 +196,16 @@ impl<E: std::fmt::Display> std::fmt::Display for HfTensorBytesError<E> {
                 "HF tensor `{name}` metadata disagrees with shard {}",
                 shard_path.display()
             ),
+            Self::ShapeMismatch {
+                name,
+                shard_path,
+                actual,
+                expected,
+            } => write!(
+                formatter,
+                "HF tensor `{name}` in {} has shape {actual:?}, expected {expected:?}",
+                shard_path.display()
+            ),
             Self::Source {
                 name,
                 shard_path,
@@ -214,7 +231,8 @@ where
             Self::MissingTensor(_)
             | Self::ReentrantShard(_)
             | Self::InvalidShardId { .. }
-            | Self::MetadataMismatch { .. } => None,
+            | Self::MetadataMismatch { .. }
+            | Self::ShapeMismatch { .. } => None,
         }
     }
 }
@@ -417,6 +435,61 @@ impl HfShardSet {
         }
         reader
             .try_visit_tensor_bytes(name, max_chunk_bytes, visit)
+            .map_err(|error| match error {
+                VisitTensorBytesError::Source(error) => HfTensorBytesError::Source {
+                    name: name.to_owned(),
+                    shard_path: shard.path.clone(),
+                    error,
+                },
+                VisitTensorBytesError::Sink(error) => HfTensorBytesError::Sink(error),
+            })
+    }
+
+    /// Widen one tensor after validating its exact indexed shape, while a
+    /// fallible sink observes the same bounded raw chunks used by the decode.
+    ///
+    /// The retained shard handle is used for both observation and widening;
+    /// no source path is reopened. Source and sink failures remain distinct.
+    #[allow(dead_code, reason = "consumed by the source-bound Qwen adapter seam")]
+    pub(super) fn try_tensor_f32_exact_with_raw_chunks<E>(
+        &self,
+        name: &str,
+        expected: &[usize],
+        max_chunk_bytes: usize,
+        visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<Vec<f32>, HfTensorBytesError<E>> {
+        let tensor = self
+            .tensor_record(name)
+            .ok_or_else(|| HfTensorBytesError::MissingTensor(name.to_owned()))?;
+        let shard =
+            self.shards
+                .get(tensor.shard_id)
+                .ok_or_else(|| HfTensorBytesError::InvalidShardId {
+                    name: name.to_owned(),
+                    shard_id: tensor.shard_id,
+                })?;
+        let mut reader = shard
+            .reader
+            .try_borrow_mut()
+            .map_err(|_| HfTensorBytesError::ReentrantShard(shard.path.clone()))?;
+        if reader.dtype(name) != Some(tensor.dtype.as_str())
+            || reader.shape(name) != Some(tensor.shape.as_slice())
+        {
+            return Err(HfTensorBytesError::MetadataMismatch {
+                name: name.to_owned(),
+                shard_path: shard.path.clone(),
+            });
+        }
+        if tensor.shape != expected {
+            return Err(HfTensorBytesError::ShapeMismatch {
+                name: name.to_owned(),
+                shard_path: shard.path.clone(),
+                actual: tensor.shape.clone(),
+                expected: expected.to_vec(),
+            });
+        }
+        reader
+            .try_tensor_f32_with_raw_chunks(name, max_chunk_bytes, visit)
             .map_err(|error| match error {
                 VisitTensorBytesError::Source(error) => HfTensorBytesError::Source {
                     name: name.to_owned(),
@@ -812,6 +885,90 @@ mod tests {
             missing_error,
             HfTensorBytesError::MissingTensor("missing".to_owned())
         );
+    }
+
+    #[test]
+    fn exact_widening_observes_the_decoded_raw_chunks_from_the_open_handle() {
+        let dir = temp_dir("exact-widening");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let raw = [0x80, 0x3f, 0x00, 0xc0, 0x60, 0x40];
+        std::fs::write(&path, safetensors_raw("x", "BF16", &[3], &raw)).unwrap();
+        let shards = HfShardSet::open(&dir).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut observed = Vec::new();
+        let mut reentrant_checked = false;
+        let values = shards
+            .try_tensor_f32_exact_with_raw_chunks("x", &[3], 3, |chunk| {
+                assert!(!chunk.is_empty());
+                assert_eq!(chunk.len() % 2, 0);
+                assert!(chunk.len() <= 3);
+                if !reentrant_checked {
+                    let nested = shards.try_tensor_f32_exact_with_raw_chunks("x", &[3], 2, |_| {
+                        Ok::<(), SinkStop>(())
+                    });
+                    assert!(matches!(nested, Err(HfTensorBytesError::ReentrantShard(_))));
+                    reentrant_checked = true;
+                }
+                observed.extend_from_slice(chunk);
+                Ok::<(), SinkStop>(())
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(observed, raw);
+        assert_eq!(values, [1.0, -2.0, 3.5]);
+        assert!(reentrant_checked);
+    }
+
+    #[test]
+    fn exact_widening_rejects_shape_before_read_and_preserves_typed_failures() {
+        let dir = temp_dir("exact-widening-errors");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        std::fs::write(
+            &path,
+            safetensors_raw("x", "BF16", &[3], &[0x80, 0x3f, 0x00, 0xc0, 0x60, 0x40]),
+        )
+        .unwrap();
+        let shards = HfShardSet::open(&dir).unwrap();
+
+        let mut shape_sink_calls = 0;
+        let shape_error = shards
+            .try_tensor_f32_exact_with_raw_chunks("x", &[1, 3], 4, |_| {
+                shape_sink_calls += 1;
+                Ok::<(), SinkStop>(())
+            })
+            .unwrap_err();
+        let sink_error = shards
+            .try_tensor_f32_exact_with_raw_chunks("x", &[3], 4, |_| Err(SinkStop::Enough))
+            .unwrap_err();
+        let source_error = shards
+            .try_tensor_f32_exact_with_raw_chunks("x", &[3], 1, |_| Ok::<(), SinkStop>(()))
+            .unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(shape_sink_calls, 0);
+        assert!(matches!(
+            shape_error,
+            HfTensorBytesError::ShapeMismatch {
+                name,
+                actual,
+                expected,
+                ..
+            } if name == "x" && actual == [3] && expected == [1, 3]
+        ));
+        assert_eq!(sink_error, HfTensorBytesError::Sink(SinkStop::Enough));
+        assert!(matches!(
+            source_error,
+            HfTensorBytesError::Source {
+                error: SafeTensorsError::InvalidChunkSize { requested: 1 },
+                ..
+            }
+        ));
     }
 
     #[test]
