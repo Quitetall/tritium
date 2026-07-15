@@ -100,6 +100,7 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0039 | _(cascade)_ | Real grad-Fisher sensitivity → `Sensitivity::Custom` + adaptive plane growth. Gate: Custom beats Uniform/Energy at fixed bpw; adaptive growth hits ≤1% at lower avg bpw | ADR 0020 step 4 | **planned** (dep 0038) | — |
 | 0040 | _(cascade)_ | Scale plumbing to 32B — streaming quantize writer, streaming GPU load, grad checkpointing, optimizer offload at scale. Gate: 32B fp loads+runs; one distill step fits memory | ADR 0020 step 5 | **planned** (dep 0037,0038) | — |
 | 0041 | _(cascade)_ | **CAPSTONE (binding gate)** — distill a standard 32B to ≤1% ppl vs fp16; report quality-vs-bpw curve + measured VRAM reduction; student runs e2e in Tritium; then Qwen3.6-27B headline. Passing unblocks the public launch (#45) | ADR 0020 step 6 / DoD | **planned** (dep all) — compute-bound | — |
+| 0043 | `docs/plans/0043-salt-v2-sota-campaign.md` | **SALT V2** — zero-point-free joint additive ternarization, exact physical-rate allocation, semantic D2/B3/S34 codecs, resumable synthesis facade, Qwen3-8B→32B confirmation and grow-to-≥50B-coefficient campaign | ADR 0028; consumes 0027 device-training substrate and 0042 growth evidence | **in progress** (software substrate; model/GPU gates open) | preregistration → fitter/format/facade → 8B → 32B/growth |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**
