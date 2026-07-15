@@ -914,7 +914,7 @@ impl RecoveryPromotionGate {
             ));
         }
         Ok(Self {
-            minimum_validation_quality,
+            minimum_validation_quality: canonical_f64(minimum_validation_quality),
             gate_digest,
         })
     }
@@ -932,38 +932,216 @@ impl RecoveryPromotionGate {
     }
 }
 
+const RECOVERY_PROMOTION_EVIDENCE_MAGIC: [u8; 8] = *b"TRPEVD\0\0";
+const RECOVERY_PROMOTION_EVIDENCE_VERSION: u16 = 1;
+const RECOVERY_PROMOTION_EVIDENCE_CONTENT_BYTES: usize = 159;
+const RECOVERY_PROMOTION_EVIDENCE_BYTES: usize = RECOVERY_PROMOTION_EVIDENCE_CONTENT_BYTES + 32;
+const RECOVERY_PROMOTION_EVIDENCE_HASH_CONTEXT: &str = "tritium recovery promotion evidence v1";
+
 /// Independently persisted evidence used to evaluate a promotion gate.
+///
+/// Instances are created from a terminal [`RecoveryCampaignRun`], not from a
+/// caller-supplied digest. The durable encoding binds every campaign context
+/// field needed to distinguish otherwise identical quality measurements.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RecoveryPromotionEvidence {
+    source_model: RecoverySourceModel,
+    source_model_id: RecoverySourceModelId,
+    activation_rung: RecoveryActivationRung,
+    track: RecoveryTrack,
+    campaign_digest: RecoveryEvidenceDigest,
+    promotion_gate: RecoveryPromotionGate,
+    selected_checkpoint: RecoverySelectedCheckpoint,
     validation_quality: f64,
     artifact_digest: RecoveryEvidenceDigest,
     evidence_digest: RecoveryEvidenceDigest,
 }
 
 impl RecoveryPromotionEvidence {
-    /// Bind a finite quality measurement to exact artifact and evidence digests.
+    /// Serialize this evidence into its canonical, versioned durable encoding.
     ///
     /// # Errors
-    /// Rejects non-finite quality.
-    pub fn new(
-        validation_quality: f64,
-        artifact_digest: RecoveryEvidenceDigest,
-        evidence_digest: RecoveryEvidenceDigest,
-    ) -> Result<Self, RecoveryError> {
-        if !validation_quality.is_finite() {
-            return Err(RecoveryError::NonFiniteMetric("campaign promotion quality"));
+    /// Rejects inconsistent internal evidence or an allocation failure.
+    pub fn to_bytes(self) -> Result<Vec<u8>, RecoveryError> {
+        self.validate_digest()?;
+        let mut bytes = self.canonical_content_bytes()?;
+        bytes
+            .try_reserve_exact(32)
+            .map_err(|_| RecoveryError::AllocationFailed("promotion evidence encoding"))?;
+        bytes.extend_from_slice(&self.evidence_digest.as_bytes());
+        Ok(bytes)
+    }
+
+    /// Reopen and strictly verify canonical promotion-evidence bytes.
+    ///
+    /// # Errors
+    /// Rejects truncation, trailing bytes, unknown versions, non-canonical
+    /// encodings, invalid fields, or a content-digest mismatch.
+    pub fn reopen(bytes: &[u8]) -> Result<Self, RecoveryError> {
+        if bytes.len() < RECOVERY_PROMOTION_EVIDENCE_MAGIC.len() + core::mem::size_of::<u16>() {
+            return Err(RecoveryError::InvalidPromotionEvidence("truncated header"));
         }
-        Ok(Self {
+        if bytes[..RECOVERY_PROMOTION_EVIDENCE_MAGIC.len()] != RECOVERY_PROMOTION_EVIDENCE_MAGIC {
+            return Err(RecoveryError::InvalidPromotionEvidence("invalid magic"));
+        }
+        let version = u16::from_le_bytes(
+            bytes[RECOVERY_PROMOTION_EVIDENCE_MAGIC.len()
+                ..RECOVERY_PROMOTION_EVIDENCE_MAGIC.len() + 2]
+                .try_into()
+                .expect("fixed version slice"),
+        );
+        if version != RECOVERY_PROMOTION_EVIDENCE_VERSION {
+            return Err(RecoveryError::UnsupportedPromotionEvidenceVersion(version));
+        }
+        if bytes.len() < RECOVERY_PROMOTION_EVIDENCE_BYTES {
+            return Err(RecoveryError::InvalidPromotionEvidence(
+                "truncated evidence",
+            ));
+        }
+        if bytes.len() > RECOVERY_PROMOTION_EVIDENCE_BYTES {
+            return Err(RecoveryError::InvalidPromotionEvidence(
+                "trailing evidence bytes",
+            ));
+        }
+
+        let mut cursor = RecoveryPromotionEvidenceCursor::new(bytes);
+        cursor.read_exact::<8>()?;
+        cursor.read_exact::<2>()?;
+        let source_model = decode_source_model(cursor.read_u8()?)
+            .map_err(|_| RecoveryError::InvalidPromotionEvidence("invalid source-model tag"))?;
+        let source_model_id = RecoverySourceModelId::new(cursor.read_exact::<32>()?)?;
+        let activation_rung = decode_activation_rung(cursor.read_u8()?)
+            .map_err(|_| RecoveryError::InvalidPromotionEvidence("invalid activation-rung tag"))?;
+        let track = decode_track(cursor.read_u8()?)
+            .map_err(|_| RecoveryError::InvalidPromotionEvidence("invalid track tag"))?;
+        let campaign_digest = RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?;
+        let promotion_gate = RecoveryPromotionGate::new(
+            cursor.read_f64()?,
+            RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?,
+        )?;
+        let selected_checkpoint = decode_selected_checkpoint(cursor.read_u8()?, cursor.read_u8()?)
+            .map_err(|_| {
+                RecoveryError::InvalidPromotionEvidence("invalid selected-checkpoint tag")
+            })?;
+        let validation_quality = cursor.read_f64()?;
+        let artifact_digest = RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?;
+        let evidence_digest = RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?;
+        if !cursor.is_empty() {
+            return Err(RecoveryError::InvalidPromotionEvidence(
+                "trailing evidence bytes",
+            ));
+        }
+
+        let evidence = Self {
+            source_model,
+            source_model_id,
+            activation_rung,
+            track,
+            campaign_digest,
+            promotion_gate,
+            selected_checkpoint,
             validation_quality,
             artifact_digest,
             evidence_digest,
-        })
+        };
+        evidence.validate_digest()?;
+        let canonical = evidence.canonical_content_bytes()?;
+        if canonical.as_slice() != &bytes[..RECOVERY_PROMOTION_EVIDENCE_CONTENT_BYTES] {
+            return Err(RecoveryError::InvalidPromotionEvidence(
+                "non-canonical evidence encoding",
+            ));
+        }
+        Ok(evidence)
+    }
+
+    fn from_run(
+        run: &RecoveryCampaignRun,
+        best: RecoveryCampaignBest,
+    ) -> Result<Self, RecoveryError> {
+        if !best.validation_quality.is_finite() {
+            return Err(RecoveryError::NonFiniteMetric("campaign promotion quality"));
+        }
+        let mut evidence = Self {
+            source_model: run.source_model,
+            source_model_id: run.source_model_id,
+            activation_rung: run.activation_rung,
+            track: run.track,
+            campaign_digest: run.campaign_digest,
+            promotion_gate: run.promotion_gate,
+            selected_checkpoint: best.checkpoint,
+            validation_quality: canonical_f64(best.validation_quality),
+            artifact_digest: best.artifact_digest,
+            evidence_digest: RecoveryEvidenceDigest([0; 32]),
+        };
+        evidence.evidence_digest =
+            promotion_evidence_content_digest(&evidence.canonical_content_bytes()?)?;
+        Ok(evidence)
     }
 
     /// Content digest of gate-evaluation evidence.
     #[must_use]
     pub const fn evidence_digest(self) -> RecoveryEvidenceDigest {
         self.evidence_digest
+    }
+
+    fn canonical_content_bytes(self) -> Result<Vec<u8>, RecoveryError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(RECOVERY_PROMOTION_EVIDENCE_CONTENT_BYTES)
+            .map_err(|_| RecoveryError::AllocationFailed("promotion evidence encoding"))?;
+        out.extend_from_slice(&RECOVERY_PROMOTION_EVIDENCE_MAGIC);
+        out.extend_from_slice(&RECOVERY_PROMOTION_EVIDENCE_VERSION.to_le_bytes());
+        out.push(encode_source_model(self.source_model));
+        out.extend_from_slice(&self.source_model_id.as_bytes());
+        out.push(encode_activation_rung(self.activation_rung));
+        out.push(encode_track(self.track));
+        out.extend_from_slice(&self.campaign_digest.as_bytes());
+        out.extend_from_slice(
+            &canonical_f64_bits(self.promotion_gate.minimum_validation_quality).to_le_bytes(),
+        );
+        out.extend_from_slice(&self.promotion_gate.gate_digest.as_bytes());
+        let (checkpoint, detail) = encode_selected_checkpoint(self.selected_checkpoint);
+        out.push(checkpoint);
+        out.push(detail);
+        out.extend_from_slice(&canonical_f64_bits(self.validation_quality).to_le_bytes());
+        out.extend_from_slice(&self.artifact_digest.as_bytes());
+        debug_assert_eq!(out.len(), RECOVERY_PROMOTION_EVIDENCE_CONTENT_BYTES);
+        Ok(out)
+    }
+
+    fn validate_digest(self) -> Result<(), RecoveryError> {
+        if !self.promotion_gate.minimum_validation_quality.is_finite()
+            || !self.validation_quality.is_finite()
+        {
+            return Err(RecoveryError::InvalidPromotionEvidence("non-finite metric"));
+        }
+        if self.promotion_gate.minimum_validation_quality.to_bits()
+            != canonical_f64_bits(self.promotion_gate.minimum_validation_quality)
+            || self.validation_quality.to_bits() != canonical_f64_bits(self.validation_quality)
+        {
+            return Err(RecoveryError::InvalidPromotionEvidence(
+                "non-canonical metric",
+            ));
+        }
+        let expected = promotion_evidence_content_digest(&self.canonical_content_bytes()?)?;
+        if expected != self.evidence_digest {
+            return Err(RecoveryError::CampaignPromotionEvidenceDigestMismatch);
+        }
+        Ok(())
+    }
+
+    fn same_semantics(self, other: Self) -> bool {
+        self.source_model == other.source_model
+            && self.source_model_id == other.source_model_id
+            && self.activation_rung == other.activation_rung
+            && self.track == other.track
+            && self.campaign_digest == other.campaign_digest
+            && self.promotion_gate.gate_digest == other.promotion_gate.gate_digest
+            && canonical_f64_bits(self.promotion_gate.minimum_validation_quality)
+                == canonical_f64_bits(other.promotion_gate.minimum_validation_quality)
+            && self.selected_checkpoint == other.selected_checkpoint
+            && canonical_f64_bits(self.validation_quality)
+                == canonical_f64_bits(other.validation_quality)
+            && self.artifact_digest == other.artifact_digest
     }
 }
 
@@ -1060,10 +1238,10 @@ struct RecoveryCampaignBest {
 }
 
 const RECOVERY_RECEIPT_MAGIC: [u8; 8] = *b"TRRCPT\0\0";
-const RECOVERY_RECEIPT_VERSION: u16 = 1;
+const RECOVERY_RECEIPT_VERSION: u16 = 2;
 const RECOVERY_RECEIPT_CONTENT_BYTES: usize = 285;
 const RECOVERY_RECEIPT_BYTES: usize = RECOVERY_RECEIPT_CONTENT_BYTES + 32;
-const RECOVERY_RECEIPT_HASH_CONTEXT: &str = "tritium recovery campaign receipt v1";
+const RECOVERY_RECEIPT_HASH_CONTEXT: &str = "tritium recovery campaign receipt v2";
 
 /// Immutable authorization and closeout evidence for one frozen recovery track.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1190,11 +1368,18 @@ impl RecoveryCampaignReceipt {
             cursor.read_f64()?,
             RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?,
         )?;
-        let promotion_evidence = RecoveryPromotionEvidence::new(
-            cursor.read_f64()?,
-            RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?,
-            RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?,
-        )?;
+        let promotion_evidence = RecoveryPromotionEvidence {
+            source_model,
+            source_model_id,
+            activation_rung,
+            track,
+            campaign_digest,
+            promotion_gate,
+            selected_checkpoint: checkpoint,
+            validation_quality: cursor.read_f64()?,
+            artifact_digest: RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?,
+            evidence_digest: RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?,
+        };
         let promotion_outcome = decode_promotion_outcome(cursor.read_u8()?)?;
         let receipt_digest = RecoveryEvidenceDigest::new(cursor.read_exact::<32>()?)?;
         if !cursor.is_empty() {
@@ -1225,7 +1410,6 @@ impl RecoveryCampaignReceipt {
             promotion_evidence,
             promotion_outcome,
         };
-        receipt.validate_semantics()?;
         let canonical = receipt.canonical_content_bytes()?;
         if canonical.as_slice() != &bytes[..RECOVERY_RECEIPT_CONTENT_BYTES] {
             return Err(RecoveryError::InvalidCampaignReceipt(
@@ -1235,6 +1419,7 @@ impl RecoveryCampaignReceipt {
         if receipt_content_digest(&canonical)? != receipt.receipt_digest {
             return Err(RecoveryError::CampaignEvidenceDigestMismatch);
         }
+        receipt.validate_semantics()?;
         Ok(receipt)
     }
 
@@ -1423,12 +1608,25 @@ impl RecoveryCampaignReceipt {
         {
             return Err(RecoveryError::InvalidCampaignReceipt("non-finite metric"));
         }
-        if canonical_f64_bits(self.best.validation_quality)
-            != canonical_f64_bits(self.promotion_evidence.validation_quality)
-            || self.best.artifact_digest != self.promotion_evidence.artifact_digest
+        let expected_promotion_evidence = RecoveryPromotionEvidence {
+            source_model: self.source_model,
+            source_model_id: self.source_model_id,
+            activation_rung: self.activation_rung,
+            track: self.track,
+            campaign_digest: self.campaign_digest,
+            promotion_gate: self.promotion_gate,
+            selected_checkpoint: self.best.checkpoint,
+            validation_quality: self.best.validation_quality,
+            artifact_digest: self.best.artifact_digest,
+            evidence_digest: self.promotion_evidence.evidence_digest,
+        };
+        if !self
+            .promotion_evidence
+            .same_semantics(expected_promotion_evidence)
         {
             return Err(RecoveryError::CampaignPromotionEvidenceMismatch);
         }
+        self.promotion_evidence.validate_digest()?;
         let expected_outcome = if self.promotion_evidence.validation_quality
             >= self.promotion_gate.minimum_validation_quality
         {
@@ -1483,27 +1681,14 @@ impl RecoveryCampaignReceipt {
                         ));
                     }
                 }
-                match self.termination {
-                    RecoveryCampaignTermination::PtqComplete => {
-                        return Err(RecoveryError::InvalidCampaignReceipt(
-                            "PTQ termination on refinement",
-                        ));
-                    }
-                    RecoveryCampaignTermination::ThreeEvaluationsWithoutImprovement
-                        if completed < 3 =>
-                    {
-                        return Err(RecoveryError::InvalidCampaignReceipt(
-                            "premature no-improvement termination",
-                        ));
-                    }
-                    RecoveryCampaignTermination::TokenCapReached
-                        if completed != RecoveryEvaluationCheckpoint::ALL.len() =>
-                    {
-                        return Err(RecoveryError::InvalidCampaignReceipt(
-                            "premature token-cap termination",
-                        ));
-                    }
-                    _ => {}
+                if !valid_refinement_terminal(
+                    self.termination,
+                    self.evaluations_completed,
+                    self.best.checkpoint,
+                ) {
+                    return Err(RecoveryError::InvalidCampaignReceipt(
+                        "impossible refinement terminal history",
+                    ));
                 }
             }
         }
@@ -1518,17 +1703,25 @@ pub struct RecoveryPredecessorEvidence {
 }
 
 impl RecoveryPredecessorEvidence {
-    /// Reopen a canonical receipt and bind independently reloaded promotion evidence.
+    /// Reopen a canonical receipt and independently persisted promotion evidence.
     ///
     /// # Errors
-    /// Rejects malformed or digest-mismatched receipt bytes and promotion
-    /// evidence whose independently reloaded digest differs from the receipt.
+    /// Rejects either malformed artifact and compares every campaign context,
+    /// selected checkpoint, quality, artifact, gate, and content digest field
+    /// duplicated across the two durable encodings.
     pub fn new(
         receipt_bytes: &[u8],
-        reopened_promotion_evidence_digest: RecoveryEvidenceDigest,
+        promotion_evidence_bytes: &[u8],
     ) -> Result<Self, RecoveryError> {
         let receipt = RecoveryCampaignReceipt::reopen(receipt_bytes)?;
-        if reopened_promotion_evidence_digest != receipt.promotion_evidence.evidence_digest {
+        let promotion_evidence = RecoveryPromotionEvidence::reopen(promotion_evidence_bytes)?;
+        if !receipt
+            .promotion_evidence
+            .same_semantics(promotion_evidence)
+        {
+            return Err(RecoveryError::CampaignPromotionEvidenceMismatch);
+        }
+        if promotion_evidence.evidence_digest != receipt.promotion_evidence.evidence_digest {
             return Err(RecoveryError::CampaignPromotionEvidenceDigestMismatch);
         }
         Ok(Self { receipt })
@@ -1541,8 +1734,51 @@ fn receipt_content_digest(bytes: &[u8]) -> Result<RecoveryEvidenceDigest, Recove
     RecoveryEvidenceDigest::new(*hasher.finalize().as_bytes())
 }
 
+fn promotion_evidence_content_digest(
+    bytes: &[u8],
+) -> Result<RecoveryEvidenceDigest, RecoveryError> {
+    let mut hasher = blake3::Hasher::new_derive_key(RECOVERY_PROMOTION_EVIDENCE_HASH_CONTEXT);
+    hasher.update(bytes);
+    RecoveryEvidenceDigest::new(*hasher.finalize().as_bytes())
+}
+
 const fn canonical_f64_bits(value: f64) -> u64 {
     if value == 0.0 { 0 } else { value.to_bits() }
+}
+
+fn canonical_f64(value: f64) -> f64 {
+    f64::from_bits(canonical_f64_bits(value))
+}
+
+const fn valid_refinement_terminal(
+    termination: RecoveryCampaignTermination,
+    evaluations_completed: u8,
+    selected_checkpoint: RecoverySelectedCheckpoint,
+) -> bool {
+    matches!(
+        (termination, evaluations_completed, selected_checkpoint),
+        (
+            RecoveryCampaignTermination::ThreeEvaluationsWithoutImprovement,
+            3,
+            RecoverySelectedCheckpoint::Predecessor
+        ) | (
+            RecoveryCampaignTermination::ThreeEvaluationsWithoutImprovement,
+            4,
+            RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneEighth)
+        ) | (
+            RecoveryCampaignTermination::TokenCapReached,
+            4,
+            RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneQuarter)
+        ) | (
+            RecoveryCampaignTermination::TokenCapReached,
+            4,
+            RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneHalf)
+        ) | (
+            RecoveryCampaignTermination::TokenCapReached,
+            4,
+            RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::Full)
+        )
+    )
 }
 
 const fn encode_source_model(value: RecoverySourceModel) -> u8 {
@@ -1690,6 +1926,57 @@ fn decode_promotion_outcome(value: u8) -> Result<RecoveryPromotionOutcome, Recov
         _ => Err(RecoveryError::InvalidCampaignReceipt(
             "invalid promotion-outcome tag",
         )),
+    }
+}
+
+struct RecoveryPromotionEvidenceCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RecoveryPromotionEvidenceCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_exact<const N: usize>(&mut self) -> Result<[u8; N], RecoveryError> {
+        let end = self
+            .offset
+            .checked_add(N)
+            .ok_or(RecoveryError::InvalidPromotionEvidence(
+                "evidence length overflow",
+            ))?;
+        let slice =
+            self.bytes
+                .get(self.offset..end)
+                .ok_or(RecoveryError::InvalidPromotionEvidence(
+                    "truncated evidence",
+                ))?;
+        self.offset = end;
+        Ok(slice.try_into().expect("fixed-size evidence slice"))
+    }
+
+    fn read_u8(&mut self) -> Result<u8, RecoveryError> {
+        Ok(self.read_exact::<1>()?[0])
+    }
+
+    fn read_u64(&mut self) -> Result<u64, RecoveryError> {
+        Ok(u64::from_le_bytes(self.read_exact::<8>()?))
+    }
+
+    fn read_f64(&mut self) -> Result<f64, RecoveryError> {
+        let bits = self.read_u64()?;
+        let value = f64::from_bits(bits);
+        if !value.is_finite() || canonical_f64_bits(value) != bits {
+            return Err(RecoveryError::InvalidPromotionEvidence(
+                "non-canonical evidence metric",
+            ));
+        }
+        Ok(value)
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
     }
 }
 
@@ -1872,7 +2159,7 @@ impl RecoveryCampaignRun {
         let termination = RecoveryCampaignTermination::PtqComplete;
         self.best = Some(RecoveryCampaignBest {
             checkpoint: RecoverySelectedCheckpoint::Ptq,
-            validation_quality,
+            validation_quality: canonical_f64(validation_quality),
             artifact_digest,
         });
         self.termination = Some(termination);
@@ -1926,6 +2213,7 @@ impl RecoveryCampaignRun {
         let prior_best = self
             .best
             .ok_or(RecoveryError::CampaignMissingBestCheckpoint)?;
+        let validation_quality = canonical_f64(validation_quality);
         if validation_quality > prior_best.validation_quality {
             self.best = Some(RecoveryCampaignBest {
                 checkpoint: RecoverySelectedCheckpoint::Evaluation(checkpoint),
@@ -1954,13 +2242,29 @@ impl RecoveryCampaignRun {
         )
     }
 
-    /// Close a terminal run into a digest-bound immutable receipt.
+    /// Prepare canonical, self-digesting promotion evidence for persistence.
+    ///
+    /// The returned value must be serialized, durably persisted, independently
+    /// reopened, and supplied as bytes to [`Self::finish`].
     ///
     /// # Errors
     /// Rejects a run without a terminal decision or retained checkpoint.
+    pub fn prepare_promotion_evidence(&self) -> Result<RecoveryPromotionEvidence, RecoveryError> {
+        self.termination.ok_or(RecoveryError::CampaignNotTerminal)?;
+        let best = self
+            .best
+            .ok_or(RecoveryError::CampaignMissingBestCheckpoint)?;
+        RecoveryPromotionEvidence::from_run(self, best)
+    }
+
+    /// Close a terminal run using independently reopened promotion evidence.
+    ///
+    /// # Errors
+    /// Rejects a non-terminal run, malformed evidence, or evidence bound to a
+    /// different campaign context, gate, checkpoint, quality, or artifact.
     pub fn finish(
         self,
-        promotion_evidence: RecoveryPromotionEvidence,
+        promotion_evidence_bytes: &[u8],
     ) -> Result<RecoveryCampaignReceipt, RecoveryError> {
         let termination = self.termination.ok_or(RecoveryError::CampaignNotTerminal)?;
         let best = self
@@ -1968,10 +2272,13 @@ impl RecoveryCampaignRun {
             .ok_or(RecoveryError::CampaignMissingBestCheckpoint)?;
         let evaluations_completed = u8::try_from(self.next_evaluation)
             .map_err(|_| RecoveryError::ArithmeticOverflow("campaign evaluations"))?;
-        if promotion_evidence.artifact_digest != best.artifact_digest
-            || promotion_evidence.validation_quality.to_bits() != best.validation_quality.to_bits()
-        {
+        let expected_promotion_evidence = self.prepare_promotion_evidence()?;
+        let promotion_evidence = RecoveryPromotionEvidence::reopen(promotion_evidence_bytes)?;
+        if !promotion_evidence.same_semantics(expected_promotion_evidence) {
             return Err(RecoveryError::CampaignPromotionEvidenceMismatch);
+        }
+        if promotion_evidence.evidence_digest != expected_promotion_evidence.evidence_digest {
+            return Err(RecoveryError::CampaignPromotionEvidenceDigestMismatch);
         }
         let promotion_outcome = if promotion_evidence.validation_quality
             >= self.promotion_gate.minimum_validation_quality
@@ -2381,6 +2688,10 @@ pub enum RecoveryError {
     InvalidCampaignReceipt(&'static str),
     /// A durable campaign receipt uses an unknown encoding version.
     UnsupportedCampaignReceiptVersion(u16),
+    /// Durable promotion evidence is malformed or non-canonical.
+    InvalidPromotionEvidence(&'static str),
+    /// Durable promotion evidence uses an unknown encoding version.
+    UnsupportedPromotionEvidenceVersion(u16),
     /// Exact source-model identity used the reserved all-zero sentinel.
     InvalidSourceModelId,
     /// The next frozen recovery track requires this exact predecessor label.
@@ -2515,6 +2826,15 @@ impl core::fmt::Display for RecoveryError {
             }
             Self::UnsupportedCampaignReceiptVersion(version) => {
                 write!(f, "unsupported recovery campaign receipt version {version}")
+            }
+            Self::InvalidPromotionEvidence(reason) => {
+                write!(f, "invalid recovery promotion evidence: {reason}")
+            }
+            Self::UnsupportedPromotionEvidenceVersion(version) => {
+                write!(
+                    f,
+                    "unsupported recovery promotion evidence version {version}"
+                )
             }
             Self::InvalidSourceModelId => {
                 f.write_str("recovery source-model identity cannot be all zero")
@@ -2881,20 +3201,41 @@ mod tests {
     }
 
     fn predecessor_evidence(receipt: &RecoveryCampaignReceipt) -> RecoveryPredecessorEvidence {
+        let promotion_evidence_bytes = receipt
+            .promotion_evidence
+            .to_bytes()
+            .expect("serialize promotion evidence");
         RecoveryPredecessorEvidence::new(
             &receipt.to_bytes().expect("serialize predecessor"),
-            receipt.promotion_evidence_digest(),
+            &promotion_evidence_bytes,
         )
         .expect("reopened predecessor")
     }
 
-    fn promotion_evidence(
-        quality: f64,
-        artifact: RecoveryEvidenceDigest,
-        seed: u8,
-    ) -> RecoveryPromotionEvidence {
-        RecoveryPromotionEvidence::new(quality, artifact, campaign_digest(seed))
-            .expect("promotion evidence")
+    fn finish_campaign(run: RecoveryCampaignRun) -> Result<RecoveryCampaignReceipt, RecoveryError> {
+        let promotion_evidence = run.prepare_promotion_evidence()?;
+        let promotion_evidence_bytes = promotion_evidence.to_bytes()?;
+        run.finish(&promotion_evidence_bytes)
+    }
+
+    fn resign_promotion_evidence(mut evidence: RecoveryPromotionEvidence) -> Vec<u8> {
+        evidence.evidence_digest = promotion_evidence_content_digest(
+            &evidence
+                .canonical_content_bytes()
+                .expect("canonical promotion evidence"),
+        )
+        .expect("promotion evidence digest");
+        evidence.to_bytes().expect("serialize promotion evidence")
+    }
+
+    fn resign_receipt(mut receipt: RecoveryCampaignReceipt) -> Vec<u8> {
+        let canonical = receipt
+            .canonical_content_bytes()
+            .expect("canonical forged receipt");
+        receipt.receipt_digest = receipt_content_digest(&canonical).expect("receipt digest");
+        let mut bytes = canonical;
+        bytes.extend_from_slice(&receipt.receipt_digest.as_bytes());
+        bytes
     }
 
     fn complete_campaign_ptq(
@@ -2912,8 +3253,7 @@ mod tests {
         .expect("authorized PTQ");
         let artifact = campaign_digest(digest_seed);
         run.record_ptq(1.0, artifact).expect("PTQ measurement");
-        run.finish(promotion_evidence(1.0, artifact, digest_seed + 100))
-            .expect("PTQ receipt")
+        finish_campaign(run).expect("PTQ receipt")
     }
 
     fn complete_campaign_refinement(
@@ -2952,8 +3292,12 @@ mod tests {
         }
         let quality = predecessor.selected_validation_quality() + 4.0;
         let artifact = campaign_digest(digest_seed + 3);
-        run.finish(promotion_evidence(quality, artifact, digest_seed + 100))
-            .expect("refinement receipt")
+        assert_eq!(
+            quality,
+            run.best.expect("best checkpoint").validation_quality
+        );
+        assert_eq!(artifact, run.best.expect("best checkpoint").artifact_digest);
+        finish_campaign(run).expect("refinement receipt")
     }
 
     #[test]
@@ -2976,9 +3320,7 @@ mod tests {
                 RecoveryCampaignTermination::PtqComplete
             ))
         );
-        let ptq_receipt = ptq
-            .finish(promotion_evidence(0.8, ptq_artifact, 4))
-            .expect("PTQ receipt");
+        let ptq_receipt = finish_campaign(ptq).expect("PTQ receipt");
         let ptq_evidence = predecessor_evidence(&ptq_receipt);
 
         assert!(matches!(
@@ -3141,9 +3483,7 @@ mod tests {
         )
         .expect("root PTQ");
         ptq.record_ptq(0.8, baseline_artifact).expect("PTQ result");
-        let ptq_receipt = ptq
-            .finish(promotion_evidence(0.8, baseline_artifact, 18))
-            .expect("PTQ receipt");
+        let ptq_receipt = finish_campaign(ptq).expect("PTQ receipt");
         let predecessor = predecessor_evidence(&ptq_receipt);
         let mut scale = RecoveryCampaignRun::start(
             campaign_plan(
@@ -3175,9 +3515,7 @@ mod tests {
             Err(RecoveryError::CampaignEvaluationAfterTerminal)
         );
 
-        let receipt = scale
-            .finish(promotion_evidence(0.8, baseline_artifact, 19))
-            .expect("early-stop receipt");
+        let receipt = finish_campaign(scale).expect("early-stop receipt");
         assert_eq!(receipt.token_cap(), Some(8_000_000));
         assert_eq!(receipt.tokens_consumed(), 4_000_000);
         assert_eq!(receipt.evaluations_completed(), 3);
@@ -3222,25 +3560,23 @@ mod tests {
             ))
         );
         assert_eq!(
-            ptq.clone()
-                .finish(promotion_evidence(1.0, campaign_digest(21), 25)),
+            finish_campaign(ptq.clone()),
             Err(RecoveryError::CampaignNotTerminal)
         );
         ptq.record_ptq(1.0, campaign_digest(21)).expect("valid PTQ");
-        let receipt = ptq
-            .finish(promotion_evidence(1.0, campaign_digest(21), 25))
-            .expect("PTQ receipt");
+        let receipt = finish_campaign(ptq).expect("PTQ receipt");
 
         let mut corrupted_receipt = receipt.to_bytes().expect("serialize receipt");
         let digest_byte = corrupted_receipt
             .last_mut()
             .expect("receipt includes content digest");
         *digest_byte ^= 1;
+        let promotion_evidence_bytes = receipt
+            .promotion_evidence
+            .to_bytes()
+            .expect("serialize promotion evidence");
         assert_eq!(
-            RecoveryPredecessorEvidence::new(
-                &corrupted_receipt,
-                receipt.promotion_evidence_digest(),
-            ),
+            RecoveryPredecessorEvidence::new(&corrupted_receipt, &promotion_evidence_bytes),
             Err(RecoveryError::CampaignEvidenceDigestMismatch)
         );
         let predecessor = predecessor_evidence(&receipt);
@@ -3324,10 +3660,17 @@ mod tests {
         );
 
         let mut future_version = bytes.clone();
-        future_version[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        future_version[8..10].copy_from_slice(&3_u16.to_le_bytes());
         assert_eq!(
             RecoveryCampaignReceipt::reopen(&future_version),
-            Err(RecoveryError::UnsupportedCampaignReceiptVersion(2))
+            Err(RecoveryError::UnsupportedCampaignReceiptVersion(3))
+        );
+
+        let mut legacy_caller_digest_version = bytes.clone();
+        legacy_caller_digest_version[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(
+            RecoveryCampaignReceipt::reopen(&legacy_caller_digest_version),
+            Err(RecoveryError::UnsupportedCampaignReceiptVersion(1))
         );
 
         let mut caller_chosen_digest = bytes;
@@ -3335,6 +3678,246 @@ mod tests {
         assert_eq!(
             RecoveryCampaignReceipt::reopen(&caller_chosen_digest),
             Err(RecoveryError::CampaignEvidenceDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn promotion_evidence_roundtrips_and_rejects_corruption_and_signed_zero() {
+        let campaign = campaign_digest(110);
+        let gate = RecoveryPromotionGate::new(-0.0, campaign_digest(111)).expect("zero gate");
+        assert_eq!(
+            gate.minimum_validation_quality().to_bits(),
+            0.0_f64.to_bits()
+        );
+        let plan = RecoveryCampaignPlan::new(
+            RecoverySourceModel::SmolLm2OneThirtyFiveMillion,
+            source_id(RecoveryModelRung::Pilot),
+            RecoveryActivationRung::A16,
+            RecoveryTrack::Ptq,
+            campaign,
+            gate,
+        );
+        let mut run = RecoveryCampaignRun::start(plan, None).expect("root PTQ");
+        run.record_ptq(-0.0, campaign_digest(112))
+            .expect("terminal PTQ");
+        let evidence = run
+            .prepare_promotion_evidence()
+            .expect("promotion evidence");
+        assert_eq!(evidence.validation_quality.to_bits(), 0.0_f64.to_bits());
+        let bytes = evidence.to_bytes().expect("canonical evidence");
+        assert_eq!(bytes.len(), RECOVERY_PROMOTION_EVIDENCE_BYTES);
+        assert_eq!(
+            RecoveryPromotionEvidence::reopen(&bytes).expect("verified evidence"),
+            evidence
+        );
+
+        let receipt = run.clone().finish(&bytes).expect("receipt");
+        assert_eq!(
+            receipt.selected_validation_quality().to_bits(),
+            0.0_f64.to_bits()
+        );
+        RecoveryPredecessorEvidence::new(&receipt.to_bytes().expect("receipt bytes"), &bytes)
+            .expect("independently reopened evidence");
+
+        let mut mutated = bytes.clone();
+        mutated[11] ^= 1;
+        assert_eq!(
+            RecoveryPromotionEvidence::reopen(&mutated),
+            Err(RecoveryError::CampaignPromotionEvidenceDigestMismatch)
+        );
+        assert_eq!(
+            run.finish(&mutated),
+            Err(RecoveryError::CampaignPromotionEvidenceDigestMismatch)
+        );
+        assert_eq!(
+            RecoveryPromotionEvidence::reopen(&bytes[..bytes.len() - 1]),
+            Err(RecoveryError::InvalidPromotionEvidence(
+                "truncated evidence"
+            ))
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            RecoveryPromotionEvidence::reopen(&trailing),
+            Err(RecoveryError::InvalidPromotionEvidence(
+                "trailing evidence bytes"
+            ))
+        );
+        let mut future_version = bytes.clone();
+        future_version[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            RecoveryPromotionEvidence::reopen(&future_version),
+            Err(RecoveryError::UnsupportedPromotionEvidenceVersion(2))
+        );
+        let mut noncanonical_zero = bytes.clone();
+        const GATE_THRESHOLD_OFFSET: usize = 77;
+        noncanonical_zero[GATE_THRESHOLD_OFFSET..GATE_THRESHOLD_OFFSET + 8]
+            .copy_from_slice(&(-0.0_f64).to_bits().to_le_bytes());
+        assert_eq!(
+            RecoveryPromotionEvidence::reopen(&noncanonical_zero),
+            Err(RecoveryError::InvalidPromotionEvidence(
+                "non-canonical evidence metric"
+            ))
+        );
+        let mut caller_digest = bytes;
+        caller_digest[RECOVERY_PROMOTION_EVIDENCE_CONTENT_BYTES..].fill(0x5a);
+        assert_eq!(
+            RecoveryPromotionEvidence::reopen(&caller_digest),
+            Err(RecoveryError::CampaignPromotionEvidenceDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn finish_and_predecessor_reject_every_resigned_context_forgery() {
+        let campaign = campaign_digest(120);
+        let plan = campaign_plan(
+            RecoveryModelRung::Pilot,
+            RecoveryActivationRung::A16,
+            RecoveryTrack::Ptq,
+            campaign,
+        );
+        let mut run = RecoveryCampaignRun::start(plan, None).expect("root PTQ");
+        run.record_ptq(0.8, campaign_digest(121))
+            .expect("terminal PTQ");
+        let original = run
+            .prepare_promotion_evidence()
+            .expect("promotion evidence");
+
+        let mut forgeries = Vec::new();
+        let mut forged = original;
+        forged.source_model = RecoverySourceModel::SmolLm2OnePointSevenBillion;
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.source_model_id = RecoverySourceModelId::new([122; 32]).expect("other source");
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.activation_rung = RecoveryActivationRung::A8;
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.track = RecoveryTrack::ScaleOnly;
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.campaign_digest = campaign_digest(123);
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.promotion_gate =
+            RecoveryPromotionGate::new(0.25, original.promotion_gate.gate_digest)
+                .expect("other threshold");
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.promotion_gate = RecoveryPromotionGate::new(
+            original.promotion_gate.minimum_validation_quality,
+            campaign_digest(124),
+        )
+        .expect("other gate");
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.selected_checkpoint = RecoverySelectedCheckpoint::Predecessor;
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.validation_quality = 0.9;
+        forgeries.push(resign_promotion_evidence(forged));
+        let mut forged = original;
+        forged.artifact_digest = campaign_digest(125);
+        forgeries.push(resign_promotion_evidence(forged));
+
+        for (index, forged_bytes) in forgeries.iter().enumerate() {
+            assert_eq!(
+                run.clone().finish(forged_bytes),
+                Err(RecoveryError::CampaignPromotionEvidenceMismatch),
+                "finish accepted context forgery {index}"
+            );
+        }
+
+        let original_bytes = original.to_bytes().expect("original evidence");
+        let receipt = run.finish(&original_bytes).expect("receipt");
+        let receipt_bytes = receipt.to_bytes().expect("receipt bytes");
+        for (index, forged_bytes) in forgeries.iter().enumerate() {
+            assert_eq!(
+                RecoveryPredecessorEvidence::new(&receipt_bytes, forged_bytes),
+                Err(RecoveryError::CampaignPromotionEvidenceMismatch),
+                "predecessor accepted context forgery {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn refinement_terminal_semantic_matrix_is_exact_and_enforced_on_reopen() {
+        let checkpoints = [
+            RecoverySelectedCheckpoint::Ptq,
+            RecoverySelectedCheckpoint::Predecessor,
+            RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneEighth),
+            RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneQuarter),
+            RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneHalf),
+            RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::Full),
+        ];
+        let terminations = [
+            RecoveryCampaignTermination::PtqComplete,
+            RecoveryCampaignTermination::ThreeEvaluationsWithoutImprovement,
+            RecoveryCampaignTermination::TokenCapReached,
+        ];
+        let allowed = [
+            (
+                RecoveryCampaignTermination::ThreeEvaluationsWithoutImprovement,
+                3,
+                RecoverySelectedCheckpoint::Predecessor,
+            ),
+            (
+                RecoveryCampaignTermination::ThreeEvaluationsWithoutImprovement,
+                4,
+                RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneEighth),
+            ),
+            (
+                RecoveryCampaignTermination::TokenCapReached,
+                4,
+                RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneQuarter),
+            ),
+            (
+                RecoveryCampaignTermination::TokenCapReached,
+                4,
+                RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::OneHalf),
+            ),
+            (
+                RecoveryCampaignTermination::TokenCapReached,
+                4,
+                RecoverySelectedCheckpoint::Evaluation(RecoveryEvaluationCheckpoint::Full),
+            ),
+        ];
+        for termination in terminations {
+            for evaluations in 0..=5 {
+                for checkpoint in checkpoints {
+                    assert_eq!(
+                        valid_refinement_terminal(termination, evaluations, checkpoint),
+                        allowed.contains(&(termination, evaluations, checkpoint)),
+                        "unexpected terminal tuple {termination:?}/{evaluations}/{checkpoint:?}"
+                    );
+                }
+            }
+        }
+
+        let campaign = campaign_digest(130);
+        let ptq = complete_campaign_ptq(
+            RecoveryModelRung::Pilot,
+            RecoveryActivationRung::A16,
+            campaign,
+            None,
+            131,
+        );
+        let mut impossible = complete_campaign_refinement(
+            RecoveryModelRung::Pilot,
+            RecoveryActivationRung::A16,
+            RecoveryTrack::ScaleOnly,
+            campaign,
+            &ptq,
+            132,
+        );
+        impossible.termination = RecoveryCampaignTermination::ThreeEvaluationsWithoutImprovement;
+        let forged_bytes = resign_receipt(impossible);
+        assert_eq!(
+            RecoveryCampaignReceipt::reopen(&forged_bytes),
+            Err(RecoveryError::InvalidCampaignReceipt(
+                "impossible refinement terminal history"
+            ))
         );
     }
 
@@ -3356,9 +3939,7 @@ mod tests {
             Err(RecoveryError::CampaignTrackHasNoTokenSchedule)
         );
         ptq.record_ptq(1.0, campaign_digest(31)).expect("PTQ");
-        let receipt = ptq
-            .finish(promotion_evidence(1.0, campaign_digest(31), 35))
-            .expect("receipt");
+        let receipt = finish_campaign(ptq).expect("receipt");
         let predecessor = predecessor_evidence(&receipt);
         let mut scale = RecoveryCampaignRun::start(
             campaign_plan(
@@ -3417,10 +3998,13 @@ mod tests {
         let mut ptq = RecoveryCampaignRun::start(ptq_plan, None).expect("root PTQ");
         let artifact = campaign_digest(83);
         ptq.record_ptq(0.8, artifact).expect("terminal PTQ");
-        let promotion = RecoveryPromotionEvidence::new(0.8, artifact, campaign_digest(84))
-            .expect("promotion evidence");
+        let promotion_evidence_bytes = ptq
+            .prepare_promotion_evidence()
+            .expect("promotion evidence")
+            .to_bytes()
+            .expect("serialize promotion evidence");
         let receipt = ptq
-            .finish(promotion)
+            .finish(&promotion_evidence_bytes)
             .expect("failed-gate receipt remains durable");
         assert_eq!(
             receipt.promotion_outcome(),
@@ -3428,7 +4012,7 @@ mod tests {
         );
         let predecessor = RecoveryPredecessorEvidence::new(
             &receipt.to_bytes().expect("serialize failed receipt"),
-            receipt.promotion_evidence_digest(),
+            &promotion_evidence_bytes,
         )
         .expect("reopened failed receipt");
         let scale_plan = RecoveryCampaignPlan::new(
@@ -3465,13 +4049,26 @@ mod tests {
         let mut run = RecoveryCampaignRun::start(plan, None).expect("root");
         let artifact = campaign_digest(93);
         run.record_ptq(0.8, artifact).expect("PTQ");
+        let mut wrong_artifact_run = RecoveryCampaignRun::start(plan, None).expect("forged root");
+        wrong_artifact_run
+            .record_ptq(0.8, campaign_digest(95))
+            .expect("forged PTQ");
+        let wrong_artifact_evidence = wrong_artifact_run
+            .prepare_promotion_evidence()
+            .expect("forged promotion evidence")
+            .to_bytes()
+            .expect("serialize forged promotion evidence");
         assert_eq!(
-            run.clone()
-                .finish(promotion_evidence(0.8, campaign_digest(95), 96)),
+            run.clone().finish(&wrong_artifact_evidence),
             Err(RecoveryError::CampaignPromotionEvidenceMismatch)
         );
+        let promotion_evidence_bytes = run
+            .prepare_promotion_evidence()
+            .expect("promotion evidence")
+            .to_bytes()
+            .expect("serialize promotion evidence");
         let receipt = run
-            .finish(promotion_evidence(0.8, artifact, 96))
+            .finish(&promotion_evidence_bytes)
             .expect("passed receipt");
         assert_eq!(
             receipt.promotion_outcome(),
@@ -3480,9 +4077,9 @@ mod tests {
         assert_eq!(
             RecoveryPredecessorEvidence::new(
                 &receipt.to_bytes().expect("serialize receipt"),
-                campaign_digest(97),
+                &wrong_artifact_evidence,
             ),
-            Err(RecoveryError::CampaignPromotionEvidenceDigestMismatch)
+            Err(RecoveryError::CampaignPromotionEvidenceMismatch)
         );
         let predecessor = predecessor_evidence(&receipt);
         let different_pilot = RecoveryCampaignPlan::new(
