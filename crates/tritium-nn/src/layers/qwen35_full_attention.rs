@@ -273,7 +273,7 @@ impl Qwen35FullAttention {
     ///
     /// Returns [`NnError::MissingConfig`] for contradictory numeric semantics or
     /// unsafe geometry, [`NnError::Shape`] for any projection/norm mismatch, or
-    /// [`NnError::Backend`] for non-finite Q/K norm weights.
+    /// [`NnError::Backend`] for non-finite projection/Q/K norm weights.
     pub fn new(
         config: &Qwen35TextConfig,
         weights: Qwen35FullAttentionWeights,
@@ -582,7 +582,8 @@ fn validate_projection(
     expected_in: usize,
 ) -> Result<(), NnError> {
     validate_len(projection.n_out(), expected_out)?;
-    validate_len(projection.k_in(), expected_in)
+    validate_len(projection.k_in(), expected_in)?;
+    projection.validate_retained_parameters()
 }
 
 fn validate_len(got: usize, expected: usize) -> Result<(), NnError> {

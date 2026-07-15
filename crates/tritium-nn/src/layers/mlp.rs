@@ -121,7 +121,8 @@ impl SwiGluMlp {
     ///
     /// # Errors
     /// Returns [`NnError::Shape`] for zero or contradictory projection geometry,
-    /// or [`NnError::MissingConfig`] when activation arithmetic modes differ.
+    /// [`NnError::MissingConfig`] when activation arithmetic modes differ, or
+    /// [`NnError::Backend`] when a projection parameter is non-finite.
     pub fn new(gate: Projection, up: Projection, down: Projection) -> Result<Self, NnError> {
         let mlp = Self { gate, up, down };
         mlp.activation_mode()?;
@@ -135,7 +136,8 @@ impl SwiGluMlp {
     ///
     /// # Errors
     /// Returns [`NnError::Shape`] for zero or contradictory projection geometry,
-    /// or [`NnError::MissingConfig`] when activation arithmetic modes differ.
+    /// [`NnError::MissingConfig`] when activation arithmetic modes differ, or
+    /// [`NnError::Backend`] when a projection parameter is non-finite.
     pub fn activation_mode(&self) -> Result<ProjectionActivationMode, NnError> {
         let n_embd = self.gate.k_in();
         let n_ff = self.gate.n_out();
@@ -145,6 +147,7 @@ impl SwiGluMlp {
                 got: n_embd.min(n_ff),
             });
         }
+        validate_projection(&self.gate, n_ff, n_embd)?;
         validate_projection(&self.up, n_ff, n_embd)?;
         validate_projection(&self.down, n_embd, n_ff)?;
 
@@ -228,7 +231,7 @@ fn validate_projection(
             got: projection.k_in(),
         });
     }
-    Ok(())
+    projection.validate_retained_parameters()
 }
 
 fn checked_buffer_len(rows: usize, width: usize, got: usize) -> Result<usize, NnError> {

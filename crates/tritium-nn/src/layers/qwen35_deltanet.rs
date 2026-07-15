@@ -305,7 +305,7 @@ impl Qwen35DeltaNet {
     ///
     /// Returns [`NnError::MissingConfig`] for unsafe/unsupported geometry or
     /// mixed projection arithmetic, [`NnError::Shape`] for any weight mismatch,
-    /// or [`NnError::Backend`] for non-finite fp32 auxiliary weights.
+    /// or [`NnError::Backend`] for non-finite projection/auxiliary weights.
     pub fn new(config: &Qwen35TextConfig, weights: Qwen35DeltaNetWeights) -> Result<Self, NnError> {
         let spec = DeltaNetSpec::bind(config)?;
         validate_projection(&weights.qkv_proj, spec.conv_width, spec.hidden_size)?;
@@ -689,7 +689,8 @@ fn validate_projection(
     expected_in: usize,
 ) -> Result<(), NnError> {
     validate_len(projection.n_out(), expected_out)?;
-    validate_len(projection.k_in(), expected_in)
+    validate_len(projection.k_in(), expected_in)?;
+    projection.validate_retained_parameters()
 }
 
 fn validate_len(got: usize, expected: usize) -> Result<(), NnError> {

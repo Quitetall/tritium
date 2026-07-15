@@ -61,6 +61,47 @@ fn binding_exposes_shared_activation_mode() {
 }
 
 #[test]
+fn binding_rejects_nonfinite_gate_parameters() {
+    let mut gate = dense_exact(3, 2);
+    if let Projection::Dense(linear) = &mut gate {
+        linear.weights[1] = f32::NAN;
+    }
+    let error = SwiGluMlp::new(gate, dense_exact(3, 2), dense_exact(2, 3))
+        .err()
+        .expect("non-finite gate projection must fail");
+    assert!(matches!(error, NnError::Backend(message) if message.contains("non-finite")));
+}
+
+#[test]
+fn binding_rejects_mutated_retained_parameter_geometry() {
+    let mut dense_gate = dense_exact(3, 2);
+    if let Projection::Dense(linear) = &mut dense_gate {
+        linear.weights.pop();
+    }
+    assert!(matches!(
+        SwiGluMlp::new(dense_gate, dense_exact(3, 2), dense_exact(2, 3)),
+        Err(NnError::Shape {
+            expected: 6,
+            got: 5
+        })
+    ));
+
+    let cpu = tritium_cpu::CpuBackend::new();
+    let mut ternary_gate =
+        Projection::Ternary(TernaryLinear::new(&cpu, &[Trit::ZERO; 6], 3, 2, 1.0).unwrap());
+    if let Projection::Ternary(linear) = &mut ternary_gate {
+        linear.scales.pop();
+    }
+    assert!(matches!(
+        SwiGluMlp::new(ternary_gate, dense_a8(3, 2), dense_a8(2, 3)),
+        Err(NnError::Shape {
+            expected: 3,
+            got: 2
+        })
+    ));
+}
+
+#[test]
 fn forward_rejects_extent_overflow_without_publishing_output() {
     let backend = tritium_cpu::CpuBackend::new();
     let mlp = SwiGluMlp::new(dense_exact(3, 2), dense_exact(3, 2), dense_exact(2, 3)).unwrap();

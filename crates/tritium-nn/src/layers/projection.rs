@@ -61,6 +61,37 @@ impl Projection {
         }
     }
 
+    /// Validate retained fp32 projection parameter geometry and finiteness.
+    ///
+    /// Packed SALT constructors validate every retained scale before publishing
+    /// their immutable storage. Resident SALT V2 handles are likewise validated
+    /// when uploaded, so only dense coefficients and deployed ternary row scales
+    /// require inspection here.
+    pub(crate) fn validate_retained_parameters(&self) -> Result<(), NnError> {
+        match self {
+            Projection::Ternary(linear) => {
+                linear.validate_retained_geometry()?;
+                if linear.scales.iter().any(|value| !value.is_finite()) {
+                    return Err(NnError::Backend(
+                        "ternary projection scales contain a non-finite value".to_owned(),
+                    ));
+                }
+            }
+            Projection::Dense(linear) => {
+                linear.validate_retained_geometry()?;
+                if linear.weights.iter().any(|value| !value.is_finite()) {
+                    return Err(NnError::Backend(
+                        "dense projection weights contain a non-finite value".to_owned(),
+                    ));
+                }
+            }
+            Projection::Salt(_) => {}
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(_) => {}
+        }
+        Ok(())
+    }
+
     /// Forward through whichever projection this is. Deployed ternary and resident
     /// SALT V2 weights use `backend`; host-packed SALT and dense weights run on the host.
     ///

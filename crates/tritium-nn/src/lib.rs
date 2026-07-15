@@ -40,7 +40,10 @@ pub use layers::{
 };
 #[cfg(feature = "tokenizer")]
 pub use model::GgufBpeTokenizer;
-pub use model::{ForwardDump, LayerWeights, ModelRunner, ModelWeights, Tokenizer};
+pub use model::{
+    ForwardDump, LayerWeights, ModelRunner, ModelWeights, Qwen35TextCache, Qwen35TextLayerWeights,
+    Qwen35TextMixerWeights, Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights, Tokenizer,
+};
 #[cfg(feature = "cuda")]
 pub use model::{
     SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,

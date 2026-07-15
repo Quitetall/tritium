@@ -94,6 +94,7 @@ impl DenseLinear {
     /// [`NnError::Shape`] on buffer-length mismatch, or [`NnError::Backend`] if
     /// A8 scratch cannot be allocated.
     pub fn forward(&self, act: &[f32], m: usize, out: &mut [f32]) -> Result<(), NnError> {
+        self.validate_retained_geometry()?;
         let k = self.k_in;
         let act_len = checked_buffer_len(m, k, act.len())?;
         if act.len() != act_len {
@@ -157,6 +158,20 @@ impl DenseLinear {
                     }
                     *slot = acc * s;
                 });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_retained_geometry(&self) -> Result<(), NnError> {
+        let expected = self.n_out.checked_mul(self.k_in).ok_or(NnError::Shape {
+            expected: usize::MAX,
+            got: self.weights.len(),
+        })?;
+        if self.weights.len() != expected {
+            return Err(NnError::Shape {
+                expected,
+                got: self.weights.len(),
+            });
         }
         Ok(())
     }
@@ -233,5 +248,20 @@ mod tests {
                 got: 0,
             })
         );
+    }
+
+    #[test]
+    fn forward_rejects_mutated_weight_geometry_without_touching_output() {
+        let mut lin = DenseLinear::new_exact(vec![0.25; 6], 3, 2).unwrap();
+        lin.weights.pop();
+        let mut out = [17.0, 19.0, 23.0];
+        assert_eq!(
+            lin.forward(&[1.0, 2.0], 1, &mut out),
+            Err(NnError::Shape {
+                expected: 6,
+                got: 5,
+            })
+        );
+        assert_eq!(out, [17.0, 19.0, 23.0]);
     }
 }

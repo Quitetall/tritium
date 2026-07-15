@@ -201,6 +201,7 @@ impl TernaryLinear {
         m: usize,
         out: &mut [f32],
     ) -> Result<(), NnError> {
+        self.validate_retained_geometry()?;
         let act_len = checked_buffer_len(m, self.k_in, act.len())?;
         if act.len() != act_len {
             return Err(NnError::Shape {
@@ -245,6 +246,39 @@ impl TernaryLinear {
 
         Ok(())
     }
+
+    pub(crate) fn validate_retained_geometry(&self) -> Result<(), NnError> {
+        if self.scales.len() != self.n_out {
+            return Err(NnError::Shape {
+                expected: self.n_out,
+                got: self.scales.len(),
+            });
+        }
+        let block_bytes = match self.format {
+            TernaryFormat::Tq1_0 => TQ1_0_BLOCK_BYTES,
+            TernaryFormat::Tq2_0 => TQ2_0_BLOCK_BYTES,
+            _ => {
+                return Err(NnError::Backend(
+                    "TernaryLinear retained an unsupported packed format".to_owned(),
+                ));
+            }
+        };
+        let expected = self
+            .n_out
+            .checked_mul(num_blocks(self.k_in))
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or(NnError::Shape {
+                expected: usize::MAX,
+                got: self.weights.len_bytes(),
+            })?;
+        if self.weights.len_bytes() != expected {
+            return Err(NnError::Shape {
+                expected,
+                got: self.weights.len_bytes(),
+            });
+        }
+        Ok(())
+    }
 }
 
 fn checked_buffer_len(rows: usize, width: usize, got: usize) -> Result<usize, NnError> {
@@ -263,4 +297,38 @@ fn zeroed_scratch(len: usize, name: &str) -> Result<Vec<f32>, NnError> {
     })?;
     values.resize(len, 0.0);
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use tritium_cpu::CpuBackend;
+
+    use super::*;
+
+    #[test]
+    fn forward_rejects_mutated_scale_and_device_geometry_without_output_mutation() {
+        let backend = CpuBackend::new();
+        let mut missing_scale = TernaryLinear::new(&backend, &[Trit::ZERO; 6], 3, 2, 1.0).unwrap();
+        missing_scale.scales.pop();
+        let mut out = [17.0, 19.0, 23.0];
+        assert_eq!(
+            missing_scale.forward(&backend, &[1.0, 2.0], 1, &mut out),
+            Err(NnError::Shape {
+                expected: 3,
+                got: 2,
+            })
+        );
+        assert_eq!(out, [17.0, 19.0, 23.0]);
+
+        let mut wrong_device_extent =
+            TernaryLinear::new(&backend, &[Trit::ZERO; 6], 3, 2, 1.0).unwrap();
+        wrong_device_extent.n_out = 4;
+        wrong_device_extent.scales.push(1.0);
+        let mut larger_out = [17.0, 19.0, 23.0, 29.0];
+        assert!(matches!(
+            wrong_device_extent.forward(&backend, &[1.0, 2.0], 1, &mut larger_out),
+            Err(NnError::Shape { .. })
+        ));
+        assert_eq!(larger_out, [17.0, 19.0, 23.0, 29.0]);
+    }
 }
