@@ -56,6 +56,15 @@ pub use cuda::{
 #[cfg(feature = "cuda")]
 pub use cuda::SaltResidentLinear;
 
+// plan 0043 Stage 6: direct encoded D2/B3/S34 execution with explicit allocation
+// evidence. `FastAliasesExact` remains visible so callers cannot mistake the
+// correctness-first alias for an optimized kernel.
+#[cfg(feature = "cuda")]
+pub use cuda::{
+    SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt, SaltV2ResidentAllocationReceipt,
+    SaltV2ResidentTensor,
+};
+
 // v0.30 (ADR 0005) skeletons. `autotune` is pure Rust (tile config + on-disk
 // cache keying) so it builds and tests on cpu-only lanes; `codegen` links
 // cudarc's nvrtc path, so it is gated behind `cuda`. WF-B implements both and the

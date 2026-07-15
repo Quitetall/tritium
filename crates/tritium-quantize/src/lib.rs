@@ -41,6 +41,12 @@ pub mod fisher;
 mod plane;
 mod quantize;
 mod recon;
+mod salt_v2;
+mod salt_v2_activation;
+mod salt_v2_allocator;
+mod salt_v2_curvature;
+mod salt_v2_feedback;
+mod salt_v2_model;
 mod training_export;
 
 pub use allocate::{AllocConfig, AllocError, Allocation, GroupInput, TRIT_BITS, allocate};
@@ -51,7 +57,8 @@ pub use architecture::{
 pub use campaign::{
     CalibrationId, CalibrationProvenance, CampaignError, CampaignId, CampaignLedger,
     CampaignMetrics, CampaignObjective, CampaignPoint, EvaluationId, EvaluationProvenance,
-    MeasuredPackage, RecipeId, RecipeProvenance,
+    ExactMillibpw, LogicalTritCount, LogicalTritRate, MeasuredPackage, PhysicalSizeReport,
+    RecipeId, RecipeProvenance, ResidentSizeComponents, SerializedSizeComponents,
 };
 pub use conversion::{
     CONVERSION_STATE_MAGIC, CONVERSION_STATE_VERSION, ConversionError, ConversionRun,
@@ -64,6 +71,36 @@ pub use quantize::{
     BaseScaleScope, QuantConfig, QuantError, QuantizedTensor, Sensitivity, quantize_tensor,
 };
 pub use recon::{ReconAccum, ReconError, ReconStats, reconstruction_stats};
+pub use salt_v2::{
+    DensePsdMetric, JointFitConfig, JointFitError, JointFitMetric, JointFitRestartReceipt,
+    JointFitStartKind, JointFitUpdatePhase, JointFitUpdateReceipt, JointTernaryFit, ScalePrecision,
+    ScaleSolveReceipt, ScaleSolveTelemetry, exact_ternary_assignment, fit_joint_ternary,
+};
+pub use salt_v2_activation::{
+    ActivationByteLedger, ActivationCache, ActivationCacheBuilder, ActivationCacheError,
+    ActivationCacheSpec, ActivationChunk, ActivationDType, ActivationDigest, ActivationShard,
+};
+pub use salt_v2_allocator::{
+    ByteDelta, GroupCandidates, NestedProfileAllocation, NestedProfileBudgets, PhysicalAllocError,
+    PhysicalBytes, PlaneCandidate, ProfileAllocation, ProfileBudget, SaltV2Profile,
+    allocate_nested_profiles,
+};
+pub use salt_v2_curvature::{
+    CurvatureError, CurvatureSourceId, InputGram, InputGramAccumulator, KfacMetric, OutputFisher,
+    OutputFisherAccumulator, build_kfac_metric,
+};
+pub use salt_v2_feedback::{
+    ColumnGroup, FeedbackError, FeedbackMetric, FeedbackProblem, FeedbackRunError, FeedbackState,
+    GroupFitRequest, fit_with_feedback,
+};
+pub use salt_v2_model::{
+    CurvatureArtifact, PhysicalRateTarget, SaltV2Config, SaltV2Curvature, SaltV2DriverError,
+    SaltV2Error, SaltV2ExternalStage, SaltV2ExternalStageRequest, SaltV2FitTrack,
+    SaltV2ModelFitInput, SaltV2ModelFitMetrics, SaltV2ModelFitReceipt, SaltV2ModelFitResult,
+    SaltV2ModelPhysicalInput, SaltV2ModelStageDriver, SaltV2Packing, SaltV2PhysicalSize,
+    SaltV2Refinement, SaltV2TensorFitInput, SaltV2TensorFitReceipt, SaltV2TileCandidateMetrics,
+    fit_salt_v2_model,
+};
 pub use training_export::{
     TrainingSaltExportError, TrainingSaltExportStats, export_training_salt_row,
 };

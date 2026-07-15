@@ -47,6 +47,8 @@ mod salt;
 mod salt_bundle;
 mod salt_bundle_reader;
 mod salt_gguf;
+pub mod salt_v2;
+pub mod salt_v2_package;
 mod sparse;
 mod tb1;
 mod teacher_cache;

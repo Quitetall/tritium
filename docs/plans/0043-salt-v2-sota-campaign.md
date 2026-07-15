@@ -1,6 +1,7 @@
 # 0043 — SALT V2 implementation and SOTA campaign
 
-Status: **PROPOSED** (2026-07-15)
+Status: **IN PROGRESS** (software/reference substrate implemented 2026-07-15;
+empirical campaign gates remain open)
 
 - **Decision:** [ADR 0028](../adr/0028-salt-v2-additive-ternarization.md)
 - **Research cutoff:** 2026-07-14, inclusive
@@ -361,7 +362,9 @@ and the relevant CPU/CUDA parity gate before the next stage depends on it.
 - Add BlockLDLQ/GPTQ residual propagation.
 - Recompute and propagate the delta caused by every scale refit.
 - Replace logical-bpw water filling with exact marginal loss per encoded byte.
-- Refit a group before pricing its next plane; cache only digest-bound curves.
+- Recompute every exact prefix loss after a jointly fitted master solution
+  changes; invalidate both profile allocations rather than mixing curves from
+  different master fits. Cache only digest-bound curves.
 
 **Gate**
 
@@ -651,24 +654,43 @@ For every implementation commit:
 No paid run starts from an uncommitted or unreviewed tree. The recipe records
 the exact clean revision.
 
-## Current implementation gaps
+## Current implementation status and gaps
 
-- `tritium-quantize::residual_expand` is greedy AbsMean, not a joint solver.
-- `QuantConfig::budget_bpw` and the allocator optimize logical trit bits rather
-  than exact encoded bytes.
-- The current tensor path uses 256-weight TQ2_0 blocks and row-wide plane
-  padding; it has no G64/G128 or radix-3 SALT V2 encoding.
-- Current `Sensitivity::Custom` accepts diagonal/tile signals but there is no
-  GuidedQuant/YAQA-style full-model curvature artifact.
-- The current campaign configuration uses one uniform `salt_planes` count; it
-  does not consume an adaptive per-group plane map and SALT V2 recipe.
-- Existing distillation proves the training path but does not implement PV
-  discrete updates or the frozen short-refinement protocol.
-- The resident CUDA SALT path is an execution substrate, not yet a SALT V2
-  mixed-plane/radix-3 kernel.
-- Required third-party baselines are not all integrated or reproduced under one
-  byte/evaluation boundary.
-- The 1.7B, Qwen3-8B, and Qwen3-32B acceptance artifacts do not exist.
+The software commit implements a bounded reference substrate, not the empirical
+claim. It adds the canonical zero-point-free D2/B3/S34 semantic package, exact
+serialized and indexed-runtime accounting, deterministic joint `3^P` fitting,
+conditioned scale solving, activation-cache reopen validation, source-bound
+input/Fisher/Kronecker curvature primitives, standalone block-feedback and
+delta-correction primitives, a two-budget exact allocator, mixed-plane model
+fitting, typed recovery/growth controls, direct CPU/CUDA add-sub-skip execution,
+and the resumable `tritium-salt` evidence facade. Compact packages remain exact
+prefixes of their near-lossless packages. ADR 0028's 2026-07-15 amendment makes
+the ordered-master prefix curve, rather than independent per-P refits, the
+binding pricing contract.
+
+The following work deliberately remains open and keeps this plan in progress:
+
+- the production model driver does not yet connect block-output reconstruction,
+  scale-only teacher-KL, or hard PV updates to real checkpoint tensors;
+- the model fitter does not yet invoke the standalone block-feedback/delta path,
+  and its curvature input must still be bound directly to the source model and
+  activation-cache identities at the solve boundary;
+- package/runtime scale geometry is G128-only; the G64/G256 promotion ablations
+  require a versioned format/runtime field before they can enter the grid;
+- signed-RHT execution and S34-constrained fitting fail closed; the direct exact
+  runtime is the correctness baseline, and the current `fast` CUDA entry point
+  aliases it rather than claiming a speedup;
+- physical component truth still requires the opened package and checked
+  runtime allocation receipt; caller-provided architecture geometry alone is
+  not claim evidence;
+- the distinct whole-head/hidden-width transform, RMSNorm/residual handling,
+  and dense function-preservation oracle required for G2 do not exist;
+- required third-party baselines have not all been integrated or reproduced
+  under one byte/evaluation boundary;
+- the 135M, 1.7B, Qwen3-8B, Llama2-7B, Qwen3-32B, and growth acceptance artifacts
+  do not exist, and no paid campaign has been run;
+- no near-zero-divergence, additive-ternary SOTA, global Pareto, or cost result
+  has been earned by this implementation alone.
 
 ## Definition of done
 

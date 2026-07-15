@@ -20,6 +20,7 @@ mod kv_cache;
 mod layers;
 mod model;
 mod ops;
+mod salt_v2_growth;
 mod teacher_cache;
 mod tensor;
 mod training;
@@ -48,6 +49,12 @@ pub use model::{
 pub use ops::{
     QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_categorical,
     sample_greedy, sample_top_k, sample_top_p, softmax_rows, truncated_top_k, truncated_top_p,
+};
+pub use salt_v2_growth::{
+    FixedEmbeddingPolicy, GrowthPlanError, GrowthTarget, IntermediateGrowthPlan,
+    MAX_ADDITIVE_PLANES, MAX_STAGE1_RECEIPT_WIDTH, PlaneWeightHistogram,
+    ProjectionCoefficientLedger, ProjectionGeometry, ProjectionPlaneCounts, Stage2Requirement,
+    WHOLE_HEAD_AND_HIDDEN_COEFFICIENT_THRESHOLD,
 };
 pub use teacher_cache::{
     TeacherCacheError, TeacherCacheReader, TeacherCacheWriter, hash_teacher_corpus,

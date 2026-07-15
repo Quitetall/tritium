@@ -6,13 +6,17 @@ use std::{
     io::{self, Read},
     path::Path,
 };
-use tritium_format::{ModelId, PackageHasher, PackageId};
+use tritium_format::{
+    ModelId, PackageHasher, PackageId,
+    salt_v2_package::{SaltV2IndexedRuntimeLedger, SaltV2PackageError, read_salt_v2_package},
+};
 
 const CALIBRATION_MAGIC: [u8; 4] = *b"TCAL";
 const CAMPAIGN_MAGIC: [u8; 4] = *b"TCMP";
 const EVALUATION_MAGIC: [u8; 4] = *b"TEVL";
 const RECIPE_MAGIC: [u8; 4] = *b"TRCP";
-const CAMPAIGN_VERSION: u8 = 2;
+const LEGACY_CAMPAIGN_VERSION: u8 = 2;
+const PHYSICAL_REPORT_CAMPAIGN_VERSION: u8 = 4;
 const PROVENANCE_VERSION: u8 = 1;
 const RECIPE_VERSION: u8 = 1;
 const CALIBRATION_ID_CONTEXT: &str = "tritium calibration provenance id v1";
@@ -58,6 +62,38 @@ fn write_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
             out.extend_from_slice(&value.to_le_bytes());
         }
     }
+}
+
+fn write_optional_physical_report(out: &mut Vec<u8>, value: Option<PhysicalSizeReport>) {
+    let Some(report) = value else {
+        out.push(0);
+        return;
+    };
+    out.push(1);
+    for value in [
+        report.core_parameter_count,
+        report.model_parameter_count,
+        report.logical_core_trits.get(),
+        report.serialized.core_payload_bytes,
+        report.serialized.core_scale_bytes,
+        report.serialized.allocation_map_bytes,
+        report.serialized.allocation_map_bits,
+        report.serialized.allocation_map_embedded_bits,
+        report.serialized.header_bytes,
+        report.serialized.transform_bytes,
+        report.serialized.preserved_bytes,
+        report.serialized.alignment_bytes,
+        report.resident.core_bytes,
+        report.resident.map_bytes,
+        report.resident.map_bits,
+        report.resident.map_embedded_bits,
+        report.resident.descriptor_bytes,
+        report.resident.preserved_bytes,
+        report.resident.shadow_bytes,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    write_optional_u64(out, report.resident.peak_workspace_bytes);
 }
 
 /// Content identity of an exact calibration provenance record.
@@ -508,6 +544,28 @@ impl MeasuredPackage {
         Self::from_reader(file)
     }
 
+    /// Remeasure a file and require its identity and length to remain unchanged.
+    ///
+    /// This is intended for the final report/publish boundary: the exact opened
+    /// artifact is hashed again instead of trusting a path, a caller-supplied
+    /// length, or an earlier filesystem metadata observation.
+    ///
+    /// # Errors
+    /// Returns the same I/O and empty-file errors as [`Self::from_file`], or
+    /// [`CampaignError::PackageMeasurementMismatch`] if any byte changed.
+    pub fn verify_file(self, path: impl AsRef<Path>) -> Result<(), CampaignError> {
+        let actual = Self::from_file(path)?;
+        if actual != self {
+            return Err(CampaignError::PackageMeasurementMismatch {
+                expected_id: self.id,
+                actual_id: actual.id,
+                expected_bytes: self.physical_bytes,
+                actual_bytes: actual.physical_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// Content identity of the exact serialized artifact.
     pub fn id(self) -> PackageId {
         self.id
@@ -519,13 +577,604 @@ impl MeasuredPackage {
     }
 }
 
+/// An exact rational storage rate measured in thousandths of a bit per weight.
+///
+/// The represented value is `numerator_millibits / denominator_weights`.
+/// Keeping both integers avoids using a rounded floating-point display value to
+/// authorize a package, resident allocation, or profile claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExactMillibpw {
+    numerator_millibits: u128,
+    denominator_weights: u64,
+}
+
+impl ExactMillibpw {
+    fn from_bytes(bytes: u64, denominator_weights: u64) -> Self {
+        Self {
+            numerator_millibits: u128::from(bytes) * 8_000,
+            denominator_weights,
+        }
+    }
+
+    /// Numerator in millibits before division by the weight count.
+    pub const fn numerator_millibits(self) -> u128 {
+        self.numerator_millibits
+    }
+
+    /// Exact weight-count denominator.
+    pub const fn denominator_weights(self) -> u64 {
+        self.denominator_weights
+    }
+
+    /// Smallest integer millibpw value no lower than the exact rate.
+    ///
+    /// This conservative ceiling is suitable for display and integer-only
+    /// budgets. Exact authorization should prefer [`Self::is_at_most`].
+    pub fn ceiling(self) -> u128 {
+        let denominator = u128::from(self.denominator_weights);
+        self.numerator_millibits.div_ceil(denominator)
+    }
+
+    /// Test an integer millibpw ceiling without division or floating point.
+    pub fn is_at_most(self, limit_millibpw: u64) -> bool {
+        self.numerator_millibits
+            <= u128::from(self.denominator_weights) * u128::from(limit_millibpw)
+    }
+
+    /// Test whether the exact rate equals an integer millibpw value.
+    pub fn equals(self, millibpw: u64) -> bool {
+        self.numerator_millibits == u128::from(self.denominator_weights) * u128::from(millibpw)
+    }
+}
+
+/// Nonzero count of logical ternary symbols assigned by an additive allocator.
+///
+/// This wrapper prevents a rounded integer bit count from being passed where the
+/// ADR requires a trit count. Information bits are derived only for display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LogicalTritCount(u64);
+
+impl LogicalTritCount {
+    /// Construct a nonzero logical trit count.
+    pub fn new(trits: u64) -> Result<Self, CampaignError> {
+        validate_nonzero("logical_core_trits", trits)?;
+        Ok(Self(trits))
+    }
+
+    /// Raw number of logical ternary symbols.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Exact rational logical trit rate plus its information-bit display projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LogicalTritRate {
+    trits: LogicalTritCount,
+    weights: u64,
+}
+
+impl LogicalTritRate {
+    /// Exact trit numerator.
+    pub const fn trits(self) -> u64 {
+        self.trits.get()
+    }
+
+    /// Exact weight denominator.
+    pub const fn weights(self) -> u64 {
+        self.weights
+    }
+
+    /// Information-theoretic bits per weight, `trits * log2(3) / weights`.
+    pub fn bpw(self) -> f64 {
+        self.trits.get() as f64 * crate::TRIT_BITS / self.weights as f64
+    }
+}
+
+/// Exact serialized component counters for one inference package.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SerializedSizeComponents {
+    core_payload_bytes: u64,
+    core_scale_bytes: u64,
+    allocation_map_bytes: u64,
+    allocation_map_bits: u64,
+    allocation_map_embedded_bits: u64,
+    header_bytes: u64,
+    transform_bytes: u64,
+    preserved_bytes: u64,
+    alignment_bytes: u64,
+}
+
+impl SerializedSizeComponents {
+    /// Record exact serialized byte counts in package order-independent classes.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        core_payload_bytes: u64,
+        core_scale_bytes: u64,
+        allocation_map_bytes: u64,
+        allocation_map_bits: u64,
+        allocation_map_embedded_bits: u64,
+        header_bytes: u64,
+        transform_bytes: u64,
+        preserved_bytes: u64,
+        alignment_bytes: u64,
+    ) -> Self {
+        Self {
+            core_payload_bytes,
+            core_scale_bytes,
+            allocation_map_bytes,
+            allocation_map_bits,
+            allocation_map_embedded_bits,
+            header_bytes,
+            transform_bytes,
+            preserved_bytes,
+            alignment_bytes,
+        }
+    }
+
+    /// Encoded ternary coefficient payload bytes.
+    pub const fn core_payload_bytes(self) -> u64 {
+        self.core_payload_bytes
+    }
+
+    /// Deployment-scale bytes associated with the core payload.
+    pub const fn core_scale_bytes(self) -> u64 {
+        self.core_scale_bytes
+    }
+
+    /// Plane-presence, plane-count, and other allocation-map bytes.
+    pub const fn allocation_map_bytes(self) -> u64 {
+        self.allocation_map_bytes
+    }
+
+    /// Exact logical allocation-map bits, including embedded terminal bits.
+    pub const fn allocation_map_bits(self) -> u64 {
+        self.allocation_map_bits
+    }
+
+    /// Logical map bits carried in mandatory package/tensor scalar fields.
+    pub const fn allocation_map_embedded_bits(self) -> u64 {
+        self.allocation_map_embedded_bits
+    }
+
+    /// Tensor, row, and container header bytes.
+    pub const fn header_bytes(self) -> u64 {
+        self.header_bytes
+    }
+
+    /// Serialized transform metadata bytes.
+    pub const fn transform_bytes(self) -> u64 {
+        self.transform_bytes
+    }
+
+    /// Serialized bytes of preserved non-core tensors and assets.
+    pub const fn preserved_bytes(self) -> u64 {
+        self.preserved_bytes
+    }
+
+    /// Alignment and padding bytes present in the exact package.
+    pub const fn alignment_bytes(self) -> u64 {
+        self.alignment_bytes
+    }
+
+    fn core_total_bytes(self) -> Result<u64, CampaignError> {
+        checked_physical_sum(
+            "serialized core",
+            [
+                self.core_payload_bytes,
+                self.core_scale_bytes,
+                self.allocation_map_bytes,
+                self.header_bytes,
+                self.transform_bytes,
+                self.alignment_bytes,
+            ],
+        )
+    }
+
+    fn total_bytes(self) -> Result<u64, CampaignError> {
+        checked_physical_sum(
+            "serialized package",
+            [
+                self.core_payload_bytes,
+                self.core_scale_bytes,
+                self.allocation_map_bytes,
+                self.header_bytes,
+                self.transform_bytes,
+                self.preserved_bytes,
+                self.alignment_bytes,
+            ],
+        )
+    }
+}
+
+/// Exact steady-state and peak resident component counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ResidentSizeComponents {
+    core_bytes: u64,
+    map_bytes: u64,
+    map_bits: u64,
+    map_embedded_bits: u64,
+    descriptor_bytes: u64,
+    preserved_bytes: u64,
+    shadow_bytes: u64,
+    peak_workspace_bytes: Option<u64>,
+}
+
+impl ResidentSizeComponents {
+    /// Record exact resident allocation byte counts.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        core_bytes: u64,
+        map_bytes: u64,
+        map_bits: u64,
+        map_embedded_bits: u64,
+        descriptor_bytes: u64,
+        preserved_bytes: u64,
+        shadow_bytes: u64,
+        peak_workspace_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            core_bytes,
+            map_bytes,
+            map_bits,
+            map_embedded_bits,
+            descriptor_bytes,
+            preserved_bytes,
+            shadow_bytes,
+            peak_workspace_bytes,
+        }
+    }
+
+    /// Resident encoded core coefficient and scale bytes.
+    pub const fn core_bytes(self) -> u64 {
+        self.core_bytes
+    }
+
+    /// Resident plane/allocation map bytes.
+    pub const fn map_bytes(self) -> u64 {
+        self.map_bytes
+    }
+
+    /// Exact logical runtime map bits, including scalar-carried terminal bits.
+    pub const fn map_bits(self) -> u64 {
+        self.map_bits
+    }
+
+    /// Runtime map bits carried in a mandatory launch scalar rather than an allocation.
+    pub const fn map_embedded_bits(self) -> u64 {
+        self.map_embedded_bits
+    }
+
+    /// Resident row, tensor, and dispatch descriptor bytes.
+    pub const fn descriptor_bytes(self) -> u64 {
+        self.descriptor_bytes
+    }
+
+    /// Resident preserved non-core tensor bytes.
+    pub const fn preserved_bytes(self) -> u64 {
+        self.preserved_bytes
+    }
+
+    /// Required alternate layouts or other persistent weight shadows.
+    pub const fn shadow_bytes(self) -> u64 {
+        self.shadow_bytes
+    }
+
+    /// Additional transient allocation present at the measured peak.
+    pub const fn peak_workspace_bytes(self) -> Option<u64> {
+        self.peak_workspace_bytes
+    }
+
+    fn core_total_bytes(self) -> Result<u64, CampaignError> {
+        checked_physical_sum(
+            "resident core",
+            [
+                self.core_bytes,
+                self.map_bytes,
+                self.descriptor_bytes,
+                self.shadow_bytes,
+            ],
+        )
+    }
+
+    fn steady_total_bytes(self) -> Result<u64, CampaignError> {
+        checked_physical_sum(
+            "steady resident",
+            [
+                self.core_bytes,
+                self.map_bytes,
+                self.descriptor_bytes,
+                self.preserved_bytes,
+                self.shadow_bytes,
+            ],
+        )
+    }
+
+    fn peak_total_bytes(self) -> Result<Option<u64>, CampaignError> {
+        self.peak_workspace_bytes
+            .map(|workspace| {
+                self.steady_total_bytes()?
+                    .checked_add(workspace)
+                    .ok_or(CampaignError::PhysicalSizeOverflow("peak resident"))
+            })
+            .transpose()
+    }
+}
+
+/// Checked exact logical, serialized, and resident accounting for one package.
+///
+/// A report is inseparably bound to the [`MeasuredPackage`] used at its
+/// construction boundary. Every serialized component is checked and must sum
+/// to that measured artifact's actual byte count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PhysicalSizeReport {
+    package: MeasuredPackage,
+    core_parameter_count: u64,
+    model_parameter_count: u64,
+    logical_core_trits: LogicalTritCount,
+    serialized: SerializedSizeComponents,
+    resident: ResidentSizeComponents,
+    serialized_core_bytes: u64,
+    steady_resident_bytes: u64,
+    peak_resident_bytes: Option<u64>,
+    resident_core_bytes: u64,
+}
+
+impl PhysicalSizeReport {
+    /// Build and validate exact physical accounting against measured bytes.
+    ///
+    /// `model_parameter_count` is the denominator for whole-model rates and
+    /// must include the `core_parameter_count` denominator used by core rates.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError`] for zero core/model counts, zero logical or
+    /// physical core storage, counter overflow, an inverted parameter-count
+    /// relationship, or a serialized total unlike `package.physical_bytes()`.
+    pub(crate) fn new(
+        package: MeasuredPackage,
+        core_parameter_count: u64,
+        model_parameter_count: u64,
+        logical_core_trits: LogicalTritCount,
+        serialized: SerializedSizeComponents,
+        resident: ResidentSizeComponents,
+    ) -> Result<Self, CampaignError> {
+        validate_nonzero("core_parameter_count", core_parameter_count)?;
+        validate_nonzero("model_parameter_count", model_parameter_count)?;
+        if core_parameter_count > model_parameter_count {
+            return Err(CampaignError::InvalidPhysicalSize(
+                "core_parameter_count exceeds model_parameter_count",
+            ));
+        }
+
+        validate_map_accounting(
+            "serialized allocation map",
+            serialized.allocation_map_bytes,
+            serialized.allocation_map_bits,
+            serialized.allocation_map_embedded_bits,
+        )?;
+        validate_map_accounting(
+            "resident allocation map",
+            resident.map_bytes,
+            resident.map_bits,
+            resident.map_embedded_bits,
+        )?;
+
+        let serialized_core_bytes = serialized.core_total_bytes()?;
+        validate_nonzero("serialized_core_bytes", serialized_core_bytes)?;
+        let serialized_total = serialized.total_bytes()?;
+        if serialized_total != package.physical_bytes() {
+            return Err(CampaignError::PhysicalPackageSizeMismatch {
+                measured_bytes: package.physical_bytes(),
+                component_bytes: serialized_total,
+            });
+        }
+
+        let resident_core_bytes = resident.core_total_bytes()?;
+        validate_nonzero("resident_core_bytes", resident_core_bytes)?;
+        let steady_resident_bytes = resident.steady_total_bytes()?;
+        let peak_resident_bytes = resident.peak_total_bytes()?;
+
+        Ok(Self {
+            package,
+            core_parameter_count,
+            model_parameter_count,
+            logical_core_trits,
+            serialized,
+            resident,
+            serialized_core_bytes,
+            steady_resident_bytes,
+            peak_resident_bytes,
+            resident_core_bytes,
+        })
+    }
+
+    /// Parse an exact SALT V2 artifact and derive all core accounting from it.
+    ///
+    /// This is the public construction boundary for SALT V2 reports. Callers
+    /// supply only the whole-model denominator and an optional independently
+    /// measured transient workspace; payload, scales, maps, headers,
+    /// transforms, padding, logical trits, and indexed-runtime allocations are
+    /// rederived from the canonical bytes. The package is treated as a
+    /// core-only artifact, so preserved-model components and shadows are zero.
+    ///
+    /// # Errors
+    /// Rejects a malformed/noncanonical package, accounting overflow, an
+    /// undersized whole-model denominator, or inconsistent derived components.
+    pub fn from_salt_v2_package_bytes(
+        package_bytes: &[u8],
+        model_parameter_count: u64,
+        peak_workspace_bytes: Option<u64>,
+    ) -> Result<Self, CampaignError> {
+        let decoded = read_salt_v2_package(package_bytes)?;
+        let runtime = SaltV2IndexedRuntimeLedger::for_package(&decoded.package)?;
+        let core_parameter_count =
+            decoded
+                .package
+                .tensors()
+                .iter()
+                .try_fold(0_u64, |total, tensor| {
+                    total
+                        .checked_add(u64::try_from(tensor.logical_coefficients()).map_err(
+                            |_| CampaignError::PhysicalSizeOverflow("core parameter count"),
+                        )?)
+                        .ok_or(CampaignError::PhysicalSizeOverflow("core parameter count"))
+                })?;
+        let logical_core_trits =
+            decoded
+                .package
+                .tensors()
+                .iter()
+                .try_fold(0_u64, |tensor_total, tensor| {
+                    tensor.tiles().iter().try_fold(tensor_total, |total, tile| {
+                        let logical_len = u64::try_from(tile.logical_len()).map_err(|_| {
+                            CampaignError::PhysicalSizeOverflow("logical core trits")
+                        })?;
+                        let plane_count = u64::try_from(tile.planes().len()).map_err(|_| {
+                            CampaignError::PhysicalSizeOverflow("logical core trits")
+                        })?;
+                        total
+                            .checked_add(
+                                logical_len.checked_mul(plane_count).ok_or(
+                                    CampaignError::PhysicalSizeOverflow("logical core trits"),
+                                )?,
+                            )
+                            .ok_or(CampaignError::PhysicalSizeOverflow("logical core trits"))
+                    })
+                })?;
+        let serialized = SerializedSizeComponents::new(
+            decoded.ledger.payload_bytes,
+            decoded.ledger.scales_bytes,
+            decoded.ledger.maps_bytes,
+            decoded.ledger.allocation_map_bits,
+            decoded.ledger.allocation_map_embedded_bits,
+            decoded.ledger.headers_bytes,
+            decoded.ledger.transform_bytes,
+            0,
+            decoded.ledger.padding_bytes,
+        );
+        let resident = ResidentSizeComponents::new(
+            runtime
+                .payload_bytes()
+                .checked_add(runtime.scale_bytes())
+                .ok_or(CampaignError::PhysicalSizeOverflow("resident core"))?,
+            runtime.allocation_map_bytes(),
+            runtime.allocation_map_bits(),
+            runtime.allocation_map_embedded_bits(),
+            runtime.rank_prefix_bytes(),
+            0,
+            runtime.dense_shadow_bytes(),
+            peak_workspace_bytes,
+        );
+        Self::new(
+            MeasuredPackage::from_bytes(package_bytes)?,
+            core_parameter_count,
+            model_parameter_count,
+            LogicalTritCount::new(logical_core_trits)?,
+            serialized,
+            resident,
+        )
+    }
+
+    /// Exact package identity and measured byte count bound to this report.
+    pub const fn package(self) -> MeasuredPackage {
+        self.package
+    }
+
+    /// Number of core parameters used for logical/core physical rates.
+    pub const fn core_parameter_count(self) -> u64 {
+        self.core_parameter_count
+    }
+
+    /// Total model parameter count used for whole-model rates.
+    pub const fn model_parameter_count(self) -> u64 {
+        self.model_parameter_count
+    }
+
+    /// Exact aggregate logical ternary symbols assigned by the allocator.
+    pub const fn logical_core_trits(self) -> LogicalTritCount {
+        self.logical_core_trits
+    }
+
+    /// Exact serialized component counters.
+    pub const fn serialized(self) -> SerializedSizeComponents {
+        self.serialized
+    }
+
+    /// Exact resident component counters.
+    pub const fn resident(self) -> ResidentSizeComponents {
+        self.resident
+    }
+
+    /// Exact serialized core bytes, including maps, headers, transforms, and alignment.
+    pub const fn serialized_core_bytes(self) -> u64 {
+        self.serialized_core_bytes
+    }
+
+    /// Exact steady-state resident core bytes, including maps, descriptors, and shadows.
+    pub const fn resident_core_bytes(self) -> u64 {
+        self.resident_core_bytes
+    }
+
+    /// Exact whole-model steady-state resident bytes.
+    pub const fn steady_resident_bytes(self) -> u64 {
+        self.steady_resident_bytes
+    }
+
+    /// Exact whole-model peak resident bytes.
+    pub const fn peak_resident_bytes(self) -> Option<u64> {
+        self.peak_resident_bytes
+    }
+
+    /// Exact rational logical-trit rate over core parameters.
+    pub const fn logical_core_rate(self) -> LogicalTritRate {
+        LogicalTritRate {
+            trits: self.logical_core_trits,
+            weights: self.core_parameter_count,
+        }
+    }
+
+    /// Exact serialized core rate over core parameters.
+    pub fn serialized_core_millibpw(self) -> ExactMillibpw {
+        ExactMillibpw::from_bytes(self.serialized_core_bytes, self.core_parameter_count)
+    }
+
+    /// Exact steady resident core rate over core parameters.
+    pub fn resident_core_millibpw(self) -> ExactMillibpw {
+        ExactMillibpw::from_bytes(self.resident_core_bytes, self.core_parameter_count)
+    }
+
+    /// Exact complete artifact-file rate over all model parameters.
+    pub fn whole_model_serialized_millibpw(self) -> ExactMillibpw {
+        ExactMillibpw::from_bytes(self.package.physical_bytes(), self.model_parameter_count)
+    }
+
+    /// Exact whole-model steady resident rate.
+    pub fn whole_model_steady_resident_millibpw(self) -> ExactMillibpw {
+        ExactMillibpw::from_bytes(self.steady_resident_bytes, self.model_parameter_count)
+    }
+
+    /// Exact whole-model peak resident rate.
+    pub fn whole_model_peak_resident_millibpw(self) -> Option<ExactMillibpw> {
+        self.peak_resident_bytes
+            .map(|bytes| ExactMillibpw::from_bytes(bytes, self.model_parameter_count))
+    }
+
+    /// Remeasure the package file and require exact identity and length equality.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`MeasuredPackage::verify_file`].
+    pub fn verify_file(self, path: impl AsRef<Path>) -> Result<(), CampaignError> {
+        self.package.verify_file(path)
+    }
+}
+
 /// Metric used as one axis of campaign Pareto dominance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CampaignObjective {
     /// Minimize exact serialized inference-artifact bytes.
     PhysicalBytes,
-    /// Minimize logical allocator bits per source weight.
+    /// Minimize the exact logical-trit ratio per source weight.
     LogicalBpw,
     /// Minimize held-out perplexity.
     Perplexity,
@@ -539,7 +1188,7 @@ pub enum CampaignObjective {
     PeakVramBytes,
 }
 
-/// Required storage metrics plus optional quality measurements for one artifact.
+/// Legacy logical-rate metrics plus optional quality and checked physical evidence.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CampaignMetrics {
     logical_bpw: f64,
@@ -548,6 +1197,7 @@ pub struct CampaignMetrics {
     task_score: Option<f64>,
     tokens_per_second: Option<f64>,
     peak_vram_bytes: Option<u64>,
+    physical_size_report: Option<PhysicalSizeReport>,
 }
 
 impl CampaignMetrics {
@@ -564,6 +1214,7 @@ impl CampaignMetrics {
             task_score: None,
             tokens_per_second: None,
             peak_vram_bytes: None,
+            physical_size_report: None,
         })
     }
 
@@ -615,7 +1266,42 @@ impl CampaignMetrics {
         if bytes == 0 {
             return Err(CampaignError::InvalidMetric("peak_vram_bytes"));
         }
+        if self
+            .physical_size_report
+            .and_then(PhysicalSizeReport::peak_resident_bytes)
+            .is_some_and(|peak| peak != bytes)
+        {
+            return Err(CampaignError::PhysicalMetricMismatch("peak_vram_bytes"));
+        }
         self.peak_vram_bytes = Some(bytes);
+        Ok(self)
+    }
+
+    /// Attach checked physical accounting to these metrics.
+    ///
+    /// The logical-rate display is always rederived from the report's exact
+    /// trit/weight ratio. When the report includes an independently measured
+    /// peak, that total becomes the peak-VRAM objective; an existing value must
+    /// agree. A report with no peak measurement does not invent one.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError::PhysicalMetricMismatch`] if an existing peak
+    /// resident measurement disagrees with the checked report.
+    pub fn with_physical_size_report(
+        mut self,
+        report: PhysicalSizeReport,
+    ) -> Result<Self, CampaignError> {
+        if let Some(report_peak) = report.peak_resident_bytes() {
+            if self
+                .peak_vram_bytes
+                .is_some_and(|bytes| bytes != report_peak)
+            {
+                return Err(CampaignError::PhysicalMetricMismatch("peak_vram_bytes"));
+            }
+            self.peak_vram_bytes = Some(report_peak);
+        }
+        self.logical_bpw = report.logical_core_rate().bpw();
+        self.physical_size_report = Some(report);
         Ok(self)
     }
 
@@ -648,6 +1334,11 @@ impl CampaignMetrics {
     pub fn peak_vram_bytes(&self) -> Option<u64> {
         self.peak_vram_bytes
     }
+
+    /// Checked exact physical accounting, when supplied.
+    pub const fn physical_size_report(&self) -> Option<&PhysicalSizeReport> {
+        self.physical_size_report.as_ref()
+    }
 }
 
 /// One immutable converted artifact and its measured campaign metrics.
@@ -665,8 +1356,9 @@ pub struct CampaignPoint {
 impl CampaignPoint {
     /// Record identities and measurements for one conversion recipe output.
     ///
-    /// Construction alone does not prove provenance. [`CampaignLedger::add`]
-    /// performs the trust-boundary validation against its pinned identities.
+    /// Construction alone does not prove provenance or bind an optional physical
+    /// report to `package`. [`CampaignLedger::add`] performs both trust-boundary
+    /// validations.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_model_id: ModelId,
@@ -798,8 +1490,10 @@ impl CampaignLedger {
     ///
     /// # Errors
     /// Returns [`CampaignError::ProvenanceMismatch`] for mixed source/calibration/
-    /// evaluation records, or [`CampaignError::DuplicatePackage`] when exact
-    /// package bytes were already recorded.
+    /// evaluation records, [`CampaignError::PackageMeasurementMismatch`] when an
+    /// attached report describes another package, or
+    /// [`CampaignError::DuplicatePackage`] when exact package bytes were already
+    /// recorded.
     pub fn add(&mut self, point: CampaignPoint) -> Result<(), CampaignError> {
         if point.source_model_id != self.source_model_id {
             return Err(CampaignError::ProvenanceMismatch("source_model"));
@@ -809,6 +1503,18 @@ impl CampaignLedger {
         }
         if point.evaluation_id != self.evaluation_id {
             return Err(CampaignError::ProvenanceMismatch("evaluation"));
+        }
+        if let Some(report) = point.metrics.physical_size_report {
+            let expected = point.package;
+            let actual = report.package();
+            if actual != expected {
+                return Err(CampaignError::PackageMeasurementMismatch {
+                    expected_id: expected.id(),
+                    actual_id: actual.id(),
+                    expected_bytes: expected.physical_bytes(),
+                    actual_bytes: actual.physical_bytes(),
+                });
+            }
         }
         if self
             .points
@@ -884,11 +1590,15 @@ impl CampaignLedger {
     ///
     /// Points are ordered by exact [`PackageId`]. Calibration and evaluation
     /// records are embedded, making the artifact self-contained for audit. This
-    /// version-2 encoding is a stable hash target, not yet an interchange format;
-    /// no public decoder is provided.
+    /// Legacy ledgers without physical reports retain their exact version-2 byte
+    /// encoding and identity. A ledger containing any physical report uses the
+    /// version-4 encoding, in which every point carries an explicit absent/present
+    /// marker and present reports bind exact trits, map bits, components, and
+    /// optional peak measurements. Neither
+    /// version is yet an interchange format; no public decoder is provided.
     ///
     /// # Errors
-    /// Returns [`CampaignError::RecordTooLarge`] if a version-2 u32 count or
+    /// Returns [`CampaignError::RecordTooLarge`] if a canonical u32 count or
     /// embedded-record length would overflow.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, CampaignError> {
         let calibration = self.calibration.canonical_bytes();
@@ -899,6 +1609,10 @@ impl CampaignLedger {
             .map_err(|_| CampaignError::RecordTooLarge("evaluation"))?;
         let point_count = u32::try_from(self.points.len())
             .map_err(|_| CampaignError::RecordTooLarge("points"))?;
+        let has_physical_reports = self
+            .points
+            .iter()
+            .any(|point| point.metrics.physical_size_report.is_some());
 
         let mut points: Vec<_> = self.points.iter().collect();
         // Raw fixed-size digest bytes avoid display-format coupling.
@@ -910,7 +1624,11 @@ impl CampaignLedger {
 
         let mut out = Vec::new();
         out.extend_from_slice(&CAMPAIGN_MAGIC);
-        out.push(CAMPAIGN_VERSION);
+        out.push(if has_physical_reports {
+            PHYSICAL_REPORT_CAMPAIGN_VERSION
+        } else {
+            LEGACY_CAMPAIGN_VERSION
+        });
         out.extend_from_slice(self.source_model_id.as_bytes());
         out.extend_from_slice(&calibration_len.to_le_bytes());
         out.extend_from_slice(&calibration);
@@ -932,6 +1650,9 @@ impl CampaignLedger {
             write_optional_f64(&mut out, point.metrics.task_score);
             write_optional_f64(&mut out, point.metrics.tokens_per_second);
             write_optional_u64(&mut out, point.metrics.peak_vram_bytes);
+            if has_physical_reports {
+                write_optional_physical_report(&mut out, point.metrics.physical_size_report);
+            }
         }
         Ok(out)
     }
@@ -950,7 +1671,8 @@ impl CampaignLedger {
 
 fn has_objective(point: &CampaignPoint, objective: CampaignObjective) -> bool {
     match objective {
-        CampaignObjective::PhysicalBytes | CampaignObjective::LogicalBpw => true,
+        CampaignObjective::PhysicalBytes => true,
+        CampaignObjective::LogicalBpw => point.metrics.physical_size_report.is_some(),
         CampaignObjective::Perplexity => point.metrics.perplexity.is_some(),
         CampaignObjective::ReconstructionMse => point.metrics.reconstruction_mse.is_some(),
         CampaignObjective::TaskScore => point.metrics.task_score.is_some(),
@@ -966,10 +1688,20 @@ fn objective_cmp(
 ) -> Ordering {
     match objective {
         CampaignObjective::PhysicalBytes => left.physical_bytes().cmp(&right.physical_bytes()),
-        CampaignObjective::LogicalBpw => left
-            .metrics
-            .logical_bpw
-            .total_cmp(&right.metrics.logical_bpw),
+        CampaignObjective::LogicalBpw => {
+            let left = left
+                .metrics
+                .physical_size_report
+                .expect("objective presence validated")
+                .logical_core_rate();
+            let right = right
+                .metrics
+                .physical_size_report
+                .expect("objective presence validated")
+                .logical_core_rate();
+            (u128::from(left.trits()) * u128::from(right.weights()))
+                .cmp(&(u128::from(right.trits()) * u128::from(left.weights())))
+        }
         CampaignObjective::Perplexity => left
             .metrics
             .perplexity
@@ -1058,6 +1790,33 @@ fn checked_package_length(current: u64, read: usize) -> Result<u64, CampaignErro
         .ok_or(CampaignError::RecordTooLarge("package"))
 }
 
+fn checked_physical_sum<const N: usize>(
+    field: &'static str,
+    components: [u64; N],
+) -> Result<u64, CampaignError> {
+    components.into_iter().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or(CampaignError::PhysicalSizeOverflow(field))
+    })
+}
+
+fn validate_map_accounting(
+    field: &'static str,
+    allocated_bytes: u64,
+    logical_bits: u64,
+    embedded_bits: u64,
+) -> Result<(), CampaignError> {
+    let accounted_bits = allocated_bytes
+        .checked_mul(8)
+        .and_then(|bits| bits.checked_add(embedded_bits))
+        .ok_or(CampaignError::PhysicalSizeOverflow(field))?;
+    if accounted_bits != logical_bits {
+        return Err(CampaignError::InvalidPhysicalSize(field));
+    }
+    Ok(())
+}
+
 fn validate_nonzero(field: &'static str, value: u64) -> Result<(), CampaignError> {
     if value == 0 {
         Err(CampaignError::ZeroValue(field))
@@ -1098,6 +1857,8 @@ fn canonicalize_zero(value: f64) -> f64 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CampaignError {
+    /// Canonical SALT V2 package parsing or runtime planning failed.
+    SaltV2Package(SaltV2PackageError),
     /// Required string field was empty.
     EmptyField(&'static str),
     /// String field exceeded canonical u32 length.
@@ -1106,6 +1867,30 @@ pub enum CampaignError {
     ZeroValue(&'static str),
     /// Metric violated its finite, sign, or non-zero constraint.
     InvalidMetric(&'static str),
+    /// A physical-size relationship was structurally invalid.
+    InvalidPhysicalSize(&'static str),
+    /// Exact physical component addition exceeded `u64`.
+    PhysicalSizeOverflow(&'static str),
+    /// Serialized components did not sum to the measured package length.
+    PhysicalPackageSizeMismatch {
+        /// Exact byte count obtained by measuring the package.
+        measured_bytes: u64,
+        /// Exact byte count obtained by checked component addition.
+        component_bytes: u64,
+    },
+    /// A remeasured or point-associated package differed from the expected package.
+    PackageMeasurementMismatch {
+        /// Expected exact package identity.
+        expected_id: PackageId,
+        /// Actual exact package identity.
+        actual_id: PackageId,
+        /// Expected exact package length.
+        expected_bytes: u64,
+        /// Actual exact package length.
+        actual_bytes: u64,
+    },
+    /// A legacy exact metric disagreed with an attached physical report.
+    PhysicalMetricMismatch(&'static str),
     /// Point did not use the ledger's pinned comparison identity.
     ProvenanceMismatch(&'static str),
     /// Exact package bytes were already present in the ledger.
@@ -1121,7 +1906,7 @@ pub enum CampaignError {
         /// Requested metric.
         objective: CampaignObjective,
     },
-    /// Version-2 campaign record exceeded a u32 count or embedded length.
+    /// Canonical campaign record exceeded a u32 count or embedded length.
     RecordTooLarge(&'static str),
     /// Exact package measurement could not open or read its byte stream.
     PackageIo {
@@ -1135,12 +1920,41 @@ pub enum CampaignError {
 impl fmt::Display for CampaignError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SaltV2Package(source) => write!(f, "SALT V2 package is invalid: {source}"),
             Self::EmptyField(field) => write!(f, "campaign field `{field}` is empty"),
             Self::FieldTooLong(field) => {
                 write!(f, "campaign field `{field}` exceeds u32 capacity")
             }
             Self::ZeroValue(field) => write!(f, "campaign field `{field}` must be non-zero"),
             Self::InvalidMetric(metric) => write!(f, "campaign metric `{metric}` is invalid"),
+            Self::InvalidPhysicalSize(reason) => {
+                write!(f, "campaign physical size is invalid: {reason}")
+            }
+            Self::PhysicalSizeOverflow(field) => {
+                write!(f, "campaign physical size `{field}` exceeds u64 capacity")
+            }
+            Self::PhysicalPackageSizeMismatch {
+                measured_bytes,
+                component_bytes,
+            } => write!(
+                f,
+                "physical components total {component_bytes} bytes, measured package is {measured_bytes} bytes"
+            ),
+            Self::PackageMeasurementMismatch {
+                expected_id,
+                actual_id,
+                expected_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "package measurement changed from `{expected_id}` ({expected_bytes} bytes) to `{actual_id}` ({actual_bytes} bytes)"
+            ),
+            Self::PhysicalMetricMismatch(metric) => {
+                write!(
+                    f,
+                    "campaign physical report disagrees with metric `{metric}`"
+                )
+            }
             Self::ProvenanceMismatch(kind) => {
                 write!(f, "campaign point has mismatched {kind} provenance")
             }
@@ -1157,7 +1971,7 @@ impl fmt::Display for CampaignError {
                 "campaign package `{package_id}` lacks objective {objective:?}"
             ),
             Self::RecordTooLarge(field) => {
-                write!(f, "campaign record `{field}` exceeds version-2 capacity")
+                write!(f, "campaign record `{field}` exceeds canonical capacity")
             }
             Self::PackageIo { operation, kind } => {
                 write!(f, "package {operation} failed: {kind}")
@@ -1168,10 +1982,24 @@ impl fmt::Display for CampaignError {
 
 impl std::error::Error for CampaignError {}
 
+impl From<SaltV2PackageError> for CampaignError {
+    fn from(value: SaltV2PackageError) -> Self {
+        Self::SaltV2Package(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tritium_format::{ModelId, SemanticModelManifest, SemanticTensor};
+    use half::f16;
+    use std::fs;
+    use tritium_format::{
+        ModelId, SemanticModelManifest, SemanticTensor,
+        salt_v2::SaltV2Codec,
+        salt_v2_package::{
+            SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
+        },
+    };
 
     fn model_id(seed: u8) -> ModelId {
         let tensor = SemanticTensor::new("w", vec![1, 1], &[seed]).expect("tensor");
@@ -1217,6 +2045,49 @@ mod tests {
         .expect("recipe")
     }
 
+    fn logical_trits(value: u64) -> LogicalTritCount {
+        LogicalTritCount::new(value).expect("nonzero logical trit count")
+    }
+
+    fn simple_physical_report(
+        package_bytes: &[u8],
+        core_parameter_count: u64,
+        model_parameter_count: u64,
+        payload_bytes: u64,
+        scale_bytes: u64,
+        other_serialized_bytes: u64,
+    ) -> PhysicalSizeReport {
+        let package = MeasuredPackage::from_bytes(package_bytes).expect("package");
+        PhysicalSizeReport::new(
+            package,
+            core_parameter_count,
+            model_parameter_count,
+            logical_trits(core_parameter_count),
+            SerializedSizeComponents::new(
+                payload_bytes,
+                scale_bytes,
+                0,
+                0,
+                0,
+                other_serialized_bytes,
+                0,
+                0,
+                0,
+            ),
+            ResidentSizeComponents::new(
+                payload_bytes + scale_bytes,
+                0,
+                0,
+                0,
+                0,
+                other_serialized_bytes,
+                0,
+                Some(7),
+            ),
+        )
+        .expect("physical report")
+    }
+
     #[test]
     fn calibration_identity_binds_exact_sample_set() {
         let first = CalibrationProvenance::new(
@@ -1252,6 +2123,291 @@ mod tests {
         let measured = MeasuredPackage::from_bytes(bytes).expect("measured package");
         assert_eq!(measured.id(), PackageId::from_package_bytes(bytes));
         assert_eq!(measured.physical_bytes(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn ptqtp_two_direct_planes_at_g128_are_exactly_4_25_bpw() {
+        // Two 2-bit planes occupy 64 bytes; two fp16 scales add 4 bytes.
+        let bytes = vec![0_u8; 68];
+        let report = PhysicalSizeReport::new(
+            MeasuredPackage::from_bytes(&bytes).expect("package"),
+            128,
+            128,
+            LogicalTritCount::new(256).expect("logical trits"),
+            SerializedSizeComponents::new(64, 4, 0, 0, 0, 0, 0, 0, 0),
+            ResidentSizeComponents::new(68, 0, 0, 0, 0, 0, 0, None),
+        )
+        .expect("physical report");
+
+        assert!(report.serialized_core_millibpw().equals(4_250));
+        assert_eq!(report.serialized_core_millibpw().ceiling(), 4_250);
+        assert!(!report.serialized_core_millibpw().is_at_most(1_580));
+        assert!(report.serialized_core_millibpw().is_at_most(4_250));
+        let logical = report.logical_core_rate();
+        assert_eq!(logical.trits(), 256);
+        assert_eq!(logical.weights(), 128);
+        assert!((logical.bpw() - 2.0 * crate::TRIT_BITS).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn salt_v2_report_is_derived_from_canonical_package_and_runtime_ledgers() {
+        let plane = SaltV2Plane::new(vec![0; 256], vec![f16::ZERO; 2]).expect("plane");
+        let tensor = SaltV2Tensor::new(
+            "w",
+            vec![256],
+            vec![SaltV2Tile::new(vec![plane]).expect("tile")],
+        )
+        .expect("tensor");
+        let package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).expect("package");
+        let encoded = write_salt_v2_package(&package).expect("encode");
+
+        let report = PhysicalSizeReport::from_salt_v2_package_bytes(&encoded.bytes, 300, None)
+            .expect("derived report");
+
+        assert_eq!(report.core_parameter_count(), 256);
+        assert_eq!(report.model_parameter_count(), 300);
+        assert_eq!(report.logical_core_trits().get(), 256);
+        assert_eq!(
+            report.package().physical_bytes(),
+            encoded.ledger.total_bytes
+        );
+        assert_eq!(report.serialized().allocation_map_bits(), 2);
+        assert_eq!(report.serialized().allocation_map_embedded_bits(), 2);
+        assert_eq!(report.resident().map_bits(), 2);
+        assert_eq!(report.resident().map_embedded_bits(), 2);
+        assert_eq!(report.resident().descriptor_bytes(), 0);
+        assert_eq!(report.peak_resident_bytes(), None);
+    }
+
+    #[test]
+    fn physical_report_rejects_zero_overflow_and_package_mismatch() {
+        assert_eq!(
+            MeasuredPackage::from_bytes(&[]),
+            Err(CampaignError::ZeroValue("physical_bytes"))
+        );
+        let package = MeasuredPackage::from_bytes(&[0; 8]).expect("package");
+        let serialized = SerializedSizeComponents::new(8, 0, 0, 0, 0, 0, 0, 0, 0);
+        let resident = ResidentSizeComponents::new(8, 0, 0, 0, 0, 0, 0, None);
+        assert_eq!(
+            PhysicalSizeReport::new(package, 0, 8, logical_trits(8), serialized, resident),
+            Err(CampaignError::ZeroValue("core_parameter_count"))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                SerializedSizeComponents::new(7, 0, 1, 7, 0, 0, 0, 0, 0),
+                resident,
+            ),
+            Err(CampaignError::InvalidPhysicalSize(
+                "serialized allocation map"
+            ))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                serialized,
+                ResidentSizeComponents::new(7, 1, 7, 0, 0, 0, 0, None),
+            ),
+            Err(CampaignError::InvalidPhysicalSize(
+                "resident allocation map"
+            ))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                SerializedSizeComponents::new(0, 0, 0, 0, 0, 0, 0, 8, 0),
+                resident,
+            ),
+            Err(CampaignError::ZeroValue("serialized_core_bytes"))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                serialized,
+                ResidentSizeComponents::new(0, 0, 0, 0, 0, 8, 0, None),
+            ),
+            Err(CampaignError::ZeroValue("resident_core_bytes"))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                SerializedSizeComponents::new(7, 0, 0, 0, 0, 0, 0, 0, 0),
+                resident,
+            ),
+            Err(CampaignError::PhysicalPackageSizeMismatch {
+                measured_bytes: 8,
+                component_bytes: 7,
+            })
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                SerializedSizeComponents::new(u64::MAX, 1, 0, 0, 0, 0, 0, 0, 0),
+                resident,
+            ),
+            Err(CampaignError::PhysicalSizeOverflow("serialized core"))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                SerializedSizeComponents::new(8, 0, 0, 0, 0, 0, 0, u64::MAX, 0),
+                resident,
+            ),
+            Err(CampaignError::PhysicalSizeOverflow("serialized package"))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                serialized,
+                ResidentSizeComponents::new(u64::MAX, 0, 0, 0, 0, 0, 1, None),
+            ),
+            Err(CampaignError::PhysicalSizeOverflow("resident core"))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                serialized,
+                ResidentSizeComponents::new(8, 0, 0, 0, 0, u64::MAX, 0, None),
+            ),
+            Err(CampaignError::PhysicalSizeOverflow("steady resident"))
+        );
+        assert_eq!(
+            PhysicalSizeReport::new(
+                package,
+                8,
+                8,
+                logical_trits(8),
+                serialized,
+                ResidentSizeComponents::new(8, 0, 0, 0, 0, 0, 0, Some(u64::MAX)),
+            ),
+            Err(CampaignError::PhysicalSizeOverflow("peak resident"))
+        );
+    }
+
+    #[test]
+    fn physical_report_remeasures_file_and_detects_change() {
+        let unique = format!(
+            "tritium-physical-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        let original = b"exact-package";
+        fs::write(&path, original).expect("write package");
+        let report = simple_physical_report(original, 64, 80, 8, 2, 3);
+        report.verify_file(&path).expect("unchanged package");
+
+        fs::write(&path, b"exact-packagf").expect("mutate same length");
+        assert!(matches!(
+            report.verify_file(&path),
+            Err(CampaignError::PackageMeasurementMismatch {
+                expected_bytes: 13,
+                actual_bytes: 13,
+                ..
+            })
+        ));
+        fs::remove_file(path).expect("remove package");
+    }
+
+    #[test]
+    fn physical_report_handles_mixed_planes_short_groups_and_alignment() {
+        for coefficient_count in 1_u64..=257 {
+            let mut remaining = coefficient_count;
+            let mut group_index = 0_u64;
+            let mut payload_bytes = 0_u64;
+            let mut scale_bytes = 0_u64;
+            let mut logical_bits = 0_u64;
+            while remaining != 0 {
+                let group_len = remaining.min(128);
+                let planes = 1 + group_index % 3;
+                // D2: each independently addressable plane is byte-ceiled.
+                payload_bytes += planes * (group_len * 2).div_ceil(8);
+                scale_bytes += planes * 2;
+                logical_bits += planes * group_len;
+                remaining -= group_len;
+                group_index += 1;
+            }
+            let group_count = coefficient_count.div_ceil(128);
+            let allocation_bits = group_count * 2;
+            let allocation_bytes = allocation_bits / 8;
+            let allocation_embedded_bits = allocation_bits % 8;
+            let header_bytes = 13;
+            let transform_bytes = 5;
+            let unaligned =
+                payload_bytes + scale_bytes + allocation_bytes + header_bytes + transform_bytes;
+            let alignment_bytes = (64 - unaligned % 64) % 64;
+            let package_bytes = unaligned + alignment_bytes;
+            let bytes = vec![0_u8; usize::try_from(package_bytes).expect("small fixture")];
+            let report = PhysicalSizeReport::new(
+                MeasuredPackage::from_bytes(&bytes).expect("package"),
+                coefficient_count,
+                coefficient_count + 11,
+                logical_trits(logical_bits),
+                SerializedSizeComponents::new(
+                    payload_bytes,
+                    scale_bytes,
+                    allocation_bytes,
+                    allocation_bits,
+                    allocation_embedded_bits,
+                    header_bytes,
+                    transform_bytes,
+                    0,
+                    alignment_bytes,
+                ),
+                ResidentSizeComponents::new(
+                    payload_bytes + scale_bytes,
+                    allocation_bytes,
+                    allocation_bits,
+                    allocation_embedded_bits,
+                    header_bytes,
+                    11,
+                    transform_bytes,
+                    Some(coefficient_count % 17),
+                ),
+            )
+            .expect("mixed report");
+
+            assert_eq!(report.package().physical_bytes(), package_bytes);
+            assert_eq!(report.serialized_core_bytes(), package_bytes);
+            assert_eq!(
+                report.peak_resident_bytes(),
+                Some(report.steady_resident_bytes() + coefficient_count % 17)
+            );
+            assert_eq!(
+                report.serialized_core_millibpw().numerator_millibits(),
+                u128::from(package_bytes) * 8_000
+            );
+        }
     }
 
     #[test]
@@ -1403,6 +2559,100 @@ mod tests {
     }
 
     #[test]
+    fn metrics_validate_exact_peak_and_ledger_validates_package_binding() {
+        let bytes = b"physical-size";
+        let report = simple_physical_report(bytes, 64, 80, 8, 2, 3);
+        let peak = report.peak_resident_bytes().expect("measured peak");
+        assert_eq!(
+            CampaignMetrics::new(2.0)
+                .expect("metrics")
+                .with_peak_vram_bytes(peak + 1)
+                .expect("legacy peak")
+                .with_physical_size_report(report),
+            Err(CampaignError::PhysicalMetricMismatch("peak_vram_bytes"))
+        );
+        assert_eq!(
+            CampaignMetrics::new(2.0)
+                .expect("metrics")
+                .with_physical_size_report(report)
+                .expect("report")
+                .with_peak_vram_bytes(peak + 1),
+            Err(CampaignError::PhysicalMetricMismatch("peak_vram_bytes"))
+        );
+
+        let source = model_id(1);
+        let calibration = calibration([1; 32]);
+        let evaluation = evaluation();
+        let metrics = CampaignMetrics::new(2.0)
+            .expect("metrics")
+            .with_physical_size_report(report)
+            .expect("report");
+        assert_eq!(metrics.peak_vram_bytes(), Some(peak));
+        let mismatched_point = CampaignPoint::new(
+            source,
+            model_id(2),
+            MeasuredPackage::from_bytes(b"different-package").expect("different"),
+            recipe(2),
+            calibration.id(),
+            evaluation.id(),
+            metrics,
+        );
+        let mut ledger = CampaignLedger::new(source, calibration, evaluation);
+        assert!(matches!(
+            ledger.add(mismatched_point),
+            Err(CampaignError::PackageMeasurementMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn physical_reports_use_v4_and_bind_component_allocation() {
+        let source = model_id(1);
+        let calibration = calibration([1; 32]);
+        let evaluation = evaluation();
+        let bytes = b"component-ledger";
+        let package = MeasuredPackage::from_bytes(bytes).expect("package");
+        let make_ledger = |header_bytes: u64, transform_bytes: u64| {
+            let report = PhysicalSizeReport::new(
+                package,
+                64,
+                80,
+                logical_trits(64),
+                SerializedSizeComponents::new(8, 2, 0, 0, 0, header_bytes, transform_bytes, 0, 0),
+                ResidentSizeComponents::new(10, 0, 0, 0, 3, 3, 0, Some(7)),
+            )
+            .expect("report");
+            let metrics = CampaignMetrics::new(2.0)
+                .expect("metrics")
+                .with_physical_size_report(report)
+                .expect("report metric");
+            let point = CampaignPoint::new(
+                source,
+                model_id(2),
+                package,
+                recipe(2),
+                calibration.id(),
+                evaluation.id(),
+                metrics,
+            );
+            let mut ledger = CampaignLedger::new(source, calibration.clone(), evaluation.clone());
+            ledger.add(point).expect("point");
+            ledger
+        };
+        // `component-ledger` is 16 bytes: 8 payload + 2 scale + 6 metadata.
+        let headers = make_ledger(6, 0);
+        let transforms = make_ledger(0, 6);
+
+        assert_eq!(
+            headers.canonical_bytes().expect("bytes")[4],
+            PHYSICAL_REPORT_CAMPAIGN_VERSION
+        );
+        assert_ne!(
+            headers.id().expect("header id"),
+            transforms.id().expect("transform id")
+        );
+    }
+
+    #[test]
     fn pareto_frontier_honors_quality_and_system_directions() {
         let source = model_id(1);
         let calibration = calibration([1; 32]);
@@ -1457,6 +2707,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![compact.package_id(), capable.package_id()]
         );
+    }
+
+    #[test]
+    fn logical_pareto_uses_exact_trit_ratios_beyond_f64_integer_precision() {
+        let source = model_id(1);
+        let calibration = calibration([1; 32]);
+        let evaluation = evaluation();
+        let denominator = (1_u64 << 53) + 2;
+        let make_point = |seed: u8, trits: u64| {
+            let bytes = [seed];
+            let package = MeasuredPackage::from_bytes(&bytes).expect("package");
+            let report = PhysicalSizeReport::new(
+                package,
+                denominator,
+                denominator,
+                logical_trits(trits),
+                SerializedSizeComponents::new(1, 0, 0, 0, 0, 0, 0, 0, 0),
+                ResidentSizeComponents::new(1, 0, 0, 0, 0, 0, 0, None),
+            )
+            .expect("report");
+            let metrics = CampaignMetrics::new(42.0)
+                .expect("placeholder display")
+                .with_physical_size_report(report)
+                .expect("physical report");
+            assert_eq!(metrics.logical_bpw(), report.logical_core_rate().bpw());
+            CampaignPoint::new(
+                source,
+                model_id(seed),
+                package,
+                recipe(seed),
+                calibration.id(),
+                evaluation.id(),
+                metrics,
+            )
+        };
+        let lower = make_point(2, 1_u64 << 53);
+        let higher = make_point(3, (1_u64 << 53) + 1);
+        assert_eq!(
+            lower.metrics().logical_bpw(),
+            higher.metrics().logical_bpw(),
+            "the fixture must collide after f64 conversion"
+        );
+        let mut ledger = CampaignLedger::new(source, calibration, evaluation);
+        ledger.add(higher).expect("higher point");
+        ledger.add(lower.clone()).expect("lower point");
+
+        let frontier = ledger
+            .pareto_frontier(&[CampaignObjective::LogicalBpw])
+            .expect("exact logical frontier");
+        assert_eq!(frontier.len(), 1);
+        assert_eq!(frontier[0].package_id(), lower.package_id());
     }
 
     #[test]
@@ -1574,10 +2875,9 @@ mod tests {
         reverse.add(b).expect("add b");
         reverse.add(a).expect("add a");
 
-        assert_eq!(
-            forward.canonical_bytes().expect("encode"),
-            reverse.canonical_bytes().expect("encode")
-        );
+        let forward_bytes = forward.canonical_bytes().expect("encode");
+        assert_eq!(forward_bytes[4], LEGACY_CAMPAIGN_VERSION);
+        assert_eq!(forward_bytes, reverse.canonical_bytes().expect("encode"));
         assert_eq!(forward.id().expect("id"), reverse.id().expect("id"));
         assert_eq!(
             forward.id().expect("id").to_string(),

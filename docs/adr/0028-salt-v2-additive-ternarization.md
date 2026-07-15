@@ -553,3 +553,32 @@ This ADR may move from Proposed only after plan 0043 produces:
 - a 32B confirmation only if its preceding stop gates pass;
 - a claim statement whose scope is mechanically derived from the gates, with
   no manual promotion from “not achieved” to “SOTA.”
+
+## Amendment 2026-07-15 — prefix pricing and physical B3 rate
+
+This amendment resolves two contradictions found while implementing the
+byte-exact reference package. It supersedes the conflicting rate and refit
+wording above; the representation and campaign gates are unchanged.
+
+First, `R_radix3` is an information-rate lower bound, not the physical rate of
+the binding B3 codec. B3 stores five trits per byte. At G128, one full plane
+therefore uses 26 payload bytes plus one 2-byte scale, or exactly 1.75 bpw before
+allocation-map, index, header, and alignment bytes. A full 256-coefficient tile
+uses 52 payload bytes plus two scales and has the same 1.75-bpw plane rate. B3
+cannot by itself establish a greater-than-10x resident-memory claim versus
+FP16. S34 uses 40 payload bytes plus four scale bytes per full G128 tile, or
+1.375 bpw before map/index overhead, and can cross that threshold only if its
+constrained quality and direct-runtime gates pass.
+
+Second, the exact Compact-prefix invariant takes precedence over independent
+refits at each plane count. Each group has one deterministic jointly fitted
+`Pmax` master solution. Its planes are ordered by the complete prefix-loss tuple,
+and `D_g(P)` is the measured loss of the first `P` planes of that same master.
+Compact and NearLossless allocate over those exact prefix curves, with the
+NearLossless counts bounded below by the Compact counts. Updating a master fit
+invalidates and recomputes the complete curve and both allocations. No
+independently refitted `P` candidate may be described as a byte prefix.
+
+The first package/runtime reference remains G128-only. G64 or G256 promotion
+requires an explicit versioned scale-geometry field and parity evidence before
+either geometry can be serialized as SALT V2.

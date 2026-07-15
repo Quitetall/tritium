@@ -4423,6 +4423,7 @@ dependencies = [
 name = "tritium-quantize"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "half",
  "proptest",
  "tritium-core",
@@ -4449,6 +4450,18 @@ dependencies = [
  "linkme",
  "tritium-core",
  "tritium-spec",
+]
+
+[[package]]
+name = "tritium-salt"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "half",
+ "serde",
+ "serde_json",
+ "tritium-format",
+ "tritium-quantize",
 ]
 
 [[package]]
@@ -4497,6 +4510,7 @@ name = "tritium-train"
 version = "1.0.0"
 dependencies = [
  "proptest",
+ "rayon",
  "tritium-core",
  "tritium-format",
  "tritium-quantize",

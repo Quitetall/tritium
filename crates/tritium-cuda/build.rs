@@ -48,6 +48,8 @@ fn main() {
     // v0.50 (ADR 0007): f32 training backward kernels (gA/gW/gs for the ternary
     // matmul). Same `--fmad=false` host-bit-match discipline as the decode kernels.
     println!("cargo:rerun-if-changed=kernels/train_grad.cu");
+    // plan 0043 Stage 6: direct D2/B3/S34 SALT V2 scalar reference kernel.
+    println!("cargo:rerun-if-changed=kernels/salt_v2.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -112,6 +114,16 @@ fn main() {
         &nvcc,
         Path::new("kernels/train_grad.cu"),
         &out_dir.join("train_grad.ptx"),
+        add_min_arch,
+        &["--fmad=false"],
+    );
+
+    // SALT V2 freezes multiply/add rounding to the scalar CPU reference. The
+    // first fast entry point deliberately aliases this exact image.
+    compile_ptx(
+        &nvcc,
+        Path::new("kernels/salt_v2.cu"),
+        &out_dir.join("salt_v2.ptx"),
         add_min_arch,
         &["--fmad=false"],
     );

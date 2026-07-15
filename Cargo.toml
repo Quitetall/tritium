@@ -22,6 +22,7 @@ members = [
     # L2 runtime + functional
     # "crates/tritium-runtime",  # registry, dispatch, mem pools, autotune cache
     "crates/tritium-quantize", # SALT: fp -> ternary plane stacks (ADR 0001/0006)
+    "crates/tritium-salt",     # SALT V2 synthesis facade + resumable pipeline (ADR 0028)
     "crates/tritium-nn",       # mixed-precision ops + model runner
     "benches",                 # divan microbenches + perf harness (v0.30, ADR 0005)
     "crates/tritium-train",     # QAT, STE autograd, optimizer (ADR 0007)
@@ -61,6 +62,7 @@ tritium-testkit = { path = "crates/tritium-testkit", version = "1.0.0" }
 tritium-cpu = { path = "crates/tritium-cpu", version = "1.0.0" }
 tritium-cuda = { path = "crates/tritium-cuda", version = "1.0.0" }
 tritium-quantize = { path = "crates/tritium-quantize", version = "1.0.0" }
+tritium-salt = { path = "crates/tritium-salt", version = "1.0.0" }
 tritium-nn = { path = "crates/tritium-nn", version = "1.0.0" }
 tritium-train = { path = "crates/tritium-train", version = "1.0.0" }
 # foundation

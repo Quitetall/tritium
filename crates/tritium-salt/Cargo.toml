@@ -1,0 +1,24 @@
+[package]
+name = "tritium-salt"
+description = "High-level, resumable orchestration for SALT V2 additive ternarization."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tritium-quantize = { workspace = true }
+
+[dev-dependencies]
+half = { workspace = true }
+tritium-format = { workspace = true }
+
+[lints]
+workspace = true

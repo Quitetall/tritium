@@ -9,7 +9,14 @@
 //! supply the TQ2_0 vectors this kernel supports.
 
 use super::*;
+use half::f16;
 use tritium_cpu::CpuBackend;
+use tritium_cpu::salt_v2::salt_v2_matvec;
+use tritium_format::salt_v2::SaltV2Codec;
+use tritium_format::salt_v2_package::{
+    SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SaltV2IndexedRuntimeLedger,
+    SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, SaltV2Transform,
+};
 use tritium_testkit::{ConformanceVector, Tolerance, generate_vectors, run_conformance};
 
 /// The full conformance set this kernel is responsible for: every TQ2_0 vector
@@ -41,6 +48,300 @@ fn seeded_f32(seed: u64, len: usize, lo: f32, hi: f32) -> Vec<f32> {
             lo + (s % 1000) as f32 / 1000.0 * (hi - lo)
         })
         .collect()
+}
+
+fn salt_v2_test_plane(logical_len: usize, plane_index: usize) -> SaltV2Plane {
+    let trits = (0..logical_len)
+        .map(|index| {
+            let group = index / 4;
+            let slot = index % 4;
+            let zero_slot = (group + plane_index) % 4;
+            if slot == zero_slot {
+                0
+            } else if (index + plane_index).is_multiple_of(2) {
+                1
+            } else {
+                -1
+            }
+        })
+        .collect();
+    let scales = (0..logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE))
+        .map(|group| f16::from_f32(0.25 + plane_index as f32 * 0.125 + group as f32 * 0.0625))
+        .collect();
+    SaltV2Plane::new(trits, scales).expect("valid SALT V2 test plane")
+}
+
+fn salt_v2_test_tensor(rows: usize, columns: usize, plane_counts: &[usize]) -> SaltV2Tensor {
+    let coefficients = rows * columns;
+    let tile_count = coefficients.div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
+    assert_eq!(plane_counts.len(), tile_count);
+    let tiles = plane_counts
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(tile_index, plane_count)| {
+            let start = tile_index * SALT_V2_ALLOCATION_TILE_SIZE;
+            let logical_len = (coefficients - start).min(SALT_V2_ALLOCATION_TILE_SIZE);
+            SaltV2Tile::new(
+                (0..plane_count)
+                    .map(|plane_index| salt_v2_test_plane(logical_len, plane_index))
+                    .collect(),
+            )
+            .expect("valid SALT V2 test tile")
+        })
+        .collect();
+    SaltV2Tensor::new(
+        format!("salt-v2-{rows}x{columns}"),
+        vec![rows as u64, columns as u64],
+        tiles,
+    )
+    .expect("valid SALT V2 test tensor")
+}
+
+fn salt_v2_dense_matmul(tensor: &SaltV2Tensor, activation: &[f32], m: usize) -> Vec<f32> {
+    let rows = tensor.dims()[0] as usize;
+    let columns = tensor.dims()[1] as usize;
+    let mut dense = vec![0.0f32; rows * columns];
+    for (index, weight) in dense.iter_mut().enumerate() {
+        let tile_index = index / SALT_V2_ALLOCATION_TILE_SIZE;
+        let local_index = index % SALT_V2_ALLOCATION_TILE_SIZE;
+        for plane in tensor.tiles()[tile_index].planes() {
+            *weight += plane.trits()[local_index].get() as f32
+                * plane.scales()[local_index / SALT_V2_SCALE_GROUP_SIZE].to_f32();
+        }
+    }
+    let mut output = vec![0.0f32; m * rows];
+    for mi in 0..m {
+        for row in 0..rows {
+            let mut sum = 0.0f32;
+            for column in 0..columns {
+                sum += activation[mi * columns + column] * dense[row * columns + column];
+            }
+            output[mi * rows + row] = sum;
+        }
+    }
+    output
+}
+
+/// Plan 0043 Stage 6: every admitted SALT V2 codec executes directly from its
+/// resident encoded payload. Mixed P=1/3/2 tiles, row-crossing macrotiles, and
+/// one-/three-column matrices cover the descriptor and codec-tail boundaries.
+/// The fast entry point is intentionally an exact-kernel alias in this first
+/// correctness slice and its receipt must say so.
+#[test]
+fn salt_v2_cuda_matches_cpu_and_dense_without_dense_weight_storage() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 CUDA parity: no device ({error})");
+            return;
+        }
+    };
+
+    let long_plane_counts = (0..257).map(|index| 1 + index % 3).collect::<Vec<_>>();
+    let cases = vec![
+        salt_v2_test_tensor(3, 173, &[1, 3, 2]),
+        salt_v2_test_tensor(2, 3, &[3]),
+        salt_v2_test_tensor(1, 1, &[1]),
+        salt_v2_test_tensor(1, 257 * SALT_V2_ALLOCATION_TILE_SIZE, &long_plane_counts),
+    ];
+    for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+        for tensor in &cases {
+            let rows = tensor.dims()[0] as usize;
+            let columns = tensor.dims()[1] as usize;
+            let m = 2;
+            let activation = seeded_f32(
+                0x5A17 + rows as u64 * 257 + columns as u64,
+                m * columns,
+                -0.75,
+                0.75,
+            );
+            let package = SaltV2Package::new(codec, vec![tensor.clone()])
+                .expect("codec accepts the test tensor");
+            let resident = cuda
+                .upload_salt_v2(tensor, codec)
+                .expect("upload semantic SALT V2 tensor");
+
+            let exact = cuda
+                .salt_v2_forward_exact(&resident, &activation, m)
+                .expect("exact SALT V2 forward");
+            let fast = cuda
+                .salt_v2_forward_fast(&resident, &activation, m)
+                .expect("fast SALT V2 forward");
+            let dense = salt_v2_dense_matmul(tensor, &activation, m);
+            let mut cpu = Vec::with_capacity(m * rows);
+            for mi in 0..m {
+                cpu.extend(
+                    salt_v2_matvec(&package, 0, &activation[mi * columns..(mi + 1) * columns])
+                        .expect("CPU SALT V2 oracle")
+                        .output,
+                );
+            }
+
+            assert_eq!(exact.output.len(), m * rows);
+            for (index, ((got, cpu_want), dense_want)) in
+                exact.output.iter().zip(&cpu).zip(&dense).enumerate()
+            {
+                assert_eq!(
+                    got.to_bits(),
+                    cpu_want.to_bits(),
+                    "exact[{index}] {codec:?} {rows}x{columns}: GPU {got} vs CPU {cpu_want}"
+                );
+                assert!(
+                    Tolerance::relative(1e-4).accepts(*got, *dense_want),
+                    "exact[{index}] {codec:?} {rows}x{columns}: GPU {got} vs dense {dense_want}"
+                );
+            }
+            assert_eq!(fast.output, exact.output);
+            assert_eq!(exact.receipt.mode(), SaltV2ForwardMode::Exact);
+            assert_eq!(fast.receipt.mode(), SaltV2ForwardMode::FastAliasesExact);
+
+            let allocation = resident.allocation_receipt();
+            let planned = SaltV2IndexedRuntimeLedger::for_tensor(tensor, codec)
+                .expect("shared indexed-runtime plan");
+            assert_eq!(allocation.runtime_ledger(), planned);
+            let expected_payload_bytes: usize = tensor
+                .tiles()
+                .iter()
+                .flat_map(|tile| tile.planes())
+                .map(|plane| {
+                    let logical_len = if codec == SaltV2Codec::S34 {
+                        plane.trits().len().div_ceil(4) * 4
+                    } else {
+                        plane.trits().len()
+                    };
+                    codec
+                        .ledger(logical_len)
+                        .expect("test payload length is representable")
+                        .physical_bytes
+                })
+                .sum();
+            let expected_scale_bytes: usize = tensor
+                .tiles()
+                .iter()
+                .flat_map(|tile| tile.planes())
+                .map(|plane| plane.scales().len() * core::mem::size_of::<u16>())
+                .sum();
+            assert_eq!(allocation.payload_bytes(), expected_payload_bytes as u64);
+            assert_eq!(allocation.scale_bytes(), expected_scale_bytes as u64);
+            assert_eq!(
+                allocation.map_bytes(),
+                (tensor.tiles().len() * 2 / 8) as u64
+            );
+            assert_eq!(
+                allocation.rank_prefix_bytes(),
+                (tensor.tiles().len().saturating_sub(1) / 256 * 4) as u64
+            );
+            assert_eq!(
+                allocation.allocation_map_bits(),
+                (tensor.tiles().len() * 2) as u64
+            );
+            assert_eq!(
+                allocation.allocation_map_embedded_bits(),
+                (tensor.tiles().len() * 2 % 8) as u64
+            );
+            assert_eq!(allocation.dense_weight_bytes(), 0);
+            assert_eq!(
+                allocation.steady_resident_bytes(),
+                allocation.payload_bytes()
+                    + allocation.scale_bytes()
+                    + allocation.map_bytes()
+                    + allocation.rank_prefix_bytes()
+            );
+            assert_eq!(exact.receipt.dense_weight_bytes(), 0);
+            assert_eq!(exact.receipt.resident_allocation(), allocation);
+            assert_eq!(
+                exact.receipt.steady_resident_bytes(),
+                allocation.steady_resident_bytes()
+            );
+            assert_eq!(
+                exact.receipt.peak_resident_bytes(),
+                allocation.steady_resident_bytes()
+                    + (activation.len() * core::mem::size_of::<f32>()) as u64
+                    + (m * rows * core::mem::size_of::<f32>()) as u64
+            );
+        }
+    }
+}
+
+/// ADR 0028 native arithmetic reduces add/sub/skip activation contributions
+/// before applying a plane/group scale. Reconstructing each dense coefficient
+/// first would overflow both products in this case instead of cancelling to 0.
+#[test]
+fn salt_v2_cuda_cancels_a_plane_group_before_scaling() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 cancellation parity: no device ({error})");
+            return;
+        }
+    };
+    let plane = SaltV2Plane::new(vec![1, -1], vec![f16::MAX]).expect("valid cancellation plane");
+    let tensor = SaltV2Tensor::new(
+        "cancellation",
+        vec![1, 2],
+        vec![SaltV2Tile::new(vec![plane]).expect("valid cancellation tile")],
+    )
+    .expect("valid cancellation tensor");
+    let activation = [f32::MAX, f32::MAX];
+
+    for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+        let package = SaltV2Package::new(codec, vec![tensor.clone()])
+            .expect("codec accepts cancellation tensor");
+        assert_eq!(
+            salt_v2_matvec(&package, 0, &activation)
+                .expect("CPU native cancellation")
+                .output,
+            [0.0]
+        );
+        let resident = cuda
+            .upload_salt_v2(&tensor, codec)
+            .expect("upload cancellation tensor");
+        let exact = cuda
+            .salt_v2_forward_exact(&resident, &activation, 1)
+            .expect("GPU native cancellation");
+        assert_eq!(exact.output, [0.0], "codec {codec:?}");
+    }
+}
+
+/// Signed RHT identity is serialized today but native CUDA activation transform
+/// execution is not. Upload must reject it before allocating a misleading
+/// untransformed resident tensor.
+#[test]
+fn salt_v2_cuda_rejects_unimplemented_tensor_transform() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 transform rejection: no device ({error})");
+            return;
+        }
+    };
+    let tensor = SaltV2Tensor::new_with_transform(
+        "rotated",
+        vec![1, 1],
+        SaltV2Transform::SignedRht {
+            seed: 7,
+            domain: 11,
+        },
+        vec![SaltV2Tile::new(vec![salt_v2_test_plane(1, 0)]).expect("valid tile")],
+    )
+    .expect("valid transformed tensor");
+    let error = cuda
+        .upload_salt_v2(&tensor, SaltV2Codec::D2)
+        .expect_err("native CUDA must not ignore SignedRht");
+    match error {
+        BackendError::InvalidInput(message) => {
+            assert!(
+                message.contains("transform"),
+                "unexpected message: {message}"
+            );
+            assert!(
+                message.contains("SignedRht"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected InvalidInput, got {other}"),
+    }
 }
 
 /// Gate C on CUDA (ADR 0007): the f32 ternary-matmul backward kernels match the

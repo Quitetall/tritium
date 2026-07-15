@@ -70,6 +70,9 @@ mod kernel;
 #[allow(unsafe_code)]
 mod simd;
 
+/// Exact, allocation-accounted SALT V2 CPU semantic reference.
+pub mod salt_v2;
+
 /// Owned host-memory buffer of packed weight bytes.
 ///
 /// [`CpuBackend::upload_weights`] copies the caller's packed bytes into one of

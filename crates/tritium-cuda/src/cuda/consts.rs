@@ -224,6 +224,8 @@ pub(super) const KERNEL_NAME_EMBED_GATHER_BWD: &str = "embed_gather_backward";
 pub(super) const KERNEL_NAME_EMBED_GATHER_BWD_SEGMENTED: &str = "embed_gather_backward_segmented";
 pub(super) const KERNEL_NAME_SOFTMAX_XENT_BWD: &str = "softmax_xent_backward";
 pub(super) const KERNEL_NAME_SCALE_CONST: &str = "scale_const";
+/// Plan 0043 Stage 6: direct scalar-correct SALT V2 D2/B3/S34 execution.
+pub(super) const KERNEL_NAME_SALT_V2_EXACT: &str = "salt_v2_forward_exact";
 /// Row-tile of [`KERNEL_NAME_LM_HEAD_TILED_F16`] — keep in sync with `LMHEAD_ROW_TILE` in decode.cu.
 pub(super) const LMHEAD_ROW_TILE: u32 = 8;
 /// Threads per block for `act_quant_int8_per_token` — must match the kernel's
@@ -262,3 +264,5 @@ pub(super) const DECODE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deco
 /// The v0.50 training backward kernels (gA/gW/gs), compiled `--fmad=false` so they
 /// match the host CPU vjp oracle bit-for-bit. Embedded the same way as the others.
 pub(super) const TRAIN_GRAD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/train_grad.ptx"));
+/// Direct SALT V2 D2/B3/S34 kernel, compiled with FMA contraction disabled.
+pub(super) const SALT_V2_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/salt_v2.ptx"));

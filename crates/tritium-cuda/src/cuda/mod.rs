@@ -229,7 +229,10 @@ mod backend;
 // but cuda::tests reaches them through `use super::*` via this glob.
 #[cfg_attr(not(test), allow(unused_imports))]
 use backend::*;
-pub use backend::{CudaBackend, SaltResidentLinear};
+pub use backend::{
+    CudaBackend, SaltResidentLinear, SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt,
+    SaltV2ResidentAllocationReceipt, SaltV2ResidentTensor,
+};
 #[allow(unused_imports)] // TrainingSaltLinear is the Track D tape seam.
 pub(crate) use backend::{EmbedSegments, TrainingSaltLinear};
 mod telemetry;

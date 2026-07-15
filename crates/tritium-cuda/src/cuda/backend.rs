@@ -4,6 +4,10 @@
 
 use super::*;
 use cudarc::driver::{HostSlice, PinnedHostSlice, SyncOnDrop};
+use tritium_format::salt_v2::SaltV2Codec;
+use tritium_format::salt_v2_package::{
+    SaltV2IndexedRuntimeLedger, SaltV2Tensor, SaltV2Transform, pack_salt_v2_plane,
+};
 
 /// A logical prefix of cudarc page-locked memory.
 ///
@@ -99,6 +103,241 @@ pub struct SaltResidentLinear {
     pub(super) row_bytes: usize,
     /// Realized plane count `T` (max over rows; ragged rows zero-padded on upload).
     pub(super) t_planes: usize,
+}
+
+/// Exact requested `CudaSlice` byte ledger for one resident SALT V2 rank-2 tensor.
+///
+/// This counts logical buffer lengths requested by this handle, not allocator
+/// rounding, retained pool capacity, CUDA context/module memory, or unrelated
+/// allocations. `dense_weight_bytes()` is structurally zero because upload
+/// retains codec payloads and reconstructs coefficients only inside the
+/// contraction kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaltV2ResidentAllocationReceipt {
+    codec: SaltV2Codec,
+    runtime: SaltV2IndexedRuntimeLedger,
+}
+
+impl SaltV2ResidentAllocationReceipt {
+    fn new(codec: SaltV2Codec, runtime: SaltV2IndexedRuntimeLedger) -> Self {
+        Self { codec, runtime }
+    }
+
+    /// Codec used by every resident plane.
+    #[must_use]
+    pub fn codec(self) -> SaltV2Codec {
+        self.codec
+    }
+
+    /// Encoded D2/B3/S34 bytes resident on the device.
+    #[must_use]
+    pub fn payload_bytes(self) -> u64 {
+        self.runtime.payload_bytes()
+    }
+
+    /// Group128 f16 scale bytes resident on the device.
+    #[must_use]
+    pub fn scale_bytes(self) -> u64 {
+        self.runtime.scale_bytes()
+    }
+
+    /// Complete two-bit allocation-map bytes resident on the device.
+    #[must_use]
+    pub fn map_bytes(self) -> u64 {
+        self.runtime.allocation_map_bytes()
+    }
+
+    /// Coarse plane-rank prefix bytes resident on the device.
+    #[must_use]
+    pub fn rank_prefix_bytes(self) -> u64 {
+        self.runtime.rank_prefix_bytes()
+    }
+
+    /// Logical two-bit allocation-map size, including scalar-carried tail bits.
+    #[must_use]
+    pub fn allocation_map_bits(self) -> u64 {
+        self.runtime.allocation_map_bits()
+    }
+
+    /// Allocation-map tail bits carried in the resident handle/kernel scalar.
+    #[must_use]
+    pub fn allocation_map_embedded_bits(self) -> u64 {
+        self.runtime.allocation_map_embedded_bits()
+    }
+
+    /// Dense dequantized weight bytes, always zero.
+    #[must_use]
+    pub fn dense_weight_bytes(self) -> u64 {
+        self.runtime.dense_shadow_bytes()
+    }
+
+    /// Sum of payload, scales, complete map bytes, and coarse rank prefixes.
+    #[must_use]
+    pub fn steady_resident_bytes(self) -> u64 {
+        self.runtime.steady_resident_bytes()
+    }
+
+    /// Shared checked indexed-runtime plan verified against the uploaded buffers.
+    #[must_use]
+    pub fn runtime_ledger(self) -> SaltV2IndexedRuntimeLedger {
+        self.runtime
+    }
+}
+
+/// Device-resident SALT V2 tensor retaining physical codec bytes, a compact
+/// allocation map, and bounded-scan rank prefixes without a dense shadow.
+#[derive(Debug)]
+pub struct SaltV2ResidentTensor {
+    payload: CudaSlice<u8>,
+    scales: CudaSlice<u16>,
+    index_metadata: Option<CudaSlice<u8>>,
+    rows: usize,
+    columns: usize,
+    tile_count: usize,
+    plane_count: usize,
+    codec_tag: u32,
+    allocation_map_bytes: u32,
+    rank_prefix_count: u32,
+    terminal_map_value: u32,
+    receipt: SaltV2ResidentAllocationReceipt,
+}
+
+impl SaltV2ResidentTensor {
+    /// Exact persistent device-allocation receipt for this tensor.
+    #[must_use]
+    pub fn allocation_receipt(&self) -> SaltV2ResidentAllocationReceipt {
+        self.receipt
+    }
+
+    /// Output rows in the row-major semantic matrix.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Contraction columns in the row-major semantic matrix.
+    #[must_use]
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
+/// Execution label written into every SALT V2 CUDA forward receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SaltV2ForwardMode {
+    /// Scalar deterministic kernel with CPU-reference reduction order.
+    Exact,
+    /// Public fast entry point currently dispatching the exact kernel unchanged.
+    FastAliasesExact,
+}
+
+/// Checked requested-`CudaSlice` ledger for one SALT V2 forward.
+///
+/// These byte totals cover the handle plus this call's activation/output
+/// buffers. They are not a physical CUDA pool/context high-water measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaltV2ForwardReceipt {
+    mode: SaltV2ForwardMode,
+    resident: SaltV2ResidentAllocationReceipt,
+    activation_bytes: u64,
+    output_bytes: u64,
+    dense_weight_bytes: u64,
+    peak_resident_bytes: u64,
+}
+
+impl SaltV2ForwardReceipt {
+    fn new(
+        mode: SaltV2ForwardMode,
+        resident: SaltV2ResidentAllocationReceipt,
+        activation_elements: usize,
+        output_elements: usize,
+    ) -> Result<Self, BackendError> {
+        let bytes = |elements: usize, field: &str| {
+            elements
+                .checked_mul(core::mem::size_of::<f32>())
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| {
+                    BackendError::InvalidInput(format!("SALT V2 {field} byte count overflows u64"))
+                })
+        };
+        let activation_bytes = bytes(activation_elements, "activation")?;
+        let output_bytes = bytes(output_elements, "output")?;
+        let peak_resident_bytes = resident
+            .steady_resident_bytes()
+            .checked_add(activation_bytes)
+            .and_then(|value| value.checked_add(output_bytes))
+            .ok_or_else(|| {
+                BackendError::InvalidInput("SALT V2 peak resident byte count overflows u64".into())
+            })?;
+        Ok(Self {
+            mode,
+            resident,
+            activation_bytes,
+            output_bytes,
+            dense_weight_bytes: 0,
+            peak_resident_bytes,
+        })
+    }
+
+    /// Exact dispatch label; fast aliasing cannot be mistaken for an optimized kernel.
+    #[must_use]
+    pub fn mode(self) -> SaltV2ForwardMode {
+        self.mode
+    }
+
+    /// Persistent encoded-weight and metadata bytes.
+    #[must_use]
+    pub fn steady_resident_bytes(self) -> u64 {
+        self.resident.steady_resident_bytes()
+    }
+
+    /// Component-level persistent allocation receipt used by this launch.
+    #[must_use]
+    pub fn resident_allocation(self) -> SaltV2ResidentAllocationReceipt {
+        self.resident
+    }
+
+    /// Per-call activation upload bytes.
+    #[must_use]
+    pub fn activation_bytes(self) -> u64 {
+        self.activation_bytes
+    }
+
+    /// Per-call device output allocation bytes.
+    #[must_use]
+    pub fn output_bytes(self) -> u64 {
+        self.output_bytes
+    }
+
+    /// Dense dequantized weight bytes, always zero.
+    #[must_use]
+    pub fn dense_weight_bytes(self) -> u64 {
+        self.dense_weight_bytes
+    }
+
+    /// Persistent bytes plus the activation and output allocations live at launch.
+    #[must_use]
+    pub fn peak_resident_bytes(self) -> u64 {
+        self.peak_resident_bytes
+    }
+}
+
+/// Host-visible output and checked allocation evidence from a SALT V2 forward.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaltV2Forward {
+    /// Row-major `[M, N]` output copied from the device.
+    pub output: Vec<f32>,
+    /// Dispatch label and device allocation accounting.
+    pub receipt: SaltV2ForwardReceipt,
+}
+
+fn pack_salt_v2_cuda_plane(
+    codec: SaltV2Codec,
+    trits: &[tritium_core::Trit],
+) -> Result<Vec<u8>, BackendError> {
+    pack_salt_v2_plane(codec, trits)
+        .map_err(|error| BackendError::InvalidInput(format!("SALT V2 codec: {error}")))
 }
 
 /// Training-specific resident SALT planes produced directly from a latent f32
@@ -197,6 +436,10 @@ pub struct CudaBackend {
     /// The resolved `salt_mpgemm_tiled_f32` kernel (v0.4.0 SALT multi-plane GEMM),
     /// driven by the resident [`CudaBackend::salt_forward`] path.
     pub(super) func_salt: CudaFunction,
+    /// Direct SALT V2 codec PTX kept alive for `func_salt_v2_exact`.
+    pub(super) _salt_v2_module: Arc<CudaModule>,
+    /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
+    pub(super) func_salt_v2_exact: CudaFunction,
     /// Sparse-aware f32-tiled kernel: bitmap skip for zero blocks (P1 opt).
     #[allow(dead_code)]
     // validated sparse mpgemm kernel; auto-dispatch integration is future (1.x) work
@@ -563,6 +806,13 @@ impl CudaBackend {
             .load_function(KERNEL_NAME_SCALE_CONST)
             .map_err(|e| driver_err("resolve scale_const kernel", &e))?;
 
+        let salt_v2_module = ctx
+            .load_module(Ptx::from_src(SALT_V2_PTX))
+            .map_err(|e| driver_err("load salt_v2 ptx", &e))?;
+        let func_salt_v2_exact = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_EXACT)
+            .map_err(|e| driver_err("resolve salt_v2_forward_exact kernel", &e))?;
+
         let device_name = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_owned());
@@ -583,6 +833,8 @@ impl CudaBackend {
             func_tiled,
             func_tiled_scaled,
             func_salt,
+            _salt_v2_module: salt_v2_module,
+            func_salt_v2_exact,
             func_tiled_f32_sparse,
             func_tiled_i8_scaled_sparse,
             func_imma,
@@ -4749,6 +5001,383 @@ impl CudaBackend {
             .map_err(|e| driver_err("download out (dtoh)", &e))?;
 
         Ok(())
+    }
+
+    /// Upload one validated rank-2 SALT V2 tensor without materializing dense weights.
+    ///
+    /// The selected codec is applied independently to every present tile plane.
+    /// Device memory retains the exact encoded payload, group128 f16 scales,
+    /// complete two-bit allocation-map bytes, and one coarse u32 plane-rank
+    /// prefix per 256-tile block after the first. Terminal map bits ride in the
+    /// mandatory launch scalar. Missing planes consume no payload or scale bytes.
+    ///
+    /// # Errors
+    /// Rejects non-matrices, dimensions or offsets that exceed the kernel's u32
+    /// ABI, codec-incompatible S34 groups, accounting overflow, and driver
+    /// allocation/upload failures.
+    pub fn upload_salt_v2(
+        &self,
+        tensor: &SaltV2Tensor,
+        codec: SaltV2Codec,
+    ) -> Result<SaltV2ResidentTensor, BackendError> {
+        if !matches!(tensor.transform(), SaltV2Transform::None) {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT V2 CUDA does not implement tensor transform {:?}; only None is accepted",
+                tensor.transform()
+            )));
+        }
+        if tensor.dims().len() != 2 {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT V2 CUDA requires rank 2, got rank {}",
+                tensor.dims().len()
+            )));
+        }
+        let rows = usize::try_from(tensor.dims()[0]).map_err(|_| {
+            BackendError::InvalidInput(format!(
+                "SALT V2 row dimension {} exceeds host usize",
+                tensor.dims()[0]
+            ))
+        })?;
+        let columns = usize::try_from(tensor.dims()[1]).map_err(|_| {
+            BackendError::InvalidInput(format!(
+                "SALT V2 column dimension {} exceeds host usize",
+                tensor.dims()[1]
+            ))
+        })?;
+        let coefficients = rows.checked_mul(columns).ok_or_else(|| {
+            BackendError::InvalidInput("SALT V2 matrix dimension product overflows usize".into())
+        })?;
+        if coefficients != tensor.logical_coefficients() {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT V2 shape has {coefficients} coefficients but tensor has {}",
+                tensor.logical_coefficients()
+            )));
+        }
+        let codec_tag = match codec {
+            SaltV2Codec::D2 => 0,
+            SaltV2Codec::B3 => 1,
+            SaltV2Codec::S34 => 2,
+            _ => {
+                return Err(BackendError::InvalidInput(format!(
+                    "unsupported SALT V2 CUDA codec {codec:?}"
+                )));
+            }
+        };
+        let to_u32 = |value: usize, field: &str| {
+            u32::try_from(value).map_err(|_| {
+                BackendError::InvalidInput(format!("SALT V2 {field} exceeds the u32 kernel ABI"))
+            })
+        };
+        to_u32(rows, "row count")?;
+        to_u32(columns, "column count")?;
+        to_u32(tensor.tiles().len(), "tile count")?;
+
+        let plane_count = tensor.tiles().iter().try_fold(0usize, |total, tile| {
+            total.checked_add(tile.planes().len()).ok_or_else(|| {
+                BackendError::InvalidInput("SALT V2 present plane count overflows usize".into())
+            })
+        })?;
+        to_u32(plane_count, "present plane count")?;
+        let planned = SaltV2IndexedRuntimeLedger::for_tensor(tensor, codec).map_err(|error| {
+            BackendError::InvalidInput(format!("SALT V2 indexed-runtime planning failed: {error}"))
+        })?;
+
+        let mut payload = Vec::<u8>::new();
+        let mut scale_bits = Vec::<u16>::new();
+        let map_bytes = usize::try_from(planned.allocation_map_bytes()).map_err(|_| {
+            BackendError::InvalidInput("SALT V2 map bytes exceed host usize".into())
+        })?;
+        let rank_prefix_bytes = usize::try_from(planned.rank_prefix_bytes()).map_err(|_| {
+            BackendError::InvalidInput("SALT V2 rank-prefix bytes exceed host usize".into())
+        })?;
+        let index_bytes = map_bytes.checked_add(rank_prefix_bytes).ok_or_else(|| {
+            BackendError::InvalidInput("SALT V2 index bytes overflow usize".into())
+        })?;
+        let mut allocation_map = Vec::<u8>::new();
+        allocation_map
+            .try_reserve_exact(map_bytes)
+            .map_err(|_| BackendError::OutOfMemory {
+                requested: map_bytes,
+            })?;
+        allocation_map.resize(map_bytes, 0);
+        let mut rank_prefixes = Vec::<u32>::new();
+        rank_prefixes
+            .try_reserve_exact(rank_prefix_bytes / core::mem::size_of::<u32>())
+            .map_err(|_| BackendError::OutOfMemory {
+                requested: rank_prefix_bytes,
+            })?;
+        let mut terminal_map_value = 0_u32;
+        let mut planes_before_tile = 0usize;
+
+        for (tile_index, tile) in tensor.tiles().iter().enumerate() {
+            if tile_index != 0
+                && tile_index.is_multiple_of(
+                    tritium_format::salt_v2_package::SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES,
+                )
+            {
+                rank_prefixes.push(to_u32(planes_before_tile, "rank prefix")?);
+            }
+            let map_code = u8::try_from(tile.planes().len() - 1)
+                .map_err(|_| BackendError::InvalidInput("SALT V2 plane count underflow".into()))?;
+            let map_bit = tile_index.checked_mul(2).ok_or_else(|| {
+                BackendError::InvalidInput("SALT V2 map bit offset overflows usize".into())
+            })?;
+            if map_bit < map_bytes * 8 {
+                allocation_map[map_bit / 8] |= map_code << (map_bit % 8);
+            } else {
+                terminal_map_value |= u32::from(map_code) << (map_bit - map_bytes * 8);
+            }
+            for plane in tile.planes() {
+                let packed = pack_salt_v2_cuda_plane(codec, plane.trits())?;
+                payload.extend_from_slice(&packed);
+                scale_bits.extend(plane.scales().iter().map(|scale| scale.to_bits()));
+            }
+            planes_before_tile = planes_before_tile
+                .checked_add(tile.planes().len())
+                .ok_or_else(|| {
+                    BackendError::InvalidInput("SALT V2 plane rank overflows usize".into())
+                })?;
+        }
+        debug_assert_eq!(planes_before_tile, plane_count);
+        to_u32(payload.len(), "payload byte count")?;
+        to_u32(scale_bits.len(), "scale count")?;
+        let mut index_metadata = allocation_map;
+        index_metadata
+            .try_reserve_exact(rank_prefix_bytes)
+            .map_err(|_| BackendError::OutOfMemory {
+                requested: index_bytes,
+            })?;
+        for prefix in &rank_prefixes {
+            index_metadata.extend_from_slice(&prefix.to_le_bytes());
+        }
+        debug_assert_eq!(index_metadata.len(), index_bytes);
+
+        let scale_bytes = scale_bits
+            .len()
+            .checked_mul(core::mem::size_of::<u16>())
+            .ok_or_else(|| {
+                BackendError::InvalidInput("SALT V2 scale bytes overflow usize".into())
+            })?;
+        let actual_matches_plan = u64::try_from(payload.len()).ok()
+            == Some(planned.payload_bytes())
+            && u64::try_from(scale_bytes).ok() == Some(planned.scale_bytes())
+            && u64::try_from(map_bytes).ok() == Some(planned.allocation_map_bytes())
+            && u64::try_from(rank_prefix_bytes).ok() == Some(planned.rank_prefix_bytes())
+            && planned.dense_shadow_bytes() == 0;
+        if !actual_matches_plan {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT V2 uploaded buffers disagree with indexed-runtime plan: actual payload={}; scale={scale_bytes}; map={map_bytes}; rank-prefix={rank_prefix_bytes}, planned={planned:?}",
+                payload.len()
+            )));
+        }
+        let receipt = SaltV2ResidentAllocationReceipt::new(codec, planned);
+
+        let d_payload = self
+            .stream
+            .clone_htod(&payload)
+            .map_err(|error| alloc_or_backend("upload SALT V2 payload", &error, payload.len()))?;
+        let d_scales = self
+            .stream
+            .clone_htod(&scale_bits)
+            .map_err(|error| alloc_or_backend("upload SALT V2 scales", &error, scale_bytes))?;
+        let d_index_metadata = if index_metadata.is_empty() {
+            None
+        } else {
+            Some(self.stream.clone_htod(&index_metadata).map_err(|error| {
+                alloc_or_backend("upload SALT V2 compact index", &error, index_bytes)
+            })?)
+        };
+        Ok(SaltV2ResidentTensor {
+            payload: d_payload,
+            scales: d_scales,
+            index_metadata: d_index_metadata,
+            rows,
+            columns,
+            tile_count: tensor.tiles().len(),
+            plane_count,
+            codec_tag,
+            allocation_map_bytes: to_u32(map_bytes, "allocation map bytes")?,
+            rank_prefix_count: to_u32(rank_prefixes.len(), "rank prefix count")?,
+            terminal_map_value,
+            receipt,
+        })
+    }
+
+    /// Execute the deterministic scalar SALT V2 kernel.
+    ///
+    /// The result streams resident trits through group128/plane add-sub-skip
+    /// activation accumulators, applies each f16 scale once, then accumulates the
+    /// output exactly like the CPU semantic oracle. No dense weight allocation is
+    /// made.
+    ///
+    /// # Errors
+    /// Rejects a handle from another CUDA context, an activation length mismatch,
+    /// non-finite input/output, launch-bound overflow, or a driver failure.
+    pub fn salt_v2_forward_exact(
+        &self,
+        tensor: &SaltV2ResidentTensor,
+        activation: &[f32],
+        m: usize,
+    ) -> Result<SaltV2Forward, BackendError> {
+        self.salt_v2_forward_impl(tensor, activation, m, SaltV2ForwardMode::Exact)
+    }
+
+    /// Execute the SALT V2 fast entry point.
+    ///
+    /// This correctness-first implementation deliberately aliases
+    /// [`Self::salt_v2_forward_exact`]. The returned receipt is labeled
+    /// [`SaltV2ForwardMode::FastAliasesExact`]; no performance claim is implied.
+    ///
+    /// # Errors
+    /// Returns the errors documented by [`Self::salt_v2_forward_exact`].
+    pub fn salt_v2_forward_fast(
+        &self,
+        tensor: &SaltV2ResidentTensor,
+        activation: &[f32],
+        m: usize,
+    ) -> Result<SaltV2Forward, BackendError> {
+        self.salt_v2_forward_impl(tensor, activation, m, SaltV2ForwardMode::FastAliasesExact)
+    }
+
+    fn salt_v2_forward_impl(
+        &self,
+        tensor: &SaltV2ResidentTensor,
+        activation: &[f32],
+        m: usize,
+        mode: SaltV2ForwardMode,
+    ) -> Result<SaltV2Forward, BackendError> {
+        if !self.same_context(&tensor.payload)
+            || !self.same_context(&tensor.scales)
+            || tensor
+                .index_metadata
+                .as_ref()
+                .is_some_and(|metadata| !self.same_context(metadata))
+        {
+            return Err(BackendError::InvalidInput(
+                "SALT V2 resident tensor belongs to a different CUDA context".into(),
+            ));
+        }
+        let activation_elements = m.checked_mul(tensor.columns).ok_or_else(|| {
+            BackendError::InvalidInput("SALT V2 activation length overflows usize".into())
+        })?;
+        if activation.len() != activation_elements {
+            return Err(BackendError::ShapeMismatch {
+                expected: activation_elements,
+                got: activation.len(),
+            });
+        }
+        if let Some((index, value)) = activation
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT V2 activation {index} is non-finite ({:#010x})",
+                value.to_bits()
+            )));
+        }
+        let output_elements = m.checked_mul(tensor.rows).ok_or_else(|| {
+            BackendError::InvalidInput("SALT V2 output length overflows usize".into())
+        })?;
+        let receipt =
+            SaltV2ForwardReceipt::new(mode, tensor.receipt, activation_elements, output_elements)?;
+        if output_elements == 0 {
+            return Ok(SaltV2Forward {
+                output: Vec::new(),
+                receipt,
+            });
+        }
+
+        let m_u32 = u32::try_from(m).map_err(|_| {
+            BackendError::InvalidInput("SALT V2 batch rows exceed the u32 kernel ABI".into())
+        })?;
+        let n_u32 = u32::try_from(tensor.rows).map_err(|_| {
+            BackendError::InvalidInput("SALT V2 output rows exceed the u32 kernel ABI".into())
+        })?;
+        let k_u32 = u32::try_from(tensor.columns).map_err(|_| {
+            BackendError::InvalidInput("SALT V2 columns exceed the u32 kernel ABI".into())
+        })?;
+        let tile_count = u32::try_from(tensor.tile_count).map_err(|_| {
+            BackendError::InvalidInput("SALT V2 tile count exceeds the u32 kernel ABI".into())
+        })?;
+        let plane_count = u32::try_from(tensor.plane_count).map_err(|_| {
+            BackendError::InvalidInput("SALT V2 plane count exceeds the u32 kernel ABI".into())
+        })?;
+        let payload_bytes = tensor.receipt.payload_bytes();
+        let scale_count = tensor.receipt.scale_bytes() / core::mem::size_of::<u16>() as u64;
+        let index_metadata = tensor.index_metadata.as_ref().unwrap_or(&tensor.payload);
+        let total_outputs = u32::try_from(output_elements).map_err(|_| {
+            BackendError::InvalidInput("SALT V2 output elements exceed the u32 launch grid".into())
+        })?;
+
+        let d_activation = self.stream.clone_htod(activation).map_err(|error| {
+            alloc_or_backend(
+                "upload SALT V2 activation",
+                &error,
+                activation_elements * core::mem::size_of::<f32>(),
+            )
+        })?;
+        let mut d_output = self
+            .stream
+            .alloc_zeros::<f32>(output_elements)
+            .map_err(|error| {
+                alloc_or_backend(
+                    "allocate SALT V2 output",
+                    &error,
+                    output_elements * core::mem::size_of::<f32>(),
+                )
+            })?;
+        let cfg = LaunchConfig {
+            grid_dim: (total_outputs.div_ceil(THREADS_PER_BLOCK), 1, 1),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_salt_v2_exact);
+        launch
+            .arg(&d_activation)
+            .arg(&tensor.payload)
+            .arg(&tensor.scales)
+            .arg(index_metadata)
+            .arg(&mut d_output)
+            .arg(&m_u32)
+            .arg(&n_u32)
+            .arg(&k_u32)
+            .arg(&tensor.codec_tag)
+            .arg(&tile_count)
+            .arg(&plane_count)
+            .arg(&payload_bytes)
+            .arg(&scale_count)
+            .arg(&tensor.allocation_map_bytes)
+            .arg(&tensor.rank_prefix_count)
+            .arg(&tensor.terminal_map_value);
+        // SAFETY: `salt_v2_forward_exact` receives the arguments above in the
+        // exact pointer/scalar order. The private resident handle owns validated
+        // payload/scales/compact index metadata from this context. `d_activation` is
+        // M*K, `d_output` is M*N, and all derived payload/scale ranks were checked
+        // against the u32 ABI and complete host allocations before upload.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|error| driver_err("launch SALT V2 exact forward", &error))?;
+        }
+        let mut output = vec![0.0f32; output_elements];
+        self.stream
+            .memcpy_dtoh(&d_output, &mut output)
+            .map_err(|error| driver_err("download SALT V2 output", &error))?;
+        if let Some((index, value)) = output
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT V2 output {index} is non-finite ({:#010x})",
+                value.to_bits()
+            )));
+        }
+        Ok(SaltV2Forward { output, receipt })
     }
 
     /// Upload a SALT tensor's rows into VRAM as one plane-major buffer, ready for

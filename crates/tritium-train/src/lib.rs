@@ -25,6 +25,7 @@ pub mod lr;
 pub mod nn;
 pub mod ops;
 pub mod optim;
+pub mod salt_v2_recovery;
 pub mod tape;
 pub mod value;
 
@@ -39,5 +40,17 @@ pub use grow::{GrowError, Net2WiderPlan, QualityBytesPoint, QualityBytesReport};
 pub use lora::Lora;
 pub use lr::LrSchedule;
 pub use optim::{AdamState, AdamW, Muon, MuonState, Optimizer, newton_schulz};
+pub use salt_v2_recovery::{
+    BypassSchedule, BypassUsageFlag, EarlyStopDecision, EarlyStopGate, EarlyStopPoint,
+    FinalRecoveryMetrics, HiddenCosineTerm, LossMode, PlateauConfig, PromotionCheckpoint,
+    PromotionDecision, PromotionEvidence, PromotionGate, RecoveryActivationRung,
+    RecoveryCampaignDecision, RecoveryCampaignPlan, RecoveryCampaignReceipt, RecoveryCampaignRun,
+    RecoveryCampaignTermination, RecoveryDirective, RecoveryError, RecoveryEvaluationCheckpoint,
+    RecoveryEvidenceDigest, RecoveryModelRung, RecoveryPhase, RecoveryPolicy,
+    RecoveryPredecessorEvidence, RecoveryPromotionEvidence, RecoveryPromotionGate,
+    RecoveryPromotionOutcome, RecoveryReceipt, RecoveryRun, RecoverySchedule,
+    RecoverySelectedCheckpoint, RecoverySourceModel, RecoverySourceModelId, RecoveryTrack,
+    StepObservation,
+};
 pub use tape::{Tape, ValueId};
 pub use value::Shape;

@@ -69,6 +69,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "salt_v2_package_parse"
+path = "fuzz_targets/salt_v2_package_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "safetensors_parse"
 path = "fuzz_targets/safetensors_parse.rs"
 test = false
