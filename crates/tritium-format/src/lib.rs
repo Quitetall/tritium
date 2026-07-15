@@ -167,6 +167,8 @@ pub enum FormatError {
     SaltNonCanonicalSparseIndices,
     /// A partial dense TQ2_0 block had non-zero trits beyond the logical row length.
     SaltNonZeroPadding,
+    /// A SALT scale was non-finite or negative, including signed zero.
+    SaltInvalidScale(u16),
     /// A GGUF container operation (read/write) failed; carries the [`GgufError`].
     Gguf(GgufError),
     /// A safetensors container operation failed; carries the [`SafeTensorsError`].
@@ -268,6 +270,12 @@ impl fmt::Display for FormatError {
             }
             FormatError::SaltNonZeroPadding => {
                 write!(f, "SALT sidecar: partial TQ2_0 block has non-zero padding")
+            }
+            FormatError::SaltInvalidScale(bits) => {
+                write!(
+                    f,
+                    "SALT sidecar: invalid non-finite or negative f16 scale 0x{bits:04x}"
+                )
             }
             FormatError::Gguf(e) => write!(f, "GGUF container: {e}"),
             FormatError::SafeTensors(e) => write!(f, "safetensors container: {e}"),

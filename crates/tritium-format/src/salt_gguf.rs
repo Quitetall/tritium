@@ -42,7 +42,8 @@ const GGUF_VERSION: u32 = 3;
 ///
 /// # Errors
 /// [`FormatError::WrongBlockLen`] if a tensor has zero rows, any [`crate::pack_salt_row`]
-/// error, or [`FormatError::Gguf`] if the GGUF layer rejects the result.
+/// error, [`FormatError::SaltInvalidScale`] if a scale is non-finite or negative
+/// (including signed zero), or [`FormatError::Gguf`] if the GGUF layer rejects the result.
 pub fn write_salt_gguf(tensors: &[(&str, &[SaltRow])]) -> Result<Vec<u8>, FormatError> {
     // Pack each tensor's rows into one contiguous blob (the per-tensor payload).
     let mut packed: Vec<(String, u64, u64, Vec<u8>)> = Vec::with_capacity(tensors.len());
@@ -90,7 +91,18 @@ fn pack_salt_row_checked(row: &SaltRow, k: usize) -> Result<Vec<u8>, FormatError
             got: row.k,
         });
     }
-    crate::pack_salt_row(row)
+    let encoded = crate::pack_salt_row(row)?;
+    for plane in &row.planes {
+        for block in plane.chunks_exact(crate::TQ2_0_BLOCK_BYTES) {
+            let scale_offset = crate::TQ2_0_BLOCK_BYTES - 2;
+            let bits = u16::from_le_bytes([block[scale_offset], block[scale_offset + 1]]);
+            let scale = half::f16::from_bits(bits);
+            if !scale.is_finite() || scale.is_sign_negative() {
+                return Err(FormatError::SaltInvalidScale(bits));
+            }
+        }
+    }
+    Ok(encoded)
 }
 
 /// Parse a tritium SALT-in-GGUF container back into its tensors.
@@ -448,6 +460,19 @@ mod tests {
         assert_eq!(got[0].salt_rows, a, "tensor 0 rows must round-trip exactly");
         assert_eq!(got[1].name, "blk.0.mlp.up.weight");
         assert_eq!(got[1].salt_rows, b, "tensor 1 rows must round-trip exactly");
+    }
+
+    #[test]
+    fn writer_rejects_scales_the_strict_reader_cannot_accept() {
+        for bits in [f16::NAN.to_bits(), f16::INFINITY.to_bits(), 0xbc00, 0x8000] {
+            let mut invalid = row(256, 1, 1);
+            invalid.planes[0][TQ2_0_BLOCK_BYTES - 2..]
+                .copy_from_slice(&bits.to_le_bytes());
+            assert_eq!(
+                write_salt_gguf(&[("invalid.weight", &[invalid])]),
+                Err(FormatError::SaltInvalidScale(bits))
+            );
+        }
     }
 
     #[test]
