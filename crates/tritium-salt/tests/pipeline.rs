@@ -210,6 +210,68 @@ fn work_lock_survives_work_directory_replacement() {
     fs::remove_dir_all(root).expect("clean fixture");
 }
 
+#[cfg(unix)]
+#[test]
+fn forked_child_drop_does_not_release_parent_work_lock() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    let root = unique_temp_dir("work-lock-fork-child-drop");
+    let spec = spec();
+    let holder = tritium_salt::SaltPipeline::start(&spec, &root).expect("parent lock owner");
+    let (mut parent_signal, mut child_signal) =
+        UnixStream::pair().expect("create child teardown signal");
+
+    // SAFETY: this test immediately confines the child to dropping its inherited
+    // pipeline, one socket write, and `_exit`; the parent owns and reaps the PID.
+    let child_pid = unsafe { raw_fork() };
+    assert!(
+        child_pid >= 0,
+        "fork failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if child_pid == 0 {
+        drop(parent_signal);
+        drop(holder);
+        let exit_code = if child_signal.write_all(b"dropped").is_ok() {
+            0
+        } else {
+            1
+        };
+        // SAFETY: this is the fork child; `_exit` avoids running the inherited
+        // test harness or any unrelated parent destructors.
+        unsafe { raw_exit(exit_code) }
+    }
+
+    drop(child_signal);
+    let mut child = RawForkChildGuard::new(child_pid);
+    parent_signal
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound fork child teardown wait");
+    let mut signal = [0_u8; 7];
+    parent_signal
+        .read_exact(&mut signal)
+        .expect("fork child dropped inherited pipeline");
+    assert_eq!(&signal, b"dropped");
+    assert_eq!(child.wait().expect("reap fork child"), 0);
+
+    assert!(matches!(
+        tritium_salt::SaltPipeline::start(&spec, &root),
+        Err(tritium_salt::SaltError::Checkpoint(
+            "pipeline work item is already locked"
+        ))
+    ));
+
+    drop(holder);
+    let resumed = tritium_salt::SaltPipeline::resume(&spec, &root)
+        .expect("creator drop releases parent lock");
+    drop(resumed);
+    fs::remove_dir_all(root).expect("clean fixture");
+}
+
 #[test]
 fn work_lock_is_released_after_process_crash_and_running_stage_is_recovered() {
     use std::{
@@ -741,6 +803,77 @@ struct CrashHoldingDriver {
 
 struct ChildProcessGuard {
     child: Option<std::process::Child>,
+}
+
+#[cfg(unix)]
+struct RawForkChildGuard {
+    pid: Option<std::ffi::c_int>,
+}
+
+#[cfg(unix)]
+impl RawForkChildGuard {
+    fn new(pid: std::ffi::c_int) -> Self {
+        assert!(pid > 0, "fork child PID must be positive");
+        Self { pid: Some(pid) }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::ffi::c_int> {
+        let pid = self.pid.expect("fork child is live");
+        let status = wait_for_raw_child(pid)?;
+        self.pid = None;
+        Ok(status)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawForkChildGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            // SAFETY: `pid` is the positive PID returned by `fork` and remains
+            // owned by this guard until a successful `waitpid`.
+            let _ = unsafe { raw_kill(pid, RAW_SIGKILL) };
+            let _ = wait_for_raw_child(pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_raw_child(pid: std::ffi::c_int) -> std::io::Result<std::ffi::c_int> {
+    loop {
+        let mut status = 0;
+        // SAFETY: `status` is writable for the call and `pid` is a child PID
+        // returned by `fork`; options zero requests a blocking reap.
+        let waited = unsafe { raw_waitpid(pid, &mut status, 0) };
+        if waited == pid {
+            return Ok(status);
+        }
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+const RAW_SIGKILL: std::ffi::c_int = 9;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "fork"]
+    fn raw_fork() -> std::ffi::c_int;
+    #[link_name = "_exit"]
+    fn raw_exit(status: std::ffi::c_int) -> !;
+    #[link_name = "waitpid"]
+    fn raw_waitpid(
+        pid: std::ffi::c_int,
+        status: *mut std::ffi::c_int,
+        options: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+    #[link_name = "kill"]
+    fn raw_kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
 }
 
 impl ChildProcessGuard {

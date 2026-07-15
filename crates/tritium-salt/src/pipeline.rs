@@ -1091,7 +1091,26 @@ pub struct SaltPipeline {
     run: ConversionRun,
     receipt: SaltReceipt,
     /// Stable inode whose exclusive OS lock protects the work item for this lifetime.
-    _work_lock: fs::File,
+    _work_lock: WorkLock,
+}
+
+/// One process-owned lock handle.
+///
+/// Unix `flock` state follows the open file description across `fork`. Only the
+/// process that acquired the lock may explicitly unlock it; a forked child must
+/// merely close its duplicate so it cannot release the live parent's lock.
+#[derive(Debug)]
+struct WorkLock {
+    file: fs::File,
+    creator_pid: u32,
+}
+
+impl Drop for WorkLock {
+    fn drop(&mut self) {
+        if std::process::id() == self.creator_pid {
+            let _ = self.file.unlock();
+        }
+    }
 }
 
 impl SaltPipeline {
@@ -1411,7 +1430,7 @@ impl SaltPipeline {
     fn load_locked(
         spec: &SaltSpec,
         work_dir: PathBuf,
-        work_lock: fs::File,
+        work_lock: WorkLock,
     ) -> Result<Self, SaltError> {
         let state_path = work_dir.join("state.bin");
         let metadata =
@@ -1887,15 +1906,6 @@ impl SaltPipeline {
     }
 }
 
-impl Drop for SaltPipeline {
-    fn drop(&mut self) {
-        // Explicitly release the shared open-file-description lock. This makes
-        // normal logical-owner teardown deterministic even if a forked child
-        // transiently inherited a duplicate descriptor.
-        let _ = self._work_lock.unlock();
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredState {
@@ -2004,7 +2014,7 @@ fn work_directory(root: &Path, work_id: WorkId) -> PathBuf {
     root.join(work_id.to_string())
 }
 
-fn acquire_work_lock(work_root: &Path, work_id: WorkId) -> Result<fs::File, SaltError> {
+fn acquire_work_lock(work_root: &Path, work_id: WorkId) -> Result<WorkLock, SaltError> {
     let lock_directory = work_root.join(WORK_LOCK_DIRECTORY);
     fs::create_dir_all(&lock_directory)
         .map_err(|error| fs_error("create pipeline lock directory", error))?;
@@ -2016,7 +2026,10 @@ fn acquire_work_lock(work_root: &Path, work_id: WorkId) -> Result<fs::File, Salt
         .open(lock_directory.join(format!("{work_id}.lock")))
         .map_err(|error| fs_error("open pipeline work lock", error))?;
     match lock.try_lock() {
-        Ok(()) => Ok(lock),
+        Ok(()) => Ok(WorkLock {
+            file: lock,
+            creator_pid: std::process::id(),
+        }),
         Err(fs::TryLockError::WouldBlock) => Err(SaltError::Checkpoint(
             "pipeline work item is already locked",
         )),
