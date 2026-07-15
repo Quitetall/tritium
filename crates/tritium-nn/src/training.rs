@@ -12,7 +12,7 @@
 
 use crate::{
     ArchSpec, DenseLinear, Mlp, MlpKind, ModelConfig, ModelWeights, Projection, SwiGluMlp,
-    TransformerBlock,
+    TokenEmbedding, TransformerBlock,
 };
 
 /// Failure to adapt or execute a SwiGLU training model.
@@ -374,7 +374,12 @@ impl TiedSwiGluTrainingModel {
         };
 
         Ok(ModelWeights {
-            token_embd: self.parameters[0].master.clone(),
+            token_embd: TokenEmbedding::from_dense(
+                self.parameters[0].master.clone(),
+                arch.vocab,
+                arch.n_embd,
+            )
+            .map_err(|error| invalid_input(&format!("model.embed_tokens.weight: {error}")))?,
             vocab: arch.vocab,
             n_embd: arch.n_embd,
             layers,
@@ -580,12 +585,29 @@ impl TiedSwiGluTrainingModel {
         if weights.vocab == 0 {
             return Err(unsupported("vocabulary must be non-zero"));
         }
+        if weights.token_embd.rows() != weights.vocab {
+            return Err(tensor_mismatch(
+                "model.embed_tokens.weight rows",
+                weights.vocab,
+                weights.token_embd.rows(),
+            ));
+        }
+        if weights.token_embd.cols() != n_embd {
+            return Err(tensor_mismatch(
+                "model.embed_tokens.weight columns",
+                n_embd,
+                weights.token_embd.cols(),
+            ));
+        }
         let embedding_elements = checked_mul(weights.vocab, n_embd, "embedding shape")?;
-        if weights.token_embd.len() != embedding_elements {
+        let token_embd = weights.token_embd.as_dense().ok_or_else(|| {
+            unsupported("packed token embedding does not contain the latent fp32 training master")
+        })?;
+        if token_embd.len() != embedding_elements {
             return Err(tensor_mismatch(
                 "model.embed_tokens.weight",
                 embedding_elements,
-                weights.token_embd.len(),
+                token_embd.len(),
             ));
         }
         validate_vector("model.norm.weight", &weights.output_norm, n_embd)?;
@@ -604,7 +626,7 @@ impl TiedSwiGluTrainingModel {
         let mut parameters = Vec::with_capacity(parameter_capacity);
         parameters.push(TrainingParameter {
             name: "model.embed_tokens.weight".to_owned(),
-            master: weights.token_embd.clone(),
+            master: token_embd.to_vec(),
             rows: weights.vocab,
             cols: n_embd,
         });

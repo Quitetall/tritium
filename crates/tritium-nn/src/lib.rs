@@ -32,7 +32,7 @@ pub use evaluation::{TeacherForcedPerplexity, teacher_forced_perplexity_windows}
 pub use kv_cache::KvCache;
 pub use layers::{
     BlockDump, BlockScratch, DenseLinear, Mlp, Projection, Relu2Mlp, SaltLinear, SwiGluMlp,
-    TernaryLinear, TransformerBlock,
+    TernaryLinear, TokenEmbedding, TransformerBlock,
 };
 #[cfg(feature = "tokenizer")]
 pub use model::GgufBpeTokenizer;

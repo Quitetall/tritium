@@ -56,7 +56,12 @@ pub fn extract(runner: &ModelRunner) -> (Arch, Vec<Vec<f32>>, Vec<(usize, usize)
         theta: cfg.rope_theta,
         n_layers: w.layers.len(),
     };
-    let mut fp: Vec<Vec<f32>> = vec![w.token_embd.clone()];
+    let mut fp: Vec<Vec<f32>> = vec![
+        w.token_embd
+            .as_dense()
+            .expect("training reference requires dense token embedding")
+            .to_vec(),
+    ];
     let mut shapes: Vec<(usize, usize)> = vec![(w.vocab, arch.n_embd)];
     for b in w.layers.iter() {
         let (gate, up, down) = match &b.mlp {

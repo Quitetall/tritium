@@ -183,7 +183,12 @@ fn salt_distillation_recovers_smollm2_perplexity() {
     };
 
     // Flat fp weights (index 0 = tied token_embd, then per layer q,k,v,o,gate,up,down) + shapes.
-    let mut fp: Vec<Vec<f32>> = vec![w.token_embd.clone()];
+    let mut fp: Vec<Vec<f32>> = vec![
+        w.token_embd
+            .as_dense()
+            .expect("fp teacher requires dense token embedding")
+            .to_vec(),
+    ];
     let mut shapes: Vec<(usize, usize)> = vec![(w.vocab, a.n_embd)];
     for b in w.layers.iter() {
         let (gate, up, down) = match &b.mlp {

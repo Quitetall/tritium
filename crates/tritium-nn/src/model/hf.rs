@@ -3,8 +3,8 @@
 //! - [`ModelWeights::load_hf`] (plan 0035): fp model from `config.json` + safetensors —
 //!   exact-fp dense projections ([`DenseLinear::new_exact`]).
 //! - [`ModelWeights::load_salt`] (plan 0036): a **SALT-quantized** model — ternary 2D weights
-//!   retained as packed additive planes and contracted through the A8 activation path, with 1D
-//!   norms + config from the original model dir. The embedding/tied head remains dense for now.
+//!   retained as packed additive planes, including one shared packed embedding/tied-head table,
+//!   with 1D norms + config from the original model dir.
 //!
 //! All loading paths — these two AND the BitNet GGUF path
 //! ([`ModelWeights::load`], P2e) — share [`build_standard_model`], the one
@@ -18,14 +18,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use tritium_format::{
-    SafeTensors, SaltBundleIndex, SaltTensor, read_salt_gguf, salt_rows_to_dense,
-};
+use tritium_format::{PackedSaltTensor, SafeTensors, SaltBundleIndex, read_salt_gguf_packed};
 
 use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
 use crate::layers::{
-    DenseLinear, Mlp, Projection, Relu2Mlp, SaltLinear, SwiGluMlp, TransformerBlock,
+    DenseLinear, Mlp, Projection, Relu2Mlp, SaltLinear, SwiGluMlp, TokenEmbedding, TransformerBlock,
 };
 use crate::model::ModelWeights;
 
@@ -96,14 +94,14 @@ impl ModelWeights {
     }
 
     /// Load a **SALT-quantized** standard-transformer model: the ternary 2D weights come from a
-    /// SALT bundle (`.tslb` or SALT-GGUF) as packed additive projections. Projection weights never
-    /// materialize as retained fp32 matrices; only the token embedding remains dense because gather
-    /// and tied-head execution still use the legacy table. 1D norms + `config.json` come from
-    /// `model_dir` (bundles carry neither). A 2D weight missing from the bundle is a **hard error**.
+    /// SALT bundle (`.tslb` or SALT-GGUF) as packed additive projections and a shared packed token
+    /// table. No 2D weight materializes as a retained fp32 matrix. 1D norms + `config.json` come
+    /// from `model_dir` (bundles carry neither). A 2D weight missing from the bundle is a hard error.
     ///
     /// # Errors
     /// [`NnError::MissingConfig`] (bad config / unsupported arch), [`NnError::MissingTensor`]
-    /// (bundle unreadable, or a norm absent from `model_dir`), [`NnError::Shape`].
+    /// (bundle unreadable, or a norm absent from `model_dir`), [`NnError::Shape`], or
+    /// [`NnError::Backend`] (for example, a packed plane with a non-finite scale).
     pub fn load_salt(
         model_dir: &Path,
         bundle: &Path,
@@ -127,13 +125,12 @@ impl ModelWeights {
             }
         };
 
-        // TSLB uses a validated borrowed index so each requested tensor decodes directly into its
-        // final packed projection. SALT-GGUF already owns a tensor index, but its current public
-        // reader returns owned tensors; retain those packed rows without fp32 projection clones.
+        // TSLB uses a validated borrowed index so only the requested tensor is decoded, then
+        // flattened into final packed storage. SALT-GGUF preserves the same dense/sparse rows.
         let bundle_bytes = std::fs::read(bundle)
             .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", bundle.display())))?;
         let source = if bundle_bytes.starts_with(b"GGUF") {
-            let tensors = read_salt_gguf(&bundle_bytes)
+            let tensors = read_salt_gguf_packed(&bundle_bytes)
                 .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?;
             let mut by_name = HashMap::with_capacity(tensors.len());
             for tensor in tensors {
@@ -186,36 +183,38 @@ impl ModelWeights {
             ));
         }
 
-        // Embedding (in bundle) remains dense for gather/tied-head; 1D norms come from master.
+        // The token table is one packed allocation shared by gather and the tied head. Validate
+        // its declared config geometry before any model assembly.
+        let embedding_tensor = source.tensor(NameSchema::Hf.top("token_embd"))?;
+        let n_embd = config.n_embd as usize;
+        if embedding_tensor.k != n_embd {
+            return Err(NnError::Shape {
+                expected: n_embd,
+                got: embedding_tensor.k,
+            });
+        }
+        if let Some(vocab) = declared_vocab
+            && embedding_tensor.rows != vocab
+        {
+            return Err(NnError::Shape {
+                expected: vocab,
+                got: embedding_tensor.rows,
+            });
+        }
+        if embedding_tensor.salt_rows.len() != embedding_tensor.rows {
+            return Err(NnError::Shape {
+                expected: embedding_tensor.rows,
+                got: embedding_tensor.salt_rows.len(),
+            });
+        }
+        let token_embd = TokenEmbedding::from_packed_salt(
+            embedding_tensor.salt_rows,
+            embedding_tensor.rows,
+            embedding_tensor.k,
+        )?;
+
+        // Only 1D norms come from the fp master.
         let provider = |name: &str| -> Result<Vec<f32>, NnError> {
-            if !name.ends_with("norm.weight") {
-                let tensor = source.tensor(name)?;
-                if name == NameSchema::Hf.top("token_embd") {
-                    let n_embd = config.n_embd as usize;
-                    if tensor.k != n_embd {
-                        return Err(NnError::Shape {
-                            expected: n_embd,
-                            got: tensor.k,
-                        });
-                    }
-                    if let Some(vocab) = declared_vocab
-                        && tensor.rows != vocab
-                    {
-                        return Err(NnError::Shape {
-                            expected: vocab,
-                            got: tensor.rows,
-                        });
-                    }
-                    if tensor.salt_rows.len() != tensor.rows {
-                        return Err(NnError::Shape {
-                            expected: tensor.rows,
-                            got: tensor.salt_rows.len(),
-                        });
-                    }
-                }
-                return salt_rows_to_dense(&tensor.salt_rows)
-                    .map_err(|e| NnError::MissingTensor(format!("dequant {name}: {e}")));
-            }
             let i = *loc
                 .get(name)
                 .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
@@ -223,14 +222,15 @@ impl ModelWeights {
                 .tensor_f32(name)
                 .map_err(|e| NnError::MissingTensor(format!("{name}: {e}")))
         };
-        let weights = build_standard_model(
+        let weights = build_standard_model_with_embedding(
             &config,
             &spec,
             NameSchema::Hf,
+            token_embd,
             |n| provider(n),
             |name, n_out, k_in| {
                 let tensor = source.tensor(name)?;
-                Ok(Projection::Salt(SaltLinear::new(
+                Ok(Projection::Salt(SaltLinear::from_packed_rows(
                     tensor.salt_rows,
                     n_out,
                     k_in,
@@ -243,16 +243,16 @@ impl ModelWeights {
 
 enum SaltTensorSource<'a> {
     Bundle(SaltBundleIndex<'a>),
-    Gguf(RefCell<HashMap<String, SaltTensor>>),
+    Gguf(RefCell<HashMap<String, PackedSaltTensor>>),
 }
 
 impl SaltTensorSource<'_> {
-    fn tensor(&self, name: &str) -> Result<SaltTensor, NnError> {
+    fn tensor(&self, name: &str) -> Result<PackedSaltTensor, NnError> {
         match self {
             Self::Bundle(index) => index
                 .tensor(name)
                 .ok_or_else(|| missing_salt_tensor(name))?
-                .decode()
+                .decode_packed()
                 .map_err(|error| {
                     NnError::MissingTensor(format!("decode SALT tensor `{name}`: {error}"))
                 }),
@@ -345,8 +345,8 @@ impl NameSchema {
 }
 
 /// Assemble [`ModelWeights`] for a standard transformer — THE one config-driven
-/// loading skeleton (P2e). `dense` provides 1D norms + the embedding (name →
-/// fp32); `proj` builds each 2D projection (name, n_out, k_in) — exact-fp
+/// loading skeleton (P2e). `dense` provides 1D norms + a dense embedding (name →
+/// fp32); `proj` builds each other 2D projection (name, n_out, k_in) — exact-fp
 /// [`DenseLinear`], A8 `DenseLinear`, or a backend-uploaded ternary linear.
 /// `spec` drives every architecture axis: MLP family, QKV bias, QK-norm,
 /// BitNet sub-norms, tied embeddings. Used by [`ModelWeights::load_hf`],
@@ -356,22 +356,45 @@ pub(crate) fn build_standard_model(
     spec: &ArchSpec,
     schema: NameSchema,
     dense: impl Fn(&str) -> Result<Vec<f32>, NnError>,
+    proj: impl FnMut(&str, usize, usize) -> Result<Projection, NnError>,
+) -> Result<ModelWeights, NnError> {
+    let n_embd = config.n_embd as usize;
+    let token_values = dense(schema.top("token_embd"))?;
+    if n_embd == 0 || token_values.is_empty() || token_values.len() % n_embd != 0 {
+        return Err(NnError::Shape {
+            expected: n_embd,
+            got: token_values.len(),
+        });
+    }
+    let vocab = token_values.len() / n_embd;
+    let token_embd = TokenEmbedding::from_dense(token_values, vocab, n_embd)?;
+    build_standard_model_with_embedding(config, spec, schema, token_embd, dense, proj)
+}
+
+/// Assemble a standard model around a pre-built dense or packed token table.
+///
+/// This is the SALT memory-floor seam: 1D tensors still come from `dense`, while
+/// the embedding/tied-head table can remain packed and is never materialized as fp32.
+pub(crate) fn build_standard_model_with_embedding(
+    config: &ModelConfig,
+    spec: &ArchSpec,
+    schema: NameSchema,
+    token_embd: TokenEmbedding,
+    dense: impl Fn(&str) -> Result<Vec<f32>, NnError>,
     mut proj: impl FnMut(&str, usize, usize) -> Result<Projection, NnError>,
 ) -> Result<ModelWeights, NnError> {
     let n_embd = config.n_embd as usize;
+    if n_embd == 0 || token_embd.cols() != n_embd || token_embd.rows() == 0 {
+        return Err(NnError::Shape {
+            expected: n_embd.max(1),
+            got: token_embd.cols(),
+        });
+    }
+    let vocab = token_embd.rows();
     let head_dim = config.head_dim() as usize;
     let q_width = config.n_head as usize * head_dim;
     let kv_width = config.n_head_kv as usize * head_dim;
     let n_ff = config.n_ff as usize;
-
-    let token_embd = dense(schema.top("token_embd"))?;
-    if n_embd == 0 || token_embd.is_empty() || token_embd.len() % n_embd != 0 {
-        return Err(NnError::Shape {
-            expected: n_embd,
-            got: token_embd.len(),
-        });
-    }
-    let vocab = token_embd.len() / n_embd;
     let output_norm = dense(schema.top("output_norm"))?;
 
     let mut layers = Vec::with_capacity(config.n_layers as usize);
@@ -606,7 +629,10 @@ mod tests {
         assert!(spec.tied_embeddings);
 
         assert_eq!(weights.vocab, vocab);
-        assert_eq!(weights.token_embd.len(), vocab * n_embd);
+        assert_eq!(
+            weights.token_embd.as_dense().map(<[f32]>::len),
+            Some(vocab * n_embd)
+        );
         assert_eq!(weights.layers.len(), 1);
         assert!(weights.lm_head.is_none(), "tied ⇒ no lm_head");
         let l0 = &weights.layers[0];
@@ -618,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn load_salt_retains_packed_projections_and_runs() {
+    fn load_salt_retains_packed_weights_and_runs() {
         use crate::{Mlp, ModelRunner, Projection};
         use tritium_format::{
             DEFAULT_SPARSE_RESIDUAL_DENSITY, SaltRow, salt_rows_to_dense,
@@ -718,6 +744,9 @@ mod tests {
                 panic!("SALT loader must retain packed additive planes")
             }
         }
+        assert!(runner.weights.token_embd.is_packed_salt());
+        assert!(runner.weights.token_embd.as_dense().is_none());
+        assert!(runner.weights.token_embd.resident_bytes() > 0);
         for layer in &runner.weights.layers {
             for projection in [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
                 assert!(matches!(projection, Projection::Salt(_)));
@@ -790,6 +819,7 @@ mod tests {
         let legacy_backend = Box::new(tritium_cpu::CpuBackend::new());
         let mut legacy_runner =
             ModelRunner::from_salt(&dir, &legacy_path, legacy_backend).expect("from_salt v1");
+        assert!(legacy_runner.weights.token_embd.is_packed_salt());
         let legacy_logits = legacy_runner
             .forward(&tokens, &positions)
             .expect("forward v1");
@@ -939,6 +969,7 @@ mod tests {
             Box::new(tritium_cpu::CpuBackend::new()),
         )
         .expect("untied SALT-GGUF");
+        assert!(untied_runner.weights.token_embd.is_packed_salt());
         assert!(matches!(
             &untied_runner.weights.lm_head,
             Some(Projection::Salt(_))

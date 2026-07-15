@@ -4658,7 +4658,12 @@ mod tests {
             rms_eps: 1e-5,
         };
         let weights = ModelWeights {
-            token_embd: vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.5],
+            token_embd: tritium_nn::TokenEmbedding::from_dense(
+                vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.5],
+                3,
+                2,
+            )
+            .unwrap(),
             vocab: 3,
             n_embd: 2,
             layers: Vec::new(),
@@ -4697,7 +4702,12 @@ mod tests {
             Projection::Dense(DenseLinear::new_exact(values, rows, cols).unwrap())
         };
         let weights = ModelWeights {
-            token_embd: (0..32).map(|index| index as f32 / 64.0 - 0.2).collect(),
+            token_embd: tritium_nn::TokenEmbedding::from_dense(
+                (0..32).map(|index| index as f32 / 64.0 - 0.2).collect(),
+                8,
+                4,
+            )
+            .unwrap(),
             vocab: 8,
             n_embd: 4,
             layers: vec![TransformerBlock {

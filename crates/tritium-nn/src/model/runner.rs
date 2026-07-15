@@ -8,7 +8,7 @@
 //!
 //! The LM head is **tied** to the token embedding (BitNet 2B4T sets
 //! `tie_word_embeddings = true` and ships no separate `output.weight`), so
-//! unembedding is a dense fp32 matmul against `token_embd`.
+//! unembedding is an exact fp32 contraction against the dense-or-packed `token_embd` table.
 
 use std::path::Path;
 
@@ -439,15 +439,7 @@ impl ModelRunner {
 
         // Embedding gather: hidden = token_embd[token] for each token.
         let mut hidden = vec![0.0f32; seq * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let row = tok as usize;
-            let src = self
-                .weights
-                .token_embd
-                .get(row * n_embd..row * n_embd + n_embd)
-                .ok_or_else(|| NnError::MissingTensor(format!("token_embd row {row}")))?;
-            hidden[t * n_embd..t * n_embd + n_embd].copy_from_slice(src);
-        }
+        self.weights.token_embd.gather(tokens, &mut hidden)?;
         if let Some(d) = dump.as_deref_mut() {
             d.embedding = hidden.clone();
             d.hidden_states.clear();
@@ -529,26 +521,11 @@ impl ModelRunner {
             logits
         } else {
             // Tied LM head: logits[v] = <last_norm, token_embd[v]>.
-            // Parallelized with rayon: 128K × 2560 dot products.
-            use rayon::prelude::*;
             let vocab = self.weights.vocab;
             let mut logits = vec![0.0f32; vocab];
-            let embd = &self.weights.token_embd;
-            logits
-                .par_chunks_mut(1024)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let base = chunk_idx * 1024;
-                    for (i, slot) in chunk.iter_mut().enumerate() {
-                        let v = base + i;
-                        let row = &embd[v * n_embd..v * n_embd + n_embd];
-                        let mut acc = 0.0f32;
-                        for k in 0..n_embd {
-                            acc += last_norm[k] * row[k];
-                        }
-                        *slot = acc;
-                    }
-                });
+            self.weights
+                .token_embd
+                .unembed_exact(&last_norm, &mut logits)?;
             logits
         };
         if let Some(d) = dump {
@@ -645,6 +622,19 @@ impl ModelRunner {
         use crate::layers::Projection;
         use tritium_cuda::{DecodeLayerSpec, DecodeLinearSpec, DecodeModelSpec};
 
+        // The current resident decoder always ties the LM head to a dense token table.
+        // Packed SALT tables and untied heads stay on the host-orchestrated path until
+        // their dedicated resident kernels are wired.
+        if weights.lm_head.is_some() {
+            return None;
+        }
+        if weights.token_embd.rows() != weights.vocab
+            || weights.token_embd.cols() != config.n_embd as usize
+        {
+            return None;
+        }
+        let token_embd = weights.token_embd.as_dense()?;
+
         // The device-resident decoder is TQ2_0-only: every projection must be
         // deployed ternary. A model carrying any SALT/dense projection returns
         // `None` here and runs the host-orchestrated forward instead.
@@ -680,7 +670,7 @@ impl ModelRunner {
             .collect::<Option<Vec<_>>>()?;
 
         Some(DecodeModelSpec {
-            token_embd: &weights.token_embd,
+            token_embd,
             output_norm: &weights.output_norm,
             layers,
             n_embd: config.n_embd as usize,
@@ -746,4 +736,63 @@ fn cpu_backend() -> Result<Box<dyn TernaryBackend>, NnError> {
         }
     }
     Err(NnError::BackendUnavailable)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_spec_tests {
+    use super::ModelRunner;
+    use crate::{DenseLinear, ModelConfig, ModelWeights, Projection, TokenEmbedding};
+    use tritium_format::PackedSaltRow;
+
+    fn config() -> ModelConfig {
+        ModelConfig {
+            arch: "llama".to_owned(),
+            n_layers: 0,
+            n_embd: 2,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 2,
+            n_ff: 2,
+            n_ctx: 8,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        }
+    }
+
+    fn dense_weights() -> ModelWeights {
+        ModelWeights {
+            token_embd: TokenEmbedding::from_dense(vec![0.0; 6], 3, 2).unwrap(),
+            vocab: 3,
+            n_embd: 2,
+            layers: Vec::new(),
+            output_norm: vec![1.0; 2],
+            lm_head: None,
+        }
+    }
+
+    #[test]
+    fn resident_spec_rejects_untied_heads_and_packed_token_tables() {
+        let config = config();
+        let mut weights = dense_weights();
+        assert!(ModelRunner::build_decode_spec(&weights, &config).is_some());
+
+        weights.lm_head = Some(Projection::Dense(
+            DenseLinear::new_exact(vec![0.0; 6], 3, 2).unwrap(),
+        ));
+        assert!(ModelRunner::build_decode_spec(&weights, &config).is_none());
+
+        weights.lm_head = None;
+        weights.token_embd = TokenEmbedding::from_dense(vec![0.0; 6], 2, 3).unwrap();
+        assert!(ModelRunner::build_decode_spec(&weights, &config).is_none());
+
+        weights.token_embd = TokenEmbedding::from_packed_salt(
+            (0..3)
+                .map(|_| PackedSaltRow::new(2, Vec::new()).unwrap())
+                .collect(),
+            3,
+            2,
+        )
+        .unwrap();
+        assert!(ModelRunner::build_decode_spec(&weights, &config).is_none());
+    }
 }

@@ -1,8 +1,9 @@
 //! Loaded model weights, read from a GGUF file.
 //!
 //! Ternary weights take the I2_S → internal path ([`tritium_format`]) and are
-//! uploaded to the backend as [`TernaryLinear`]; norms, the token embedding, and
-//! the LM head are widened to host-side fp32 ([`crate::tensor`]). The loader maps
+//! uploaded to the backend as [`TernaryLinear`]. Native GGUF norms, token embedding,
+//! and LM head are widened to host-side fp32 ([`crate::tensor`]); SALT loading retains
+//! its 2D token table and projections packed. The loader maps
 //! GGUF tensor names (`token_embd.weight`, `blk.N.*`, `output_norm.weight`) to
 //! these fields.
 //!
@@ -30,7 +31,7 @@ use tritium_spec::TernaryBackend;
 
 use crate::config::{ArchSpec, ModelConfig};
 use crate::error::NnError;
-use crate::layers::{Projection, TernaryLinear, TransformerBlock};
+use crate::layers::{Projection, TernaryLinear, TokenEmbedding, TransformerBlock};
 use crate::tensor::f16_bytes_to_f32;
 
 /// The weights for one decoder layer, ready to run.
@@ -47,9 +48,9 @@ const GGML_TYPE_I2_S: u32 = tritium_format::GGML_TYPE_I2_S;
 /// All weights for a model: embeddings, per-layer blocks, final norm, LM head.
 #[allow(missing_debug_implementations)]
 pub struct ModelWeights {
-    /// Token embedding table, fp32, `[vocab, n_embd]` row-major. Also used as the
-    /// (tied) LM head: `logits = h · token_embd[v]` for each vocab row `v`.
-    pub token_embd: Vec<f32>,
+    /// Dense or packed token table, `[vocab, n_embd]`. Also used as the tied LM
+    /// head: `logits = h · token_embd[v]` for each vocabulary row `v`.
+    pub token_embd: TokenEmbedding,
     /// Vocabulary size (rows of `token_embd`).
     pub vocab: usize,
     /// Hidden size (columns of `token_embd`).

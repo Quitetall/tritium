@@ -44,6 +44,7 @@ fn packed_salt_linear_matches_dense_a8_without_matrix_materialization() {
     assert_eq!(got, expected);
     let encoded_bytes: usize = rows.iter().flat_map(|row| &row.planes).map(Vec::len).sum();
     assert_eq!(salt_linear.packed_bytes(), encoded_bytes);
+    assert!(salt_linear.resident_bytes() >= salt_linear.packed_bytes());
     assert!(salt_linear.packed_bytes() < n * k * size_of::<f32>());
 }
 

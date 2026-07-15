@@ -16,8 +16,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    FormatError, GgufFile, GgufValue, SALT_HEADER_BYTES, SaltRow, SaltTensor, TensorInfo,
-    TensorOut, packed_salt_row_len, read_gguf, unpack_salt_row, write_gguf,
+    FormatError, GgufFile, GgufValue, PackedSaltRow, PackedSaltTensor, SALT_HEADER_BYTES, SaltRow,
+    SaltTensor, TensorInfo, TensorOut, packed_salt_row_len, read_gguf, unpack_packed_salt_row,
+    write_gguf,
 };
 
 /// tritium-private ggml type-id for a SALT tensor (per-row TQ2_0 planes). Standard
@@ -40,7 +41,7 @@ const GGUF_VERSION: u32 = 3;
 /// row, so a tensor must have at least one row. Tensors are emitted in input order.
 ///
 /// # Errors
-/// [`FormatError::WrongBlockLen`] if a tensor has zero rows, any [`pack_salt_row`]
+/// [`FormatError::WrongBlockLen`] if a tensor has zero rows, any [`crate::pack_salt_row`]
 /// error, or [`FormatError::Gguf`] if the GGUF layer rejects the result.
 pub fn write_salt_gguf(tensors: &[(&str, &[SaltRow])]) -> Result<Vec<u8>, FormatError> {
     // Pack each tensor's rows into one contiguous blob (the per-tensor payload).
@@ -107,8 +108,35 @@ fn pack_salt_row_checked(row: &SaltRow, k: usize) -> Result<Vec<u8>, FormatError
 /// if the marker is absent/wrong, a SALT tensor has other than 2 dims, tensor layout
 /// is non-canonical, or an unsized non-SALT private type is present;
 /// [`FormatError::WrongBlockLen`] on a truncated or length-mismatched payload, or
-/// any [`unpack_salt_row`] error.
+/// any [`crate::unpack_salt_row`] error.
 pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
+    read_salt_gguf_packed(bytes)?
+        .into_iter()
+        .map(|tensor| {
+            let salt_rows = tensor
+                .salt_rows
+                .into_iter()
+                .map(PackedSaltRow::into_dense)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(SaltTensor {
+                name: tensor.name,
+                rows: tensor.rows,
+                k: tensor.k,
+                salt_rows,
+            })
+        })
+        .collect()
+}
+
+/// Parse a tritium SALT-in-GGUF container while preserving progressive sparse planes.
+///
+/// This has the same envelope, tensor-table, bounds, and padding validation as
+/// [`read_salt_gguf`], but returns [`PackedSaltTensor`] rows instead of expanding sparse
+/// residuals into dense TQ2_0 bytes.
+///
+/// # Errors
+/// Same errors as [`read_salt_gguf`].
+pub fn read_salt_gguf_packed(bytes: &[u8]) -> Result<Vec<PackedSaltTensor>, FormatError> {
     let f = read_gguf(bytes)?;
     if f.get_metadata(SALT_GGUF_FORMAT_KEY)
         .and_then(GgufValue::as_str)
@@ -154,18 +182,18 @@ pub fn read_salt_gguf(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
                 expected: end,
                 got: blob.len(),
             })?;
-            let row = unpack_salt_row(encoded)?;
-            if row.k != k {
+            let row = unpack_packed_salt_row(encoded)?;
+            if row.k() != k {
                 return Err(FormatError::WrongBlockLen {
                     expected: k,
-                    got: row.k,
+                    got: row.k(),
                 });
             }
             salt_rows.push(row);
             off = end;
         }
         validate_payload_tail(&f, index, blob, off)?;
-        out.push(SaltTensor {
+        out.push(PackedSaltTensor {
             name: t.name.clone(),
             rows,
             k,

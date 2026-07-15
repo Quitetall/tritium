@@ -1,6 +1,6 @@
 use tritium_nn::{
     ArchSpec, DenseLinear, Mlp, MlpKind, ModelConfig, ModelRunner, ModelWeights, Projection,
-    SwiGluMlp, SwiGluTrainingModel, TransformerBlock,
+    SwiGluMlp, SwiGluTrainingModel, TokenEmbedding, TransformerBlock,
 };
 
 fn config() -> ModelConfig {
@@ -63,9 +63,9 @@ fn weights(tied: bool) -> ModelWeights {
         .collect();
     let token_embd = (0..7 * 4)
         .map(|index| (((index * 5) % 17) as f32 - 8.0) / 64.0)
-        .collect();
+        .collect::<Vec<_>>();
     ModelWeights {
-        token_embd,
+        token_embd: TokenEmbedding::from_dense(token_embd, 7, 4).unwrap(),
         vocab: 7,
         n_embd: 4,
         layers,

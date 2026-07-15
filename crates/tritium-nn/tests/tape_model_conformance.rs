@@ -65,7 +65,12 @@ fn tape_model_matches_modelrunner_on_smollm2() {
 
     // Build the differentiable forward on the tape from the fp weights (leaves = un-quantized).
     let mut t = Tape::new();
-    let embd = t.leaf(w.token_embd.clone());
+    let embd = t.leaf(
+        w.token_embd
+            .as_dense()
+            .expect("conformance fixture requires dense token embedding")
+            .to_vec(),
+    );
     let mut hidden = t.embed_gather(embd, &tokens, vocab, n_embd);
 
     for li in 0..n_layers {

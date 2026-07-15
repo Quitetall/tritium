@@ -148,7 +148,7 @@ fn build_weights(st: &SafeTensors, cfg: &ModelConfig, mode: Mode) -> ModelWeight
         .collect();
 
     ModelWeights {
-        token_embd,
+        token_embd: tritium_nn::TokenEmbedding::from_dense(token_embd, vocab, n_embd).unwrap(),
         vocab,
         n_embd,
         layers,

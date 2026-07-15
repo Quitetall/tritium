@@ -1,6 +1,6 @@
 use tritium_nn::{
     ArchSpec, DenseLinear, Mlp, MlpKind, ModelConfig, ModelWeights, Projection, SwiGluMlp,
-    SwiGluTrainingModel, TiedSwiGluTrainingModel, TransformerBlock,
+    SwiGluTrainingModel, TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
 };
 
 fn dense(rows: usize, cols: usize, marker: f32) -> Projection {
@@ -59,7 +59,7 @@ fn weights() -> ModelWeights {
         })
         .collect();
     ModelWeights {
-        token_embd: vec![0.5; 5 * 4],
+        token_embd: TokenEmbedding::from_dense(vec![0.5; 5 * 4], 5, 4).unwrap(),
         vocab: 5,
         n_embd: 4,
         layers,
@@ -506,6 +506,25 @@ fn config_validation_accepts_tied_and_untied_lm_heads() {
 
 #[test]
 fn extraction_rejects_hidden_bias_qk_norm_and_untied_weight_mismatches() {
+    let mut packed_embedding = weights();
+    packed_embedding.token_embd = TokenEmbedding::from_packed_salt(
+        (0..5)
+            .map(|_| tritium_format::PackedSaltRow::new(4, Vec::new()).unwrap())
+            .collect(),
+        5,
+        4,
+    )
+    .unwrap();
+    let error =
+        TiedSwiGluTrainingModel::extract(&config(), &spec(), &packed_embedding).unwrap_err();
+    assert!(error.to_string().contains("latent fp32"), "{error}");
+
+    let mut transposed_embedding = weights();
+    transposed_embedding.token_embd = TokenEmbedding::from_dense(vec![0.5; 20], 4, 5).unwrap();
+    let error =
+        TiedSwiGluTrainingModel::extract(&config(), &spec(), &transposed_embedding).unwrap_err();
+    assert!(error.to_string().contains("rows"), "{error}");
+
     let mut biased = weights();
     biased.layers[0].q_bias = vec![0.0; 4];
     let error = TiedSwiGluTrainingModel::extract(&config(), &spec(), &biased).unwrap_err();

@@ -1,24 +1,20 @@
 //! Packed additive SALT projection.
 //!
-//! [`SaltLinear`] retains TQ2_0 planes and reconstructs one 256-weight block at a
-//! time during the A8 contraction. It matches [`DenseLinear`](super::DenseLinear)
-//! bit-for-bit without retaining an `N × K` fp32 matrix.
+//! [`SaltLinear`] retains dense and sparse additive planes and reconstructs one
+//! 256-weight block at a time during the A8 contraction. It matches
+//! [`DenseLinear`](super::DenseLinear) bit-for-bit without retaining an `N × K`
+//! fp32 matrix.
 
-use half::f16;
-use rayon::prelude::*;
-use tritium_core::Trit;
-use tritium_format::{QK_K, SaltRow, TQ2_0_BLOCK_BYTES, unpack_tq2_0_block};
+use tritium_format::{PackedSaltRow, SaltRow};
 
 use crate::error::NnError;
+use crate::layers::packed_salt::PackedSaltMatrix;
 use crate::ops::quantize_activation_int8;
 
 /// A bias-free additive ternary projection backed by packed SALT rows.
 #[derive(Clone, Debug)]
 pub struct SaltLinear {
-    n_out: usize,
-    k_in: usize,
-    rows: Vec<SaltRow>,
-    packed_bytes: usize,
+    matrix: PackedSaltMatrix,
 }
 
 impl SaltLinear {
@@ -36,58 +32,69 @@ impl SaltLinear {
                 got: rows.len(),
             });
         }
-        if k_in == 0 {
+        if k_in == 0 || u32::try_from(k_in).is_err() {
             return Err(NnError::Shape {
-                expected: 1,
-                got: 0,
-            });
-        }
-        if u32::try_from(k_in).is_err() {
-            return Err(NnError::Shape {
-                expected: u32::MAX as usize,
+                expected: if k_in == 0 { 1 } else { u32::MAX as usize },
                 got: k_in,
             });
         }
-        let mut packed_bytes = 0usize;
-        for row in &rows {
-            if row.k != k_in {
-                return Err(NnError::Shape {
-                    expected: k_in,
-                    got: row.k,
-                });
-            }
-            packed_bytes =
-                packed_bytes
-                    .checked_add(validate_packed_row(row)?)
-                    .ok_or(NnError::Shape {
-                        expected: usize::MAX,
-                        got: packed_bytes,
-                    })?;
+        if let Some(row) = rows.iter().find(|row| row.k != k_in) {
+            return Err(NnError::Shape {
+                expected: k_in,
+                got: row.k,
+            });
         }
+        let rows = rows
+            .into_iter()
+            .map(PackedSaltRow::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| NnError::Backend(error.to_string()))?;
+        Self::from_packed_rows(rows, n_out, k_in)
+    }
+
+    /// Build directly from validated dense/sparse SALT rows without expanding residuals.
+    ///
+    /// # Errors
+    /// [`NnError::Shape`] if matrix geometry disagrees with the rows, or
+    /// [`NnError::Backend`] if a packed plane contains a non-finite scale.
+    pub fn from_packed_rows(
+        rows: Vec<PackedSaltRow>,
+        n_out: usize,
+        k_in: usize,
+    ) -> Result<Self, NnError> {
         Ok(Self {
-            n_out,
-            k_in,
-            rows,
-            packed_bytes,
+            matrix: PackedSaltMatrix::new(rows, n_out, k_in)?,
         })
     }
 
     /// Packed plane payload bytes retained by this projection.
     #[must_use]
-    pub const fn packed_bytes(&self) -> usize {
-        self.packed_bytes
+    pub fn packed_bytes(&self) -> usize {
+        self.matrix.packed_bytes()
+    }
+
+    /// Total retained arena and row/plane metadata bytes, excluding the struct itself.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.matrix.resident_bytes()
+    }
+
+    /// Number of residual planes retained in sparse form.
+    #[must_use]
+    pub const fn sparse_plane_count(&self) -> usize {
+        self.matrix.sparse_plane_count()
     }
 
     /// Output feature count (`N`).
     #[must_use]
     pub const fn n_out(&self) -> usize {
-        self.n_out
+        self.matrix.n_out()
     }
 
     /// Input feature count (`K`).
     #[must_use]
     pub const fn k_in(&self) -> usize {
-        self.k_in
+        self.matrix.k_in()
     }
 
     /// A8 forward matching `salt_rows_to_dense → DenseLinear::new` bit-for-bit.
@@ -99,7 +106,7 @@ impl SaltLinear {
     /// [`NnError::Shape`] on operand/output mismatch, or [`NnError::Backend`] if a
     /// retained packed block cannot be decoded.
     pub fn forward(&self, act: &[f32], m: usize, out: &mut [f32]) -> Result<(), NnError> {
-        let act_len = m.checked_mul(self.k_in).ok_or(NnError::Shape {
+        let act_len = m.checked_mul(self.k_in()).ok_or(NnError::Shape {
             expected: usize::MAX,
             got: act.len(),
         })?;
@@ -109,7 +116,7 @@ impl SaltLinear {
                 got: act.len(),
             });
         }
-        let out_len = m.checked_mul(self.n_out).ok_or(NnError::Shape {
+        let out_len = m.checked_mul(self.n_out()).ok_or(NnError::Shape {
             expected: usize::MAX,
             got: out.len(),
         })?;
@@ -122,81 +129,14 @@ impl SaltLinear {
 
         let mut q_act = vec![0.0f32; act_len];
         let mut act_scale = vec![0.0f32; m];
-        quantize_activation_int8(act, m, self.k_in, &mut q_act, &mut act_scale)?;
+        quantize_activation_int8(act, m, self.k_in(), &mut q_act, &mut act_scale)?;
 
-        out.par_iter_mut()
-            .enumerate()
-            .try_for_each(|(output_index, slot)| {
-                let activation_row = output_index / self.n_out;
-                let output_channel = output_index % self.n_out;
-                let q = &q_act[activation_row * self.k_in..(activation_row + 1) * self.k_in];
-                *slot = packed_row_dot(q, &self.rows[output_channel])? * act_scale[activation_row];
-                Ok::<(), NnError>(())
-            })
-    }
-}
-
-fn validate_packed_row(row: &SaltRow) -> Result<usize, NnError> {
-    if row.planes.len() > u8::MAX as usize {
-        return Err(NnError::Backend(format!(
-            "SALT row has {} planes; maximum is {}",
-            row.planes.len(),
-            u8::MAX
-        )));
-    }
-    let blocks = row.k.div_ceil(QK_K);
-    let plane_bytes = blocks
-        .checked_mul(TQ2_0_BLOCK_BYTES)
-        .ok_or(NnError::Shape {
-            expected: usize::MAX,
-            got: row.k,
-        })?;
-    let mut trits = [Trit::ZERO; QK_K];
-    let mut scale = f16::ZERO;
-    for plane in &row.planes {
-        if plane.len() != plane_bytes {
-            return Err(NnError::Backend(format!(
-                "malformed SALT plane: expected {plane_bytes} bytes, got {}",
-                plane.len()
-            )));
-        }
-        for block in plane.chunks_exact(TQ2_0_BLOCK_BYTES) {
-            unpack_tq2_0_block(block, &mut trits, &mut scale)
-                .map_err(|error| NnError::Backend(error.to_string()))?;
-        }
-    }
-    row.planes
-        .len()
-        .checked_mul(plane_bytes)
-        .ok_or(NnError::Shape {
-            expected: usize::MAX,
-            got: row.planes.len(),
-        })
-}
-
-fn packed_row_dot(act: &[f32], row: &SaltRow) -> Result<f32, NnError> {
-    let mut acc = 0.0f32;
-    let mut trits = [Trit::ZERO; QK_K];
-    let mut weight = [0.0f32; QK_K];
-    let blocks = row.k.div_ceil(QK_K);
-    for block_index in 0..blocks {
-        weight.fill(0.0);
-        for plane in &row.planes {
-            let start = block_index * TQ2_0_BLOCK_BYTES;
-            let block = &plane[start..start + TQ2_0_BLOCK_BYTES];
-            let mut scale = f16::ZERO;
-            unpack_tq2_0_block(block, &mut trits, &mut scale)
-                .map_err(|error| NnError::Backend(error.to_string()))?;
-            let scale = scale.to_f32();
-            for (combined, trit) in weight.iter_mut().zip(&trits) {
-                *combined += scale * trit.to_f32();
+        self.matrix.project_rows(&q_act, m, out)?;
+        for (row, scale) in out.chunks_mut(self.n_out()).zip(act_scale) {
+            for value in row {
+                *value *= scale;
             }
         }
-        let start = block_index * QK_K;
-        let end = (start + QK_K).min(row.k);
-        for index in start..end {
-            acc += act[index] * weight[index - start];
-        }
+        Ok(())
     }
-    Ok(acc)
 }

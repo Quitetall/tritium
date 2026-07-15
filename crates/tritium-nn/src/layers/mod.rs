@@ -8,8 +8,10 @@
 mod dense;
 mod linear;
 mod mlp;
+mod packed_salt;
 mod projection;
 mod salt;
+mod token_embedding;
 mod transformer_block;
 
 pub use dense::DenseLinear;
@@ -17,4 +19,5 @@ pub use linear::TernaryLinear;
 pub use mlp::{Mlp, Relu2Mlp, SwiGluMlp};
 pub use projection::Projection;
 pub use salt::SaltLinear;
+pub use token_embedding::TokenEmbedding;
 pub use transformer_block::{BlockDump, BlockScratch, TransformerBlock};

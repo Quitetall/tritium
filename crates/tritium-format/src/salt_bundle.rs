@@ -18,8 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    FormatError, SALT_HEADER_BYTES, SaltRow, pack_progressive_salt_row, pack_salt_row,
-    packed_salt_row_len, unpack_salt_row_prefix,
+    FormatError, PackedSaltRow, SALT_HEADER_BYTES, SaltRow, pack_progressive_salt_row,
+    pack_salt_row, packed_salt_row_len, unpack_packed_salt_row_prefix,
 };
 
 /// Bundle magic: `b"TSLB"` (Tritium SALT Bundle).
@@ -39,6 +39,19 @@ pub struct SaltTensor {
     pub k: usize,
     /// One [`SaltRow`] per output channel; `rows.len() == rows`.
     pub salt_rows: Vec<SaltRow>,
+}
+
+/// One tensor recovered without expanding progressive sparse residual planes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackedSaltTensor {
+    /// Tensor name (e.g. `"model.layers.0.self_attn.q_proj.weight"`).
+    pub name: String,
+    /// Output channels (rows of the original matrix).
+    pub rows: usize,
+    /// Input features per row.
+    pub k: usize,
+    /// One validated packed row per output channel.
+    pub salt_rows: Vec<PackedSaltRow>,
 }
 
 /// Validated, zero-copy view of one tensor inside a [`SaltBundleIndex`].
@@ -80,6 +93,14 @@ impl<'a> SaltTensorView<'a> {
         self.decode_prefix(usize::MAX)
     }
 
+    /// Decode every additive plane while preserving dense/sparse plane storage.
+    ///
+    /// # Errors
+    /// Returns [`FormatError`] if row framing, shape, or payload validation fails.
+    pub fn decode_packed(self) -> Result<PackedSaltTensor, FormatError> {
+        self.decode_packed_prefix(usize::MAX)
+    }
+
     /// Decode at most `max_planes` additive planes per row.
     ///
     /// All omitted payloads remain validated by [`SaltBundleIndex::new`].
@@ -87,22 +108,43 @@ impl<'a> SaltTensorView<'a> {
     /// # Errors
     /// Returns [`FormatError`] if row framing, shape, or payload validation fails.
     pub fn decode_prefix(self, max_planes: usize) -> Result<SaltTensor, FormatError> {
+        let packed = self.decode_packed_prefix(max_planes)?;
+        let salt_rows = packed
+            .salt_rows
+            .into_iter()
+            .map(PackedSaltRow::into_dense)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SaltTensor {
+            name: packed.name,
+            rows: packed.rows,
+            k: packed.k,
+            salt_rows,
+        })
+    }
+
+    /// Decode at most `max_planes` per row without expanding sparse residuals.
+    ///
+    /// All omitted payloads remain validated by [`SaltBundleIndex::new`].
+    ///
+    /// # Errors
+    /// Returns [`FormatError`] if row framing, shape, or payload validation fails.
+    pub fn decode_packed_prefix(self, max_planes: usize) -> Result<PackedSaltTensor, FormatError> {
         let mut salt_rows = Vec::with_capacity(
             self.rows
                 .min(self.blob.len() / SALT_HEADER_BYTES + usize::from(!self.blob.is_empty())),
         );
         walk_tensor_rows(self.blob, self.rows, |encoded| {
-            let row = unpack_salt_row_prefix(encoded, max_planes)?;
-            if row.k != self.k {
+            let row = unpack_packed_salt_row_prefix(encoded, max_planes)?;
+            if row.k() != self.k {
                 return Err(FormatError::WrongBlockLen {
                     expected: self.k,
-                    got: row.k,
+                    got: row.k(),
                 });
             }
             salt_rows.push(row);
             Ok(())
         })?;
-        Ok(SaltTensor {
+        Ok(PackedSaltTensor {
             name: self.name.to_owned(),
             rows: self.rows,
             k: self.k,
@@ -165,11 +207,11 @@ impl<'a> SaltBundleIndex<'a> {
         for entry in entries {
             let blob = c.take(entry.data_len)?;
             walk_tensor_rows(blob, entry.rows, |encoded| {
-                let row = unpack_salt_row_prefix(encoded, 0)?;
-                if row.k != entry.k {
+                let row = unpack_packed_salt_row_prefix(encoded, 0)?;
+                if row.k() != entry.k {
                     return Err(FormatError::WrongBlockLen {
                         expected: entry.k,
-                        got: row.k,
+                        got: row.k(),
                     });
                 }
                 Ok(())
@@ -410,7 +452,7 @@ fn walk_tensor_rows(
 /// # Errors
 /// [`FormatError::SaltBadMagic`] on a bad magic, [`FormatError::UnsupportedSaltVersion`] on
 /// a version this build can't read, [`FormatError::WrongBlockLen`] on truncation/length
-/// disagreement, or any underlying [`unpack_salt_row`] error.
+/// disagreement, or any underlying [`crate::unpack_salt_row`] error.
 pub fn read_salt_bundle(bytes: &[u8]) -> Result<Vec<SaltTensor>, FormatError> {
     read_salt_bundle_prefix(bytes, usize::MAX)
 }

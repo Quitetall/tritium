@@ -18,12 +18,14 @@
 //! declared type) it holds legacy plain-TQ2 calls [`read_legacy_as_salt`] to wrap
 //! those bytes as a one-plane row — a pre-SALT model loads as flat AbsMean.
 
+use core::mem::size_of;
+
 use half::f16;
 use tritium_core::Trit;
 
 use crate::{
     FormatError, PlaneRepr, QK_K, TQ2_0_BLOCK_BYTES, choose_plane_repr, expand_plane_repr,
-    num_blocks, pack_sparse_plane, unpack_sparse_plane, unpack_tq2_0_row,
+    num_blocks, pack_sparse_plane, sparse_to_tq2_0, unpack_sparse_plane, unpack_tq2_0_row,
 };
 
 /// Sidecar magic: `b"TSLT"` (Tritium SALT).
@@ -69,6 +71,154 @@ impl SaltRow {
     #[inline]
     fn plane_bytes(&self) -> usize {
         num_blocks(self.k) * TQ2_0_BLOCK_BYTES
+    }
+}
+
+/// One SALT row retaining each plane in its selected dense or sparse storage form.
+///
+/// Unlike [`SaltRow`], this representation does not expand progressive sparse residuals
+/// into dense TQ2_0 bytes. Fields stay private so every instance has validated plane
+/// geometry, a dense base plane when non-empty, and canonical sparse coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackedSaltRow {
+    k: usize,
+    planes: Vec<PlaneRepr>,
+}
+
+impl PackedSaltRow {
+    /// Validate and retain one row of adaptive dense/sparse planes.
+    ///
+    /// An empty plane list is a valid all-zero row. A non-empty row must begin with
+    /// a dense plane; only residual planes may be sparse.
+    ///
+    /// # Errors
+    /// Returns a typed format error for oversized rows, malformed dense payloads,
+    /// a sparse base plane, or invalid sparse geometry/coordinates/signs.
+    pub fn new(k: usize, planes: Vec<PlaneRepr>) -> Result<Self, FormatError> {
+        if planes.len() > u8::MAX as usize {
+            return Err(FormatError::SaltTooManyPlanes(planes.len()));
+        }
+        if k > u32::MAX as usize {
+            return Err(FormatError::SaltRowTooLong(k));
+        }
+        if matches!(planes.first(), Some(PlaneRepr::Sparse(_))) {
+            return Err(FormatError::SaltSparseBasePlane);
+        }
+        let plane_bytes =
+            num_blocks(k)
+                .checked_mul(TQ2_0_BLOCK_BYTES)
+                .ok_or(FormatError::WrongBlockLen {
+                    expected: usize::MAX,
+                    got: k,
+                })?;
+        for plane in &planes {
+            match plane {
+                PlaneRepr::Dense(bytes) => validate_dense_plane(bytes, plane_bytes)?,
+                PlaneRepr::Sparse(sparse) => {
+                    if sparse.k != k {
+                        return Err(FormatError::WrongBlockLen {
+                            expected: k,
+                            got: sparse.k,
+                        });
+                    }
+                    // Reuse the canonical serializer's complete validation without retaining
+                    // its temporary framing bytes. PackedSaltRow itself stores the compact
+                    // scales and signed coordinates directly.
+                    let _ = pack_sparse_plane(sparse)?;
+                }
+            }
+        }
+        Ok(Self { k, planes })
+    }
+
+    /// Logical row length `K`.
+    #[must_use]
+    pub const fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Realized additive plane count.
+    #[must_use]
+    pub fn plane_count(&self) -> usize {
+        self.planes.len()
+    }
+
+    /// Validated plane representations in additive order.
+    #[must_use]
+    pub fn planes(&self) -> &[PlaneRepr] {
+        &self.planes
+    }
+
+    /// Number of residual planes retained sparsely.
+    #[must_use]
+    pub fn sparse_plane_count(&self) -> usize {
+        self.planes
+            .iter()
+            .filter(|plane| matches!(plane, PlaneRepr::Sparse(_)))
+            .count()
+    }
+
+    /// Payload bytes represented by the retained dense bytes, sparse scales, and
+    /// packed signed coordinates. Container metadata and allocator overhead are excluded.
+    #[must_use]
+    pub fn resident_payload_bytes(&self) -> usize {
+        self.planes.iter().fold(0usize, |total, plane| {
+            let bytes = match plane {
+                PlaneRepr::Dense(bytes) => bytes.len(),
+                PlaneRepr::Sparse(sparse) => sparse
+                    .scales
+                    .len()
+                    .saturating_mul(size_of::<f16>())
+                    .saturating_add(sparse.idx.len().saturating_mul(size_of::<u32>()))
+                    .saturating_add(sparse.sign.len().saturating_mul(size_of::<i8>())),
+            };
+            total.saturating_add(bytes)
+        })
+    }
+
+    /// Expand sparse residuals into the legacy all-dense [`SaltRow`] representation.
+    ///
+    /// # Errors
+    /// Returns a format error if a retained sparse plane cannot be reconstructed.
+    pub fn to_dense(&self) -> Result<SaltRow, FormatError> {
+        let planes = self
+            .planes
+            .iter()
+            .map(expand_plane_repr)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SaltRow { k: self.k, planes })
+    }
+
+    /// Consume this row and expand only its sparse residuals into legacy dense planes.
+    /// Dense plane allocations are moved directly into the returned [`SaltRow`].
+    ///
+    /// # Errors
+    /// Returns a format error if a retained sparse plane cannot be reconstructed.
+    pub fn into_dense(self) -> Result<SaltRow, FormatError> {
+        let planes = self
+            .planes
+            .into_iter()
+            .map(|plane| match plane {
+                PlaneRepr::Dense(bytes) => Ok(bytes),
+                PlaneRepr::Sparse(sparse) => sparse_to_tq2_0(&sparse),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SaltRow { k: self.k, planes })
+    }
+
+    fn from_validated(k: usize, planes: Vec<PlaneRepr>) -> Self {
+        Self { k, planes }
+    }
+}
+
+impl TryFrom<SaltRow> for PackedSaltRow {
+    type Error = FormatError;
+
+    fn try_from(row: SaltRow) -> Result<Self, Self::Error> {
+        Self::new(
+            row.k,
+            row.planes.into_iter().map(PlaneRepr::Dense).collect(),
+        )
     }
 }
 
@@ -352,14 +502,25 @@ pub fn unpack_salt_row(bytes: &[u8]) -> Result<SaltRow, FormatError> {
     unpack_salt_row_prefix(bytes, usize::MAX)
 }
 
-/// Parse a SALT row while materializing at most `max_planes` additive planes.
+/// Parse a SALT row while retaining progressive sparse residuals.
 ///
-/// All descriptors and payloads are still validated. Legacy v1 rows and progressive
-/// v2 rows share the same returned dense [`SaltRow`] runtime representation.
+/// # Errors
+/// Same malformed-input errors as [`unpack_salt_row`].
+pub fn unpack_packed_salt_row(bytes: &[u8]) -> Result<PackedSaltRow, FormatError> {
+    unpack_packed_salt_row_prefix(bytes, usize::MAX)
+}
+
+/// Parse a SALT row while retaining at most `max_planes` in their encoded dense/sparse form.
+///
+/// Every descriptor and payload is still validated, including omitted planes. Legacy v1
+/// rows are represented as dense planes; progressive v2 sparse residuals remain sparse.
 ///
 /// # Errors
 /// Same errors as [`packed_salt_row_len`], plus malformed dense/sparse payload errors.
-pub fn unpack_salt_row_prefix(bytes: &[u8], max_planes: usize) -> Result<SaltRow, FormatError> {
+pub fn unpack_packed_salt_row_prefix(
+    bytes: &[u8],
+    max_planes: usize,
+) -> Result<PackedSaltRow, FormatError> {
     let layout = parse_salt_row_layout(bytes)?;
     if bytes.len() != layout.encoded_len {
         return Err(FormatError::WrongBlockLen {
@@ -376,7 +537,7 @@ pub fn unpack_salt_row_prefix(bytes: &[u8], max_planes: usize) -> Result<SaltRow
                 let payload = &bytes[offset..offset + layout.plane_bytes];
                 validate_dense_plane(payload, layout.plane_bytes)?;
                 if index < keep {
-                    planes.push(payload.to_vec());
+                    planes.push(PlaneRepr::Dense(payload.to_vec()));
                 }
             }
         }
@@ -389,7 +550,7 @@ pub fn unpack_salt_row_prefix(bytes: &[u8], max_planes: usize) -> Result<SaltRow
                     PLANE_TAG_DENSE => {
                         validate_dense_plane(payload, layout.plane_bytes)?;
                         if index < keep {
-                            planes.push(payload.to_vec());
+                            planes.push(PlaneRepr::Dense(payload.to_vec()));
                         }
                     }
                     PLANE_TAG_SPARSE => {
@@ -401,7 +562,7 @@ pub fn unpack_salt_row_prefix(bytes: &[u8], max_planes: usize) -> Result<SaltRow
                             });
                         }
                         if index < keep {
-                            planes.push(expand_plane_repr(&PlaneRepr::Sparse(sparse))?);
+                            planes.push(PlaneRepr::Sparse(sparse));
                         }
                     }
                     _ => unreachable!("plane tag validated"),
@@ -411,10 +572,18 @@ pub fn unpack_salt_row_prefix(bytes: &[u8], max_planes: usize) -> Result<SaltRow
         }
         _ => unreachable!("row version validated"),
     }
-    Ok(SaltRow {
-        k: layout.k,
-        planes,
-    })
+    Ok(PackedSaltRow::from_validated(layout.k, planes))
+}
+
+/// Parse a SALT row while materializing at most `max_planes` additive planes.
+///
+/// All descriptors and payloads are still validated. Legacy v1 rows and progressive
+/// v2 rows share the same returned dense [`SaltRow`] runtime representation.
+///
+/// # Errors
+/// Same errors as [`packed_salt_row_len`], plus malformed dense/sparse payload errors.
+pub fn unpack_salt_row_prefix(bytes: &[u8], max_planes: usize) -> Result<SaltRow, FormatError> {
+    unpack_packed_salt_row_prefix(bytes, max_planes)?.into_dense()
 }
 
 /// Wrap a legacy plain-TQ2 row (no SALT header) as a one-plane [`SaltRow`].
