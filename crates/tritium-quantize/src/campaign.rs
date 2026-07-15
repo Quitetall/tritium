@@ -19,6 +19,9 @@ const LEGACY_CAMPAIGN_VERSION: u8 = 2;
 const PHYSICAL_REPORT_CAMPAIGN_VERSION: u8 = 4;
 const PROVENANCE_VERSION: u8 = 1;
 const RECIPE_VERSION: u8 = 1;
+const DIGEST_BYTES: usize = 32;
+const LEGACY_POINT_MIN_BYTES: usize = DIGEST_BYTES * 2 + 8 + 4 + 8 + 5;
+const PHYSICAL_REPORT_POINT_MIN_BYTES: usize = LEGACY_POINT_MIN_BYTES + 1;
 const CALIBRATION_ID_CONTEXT: &str = "tritium calibration provenance id v1";
 const CAMPAIGN_ID_CONTEXT: &str = "tritium campaign ledger id v1";
 const EVALUATION_ID_CONTEXT: &str = "tritium evaluation provenance id v1";
@@ -1526,6 +1529,129 @@ impl CampaignLedger {
         }
     }
 
+    /// Restore a byte-for-byte canonical version-2 or version-4 campaign ledger.
+    ///
+    /// Parsing is bounded by the supplied slice: declared record lengths and the
+    /// point count are checked against remaining bytes before allocation. Every
+    /// decoded provenance record, metric, physical report, and point is rebuilt
+    /// through its validated constructor, then the complete ledger is re-encoded
+    /// and required to equal `bytes`. This rejects alternate encodings, point
+    /// reordering, duplicate packages, inconsistent physical accounting, and
+    /// trailing data.
+    ///
+    /// Embedded model and package digests are restored as already-domain-separated
+    /// identities. This operation does not prove possession of their source
+    /// manifest or package bytes; callers requiring that evidence must separately
+    /// remeasure the referenced artifacts.
+    ///
+    /// # Errors
+    /// Returns [`CampaignError`] for malformed, unsupported, truncated,
+    /// noncanonical, oversized, or internally inconsistent bytes.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CampaignError> {
+        let mut cursor = CampaignDecodeCursor::new(bytes);
+        if cursor.array::<4>("campaign magic")? != CAMPAIGN_MAGIC {
+            return Err(CampaignError::BadRecordMagic("campaign"));
+        }
+        let version = cursor.u8("campaign version")?;
+        let point_min_bytes = match version {
+            LEGACY_CAMPAIGN_VERSION => LEGACY_POINT_MIN_BYTES,
+            PHYSICAL_REPORT_CAMPAIGN_VERSION => PHYSICAL_REPORT_POINT_MIN_BYTES,
+            _ => {
+                return Err(CampaignError::UnsupportedRecordVersion {
+                    record: "campaign",
+                    version,
+                });
+            }
+        };
+        let source_model_id = ModelId::from_digest(cursor.array("source model id")?);
+        let calibration =
+            decode_calibration_provenance(cursor.length_prefixed("calibration record")?)?;
+        let evaluation =
+            decode_evaluation_provenance(cursor.length_prefixed("evaluation record")?)?;
+        let point_count = cursor.u32("campaign point count")? as usize;
+        if point_count > cursor.remaining() / point_min_bytes {
+            return Err(CampaignError::TruncatedRecord("campaign points"));
+        }
+
+        let calibration_id = calibration.id();
+        let evaluation_id = evaluation.id();
+        let mut ledger = Self::new(source_model_id, calibration, evaluation);
+        ledger.points.try_reserve_exact(point_count).map_err(|_| {
+            CampaignError::CampaignAllocationFailed {
+                field: "campaign points",
+                count: point_count,
+            }
+        })?;
+        let mut previous_package_id: Option<PackageId> = None;
+        for _ in 0..point_count {
+            let model_id = ModelId::from_digest(cursor.array("point model id")?);
+            let package = MeasuredPackage {
+                id: PackageId::from_digest(cursor.array("point package id")?),
+                physical_bytes: cursor.u64("point physical bytes")?,
+            };
+            if let Some(previous) = previous_package_id {
+                match previous.as_bytes().cmp(package.id().as_bytes()) {
+                    Ordering::Less => {}
+                    Ordering::Equal => return Err(CampaignError::DuplicatePackage(package.id())),
+                    Ordering::Greater => return Err(CampaignError::NonCanonicalCampaign),
+                }
+            }
+            previous_package_id = Some(package.id());
+            validate_nonzero("physical_bytes", package.physical_bytes)?;
+            let recipe = decode_recipe_provenance(cursor.length_prefixed("recipe record")?)?;
+            let logical_bpw = cursor.f64("logical_bpw")?;
+            let perplexity = cursor.optional_f64("perplexity")?;
+            let reconstruction_mse = cursor.optional_f64("reconstruction_mse")?;
+            let task_score = cursor.optional_f64("task_score")?;
+            let tokens_per_second = cursor.optional_f64("tokens_per_second")?;
+            let peak_vram_bytes = cursor.optional_u64("peak_vram_bytes")?;
+            let physical_size_report = if version == PHYSICAL_REPORT_CAMPAIGN_VERSION {
+                decode_optional_physical_report(&mut cursor, package)?
+            } else {
+                None
+            };
+
+            let mut metrics = CampaignMetrics::new(logical_bpw)?;
+            if let Some(value) = perplexity {
+                metrics = metrics.with_perplexity(value)?;
+            }
+            if let Some(value) = reconstruction_mse {
+                metrics = metrics.with_reconstruction_mse(value)?;
+            }
+            if let Some(value) = task_score {
+                metrics = metrics.with_task_score(value)?;
+            }
+            if let Some(value) = tokens_per_second {
+                metrics = metrics.with_tokens_per_second(value)?;
+            }
+            if let Some(value) = peak_vram_bytes {
+                metrics = metrics.with_peak_vram_bytes(value)?;
+            }
+            if let Some(report) = physical_size_report {
+                metrics = metrics.with_physical_size_report(report)?;
+            }
+            let point = CampaignPoint::new(
+                source_model_id,
+                model_id,
+                package,
+                recipe,
+                calibration_id,
+                evaluation_id,
+                metrics,
+            );
+            ledger.validate_point(&point)?;
+            ledger.points.push(point);
+        }
+        if cursor.remaining() != 0 {
+            return Err(CampaignError::TrailingCampaignBytes(cursor.remaining()));
+        }
+
+        if ledger.canonical_bytes()?.as_slice() != bytes {
+            return Err(CampaignError::NonCanonicalCampaign);
+        }
+        Ok(ledger)
+    }
+
     /// Full-precision source model shared by every point.
     pub fn source_model_id(&self) -> ModelId {
         self.source_model_id
@@ -1565,6 +1691,19 @@ impl CampaignLedger {
     /// [`CampaignError::DuplicatePackage`] when exact package bytes were already
     /// recorded.
     pub fn add(&mut self, point: CampaignPoint) -> Result<(), CampaignError> {
+        self.validate_point(&point)?;
+        if self
+            .points
+            .iter()
+            .any(|existing| existing.package_id() == point.package_id())
+        {
+            return Err(CampaignError::DuplicatePackage(point.package_id()));
+        }
+        self.points.push(point);
+        Ok(())
+    }
+
+    fn validate_point(&self, point: &CampaignPoint) -> Result<(), CampaignError> {
         if point.source_model_id != self.source_model_id {
             return Err(CampaignError::ProvenanceMismatch("source_model"));
         }
@@ -1586,14 +1725,6 @@ impl CampaignLedger {
                 });
             }
         }
-        if self
-            .points
-            .iter()
-            .any(|existing| existing.package_id() == point.package_id())
-        {
-            return Err(CampaignError::DuplicatePackage(point.package_id()));
-        }
-        self.points.push(point);
         Ok(())
     }
 
@@ -1664,8 +1795,8 @@ impl CampaignLedger {
     /// encoding and identity. A ledger containing any physical report uses the
     /// version-4 encoding, in which every point carries an explicit absent/present
     /// marker and present reports bind exact trits, map bits, components, and
-    /// optional peak measurements. Neither
-    /// version is yet an interchange format; no public decoder is provided.
+    /// optional peak measurements. Both versions are accepted by
+    /// [`Self::from_canonical_bytes`].
     ///
     /// # Errors
     /// Returns [`CampaignError::RecordTooLarge`] if a canonical u32 count or
@@ -1736,6 +1867,235 @@ impl CampaignLedger {
             CAMPAIGN_ID_CONTEXT,
             &self.canonical_bytes()?,
         )))
+    }
+}
+
+fn decode_calibration_provenance(bytes: &[u8]) -> Result<CalibrationProvenance, CampaignError> {
+    let mut cursor = CampaignDecodeCursor::new(bytes);
+    if cursor.array::<4>("calibration magic")? != CALIBRATION_MAGIC {
+        return Err(CampaignError::BadRecordMagic("calibration"));
+    }
+    let version = cursor.u8("calibration version")?;
+    if version != PROVENANCE_VERSION {
+        return Err(CampaignError::UnsupportedRecordVersion {
+            record: "calibration",
+            version,
+        });
+    }
+    let value = CalibrationProvenance::new(
+        cursor.string("calibration dataset")?,
+        cursor.string("calibration revision")?,
+        cursor.array("calibration sample digest")?,
+        cursor.array("calibration tokenizer digest")?,
+        cursor.u64("calibration sample count")?,
+        cursor.u64("calibration token count")?,
+        cursor.u32("calibration sequence length")?,
+        cursor.u64("calibration seed")?,
+    )?;
+    if cursor.remaining() != 0 || value.canonical_bytes().as_slice() != bytes {
+        return Err(CampaignError::NonCanonicalCampaign);
+    }
+    Ok(value)
+}
+
+fn decode_evaluation_provenance(bytes: &[u8]) -> Result<EvaluationProvenance, CampaignError> {
+    let mut cursor = CampaignDecodeCursor::new(bytes);
+    if cursor.array::<4>("evaluation magic")? != EVALUATION_MAGIC {
+        return Err(CampaignError::BadRecordMagic("evaluation"));
+    }
+    let version = cursor.u8("evaluation version")?;
+    if version != PROVENANCE_VERSION {
+        return Err(CampaignError::UnsupportedRecordVersion {
+            record: "evaluation",
+            version,
+        });
+    }
+    let value = EvaluationProvenance::new(
+        cursor.string("evaluation suite")?,
+        cursor.string("evaluation revision")?,
+        cursor.array("evaluation sample digest")?,
+        cursor.array("evaluation tokenizer digest")?,
+        cursor.array("evaluation harness digest")?,
+        cursor.u64("evaluation sample count")?,
+        cursor.u64("evaluation token count")?,
+    )?;
+    if cursor.remaining() != 0 || value.canonical_bytes().as_slice() != bytes {
+        return Err(CampaignError::NonCanonicalCampaign);
+    }
+    Ok(value)
+}
+
+fn decode_recipe_provenance(bytes: &[u8]) -> Result<RecipeProvenance, CampaignError> {
+    let mut cursor = CampaignDecodeCursor::new(bytes);
+    if cursor.array::<4>("recipe magic")? != RECIPE_MAGIC {
+        return Err(CampaignError::BadRecordMagic("recipe"));
+    }
+    let version = cursor.u8("recipe version")?;
+    if version != RECIPE_VERSION {
+        return Err(CampaignError::UnsupportedRecordVersion {
+            record: "recipe",
+            version,
+        });
+    }
+    let value = RecipeProvenance::new(
+        cursor.string("recipe implementation")?,
+        cursor.string("recipe revision")?,
+        cursor.owned_length_prefixed("recipe canonical config")?,
+        cursor.string("recipe command")?,
+    )?;
+    if cursor.remaining() != 0 || value.canonical_bytes().as_slice() != bytes {
+        return Err(CampaignError::NonCanonicalCampaign);
+    }
+    Ok(value)
+}
+
+fn decode_optional_physical_report(
+    cursor: &mut CampaignDecodeCursor<'_>,
+    package: MeasuredPackage,
+) -> Result<Option<PhysicalSizeReport>, CampaignError> {
+    match cursor.u8("physical report presence")? {
+        0 => Ok(None),
+        1 => {
+            let core_parameter_count = cursor.u64("physical core parameter count")?;
+            let model_parameter_count = cursor.u64("physical model parameter count")?;
+            let logical_core_trits =
+                LogicalTritCount::new(cursor.u64("physical logical core trits")?)?;
+            let serialized = SerializedSizeComponents::new(
+                cursor.u64("serialized core payload bytes")?,
+                cursor.u64("serialized core scale bytes")?,
+                cursor.u64("serialized allocation map bytes")?,
+                cursor.u64("serialized allocation map bits")?,
+                cursor.u64("serialized allocation map embedded bits")?,
+                cursor.u64("serialized header bytes")?,
+                cursor.u64("serialized transform bytes")?,
+                cursor.u64("serialized preserved bytes")?,
+                cursor.u64("serialized alignment bytes")?,
+            );
+            let resident = ResidentSizeComponents::new(
+                cursor.u64("resident core bytes")?,
+                cursor.u64("resident map bytes")?,
+                cursor.u64("resident map bits")?,
+                cursor.u64("resident map embedded bits")?,
+                cursor.u64("resident descriptor bytes")?,
+                cursor.u64("resident preserved bytes")?,
+                cursor.u64("resident shadow bytes")?,
+                cursor.optional_u64("resident peak workspace bytes")?,
+            );
+            PhysicalSizeReport::new(
+                package,
+                core_parameter_count,
+                model_parameter_count,
+                logical_core_trits,
+                serialized,
+                resident,
+            )
+            .map(Some)
+        }
+        value => Err(CampaignError::InvalidCampaignTag {
+            field: "physical report presence",
+            value,
+        }),
+    }
+}
+
+struct CampaignDecodeCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CampaignDecodeCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    const fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
+    fn take(&mut self, len: usize, field: &'static str) -> Result<&'a [u8], CampaignError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(CampaignError::TruncatedRecord(field))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(CampaignError::TruncatedRecord(field))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self, field: &'static str) -> Result<[u8; N], CampaignError> {
+        Ok(self
+            .take(N, field)?
+            .try_into()
+            .expect("campaign decoder requested an exact-size slice"))
+    }
+
+    fn u8(&mut self, field: &'static str) -> Result<u8, CampaignError> {
+        Ok(self.take(1, field)?[0])
+    }
+
+    fn u32(&mut self, field: &'static str) -> Result<u32, CampaignError> {
+        Ok(u32::from_le_bytes(self.array(field)?))
+    }
+
+    fn u64(&mut self, field: &'static str) -> Result<u64, CampaignError> {
+        Ok(u64::from_le_bytes(self.array(field)?))
+    }
+
+    fn f64(&mut self, field: &'static str) -> Result<f64, CampaignError> {
+        Ok(f64::from_bits(self.u64(field)?))
+    }
+
+    fn length_prefixed(&mut self, field: &'static str) -> Result<&'a [u8], CampaignError> {
+        let len =
+            usize::try_from(self.u32(field)?).map_err(|_| CampaignError::RecordTooLarge(field))?;
+        self.take(len, field)
+    }
+
+    fn string(&mut self, field: &'static str) -> Result<String, CampaignError> {
+        let bytes = self.length_prefixed(field)?;
+        let value =
+            core::str::from_utf8(bytes).map_err(|_| CampaignError::InvalidCampaignUtf8(field))?;
+        let mut owned = String::new();
+        owned.try_reserve_exact(value.len()).map_err(|_| {
+            CampaignError::CampaignAllocationFailed {
+                field,
+                count: value.len(),
+            }
+        })?;
+        owned.push_str(value);
+        Ok(owned)
+    }
+
+    fn owned_length_prefixed(&mut self, field: &'static str) -> Result<Vec<u8>, CampaignError> {
+        let bytes = self.length_prefixed(field)?;
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(bytes.len()).map_err(|_| {
+            CampaignError::CampaignAllocationFailed {
+                field,
+                count: bytes.len(),
+            }
+        })?;
+        owned.extend_from_slice(bytes);
+        Ok(owned)
+    }
+
+    fn optional_f64(&mut self, field: &'static str) -> Result<Option<f64>, CampaignError> {
+        match self.u8(field)? {
+            0 => Ok(None),
+            1 => self.f64(field).map(Some),
+            value => Err(CampaignError::InvalidCampaignTag { field, value }),
+        }
+    }
+
+    fn optional_u64(&mut self, field: &'static str) -> Result<Option<u64>, CampaignError> {
+        match self.u8(field)? {
+            0 => Ok(None),
+            1 => self.u64(field).map(Some),
+            value => Err(CampaignError::InvalidCampaignTag { field, value }),
+        }
     }
 }
 
@@ -2054,6 +2414,37 @@ pub enum CampaignError {
         /// Requested metric.
         objective: CampaignObjective,
     },
+    /// A canonical campaign or embedded record had the wrong magic bytes.
+    BadRecordMagic(&'static str),
+    /// A canonical campaign or embedded record used an unsupported version.
+    UnsupportedRecordVersion {
+        /// Record whose version was rejected.
+        record: &'static str,
+        /// Encoded version byte.
+        version: u8,
+    },
+    /// Input ended before a fixed or declared campaign field completed.
+    TruncatedRecord(&'static str),
+    /// Bytes remained after the declared campaign points were decoded.
+    TrailingCampaignBytes(usize),
+    /// An optional-field discriminant was not zero or one.
+    InvalidCampaignTag {
+        /// Optional field whose tag was invalid.
+        field: &'static str,
+        /// Encoded tag byte.
+        value: u8,
+    },
+    /// A textual campaign field was not valid UTF-8.
+    InvalidCampaignUtf8(&'static str),
+    /// A bounded allocation for decoded campaign data failed.
+    CampaignAllocationFailed {
+        /// Decoded field being allocated.
+        field: &'static str,
+        /// Requested byte or element count.
+        count: usize,
+    },
+    /// Decoded values did not re-encode to the exact supplied bytes.
+    NonCanonicalCampaign,
     /// Canonical campaign record exceeded a u32 count or embedded length.
     RecordTooLarge(&'static str),
     /// Exact package measurement could not open or read its byte stream.
@@ -2131,6 +2522,31 @@ impl fmt::Display for CampaignError {
                 f,
                 "campaign package `{package_id}` lacks objective {objective:?}"
             ),
+            Self::BadRecordMagic(record) => {
+                write!(f, "campaign {record} record has bad magic")
+            }
+            Self::UnsupportedRecordVersion { record, version } => {
+                write!(f, "unsupported campaign {record} record version {version}")
+            }
+            Self::TruncatedRecord(field) => {
+                write!(f, "campaign record is truncated in {field}")
+            }
+            Self::TrailingCampaignBytes(count) => {
+                write!(f, "campaign record has {count} trailing bytes")
+            }
+            Self::InvalidCampaignTag { field, value } => {
+                write!(f, "campaign field `{field}` has invalid tag {value}")
+            }
+            Self::InvalidCampaignUtf8(field) => {
+                write!(f, "campaign field `{field}` is not valid UTF-8")
+            }
+            Self::CampaignAllocationFailed { field, count } => {
+                write!(
+                    f,
+                    "campaign field `{field}` could not allocate {count} units"
+                )
+            }
+            Self::NonCanonicalCampaign => f.write_str("campaign record is not canonically encoded"),
             Self::RecordTooLarge(field) => {
                 write!(f, "campaign record `{field}` exceeds canonical capacity")
             }
@@ -2247,6 +2663,123 @@ mod tests {
             ),
         )
         .expect("physical report")
+    }
+
+    fn legacy_campaign_fixture() -> CampaignLedger {
+        let source = model_id(1);
+        let calibration = calibration([1; 32]);
+        let evaluation = evaluation();
+        let mut ledger = CampaignLedger::new(source, calibration.clone(), evaluation.clone());
+        for seed in [2, 3] {
+            let point = CampaignPoint::new(
+                source,
+                model_id(seed),
+                MeasuredPackage::from_bytes(&[seed; 4]).expect("package"),
+                recipe(seed),
+                calibration.id(),
+                evaluation.id(),
+                CampaignMetrics::new(2.0).expect("metrics"),
+            );
+            ledger.add(point).expect("point");
+        }
+        ledger
+    }
+
+    fn physical_campaign_fixture() -> CampaignLedger {
+        let source = model_id(1);
+        let calibration = calibration([1; 32]);
+        let evaluation = evaluation();
+        let package_bytes = b"component-ledger";
+        let package = MeasuredPackage::from_bytes(package_bytes).expect("package");
+        let report = simple_physical_report(package_bytes, 64, 80, 8, 2, 6);
+        let metrics = CampaignMetrics::new(2.0)
+            .expect("metrics")
+            .with_perplexity(8.5)
+            .expect("perplexity")
+            .with_reconstruction_mse(0.125)
+            .expect("mse")
+            .with_task_score(0.75)
+            .expect("score")
+            .with_tokens_per_second(42.0)
+            .expect("throughput")
+            .with_physical_size_report(report)
+            .expect("report");
+        let point = CampaignPoint::new(
+            source,
+            model_id(2),
+            package,
+            recipe(2),
+            calibration.id(),
+            evaluation.id(),
+            metrics,
+        );
+        let mut ledger = CampaignLedger::new(source, calibration, evaluation);
+        ledger.add(point).expect("point");
+        ledger
+    }
+
+    fn campaign_layout(bytes: &[u8]) -> (usize, Vec<core::ops::Range<usize>>, Vec<Option<usize>>) {
+        let mut cursor = CampaignDecodeCursor::new(bytes);
+        cursor.take(4, "magic").expect("magic");
+        let version = cursor.u8("version").expect("version");
+        cursor.take(DIGEST_BYTES, "source").expect("source");
+        cursor.length_prefixed("calibration").expect("calibration");
+        cursor.length_prefixed("evaluation").expect("evaluation");
+        let point_count_offset = cursor.offset;
+        let point_count = cursor.u32("count").expect("count") as usize;
+        let mut ranges = Vec::new();
+        let mut physical_offsets = Vec::new();
+        for _ in 0..point_count {
+            let start = cursor.offset;
+            cursor
+                .take(DIGEST_BYTES * 2 + 8, "point identities")
+                .expect("point identities");
+            cursor.length_prefixed("recipe").expect("recipe");
+            cursor.take(8, "logical bpw").expect("logical bpw");
+            for field in ["perplexity", "mse", "score", "throughput"] {
+                cursor.optional_f64(field).expect("optional f64");
+            }
+            cursor.optional_u64("peak").expect("optional peak");
+            if version == PHYSICAL_REPORT_CAMPAIGN_VERSION {
+                let report_offset = cursor.offset;
+                match cursor.u8("report").expect("report") {
+                    0 => {}
+                    1 => {
+                        cursor
+                            .take(19 * 8, "physical counters")
+                            .expect("physical counters");
+                        cursor.optional_u64("workspace").expect("workspace");
+                    }
+                    _ => panic!("fixture has invalid physical report tag"),
+                }
+                physical_offsets.push(Some(report_offset));
+            } else {
+                physical_offsets.push(None);
+            }
+            ranges.push(start..cursor.offset);
+        }
+        assert_eq!(cursor.remaining(), 0);
+        (point_count_offset, ranges, physical_offsets)
+    }
+
+    fn calibration_field_offsets(bytes: &[u8]) -> (usize, usize) {
+        let calibration_start = 4 + 1 + DIGEST_BYTES + 4;
+        let calibration_len = u32::from_le_bytes(
+            bytes[calibration_start - 4..calibration_start]
+                .try_into()
+                .expect("calibration length"),
+        ) as usize;
+        let mut cursor = CampaignDecodeCursor::new(
+            &bytes[calibration_start..calibration_start + calibration_len],
+        );
+        cursor.take(5, "header").expect("calibration header");
+        let dataset_len = cursor.u32("dataset len").expect("dataset len") as usize;
+        let dataset_offset = calibration_start + cursor.offset;
+        cursor.take(dataset_len, "dataset").expect("dataset");
+        cursor.length_prefixed("revision").expect("revision");
+        cursor.take(DIGEST_BYTES * 2, "digests").expect("digests");
+        let sample_count_offset = calibration_start + cursor.offset;
+        (dataset_offset, sample_count_offset)
     }
 
     #[test]
@@ -3054,6 +3587,169 @@ mod tests {
                 .map(|point| point.package_id())
                 .collect::<Vec<_>>(),
             vec![compact.package_id(), accurate.package_id()]
+        );
+    }
+
+    #[test]
+    fn campaign_decoder_round_trips_v2_and_v4_bytes_and_identity() {
+        for expected in [legacy_campaign_fixture(), physical_campaign_fixture()] {
+            let bytes = expected.canonical_bytes().expect("encode");
+            let expected_id = expected.id().expect("campaign id");
+            let decoded = CampaignLedger::from_canonical_bytes(&bytes).expect("decode");
+
+            assert_eq!(decoded.canonical_bytes().expect("re-encode"), bytes);
+            assert_eq!(decoded.id().expect("decoded id"), expected_id);
+            assert_eq!(decoded.source_model_id(), expected.source_model_id());
+            assert_eq!(decoded.calibration(), expected.calibration());
+            assert_eq!(decoded.evaluation(), expected.evaluation());
+            assert_eq!(decoded.points().len(), expected.points().len());
+        }
+    }
+
+    #[test]
+    fn campaign_decoder_rejects_every_truncation_and_trailing_bytes() {
+        let bytes = physical_campaign_fixture()
+            .canonical_bytes()
+            .expect("encode");
+        for end in 0..bytes.len() {
+            assert!(
+                matches!(
+                    CampaignLedger::from_canonical_bytes(&bytes[..end]),
+                    Err(CampaignError::TruncatedRecord(_))
+                ),
+                "prefix ending at {end} must be rejected as truncated"
+            );
+        }
+
+        let mut trailing = bytes;
+        trailing.extend_from_slice(&[0xaa, 0x55]);
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&trailing),
+            Err(CampaignError::TrailingCampaignBytes(2))
+        );
+    }
+
+    #[test]
+    fn campaign_decoder_rejects_bad_magic_versions_tags_and_utf8() {
+        let bytes = legacy_campaign_fixture().canonical_bytes().expect("encode");
+
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 1;
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&bad_magic),
+            Err(CampaignError::BadRecordMagic("campaign"))
+        );
+
+        let mut bad_version = bytes.clone();
+        bad_version[4] = 3;
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&bad_version),
+            Err(CampaignError::UnsupportedRecordVersion {
+                record: "campaign",
+                version: 3,
+            })
+        );
+
+        let mut bad_tag = bytes.clone();
+        let (_, point_ranges, _) = campaign_layout(&bytes);
+        let last_point = point_ranges.last().expect("point");
+        bad_tag[last_point.end - 1] = 2;
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&bad_tag),
+            Err(CampaignError::InvalidCampaignTag {
+                field: "peak_vram_bytes",
+                value: 2,
+            })
+        );
+
+        let mut bad_utf8 = bytes;
+        let (dataset_offset, _) = calibration_field_offsets(&bad_utf8);
+        bad_utf8[dataset_offset] = 0xff;
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&bad_utf8),
+            Err(CampaignError::InvalidCampaignUtf8("calibration dataset"))
+        );
+    }
+
+    #[test]
+    fn campaign_decoder_bounds_declared_lengths_and_point_counts_before_allocation() {
+        let bytes = legacy_campaign_fixture().canonical_bytes().expect("encode");
+        let mut oversized_calibration = bytes.clone();
+        let calibration_len_offset = 4 + 1 + DIGEST_BYTES;
+        oversized_calibration[calibration_len_offset..calibration_len_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&oversized_calibration),
+            Err(CampaignError::TruncatedRecord("calibration record"))
+        );
+
+        let mut oversized_count = bytes;
+        let (point_count_offset, _, _) = campaign_layout(&oversized_count);
+        oversized_count[point_count_offset..point_count_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&oversized_count),
+            Err(CampaignError::TruncatedRecord("campaign points"))
+        );
+    }
+
+    #[test]
+    fn campaign_decoder_rejects_noncanonical_order_and_duplicate_packages() {
+        let bytes = legacy_campaign_fixture().canonical_bytes().expect("encode");
+        let (_, ranges, _) = campaign_layout(&bytes);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].len(), ranges[1].len());
+
+        let first = bytes[ranges[0].clone()].to_vec();
+        let second = bytes[ranges[1].clone()].to_vec();
+        let mut reversed = bytes.clone();
+        reversed[ranges[0].clone()].copy_from_slice(&second);
+        reversed[ranges[1].clone()].copy_from_slice(&first);
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&reversed),
+            Err(CampaignError::NonCanonicalCampaign)
+        );
+
+        let first_package =
+            bytes[ranges[0].start + DIGEST_BYTES..ranges[0].start + DIGEST_BYTES * 2].to_vec();
+        let mut duplicate = bytes;
+        duplicate[ranges[1].start + DIGEST_BYTES..ranges[1].start + DIGEST_BYTES * 2]
+            .copy_from_slice(&first_package);
+        assert!(matches!(
+            CampaignLedger::from_canonical_bytes(&duplicate),
+            Err(CampaignError::DuplicatePackage(_))
+        ));
+    }
+
+    #[test]
+    fn campaign_decoder_reapplies_provenance_and_physical_package_validation() {
+        let mut invalid_provenance = legacy_campaign_fixture().canonical_bytes().expect("encode");
+        let (_, sample_count_offset) = calibration_field_offsets(&invalid_provenance);
+        invalid_provenance[sample_count_offset..sample_count_offset + 8].fill(0);
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&invalid_provenance),
+            Err(CampaignError::ZeroValue("sample_count"))
+        );
+
+        let mut invalid_physical = physical_campaign_fixture()
+            .canonical_bytes()
+            .expect("encode");
+        let (_, _, report_offsets) = campaign_layout(&invalid_physical);
+        let report_offset = report_offsets[0].expect("physical report");
+        let serialized_payload_offset = report_offset + 1 + 3 * 8;
+        let payload = u64::from_le_bytes(
+            invalid_physical[serialized_payload_offset..serialized_payload_offset + 8]
+                .try_into()
+                .expect("payload bytes"),
+        );
+        invalid_physical[serialized_payload_offset..serialized_payload_offset + 8]
+            .copy_from_slice(&(payload + 1).to_le_bytes());
+        assert_eq!(
+            CampaignLedger::from_canonical_bytes(&invalid_physical),
+            Err(CampaignError::PhysicalPackageSizeMismatch {
+                measured_bytes: 16,
+                component_bytes: 17,
+            })
         );
     }
 
