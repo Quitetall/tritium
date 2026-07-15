@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use tritium_format::SafeTensorsReader;
+use tritium_format::{SafeTensorsError, SafeTensorsReader, VisitTensorBytesError};
 
 use crate::error::NnError;
 
@@ -119,12 +119,112 @@ struct HfShard {
     reader: RefCell<SafeTensorsReader<File>>,
 }
 
+#[derive(Debug)]
+struct HfTensorRecord {
+    name: String,
+    dtype: String,
+    shape: Vec<usize>,
+    shard_id: usize,
+}
+
+#[derive(Debug)]
+struct HfTensorLocation {
+    dtype: String,
+    shape: Vec<usize>,
+    shard_id: usize,
+}
+
+/// Immutable metadata for one indexed Hugging Face tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HfTensorMetadata<'a> {
+    pub(super) name: &'a str,
+    pub(super) dtype: &'a str,
+    pub(super) shape: &'a [usize],
+    /// Stable ordinal assigned by lexical shard-path order within this set.
+    pub(super) shard_id: usize,
+    pub(super) shard_path: &'a Path,
+}
+
+/// Error from streaming a tensor out of an indexed Hugging Face shard.
+#[allow(dead_code, reason = "consumed by the source-bound Qwen adapter seam")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HfTensorBytesError<E> {
+    /// The set does not index the requested tensor.
+    MissingTensor(String),
+    /// A callback attempted to read the same shard recursively.
+    ReentrantShard(PathBuf),
+    /// A tensor record references no opened shard.
+    InvalidShardId { name: String, shard_id: usize },
+    /// The canonical metadata index and its originating reader disagree.
+    MetadataMismatch { name: String, shard_path: PathBuf },
+    /// The already-open safetensors source failed.
+    Source {
+        name: String,
+        shard_path: PathBuf,
+        error: SafeTensorsError,
+    },
+    /// The caller-provided byte sink stopped the stream.
+    Sink(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for HfTensorBytesError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingTensor(name) => write!(formatter, "missing HF tensor `{name}`"),
+            Self::ReentrantShard(path) => {
+                write!(
+                    formatter,
+                    "reentrant read of safetensors shard {}",
+                    path.display()
+                )
+            }
+            Self::InvalidShardId { name, shard_id } => {
+                write!(
+                    formatter,
+                    "HF tensor `{name}` references absent shard {shard_id}"
+                )
+            }
+            Self::MetadataMismatch { name, shard_path } => write!(
+                formatter,
+                "HF tensor `{name}` metadata disagrees with shard {}",
+                shard_path.display()
+            ),
+            Self::Source {
+                name,
+                shard_path,
+                error,
+            } => write!(
+                formatter,
+                "read HF tensor `{name}` from {}: {error}",
+                shard_path.display()
+            ),
+            Self::Sink(error) => write!(formatter, "HF tensor byte sink: {error}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for HfTensorBytesError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source { error, .. } => Some(error),
+            Self::Sink(error) => Some(error),
+            Self::MissingTensor(_)
+            | Self::ReentrantShard(_)
+            | Self::InvalidShardId { .. }
+            | Self::MetadataMismatch { .. } => None,
+        }
+    }
+}
+
 /// Indexed HF shards. Only their JSON headers remain resident; tensor payloads
 /// are seek-read on demand.
 #[derive(Debug)]
 pub(super) struct HfShardSet {
     shards: Vec<HfShard>,
-    by_name: HashMap<String, usize>,
+    tensors: Vec<HfTensorRecord>,
 }
 
 impl HfShardSet {
@@ -169,14 +269,12 @@ impl HfShardSet {
                     MAX_HF_TENSOR_NAME_BYTES,
                     "safetensors tensor-name bytes",
                 )?;
-                let rank = reader
-                    .shape(name)
-                    .ok_or_else(|| {
-                        NnError::MissingTensor(format!(
-                            "safetensors tensor `{name}` has no indexed shape"
-                        ))
-                    })?
-                    .len();
+                let shape = reader.shape(name).ok_or_else(|| {
+                    NnError::MissingTensor(format!(
+                        "safetensors tensor `{name}` has no indexed shape"
+                    ))
+                })?;
+                let rank = shape.len();
                 if rank > MAX_HF_TENSOR_RANK {
                     return Err(NnError::MissingTensor(format!(
                         "safetensors tensor `{name}` has rank {rank}, limit is {MAX_HF_TENSOR_RANK}"
@@ -188,12 +286,24 @@ impl HfShardSet {
                     MAX_HF_SHAPE_DIMS,
                     "safetensors shape dimensions",
                 )?;
-                let owned_name = try_owned(name, "safetensors tensor name")?;
-                if by_name.insert(owned_name, shard_index).is_some() {
+                let dtype = reader.dtype(name).ok_or_else(|| {
+                    NnError::MissingTensor(format!(
+                        "safetensors tensor `{name}` has no indexed dtype"
+                    ))
+                })?;
+                if by_name.contains_key(name) {
                     return Err(NnError::MissingTensor(format!(
                         "duplicate safetensors tensor `{name}`"
                     )));
                 }
+                by_name.insert(
+                    try_owned(name, "safetensors tensor name")?,
+                    HfTensorLocation {
+                        dtype: try_owned(dtype, "safetensors tensor dtype")?,
+                        shape: try_owned_shape(shape)?,
+                        shard_id: shard_index,
+                    },
+                );
             }
             shard_by_path.insert(path.clone(), shard_index);
             shards.push(HfShard {
@@ -201,16 +311,32 @@ impl HfShardSet {
                 reader: RefCell::new(reader),
             });
         }
+        let mut tensors = Vec::new();
+        tensors.try_reserve_exact(by_name.len()).map_err(|_| {
+            NnError::MissingTensor(format!(
+                "could not reserve canonical metadata for {} safetensors tensors",
+                by_name.len()
+            ))
+        })?;
+        for (name, location) in by_name {
+            tensors.push(HfTensorRecord {
+                name,
+                dtype: location.dtype,
+                shape: location.shape,
+                shard_id: location.shard_id,
+            });
+        }
+        tensors.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         if let Some(weight_map) = weight_map {
-            for (name, expected_path) in weight_map {
+            for (name, expected_path) in &weight_map {
                 let expected_shard =
-                    shard_by_path.get(&expected_path).copied().ok_or_else(|| {
+                    shard_by_path.get(expected_path).copied().ok_or_else(|| {
                         NnError::MissingTensor(format!(
                             "index.json references unresolved shard {}",
                             expected_path.display()
                         ))
                     })?;
-                let actual_shard = by_name.get(&name).copied().ok_or_else(|| {
+                let actual_shard = find_tensor(&tensors, name).map(|tensor| tensor.shard_id).ok_or_else(|| {
                     NnError::MissingTensor(format!(
                         "index.json maps tensor `{name}` to {}, but that shard does not contain it",
                         expected_path.display()
@@ -224,12 +350,81 @@ impl HfShardSet {
                     )));
                 }
             }
+            if let Some(unmapped) = tensors
+                .iter()
+                .find(|tensor| !weight_map.contains_key(&tensor.name))
+            {
+                return Err(NnError::MissingTensor(format!(
+                    "index.json omits tensor `{}` stored in {}",
+                    unmapped.name,
+                    shards[unmapped.shard_id].path.display()
+                )));
+            }
         }
-        Ok(Self { shards, by_name })
+        Ok(Self { shards, tensors })
     }
 
     pub(super) fn names(&self) -> impl Iterator<Item = &str> {
-        self.by_name.keys().map(String::as_str)
+        self.metadata().map(|tensor| tensor.name)
+    }
+
+    /// Tensor metadata in canonical global tensor-name order.
+    pub(super) fn metadata(&self) -> impl ExactSizeIterator<Item = HfTensorMetadata<'_>> {
+        self.tensors.iter().map(|tensor| {
+            let shard = &self.shards[tensor.shard_id];
+            HfTensorMetadata {
+                name: &tensor.name,
+                dtype: &tensor.dtype,
+                shape: &tensor.shape,
+                shard_id: tensor.shard_id,
+                shard_path: &shard.path,
+            }
+        })
+    }
+
+    /// Stream one tensor's exact stored payload from its already-open shard.
+    ///
+    /// Chunks retain [`SafeTensorsReader::try_visit_tensor_bytes`] ordering and
+    /// bounds. Sink errors remain typed and stop the source read immediately.
+    #[allow(dead_code, reason = "consumed by the source-bound Qwen adapter seam")]
+    pub(super) fn try_visit_tensor_bytes<E>(
+        &self,
+        name: &str,
+        max_chunk_bytes: usize,
+        visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), HfTensorBytesError<E>> {
+        let tensor = self
+            .tensor_record(name)
+            .ok_or_else(|| HfTensorBytesError::MissingTensor(name.to_owned()))?;
+        let shard =
+            self.shards
+                .get(tensor.shard_id)
+                .ok_or_else(|| HfTensorBytesError::InvalidShardId {
+                    name: name.to_owned(),
+                    shard_id: tensor.shard_id,
+                })?;
+        let mut reader = shard
+            .reader
+            .try_borrow_mut()
+            .map_err(|_| HfTensorBytesError::ReentrantShard(shard.path.clone()))?;
+        if reader.dtype(name) != Some(tensor.dtype.as_str())
+            || reader.shape(name) != Some(tensor.shape.as_slice())
+        {
+            return Err(HfTensorBytesError::MetadataMismatch {
+                name: name.to_owned(),
+                shard_path: shard.path.clone(),
+            });
+        }
+        reader
+            .try_visit_tensor_bytes(name, max_chunk_bytes, visit)
+            .map_err(|error| match error {
+                VisitTensorBytesError::Source(error) => HfTensorBytesError::Source {
+                    name: name.to_owned(),
+                    shard_path: shard.path.clone(),
+                    error,
+                },
+                VisitTensorBytesError::Sink(error) => HfTensorBytesError::Sink(error),
+            })
     }
 
     /// Read a tensor only after its metadata shape exactly matches `expected`.
@@ -272,9 +467,9 @@ impl HfShardSet {
         shape_matches: impl FnOnce(&[usize]) -> bool,
         expected: impl FnOnce() -> String,
     ) -> Result<Vec<f32>, NnError> {
-        let shard_index = *self
-            .by_name
-            .get(name)
+        let shard_index = self
+            .tensor_record(name)
+            .map(|tensor| tensor.shard_id)
             .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
         let shard = &self.shards[shard_index];
         let mut reader = shard.reader.try_borrow_mut().map_err(|_| {
@@ -300,6 +495,17 @@ impl HfShardSet {
             ))
         })
     }
+
+    fn tensor_record(&self, name: &str) -> Option<&HfTensorRecord> {
+        find_tensor(&self.tensors, name)
+    }
+}
+
+fn find_tensor<'a>(tensors: &'a [HfTensorRecord], name: &str) -> Option<&'a HfTensorRecord> {
+    tensors
+        .binary_search_by(|tensor| tensor.name.as_str().cmp(name))
+        .ok()
+        .map(|index| &tensors[index])
 }
 
 /// Resolve a model directory to its safetensors shard files, in deterministic order:
@@ -423,6 +629,18 @@ fn try_owned(value: &str, label: &str) -> Result<String, NnError> {
     Ok(owned)
 }
 
+fn try_owned_shape(shape: &[usize]) -> Result<Vec<usize>, NnError> {
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(shape.len()).map_err(|_| {
+        NnError::MissingTensor(format!(
+            "could not reserve {} dimensions for safetensors tensor shape",
+            shape.len()
+        ))
+    })?;
+    owned.extend_from_slice(shape);
+    Ok(owned)
+}
+
 fn read_bounded_index(path: &Path) -> Result<String, NnError> {
     // HF cache snapshots intentionally use symlinks into their sibling blob store. The
     // lexical index path is confined, but following those operator-provided symlinks is required
@@ -458,18 +676,142 @@ fn read_bounded_index(path: &Path) -> Result<String, NnError> {
 
 #[cfg(test)]
 mod tests {
-    use super::HfShardSet;
+    use super::{HfShardSet, HfTensorBytesError};
+    use tritium_format::SafeTensorsError;
 
     fn safetensors(name: &str) -> Vec<u8> {
-        let header = format!(r#"{{"{name}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+        safetensors_values(name, &[1.0])
+    }
+
+    fn safetensors_values(name: &str, values: &[f32]) -> Vec<u8> {
+        let payload = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        safetensors_raw(name, "F32", &[values.len()], &payload)
+    }
+
+    fn safetensors_raw(name: &str, dtype: &str, shape: &[usize], payload: &[u8]) -> Vec<u8> {
+        let byte_len = payload.len();
+        let header = format!(
+            r#"{{"{name}":{{"dtype":"{dtype}","shape":{shape:?},"data_offsets":[0,{byte_len}]}}}}"#
+        );
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend_from_slice(header.as_bytes());
-        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(payload);
         bytes
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("tritium-hf-shards-{label}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn metadata_is_global_name_order_with_stable_shard_identity() {
+        let dir = temp_dir("metadata-order");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.safetensors"), safetensors("z.weight")).unwrap();
+        std::fs::write(
+            dir.join("b.safetensors"),
+            safetensors_raw("a.weight", "BF16", &[2], &[0, 0, 128, 63]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"z.weight":"a.safetensors","a.weight":"b.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let shards = HfShardSet::open(&dir).unwrap();
+        let actual = shards
+            .metadata()
+            .map(|tensor| {
+                (
+                    tensor.name,
+                    tensor.dtype,
+                    tensor.shape,
+                    tensor.shard_id,
+                    tensor
+                        .shard_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            actual,
+            [
+                ("a.weight", "BF16", &[2][..], 1, "b.safetensors".to_owned()),
+                ("z.weight", "F32", &[1][..], 0, "a.safetensors".to_owned()),
+            ]
+        );
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SinkStop {
+        Enough,
+    }
+
+    #[test]
+    fn raw_visitor_uses_open_handle_and_preserves_sink_error() {
+        let dir = temp_dir("raw-visitor");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let values = [1.0f32, -2.0, 3.5];
+        std::fs::write(&path, safetensors_values("x", &values)).unwrap();
+        let shards = HfShardSet::open(&dir).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut actual = Vec::new();
+        let mut reentrant_checked = false;
+        shards
+            .try_visit_tensor_bytes("x", 5, |chunk| {
+                assert!(!chunk.is_empty());
+                assert!(chunk.len() <= 5);
+                if !reentrant_checked {
+                    let nested = shards.try_visit_tensor_bytes("x", 2, |_| Ok::<(), SinkStop>(()));
+                    assert!(matches!(nested, Err(HfTensorBytesError::ReentrantShard(_))));
+                    reentrant_checked = true;
+                }
+                actual.extend_from_slice(chunk);
+                Ok::<(), SinkStop>(())
+            })
+            .unwrap();
+        let expected = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(reentrant_checked);
+
+        let error = shards
+            .try_visit_tensor_bytes("x", 2, |_| Err(SinkStop::Enough))
+            .unwrap_err();
+        let source_error = shards
+            .try_visit_tensor_bytes("x", 0, |_| Ok::<(), SinkStop>(()))
+            .unwrap_err();
+        let missing_error = shards
+            .try_visit_tensor_bytes("missing", 2, |_| Ok::<(), SinkStop>(()))
+            .unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(error, HfTensorBytesError::Sink(SinkStop::Enough));
+        assert!(matches!(
+            source_error,
+            HfTensorBytesError::Source {
+                error: SafeTensorsError::InvalidChunkSize { requested: 0 },
+                ..
+            }
+        ));
+        assert_eq!(
+            missing_error,
+            HfTensorBytesError::MissingTensor("missing".to_owned())
+        );
     }
 
     #[test]
@@ -479,6 +821,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.safetensors"), safetensors("x")).unwrap();
         std::fs::write(dir.join("b.safetensors"), safetensors("x")).unwrap();
+        std::fs::write(dir.join("z.safetensors"), b"unreadable later shard").unwrap();
 
         let error = HfShardSet::open(&dir).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
@@ -536,6 +879,31 @@ mod tests {
             assert!(HfShardSet::open(&dir).is_err(), "index case {label}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn shard_index_must_cover_every_tensor_in_referenced_shards() {
+        let dir = temp_dir("incomplete-index");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = concat!(
+            r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"#,
+            r#""y":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}}"#
+        );
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&2.0f32.to_le_bytes());
+        std::fs::write(dir.join("a.safetensors"), bytes).unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"x":"a.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let error = HfShardSet::open(&dir).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(error.to_string().contains("omits tensor `y`"));
     }
 
     #[test]
