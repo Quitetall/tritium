@@ -16,7 +16,7 @@
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
-use crate::layers::Projection;
+use crate::layers::{Projection, ProjectionActivationMode};
 use crate::ops::rmsnorm;
 
 /// A gated squared-ReLU MLP block with the BitNet intermediate sub-norm.
@@ -109,12 +109,61 @@ pub struct SwiGluMlp {
 }
 
 impl SwiGluMlp {
+    /// Bind three projections to one validated SwiGLU geometry.
+    ///
+    /// `gate` and `up` must both map `n_embd → n_ff`; `down` must map
+    /// `n_ff → n_embd`. All projections must consume activations through one
+    /// arithmetic mode.
+    ///
+    /// Public fields remain available for checkpoint loaders that build this
+    /// struct directly. Such callers receive the same validation at
+    /// [`forward`](Self::forward).
+    ///
+    /// # Errors
+    /// Returns [`NnError::Shape`] for zero or contradictory projection geometry,
+    /// or [`NnError::MissingConfig`] when activation arithmetic modes differ.
+    pub fn new(gate: Projection, up: Projection, down: Projection) -> Result<Self, NnError> {
+        let mlp = Self { gate, up, down };
+        mlp.activation_mode()?;
+        Ok(mlp)
+    }
+
+    /// Validate projection geometry and return their shared activation mode.
+    ///
+    /// This also validates instances assembled through public struct fields,
+    /// giving future Qwen runners one fail-closed binding seam.
+    ///
+    /// # Errors
+    /// Returns [`NnError::Shape`] for zero or contradictory projection geometry,
+    /// or [`NnError::MissingConfig`] when activation arithmetic modes differ.
+    pub fn activation_mode(&self) -> Result<ProjectionActivationMode, NnError> {
+        let n_embd = self.gate.k_in();
+        let n_ff = self.gate.n_out();
+        if n_embd == 0 || n_ff == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: n_embd.min(n_ff),
+            });
+        }
+        validate_projection(&self.up, n_ff, n_embd)?;
+        validate_projection(&self.down, n_embd, n_ff)?;
+
+        let mode = self.gate.activation_mode();
+        if self.up.activation_mode() != mode || self.down.activation_mode() != mode {
+            return Err(NnError::MissingConfig(
+                "SwiGLU projections must use one activation arithmetic mode".to_owned(),
+            ));
+        }
+        Ok(mode)
+    }
+
     /// Forward over `m` tokens: `out = down( silu(gate(x)) ⊙ up(x) )`.
     /// `x` is `[m, n_embd]`; `out` is `[m, n_embd]`, overwritten.
     ///
     /// # Errors
-    /// [`NnError::Shape`] on buffer-length mismatch, or [`NnError::Backend`] if a
-    /// projection's backend GEMM fails.
+    /// [`NnError::Shape`] on projection or buffer mismatch,
+    /// [`NnError::MissingConfig`] when projection activation modes differ, or
+    /// [`NnError::Backend`] if scratch allocation or a projection fails.
     pub fn forward(
         &self,
         backend: &dyn TernaryBackend,
@@ -122,24 +171,29 @@ impl SwiGluMlp {
         m: usize,
         out: &mut [f32],
     ) -> Result<(), NnError> {
+        self.activation_mode()?;
         let n_embd = self.gate.k_in();
         let n_ff = self.gate.n_out();
-        if x.len() != m * n_embd {
+        let input_len = checked_buffer_len(m, n_embd, x.len())?;
+        if x.len() != input_len {
             return Err(NnError::Shape {
-                expected: m * n_embd,
+                expected: input_len,
                 got: x.len(),
             });
         }
-        if out.len() != m * n_embd {
+        let output_len = checked_buffer_len(m, n_embd, out.len())?;
+        if out.len() != output_len {
             return Err(NnError::Shape {
-                expected: m * n_embd,
+                expected: output_len,
                 got: out.len(),
             });
         }
+        let hidden_len = checked_buffer_len(m, n_ff, x.len())?;
 
         // gate(x) and up(x): both `[m, n_ff]`.
-        let mut gate = vec![0.0f32; m * n_ff];
-        let mut up = vec![0.0f32; m * n_ff];
+        let mut gate = zeroed_scratch(hidden_len, "SwiGLU gate")?;
+        let mut up = zeroed_scratch(hidden_len, "SwiGLU up")?;
+        let mut staged_out = zeroed_scratch(output_len, "SwiGLU output")?;
         self.gate.forward(backend, x, m, &mut gate)?;
         self.up.forward(backend, x, m, &mut up)?;
 
@@ -151,8 +205,48 @@ impl SwiGluMlp {
         }
 
         // down(·): `[m, n_ff] → [m, n_embd]`.
-        self.down.forward(backend, &gate, m, out)
+        self.down.forward(backend, &gate, m, &mut staged_out)?;
+        out.copy_from_slice(&staged_out);
+        Ok(())
     }
+}
+
+fn validate_projection(
+    projection: &Projection,
+    expected_n_out: usize,
+    expected_k_in: usize,
+) -> Result<(), NnError> {
+    if projection.n_out() != expected_n_out {
+        return Err(NnError::Shape {
+            expected: expected_n_out,
+            got: projection.n_out(),
+        });
+    }
+    if projection.k_in() != expected_k_in {
+        return Err(NnError::Shape {
+            expected: expected_k_in,
+            got: projection.k_in(),
+        });
+    }
+    Ok(())
+}
+
+fn checked_buffer_len(rows: usize, width: usize, got: usize) -> Result<usize, NnError> {
+    rows.checked_mul(width).ok_or(NnError::Shape {
+        expected: usize::MAX,
+        got,
+    })
+}
+
+fn zeroed_scratch(len: usize, name: &str) -> Result<Vec<f32>, NnError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        NnError::Backend(format!(
+            "allocate {name} scratch for {len} f32 values: {error}"
+        ))
+    })?;
+    values.resize(len, 0.0);
+    Ok(values)
 }
 
 /// The block's feed-forward, dispatched by architecture ([`crate::MlpKind`]).
