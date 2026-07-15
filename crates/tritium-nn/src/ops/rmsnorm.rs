@@ -41,6 +41,34 @@ pub(crate) fn sum_squares_canonical(x: &[f32]) -> f32 {
 /// # Errors
 /// [`NnError::Shape`] if the buffer lengths disagree.
 pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) -> Result<(), NnError> {
+    rmsnorm_with_scale(x, w, eps, out, |weight| weight)
+}
+
+/// Zero-centered RMSNorm used by Qwen3.5:
+/// `out[i] = x[i] / sqrt(mean(x²) + eps) · (1 + w[i])`.
+///
+/// Qwen3.5 stores zero as the identity scale, unlike ordinary [`rmsnorm`],
+/// which stores one. Inputs, weights, reduction, and output are all `f32`.
+///
+/// # Errors
+/// [`NnError::Shape`] if the buffer lengths disagree.
+pub fn rmsnorm_zero_centered(
+    x: &[f32],
+    w: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) -> Result<(), NnError> {
+    rmsnorm_with_scale(x, w, eps, out, |weight| 1.0 + weight)
+}
+
+#[inline]
+fn rmsnorm_with_scale(
+    x: &[f32],
+    w: &[f32],
+    eps: f32,
+    out: &mut [f32],
+    scale: impl Fn(f32) -> f32,
+) -> Result<(), NnError> {
     if x.len() != w.len() {
         return Err(NnError::Shape {
             expected: x.len(),
@@ -60,7 +88,7 @@ pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) -> Result<(), Nn
     let mean_sq = sum_squares_canonical(x) / n as f32;
     let inv = 1.0 / (mean_sq + eps).sqrt();
     for ((o, &xi), &wi) in out.iter_mut().zip(x).zip(w) {
-        *o = xi * inv * wi;
+        *o = xi * inv * scale(wi);
     }
     Ok(())
 }

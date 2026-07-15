@@ -15,8 +15,8 @@ mod softmax;
 
 pub use act_quant::{QB, quantize_activation_int8};
 pub use attention::gqa_attention;
-pub use rmsnorm::rmsnorm;
-pub use rope::rope_apply;
+pub use rmsnorm::{rmsnorm, rmsnorm_zero_centered};
+pub use rope::{rope_apply, rope_apply_partial_neox};
 pub use sampling::{
     sample_categorical, sample_greedy, sample_top_k, sample_top_p, truncated_top_k, truncated_top_p,
 };
