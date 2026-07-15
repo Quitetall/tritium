@@ -149,6 +149,14 @@ fn seek_reader_bounds_payload_read_requests_and_handles_partial_reads() {
     assert_eq!(values[0], 0.0);
     assert_eq!(values[VALUES - 1], (VALUES - 1) as f32);
     assert!(trace.lock().unwrap().max_request <= 64 * 1024);
+
+    *trace.lock().unwrap() = ReadTrace::default();
+    let mut visited = 0usize;
+    tensors
+        .visit_tensor_bytes("x", usize::MAX, |chunk| visited += chunk.len())
+        .unwrap();
+    assert_eq!(visited, VALUES * size_of::<f32>());
+    assert!(trace.lock().unwrap().max_request <= 64 * 1024);
 }
 
 #[test]
@@ -204,4 +212,143 @@ fn seek_reader_matches_borrowed_scalar_and_zero_sized_tensors() {
     }
     assert_eq!(seek.tensor_f32("scalar").unwrap(), vec![1.25]);
     assert!(seek.tensor_f32("empty").unwrap().is_empty());
+}
+
+#[test]
+fn seek_reader_visits_exact_stored_bytes_for_fp_and_non_widening_dtypes() {
+    let bf16_bytes = [1.0f32, -2.0, 0.5]
+        .into_iter()
+        .flat_map(|value| bf16::from_f32(value).to_bits().to_le_bytes())
+        .collect::<Vec<_>>();
+    let f16_bytes = [9.0f32, -8.0]
+        .into_iter()
+        .flat_map(|value| f16::from_f32(value).to_bits().to_le_bytes())
+        .collect::<Vec<_>>();
+    let f32_bytes = [3.0f32, -4.0, 0.125]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let u8_bytes = vec![0, 127, 255];
+    let mut data = Vec::new();
+    data.extend_from_slice(&bf16_bytes);
+    data.extend_from_slice(&f16_bytes);
+    data.extend_from_slice(&f32_bytes);
+    data.extend_from_slice(&u8_bytes);
+    let header = format!(
+        r#"{{"a_bf16":{{"dtype":"BF16","shape":[3],"data_offsets":[0,{}]}},"b_f16":{{"dtype":"F16","shape":[2],"data_offsets":[{},{}]}},"c_f32":{{"dtype":"F32","shape":[3],"data_offsets":[{},{}]}},"d_u8":{{"dtype":"U8","shape":[3],"data_offsets":[{},{}]}}}}"#,
+        bf16_bytes.len(),
+        bf16_bytes.len(),
+        bf16_bytes.len() + f16_bytes.len(),
+        bf16_bytes.len() + f16_bytes.len(),
+        bf16_bytes.len() + f16_bytes.len() + f32_bytes.len(),
+        bf16_bytes.len() + f16_bytes.len() + f32_bytes.len(),
+        data.len()
+    );
+    let trace = Arc::new(Mutex::new(ReadTrace::default()));
+    let guarded = GuardedReader {
+        inner: Cursor::new(container(&header, data)),
+        forbidden: Vec::new(),
+        trace: Arc::clone(&trace),
+        max_per_read: usize::MAX,
+    };
+    let mut tensors = SafeTensorsReader::new(guarded).unwrap();
+    *trace.lock().unwrap() = ReadTrace::default();
+
+    for (name, dtype, shape, expected, chunk_cap) in [
+        ("c_f32", "F32", &[3usize][..], &f32_bytes, 5usize),
+        ("a_bf16", "BF16", &[3usize][..], &bf16_bytes, 1usize),
+        ("c_f32", "F32", &[3usize][..], &f32_bytes, 2usize),
+        ("b_f16", "F16", &[2usize][..], &f16_bytes, 3usize),
+        ("d_u8", "U8", &[3usize][..], &u8_bytes, 2usize),
+    ] {
+        assert_eq!(tensors.dtype(name), Some(dtype));
+        assert_eq!(tensors.shape(name), Some(shape));
+        let mut observed = Vec::new();
+        let mut chunk_lengths = Vec::new();
+        tensors
+            .visit_tensor_bytes(name, chunk_cap, |chunk| {
+                assert!(!chunk.is_empty());
+                assert!(chunk.len() <= chunk_cap);
+                chunk_lengths.push(chunk.len());
+                observed.extend_from_slice(chunk);
+            })
+            .unwrap();
+        assert_eq!(&observed, expected);
+        assert_eq!(chunk_lengths.iter().sum::<usize>(), expected.len());
+    }
+
+    assert!(trace.lock().unwrap().max_request <= 5);
+    // A later widened read proves the visitor did not make subsequent access
+    // depend on the underlying reader's current cursor.
+    assert_eq!(tensors.tensor_f32("a_bf16").unwrap(), vec![1.0, -2.0, 0.5]);
+}
+
+#[test]
+fn seek_reader_raw_visitor_rejects_missing_tensor_and_zero_chunk_cap() {
+    let header = r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"empty":{"dtype":"F32","shape":[0],"data_offsets":[4,4]}}"#;
+    let mut tensors = SafeTensorsReader::new(Cursor::new(container(header, vec![0; 4]))).unwrap();
+
+    assert!(matches!(
+        tensors.visit_tensor_bytes("missing", 1, |_| {}),
+        Err(SafeTensorsError::NotFound(name)) if name == "missing"
+    ));
+    assert!(matches!(
+        tensors.visit_tensor_bytes("x", 0, |_| {}),
+        Err(SafeTensorsError::InvalidChunkSize { requested: 0 })
+    ));
+    let mut calls = 0;
+    tensors
+        .visit_tensor_bytes("empty", 1, |_| calls += 1)
+        .unwrap();
+    assert_eq!(calls, 0);
+}
+
+#[derive(Clone, Debug)]
+struct SharedReader(Arc<Mutex<Cursor<Vec<u8>>>>);
+
+impl Read for SharedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().read(buf)
+    }
+}
+
+impl Seek for SharedReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.0.lock().unwrap().seek(pos)
+    }
+}
+
+#[test]
+fn seek_reader_raw_visitor_reads_live_bytes_and_fails_on_truncation() {
+    let header = r#"{"x":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+    let bytes = container(
+        header,
+        [1.0f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect(),
+    );
+    let data_start = 8 + header.len();
+    let shared = Arc::new(Mutex::new(Cursor::new(bytes)));
+    let mut tensors = SafeTensorsReader::new(SharedReader(Arc::clone(&shared))).unwrap();
+
+    let replacement = [3.0f32, 4.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    shared.lock().unwrap().get_mut()[data_start..].copy_from_slice(&replacement);
+    let mut observed = Vec::new();
+    tensors
+        .visit_tensor_bytes("x", 3, |chunk| observed.extend_from_slice(chunk))
+        .unwrap();
+    assert_eq!(observed, replacement);
+
+    shared.lock().unwrap().get_mut().truncate(data_start + 7);
+    assert!(matches!(
+        tensors.visit_tensor_bytes("x", 3, |_| {}),
+        Err(SafeTensorsError::Io {
+            kind: io::ErrorKind::UnexpectedEof,
+            ..
+        })
+    ));
 }

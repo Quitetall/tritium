@@ -82,6 +82,11 @@ pub enum SafeTensorsError {
     },
     /// Tensor offsets do not form one contiguous, complete data region.
     InvalidLayout(String),
+    /// A raw-payload visitor was given a zero-byte chunk limit.
+    InvalidChunkSize {
+        /// Requested maximum bytes per visitor call.
+        requested: usize,
+    },
 }
 
 impl fmt::Display for SafeTensorsError {
@@ -136,6 +141,10 @@ impl fmt::Display for SafeTensorsError {
             SafeTensorsError::InvalidLayout(message) => {
                 write!(f, "safetensors: invalid data layout: {message}")
             }
+            SafeTensorsError::InvalidChunkSize { requested } => write!(
+                f,
+                "safetensors: raw tensor visitor chunk size must be positive, got {requested}"
+            ),
         }
     }
 }
@@ -253,11 +262,66 @@ impl FloatDtype {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct RawTensorLayout {
+    offset: u64,
+    byte_len: usize,
+    numel: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct TensorLayout {
     offset: u64,
     byte_len: usize,
     numel: usize,
     dtype: FloatDtype,
+}
+
+fn raw_tensor_layout_entry(
+    name: &str,
+    tensor: &RawTensor,
+    data_len: u64,
+) -> Result<RawTensorLayout, SafeTensorsError> {
+    let [start, end] = tensor.data_offsets;
+    if start > end || end > data_len {
+        return Err(SafeTensorsError::OutOfBounds(name.to_owned()));
+    }
+    let byte_len = usize::try_from(end - start).map_err(|_| SafeTensorsError::ShapeOverflow {
+        name: name.to_owned(),
+    })?;
+    let bits = storage_bits(&tensor.dtype).ok_or_else(|| SafeTensorsError::UnsupportedDtype {
+        name: name.to_owned(),
+        dtype: tensor.dtype.clone(),
+    })?;
+    let numel = tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+        .ok_or_else(|| SafeTensorsError::ShapeOverflow {
+            name: name.to_owned(),
+        })?;
+    let bit_len = numel
+        .checked_mul(bits)
+        .ok_or_else(|| SafeTensorsError::ShapeOverflow {
+            name: name.to_owned(),
+        })?;
+    if bit_len % 8 != 0 {
+        return Err(SafeTensorsError::InvalidLayout(format!(
+            "tensor `{name}` has a non-byte-aligned {bit_len}-bit payload"
+        )));
+    }
+    let expected = bit_len / 8;
+    if byte_len != expected {
+        return Err(SafeTensorsError::LengthMismatch {
+            name: name.to_owned(),
+            expected,
+            got: byte_len,
+        });
+    }
+    Ok(RawTensorLayout {
+        offset: start,
+        byte_len,
+        numel,
+    })
 }
 
 fn checked_header_len(declared: u64) -> Result<usize, SafeTensorsError> {
@@ -321,37 +385,7 @@ fn validate_layout(
                 "tensor `{name}` starts at {start}, expected {cursor}, and ends at {end}"
             )));
         }
-        if end > data_len {
-            return Err(SafeTensorsError::OutOfBounds(name.clone()));
-        }
-        let bits =
-            storage_bits(&tensor.dtype).ok_or_else(|| SafeTensorsError::UnsupportedDtype {
-                name: name.clone(),
-                dtype: tensor.dtype.clone(),
-            })?;
-        let numel = tensor
-            .shape
-            .iter()
-            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
-            .ok_or_else(|| SafeTensorsError::ShapeOverflow { name: name.clone() })?;
-        let bit_len = numel
-            .checked_mul(bits)
-            .ok_or_else(|| SafeTensorsError::ShapeOverflow { name: name.clone() })?;
-        if bit_len % 8 != 0 {
-            return Err(SafeTensorsError::InvalidLayout(format!(
-                "tensor `{name}` has a non-byte-aligned {bit_len}-bit payload"
-            )));
-        }
-        let expected = bit_len / 8;
-        let got = usize::try_from(end - start)
-            .map_err(|_| SafeTensorsError::ShapeOverflow { name: name.clone() })?;
-        if got != expected {
-            return Err(SafeTensorsError::LengthMismatch {
-                name: name.clone(),
-                expected,
-                got,
-            });
-        }
+        raw_tensor_layout_entry(name, tensor, data_len)?;
         cursor = end;
     }
     if cursor != data_len {
@@ -370,13 +404,7 @@ fn tensor_layout(
     let tensor = tensors
         .get(name)
         .ok_or_else(|| SafeTensorsError::NotFound(name.to_owned()))?;
-    let [start, end] = tensor.data_offsets;
-    if start > end || end > data_len {
-        return Err(SafeTensorsError::OutOfBounds(name.to_owned()));
-    }
-    let byte_len = usize::try_from(end - start).map_err(|_| SafeTensorsError::ShapeOverflow {
-        name: name.to_owned(),
-    })?;
+    let raw = raw_tensor_layout_entry(name, tensor, data_len)?;
     let dtype = match tensor.dtype.as_str() {
         "BF16" => FloatDtype::Bf16,
         "F16" => FloatDtype::F16,
@@ -388,39 +416,30 @@ fn tensor_layout(
             });
         }
     };
-    let numel = tensor
-        .shape
-        .iter()
-        .try_fold(1usize, |acc, &dimension| acc.checked_mul(dimension))
-        .ok_or_else(|| SafeTensorsError::ShapeOverflow {
-            name: name.to_owned(),
-        })?;
-    let expected =
-        numel
-            .checked_mul(dtype.byte_size())
-            .ok_or_else(|| SafeTensorsError::ShapeOverflow {
-                name: name.to_owned(),
-            })?;
-    if byte_len != expected {
-        return Err(SafeTensorsError::LengthMismatch {
-            name: name.to_owned(),
-            expected,
-            got: byte_len,
-        });
-    }
     // Check the widened allocation size separately. This can overflow even when
     // the source BF16/F16 span fits in `usize`.
-    numel
+    raw.numel
         .checked_mul(size_of::<f32>())
         .ok_or_else(|| SafeTensorsError::ShapeOverflow {
             name: name.to_owned(),
         })?;
     Ok(TensorLayout {
-        offset: start,
-        byte_len,
-        numel,
+        offset: raw.offset,
+        byte_len: raw.byte_len,
+        numel: raw.numel,
         dtype,
     })
+}
+
+fn raw_tensor_layout(
+    tensors: &BTreeMap<String, RawTensor>,
+    name: &str,
+    data_len: u64,
+) -> Result<RawTensorLayout, SafeTensorsError> {
+    let tensor = tensors
+        .get(name)
+        .ok_or_else(|| SafeTensorsError::NotFound(name.to_owned()))?;
+    raw_tensor_layout_entry(name, tensor, data_len)
 }
 
 fn reserve_f32(numel: usize) -> Result<Vec<f32>, SafeTensorsError> {
@@ -452,6 +471,39 @@ fn append_f32(output: &mut Vec<f32>, dtype: FloatDtype, raw: &[u8]) {
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
         ),
     }
+}
+
+fn visit_reader_range<R: Read + Seek>(
+    reader: &mut R,
+    absolute: u64,
+    byte_len: usize,
+    max_chunk_bytes: usize,
+    mut visit: impl FnMut(&[u8]),
+) -> Result<(), SafeTensorsError> {
+    if max_chunk_bytes == 0 {
+        return Err(SafeTensorsError::InvalidChunkSize {
+            requested: max_chunk_bytes,
+        });
+    }
+    if byte_len == 0 {
+        return Ok(());
+    }
+
+    reader
+        .seek(SeekFrom::Start(absolute))
+        .map_err(|error| io_error("seek to tensor payload", error))?;
+    let mut scratch = [0u8; READ_CHUNK_BYTES];
+    let chunk_capacity = max_chunk_bytes.min(scratch.len());
+    let mut remaining = byte_len;
+    while remaining != 0 {
+        let count = remaining.min(chunk_capacity);
+        reader
+            .read_exact(&mut scratch[..count])
+            .map_err(|error| io_error("read tensor payload", error))?;
+        visit(&scratch[..count]);
+        remaining -= count;
+    }
+    Ok(())
 }
 
 /// A parsed safetensors buffer: the header table + a borrow of the data region.
@@ -630,6 +682,45 @@ impl<R: Read + Seek> SafeTensorsReader<R> {
         self.tensors.get(name).map(|tensor| tensor.dtype.as_str())
     }
 
+    /// Visit one tensor's exact stored payload without widening or allocating
+    /// storage proportional to the tensor size.
+    ///
+    /// `visit` receives consecutive, non-empty slices in row-major storage
+    /// order. Each slice is at most `max_chunk_bytes` bytes (and at most the
+    /// reader's fixed 64 KiB staging bound). A zero-sized tensor succeeds
+    /// without invoking `visit`. Use [`Self::dtype`] and [`Self::shape`] to
+    /// domain-separate a content digest from tensors with different metadata.
+    ///
+    /// Every call seeks to an absolute payload offset, so it does not depend on
+    /// the cursor left by an earlier tensor read and does not affect later
+    /// reader operations. The source is live and callbacks are nontransactional:
+    /// an I/O error can occur after earlier chunks were delivered, and concurrent
+    /// source mutation can produce a mixed stream. Callers must discard partial
+    /// effects on `Err` and keep identity inputs stable for the full visit.
+    ///
+    /// # Errors
+    /// Returns a typed [`SafeTensorsError`] for an absent or malformed tensor,
+    /// a zero `max_chunk_bytes`, or a failed absolute seek/read.
+    pub fn visit_tensor_bytes(
+        &mut self,
+        name: &str,
+        max_chunk_bytes: usize,
+        visit: impl FnMut(&[u8]),
+    ) -> Result<(), SafeTensorsError> {
+        let layout = raw_tensor_layout(&self.tensors, name, self.data_len)?;
+        let absolute = self
+            .data_start
+            .checked_add(layout.offset)
+            .ok_or_else(|| SafeTensorsError::OutOfBounds(name.to_owned()))?;
+        visit_reader_range(
+            &mut self.reader,
+            absolute,
+            layout.byte_len,
+            max_chunk_bytes,
+            visit,
+        )
+    }
+
     /// Seek to one tensor and return its row-major values widened to `f32`.
     /// Reads are chunked to bound raw staging memory independently of tensor size.
     ///
@@ -643,25 +734,15 @@ impl<R: Read + Seek> SafeTensorsReader<R> {
             .checked_add(layout.offset)
             .ok_or_else(|| SafeTensorsError::OutOfBounds(name.to_owned()))?;
         let mut output = reserve_f32(layout.numel)?;
-        if layout.byte_len == 0 {
-            return Ok(output);
-        }
-
-        self.reader
-            .seek(SeekFrom::Start(absolute))
-            .map_err(|error| io_error("seek to tensor payload", error))?;
-        let mut scratch = [0u8; READ_CHUNK_BYTES];
         let alignment = layout.dtype.byte_size();
-        let chunk_capacity = scratch.len() - scratch.len() % alignment;
-        let mut remaining = layout.byte_len;
-        while remaining != 0 {
-            let count = remaining.min(chunk_capacity);
-            self.reader
-                .read_exact(&mut scratch[..count])
-                .map_err(|error| io_error("read tensor payload", error))?;
-            append_f32(&mut output, layout.dtype, &scratch[..count]);
-            remaining -= count;
-        }
+        let chunk_capacity = READ_CHUNK_BYTES - READ_CHUNK_BYTES % alignment;
+        visit_reader_range(
+            &mut self.reader,
+            absolute,
+            layout.byte_len,
+            chunk_capacity,
+            |raw| append_f32(&mut output, layout.dtype, raw),
+        )?;
         debug_assert_eq!(output.len(), layout.numel);
         Ok(output)
     }

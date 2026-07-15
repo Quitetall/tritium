@@ -100,6 +100,14 @@ impl std::error::Error for ArtifactError {}
 pub struct ModelId([u8; 32]);
 
 impl ModelId {
+    /// Restore an already domain-separated semantic-model digest.
+    ///
+    /// This is a decoding primitive for canonical records. It does not prove
+    /// that the caller has the manifest whose digest is supplied.
+    pub const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     /// Return the raw 256-bit digest.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -117,6 +125,14 @@ impl fmt::Display for ModelId {
 pub struct PackageId([u8; 32]);
 
 impl PackageId {
+    /// Restore an already domain-separated exact-package digest.
+    ///
+    /// This is a decoding primitive for canonical records. It does not hash or
+    /// otherwise verify the package bytes represented by the digest.
+    pub const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     /// Hash exact package bytes using the versioned transport-ID domain.
     pub fn from_package_bytes(bytes: &[u8]) -> Self {
         let mut hasher = PackageHasher::new();
@@ -179,6 +195,61 @@ pub struct SemanticTensor {
     content_digest: [u8; 32],
 }
 
+/// Incremental hasher for one [`SemanticTensor`]'s canonical logical bytes.
+///
+/// The byte stream uses the same versioned, domain-separated identity encoding
+/// as [`SemanticTensor::new`]. Chunk boundaries have no semantic meaning: callers
+/// may stream an arbitrarily large tensor without retaining its logical bytes in
+/// memory. The architecture adapter remains responsible for supplying its
+/// canonical logical encoding, including dtype and scale semantics.
+#[derive(Clone, Debug)]
+pub struct SemanticTensorHasher {
+    name: String,
+    shape: Vec<u64>,
+    hasher: blake3::Hasher,
+}
+
+impl SemanticTensorHasher {
+    /// Start hashing a named, shaped tensor using the current semantic-tensor domain.
+    ///
+    /// Metadata is validated by [`finalize`](Self::finalize), after the content
+    /// digest is complete, exactly as it is by [`SemanticTensor::new`].
+    pub fn new(name: impl Into<String>, shape: Vec<u64>) -> Self {
+        Self {
+            name: name.into(),
+            shape,
+            hasher: blake3::Hasher::new_derive_key(TENSOR_HASH_CONTEXT),
+        }
+    }
+
+    /// Start hashing content whose validated metadata is retained elsewhere.
+    pub(crate) fn new_content_only() -> Self {
+        Self {
+            name: String::new(),
+            shape: Vec::new(),
+            hasher: blake3::Hasher::new_derive_key(TENSOR_HASH_CONTEXT),
+        }
+    }
+
+    /// Add the next ordered chunk of canonical logical tensor bytes.
+    pub fn update(&mut self, logical_bytes: &[u8]) {
+        self.hasher.update(logical_bytes);
+    }
+
+    /// Finish hashing, validate the name and shape, and build the tensor entry.
+    ///
+    /// # Errors
+    /// Returns [`ArtifactError`] for an empty name or invalid shape.
+    pub fn finalize(self) -> Result<SemanticTensor, ArtifactError> {
+        SemanticTensor::from_digest(self.name, self.shape, *self.hasher.finalize().as_bytes())
+    }
+
+    /// Finish only the canonical content digest, discarding placeholder metadata.
+    pub(crate) fn finalize_content_digest(self) -> [u8; 32] {
+        *self.hasher.finalize().as_bytes()
+    }
+}
+
 impl SemanticTensor {
     /// Build and validate a tensor entry, hashing its canonical logical bytes.
     ///
@@ -189,14 +260,12 @@ impl SemanticTensor {
         shape: Vec<u64>,
         logical_bytes: &[u8],
     ) -> Result<Self, ArtifactError> {
-        Self::from_digest(
-            name.into(),
-            shape,
-            domain_hash(TENSOR_HASH_CONTEXT, logical_bytes),
-        )
+        let mut hasher = SemanticTensorHasher::new(name, shape);
+        hasher.update(logical_bytes);
+        hasher.finalize()
     }
 
-    fn from_digest(
+    pub(crate) fn from_digest(
         name: String,
         shape: Vec<u64>,
         content_digest: [u8; 32],
@@ -576,5 +645,71 @@ mod tests {
             PackageHasher::default().finalize(),
             PackageId::from_package_bytes(&[])
         );
+    }
+
+    #[test]
+    fn typed_ids_restore_canonical_digest_bytes() {
+        let model_digest = [0x5a; 32];
+        let package_digest = [0xa5; 32];
+
+        assert_eq!(ModelId::from_digest(model_digest).as_bytes(), &model_digest);
+        assert_eq!(
+            PackageId::from_digest(package_digest).as_bytes(),
+            &package_digest
+        );
+    }
+
+    #[test]
+    fn incremental_semantic_tensor_identity_matches_one_shot_for_every_chunking() {
+        let bytes = b"logical-v1";
+        let expected =
+            SemanticTensor::new("layer.weight", vec![2, 5], bytes).expect("valid one-shot tensor");
+
+        // Exercise every possible partition of this byte stream, plus empty
+        // updates at both ends. This covers uneven and single-byte chunks.
+        for boundaries in 0..(1_u16 << (bytes.len() - 1)) {
+            let mut hasher = SemanticTensorHasher::new("layer.weight", vec![2, 5]);
+            hasher.update(&[]);
+            let mut start = 0;
+            for boundary in 0..bytes.len() - 1 {
+                if boundaries & (1 << boundary) != 0 {
+                    hasher.update(&bytes[start..=boundary]);
+                    start = boundary + 1;
+                }
+            }
+            hasher.update(&bytes[start..]);
+            hasher.update(&[]);
+            assert_eq!(hasher.finalize().expect("valid streamed tensor"), expected);
+        }
+    }
+
+    #[test]
+    fn incremental_semantic_tensor_identity_handles_empty_content() {
+        let expected = SemanticTensor::new("empty.weight", vec![1], &[])
+            .expect("empty logical content is valid");
+        let mut hasher = SemanticTensorHasher::new("empty.weight", vec![1]);
+        hasher.update(&[]);
+
+        assert_eq!(hasher.finalize().expect("empty streamed tensor"), expected);
+    }
+
+    #[test]
+    fn incremental_semantic_tensor_validation_matches_one_shot() {
+        let invalid = [
+            ("", Vec::from([1])),
+            ("empty-shape", Vec::new()),
+            ("zero-first", Vec::from([0, 2])),
+            ("zero-later", Vec::from([2, 3, 0, 4])),
+        ];
+
+        for (name, shape) in invalid {
+            let one_shot = SemanticTensor::new(name, shape.clone(), b"logical bytes")
+                .expect_err("metadata must be rejected");
+            let mut hasher = SemanticTensorHasher::new(name, shape);
+            hasher.update(b"logical ");
+            hasher.update(b"bytes");
+            let streamed = hasher.finalize().expect_err("metadata must be rejected");
+            assert_eq!(streamed, one_shot);
+        }
     }
 }

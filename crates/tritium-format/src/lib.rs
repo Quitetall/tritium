@@ -60,6 +60,7 @@ mod tqidx;
 
 pub use artifact::{
     ArtifactError, ModelId, PackageHasher, PackageId, SemanticModelManifest, SemanticTensor,
+    SemanticTensorHasher,
 };
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,

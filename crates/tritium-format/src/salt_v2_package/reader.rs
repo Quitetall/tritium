@@ -155,6 +155,7 @@ pub struct SaltV2TensorInfo {
     encoded_payload_bytes: u64,
     encoded_scale_bytes: u64,
     runtime_ledger: SaltV2IndexedRuntimeLedger,
+    semantic_content_digest: [u8; 32],
 }
 
 impl SaltV2TensorInfo {
@@ -511,6 +512,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                     encoded_payload_bytes: declared_payload,
                     encoded_scale_bytes: declared_scales,
                     runtime_ledger: SaltV2IndexedRuntimeLedger::zero(),
+                    semantic_content_digest: [0; 32],
                 },
                 record_offset,
                 metadata_len: payload_offset
@@ -621,10 +623,24 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
             if metadata_digest != tensor.metadata_digest {
                 return Err(SaltV2PackageReadError::SourceChanged(tensor.name.clone()));
             }
-            let section_digest = scan_tensor(&mut source, codec, &map, tensor, |_| {})?;
+            let mut semantic_hasher = SaltV2SemanticTensorHasher::new_content_only(
+                &tensor.info.dims,
+                tensor.info.logical_coefficients,
+                tensor.info.transform,
+                tensor.info.tile_count,
+            );
+            let section_digest = scan_tensor(
+                &mut source,
+                codec,
+                &map,
+                tensor,
+                Some(&mut semantic_hasher),
+                |_| {},
+            )?;
             if section_digest != tensor.section_digest {
                 return Err(SaltV2PackageReadError::SourceChanged(tensor.name.clone()));
             }
+            tensor.info.semantic_content_digest = semantic_hasher.finalize_content_digest();
             checked_ledger_add(
                 &mut ledger.payload_bytes,
                 usize::try_from(physical.payload_bytes)
@@ -728,6 +744,24 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
         self.find_tensor(name).map(|tensor| &tensor.info)
     }
 
+    /// Codec-independent semantic manifest entry for a named tensor.
+    ///
+    /// Its content digest is computed during the mandatory bounded validation
+    /// scan. This constructs the owned entry from cached metadata and that digest,
+    /// without materializing or rescanning tensor coefficients.
+    #[must_use]
+    pub fn semantic_tensor(&self, name: &str) -> Option<SemanticTensor> {
+        let tensor = self.find_tensor(name)?;
+        Some(
+            SemanticTensor::from_digest(
+                tensor.name.clone(),
+                tensor.info.dims.clone(),
+                tensor.info.semantic_content_digest,
+            )
+            .expect("strict construction already validated tensor name and shape"),
+        )
+    }
+
     /// Visit one tensor's canonical packed planes using bounded reusable staging.
     ///
     /// Static package/header/map metadata is verified before the first callback.
@@ -776,7 +810,14 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
         // so canonical decode and scale checks prevent malformed mutated bytes
         // from ever reaching a callback while the final digest catches valid
         // same-length mutations.
-        let digest = match scan_tensor(&mut self.source, self.codec, &self.map, &tensor, visitor) {
+        let digest = match scan_tensor(
+            &mut self.source,
+            self.codec,
+            &self.map,
+            &tensor,
+            None,
+            visitor,
+        ) {
             Ok(digest) => digest,
             Err(SaltV2PackageReadError::Format(_)) => {
                 return Err(SaltV2PackageReadError::SourceChanged(name.to_owned()));
@@ -856,6 +897,7 @@ fn scan_tensor<R: Read + Seek>(
     codec: SaltV2Codec,
     map: &OwnedPresenceMap,
     tensor: &IndexedTensor,
+    mut semantic_hasher: Option<&mut SaltV2SemanticTensorHasher>,
     mut visitor: impl FnMut(PackedSaltV2PlaneRef<'_>),
 ) -> Result<TensorSectionDigest, SaltV2PackageReadError> {
     let mut descriptors = Vec::new();
@@ -956,6 +998,20 @@ fn scan_tensor<R: Read + Seek>(
             }
             let scale_count = scale_bytes.len() / 2;
             validate_scales(&trits, &decoded_scales[..scale_count])?;
+            if let Some(hasher) = &mut semantic_hasher {
+                if descriptor.plane_index == 0 {
+                    hasher.update_tile(
+                        descriptor.tile_index,
+                        descriptor.logical_len,
+                        descriptor.plane_count,
+                    );
+                }
+                hasher.update_plane(
+                    descriptor.plane_index,
+                    &trits,
+                    &decoded_scales[..scale_count],
+                );
+            }
             visitor(PackedSaltV2PlaneRef {
                 tile_index: descriptor.tile_index,
                 plane_index: descriptor.plane_index,

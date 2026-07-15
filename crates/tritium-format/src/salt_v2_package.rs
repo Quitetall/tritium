@@ -19,6 +19,7 @@ use crate::salt_v2::{
     SaltV2Codec, SaltV2CodecError, pack_b3, pack_d2, pack_s34, unpack_b3_into, unpack_d2_into,
     unpack_s34_into,
 };
+use crate::{SemanticTensor, SemanticTensorHasher};
 
 mod reader;
 
@@ -70,6 +71,9 @@ pub const SALT_V2_INDEXED_RUNTIME_RANK_PREFIX_BYTES: usize = core::mem::size_of:
 
 /// Canonical package alignment.
 pub const SALT_V2_PACKAGE_ALIGNMENT: usize = 8;
+
+/// Domain and encoding version for codec-independent SALT V2 tensor semantics.
+const SALT_V2_SEMANTIC_TENSOR_DOMAIN: &[u8] = b"tritium.salt-v2.semantic-tensor.v1\0";
 
 /// A validated, zero-point-free additive ternary plane for one allocation tile.
 #[derive(Clone, Debug, PartialEq)]
@@ -213,6 +217,109 @@ pub enum SaltV2Transform {
     },
 }
 
+/// Incremental canonical encoder for one codec-independent SALT V2 tensor.
+///
+/// The stream deliberately contains semantic geometry, allocation structure,
+/// decoded trits, and exact scale bits. It does not contain package codec,
+/// transport padding, presence-map representation, offsets, or record order.
+/// Counts, indices, dimensions, and transform parameters are little-endian u64
+/// values; tags and trits are single bytes. After the fixed domain come the
+/// transform tag and any seed/domain parameters, rank and dimensions, logical
+/// coefficient and tile counts, then each tile's index, length, and plane count.
+/// Each ordered plane contributes its index, trit count, trits encoded as
+/// `-1 => 0`, `0 => 1`, `+1 => 2`, scale count, and exact f16 scale bits.
+struct SaltV2SemanticTensorHasher {
+    inner: SemanticTensorHasher,
+}
+
+impl SaltV2SemanticTensorHasher {
+    fn new(
+        name: &str,
+        dims: &[u64],
+        logical_coefficients: usize,
+        transform: SaltV2Transform,
+        tile_count: usize,
+    ) -> Self {
+        Self::with_inner(
+            SemanticTensorHasher::new(name, dims.to_vec()),
+            dims,
+            logical_coefficients,
+            transform,
+            tile_count,
+        )
+    }
+
+    fn new_content_only(
+        dims: &[u64],
+        logical_coefficients: usize,
+        transform: SaltV2Transform,
+        tile_count: usize,
+    ) -> Self {
+        Self::with_inner(
+            SemanticTensorHasher::new_content_only(),
+            dims,
+            logical_coefficients,
+            transform,
+            tile_count,
+        )
+    }
+
+    fn with_inner(
+        mut inner: SemanticTensorHasher,
+        dims: &[u64],
+        logical_coefficients: usize,
+        transform: SaltV2Transform,
+        tile_count: usize,
+    ) -> Self {
+        inner.update(SALT_V2_SEMANTIC_TENSOR_DOMAIN);
+        match transform {
+            SaltV2Transform::None => inner.update(&[0]),
+            SaltV2Transform::SignedRht { seed, domain } => {
+                inner.update(&[1]);
+                inner.update(&seed.to_le_bytes());
+                inner.update(&domain.to_le_bytes());
+            }
+        }
+        inner.update(&(dims.len() as u64).to_le_bytes());
+        for &dimension in dims {
+            inner.update(&dimension.to_le_bytes());
+        }
+        inner.update(&(logical_coefficients as u64).to_le_bytes());
+        inner.update(&(tile_count as u64).to_le_bytes());
+        Self { inner }
+    }
+
+    fn update_tile(&mut self, tile_index: usize, logical_len: usize, plane_count: usize) {
+        self.inner.update(&(tile_index as u64).to_le_bytes());
+        self.inner.update(&(logical_len as u64).to_le_bytes());
+        self.inner.update(&(plane_count as u64).to_le_bytes());
+    }
+
+    fn update_plane(&mut self, plane_index: usize, trits: &[Trit], scales: &[f16]) {
+        self.inner.update(&(plane_index as u64).to_le_bytes());
+        self.inner.update(&(trits.len() as u64).to_le_bytes());
+        let mut canonical_trits = [0u8; SALT_V2_ALLOCATION_TILE_SIZE];
+        for (encoded, trit) in canonical_trits.iter_mut().zip(trits) {
+            *encoded = (trit.get() + 1) as u8;
+        }
+        self.inner.update(&canonical_trits[..trits.len()]);
+        self.inner.update(&(scales.len() as u64).to_le_bytes());
+        for scale in scales {
+            self.inner.update(&scale.to_bits().to_le_bytes());
+        }
+    }
+
+    fn finalize(self) -> SemanticTensor {
+        self.inner
+            .finalize()
+            .expect("SALT V2 construction already validated tensor name and shape")
+    }
+
+    fn finalize_content_digest(self) -> [u8; 32] {
+        self.inner.finalize_content_digest()
+    }
+}
+
 /// A named SALT V2 tensor split into deterministic allocation macrotiles.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SaltV2Tensor {
@@ -325,6 +432,29 @@ impl SaltV2Tensor {
     #[must_use]
     pub fn tiles(&self) -> &[SaltV2Tile] {
         &self.tiles
+    }
+
+    /// Build the codec-independent semantic manifest entry for this tensor.
+    ///
+    /// The content digest binds transform parameters, tensor geometry, ordered
+    /// tile/plane structure, decoded trits, and exact f16 scale bits. Repacking
+    /// the same tensor as D2, B3, or S34 therefore leaves this identity unchanged.
+    #[must_use]
+    pub fn semantic_tensor(&self) -> SemanticTensor {
+        let mut hasher = SaltV2SemanticTensorHasher::new(
+            &self.name,
+            &self.dims,
+            self.logical_coefficients,
+            self.transform,
+            self.tiles.len(),
+        );
+        for (tile_index, tile) in self.tiles.iter().enumerate() {
+            hasher.update_tile(tile_index, tile.logical_len(), tile.planes.len());
+            for (plane_index, plane) in tile.planes.iter().enumerate() {
+                hasher.update_plane(plane_index, &plane.trits, &plane.scales);
+            }
+        }
+        hasher.finalize()
     }
 }
 
