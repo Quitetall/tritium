@@ -440,16 +440,16 @@ pub(crate) fn salt(
         };
         let qt = quantize_tensor(&weights, rows, k, &cfg).context("SALT quantize failed")?;
         let deq = dequantized_rows(&qt.salt_rows)?;
-        reports.push(salt_budget_report(
-            budget,
-            &qt.plane_counts,
+        reports.push(salt_budget_report(SaltBudgetInputs {
+            requested_bpw: budget,
+            plane_counts: &qt.plane_counts,
             rows,
             k,
-            qt.packed_weight_bpw(),
-            qt.sidecar_bpw(),
-            &weights,
-            &deq,
-        ));
+            packed_weight_bpw: qt.packed_weight_bpw(),
+            sidecar_bpw: qt.sidecar_bpw(),
+            weights: &weights,
+            deq: &deq,
+        }));
     }
     let report = SaltReport {
         report: "salt",
@@ -862,16 +862,28 @@ fn dequantized_rows(rows: &[tritium_format::SaltRow]) -> anyhow::Result<Vec<f32>
     Ok(out)
 }
 
-fn salt_budget_report(
+struct SaltBudgetInputs<'a> {
     requested_bpw: f64,
-    plane_counts: &[usize],
+    plane_counts: &'a [usize],
     rows: usize,
     k: usize,
     packed_weight_bpw: f64,
     sidecar_bpw: f64,
-    weights: &[f32],
-    deq: &[f32],
-) -> SaltBudgetReport {
+    weights: &'a [f32],
+    deq: &'a [f32],
+}
+
+fn salt_budget_report(inputs: SaltBudgetInputs<'_>) -> SaltBudgetReport {
+    let SaltBudgetInputs {
+        requested_bpw,
+        plane_counts,
+        rows,
+        k,
+        packed_weight_bpw,
+        sidecar_bpw,
+        weights,
+        deq,
+    } = inputs;
     let mut squared = 0.0f64;
     let mut max_abs_error = 0.0f64;
     for (&w, &q) in weights.iter().zip(deq.iter()) {
@@ -1030,56 +1042,6 @@ fn percentile_sorted(samples: &[f64], p: f64) -> f64 {
     );
     let idx = ((samples.len() as f64 * p).ceil() as usize).saturating_sub(1);
     samples[idx.min(samples.len() - 1)]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn budgets_parse_csv() {
-        let got = parse_budgets("1.585, 2.0").expect("parse budgets");
-        assert_eq!(got.len(), 2);
-        assert!((got[1] - 2.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn budgets_reject_below_floor() {
-        let err = parse_budgets("1.0").expect_err("below floor must error");
-        assert!(format!("{err:#}").contains(">="));
-    }
-
-    #[test]
-    fn salt_budget_metrics_are_finite() {
-        let weights = vec![0.0, 1.0, -1.0, 0.5];
-        let deq = vec![0.0, 0.75, -1.0, 0.25];
-        let report = salt_budget_report(2.0, &[1], 1, 4, 2.0625, 2.375, &weights, &deq);
-        assert_eq!(report.dense_stored_bpw, tritium_quantize::TRIT_BITS);
-        assert_eq!(report.packed_weight_bpw, 2.0625);
-        assert_eq!(report.sidecar_bpw, 2.375);
-        assert!(report.mse > 0.0);
-        assert_eq!(report.plane_histogram[0].planes, 1);
-        assert_eq!(report.plane_histogram[0].groups, 1);
-    }
-
-    #[test]
-    fn decode_table_contains_key_metrics() {
-        let report = DecodeReport {
-            report: "decode",
-            backend: "cpu".to_owned(),
-            prompt_tokens: 3,
-            decode_steps: 2,
-            warmup_steps: 1,
-            elapsed_ms: 10.0,
-            tokens_per_sec: 200.0,
-            ms_per_token: 5.0,
-            roofline_4090_pct: 25.0,
-            baseline_4090_drop_pct: 0.0,
-        };
-        let table = decode_table(&report);
-        assert!(table.contains("tokens_per_sec"));
-        assert!(table.contains("roofline_4090_pct"));
-    }
 }
 
 /// `tritium report sparsity` — the Track-A ternary census: per-tensor
@@ -1249,4 +1211,63 @@ pub(crate) fn sparsity(model: &Path) -> anyhow::Result<()> {
         tot_zb as f64 / tot_b.max(1) as f64 * 100.0
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budgets_parse_csv() {
+        let got = parse_budgets("1.585, 2.0").expect("parse budgets");
+        assert_eq!(got.len(), 2);
+        assert!((got[1] - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budgets_reject_below_floor() {
+        let err = parse_budgets("1.0").expect_err("below floor must error");
+        assert!(format!("{err:#}").contains(">="));
+    }
+
+    #[test]
+    fn salt_budget_metrics_are_finite() {
+        let weights = vec![0.0, 1.0, -1.0, 0.5];
+        let deq = vec![0.0, 0.75, -1.0, 0.25];
+        let report = salt_budget_report(SaltBudgetInputs {
+            requested_bpw: 2.0,
+            plane_counts: &[1],
+            rows: 1,
+            k: 4,
+            packed_weight_bpw: 2.0625,
+            sidecar_bpw: 2.375,
+            weights: &weights,
+            deq: &deq,
+        });
+        assert_eq!(report.dense_stored_bpw, tritium_quantize::TRIT_BITS);
+        assert_eq!(report.packed_weight_bpw, 2.0625);
+        assert_eq!(report.sidecar_bpw, 2.375);
+        assert!(report.mse > 0.0);
+        assert_eq!(report.plane_histogram[0].planes, 1);
+        assert_eq!(report.plane_histogram[0].groups, 1);
+    }
+
+    #[test]
+    fn decode_table_contains_key_metrics() {
+        let report = DecodeReport {
+            report: "decode",
+            backend: "cpu".to_owned(),
+            prompt_tokens: 3,
+            decode_steps: 2,
+            warmup_steps: 1,
+            elapsed_ms: 10.0,
+            tokens_per_sec: 200.0,
+            ms_per_token: 5.0,
+            roofline_4090_pct: 25.0,
+            baseline_4090_drop_pct: 0.0,
+        };
+        let table = decode_table(&report);
+        assert!(table.contains("tokens_per_sec"));
+        assert!(table.contains("roofline_4090_pct"));
+    }
 }

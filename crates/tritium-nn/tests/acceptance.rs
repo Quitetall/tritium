@@ -107,22 +107,23 @@ struct Reference {
     eos_token_id: u32,
 }
 
-/// Load the reference + model bytes, or `None` (with a printed reason) if either
-/// is absent — the offline/cpu-only skip path shared by every test here.
-
 /// Serializes the GPU-heavy tests within this binary: each loads a full model
 /// (~2.5 GB VRAM), and the default parallel test threads OOM-flake whenever a
 /// co-resident GPU process (another session's server, a desktop) squeezes
 /// free VRAM — observed live. Poison-tolerant: a panicked test must not fail
 /// the rest with a PoisonError.
+#[cfg(feature = "cuda")]
 static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(feature = "cuda")]
 fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
     GPU_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Load the reference + model bytes, or `None` (with a printed reason) if either
+/// is absent — the offline/cpu-only skip path shared by every test here.
 fn maybe_load() -> Option<(Reference, Vec<u8>)> {
     if !Path::new(GGUF_PATH).exists() {
         eprintln!("skipping: {GGUF_PATH} absent (gated real-model test)");

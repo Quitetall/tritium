@@ -18,7 +18,9 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(all(feature = "cuda", windows))]
 use std::os::windows::fs::MetadataExt as _;
 
-use anyhow::{Context, bail, ensure};
+#[cfg(feature = "cuda")]
+use anyhow::ensure;
+use anyhow::{Context, bail};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use tritium_format::TeacherCacheHeader;
@@ -343,6 +345,7 @@ fn semantic_model_digest(
     semantic_training_model_digest(config, spec, model)
 }
 
+#[cfg(feature = "cuda")]
 fn training_parameter_count(model: &TiedSwiGluTrainingModel) -> anyhow::Result<u64> {
     let matrix_count = model
         .parameters()
@@ -421,11 +424,13 @@ fn semantic_model_digest_parts(
     *hash.finalize().as_bytes()
 }
 
+#[cfg(any(feature = "cuda", test))]
 fn hash_bytes(hash: &mut blake3::Hasher, bytes: &[u8]) {
     hash.update(&(bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
 }
 
+#[cfg(any(feature = "cuda", test))]
 fn hash_f32s(hash: &mut blake3::Hasher, values: &[f32]) {
     hash.update(&(values.len() as u64).to_le_bytes());
     for value in values {
@@ -1019,7 +1024,7 @@ const fn default_checkpoint_shards() -> usize {
 const fn default_timing_warmup_steps() -> usize {
     1
 }
-#[cfg(any(feature = "cuda", test))]
+#[cfg(feature = "cuda")]
 const fn default_worker_timeout_seconds() -> u64 {
     86_400
 }
@@ -1052,7 +1057,7 @@ enum CampaignPackedComputePolicy {
     Fast,
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CampaignDistributed {
@@ -4584,10 +4589,9 @@ fn load_existing_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tritium_nn::{
-        DenseLinear, Mlp, Projection, SwiGluMlp, TiedSwiGluTrainingArchitecture, TrainingParameter,
-        TransformerBlock,
-    };
+    #[cfg(feature = "cuda")]
+    use tritium_nn::{DenseLinear, Mlp, Projection, SwiGluMlp, TransformerBlock};
+    use tritium_nn::{TiedSwiGluTrainingArchitecture, TrainingParameter};
 
     fn temp_path(name: &str) -> PathBuf {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
