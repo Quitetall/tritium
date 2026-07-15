@@ -15,7 +15,7 @@ and SALT codec benches always run (no GPU, no model).
 | `gpu_mpgemm` | `cuda` | GPU **add-only** (TQ2_0, tiled+simple) and **IMMA int8** mpGEMM over the BitNet shapes |
 | `e2e` | `cuda` + model | **decode** + **prefill** tokens/sec on BitNet 2B4T, each coupled to an unchanged-perplexity assertion |
 | `roofline` | always | the decode `bandwidth / model_bytes` ceiling + committed competitor baselines (pure arithmetic) |
-| `salt_codec` | always | SALT V2 D2/B3/S34 pack + unpack across codec/group boundaries and representative ternary distributions |
+| `salt_codec` | always | SALT V2 D2/B3/S34 pack + unpack across codec/group boundaries, plus matched S34-valid tensors through all three codecs |
 
 The shared fixtures, shapes, roofline math, and the baseline/regression types live in
 `src/lib.rs` (`tritium_benches`), unit-tested on every lane.

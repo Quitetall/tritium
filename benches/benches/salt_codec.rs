@@ -15,7 +15,7 @@ use tritium_format::salt_v2::{
     SaltV2CodecError, pack_b3, pack_d2, pack_s34, unpack_b3, unpack_d2, unpack_s34,
 };
 
-const DENSE_LENGTHS: [usize; 8] = [1, 4, 5, 127, 128, 129, 4_096, 1 << 20];
+const DENSE_LENGTHS: [usize; 10] = [1, 3, 4, 5, 6, 127, 128, 129, 4_096, 1 << 20];
 const S34_LENGTHS: [usize; 10] = [4, 8, 28, 32, 36, 124, 128, 132, 4_096, 1 << 20];
 
 #[derive(Clone, Copy, Debug)]
@@ -233,6 +233,53 @@ fn b3_unpack(bencher: Bencher, case: DenseCase) {
     bench_unpack(
         bencher,
         dense_fixture(case),
+        SaltV2Codec::B3,
+        pack_b3,
+        unpack_b3,
+    );
+}
+
+// These matched cases feed byte-identical, S34-valid trits through every codec.
+// Keep them separate from the broader dense-only sweep so codec throughput is
+// not confounded with a different input distribution.
+#[divan::bench(args = s34_cases())]
+fn matched_d2_pack(bencher: Bencher, case: S34Case) {
+    bench_pack(
+        bencher,
+        s34_fixture(case),
+        SaltV2Codec::D2,
+        pack_d2,
+        unpack_d2,
+    );
+}
+
+#[divan::bench(args = s34_cases())]
+fn matched_d2_unpack(bencher: Bencher, case: S34Case) {
+    bench_unpack(
+        bencher,
+        s34_fixture(case),
+        SaltV2Codec::D2,
+        pack_d2,
+        unpack_d2,
+    );
+}
+
+#[divan::bench(args = s34_cases())]
+fn matched_b3_pack(bencher: Bencher, case: S34Case) {
+    bench_pack(
+        bencher,
+        s34_fixture(case),
+        SaltV2Codec::B3,
+        pack_b3,
+        unpack_b3,
+    );
+}
+
+#[divan::bench(args = s34_cases())]
+fn matched_b3_unpack(bencher: Bencher, case: S34Case) {
+    bench_unpack(
+        bencher,
+        s34_fixture(case),
         SaltV2Codec::B3,
         pack_b3,
         unpack_b3,
