@@ -181,10 +181,43 @@ pub struct Qwen35FullAttentionCache {
 }
 
 impl Qwen35FullAttentionCache {
+    /// Whole-model transaction watermark used by the hybrid Qwen runner.
+    #[must_use]
+    pub(crate) const fn committed_len(&self) -> usize {
+        self.inner.len
+    }
+
+    /// Validate a whole-model rollback target without mutating cache state.
+    ///
+    /// A hybrid runner preflights every layer before rolling any layer back, so
+    /// the subsequent [`Self::rollback_to`] calls cannot fail midway through a
+    /// model-wide rollback.
+    pub(crate) fn preflight_rollback_to(&self, base: usize) -> Result<(), NnError> {
+        if base <= self.inner.len {
+            Ok(())
+        } else {
+            Err(NnError::Shape {
+                expected: self.inner.len,
+                got: base,
+            })
+        }
+    }
+
+    /// Restore a target already accepted by [`Self::preflight_rollback_to`].
+    ///
+    /// This path only truncates retained vectors and cannot allocate, panic, or
+    /// return an error. An invalid target is a guarded no-op; callers use the
+    /// preflight to report that invariant violation before mutation begins.
+    pub(crate) fn rollback_to(&mut self, base: usize) {
+        if self.preflight_rollback_to(base).is_ok() {
+            self.inner.rollback_to(base);
+        }
+    }
+
     /// Number of committed tokens.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.inner.len
+        self.committed_len()
     }
 
     /// Whether no tokens are committed.
@@ -361,7 +394,7 @@ impl Qwen35FullAttention {
             });
         }
 
-        let checkpoint = cache.inner.len;
+        let checkpoint = cache.committed_len();
         let new_context = checkpoint.checked_add(sequence).ok_or(NnError::Shape {
             expected: cache.inner.max_ctx,
             got: usize::MAX,
@@ -462,7 +495,7 @@ impl Qwen35FullAttention {
                 Ok(())
             }
             Err(error) => {
-                cache.inner.rollback_to(checkpoint);
+                cache.rollback_to(checkpoint);
                 Err(error)
             }
         }
@@ -592,4 +625,168 @@ fn zeroed_scratch(len: usize, name: &str) -> Result<Vec<f32>, NnError> {
 
 fn invalid_config(reason: impl Into<String>) -> NnError {
     NnError::MissingConfig(reason.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use tritium_cpu::CpuBackend;
+
+    use super::{Qwen35FullAttention, Qwen35FullAttentionWeights};
+    use crate::layers::{DenseLinear, Projection};
+    use crate::qwen35_config::{
+        Qwen35DeltaNetConfig, Qwen35Dtype, Qwen35FullAttentionConfig, Qwen35LayerType,
+        Qwen35MtpConfig, Qwen35NormWeightSemantics, Qwen35OutputGate, Qwen35RopeConfig,
+        Qwen35RopeType, Qwen35TextConfig,
+    };
+
+    fn dense(values: &[f32], n_out: usize, k_in: usize) -> Projection {
+        Projection::Dense(DenseLinear::new_exact(values.to_vec(), n_out, k_in).unwrap())
+    }
+
+    fn layer() -> Qwen35FullAttention {
+        let config = Qwen35TextConfig {
+            model_type: "qwen3_5_text".to_owned(),
+            num_hidden_layers: 1,
+            hidden_size: 2,
+            intermediate_size: 4,
+            vocab_size: 8,
+            max_position_embeddings: 8,
+            full_attention_interval: 1,
+            layer_types: vec![Qwen35LayerType::FullAttention],
+            full_attention: Qwen35FullAttentionConfig {
+                num_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 2,
+                bias: false,
+                dropout: 0.0,
+                output_gate: Qwen35OutputGate::Sigmoid,
+                norm_weight_semantics: Qwen35NormWeightSemantics::ZeroCenteredOnePlusWeight,
+            },
+            delta_net: Qwen35DeltaNetConfig {
+                conv_kernel_dim: 4,
+                num_key_heads: 1,
+                num_value_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+                state_arithmetic_dtype: Qwen35Dtype::Float32,
+                output_gate: Qwen35OutputGate::Swish,
+                gated_norm_weight_semantics: Qwen35NormWeightSemantics::UnitCenteredDirectWeight,
+            },
+            rope: Qwen35RopeConfig {
+                theta: 10_000.0,
+                partial_rotary_factor: 1.0,
+                rotary_dim: 2,
+                rope_type: Qwen35RopeType::Default,
+                mrope_interleaved: true,
+                mrope_section: [1, 0, 0],
+            },
+            rms_norm_eps: 1e-6,
+            source_dtype: Qwen35Dtype::Bfloat16,
+            use_cache: true,
+            tied_embeddings: false,
+            mtp: Qwen35MtpConfig {
+                num_hidden_layers: 1,
+                dedicated_embeddings: false,
+            },
+        };
+        let identity = [1.0, 0.0, 0.0, 1.0];
+        let weights = Qwen35FullAttentionWeights::new(
+            dense(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], 4, 2),
+            dense(&identity, 2, 2),
+            dense(&identity, 2, 2),
+            dense(&identity, 2, 2),
+            vec![0.0; 2],
+            vec![0.0; 2],
+        );
+        Qwen35FullAttention::new(&config, weights).unwrap()
+    }
+
+    #[test]
+    fn provisional_append_can_be_preflighted_and_rolled_back_exactly() {
+        let layer = layer();
+        let backend = CpuBackend::new();
+        let mut cache = layer.new_cache(4).unwrap();
+        let mut prefix_output = [f32::NAN; 2];
+        layer
+            .forward(&backend, &[1.0, 0.0], &[0], &mut cache, &mut prefix_output)
+            .unwrap();
+        let base = cache.committed_len();
+        let prefix_keys = cache.keys().to_vec();
+        let prefix_values = cache.values().to_vec();
+
+        let mut first_suffix_output = [f32::NAN; 2];
+        layer
+            .forward(
+                &backend,
+                &[0.0, 1.0],
+                &[1],
+                &mut cache,
+                &mut first_suffix_output,
+            )
+            .unwrap();
+        let appended_keys = cache.keys().to_vec();
+        let appended_values = cache.values().to_vec();
+        assert_eq!(cache.committed_len(), base + 1);
+
+        cache.preflight_rollback_to(base).unwrap();
+        cache.rollback_to(base);
+        assert_eq!(cache.committed_len(), base);
+        assert_eq!(cache.keys(), prefix_keys);
+        assert_eq!(cache.values(), prefix_values);
+
+        let mut replayed_suffix_output = [f32::NAN; 2];
+        layer
+            .forward(
+                &backend,
+                &[0.0, 1.0],
+                &[1],
+                &mut cache,
+                &mut replayed_suffix_output,
+            )
+            .unwrap();
+        assert_eq!(replayed_suffix_output, first_suffix_output);
+        assert_eq!(cache.keys(), appended_keys);
+        assert_eq!(cache.values(), appended_values);
+    }
+
+    #[test]
+    fn rollback_preflight_rejects_a_future_target_without_mutation() {
+        let layer = layer();
+        let backend = CpuBackend::new();
+        let mut cache = layer.new_cache(4).unwrap();
+        let mut output = [f32::NAN; 2];
+        layer
+            .forward(&backend, &[1.0, 0.0], &[0], &mut cache, &mut output)
+            .unwrap();
+        let keys = cache.keys().to_vec();
+        let values = cache.values().to_vec();
+
+        let error = cache
+            .preflight_rollback_to(cache.committed_len() + 1)
+            .unwrap_err();
+
+        assert!(matches!(error, crate::NnError::Shape { .. }));
+        assert_eq!(cache.committed_len(), 1);
+        assert_eq!(cache.keys(), keys);
+        assert_eq!(cache.values(), values);
+    }
+
+    #[test]
+    fn direct_invalid_rollback_is_a_noop() {
+        let layer = layer();
+        let backend = CpuBackend::new();
+        let mut cache = layer.new_cache(4).unwrap();
+        let mut output = [f32::NAN; 2];
+        layer
+            .forward(&backend, &[1.0, 0.0], &[0], &mut cache, &mut output)
+            .unwrap();
+        let keys = cache.keys().to_vec();
+        let values = cache.values().to_vec();
+
+        cache.rollback_to(cache.committed_len() + 1);
+
+        assert_eq!(cache.committed_len(), 1);
+        assert_eq!(cache.keys(), keys);
+        assert_eq!(cache.values(), values);
+    }
 }
