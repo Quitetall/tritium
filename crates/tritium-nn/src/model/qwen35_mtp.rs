@@ -68,7 +68,7 @@ impl Qwen35MtpInputPlan<'_> {
 ///
 /// This group owns 11 checkpoint tensors: two decoder norms, six attention
 /// tensors, and three SwiGLU projections.
-#[allow(dead_code, missing_debug_implementations)]
+#[allow(missing_debug_implementations)]
 pub struct Qwen35MtpLayerWeights {
     input_norm: Vec<f32>,
     attention: Qwen35FullAttentionWeights,
@@ -99,7 +99,7 @@ impl Qwen35MtpLayerWeights {
 /// There is intentionally no token embedding or language head field: the
 /// future verified executor must reuse the target language model's distinct
 /// embedding and untied head without allocating copies.
-#[allow(dead_code, missing_debug_implementations)]
+#[allow(missing_debug_implementations)]
 pub struct Qwen35MtpWeights {
     pre_fc_norm_embedding: Vec<f32>,
     pre_fc_norm_hidden: Vec<f32>,
@@ -282,8 +282,15 @@ fn build_input_plan<'target>(
     position_start: usize,
     target_hidden_states: &'target [f32],
 ) -> Result<Qwen35MtpInputPlan<'target>, NnError> {
+    let last_offset = target_token_ids
+        .len()
+        .checked_sub(1)
+        .ok_or(NnError::Shape {
+            expected: 1,
+            got: 0,
+        })?;
     position_start
-        .checked_add(target_token_ids.len() - 1)
+        .checked_add(last_offset)
         .ok_or_else(|| NnError::Backend("Qwen3.5 MTP position range overflow".to_owned()))?;
 
     let mut shifted_token_ids = Vec::new();
@@ -370,6 +377,13 @@ fn invalid_config(message: impl Into<String>) -> NnError {
 #[cfg(test)]
 mod tests {
     use super::build_input_plan;
+
+    #[test]
+    fn empty_input_plan_fails_closed() {
+        let hidden = [];
+        let error = build_input_plan(&[], 3, 0, &hidden).unwrap_err();
+        assert!(matches!(error, crate::NnError::Shape { .. }));
+    }
 
     #[test]
     fn position_overflow_fails_closed() {

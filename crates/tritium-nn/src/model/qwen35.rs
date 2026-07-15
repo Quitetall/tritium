@@ -213,6 +213,8 @@ pub struct Qwen35TextOutput {
     last_logits: Vec<f32>,
 }
 
+// Equality remains a comparison of published numeric output values. Private
+// runner provenance is an execution authority checked separately by MTP.
 impl PartialEq for Qwen35TextOutput {
     fn eq(&self, other: &Self) -> bool {
         self.position_start == other.position_start
@@ -232,7 +234,7 @@ impl Qwen35TextOutput {
 
     /// Number of input token rows represented by the hidden-state buffer.
     #[must_use]
-    pub fn sequence(&self) -> usize {
+    pub const fn sequence(&self) -> usize {
         self.input_token_ids.len()
     }
 
