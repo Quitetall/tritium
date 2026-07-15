@@ -996,6 +996,9 @@ impl PhysicalSizeReport {
     /// transforms, padding, logical trits, and indexed-runtime allocations are
     /// rederived from the canonical bytes. The package is treated as a
     /// core-only artifact, so preserved-model components and shadows are zero.
+    /// This compatibility path predicts the indexed runtime layout but does not
+    /// prove that a runtime allocated it. Physical resident claims should use
+    /// [`Self::from_salt_v2_package_bytes_with_runtime_receipts`].
     ///
     /// # Errors
     /// Rejects a malformed/noncanonical package, accounting overflow, an
@@ -1052,20 +1055,23 @@ impl PhysicalSizeReport {
                     supplied: supplied.len(),
                 });
             }
-            for (tensor_index, (tensor, supplied)) in decoded
-                .package
-                .tensors()
-                .iter()
-                .zip(supplied.iter().copied())
-                .enumerate()
+            for (tensor_index, (tensor, supplied)) in
+                decoded.package.tensors().iter().zip(supplied).enumerate()
             {
                 let expected =
                     SaltV2IndexedRuntimeLedger::for_tensor(tensor, decoded.package.codec())?;
-                if supplied != expected {
+                if supplied != &expected {
+                    let (component, expected_value, supplied_value) = runtime_ledger_mismatch(
+                        expected, *supplied,
+                    )
+                    .ok_or(CampaignError::InvalidPhysicalSize(
+                        "runtime ledger comparison omitted a field",
+                    ))?;
                     return Err(CampaignError::RuntimeAllocationMismatch {
                         tensor_index,
-                        expected: Box::new(expected),
-                        supplied: Box::new(supplied),
+                        component,
+                        expected: expected_value,
+                        supplied: supplied_value,
                     });
                 }
             }
@@ -1881,6 +1887,66 @@ fn validate_map_accounting(
     Ok(())
 }
 
+fn runtime_ledger_mismatch(
+    expected: SaltV2IndexedRuntimeLedger,
+    supplied: SaltV2IndexedRuntimeLedger,
+) -> Option<(&'static str, u64, u64)> {
+    [
+        (
+            "payload bytes",
+            expected.payload_bytes(),
+            supplied.payload_bytes(),
+        ),
+        (
+            "scale bytes",
+            expected.scale_bytes(),
+            supplied.scale_bytes(),
+        ),
+        (
+            "allocation-map bytes",
+            expected.allocation_map_bytes(),
+            supplied.allocation_map_bytes(),
+        ),
+        (
+            "rank-prefix bytes",
+            expected.rank_prefix_bytes(),
+            supplied.rank_prefix_bytes(),
+        ),
+        (
+            "allocation-map bits",
+            expected.allocation_map_bits(),
+            supplied.allocation_map_bits(),
+        ),
+        (
+            "allocation-map embedded bits",
+            expected.allocation_map_embedded_bits(),
+            supplied.allocation_map_embedded_bits(),
+        ),
+        (
+            "dense shadow bytes",
+            expected.dense_shadow_bytes(),
+            supplied.dense_shadow_bytes(),
+        ),
+        (
+            "allocation tiles",
+            expected.allocation_tiles(),
+            supplied.allocation_tiles(),
+        ),
+        (
+            "present planes",
+            expected.present_planes(),
+            supplied.present_planes(),
+        ),
+        (
+            "steady resident bytes",
+            expected.steady_resident_bytes(),
+            supplied.steady_resident_bytes(),
+        ),
+    ]
+    .into_iter()
+    .find(|(_, expected, supplied)| expected != supplied)
+}
+
 fn validate_nonzero(field: &'static str, value: u64) -> Result<(), CampaignError> {
     if value == 0 {
         Err(CampaignError::ZeroValue(field))
@@ -1953,10 +2019,12 @@ pub enum CampaignError {
     RuntimeAllocationMismatch {
         /// Tensor ordinal in canonical package order.
         tensor_index: usize,
-        /// Canonical indexed-runtime layout rederived from the package.
-        expected: Box<SaltV2IndexedRuntimeLedger>,
-        /// Allocation ledger reported by the resident runtime handle.
-        supplied: Box<SaltV2IndexedRuntimeLedger>,
+        /// First canonical component that disagreed.
+        component: &'static str,
+        /// Component value rederived from the package.
+        expected: u64,
+        /// Component value reported by the resident runtime handle.
+        supplied: u64,
     },
     /// A remeasured or point-associated package differed from the expected package.
     PackageMeasurementMismatch {
@@ -2026,13 +2094,12 @@ impl fmt::Display for CampaignError {
             ),
             Self::RuntimeAllocationMismatch {
                 tensor_index,
+                component,
                 expected,
                 supplied,
             } => write!(
                 f,
-                "tensor {tensor_index} runtime allocation receipt differs from the package-derived indexed layout (expected {} steady bytes, supplied {})",
-                expected.steady_resident_bytes(),
-                supplied.steady_resident_bytes()
+                "tensor {tensor_index} runtime allocation receipt has {component}={supplied}, package-derived value is {expected}"
             ),
             Self::PackageMeasurementMismatch {
                 expected_id,
@@ -2304,8 +2371,9 @@ mod tests {
             ),
             Err(CampaignError::RuntimeAllocationMismatch {
                 tensor_index: 0,
-                expected: Box::new(runtime),
-                supplied: Box::new(wrong_runtime),
+                component: "payload bytes",
+                expected: runtime.payload_bytes(),
+                supplied: wrong_runtime.payload_bytes(),
             })
         );
         assert_eq!(
