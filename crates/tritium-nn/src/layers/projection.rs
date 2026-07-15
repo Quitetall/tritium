@@ -49,16 +49,7 @@ impl Projection {
             Projection::Ternary(l) => l.forward(backend, act, m, out),
             Projection::Salt(l) => l.forward(act, m, out),
             #[cfg(feature = "cuda")]
-            Projection::SaltV2(tensor) => {
-                let cuda = salt_v2_cuda_backend(backend)?;
-                match cuda.salt_v2_forward_exact_into(tensor, act, m, out) {
-                    Ok(_receipt) => Ok(()),
-                    Err(tritium_spec::BackendError::ShapeMismatch { expected, got }) => {
-                        Err(NnError::Shape { expected, got })
-                    }
-                    Err(error) => Err(NnError::Backend(error.to_string())),
-                }
-            }
+            Projection::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, act, m, out),
             Projection::Dense(l) => l.forward(act, m, out),
         }
     }
@@ -120,4 +111,22 @@ pub(crate) fn salt_v2_cuda_backend(
                 "resident SALT V2 weights require a backend-aware CUDA execution path".into(),
             )
         })
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn salt_v2_forward_exact(
+    backend: &dyn TernaryBackend,
+    tensor: &tritium_cuda::SaltV2ResidentTensor,
+    act: &[f32],
+    m: usize,
+    out: &mut [f32],
+) -> Result<(), NnError> {
+    let cuda = salt_v2_cuda_backend(backend)?;
+    match cuda.salt_v2_forward_exact_into(tensor, act, m, out) {
+        Ok(_receipt) => Ok(()),
+        Err(tritium_spec::BackendError::ShapeMismatch { expected, got }) => {
+            Err(NnError::Shape { expected, got })
+        }
+        Err(error) => Err(NnError::Backend(error.to_string())),
+    }
 }

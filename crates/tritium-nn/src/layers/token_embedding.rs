@@ -12,7 +12,7 @@ use tritium_spec::TernaryBackend;
 use crate::error::NnError;
 use crate::layers::packed_salt::PackedSaltMatrix;
 #[cfg(feature = "cuda")]
-use crate::layers::projection::salt_v2_cuda_backend;
+use crate::layers::projection::{salt_v2_cuda_backend, salt_v2_forward_exact};
 
 #[derive(Clone, Debug)]
 enum Storage {
@@ -145,7 +145,10 @@ impl TokenEmbedding {
         }
     }
 
-    /// Whether this table retains packed additive SALT rows.
+    /// Whether this table retains additive SALT storage.
+    ///
+    /// The historical method name covers both host-packed SALT V1 rows and a
+    /// physically encoded resident SALT V2 tensor.
     #[must_use]
     pub const fn is_packed_salt(&self) -> bool {
         match self.storage {
@@ -326,9 +329,7 @@ impl TokenEmbedding {
         let _ = backend;
         match &self.storage {
             #[cfg(feature = "cuda")]
-            Storage::SaltV2(tensor) => {
-                super::Projection::SaltV2(Arc::clone(tensor)).forward(backend, hidden, 1, logits)
-            }
+            Storage::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, hidden, 1, logits),
             Storage::Dense(_) | Storage::Salt(_) => self.unembed_exact(hidden, logits),
         }
     }

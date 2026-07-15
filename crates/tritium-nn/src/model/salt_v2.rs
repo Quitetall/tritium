@@ -296,18 +296,7 @@ impl ModelWeights {
                 package_path.display()
             )));
         }
-        let mut source = BufReader::with_capacity(PACKAGE_IO_BUFFER_BYTES, file);
-        let initial_id = hash_package(&mut source, package_path)?;
-        if initial_id != expected_package_id {
-            return Err(package_identity_error(
-                package_path,
-                expected_package_id,
-                initial_id,
-            ));
-        }
-        source.seek(SeekFrom::Start(0)).map_err(|error| {
-            NnError::MissingTensor(format!("rewind {}: {error}", package_path.display()))
-        })?;
+        let source = BufReader::with_capacity(PACKAGE_IO_BUFFER_BYTES, file);
         let mut reader = SaltV2PackageReader::new_strict(source).map_err(|error| {
             NnError::MissingTensor(format!("index {}: {error}", package_path.display()))
         })?;
