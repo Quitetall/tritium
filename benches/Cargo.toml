@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "roofline"
 harness = false
+
+[[bench]]
+name = "salt_codec"
+harness = false

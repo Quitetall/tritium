@@ -4,8 +4,8 @@ Divan microbenchmarks + an end-to-end tokens/sec harness + a roofline / %-of-SOL
 toolkit + the competitor-baseline regression gate for Tritium.
 
 All GPU bench bodies are behind the `cuda` cargo feature; the end-to-end bench is
-additionally gated on the BitNet 2B4T GGUF being present. The CPU mpGEMM bench and
-the roofline bench always run (no GPU, no model).
+additionally gated on the BitNet 2B4T GGUF being present. The CPU mpGEMM, roofline,
+and SALT codec benches always run (no GPU, no model).
 
 ## Layout
 
@@ -15,6 +15,7 @@ the roofline bench always run (no GPU, no model).
 | `gpu_mpgemm` | `cuda` | GPU **add-only** (TQ2_0, tiled+simple) and **IMMA int8** mpGEMM over the BitNet shapes |
 | `e2e` | `cuda` + model | **decode** + **prefill** tokens/sec on BitNet 2B4T, each coupled to an unchanged-perplexity assertion |
 | `roofline` | always | the decode `bandwidth / model_bytes` ceiling + committed competitor baselines (pure arithmetic) |
+| `salt_codec` | always | SALT V2 D2/B3/S34 pack + unpack across codec/group boundaries and representative ternary distributions |
 
 The shared fixtures, shapes, roofline math, and the baseline/regression types live in
 `src/lib.rs` (`tritium_benches`), unit-tested on every lane.
@@ -22,7 +23,7 @@ The shared fixtures, shapes, roofline math, and the baseline/regression types li
 ## Running
 
 ```sh
-# CPU-only (no GPU, no toolkit) — builds + runs the CPU + roofline benches:
+# CPU-only (no GPU, no toolkit) — runs CPU, roofline, and SALT codec benches:
 cargo bench -p tritium-benches
 
 # GPU lane (needs nvcc + an NVIDIA GPU). Compiles the cuda-gated benches:
@@ -33,6 +34,9 @@ cargo bench -p tritium-benches --features cuda --bench gpu_mpgemm   # just the G
 # End-to-end tokens/sec (needs the model at
 # ~/.cache/tritium-models/bitnet-2b4t-gguf/ggml-model-i2_s.gguf):
 cargo bench -p tritium-benches --features cuda --bench e2e
+
+# Host-only SALT V2 codec sweep (logical trits/sec + exact packed bytes/sec):
+cargo bench -p tritium-benches --bench salt_codec
 ```
 
 The GPU mpGEMM benches sweep `M ∈ {1,8,32,256,512}` × `(N,K) ∈ {2560,6912}²` — the
