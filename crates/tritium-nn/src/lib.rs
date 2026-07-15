@@ -20,6 +20,7 @@ mod kv_cache;
 mod layers;
 mod model;
 mod ops;
+mod qwen35_config;
 mod salt_v2_growth;
 mod teacher_cache;
 mod tensor;
@@ -53,6 +54,12 @@ pub use model::{
 pub use ops::{
     QB, gqa_attention, quantize_activation_int8, rmsnorm, rope_apply, sample_categorical,
     sample_greedy, sample_top_k, sample_top_p, softmax_rows, truncated_top_k, truncated_top_p,
+};
+pub use qwen35_config::{
+    QWEN36_27B_REPOSITORY, QWEN36_27B_REVISION, Qwen35CheckpointConfig, Qwen35DeltaNetConfig,
+    Qwen35Dtype, Qwen35FullAttentionConfig, Qwen35LayerType, Qwen35MtpConfig,
+    Qwen35NormWeightSemantics, Qwen35OutputGate, Qwen35RopeConfig, Qwen35RopeType,
+    Qwen35TextConfig, Qwen35VisionScope,
 };
 pub use salt_v2_growth::{
     AppliedIntermediateGrowthReceipt, DENSE_GROWTH_ORACLE_ALGORITHM_V1,
