@@ -1,24 +1,33 @@
-//! Dense-or-packed token table shared by embedding gather and a tied LM head.
+//! Dense, host-packed, or CUDA-resident token table shared by embedding gather
+//! and a tied LM head.
 
 use core::mem::size_of;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use tritium_format::PackedSaltRow;
+use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
 use crate::layers::packed_salt::PackedSaltMatrix;
+#[cfg(feature = "cuda")]
+use crate::layers::projection::salt_v2_cuda_backend;
 
 #[derive(Clone, Debug)]
 enum Storage {
     Dense(Vec<f32>),
     Salt(PackedSaltMatrix),
+    #[cfg(feature = "cuda")]
+    SaltV2(Arc<tritium_cuda::SaltV2ResidentTensor>),
 }
 
 /// One token table used for both input embedding gather and exact tied-head logits.
 ///
 /// Dense fp/BitNet models retain their original fp32 table. SALT models retain one
-/// packed additive matrix; gather and unembedding execute against that same storage,
-/// so tying never creates a second `vocab × hidden` allocation.
+/// host-packed matrix or one physically encoded CUDA allocation; gather and
+/// unembedding execute against that same storage, so tying never creates a second
+/// `vocab × hidden` allocation.
 #[derive(Clone, Debug)]
 pub struct TokenEmbedding {
     rows: usize,
@@ -27,6 +36,32 @@ pub struct TokenEmbedding {
 }
 
 impl TokenEmbedding {
+    /// Build a token table around an already-published CUDA SALT V2 allocation.
+    ///
+    /// The [`Arc`] is also suitable for a tied [`Projection::SaltV2`](super::Projection),
+    /// so embedding and unembedding can share the same physical allocation.
+    ///
+    /// # Errors
+    /// [`NnError::Shape`] if the resident handle has an empty vocabulary or hidden width.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn from_salt_v2_resident(
+        tensor: Arc<tritium_cuda::SaltV2ResidentTensor>,
+    ) -> Result<Self, NnError> {
+        let rows = tensor.rows();
+        let cols = tensor.columns();
+        if rows == 0 || cols == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: rows.saturating_mul(cols),
+            });
+        }
+        Ok(Self {
+            rows,
+            cols,
+            storage: Storage::SaltV2(tensor),
+        })
+    }
+
     pub(crate) fn from_packed_matrix(
         matrix: PackedSaltMatrix,
         rows: usize,
@@ -105,21 +140,31 @@ impl TokenEmbedding {
         match &self.storage {
             Storage::Dense(values) => Some(values),
             Storage::Salt(_) => None,
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(_) => None,
         }
     }
 
     /// Whether this table retains packed additive SALT rows.
     #[must_use]
     pub const fn is_packed_salt(&self) -> bool {
-        matches!(self.storage, Storage::Salt(_))
+        match self.storage {
+            Storage::Salt(_) => true,
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(_) => true,
+            Storage::Dense(_) => false,
+        }
     }
 
-    /// Number of sparse residual planes in the packed table, or zero for dense fp32.
+    /// Number of host-side sparse residual planes. Dense fp32 and resident SALT V2
+    /// return zero; the resident physical codec does not expose V1 sparse-plane metadata.
     #[must_use]
     pub const fn sparse_plane_count(&self) -> usize {
         match &self.storage {
             Storage::Dense(_) => 0,
             Storage::Salt(matrix) => matrix.sparse_plane_count(),
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(_) => 0,
         }
     }
 
@@ -130,6 +175,11 @@ impl TokenEmbedding {
         match &self.storage {
             Storage::Dense(values) => values.capacity().saturating_mul(size_of::<f32>()),
             Storage::Salt(matrix) => matrix.resident_bytes(),
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(tensor) => {
+                usize::try_from(tensor.allocation_receipt().steady_resident_bytes())
+                    .unwrap_or(usize::MAX)
+            }
         }
     }
 
@@ -141,6 +191,11 @@ impl TokenEmbedding {
     pub fn gather(&self, tokens: &[u32], out: &mut [f32]) -> Result<(), NnError> {
         match &self.storage {
             Storage::Salt(matrix) => matrix.gather(tokens, out),
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(_) => Err(NnError::Backend(
+                "resident SALT V2 embedding gather requires the backend-aware gather_with_backend"
+                    .into(),
+            )),
             Storage::Dense(values) => {
                 let expected = tokens.len().checked_mul(self.cols).ok_or(NnError::Shape {
                     expected: usize::MAX,
@@ -171,6 +226,49 @@ impl TokenEmbedding {
         }
     }
 
+    /// Gather token rows, dispatching resident SALT V2 storage through its owning
+    /// CUDA backend while retaining the existing host behavior for dense/SALT V1.
+    ///
+    /// # Errors
+    /// The errors documented by [`Self::gather`], or [`NnError::Backend`] when a
+    /// resident table is paired with a non-CUDA/different-context backend.
+    pub fn gather_with_backend(
+        &self,
+        backend: &dyn TernaryBackend,
+        tokens: &[u32],
+        out: &mut [f32],
+    ) -> Result<(), NnError> {
+        #[cfg(not(feature = "cuda"))]
+        let _ = backend;
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(tensor) => {
+                let expected = tokens.len().checked_mul(self.cols).ok_or(NnError::Shape {
+                    expected: usize::MAX,
+                    got: out.len(),
+                })?;
+                if out.len() != expected {
+                    return Err(NnError::Shape {
+                        expected,
+                        got: out.len(),
+                    });
+                }
+                if let Some(row) = tokens
+                    .iter()
+                    .copied()
+                    .map(u64::from)
+                    .find(|&row| row >= self.rows as u64)
+                {
+                    return Err(NnError::MissingTensor(format!("token_embd row {row}")));
+                }
+                let cuda = salt_v2_cuda_backend(backend)?;
+                let _receipt = cuda.salt_v2_gather_rows(tensor, tokens, out)?;
+                Ok(())
+            }
+            Storage::Dense(_) | Storage::Salt(_) => self.gather(tokens, out),
+        }
+    }
+
     /// Compute exact tied-head logits in global-K accumulation order.
     ///
     /// Packed weights are reconstructed one 256-element block at a time. No A8
@@ -193,6 +291,11 @@ impl TokenEmbedding {
         }
         match &self.storage {
             Storage::Salt(matrix) => matrix.project_exact(hidden, logits),
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(_) => Err(NnError::Backend(
+                "resident SALT V2 unembedding requires the backend-aware unembed_exact_with_backend"
+                    .into(),
+            )),
             Storage::Dense(values) => {
                 logits.par_iter_mut().enumerate().for_each(|(row, slot)| {
                     let weights = &values[row * self.cols..(row + 1) * self.cols];
@@ -205,5 +308,116 @@ impl TokenEmbedding {
                 Ok(())
             }
         }
+    }
+
+    /// Compute tied-head logits, dispatching resident SALT V2 storage through
+    /// the same exact CUDA projection path used by [`Projection::SaltV2`](super::Projection).
+    ///
+    /// # Errors
+    /// The errors documented by [`Self::unembed_exact`], or [`NnError::Backend`]
+    /// when a resident table is paired with a non-CUDA/different-context backend.
+    pub fn unembed_exact_with_backend(
+        &self,
+        backend: &dyn TernaryBackend,
+        hidden: &[f32],
+        logits: &mut [f32],
+    ) -> Result<(), NnError> {
+        #[cfg(not(feature = "cuda"))]
+        let _ = backend;
+        match &self.storage {
+            #[cfg(feature = "cuda")]
+            Storage::SaltV2(tensor) => {
+                super::Projection::SaltV2(Arc::clone(tensor)).forward(backend, hidden, 1, logits)
+            }
+            Storage::Dense(_) | Storage::Salt(_) => self.unembed_exact(hidden, logits),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests {
+    use std::sync::Arc;
+
+    use half::f16;
+    use tritium_format::salt_v2::SaltV2Codec;
+    use tritium_format::salt_v2_package::{SaltV2Plane, SaltV2Tensor, SaltV2Tile};
+
+    use super::TokenEmbedding;
+    use crate::layers::Projection;
+
+    #[test]
+    fn resident_salt_v2_table_gathers_and_unembeds_through_its_cuda_backend() {
+        let cuda = match tritium_cuda::CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping resident SALT V2 embedding test: no CUDA device ({error})");
+                return;
+            }
+        };
+        let plane = SaltV2Plane::new(vec![1, 0, -1, 0, 1, 1, -1, -1, 0], vec![f16::from_f32(0.5)])
+            .expect("valid resident embedding plane");
+        let tensor = SaltV2Tensor::new(
+            "token_embd.weight",
+            vec![3, 3],
+            vec![SaltV2Tile::new(vec![plane]).expect("valid resident embedding tile")],
+        )
+        .expect("valid resident embedding tensor");
+        let resident = Arc::new(
+            cuda.upload_salt_v2(&tensor, SaltV2Codec::D2)
+                .expect("upload resident embedding"),
+        );
+        let embedding = TokenEmbedding::from_salt_v2_resident(Arc::clone(&resident))
+            .expect("build resident embedding");
+        let tied_head = Projection::SaltV2(Arc::clone(&resident));
+
+        assert_eq!(Arc::strong_count(&resident), 3);
+        assert!(embedding.as_dense().is_none());
+        assert_eq!((embedding.rows(), embedding.cols()), (3, 3));
+
+        let mut gathered = vec![f32::NAN; 9];
+        embedding
+            .gather_with_backend(&cuda, &[2, 0, 2], &mut gathered)
+            .expect("gather resident rows");
+        assert_eq!(
+            gathered,
+            vec![-0.5, -0.5, 0.0, 0.5, 0.0, -0.5, -0.5, -0.5, 0.0]
+        );
+
+        let hidden = [2.0, -1.0, 4.0];
+        let mut logits = vec![f32::NAN; 3];
+        embedding
+            .unembed_exact_with_backend(&cuda, &hidden, &mut logits)
+            .expect("unembed through resident table");
+        assert_eq!(logits, vec![-1.0, 1.5, -0.5]);
+
+        let mut projection_logits = vec![f32::NAN; 3];
+        tied_head
+            .forward(&cuda, &hidden, 1, &mut projection_logits)
+            .expect("forward through shared resident head");
+        assert_eq!(projection_logits, logits);
+
+        assert!(matches!(
+            embedding.gather_with_backend(&cuda, &[0], &mut [0.0; 2]),
+            Err(crate::NnError::Shape {
+                expected: 3,
+                got: 2
+            })
+        ));
+        assert!(matches!(
+            embedding.gather_with_backend(&cuda, &[3], &mut [0.0; 3]),
+            Err(crate::NnError::MissingTensor(_))
+        ));
+        assert!(matches!(
+            tied_head.forward(&cuda, &hidden, 1, &mut [0.0; 2]),
+            Err(crate::NnError::Shape {
+                expected: 3,
+                got: 2
+            })
+        ));
+
+        let error = embedding
+            .gather(&[0], &mut [0.0; 3])
+            .expect_err("host-only gather must reject resident storage");
+        assert!(error.to_string().contains("backend-aware"));
     }
 }

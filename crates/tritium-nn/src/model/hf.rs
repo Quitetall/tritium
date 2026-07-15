@@ -312,7 +312,7 @@ pub(crate) enum NameSchema {
 
 impl NameSchema {
     /// Top-level (non-layer) slot name.
-    fn top(self, slot: &str) -> &'static str {
+    pub(super) fn top(self, slot: &str) -> &'static str {
         match (self, slot) {
             (NameSchema::Hf, "token_embd") => "model.embed_tokens.weight",
             (NameSchema::Hf, "output_norm") => "model.norm.weight",
@@ -325,7 +325,7 @@ impl NameSchema {
     }
 
     /// Per-layer slot name.
-    fn layer(self, i: usize, slot: &str) -> String {
+    pub(super) fn layer(self, i: usize, slot: &str) -> String {
         let s = match (self, slot) {
             (NameSchema::Hf, _) => {
                 return format!(
@@ -560,7 +560,7 @@ pub(crate) fn build_standard_model_with_embedding(
     })
 }
 
-fn declared_vocab_size(config: &serde_json::Value) -> Result<Option<usize>, NnError> {
+pub(super) fn declared_vocab_size(config: &serde_json::Value) -> Result<Option<usize>, NnError> {
     let Some(value) = config.get("vocab_size") else {
         return Ok(None);
     };
@@ -574,7 +574,7 @@ fn declared_vocab_size(config: &serde_json::Value) -> Result<Option<usize>, NnEr
 
 const MAX_CONFIG_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
-fn read_config_json(path: &Path) -> Result<String, NnError> {
+pub(super) fn read_config_json(path: &Path) -> Result<String, NnError> {
     let file = File::open(path)
         .map_err(|error| NnError::MissingConfig(format!("open {}: {error}", path.display())))?;
     let metadata = file
@@ -602,7 +602,7 @@ fn read_config_json(path: &Path) -> Result<String, NnError> {
     Ok(text)
 }
 
-fn resolve_optional_attention_weights(
+pub(super) fn resolve_optional_attention_weights(
     config: &ModelConfig,
     config_value: &serde_json::Value,
     shards: &HfShardSet,
@@ -920,6 +920,10 @@ mod tests {
             }
             Projection::Dense(_) | Projection::Ternary(_) => {
                 panic!("SALT loader must retain packed additive planes")
+            }
+            #[cfg(feature = "cuda")]
+            Projection::SaltV2(_) => {
+                panic!("legacy SALT loader must retain host-packed additive planes")
             }
         }
         assert!(runner.weights.token_embd.is_packed_salt());

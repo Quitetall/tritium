@@ -9,6 +9,8 @@ mod bpe_tokenizer;
 mod hf;
 mod hf_shards;
 mod runner;
+#[cfg(feature = "cuda")]
+mod salt_v2;
 mod tokenizer;
 mod training_salt;
 mod weights;
@@ -16,6 +18,10 @@ mod weights;
 #[cfg(feature = "tokenizer")]
 pub use bpe_tokenizer::GgufBpeTokenizer;
 pub use runner::{ForwardDump, ModelRunner};
+#[cfg(feature = "cuda")]
+pub use salt_v2::{
+    SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,
+};
 pub use tokenizer::Tokenizer;
 pub use training_salt::{
     TRAINING_SALT_COMPLETED_STEP_KEY, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE,

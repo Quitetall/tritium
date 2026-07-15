@@ -4,9 +4,9 @@
 //! reuse the one validated forward instead of copying it.
 
 use tritium_nn::{Mlp, ModelRunner, Projection};
+use tritium_train::Tape;
 use tritium_train::nn::attention;
 use tritium_train::tape::ValueId;
-use tritium_train::Tape;
 
 /// Dims + fp 1D norms for the tape forward (the parts held fp, not quantized/trained).
 pub struct Arch {
@@ -30,6 +30,8 @@ pub fn dense(p: &Projection) -> (Vec<f32>, usize, usize) {
         Projection::Salt(_) | Projection::Ternary(_) => {
             panic!("from_hf builds Dense projections")
         }
+        #[cfg(feature = "cuda")]
+        Projection::SaltV2(_) => panic!("from_hf builds Dense projections"),
     }
 }
 

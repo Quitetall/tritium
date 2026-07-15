@@ -57,6 +57,8 @@ fn dense(p: &Projection) -> (Vec<f32>, usize, usize) {
         Projection::Salt(_) | Projection::Ternary(_) => {
             panic!("from_hf builds Dense projections")
         }
+        #[cfg(feature = "cuda")]
+        Projection::SaltV2(_) => panic!("from_hf must not build resident SALT V2 projections"),
     }
 }
 

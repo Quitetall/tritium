@@ -20,6 +20,8 @@ use crate::error::NnError;
 use crate::error::ResidentOpError;
 use crate::kv_cache::KvCache;
 use crate::layers::{BlockDump, BlockScratch};
+#[cfg(feature = "cuda")]
+use crate::model::SaltV2ModelAllocationReceipt;
 use crate::model::weights::ModelWeights;
 use crate::ops::{rmsnorm, sample_greedy};
 use tritium_format::GgufFile;
@@ -166,6 +168,35 @@ impl ModelRunner {
     ) -> Result<Self, NnError> {
         let (config, weights) = ModelWeights::load_salt(model_dir, bundle)?;
         Self::try_from_weights(config, weights, backend)
+    }
+
+    /// Load a complete SALT V2 package directly into its final CUDA allocations.
+    ///
+    /// The caller-provided package identity is verified by the strict package
+    /// loader. The returned receipt accounts for every published resident matrix
+    /// and preserved fp32 vector; no partially assembled runner is returned.
+    ///
+    /// # Errors
+    /// [`NnError::Backend`] if `backend` is not a concrete CUDA backend, or any
+    /// configuration, package, upload, or runner-construction error reported by
+    /// [`ModelWeights::load_salt_v2`].
+    #[cfg(feature = "cuda")]
+    pub fn from_salt_v2(
+        model_dir: &Path,
+        package: &Path,
+        expected_package_id: tritium_format::PackageId,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<(Self, SaltV2ModelAllocationReceipt), NnError> {
+        let cuda = backend
+            .as_concrete()
+            .and_then(|concrete| concrete.downcast_ref::<tritium_cuda::CudaBackend>())
+            .ok_or_else(|| {
+                NnError::Backend("SALT V2 model loading requires a concrete CUDA backend".into())
+            })?;
+        let (config, weights, receipt) =
+            ModelWeights::load_salt_v2(model_dir, package, expected_package_id, cuda)?;
+        let runner = Self::try_from_weights(config, weights, backend)?;
+        Ok((runner, receipt))
     }
 
     /// Load a self-contained tied-SwiGLU training-SALT GGUF artifact.
@@ -447,7 +478,9 @@ impl ModelRunner {
 
         // Embedding gather: hidden = token_embd[token] for each token.
         let mut hidden = vec![0.0f32; seq * n_embd];
-        self.weights.token_embd.gather(tokens, &mut hidden)?;
+        self.weights
+            .token_embd
+            .gather_with_backend(self.backend.as_ref(), tokens, &mut hidden)?;
         if let Some(d) = dump.as_deref_mut() {
             d.embedding = hidden.clone();
             d.hidden_states.clear();
@@ -538,9 +571,11 @@ impl ModelRunner {
                 // Tied LM head: logits[v] = <last_norm, token_embd[v]>.
                 let vocab = self.weights.vocab;
                 let mut logits = vec![0.0f32; vocab];
-                self.weights
-                    .token_embd
-                    .unembed_exact(&last_norm, &mut logits)?;
+                self.weights.token_embd.unembed_exact_with_backend(
+                    self.backend.as_ref(),
+                    &last_norm,
+                    &mut logits,
+                )?;
                 logits
             };
             if let Some(d) = dump {
@@ -762,9 +797,15 @@ fn cpu_backend() -> Result<Box<dyn TernaryBackend>, NnError> {
 
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_spec_tests {
+    use std::sync::Arc;
+
+    use half::f16;
+
     use super::ModelRunner;
-    use crate::{DenseLinear, ModelConfig, ModelWeights, Projection, TokenEmbedding};
-    use tritium_format::PackedSaltRow;
+    use crate::{DenseLinear, ModelConfig, ModelWeights, NnError, Projection, TokenEmbedding};
+    use tritium_format::salt_v2::SaltV2Codec;
+    use tritium_format::salt_v2_package::{SaltV2Plane, SaltV2Tensor, SaltV2Tile};
+    use tritium_format::{PackageId, PackedSaltRow};
 
     fn config() -> ModelConfig {
         ModelConfig {
@@ -816,5 +857,61 @@ mod cuda_spec_tests {
         )
         .unwrap();
         assert!(ModelRunner::build_decode_spec(&weights, &config).is_none());
+    }
+
+    #[test]
+    fn salt_v2_facade_rejects_a_non_cuda_backend_before_package_io() {
+        let error = match ModelRunner::from_salt_v2(
+            std::path::Path::new("/path/that/must/not/be/read"),
+            std::path::Path::new("/package/that/must/not/be/read"),
+            PackageId::from_package_bytes(b"unread package"),
+            Box::new(tritium_cpu::CpuBackend::new()),
+        ) {
+            Ok(_) => panic!("a CPU backend must not load resident SALT V2"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, NnError::Backend(message) if message.contains("concrete CUDA")));
+    }
+
+    #[test]
+    fn runner_dispatches_resident_tied_embedding_and_head_through_cuda() {
+        let cuda = match tritium_cuda::CudaBackend::new(0) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("skipping resident SALT V2 runner test: no CUDA device ({error})");
+                return;
+            }
+        };
+        let tensor = SaltV2Tensor::new(
+            "model.embed_tokens.weight",
+            vec![3, 2],
+            vec![
+                SaltV2Tile::new(vec![
+                    SaltV2Plane::new(vec![1, 0, 0, 1, -1, -1], vec![f16::from_f32(1.0)])
+                        .expect("valid tied table plane"),
+                ])
+                .expect("valid tied table tile"),
+            ],
+        )
+        .expect("valid tied table tensor");
+        let resident = Arc::new(
+            cuda.upload_salt_v2(&tensor, SaltV2Codec::D2)
+                .expect("upload tied table"),
+        );
+        let weights = ModelWeights {
+            token_embd: TokenEmbedding::from_salt_v2_resident(resident).expect("build tied table"),
+            vocab: 3,
+            n_embd: 2,
+            layers: Vec::new(),
+            output_norm: vec![1.0; 2],
+            lm_head: None,
+        };
+        let mut runner = ModelRunner::from_weights(config(), weights, Box::new(cuda));
+
+        let logits = runner.forward(&[0], &[0]).expect("resident tied forward");
+        let normalized = (0.5_f32 + 1.0e-5).sqrt().recip();
+        assert!((logits[0] - normalized).abs() <= 1.0e-6);
+        assert_eq!(logits[1].to_bits(), 0.0_f32.to_bits());
+        assert!((logits[2] + normalized).abs() <= 1.0e-6);
     }
 }

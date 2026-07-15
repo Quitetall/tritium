@@ -4,6 +4,7 @@ use core::fmt;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 
 use super::*;
+use crate::{PackageHasher, PackageId};
 
 const MAX_TENSORS: u64 = 1_000_000;
 const MAX_TOTAL_NAME_BYTES: u64 = 100_000_000;
@@ -297,10 +298,12 @@ impl OwnedPresenceMap {
 #[derive(Debug)]
 pub struct SaltV2PackageReader<R> {
     source: Source<R>,
+    package_id: PackageId,
     header: [u8; SALT_V2_PACKAGE_HEADER_BYTES],
     codec: SaltV2Codec,
     ledger: SaltV2PackageLedger,
     tensors: Vec<IndexedTensor>,
+    encoded_order: Vec<usize>,
     map: OwnedPresenceMap,
     map_offset: u64,
 }
@@ -318,6 +321,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
     /// names, malformed unselected planes, truncation, and trailing bytes fail here.
     pub fn new_strict(reader: R) -> Result<Self, SaltV2PackageReadError> {
         let mut source = Source::new(reader)?;
+        source.start_package_hash();
         let header = source.array::<SALT_V2_PACKAGE_HEADER_BYTES>("read package header")?;
         let mut header_cursor = Cursor::new(&header);
         if header_cursor.take(SALT_V2_PACKAGE_MAGIC.len())? != SALT_V2_PACKAGE_MAGIC {
@@ -375,6 +379,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
 
         for _ in 0..tensor_count_usize {
             let record_offset = source.position();
+            source.start_range_digest();
             let name_len = u64::from(source.u32("read tensor name length")?);
             let rank = u64::from(source.u32("read tensor rank")?);
             enforce_limit("tensor rank", rank, MAX_RANK)?;
@@ -458,6 +463,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 .checked_add(full_tile_count)
                 .ok_or(SaltV2PackageError::LengthOverflow)?;
             let payload_offset = source.position();
+            let metadata_digest = source.finish_range_digest();
             let scales_offset = payload_offset
                 .checked_add(declared_payload)
                 .ok_or(SaltV2PackageError::LengthOverflow)?;
@@ -476,7 +482,11 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 }
                 .into());
             }
-            source.seek_abs(sections_end, "skip tensor sections")?;
+            let payload_digest =
+                source.digest_next(declared_payload, "read tensor payload for package identity")?;
+            let scale_digest =
+                source.digest_next(declared_scales, "read tensor scales for package identity")?;
+            debug_assert_eq!(source.position(), sections_end);
 
             let dims_bytes = rank_usize
                 .checked_mul(8)
@@ -511,8 +521,11 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 full_tile_start,
                 full_tile_count,
                 ragged_plane_count,
-                metadata_digest: [0; 32],
-                section_digest: TensorSectionDigest::default(),
+                metadata_digest,
+                section_digest: TensorSectionDigest {
+                    payload: payload_digest,
+                    scales: scale_digest,
+                },
             });
         }
 
@@ -542,6 +555,7 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
         if padding.iter().any(|byte| *byte != 0) {
             return Err(SaltV2PackageError::NonCanonicalFilePadding.into());
         }
+        let package_id = source.finish_package_hash()?;
 
         let total_map_bits = total_tiles
             .checked_mul(2)
@@ -598,14 +612,19 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 })?;
             tensor.info.present_planes = present_planes;
             tensor.info.runtime_ledger = indexed_runtime_ledger(tensor, present_planes)?;
-            tensor.metadata_digest = hash_range(
+            let metadata_digest = hash_range(
                 &mut source,
                 tensor.record_offset,
                 tensor.metadata_len,
                 "hash tensor metadata",
             )?;
+            if metadata_digest != tensor.metadata_digest {
+                return Err(SaltV2PackageReadError::SourceChanged(tensor.name.clone()));
+            }
             let section_digest = scan_tensor(&mut source, codec, &map, tensor, |_| {})?;
-            tensor.section_digest = section_digest;
+            if section_digest != tensor.section_digest {
+                return Err(SaltV2PackageReadError::SourceChanged(tensor.name.clone()));
+            }
             checked_ledger_add(
                 &mut ledger.payload_bytes,
                 usize::try_from(physical.payload_bytes)
@@ -626,6 +645,11 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
                 .ok_or(SaltV2PackageError::LengthOverflow)?;
         }
 
+        let mut encoded_order = Vec::new();
+        try_reserve_exact::<usize>(&mut encoded_order, tensors.len())?;
+        encoded_order.extend(0..tensors.len());
+        encoded_order.sort_unstable_by_key(|&index| tensors[index].record_offset);
+
         ledger.padding_bytes = expected_padding as u64;
         ledger.serialized_unpadded_bytes = ledger
             .headers_bytes
@@ -642,10 +666,12 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
 
         Ok(Self {
             source,
+            package_id,
             header,
             codec,
             ledger,
             tensors,
+            encoded_order,
             map,
             map_offset,
         })
@@ -655,6 +681,15 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
     #[must_use]
     pub const fn codec(&self) -> SaltV2Codec {
         self.codec
+    }
+
+    /// Exact identity of the package bytes consumed by strict construction.
+    ///
+    /// The identity is computed during the same bounded, sequential pass that
+    /// supplies parsed metadata and every retained mutation baseline.
+    #[must_use]
+    pub const fn package_id(&self) -> PackageId {
+        self.package_id
     }
 
     /// Exact physical package ledger measured during strict validation.
@@ -678,6 +713,13 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
     /// Tensor names in lexical order.
     pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.tensors.iter().map(|tensor| tensor.name.as_str())
+    }
+
+    /// Tensor names in their physical package-record order.
+    pub fn tensor_names_encoded_order(&self) -> impl Iterator<Item = &str> {
+        self.encoded_order
+            .iter()
+            .map(|&index| self.tensors[index].name.as_str())
     }
 
     /// Metadata and exact final indexed-runtime requirements for a named tensor.
@@ -1119,6 +1161,8 @@ struct Source<R> {
     inner: R,
     len: u64,
     position: u64,
+    package_hasher: Option<PackageHasher>,
+    range_hasher: Option<blake3::Hasher>,
 }
 
 impl<R: Read + Seek> Source<R> {
@@ -1142,7 +1186,62 @@ impl<R: Read + Seek> Source<R> {
             inner,
             len,
             position: 0,
+            package_hasher: None,
+            range_hasher: None,
         })
+    }
+
+    fn start_package_hash(&mut self) {
+        debug_assert_eq!(self.position, 0);
+        debug_assert!(self.package_hasher.is_none());
+        self.package_hasher = Some(PackageHasher::new());
+    }
+
+    fn finish_package_hash(&mut self) -> Result<PackageId, SaltV2PackageReadError> {
+        if self.position != self.len {
+            return Err(SaltV2PackageError::Truncated {
+                needed: usize::try_from(self.len).unwrap_or(usize::MAX),
+                remaining: usize::try_from(self.remaining()).unwrap_or(usize::MAX),
+            }
+            .into());
+        }
+        Ok(self
+            .package_hasher
+            .take()
+            .expect("package hash starts before the first package byte")
+            .finalize())
+    }
+
+    fn start_range_digest(&mut self) {
+        debug_assert!(self.range_hasher.is_none());
+        self.range_hasher = Some(blake3::Hasher::new());
+    }
+
+    fn finish_range_digest(&mut self) -> [u8; 32] {
+        *self
+            .range_hasher
+            .take()
+            .expect("range digest starts before metadata")
+            .finalize()
+            .as_bytes()
+    }
+
+    fn digest_next(&mut self, len: u64, context: &str) -> Result<[u8; 32], SaltV2PackageReadError> {
+        let mut scratch = Vec::new();
+        reserve_and_resize(
+            &mut scratch,
+            usize::try_from(len.min(MAX_READ_CHUNK_BYTES as u64)).unwrap_or(MAX_READ_CHUNK_BYTES),
+        )?;
+        let mut remaining = len;
+        let mut hasher = blake3::Hasher::new();
+        while remaining != 0 {
+            let chunk_len = usize::try_from(remaining.min(MAX_READ_CHUNK_BYTES as u64))
+                .expect("chunk length fits usize");
+            self.read_exact_chunks(&mut scratch[..chunk_len], context)?;
+            hasher.update(&scratch[..chunk_len]);
+            remaining -= chunk_len as u64;
+        }
+        Ok(*hasher.finalize().as_bytes())
     }
 
     const fn len(&self) -> u64 {
@@ -1212,6 +1311,12 @@ impl<R: Read + Seek> Source<R> {
                 .read_exact(chunk)
                 .map_err(|error| io_error(context, error))?;
             self.position += chunk.len() as u64;
+            if let Some(hasher) = &mut self.package_hasher {
+                hasher.update(chunk);
+            }
+            if let Some(hasher) = &mut self.range_hasher {
+                hasher.update(chunk);
+            }
         }
         Ok(())
     }

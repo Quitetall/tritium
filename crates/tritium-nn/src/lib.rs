@@ -38,6 +38,10 @@ pub use layers::{
 #[cfg(feature = "tokenizer")]
 pub use model::GgufBpeTokenizer;
 pub use model::{ForwardDump, LayerWeights, ModelRunner, ModelWeights, Tokenizer};
+#[cfg(feature = "cuda")]
+pub use model::{
+    SaltV2LoadedTensorReceipt, SaltV2ModelAllocationReceipt, SaltV2PreservedTensorReceipt,
+};
 pub use model::{
     TRAINING_SALT_COMPLETED_STEP_KEY, TRAINING_SALT_FORMAT_KEY, TRAINING_SALT_FORMAT_VALUE,
     TRAINING_SALT_GROWTH_RECEIPT_KEY, TRAINING_SALT_HF_CONFIG_KEY,

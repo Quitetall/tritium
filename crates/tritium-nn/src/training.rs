@@ -1275,6 +1275,12 @@ fn extract_dense(
                 "{name} is already ternary; a latent fp32 master is required"
             )));
         }
+        #[cfg(feature = "cuda")]
+        Projection::SaltV2(_) => {
+            return Err(unsupported(&format!(
+                "{name} is already resident SALT V2; a latent fp32 master is required"
+            )));
+        }
     };
     if dense.n_out != rows || dense.k_in != cols {
         return Err(unsupported(&format!(

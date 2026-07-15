@@ -683,7 +683,16 @@ order with 64 KiB payload staging, and detects same-handle source mutation. The
 CUDA consumer now preallocates those exact payload/scale arenas, streams the
 reader through fixed 64 KiB host buffers, constructs only the compact map/rank
 index, and publishes the resident handle and allocation receipt only after the
-reader's terminal mutation check succeeds.
+reader's terminal mutation check succeeds. Exact CUDA projection and selected-
+row embedding kernels now execute D2/B3/S34 directly from those arenas, publish
+caller output transactionally, and report transient plus steady allocations
+without a dense weight shadow. A strict `tritium-nn` assembler binds the caller's
+expected package identity before and after load, consumes every package matrix
+exactly once, retains only required fp32 vectors, supports tied and untied heads,
+preserves Qwen2 QKV biases and Qwen3 QK-normalization weights, and returns a
+canonical whole-model weight-allocation receipt. Real-CUDA fixtures compare complete
+Llama/Qwen model logits against an independent dense Hugging Face reconstruction
+for every admitted codec.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
@@ -721,11 +730,12 @@ The following work deliberately remains open and keeps this plan in progress:
 - `PhysicalSizeReport::from_salt_v2_package_bytes_with_runtime_receipts(...)`
   now rederives the complete indexed layout from canonical package bytes and
   rejects wrong-count or component-disagreeing per-tensor resident runtime
-  ledgers. The streamed CUDA tensor adapter now returns the independently
-  checked resident allocation receipt for one opened package tensor. The
-  production campaign adapter must still aggregate receipts from the complete
-  preserved model allocation set; caller-provided architecture geometry alone
-  is not claim evidence;
+  ledgers. The whole-model assembler now aggregates independently checked CUDA
+  receipts in canonical package order and separately content-binds every
+  preserved fp32 vector. The production campaign adapter must still feed this
+  measured whole-model receipt into `PhysicalSizeReport` and the immutable
+  campaign ledger; caller-provided architecture geometry alone is not claim
+  evidence;
 - G1 widening now has canonical source/result identities, deterministic oracle
   evidence, transactional rollback, and a tracked-fp32-payload preflight. The
   dense oracle still constructs infallible full-model clones, so this is not a
@@ -735,12 +745,15 @@ The following work deliberately remains open and keeps this plan in progress:
 - the eager semantic SALT V2 decoder remains as a compatibility/reference API,
   while `SaltV2PackageReader` supplies strict bounded-staging package access.
   The CUDA adapter consumes its packed-plane visitor directly into final device
-  arenas, but the `tritium-nn` model assembler does not yet map a whole SALT V2
-  package plus norms/config into projections and embeddings. The legacy model
-  adapter also rejects Qwen QK-norm and QKV-bias checkpoints. That end-to-end
-  target-architecture integration must precede any Qwen campaign;
-- resident large-K CUDA SALT kernels and a paged fp16 or int8 KV cache with a
-  runtime context override remain required for practical 32B serving;
+  arenas and the `tritium-nn` assembler maps a complete package plus
+  configuration/preserved vectors into runnable projections, embeddings, and
+  heads. This is still a host-orchestrated correctness path: the fused resident
+  decoder does not yet accept SALT V2 projections, and the training architecture
+  does not yet retain Qwen QKV biases or QK-normalization vectors. Those two
+  device/training integrations must precede a Qwen refinement campaign;
+- optimized resident large-K CUDA SALT kernels, SALT V2 fused decoder/prefill
+  dispatch, and a paged fp16 or int8 KV cache with a runtime context override
+  remain required for practical 32B serving;
 - required third-party baselines have not all been integrated or reproduced
   under one byte/evaluation boundary;
 - the 135M, 1.7B, Qwen3-8B, Llama2-7B, Qwen3-32B, and growth acceptance artifacts

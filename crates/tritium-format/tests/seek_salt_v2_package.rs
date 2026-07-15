@@ -3,6 +3,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::rc::Rc;
 
 use half::f16;
+use tritium_format::PackageId;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
     PackedSaltV2PlaneRef, SALT_V2_PACKAGE_MAGIC, SALT_V2_PACKAGE_VERSION,
@@ -168,6 +169,7 @@ impl Seek for ShortTrackedReader {
 #[test]
 fn strict_seek_reader_visits_canonical_planes_in_arbitrary_tensor_order() {
     let encoded = write_salt_v2_package(&package()).unwrap();
+    let expected_package_id = PackageId::from_package_bytes(&encoded.bytes);
     let eager = read_salt_v2_package(&encoded.bytes).unwrap();
     let max_request = Rc::new(Cell::new(0));
     let source = ShortTrackedReader {
@@ -178,8 +180,13 @@ fn strict_seek_reader_visits_canonical_planes_in_arbitrary_tensor_order() {
     let mut reader = SaltV2PackageReader::new_strict(source).unwrap();
 
     assert_eq!(reader.codec(), SaltV2Codec::D2);
+    assert_eq!(reader.package_id(), expected_package_id);
     assert_eq!(reader.ledger(), encoded.ledger);
     assert_eq!(reader.tensor_names().collect::<Vec<_>>(), ["a", "z"]);
+    assert_eq!(
+        reader.tensor_names_encoded_order().collect::<Vec<_>>(),
+        ["z", "a"]
+    );
     assert_eq!(reader.len(), 2);
     assert!(!reader.is_empty());
 
@@ -224,8 +231,10 @@ fn strict_seek_reader_matches_eager_decode_for_every_physical_codec() {
         s34_package(),
     ] {
         let encoded = write_salt_v2_package(&package).unwrap();
+        let expected_package_id = PackageId::from_package_bytes(&encoded.bytes);
         let eager = read_salt_v2_package(&encoded.bytes).unwrap();
         let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+        assert_eq!(reader.package_id(), expected_package_id);
         assert_eq!(reader.codec(), eager.package.codec());
         assert_eq!(reader.ledger(), eager.ledger);
         for tensor in eager.package.tensors() {
