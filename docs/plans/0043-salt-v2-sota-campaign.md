@@ -675,7 +675,11 @@ natural column group, both fit inputs and reconstructions, the exact number of
 nonzero deltas, and the final working/reconstruction states. Legacy SALT-GGUF
 and TSLB consumers now index through `Read + Seek`, validate complete container
 structure and every SALT payload, and build final packed arenas without retaining
-an artifact-wide copy.
+an artifact-wide copy. The canonical SALT V2 package now has the same strict
+seek-backed format seam: it validates every D2/B3/S34 plane and scale, retains
+only owned tensor metadata plus the compact physical presence map, reports exact
+per-tensor indexed-runtime requirements, streams named tensors in arbitrary
+order with 64 KiB payload staging, and detects same-handle source mutation.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
@@ -722,10 +726,12 @@ The following work deliberately remains open and keeps this plan in progress:
   model-scale RSS/admission guarantee and remains a blocker before a 32B run;
 - the distinct whole-head/hidden-width transform, RMSNorm/residual handling,
   and dense function-preservation oracle required for G2 do not exist;
-- SALT V2 package opening is still eager and materializes semantic trit vectors;
-  there is no seek-indexed SALT V2 model loader, and the legacy model adapter
-  rejects Qwen QK-norm and QKV-bias checkpoints. A bounded SALT V2 consumer and
-  end-to-end target-architecture integration must precede any Qwen campaign;
+- the eager semantic SALT V2 decoder remains as a compatibility/reference API,
+  while `SaltV2PackageReader` supplies strict bounded-staging package access.
+  No model adapter yet consumes its packed-plane visitor into final CPU/CUDA
+  arenas, and the legacy model adapter rejects Qwen QK-norm and QKV-bias
+  checkpoints. That bounded runtime consumer and end-to-end target-architecture
+  integration must precede any Qwen campaign;
 - resident large-K CUDA SALT kernels and a paged fp16 or int8 KV cache with a
   runtime context override remain required for practical 32B serving;
 - required third-party baselines have not all been integrated or reproduced

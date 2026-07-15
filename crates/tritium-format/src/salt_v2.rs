@@ -283,11 +283,21 @@ pub fn pack_d2(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
 /// Returns a typed error for an overflowing count, a non-exact byte length, a
 /// reserved `11` code, or a partial byte not padded with zero-trit code `01`.
 pub fn unpack_d2(packed: &[u8], logical_trits: usize) -> Result<Vec<Trit>, SaltV2CodecError> {
+    let mut trits = Vec::with_capacity(logical_trits);
+    unpack_d2_into(packed, logical_trits, &mut trits)?;
+    Ok(trits)
+}
+
+pub(crate) fn unpack_d2_into(
+    packed: &[u8],
+    logical_trits: usize,
+    trits: &mut Vec<Trit>,
+) -> Result<(), SaltV2CodecError> {
     let ledger = SaltV2Codec::D2.ledger(logical_trits)?;
     require_exact_length(SaltV2Codec::D2, packed, ledger.physical_bytes)?;
 
     let physical_trits = ledger.physical_bytes * D2_TRITS_PER_BYTE;
-    let mut trits = Vec::with_capacity(logical_trits);
+    trits.clear();
     for index in 0..physical_trits {
         let code = (packed[index / D2_TRITS_PER_BYTE] >> (2 * (index % D2_TRITS_PER_BYTE))) & 0b11;
         if code == 0b11 {
@@ -308,7 +318,7 @@ pub fn unpack_d2(packed: &[u8], logical_trits: usize) -> Result<Vec<Trit>, SaltV
         }
         trits.push(Trit::from_i8(code as i8 - 1).expect("validated D2 code"));
     }
-    Ok(trits)
+    Ok(())
 }
 
 /// Pack trits as B3, five little-endian radix-3 digits per byte.
@@ -346,10 +356,20 @@ pub fn pack_b3(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
 /// Returns a typed error for an overflowing count, a non-exact byte length, a
 /// byte code at or above `3^5`, or a tail radix digit that is not semantic zero.
 pub fn unpack_b3(packed: &[u8], logical_trits: usize) -> Result<Vec<Trit>, SaltV2CodecError> {
+    let mut trits = Vec::with_capacity(logical_trits);
+    unpack_b3_into(packed, logical_trits, &mut trits)?;
+    Ok(trits)
+}
+
+pub(crate) fn unpack_b3_into(
+    packed: &[u8],
+    logical_trits: usize,
+    trits: &mut Vec<Trit>,
+) -> Result<(), SaltV2CodecError> {
     let ledger = SaltV2Codec::B3.ledger(logical_trits)?;
     require_exact_length(SaltV2Codec::B3, packed, ledger.physical_bytes)?;
 
-    let mut trits = Vec::with_capacity(logical_trits);
+    trits.clear();
     for (byte_index, &byte) in packed.iter().enumerate() {
         if u16::from(byte) >= B3_CODE_COUNT {
             return Err(SaltV2CodecError::InvalidB3Code {
@@ -375,7 +395,7 @@ pub fn unpack_b3(packed: &[u8], logical_trits: usize) -> Result<Vec<Trit>, SaltV
             trits.push(Trit::from_i8(digit as i8 - 1).expect("validated B3 digit"));
         }
     }
-    Ok(trits)
+    Ok(())
 }
 
 /// Pack structured 3:4 trits as one five-bit code per four-trit group.
@@ -428,12 +448,22 @@ pub fn pack_s34(trits: &[Trit]) -> Result<Vec<u8>, SaltV2CodecError> {
 /// Returns a typed error for an invalid trit count, overflowing size accounting,
 /// a non-exact byte length, or nonzero terminal byte padding.
 pub fn unpack_s34(packed: &[u8], logical_trits: usize) -> Result<Vec<Trit>, SaltV2CodecError> {
+    let mut trits = Vec::with_capacity(logical_trits);
+    unpack_s34_into(packed, logical_trits, &mut trits)?;
+    Ok(trits)
+}
+
+pub(crate) fn unpack_s34_into(
+    packed: &[u8],
+    logical_trits: usize,
+    trits: &mut Vec<Trit>,
+) -> Result<(), SaltV2CodecError> {
     let ledger = SaltV2Codec::S34.ledger(logical_trits)?;
     require_exact_length(SaltV2Codec::S34, packed, ledger.physical_bytes)?;
     validate_s34_bit_padding(packed, &ledger)?;
 
     let groups = logical_trits / S34_TRITS_PER_GROUP;
-    let mut trits = Vec::with_capacity(logical_trits);
+    trits.clear();
     for group_index in 0..groups {
         let code = read_s34_code(packed, group_index);
         let zero_index = usize::from(code & 0b11);
@@ -448,7 +478,7 @@ pub fn unpack_s34(packed: &[u8], logical_trits: usize) -> Result<Vec<Trit>, Salt
             sign_index += 1;
         }
     }
-    Ok(trits)
+    Ok(())
 }
 
 fn write_s34_code(packed: &mut [u8], group_index: usize, code: u8) {

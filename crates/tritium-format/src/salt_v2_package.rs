@@ -16,7 +16,14 @@ use half::f16;
 use tritium_core::Trit;
 
 use crate::salt_v2::{
-    SaltV2Codec, SaltV2CodecError, pack_b3, pack_d2, pack_s34, unpack_b3, unpack_d2, unpack_s34,
+    SaltV2Codec, SaltV2CodecError, pack_b3, pack_d2, pack_s34, unpack_b3_into, unpack_d2_into,
+    unpack_s34_into,
+};
+
+mod reader;
+
+pub use reader::{
+    PackedSaltV2PlaneRef, SaltV2PackageReadError, SaltV2PackageReader, SaltV2TensorInfo,
 };
 
 /// Number of coefficients sharing one SALT V2 scale.
@@ -1844,20 +1851,61 @@ fn unpack_semantic_plane(
     packed: &[u8],
     logical_len: usize,
 ) -> Result<Vec<Trit>, SaltV2PackageError> {
-    Ok(match codec {
-        SaltV2Codec::D2 => unpack_d2(packed, logical_len)?,
-        SaltV2Codec::B3 => unpack_b3(packed, logical_len)?,
+    let mut decoded = Vec::with_capacity(stored_trit_count(codec, logical_len)?);
+    unpack_semantic_plane_into(codec, packed, logical_len, &mut decoded)?;
+    Ok(decoded)
+}
+
+fn unpack_semantic_plane_into(
+    codec: SaltV2Codec,
+    packed: &[u8],
+    logical_len: usize,
+    decoded: &mut Vec<Trit>,
+) -> Result<(), SaltV2PackageError> {
+    match codec {
+        SaltV2Codec::D2 => unpack_d2_into(packed, logical_len, decoded)?,
+        SaltV2Codec::B3 => unpack_b3_into(packed, logical_len, decoded)?,
         SaltV2Codec::S34 => {
             let stored_len = stored_trit_count(codec, logical_len)?;
-            let mut decoded = unpack_s34(packed, stored_len)?;
-            let canonical = canonical_s34_trits(&decoded[..logical_len])?;
-            if decoded != canonical {
-                return Err(SaltV2PackageError::NonCanonicalS34ShapePadding);
-            }
+            unpack_s34_into(packed, stored_len, decoded)?;
+            validate_s34_shape_padding(decoded, logical_len)?;
             decoded.truncate(logical_len);
-            decoded
         }
-    })
+    }
+    Ok(())
+}
+
+fn validate_s34_shape_padding(
+    decoded: &[Trit],
+    logical_len: usize,
+) -> Result<(), SaltV2PackageError> {
+    if decoded.len() == logical_len {
+        return Ok(());
+    }
+    let group_start = logical_len / 4 * 4;
+    let logical_tail = &decoded[group_start..logical_len];
+    let zero_count = logical_tail.iter().filter(|trit| trit.is_zero()).count();
+    if zero_count > 1 {
+        return Err(SaltV2PackageError::S34IncompatibleGroup {
+            group_index: group_start / 4,
+            logical_trits: logical_tail.len(),
+            zero_count,
+        });
+    }
+    let mut padding_start = logical_len;
+    if zero_count == 0 {
+        if decoded.get(padding_start) != Some(&Trit::ZERO) {
+            return Err(SaltV2PackageError::NonCanonicalS34ShapePadding);
+        }
+        padding_start += 1;
+    }
+    if decoded[padding_start..]
+        .iter()
+        .any(|trit| *trit != Trit::NEG)
+    {
+        return Err(SaltV2PackageError::NonCanonicalS34ShapePadding);
+    }
+    Ok(())
 }
 
 fn canonical_s34_trits(trits: &[Trit]) -> Result<Vec<Trit>, SaltV2PackageError> {
