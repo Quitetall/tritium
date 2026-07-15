@@ -53,6 +53,9 @@ libc = { version = "0.2", optional = true }
 [dev-dependencies]
 # `salt_model_cli` parses the report's JSON output to assert fidelity invariants.
 serde_json = { workspace = true }
+# Campaign sidecar tests exercise canonical Net2Wider receipt constants even when
+# the optional CUDA feature (and its training dependency) is disabled.
+tritium-train = { workspace = true }
 # `fisher_quantize_cli` reads back the emitted SALT bundle to assert the Fisher sidecar drove
 # plane allocation (plan 0039 step 4).
 tritium-format = { workspace = true }
