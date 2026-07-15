@@ -9,6 +9,7 @@ mod bpe_tokenizer;
 mod hf;
 mod hf_shards;
 mod qwen35;
+mod qwen35_hf;
 mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
@@ -22,6 +23,7 @@ pub use qwen35::{
     Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput,
     Qwen35TextRunner, Qwen35TextWeights,
 };
+pub use qwen35_hf::{Qwen35HfLanguageModel, Qwen35HfLanguageReceipt};
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]
 pub use salt_v2::{

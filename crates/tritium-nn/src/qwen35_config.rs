@@ -695,7 +695,6 @@ fn parse_three_u32(
         let value = value
             .as_u64()
             .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value != 0)
             .ok_or_else(|| invalid(format!("{path}.{key}[{index}]")))?;
         output[index] = value;
     }
@@ -839,6 +838,28 @@ mod tests {
                 .validate_pinned_qwen36_27b(QWEN36_27B_REVISION)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn official_oracle_geometry_allows_zero_width_unused_mrope_axes() {
+        let mut value = config_value(2, 2);
+        let text = &mut value["text_config"];
+        text["head_dim"] = json!(4);
+        text["hidden_size"] = json!(4);
+        text["intermediate_size"] = json!(6);
+        text["linear_key_head_dim"] = json!(2);
+        text["linear_num_key_heads"] = json!(1);
+        text["linear_num_value_heads"] = json!(2);
+        text["linear_value_head_dim"] = json!(2);
+        text["max_position_embeddings"] = json!(32);
+        text["num_attention_heads"] = json!(2);
+        text["num_key_value_heads"] = json!(1);
+        text["vocab_size"] = json!(7);
+        text["rope_parameters"]["mrope_section"] = json!([1, 0, 0]);
+
+        let config = parse(&value).expect("parse official tiny oracle geometry");
+        assert_eq!(config.text.rope.rotary_dim, 2);
+        assert_eq!(config.text.rope.mrope_section, [1, 0, 0]);
     }
 
     #[test]

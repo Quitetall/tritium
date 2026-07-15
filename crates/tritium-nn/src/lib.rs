@@ -41,8 +41,9 @@ pub use layers::{
 #[cfg(feature = "tokenizer")]
 pub use model::GgufBpeTokenizer;
 pub use model::{
-    ForwardDump, LayerWeights, ModelRunner, ModelWeights, Qwen35TextCache, Qwen35TextLayerWeights,
-    Qwen35TextMixerWeights, Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights, Tokenizer,
+    ForwardDump, LayerWeights, ModelRunner, ModelWeights, Qwen35HfLanguageModel,
+    Qwen35HfLanguageReceipt, Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights,
+    Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights, Tokenizer,
 };
 #[cfg(feature = "cuda")]
 pub use model::{
