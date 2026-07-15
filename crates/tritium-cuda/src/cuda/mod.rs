@@ -231,7 +231,7 @@ mod backend;
 use backend::*;
 pub use backend::{
     CudaBackend, SaltResidentLinear, SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt,
-    SaltV2ResidentAllocationReceipt, SaltV2ResidentTensor,
+    SaltV2GatherReceipt, SaltV2ResidentAllocationReceipt, SaltV2ResidentTensor,
 };
 #[allow(unused_imports)] // TrainingSaltLinear is the Track D tape seam.
 pub(crate) use backend::{EmbedSegments, TrainingSaltLinear};

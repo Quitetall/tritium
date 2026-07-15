@@ -61,8 +61,8 @@ pub use cuda::SaltResidentLinear;
 // correctness-first alias for an optimized kernel.
 #[cfg(feature = "cuda")]
 pub use cuda::{
-    SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt, SaltV2ResidentAllocationReceipt,
-    SaltV2ResidentTensor,
+    SaltV2Forward, SaltV2ForwardMode, SaltV2ForwardReceipt, SaltV2GatherReceipt,
+    SaltV2ResidentAllocationReceipt, SaltV2ResidentTensor,
 };
 
 // v0.30 (ADR 0005) skeletons. `autotune` is pure Rust (tile config + on-disk

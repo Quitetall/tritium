@@ -125,6 +125,227 @@ fn salt_v2_dense_matmul(tensor: &SaltV2Tensor, activation: &[f32], m: usize) -> 
     output
 }
 
+fn salt_v2_dense_weights(tensor: &SaltV2Tensor) -> Vec<f32> {
+    let rows = tensor.dims()[0] as usize;
+    let columns = tensor.dims()[1] as usize;
+    let mut dense = vec![0.0f32; rows * columns];
+    for (index, weight) in dense.iter_mut().enumerate() {
+        let tile_index = index / SALT_V2_ALLOCATION_TILE_SIZE;
+        let local_index = index % SALT_V2_ALLOCATION_TILE_SIZE;
+        for plane in tensor.tiles()[tile_index].planes() {
+            *weight += plane.trits()[local_index].get() as f32
+                * plane.scales()[local_index / SALT_V2_SCALE_GROUP_SIZE].to_f32();
+        }
+    }
+    dense
+}
+
+/// Plan 0043 model-loader seam: a caller-owned host output can be reused across
+/// SALT V2 projections. The returned receipt remains identical to the allocating
+/// API and no dense weight allocation is introduced.
+#[test]
+fn salt_v2_cuda_exact_forward_into_matches_allocating_api() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 CUDA forward-into parity: no device ({error})");
+            return;
+        }
+    };
+    let tensor = salt_v2_test_tensor(3, 173, &[1, 3, 2]);
+    let activation = seeded_f32(0xF012_1A70, 2 * 173, -0.75, 0.75);
+
+    for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+        let resident = cuda
+            .upload_salt_v2(&tensor, codec)
+            .expect("upload semantic SALT V2 tensor");
+        let allocating = cuda
+            .salt_v2_forward_exact(&resident, &activation, 2)
+            .expect("allocating exact forward");
+        let mut output = vec![f32::NAN; allocating.output.len()];
+        let receipt = cuda
+            .salt_v2_forward_exact_into(&resident, &activation, 2, &mut output)
+            .expect("caller-owned exact forward");
+
+        assert_eq!(output, allocating.output, "{codec:?} forward-into parity");
+        assert_eq!(receipt, allocating.receipt);
+        assert_eq!(receipt.dense_weight_bytes(), 0);
+        assert_eq!(
+            resident.allocation_receipt(),
+            receipt.resident_allocation(),
+            "forward must retain only the original encoded allocation"
+        );
+
+        let mut wrong = vec![0.0; output.len() - 1];
+        assert!(matches!(
+            cuda.salt_v2_forward_exact_into(&resident, &activation, 2, &mut wrong),
+            Err(BackendError::ShapeMismatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn salt_v2_cuda_forward_into_is_transactional_on_nonfinite_result() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 CUDA forward-into transaction gate: no device ({error})");
+            return;
+        }
+    };
+    let plane = SaltV2Plane::new(vec![1, 1], vec![f16::ONE]).expect("valid overflow plane");
+    let tile = SaltV2Tile::new(vec![plane]).expect("valid overflow tile");
+    let tensor =
+        SaltV2Tensor::new("overflow", vec![1, 2], vec![tile]).expect("valid overflow tensor");
+    let resident = cuda
+        .upload_salt_v2(&tensor, SaltV2Codec::D2)
+        .expect("upload overflow tensor");
+    let sentinel = f32::from_bits(0x3f12_3456);
+    let mut output = [sentinel];
+
+    let error = cuda
+        .salt_v2_forward_exact_into(&resident, &[f32::MAX, f32::MAX], 1, &mut output)
+        .expect_err("non-finite result must be rejected");
+    assert!(matches!(error, BackendError::InvalidInput(_)));
+    assert_eq!(output[0].to_bits(), sentinel.to_bits());
+    assert!(
+        cuda.salt_v2_forward_exact(&resident, &[f32::MAX, f32::MAX], 1)
+            .is_err(),
+        "allocating and caller-owned APIs must share rejection semantics"
+    );
+}
+
+/// Token embeddings need selected semantic rows without ever materializing the
+/// full dense table. Repeated IDs preserve order and duplicate the exact row;
+/// all three physical codecs must reconstruct the same semantic values.
+#[test]
+fn salt_v2_cuda_gathers_repeated_rows_without_dense_shadow() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 CUDA row gather parity: no device ({error})");
+            return;
+        }
+    };
+    let tensor = salt_v2_test_tensor(5, 173, &[1, 3, 2, 3]);
+    let dense = salt_v2_dense_weights(&tensor);
+    let selected = [4_u32, 1, 4, 0];
+    let columns = tensor.dims()[1] as usize;
+    let mut expected = Vec::with_capacity(selected.len() * columns);
+    for &row in &selected {
+        let start = row as usize * columns;
+        expected.extend_from_slice(&dense[start..start + columns]);
+    }
+
+    for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+        let resident = cuda
+            .upload_salt_v2(&tensor, codec)
+            .expect("upload semantic SALT V2 embedding");
+        let package = SaltV2Package::new(codec, vec![tensor.clone()])
+            .expect("codec accepts the embedding tensor");
+        let encoded = write_salt_v2_package(&package).expect("encode SALT V2 embedding package");
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes))
+            .expect("strict embedding package reader");
+        let streamed = cuda
+            .upload_salt_v2_from_reader(&mut reader, tensor.name())
+            .expect("stream SALT V2 embedding from package");
+        let allocation_before = resident.allocation_receipt();
+        let mut output = vec![f32::NAN; expected.len()];
+        let receipt = cuda
+            .salt_v2_gather_rows(&resident, &selected, &mut output)
+            .expect("gather selected SALT V2 rows");
+        let mut streamed_output = vec![f32::NAN; expected.len()];
+        let streamed_receipt = cuda
+            .salt_v2_gather_rows(&streamed, &selected, &mut streamed_output)
+            .expect("gather selected streamed SALT V2 rows");
+
+        for (index, (&got, &want)) in output.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{codec:?} gathered coefficient {index}: {got} != {want}"
+            );
+        }
+        assert_eq!(streamed_output, output, "{codec:?} streamed gather parity");
+        assert_eq!(streamed_receipt, receipt);
+        assert_eq!(&output[..columns], &output[2 * columns..3 * columns]);
+        assert_eq!(receipt.resident_allocation(), allocation_before);
+        assert_eq!(resident.allocation_receipt(), allocation_before);
+        assert_eq!(receipt.row_index_bytes(), selected.len() as u64 * 4);
+        assert_eq!(
+            receipt.output_bytes(),
+            expected.len() as u64 * core::mem::size_of::<f32>() as u64
+        );
+        assert_eq!(receipt.dense_weight_bytes(), 0);
+        assert_eq!(
+            receipt.peak_resident_bytes(),
+            allocation_before.steady_resident_bytes()
+                + receipt.row_index_bytes()
+                + receipt.output_bytes()
+        );
+    }
+}
+
+#[test]
+fn salt_v2_cuda_gather_rejects_oov_before_touching_output() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 CUDA row gather OOV gate: no device ({error})");
+            return;
+        }
+    };
+    let tensor = salt_v2_test_tensor(3, 173, &[1, 3, 2]);
+    let resident = cuda
+        .upload_salt_v2(&tensor, SaltV2Codec::D2)
+        .expect("upload semantic SALT V2 embedding");
+    let sentinel = 0x7fc0_1234_u32;
+    let mut output = vec![f32::from_bits(sentinel); 2 * 173];
+
+    let error = cuda
+        .salt_v2_gather_rows(&resident, &[1, 3], &mut output)
+        .expect_err("row equal to vocab size must be rejected");
+    assert!(matches!(error, BackendError::InvalidInput(_)));
+    assert!(output.iter().all(|value| value.to_bits() == sentinel));
+}
+
+#[test]
+fn salt_v2_cuda_gather_crosses_rank_prefix_boundary() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("skipping SALT V2 CUDA row gather rank-prefix gate: no device ({error})");
+            return;
+        }
+    };
+    let plane_counts = (0..258).map(|tile| 1 + tile % 3).collect::<Vec<_>>();
+    let tensor = salt_v2_test_tensor(258, SALT_V2_ALLOCATION_TILE_SIZE, &plane_counts);
+    let dense = salt_v2_dense_weights(&tensor);
+    let selected = [256_u32, 257, 0];
+    let columns = SALT_V2_ALLOCATION_TILE_SIZE;
+    let mut expected = Vec::with_capacity(selected.len() * columns);
+    for &row in &selected {
+        let start = row as usize * columns;
+        expected.extend_from_slice(&dense[start..start + columns]);
+    }
+
+    for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+        let resident = cuda
+            .upload_salt_v2(&tensor, codec)
+            .expect("upload rank-prefix SALT V2 embedding");
+        let mut output = vec![f32::NAN; expected.len()];
+        cuda.salt_v2_gather_rows(&resident, &selected, &mut output)
+            .expect("gather rows across rank-prefix boundary");
+        for (index, (&got, &want)) in output.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{codec:?} rank-prefix coefficient {index}: {got} != {want}"
+            );
+        }
+    }
+}
+
 /// Plan 0043 Stage 6: every admitted SALT V2 codec executes directly from its
 /// resident encoded payload. Mixed P=1/3/2 tiles, row-crossing macrotiles, and
 /// one-/three-column matrices cover the descriptor and codec-tail boundaries;

@@ -10,6 +10,8 @@ use tritium_format::salt_v2_package::{
 };
 
 mod salt_v2_reader_upload;
+mod salt_v2_runtime;
+pub use salt_v2_runtime::SaltV2GatherReceipt;
 
 /// A logical prefix of cudarc page-locked memory.
 ///
@@ -442,6 +444,8 @@ pub struct CudaBackend {
     pub(super) _salt_v2_module: Arc<CudaModule>,
     /// Scalar-correct D2/B3/S34 forward. The first fast API aliases this handle.
     pub(super) func_salt_v2_exact: CudaFunction,
+    /// Exact selected-row reconstruction for SALT V2 token embeddings.
+    pub(super) func_salt_v2_gather: CudaFunction,
     /// Sparse-aware f32-tiled kernel: bitmap skip for zero blocks (P1 opt).
     #[allow(dead_code)]
     // validated sparse mpgemm kernel; auto-dispatch integration is future (1.x) work
@@ -814,6 +818,9 @@ impl CudaBackend {
         let func_salt_v2_exact = salt_v2_module
             .load_function(KERNEL_NAME_SALT_V2_EXACT)
             .map_err(|e| driver_err("resolve salt_v2_forward_exact kernel", &e))?;
+        let func_salt_v2_gather = salt_v2_module
+            .load_function(KERNEL_NAME_SALT_V2_GATHER)
+            .map_err(|e| driver_err("resolve salt_v2_gather_rows kernel", &e))?;
 
         let device_name = ctx
             .name()
@@ -837,6 +844,7 @@ impl CudaBackend {
             func_salt,
             _salt_v2_module: salt_v2_module,
             func_salt_v2_exact,
+            func_salt_v2_gather,
             func_tiled_f32_sparse,
             func_tiled_i8_scaled_sparse,
             func_imma,
@@ -5248,137 +5256,10 @@ impl CudaBackend {
         m: usize,
         mode: SaltV2ForwardMode,
     ) -> Result<SaltV2Forward, BackendError> {
-        if !self.same_context(&tensor.payload)
-            || !self.same_context(&tensor.scales)
-            || tensor
-                .index_metadata
-                .as_ref()
-                .is_some_and(|metadata| !self.same_context(metadata))
-        {
-            return Err(BackendError::InvalidInput(
-                "SALT V2 resident tensor belongs to a different CUDA context".into(),
-            ));
-        }
-        let activation_elements = m.checked_mul(tensor.columns).ok_or_else(|| {
-            BackendError::InvalidInput("SALT V2 activation length overflows usize".into())
-        })?;
-        if activation.len() != activation_elements {
-            return Err(BackendError::ShapeMismatch {
-                expected: activation_elements,
-                got: activation.len(),
-            });
-        }
-        if let Some((index, value)) = activation
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-        {
-            return Err(BackendError::InvalidInput(format!(
-                "SALT V2 activation {index} is non-finite ({:#010x})",
-                value.to_bits()
-            )));
-        }
-        let output_elements = m.checked_mul(tensor.rows).ok_or_else(|| {
-            BackendError::InvalidInput("SALT V2 output length overflows usize".into())
-        })?;
-        let receipt =
-            SaltV2ForwardReceipt::new(mode, tensor.receipt, activation_elements, output_elements)?;
-        if output_elements == 0 {
-            return Ok(SaltV2Forward {
-                output: Vec::new(),
-                receipt,
-            });
-        }
-
-        let m_u32 = u32::try_from(m).map_err(|_| {
-            BackendError::InvalidInput("SALT V2 batch rows exceed the u32 kernel ABI".into())
-        })?;
-        let n_u32 = u32::try_from(tensor.rows).map_err(|_| {
-            BackendError::InvalidInput("SALT V2 output rows exceed the u32 kernel ABI".into())
-        })?;
-        let k_u32 = u32::try_from(tensor.columns).map_err(|_| {
-            BackendError::InvalidInput("SALT V2 columns exceed the u32 kernel ABI".into())
-        })?;
-        let tile_count = u32::try_from(tensor.tile_count).map_err(|_| {
-            BackendError::InvalidInput("SALT V2 tile count exceeds the u32 kernel ABI".into())
-        })?;
-        let plane_count = u32::try_from(tensor.plane_count).map_err(|_| {
-            BackendError::InvalidInput("SALT V2 plane count exceeds the u32 kernel ABI".into())
-        })?;
-        let payload_bytes = tensor.receipt.payload_bytes();
-        let scale_count = tensor.receipt.scale_bytes() / core::mem::size_of::<u16>() as u64;
-        let index_metadata = tensor.index_metadata.as_ref().unwrap_or(&tensor.payload);
-        let total_outputs = u32::try_from(output_elements).map_err(|_| {
-            BackendError::InvalidInput("SALT V2 output elements exceed the u32 launch grid".into())
-        })?;
-
-        let d_activation = self.stream.clone_htod(activation).map_err(|error| {
-            alloc_or_backend(
-                "upload SALT V2 activation",
-                &error,
-                activation_elements * core::mem::size_of::<f32>(),
-            )
-        })?;
-        let mut d_output = self
-            .stream
-            .alloc_zeros::<f32>(output_elements)
-            .map_err(|error| {
-                alloc_or_backend(
-                    "allocate SALT V2 output",
-                    &error,
-                    output_elements * core::mem::size_of::<f32>(),
-                )
-            })?;
-        let cfg = LaunchConfig {
-            grid_dim: (total_outputs.div_ceil(THREADS_PER_BLOCK), 1, 1),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch = self.stream.launch_builder(&self.func_salt_v2_exact);
-        launch
-            .arg(&d_activation)
-            .arg(&tensor.payload)
-            .arg(&tensor.scales)
-            .arg(index_metadata)
-            .arg(&mut d_output)
-            .arg(&m_u32)
-            .arg(&n_u32)
-            .arg(&k_u32)
-            .arg(&tensor.codec_tag)
-            .arg(&tile_count)
-            .arg(&plane_count)
-            .arg(&payload_bytes)
-            .arg(&scale_count)
-            .arg(&tensor.allocation_map_bytes)
-            .arg(&tensor.rank_prefix_count)
-            .arg(&tensor.terminal_map_value);
-        // SAFETY: `salt_v2_forward_exact` receives the arguments above in the
-        // exact pointer/scalar order. The private resident handle owns validated
-        // payload/scales/compact index metadata from this context. `d_activation` is
-        // M*K, `d_output` is M*N, and all derived payload/scale ranks were checked
-        // against the u32 ABI and complete host allocations before upload.
-        #[allow(unsafe_code)]
-        unsafe {
-            launch
-                .launch(cfg)
-                .map_err(|error| driver_err("launch SALT V2 exact forward", &error))?;
-        }
-        let mut output = vec![0.0f32; output_elements];
-        self.stream
-            .memcpy_dtoh(&d_output, &mut output)
-            .map_err(|error| driver_err("download SALT V2 output", &error))?;
-        if let Some((index, value)) = output
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-        {
-            return Err(BackendError::InvalidInput(format!(
-                "SALT V2 output {index} is non-finite ({:#010x})",
-                value.to_bits()
-            )));
-        }
+        let (receipt, output_elements) =
+            self.salt_v2_forward_preflight(tensor, activation, m, None, mode)?;
+        let output =
+            self.salt_v2_forward_launch(tensor, activation, m, output_elements, receipt)?;
         Ok(SaltV2Forward { output, receipt })
     }
 
