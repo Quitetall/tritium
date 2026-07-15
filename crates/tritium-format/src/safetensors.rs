@@ -547,23 +547,6 @@ fn try_visit_reader_range<R: Read + Seek, E>(
     Ok(())
 }
 
-fn visit_reader_range<R: Read + Seek>(
-    reader: &mut R,
-    absolute: u64,
-    byte_len: usize,
-    max_chunk_bytes: usize,
-    mut visit: impl FnMut(&[u8]),
-) -> Result<(), SafeTensorsError> {
-    match try_visit_reader_range(reader, absolute, byte_len, max_chunk_bytes, |chunk| {
-        visit(chunk);
-        Ok::<(), std::convert::Infallible>(())
-    }) {
-        Ok(()) => Ok(()),
-        Err(VisitTensorBytesError::Source(error)) => Err(error),
-        Err(VisitTensorBytesError::Sink(never)) => match never {},
-    }
-}
-
 /// A parsed safetensors buffer: the header table + a borrow of the data region.
 #[derive(Debug)]
 pub struct SafeTensors<'a> {
@@ -813,6 +796,56 @@ impl<R: Read + Seek> SafeTensorsReader<R> {
         )
     }
 
+    /// Widen one tensor to `f32` while a fallible sink observes the exact raw
+    /// chunks used by that decode.
+    ///
+    /// Raw chunks are consecutive, non-empty, row-major slices aligned to the
+    /// source dtype width. Each is at most `max_chunk_bytes` and at most the
+    /// fixed 64 KiB reader staging bound. Returning a sink error stops before
+    /// any later chunk is read and discards the provisional widened output.
+    ///
+    /// # Errors
+    /// Returns [`VisitTensorBytesError::Source`] for an absent/malformed tensor,
+    /// failed allocation or read, or a chunk limit smaller than one source
+    /// element. Returns [`VisitTensorBytesError::Sink`] when `visit` rejects a
+    /// raw chunk.
+    pub fn try_tensor_f32_with_raw_chunks<E>(
+        &mut self,
+        name: &str,
+        max_chunk_bytes: usize,
+        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<Vec<f32>, VisitTensorBytesError<E>> {
+        let layout = tensor_layout(&self.tensors, name, self.data_len)
+            .map_err(VisitTensorBytesError::Source)?;
+        let absolute = self.data_start.checked_add(layout.offset).ok_or_else(|| {
+            VisitTensorBytesError::Source(SafeTensorsError::OutOfBounds(name.to_owned()))
+        })?;
+        let mut output = reserve_f32(layout.numel).map_err(VisitTensorBytesError::Source)?;
+        let alignment = layout.dtype.byte_size();
+        let bounded = max_chunk_bytes.min(READ_CHUNK_BYTES);
+        let chunk_capacity = bounded - bounded % alignment;
+        if chunk_capacity == 0 {
+            return Err(VisitTensorBytesError::Source(
+                SafeTensorsError::InvalidChunkSize {
+                    requested: max_chunk_bytes,
+                },
+            ));
+        }
+        try_visit_reader_range(
+            &mut self.reader,
+            absolute,
+            layout.byte_len,
+            chunk_capacity,
+            |raw| {
+                visit(raw)?;
+                append_f32(&mut output, layout.dtype, raw);
+                Ok(())
+            },
+        )?;
+        debug_assert_eq!(output.len(), layout.numel);
+        Ok(output)
+    }
+
     /// Seek to one tensor and return its row-major values widened to `f32`.
     /// Reads are chunked to bound raw staging memory independently of tensor size.
     ///
@@ -820,23 +853,13 @@ impl<R: Read + Seek> SafeTensorsReader<R> {
     /// Returns a typed [`SafeTensorsError`] for an absent/malformed tensor, a
     /// failed output reservation, or a failed absolute seek/read.
     pub fn tensor_f32(&mut self, name: &str) -> Result<Vec<f32>, SafeTensorsError> {
-        let layout = tensor_layout(&self.tensors, name, self.data_len)?;
-        let absolute = self
-            .data_start
-            .checked_add(layout.offset)
-            .ok_or_else(|| SafeTensorsError::OutOfBounds(name.to_owned()))?;
-        let mut output = reserve_f32(layout.numel)?;
-        let alignment = layout.dtype.byte_size();
-        let chunk_capacity = READ_CHUNK_BYTES - READ_CHUNK_BYTES % alignment;
-        visit_reader_range(
-            &mut self.reader,
-            absolute,
-            layout.byte_len,
-            chunk_capacity,
-            |raw| append_f32(&mut output, layout.dtype, raw),
-        )?;
-        debug_assert_eq!(output.len(), layout.numel);
-        Ok(output)
+        match self.try_tensor_f32_with_raw_chunks(name, READ_CHUNK_BYTES, |_| {
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(output) => Ok(output),
+            Err(VisitTensorBytesError::Source(error)) => Err(error),
+            Err(VisitTensorBytesError::Sink(never)) => match never {},
+        }
     }
 }
 
@@ -1014,6 +1037,32 @@ mod tests {
         );
         assert_eq!(st.tensor_f32("b_f16").unwrap(), vec![9.0, -8.0]);
         assert_eq!(st.tensor_f32("c_f32").unwrap(), vec![3.0, -4.0, 0.125]);
+    }
+
+    #[test]
+    fn seek_reader_widens_the_exact_raw_chunks_seen_by_a_fallible_sink() {
+        let mut data = Vec::new();
+        for value in [1.0f32, -2.0, 0.5, -0.25] {
+            data.extend_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes());
+        }
+        let header = r#"{"x":{"dtype":"BF16","shape":[2,2],"data_offsets":[0,8]}}"#;
+        let mut reader = SafeTensorsReader::new(io::Cursor::new(build(header, &data))).unwrap();
+        let mut observed = Vec::new();
+        let values = reader
+            .try_tensor_f32_with_raw_chunks("x", 3, |chunk| {
+                assert_eq!(chunk.len() % 2, 0);
+                assert!(chunk.len() <= 3);
+                observed.extend_from_slice(chunk);
+                Ok::<(), SinkStop>(())
+            })
+            .unwrap();
+        assert_eq!(observed, data);
+        assert_eq!(values, [1.0, -2.0, 0.5, -0.25]);
+
+        let error = reader
+            .try_tensor_f32_with_raw_chunks("x", 4, |_| Err(SinkStop::Enough))
+            .unwrap_err();
+        assert_eq!(error, VisitTensorBytesError::Sink(SinkStop::Enough));
     }
 
     #[test]
