@@ -10,6 +10,7 @@ mod linear;
 mod mlp;
 mod packed_salt;
 mod projection;
+mod qwen35_deltanet;
 mod qwen35_full_attention;
 mod salt;
 mod token_embedding;
@@ -21,6 +22,7 @@ pub use dense::DenseLinear;
 pub use linear::TernaryLinear;
 pub use mlp::{Mlp, Relu2Mlp, SwiGluMlp};
 pub use projection::{Projection, ProjectionActivationMode};
+pub use qwen35_deltanet::{Qwen35DeltaNet, Qwen35DeltaNetCache, Qwen35DeltaNetWeights};
 pub use qwen35_full_attention::{
     Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights,
 };
