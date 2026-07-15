@@ -13,12 +13,17 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 mod pipeline;
+mod qwen36_preflight;
 
 pub use pipeline::{
     AdvanceOutcome, DriverFailure, FailureReceipt, HardwareReceipt, HardwareUsage, Metric,
     MetricReceipt, PhysicalLedger, PipelineStatus, ProvenanceReceipt, PublishedArtifact,
     QualityEvidence, SaltDriver, SaltPipeline, SaltReceipt, StageArtifact, StageOutput,
     StageReceiptRecord, StageRequest,
+};
+pub use qwen36_preflight::{
+    Qwen36CampaignPreflight, Qwen36CampaignPreflightError, Qwen36CampaignPreflightReceipt,
+    Qwen36SourceIdentityStatus,
 };
 
 const CONTENT_ID_CONTEXT: &str = "tritium salt content id v1";

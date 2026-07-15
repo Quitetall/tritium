@@ -1,0 +1,70 @@
+use std::path::Path;
+
+use tritium_salt::{
+    Qwen36CampaignPreflight, Qwen36CampaignPreflightError, Qwen36SourceIdentityStatus,
+};
+
+const PINNED_METADATA_DIGEST: [u8; 32] = [
+    0xad, 0xd3, 0x32, 0xd2, 0x3a, 0x10, 0x12, 0xaa, 0x1d, 0x77, 0x33, 0x9e, 0x04, 0x61, 0x30, 0x42,
+    0xaa, 0x56, 0xfb, 0x7c, 0xab, 0x49, 0x08, 0xf7, 0x72, 0x6a, 0xc7, 0x8b, 0x78, 0xef, 0x2d, 0x8e,
+];
+
+#[test]
+fn wrong_revision_fails_before_source_open() {
+    let result = Qwen36CampaignPreflight::open(
+        Path::new("this-path-must-not-be-opened"),
+        "mutable-main-branch",
+    );
+    assert!(matches!(
+        result,
+        Err(Qwen36CampaignPreflightError::WrongRevision)
+    ));
+}
+
+#[test]
+#[ignore = "streams the complete local Qwen3.6-27B checkpoint"]
+fn real_revision_declared_checkpoint_earns_candidate_receipt() {
+    let model_dir = std::env::var_os("TRITIUM_QWEN36_27B_DIR")
+        .expect("set TRITIUM_QWEN36_27B_DIR to the pinned local snapshot");
+    let preflight =
+        Qwen36CampaignPreflight::open(Path::new(&model_dir), tritium_nn::QWEN36_27B_REVISION)
+            .expect("pinned campaign preflight");
+
+    assert_eq!(preflight.receipt().repository(), "Qwen/Qwen3.6-27B");
+    assert_eq!(
+        preflight.receipt().revision(),
+        "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
+    );
+    assert_eq!(preflight.receipt().total_tensors(), 1_199);
+    assert_eq!(preflight.receipt().included_tensors(), 866);
+    assert_eq!(preflight.receipt().payload_bytes(), 55_562_855_904);
+    assert_eq!(preflight.receipt().metadata_record_bytes(), 75_705);
+    assert_eq!(
+        preflight.receipt().metadata_digest(),
+        &PINNED_METADATA_DIGEST
+    );
+    assert_eq!(
+        preflight.receipt().identity_status(),
+        Qwen36SourceIdentityStatus::MeasuredAwaitingOfficialRegistration
+    );
+
+    let coverage = preflight.receipt().coverage();
+    assert_eq!(coverage.language().tensors(), 851);
+    assert_eq!(coverage.mtp().tensors(), 15);
+    assert_eq!(coverage.vision().tensors(), 333);
+    assert_eq!(coverage.additive_ternary().tensors(), 506);
+    assert_eq!(coverage.preserve_source().tensors(), 360);
+
+    let language = preflight.receipt().language();
+    assert_eq!(language.language_tensors(), 851);
+    assert_eq!(language.language_matrices(), 498);
+    assert_eq!(language.language_preserved_tensors(), 353);
+    assert_eq!(language.deferred_mtp_tensors(), 15);
+    assert_eq!(language.deferred_vision_tensors(), 333);
+
+    assert_eq!(preflight.source_manifest().tensors().len(), 1_199);
+    assert_eq!(
+        preflight.receipt().source_model_id(),
+        preflight.source_manifest().model_id()
+    );
+}

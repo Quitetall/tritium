@@ -14,11 +14,12 @@ categories.workspace = true
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tritium-format = { workspace = true }
+tritium-nn = { workspace = true }
 tritium-quantize = { workspace = true }
 
 [dev-dependencies]
 half = { workspace = true }
-tritium-format = { workspace = true }
 
 [lints]
 workspace = true

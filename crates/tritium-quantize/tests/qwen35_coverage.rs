@@ -66,6 +66,7 @@ fn pinned_official_metadata_has_frozen_coverage_and_policy() {
         ]
     );
     assert_eq!(manifest.metadata_record_bytes(), 75_705);
+    assert_eq!(manifest.expected_source_payload_bytes(), 55_562_855_904);
     assert_eq!(summary.total().tensors(), 1_199);
     assert_eq!(summary.total().coefficients(), 27_781_427_952);
     assert_eq!(summary.language().tensors(), 851);

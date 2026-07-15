@@ -420,6 +420,14 @@ impl Qwen35CoverageManifest {
     pub const fn metadata_record_bytes(&self) -> u64 {
         self.metadata_record_bytes
     }
+
+    /// Exact SafeTensors payload bytes required by this all-BF16 source policy.
+    ///
+    /// Construction has already validated the frozen coefficient totals and
+    /// that every source tensor uses two-byte BF16 storage.
+    pub const fn expected_source_payload_bytes(&self) -> u64 {
+        self.summary.total.coefficients * 2
+    }
 }
 
 /// Why pinned Qwen3.6-27B metadata was rejected.
