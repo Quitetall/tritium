@@ -1,8 +1,9 @@
 use tritium_nn::{
-    ArchSpec, DenseLinear, FixedEmbeddingPolicy, GrowthPlanError, GrowthSourceModelId,
-    GrowthTarget, Mlp, MlpKind, ModelConfig, ModelWeights, Projection, ProjectionGeometry,
-    ProjectionPlaneCounts, SwiGluMlp, SwiGluTrainingModel, TiedSwiGluTrainingModel, TokenEmbedding,
-    TransformerBlock,
+    AppliedIntermediateGrowthReceipt, ArchSpec, DENSE_GROWTH_ORACLE_ALGORITHM_V1,
+    DENSE_GROWTH_ORACLE_TOLERANCE, DenseLinear, FixedEmbeddingPolicy, GrowthPlanError,
+    GrowthResultModelId, GrowthSourceModelId, GrowthTarget, Mlp, MlpKind, ModelConfig, ModelRunner,
+    ModelWeights, Projection, ProjectionGeometry, ProjectionPlaneCounts, SwiGluMlp,
+    SwiGluTrainingModel, TiedSwiGluTrainingModel, TokenEmbedding, TransformerBlock,
 };
 
 fn dense(rows: usize, cols: usize, marker: f32) -> Projection {
@@ -68,6 +69,18 @@ fn weights() -> ModelWeights {
         output_norm: vec![300.0; 4],
         lm_head: None,
     }
+}
+
+fn dense_training_logits(
+    config: ModelConfig,
+    model: &TiedSwiGluTrainingModel,
+    tokens: &[u32],
+) -> Vec<f32> {
+    let dense = model.to_dense_weights().expect("dense oracle weights");
+    let mut runner =
+        ModelRunner::from_weights(config, dense, Box::new(tritium_cpu::CpuBackend::new()));
+    let positions: Vec<_> = (0..tokens.len()).collect();
+    runner.forward(tokens, &positions).expect("dense oracle")
 }
 
 fn untied_spec() -> ArchSpec {
@@ -487,10 +500,280 @@ fn checked_growth_recomputes_source_identity_before_mutation_and_issues_receipt_
         "identity rejection must precede mutation"
     );
 
+    let oracle_source = source.clone();
     let receipt = plan.apply(&config, &spec, &mut source).unwrap();
     assert_eq!(source.architecture().n_ff, 7);
     assert_eq!(receipt.source_model_id(), source_id);
+    let mut grown_config = config.clone();
+    grown_config.n_ff = receipt.new_width();
+    let expected_result_id =
+        GrowthResultModelId::from_training_model(&grown_config, &spec, &source).unwrap();
+    assert_eq!(receipt.result_model_id(), expected_result_id);
+    receipt
+        .validate_result_model(&grown_config, &spec, &source)
+        .unwrap();
+
+    let mut changed_mlp_weights = source.to_dense_weights().unwrap();
+    let Mlp::SwiGlu(changed_mlp) = &mut changed_mlp_weights.layers[0].mlp else {
+        unreachable!("fixture uses SwiGLU")
+    };
+    let Projection::Dense(changed_gate) = &mut changed_mlp.gate else {
+        unreachable!("training reconstruction is dense")
+    };
+    changed_gate.weights[0] += 0.125;
+    let changed_mlp_model =
+        TiedSwiGluTrainingModel::extract(&grown_config, &spec, &changed_mlp_weights).unwrap();
+    assert!(matches!(
+        receipt.validate_result_model(&grown_config, &spec, &changed_mlp_model),
+        Err(GrowthPlanError::ResultModelMismatch { .. })
+    ));
+
+    let mut changed_attention_weights = source.to_dense_weights().unwrap();
+    let Projection::Dense(changed_query) = &mut changed_attention_weights.layers[0].q_proj else {
+        unreachable!("training reconstruction is dense")
+    };
+    changed_query.weights[0] -= 0.125;
+    let changed_attention_model =
+        TiedSwiGluTrainingModel::extract(&grown_config, &spec, &changed_attention_weights).unwrap();
+    assert!(matches!(
+        receipt.validate_result_model(&grown_config, &spec, &changed_attention_model),
+        Err(GrowthPlanError::ResultModelMismatch { .. })
+    ));
+    assert_eq!(receipt.target(), target);
+    assert_eq!(
+        receipt.resulting_core_coefficient_count(),
+        plan.resulting_core_coefficient_count()
+    );
+    assert_eq!(receipt.seed(), 0x27);
+    assert_eq!(receipt.old_width(), 6);
+    assert_eq!(receipt.new_width(), 7);
+    let replay = receipt.replay_plan().unwrap();
+    assert_eq!(
+        receipt.source_indices(),
+        replay
+            .source_indices()
+            .iter()
+            .map(|&value| u32::try_from(value).unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        receipt.replication_counts(),
+        replay
+            .replication_counts()
+            .iter()
+            .map(|&value| u32::try_from(value).unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(receipt.split_numerators(), replay.split_numerators());
+    let oracle = receipt.function_preservation();
+    assert_eq!(oracle.algorithm(), DENSE_GROWTH_ORACLE_ALGORITHM_V1);
+    assert_eq!(oracle.vocabulary(), 5);
+    assert_eq!(oracle.context_length(), 32);
+    assert_eq!(oracle.tokens(), [0, 4, 2, 3]);
+    assert_eq!(oracle.logit_count(), 5);
+    assert_eq!(oracle.tolerance(), DENSE_GROWTH_ORACLE_TOLERANCE);
+    assert!(oracle.max_absolute_error() <= oracle.tolerance());
+    assert!(!oracle.tokens().is_empty());
+    assert!(oracle.logit_count() > 0);
+    assert_ne!(oracle.source_logits_digest(), [0; 32]);
+    assert_ne!(oracle.grown_logits_digest(), [0; 32]);
+    let independent_source = dense_training_logits(config.clone(), &oracle_source, oracle.tokens());
+    let independent_grown = dense_training_logits(grown_config.clone(), &source, oracle.tokens());
+    let independent_max = independent_source
+        .iter()
+        .zip(independent_grown)
+        .map(|(&before, after)| (before - after).abs())
+        .fold(0.0_f32, f32::max);
+    assert_eq!(
+        oracle.max_absolute_error().to_bits(),
+        independent_max.to_bits()
+    );
     plan.validate_receipt(&receipt).unwrap();
+
+    let canonical = receipt.canonical_bytes().unwrap();
+    let digest = receipt.digest().unwrap();
+    let reopened =
+        AppliedIntermediateGrowthReceipt::from_canonical_bytes_verified(&canonical, digest)
+            .unwrap();
+    assert_eq!(reopened, receipt);
+    plan.validate_receipt(&reopened).unwrap();
+
+    let mut tampered = canonical.clone();
+    let last = tampered.last_mut().expect("nonempty receipt");
+    *last ^= 1;
+    assert!(
+        AppliedIntermediateGrowthReceipt::from_canonical_bytes_verified(&tampered, digest).is_err()
+    );
+
+    let mut bad_version = canonical.clone();
+    bad_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+    assert!(matches!(
+        AppliedIntermediateGrowthReceipt::from_canonical_bytes(&bad_version),
+        Err(GrowthPlanError::UnsupportedReceiptVersion(2))
+    ));
+
+    // Fixed v1 header: magic/version/reserved/source/result/targets/count, then seed.
+    let mut seed_mapping_mismatch = canonical.clone();
+    seed_mapping_mismatch[96..104].copy_from_slice(&0x28_u64.to_le_bytes());
+    assert!(matches!(
+        AppliedIntermediateGrowthReceipt::from_canonical_bytes(&seed_mapping_mismatch),
+        Err(GrowthPlanError::ReceiptMismatch)
+    ));
+
+    let mut hostile_source_count = canonical.clone();
+    hostile_source_count[116..120].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        AppliedIntermediateGrowthReceipt::from_canonical_bytes(&hostile_source_count),
+        Err(GrowthPlanError::InvalidReceiptField(_))
+    ));
+
+    // This fixture has new_width=7 and old_width=6, placing oracle tolerance at 224.
+    let mut relaxed_tolerance = canonical.clone();
+    relaxed_tolerance[224..228].copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+    assert!(matches!(
+        AppliedIntermediateGrowthReceipt::from_canonical_bytes(&relaxed_tolerance),
+        Err(GrowthPlanError::InvalidOracleEvidence(_))
+    ));
+
+    let mut trailing = canonical;
+    trailing.push(0);
+    assert!(AppliedIntermediateGrowthReceipt::from_canonical_bytes(&trailing).is_err());
+}
+
+#[test]
+fn checked_growth_validates_descriptors_before_hashing_or_mutating() {
+    let config = config();
+    let spec = spec();
+    let model = TiedSwiGluTrainingModel::extract(&config, &spec, &weights()).unwrap();
+    let mut wrong_config = config.clone();
+    wrong_config.n_ff += 1;
+
+    assert!(matches!(
+        GrowthSourceModelId::from_training_model(&wrong_config, &spec, &model),
+        Err(GrowthPlanError::SourceDescriptorMismatch(
+            "intermediate_width"
+        ))
+    ));
+
+    let source_id = GrowthSourceModelId::from_training_model(&config, &spec, &model).unwrap();
+    let geometry = ProjectionGeometry::new(
+        usize::try_from(config.n_layers).unwrap(),
+        usize::try_from(config.n_embd).unwrap(),
+        usize::try_from(config.n_head * config.head_dim).unwrap(),
+        usize::try_from(config.n_head_kv * config.head_dim).unwrap(),
+        usize::try_from(config.n_ff).unwrap(),
+        weights().vocab,
+        ProjectionPlaneCounts::new(1, 1, 1, 1, 1, 1, 1).unwrap(),
+        FixedEmbeddingPolicy::PreservedDense { tied_lm_head: true },
+    )
+    .unwrap();
+    let target =
+        GrowthTarget::intermediate_at_least(geometry.core_coefficient_count(7).unwrap()).unwrap();
+    let plan = geometry.plan(source_id, target, 0x27).unwrap();
+    let mut application_model = model.clone();
+    let before = application_model.clone();
+
+    assert!(matches!(
+        plan.apply(&wrong_config, &spec, &mut application_model),
+        Err(GrowthPlanError::SourceDescriptorMismatch(
+            "intermediate_width"
+        ))
+    ));
+    assert_eq!(application_model, before);
+}
+
+#[test]
+fn applied_growth_receipts_explicitly_distinguish_target_and_seed() {
+    let config = config();
+    let spec = spec();
+    let source = TiedSwiGluTrainingModel::extract(&config, &spec, &weights()).unwrap();
+    let source_id = GrowthSourceModelId::from_training_model(&config, &spec, &source).unwrap();
+    let geometry = ProjectionGeometry::new(
+        usize::try_from(config.n_layers).unwrap(),
+        usize::try_from(config.n_embd).unwrap(),
+        usize::try_from(config.n_head * config.head_dim).unwrap(),
+        usize::try_from(config.n_head_kv * config.head_dim).unwrap(),
+        usize::try_from(config.n_ff).unwrap(),
+        weights().vocab,
+        ProjectionPlaneCounts::new(1, 1, 1, 1, 1, 1, 1).unwrap(),
+        FixedEmbeddingPolicy::PreservedDense { tied_lm_head: true },
+    )
+    .unwrap();
+    let base = geometry.core_coefficient_count(6).unwrap();
+    let widened = geometry.core_coefficient_count(7).unwrap();
+    assert!(widened > base + 1);
+    let first_target = GrowthTarget::intermediate_at_least(widened - 1).unwrap();
+    let second_target = GrowthTarget::intermediate_at_least(widened).unwrap();
+    let first_plan = geometry.plan(source_id, first_target, 0x27).unwrap();
+    let different_target_plan = geometry.plan(source_id, second_target, 0x27).unwrap();
+    let different_seed_plan = geometry.plan(source_id, first_target, 0x28).unwrap();
+    assert_eq!(first_plan.new_width(), different_target_plan.new_width());
+    assert_eq!(first_plan.new_width(), different_seed_plan.new_width());
+
+    let mut first_model = source.clone();
+    let mut different_target_model = source.clone();
+    let mut different_seed_model = source;
+    let first = first_plan.apply(&config, &spec, &mut first_model).unwrap();
+    let different_target = different_target_plan
+        .apply(&config, &spec, &mut different_target_model)
+        .unwrap();
+    let different_seed = different_seed_plan
+        .apply(&config, &spec, &mut different_seed_model)
+        .unwrap();
+
+    assert_eq!(first.target(), first_target);
+    assert_eq!(different_target.target(), second_target);
+    assert_eq!(first.seed(), 0x27);
+    assert_eq!(different_seed.seed(), 0x28);
+    assert_ne!(first.digest().unwrap(), different_target.digest().unwrap());
+    assert_ne!(first.digest().unwrap(), different_seed.digest().unwrap());
+    assert!(first_plan.validate_receipt(&different_target).is_err());
+    assert!(first_plan.validate_receipt(&different_seed).is_err());
+}
+
+#[test]
+fn identity_growth_receipts_bind_seed_even_when_mapping_is_identical() {
+    let config = config();
+    let spec = spec();
+    let source = TiedSwiGluTrainingModel::extract(&config, &spec, &weights()).unwrap();
+    let source_id = GrowthSourceModelId::from_training_model(&config, &spec, &source).unwrap();
+    let geometry = ProjectionGeometry::new(
+        usize::try_from(config.n_layers).unwrap(),
+        usize::try_from(config.n_embd).unwrap(),
+        usize::try_from(config.n_head * config.head_dim).unwrap(),
+        usize::try_from(config.n_head_kv * config.head_dim).unwrap(),
+        usize::try_from(config.n_ff).unwrap(),
+        weights().vocab,
+        ProjectionPlaneCounts::new(1, 1, 1, 1, 1, 1, 1).unwrap(),
+        FixedEmbeddingPolicy::PreservedDense { tied_lm_head: true },
+    )
+    .unwrap();
+    let target =
+        GrowthTarget::intermediate_at_least(geometry.core_coefficient_count(6).unwrap()).unwrap();
+    let first_plan = geometry.plan(source_id, target, 0x27).unwrap();
+    let second_plan = geometry.plan(source_id, target, 0x28).unwrap();
+    let mut first_model = source.clone();
+    let mut second_model = source;
+    let first = first_plan.apply(&config, &spec, &mut first_model).unwrap();
+    let second = second_plan
+        .apply(&config, &spec, &mut second_model)
+        .unwrap();
+
+    assert_eq!(first.source_indices(), second.source_indices());
+    assert_eq!(first.replication_counts(), second.replication_counts());
+    assert_eq!(first.split_numerators(), None);
+    assert_eq!(second.split_numerators(), None);
+    assert_eq!(
+        first.result_model_id().as_bytes(),
+        first.source_model_id().as_bytes()
+    );
+    assert_eq!(
+        second.result_model_id().as_bytes(),
+        second.source_model_id().as_bytes()
+    );
+    assert_ne!(first.seed(), second.seed());
+    assert_ne!(first.digest().unwrap(), second.digest().unwrap());
+    assert!(first_plan.validate_receipt(&second).is_err());
 }
 
 #[test]

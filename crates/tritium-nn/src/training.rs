@@ -32,6 +32,13 @@ pub enum TrainingAdapterError {
     },
     /// A runtime caller input is invalid.
     InvalidInput(String),
+    /// A bounded host allocation could not be reserved.
+    AllocationFailed {
+        /// Logical allocation site.
+        allocation: &'static str,
+        /// Requested payload bytes, excluding allocator metadata.
+        requested_bytes: usize,
+    },
     /// A device operation failed.
     Backend(String),
 }
@@ -51,6 +58,13 @@ impl core::fmt::Display for TrainingAdapterError {
                 "training tensor {name} expected {expected} elements, got {got}"
             ),
             Self::InvalidInput(reason) => write!(formatter, "invalid training input: {reason}"),
+            Self::AllocationFailed {
+                allocation,
+                requested_bytes,
+            } => write!(
+                formatter,
+                "training allocation failed: {allocation} ({requested_bytes} requested bytes)"
+            ),
             Self::Backend(reason) => write!(formatter, "training backend error: {reason}"),
         }
     }
@@ -127,6 +141,83 @@ pub struct TiedSwiGluTrainingModel {
     arch: TiedSwiGluTrainingArchitecture,
     parameters: Vec<TrainingParameter>,
     lm_head_tied: bool,
+}
+
+struct StagedIntermediateLayer {
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+}
+
+struct OriginalIntermediateLayer {
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+}
+
+/// Provisional intermediate-width mutation that restores the source tensors
+/// unless explicitly committed.
+///
+/// Construction stages every widened MLP tensor before changing the model. Once
+/// installed, the original MLP tensors remain owned by this guard so callers can
+/// run fallible validation against the widened candidate without cloning the
+/// embedding, attention, norms, or output head.
+pub(crate) struct IntermediateWideningTransaction<'model> {
+    model: &'model mut TiedSwiGluTrainingModel,
+    original_width: usize,
+    originals: Vec<OriginalIntermediateLayer>,
+    plan: Option<tritium_train::Net2WiderPlan>,
+    committed: bool,
+}
+
+impl IntermediateWideningTransaction<'_> {
+    /// Widened candidate visible to post-transform validation.
+    pub(crate) fn model(&self) -> &TiedSwiGluTrainingModel {
+        self.model
+    }
+
+    /// Exact deterministic plan installed in the provisional candidate.
+    pub(crate) fn plan(&self) -> &tritium_train::Net2WiderPlan {
+        self.plan
+            .as_ref()
+            .expect("uncommitted widening transaction retains its plan")
+    }
+
+    /// Keep the widened tensors and return their deterministic transform plan.
+    pub(crate) fn commit(mut self) -> tritium_train::Net2WiderPlan {
+        let plan = self
+            .plan
+            .take()
+            .expect("uncommitted widening transaction retains its plan");
+        self.committed = true;
+        plan
+    }
+
+    fn rollback(&mut self) {
+        for (layer_index, original) in self.originals.drain(..).enumerate() {
+            let base = 1 + 7 * layer_index;
+            let gate = &mut self.model.parameters[base + 4];
+            gate.master = original.gate;
+            gate.rows = self.original_width;
+
+            let up = &mut self.model.parameters[base + 5];
+            up.master = original.up;
+            up.rows = self.original_width;
+
+            let down = &mut self.model.parameters[base + 6];
+            down.master = original.down;
+            down.cols = self.original_width;
+        }
+        self.model.arch.n_ff = self.original_width;
+    }
+}
+
+impl Drop for IntermediateWideningTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.rollback();
+        }
+    }
 }
 
 /// Hash every semantic input consumed by a SwiGLU training graph.
@@ -397,20 +488,45 @@ impl TiedSwiGluTrainingModel {
     /// before SALT quantization while breaking clone permutation symmetry.
     /// Canonical parameter names and order are unchanged.
     ///
-    /// The model is fully preflighted before mutation. During mutation, only one
-    /// source tensor and its expanded replacement are live at a time, so temporary
-    /// storage is bounded by the largest individual MLP tensor rather than model
-    /// depth.
+    /// The model is fully preflighted and every widened MLP tensor is staged
+    /// before the first source tensor or geometry field is changed. A staging
+    /// failure therefore leaves the complete model byte-for-byte unchanged.
+    /// Temporary storage is the widened MLP plane; embeddings, attention, norms,
+    /// and the output head are never cloned.
     ///
     /// # Errors
     /// Returns [`TrainingAdapterError::InvalidInput`] when `new_width` narrows the
     /// model, a size overflows, parameter geometry is inconsistent, or latent
-    /// masters have already moved into an optimizer.
+    /// masters have already moved into an optimizer, and
+    /// [`TrainingAdapterError::AllocationFailed`] when staged MLP or rollback
+    /// storage cannot be reserved.
     pub fn widen_intermediate(
         &mut self,
         new_width: usize,
         seed: u64,
     ) -> Result<tritium_train::Net2WiderPlan, TrainingAdapterError> {
+        Ok(self.begin_intermediate_widening(new_width, seed)?.commit())
+    }
+
+    /// Install a provisional widening whose source MLP tensors remain available
+    /// for automatic rollback until the caller commits it.
+    pub(crate) fn begin_intermediate_widening(
+        &mut self,
+        new_width: usize,
+        seed: u64,
+    ) -> Result<IntermediateWideningTransaction<'_>, TrainingAdapterError> {
+        self.begin_intermediate_widening_with_hook(new_width, seed, |_| Ok(()))
+    }
+
+    fn begin_intermediate_widening_with_hook<F>(
+        &mut self,
+        new_width: usize,
+        seed: u64,
+        mut after_staged_projection: F,
+    ) -> Result<IntermediateWideningTransaction<'_>, TrainingAdapterError>
+    where
+        F: FnMut(usize) -> Result<(), TrainingAdapterError>,
+    {
         let old_width = self.arch.n_ff;
         let expected_parameters = self
             .arch
@@ -451,31 +567,93 @@ impl TiedSwiGluTrainingModel {
         let plan = tritium_train::Net2WiderPlan::seeded(old_width, new_width, seed)
             .map_err(|error| invalid_input(&error.to_string()))?;
         if new_width == old_width {
-            return Ok(plan);
+            return Ok(IntermediateWideningTransaction {
+                model: self,
+                original_width: old_width,
+                originals: Vec::new(),
+                plan: Some(plan),
+                committed: false,
+            });
         }
 
+        // Do every fallible transform before changing a source tensor. An error or
+        // unwind during staging therefore observes `self` before mutable commit.
+        let mut staged = Vec::new();
+        staged.try_reserve_exact(self.arch.n_layers).map_err(|_| {
+            allocation_failed::<StagedIntermediateLayer>(
+                "widened MLP staging journal",
+                self.arch.n_layers,
+            )
+        })?;
+        let mut staged_projection_count = 0;
         for layer_index in 0..self.arch.n_layers {
             let base = 1 + 7 * layer_index;
+            let gate = expand_incoming_rows_fallible(
+                &plan,
+                &self.parameters[base + 4].master,
+                self.arch.n_embd,
+            )?;
+            staged_projection_count += 1;
+            after_staged_projection(staged_projection_count)?;
+
+            let up = expand_incoming_rows_fallible(
+                &plan,
+                &self.parameters[base + 5].master,
+                self.arch.n_embd,
+            )?;
+            staged_projection_count += 1;
+            after_staged_projection(staged_projection_count)?;
+
+            let down = expand_outgoing_columns_fallible(
+                &plan,
+                &self.parameters[base + 6].master,
+                self.arch.n_embd,
+            )?;
+            staged_projection_count += 1;
+            after_staged_projection(staged_projection_count)?;
+            staged.push(StagedIntermediateLayer { gate, up, down });
+        }
+
+        // Reserve the rollback journal before the first swap. From here through
+        // transaction construction, all operations are fixed-capacity moves and
+        // in-bounds writes established by the preflight above.
+        let mut originals = Vec::new();
+        originals
+            .try_reserve_exact(self.arch.n_layers)
+            .map_err(|_| {
+                allocation_failed::<OriginalIntermediateLayer>(
+                    "growth rollback journal",
+                    self.arch.n_layers,
+                )
+            })?;
+        for (layer_index, replacement) in staged.into_iter().enumerate() {
+            let base = 1 + 7 * layer_index;
             let gate = &mut self.parameters[base + 4];
-            gate.master = plan
-                .expand_incoming_rows(&gate.master, self.arch.n_embd)
-                .map_err(|error| invalid_input(&error.to_string()))?;
+            let original_gate = core::mem::replace(&mut gate.master, replacement.gate);
             gate.rows = new_width;
 
             let up = &mut self.parameters[base + 5];
-            up.master = plan
-                .expand_incoming_rows(&up.master, self.arch.n_embd)
-                .map_err(|error| invalid_input(&error.to_string()))?;
+            let original_up = core::mem::replace(&mut up.master, replacement.up);
             up.rows = new_width;
 
             let down = &mut self.parameters[base + 6];
-            down.master = plan
-                .expand_outgoing_columns(&down.master, self.arch.n_embd)
-                .map_err(|error| invalid_input(&error.to_string()))?;
+            let original_down = core::mem::replace(&mut down.master, replacement.down);
             down.cols = new_width;
+
+            originals.push(OriginalIntermediateLayer {
+                gate: original_gate,
+                up: original_up,
+                down: original_down,
+            });
         }
         self.arch.n_ff = new_width;
-        Ok(plan)
+        Ok(IntermediateWideningTransaction {
+            model: self,
+            original_width: old_width,
+            originals,
+            plan: Some(plan),
+            committed: false,
+        })
     }
 
     /// Validate that an HF architecture can use the packed training graph.
@@ -983,6 +1161,107 @@ fn validate_training_tokens(
     Ok(())
 }
 
+fn expand_incoming_rows_fallible(
+    plan: &tritium_train::Net2WiderPlan,
+    weights: &[f32],
+    input_width: usize,
+) -> Result<Vec<f32>, TrainingAdapterError> {
+    let old_width = plan.replication_counts().len();
+    let expected = old_width
+        .checked_mul(input_width)
+        .ok_or_else(|| invalid_input("incoming projection size overflows usize"))?;
+    if weights.len() != expected {
+        return Err(tensor_mismatch(
+            "incoming growth projection",
+            expected,
+            weights.len(),
+        ));
+    }
+    let output_len = plan
+        .source_indices()
+        .len()
+        .checked_mul(input_width)
+        .ok_or_else(|| invalid_input("expanded incoming projection overflows usize"))?;
+    let mut expanded = Vec::new();
+    expanded
+        .try_reserve_exact(output_len)
+        .map_err(|_| allocation_failed::<f32>("expanded incoming projection", output_len))?;
+    for &source in plan.source_indices() {
+        let start = source
+            .checked_mul(input_width)
+            .ok_or_else(|| invalid_input("incoming source row overflows usize"))?;
+        let end = start
+            .checked_add(input_width)
+            .ok_or_else(|| invalid_input("incoming source row end overflows usize"))?;
+        let row = weights
+            .get(start..end)
+            .ok_or_else(|| invalid_input("incoming source row is outside the tensor"))?;
+        expanded.extend_from_slice(row);
+    }
+    Ok(expanded)
+}
+
+fn expand_outgoing_columns_fallible(
+    plan: &tritium_train::Net2WiderPlan,
+    weights: &[f32],
+    output_width: usize,
+) -> Result<Vec<f32>, TrainingAdapterError> {
+    let old_width = plan.replication_counts().len();
+    let new_width = plan.source_indices().len();
+    let expected = output_width
+        .checked_mul(old_width)
+        .ok_or_else(|| invalid_input("outgoing projection size overflows usize"))?;
+    if weights.len() != expected {
+        return Err(tensor_mismatch(
+            "outgoing growth projection",
+            expected,
+            weights.len(),
+        ));
+    }
+    let output_len = output_width
+        .checked_mul(new_width)
+        .ok_or_else(|| invalid_input("expanded outgoing projection overflows usize"))?;
+    let mut expanded = Vec::new();
+    expanded
+        .try_reserve_exact(output_len)
+        .map_err(|_| allocation_failed::<f32>("expanded outgoing projection", output_len))?;
+    let denominator = plan
+        .split_denominator_log2()
+        .map(|exponent| {
+            1_u32
+                .checked_shl(exponent)
+                .ok_or_else(|| invalid_input("outgoing split denominator overflows u32"))
+        })
+        .transpose()?;
+    for row in weights.chunks_exact(old_width) {
+        for (new_index, &source) in plan.source_indices().iter().enumerate() {
+            let source_weight = *row
+                .get(source)
+                .ok_or_else(|| invalid_input("outgoing source column is outside the tensor"))?;
+            let coefficient = match (plan.split_numerators(), denominator) {
+                (Some(numerators), Some(denominator)) => {
+                    let numerator = *numerators.get(new_index).ok_or_else(|| {
+                        invalid_input("outgoing split numerator is outside the plan")
+                    })?;
+                    numerator as f32 / denominator as f32
+                }
+                (None, None) => {
+                    let copies = *plan.replication_counts().get(source).ok_or_else(|| {
+                        invalid_input("outgoing replication count is outside the plan")
+                    })?;
+                    if copies == 0 {
+                        return Err(invalid_input("outgoing replication count is zero"));
+                    }
+                    1.0 / copies as f32
+                }
+                _ => return Err(invalid_input("outgoing split metadata is inconsistent")),
+            };
+            expanded.push(source_weight * coefficient);
+        }
+    }
+    Ok(expanded)
+}
+
 fn extract_dense(
     name: String,
     projection: &Projection,
@@ -1065,4 +1344,93 @@ fn tensor_mismatch(name: &str, expected: usize, got: usize) -> TrainingAdapterEr
 
 fn invalid_input(reason: &str) -> TrainingAdapterError {
     TrainingAdapterError::InvalidInput(reason.to_owned())
+}
+
+fn allocation_failed<T>(allocation: &'static str, elements: usize) -> TrainingAdapterError {
+    TrainingAdapterError::AllocationFailed {
+        allocation,
+        requested_bytes: elements.saturating_mul(core::mem::size_of::<T>()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widening_staging_failure_after_an_earlier_layer_is_atomic() {
+        let mut model = atomic_growth_fixture();
+        let before = model.clone();
+
+        let error = match model.begin_intermediate_widening_with_hook(5, 0x27, |projection| {
+            if projection == 4 {
+                Err(allocation_failed::<f32>(
+                    "injected second-layer staging allocation",
+                    1,
+                ))
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(_) => panic!("injected staging failure must reject widening"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            TrainingAdapterError::AllocationFailed {
+                allocation: "injected second-layer staging allocation",
+                requested_bytes: 4,
+            }
+        );
+        assert_eq!(model, before);
+    }
+
+    fn atomic_growth_fixture() -> TiedSwiGluTrainingModel {
+        let n_layers = 2;
+        let n_embd = 2;
+        let n_ff = 3;
+        let mut parameters = Vec::new();
+        parameters.push(parameter("embed", 4, n_embd, 0.25));
+        for layer in 0..n_layers {
+            let marker = layer as f32 + 1.0;
+            parameters.extend([
+                parameter("q", n_embd, n_embd, marker),
+                parameter("k", n_embd, n_embd, marker + 0.1),
+                parameter("v", n_embd, n_embd, marker + 0.2),
+                parameter("o", n_embd, n_embd, marker + 0.3),
+                parameter("gate", n_ff, n_embd, marker + 0.4),
+                parameter("up", n_ff, n_embd, marker + 0.5),
+                parameter("down", n_embd, n_ff, marker + 0.6),
+            ]);
+        }
+        TiedSwiGluTrainingModel {
+            arch: TiedSwiGluTrainingArchitecture {
+                attn_norms: vec![vec![1.0; n_embd]; n_layers],
+                ffn_norms: vec![vec![1.0; n_embd]; n_layers],
+                output_norm: vec![1.0; n_embd],
+                n_embd,
+                n_head: 1,
+                n_head_kv: 1,
+                head_dim: n_embd,
+                n_ff,
+                vocab: 4,
+                rms_eps: 1e-5,
+                rope_theta: 10_000.0,
+                n_layers,
+                n_ctx: 8,
+            },
+            parameters,
+            lm_head_tied: true,
+        }
+    }
+
+    fn parameter(name: &str, rows: usize, cols: usize, value: f32) -> TrainingParameter {
+        TrainingParameter {
+            name: name.to_owned(),
+            master: vec![value; rows * cols],
+            rows,
+            cols,
+        }
+    }
 }

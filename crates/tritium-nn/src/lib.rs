@@ -51,8 +51,10 @@ pub use ops::{
     sample_greedy, sample_top_k, sample_top_p, softmax_rows, truncated_top_k, truncated_top_p,
 };
 pub use salt_v2_growth::{
-    FixedEmbeddingPolicy, GrowthPlanError, GrowthSourceModelId, GrowthTarget,
-    IntermediateGrowthPlan, IntermediateGrowthReceipt, MAX_ADDITIVE_PLANES,
+    AppliedIntermediateGrowthReceipt, DENSE_GROWTH_ORACLE_ALGORITHM_V1,
+    DENSE_GROWTH_ORACLE_TOLERANCE, FixedEmbeddingPolicy, GrowthFunctionPreservationEvidence,
+    GrowthPlanError, GrowthReceiptDigest, GrowthResultModelId, GrowthSourceModelId, GrowthTarget,
+    GrowthTrackedFp32PayloadEstimate, IntermediateGrowthPlan, MAX_ADDITIVE_PLANES,
     MAX_STAGE1_RECEIPT_WIDTH, PlaneWeightHistogram, ProjectionCoefficientLedger,
     ProjectionGeometry, ProjectionPlaneCounts, Stage2Requirement,
     WHOLE_HEAD_AND_HIDDEN_COEFFICIENT_THRESHOLD,
