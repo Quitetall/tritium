@@ -1005,7 +1005,71 @@ impl PhysicalSizeReport {
         model_parameter_count: u64,
         peak_workspace_bytes: Option<u64>,
     ) -> Result<Self, CampaignError> {
+        Self::from_salt_v2_package_bytes_checked_runtime(
+            package_bytes,
+            model_parameter_count,
+            None,
+            peak_workspace_bytes,
+        )
+    }
+
+    /// Parse an exact SALT V2 artifact and verify a runtime allocation receipt against it.
+    ///
+    /// Supply one ledger per package tensor in canonical order, obtained from the resident runtime
+    /// handles after their allocations succeed, for example via
+    /// `SaltV2ResidentAllocationReceipt::runtime_ledger()` on CUDA. Every component must equal the
+    /// tensor layout rederived from the opened canonical package; a matching aggregate total with
+    /// different per-tensor payload, scale, map, or rank-prefix components is rejected.
+    ///
+    /// # Errors
+    /// Returns the same failures as [`Self::from_salt_v2_package_bytes`] and additionally rejects
+    /// a missing, extra, or component-disagreeing runtime receipt.
+    pub fn from_salt_v2_package_bytes_with_runtime_receipts(
+        package_bytes: &[u8],
+        model_parameter_count: u64,
+        runtime_receipts: &[SaltV2IndexedRuntimeLedger],
+        peak_workspace_bytes: Option<u64>,
+    ) -> Result<Self, CampaignError> {
+        Self::from_salt_v2_package_bytes_checked_runtime(
+            package_bytes,
+            model_parameter_count,
+            Some(runtime_receipts),
+            peak_workspace_bytes,
+        )
+    }
+
+    fn from_salt_v2_package_bytes_checked_runtime(
+        package_bytes: &[u8],
+        model_parameter_count: u64,
+        runtime_receipts: Option<&[SaltV2IndexedRuntimeLedger]>,
+        peak_workspace_bytes: Option<u64>,
+    ) -> Result<Self, CampaignError> {
         let decoded = read_salt_v2_package(package_bytes)?;
+        if let Some(supplied) = runtime_receipts {
+            if supplied.len() != decoded.package.tensors().len() {
+                return Err(CampaignError::RuntimeAllocationReceiptCountMismatch {
+                    expected: decoded.package.tensors().len(),
+                    supplied: supplied.len(),
+                });
+            }
+            for (tensor_index, (tensor, supplied)) in decoded
+                .package
+                .tensors()
+                .iter()
+                .zip(supplied.iter().copied())
+                .enumerate()
+            {
+                let expected =
+                    SaltV2IndexedRuntimeLedger::for_tensor(tensor, decoded.package.codec())?;
+                if supplied != expected {
+                    return Err(CampaignError::RuntimeAllocationMismatch {
+                        tensor_index,
+                        expected: Box::new(expected),
+                        supplied: Box::new(supplied),
+                    });
+                }
+            }
+        }
         let runtime = SaltV2IndexedRuntimeLedger::for_package(&decoded.package)?;
         let core_parameter_count =
             decoded
@@ -1878,6 +1942,22 @@ pub enum CampaignError {
         /// Exact byte count obtained by checked component addition.
         component_bytes: u64,
     },
+    /// The number of per-tensor runtime receipts differed from the opened package.
+    RuntimeAllocationReceiptCountMismatch {
+        /// Tensor count in the canonical package.
+        expected: usize,
+        /// Number of supplied resident receipts.
+        supplied: usize,
+    },
+    /// A resident runtime's checked allocation ledger differed from one opened tensor.
+    RuntimeAllocationMismatch {
+        /// Tensor ordinal in canonical package order.
+        tensor_index: usize,
+        /// Canonical indexed-runtime layout rederived from the package.
+        expected: Box<SaltV2IndexedRuntimeLedger>,
+        /// Allocation ledger reported by the resident runtime handle.
+        supplied: Box<SaltV2IndexedRuntimeLedger>,
+    },
     /// A remeasured or point-associated package differed from the expected package.
     PackageMeasurementMismatch {
         /// Expected exact package identity.
@@ -1939,6 +2019,20 @@ impl fmt::Display for CampaignError {
             } => write!(
                 f,
                 "physical components total {component_bytes} bytes, measured package is {measured_bytes} bytes"
+            ),
+            Self::RuntimeAllocationReceiptCountMismatch { expected, supplied } => write!(
+                f,
+                "runtime allocation receipt count is {supplied}, package contains {expected} tensors"
+            ),
+            Self::RuntimeAllocationMismatch {
+                tensor_index,
+                expected,
+                supplied,
+            } => write!(
+                f,
+                "tensor {tensor_index} runtime allocation receipt differs from the package-derived indexed layout (expected {} steady bytes, supplied {})",
+                expected.steady_resident_bytes(),
+                supplied.steady_resident_bytes()
             ),
             Self::PackageMeasurementMismatch {
                 expected_id,
@@ -2155,14 +2249,22 @@ mod tests {
         let tensor = SaltV2Tensor::new(
             "w",
             vec![256],
-            vec![SaltV2Tile::new(vec![plane]).expect("tile")],
+            vec![SaltV2Tile::new(vec![plane.clone()]).expect("tile")],
         )
         .expect("tensor");
         let package = SaltV2Package::new(SaltV2Codec::D2, vec![tensor]).expect("package");
+        let runtime = SaltV2IndexedRuntimeLedger::for_package(&package).expect("runtime ledger");
         let encoded = write_salt_v2_package(&package).expect("encode");
 
         let report = PhysicalSizeReport::from_salt_v2_package_bytes(&encoded.bytes, 300, None)
             .expect("derived report");
+        let receipt_report = PhysicalSizeReport::from_salt_v2_package_bytes_with_runtime_receipts(
+            &encoded.bytes,
+            300,
+            &[runtime],
+            Some(7),
+        )
+        .expect("receipt-checked report");
 
         assert_eq!(report.core_parameter_count(), 256);
         assert_eq!(report.model_parameter_count(), 300);
@@ -2177,6 +2279,47 @@ mod tests {
         assert_eq!(report.resident().map_embedded_bits(), 2);
         assert_eq!(report.resident().descriptor_bytes(), 0);
         assert_eq!(report.peak_resident_bytes(), None);
+        assert_eq!(
+            receipt_report.steady_resident_bytes(),
+            report.steady_resident_bytes()
+        );
+        assert_eq!(receipt_report.peak_resident_bytes(), Some(75));
+
+        let two_plane_tensor = SaltV2Tensor::new(
+            "w",
+            vec![256],
+            vec![SaltV2Tile::new(vec![plane.clone(), plane]).expect("two-plane tile")],
+        )
+        .expect("two-plane tensor");
+        let two_plane_package =
+            SaltV2Package::new(SaltV2Codec::D2, vec![two_plane_tensor]).expect("two-plane package");
+        let wrong_runtime = SaltV2IndexedRuntimeLedger::for_package(&two_plane_package)
+            .expect("different runtime ledger");
+        assert_eq!(
+            PhysicalSizeReport::from_salt_v2_package_bytes_with_runtime_receipts(
+                &encoded.bytes,
+                300,
+                &[wrong_runtime],
+                None,
+            ),
+            Err(CampaignError::RuntimeAllocationMismatch {
+                tensor_index: 0,
+                expected: Box::new(runtime),
+                supplied: Box::new(wrong_runtime),
+            })
+        );
+        assert_eq!(
+            PhysicalSizeReport::from_salt_v2_package_bytes_with_runtime_receipts(
+                &encoded.bytes,
+                300,
+                &[],
+                None,
+            ),
+            Err(CampaignError::RuntimeAllocationReceiptCountMismatch {
+                expected: 1,
+                supplied: 0,
+            })
+        );
     }
 
     #[test]

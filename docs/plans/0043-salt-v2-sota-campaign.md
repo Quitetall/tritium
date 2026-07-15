@@ -710,9 +710,12 @@ The following work deliberately remains open and keeps this plan in progress:
   independently seekable and win after tables, indexes, checksums, padding,
   decode latency, and peak scratch are charged. Expansion before execution does
   not reduce the resident-weight claim;
-- physical component truth still requires the opened immutable package and a
-  checked runtime allocation receipt; caller-provided architecture geometry
-  alone is not claim evidence;
+- `PhysicalSizeReport::from_salt_v2_package_bytes_with_runtime_receipts(...)`
+  now rederives the complete indexed layout from canonical package bytes and
+  rejects wrong-count or component-disagreeing per-tensor resident runtime
+  ledgers. The production campaign adapter must still open the immutable
+  artifact and bind independently measured preserved model allocations;
+  caller-provided architecture geometry alone is not claim evidence;
 - G1 widening now has canonical source/result identities, deterministic oracle
   evidence, transactional rollback, and a tracked-fp32-payload preflight. The
   dense oracle still constructs infallible full-model clones, so this is not a
