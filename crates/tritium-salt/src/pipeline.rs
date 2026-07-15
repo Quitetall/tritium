@@ -16,6 +16,7 @@ use crate::{ContentId, SaltError, SaltProfile, SaltSpec, SaltStage, WorkId};
 const STATE_MAGIC: [u8; 4] = *b"TSV2";
 const STATE_VERSION: u8 = 4;
 const STATE_HASH_CONTEXT: &str = "tritium salt pipeline state v1";
+const WORK_LOCK_FILE: &str = "pipeline.lock";
 const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const STATE_HEADER_BYTES: u64 = 4 + 1 + 8;
 const STATE_CHECKSUM_BYTES: u64 = 32;
@@ -1089,22 +1090,26 @@ pub struct SaltPipeline {
     work_dir: PathBuf,
     run: ConversionRun,
     receipt: SaltReceipt,
+    /// Stable inode whose exclusive OS lock protects the work item for this lifetime.
+    _work_lock: fs::File,
 }
 
 impl SaltPipeline {
     /// Start new work or resume an existing checkpoint for the identical spec.
     pub fn start(spec: &SaltSpec, work_root: impl AsRef<Path>) -> Result<Self, SaltError> {
         let work_dir = work_directory(work_root.as_ref(), spec.work_id());
+        fs::create_dir_all(&work_dir).map_err(|error| fs_error("create work directory", error))?;
+        let work_lock = acquire_work_lock(&work_dir)?;
         let state_path = work_dir.join("state.bin");
         if state_path.exists() {
-            return Self::load(spec, work_dir);
+            return Self::load_locked(spec, work_dir, work_lock);
         }
-        fs::create_dir_all(&work_dir).map_err(|error| fs_error("create work directory", error))?;
         let pipeline = Self {
             spec: spec.clone(),
             work_dir,
             run: ConversionRun::new(*spec.work_id().as_bytes()),
             receipt: SaltReceipt::new(spec),
+            _work_lock: work_lock,
         };
         pipeline.persist()?;
         Ok(pipeline)
@@ -1112,7 +1117,9 @@ impl SaltPipeline {
 
     /// Resume an existing checkpoint for the identical content-addressed spec.
     pub fn resume(spec: &SaltSpec, work_root: impl AsRef<Path>) -> Result<Self, SaltError> {
-        Self::load(spec, work_directory(work_root.as_ref(), spec.work_id()))
+        let work_dir = work_directory(work_root.as_ref(), spec.work_id());
+        let work_lock = acquire_work_lock(&work_dir)?;
+        Self::load_locked(spec, work_dir, work_lock)
     }
 
     /// Content-addressed work identity.
@@ -1399,7 +1406,11 @@ impl SaltPipeline {
         }
     }
 
-    fn load(spec: &SaltSpec, work_dir: PathBuf) -> Result<Self, SaltError> {
+    fn load_locked(
+        spec: &SaltSpec,
+        work_dir: PathBuf,
+        work_lock: fs::File,
+    ) -> Result<Self, SaltError> {
         let state_path = work_dir.join("state.bin");
         let metadata =
             fs::metadata(&state_path).map_err(|error| fs_error("inspect pipeline state", error))?;
@@ -1422,6 +1433,7 @@ impl SaltPipeline {
             work_dir,
             run,
             receipt: stored.receipt,
+            _work_lock: work_lock,
         };
         pipeline.validate_loaded_state()?;
         if pipeline.run.status() == RunStatus::Running {
@@ -1979,6 +1991,23 @@ fn artifact_path(work_dir: &Path, artifact: &StageArtifact) -> Result<PathBuf, S
 
 fn work_directory(root: &Path, work_id: WorkId) -> PathBuf {
     root.join(work_id.to_string())
+}
+
+fn acquire_work_lock(work_dir: &Path) -> Result<fs::File, SaltError> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(work_dir.join(WORK_LOCK_FILE))
+        .map_err(|error| fs_error("open pipeline work lock", error))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => Err(SaltError::Checkpoint(
+            "pipeline work item is already locked",
+        )),
+        Err(fs::TryLockError::Error(error)) => Err(fs_error("lock pipeline work item", error)),
+    }
 }
 
 fn encode_state(state: &StoredState) -> Result<Vec<u8>, SaltError> {

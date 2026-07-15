@@ -126,6 +126,121 @@ fn retryable_failure_resumes_the_same_stage() {
 }
 
 #[test]
+fn work_lock_rejects_concurrent_reconcile_before_driver_and_releases_on_drop() {
+    use std::{sync::mpsc, thread};
+
+    let root = unique_temp_dir("work-lock");
+    let spec = spec();
+    let holder_root = root.clone();
+    let holder_spec = spec.clone();
+    let (locked_tx, locked_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let holder = thread::spawn(move || {
+        let pipeline = tritium_salt::SaltPipeline::start(&holder_spec, &holder_root)
+            .expect("first process-local owner");
+        locked_tx.send(()).expect("report held lock");
+        release_rx.recv().expect("release requested");
+        drop(pipeline);
+    });
+
+    locked_rx.recv().expect("lock acquired");
+    let mut blocked_driver = FixtureDriver::default();
+    assert!(matches!(
+        SaltV2::reconcile(&spec, &root, &mut blocked_driver),
+        Err(tritium_salt::SaltError::Checkpoint(
+            "pipeline work item is already locked"
+        ))
+    ));
+    assert!(blocked_driver.stages.is_empty());
+    assert!(matches!(
+        tritium_salt::SaltPipeline::resume(&spec, &root),
+        Err(tritium_salt::SaltError::Checkpoint(
+            "pipeline work item is already locked"
+        ))
+    ));
+
+    release_tx.send(()).expect("release holder");
+    holder.join().expect("holder thread");
+    let mut resumed_driver = FixtureDriver::default();
+    let receipt = SaltV2::reconcile(&spec, &root, &mut resumed_driver)
+        .expect("lock released when owner dropped");
+    assert!(receipt.published().is_some());
+    assert_eq!(resumed_driver.stages.as_slice(), &SaltStage::ALL);
+    fs::remove_dir_all(root).expect("clean fixture");
+}
+
+#[test]
+fn work_lock_is_released_after_process_crash_and_running_stage_is_recovered() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let root = unique_temp_dir("work-lock-process");
+    let spec = spec();
+    let ready = root.join("child.ready");
+    let mut child = Command::new(std::env::current_exe().expect("integration-test executable"))
+        .arg("--exact")
+        .arg("work_lock_process_crash_helper")
+        .arg("--nocapture")
+        .env("TRITIUM_SALT_LOCK_TEST_ROOT", &root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn lock holder");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not enter a running locked stage");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut blocked_driver = FixtureDriver::default();
+    assert!(matches!(
+        SaltV2::reconcile(&spec, &root, &mut blocked_driver),
+        Err(tritium_salt::SaltError::Checkpoint(
+            "pipeline work item is already locked"
+        ))
+    ));
+    assert!(blocked_driver.stages.is_empty());
+
+    child.kill().expect("terminate lock holder");
+    child.wait().expect("reap lock holder");
+    let mut recovery_driver = FixtureDriver::default();
+    let receipt = SaltV2::reconcile(&spec, &root, &mut recovery_driver)
+        .expect("crash releases lock and running stage recovers");
+    let ingest = receipt
+        .stage_receipts()
+        .iter()
+        .find(|record| record.stage() == SaltStage::Ingest && record.accepted())
+        .expect("accepted recovered ingest");
+    assert_eq!(ingest.attempt(), 2);
+    assert_eq!(receipt.failures().len(), 1);
+    assert_eq!(receipt.failures()[0].code(), "interrupted");
+    fs::remove_dir_all(root).expect("clean fixture");
+}
+
+#[test]
+fn work_lock_process_crash_helper() {
+    let Some(root) = std::env::var_os("TRITIUM_SALT_LOCK_TEST_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let spec = spec();
+    let mut pipeline = tritium_salt::SaltPipeline::start(&spec, &root).expect("child pipeline");
+    let mut driver = CrashHoldingDriver {
+        ready: root.join("child.ready"),
+    };
+    let _ = pipeline.advance(&mut driver);
+    panic!("crash holder unexpectedly returned");
+}
+
+#[test]
 fn resume_rehashes_every_accepted_upstream_artifact() {
     let root = unique_temp_dir("artifact-rehash");
     let spec = spec();
@@ -224,6 +339,7 @@ fn failed_quality_evidence_is_retained_and_publish_never_runs() {
             .map(|record| record.accepted()),
         Some(false)
     );
+    drop(pipeline);
 
     let mut must_not_run = FixtureDriver::default();
     assert!(matches!(
@@ -572,6 +688,21 @@ struct FixtureDriver {
     publish_early: bool,
     resident_core_bytes: u64,
     wrong_quality_package: bool,
+}
+
+struct CrashHoldingDriver {
+    ready: PathBuf,
+}
+
+impl SaltDriver for CrashHoldingDriver {
+    fn run_stage(&mut self, _request: StageRequest<'_>) -> Result<StageOutput, DriverFailure> {
+        use std::{thread, time::Duration};
+
+        fs::write(&self.ready, b"running").expect("signal running stage");
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
 }
 
 impl SaltDriver for FixtureDriver {
