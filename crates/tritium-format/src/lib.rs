@@ -47,6 +47,7 @@ mod salt;
 mod salt_bundle;
 mod salt_bundle_reader;
 mod salt_gguf;
+mod salt_gguf_reader;
 pub mod salt_v2;
 pub mod salt_v2_package;
 mod sparse;
@@ -93,6 +94,7 @@ pub use salt_gguf::{
     GGML_TYPE_TRITIUM_SALT, SALT_GGUF_FORMAT_KEY, SALT_GGUF_FORMAT_VALUE, read_salt_gguf,
     read_salt_gguf_packed, write_salt_gguf,
 };
+pub use salt_gguf_reader::{SaltGgufReadError, SaltGgufReader, SaltGgufTensorInfo};
 pub use sparse::{
     PlaneRepr, SPARSE_HEADER_BYTES, SPARSE_MAGIC, SPARSE_VERSION, SparsePlane, SparsePlaneRef,
     choose_plane_repr, dequant_sparse_plane, expand_plane_repr, pack_sparse_plane, sparse_dot,

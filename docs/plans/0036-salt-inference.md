@@ -86,8 +86,8 @@ The file-backed `load_salt` fp-master userspace floor is now removed:
   before reading.
 
 At this checkpoint, 32B loading was not production-ready: both TSLB and SALT-GGUF still had eager
-copies and SALT projections/token tables did not enter the resident CUDA decoder. The next section
-records removal of the TSLB copies; the GGUF and CUDA limitations remain.
+copies and SALT projections/token tables did not enter the resident CUDA decoder. The next two
+sections record removal of the TSLB and legacy SALT-GGUF copies; the CUDA limitation remains.
 
 ## Direct-arena TSLB loading (2026-07-15)
 
@@ -105,8 +105,8 @@ The TSLB model path now removes both remaining host-side bundle copies:
 - Named tensor visits use absolute seeks and one reusable encoded-row buffer. Individual `Read`
   requests are capped at 64 KiB; file-backed loading adds a 64 KiB `BufReader` to avoid one syscall
   per row header. A complete visit rechecks the payload digest, detecting valid same-length mutation
-  through the already-open source handle. Visitor mutation is transactional until the method returns
-  `Ok`, because a late read or digest failure can follow earlier callbacks.
+  through the already-open source handle. Callbacks can precede a late read or digest failure and
+  are not rolled back; transactional callers stage the destination until the visit returns `Ok`.
 - Allocation-free `PackedSaltRowRef` and `SparsePlaneRef` views let `PackedSaltMatrixBuilder` copy
   each row directly into pre-sized final dense-byte, sparse-scale, sparse-entry, row-metadata, and
   plane-metadata arenas. It preflights validation and exact element requirements before mutation,
@@ -131,15 +131,32 @@ not support a physical “more than 10×” claim. Crossing that threshold requi
 entropy coding, better scale amortization, and compact or implicit dense-plane metadata, with quality
 measured separately.
 
-SALT-GGUF remains an explicit eager compatibility path: it still reads the whole artifact and
-materializes all packed tensors before model assembly. The next memory slice is a strict seek-backed
-GGUF metadata/tensor adapter with the same direct-arena consumer. TSLB also reads all payload bytes
-twice when every tensor is selected, and warmed file cache can appear in cgroup physical-memory
-peaks even though anonymous heap stays row-bounded.
+## Direct-arena legacy SALT-GGUF loading (2026-07-15)
+
+The legacy SALT-GGUF compatibility path now has the same bounded-memory consumer contract:
+
+- `SaltGgufReader<R: Read + Seek>` streams the GGUF metadata and tensor table, validates canonical
+  offsets and zero alignment gaps, and strictly scans every private SALT tensor. Sized standard
+  tensors are row/block-layout-validated and ignored; unknown unsized types fail closed. Homogeneous
+  nested metadata arrays are supported consistently by eager, writer, and seek paths with shared
+  depth/element bounds. BOOL bytes are canonical. A declared `general.alignment` must be a nonzero
+  U32 multiple of eight; only an absent key defaults to 32. Any non-finite, negative, or signed-zero
+  SALT scale fails construction even in an unselected tensor. Explicit bounds cover header,
+  alignment, tensor, metadata, string, name, dimension, row, plane, and encoded-row resources.
+- Construction retains only name-sorted SALT metadata, exact final-arena requirements, and BLAKE3
+  payload digests. Unselected SALT tensors are fully parsed, so corruption cannot hide behind named
+  lookup. Named visits use absolute seeks, one reusable row buffer, and at most 64 KiB per underlying
+  `Read` request, then recheck exact length and digest. Callbacks can precede a late error and are not
+  rolled back; transactional callers stage the destination until the visit returns `Ok`.
+- `ModelWeights::load_salt` passes both TSLB and SALT-GGUF row references directly into
+  `PackedSaltMatrixBuilder`; the GGUF path no longer calls `read_to_end`, retains a whole-artifact
+  buffer, constructs per-row owned `PackedSaltRow`s, or keeps an all-tensor `HashMap`.
+
+Both containers still read all SALT payload bytes twice when every tensor is selected, and warmed
+file cache can appear in cgroup physical-memory peaks even though anonymous heap stays row-bounded.
 
 Host fp32 K/V vectors now start empty and grow fallibly in 64-row chunks, so an artifact's declared
 maximum context no longer becomes an unchecked eager allocation. The full-context physical cost is
 unchanged: for 64 layers and KV width 1024 it is 17.18 GB at 32K context and 68.72 GB at 128K.
-Production 32B serving therefore still requires, in order: seek-backed GGUF, compact SALT
-payload/metadata, resident large-K CUDA SALT kernels, and a paged fp16 or int8 KV cache with a runtime
-context override.
+Production 32B serving therefore still requires, in order: compact SALT payload/metadata, resident
+large-K CUDA SALT kernels, and a paged fp16 or int8 KV cache with a runtime context override.

@@ -16,14 +16,11 @@
 //! retains the resulting fp32 model; the SALT loader retains only widened 1D norms from the master.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use tritium_format::{
-    PackedSaltTensor, SALT_BUNDLE_MAGIC, SaltBundleReader, read_salt_gguf_packed,
-};
+use tritium_format::{SALT_BUNDLE_MAGIC, SaltBundleReader, SaltGgufReader};
 
 use crate::config::{ArchSpec, MlpKind, ModelConfig};
 use crate::error::NnError;
@@ -113,9 +110,9 @@ impl ModelWeights {
             ));
         }
 
-        // Open once, pinning the source handle before format sniffing. Canonical TSLB is
-        // strict-seek scanned and then streams selected rows directly into final arenas.
-        // SALT-GGUF remains the explicit eager compatibility fallback for this slice.
+        // Open once, pinning the source handle before format sniffing. Both canonical TSLB and
+        // legacy SALT-GGUF are strict-seek scanned, then stream selected rows directly into final
+        // arenas without retaining the artifact or intermediate owned rows.
         let mut artifact = File::open(bundle)
             .map_err(|e| NnError::MissingTensor(format!("open {}: {e}", bundle.display())))?;
         if !artifact
@@ -136,22 +133,11 @@ impl ModelWeights {
             .seek(SeekFrom::Start(0))
             .map_err(|e| NnError::MissingTensor(format!("seek {}: {e}", bundle.display())))?;
         let source = if magic == *b"GGUF" {
-            let mut bundle_bytes = Vec::new();
-            artifact
-                .read_to_end(&mut bundle_bytes)
-                .map_err(|e| NnError::MissingTensor(format!("read {}: {e}", bundle.display())))?;
-            let tensors = read_salt_gguf_packed(&bundle_bytes)
-                .map_err(|e| NnError::MissingTensor(format!("parse SALT bundle: {e}")))?;
-            let mut by_name = HashMap::with_capacity(tensors.len());
-            for tensor in tensors {
-                let name = tensor.name.clone();
-                if by_name.insert(name.clone(), tensor).is_some() {
-                    return Err(NnError::MissingTensor(format!(
-                        "duplicate SALT tensor `{name}`"
-                    )));
-                }
-            }
-            SaltTensorSource::Gguf(RefCell::new(by_name))
+            SaltTensorSource::Gguf(RefCell::new(
+                SaltGgufReader::new_strict(BufReader::with_capacity(64 * 1024, artifact)).map_err(
+                    |e| NnError::MissingTensor(format!("index {}: {e}", bundle.display())),
+                )?,
+            ))
         } else if magic == SALT_BUNDLE_MAGIC {
             SaltTensorSource::Bundle(RefCell::new(
                 SaltBundleReader::new_strict(BufReader::with_capacity(64 * 1024, artifact))
@@ -202,7 +188,7 @@ impl ModelWeights {
 
 enum SaltTensorSource {
     Bundle(RefCell<SaltBundleReader<BufReader<File>>>),
-    Gguf(RefCell<HashMap<String, PackedSaltTensor>>),
+    Gguf(RefCell<SaltGgufReader<BufReader<File>>>),
 }
 
 impl SaltTensorSource {
@@ -244,13 +230,36 @@ impl SaltTensorSource {
                 }
                 builder.finish()
             }
-            Self::Gguf(tensors) => {
-                let tensor = tensors
-                    .borrow_mut()
-                    .remove(name)
+            Self::Gguf(reader) => {
+                let mut reader = reader.try_borrow_mut().map_err(|_| {
+                    NnError::Backend(format!("reentrant SALT tensor read for `{name}`"))
+                })?;
+                let info = reader
+                    .tensor_info(name)
+                    .cloned()
                     .ok_or_else(|| missing_salt_tensor(name))?;
-                validate_salt_shape(name, (tensor.rows, tensor.k), expected_rows, expected_k)?;
-                PackedSaltMatrix::new(tensor.salt_rows, tensor.rows, tensor.k)
+                validate_salt_shape(name, info.shape(), expected_rows, expected_k)?;
+                let mut builder = PackedSaltMatrixBuilder::from_streamed(
+                    info.shape().0,
+                    info.shape().1,
+                    info.storage_requirements(),
+                )?;
+                let mut builder_error = None;
+                reader
+                    .visit_packed_tensor(name, |row| {
+                        if builder_error.is_none()
+                            && let Err(error) = builder.push_ref(row)
+                        {
+                            builder_error = Some(error);
+                        }
+                    })
+                    .map_err(|error| {
+                        NnError::MissingTensor(format!("read SALT tensor `{name}`: {error}"))
+                    })?;
+                if let Some(error) = builder_error {
+                    return Err(error);
+                }
+                builder.finish()
             }
         }
     }

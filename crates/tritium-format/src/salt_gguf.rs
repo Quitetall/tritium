@@ -516,7 +516,9 @@ mod tests {
 
     #[test]
     fn salt_row_count_cannot_consume_a_following_f32_tensor() {
-        let first = pack_salt_row(&row(256, 1, 1)).unwrap();
+        // Three planes make this row 208 bytes, preserving exact adjacency under
+        // the minimum official eight-byte GGUF alignment.
+        let first = pack_salt_row(&row(256, 3, 1)).unwrap();
         // A valid encoded SALT row is also a multiple of four bytes. Present those
         // bytes as an F32 tensor so an EOF-bounded SALT walk would accept it as the
         // forged second row. The table boundary must stop that walk first.
@@ -536,7 +538,7 @@ mod tests {
                 data: &disguised_following,
             },
         ];
-        let bytes = write_gguf(3, &metadata(1), &tensors).unwrap();
+        let bytes = write_gguf(3, &metadata(8), &tensors).unwrap();
 
         assert!(read_gguf(&bytes).is_ok(), "generic envelope remains valid");
         assert!(read_salt_gguf(&bytes).is_err());

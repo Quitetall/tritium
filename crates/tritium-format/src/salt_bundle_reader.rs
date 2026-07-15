@@ -149,27 +149,34 @@ impl PackedSaltStorageRequirements {
         self.sparse_planes
     }
 
-    fn add_row(&mut self, row: PackedSaltRowRef<'_>) -> Result<(), SaltBundleReadError> {
-        self.rows = checked_add(self.rows, 1, "row count")?;
-        self.planes = checked_add(self.planes, row.plane_count(), "plane count")?;
+    pub(crate) fn try_add_row(&mut self, row: PackedSaltRowRef<'_>) -> Option<()> {
+        let rows = self.rows.checked_add(1)?;
+        let planes = self.planes.checked_add(row.plane_count())?;
+        let mut dense_bytes = self.dense_bytes;
+        let mut sparse_scales = self.sparse_scales;
+        let mut sparse_entries = self.sparse_entries;
+        let mut sparse_planes = self.sparse_planes;
         for plane in row.planes() {
             if let Some(bytes) = plane.dense_bytes() {
-                self.dense_bytes = checked_add(self.dense_bytes, bytes.len(), "dense byte count")?;
+                dense_bytes = dense_bytes.checked_add(bytes.len())?;
             } else if let Some(sparse) = plane.sparse() {
-                self.sparse_scales = checked_add(
-                    self.sparse_scales,
-                    sparse.scale_count(),
-                    "sparse scale count",
-                )?;
-                self.sparse_entries = checked_add(
-                    self.sparse_entries,
-                    sparse.entry_count(),
-                    "sparse entry count",
-                )?;
-                self.sparse_planes = checked_add(self.sparse_planes, 1, "sparse plane count")?;
+                sparse_scales = sparse_scales.checked_add(sparse.scale_count())?;
+                sparse_entries = sparse_entries.checked_add(sparse.entry_count())?;
+                sparse_planes = sparse_planes.checked_add(1)?;
             }
         }
-        Ok(())
+        self.rows = rows;
+        self.planes = planes;
+        self.dense_bytes = dense_bytes;
+        self.sparse_scales = sparse_scales;
+        self.sparse_entries = sparse_entries;
+        self.sparse_planes = sparse_planes;
+        Some(())
+    }
+
+    fn add_row(&mut self, row: PackedSaltRowRef<'_>) -> Result<(), SaltBundleReadError> {
+        self.try_add_row(row)
+            .ok_or_else(|| limit_error("packed storage requirements", u64::MAX, usize::MAX as u64))
     }
 }
 
@@ -413,8 +420,9 @@ impl<R: Read + Seek> SaltBundleReader<R> {
     ///
     /// A complete visit verifies row geometry, exact payload length, and the
     /// construction-time payload digest. The visitor may be called before a late I/O or
-    /// digest error is known, so callers must treat sink mutation as transactional until
-    /// this method returns `Ok(())`.
+    /// digest error is known, and this method cannot roll callback side effects back.
+    /// Callers requiring transactional mutation must stage their sink and publish it only
+    /// after this method returns `Ok(())`.
     ///
     /// # Errors
     /// Returns a typed error for a missing tensor, I/O failure, malformed row, or
@@ -466,20 +474,6 @@ impl<R: Read + Seek> SaltBundleReader<R> {
             .ok()
             .map(|index| &self.tensors[index])
     }
-}
-
-fn checked_add(
-    current: usize,
-    additional: usize,
-    resource: &str,
-) -> Result<usize, SaltBundleReadError> {
-    current.checked_add(additional).ok_or_else(|| {
-        limit_error(
-            resource,
-            u64::MAX,
-            usize::MAX.try_into().unwrap_or(u64::MAX),
-        )
-    })
 }
 
 fn enforce_limit(resource: &str, actual: u64, limit: u64) -> Result<(), SaltBundleReadError> {

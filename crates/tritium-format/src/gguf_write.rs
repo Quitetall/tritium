@@ -14,7 +14,10 @@ use core::fmt;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-use crate::gguf::{DEFAULT_ALIGNMENT, GgufError, GgufValue};
+use crate::gguf::{
+    GgufError, GgufValue, MAX_METADATA_ARRAY_ELEMENTS, MAX_METADATA_DEPTH, metadata_alignment,
+    tensor_n_bytes, tensor_type_is_sized,
+};
 
 const STREAM_WRITE_CHUNK_BYTES: usize = 8 * 1024;
 
@@ -45,9 +48,6 @@ fn value_type_tag(v: &GgufValue) -> u32 {
 
 /// Append a scalar value (everything except [`GgufValue::Array`]) in the exact
 /// little-endian encoding [`crate::read_gguf`]'s `read_value` consumes.
-///
-/// Returns [`GgufError::UnknownValueType`]`(9)` for a nested array, which GGUF
-/// forbids and the reader rejects — keeping the writer round-trip-faithful.
 fn push_scalar(out: &mut Vec<u8>, v: &GgufValue) -> Result<(), GgufError> {
     match v {
         GgufValue::U8(x) => out.push(*x),
@@ -67,24 +67,46 @@ fn push_scalar(out: &mut Vec<u8>, v: &GgufValue) -> Result<(), GgufError> {
     Ok(())
 }
 
-/// Append a full metadata value: its `value_type` tag, then the payload. For an
-/// array, the element `value_type`, the `u64` count, then each element (which
-/// must itself be a scalar — GGUF arrays do not nest).
-fn push_value(out: &mut Vec<u8>, v: &GgufValue) -> Result<(), GgufError> {
+/// Append a full metadata value and recursively encode homogeneous arrays.
+fn push_value(
+    out: &mut Vec<u8>,
+    v: &GgufValue,
+    total_array_elements: &mut u64,
+) -> Result<(), GgufError> {
     out.extend_from_slice(&value_type_tag(v).to_le_bytes());
-    match v {
+    push_value_payload(out, v, 0, total_array_elements)
+}
+
+/// Append a value payload whose type tag is carried by its parent.
+fn push_value_payload(
+    out: &mut Vec<u8>,
+    value: &GgufValue,
+    depth: u8,
+    total_array_elements: &mut u64,
+) -> Result<(), GgufError> {
+    match value {
         GgufValue::Array(items) => {
+            if depth >= MAX_METADATA_DEPTH {
+                return Err(GgufError::DimsOverflow);
+            }
+            let count = u64::try_from(items.len()).map_err(|_| GgufError::DimsOverflow)?;
+            *total_array_elements = total_array_elements
+                .checked_add(count)
+                .ok_or(GgufError::DimsOverflow)?;
+            if *total_array_elements > MAX_METADATA_ARRAY_ELEMENTS {
+                return Err(GgufError::DimsOverflow);
+            }
             // An empty array carries no element to infer the child type from;
             // U8 (tag 0) round-trips structurally since there are no elements.
             let child_tag = items.first().map_or(0, value_type_tag);
             out.extend_from_slice(&child_tag.to_le_bytes());
-            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
             for item in items {
                 if value_type_tag(item) != child_tag {
                     // Heterogeneous arrays are unrepresentable in GGUF.
                     return Err(GgufError::UnknownValueType(9));
                 }
-                push_scalar(out, item)?;
+                push_value_payload(out, item, depth + 1, total_array_elements)?;
             }
             Ok(())
         }
@@ -105,10 +127,9 @@ fn align_up(pos: u64, align: u64) -> Result<u64, GgufError> {
 /// One tensor to emit: name, shape (ggml order, fastest-varying first), ggml
 /// type-id, and the already-packed payload bytes.
 ///
-/// `data.len()` should equal the byte size the reader computes from `dims` and
-/// `ggml_type` for sized types; the writer lays the next tensor after it either
-/// way, but a short payload would make the reader's bounds check read into the
-/// padding.
+/// `data.len()` must equal the byte size the reader computes from `dims` and
+/// `ggml_type` for known sized types. Unknown/custom type IDs retain their caller-
+/// declared payload length.
 #[derive(Debug)]
 pub struct TensorOut<'a> {
     /// Tensor name (written as a GGUF string).
@@ -251,15 +272,15 @@ fn build_layout(
         return Err(GgufError::UnsupportedVersion(version));
     }
 
-    let alignment = metadata
-        .get("general.alignment")
-        .and_then(GgufValue::as_u64)
-        .filter(|&value| value != 0)
-        .unwrap_or(DEFAULT_ALIGNMENT);
+    let alignment = metadata_alignment(metadata)?;
 
     let mut offsets = Vec::with_capacity(tensors.len());
     let mut relative_end = 0u64;
     for tensor in tensors {
+        let expected_data_len = tensor_n_bytes(tensor.ggml_type, &tensor.dims)?;
+        if tensor_type_is_sized(tensor.ggml_type) && tensor.data_len != expected_data_len {
+            return Err(GgufError::InvalidTensorShape);
+        }
         let offset = align_up(relative_end, alignment)?;
         offsets.push(offset);
         relative_end = offset
@@ -272,9 +293,10 @@ fn build_layout(
     header.extend_from_slice(&version.to_le_bytes());
     header.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
     header.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+    let mut total_array_elements = 0u64;
     for (key, value) in metadata {
         push_gguf_string(&mut header, key);
-        push_value(&mut header, value)?;
+        push_value(&mut header, value, &mut total_array_elements)?;
     }
     for (tensor, &offset) in tensors.iter().zip(&offsets) {
         push_gguf_string(&mut header, &tensor.name);
@@ -479,7 +501,12 @@ impl<W: Write> GgufStreamWriter<W> {
 ///
 /// # Errors
 /// - [`GgufError::UnsupportedVersion`] if `version` is not 2 or 3.
-/// - [`GgufError::DimsOverflow`] on offset/length arithmetic overflow.
+/// - [`GgufError::InvalidAlignment`] for invalid declared alignment.
+/// - [`GgufError::InvalidTensorShape`] when a known type's shape or payload length
+///   disagrees with its GGML block layout.
+/// - [`GgufError::UnknownValueType`] for a heterogeneous metadata array.
+/// - [`GgufError::DimsOverflow`] on offset/length arithmetic overflow or excessive
+///   metadata-array depth/elements.
 pub fn write_gguf(
     version: u32,
     metadata: &BTreeMap<String, GgufValue>,
@@ -625,6 +652,41 @@ mod tests {
     }
 
     #[test]
+    fn known_tensor_geometry_and_payload_length_must_match() {
+        let metadata = BTreeMap::new();
+        let one_block = vec![0; 66];
+        let malformed_row = [TensorOut {
+            name: "bad-row".into(),
+            dims: vec![128, 2],
+            ggml_type: GGML_TYPE_TQ2_0,
+            data: &one_block,
+        }];
+        assert!(matches!(
+            write_gguf(3, &metadata, &malformed_row),
+            Err(GgufError::InvalidTensorShape)
+        ));
+
+        let short_f32 = [TensorOut {
+            name: "short-f32".into(),
+            dims: vec![2],
+            ggml_type: 0,
+            data: &1.0f32.to_le_bytes(),
+        }];
+        assert!(matches!(
+            write_gguf(3, &metadata, &short_f32),
+            Err(GgufError::InvalidTensorShape)
+        ));
+
+        let custom = [TensorOut {
+            name: "custom".into(),
+            dims: vec![128, 2],
+            ggml_type: 169,
+            data: &one_block,
+        }];
+        assert!(write_gguf(3, &metadata, &custom).is_ok());
+    }
+
+    #[test]
     fn empty_array_round_trips() {
         let mut meta = BTreeMap::new();
         meta.insert("a.empty".into(), GgufValue::Array(vec![]));
@@ -647,13 +709,59 @@ mod tests {
     }
 
     #[test]
-    fn nested_array_rejected() {
+    fn nested_homogeneous_arrays_round_trip() {
         let mut meta = BTreeMap::new();
         meta.insert(
             "a.nested".into(),
-            GgufValue::Array(vec![GgufValue::Array(vec![GgufValue::U8(1)])]),
+            GgufValue::Array(vec![
+                GgufValue::Array(vec![
+                    GgufValue::Array(vec![GgufValue::U8(1), GgufValue::U8(2)]),
+                    GgufValue::Array(vec![GgufValue::U8(3)]),
+                ]),
+                GgufValue::Array(vec![GgufValue::Array(vec![])]),
+            ]),
         );
-        assert!(write_gguf(3, &meta, &[]).is_err());
+        let bytes = write_gguf(3, &meta, &[]).expect("write nested arrays");
+        let parsed = read_gguf(&bytes).expect("read nested arrays");
+        assert_eq!(parsed.metadata, meta);
+    }
+
+    #[test]
+    fn heterogeneous_arrays_remain_rejected() {
+        let metadata = BTreeMap::from([(
+            "a.mixed".into(),
+            GgufValue::Array(vec![GgufValue::U8(1), GgufValue::U16(2)]),
+        )]);
+        assert!(write_gguf(3, &metadata, &[]).is_err());
+    }
+
+    #[test]
+    fn metadata_array_depth_is_bounded() {
+        let mut value = GgufValue::U8(1);
+        for _ in 0..=MAX_METADATA_DEPTH {
+            value = GgufValue::Array(vec![value]);
+        }
+        let metadata = BTreeMap::from([("a.too_deep".into(), value)]);
+        assert_eq!(
+            write_gguf(3, &metadata, &[]).unwrap_err(),
+            GgufError::DimsOverflow
+        );
+    }
+
+    #[test]
+    fn invalid_declared_alignment_is_rejected() {
+        for alignment in [
+            GgufValue::U32(0),
+            GgufValue::U32(12),
+            GgufValue::I32(-8),
+            GgufValue::U64(32),
+        ] {
+            let metadata = BTreeMap::from([("general.alignment".into(), alignment)]);
+            assert_eq!(
+                write_gguf(3, &metadata, &[]).unwrap_err(),
+                GgufError::InvalidAlignment
+            );
+        }
     }
 
     #[test]
@@ -669,7 +777,7 @@ mod tests {
             GgufValue::Array(vec![GgufValue::U32(3), GgufValue::U32(5)]),
         );
         let first: Vec<u8> = (0..66u8).collect();
-        let second: Vec<u8> = (0..131u8).map(|byte| byte ^ 0xA5).collect();
+        let second: Vec<u8> = (0..132u16).map(|byte| byte as u8 ^ 0xA5).collect();
         let tensors = vec![
             TensorOut {
                 name: "blk.0.weight".into(),

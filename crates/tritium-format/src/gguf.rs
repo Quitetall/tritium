@@ -38,6 +38,12 @@ const MAX_STRING_LEN: u64 = 64 * 1024 * 1024;
 /// Upper bound on array / table element counts, to reject overflow-y inputs early.
 const MAX_COUNT: u64 = 1u64 << 32;
 
+/// Maximum supported nesting of homogeneous GGUF metadata arrays.
+pub(crate) const MAX_METADATA_DEPTH: u8 = 8;
+
+/// Maximum aggregate array elements across one GGUF metadata table.
+pub(crate) const MAX_METADATA_ARRAY_ELEMENTS: u64 = 16_000_000;
+
 /// Maximum tensor dimension count accepted. ggml's `GGML_MAX_DIMS` is 4; 8 leaves
 /// headroom. Bounding this keeps `n_dims` from driving a huge upfront allocation.
 const MAX_DIMS: u32 = 8;
@@ -61,6 +67,12 @@ pub enum GgufError {
     StringTooLong,
     /// A tensor's dimension product, or a declared count, overflowed `u64`/`usize`.
     DimsOverflow,
+    /// A known tensor type's shape or payload length was incompatible with its block layout.
+    InvalidTensorShape,
+    /// `general.alignment` was present but was not a nonzero U32 multiple of eight.
+    InvalidAlignment,
+    /// A BOOL metadata payload byte was not the canonical zero or one.
+    InvalidBoolean(u8),
     /// A tensor's `offset + n_bytes` fell outside the tensor-data section.
     OffsetOutOfBounds,
     /// A metadata value declared a `value_type` id that GGUF does not define.
@@ -77,6 +89,19 @@ impl fmt::Display for GgufError {
             GgufError::Truncated => write!(f, "buffer truncated: read past end of input"),
             GgufError::StringTooLong => write!(f, "GGUF string length exceeds the sane bound"),
             GgufError::DimsOverflow => write!(f, "tensor dimensions or count overflowed"),
+            GgufError::InvalidTensorShape => {
+                write!(
+                    f,
+                    "tensor shape or payload length is incompatible with its GGML type"
+                )
+            }
+            GgufError::InvalidAlignment => write!(
+                f,
+                "general.alignment must be a nonzero U32 multiple of eight"
+            ),
+            GgufError::InvalidBoolean(value) => {
+                write!(f, "GGUF BOOL byte {value} is not zero or one")
+            }
             GgufError::OffsetOutOfBounds => {
                 write!(f, "tensor offset/size outside the data section")
             }
@@ -147,8 +172,8 @@ impl<'a> Cursor<'a> {
 
 /// A scalar or aggregate value read from the GGUF metadata table.
 ///
-/// Integers keep their declared width; [`GgufValue::Array`] preserves element
-/// order and may nest only one level (GGUF arrays do not hold arrays).
+/// Integers keep their declared width; [`GgufValue::Array`] preserves homogeneous
+/// element order and may recursively contain homogeneous arrays.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum GgufValue {
@@ -170,7 +195,7 @@ pub enum GgufValue {
     Bool(bool),
     /// `value_type` 8.
     String(String),
-    /// `value_type` 9: a homogeneous list of scalars.
+    /// `value_type` 9: a homogeneous list of values, including nested arrays.
     Array(Vec<GgufValue>),
     /// `value_type` 10.
     U64(u64),
@@ -183,8 +208,7 @@ pub enum GgufValue {
 impl GgufValue {
     /// Interpret this value as an unsigned integer, widening any integer width.
     ///
-    /// Returns `None` for non-integer kinds. Used to read `general.alignment`,
-    /// which GGUF may store as any unsigned width.
+    /// Returns `None` for non-integer kinds.
     #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
@@ -266,10 +290,12 @@ impl GgufValue {
 }
 
 /// Read one metadata value of the given `value_type` from the cursor.
-///
-/// `depth` guards against an array-of-arrays (illegal in GGUF) and any other
-/// pathological nesting: it is 0 at the top level and 1 inside an array.
-fn read_value(cur: &mut Cursor<'_>, value_type: u32, depth: u32) -> Result<GgufValue, GgufError> {
+fn read_value(
+    cur: &mut Cursor<'_>,
+    value_type: u32,
+    depth: u8,
+    total_array_elements: &mut u64,
+) -> Result<GgufValue, GgufError> {
     Ok(match value_type {
         0 => GgufValue::U8(cur.u8()?),
         1 => GgufValue::I8(cur.u8()? as i8),
@@ -278,23 +304,42 @@ fn read_value(cur: &mut Cursor<'_>, value_type: u32, depth: u32) -> Result<GgufV
         4 => GgufValue::U32(cur.u32()?),
         5 => GgufValue::I32(cur.u32()? as i32),
         6 => GgufValue::F32(f32::from_bits(cur.u32()?)),
-        7 => GgufValue::Bool(cur.u8()? != 0),
+        7 => {
+            let value = cur.u8()?;
+            if value > 1 {
+                return Err(GgufError::InvalidBoolean(value));
+            }
+            GgufValue::Bool(value != 0)
+        }
         8 => GgufValue::String(cur.gguf_string()?),
         9 => {
-            if depth > 0 {
-                // GGUF forbids nested arrays; treat as an unknown shape.
-                return Err(GgufError::UnknownValueType(9));
+            if depth >= MAX_METADATA_DEPTH {
+                return Err(GgufError::DimsOverflow);
             }
             let child_type = cur.u32()?;
+            if child_type > 12 {
+                return Err(GgufError::UnknownValueType(child_type));
+            }
             let count = cur.u64()?;
             if count > MAX_COUNT {
+                return Err(GgufError::DimsOverflow);
+            }
+            *total_array_elements = total_array_elements
+                .checked_add(count)
+                .ok_or(GgufError::DimsOverflow)?;
+            if *total_array_elements > MAX_METADATA_ARRAY_ELEMENTS {
                 return Err(GgufError::DimsOverflow);
             }
             // `count <= MAX_COUNT` (2^32) fits usize on 64-bit; cap to be safe.
             let count = usize::try_from(count).map_err(|_| GgufError::DimsOverflow)?;
             let mut items = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
-                items.push(read_value(cur, child_type, depth + 1)?);
+                items.push(read_value(
+                    cur,
+                    child_type,
+                    depth + 1,
+                    total_array_elements,
+                )?);
             }
             GgufValue::Array(items)
         }
@@ -370,18 +415,34 @@ fn type_block_layout(ggml_type: u32) -> Option<(u64, u64)> {
     }
 }
 
-/// Compute payload byte-size from element count and type, mirroring ggml's
-/// `nbytes = (n_elements / block_n) * block_size`.
-fn tensor_n_bytes(ggml_type: u32, n_elements: u64) -> Result<u64, GgufError> {
+pub(crate) fn tensor_type_is_sized(ggml_type: u32) -> bool {
+    type_block_layout(ggml_type).is_some()
+}
+
+/// Compute payload byte-size from row geometry and type.
+///
+/// ggml block formats require the fastest-varying dimension to contain a whole
+/// number of blocks; blocks never straddle rows.
+pub(crate) fn tensor_n_bytes(ggml_type: u32, dims: &[u64]) -> Result<u64, GgufError> {
     let Some((block_size, block_n)) = type_block_layout(ggml_type) else {
         // Unknown type: we cannot size it; report 0 rather than guess.
         return Ok(0);
     };
-    // n_blocks = ceil(n_elements / block_n); ggml tensors are block-aligned, but
-    // div_ceil keeps us safe against any non-multiple input without panicking.
-    let n_blocks = n_elements.div_ceil(block_n);
-    n_blocks
+    let row_elements = dims.first().copied().unwrap_or(1);
+    if row_elements % block_n != 0 {
+        return Err(GgufError::InvalidTensorShape);
+    }
+    let rows = dims
+        .get(1..)
+        .unwrap_or_default()
+        .iter()
+        .try_fold(1u64, |rows, &dimension| {
+            rows.checked_mul(dimension).ok_or(GgufError::DimsOverflow)
+        })?;
+    let row_blocks = row_elements / block_n;
+    row_blocks
         .checked_mul(block_size)
+        .and_then(|row_bytes| row_bytes.checked_mul(rows))
         .ok_or(GgufError::DimsOverflow)
 }
 
@@ -432,14 +493,23 @@ impl GgufFile {
         self.tensors.iter().find(|t| t.name == name)
     }
 
-    /// The effective tensor-data alignment: `general.alignment` if present and
-    /// non-zero, else [`DEFAULT_ALIGNMENT`].
+    /// The effective tensor-data alignment. Parsed files use their validated U32
+    /// `general.alignment`; an absent key uses [`DEFAULT_ALIGNMENT`].
     #[must_use]
     pub fn alignment(&self) -> u64 {
-        self.get_metadata("general.alignment")
-            .and_then(GgufValue::as_u64)
-            .filter(|&a| a != 0)
-            .unwrap_or(DEFAULT_ALIGNMENT)
+        metadata_alignment(&self.metadata).unwrap_or(DEFAULT_ALIGNMENT)
+    }
+}
+
+/// Resolve official GGUF alignment metadata.
+///
+/// The key is optional. When present its type must be U32 and its value must be
+/// nonzero and divisible by eight.
+pub(crate) fn metadata_alignment(metadata: &BTreeMap<String, GgufValue>) -> Result<u64, GgufError> {
+    match metadata.get("general.alignment") {
+        None => Ok(DEFAULT_ALIGNMENT),
+        Some(GgufValue::U32(value)) if *value != 0 && value % 8 == 0 => Ok(u64::from(*value)),
+        Some(_) => Err(GgufError::InvalidAlignment),
     }
 }
 
@@ -462,8 +532,9 @@ fn align_up(pos: u64, align: u64) -> Result<u64, GgufError> {
 /// # Errors
 /// Returns a typed [`GgufError`] for any malformed input — bad magic, an
 /// unsupported version, truncation, an over-long string, a count/dimension
-/// overflow, a tensor offset outside the data section, or an unknown metadata
-/// value type. It never panics and never reads out of bounds.
+/// overflow, block-misaligned quantized row geometry, a tensor offset outside the
+/// data section, invalid alignment/BOOL metadata, excessive nested-array resources,
+/// or an unknown metadata value type. It never panics and never reads out of bounds.
 ///
 /// # Examples
 /// ```
@@ -492,19 +563,16 @@ pub fn read_gguf(buf: &[u8]) -> Result<GgufFile, GgufError> {
 
     // Metadata table.
     let mut metadata = BTreeMap::new();
+    let mut total_array_elements = 0u64;
     for _ in 0..metadata_kv_count {
         let key = cur.gguf_string()?;
         let value_type = cur.u32()?;
-        let value = read_value(&mut cur, value_type, 0)?;
+        let value = read_value(&mut cur, value_type, 0, &mut total_array_elements)?;
         metadata.insert(key, value);
     }
 
-    // Resolve alignment from the metadata we just parsed (default 32).
-    let alignment = metadata
-        .get("general.alignment")
-        .and_then(GgufValue::as_u64)
-        .filter(|&a| a != 0)
-        .unwrap_or(DEFAULT_ALIGNMENT);
+    // Resolve and validate official alignment metadata (default 32 only when absent).
+    let alignment = metadata_alignment(&metadata)?;
 
     // Tensor-info table.
     // `tensor_count` is attacker-controlled — cap the speculative reserve; the loop
@@ -541,7 +609,7 @@ pub fn read_gguf(buf: &[u8]) -> Result<GgufFile, GgufError> {
         for &d in &dims {
             n_elements = n_elements.checked_mul(d).ok_or(GgufError::DimsOverflow)?;
         }
-        let n_bytes = tensor_n_bytes(ggml_type, n_elements)?;
+        let n_bytes = tensor_n_bytes(ggml_type, &dims)?;
         // Validate the span only for types we can size; unknown types yield 0.
         if n_bytes > 0 {
             let end = offset.checked_add(n_bytes).ok_or(GgufError::DimsOverflow)?;
