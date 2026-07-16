@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tritium_salt::{
     Qwen36AdmittedSource, Qwen36CampaignPreflight, Qwen36CampaignPreflightError,
-    Qwen36SourceIdentityStatus, Qwen36SourceProof,
+    Qwen36SourceIdentityStatus, Qwen36SourceProof, Qwen36TensorWorkError, Qwen36TensorWorkStore,
 };
 
 const PINNED_METADATA_DIGEST: [u8; 32] = [
@@ -84,5 +84,24 @@ fn real_revision_declared_checkpoint_earns_candidate_receipt() {
         reopened.source_model_id(),
         admitted.receipt().source_model_id()
     );
+    let work = Qwen36TensorWorkStore::open(&admitted).expect("open tensor workspace");
+    let workspace = work
+        .reconcile_preserved()
+        .expect("persist exact preserved tensors");
+    assert_eq!(workspace.summary().active_tensors(), 866);
+    assert_eq!(workspace.summary().additive_required(), 506);
+    assert_eq!(workspace.summary().preserved_tensors(), 360);
+    assert_eq!(workspace.summary().preserved_payload_bytes(), 5_343_232);
+    assert_eq!(
+        workspace.identity_status(),
+        Qwen36SourceIdentityStatus::MeasuredAwaitingOfficialRegistration
+    );
+    assert!(matches!(
+        work.require_complete(),
+        Err(Qwen36TensorWorkError::MissingAdditiveArtifacts {
+            expected: 506,
+            present: 0
+        })
+    ));
     let _ = std::fs::remove_dir_all(work_root);
 }

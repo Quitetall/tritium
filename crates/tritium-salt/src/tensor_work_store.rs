@@ -5,8 +5,9 @@ use std::{
     error::Error,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use tritium_format::ModelId;
@@ -294,13 +295,14 @@ impl TensorWorkStore {
     /// Returns [`TensorWorkError`] if a required path is a symlink, special
     /// file, or cannot be created and inspected.
     pub fn open(root: &Path) -> Result<Self, TensorWorkError> {
-        ensure_directory(root, "store root")?;
+        let root = absolute_path(root)?;
+        ensure_durable_directory(&root, "store root")?;
         let objects = root.join(OBJECT_DIRECTORY);
-        ensure_directory(&objects, "object directory")?;
+        ensure_durable_directory(&objects, "object directory")?;
         let temporary = root.join(TEMP_DIRECTORY);
-        ensure_directory(&temporary, "temporary directory")?;
+        ensure_durable_directory(&temporary, "temporary directory")?;
         Ok(Self {
-            root: root.to_path_buf(),
+            root,
             objects,
             temporary,
         })
@@ -346,16 +348,8 @@ impl TensorWorkStore {
     ) -> Result<TensorRecordReceipt, TensorPutError<E>> {
         validate_info(&spec.0).map_err(TensorPutError::Store)?;
         let record_bytes = exact_record_bytes(&spec.0).map_err(TensorPutError::Store)?;
-        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temporary = self
-            .temporary
-            .join(format!("record.tmp.{}.{}", std::process::id(), nonce));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| TensorPutError::Store(work_io("create temporary record", error)))?;
+        let (temporary, file) =
+            create_temporary_file(&self.temporary, "record.tmp").map_err(TensorPutError::Store)?;
         let result = self.write_temporary(file, &temporary, spec, record_bytes, produce);
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -435,7 +429,7 @@ impl TensorWorkStore {
         let parent = path
             .parent()
             .ok_or(TensorWorkError::InvalidPath("record parent"))?;
-        ensure_directory(parent, "record prefix directory")?;
+        ensure_durable_directory(parent, "record prefix directory")?;
         sync_directory(&self.objects, "sync object directory")?;
         match fs::hard_link(temporary, &path) {
             Ok(()) => {}
@@ -1270,14 +1264,93 @@ impl<'a> ReceiptCursor<'a> {
     }
 }
 
-fn ensure_directory(path: &Path, field: &'static str) -> Result<(), TensorWorkError> {
-    fs::create_dir_all(path).map_err(|error| work_io("create tensor work directory", error))?;
+pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf, TensorWorkError> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(TensorWorkError::InvalidPath("store root traversal"));
+    }
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .map_err(|error| work_io("resolve tensor work root", error))
+    }
+}
+
+pub(crate) fn ensure_durable_directory(
+    path: &Path,
+    field: &'static str,
+) -> Result<(), TensorWorkError> {
+    if path.as_os_str().is_empty() {
+        return Err(TensorWorkError::InvalidPath(field));
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_durable_directory(parent, "directory ancestor")?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(TensorWorkError::InvalidPath(field));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(work_io("inspect tensor work directory", error)),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(TensorWorkError::InvalidPath("directory parent"))?;
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(work_io("create tensor work directory", error)),
+    }
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| work_io("inspect tensor work directory", error))?;
+        .map_err(|error| work_io("inspect created tensor work directory", error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(TensorWorkError::InvalidPath(field));
     }
-    Ok(())
+    sync_directory(parent, "sync tensor work parent directory")
+}
+
+pub(crate) fn create_temporary_file(
+    directory: &Path,
+    prefix: &str,
+) -> Result<(PathBuf, File), TensorWorkError> {
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..128 {
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            "{prefix}.{}.{}.{}",
+            std::process::id(),
+            epoch,
+            nonce
+        ));
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(work_io("create temporary record", error)),
+        }
+    }
+    Err(TensorWorkError::Io {
+        operation: "create unique temporary record",
+        kind: io::ErrorKind::AlreadyExists,
+    })
 }
 
 #[cfg(unix)]

@@ -153,3 +153,23 @@ fn reopened_records_fail_closed_after_exact_byte_tampering() {
     ));
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[test]
+fn store_rejects_symlinked_ancestor_directories() {
+    use std::os::unix::fs::symlink;
+
+    let root = fixture_root("ancestor-symlink");
+    let _ = std::fs::remove_dir_all(&root);
+    let redirect = root.join("redirect");
+    std::fs::create_dir_all(&redirect).unwrap();
+    let link = root.join("linked");
+    symlink(&redirect, &link).unwrap();
+
+    assert!(matches!(
+        TensorWorkStore::open(&link.join("nested")),
+        Err(TensorWorkError::InvalidPath(_))
+    ));
+    assert!(!redirect.join("nested").exists());
+    let _ = std::fs::remove_dir_all(root);
+}

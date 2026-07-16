@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 mod pipeline;
 mod qwen36_preflight;
 mod qwen36_source_admission;
+mod qwen36_tensor_work;
 mod tensor_work_store;
 
 pub use pipeline::{
@@ -30,6 +31,11 @@ pub use qwen36_preflight::{
 pub use qwen36_source_admission::{
     Qwen36AdmissionError, Qwen36AdmissionReceipt, Qwen36AdmittedSource, Qwen36LanguageCoverage,
     Qwen36SourceProof, Qwen36SourceProofError,
+};
+pub use qwen36_tensor_work::{
+    Qwen36AdditiveSlotState, Qwen36AdditiveWorkSlot, Qwen36LanguageMtpWorkspaceReceipt,
+    Qwen36PreservedVisitError, Qwen36TensorWorkError, Qwen36TensorWorkStore,
+    Qwen36TensorWorkSummary,
 };
 pub use tensor_work_store::{
     TensorPayloadWriter, TensorPutError, TensorRecordInfo, TensorRecordReader, TensorRecordReceipt,

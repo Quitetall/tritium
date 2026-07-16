@@ -271,6 +271,28 @@ impl Qwen35ContentVerifiedHfSource {
         self.tensor_f32_exact(name, &expected)
     }
 
+    /// Construct the architecture-framed semantic hasher for one source tensor.
+    ///
+    /// This lets durable downstream stores revalidate copied raw payload bytes
+    /// against the same tensor identity used by source admission without
+    /// duplicating Qwen framing constants.
+    ///
+    /// # Errors
+    /// Returns [`NnError`] if the tensor is absent, its dtype is unsupported, or
+    /// bounded owned metadata cannot be constructed.
+    pub fn source_tensor_semantic_hasher(
+        &self,
+        name: &str,
+    ) -> Result<SemanticTensorHasher, NnError> {
+        let metadata = find_metadata(&self.source.metadata, name)?;
+        let dtype_tag = source_dtype_tag(name, &metadata.dtype)?;
+        let hasher_name = try_owned_string(name, "verified semantic tensor name")?;
+        let hasher_shape = try_owned_u64_shape(&metadata.shape, name)?;
+        let mut hasher = SemanticTensorHasher::new(hasher_name, hasher_shape);
+        update_tensor_frame(&mut hasher, dtype_tag);
+        Ok(hasher)
+    }
+
     /// Stream exact stored tensor bytes from retained shard handles.
     ///
     /// Chunks never exceed `max_chunk_bytes`. The same semantic frame used by
@@ -291,18 +313,11 @@ impl Qwen35ContentVerifiedHfSource {
         max_chunk_bytes: usize,
         mut visit: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<u64, Qwen35TensorStreamError<E>> {
-        let metadata =
-            find_metadata(&self.source.metadata, name).map_err(Qwen35TensorStreamError::Source)?;
         let expected_semantic = find_semantic_tensor(self.identity.manifest(), name)
             .map_err(Qwen35TensorStreamError::Source)?;
-        let dtype_tag =
-            source_dtype_tag(name, &metadata.dtype).map_err(Qwen35TensorStreamError::Source)?;
-        let hasher_name = try_owned_string(name, "verified semantic tensor name")
+        let mut hasher = self
+            .source_tensor_semantic_hasher(name)
             .map_err(Qwen35TensorStreamError::Source)?;
-        let hasher_shape =
-            try_owned_u64_shape(&metadata.shape, name).map_err(Qwen35TensorStreamError::Source)?;
-        let mut hasher = SemanticTensorHasher::new(hasher_name, hasher_shape);
-        update_tensor_frame(&mut hasher, dtype_tag);
         let mut payload_bytes = 0_u64;
         self.source
             .shards

@@ -8,10 +8,11 @@
 use core::fmt;
 use std::path::Path;
 
-use tritium_format::{ModelId, SemanticModelManifest};
+use tritium_format::{ModelId, SemanticModelManifest, SemanticTensorHasher};
 use tritium_nn::{
     NnError, QWEN36_27B_REPOSITORY, QWEN36_27B_REVISION, Qwen35ContentVerifiedHfSource,
     Qwen35HfLanguageReceipt, Qwen35HfSource, Qwen35HfSourceIdentity, Qwen35HfTensorMetadata,
+    Qwen35TensorStreamError,
 };
 use tritium_quantize::{
     QWEN36_27B_COVERAGE_REVISION, Qwen35CoverageDisposition, Qwen35CoverageError,
@@ -240,6 +241,38 @@ impl Qwen36CampaignPreflight {
         self.source
             .tensor_f32(name)
             .map_err(Qwen36CampaignPreflightError::SourceIdentity)
+    }
+
+    /// Stream exact source tensor bytes through the retained, content-verified handles.
+    ///
+    /// The source remains live rather than snapshotted. Callers must prevent
+    /// concurrent mutation for the full visit and discard partial sink effects
+    /// after any error.
+    ///
+    /// # Errors
+    /// Returns [`Qwen35TensorStreamError::Source`] for changed or malformed
+    /// source content and [`Qwen35TensorStreamError::Sink`] for a typed callback
+    /// failure.
+    pub fn try_visit_tensor_bytes<E>(
+        &self,
+        name: &str,
+        max_chunk_bytes: usize,
+        visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<u64, Qwen35TensorStreamError<E>> {
+        self.source
+            .try_visit_tensor_bytes(name, max_chunk_bytes, visit)
+    }
+
+    /// Construct the exact Qwen source-semantic hasher for a covered tensor.
+    ///
+    /// # Errors
+    /// Returns [`NnError`] if the tensor is absent or its admitted metadata
+    /// cannot initialize the architecture-framed hasher.
+    pub fn source_tensor_semantic_hasher(
+        &self,
+        name: &str,
+    ) -> Result<SemanticTensorHasher, NnError> {
+        self.source.source_tensor_semantic_hasher(name)
     }
 
     fn finish(

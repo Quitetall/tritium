@@ -364,6 +364,25 @@ fn verified_source_streams_bounded_raw_chunks_and_preserves_sink_errors() {
         .unwrap();
     assert_eq!(payload_bytes, expected.len() as u64);
     assert_eq!(actual, expected);
+    let mut semantic_hasher = source
+        .source_tensor_semantic_hasher("model.language_model.norm.weight")
+        .unwrap();
+    semantic_hasher.update(&actual);
+    let semantic = semantic_hasher.finalize().unwrap();
+    let admitted = source
+        .identity()
+        .manifest()
+        .tensors()
+        .iter()
+        .find(|tensor| tensor.name() == "model.language_model.norm.weight")
+        .unwrap();
+    assert_eq!(&semantic, admitted);
+    actual[0] ^= 1;
+    let mut tampered_hasher = source
+        .source_tensor_semantic_hasher("model.language_model.norm.weight")
+        .unwrap();
+    tampered_hasher.update(&actual);
+    assert_ne!(tampered_hasher.finalize().unwrap(), *admitted);
 
     let error = source
         .try_visit_tensor_bytes("model.language_model.norm.weight", 3, |_| Err(SinkStop))

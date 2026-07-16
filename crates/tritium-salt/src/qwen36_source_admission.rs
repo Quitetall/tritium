@@ -3,10 +3,12 @@
 use core::fmt;
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tritium_format::{ArtifactError, ModelId, SemanticModelManifest};
 use tritium_quantize::{
@@ -15,6 +17,8 @@ use tritium_quantize::{
 
 use crate::{
     ContentId, Qwen36CampaignPreflight, Qwen36CampaignPreflightError, Qwen36SourceIdentityStatus,
+    TensorWorkError,
+    tensor_work_store::{absolute_path, create_temporary_file, ensure_durable_directory},
 };
 
 const PROOF_MAGIC: [u8; 8] = *b"TSQ36AD\0";
@@ -28,6 +32,7 @@ const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_POLICY_BYTES: usize = 16 * 1024 * 1024;
 const CHECKSUM_BYTES: usize = 32;
+#[cfg(test)]
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Exact language-schema counts retained by the durable admission proof.
@@ -418,7 +423,8 @@ impl Qwen36AdmittedSource {
             .map_err(Qwen36AdmissionError::Proof)?;
         let proof_id = ContentId::of_bytes(&bytes);
         let manifest_content_id = proof.manifest_content_id();
-        let _lock = AdmissionLock::acquire(work_root, proof_id)?;
+        let work_root = absolute_path(work_root).map_err(map_directory_error)?;
+        let _lock = AdmissionLock::acquire(&work_root, proof_id)?;
         let source_dir = work_root.join(SOURCE_DIRECTORY);
         ensure_directory(&source_dir)?;
         let manifest_dir = source_dir.join(manifest_content_id.to_string());
@@ -482,6 +488,40 @@ impl Qwen36AdmittedSource {
     /// matches the admitted semantic manifest or widening fails.
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, Qwen36CampaignPreflightError> {
         self.preflight.tensor_f32(name)
+    }
+
+    /// Stream exact admitted tensor bytes without widening or reopening source paths.
+    ///
+    /// This retains admission typestate while delegating to the same opened shard
+    /// handles whose semantic identity is bound by [`Self::proof`].
+    ///
+    /// # Errors
+    /// Returns [`tritium_nn::Qwen35TensorStreamError::Source`] for changed or
+    /// malformed source content and
+    /// [`tritium_nn::Qwen35TensorStreamError::Sink`] for a typed callback failure.
+    pub fn try_visit_tensor_bytes<E>(
+        &self,
+        name: &str,
+        max_chunk_bytes: usize,
+        visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<u64, tritium_nn::Qwen35TensorStreamError<E>> {
+        self.preflight
+            .try_visit_tensor_bytes(name, max_chunk_bytes, visit)
+    }
+
+    /// Construct the architecture-framed hasher used by source admission.
+    ///
+    /// Downstream stores use this to prove reopened copied payloads still match
+    /// the source semantic digest bound by [`Self::proof`].
+    ///
+    /// # Errors
+    /// Returns [`tritium_nn::NnError`] if the tensor is absent or its admitted
+    /// metadata cannot initialize the hasher.
+    pub fn source_tensor_semantic_hasher(
+        &self,
+        name: &str,
+    ) -> Result<tritium_format::SemanticTensorHasher, tritium_nn::NnError> {
+        self.preflight.source_tensor_semantic_hasher(name)
     }
 }
 
@@ -871,19 +911,18 @@ fn validate_numeric(
 }
 
 fn ensure_directory(path: &Path) -> Result<(), Qwen36AdmissionError> {
-    fs::create_dir_all(path).map_err(|error| admission_io("create work directory", error))?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| admission_io("inspect work directory", error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(Qwen36AdmissionError::InvalidWorkPath("work directory"));
-    }
-    Ok(())
+    ensure_durable_directory(path, "work directory").map_err(map_directory_error)
 }
 
 fn persist_exact(path: &Path, bytes: &[u8]) -> Result<(), Qwen36AdmissionError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            return verify_existing_proof(path, &metadata, bytes);
+            verify_existing_proof(path, &metadata, bytes)?;
+            return sync_directory(
+                path.parent()
+                    .ok_or(Qwen36AdmissionError::InvalidWorkPath("proof parent"))?,
+                "sync existing source proof directory",
+            );
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(admission_io("inspect source proof", error)),
@@ -892,13 +931,9 @@ fn persist_exact(path: &Path, bytes: &[u8]) -> Result<(), Qwen36AdmissionError> 
     let parent = path
         .parent()
         .ok_or(Qwen36AdmissionError::InvalidWorkPath("proof parent"))?;
-    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!("{PROOF_FILE}.tmp.{}.{}", std::process::id(), nonce));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| admission_io("create temporary source proof", error))?;
+    ensure_directory(parent)?;
+    let (temporary, mut file) =
+        create_temporary_file(parent, &format!("{PROOF_FILE}.tmp")).map_err(map_directory_error)?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&temporary);
         return Err(admission_io("write temporary source proof", error));
@@ -919,13 +954,13 @@ fn persist_exact(path: &Path, bytes: &[u8]) -> Result<(), Qwen36AdmissionError> 
             return Err(admission_io("publish source proof", error));
         }
     }
+    if let Err(error) = sync_directory(parent, "sync source proof directory") {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     fs::remove_file(&temporary)
         .map_err(|error| admission_io("remove temporary source proof", error))?;
-    #[cfg(unix)]
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| admission_io("sync source proof directory", error))?;
-    Ok(())
+    sync_directory(parent, "resync source proof directory")
 }
 
 fn verify_existing_proof(
@@ -939,8 +974,35 @@ fn verify_existing_proof(
     if metadata.len() > MAX_PROOF_BYTES as u64 {
         return Err(Qwen36AdmissionError::ExistingProofMismatch);
     }
-    let existing =
-        fs::read(path).map_err(|error| admission_io("read existing source proof", error))?;
+    let mut file =
+        fs::File::open(path).map_err(|error| admission_io("open existing source proof", error))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| admission_io("inspect opened source proof", error))?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|error| admission_io("reinspect source proof", error))?;
+    if after.file_type().is_symlink()
+        || !after.is_file()
+        || !same_file_identity(metadata, &opened)
+        || !same_file_identity(&opened, &after)
+        || opened.len() != metadata.len()
+        || opened.len() != after.len()
+    {
+        return Err(Qwen36AdmissionError::InvalidWorkPath("proof file"));
+    }
+    let opened_len =
+        usize::try_from(opened.len()).map_err(|_| Qwen36AdmissionError::ExistingProofMismatch)?;
+    let mut existing = Vec::new();
+    existing
+        .try_reserve_exact(opened_len)
+        .map_err(|_| Qwen36AdmissionError::ExistingProofMismatch)?;
+    (&mut file)
+        .take(MAX_PROOF_BYTES as u64 + 1)
+        .read_to_end(&mut existing)
+        .map_err(|error| admission_io("read existing source proof", error))?;
+    if existing.len() as u64 != opened.len() {
+        return Err(Qwen36AdmissionError::ExistingProofMismatch);
+    }
     let decoded = Qwen36SourceProof::from_canonical_bytes(&existing)
         .map_err(|_| Qwen36AdmissionError::ExistingProofMismatch)?;
     if existing != expected
@@ -948,6 +1010,38 @@ fn verify_existing_proof(
     {
         return Err(Qwen36AdmissionError::ExistingProofMismatch);
     }
+    Ok(())
+}
+
+fn map_directory_error(error: TensorWorkError) -> Qwen36AdmissionError {
+    match error {
+        TensorWorkError::Io { operation, kind } => Qwen36AdmissionError::Io { operation, kind },
+        TensorWorkError::InvalidPath(_) => Qwen36AdmissionError::InvalidWorkPath("work directory"),
+        _ => Qwen36AdmissionError::InvalidWorkPath("work directory"),
+    }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.is_file() == right.is_file() && left.len() == right.len()
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path, operation: &'static str) -> Result<(), Qwen36AdmissionError> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| admission_io(operation, error))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path, _operation: &'static str) -> Result<(), Qwen36AdmissionError> {
     Ok(())
 }
 
@@ -1004,67 +1098,68 @@ fn admission_io(operation: &'static str, error: io::Error) -> Qwen36AdmissionErr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) fn test_fixture_source_proof() -> Qwen36SourceProof {
     use tritium_format::SemanticTensor;
     use tritium_quantize::{QWEN36_27B_COVERAGE_REVISION, Qwen35TensorMetadata};
 
-    use super::*;
-
     const PINNED_METADATA: &str =
         include_str!("../../tritium-quantize/tests/fixtures/qwen36-27b-metadata.tsv");
-
-    fn fixture_coverage() -> Qwen35CoverageManifest {
-        let owned: Vec<_> = PINNED_METADATA
-            .lines()
-            .map(|line| {
-                let mut fields = line.split('\t');
-                let name = fields.next().unwrap().to_owned();
-                let dtype = fields.next().unwrap().to_owned();
-                let shape = fields
-                    .next()
-                    .unwrap()
-                    .split(',')
-                    .map(|value| value.parse::<u64>().unwrap())
-                    .collect::<Vec<_>>();
-                (name, dtype, shape)
-            })
-            .collect();
-        Qwen35CoverageManifest::from_metadata(
-            QWEN36_27B_COVERAGE_REVISION,
-            owned
-                .iter()
-                .map(|(name, dtype, shape)| Qwen35TensorMetadata::new(name, dtype, shape)),
-        )
-        .unwrap()
+    let owned: Vec<_> = PINNED_METADATA
+        .lines()
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next().unwrap().to_owned();
+            let dtype = fields.next().unwrap().to_owned();
+            let shape = fields
+                .next()
+                .unwrap()
+                .split(',')
+                .map(|value| value.parse::<u64>().unwrap())
+                .collect::<Vec<_>>();
+            (name, dtype, shape)
+        })
+        .collect();
+    let coverage = Qwen35CoverageManifest::from_metadata(
+        QWEN36_27B_COVERAGE_REVISION,
+        owned
+            .iter()
+            .map(|(name, dtype, shape)| Qwen35TensorMetadata::new(name, dtype, shape)),
+    )
+    .unwrap();
+    let canonical_config = tritium_nn::qwen36_27b_canonical_source_config().unwrap();
+    let tensors = coverage
+        .entries()
+        .iter()
+        .map(|entry| SemanticTensor::new(entry.name(), entry.shape().to_vec(), b"fixture").unwrap())
+        .collect();
+    let manifest = SemanticModelManifest::new(
+        tritium_nn::QWEN35_HF_SOURCE_ARCHITECTURE,
+        &canonical_config,
+        tensors,
+    )
+    .unwrap();
+    Qwen36SourceProof {
+        canonical_config,
+        manifest,
+        coverage,
+        payload_bytes: 55_562_855_904,
+        language: Qwen36LanguageCoverage {
+            tensors: 851,
+            matrices: 498,
+            preserved: 353,
+            deferred_mtp: 15,
+            deferred_vision: 333,
+        },
+        identity_status: Qwen36SourceIdentityStatus::MeasuredAwaitingOfficialRegistration,
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     fn fixture_proof() -> Qwen36SourceProof {
-        let coverage = fixture_coverage();
-        let config = tritium_nn::qwen36_27b_canonical_source_config().unwrap();
-        let tensors = coverage
-            .entries()
-            .iter()
-            .map(|entry| {
-                SemanticTensor::new(entry.name(), entry.shape().to_vec(), b"fixture").unwrap()
-            })
-            .collect();
-        let manifest =
-            SemanticModelManifest::new(tritium_nn::QWEN35_HF_SOURCE_ARCHITECTURE, &config, tensors)
-                .unwrap();
-        Qwen36SourceProof {
-            canonical_config: config,
-            manifest,
-            coverage,
-            payload_bytes: 55_562_855_904,
-            language: Qwen36LanguageCoverage {
-                tensors: 851,
-                matrices: 498,
-                preserved: 353,
-                deferred_mtp: 15,
-                deferred_vision: 333,
-            },
-            identity_status: Qwen36SourceIdentityStatus::MeasuredAwaitingOfficialRegistration,
-        }
+        test_fixture_source_proof()
     }
 
     #[test]
