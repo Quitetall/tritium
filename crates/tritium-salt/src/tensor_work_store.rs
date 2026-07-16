@@ -320,6 +320,11 @@ impl TensorWorkStore {
         &self.objects
     }
 
+    #[cfg(unix)]
+    pub(crate) fn temporary_dir(&self) -> &Path {
+        &self.temporary
+    }
+
     /// Deterministic content-addressed path for a record ID.
     #[must_use]
     pub fn record_path(&self, record_id: ContentId) -> PathBuf {
@@ -327,6 +332,32 @@ impl TensorWorkStore {
         self.objects
             .join(prefix)
             .join(format!("{record_id}.{RECORD_EXTENSION}"))
+    }
+
+    /// Remove crash-left temporary records while the caller holds exclusive store ownership.
+    #[cfg(unix)]
+    pub(crate) fn scavenge_temporary(&self) -> Result<u64, TensorWorkError> {
+        let mut removed = 0_u64;
+        let entries = fs::read_dir(&self.temporary)
+            .map_err(|error| work_io("read temporary record directory", error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| work_io("read temporary record entry", error))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| work_io("inspect temporary record", error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(TensorWorkError::InvalidPath("temporary record"));
+            }
+            fs::remove_file(&path)
+                .map_err(|error| work_io("remove stale temporary record", error))?;
+            removed = removed
+                .checked_add(1)
+                .ok_or(TensorWorkError::LengthOverflow)?;
+        }
+        if removed != 0 {
+            sync_directory(&self.temporary, "sync scavenged temporary directory")?;
+        }
+        Ok(removed)
     }
 
     /// Stream and immutably publish one exact tensor record.

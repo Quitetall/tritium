@@ -776,9 +776,18 @@ The following work deliberately remains open and keeps this plan in progress:
   `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult` slices exact
   prefixes without refitting. This is still a bounded CPU reference: its full
   inverse Hessian is dense binary64, input columns and natural groups must
-  preserve row-local G128 scale geometry, and the content-addressed master is
-  owned in memory rather than reopenable from a sharded on-disk artifact. A
-  production-scale factorized/sharded master writer and reader remain open;
+  preserve row-local G128 scale geometry, and fitting still owns the whole model
+  master in memory. Canonical per-tensor radix-3 masters are now streamed into an
+  immutable CAS, semantically reopened with bounded staging, installed beneath a
+  base-preserving Qwen campaign namespace, and sealed only after all 506 ordered
+  language/MTP PTQ masters verify. Refined campaign admission still fails closed
+  until it can bind a parent completion and prove that every child keeps the
+  parent's trits, admissible prefixes, and allocation fixed. The production driver
+  must still stream fitter output directly into that store. Generic-record reopen
+  followed by SALT semantic decode currently reads each master twice, while an
+  exact-length invalid producer can leave an unreferenced CAS object; a fused
+  validation-aware single-pass writer/visitor plus orphan reclamation is required
+  before the 27B campaign;
 - package/runtime scale geometry is G128-only; the G64/G256 promotion ablations
   require a versioned format/runtime field before they can enter the grid;
 - the equal-cost allocator is exact and scalable, including binary64 reduction

@@ -1,8 +1,15 @@
 //! Durable language-plus-MTP tensor workspace for the pinned Qwen3.6 campaign.
 //!
-//! This module copies only the 360 source-precision tensors required by the
-//! product artifact. The 506 additive matrices remain explicit missing slots
-//! until a canonical, reopenable `SaltV2MasterFit` schema exists.
+//! The immutable base manifest copies only the 360 source-precision tensors
+//! required by the product artifact. Independently versioned additive campaigns
+//! install the 506 canonical tensor masters without rewriting that base.
+
+mod additive_master;
+
+pub use additive_master::{
+    Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
+    Qwen36AdditiveMasterReceipt, Qwen36CompleteWorkspaceReceipt,
+};
 
 use core::{convert::Infallible, fmt};
 use std::{
@@ -12,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use tritium_format::{ModelId, SemanticTensorHasher};
+use tritium_format::{ModelId, SemanticTensorHasher, salt_v2_master::SaltV2MasterError};
 use tritium_nn::{NnError, Qwen35TensorStreamError};
 use tritium_quantize::{
     Qwen35CoverageDisposition, Qwen35CoverageEntry, Qwen35SourceDtype, Qwen35TensorRole,
@@ -86,6 +93,16 @@ pub struct Qwen36TensorWorkSummary {
 }
 
 impl Qwen36TensorWorkSummary {
+    fn with_additive_present(mut self, present: u64) -> Result<Self, Qwen36TensorWorkError> {
+        if present > self.additive_required {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "additive master count",
+            ));
+        }
+        self.additive_present = present;
+        Ok(self)
+    }
+
     /// Language and MTP tensors in current product scope.
     #[must_use]
     pub const fn active_tensors(self) -> u64 {
@@ -144,7 +161,7 @@ impl Qwen36TensorWorkSummary {
 /// State of one named additive language/MTP tensor slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen36AdditiveSlotState {
-    /// No canonical reopenable additive-master schema exists in this workspace version.
+    /// The immutable base manifest carries no campaign-specific master reference.
     MissingCanonicalMaster,
 }
 
@@ -428,11 +445,10 @@ impl<'a> Qwen36TensorWorkStore<'a> {
         Ok((bytes, manifest))
     }
 
-    /// Require a complete 866-tensor language-plus-MTP workspace.
+    /// Require completeness in the immutable preserved-source base manifest.
     ///
-    /// This version intentionally cannot succeed: the 506 additive slots have
-    /// no canonical on-disk master schema yet. Preserved records are still fully
-    /// reopened before the typed incompleteness result is returned.
+    /// The base manifest intentionally remains incomplete and byte-stable.
+    /// Open a [`Qwen36AdditiveCampaignStore`] to install and seal additive masters.
     ///
     /// # Errors
     /// Returns [`Qwen36TensorWorkError::MissingAdditiveArtifacts`] after a valid
@@ -977,6 +993,8 @@ pub enum Qwen36TensorWorkError {
     SourceProof(Qwen36SourceProofError),
     /// Generic tensor object framing, I/O, or validation failed.
     TensorStore(TensorWorkError),
+    /// Canonical additive tensor-master framing or semantics failed.
+    Master(SaltV2MasterError),
     /// Same-handle source bytes no longer match admitted semantic identity.
     Source(NnError),
     /// Workspace filesystem operation failed.
@@ -998,8 +1016,21 @@ pub enum Qwen36TensorWorkError {
     WorkspaceMismatch(&'static str),
     /// Existing immutable slot or manifest differed from expected exact bytes.
     ExistingArtifactMismatch(&'static str),
+    /// Another process currently owns the immutable additive campaign.
+    CampaignLocked,
+    /// Refined work requires a parent campaign and fixed-trit verification.
+    RefinedCampaignRequiresParent,
+    /// This platform cannot prove stable filesystem identities for campaign mutation.
+    AdditiveCampaignUnsupportedPlatform,
     /// Requested tensor is not a preserved language/MTP tensor in the pinned plan.
     UnknownPreservedTensor,
+    /// Requested tensor is not an additive language/MTP tensor in the pinned plan.
+    UnknownAdditiveTensor,
+    /// One expected additive campaign slot has not been installed.
+    MissingAdditiveMaster {
+        /// Canonical missing tensor name.
+        name: String,
+    },
     /// Final envelope remains blocked on canonical additive master artifacts.
     MissingAdditiveArtifacts {
         /// Required additive matrix count.
@@ -1014,6 +1045,7 @@ impl fmt::Display for Qwen36TensorWorkError {
         match self {
             Self::SourceProof(error) => write!(formatter, "Qwen3.6 source proof failed: {error}"),
             Self::TensorStore(error) => write!(formatter, "Qwen3.6 tensor store failed: {error}"),
+            Self::Master(error) => write!(formatter, "Qwen3.6 tensor master failed: {error}"),
             Self::Source(error) => write!(formatter, "Qwen3.6 source stream failed: {error}"),
             Self::Io { operation, kind } => {
                 write!(formatter, "Qwen3.6 tensor work {operation} failed: {kind}")
@@ -1030,7 +1062,19 @@ impl fmt::Display for Qwen36TensorWorkError {
             Self::ExistingArtifactMismatch(field) => {
                 write!(formatter, "existing Qwen3.6 {field} changed or is corrupt")
             }
+            Self::CampaignLocked => {
+                formatter.write_str("Qwen3.6 additive campaign is already locked")
+            }
+            Self::RefinedCampaignRequiresParent => formatter.write_str(
+                "Qwen3.6 refined campaign requires parent-bound fixed-trit verification",
+            ),
+            Self::AdditiveCampaignUnsupportedPlatform => formatter
+                .write_str("Qwen3.6 additive campaigns require Unix stable-file identity support"),
             Self::UnknownPreservedTensor => formatter.write_str("unknown preserved Qwen3.6 tensor"),
+            Self::UnknownAdditiveTensor => formatter.write_str("unknown additive Qwen3.6 tensor"),
+            Self::MissingAdditiveMaster { name } => {
+                write!(formatter, "Qwen3.6 additive master is missing for {name}")
+            }
             Self::MissingAdditiveArtifacts { expected, present } => write!(
                 formatter,
                 "Qwen3.6 workspace lacks additive master artifacts: expected {expected}, present {present}"
@@ -1044,6 +1088,7 @@ impl Error for Qwen36TensorWorkError {
         match self {
             Self::SourceProof(error) => Some(error),
             Self::TensorStore(error) => Some(error),
+            Self::Master(error) => Some(error),
             Self::Source(error) => Some(error),
             _ => None,
         }
