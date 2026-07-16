@@ -313,14 +313,16 @@ impl SaltV2MasterTensorSpec {
         if cursor.u8()? != 0 {
             return Err(SaltV2MasterError::MalformedMetadata("reserved byte"));
         }
-        let name_len = cursor.u32()? as usize;
+        let name_len = usize::try_from(cursor.u32()?)
+            .map_err(|_| SaltV2MasterError::MalformedMetadata("name length"))?;
         if name_len == 0 || name_len > MAX_NAME_BYTES {
             return Err(SaltV2MasterError::InvalidName);
         }
         let name = std::str::from_utf8(cursor.take(name_len)?)
             .map_err(|_| SaltV2MasterError::InvalidName)?
             .to_owned();
-        let rank = cursor.u32()? as usize;
+        let rank = usize::try_from(cursor.u32()?)
+            .map_err(|_| SaltV2MasterError::MalformedMetadata("rank"))?;
         if rank == 0 || rank > MAX_RANK {
             return Err(SaltV2MasterError::InvalidShape);
         }

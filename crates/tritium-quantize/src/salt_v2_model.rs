@@ -5061,6 +5061,8 @@ mod tests {
 
     #[test]
     fn all_zero_s34_model_uses_only_positive_scales_and_a_valid_frontier() {
+        use tritium_format::salt_v2_master::SaltV2MasterTensorDecoder;
+
         let weights = vec![0.0; 256];
         let diagonal = vec![1.0; weights.len()];
         let mut recipe = config(10_000);
@@ -5080,6 +5082,54 @@ mod tests {
         }));
         tritium_format::salt_v2_package::read_salt_v2_package(&fitted.package_bytes)
             .expect("deployable zero S34 package");
+
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let curvature = CurvatureArtifact::diagonal_fisher(source_id, [81; 32], &diagonal);
+        let tensors = [SaltV2TensorFitInput {
+            name: "model.layers.0.mlp.down_proj.weight",
+            weights: &weights,
+            rows: 2,
+            cols: 128,
+            curvature,
+        }];
+        let master = fit_salt_v2_master_without_feedback(
+            SaltV2ModelFitInput {
+                tensors: &tensors,
+                activations: &cache,
+                source_model_id: model_id,
+                physical: SaltV2ModelPhysicalInput {
+                    total_model_parameters: weights.len() as u64,
+                    ..SaltV2ModelPhysicalInput::default()
+                },
+            },
+            &recipe,
+        )
+        .expect("zero S34 master fit");
+        let tile = &master.work[0].tiles[0];
+        assert!(tile.candidates.len() < recipe.max_planes);
+        assert_eq!(tile.master.planes().len(), recipe.max_planes);
+        assert_eq!(tile.losses.len(), recipe.max_planes);
+        let spec = master.tensor_master_spec(0, [82; 32]).unwrap();
+        let mut payload = Vec::new();
+        master
+            .write_tensor_master(0, [82; 32], &mut payload)
+            .expect("stream solver-produced zero S34 master");
+        let mut decoder = SaltV2MasterTensorDecoder::new(&spec).unwrap();
+        let mut decoded = Vec::new();
+        decoder
+            .try_push(&payload, &mut |tile| {
+                decoded.push(tile);
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .unwrap();
+        decoder.finish().unwrap();
+        assert_eq!(
+            usize::from(decoded[0].admissible_planes()),
+            tile.candidates.len()
+        );
+        assert_eq!(decoded[0].planes().len(), recipe.max_planes);
 
         let unbounded = SaltV2Config {
             packing: SaltV2Packing::S34,
