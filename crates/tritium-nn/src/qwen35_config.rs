@@ -266,8 +266,17 @@ impl Qwen35CheckpointConfig {
                 "revision must be pinned Qwen3.6-27B revision {QWEN36_27B_REVISION}"
             )));
         }
-        let text = &self.text;
-        let expected_schedule: Vec<_> = (0..64)
+        if self == &Self::pinned_qwen36_27b() {
+            Ok(())
+        } else {
+            Err(invalid(format!(
+                "configuration does not match pinned {QWEN36_27B_REPOSITORY} geometry"
+            )))
+        }
+    }
+
+    pub(crate) fn pinned_qwen36_27b() -> Self {
+        let layer_types = (0..64)
             .map(|index| {
                 if (index + 1) % 4 == 0 {
                     Qwen35LayerType::FullAttention
@@ -276,54 +285,58 @@ impl Qwen35CheckpointConfig {
                 }
             })
             .collect();
-        let matches = self.model_type == OUTER_MODEL_TYPE
-            && self.architecture == OUTER_ARCHITECTURE
-            && !self.language_model_only
-            && !self.tied_embeddings
-            && self.vision_scope == Qwen35VisionScope::PresentDeferred
-            && text.model_type == TEXT_MODEL_TYPE
-            && text.num_hidden_layers == 64
-            && text.hidden_size == 5_120
-            && text.intermediate_size == 17_408
-            && text.vocab_size == 248_320
-            && text.max_position_embeddings == 262_144
-            && text.full_attention_interval == 4
-            && text.layer_types == expected_schedule
-            && text.full_attention.num_heads == 24
-            && text.full_attention.num_key_value_heads == 4
-            && text.full_attention.head_dim == 256
-            && !text.full_attention.bias
-            && text.full_attention.dropout == 0.0
-            && text.full_attention.output_gate == Qwen35OutputGate::Sigmoid
-            && text.full_attention.norm_weight_semantics
-                == Qwen35NormWeightSemantics::ZeroCenteredOnePlusWeight
-            && text.delta_net.conv_kernel_dim == 4
-            && text.delta_net.num_key_heads == 16
-            && text.delta_net.num_value_heads == 48
-            && text.delta_net.key_head_dim == 128
-            && text.delta_net.value_head_dim == 128
-            && text.delta_net.state_arithmetic_dtype == Qwen35Dtype::Float32
-            && text.delta_net.output_gate == Qwen35OutputGate::Swish
-            && text.delta_net.gated_norm_weight_semantics
-                == Qwen35NormWeightSemantics::UnitCenteredDirectWeight
-            && text.rope.theta == 10_000_000.0
-            && text.rope.partial_rotary_factor == 0.25
-            && text.rope.rotary_dim == 64
-            && text.rope.rope_type == Qwen35RopeType::Default
-            && text.rope.mrope_interleaved
-            && text.rope.mrope_section == [11, 11, 10]
-            && text.rms_norm_eps == 1e-6
-            && text.source_dtype == Qwen35Dtype::Bfloat16
-            && text.use_cache
-            && !text.tied_embeddings
-            && text.mtp.num_hidden_layers == 1
-            && !text.mtp.dedicated_embeddings;
-        if matches {
-            Ok(())
-        } else {
-            Err(invalid(format!(
-                "configuration does not match pinned {QWEN36_27B_REPOSITORY} geometry"
-            )))
+        Self {
+            model_type: OUTER_MODEL_TYPE.to_owned(),
+            architecture: OUTER_ARCHITECTURE.to_owned(),
+            language_model_only: false,
+            tied_embeddings: false,
+            text: Qwen35TextConfig {
+                model_type: TEXT_MODEL_TYPE.to_owned(),
+                num_hidden_layers: 64,
+                hidden_size: 5_120,
+                intermediate_size: 17_408,
+                vocab_size: 248_320,
+                max_position_embeddings: 262_144,
+                full_attention_interval: 4,
+                layer_types,
+                full_attention: Qwen35FullAttentionConfig {
+                    num_heads: 24,
+                    num_key_value_heads: 4,
+                    head_dim: 256,
+                    bias: false,
+                    dropout: 0.0,
+                    output_gate: Qwen35OutputGate::Sigmoid,
+                    norm_weight_semantics: Qwen35NormWeightSemantics::ZeroCenteredOnePlusWeight,
+                },
+                delta_net: Qwen35DeltaNetConfig {
+                    conv_kernel_dim: 4,
+                    num_key_heads: 16,
+                    num_value_heads: 48,
+                    key_head_dim: 128,
+                    value_head_dim: 128,
+                    state_arithmetic_dtype: Qwen35Dtype::Float32,
+                    output_gate: Qwen35OutputGate::Swish,
+                    gated_norm_weight_semantics:
+                        Qwen35NormWeightSemantics::UnitCenteredDirectWeight,
+                },
+                rope: Qwen35RopeConfig {
+                    theta: 10_000_000.0,
+                    partial_rotary_factor: 0.25,
+                    rotary_dim: 64,
+                    rope_type: Qwen35RopeType::Default,
+                    mrope_interleaved: true,
+                    mrope_section: [11, 11, 10],
+                },
+                rms_norm_eps: 1e-6,
+                source_dtype: Qwen35Dtype::Bfloat16,
+                use_cache: true,
+                tied_embeddings: false,
+                mtp: Qwen35MtpConfig {
+                    num_hidden_layers: 1,
+                    dedicated_embeddings: false,
+                },
+            },
+            vision_scope: Qwen35VisionScope::PresentDeferred,
         }
     }
 }

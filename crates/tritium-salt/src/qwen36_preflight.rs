@@ -29,6 +29,24 @@ pub enum Qwen36SourceIdentityStatus {
     MeasuredAwaitingOfficialRegistration,
 }
 
+impl Qwen36SourceIdentityStatus {
+    /// Stable machine-readable status label for evidence records.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MeasuredAwaitingOfficialRegistration => "measured-awaiting-official-registration",
+        }
+    }
+
+    /// Whether independently audited official payload identity has been matched.
+    #[must_use]
+    pub const fn official_payload_authenticated(self) -> bool {
+        match self {
+            Self::MeasuredAwaitingOfficialRegistration => false,
+        }
+    }
+}
+
 /// Scalar evidence emitted by a completed Qwen3.6 campaign-candidate preflight.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen36CampaignPreflightReceipt {
@@ -190,6 +208,12 @@ impl Qwen36CampaignPreflight {
     #[must_use]
     pub const fn source_identity(&self) -> &Qwen35HfSourceIdentity {
         self.source.identity()
+    }
+
+    /// Versioned canonical typed configuration bytes bound into the source manifest.
+    #[must_use]
+    pub fn canonical_config_bytes(&self) -> &[u8] {
+        self.source.canonical_config_bytes()
     }
 
     /// Measured semantic model ID.

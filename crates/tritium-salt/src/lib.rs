@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 mod pipeline;
 mod qwen36_preflight;
+mod qwen36_source_admission;
 
 pub use pipeline::{
     AdvanceOutcome, DriverFailure, FailureReceipt, HardwareReceipt, HardwareUsage, Metric,
@@ -24,6 +25,10 @@ pub use pipeline::{
 pub use qwen36_preflight::{
     Qwen36CampaignPreflight, Qwen36CampaignPreflightError, Qwen36CampaignPreflightReceipt,
     Qwen36SourceIdentityStatus,
+};
+pub use qwen36_source_admission::{
+    Qwen36AdmissionError, Qwen36AdmissionReceipt, Qwen36AdmittedSource, Qwen36LanguageCoverage,
+    Qwen36SourceProof, Qwen36SourceProofError,
 };
 
 const CONTENT_ID_CONTEXT: &str = "tritium salt content id v1";

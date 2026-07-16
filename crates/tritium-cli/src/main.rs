@@ -35,6 +35,7 @@ mod pull;
 mod quantize;
 mod repack;
 mod report;
+mod salt;
 
 /// BitNet 2B4T uses the LLaMA-3 tokenizer, whose end-of-text token is `128001`.
 /// Used as the default stop token for `generate` when `--eos` is not given.
@@ -68,6 +69,12 @@ enum Command {
         /// Campaign operation.
         #[command(subcommand)]
         campaign: campaign::CampaignCommand,
+    },
+    /// Admit sources and run resumable SALT V2 synthesis workflows.
+    Salt {
+        /// SALT V2 operation.
+        #[command(subcommand)]
+        salt: salt::SaltCommand,
     },
     /// Download a GGUF model from the HuggingFace hub into the local cache
     /// (~/.cache/tritium-models, override with TRITIUM_MODEL_CACHE). Resumes
@@ -329,6 +336,7 @@ fn main() -> anyhow::Result<()> {
         Command::Inspect { path } => inspect::run(&path)?,
         Command::ListBackends => backends::run(),
         Command::Campaign { campaign: command } => campaign::run(command)?,
+        Command::Salt { salt: command } => salt::run(command)?,
         Command::Pull {
             repo,
             file,
@@ -488,6 +496,35 @@ mod tests {
             Command::Campaign {
                 campaign: campaign::CampaignCommand::Run { config }
             } if config == std::path::Path::new("campaign.json")
+        ));
+    }
+
+    #[test]
+    fn qwen36_preflight_cli_parses_immutable_candidate_output() {
+        let cli = Cli::try_parse_from([
+            "tritium",
+            "salt",
+            "qwen36-preflight",
+            "--model-dir",
+            "model",
+            "--work-root",
+            "work",
+            "--output",
+            "candidate.json",
+        ])
+        .expect("Qwen3.6 preflight CLI");
+
+        assert!(matches!(
+            cli.command,
+            Command::Salt {
+                salt: salt::SaltCommand::Qwen36Preflight {
+                    model_dir,
+                    work_root,
+                    output,
+                }
+            } if model_dir == std::path::Path::new("model")
+                && work_root == std::path::Path::new("work")
+                && output == std::path::Path::new("candidate.json")
         ));
     }
 }

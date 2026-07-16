@@ -22,7 +22,9 @@ use crate::qwen35_config::{
     Qwen35RopeConfig, Qwen35RopeType, Qwen35TextConfig, Qwen35VisionScope,
 };
 
-const SOURCE_ARCHITECTURE: &str = "qwen3_5::content_bound_language_with_deferred_mtp_vision_v1";
+/// Semantic-manifest architecture for the content-bound Qwen3.5-family source adapter.
+pub const QWEN35_HF_SOURCE_ARCHITECTURE: &str =
+    "qwen3_5::content_bound_language_with_deferred_mtp_vision_v1";
 const SOURCE_CONFIG_MAGIC: &[u8; 8] = b"TRQ35SC\0";
 const SOURCE_CONFIG_VERSION: u8 = 1;
 const SOURCE_TENSOR_MAGIC: &[u8; 8] = b"TRQ35HF\0";
@@ -179,6 +181,12 @@ impl Qwen35ContentVerifiedHfSource {
     #[must_use]
     pub const fn config(&self) -> &Qwen35CheckpointConfig {
         &self.source.config
+    }
+
+    /// Versioned canonical language-plus-MTP configuration bytes bound into the manifest.
+    #[must_use]
+    pub fn canonical_config_bytes(&self) -> &[u8] {
+        &self.source.canonical_config
     }
 
     /// Complete canonical source metadata.
@@ -339,7 +347,7 @@ fn derive_source_identity(source: &Qwen35HfSource) -> Result<Qwen35HfSourceIdent
             ))
         })?);
     }
-    let architecture = try_owned_string(SOURCE_ARCHITECTURE, "semantic architecture")?;
+    let architecture = try_owned_string(QWEN35_HF_SOURCE_ARCHITECTURE, "semantic architecture")?;
     let manifest = SemanticModelManifest::new(architecture, &source.canonical_config, tensors)
         .map_err(|error| {
             NnError::MissingConfig(format!("build Qwen3.5 semantic source manifest: {error}"))
@@ -633,6 +641,15 @@ fn canonical_source_config(config: &Qwen35CheckpointConfig) -> Result<Vec<u8>, N
     Ok(output)
 }
 
+/// Exact canonical configuration selected by the pinned Qwen3.6-27B campaign.
+///
+/// # Errors
+/// Returns [`NnError`] only if encoding the frozen typed configuration cannot
+/// allocate its bounded record.
+pub fn qwen36_27b_canonical_source_config() -> Result<Vec<u8>, NnError> {
+    canonical_source_config(&Qwen35CheckpointConfig::pinned_qwen36_27b())
+}
+
 fn write_string(output: &mut Vec<u8>, value: &str) -> Result<(), NnError> {
     write_u32(
         output,
@@ -699,5 +716,24 @@ const fn rope_type_tag(value: Qwen35RopeType) -> u8 {
 const fn vision_scope_tag(value: Qwen35VisionScope) -> u8 {
     match value {
         Qwen35VisionScope::PresentDeferred => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PINNED_CONFIG: &str = include_str!("../../tests/fixtures/qwen36-27b-config.json");
+
+    #[test]
+    fn frozen_canonical_config_matches_the_parsed_pinned_fixture() {
+        let parsed = Qwen35CheckpointConfig::from_hf_config(PINNED_CONFIG).unwrap();
+        parsed
+            .validate_pinned_qwen36_27b(crate::QWEN36_27B_REVISION)
+            .unwrap();
+        assert_eq!(
+            canonical_source_config(&parsed).unwrap(),
+            qwen36_27b_canonical_source_config().unwrap()
+        );
     }
 }

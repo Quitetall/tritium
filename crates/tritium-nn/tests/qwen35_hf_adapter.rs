@@ -275,6 +275,16 @@ fn source_identity_is_independent_of_shard_layout_and_json_formatting() {
     );
     let sharded = sharded.verify_semantic_identity().unwrap();
     let single = single.verify_semantic_identity().unwrap();
+    assert_eq!(
+        sharded.canonical_config_bytes(),
+        single.canonical_config_bytes()
+    );
+    assert!(
+        sharded
+            .identity()
+            .manifest()
+            .matches_canonical_config(sharded.canonical_config_bytes())
+    );
     let source_model_id = sharded.model_id();
     assert_eq!(source_model_id, single.model_id());
     assert_eq!(

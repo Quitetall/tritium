@@ -41,12 +41,12 @@ pub use layers::{
 #[cfg(feature = "tokenizer")]
 pub use model::GgufBpeTokenizer;
 pub use model::{
-    ForwardDump, LayerWeights, ModelRunner, ModelWeights, QWEN35_MTP_UNVERIFIED_REASON,
-    Qwen35ContentVerifiedHfSource, Qwen35HfLanguageModel, Qwen35HfLanguageReceipt, Qwen35HfSource,
-    Qwen35HfSourceIdentity, Qwen35HfTensorMetadata, Qwen35MtpInputPlan, Qwen35MtpLayerWeights,
-    Qwen35MtpStatus, Qwen35MtpWeights, Qwen35TextCache, Qwen35TextLayerWeights,
-    Qwen35TextMixerWeights, Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights, Tokenizer,
-    UnverifiedQwen35Mtp,
+    ForwardDump, LayerWeights, ModelRunner, ModelWeights, QWEN35_HF_SOURCE_ARCHITECTURE,
+    QWEN35_MTP_UNVERIFIED_REASON, Qwen35ContentVerifiedHfSource, Qwen35HfLanguageModel,
+    Qwen35HfLanguageReceipt, Qwen35HfSource, Qwen35HfSourceIdentity, Qwen35HfTensorMetadata,
+    Qwen35MtpInputPlan, Qwen35MtpLayerWeights, Qwen35MtpStatus, Qwen35MtpWeights, Qwen35TextCache,
+    Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput, Qwen35TextRunner,
+    Qwen35TextWeights, Tokenizer, UnverifiedQwen35Mtp, qwen36_27b_canonical_source_config,
 };
 #[cfg(feature = "cuda")]
 pub use model::{

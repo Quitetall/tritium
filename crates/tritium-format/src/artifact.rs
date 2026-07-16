@@ -373,6 +373,12 @@ impl SemanticModelManifest {
         &self.config_digest
     }
 
+    /// Whether exact canonical configuration bytes match this manifest.
+    #[must_use]
+    pub fn matches_canonical_config(&self, canonical_config_bytes: &[u8]) -> bool {
+        domain_hash(CONFIG_HASH_CONTEXT, canonical_config_bytes) == self.config_digest
+    }
+
     /// Return tensors sorted by canonical name.
     pub fn tensors(&self) -> &[SemanticTensor] {
         &self.tensors
@@ -556,6 +562,8 @@ mod tests {
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
         assert_eq!(a.model_id(), b.model_id());
         assert_eq!(a.tensors()[0].name(), "a.weight");
+        assert!(a.matches_canonical_config(br#"{"hidden_size":4}"#));
+        assert!(!a.matches_canonical_config(br#"{"hidden_size":5}"#));
     }
 
     #[test]

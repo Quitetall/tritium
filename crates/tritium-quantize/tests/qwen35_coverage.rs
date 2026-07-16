@@ -120,6 +120,42 @@ fn input_order_does_not_change_the_canonical_manifest() {
 }
 
 #[test]
+fn canonical_policy_round_trip_binds_exact_tensor_actions() {
+    let metadata = fixture_metadata();
+    let manifest = build_manifest(&metadata).expect("pinned metadata");
+    let bytes = manifest.canonical_policy_bytes();
+    let decoded = Qwen35CoverageManifest::from_canonical_policy_bytes(&bytes)
+        .expect("canonical policy round trip");
+
+    assert_eq!(decoded, manifest);
+    assert_eq!(decoded.canonical_policy_bytes(), bytes);
+    assert_eq!(decoded.policy_digest(), manifest.policy_digest());
+
+    let mut bad_version = bytes.clone();
+    bad_version[8] = bad_version[8].wrapping_add(1);
+    assert!(matches!(
+        Qwen35CoverageManifest::from_canonical_policy_bytes(&bad_version),
+        Err(Qwen35CoverageError::UnsupportedCanonicalPolicyVersion(_))
+    ));
+
+    assert!(matches!(
+        Qwen35CoverageManifest::from_canonical_policy_bytes(&bytes[..bytes.len() - 1]),
+        Err(Qwen35CoverageError::MalformedCanonicalPolicy(_))
+    ));
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(matches!(
+        Qwen35CoverageManifest::from_canonical_policy_bytes(&trailing),
+        Err(Qwen35CoverageError::NonCanonicalPolicy)
+    ));
+
+    let mut changed_action = bytes;
+    *changed_action.last_mut().expect("last disposition tag") ^= 1;
+    assert!(Qwen35CoverageManifest::from_canonical_policy_bytes(&changed_action).is_err());
+}
+
+#[test]
 fn scopes_roles_and_rank_policy_are_explicit() {
     let metadata = fixture_metadata();
     let manifest = build_manifest(&metadata).expect("pinned metadata");

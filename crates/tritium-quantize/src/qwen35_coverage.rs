@@ -14,10 +14,14 @@ use core::fmt;
 /// Immutable Qwen3.6-27B revision selected by the active campaign.
 pub const QWEN36_27B_COVERAGE_REVISION: &str = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9";
 
+const CANONICAL_POLICY_MAGIC: [u8; 8] = *b"TQ36COV\0";
+const CANONICAL_POLICY_VERSION: u8 = 1;
+const POLICY_DIGEST_CONTEXT: &str = "tritium qwen3.6 coverage policy v1";
 const EXPECTED_TENSORS: usize = 1_199;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_DTYPE_BYTES: usize = 16;
 const MAX_RANK: usize = 5;
+const MAX_REVISION_BYTES: usize = 128;
 const EXPECTED_METADATA_RECORD_BYTES: u64 = 75_705;
 const EXPECTED_METADATA_DIGEST: [u8; 32] = [
     0xad, 0xd3, 0x32, 0xd2, 0x3a, 0x10, 0x12, 0xaa, 0x1d, 0x77, 0x33, 0x9e, 0x04, 0x61, 0x30, 0x42,
@@ -428,6 +432,131 @@ impl Qwen35CoverageManifest {
     pub const fn expected_source_payload_bytes(&self) -> u64 {
         self.summary.total.coefficients * 2
     }
+
+    /// Canonical bytes binding every admitted tensor to its exact conversion action.
+    ///
+    /// Unlike [`Self::metadata_digest`], this record includes scope, semantic
+    /// role, disposition, and checked coefficient count as well as source
+    /// name, dtype, and shape. It is therefore suitable for durable campaign
+    /// admission and recipe provenance.
+    #[must_use]
+    pub fn canonical_policy_bytes(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.extend_from_slice(&CANONICAL_POLICY_MAGIC);
+        output.push(CANONICAL_POLICY_VERSION);
+        write_policy_bytes(&mut output, QWEN36_27B_COVERAGE_REVISION.as_bytes());
+        write_policy_u32(&mut output, self.entries.len());
+        for entry in &self.entries {
+            write_policy_bytes(&mut output, entry.name.as_bytes());
+            output.push(dtype_tag(entry.dtype));
+            write_policy_u32(&mut output, entry.shape.len());
+            for &dimension in &entry.shape {
+                output.extend_from_slice(&dimension.to_le_bytes());
+            }
+            output.extend_from_slice(&entry.coefficients.to_le_bytes());
+            output.extend_from_slice(&[
+                scope_tag(entry.scope),
+                role_tag(entry.role),
+                disposition_tag(entry.disposition),
+            ]);
+        }
+        output
+    }
+
+    /// Domain-separated identity of [`Self::canonical_policy_bytes`].
+    #[must_use]
+    pub fn policy_digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(POLICY_DIGEST_CONTEXT);
+        hasher.update(&self.canonical_policy_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Decode and revalidate an exact canonical coverage-policy record.
+    ///
+    /// The decoder never trusts serialized classifications. It reconstructs
+    /// the pinned manifest from name, dtype, and shape, then requires every
+    /// serialized coefficient count, scope, role, and disposition to equal the
+    /// current immutable policy and finally requires byte-for-byte canonical
+    /// re-encoding.
+    ///
+    /// # Errors
+    /// Returns [`Qwen35CoverageError`] for malformed, unsupported, noncanonical,
+    /// or no-longer-pinned policy bytes.
+    pub fn from_canonical_policy_bytes(bytes: &[u8]) -> Result<Self, Qwen35CoverageError> {
+        let mut cursor = PolicyCursor::new(bytes);
+        if cursor.take(CANONICAL_POLICY_MAGIC.len())? != CANONICAL_POLICY_MAGIC {
+            return Err(Qwen35CoverageError::MalformedCanonicalPolicy("magic"));
+        }
+        let version = cursor.u8()?;
+        if version != CANONICAL_POLICY_VERSION {
+            return Err(Qwen35CoverageError::UnsupportedCanonicalPolicyVersion(
+                version,
+            ));
+        }
+        let revision = cursor.string(MAX_REVISION_BYTES, "revision")?;
+        if revision != QWEN36_27B_COVERAGE_REVISION {
+            return Err(Qwen35CoverageError::WrongRevision);
+        }
+        let entry_count = cursor.u32()? as usize;
+        if entry_count != EXPECTED_TENSORS {
+            return Err(Qwen35CoverageError::MalformedCanonicalPolicy(
+                "tensor count",
+            ));
+        }
+
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(entry_count)
+            .map_err(|_| Qwen35CoverageError::AllocationFailed)?;
+        for _ in 0..entry_count {
+            let name = cursor.string(MAX_NAME_BYTES, "tensor name")?.to_owned();
+            let dtype = cursor.u8()?;
+            if dtype != dtype_tag(Qwen35SourceDtype::Bfloat16) {
+                return Err(Qwen35CoverageError::MalformedCanonicalPolicy("dtype tag"));
+            }
+            let rank = cursor.u32()? as usize;
+            if rank == 0 || rank > MAX_RANK {
+                return Err(Qwen35CoverageError::MalformedCanonicalPolicy("rank"));
+            }
+            let mut shape = Vec::with_capacity(rank);
+            for _ in 0..rank {
+                shape.push(cursor.u64()?);
+            }
+            decoded.push(DecodedPolicyEntry {
+                name,
+                shape,
+                coefficients: cursor.u64()?,
+                scope: cursor.u8()?,
+                role: cursor.u8()?,
+                disposition: cursor.u8()?,
+            });
+        }
+        if cursor.remaining() != 0 {
+            return Err(Qwen35CoverageError::NonCanonicalPolicy);
+        }
+
+        let manifest = Self::from_metadata(
+            revision,
+            decoded
+                .iter()
+                .map(|entry| Qwen35TensorMetadata::new(&entry.name, "BF16", &entry.shape)),
+        )?;
+        for (encoded, actual) in decoded.iter().zip(&manifest.entries) {
+            if encoded.name != actual.name
+                || encoded.shape != actual.shape
+                || encoded.coefficients != actual.coefficients
+                || encoded.scope != scope_tag(actual.scope)
+                || encoded.role != role_tag(actual.role)
+                || encoded.disposition != disposition_tag(actual.disposition)
+            {
+                return Err(Qwen35CoverageError::NonCanonicalPolicy);
+            }
+        }
+        if manifest.canonical_policy_bytes() != bytes {
+            return Err(Qwen35CoverageError::NonCanonicalPolicy);
+        }
+        Ok(manifest)
+    }
 }
 
 /// Why pinned Qwen3.6-27B metadata was rejected.
@@ -505,6 +634,12 @@ pub enum Qwen35CoverageError {
     },
     /// Checked coverage totals differed from the frozen policy.
     CoverageSummaryMismatch,
+    /// Canonical coverage policy used an unsupported format version.
+    UnsupportedCanonicalPolicyVersion(u8),
+    /// Canonical coverage policy was truncated or structurally malformed.
+    MalformedCanonicalPolicy(&'static str),
+    /// Coverage policy decoded but did not use the unique canonical encoding.
+    NonCanonicalPolicy,
     /// A checked aggregate exceeded `u64`.
     SummaryOverflow,
     /// A bounded caller-controlled allocation could not be reserved.
@@ -579,6 +714,18 @@ impl fmt::Display for Qwen35CoverageError {
             Self::CoverageSummaryMismatch => {
                 f.write_str("coverage totals differ from frozen Qwen3.6-27B policy")
             }
+            Self::UnsupportedCanonicalPolicyVersion(version) => {
+                write!(
+                    f,
+                    "unsupported canonical Qwen3.6 coverage policy version {version}"
+                )
+            }
+            Self::MalformedCanonicalPolicy(field) => {
+                write!(f, "malformed canonical Qwen3.6 coverage policy {field}")
+            }
+            Self::NonCanonicalPolicy => {
+                f.write_str("Qwen3.6 coverage policy is not canonically encoded")
+            }
             Self::SummaryOverflow => f.write_str("coverage aggregate overflows u64"),
             Self::AllocationFailed => f.write_str("bounded metadata allocation failed"),
         }
@@ -586,6 +733,130 @@ impl fmt::Display for Qwen35CoverageError {
 }
 
 impl std::error::Error for Qwen35CoverageError {}
+
+#[derive(Debug)]
+struct DecodedPolicyEntry {
+    name: String,
+    shape: Vec<u64>,
+    coefficients: u64,
+    scope: u8,
+    role: u8,
+    disposition: u8,
+}
+
+struct PolicyCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> PolicyCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8], Qwen35CoverageError> {
+        let end =
+            self.offset
+                .checked_add(count)
+                .ok_or(Qwen35CoverageError::MalformedCanonicalPolicy(
+                    "length overflow",
+                ))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(Qwen35CoverageError::MalformedCanonicalPolicy("truncated"))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, Qwen35CoverageError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, Qwen35CoverageError> {
+        let mut bytes = [0_u8; 4];
+        bytes.copy_from_slice(self.take(4)?);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, Qwen35CoverageError> {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn string(
+        &mut self,
+        maximum: usize,
+        field: &'static str,
+    ) -> Result<&'a str, Qwen35CoverageError> {
+        let length = self.u32()? as usize;
+        if length == 0 || length > maximum {
+            return Err(Qwen35CoverageError::MalformedCanonicalPolicy(field));
+        }
+        core::str::from_utf8(self.take(length)?)
+            .map_err(|_| Qwen35CoverageError::MalformedCanonicalPolicy(field))
+    }
+}
+
+fn write_policy_u32(output: &mut Vec<u8>, value: usize) {
+    output.extend_from_slice(
+        &u32::try_from(value)
+            .expect("validated Qwen3.6 policy length fits u32")
+            .to_le_bytes(),
+    );
+}
+
+fn write_policy_bytes(output: &mut Vec<u8>, value: &[u8]) {
+    write_policy_u32(output, value.len());
+    output.extend_from_slice(value);
+}
+
+const fn dtype_tag(dtype: Qwen35SourceDtype) -> u8 {
+    match dtype {
+        Qwen35SourceDtype::Bfloat16 => 1,
+    }
+}
+
+const fn scope_tag(scope: Qwen35TensorScope) -> u8 {
+    match scope {
+        Qwen35TensorScope::Language => 1,
+        Qwen35TensorScope::MtpDrafter => 2,
+        Qwen35TensorScope::DeferredVision => 3,
+    }
+}
+
+const fn role_tag(role: Qwen35TensorRole) -> u8 {
+    match role {
+        Qwen35TensorRole::TokenEmbedding => 1,
+        Qwen35TensorRole::OutputHead => 2,
+        Qwen35TensorRole::Normalization => 3,
+        Qwen35TensorRole::MlpProjection => 4,
+        Qwen35TensorRole::FullAttentionProjection => 5,
+        Qwen35TensorRole::DeltaNetProjection => 6,
+        Qwen35TensorRole::DeltaNetState => 7,
+        Qwen35TensorRole::DeltaNetConvolution => 8,
+        Qwen35TensorRole::MtpFusionProjection => 9,
+        Qwen35TensorRole::VisionAttentionProjection => 10,
+        Qwen35TensorRole::VisionMlpProjection => 11,
+        Qwen35TensorRole::VisionPatchEmbedding => 12,
+        Qwen35TensorRole::VisionPositionalEmbedding => 13,
+        Qwen35TensorRole::VisionMergerProjection => 14,
+        Qwen35TensorRole::Bias => 15,
+    }
+}
+
+const fn disposition_tag(disposition: Qwen35CoverageDisposition) -> u8 {
+    match disposition {
+        Qwen35CoverageDisposition::AdditiveTernary => 1,
+        Qwen35CoverageDisposition::PreserveSource => 2,
+        Qwen35CoverageDisposition::ExcludedFutureVision => 3,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ExpectedTensor {

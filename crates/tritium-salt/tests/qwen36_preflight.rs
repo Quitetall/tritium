@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use tritium_salt::{
-    Qwen36CampaignPreflight, Qwen36CampaignPreflightError, Qwen36SourceIdentityStatus,
+    Qwen36AdmittedSource, Qwen36CampaignPreflight, Qwen36CampaignPreflightError,
+    Qwen36SourceIdentityStatus, Qwen36SourceProof,
 };
 
 const PINNED_METADATA_DIGEST: [u8; 32] = [
@@ -67,4 +68,21 @@ fn real_revision_declared_checkpoint_earns_candidate_receipt() {
         preflight.receipt().source_model_id(),
         preflight.source_manifest().model_id()
     );
+
+    let work_root = std::env::temp_dir().join(format!(
+        "tritium-qwen36-real-admission-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&work_root);
+    let admitted =
+        Qwen36AdmittedSource::admit(preflight, &work_root).expect("durable candidate admission");
+    let proof_bytes = std::fs::read(admitted.proof_path()).expect("read durable proof");
+    let reopened = Qwen36SourceProof::from_canonical_bytes(&proof_bytes).expect("reopen proof");
+    assert_eq!(&reopened, admitted.proof());
+    assert_eq!(reopened.proof_id().unwrap(), admitted.receipt().proof_id());
+    assert_eq!(
+        reopened.source_model_id(),
+        admitted.receipt().source_model_id()
+    );
+    let _ = std::fs::remove_dir_all(work_root);
 }
