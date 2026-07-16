@@ -28,7 +28,8 @@ pub use qwen35::{
 pub use qwen35_hf::{Qwen35HfLanguageModel, Qwen35HfLanguageReceipt};
 pub use qwen35_hf_source::{
     QWEN35_HF_SOURCE_ARCHITECTURE, Qwen35ContentVerifiedHfSource, Qwen35HfSource,
-    Qwen35HfSourceIdentity, Qwen35HfTensorMetadata, qwen36_27b_canonical_source_config,
+    Qwen35HfSourceIdentity, Qwen35HfTensorMetadata, Qwen35TensorStreamError,
+    qwen36_27b_canonical_source_config,
 };
 pub use qwen35_mtp::{
     QWEN35_MTP_UNVERIFIED_REASON, Qwen35MtpInputPlan, Qwen35MtpLayerWeights, Qwen35MtpStatus,

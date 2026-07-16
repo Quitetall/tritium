@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 mod pipeline;
 mod qwen36_preflight;
 mod qwen36_source_admission;
+mod tensor_work_store;
 
 pub use pipeline::{
     AdvanceOutcome, DriverFailure, FailureReceipt, HardwareReceipt, HardwareUsage, Metric,
@@ -29,6 +30,10 @@ pub use qwen36_preflight::{
 pub use qwen36_source_admission::{
     Qwen36AdmissionError, Qwen36AdmissionReceipt, Qwen36AdmittedSource, Qwen36LanguageCoverage,
     Qwen36SourceProof, Qwen36SourceProofError,
+};
+pub use tensor_work_store::{
+    TensorPayloadWriter, TensorPutError, TensorRecordInfo, TensorRecordReader, TensorRecordReceipt,
+    TensorRecordSpec, TensorVisitError, TensorWorkError, TensorWorkStore,
 };
 
 const CONTENT_ID_CONTEXT: &str = "tritium salt content id v1";

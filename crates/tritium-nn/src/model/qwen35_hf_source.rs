@@ -1,6 +1,8 @@
 //! Once-opened, content-bound Hugging Face sources for Qwen3.5-family models.
 
 use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
 use std::path::Path;
 
 use tritium_format::{
@@ -37,6 +39,35 @@ pub struct Qwen35HfTensorMetadata {
     name: String,
     dtype: String,
     shape: Vec<u64>,
+}
+
+/// Failure while streaming exact bytes from a content-verified Qwen source tensor.
+#[derive(Debug)]
+pub enum Qwen35TensorStreamError<E> {
+    /// Retained source metadata, payload, or semantic identity failed validation.
+    Source(NnError),
+    /// Caller-provided byte sink stopped the stream.
+    Sink(E),
+}
+
+impl<E: fmt::Display> fmt::Display for Qwen35TensorStreamError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(error) => {
+                write!(formatter, "Qwen3.5 tensor source stream failed: {error}")
+            }
+            Self::Sink(error) => write!(formatter, "Qwen3.5 tensor byte sink failed: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for Qwen35TensorStreamError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::Sink(error) => Some(error),
+        }
+    }
 }
 
 impl Qwen35HfTensorMetadata {
@@ -238,6 +269,74 @@ impl Qwen35ContentVerifiedHfSource {
             })?);
         }
         self.tensor_f32_exact(name, &expected)
+    }
+
+    /// Stream exact stored tensor bytes from retained shard handles.
+    ///
+    /// Chunks never exceed `max_chunk_bytes`. The same semantic frame used by
+    /// source admission is recomputed around the streamed payload and compared
+    /// with the retained manifest before success is returned.
+    ///
+    /// The retained source is live, not a filesystem snapshot, and callbacks
+    /// are nontransactional. The caller must prevent concurrent source mutation
+    /// for the full visit and discard partial sink effects on any error.
+    ///
+    /// # Errors
+    /// Returns [`Qwen35TensorStreamError::Source`] for absent, changed, or
+    /// malformed source content and [`Qwen35TensorStreamError::Sink`] without
+    /// erasing the caller's typed sink failure.
+    pub fn try_visit_tensor_bytes<E>(
+        &self,
+        name: &str,
+        max_chunk_bytes: usize,
+        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<u64, Qwen35TensorStreamError<E>> {
+        let metadata =
+            find_metadata(&self.source.metadata, name).map_err(Qwen35TensorStreamError::Source)?;
+        let expected_semantic = find_semantic_tensor(self.identity.manifest(), name)
+            .map_err(Qwen35TensorStreamError::Source)?;
+        let dtype_tag =
+            source_dtype_tag(name, &metadata.dtype).map_err(Qwen35TensorStreamError::Source)?;
+        let hasher_name = try_owned_string(name, "verified semantic tensor name")
+            .map_err(Qwen35TensorStreamError::Source)?;
+        let hasher_shape =
+            try_owned_u64_shape(&metadata.shape, name).map_err(Qwen35TensorStreamError::Source)?;
+        let mut hasher = SemanticTensorHasher::new(hasher_name, hasher_shape);
+        update_tensor_frame(&mut hasher, dtype_tag);
+        let mut payload_bytes = 0_u64;
+        self.source
+            .shards
+            .try_visit_tensor_bytes(name, max_chunk_bytes, |chunk| {
+                let chunk_bytes = u64::try_from(chunk.len()).map_err(|_| {
+                    VerifiedStreamSinkError::Source(NnError::Backend(
+                        "Qwen3.5 tensor stream chunk length exceeds u64".into(),
+                    ))
+                })?;
+                payload_bytes = payload_bytes.checked_add(chunk_bytes).ok_or_else(|| {
+                    VerifiedStreamSinkError::Source(NnError::Backend(
+                        "Qwen3.5 tensor stream byte count overflow".into(),
+                    ))
+                })?;
+                hasher.update(chunk);
+                visit(chunk).map_err(VerifiedStreamSinkError::Sink)
+            })
+            .map_err(map_verified_stream_error)?;
+        let actual = hasher
+            .finalize()
+            .map_err(|error| {
+                NnError::MissingTensor(format!(
+                    "finalize streamed Qwen3.5 tensor `{name}`: {error}"
+                ))
+            })
+            .map_err(Qwen35TensorStreamError::Source)?;
+        if &actual != expected_semantic {
+            return Err(Qwen35TensorStreamError::Source(NnError::MissingTensor(
+                format!(
+                    "verified Qwen3.5 source tensor `{name}` changed after semantic identity verification"
+                ),
+            )));
+        }
+        Ok(payload_bytes)
     }
 
     /// Consume the verified source into the exact-fp32 language reference.
@@ -460,48 +559,87 @@ fn try_owned_u64_shape(shape: &[u64], name: &str) -> Result<Vec<u64>, NnError> {
     Ok(output)
 }
 
+enum VerifiedStreamSinkError<E> {
+    Source(NnError),
+    Sink(E),
+}
+
+fn map_verified_stream_error<E>(
+    error: HfTensorBytesError<VerifiedStreamSinkError<E>>,
+) -> Qwen35TensorStreamError<E> {
+    match partition_hf_error(error) {
+        HfErrorPartition::Source(error)
+        | HfErrorPartition::Sink(VerifiedStreamSinkError::Source(error)) => {
+            Qwen35TensorStreamError::Source(error)
+        }
+        HfErrorPartition::Sink(VerifiedStreamSinkError::Sink(error)) => {
+            Qwen35TensorStreamError::Sink(error)
+        }
+    }
+}
+
 fn map_hf_error<E>(error: HfTensorBytesError<E>, map_sink: impl FnOnce(E) -> NnError) -> NnError {
+    match partition_hf_error(error) {
+        HfErrorPartition::Source(error) => error,
+        HfErrorPartition::Sink(error) => map_sink(error),
+    }
+}
+
+enum HfErrorPartition<E> {
+    Source(NnError),
+    Sink(E),
+}
+
+fn partition_hf_error<E>(error: HfTensorBytesError<E>) -> HfErrorPartition<E> {
     match error {
-        HfTensorBytesError::MissingTensor(name) => NnError::MissingTensor(name),
+        HfTensorBytesError::MissingTensor(name) => {
+            HfErrorPartition::Source(NnError::MissingTensor(name))
+        }
         HfTensorBytesError::ShapeMismatch {
             name,
             shard_path,
             actual,
             expected,
-        } => NnError::MissingTensor(format!(
+        } => HfErrorPartition::Source(NnError::MissingTensor(format!(
             "tensor `{name}` in {} has shape {actual:?}, expected {expected:?}",
             shard_path.display()
-        )),
+        ))),
         HfTensorBytesError::Source {
             name,
             shard_path,
             error:
                 error @ (SafeTensorsError::AllocationFailed { .. }
                 | SafeTensorsError::InvalidChunkSize { .. }),
-        } => NnError::Backend(format!(
+        } => HfErrorPartition::Source(NnError::Backend(format!(
             "read Qwen3.5 tensor `{name}` from {}: {error}",
             shard_path.display()
-        )),
+        ))),
         HfTensorBytesError::Source {
             name,
             shard_path,
             error,
-        } => NnError::MissingTensor(format!(
+        } => HfErrorPartition::Source(NnError::MissingTensor(format!(
             "read Qwen3.5 tensor `{name}` from {}: {error}",
             shard_path.display()
-        )),
-        HfTensorBytesError::ReentrantShard(path) => NnError::Backend(format!(
-            "reentrant read of Qwen3.5 safetensors shard {}",
-            path.display()
-        )),
-        HfTensorBytesError::InvalidShardId { name, shard_id } => NnError::Backend(format!(
-            "Qwen3.5 tensor `{name}` references absent retained shard {shard_id}"
-        )),
-        HfTensorBytesError::MetadataMismatch { name, shard_path } => NnError::Backend(format!(
-            "Qwen3.5 tensor `{name}` metadata disagrees with retained shard {}",
-            shard_path.display()
-        )),
-        HfTensorBytesError::Sink(error) => map_sink(error),
+        ))),
+        HfTensorBytesError::ReentrantShard(path) => {
+            HfErrorPartition::Source(NnError::Backend(format!(
+                "reentrant read of Qwen3.5 safetensors shard {}",
+                path.display()
+            )))
+        }
+        HfTensorBytesError::InvalidShardId { name, shard_id } => {
+            HfErrorPartition::Source(NnError::Backend(format!(
+                "Qwen3.5 tensor `{name}` references absent retained shard {shard_id}"
+            )))
+        }
+        HfTensorBytesError::MetadataMismatch { name, shard_path } => {
+            HfErrorPartition::Source(NnError::Backend(format!(
+                "Qwen3.5 tensor `{name}` metadata disagrees with retained shard {}",
+                shard_path.display()
+            )))
+        }
+        HfTensorBytesError::Sink(error) => HfErrorPartition::Sink(error),
     }
 }
 

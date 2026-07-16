@@ -5,7 +5,7 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use tritium_nn::{Qwen35HfLanguageModel, Qwen35HfSource};
+use tritium_nn::{Qwen35HfLanguageModel, Qwen35HfSource, Qwen35TensorStreamError};
 
 const H: usize = 4;
 const I: usize = 6;
@@ -326,6 +326,50 @@ fn source_identity_binds_payload_bits_not_only_metadata() {
 
     let _ = std::fs::remove_dir_all(&original_dir);
     let _ = std::fs::remove_dir_all(&mutated_dir);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SinkStop;
+
+#[test]
+fn verified_source_streams_bounded_raw_chunks_and_preserves_sink_errors() {
+    let dir = fixture_dir("verified-byte-stream");
+    let tensors = oracle_tensors();
+    let expected = tensors
+        .iter()
+        .find(|tensor| tensor.name == "model.language_model.norm.weight")
+        .unwrap()
+        .values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    write_single_shard_fixture(&dir, tensors);
+    let source = Qwen35HfSource::open(&dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap();
+
+    let mut actual = Vec::new();
+    let payload_bytes = source
+        .try_visit_tensor_bytes(
+            "model.language_model.norm.weight",
+            5,
+            |chunk| -> Result<(), SinkStop> {
+                assert!(!chunk.is_empty());
+                assert!(chunk.len() <= 5);
+                actual.extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(payload_bytes, expected.len() as u64);
+    assert_eq!(actual, expected);
+
+    let error = source
+        .try_visit_tensor_bytes("model.language_model.norm.weight", 3, |_| Err(SinkStop))
+        .unwrap_err();
+    assert!(matches!(error, Qwen35TensorStreamError::Sink(SinkStop)));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
