@@ -921,6 +921,7 @@ fn persist_exact(path: &Path, bytes: &[u8]) -> Result<(), Qwen36AdmissionError> 
     }
     fs::remove_file(&temporary)
         .map_err(|error| admission_io("remove temporary source proof", error))?;
+    #[cfg(unix)]
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| admission_io("sync source proof directory", error))?;
