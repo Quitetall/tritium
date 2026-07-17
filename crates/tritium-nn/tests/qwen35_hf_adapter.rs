@@ -198,6 +198,8 @@ fn oracle_tensors() -> Vec<TensorFixture> {
 }
 
 fn exact_mtp_tensors() -> Vec<TensorFixture> {
+    // Loader-only H8 schema fixture: continue the local fixture's ordinal stream.
+    // Sealed vLLM parity uses `sealed_mtp_oracle_tensors` and its 15..=29 ordinals.
     vec![
         tensor("mtp.pre_fc_norm_embedding.weight", &[H], 28),
         tensor("mtp.pre_fc_norm_hidden.weight", &[H], 29),
