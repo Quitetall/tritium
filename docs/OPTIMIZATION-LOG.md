@@ -1106,11 +1106,21 @@ v0.4.x era and never wired to the model) now serves prefill.
   **1,969.7 tok/s** (p50 260 ms) vs 1,068 baseline = **+84%**; prompt-64
   prefill 1,693 tok/s (was ~1,068 at pp512 shapes). Decode untouched
   (317.9 tok/s @ 32-step short-ctx; 221.5 @ 256-step post-512-prefill ctx —
-  shape-dependent, not a regression). **The ≥6,000 gate is OPEN**: the
-  remaining ~260 ms is NOT GEMM-dominated anymore — profile-driven gap
-  analysis is the next step (candidate levers, in order: attention/norm/
-  rope/quant kernels at M=512, per-layer act-quant launches, cp.async
-  staging in the IMMA kernel, fused qkv/gateup shadows).
+  shape-dependent, not a regression). **The ≥6,000 gate is OPEN** — and the
+  nsys profile (5×512-token prefills, quiet box) CORRECTS the first guess:
+  the remaining ~278 ms IS still GEMM-dominated. Per prefill:
+  tq2_0_imma_mpgemm 197 ms (63.3%, 210 launches, mean 938 µs with 19.5 ms
+  outliers — the deliberately-boring SIMT-staged kernel generation, no
+  cp.async/ldmatrix), gqa_attention_batch_f32 109 ms (35.0% — the O(M²)
+  prefill attention at M=512), everything else < 2%. The launch-overhead
+  hypothesis is REFUTED (kernel time ≈ wall time; graphing prefill would
+  buy ~nothing). The two levers, in order: (1) cp.async/ldmatrix staging
+  + tile-winner audit in the IMMA kernel (the deferred second half of
+  Track P — needs ~5.6× on the GEMM share to make the gate); (2) a real
+  prefill attention kernel (flash-style tiling; the split/tree machinery
+  serves decode/verify, not M=P prefill — needs ~2.7×). Both are genuine
+  kernel work, honestly scoped as the NEXT campaign leg; wiring alone got
+  +84% and is done.
 
 Also: `tritium report compare` + docs/BENCHMARKS.md shipped (Track R) —
 one-command ledger with environment capture (it disclosed the co-resident
