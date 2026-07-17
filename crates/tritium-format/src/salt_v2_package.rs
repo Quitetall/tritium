@@ -1927,7 +1927,7 @@ fn decode_tensor_tiles(
             .map_err(|_| SaltV2PackageError::AllocationFailed)?;
         for _ in 0..plane_count {
             let packed = payload_cursor.take(packed_len)?;
-            let trits = unpack_semantic_plane(codec, packed, logical_len)?;
+            let trits = unpack_salt_v2_plane(codec, packed, logical_len)?;
             let scale_bytes = scale_cursor.take(
                 scale_count
                     .checked_mul(2)
@@ -1976,12 +1976,31 @@ pub fn pack_salt_v2_plane(
     })
 }
 
-fn unpack_semantic_plane(
+/// Unpack one canonical package-codec plane to its logical ternary coefficients.
+///
+/// For canonical nonempty planes no longer than one allocation tile, this is the
+/// semantic inverse of [`pack_salt_v2_plane`]. For S34, `logical_len` excludes
+/// canonical shape padding; the decoder validates that padding before returning
+/// exactly the logical coefficients.
+///
+/// # Errors
+/// Returns [`SaltV2PackageError::InvalidPlaneLength`] when `logical_len` is zero
+/// or exceeds one allocation tile, [`SaltV2PackageError::AllocationFailed`] when
+/// decoded storage cannot be reserved, or a codec/package error when the physical
+/// payload length, ternary codes, or S34 shape padding are non-canonical.
+pub fn unpack_salt_v2_plane(
     codec: SaltV2Codec,
     packed: &[u8],
     logical_len: usize,
 ) -> Result<Vec<Trit>, SaltV2PackageError> {
-    let mut decoded = Vec::with_capacity(stored_trit_count(codec, logical_len)?);
+    if logical_len == 0 || logical_len > SALT_V2_ALLOCATION_TILE_SIZE {
+        return Err(SaltV2PackageError::InvalidPlaneLength { got: logical_len });
+    }
+    let stored_len = stored_trit_count(codec, logical_len)?;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(stored_len)
+        .map_err(|_| SaltV2PackageError::AllocationFailed)?;
     unpack_semantic_plane_into(codec, packed, logical_len, &mut decoded)?;
     Ok(decoded)
 }

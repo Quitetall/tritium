@@ -93,6 +93,7 @@ fn strict_reader_reuses_decode_scratch_instead_of_materializing_semantic_trits()
     reader
         .visit_packed_tensor("large.zero", |_| visited += 1)
         .unwrap();
+    reader.verify_unchanged().unwrap();
     TRACK_ALLOCATIONS.store(false, Ordering::SeqCst);
 
     assert_eq!(visited, 32 * 1024 * 1024 / SALT_V2_ALLOCATION_TILE_SIZE);

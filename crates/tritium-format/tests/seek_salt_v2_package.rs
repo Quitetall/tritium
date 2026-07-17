@@ -6,10 +6,10 @@ use half::f16;
 use tritium_format::PackageId;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
-    PackedSaltV2PlaneRef, SALT_V2_PACKAGE_MAGIC, SALT_V2_PACKAGE_VERSION,
-    SaltV2IndexedRuntimeLedger, SaltV2Package, SaltV2PackageReadError, SaltV2PackageReader,
-    SaltV2Plane, SaltV2Tensor, SaltV2Tile, pack_salt_v2_plane, read_salt_v2_package,
-    write_salt_v2_package,
+    PackedSaltV2PlaneRef, SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_PACKAGE_MAGIC,
+    SALT_V2_PACKAGE_VERSION, SaltV2IndexedRuntimeLedger, SaltV2Package, SaltV2PackageError,
+    SaltV2PackageReadError, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile,
+    pack_salt_v2_plane, read_salt_v2_package, unpack_salt_v2_plane, write_salt_v2_package,
 };
 
 fn plane(len: usize, seed: usize) -> SaltV2Plane {
@@ -224,6 +224,46 @@ fn strict_seek_reader_visits_canonical_planes_in_arbitrary_tensor_order() {
 }
 
 #[test]
+fn strict_seek_reader_exposes_exact_mixed_and_ragged_tile_plane_counts() {
+    let encoded = write_salt_v2_package(&package()).unwrap();
+    let reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+
+    let mut counts = reader.tensor_plane_counts("z").unwrap();
+    assert_eq!(counts.len(), 3);
+    assert_eq!(counts.next(), Some(1));
+    assert_eq!(counts.len(), 2);
+    assert_eq!(counts.collect::<Vec<_>>(), [3, 2]);
+    assert_eq!(
+        reader.tensor_plane_counts("a").unwrap().collect::<Vec<_>>(),
+        [2]
+    );
+    assert!(matches!(
+        reader.tensor_plane_counts("absent"),
+        Err(SaltV2PackageReadError::TensorNotFound(name)) if name == "absent"
+    ));
+}
+
+#[test]
+fn public_s34_plane_decoder_removes_canonical_ragged_shape_padding() {
+    let plane = SaltV2Plane::new(vec![0, -1, 1, -1, 1, -1], vec![f16::from_f32(0.5)]).unwrap();
+    let packed = pack_salt_v2_plane(SaltV2Codec::S34, plane.trits()).unwrap();
+
+    let decoded = unpack_salt_v2_plane(SaltV2Codec::S34, &packed, 6).unwrap();
+
+    assert_eq!(decoded, plane.trits());
+}
+
+#[test]
+fn public_plane_decoder_rejects_non_plane_lengths_before_allocation() {
+    for logical_len in [0, SALT_V2_ALLOCATION_TILE_SIZE + 1, usize::MAX] {
+        assert_eq!(
+            unpack_salt_v2_plane(SaltV2Codec::D2, &[], logical_len),
+            Err(SaltV2PackageError::InvalidPlaneLength { got: logical_len })
+        );
+    }
+}
+
+#[test]
 fn strict_seek_reader_matches_eager_decode_for_every_physical_codec() {
     for package in [
         package_with_codec(SaltV2Codec::D2),
@@ -364,6 +404,33 @@ fn selected_tensor_digest_detects_valid_same_length_mutation() {
     assert!(matches!(
         error,
         SaltV2PackageReadError::SourceChanged(name) if name == "w"
+    ));
+}
+
+#[test]
+fn terminal_package_check_detects_same_length_mutation_after_an_earlier_visit() {
+    let bytes = write_salt_v2_package(&package()).unwrap().bytes;
+    let shared = Rc::new(RefCell::new(bytes));
+    let mut reader = SaltV2PackageReader::new_strict(SharedCursor {
+        bytes: Rc::clone(&shared),
+        position: 0,
+    })
+    .unwrap();
+
+    reader.visit_packed_tensor("a", |_| {}).unwrap();
+    reader.verify_unchanged().unwrap();
+
+    shared.borrow_mut()[0] ^= 0x80;
+    assert!(matches!(
+        reader.verify_unchanged(),
+        Err(SaltV2PackageReadError::PackageChanged)
+    ));
+
+    shared.borrow_mut()[0] ^= 0x80;
+    shared.borrow_mut().push(0);
+    assert!(matches!(
+        reader.verify_unchanged(),
+        Err(SaltV2PackageReadError::PackageChanged)
     ));
 }
 

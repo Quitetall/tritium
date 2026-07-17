@@ -48,6 +48,8 @@ pub enum SaltV2PackageReadError {
     TensorNotFound(String),
     /// Tensor bytes changed after strict construction-time validation.
     SourceChanged(String),
+    /// Exact package bytes changed after strict construction-time validation.
+    PackageChanged,
 }
 
 impl fmt::Display for SaltV2PackageReadError {
@@ -73,6 +75,7 @@ impl fmt::Display for SaltV2PackageReadError {
             Self::SourceChanged(name) => {
                 write!(f, "SALT V2 tensor `{name}` changed after validation")
             }
+            Self::PackageChanged => f.write_str("SALT V2 package bytes changed after validation"),
         }
     }
 }
@@ -744,6 +747,25 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
         self.find_tensor(name).map(|tensor| &tensor.info)
     }
 
+    /// Per-tile present additive-plane counts for a named tensor.
+    ///
+    /// The exact-size iterator reads the retained, strictly validated presence
+    /// map without exposing its physical byte layout. Call
+    /// [`Self::verify_unchanged`] after consuming package metadata and counts
+    /// when the result will authorize publication or another durable action.
+    ///
+    /// # Errors
+    /// Returns [`SaltV2PackageReadError::TensorNotFound`] when `name` is absent.
+    pub fn tensor_plane_counts(
+        &self,
+        name: &str,
+    ) -> Result<impl ExactSizeIterator<Item = usize> + '_, SaltV2PackageReadError> {
+        let tensor = self
+            .find_tensor(name)
+            .ok_or_else(|| SaltV2PackageReadError::TensorNotFound(name.to_owned()))?;
+        Ok(TensorPlaneCounts::new(&self.map, tensor))
+    }
+
     /// Codec-independent semantic manifest entry for a named tensor.
     ///
     /// Its content digest is computed during the mandatory bounded validation
@@ -826,6 +848,45 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
         };
         if digest != tensor.section_digest {
             return Err(SaltV2PackageReadError::SourceChanged(name.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Recompute and verify the exact package identity through this reader handle.
+    ///
+    /// This terminal integrity check uses at most 64 KiB of scratch space and
+    /// covers all package bytes, including tensors not visited by the caller.
+    /// Call it after the final metadata/count/plane read and before publishing a
+    /// result derived from those reads. Later source mutation is outside the
+    /// guarantee of this method.
+    ///
+    /// # Errors
+    /// Returns [`SaltV2PackageReadError::PackageChanged`] when the source length
+    /// or exact package identity differs from strict construction. I/O and
+    /// bounded-allocation failures remain typed.
+    pub fn verify_unchanged(&mut self) -> Result<(), SaltV2PackageReadError> {
+        if !self.source.len_unchanged()? {
+            return Err(SaltV2PackageReadError::PackageChanged);
+        }
+        self.source.seek_abs(0, "verify package identity")?;
+        let mut scratch = Vec::new();
+        reserve_and_resize(
+            &mut scratch,
+            usize::try_from(self.source.len().min(MAX_READ_CHUNK_BYTES as u64))
+                .unwrap_or(MAX_READ_CHUNK_BYTES),
+        )?;
+        let mut remaining = self.source.len();
+        let mut hasher = PackageHasher::new();
+        while remaining != 0 {
+            let chunk_len = usize::try_from(remaining.min(MAX_READ_CHUNK_BYTES as u64))
+                .expect("chunk length fits usize");
+            self.source
+                .read_exact_chunks(&mut scratch[..chunk_len], "verify package identity")?;
+            hasher.update(&scratch[..chunk_len]);
+            remaining -= chunk_len as u64;
+        }
+        if !self.source.len_unchanged()? || hasher.finalize() != self.package_id {
+            return Err(SaltV2PackageReadError::PackageChanged);
         }
         Ok(())
     }
