@@ -46,9 +46,8 @@ _FORBIDDEN_INHERITED_RUNTIME_VARIABLES = frozenset(
 )
 _forbidden_inherited_runtime_variables = sorted(
     name
-    for name, value in os.environ.items()
-    if value
-    and (
+    for name in os.environ
+    if (
         name.startswith("TRITON_")
         or name in _FORBIDDEN_INHERITED_RUNTIME_VARIABLES
     )
