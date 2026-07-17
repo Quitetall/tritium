@@ -465,6 +465,8 @@ and the relevant CPU/CUDA parity gate before the next stage depends on it.
 
 - Add block-output reconstruction on cached activations.
 - Add scale-only teacher-KL refinement with fixed trits/allocation.
+- Treat master-layer fixed-trit/prefix admission and selected package-allocation
+  admission as separate proofs; neither may stand in for the other.
 - Add smooth warmup followed by PV hard-trit/scale alternating updates.
 - Project and validate hard trits after every discrete phase and before every
   checkpoint.
@@ -780,22 +782,36 @@ The following work deliberately remains open and keeps this plan in progress:
   master in memory. Canonical per-tensor radix-3 masters are now streamed into an
   immutable CAS, semantically reopened with bounded staging, installed beneath a
   base-preserving Qwen campaign namespace, and sealed only after all 506 ordered
-  language/MTP PTQ masters verify. Refined campaign admission still fails closed
-  until it can bind a parent completion and prove that every child keeps the
-  parent's trits, admissible prefixes, and allocation fixed. The production driver
-  must still stream fitter output directly into that store. CAS installation now
-  stages one exact record, fuses generic byte validation with canonical SALT
-  semantic decoding through the retained file handle, requires decoder completion
-  before sync/publication, and returns both generic and semantic receipts without
-  an install-time reopen. Strict campaign reopen/progress/seal paths use the same
-  one-pass verified visitor instead of reading each master twice, and sealing no
-  longer immediately repeats its just-completed full verification. Exclusive
-  campaign resume and pre-seal paths now mark canonical slot roots and reclaim
-  only canonical unreferenced objects, reject unknown object layouts before any
-  unlink, remove recognized crash-left slot temporaries, serialize same-handle
-  mutation, and never sweep a sealed namespace. Exact-length semantic failures
-  therefore publish neither CAS objects nor slots, while valid crash-window
-  orphans are deterministically reclaimed before the 27B campaign;
+  language/MTP PTQ masters verify. A sealed PTQ campaign can now open a distinct,
+  typed ScaleOnly child: its descriptor binds the exact parent completion, base
+  workspace, campaign, ordered master set, every parent tensor-master identity,
+  and a bounded-streaming projection of static geometry, per-tile admissible
+  prefixes, plane order, and every hard trit. Child losses and scales may change;
+  install, reopen, progress, seal, and completion reopen reject any trit/prefix or
+  live-parent drift. Parent checks run immediately before CAS/completion
+  publication; fixed-structure and prepublication failures publish no child object
+  or slot, terminal parent rechecks fail closed, sealed namespaces cannot be
+  rewritten through install, and the public PTQ opener cannot be used to escape
+  the typed refined capability. Ordinary PTQ lifecycle scans skip the new fixed
+  projection and its additional trit hashing, preserving their existing bytes
+  and identities.
+  This is only **master-layer structural admission**: the parent completion has no
+  selected Compact/NearLossless allocation map, so fixed selected allocation and
+  refined package admission remain unproved and fail closed. PV/KL children also
+  remain rejected. The production fitter/refinement driver must still stream real
+  checkpoint output into the store and the package layer must bind the selected
+  allocation before Stage 5 can advance. CAS installation otherwise stages one
+  exact record, fuses generic byte validation with canonical SALT semantic decoding
+  through the retained file handle, requires decoder completion before
+  sync/publication, and returns both generic and semantic receipts without an
+  install-time reopen. Strict campaign reopen/progress/seal paths use the same
+  one-pass verified visitor instead of reading each master twice. Exclusive
+  campaign resume and pre-seal paths mark canonical slot roots and reclaim only
+  canonical unreferenced objects, reject unknown object layouts before any unlink,
+  remove recognized crash-left slot temporaries, serialize same-handle mutation,
+  and never sweep a sealed namespace. Exact-length semantic failures therefore
+  publish neither CAS objects nor slots, while valid crash-window orphans are
+  deterministically reclaimed before the 27B campaign;
 - package/runtime scale geometry is G128-only; the G64/G256 promotion ablations
   require a versioned format/runtime field before they can enter the grid;
 - the equal-cost allocator is exact and scalable, including binary64 reduction

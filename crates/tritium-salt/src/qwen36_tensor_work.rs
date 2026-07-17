@@ -8,7 +8,7 @@ mod additive_master;
 
 pub use additive_master::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
-    Qwen36AdditiveMasterReceipt, Qwen36CompleteWorkspaceReceipt,
+    Qwen36AdditiveMasterReceipt, Qwen36CompleteWorkspaceReceipt, Qwen36ScaleOnlyCampaignStore,
 };
 
 use core::{convert::Infallible, fmt};

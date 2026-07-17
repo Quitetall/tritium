@@ -1,6 +1,6 @@
 //! Immutable additive-master campaigns layered over one preserved-source workspace.
 
-use core::{convert::Infallible, fmt};
+use core::fmt;
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::{
@@ -14,10 +14,11 @@ use std::{
 use tritium_format::{
     ModelId,
     salt_v2_master::{
-        SALT_V2_MASTER_TENSOR_SCHEMA, SaltV2MasterError, SaltV2MasterTensorDecoder,
-        SaltV2MasterTensorReceipt, SaltV2MasterTensorSpec, SaltV2MasterTrack,
+        SALT_V2_MASTER_TENSOR_SCHEMA, SaltV2FitConstraint, SaltV2MasterTensorDecoder,
+        SaltV2MasterTensorReceipt, SaltV2MasterTensorSpec, SaltV2MasterTile, SaltV2MasterTrack,
         SaltV2MasterVisitError,
     },
+    salt_v2_package::SALT_V2_ALLOCATION_TILE_SIZE,
 };
 
 #[cfg(unix)]
@@ -47,6 +48,8 @@ const SLOT_EXTENSION: &str = "tq36mref";
 #[cfg(unix)]
 const CAMPAIGN_MAGIC: [u8; 8] = *b"TSQ36CP\0";
 const CATALOG_MAGIC: [u8; 8] = *b"TSQ36SC\0";
+#[cfg(unix)]
+const SCALE_ONLY_CATALOG_MAGIC: [u8; 8] = *b"TSQ36SL\0";
 const SLOT_MAGIC: [u8; 8] = *b"TSQ36AR\0";
 const COMPLETION_MAGIC: [u8; 8] = *b"TSQ36CM\0";
 const FORMAT_VERSION: u16 = 1;
@@ -56,14 +59,17 @@ const SLOT_CHECKSUM_CONTEXT: &str = "tritium qwen3.6 additive master receipt che
 const COMPLETION_CHECKSUM_CONTEXT: &str = "tritium qwen3.6 complete workspace checksum v1";
 const MASTER_SET_CONTEXT: &str = "tritium qwen3.6 ordered additive master set v1";
 const SLOT_KEY_CONTEXT: &str = "tritium qwen3.6 additive campaign slot key v1";
+const FIXED_MASTER_CONTEXT: &str = "tritium qwen3.6 scale-only fixed master v1";
 const MASTER_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SLOT_RECEIPT_BYTES: u64 = 512 * 1024;
 
-/// Exact ordered tensor-master metadata that defines one rate-free Qwen PTQ campaign.
+/// Exact ordered tensor-master metadata that defines one rate-free Qwen additive campaign.
 ///
 /// Every tensor-specific curvature, feedback, widened-source, and parent digest
 /// is committed before any payload can be installed. Deployment rate and codec
-/// are absent because canonical tensor masters are reusable work artifacts.
+/// are absent because canonical tensor masters are reusable work artifacts. The
+/// public constructor admits PTQ only; refined instances come from a typed,
+/// parent-bound campaign opener.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen36AdditiveCampaignSpec {
     expected_masters: Vec<SaltV2MasterTensorSpec>,
@@ -107,6 +113,35 @@ impl Qwen36AdditiveCampaignSpec {
     #[must_use]
     pub fn expected_masters(&self) -> &[SaltV2MasterTensorSpec] {
         &self.expected_masters
+    }
+
+    #[cfg(unix)]
+    fn new_scale_only(
+        parent_completion: &Qwen36CompleteWorkspaceReceipt,
+        parent_specs: &[SaltV2MasterTensorSpec],
+        parent_masters: &[Qwen36AdditiveMasterReceipt],
+        parent_fixed_ids: &[[u8; 32]],
+        mut expected_masters: Vec<SaltV2MasterTensorSpec>,
+    ) -> Result<Self, Qwen36TensorWorkError> {
+        validate_scale_only_masters(parent_specs, parent_masters, &expected_masters)?;
+        if parent_fixed_ids.len() != parent_masters.len() {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only fixed master count",
+            ));
+        }
+        let catalog_bytes = encode_scale_only_master_catalog(
+            parent_completion,
+            parent_masters,
+            parent_fixed_ids,
+            &expected_masters,
+        )?;
+        let spec_id = ContentId::of_bytes(&catalog_bytes);
+        expected_masters.shrink_to_fit();
+        Ok(Self {
+            expected_masters,
+            catalog_bytes,
+            spec_id,
+        })
     }
 }
 
@@ -571,6 +606,20 @@ pub struct Qwen36AdditiveCampaignStore<'store, 'source> {
     _lock: CampaignLock,
 }
 
+/// Parent-bound, fixed-trit scale-only campaign over one sealed PTQ campaign.
+///
+/// This rate-free work layer proves parent identity, tensor geometry, admissible
+/// prefixes, and hard trits. Deployment allocation-map binding remains a
+/// separate package-stage requirement.
+#[derive(Debug)]
+pub struct Qwen36ScaleOnlyCampaignStore<'parent, 'store, 'source> {
+    parent: &'parent Qwen36AdditiveCampaignStore<'store, 'source>,
+    campaign: Qwen36AdditiveCampaignStore<'store, 'source>,
+    parent_completion: Qwen36CompleteWorkspaceReceipt,
+    parent_masters: Vec<Qwen36AdditiveMasterReceipt>,
+    parent_fixed_ids: Vec<[u8; 32]>,
+}
+
 impl<'source> Qwen36TensorWorkStore<'source> {
     /// Open or resume an exclusive additive campaign over this exact base workspace.
     ///
@@ -583,6 +632,15 @@ impl<'source> Qwen36TensorWorkStore<'source> {
     /// campaign currently owned by another process.
     #[cfg(unix)]
     pub fn open_master_campaign<'store>(
+        &'store self,
+        spec: Qwen36AdditiveCampaignSpec,
+    ) -> Result<Qwen36AdditiveCampaignStore<'store, 'source>, Qwen36TensorWorkError> {
+        validate_expected_masters(&spec.expected_masters)?;
+        self.open_additive_campaign(spec)
+    }
+
+    #[cfg(unix)]
+    fn open_additive_campaign<'store>(
         &'store self,
         spec: Qwen36AdditiveCampaignSpec,
     ) -> Result<Qwen36AdditiveCampaignStore<'store, 'source>, Qwen36TensorWorkError> {
@@ -650,7 +708,54 @@ impl<'source> Qwen36TensorWorkStore<'source> {
     }
 }
 
-impl Qwen36AdditiveCampaignStore<'_, '_> {
+impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
+    /// Open or resume a scale-only child whose parent is this sealed PTQ campaign.
+    ///
+    /// Child metadata must bind every corresponding parent tensor master and
+    /// preserve source identity and semantic geometry. Payload installation adds
+    /// bounded fixed-trit and admissible-prefix verification.
+    ///
+    /// # Errors
+    /// Returns [`Qwen36TensorWorkError`] unless this parent strictly reopens as
+    /// complete or any child lineage, metadata, filesystem, or lock check fails.
+    #[cfg(unix)]
+    pub fn open_scale_only_campaign<'parent>(
+        &'parent self,
+        expected_masters: Vec<SaltV2MasterTensorSpec>,
+    ) -> Result<Qwen36ScaleOnlyCampaignStore<'parent, 'store, 'source>, Qwen36TensorWorkError> {
+        let (parent_completion, parent_manifest, parent_fixed_ids) =
+            self.require_complete_verified(FixedCampaignMode::Capture)?;
+        let spec = Qwen36AdditiveCampaignSpec::new_scale_only(
+            &parent_completion,
+            &self.spec.expected_masters,
+            &parent_manifest.masters,
+            &parent_fixed_ids,
+            expected_masters,
+        )?;
+        let campaign = self.base.open_additive_campaign(spec)?;
+        let child = Qwen36ScaleOnlyCampaignStore {
+            parent: self,
+            campaign,
+            parent_completion,
+            parent_masters: parent_manifest.masters,
+            parent_fixed_ids,
+        };
+        child.verify_parent_campaign()?;
+        Ok(child)
+    }
+
+    /// Reject scale-only child mutation where stable file identity is unavailable.
+    ///
+    /// # Errors
+    /// Always returns [`Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform`].
+    #[cfg(not(unix))]
+    pub fn open_scale_only_campaign<'parent>(
+        &'parent self,
+        _expected_masters: Vec<SaltV2MasterTensorSpec>,
+    ) -> Result<Qwen36ScaleOnlyCampaignStore<'parent, 'store, 'source>, Qwen36TensorWorkError> {
+        Err(Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform)
+    }
+
     /// Content identity of the base-bound campaign descriptor.
     #[must_use]
     pub const fn campaign_id(&self) -> ContentId {
@@ -691,6 +796,16 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         spec: &SaltV2MasterTensorSpec,
         produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), E>,
     ) -> Result<Qwen36AdditiveMasterReceipt, Qwen36AdditiveInstallError<E>> {
+        self.install_master_with_fixed(spec, FixedMasterMode::Skip, produce, || Ok(()))
+    }
+
+    fn install_master_with_fixed<E>(
+        &self,
+        spec: &SaltV2MasterTensorSpec,
+        fixed_mode: FixedMasterMode,
+        produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), E>,
+        prepublish: impl FnOnce() -> Result<(), Qwen36TensorWorkError>,
+    ) -> Result<Qwen36AdditiveMasterReceipt, Qwen36AdditiveInstallError<E>> {
         let _mutation = self
             .begin_mutation()
             .map_err(Qwen36AdditiveInstallError::Campaign)?;
@@ -703,8 +818,26 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         match fs::symlink_metadata(&slot_path) {
             Ok(_) => {
                 let receipt = self
-                    .reopen_slot(ordinal, spec)
+                    .reopen_slot_with_fixed(ordinal, spec, fixed_mode)
                     .map_err(Qwen36AdditiveInstallError::Campaign)?;
+                match fs::symlink_metadata(self.completion_path()) {
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                        return Err(Qwen36AdditiveInstallError::Campaign(
+                            Qwen36TensorWorkError::InvalidPath("complete additive workspace"),
+                        ));
+                    }
+                    Ok(_) => {
+                        self.require_complete()
+                            .map_err(Qwen36AdditiveInstallError::Campaign)?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(Qwen36AdditiveInstallError::Campaign(work_io(
+                            "inspect completion seal",
+                            error,
+                        )));
+                    }
+                }
                 self.ensure_current()
                     .map_err(Qwen36AdditiveInstallError::Campaign)?;
                 return Ok(receipt);
@@ -717,32 +850,50 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
                 )));
             }
         }
+        match fs::symlink_metadata(self.completion_path()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(Qwen36AdditiveInstallError::Campaign(
+                    Qwen36TensorWorkError::InvalidPath("complete additive workspace"),
+                ));
+            }
+            Ok(_) => {
+                return Err(Qwen36AdditiveInstallError::Campaign(
+                    Qwen36TensorWorkError::ExistingArtifactMismatch("sealed additive campaign"),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Qwen36AdditiveInstallError::Campaign(work_io(
+                    "inspect completion seal",
+                    error,
+                )));
+            }
+        }
         let record_spec = master_record_spec(spec).map_err(Qwen36AdditiveInstallError::Campaign)?;
-        let validator = CanonicalMasterValidator(
-            SaltV2MasterTensorDecoder::new(spec)
-                .map_err(Qwen36TensorWorkError::Master)
-                .map_err(Qwen36AdditiveInstallError::Campaign)?,
-        );
-        let (record, master) = match self.objects.put_validated(&record_spec, validator, produce) {
-            Ok(validated) => validated,
-            Err(TensorValidatedPutError::Store(error)) => {
-                return Err(Qwen36AdditiveInstallError::Campaign(
-                    Qwen36TensorWorkError::TensorStore(error),
-                ));
-            }
-            Err(TensorValidatedPutError::Producer(error)) => {
-                return Err(Qwen36AdditiveInstallError::Producer(error));
-            }
-            Err(TensorValidatedPutError::Validator(error)) => {
-                return Err(Qwen36AdditiveInstallError::Campaign(
-                    Qwen36TensorWorkError::Master(error),
-                ));
-            }
-        };
+        let validator = CanonicalMasterValidator::new(spec, fixed_mode)
+            .map_err(Qwen36AdditiveInstallError::Campaign)?;
+        let (record, verified) =
+            match self
+                .objects
+                .put_validated_checked(&record_spec, validator, produce, prepublish)
+            {
+                Ok(validated) => validated,
+                Err(TensorValidatedPutError::Store(error)) => {
+                    return Err(Qwen36AdditiveInstallError::Campaign(
+                        Qwen36TensorWorkError::TensorStore(error),
+                    ));
+                }
+                Err(TensorValidatedPutError::Producer(error)) => {
+                    return Err(Qwen36AdditiveInstallError::Producer(error));
+                }
+                Err(TensorValidatedPutError::Validator(error)) => {
+                    return Err(Qwen36AdditiveInstallError::Campaign(error));
+                }
+            };
         let receipt = Qwen36AdditiveMasterReceipt::new(
             self.campaign_id,
             ordinal as u64,
-            master.tensor_master_id(),
+            verified.master.tensor_master_id(),
             record,
         )
         .map_err(Qwen36AdditiveInstallError::Campaign)?;
@@ -787,12 +938,24 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
     /// Returns [`Qwen36TensorWorkError`] for any corrupt or contradictory present
     /// slot, changed campaign/base bytes, or checked count overflow.
     pub fn progress(&self) -> Result<Qwen36TensorWorkSummary, Qwen36TensorWorkError> {
+        self.progress_with_fixed(FixedCampaignMode::Skip)
+    }
+
+    fn progress_with_fixed(
+        &self,
+        fixed_mode: FixedCampaignMode<'_>,
+    ) -> Result<Qwen36TensorWorkSummary, Qwen36TensorWorkError> {
+        fixed_mode.validate_count(self.spec.expected_masters.len())?;
         self.ensure_current()?;
         let mut present = 0_u64;
         for (ordinal, expected) in self.spec.expected_masters.iter().enumerate() {
             match fs::symlink_metadata(self.slot_path(ordinal, expected.name())) {
                 Ok(_) => {
-                    self.reopen_slot(ordinal, expected)?;
+                    self.reopen_slot_with_fixed(
+                        ordinal,
+                        expected,
+                        fixed_mode.master_mode(ordinal)?,
+                    )?;
                     present =
                         present
                             .checked_add(1)
@@ -818,6 +981,15 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
     /// Returns [`Qwen36TensorWorkError::MissingAdditiveArtifacts`] while any slot
     /// is absent, or another validation/publication error for changed bytes.
     pub fn seal_complete(&self) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        self.seal_complete_with_fixed(FixedCampaignMode::Skip, || Ok(()))
+    }
+
+    fn seal_complete_with_fixed(
+        &self,
+        fixed_mode: FixedCampaignMode<'_>,
+        prepublish: impl FnOnce() -> Result<(), Qwen36TensorWorkError>,
+    ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        fixed_mode.validate_count(self.spec.expected_masters.len())?;
         let _mutation = self.begin_mutation()?;
         self.ensure_current()?;
         self.reclaim_unreferenced_objects()?;
@@ -829,7 +1001,11 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         for (ordinal, expected) in self.spec.expected_masters.iter().enumerate() {
             match fs::symlink_metadata(self.slot_path(ordinal, expected.name())) {
                 Ok(_) => {
-                    masters.push(self.reopen_slot(ordinal, expected)?);
+                    masters.push(self.reopen_slot_with_fixed(
+                        ordinal,
+                        expected,
+                        fixed_mode.master_mode(ordinal)?,
+                    )?);
                     present =
                         present
                             .checked_add(1)
@@ -855,6 +1031,7 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         )?;
         let bytes = manifest.canonical_bytes()?;
         self.ensure_current()?;
+        prepublish()?;
         persist_exact(
             &self.completion_path(),
             &bytes,
@@ -873,11 +1050,27 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
     pub fn require_complete(
         &self,
     ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        self.require_complete_verified(FixedCampaignMode::Skip)
+            .map(|(receipt, _, _)| receipt)
+    }
+
+    fn require_complete_verified(
+        &self,
+        fixed_mode: FixedCampaignMode<'_>,
+    ) -> Result<
+        (
+            Qwen36CompleteWorkspaceReceipt,
+            CompleteManifest,
+            Vec<[u8; 32]>,
+        ),
+        Qwen36TensorWorkError,
+    > {
+        fixed_mode.validate_count(self.spec.expected_masters.len())?;
         self.ensure_current()?;
         match fs::symlink_metadata(self.completion_path()) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let summary = self.progress()?;
+                let summary = self.progress_with_fixed(fixed_mode)?;
                 return Err(Qwen36TensorWorkError::MissingAdditiveArtifacts {
                     expected: summary.additive_required(),
                     present: summary.additive_present(),
@@ -914,19 +1107,27 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         reopened
             .try_reserve_exact(manifest.masters.len())
             .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+        let mut fixed_ids = Vec::new();
+        fixed_ids
+            .try_reserve_exact(manifest.masters.len())
+            .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
         for (ordinal, (sealed, expected)) in manifest
             .masters
             .iter()
             .zip(&self.spec.expected_masters)
             .enumerate()
         {
-            let current = self.reopen_slot(ordinal, expected)?;
+            let (current, verified) =
+                self.reopen_slot_verified(ordinal, expected, fixed_mode.master_mode(ordinal)?)?;
             if current != *sealed {
                 return Err(Qwen36TensorWorkError::WorkspaceMismatch(
                     "completion master receipt",
                 ));
             }
             reopened.push(current);
+            if let Some(fixed_id) = verified.fixed_id {
+                fixed_ids.push(fixed_id);
+            }
         }
         if derive_master_set_id(&reopened)? != manifest.master_set_id {
             return Err(Qwen36TensorWorkError::WorkspaceMismatch(
@@ -934,7 +1135,8 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
             ));
         }
         self.ensure_current()?;
-        manifest.receipt(&bytes)
+        let receipt = manifest.receipt(&bytes)?;
+        Ok((receipt, manifest, fixed_ids))
     }
 
     fn descriptor_path(&self) -> PathBuf {
@@ -950,6 +1152,25 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
 
     fn completion_path(&self) -> PathBuf {
         self.root.join(COMPLETION_FILE)
+    }
+
+    fn verify_completion_receipt(
+        &self,
+        expected: &Qwen36CompleteWorkspaceReceipt,
+    ) -> Result<(), Qwen36TensorWorkError> {
+        self.ensure_current()?;
+        let bytes = read_regular_bounded(
+            &self.completion_path(),
+            MAX_WORKSPACE_BYTES as u64,
+            "complete additive workspace",
+        )?;
+        let manifest = CompleteManifest::from_canonical_bytes(&bytes)?;
+        if manifest.receipt(&bytes)? != *expected {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only parent completion",
+            ));
+        }
+        self.ensure_current()
     }
 
     fn expected_ordinal(
@@ -971,14 +1192,32 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         ordinal: usize,
         expected: &SaltV2MasterTensorSpec,
     ) -> Result<Qwen36AdditiveMasterReceipt, Qwen36TensorWorkError> {
+        self.reopen_slot_with_fixed(ordinal, expected, FixedMasterMode::Skip)
+    }
+
+    fn reopen_slot_with_fixed(
+        &self,
+        ordinal: usize,
+        expected: &SaltV2MasterTensorSpec,
+        fixed_mode: FixedMasterMode,
+    ) -> Result<Qwen36AdditiveMasterReceipt, Qwen36TensorWorkError> {
+        Ok(self.reopen_slot_verified(ordinal, expected, fixed_mode)?.0)
+    }
+
+    fn reopen_slot_verified(
+        &self,
+        ordinal: usize,
+        expected: &SaltV2MasterTensorSpec,
+        fixed_mode: FixedMasterMode,
+    ) -> Result<(Qwen36AdditiveMasterReceipt, VerifiedMaster), Qwen36TensorWorkError> {
         let receipt = self.reopen_slot_receipt(ordinal, expected)?;
-        let master = self.verify_record(&receipt.record, expected)?;
-        if master.tensor_master_id() != receipt.tensor_master_id {
+        let verified = self.verify_record(&receipt.record, expected, fixed_mode)?;
+        if verified.master.tensor_master_id() != receipt.tensor_master_id {
             return Err(Qwen36TensorWorkError::WorkspaceMismatch(
                 "additive tensor master identity",
             ));
         }
-        Ok(receipt)
+        Ok((receipt, verified))
     }
 
     fn reopen_slot_receipt(
@@ -1096,25 +1335,24 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         &self,
         record: &TensorRecordReceipt,
         expected: &SaltV2MasterTensorSpec,
-    ) -> Result<tritium_format::salt_v2_master::SaltV2MasterTensorReceipt, Qwen36TensorWorkError>
-    {
+        fixed_mode: FixedMasterMode,
+    ) -> Result<VerifiedMaster, Qwen36TensorWorkError> {
         validate_record_descriptor(record, expected)?;
-        let mut decoder =
-            SaltV2MasterTensorDecoder::new(expected).map_err(Qwen36TensorWorkError::Master)?;
+        let mut validator = CanonicalMasterValidator::new(expected, fixed_mode)?;
         self.objects
             .try_visit_verified(record, MASTER_STREAM_CHUNK_BYTES, |chunk| {
-                decoder.try_push(chunk, &mut |_| Ok::<(), Infallible>(()))
+                validator.try_push(chunk)
             })
-            .map_err(map_master_visit_error)?;
-        let master = decoder.finish().map_err(Qwen36TensorWorkError::Master)?;
-        if master.payload_bytes() != expected.payload_bytes()
-            || master.tile_count() != expected.tile_count() as u64
+            .map_err(map_validator_visit_error)?;
+        let verified = validator.finish()?;
+        if verified.master.payload_bytes() != expected.payload_bytes()
+            || verified.master.tile_count() != expected.tile_count() as u64
         {
             return Err(Qwen36TensorWorkError::WorkspaceMismatch(
                 "additive master payload geometry",
             ));
         }
-        Ok(master)
+        Ok(verified)
     }
 
     fn slot_path(&self, ordinal: usize, name: &str) -> PathBuf {
@@ -1149,6 +1387,218 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         self._lock.validate_path()?;
         validate_directories(&self.directories)?;
         Ok(())
+    }
+}
+
+impl Qwen36ScaleOnlyCampaignStore<'_, '_, '_> {
+    /// Content identity of the parent-bound child campaign descriptor.
+    #[must_use]
+    pub const fn campaign_id(&self) -> ContentId {
+        self.campaign.campaign_id()
+    }
+
+    /// Exact sealed PTQ completion admitted as this campaign's parent.
+    #[must_use]
+    pub const fn parent_completion_id(&self) -> ContentId {
+        self.parent_completion.completion_id()
+    }
+
+    /// PTQ campaign whose verified masters define fixed child trits and prefixes.
+    #[must_use]
+    pub const fn parent_campaign_id(&self) -> ContentId {
+        self.parent.campaign_id()
+    }
+
+    /// Exact ordered scale-only master specification admitted by this campaign.
+    #[must_use]
+    pub const fn spec(&self) -> &Qwen36AdditiveCampaignSpec {
+        self.campaign.spec()
+    }
+
+    /// Immutable child campaign root.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        self.campaign.root()
+    }
+
+    /// Install one scale-only master after verifying its sealed parent and fixed structure.
+    ///
+    /// Loss curves and scales may change. Every admissible prefix and hard trit
+    /// must match the corresponding verified parent before CAS publication.
+    ///
+    /// # Errors
+    /// Returns [`Qwen36AdditiveInstallError::Campaign`] for changed parent/child
+    /// lineage or fixed structure, and [`Qwen36AdditiveInstallError::Producer`]
+    /// for a typed producer failure.
+    pub fn install_master<E>(
+        &self,
+        spec: &SaltV2MasterTensorSpec,
+        produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), E>,
+    ) -> Result<Qwen36AdditiveMasterReceipt, Qwen36AdditiveInstallError<E>> {
+        let ordinal = self
+            .campaign
+            .expected_ordinal(spec)
+            .map_err(Qwen36AdditiveInstallError::Campaign)?;
+        match fs::symlink_metadata(self.campaign.completion_path()) {
+            Ok(_) => {
+                self.require_complete()
+                    .map_err(Qwen36AdditiveInstallError::Campaign)?;
+                return self
+                    .reopen_master(spec.name())
+                    .map_err(Qwen36AdditiveInstallError::Campaign);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Qwen36AdditiveInstallError::Campaign(work_io(
+                    "inspect completion seal",
+                    error,
+                )));
+            }
+        }
+        self.verify_parent_master(ordinal)
+            .map_err(Qwen36AdditiveInstallError::Campaign)?;
+        let fixed_id = self.parent_fixed_ids.get(ordinal).copied().ok_or(
+            Qwen36AdditiveInstallError::Campaign(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only fixed master count",
+            )),
+        )?;
+        let receipt = self.campaign.install_master_with_fixed(
+            spec,
+            FixedMasterMode::Require(fixed_id),
+            produce,
+            || self.verify_parent_master(ordinal),
+        )?;
+        self.verify_parent_master(ordinal)
+            .map_err(Qwen36AdditiveInstallError::Campaign)?;
+        Ok(receipt)
+    }
+
+    /// Strictly reopen one child master and its corresponding sealed parent.
+    ///
+    /// # Errors
+    /// Returns [`Qwen36TensorWorkError`] for unknown, missing, changed, or
+    /// fixed-structure-incompatible parent or child artifacts.
+    pub fn reopen_master(
+        &self,
+        name: &str,
+    ) -> Result<Qwen36AdditiveMasterReceipt, Qwen36TensorWorkError> {
+        self.campaign.ensure_current()?;
+        let ordinal = self
+            .campaign
+            .spec
+            .expected_masters
+            .binary_search_by(|master| master.name().cmp(name))
+            .map_err(|_| Qwen36TensorWorkError::UnknownAdditiveTensor)?;
+        self.verify_parent_master(ordinal)?;
+        let fixed_id = self.parent_fixed_ids.get(ordinal).copied().ok_or(
+            Qwen36TensorWorkError::WorkspaceMismatch("scale-only fixed master count"),
+        )?;
+        let receipt = self.campaign.reopen_slot_with_fixed(
+            ordinal,
+            &self.campaign.spec.expected_masters[ordinal],
+            FixedMasterMode::Require(fixed_id),
+        )?;
+        self.campaign.ensure_current()?;
+        self.verify_parent_master(ordinal)?;
+        Ok(receipt)
+    }
+
+    /// Recompute child progress while strictly verifying the sealed parent.
+    ///
+    /// # Errors
+    /// Returns [`Qwen36TensorWorkError`] for changed lineage or any corrupt,
+    /// contradictory, or fixed-structure-incompatible artifact.
+    pub fn progress(&self) -> Result<Qwen36TensorWorkSummary, Qwen36TensorWorkError> {
+        self.verify_parent_campaign()?;
+        let summary = self
+            .campaign
+            .progress_with_fixed(FixedCampaignMode::Require(&self.parent_fixed_ids))?;
+        self.verify_parent_campaign()?;
+        Ok(summary)
+    }
+
+    /// Seal a structurally complete fixed-trit child campaign.
+    ///
+    /// # Errors
+    /// Returns [`Qwen36TensorWorkError`] unless the parent and every child master
+    /// strictly reopen with their originally bound fixed structures.
+    pub fn seal_complete(&self) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        self.verify_parent_campaign()?;
+        let receipt = self
+            .campaign
+            .seal_complete_with_fixed(FixedCampaignMode::Require(&self.parent_fixed_ids), || {
+                self.verify_parent_campaign()
+            })?;
+        self.verify_parent_campaign()?;
+        Ok(receipt)
+    }
+
+    /// Strictly reopen the sealed parent and completed fixed-trit child.
+    ///
+    /// # Errors
+    /// Returns [`Qwen36TensorWorkError`] for incomplete or changed lineage,
+    /// receipts, records, payloads, trits, or admissible prefixes.
+    pub fn require_complete(
+        &self,
+    ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        self.verify_parent_campaign()?;
+        let receipt = self
+            .campaign
+            .require_complete_verified(FixedCampaignMode::Require(&self.parent_fixed_ids))?
+            .0;
+        self.verify_parent_campaign()?;
+        Ok(receipt)
+    }
+
+    fn verify_parent_master(&self, ordinal: usize) -> Result<(), Qwen36TensorWorkError> {
+        self.parent
+            .verify_completion_receipt(&self.parent_completion)?;
+        self.verify_parent_master_record(ordinal)?;
+        self.parent
+            .verify_completion_receipt(&self.parent_completion)
+    }
+
+    fn verify_parent_master_record(&self, ordinal: usize) -> Result<(), Qwen36TensorWorkError> {
+        let expected = self.parent.spec.expected_masters.get(ordinal).ok_or(
+            Qwen36TensorWorkError::WorkspaceMismatch("scale-only parent tensor count"),
+        )?;
+        let sealed =
+            self.parent_masters
+                .get(ordinal)
+                .ok_or(Qwen36TensorWorkError::WorkspaceMismatch(
+                    "scale-only parent master receipt",
+                ))?;
+        let fixed_id = self.parent_fixed_ids.get(ordinal).copied().ok_or(
+            Qwen36TensorWorkError::WorkspaceMismatch("scale-only fixed master count"),
+        )?;
+        let (current, _) = self.parent.reopen_slot_verified(
+            ordinal,
+            expected,
+            FixedMasterMode::Require(fixed_id),
+        )?;
+        if current != *sealed {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only parent master receipt",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_parent_campaign(&self) -> Result<(), Qwen36TensorWorkError> {
+        self.parent
+            .verify_completion_receipt(&self.parent_completion)?;
+        if self.parent_masters.len() != self.parent.spec.expected_masters.len()
+            || self.parent_fixed_ids.len() != self.parent_masters.len()
+        {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only parent tensor count",
+            ));
+        }
+        for ordinal in 0..self.parent_masters.len() {
+            self.verify_parent_master_record(ordinal)?;
+        }
+        self.parent
+            .verify_completion_receipt(&self.parent_completion)
     }
 }
 
@@ -1257,35 +1707,207 @@ fn recognized_slot_temporary(name: &str) -> bool {
     }) && fields.next().is_none()
 }
 
-struct CanonicalMasterValidator<'a>(SaltV2MasterTensorDecoder<'a>);
+#[derive(Clone, Copy, Debug)]
+struct VerifiedMaster {
+    master: SaltV2MasterTensorReceipt,
+    fixed_id: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FixedMasterMode {
+    Skip,
+    #[cfg(unix)]
+    Capture,
+    Require([u8; 32]),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FixedCampaignMode<'a> {
+    Skip,
+    #[cfg(unix)]
+    Capture,
+    Require(&'a [[u8; 32]]),
+}
+
+impl FixedCampaignMode<'_> {
+    fn validate_count(self, expected: usize) -> Result<(), Qwen36TensorWorkError> {
+        if matches!(self, Self::Require(ids) if ids.len() != expected) {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only fixed master count",
+            ));
+        }
+        Ok(())
+    }
+
+    fn master_mode(self, ordinal: usize) -> Result<FixedMasterMode, Qwen36TensorWorkError> {
+        match self {
+            Self::Skip => Ok(FixedMasterMode::Skip),
+            #[cfg(unix)]
+            Self::Capture => Ok(FixedMasterMode::Capture),
+            Self::Require(ids) => ids
+                .get(ordinal)
+                .copied()
+                .map(FixedMasterMode::Require)
+                .ok_or(Qwen36TensorWorkError::WorkspaceMismatch(
+                    "scale-only fixed master count",
+                )),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FixedMasterHasher {
+    hasher: blake3::Hasher,
+    expected_tiles: usize,
+    next_tile: usize,
+}
+
+impl FixedMasterHasher {
+    fn new(spec: &SaltV2MasterTensorSpec) -> Result<Self, Qwen36TensorWorkError> {
+        let mut hasher = blake3::Hasher::new_derive_key(FIXED_MASTER_CONTEXT);
+        hasher.update(&spec.tensor_index().to_le_bytes());
+        hasher.update(spec.source_model_id().as_bytes());
+        hasher.update(spec.source_tensor_digest());
+        hasher.update(spec.widened_source_digest());
+        let name_length = u64::try_from(spec.name().len())
+            .map_err(|_| Qwen36TensorWorkError::LengthOverflow("fixed master name"))?;
+        hasher.update(&name_length.to_le_bytes());
+        hasher.update(spec.name().as_bytes());
+        let rank = u64::try_from(spec.shape().len())
+            .map_err(|_| Qwen36TensorWorkError::LengthOverflow("fixed master rank"))?;
+        hasher.update(&rank.to_le_bytes());
+        for dimension in spec.shape() {
+            hasher.update(&dimension.to_le_bytes());
+        }
+        let logical = u64::try_from(spec.logical_coefficients()).map_err(|_| {
+            Qwen36TensorWorkError::LengthOverflow("fixed master logical coefficients")
+        })?;
+        let tiles = u64::try_from(spec.tile_count())
+            .map_err(|_| Qwen36TensorWorkError::LengthOverflow("fixed master tile count"))?;
+        hasher.update(&logical.to_le_bytes());
+        hasher.update(&tiles.to_le_bytes());
+        hasher.update(&[
+            match spec.geometry().constraint {
+                SaltV2FitConstraint::Dense => 0,
+                SaltV2FitConstraint::S34 => 1,
+            },
+            spec.geometry().max_planes,
+        ]);
+        Ok(Self {
+            hasher,
+            expected_tiles: spec.tile_count(),
+            next_tile: 0,
+        })
+    }
+
+    fn try_push(&mut self, tile: SaltV2MasterTile) -> Result<(), Qwen36TensorWorkError> {
+        let tile_ordinal = u64::try_from(self.next_tile)
+            .map_err(|_| Qwen36TensorWorkError::LengthOverflow("fixed master tile ordinal"))?;
+        let plane_count = u8::try_from(tile.planes().len())
+            .map_err(|_| Qwen36TensorWorkError::LengthOverflow("fixed master plane count"))?;
+        self.hasher.update(&tile_ordinal.to_le_bytes());
+        self.hasher.update(&[tile.admissible_planes(), plane_count]);
+        for (plane_ordinal, plane) in tile.planes().iter().enumerate() {
+            let plane_ordinal = u8::try_from(plane_ordinal)
+                .map_err(|_| Qwen36TensorWorkError::LengthOverflow("fixed master plane ordinal"))?;
+            let trit_count = u64::try_from(plane.trits().len())
+                .map_err(|_| Qwen36TensorWorkError::LengthOverflow("fixed master trit count"))?;
+            self.hasher.update(&[plane_ordinal]);
+            self.hasher.update(&trit_count.to_le_bytes());
+            let mut encoded = [0_u8; SALT_V2_ALLOCATION_TILE_SIZE];
+            for (output, trit) in encoded.iter_mut().zip(plane.trits()) {
+                *output = trit.get().to_le_bytes()[0];
+            }
+            self.hasher.update(&encoded[..plane.trits().len()]);
+        }
+        self.next_tile =
+            self.next_tile
+                .checked_add(1)
+                .ok_or(Qwen36TensorWorkError::LengthOverflow(
+                    "fixed master tile count",
+                ))?;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<[u8; 32], Qwen36TensorWorkError> {
+        if self.next_tile != self.expected_tiles {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "fixed master tile count",
+            ));
+        }
+        Ok(*self.hasher.finalize().as_bytes())
+    }
+}
+
+struct CanonicalMasterValidator<'a> {
+    decoder: SaltV2MasterTensorDecoder<'a>,
+    fixed: Option<FixedMasterHasher>,
+    expected_fixed_id: Option<[u8; 32]>,
+}
+
+impl<'a> CanonicalMasterValidator<'a> {
+    fn new(
+        spec: &'a SaltV2MasterTensorSpec,
+        fixed_mode: FixedMasterMode,
+    ) -> Result<Self, Qwen36TensorWorkError> {
+        Ok(Self {
+            decoder: SaltV2MasterTensorDecoder::new(spec).map_err(Qwen36TensorWorkError::Master)?,
+            fixed: match fixed_mode {
+                FixedMasterMode::Skip => None,
+                #[cfg(unix)]
+                FixedMasterMode::Capture => Some(FixedMasterHasher::new(spec)?),
+                FixedMasterMode::Require(_) => Some(FixedMasterHasher::new(spec)?),
+            },
+            expected_fixed_id: match fixed_mode {
+                FixedMasterMode::Require(fixed_id) => Some(fixed_id),
+                FixedMasterMode::Skip => None,
+                #[cfg(unix)]
+                FixedMasterMode::Capture => None,
+            },
+        })
+    }
+}
 
 impl TensorPayloadValidator for CanonicalMasterValidator<'_> {
-    type Error = SaltV2MasterError;
-    type Output = SaltV2MasterTensorReceipt;
+    type Error = Qwen36TensorWorkError;
+    type Output = VerifiedMaster;
 
     fn try_push(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.0
-            .try_push(bytes, &mut |_| Ok::<(), Infallible>(()))
+        self.decoder
+            .try_push(bytes, &mut |tile| match &mut self.fixed {
+                Some(fixed) => fixed.try_push(tile),
+                None => Ok(()),
+            })
             .map_err(|error| match error {
-                SaltV2MasterVisitError::Master(error) => error,
-                SaltV2MasterVisitError::Visitor(impossible) => match impossible {},
+                SaltV2MasterVisitError::Master(error) => Qwen36TensorWorkError::Master(error),
+                SaltV2MasterVisitError::Visitor(error) => error,
             })
     }
 
     fn finish(self) -> Result<Self::Output, Self::Error> {
-        self.0.finish()
+        let master = self
+            .decoder
+            .finish()
+            .map_err(Qwen36TensorWorkError::Master)?;
+        let fixed_id = self.fixed.map(FixedMasterHasher::finish).transpose()?;
+        if self
+            .expected_fixed_id
+            .is_some_and(|expected| fixed_id != Some(expected))
+        {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only fixed trits and prefixes",
+            ));
+        }
+        Ok(VerifiedMaster { master, fixed_id })
     }
 }
 
-fn map_master_visit_error(
-    error: TensorVisitError<SaltV2MasterVisitError<Infallible>>,
+fn map_validator_visit_error(
+    error: TensorVisitError<Qwen36TensorWorkError>,
 ) -> Qwen36TensorWorkError {
     match error {
         TensorVisitError::Store(error) => Qwen36TensorWorkError::TensorStore(error),
-        TensorVisitError::Sink(SaltV2MasterVisitError::Master(error)) => {
-            Qwen36TensorWorkError::Master(error)
-        }
-        TensorVisitError::Sink(SaltV2MasterVisitError::Visitor(impossible)) => match impossible {},
+        TensorVisitError::Sink(error) => error,
     }
 }
 
@@ -1396,12 +2018,28 @@ fn acquire_campaign_lock(path: &Path) -> Result<CampaignLock, Qwen36TensorWorkEr
 fn validate_expected_masters(
     masters: &[SaltV2MasterTensorSpec],
 ) -> Result<(), Qwen36TensorWorkError> {
-    let first = &masters[0];
+    if masters[0].evidence().track != SaltV2MasterTrack::Ptq {
+        return Err(Qwen36TensorWorkError::RefinedCampaignRequiresParent);
+    }
+    validate_expected_master_track(masters, SaltV2MasterTrack::Ptq)
+}
+
+fn validate_expected_master_track(
+    masters: &[SaltV2MasterTensorSpec],
+    track: SaltV2MasterTrack,
+) -> Result<(), Qwen36TensorWorkError> {
+    let first = masters
+        .first()
+        .ok_or(Qwen36TensorWorkError::WorkspaceMalformed(
+            "additive campaign tensor count",
+        ))?;
     let common_evidence = first.evidence();
     let common_geometry = first.geometry();
     let common_model = first.source_model_id();
-    if common_evidence.track != SaltV2MasterTrack::Ptq {
-        return Err(Qwen36TensorWorkError::RefinedCampaignRequiresParent);
+    if common_evidence.track != track {
+        return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+            "additive campaign track",
+        ));
     }
     for (ordinal, master) in masters.iter().enumerate() {
         let expected_ordinal = u64::try_from(ordinal)
@@ -1442,6 +2080,43 @@ fn validate_expected_masters(
         master
             .canonical_bytes()
             .map_err(Qwen36TensorWorkError::Master)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_scale_only_masters(
+    parent_specs: &[SaltV2MasterTensorSpec],
+    parent_masters: &[Qwen36AdditiveMasterReceipt],
+    children: &[SaltV2MasterTensorSpec],
+) -> Result<(), Qwen36TensorWorkError> {
+    if children.is_empty()
+        || children.len() > MAX_ACTIVE_TENSORS
+        || children.len() != parent_specs.len()
+        || children.len() != parent_masters.len()
+    {
+        return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+            "scale-only parent tensor count",
+        ));
+    }
+    validate_expected_master_track(children, SaltV2MasterTrack::ScaleOnly)?;
+    for ((parent, parent_receipt), child) in parent_specs.iter().zip(parent_masters).zip(children) {
+        if parent.evidence().track != SaltV2MasterTrack::Ptq
+            || child.evidence().parent_master_id != Some(parent_receipt.tensor_master_id())
+            || child.tensor_index() != parent.tensor_index()
+            || child.name() != parent.name()
+            || child.shape() != parent.shape()
+            || child.logical_coefficients() != parent.logical_coefficients()
+            || child.source_model_id() != parent.source_model_id()
+            || child.source_tensor_digest() != parent.source_tensor_digest()
+            || child.widened_source_digest() != parent.widened_source_digest()
+            || child.geometry() != parent.geometry()
+            || child.tile_count() != parent.tile_count()
+        {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only parent tensor binding",
+            ));
+        }
     }
     Ok(())
 }
@@ -1493,6 +2168,7 @@ fn encode_master_catalog(
     masters: &[SaltV2MasterTensorSpec],
 ) -> Result<Vec<u8>, Qwen36TensorWorkError> {
     let mut output = Vec::new();
+    reserve_catalog_append(&mut output, 8 + 2 + 2 + 4, "master catalog too large")?;
     output.extend_from_slice(&CATALOG_MAGIC);
     output.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     output.extend_from_slice(&0_u16.to_le_bytes());
@@ -1505,15 +2181,83 @@ fn encode_master_catalog(
             .map_err(Qwen36TensorWorkError::Master)?;
         let length = u32::try_from(bytes.len())
             .map_err(|_| Qwen36TensorWorkError::LengthOverflow("master metadata"))?;
+        reserve_catalog_append(
+            &mut output,
+            4_usize
+                .checked_add(bytes.len())
+                .ok_or(Qwen36TensorWorkError::LengthOverflow("master catalog"))?,
+            "master catalog too large",
+        )?;
         output.extend_from_slice(&length.to_le_bytes());
         output.extend_from_slice(&bytes);
     }
-    if output.len() > MAX_WORKSPACE_BYTES {
-        return Err(Qwen36TensorWorkError::WorkspaceMalformed(
-            "master catalog too large",
-        ));
+    Ok(output)
+}
+
+#[cfg(unix)]
+fn encode_scale_only_master_catalog(
+    parent: &Qwen36CompleteWorkspaceReceipt,
+    parent_masters: &[Qwen36AdditiveMasterReceipt],
+    parent_fixed_ids: &[[u8; 32]],
+    masters: &[SaltV2MasterTensorSpec],
+) -> Result<Vec<u8>, Qwen36TensorWorkError> {
+    let mut output = Vec::new();
+    reserve_catalog_append(
+        &mut output,
+        8 + 2 + 2 + (4 * 32) + 4,
+        "scale-only master catalog too large",
+    )?;
+    output.extend_from_slice(&SCALE_ONLY_CATALOG_MAGIC);
+    output.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    output.extend_from_slice(&0_u16.to_le_bytes());
+    output.extend_from_slice(parent.completion_id().as_bytes());
+    output.extend_from_slice(parent.base_workspace_id().as_bytes());
+    output.extend_from_slice(parent.campaign_id().as_bytes());
+    output.extend_from_slice(&parent.master_set_id());
+    let count = u32::try_from(masters.len())
+        .map_err(|_| Qwen36TensorWorkError::LengthOverflow("scale-only master catalog count"))?;
+    output.extend_from_slice(&count.to_le_bytes());
+    for ((parent_master, parent_fixed_id), master) in
+        parent_masters.iter().zip(parent_fixed_ids).zip(masters)
+    {
+        let bytes = master
+            .canonical_bytes()
+            .map_err(Qwen36TensorWorkError::Master)?;
+        let length = u32::try_from(bytes.len())
+            .map_err(|_| Qwen36TensorWorkError::LengthOverflow("scale-only master metadata"))?;
+        reserve_catalog_append(
+            &mut output,
+            (2_usize * 32)
+                .checked_add(4)
+                .and_then(|length| length.checked_add(bytes.len()))
+                .ok_or(Qwen36TensorWorkError::LengthOverflow(
+                    "scale-only master catalog",
+                ))?,
+            "scale-only master catalog too large",
+        )?;
+        output.extend_from_slice(&parent_master.tensor_master_id());
+        output.extend_from_slice(parent_fixed_id);
+        output.extend_from_slice(&length.to_le_bytes());
+        output.extend_from_slice(&bytes);
     }
     Ok(output)
+}
+
+fn reserve_catalog_append(
+    output: &mut Vec<u8>,
+    additional: usize,
+    too_large: &'static str,
+) -> Result<(), Qwen36TensorWorkError> {
+    let next = output
+        .len()
+        .checked_add(additional)
+        .ok_or(Qwen36TensorWorkError::LengthOverflow("master catalog"))?;
+    if next > MAX_WORKSPACE_BYTES {
+        return Err(Qwen36TensorWorkError::WorkspaceMalformed(too_large));
+    }
+    output
+        .try_reserve(additional)
+        .map_err(|_| Qwen36TensorWorkError::AllocationFailed)
 }
 
 #[cfg(unix)]
@@ -1747,6 +2491,37 @@ mod tests {
         .expect("valid fixture campaign")
     }
 
+    fn fixture_scale_only_master(
+        parent: &Qwen36AdditiveMasterReceipt,
+        name: &str,
+        source_digest: [u8; 32],
+        ordinal: u64,
+        widened_digest: [u8; 32],
+    ) -> SaltV2MasterTensorSpec {
+        SaltV2MasterTensorSpec::new(
+            name,
+            vec![1, 4],
+            ModelId::from_digest([11; 32]),
+            source_digest,
+            widened_digest,
+            ordinal,
+            SaltV2MasterEvidence {
+                recipe_id: [61; 32],
+                solver_id: [62; 32],
+                activation_digest: [63; 32],
+                curvature_digest: [if ordinal == 0 { 70 } else { 71 }; 32],
+                feedback_digest: None,
+                track: SaltV2MasterTrack::ScaleOnly,
+                parent_master_id: Some(parent.tensor_master_id()),
+            },
+            SaltV2MasterGeometry {
+                constraint: SaltV2FitConstraint::S34,
+                max_planes: 2,
+            },
+        )
+        .expect("valid scale-only fixture master")
+    }
+
     fn write_fixture_master(
         spec: &SaltV2MasterTensorSpec,
         writer: &mut TensorPayloadWriter<'_>,
@@ -1759,6 +2534,53 @@ mod tests {
         let planes = [
             SaltV2Plane::new(vec![-1, 0, 1, -1], vec![f16::from_f32(0.5)])?,
             SaltV2Plane::new(vec![1, -1, 0, 1], vec![f16::from_f32(0.25)])?,
+        ];
+        let mut encoder = SaltV2MasterTensorEncoder::new(spec, writer)?;
+        encoder.write_tile(admissible_planes, &losses, &planes)?;
+        encoder.finish()?;
+        Ok(())
+    }
+
+    fn write_scale_only_fixture_master(
+        spec: &SaltV2MasterTensorSpec,
+        writer: &mut TensorPayloadWriter<'_>,
+        admissible_planes: u8,
+    ) -> Result<(), SaltV2MasterError> {
+        write_scale_only_fixture_master_with_first_trits(spec, writer, admissible_planes, -1, 1)
+    }
+
+    fn write_scale_only_fixture_master_with_first_trit(
+        spec: &SaltV2MasterTensorSpec,
+        writer: &mut TensorPayloadWriter<'_>,
+        admissible_planes: u8,
+        first_trit: i8,
+    ) -> Result<(), SaltV2MasterError> {
+        write_scale_only_fixture_master_with_first_trits(
+            spec,
+            writer,
+            admissible_planes,
+            first_trit,
+            1,
+        )
+    }
+
+    fn write_scale_only_fixture_master_with_first_trits(
+        spec: &SaltV2MasterTensorSpec,
+        writer: &mut TensorPayloadWriter<'_>,
+        admissible_planes: u8,
+        first_plane_trit: i8,
+        second_plane_trit: i8,
+    ) -> Result<(), SaltV2MasterError> {
+        let losses = [
+            SaltV2PrefixLoss::new(3.0, 2.0)?,
+            SaltV2PrefixLoss::new(0.75, 0.25)?,
+        ];
+        let planes = [
+            SaltV2Plane::new(vec![first_plane_trit, 0, 1, -1], vec![f16::from_f32(0.625)])?,
+            SaltV2Plane::new(
+                vec![second_plane_trit, -1, 0, 1],
+                vec![f16::from_f32(0.375)],
+            )?,
         ];
         let mut encoder = SaltV2MasterTensorEncoder::new(spec, writer)?;
         encoder.write_tile(admissible_planes, &losses, &planes)?;
@@ -2181,6 +3003,230 @@ mod tests {
             Qwen36AdditiveCampaignSpec::new(vec![refined]),
             Err(Qwen36TensorWorkError::RefinedCampaignRequiresParent)
         ));
+    }
+
+    #[test]
+    fn sealed_ptq_campaign_admits_parent_bound_scale_only_campaign() {
+        let root = fixture_root("scale-only-open");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open base workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let parent_spec = fixture_campaign_spec();
+        let parent = base
+            .open_master_campaign(parent_spec.clone())
+            .expect("open PTQ parent campaign");
+        let mut parent_masters = Vec::new();
+        for (ordinal, expected) in parent_spec.expected_masters().iter().enumerate() {
+            parent_masters.push(
+                parent
+                    .install_master(expected, |writer| {
+                        write_fixture_master(expected, writer, if ordinal == 0 { 1 } else { 2 })
+                    })
+                    .expect("install PTQ parent master"),
+            );
+        }
+        let child_specs = vec![
+            fixture_scale_only_master(&parent_masters[0], "language.weight", [21; 32], 0, [51; 32]),
+            fixture_scale_only_master(&parent_masters[1], "mtp.weight", [22; 32], 1, [52; 32]),
+        ];
+        assert!(matches!(
+            parent.open_scale_only_campaign(child_specs.clone()),
+            Err(Qwen36TensorWorkError::MissingAdditiveArtifacts {
+                expected: 2,
+                present: 2
+            })
+        ));
+        let parent_completion = parent.seal_complete().expect("seal PTQ parent");
+
+        let child = parent
+            .open_scale_only_campaign(child_specs)
+            .expect("open parent-bound scale-only campaign");
+        assert_eq!(
+            child.parent_completion_id(),
+            parent_completion.completion_id()
+        );
+        assert_ne!(child.campaign_id(), parent.campaign_id());
+        assert!(matches!(
+            base.open_master_campaign(child.spec().clone()),
+            Err(Qwen36TensorWorkError::RefinedCampaignRequiresParent)
+        ));
+
+        drop(child);
+        drop(parent);
+        drop(base);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scale_only_campaign_accepts_new_losses_and_scales_with_fixed_trits() {
+        let root = fixture_root("scale-only-fixed-trits");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open base workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let parent_spec = fixture_campaign_spec();
+        let parent = base
+            .open_master_campaign(parent_spec.clone())
+            .expect("open PTQ parent campaign");
+        let mut parent_masters = Vec::new();
+        for (ordinal, expected) in parent_spec.expected_masters().iter().enumerate() {
+            parent_masters.push(
+                parent
+                    .install_master(expected, |writer| {
+                        write_fixture_master(expected, writer, if ordinal == 0 { 1 } else { 2 })
+                    })
+                    .expect("install PTQ parent master"),
+            );
+        }
+        parent.seal_complete().expect("seal PTQ parent");
+        let child_specs = vec![
+            fixture_scale_only_master(&parent_masters[0], "language.weight", [21; 32], 0, [51; 32]),
+            fixture_scale_only_master(&parent_masters[1], "mtp.weight", [22; 32], 1, [52; 32]),
+        ];
+        let child = parent
+            .open_scale_only_campaign(child_specs.clone())
+            .expect("open scale-only child");
+
+        for (ordinal, expected) in child_specs.iter().enumerate() {
+            let installed = child
+                .install_master(expected, |writer| {
+                    write_scale_only_fixture_master(
+                        expected,
+                        writer,
+                        if ordinal == 0 { 1 } else { 2 },
+                    )
+                })
+                .expect("install scale-only child master");
+            assert_ne!(
+                installed.tensor_master_id(),
+                parent_masters[ordinal].tensor_master_id()
+            );
+        }
+        assert_eq!(child.progress().unwrap().additive_present(), 2);
+        let completion = child.seal_complete().expect("seal scale-only child");
+        assert_eq!(completion, child.require_complete().unwrap());
+
+        let first = &child_specs[0];
+        fs::remove_file(child.campaign.slot_path(0, first.name()))
+            .expect("remove sealed child slot");
+        let producer_called = Cell::new(false);
+        assert!(matches!(
+            child.install_master(first, |writer| {
+                producer_called.set(true);
+                write_scale_only_fixture_master(first, writer, 1)
+            }),
+            Err(Qwen36AdditiveInstallError::Campaign(_))
+        ));
+        assert!(!producer_called.get());
+
+        let mut descriptor = child.campaign.descriptor_bytes.clone();
+        descriptor[0] ^= 0xff;
+        fs::write(child.campaign.descriptor_path(), descriptor).expect("tamper child descriptor");
+        assert!(matches!(
+            child.reopen_master("language.weight"),
+            Err(Qwen36TensorWorkError::ExistingArtifactMismatch(
+                "additive campaign descriptor"
+            ))
+        ));
+
+        drop(child);
+        drop(parent);
+        drop(base);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scale_only_campaign_rejects_changed_trits_and_prefixes_before_publication() {
+        let root = fixture_root("scale-only-structure-mismatch");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open base workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let parent_spec = fixture_campaign_spec();
+        let parent = base
+            .open_master_campaign(parent_spec.clone())
+            .expect("open PTQ parent campaign");
+        let mut parent_masters = Vec::new();
+        for (ordinal, expected) in parent_spec.expected_masters().iter().enumerate() {
+            parent_masters.push(
+                parent
+                    .install_master(expected, |writer| {
+                        write_fixture_master(expected, writer, if ordinal == 0 { 1 } else { 2 })
+                    })
+                    .expect("install PTQ parent master"),
+            );
+        }
+        parent.seal_complete().expect("seal PTQ parent");
+        let child_specs = vec![
+            fixture_scale_only_master(&parent_masters[0], "language.weight", [21; 32], 0, [51; 32]),
+            fixture_scale_only_master(&parent_masters[1], "mtp.weight", [22; 32], 1, [52; 32]),
+        ];
+        let child = parent
+            .open_scale_only_campaign(child_specs.clone())
+            .expect("open scale-only child");
+        let first = &child_specs[0];
+
+        assert!(matches!(
+            child.install_master(first, |writer| {
+                write_scale_only_fixture_master_with_first_trit(first, writer, 1, 1)
+            }),
+            Err(Qwen36AdditiveInstallError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch("scale-only fixed trits and prefixes")
+            ))
+        ));
+        assert!(matches!(
+            child.install_master(first, |writer| {
+                write_scale_only_fixture_master_with_first_trits(first, writer, 1, -1, -1)
+            }),
+            Err(Qwen36AdditiveInstallError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch("scale-only fixed trits and prefixes")
+            ))
+        ));
+        assert!(matches!(
+            child.install_master(first, |writer| {
+                write_scale_only_fixture_master(first, writer, 2)
+            }),
+            Err(Qwen36AdditiveInstallError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch("scale-only fixed trits and prefixes")
+            ))
+        ));
+        assert!(!child.campaign.slot_path(0, first.name()).exists());
+        assert_eq!(object_record_count(child.campaign.objects.objects_dir()), 0);
+        assert_eq!(
+            fs::read_dir(child.campaign.objects.temporary_dir())
+                .expect("read temporary directory")
+                .count(),
+            0
+        );
+        assert_eq!(child.progress().unwrap().additive_present(), 0);
+
+        let parent_completion_path = parent.completion_path();
+        assert!(matches!(
+            child.install_master(first, |writer| {
+                write_scale_only_fixture_master(first, writer, 1)?;
+                fs::write(&parent_completion_path, b"changed parent completion")
+                    .expect("tamper parent completion");
+                Ok::<(), SaltV2MasterError>(())
+            }),
+            Err(Qwen36AdditiveInstallError::Campaign(_))
+        ));
+        assert!(!child.campaign.slot_path(0, first.name()).exists());
+        assert_eq!(object_record_count(child.campaign.objects.objects_dir()), 0);
+        assert_eq!(
+            fs::read_dir(child.campaign.objects.temporary_dir())
+                .expect("read temporary directory")
+                .count(),
+            0
+        );
+
+        drop(child);
+        drop(parent);
+        drop(base);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

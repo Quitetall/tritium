@@ -514,6 +514,19 @@ impl TensorWorkStore {
     where
         V: TensorPayloadValidator,
     {
+        self.put_validated_checked(spec, validator, produce, || Ok(()))
+    }
+
+    pub(crate) fn put_validated_checked<P, V>(
+        &self,
+        spec: &TensorRecordSpec,
+        validator: V,
+        produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), P>,
+        prepublish: impl FnOnce() -> Result<(), V::Error>,
+    ) -> Result<(TensorRecordReceipt, V::Output), TensorValidatedPutError<P, V::Error>>
+    where
+        V: TensorPayloadValidator,
+    {
         let (temporary, mut staged) =
             self.prepare_temporary(spec, produce)
                 .map_err(|error| match error {
@@ -521,7 +534,13 @@ impl TensorWorkStore {
                     TensorPutError::Producer(error) => TensorValidatedPutError::Producer(error),
                 })?;
         let validation = validate_staged_record(&mut staged, validator)?;
-        self.commit_staged(&temporary, &staged)
+        self.sync_staged(&staged)
+            .map_err(TensorValidatedPutError::Store)?;
+        let path = self
+            .prepare_publish(&staged.receipt)
+            .map_err(TensorValidatedPutError::Store)?;
+        prepublish().map_err(TensorValidatedPutError::Validator)?;
+        self.publish_prepared(&temporary.0, &staged.receipt, &path)
             .map_err(TensorValidatedPutError::Store)?;
         Ok((staged.receipt, validation))
     }
@@ -545,11 +564,16 @@ impl TensorWorkStore {
         temporary: &TemporaryRecordGuard,
         staged: &StagedTensorRecord,
     ) -> Result<(), TensorWorkError> {
+        self.sync_staged(staged)?;
+        let path = self.prepare_publish(&staged.receipt)?;
+        self.publish_prepared(&temporary.0, &staged.receipt, &path)
+    }
+
+    fn sync_staged(&self, staged: &StagedTensorRecord) -> Result<(), TensorWorkError> {
         staged
             .file
             .sync_all()
-            .map_err(|error| work_io("sync temporary record", error))?;
-        self.publish(&temporary.0, &staged.receipt)
+            .map_err(|error| work_io("sync temporary record", error))
     }
 
     fn stage_temporary<E>(
@@ -615,21 +639,29 @@ impl TensorWorkStore {
         })
     }
 
-    fn publish(
-        &self,
-        temporary: &Path,
-        receipt: &TensorRecordReceipt,
-    ) -> Result<(), TensorWorkError> {
+    fn prepare_publish(&self, receipt: &TensorRecordReceipt) -> Result<PathBuf, TensorWorkError> {
         let path = self.record_path(receipt.record_id);
         let parent = path
             .parent()
             .ok_or(TensorWorkError::InvalidPath("record parent"))?;
         ensure_durable_directory(parent, "record prefix directory")?;
         sync_directory(&self.objects, "sync object directory")?;
-        match fs::hard_link(temporary, &path) {
+        Ok(path)
+    }
+
+    fn publish_prepared(
+        &self,
+        temporary: &Path,
+        receipt: &TensorRecordReceipt,
+        path: &Path,
+    ) -> Result<(), TensorWorkError> {
+        let parent = path
+            .parent()
+            .ok_or(TensorWorkError::InvalidPath("record parent"))?;
+        match fs::hard_link(temporary, path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let existing = open_and_verify(&path, receipt)?;
+                let existing = open_and_verify(path, receipt)?;
                 drop(existing);
             }
             Err(error) => return Err(work_io("publish tensor record", error)),
