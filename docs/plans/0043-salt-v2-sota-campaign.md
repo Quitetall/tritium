@@ -783,11 +783,19 @@ The following work deliberately remains open and keeps this plan in progress:
   language/MTP PTQ masters verify. Refined campaign admission still fails closed
   until it can bind a parent completion and prove that every child keeps the
   parent's trits, admissible prefixes, and allocation fixed. The production driver
-  must still stream fitter output directly into that store. Generic-record reopen
-  followed by SALT semantic decode currently reads each master twice, while an
-  exact-length invalid producer can leave an unreferenced CAS object; a fused
-  validation-aware single-pass writer/visitor plus orphan reclamation is required
-  before the 27B campaign;
+  must still stream fitter output directly into that store. CAS installation now
+  stages one exact record, fuses generic byte validation with canonical SALT
+  semantic decoding through the retained file handle, requires decoder completion
+  before sync/publication, and returns both generic and semantic receipts without
+  an install-time reopen. Strict campaign reopen/progress/seal paths use the same
+  one-pass verified visitor instead of reading each master twice, and sealing no
+  longer immediately repeats its just-completed full verification. Exclusive
+  campaign resume and pre-seal paths now mark canonical slot roots and reclaim
+  only canonical unreferenced objects, reject unknown object layouts before any
+  unlink, remove recognized crash-left slot temporaries, serialize same-handle
+  mutation, and never sweep a sealed namespace. Exact-length semantic failures
+  therefore publish neither CAS objects nor slots, while valid crash-window
+  orphans are deterministically reclaimed before the 27B campaign;
 - package/runtime scale geometry is G128-only; the G64/G256 promotion ablations
   require a versioned format/runtime field before they can enter the grid;
 - the equal-cost allocator is exact and scalable, including binary64 reduction

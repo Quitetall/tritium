@@ -1016,7 +1016,7 @@ pub enum Qwen36TensorWorkError {
     WorkspaceMismatch(&'static str),
     /// Existing immutable slot or manifest differed from expected exact bytes.
     ExistingArtifactMismatch(&'static str),
-    /// Another process currently owns the immutable additive campaign.
+    /// Another process or same-handle mutation currently owns the additive campaign.
     CampaignLocked,
     /// Refined work requires a parent campaign and fixed-trit verification.
     RefinedCampaignRequiresParent,
@@ -1063,7 +1063,7 @@ impl fmt::Display for Qwen36TensorWorkError {
                 write!(formatter, "existing Qwen3.6 {field} changed or is corrupt")
             }
             Self::CampaignLocked => {
-                formatter.write_str("Qwen3.6 additive campaign is already locked")
+                formatter.write_str("Qwen3.6 additive campaign is already locked or mutating")
             }
             Self::RefinedCampaignRequiresParent => formatter.write_str(
                 "Qwen3.6 refined campaign requires parent-bound fixed-trit verification",

@@ -4,6 +4,7 @@ use core::{convert::Infallible, fmt};
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::{
+    cell::Cell,
     error::Error,
     fs::{self, File},
     io,
@@ -13,18 +14,22 @@ use std::{
 use tritium_format::{
     ModelId,
     salt_v2_master::{
-        SALT_V2_MASTER_TENSOR_SCHEMA, SaltV2MasterTensorDecoder, SaltV2MasterTensorSpec,
-        SaltV2MasterTrack, SaltV2MasterVisitError,
+        SALT_V2_MASTER_TENSOR_SCHEMA, SaltV2MasterError, SaltV2MasterTensorDecoder,
+        SaltV2MasterTensorReceipt, SaltV2MasterTensorSpec, SaltV2MasterTrack,
+        SaltV2MasterVisitError,
     },
 };
 
 #[cfg(unix)]
 use crate::tensor_work_store::ensure_durable_directory;
 use crate::{
-    ContentId, Qwen36SourceIdentityStatus, TensorPayloadWriter, TensorPutError,
-    TensorRecordReceipt, TensorRecordSpec, TensorVisitError, TensorWorkStore,
+    ContentId, Qwen36SourceIdentityStatus, TensorPayloadValidator, TensorPayloadWriter,
+    TensorRecordReceipt, TensorRecordSpec, TensorValidatedPutError, TensorVisitError,
+    TensorWorkStore,
 };
 
+#[cfg(unix)]
+use super::sync_directory;
 use super::{
     CHECKSUM_BYTES, MAX_ACTIVE_TENSORS, MAX_WORKSPACE_BYTES, Qwen36LanguageMtpWorkspaceReceipt,
     Qwen36TensorWorkError, Qwen36TensorWorkStore, Qwen36TensorWorkSummary,
@@ -562,6 +567,7 @@ pub struct Qwen36AdditiveCampaignStore<'store, 'source> {
     campaign_id: ContentId,
     additive_coefficients: u64,
     directories: Vec<PinnedDirectory>,
+    mutation_active: Cell<bool>,
     _lock: CampaignLock,
 }
 
@@ -619,8 +625,14 @@ impl<'source> Qwen36TensorWorkStore<'source> {
             campaign_id,
             additive_coefficients,
             directories,
+            mutation_active: Cell::new(false),
             _lock: lock,
         };
+        campaign.ensure_current()?;
+        {
+            let _mutation = campaign.begin_mutation()?;
+            campaign.reclaim_unreferenced_objects()?;
+        }
         campaign.ensure_current()?;
         Ok(campaign)
     }
@@ -679,6 +691,9 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         spec: &SaltV2MasterTensorSpec,
         produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), E>,
     ) -> Result<Qwen36AdditiveMasterReceipt, Qwen36AdditiveInstallError<E>> {
+        let _mutation = self
+            .begin_mutation()
+            .map_err(Qwen36AdditiveInstallError::Campaign)?;
         self.ensure_current()
             .map_err(Qwen36AdditiveInstallError::Campaign)?;
         let ordinal = self
@@ -703,20 +718,27 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
             }
         }
         let record_spec = master_record_spec(spec).map_err(Qwen36AdditiveInstallError::Campaign)?;
-        let record = match self.objects.put(&record_spec, produce) {
-            Ok(record) => record,
-            Err(TensorPutError::Store(error)) => {
+        let validator = CanonicalMasterValidator(
+            SaltV2MasterTensorDecoder::new(spec)
+                .map_err(Qwen36TensorWorkError::Master)
+                .map_err(Qwen36AdditiveInstallError::Campaign)?,
+        );
+        let (record, master) = match self.objects.put_validated(&record_spec, validator, produce) {
+            Ok(validated) => validated,
+            Err(TensorValidatedPutError::Store(error)) => {
                 return Err(Qwen36AdditiveInstallError::Campaign(
                     Qwen36TensorWorkError::TensorStore(error),
                 ));
             }
-            Err(TensorPutError::Producer(error)) => {
+            Err(TensorValidatedPutError::Producer(error)) => {
                 return Err(Qwen36AdditiveInstallError::Producer(error));
             }
+            Err(TensorValidatedPutError::Validator(error)) => {
+                return Err(Qwen36AdditiveInstallError::Campaign(
+                    Qwen36TensorWorkError::Master(error),
+                ));
+            }
         };
-        let master = self
-            .verify_record(&record, spec)
-            .map_err(Qwen36AdditiveInstallError::Campaign)?;
         let receipt = Qwen36AdditiveMasterReceipt::new(
             self.campaign_id,
             ordinal as u64,
@@ -730,9 +752,6 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         self.ensure_current()
             .map_err(Qwen36AdditiveInstallError::Campaign)?;
         persist_exact(&slot_path, &bytes, "additive master slot")
-            .map_err(Qwen36AdditiveInstallError::Campaign)?;
-        let receipt = self
-            .reopen_slot(ordinal, spec)
             .map_err(Qwen36AdditiveInstallError::Campaign)?;
         self.ensure_current()
             .map_err(Qwen36AdditiveInstallError::Campaign)?;
@@ -799,7 +818,9 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
     /// Returns [`Qwen36TensorWorkError::MissingAdditiveArtifacts`] while any slot
     /// is absent, or another validation/publication error for changed bytes.
     pub fn seal_complete(&self) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
+        let _mutation = self.begin_mutation()?;
         self.ensure_current()?;
+        self.reclaim_unreferenced_objects()?;
         let mut masters = Vec::new();
         masters
             .try_reserve_exact(self.spec.expected_masters.len())
@@ -839,7 +860,8 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
             &bytes,
             "complete additive workspace",
         )?;
-        self.require_complete()
+        self.ensure_current()?;
+        manifest.receipt(&bytes)
     }
 
     /// Strictly reopen the completion seal and every referenced canonical master.
@@ -919,6 +941,13 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         self.root.join(CAMPAIGN_FILE)
     }
 
+    fn begin_mutation(&self) -> Result<CampaignMutationGuard<'_>, Qwen36TensorWorkError> {
+        if self.mutation_active.replace(true) {
+            return Err(Qwen36TensorWorkError::CampaignLocked);
+        }
+        Ok(CampaignMutationGuard(&self.mutation_active))
+    }
+
     fn completion_path(&self) -> PathBuf {
         self.root.join(COMPLETION_FILE)
     }
@@ -938,6 +967,21 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
     }
 
     fn reopen_slot(
+        &self,
+        ordinal: usize,
+        expected: &SaltV2MasterTensorSpec,
+    ) -> Result<Qwen36AdditiveMasterReceipt, Qwen36TensorWorkError> {
+        let receipt = self.reopen_slot_receipt(ordinal, expected)?;
+        let master = self.verify_record(&receipt.record, expected)?;
+        if master.tensor_master_id() != receipt.tensor_master_id {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "additive tensor master identity",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    fn reopen_slot_receipt(
         &self,
         ordinal: usize,
         expected: &SaltV2MasterTensorSpec,
@@ -962,13 +1006,90 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
                 "additive master slot binding",
             ));
         }
-        let master = self.verify_record(&receipt.record, expected)?;
-        if master.tensor_master_id() != receipt.tensor_master_id {
-            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
-                "additive tensor master identity",
-            ));
-        }
+        validate_record_descriptor(&receipt.record, expected)?;
         Ok(receipt)
+    }
+
+    #[cfg(unix)]
+    fn reclaim_unreferenced_objects(&self) -> Result<(), Qwen36TensorWorkError> {
+        match fs::symlink_metadata(self.completion_path()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(Qwen36TensorWorkError::InvalidPath(
+                    "complete additive workspace",
+                ));
+            }
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(work_io("inspect completion seal", error)),
+        }
+        self.ensure_current()?;
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(self.spec.expected_masters.len())
+            .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+        let mut known_slots = Vec::new();
+        known_slots
+            .try_reserve_exact(self.spec.expected_masters.len())
+            .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+        for (ordinal, expected) in self.spec.expected_masters.iter().enumerate() {
+            let path = self.slot_path(ordinal, expected.name());
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let receipt = self.reopen_slot_receipt(ordinal, expected)?;
+                    retained.push(receipt.record.record_id());
+                    known_slots.push(path);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(work_io("inspect additive master slot", error)),
+            }
+        }
+        let mut stale_slot_temporaries = Vec::new();
+        let entries = fs::read_dir(&self.slots)
+            .map_err(|error| work_io("read additive slot directory", error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| work_io("read additive slot entry", error))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| work_io("inspect additive slot entry", error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(Qwen36TensorWorkError::InvalidPath("additive slot entry"));
+            }
+            if known_slots.contains(&path) {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| Qwen36TensorWorkError::InvalidPath("additive slot name"))?;
+            if !recognized_slot_temporary(&name) {
+                return Err(Qwen36TensorWorkError::ExistingArtifactMismatch(
+                    "additive slot namespace",
+                ));
+            }
+            stale_slot_temporaries
+                .try_reserve(1)
+                .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+            stale_slot_temporaries.push(path);
+        }
+        let orphan_sweep = self
+            .objects
+            .prepare_unreferenced_scavenge(&retained)
+            .map_err(Qwen36TensorWorkError::TensorStore)?;
+        for temporary in stale_slot_temporaries {
+            fs::remove_file(&temporary)
+                .map_err(|error| work_io("remove stale additive slot temporary", error))?;
+            sync_directory(&self.slots, "sync scavenged additive slot directory")?;
+        }
+        self.objects
+            .commit_unreferenced_scavenge(orphan_sweep)
+            .map_err(Qwen36TensorWorkError::TensorStore)?;
+        self.ensure_current()?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn reclaim_unreferenced_objects(&self) -> Result<(), Qwen36TensorWorkError> {
+        Err(Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform)
     }
 
     fn verify_record(
@@ -977,22 +1098,11 @@ impl Qwen36AdditiveCampaignStore<'_, '_> {
         expected: &SaltV2MasterTensorSpec,
     ) -> Result<tritium_format::salt_v2_master::SaltV2MasterTensorReceipt, Qwen36TensorWorkError>
     {
-        let inner = SaltV2MasterTensorSpec::from_canonical_bytes(record.info().schema_metadata())
-            .map_err(Qwen36TensorWorkError::Master)?;
-        let record_spec = master_record_spec(expected)?;
-        if inner != *expected || !record.matches_spec(&record_spec) {
-            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
-                "additive master record descriptor",
-            ));
-        }
-        let mut reader = self
-            .objects
-            .open_verified(record)
-            .map_err(Qwen36TensorWorkError::TensorStore)?;
+        validate_record_descriptor(record, expected)?;
         let mut decoder =
             SaltV2MasterTensorDecoder::new(expected).map_err(Qwen36TensorWorkError::Master)?;
-        reader
-            .try_visit_payload(MASTER_STREAM_CHUNK_BYTES, |chunk| {
+        self.objects
+            .try_visit_verified(record, MASTER_STREAM_CHUNK_BYTES, |chunk| {
                 decoder.try_push(chunk, &mut |_| Ok::<(), Infallible>(()))
             })
             .map_err(map_master_visit_error)?;
@@ -1119,6 +1229,54 @@ fn master_record_spec(
     .map_err(Qwen36TensorWorkError::TensorStore)
 }
 
+fn validate_record_descriptor(
+    record: &TensorRecordReceipt,
+    expected: &SaltV2MasterTensorSpec,
+) -> Result<(), Qwen36TensorWorkError> {
+    let inner = SaltV2MasterTensorSpec::from_canonical_bytes(record.info().schema_metadata())
+        .map_err(Qwen36TensorWorkError::Master)?;
+    let record_spec = master_record_spec(expected)?;
+    if inner != *expected || !record.matches_spec(&record_spec) {
+        return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+            "additive master record descriptor",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recognized_slot_temporary(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(".additive-master-slot.tmp.") else {
+        return false;
+    };
+    let mut fields = suffix.split('.');
+    (0..3).all(|_| {
+        fields.next().is_some_and(|field| {
+            !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }) && fields.next().is_none()
+}
+
+struct CanonicalMasterValidator<'a>(SaltV2MasterTensorDecoder<'a>);
+
+impl TensorPayloadValidator for CanonicalMasterValidator<'_> {
+    type Error = SaltV2MasterError;
+    type Output = SaltV2MasterTensorReceipt;
+
+    fn try_push(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0
+            .try_push(bytes, &mut |_| Ok::<(), Infallible>(()))
+            .map_err(|error| match error {
+                SaltV2MasterVisitError::Master(error) => error,
+                SaltV2MasterVisitError::Visitor(impossible) => match impossible {},
+            })
+    }
+
+    fn finish(self) -> Result<Self::Output, Self::Error> {
+        self.0.finish()
+    }
+}
+
 fn map_master_visit_error(
     error: TensorVisitError<SaltV2MasterVisitError<Infallible>>,
 ) -> Qwen36TensorWorkError {
@@ -1148,6 +1306,15 @@ fn derive_master_set_id(
         hasher.update(&master.tensor_master_id);
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+#[derive(Debug)]
+struct CampaignMutationGuard<'a>(&'a Cell<bool>);
+
+impl Drop for CampaignMutationGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 #[derive(Debug)]
@@ -1607,6 +1774,22 @@ mod tests {
         ))
     }
 
+    fn object_record_count(objects: &Path) -> usize {
+        fs::read_dir(objects)
+            .expect("read object directory")
+            .map(|entry| {
+                let entry = entry.expect("read object entry");
+                if entry.file_type().expect("inspect object entry").is_dir() {
+                    fs::read_dir(entry.path())
+                        .expect("read object prefix")
+                        .count()
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
     fn seal_fixture_in_order(label: &str, order: [usize; 2]) -> Qwen36CompleteWorkspaceReceipt {
         let root = fixture_root(label);
         let _ = fs::remove_dir_all(&root);
@@ -1781,6 +1964,13 @@ mod tests {
             ))
         ));
         assert!(!campaign.slot_path(0, expected.name()).exists());
+        assert_eq!(object_record_count(campaign.objects.objects_dir()), 0);
+        assert_eq!(
+            fs::read_dir(campaign.objects.temporary_dir())
+                .expect("read temporary directory")
+                .count(),
+            0
+        );
         assert_eq!(campaign.progress().unwrap().additive_present(), 0);
 
         let mut descriptor = campaign.descriptor_bytes.clone();
@@ -1792,6 +1982,106 @@ mod tests {
                 "additive campaign descriptor"
             ))
         ));
+
+        drop(campaign);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn campaign_reclaims_crash_orphans_without_touching_referenced_masters() {
+        let root = fixture_root("orphan-reclamation");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open base workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let campaign_spec = fixture_campaign_spec();
+        let campaign = base
+            .open_master_campaign(campaign_spec.clone())
+            .expect("open additive campaign");
+        let first = campaign
+            .install_master(&campaign_spec.expected_masters()[0], |writer| {
+                assert!(matches!(
+                    campaign.seal_complete(),
+                    Err(Qwen36TensorWorkError::CampaignLocked)
+                ));
+                write_fixture_master(&campaign_spec.expected_masters()[0], writer, 1)
+            })
+            .expect("install referenced master");
+        let first_path = campaign.objects.record_path(first.record.record_id());
+        let orphan_spec =
+            master_record_spec(&campaign_spec.expected_masters()[1]).expect("orphan record spec");
+        let orphan = campaign
+            .objects
+            .put(&orphan_spec, |writer| {
+                write_fixture_master(&campaign_spec.expected_masters()[1], writer, 2)
+            })
+            .expect("publish crash-window orphan");
+        let orphan_path = campaign.objects.record_path(orphan.record_id());
+        let stale_slot_temporary = campaign.slots.join(".additive-master-slot.tmp.1.2.3");
+        fs::write(&stale_slot_temporary, b"partial slot").expect("write stale slot temporary");
+        assert_eq!(object_record_count(campaign.objects.objects_dir()), 2);
+        drop(campaign);
+
+        let campaign = base
+            .open_master_campaign(campaign_spec.clone())
+            .expect("reopen and reclaim campaign");
+        assert!(first_path.exists());
+        assert!(!orphan_path.exists());
+        assert!(!stale_slot_temporary.exists());
+        assert_eq!(object_record_count(campaign.objects.objects_dir()), 1);
+        assert_eq!(campaign.reopen_master("language.weight").unwrap(), first);
+        assert_eq!(campaign.progress().unwrap().additive_present(), 1);
+
+        drop(campaign);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_object_layout_aborts_reclamation_before_any_unlink() {
+        let root = fixture_root("orphan-reclamation-fail-closed");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open base workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let campaign_spec = fixture_campaign_spec();
+        let campaign = base
+            .open_master_campaign(campaign_spec.clone())
+            .expect("open additive campaign");
+        let mut orphan_paths = Vec::new();
+        for (ordinal, expected) in campaign_spec.expected_masters().iter().enumerate() {
+            let record_spec = master_record_spec(expected).expect("orphan record spec");
+            let orphan = campaign
+                .objects
+                .put(&record_spec, |writer| {
+                    write_fixture_master(expected, writer, if ordinal == 0 { 1 } else { 2 })
+                })
+                .expect("publish crash-window orphan");
+            orphan_paths.push(campaign.objects.record_path(orphan.record_id()));
+        }
+        let unknown = campaign.objects.objects_dir().join("not-a-prefix");
+        fs::write(&unknown, b"unknown object layout").expect("write unknown object entry");
+        let stale_slot_temporary = campaign.slots.join(".additive-master-slot.tmp.1.2.3");
+        fs::write(&stale_slot_temporary, b"partial slot").expect("write stale slot temporary");
+        drop(campaign);
+
+        assert!(matches!(
+            base.open_master_campaign(campaign_spec.clone()),
+            Err(Qwen36TensorWorkError::TensorStore(
+                crate::TensorWorkError::InvalidPath("record prefix directory")
+            ))
+        ));
+        assert!(orphan_paths.iter().all(|path| path.exists()));
+        assert!(stale_slot_temporary.exists());
+
+        fs::remove_file(unknown).expect("remove unknown object entry");
+        let campaign = base
+            .open_master_campaign(campaign_spec)
+            .expect("retry canonical reclamation");
+        assert!(orphan_paths.iter().all(|path| !path.exists()));
+        assert!(!stale_slot_temporary.exists());
+        assert_eq!(object_record_count(campaign.objects.objects_dir()), 0);
 
         drop(campaign);
         let _ = fs::remove_dir_all(root);

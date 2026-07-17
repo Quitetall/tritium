@@ -1,6 +1,6 @@
 //! Immutable, streaming, per-tensor work records for large synthesis campaigns.
 
-use core::fmt;
+use core::{convert::Infallible, fmt};
 use std::{
     error::Error,
     fs::{self, File, OpenOptions},
@@ -26,6 +26,8 @@ const PAYLOAD_DIGEST_CONTEXT: &str = "tritium tensor work payload v1";
 const OBJECT_DIRECTORY: &str = "objects";
 const TEMP_DIRECTORY: &str = ".tmp";
 const RECORD_EXTENSION: &str = "twr";
+#[cfg(unix)]
+const CONTENT_ID_TEXT_PREFIX: &str = "tsc1_";
 const MAX_NAME_BYTES: usize = 64 * 1024;
 const MAX_RANK: usize = 32;
 const MAX_SCHEMA_METADATA_BYTES: usize = 16 * 1024 * 1024;
@@ -280,6 +282,30 @@ impl TensorRecordReceipt {
     }
 }
 
+/// Streaming semantic validator used by [`TensorWorkStore::put_validated`].
+///
+/// `try_push` receives the persisted payload in bounded chunks. `finish` must
+/// enforce every terminal invariant and returns the semantic receipt or other
+/// caller-owned validation result bound to those exact bytes.
+pub trait TensorPayloadValidator {
+    /// Semantic result returned after complete validation.
+    type Output;
+    /// Typed semantic validation failure.
+    type Error;
+
+    /// Consume one nonempty payload chunk in canonical byte order.
+    ///
+    /// # Errors
+    /// Returns the validator's typed semantic failure.
+    fn try_push(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+
+    /// Complete validation after the declared payload length was consumed.
+    ///
+    /// # Errors
+    /// Returns the validator's typed terminal semantic failure.
+    fn finish(self) -> Result<Self::Output, Self::Error>;
+}
+
 /// Filesystem-backed immutable tensor-object store.
 #[derive(Debug)]
 pub struct TensorWorkStore {
@@ -360,6 +386,86 @@ impl TensorWorkStore {
         Ok(removed)
     }
 
+    /// Validate the complete object layout and prepare unreferenced removals.
+    ///
+    /// Caller must hold exclusive ownership of this store and prove that
+    /// `retained` contains every live record. The complete object layout is
+    /// validated without unlinking anything.
+    #[cfg(unix)]
+    pub(crate) fn prepare_unreferenced_scavenge(
+        &self,
+        retained: &[ContentId],
+    ) -> Result<TensorOrphanSweep, TensorWorkError> {
+        let mut orphans = Vec::new();
+        let prefixes = fs::read_dir(&self.objects)
+            .map_err(|error| work_io("read record object directory", error))?;
+        for prefix in prefixes {
+            let prefix = prefix.map_err(|error| work_io("read record prefix entry", error))?;
+            let prefix_path = prefix.path();
+            let prefix_metadata = fs::symlink_metadata(&prefix_path)
+                .map_err(|error| work_io("inspect record prefix", error))?;
+            if prefix_metadata.file_type().is_symlink() || !prefix_metadata.is_dir() {
+                return Err(TensorWorkError::InvalidPath("record prefix directory"));
+            }
+            let prefix_name = prefix
+                .file_name()
+                .into_string()
+                .map_err(|_| TensorWorkError::InvalidPath("record prefix name"))?;
+            if !canonical_record_prefix(&prefix_name) {
+                return Err(TensorWorkError::InvalidPath("record prefix name"));
+            }
+            let records = fs::read_dir(&prefix_path)
+                .map_err(|error| work_io("read record prefix directory", error))?;
+            for record in records {
+                let record = record.map_err(|error| work_io("read record entry", error))?;
+                let path = record.path();
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|error| work_io("inspect record entry", error))?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(TensorWorkError::InvalidPath("record object"));
+                }
+                let name = record
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| TensorWorkError::InvalidPath("record object name"))?;
+                let record_id = canonical_record_id(&prefix_name, &name)
+                    .ok_or(TensorWorkError::InvalidPath("record object name"))?;
+                if retained.contains(&record_id) {
+                    continue;
+                }
+                orphans
+                    .try_reserve(1)
+                    .map_err(|_| TensorWorkError::AllocationFailed)?;
+                orphans.push(OrphanRecord {
+                    path,
+                    parent: prefix_path.clone(),
+                    metadata,
+                });
+            }
+        }
+        validate_orphan_records(&orphans)?;
+        Ok(TensorOrphanSweep { orphans })
+    }
+
+    /// Commit a previously validated orphan sweep.
+    ///
+    /// Caller must retain exclusive ownership from preparation through commit.
+    /// Every captured inode is revalidated before the first object unlink so a
+    /// stale sweep fails closed. Empty canonical prefix directories remain.
+    #[cfg(unix)]
+    pub(crate) fn commit_unreferenced_scavenge(
+        &self,
+        sweep: TensorOrphanSweep,
+    ) -> Result<(), TensorWorkError> {
+        validate_orphan_records(&sweep.orphans)?;
+        for orphan in sweep.orphans {
+            fs::remove_file(&orphan.path)
+                .map_err(|error| work_io("remove orphan record", error))?;
+            sync_directory(&orphan.parent, "sync reclaimed record prefix")?;
+        }
+        Ok(())
+    }
+
     /// Stream and immutably publish one exact tensor record.
     ///
     /// The producer may write in arbitrary chunk sizes but must write exactly
@@ -367,6 +473,8 @@ impl TensorWorkStore {
     /// leave no newly published record. Publication itself is atomic. A cleanup
     /// or durability error after the no-replace link succeeds may return an error
     /// with the exact record already visible; retrying the same put is idempotent.
+    /// A writer-recorded overrun or I/O failure takes precedence over a producer
+    /// error returned after that same failed write.
     ///
     /// # Errors
     /// Returns [`TensorPutError::Producer`] without erasing the producer's typed
@@ -377,27 +485,83 @@ impl TensorWorkStore {
         spec: &TensorRecordSpec,
         produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), E>,
     ) -> Result<TensorRecordReceipt, TensorPutError<E>> {
+        let (temporary, staged) = self.prepare_temporary(spec, produce)?;
+        self.commit_staged(&temporary, &staged)
+            .map_err(TensorPutError::Store)?;
+        Ok(staged.receipt)
+    }
+
+    /// Stream, validate, and immutably publish one exact tensor record.
+    ///
+    /// Validation reads the complete staged record once through the retained
+    /// temporary-file handle. The validator sees each payload byte exactly once,
+    /// and its terminal result is required before file sync or CAS publication.
+    /// Producer, length, store, or validation failure leaves no published object.
+    /// A writer-recorded overrun or I/O failure takes precedence over a producer
+    /// error returned after that same failed write.
+    ///
+    /// # Errors
+    /// Returns [`TensorValidatedPutError::Producer`] or
+    /// [`TensorValidatedPutError::Validator`] without erasing either typed error,
+    /// and [`TensorValidatedPutError::Store`] for framing, length, I/O,
+    /// validation-read, publication, or existing-object failures.
+    pub fn put_validated<P, V>(
+        &self,
+        spec: &TensorRecordSpec,
+        validator: V,
+        produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), P>,
+    ) -> Result<(TensorRecordReceipt, V::Output), TensorValidatedPutError<P, V::Error>>
+    where
+        V: TensorPayloadValidator,
+    {
+        let (temporary, mut staged) =
+            self.prepare_temporary(spec, produce)
+                .map_err(|error| match error {
+                    TensorPutError::Store(error) => TensorValidatedPutError::Store(error),
+                    TensorPutError::Producer(error) => TensorValidatedPutError::Producer(error),
+                })?;
+        let validation = validate_staged_record(&mut staged, validator)?;
+        self.commit_staged(&temporary, &staged)
+            .map_err(TensorValidatedPutError::Store)?;
+        Ok((staged.receipt, validation))
+    }
+
+    fn prepare_temporary<E>(
+        &self,
+        spec: &TensorRecordSpec,
+        produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), E>,
+    ) -> Result<(TemporaryRecordGuard, StagedTensorRecord), TensorPutError<E>> {
         validate_info(&spec.0).map_err(TensorPutError::Store)?;
         let record_bytes = exact_record_bytes(&spec.0).map_err(TensorPutError::Store)?;
         let (temporary, file) =
             create_temporary_file(&self.temporary, "record.tmp").map_err(TensorPutError::Store)?;
-        let result = self.write_temporary(file, &temporary, spec, record_bytes, produce);
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        let temporary = TemporaryRecordGuard(temporary);
+        let staged = self.stage_temporary(file, spec, record_bytes, produce)?;
+        Ok((temporary, staged))
     }
 
-    fn write_temporary<E>(
+    fn commit_staged(
+        &self,
+        temporary: &TemporaryRecordGuard,
+        staged: &StagedTensorRecord,
+    ) -> Result<(), TensorWorkError> {
+        staged
+            .file
+            .sync_all()
+            .map_err(|error| work_io("sync temporary record", error))?;
+        self.publish(&temporary.0, &staged.receipt)
+    }
+
+    fn stage_temporary<E>(
         &self,
         file: File,
-        temporary: &Path,
         spec: &TensorRecordSpec,
         record_bytes: u64,
         produce: impl FnOnce(&mut TensorPayloadWriter<'_>) -> Result<(), E>,
-    ) -> Result<TensorRecordReceipt, TensorPutError<E>> {
+    ) -> Result<StagedTensorRecord, TensorPutError<E>> {
         let mut sink = RecordSink::new(file);
         write_record_prefix(&mut sink, &spec.0, record_bytes).map_err(TensorPutError::Store)?;
+        let payload_offset = sink.written;
         let mut payload_writer = TensorPayloadWriter::new(&mut sink, spec.payload_bytes());
         let produced = produce(&mut payload_writer);
         let actual = payload_writer.written;
@@ -405,9 +569,6 @@ impl TensorWorkStore {
         let ignored_io_failure = payload_writer.io_failure;
         let payload_digest = *payload_writer.payload_hasher.finalize().as_bytes();
         drop(payload_writer);
-        if let Err(error) = produced {
-            return Err(TensorPutError::Producer(error));
-        }
         if overrun {
             return Err(TensorPutError::Store(TensorWorkError::PayloadOverrun {
                 expected: spec.payload_bytes(),
@@ -418,6 +579,9 @@ impl TensorWorkStore {
                 operation: "write record payload",
                 kind,
             }));
+        }
+        if let Err(error) = produced {
+            return Err(TensorPutError::Producer(error));
         }
         if actual != spec.payload_bytes() {
             return Err(TensorPutError::Store(
@@ -438,17 +602,17 @@ impl TensorWorkStore {
                 },
             ));
         }
-        file.sync_all()
-            .map_err(|error| TensorPutError::Store(work_io("sync temporary record", error)))?;
         let receipt = TensorRecordReceipt {
             record_id,
             record_bytes,
             payload_digest,
             info: spec.0.clone(),
         };
-        self.publish(temporary, &receipt)
-            .map_err(TensorPutError::Store)?;
-        Ok(receipt)
+        Ok(StagedTensorRecord {
+            file,
+            receipt,
+            payload_offset,
+        })
     }
 
     fn publish(
@@ -465,7 +629,7 @@ impl TensorWorkStore {
         match fs::hard_link(temporary, &path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let existing = open_and_verify(&path, Some(receipt))?;
+                let existing = open_and_verify(&path, receipt)?;
                 drop(existing);
             }
             Err(error) => return Err(work_io("publish tensor record", error)),
@@ -488,7 +652,31 @@ impl TensorWorkStore {
         &self,
         receipt: &TensorRecordReceipt,
     ) -> Result<TensorRecordReader, TensorWorkError> {
-        open_and_verify(&self.record_path(receipt.record_id), Some(receipt))
+        open_and_verify(&self.record_path(receipt.record_id), receipt)
+    }
+
+    /// Open and validate one exact record while visiting its payload once.
+    ///
+    /// Generic framing, descriptor, payload digest, content ID, exact length,
+    /// path identity, and same-handle terminal length are checked in the same
+    /// pass that invokes `visit`. Callback side effects are nontransactional
+    /// because final mutation detection necessarily occurs after the last
+    /// callback.
+    ///
+    /// # Errors
+    /// Returns [`TensorVisitError::Store`] for path, record, receipt, mutation,
+    /// or chunk-size failure and [`TensorVisitError::Sink`] without erasing the
+    /// visitor's typed failure.
+    pub fn try_visit_verified<E>(
+        &self,
+        receipt: &TensorRecordReceipt,
+        max_chunk_bytes: usize,
+        visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), TensorVisitError<E>> {
+        let mut file =
+            open_record_handle(&self.record_path(receipt.record_id), receipt.record_bytes)
+                .map_err(TensorVisitError::Store)?;
+        visit_verified_file(&mut file, receipt, None, max_chunk_bytes, visit).map(|_| ())
     }
 }
 
@@ -601,86 +789,16 @@ impl TensorRecordReader {
     pub fn try_visit_payload<E>(
         &mut self,
         max_chunk_bytes: usize,
-        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+        visit: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<(), TensorVisitError<E>> {
-        if max_chunk_bytes == 0 {
-            return Err(TensorVisitError::Store(TensorWorkError::InvalidChunkSize));
-        }
-        let before = self
-            .file
-            .metadata()
-            .map_err(|error| TensorVisitError::Store(work_io("inspect tensor record", error)))?
-            .len();
-        if before != self.receipt.record_bytes {
-            return Err(TensorVisitError::Store(
-                TensorWorkError::RecordLengthMismatch {
-                    expected: self.receipt.record_bytes,
-                    actual: before,
-                },
-            ));
-        }
-        self.file
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| TensorVisitError::Store(work_io("seek tensor record", error)))?;
-        let mut reader = HashingReader::new(&mut self.file);
-        let prefix = read_record_prefix(&mut reader).map_err(TensorVisitError::Store)?;
-        if prefix.info != self.receipt.info
-            || prefix.total_bytes != self.receipt.record_bytes
-            || prefix.payload_offset != self.payload_offset
-        {
-            return Err(TensorVisitError::Store(TensorWorkError::ReceiptMismatch));
-        }
-        let chunk_bytes = max_chunk_bytes.min(MAX_STAGING_BYTES);
-        let mut staging = Vec::new();
-        staging
-            .try_reserve_exact(chunk_bytes)
-            .map_err(|_| TensorVisitError::Store(TensorWorkError::AllocationFailed))?;
-        staging.resize(chunk_bytes, 0);
-        let mut remaining = prefix.info.payload_bytes;
-        let mut payload_hasher = blake3::Hasher::new_derive_key(PAYLOAD_DIGEST_CONTEXT);
-        while remaining != 0 {
-            let count = usize::try_from(remaining.min(chunk_bytes as u64))
-                .map_err(|_| TensorVisitError::Store(TensorWorkError::LengthOverflow))?;
-            reader
-                .read_exact(&mut staging[..count])
-                .map_err(TensorVisitError::Store)?;
-            payload_hasher.update(&staging[..count]);
-            visit(&staging[..count]).map_err(TensorVisitError::Sink)?;
-            remaining -= count as u64;
-        }
-        let footer = reader.digest().map_err(TensorVisitError::Store)?;
-        let actual_payload_digest = *payload_hasher.finalize().as_bytes();
-        if footer != actual_payload_digest || footer != self.receipt.payload_digest {
-            return Err(TensorVisitError::Store(
-                TensorWorkError::PayloadDigestMismatch,
-            ));
-        }
-        if reader.position != prefix.total_bytes {
-            return Err(TensorVisitError::Store(
-                TensorWorkError::RecordLengthMismatch {
-                    expected: prefix.total_bytes,
-                    actual: reader.position,
-                },
-            ));
-        }
-        let record_id = reader.finish();
-        if record_id != self.receipt.record_id {
-            return Err(TensorVisitError::Store(TensorWorkError::RecordIdMismatch));
-        }
-        let after = self
-            .file
-            .metadata()
-            .map_err(|error| TensorVisitError::Store(work_io("reinspect tensor record", error)))?
-            .len();
-        if after != before {
-            return Err(TensorVisitError::Store(
-                TensorWorkError::RecordLengthMismatch {
-                    expected: before,
-                    actual: after,
-                },
-            ));
-        }
-        Ok(())
+        visit_verified_file(
+            &mut self.file,
+            &self.receipt,
+            Some(self.payload_offset),
+            max_chunk_bytes,
+            visit,
+        )
+        .map(|_| ())
     }
 }
 
@@ -810,6 +928,38 @@ impl<E: Error + 'static> Error for TensorPutError<E> {
     }
 }
 
+/// Failure from [`TensorWorkStore::put_validated`] retaining typed producer and validator errors.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TensorValidatedPutError<P, V> {
+    /// Store, framing, length, validation-read, I/O, or publication failure.
+    Store(TensorWorkError),
+    /// Caller-provided producer stopped before complete staging.
+    Producer(P),
+    /// Caller-provided semantic validator rejected the exact staged payload.
+    Validator(V),
+}
+
+impl<P: fmt::Display, V: fmt::Display> fmt::Display for TensorValidatedPutError<P, V> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "validated tensor store put failed: {error}"),
+            Self::Producer(error) => write!(formatter, "tensor payload producer failed: {error}"),
+            Self::Validator(error) => write!(formatter, "tensor payload validator failed: {error}"),
+        }
+    }
+}
+
+impl<P: Error + 'static, V: Error + 'static> Error for TensorValidatedPutError<P, V> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Producer(error) => Some(error),
+            Self::Validator(error) => Some(error),
+        }
+    }
+}
+
 /// Failure while streaming a verified record payload to a typed sink.
 #[derive(Debug)]
 pub enum TensorVisitError<E> {
@@ -835,6 +985,52 @@ impl<E: Error + 'static> Error for TensorVisitError<E> {
             Self::Sink(error) => Some(error),
         }
     }
+}
+
+#[derive(Debug)]
+struct TemporaryRecordGuard(PathBuf);
+
+impl Drop for TemporaryRecordGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Debug)]
+struct StagedTensorRecord {
+    file: File,
+    receipt: TensorRecordReceipt,
+    payload_offset: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct OrphanRecord {
+    path: PathBuf,
+    parent: PathBuf,
+    metadata: fs::Metadata,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct TensorOrphanSweep {
+    orphans: Vec<OrphanRecord>,
+}
+
+#[cfg(unix)]
+fn validate_orphan_records(orphans: &[OrphanRecord]) -> Result<(), TensorWorkError> {
+    for orphan in orphans {
+        let current = fs::symlink_metadata(&orphan.path)
+            .map_err(|error| work_io("reinspect orphan record", error))?;
+        if current.file_type().is_symlink()
+            || !current.is_file()
+            || !same_file_identity(&orphan.metadata, &current)
+            || current.len() != orphan.metadata.len()
+        {
+            return Err(TensorWorkError::InvalidPath("changed orphan record"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1047,16 +1243,40 @@ fn read_record_prefix(reader: &mut HashingReader<'_>) -> Result<RecordPrefix, Te
     })
 }
 
-fn open_and_verify(
-    path: &Path,
-    expected: Option<&TensorRecordReceipt>,
-) -> Result<TensorRecordReader, TensorWorkError> {
+fn validate_staged_record<P, V>(
+    staged: &mut StagedTensorRecord,
+    mut validator: V,
+) -> Result<V::Output, TensorValidatedPutError<P, V::Error>>
+where
+    V: TensorPayloadValidator,
+{
+    match visit_verified_file(
+        &mut staged.file,
+        &staged.receipt,
+        Some(staged.payload_offset),
+        MAX_STAGING_BYTES,
+        |chunk| validator.try_push(chunk),
+    ) {
+        Ok(_) => {}
+        Err(TensorVisitError::Store(error)) => {
+            return Err(TensorValidatedPutError::Store(error));
+        }
+        Err(TensorVisitError::Sink(error)) => {
+            return Err(TensorValidatedPutError::Validator(error));
+        }
+    }
+    validator
+        .finish()
+        .map_err(TensorValidatedPutError::Validator)
+}
+
+fn open_record_handle(path: &Path, expected_bytes: u64) -> Result<File, TensorWorkError> {
     let metadata_before =
         fs::symlink_metadata(path).map_err(|error| work_io("inspect tensor record", error))?;
     if metadata_before.file_type().is_symlink() || !metadata_before.is_file() {
         return Err(TensorWorkError::InvalidPath("record file"));
     }
-    let mut file = File::open(path).map_err(|error| work_io("open tensor record", error))?;
+    let file = File::open(path).map_err(|error| work_io("open tensor record", error))?;
     let opened_metadata = file
         .metadata()
         .map_err(|error| work_io("inspect opened tensor record", error))?;
@@ -1079,56 +1299,116 @@ fn open_and_verify(
             actual: opened_bytes,
         });
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| work_io("seek tensor record", error))?;
-    let mut reader = HashingReader::new(&mut file);
-    let prefix = read_record_prefix(&mut reader)?;
-    if prefix.total_bytes != opened_bytes {
+    if opened_bytes != expected_bytes {
         return Err(TensorWorkError::RecordLengthMismatch {
-            expected: prefix.total_bytes,
+            expected: expected_bytes,
             actual: opened_bytes,
         });
     }
-    let mut staging = [0_u8; MAX_STAGING_BYTES];
+    Ok(file)
+}
+
+fn visit_verified_file<E>(
+    file: &mut File,
+    receipt: &TensorRecordReceipt,
+    expected_payload_offset: Option<u64>,
+    max_chunk_bytes: usize,
+    mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<u64, TensorVisitError<E>> {
+    if max_chunk_bytes == 0 {
+        return Err(TensorVisitError::Store(TensorWorkError::InvalidChunkSize));
+    }
+    let before = file
+        .metadata()
+        .map_err(|error| TensorVisitError::Store(work_io("inspect tensor record", error)))?
+        .len();
+    if before != receipt.record_bytes {
+        return Err(TensorVisitError::Store(
+            TensorWorkError::RecordLengthMismatch {
+                expected: receipt.record_bytes,
+                actual: before,
+            },
+        ));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| TensorVisitError::Store(work_io("seek tensor record", error)))?;
+    let mut reader = HashingReader::new(file);
+    let prefix = read_record_prefix(&mut reader).map_err(TensorVisitError::Store)?;
+    if prefix.info != receipt.info
+        || prefix.total_bytes != receipt.record_bytes
+        || expected_payload_offset.is_some_and(|offset| prefix.payload_offset != offset)
+    {
+        return Err(TensorVisitError::Store(TensorWorkError::ReceiptMismatch));
+    }
+    let chunk_bytes = max_chunk_bytes.min(MAX_STAGING_BYTES);
+    let mut staging = Vec::new();
+    staging
+        .try_reserve_exact(chunk_bytes)
+        .map_err(|_| TensorVisitError::Store(TensorWorkError::AllocationFailed))?;
+    staging.resize(chunk_bytes, 0);
     let mut remaining = prefix.info.payload_bytes;
     let mut payload_hasher = blake3::Hasher::new_derive_key(PAYLOAD_DIGEST_CONTEXT);
     while remaining != 0 {
-        let count = usize::try_from(remaining.min(MAX_STAGING_BYTES as u64))
-            .map_err(|_| TensorWorkError::LengthOverflow)?;
-        reader.read_exact(&mut staging[..count])?;
+        let count = usize::try_from(remaining.min(chunk_bytes as u64))
+            .map_err(|_| TensorVisitError::Store(TensorWorkError::LengthOverflow))?;
+        reader
+            .read_exact(&mut staging[..count])
+            .map_err(TensorVisitError::Store)?;
         payload_hasher.update(&staging[..count]);
+        visit(&staging[..count]).map_err(TensorVisitError::Sink)?;
         remaining -= count as u64;
     }
-    let footer = reader.digest()?;
+    let footer = reader.digest().map_err(TensorVisitError::Store)?;
     let payload_digest = *payload_hasher.finalize().as_bytes();
-    if footer != payload_digest {
-        return Err(TensorWorkError::PayloadDigestMismatch);
+    if footer != payload_digest || footer != receipt.payload_digest {
+        return Err(TensorVisitError::Store(
+            TensorWorkError::PayloadDigestMismatch,
+        ));
     }
     if reader.position != prefix.total_bytes {
-        return Err(TensorWorkError::RecordLengthMismatch {
-            expected: prefix.total_bytes,
-            actual: reader.position,
-        });
+        return Err(TensorVisitError::Store(
+            TensorWorkError::RecordLengthMismatch {
+                expected: prefix.total_bytes,
+                actual: reader.position,
+            },
+        ));
     }
     let record_id = reader.finish();
-    let receipt = TensorRecordReceipt {
-        record_id,
-        record_bytes: prefix.total_bytes,
-        payload_digest,
-        info: prefix.info,
-    };
-    if let Some(expected) = expected {
-        if receipt.record_id != expected.record_id {
-            return Err(TensorWorkError::RecordIdMismatch);
-        }
-        if &receipt != expected {
-            return Err(TensorWorkError::ReceiptMismatch);
-        }
+    if record_id != receipt.record_id {
+        return Err(TensorVisitError::Store(TensorWorkError::RecordIdMismatch));
     }
+    let after = file
+        .metadata()
+        .map_err(|error| TensorVisitError::Store(work_io("reinspect tensor record", error)))?
+        .len();
+    if after != before {
+        return Err(TensorVisitError::Store(
+            TensorWorkError::RecordLengthMismatch {
+                expected: before,
+                actual: after,
+            },
+        ));
+    }
+    Ok(prefix.payload_offset)
+}
+
+fn open_and_verify(
+    path: &Path,
+    expected: &TensorRecordReceipt,
+) -> Result<TensorRecordReader, TensorWorkError> {
+    let mut file = open_record_handle(path, expected.record_bytes)?;
+    let payload_offset =
+        match visit_verified_file(&mut file, expected, None, MAX_STAGING_BYTES, |_| {
+            Ok::<(), Infallible>(())
+        }) {
+            Ok(payload_offset) => payload_offset,
+            Err(TensorVisitError::Store(error)) => return Err(error),
+            Err(TensorVisitError::Sink(impossible)) => match impossible {},
+        };
     Ok(TensorRecordReader {
         file,
-        receipt,
-        payload_offset: prefix.payload_offset,
+        receipt: expected.clone(),
+        payload_offset,
     })
 }
 
@@ -1292,6 +1572,40 @@ impl<'a> ReceiptCursor<'a> {
         let mut digest = [0; 32];
         digest.copy_from_slice(self.take(32)?);
         Ok(digest)
+    }
+}
+
+#[cfg(unix)]
+fn canonical_record_prefix(prefix: &str) -> bool {
+    prefix.len() == 2 && prefix.bytes().all(|byte| lower_hex_nibble(byte).is_some())
+}
+
+#[cfg(unix)]
+fn canonical_record_id(prefix: &str, name: &str) -> Option<ContentId> {
+    let stem = name.strip_suffix(&format!(".{RECORD_EXTENSION}"))?;
+    let hex = stem.strip_prefix(CONTENT_ID_TEXT_PREFIX)?;
+    if hex.len() != 64
+        || !hex.bytes().all(|byte| lower_hex_nibble(byte).is_some())
+        || prefix.as_bytes() != &hex.as_bytes()[..2]
+    {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (output, encoded) in digest.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        *output = lower_hex_nibble(encoded[0])?
+            .checked_mul(16)?
+            .checked_add(lower_hex_nibble(encoded[1])?)?;
+    }
+    let record_id = ContentId::from_digest(digest);
+    (name == format!("{record_id}.{RECORD_EXTENSION}")).then_some(record_id)
+}
+
+#[cfg(unix)]
+const fn lower_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 

@@ -39,8 +39,9 @@ pub use qwen36_tensor_work::{
     Qwen36TensorWorkError, Qwen36TensorWorkStore, Qwen36TensorWorkSummary,
 };
 pub use tensor_work_store::{
-    TensorPayloadWriter, TensorPutError, TensorRecordInfo, TensorRecordReader, TensorRecordReceipt,
-    TensorRecordSpec, TensorVisitError, TensorWorkError, TensorWorkStore,
+    TensorPayloadValidator, TensorPayloadWriter, TensorPutError, TensorRecordInfo,
+    TensorRecordReader, TensorRecordReceipt, TensorRecordSpec, TensorValidatedPutError,
+    TensorVisitError, TensorWorkError, TensorWorkStore,
 };
 
 const CONTENT_ID_CONTEXT: &str = "tritium salt content id v1";
