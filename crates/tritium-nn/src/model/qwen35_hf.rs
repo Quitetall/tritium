@@ -2,11 +2,14 @@
 //!
 //! This adapter binds the exact hybrid language schema to the already-open
 //! safetensors shards and widens supported floating-point source tensors into
-//! the existing exact-fp32 runner.  It is deliberately a family/reference
-//! loader: its receipt is not a pinned campaign identity, it does not load MTP,
-//! and it explicitly defers vision tensors.
+//! the existing exact-fp32 runner. It is deliberately a family/reference
+//! loader: its receipt is not a pinned campaign identity, its language-only
+//! entry point defers MTP, and its combined entry point exact-loads MTP into an
+//! unverified graph that still requires numerical promotion. Vision remains
+//! explicitly deferred.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::Path;
 
 use tritium_spec::TernaryBackend;
@@ -18,8 +21,11 @@ use crate::layers::{
 };
 use crate::model::hf_shards::HfShardSet;
 use crate::model::qwen35_hf_source::{Qwen35HfSource, Qwen35HfSourceIdentity};
+use crate::model::qwen35_mtp_oracle::load_authorized_qwen35_mtp_oracle;
 use crate::model::{
+    Qwen35MtpLayerWeights, Qwen35MtpParityReceipt, Qwen35MtpRunner, Qwen35MtpWeights,
     Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextRunner, Qwen35TextWeights,
+    UnverifiedQwen35Mtp,
 };
 use crate::qwen35_config::{Qwen35CheckpointConfig, Qwen35LayerType, Qwen35TextConfig};
 
@@ -57,6 +63,41 @@ pub struct Qwen35HfLanguageReceipt {
     language_preserved_tensors: usize,
     deferred_mtp_tensors: usize,
     deferred_vision_tensors: usize,
+}
+
+/// Exact schema-consumption receipt for a language-plus-MTP dense reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35HfLanguageMtpReceipt {
+    language: Qwen35HfLanguageReceipt,
+    mtp_tensors: usize,
+    mtp_matrices: usize,
+    mtp_preserved_tensors: usize,
+}
+
+impl Qwen35HfLanguageMtpReceipt {
+    /// Language-core schema receipt.
+    #[must_use]
+    pub const fn language(&self) -> &Qwen35HfLanguageReceipt {
+        &self.language
+    }
+
+    /// Exact MTP tensors consumed by the combined loader.
+    #[must_use]
+    pub const fn mtp_tensors(&self) -> usize {
+        self.mtp_tensors
+    }
+
+    /// Rank-two MTP matrices consumed by the combined loader.
+    #[must_use]
+    pub const fn mtp_matrices(&self) -> usize {
+        self.mtp_matrices
+    }
+
+    /// MTP normalization vectors consumed by the combined loader.
+    #[must_use]
+    pub const fn mtp_preserved_tensors(&self) -> usize {
+        self.mtp_preserved_tensors
+    }
 }
 
 impl Qwen35HfLanguageReceipt {
@@ -163,6 +204,227 @@ impl Qwen35HfLanguageModel {
             receipt,
             source_identity,
         }
+    }
+}
+
+/// Content-bound dense language core plus an exact but unverified MTP graph.
+#[allow(missing_debug_implementations)]
+pub struct Qwen35HfLanguageMtpModel {
+    config: Qwen35CheckpointConfig,
+    runner: Qwen35TextRunner,
+    mtp: UnverifiedQwen35Mtp,
+    receipt: Qwen35HfLanguageMtpReceipt,
+    source_identity: Qwen35HfSourceIdentity,
+}
+
+/// Failed MTP promotion together with the still-loaded source-bound model.
+///
+/// Authentication and parity use fresh caches and do not mutate model weights.
+/// Callers may inspect the error, correct the artifact/backend issue, and retry
+/// without reloading a checkpoint-scale source.
+pub struct Qwen35MtpPromotionError {
+    model: Box<Qwen35HfLanguageMtpModel>,
+    error: NnError,
+}
+
+impl Qwen35MtpPromotionError {
+    /// Promotion failure that prevented executable MTP publication.
+    #[must_use]
+    pub const fn error(&self) -> &NnError {
+        &self.error
+    }
+
+    /// Still-loaded unverified model available for inspection or retry.
+    #[must_use]
+    pub fn model(&self) -> &Qwen35HfLanguageMtpModel {
+        &self.model
+    }
+
+    /// Recover ownership of the model and failure.
+    #[must_use]
+    pub fn into_parts(self) -> (Qwen35HfLanguageMtpModel, NnError) {
+        (*self.model, self.error)
+    }
+}
+
+impl fmt::Debug for Qwen35MtpPromotionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Qwen35MtpPromotionError")
+            .field("source_model_id", &self.model.source_identity.model_id())
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl fmt::Display for Qwen35MtpPromotionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for Qwen35MtpPromotionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl Qwen35HfLanguageMtpModel {
+    /// Validated family configuration.
+    #[must_use]
+    pub const fn config(&self) -> &Qwen35CheckpointConfig {
+        &self.config
+    }
+
+    /// Exact-fp32 target language runner.
+    #[must_use]
+    pub const fn runner(&self) -> &Qwen35TextRunner {
+        &self.runner
+    }
+
+    /// Structurally complete MTP graph awaiting official-oracle parity.
+    #[must_use]
+    pub const fn mtp(&self) -> &UnverifiedQwen35Mtp {
+        &self.mtp
+    }
+
+    /// Exact language-plus-MTP schema receipt.
+    #[must_use]
+    pub const fn receipt(&self) -> &Qwen35HfLanguageMtpReceipt {
+        &self.receipt
+    }
+
+    /// Content-derived identity of every source tensor.
+    #[must_use]
+    pub const fn source_identity(&self) -> &Qwen35HfSourceIdentity {
+        &self.source_identity
+    }
+
+    /// Compare this exact source against a compiled-authorized vLLM artifact.
+    ///
+    /// The artifact body, oracle manifest, numeric policy, coverage policy, and
+    /// source-derived [`tritium_format::ModelId`] must match one exact private
+    /// authorization row. Callers cannot select a tolerance, inject expected
+    /// values, or promote weights under an unrelated model identity. The only
+    /// compiled authorization currently carries synthetic-fixture evidence; a
+    /// successful return authorizes correctness testing, not production
+    /// campaign admission.
+    ///
+    /// # Errors
+    /// Returns an execution, provenance, shape, or numeric mismatch together
+    /// with the still-loaded unverified model, so checkpoint-scale callers can
+    /// correct the failure and retry without reloading source weights.
+    pub fn verify_mtp(
+        self,
+        authorized_oracle_bytes: &[u8],
+    ) -> Result<Qwen35VerifiedHfLanguageMtpModel, Qwen35MtpPromotionError> {
+        let trace = match load_authorized_qwen35_mtp_oracle(
+            authorized_oracle_bytes,
+            &self.config,
+            &self.source_identity,
+        ) {
+            Ok(trace) => trace,
+            Err(error) => {
+                return Err(Qwen35MtpPromotionError {
+                    model: Box::new(self),
+                    error,
+                });
+            }
+        };
+        let (promoted_mtp, mtp_receipt) = match self.mtp.verify_trace(&self.runner, trace) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(Qwen35MtpPromotionError {
+                    model: Box::new(self),
+                    error,
+                });
+            }
+        };
+        let Self {
+            config,
+            runner,
+            mtp: _,
+            receipt,
+            source_identity,
+        } = self;
+        Ok(Qwen35VerifiedHfLanguageMtpModel {
+            config,
+            runner,
+            mtp: promoted_mtp,
+            receipt,
+            source_identity,
+            mtp_receipt,
+        })
+    }
+
+    pub(super) fn from_verified_source(
+        config: Qwen35CheckpointConfig,
+        runner: Qwen35TextRunner,
+        mtp: UnverifiedQwen35Mtp,
+        receipt: Qwen35HfLanguageMtpReceipt,
+        source_identity: Qwen35HfSourceIdentity,
+    ) -> Self {
+        Self {
+            config,
+            runner,
+            mtp,
+            receipt,
+            source_identity,
+        }
+    }
+}
+
+/// Content-bound language-plus-MTP model promoted by pinned serving-oracle parity.
+///
+/// The current compiled authorization is synthetic fixture evidence. This type
+/// permits MTP execution for correctness work, but its receipt deliberately
+/// fails production admission until a separately reviewed production policy
+/// and exact checkpoint artifact are compiled.
+#[allow(missing_debug_implementations)]
+pub struct Qwen35VerifiedHfLanguageMtpModel {
+    config: Qwen35CheckpointConfig,
+    runner: Qwen35TextRunner,
+    mtp: Qwen35MtpRunner,
+    receipt: Qwen35HfLanguageMtpReceipt,
+    source_identity: Qwen35HfSourceIdentity,
+    mtp_receipt: Qwen35MtpParityReceipt,
+}
+
+impl Qwen35VerifiedHfLanguageMtpModel {
+    /// Validated family configuration.
+    #[must_use]
+    pub const fn config(&self) -> &Qwen35CheckpointConfig {
+        &self.config
+    }
+
+    /// Exact target language runner sharing embedding and head with MTP.
+    #[must_use]
+    pub const fn runner(&self) -> &Qwen35TextRunner {
+        &self.runner
+    }
+
+    /// Receipt-gated executable MTP runner.
+    #[must_use]
+    pub const fn mtp(&self) -> &Qwen35MtpRunner {
+        &self.mtp
+    }
+
+    /// Exact language-plus-MTP schema receipt.
+    #[must_use]
+    pub const fn receipt(&self) -> &Qwen35HfLanguageMtpReceipt {
+        &self.receipt
+    }
+
+    /// Content-derived identity of every source tensor.
+    #[must_use]
+    pub const fn source_identity(&self) -> &Qwen35HfSourceIdentity {
+        &self.source_identity
+    }
+
+    /// Pinned vLLM parity evidence authorizing MTP execution.
+    #[must_use]
+    pub const fn mtp_receipt(&self) -> &Qwen35MtpParityReceipt {
+        &self.mtp_receipt
     }
 }
 
@@ -403,6 +665,184 @@ pub(super) fn language_schema(
         }
     }
     Ok(schema)
+}
+
+pub(super) fn mtp_schema(
+    config: &Qwen35TextConfig,
+) -> Result<BTreeMap<String, TensorSpec>, NnError> {
+    let hidden = axis(config.hidden_size);
+    let intermediate = axis(config.intermediate_size);
+    let head_dim = axis(config.full_attention.head_dim);
+    let query_width = checked_product(
+        axis(config.full_attention.num_heads),
+        head_dim,
+        "MTP full-attention query width",
+    )?;
+    let gated_query_width = query_width
+        .checked_mul(2)
+        .ok_or_else(|| invalid_geometry("MTP gated query width overflow"))?;
+    let kv_width = checked_product(
+        axis(config.full_attention.num_key_value_heads),
+        head_dim,
+        "MTP full-attention KV width",
+    )?;
+    let fused_width = hidden
+        .checked_mul(2)
+        .ok_or_else(|| invalid_geometry("MTP fusion width overflow"))?;
+    let mut schema = BTreeMap::new();
+    for (name, shape, role) in [
+        (
+            "mtp.pre_fc_norm_embedding.weight",
+            vec![hidden],
+            TensorRole::Preserved,
+        ),
+        (
+            "mtp.pre_fc_norm_hidden.weight",
+            vec![hidden],
+            TensorRole::Preserved,
+        ),
+        (
+            "mtp.fc.weight",
+            vec![hidden, fused_width],
+            TensorRole::Matrix,
+        ),
+        (
+            "mtp.layers.0.input_layernorm.weight",
+            vec![hidden],
+            TensorRole::Preserved,
+        ),
+        (
+            "mtp.layers.0.self_attn.q_proj.weight",
+            vec![gated_query_width, hidden],
+            TensorRole::Matrix,
+        ),
+        (
+            "mtp.layers.0.self_attn.k_proj.weight",
+            vec![kv_width, hidden],
+            TensorRole::Matrix,
+        ),
+        (
+            "mtp.layers.0.self_attn.v_proj.weight",
+            vec![kv_width, hidden],
+            TensorRole::Matrix,
+        ),
+        (
+            "mtp.layers.0.self_attn.o_proj.weight",
+            vec![hidden, query_width],
+            TensorRole::Matrix,
+        ),
+        (
+            "mtp.layers.0.self_attn.q_norm.weight",
+            vec![head_dim],
+            TensorRole::Preserved,
+        ),
+        (
+            "mtp.layers.0.self_attn.k_norm.weight",
+            vec![head_dim],
+            TensorRole::Preserved,
+        ),
+        (
+            "mtp.layers.0.post_attention_layernorm.weight",
+            vec![hidden],
+            TensorRole::Preserved,
+        ),
+        (
+            "mtp.layers.0.mlp.gate_proj.weight",
+            vec![intermediate, hidden],
+            TensorRole::Matrix,
+        ),
+        (
+            "mtp.layers.0.mlp.up_proj.weight",
+            vec![intermediate, hidden],
+            TensorRole::Matrix,
+        ),
+        (
+            "mtp.layers.0.mlp.down_proj.weight",
+            vec![hidden, intermediate],
+            TensorRole::Matrix,
+        ),
+        ("mtp.norm.weight", vec![hidden], TensorRole::Preserved),
+    ] {
+        insert_spec(&mut schema, name.to_owned(), &shape, role)?;
+    }
+    Ok(schema)
+}
+
+pub(super) fn preflight_mtp_source(
+    shards: &HfShardSet,
+    schema: &BTreeMap<String, TensorSpec>,
+    mut language: Qwen35HfLanguageReceipt,
+) -> Result<Qwen35HfLanguageMtpReceipt, NnError> {
+    let mut consumed = BTreeSet::new();
+    for tensor in shards
+        .metadata()
+        .filter(|tensor| tensor.name.starts_with("mtp."))
+    {
+        let expected = schema.get(tensor.name).ok_or_else(|| {
+            NnError::MissingTensor(format!(
+                "unexpected Qwen3.5 MTP source tensor `{}`",
+                tensor.name
+            ))
+        })?;
+        if !matches!(tensor.dtype, "F32" | "F16" | "BF16") {
+            return Err(NnError::MissingTensor(format!(
+                "tensor `{}` has unsupported dtype {}, expected F32, F16, or BF16",
+                tensor.name, tensor.dtype
+            )));
+        }
+        if tensor.shape != expected.shape {
+            return Err(NnError::MissingTensor(format!(
+                "tensor `{}` in {} has shape {:?}, expected {:?}",
+                tensor.name,
+                tensor.shard_path.display(),
+                tensor.shape,
+                expected.shape
+            )));
+        }
+        consumed.insert(tensor.name);
+    }
+    if let Some(missing) = schema.keys().find(|name| !consumed.contains(name.as_str())) {
+        return Err(NnError::MissingTensor(missing.clone()));
+    }
+    let mtp_matrices = schema
+        .values()
+        .filter(|tensor| tensor.role == TensorRole::Matrix)
+        .count();
+    language.deferred_mtp_tensors = 0;
+    Ok(Qwen35HfLanguageMtpReceipt {
+        language,
+        mtp_tensors: schema.len(),
+        mtp_matrices,
+        mtp_preserved_tensors: schema.len() - mtp_matrices,
+    })
+}
+
+pub(super) fn load_mtp_weights<S: Qwen35HfTensorSource + ?Sized>(
+    shards: &S,
+    config: &Qwen35TextConfig,
+) -> Result<Qwen35MtpWeights, NnError> {
+    let hidden = axis(config.hidden_size);
+    let intermediate = axis(config.intermediate_size);
+    let fused_width = hidden
+        .checked_mul(2)
+        .ok_or_else(|| invalid_geometry("MTP fusion width overflow"))?;
+    let layer = "mtp.layers.0";
+    Ok(Qwen35MtpWeights::new(
+        vector(shards, "mtp", "pre_fc_norm_embedding.weight", hidden)?,
+        vector(shards, "mtp", "pre_fc_norm_hidden.weight", hidden)?,
+        dense(shards, "mtp", "fc.weight", hidden, fused_width)?,
+        Qwen35MtpLayerWeights::new(
+            vector(shards, layer, "input_layernorm.weight", hidden)?,
+            load_full_attention(shards, config, layer, hidden)?,
+            vector(shards, layer, "post_attention_layernorm.weight", hidden)?,
+            SwiGluMlp::new(
+                dense(shards, layer, "mlp.gate_proj.weight", intermediate, hidden)?,
+                dense(shards, layer, "mlp.up_proj.weight", intermediate, hidden)?,
+                dense(shards, layer, "mlp.down_proj.weight", hidden, intermediate)?,
+            )?,
+        ),
+        vector(shards, "mtp", "norm.weight", hidden)?,
+    ))
 }
 
 pub(super) fn load_language_weights<S: Qwen35HfTensorSource + ?Sized>(

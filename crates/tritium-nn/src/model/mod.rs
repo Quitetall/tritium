@@ -12,6 +12,7 @@ mod qwen35;
 mod qwen35_hf;
 mod qwen35_hf_source;
 mod qwen35_mtp;
+mod qwen35_mtp_oracle;
 mod runner;
 #[cfg(feature = "cuda")]
 mod salt_v2;
@@ -25,15 +26,20 @@ pub use qwen35::{
     Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights, Qwen35TextOutput,
     Qwen35TextRunner, Qwen35TextWeights,
 };
-pub use qwen35_hf::{Qwen35HfLanguageModel, Qwen35HfLanguageReceipt};
+pub use qwen35_hf::{
+    Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel, Qwen35HfLanguageMtpReceipt,
+    Qwen35HfLanguageReceipt, Qwen35MtpPromotionError, Qwen35VerifiedHfLanguageMtpModel,
+};
 pub use qwen35_hf_source::{
     QWEN35_HF_SOURCE_ARCHITECTURE, Qwen35ContentVerifiedHfSource, Qwen35HfSource,
     Qwen35HfSourceIdentity, Qwen35HfTensorMetadata, Qwen35TensorStreamError,
     qwen36_27b_canonical_source_config,
 };
 pub use qwen35_mtp::{
-    QWEN35_MTP_UNVERIFIED_REASON, Qwen35MtpInputPlan, Qwen35MtpLayerWeights, Qwen35MtpStatus,
-    Qwen35MtpWeights, UnverifiedQwen35Mtp,
+    QWEN35_MTP_UNVERIFIED_REASON, QWEN35_MTP_VLLM_ORACLE_REVISION, QWEN35_MTP_VLLM_SOURCE_SHA256,
+    Qwen35MtpCache, Qwen35MtpInputPlan, Qwen35MtpLayerWeights, Qwen35MtpOracleCoverageProfile,
+    Qwen35MtpOracleEvidenceClass, Qwen35MtpOutput, Qwen35MtpParityReceipt, Qwen35MtpRunner,
+    Qwen35MtpStatus, Qwen35MtpWeights, UnverifiedQwen35Mtp,
 };
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]

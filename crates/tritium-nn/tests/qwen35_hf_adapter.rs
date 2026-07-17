@@ -5,11 +5,126 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use tritium_nn::{Qwen35HfLanguageModel, Qwen35HfSource, Qwen35TensorStreamError};
+use tritium_nn::{
+    QWEN35_MTP_VLLM_ORACLE_REVISION, Qwen35HfLanguageModel, Qwen35HfSource,
+    Qwen35MtpOracleCoverageProfile, Qwen35MtpOracleEvidenceClass, Qwen35MtpStatus,
+    Qwen35TensorStreamError,
+};
 
 const H: usize = 4;
 const I: usize = 6;
 const V: usize = 7;
+const MTP_ORACLE_H: usize = 32;
+const MTP_ORACLE_I: usize = 48;
+const MTP_ORACLE_V: usize = 37;
+const MTP_ORACLE_HEAD_DIM: usize = 32;
+const MTP_ORACLE_HEADS: usize = 2;
+const MTP_ORACLE_KV_HEADS: usize = 2;
+const SEALED_MTP_ORACLE: &[u8] = include_bytes!("fixtures/qwen35-mtp-oracle-fixture-v1.bin");
+const SEALED_MTP_ORACLE_MANIFEST: &[u8] =
+    include_bytes!("fixtures/qwen35-mtp-oracle-manifest-v1.json");
+const SEALED_MTP_ORACLE_GENERATOR: &[u8] = include_bytes!("../oracle/gen_qwen35_mtp_goldens.py");
+const MTP_ORACLE_MANIFEST_ID_CONTEXT: &str =
+    "tritium qwen3.5 mtp oracle implementation manifest v1";
+const SEALED_MTP_SOURCE_MODEL_ID: [u8; 32] = [
+    0xe7, 0x9e, 0xea, 0xcd, 0x41, 0x6d, 0x7c, 0xe9, 0xd4, 0xf2, 0x23, 0x95, 0x5b, 0x18, 0x9b, 0xcc,
+    0x90, 0xeb, 0xb4, 0x18, 0x82, 0x61, 0x9f, 0x4c, 0x4b, 0x3b, 0x88, 0x04, 0x65, 0x12, 0x6d, 0x92,
+];
+const SEALED_MTP_SOURCE_CONFIG_DIGEST: [u8; 32] = [
+    0xc9, 0xb6, 0x3f, 0x23, 0xbe, 0x99, 0xae, 0x8f, 0xf2, 0x3b, 0x82, 0x7f, 0xba, 0x6b, 0xe6, 0x53,
+    0xef, 0xba, 0xff, 0x68, 0xa2, 0xee, 0xb8, 0xdc, 0x0d, 0xbe, 0xd7, 0x53, 0xb8, 0xb8, 0xf3, 0x9c,
+];
+const SEALED_MTP_ORACLE_BODY_ID: [u8; 32] = [
+    0x06, 0xc2, 0x96, 0x6c, 0x7b, 0xaa, 0x99, 0x40, 0x42, 0x8b, 0x6c, 0xba, 0x6a, 0xd1, 0x73, 0x4e,
+    0xb4, 0x9f, 0x77, 0x88, 0xa8, 0x51, 0x2e, 0xb3, 0x95, 0x10, 0x42, 0x79, 0x60, 0x4b, 0x84, 0x58,
+];
+const SEALED_MTP_ORACLE_MANIFEST_ID: [u8; 32] = [
+    0xf1, 0x59, 0x5c, 0xe9, 0x28, 0x7a, 0x6b, 0xb1, 0xf4, 0xd9, 0xc6, 0x28, 0xe3, 0xc2, 0x08, 0xea,
+    0x04, 0x0d, 0xa8, 0xd1, 0x2c, 0x8a, 0x58, 0x6f, 0xbf, 0x56, 0x37, 0x94, 0xa7, 0xbc, 0x5a, 0x3d,
+];
+
+#[test]
+fn sealed_mtp_manifest_is_canonical_and_binds_generator_and_body() {
+    let canonical = SEALED_MTP_ORACLE_MANIFEST
+        .strip_suffix(b"\n")
+        .expect("manifest must have one trailing newline");
+    assert!(!canonical.ends_with(b"\n"));
+    let manifest: serde_json::Value = serde_json::from_slice(canonical).unwrap();
+    assert_eq!(serde_json::to_vec(&manifest).unwrap(), canonical);
+
+    let mut hasher = blake3::Hasher::new_derive_key(MTP_ORACLE_MANIFEST_ID_CONTEXT);
+    hasher.update(canonical);
+    let manifest_id = *hasher.finalize().as_bytes();
+    assert_eq!(manifest_id, SEALED_MTP_ORACLE_MANIFEST_ID);
+    assert_eq!(&SEALED_MTP_ORACLE[20..52], manifest_id.as_slice());
+    assert_eq!(
+        manifest["generator_blake3"].as_str().unwrap(),
+        blake3::hash(SEALED_MTP_ORACLE_GENERATOR).to_hex().as_str()
+    );
+    assert_eq!(
+        manifest["runtime_cache_policy"].as_str(),
+        Some("fresh-isolated-no-prior-cache")
+    );
+    assert_eq!(
+        manifest["inherited_runtime_override_policy"]["rejected_prefixes"],
+        serde_json::json!(["TRITON_"])
+    );
+    assert!(
+        manifest["inherited_runtime_override_policy"]["rejected_exact"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "PTXAS_OPTIONS")
+    );
+    assert_eq!(
+        manifest["triton_compiler_controls"],
+        serde_json::json!({
+            "cudacrt_override": null,
+            "cudart_override": null,
+            "default_fp_fusion": true,
+            "disable_ptxas_opt": false,
+            "fp32_default": null,
+            "libcuda_override": null,
+            "libdevice_override": null,
+            "mock_ptx_version": null,
+            "override_arch": null,
+            "ptxas_options": null,
+            "ptxas_selection": "bundled",
+            "ptxas_version": "12.8"
+        })
+    );
+    assert_eq!(
+        manifest["numeric_profile"].as_str(),
+        Some("fp32-storage-tf32-attention-absolute-2e-3")
+    );
+    assert_eq!(
+        manifest["loaded_vllm_native_extensions_sha256"]
+            .as_object()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        manifest["loaded_numeric_libraries_sha256"]
+            .as_object()
+            .unwrap()
+            .len(),
+        61
+    );
+    assert_eq!(
+        manifest["installed_distributions"]["torch"]["record_payload_verification"]
+            ["hashed_entries"]
+            .as_u64(),
+        Some(11_846)
+    );
+    assert_eq!(
+        manifest["triton_jit_cubins_sha256"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+}
 
 #[derive(Clone)]
 struct TensorFixture {
@@ -80,6 +195,163 @@ fn oracle_tensors() -> Vec<TensorFixture> {
         tensor(format!("{full}.post_attention_layernorm.weight"), &[H], 25),
     ]);
     tensors
+}
+
+fn exact_mtp_tensors() -> Vec<TensorFixture> {
+    vec![
+        tensor("mtp.pre_fc_norm_embedding.weight", &[H], 28),
+        tensor("mtp.pre_fc_norm_hidden.weight", &[H], 29),
+        tensor("mtp.fc.weight", &[H, 2 * H], 30),
+        tensor("mtp.layers.0.input_layernorm.weight", &[H], 31),
+        tensor("mtp.layers.0.self_attn.q_proj.weight", &[16, H], 32),
+        tensor("mtp.layers.0.self_attn.k_proj.weight", &[4, H], 33),
+        tensor("mtp.layers.0.self_attn.v_proj.weight", &[4, H], 34),
+        tensor("mtp.layers.0.self_attn.o_proj.weight", &[H, 8], 35),
+        tensor("mtp.layers.0.self_attn.q_norm.weight", &[4], 36),
+        tensor("mtp.layers.0.self_attn.k_norm.weight", &[4], 37),
+        tensor("mtp.layers.0.post_attention_layernorm.weight", &[H], 38),
+        tensor("mtp.layers.0.mlp.gate_proj.weight", &[I, H], 39),
+        tensor("mtp.layers.0.mlp.up_proj.weight", &[I, H], 40),
+        tensor("mtp.layers.0.mlp.down_proj.weight", &[H, I], 41),
+        tensor("mtp.norm.weight", &[H], 42),
+    ]
+}
+
+fn oracle_tensors_with_exact_mtp() -> Vec<TensorFixture> {
+    let mut tensors = oracle_tensors()
+        .into_iter()
+        .filter(|tensor| !tensor.name.starts_with("mtp."))
+        .collect::<Vec<_>>();
+    tensors.extend(exact_mtp_tensors());
+    tensors
+}
+
+fn sealed_mtp_oracle_tensors() -> Vec<TensorFixture> {
+    let query_width = MTP_ORACLE_HEADS * MTP_ORACLE_HEAD_DIM;
+    let gated_query_width = 2 * query_width;
+    let kv_width = MTP_ORACLE_KV_HEADS * MTP_ORACLE_HEAD_DIM;
+    let language = "model.language_model.layers.0";
+    let mtp = "mtp.layers.0";
+    vec![
+        tensor(
+            "model.language_model.embed_tokens.weight",
+            &[MTP_ORACLE_V, MTP_ORACLE_H],
+            0,
+        ),
+        tensor(
+            format!("{language}.self_attn.q_proj.weight"),
+            &[gated_query_width, MTP_ORACLE_H],
+            1,
+        ),
+        tensor(
+            format!("{language}.self_attn.k_proj.weight"),
+            &[kv_width, MTP_ORACLE_H],
+            2,
+        ),
+        tensor(
+            format!("{language}.self_attn.v_proj.weight"),
+            &[kv_width, MTP_ORACLE_H],
+            3,
+        ),
+        tensor(
+            format!("{language}.self_attn.o_proj.weight"),
+            &[MTP_ORACLE_H, query_width],
+            4,
+        ),
+        tensor(
+            format!("{language}.self_attn.q_norm.weight"),
+            &[MTP_ORACLE_HEAD_DIM],
+            5,
+        ),
+        tensor(
+            format!("{language}.self_attn.k_norm.weight"),
+            &[MTP_ORACLE_HEAD_DIM],
+            6,
+        ),
+        tensor(
+            format!("{language}.mlp.gate_proj.weight"),
+            &[MTP_ORACLE_I, MTP_ORACLE_H],
+            7,
+        ),
+        tensor(
+            format!("{language}.mlp.up_proj.weight"),
+            &[MTP_ORACLE_I, MTP_ORACLE_H],
+            8,
+        ),
+        tensor(
+            format!("{language}.mlp.down_proj.weight"),
+            &[MTP_ORACLE_H, MTP_ORACLE_I],
+            9,
+        ),
+        tensor(
+            format!("{language}.input_layernorm.weight"),
+            &[MTP_ORACLE_H],
+            10,
+        ),
+        tensor(
+            format!("{language}.post_attention_layernorm.weight"),
+            &[MTP_ORACLE_H],
+            11,
+        ),
+        tensor("model.language_model.norm.weight", &[MTP_ORACLE_H], 12),
+        tensor("lm_head.weight", &[MTP_ORACLE_V, MTP_ORACLE_H], 13),
+        tensor("model.visual.pos_embed.weight", &[1, MTP_ORACLE_H], 14),
+        tensor("mtp.pre_fc_norm_embedding.weight", &[MTP_ORACLE_H], 15),
+        tensor("mtp.pre_fc_norm_hidden.weight", &[MTP_ORACLE_H], 16),
+        tensor("mtp.fc.weight", &[MTP_ORACLE_H, 2 * MTP_ORACLE_H], 17),
+        tensor(format!("{mtp}.input_layernorm.weight"), &[MTP_ORACLE_H], 18),
+        tensor(
+            format!("{mtp}.self_attn.q_proj.weight"),
+            &[gated_query_width, MTP_ORACLE_H],
+            19,
+        ),
+        tensor(
+            format!("{mtp}.self_attn.k_proj.weight"),
+            &[kv_width, MTP_ORACLE_H],
+            20,
+        ),
+        tensor(
+            format!("{mtp}.self_attn.v_proj.weight"),
+            &[kv_width, MTP_ORACLE_H],
+            21,
+        ),
+        tensor(
+            format!("{mtp}.self_attn.o_proj.weight"),
+            &[MTP_ORACLE_H, query_width],
+            22,
+        ),
+        tensor(
+            format!("{mtp}.self_attn.q_norm.weight"),
+            &[MTP_ORACLE_HEAD_DIM],
+            23,
+        ),
+        tensor(
+            format!("{mtp}.self_attn.k_norm.weight"),
+            &[MTP_ORACLE_HEAD_DIM],
+            24,
+        ),
+        tensor(
+            format!("{mtp}.post_attention_layernorm.weight"),
+            &[MTP_ORACLE_H],
+            25,
+        ),
+        tensor(
+            format!("{mtp}.mlp.gate_proj.weight"),
+            &[MTP_ORACLE_I, MTP_ORACLE_H],
+            26,
+        ),
+        tensor(
+            format!("{mtp}.mlp.up_proj.weight"),
+            &[MTP_ORACLE_I, MTP_ORACLE_H],
+            27,
+        ),
+        tensor(
+            format!("{mtp}.mlp.down_proj.weight"),
+            &[MTP_ORACLE_H, MTP_ORACLE_I],
+            28,
+        ),
+        tensor("mtp.norm.weight", &[MTP_ORACLE_H], 29),
+    ]
 }
 
 fn safetensors(tensors: &[TensorFixture]) -> Vec<u8> {
@@ -155,6 +427,55 @@ fn config_json() -> String {
     .to_string()
 }
 
+fn sealed_mtp_oracle_config_json() -> String {
+    json!({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "language_model_only": false,
+        "model_type": "qwen3_5",
+        "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "dtype": "bfloat16",
+            "full_attention_interval": 1,
+            "head_dim": MTP_ORACLE_HEAD_DIM,
+            "hidden_act": "silu",
+            "hidden_size": MTP_ORACLE_H,
+            "intermediate_size": MTP_ORACLE_I,
+            "layer_types": ["full_attention"],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 16,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_value_head_dim": 8,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 64,
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 1,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": MTP_ORACLE_HEADS,
+            "num_hidden_layers": 1,
+            "num_key_value_heads": MTP_ORACLE_KV_HEADS,
+            "output_gate_type": "swish",
+            "partial_rotary_factor": 0.5,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [8, 0, 0],
+                "partial_rotary_factor": 0.5,
+                "rope_theta": 10000.0,
+                "rope_type": "default"
+            },
+            "tie_word_embeddings": false,
+            "use_cache": true,
+            "vocab_size": MTP_ORACLE_V
+        },
+        "tie_word_embeddings": false,
+        "vision_config": {"model_type": "qwen3_5"}
+    })
+    .to_string()
+}
+
 fn fixture_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("tritium-qwen35-hf-{label}-{}", std::process::id()))
 }
@@ -164,9 +485,13 @@ fn write_fixture(dir: &Path) {
 }
 
 fn write_fixture_tensors(dir: &Path, tensors: Vec<TensorFixture>) {
+    write_fixture_tensors_with_config(dir, tensors, &config_json());
+}
+
+fn write_fixture_tensors_with_config(dir: &Path, tensors: Vec<TensorFixture>, config: &str) {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(dir.join("config.json"), config_json()).unwrap();
+    std::fs::write(dir.join("config.json"), config).unwrap();
     let mut left = Vec::new();
     let mut right = Vec::new();
     let mut weight_map = BTreeMap::new();
@@ -540,4 +865,229 @@ fn unknown_language_tensor_fails_closed() {
         Err(tritium_nn::NnError::MissingTensor(reason))
             if reason.contains("unrecognized.weight")
     ));
+}
+
+#[test]
+fn sealed_mtp_oracle_fixture_has_stable_source_identity() {
+    let dir = fixture_dir("sealed-mtp-oracle-identity");
+    write_fixture_tensors_with_config(
+        &dir,
+        sealed_mtp_oracle_tensors(),
+        &sealed_mtp_oracle_config_json(),
+    );
+    let source = Qwen35HfSource::open(&dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap();
+    assert_eq!(source.model_id().as_bytes(), &SEALED_MTP_SOURCE_MODEL_ID);
+    assert_eq!(
+        source.identity().manifest().config_digest(),
+        &SEALED_MTP_SOURCE_CONFIG_DIGEST
+    );
+    assert_eq!(source.config().text.hidden_size, MTP_ORACLE_H as u32);
+    assert_eq!(
+        source.config().text.full_attention.num_key_value_heads,
+        MTP_ORACLE_KV_HEADS as u32
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn exact_mtp_loader_promotes_only_after_pinned_vllm_prefill_decode_parity() {
+    let dir = fixture_dir("sealed-mtp-oracle");
+    write_fixture_tensors_with_config(
+        &dir,
+        sealed_mtp_oracle_tensors(),
+        &sealed_mtp_oracle_config_json(),
+    );
+    let source = Qwen35HfSource::open(&dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap();
+    let source_model_id = source.model_id();
+    assert_eq!(source_model_id.as_bytes(), &SEALED_MTP_SOURCE_MODEL_ID);
+    assert_eq!(
+        source.identity().manifest().config_digest(),
+        &SEALED_MTP_SOURCE_CONFIG_DIGEST
+    );
+
+    let model = source
+        .load_language_mtp(Box::new(tritium_cpu::CpuBackend::new()))
+        .unwrap();
+    assert_eq!(model.mtp().status(), Qwen35MtpStatus::Unverified);
+    assert_eq!(model.receipt().mtp_tensors(), 15);
+    assert_eq!(model.receipt().language().deferred_mtp_tensors(), 0);
+
+    let model = model.verify_mtp(SEALED_MTP_ORACLE).unwrap();
+    let receipt = model.mtp_receipt();
+    assert_eq!(receipt.source_model_id(), source_model_id);
+    assert_ne!(*receipt.source_model_id().as_bytes(), [0; 32]);
+    assert_eq!(receipt.oracle_revision(), QWEN35_MTP_VLLM_ORACLE_REVISION);
+    assert_eq!(receipt.oracle_body_id(), SEALED_MTP_ORACLE_BODY_ID);
+    assert_eq!(receipt.oracle_manifest_id(), SEALED_MTP_ORACLE_MANIFEST_ID);
+    assert_eq!(receipt.steps(), 2);
+    assert_eq!(receipt.tolerance(), 2e-3);
+    assert!(receipt.max_absolute_error() <= 2e-3);
+    assert_eq!(
+        receipt.evidence_class(),
+        Qwen35MtpOracleEvidenceClass::Fixture
+    );
+    assert_eq!(
+        receipt.coverage_profile(),
+        Qwen35MtpOracleCoverageProfile::FixturePrefillDecode
+    );
+    assert!(!receipt.qualifies_for_production());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn exact_mtp_loader_rejects_missing_unknown_and_wrong_shape_tensors() {
+    let missing_dir = fixture_dir("exact-mtp-missing");
+    let missing = oracle_tensors_with_exact_mtp()
+        .into_iter()
+        .filter(|tensor| tensor.name != "mtp.fc.weight")
+        .collect();
+    write_fixture_tensors(&missing_dir, missing);
+    let missing = Qwen35HfSource::open(&missing_dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap()
+        .load_language_mtp(Box::new(tritium_cpu::CpuBackend::new()));
+    assert!(matches!(
+        missing,
+        Err(tritium_nn::NnError::MissingTensor(name)) if name == "mtp.fc.weight"
+    ));
+
+    let unknown_dir = fixture_dir("exact-mtp-unknown");
+    let mut unknown = oracle_tensors_with_exact_mtp();
+    unknown.push(tensor("mtp.layers.1.norm.weight", &[H], 43));
+    write_fixture_tensors(&unknown_dir, unknown);
+    let unknown = Qwen35HfSource::open(&unknown_dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap()
+        .load_language_mtp(Box::new(tritium_cpu::CpuBackend::new()));
+    assert!(matches!(
+        unknown,
+        Err(tritium_nn::NnError::MissingTensor(reason))
+            if reason.contains("unexpected") && reason.contains("mtp.layers.1.norm.weight")
+    ));
+
+    let wrong_shape_dir = fixture_dir("exact-mtp-wrong-shape");
+    let mut wrong_shape = oracle_tensors_with_exact_mtp();
+    let q_proj = wrong_shape
+        .iter_mut()
+        .find(|tensor| tensor.name == "mtp.layers.0.self_attn.q_proj.weight")
+        .unwrap();
+    q_proj.shape = vec![8, H];
+    q_proj.values = parameter(32, 8 * H);
+    write_fixture_tensors(&wrong_shape_dir, wrong_shape);
+    let wrong_shape = Qwen35HfSource::open(&wrong_shape_dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap()
+        .load_language_mtp(Box::new(tritium_cpu::CpuBackend::new()));
+    assert!(matches!(
+        wrong_shape,
+        Err(tritium_nn::NnError::MissingTensor(reason))
+            if reason.contains("q_proj.weight") && reason.contains("expected [16, 4]")
+    ));
+
+    let _ = std::fs::remove_dir_all(missing_dir);
+    let _ = std::fs::remove_dir_all(unknown_dir);
+    let _ = std::fs::remove_dir_all(wrong_shape_dir);
+}
+
+#[test]
+fn one_bit_oracle_artifact_mutation_cannot_promote_mtp() {
+    let dir = fixture_dir("sealed-mtp-mutated-artifact");
+    write_fixture_tensors_with_config(
+        &dir,
+        sealed_mtp_oracle_tensors(),
+        &sealed_mtp_oracle_config_json(),
+    );
+    let model = Qwen35HfSource::open(&dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap()
+        .load_language_mtp(Box::new(tritium_cpu::CpuBackend::new()))
+        .unwrap();
+    let mut mutated = SEALED_MTP_ORACLE.to_vec();
+    let last = mutated.last_mut().expect("sealed oracle is not empty");
+    *last ^= 1;
+
+    let failure = match model.verify_mtp(&mutated) {
+        Ok(_) => panic!("mutated oracle promoted MTP"),
+        Err(failure) => failure,
+    };
+    let (model, error) = failure.into_parts();
+    assert!(matches!(
+        error,
+        tritium_nn::NnError::InvalidArtifact(reason)
+            if reason.contains("absent from the compiled allowlist")
+    ));
+    let retried = model.verify_mtp(SEALED_MTP_ORACLE).unwrap();
+    assert_eq!(
+        retried.mtp_receipt().oracle_body_id(),
+        SEALED_MTP_ORACLE_BODY_ID
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn caller_cannot_select_mtp_tolerance_by_mutating_numeric_profile() {
+    let dir = fixture_dir("sealed-mtp-mutated-numeric-profile");
+    write_fixture_tensors_with_config(
+        &dir,
+        sealed_mtp_oracle_tensors(),
+        &sealed_mtp_oracle_config_json(),
+    );
+    let model = Qwen35HfSource::open(&dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap()
+        .load_language_mtp(Box::new(tritium_cpu::CpuBackend::new()))
+        .unwrap();
+    let mut mutated = SEALED_MTP_ORACLE.to_vec();
+    // Header bytes 12..14 are the fixed numeric-profile identifier. There is
+    // intentionally no caller-controlled tolerance argument on verify_mtp.
+    mutated[12] ^= 1;
+
+    let failure = match model.verify_mtp(&mutated) {
+        Ok(_) => panic!("mutated numeric profile promoted MTP"),
+        Err(failure) => failure,
+    };
+    assert!(matches!(
+        failure.error(),
+        tritium_nn::NnError::InvalidArtifact(reason)
+            if reason.contains("unsupported oracle profile tuple")
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn authentic_oracle_cannot_promote_a_source_with_one_payload_bit_changed() {
+    let dir = fixture_dir("sealed-mtp-mutated-source");
+    let mut tensors = sealed_mtp_oracle_tensors();
+    tensors[0].values[0] = f32::from_bits(tensors[0].values[0].to_bits() ^ 1);
+    write_fixture_tensors_with_config(&dir, tensors, &sealed_mtp_oracle_config_json());
+    let source = Qwen35HfSource::open(&dir)
+        .unwrap()
+        .verify_semantic_identity()
+        .unwrap();
+    assert_ne!(source.model_id().as_bytes(), &SEALED_MTP_SOURCE_MODEL_ID);
+    let model = source
+        .load_language_mtp(Box::new(tritium_cpu::CpuBackend::new()))
+        .unwrap();
+
+    let failure = match model.verify_mtp(SEALED_MTP_ORACLE) {
+        Ok(_) => panic!("foreign source promoted MTP"),
+        Err(failure) => failure,
+    };
+    assert!(matches!(
+        failure.error(),
+        tritium_nn::NnError::InvalidArtifact(reason)
+            if reason.contains("absent from the compiled allowlist")
+    ));
+    let _ = std::fs::remove_dir_all(dir);
 }

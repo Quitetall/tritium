@@ -439,6 +439,37 @@ impl Qwen35TextRunner {
         &self.identity
     }
 
+    pub(crate) const fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    pub(crate) const fn rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+
+    pub(crate) fn execution_backend(&self) -> &dyn TernaryBackend {
+        self.backend.as_ref()
+    }
+
+    pub(crate) fn gather_shared_embedding(
+        &self,
+        tokens: &[u32],
+        output: &mut [f32],
+    ) -> Result<(), NnError> {
+        self.embedding
+            .gather_with_backend(self.backend.as_ref(), tokens, output)
+    }
+
+    pub(crate) fn project_shared_head(
+        &self,
+        hidden_states: &[f32],
+        rows: usize,
+        output: &mut [f32],
+    ) -> Result<(), NnError> {
+        self.lm_head
+            .forward(self.backend.as_ref(), hidden_states, rows, output)
+    }
+
     /// Allocate one exact-runner hybrid cache.
     ///
     /// # Errors

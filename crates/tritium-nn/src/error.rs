@@ -18,6 +18,16 @@ pub enum NnError {
     /// A required HuggingFace `config.json` key was absent or the wrong type; the
     /// `String` is the key (or a short reason).
     MissingConfig(String),
+    /// A model-side evidence or package artifact was malformed, unauthorized,
+    /// or inconsistent with the loaded source model.
+    InvalidArtifact(String),
+    /// A bounded model operation could not reserve the required host memory.
+    ResourceExhausted(String),
+    /// A model value, output, or cache came from an incompatible execution
+    /// capability or content identity.
+    Provenance(String),
+    /// A preregistered numeric or state-transition verification failed.
+    Verification(String),
     /// A backend call failed; the message is the stringified `BackendError`.
     Backend(String),
     /// A tensor used a ggml type-id this layer cannot consume (the `u32` is the
@@ -46,6 +56,10 @@ impl fmt::Display for NnError {
             NnError::MissingConfig(key) => {
                 write!(f, "missing or mistyped HF config key: {key}")
             }
+            NnError::InvalidArtifact(msg) => write!(f, "invalid model artifact: {msg}"),
+            NnError::ResourceExhausted(msg) => write!(f, "model resource exhausted: {msg}"),
+            NnError::Provenance(msg) => write!(f, "model provenance error: {msg}"),
+            NnError::Verification(msg) => write!(f, "model verification failed: {msg}"),
             NnError::Backend(msg) => write!(f, "backend error: {msg}"),
             NnError::UnsupportedTensorType(t) => {
                 write!(f, "unsupported ggml tensor type-id: {t}")

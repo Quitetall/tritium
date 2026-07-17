@@ -42,11 +42,15 @@ pub use layers::{
 pub use model::GgufBpeTokenizer;
 pub use model::{
     ForwardDump, LayerWeights, ModelRunner, ModelWeights, QWEN35_HF_SOURCE_ARCHITECTURE,
-    QWEN35_MTP_UNVERIFIED_REASON, Qwen35ContentVerifiedHfSource, Qwen35HfLanguageModel,
-    Qwen35HfLanguageReceipt, Qwen35HfSource, Qwen35HfSourceIdentity, Qwen35HfTensorMetadata,
-    Qwen35MtpInputPlan, Qwen35MtpLayerWeights, Qwen35MtpStatus, Qwen35MtpWeights,
-    Qwen35TensorStreamError, Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights,
-    Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights, Tokenizer, UnverifiedQwen35Mtp,
+    QWEN35_MTP_UNVERIFIED_REASON, QWEN35_MTP_VLLM_ORACLE_REVISION, QWEN35_MTP_VLLM_SOURCE_SHA256,
+    Qwen35ContentVerifiedHfSource, Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel,
+    Qwen35HfLanguageMtpReceipt, Qwen35HfLanguageReceipt, Qwen35HfSource, Qwen35HfSourceIdentity,
+    Qwen35HfTensorMetadata, Qwen35MtpCache, Qwen35MtpInputPlan, Qwen35MtpLayerWeights,
+    Qwen35MtpOracleCoverageProfile, Qwen35MtpOracleEvidenceClass, Qwen35MtpOutput,
+    Qwen35MtpParityReceipt, Qwen35MtpPromotionError, Qwen35MtpRunner, Qwen35MtpStatus,
+    Qwen35MtpWeights, Qwen35TensorStreamError, Qwen35TextCache, Qwen35TextLayerWeights,
+    Qwen35TextMixerWeights, Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights,
+    Qwen35VerifiedHfLanguageMtpModel, Tokenizer, UnverifiedQwen35Mtp,
     qwen36_27b_canonical_source_config,
 };
 #[cfg(feature = "cuda")]

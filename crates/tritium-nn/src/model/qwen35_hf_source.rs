@@ -11,13 +11,14 @@ use tritium_format::{
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
-use crate::model::Qwen35TextRunner;
 use crate::model::hf::read_config_json;
 use crate::model::hf_shards::{HfShardSet, HfTensorBytesError};
 use crate::model::qwen35_hf::{
-    Qwen35HfLanguageModel, Qwen35HfLanguageReceipt, Qwen35HfTensorSource, language_schema,
-    load_language_weights, preflight_source,
+    Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel, Qwen35HfLanguageReceipt, Qwen35HfTensorSource,
+    language_schema, load_language_weights, load_mtp_weights, mtp_schema, preflight_mtp_source,
+    preflight_source,
 };
+use crate::model::{Qwen35TextRunner, UnverifiedQwen35Mtp};
 use crate::qwen35_config::{
     Qwen35CheckpointConfig, Qwen35DeltaNetConfig, Qwen35Dtype, Qwen35FullAttentionConfig,
     Qwen35LayerType, Qwen35MtpConfig, Qwen35NormWeightSemantics, Qwen35OutputGate,
@@ -377,6 +378,41 @@ impl Qwen35ContentVerifiedHfSource {
             source.config,
             runner,
             language_receipt,
+            identity,
+        ))
+    }
+
+    /// Consume the verified source into exact-fp32 language and MTP graphs.
+    ///
+    /// The combined loader requires exactly the official 15-tensor `mtp.*`
+    /// schema. It returns the MTP graph structurally unverified; execution remains
+    /// unavailable until [`Qwen35HfLanguageMtpModel::verify_mtp`] matches a pinned
+    /// pinned vLLM fixture prefill/decode trace.
+    ///
+    /// # Errors
+    /// Returns an error for a missing, unknown, duplicate, wrong-shape, changed,
+    /// or unsupported MTP tensor, or for language/MTP assembly failure.
+    pub fn load_language_mtp(
+        self,
+        backend: Box<dyn TernaryBackend>,
+    ) -> Result<Qwen35HfLanguageMtpModel, NnError> {
+        let mtp_schema = mtp_schema(&self.source.config.text)?;
+        let receipt =
+            preflight_mtp_source(&self.source.shards, &mtp_schema, self.language_receipt)?;
+        let language_weights = load_language_weights(&self, &self.source.config.text)?;
+        let mtp_weights = load_mtp_weights(&self, &self.source.config.text)?;
+        let runner = Qwen35TextRunner::new(&self.source.config.text, language_weights, backend)?;
+        let mtp = UnverifiedQwen35Mtp::new(&runner, mtp_weights)?;
+        let Self {
+            source,
+            identity,
+            language_receipt: _,
+        } = self;
+        Ok(Qwen35HfLanguageMtpModel::from_verified_source(
+            source.config,
+            runner,
+            mtp,
+            receipt,
             identity,
         ))
     }
