@@ -1,7 +1,7 @@
 # 0043 — SALT V2 implementation and SOTA campaign
 
-Status: **IN PROGRESS** (software/reference substrate implemented 2026-07-15;
-empirical campaign gates remain open)
+Status: **IN PROGRESS** (Qwen family/MTP fixture gate implemented 2026-07-17;
+checkpoint-scale and empirical campaign gates remain open)
 
 - **Decision:** [ADR 0028](../adr/0028-salt-v2-additive-ternarization.md)
 - **Research cutoff:** 2026-07-14, inclusive
@@ -50,10 +50,14 @@ linear-attention/Gated DeltaNet blocks followed by one full-attention block.
 The checkpoint declares `mtp_num_hidden_layers = 1`, and the official serving
 instructions include MTP deployment configurations.
 
-Tritium's current Llama/Qwen3 model skeleton handles a conventional
-SwiGLU/GQA/RoPE transformer. It cannot ingest this outer configuration,
-Gated DeltaNet schedule, or MTP module. A Qwen3.6 architecture adapter is
-therefore ahead of the production campaign driver on the critical path.
+Tritium now has a content-bound Qwen3.5-family reference adapter that parses the
+outer/nested configuration, executes configured Gated DeltaNet and
+full-attention language layers, and exact-loads the one-layer MTP module. A
+small pinned-vLLM prefill/decode fixture passes the MTP gate. This is component
+evidence only: the pinned 27B checkpoint has not been loaded, all 64 layers have
+not been compared with the reference, and no checkpoint-scale coverage,
+host/CUDA parity, allocation, or serving receipt exists. Those proofs remain
+ahead of the production campaign driver on the critical path.
 
 The active order is:
 
@@ -579,6 +583,18 @@ the 27B campaign.
 - Run any literature-continuity model only after the flagship artifact exists;
   it cannot substitute for the 27B result.
 
+**Current narrow evidence (2026-07-17):** the MTP implementation has an exact
+15-tensor loader and a compiled-authorized synthetic H32/I48/V37 fixture. The
+fixture executes pinned vLLM's real `EagleProposer.set_inputs_first_pass`, target
+and MTP models, Triton attention, multi-token prefill, cached decode, target
+logits/argmax, MTP logits, and complete two-KV-head caches. Two fresh-cache CUDA
+oracle generations were byte-identical, and the Tritium CPU reference matched
+the sealed lanes under the fixed 2e-3 absolute profile. The generator rejects
+all inherited Triton controls and the non-prefixed compiler/PTXAS override set,
+then attests the resolved bundled compiler inputs. This proves the narrow
+fixture contract only. It does not satisfy the 64-layer dense parity, exact 27B
+coverage, Tritium CUDA, checkpoint-scale serving, or PTQ work items above.
+
 **PTQ gate before refinement**
 
 - R3 SALT V2 closes at least 50% of SALT V1's perplexity gap to bf16.
@@ -759,6 +775,14 @@ preserves Qwen2 QKV biases and Qwen3 QK-normalization weights, and returns a
 canonical whole-model weight-allocation receipt. Real-CUDA fixtures compare complete
 Llama/Qwen model logits against an independent dense Hugging Face reconstruction
 for every admitted codec.
+The Qwen3.5-family reference seam now parses the outer and nested configuration,
+content-binds canonical execution semantics and every source tensor, assembles
+configured Gated DeltaNet/full-attention language schedules, and exact-loads the
+15-tensor one-layer MTP graph. MTP execution is capability-gated by a private
+compiled oracle ledger. Its only row is a reproducible synthetic fixture that
+binds official vLLM first-pass proposer inputs, target hidden/logit/token parity,
+MTP hidden/logit parity, and full prefill/decode KV caches; its receipt is
+explicitly ineligible for production.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
@@ -767,10 +791,12 @@ outside the direct-runtime claim until it earns separate evidence.
 
 The following work deliberately remains open and keeps this plan in progress:
 
-- the active Qwen3.6-27B adapter does not exist. The current Llama/Qwen3
-  skeleton cannot parse the outer `qwen3_5` configuration with nested
-  `text_config`, execute Gated DeltaNet/linear-attention layers, reproduce the
-  mixed 3:1 layer schedule, or load and receipt the one-layer MTP drafter;
+- the Qwen3.5-family adapter and MTP fixture gate exist, but the exact pinned
+  Qwen3.6-27B shards have not been streamed through them. There is no proof yet
+  for the 64-layer 3:1 mixed schedule, the checkpoint-scale language/MTP tensor
+  set, Tritium host/CUDA parity, full serving lifecycle, or practical recurrent
+  and KV-cache allocations. The compiled MTP authorization ledger contains no
+  production evidence row, so fixture success cannot admit Stage 8;
 - the production model driver does not yet connect block-output reconstruction,
   scale-only teacher-KL, or hard PV updates to real checkpoint tensors;
 - `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense

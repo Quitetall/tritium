@@ -658,3 +658,58 @@ umbrella claim "Tritium SOTA" may be emitted only when all applicable gates in
 both [ADR 0026](./0026-sota-campaign.md) and this ADR are green. Neither a PTQ
 win, a refined win, a decode-only lead, nor completion of the language-only
 scope is sufficient by itself.
+
+## Amendment 2026-07-17 — source-bound Qwen family and MTP fixture gate
+
+This amendment supersedes only the implementation-status statement above that
+the Qwen3.6 adapter and MTP module do not exist. It does not relax or complete a
+campaign gate.
+
+Tritium now has a content-bound Qwen3.5-family dense reference seam. It parses
+the outer configuration and canonical nested `text_config`, validates the
+configured hybrid language schedule, exact-loads the language tensors, and
+implements Gated DeltaNet, full attention, and a one-layer Qwen MTP runner. The
+combined loader accepts exactly the official 15-tensor MTP schema, clears those
+tensors from the deferred-language receipt, and leaves the graph unexecutable
+until an authorized parity artifact passes. Failed authorization or parity
+returns the still-loaded model for retry.
+
+The first authorized evidence is deliberately a synthetic fixture, not the
+flagship checkpoint. It uses hidden width 32, intermediate width 48, vocabulary
+37, two query and two KV heads, and one full-attention target layer plus one MTP
+layer. Its two transactions cover multi-token prefill followed by cached
+one-token decode. The generator executes pinned vLLM revision
+`36484e464a6cf763c5b4c8af7be8e19df324997a`, calls the real
+`EagleProposer.set_inputs_first_pass`, runs the target and MTP wrappers with the
+Triton attention backend, and seals target hidden states, target logits and
+greedy token selection, MTP hidden states and logits, and the complete MTP key
+and value caches. Tritium compares every finite lane under the fixed
+`fp32-storage-tf32-attention-absolute-2e-3` profile; callers cannot select a
+tolerance or inject an expected trace through the safe API.
+
+The oracle generation environment is also part of the evidence. Generation
+starts from fresh isolated compiler caches and binds the clean vLLM tree,
+selected source files, all checkout native extensions, the exact five loaded
+vLLM native extensions, Python and verified installed-distribution payloads,
+Torch and Triton revisions, compiler inputs, the eight generated cubins, 61
+mapped numeric libraries, RTX 4090 geometry, CUDA 13.0, NVIDIA driver 610.43.03,
+and the driver libraries. All inherited `TRITON_*` controls plus the non-prefixed
+PTXAS, LLVM, compiler, and remote-cache controls are rejected before importing
+Triton; the resolved bundled PTXAS/libdevice and compiler-control state are
+recorded and checked. The canonical generator is
+packaged with `tritium-nn`; the workspace tool is only its launcher. Two
+independent fresh-cache runs were byte-identical. The sealed body is 5,368 bytes,
+has SHA-256 `902aeb8f465beb8c8962f8289c0cfbe3baa1e26e0f12e17690df7f7949ebf2fc`,
+and domain-separated body ID
+`4910ae294fc2b2af75f2ecb8bc58237cfe0ae12a2592b2083857773c205c08c2`.
+Its canonical implementation-manifest ID is
+`3b7a2c3bfd4f8fc45ec17872430048b84f337728b3145ebaa460f5644203157d`.
+
+The private compiled authorization ledger contains only this fixture evidence
+class, and fixture receipts cannot qualify for production. Stage 8 therefore
+remains open. Required missing evidence includes the exact pinned 27B source and
+1,199-tensor coverage receipt, all 64 mixed-schedule language layers, the
+checkpoint MTP drafter, Tritium host/CUDA parity at checkpoint scale, an
+official checkpoint-scale serving trace, measured allocations, and the PTQ and
+refined quality/runtime campaigns. No paid compute is authorized by this
+amendment.
