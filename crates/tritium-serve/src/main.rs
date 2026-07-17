@@ -155,9 +155,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if kv_pool_tokens.is_some() && batch_slots <= 1 {
-        return Err("--kv-pool-tokens requires --batch-slots > 1 (paged KV is the \
+        return Err(
+            "--kv-pool-tokens requires --batch-slots > 1 (paged KV is the \
                     batched worker's pool)"
-            .into());
+                .into(),
+        );
     }
     let cfg = ServeConfig {
         model_id,

@@ -494,8 +494,9 @@ pub(crate) fn run_batched(
                         )));
                         continue;
                     }
-                    let out = runner.tree_verify_greedy(&tokens, &parents).map_err(|e| {
-                        match e {
+                    let out = runner
+                        .tree_verify_greedy(&tokens, &parents)
+                        .map_err(|e| match e {
                             tritium_nn::ResidentOpError::Unavailable => {
                                 crate::generator::TreeOpError::Unsupported(
                                     "tree-verify needs the CUDA device-resident decoder".into(),
@@ -505,8 +506,7 @@ pub(crate) fn run_batched(
                                 tritium_spec::BackendError::InvalidInput(m),
                             ) => crate::generator::TreeOpError::BadRequest(m),
                             other => crate::generator::TreeOpError::Internal(other.to_string()),
-                        }
-                    });
+                        });
                     let _ = resp.send(out);
                 }
             }

@@ -258,9 +258,7 @@ async fn cuda_batched_tree_session_coexists() {
     // Two chained verify rounds against whatever router: open → verify
     // [root, d1, d2] chain → verify again rooted at the last committed token.
     // Returns (pending_token, committed_round1, committed_round2).
-    let session_rounds = |router: Router,
-                          prompt: Vec<u32>,
-                          drafts: Vec<u32>| async move {
+    let session_rounds = |router: Router, prompt: Vec<u32>, drafts: Vec<u32>| async move {
         let (st, v) = tree_post(
             &router,
             "/v1/tree/session",
@@ -303,11 +301,8 @@ async fn cuda_batched_tree_session_coexists() {
             max_new_default: 32,
             ..ServeConfig::default()
         };
-        let (router, _d) = tritium_serve::build_router(
-            Box::new(RunnerGenerator::new(runner, u32::MAX)),
-            tok,
-            cfg,
-        );
+        let (router, _d) =
+            tritium_serve::build_router(Box::new(RunnerGenerator::new(runner, u32::MAX)), tok, cfg);
         session_rounds(router, session_prompt.clone(), drafts.clone()).await
     };
 
@@ -329,7 +324,10 @@ async fn cuda_batched_tree_session_coexists() {
     // (a) Idle-pool batched session == single-worker session, token for token.
     let (b_root, b_rounds) =
         session_rounds(router.clone(), session_prompt.clone(), drafts.clone()).await;
-    assert_eq!(b_root, single_root, "C4a: batched root != single-worker root");
+    assert_eq!(
+        b_root, single_root,
+        "C4a: batched root != single-worker root"
+    );
     assert_eq!(
         b_rounds, single_rounds,
         "C4a: batched committed tokens != single-worker (mode must be lossless)"
@@ -402,11 +400,8 @@ async fn cuda_batched_tree_session_coexists() {
             max_new_default: 32,
             ..ServeConfig::default()
         };
-        let (r, _d) = tritium_serve::build_router(
-            Box::new(RunnerGenerator::new(runner, u32::MAX)),
-            tok,
-            cfg,
-        );
+        let (r, _d) =
+            tritium_serve::build_router(Box::new(RunnerGenerator::new(runner, u32::MAX)), tok, cfg);
         accept_on(r, session_prompt.clone(), informed.clone()).await
     };
     assert!(
@@ -588,7 +583,9 @@ fn spawn_stream(
                     .as_str()
                     .is_some_and(|s| !s.trim().is_empty())
                 {
-                    sink.lock().expect("times lock").push(std::time::Instant::now());
+                    sink.lock()
+                        .expect("times lock")
+                        .push(std::time::Instant::now());
                 }
             }
         }
