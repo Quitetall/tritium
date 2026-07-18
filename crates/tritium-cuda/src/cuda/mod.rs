@@ -1788,7 +1788,19 @@ impl CudaDecodeModel {
             .alloc_zeros::<i8>(m * n_ff)
             .map_err(|e| driver_err("prefill d_qact", &e))?;
         let mut d_act_scale = alloc(m, "prefill d_act_scale")?;
-        let mut d_scores = alloc(m * n_head * ctx_max, "prefill d_scores")?;
+        // v2 attention covers this prefill? Invariant across layers (head_dim,
+        // causal_offset, m are fixed), so decide once. v2 keeps scores in
+        // shared — the rev-1 [m, n_head, ctx_max] scratch (tens of MB at long
+        // ctx) is only allocated when the rev-1 kernel will actually run
+        // (review 98ab046 nit N1).
+        let attn_v2: Option<CudaFunction> = self.f_attn_batch_v2.clone().filter(|_| {
+            head_dim <= consts::ATTN_V2_HDMAX && causal_offset + m <= consts::ATTN_V2_MAX_CTX
+        });
+        let mut d_scores = if attn_v2.is_some() {
+            alloc(1, "prefill d_scores (v2 stub)")?
+        } else {
+            alloc(m * n_head * ctx_max, "prefill d_scores")?
+        };
         let mut d_logits = alloc(self.vocab, "prefill d_logits")?;
 
         // Embedding gather (m rows).
@@ -1879,9 +1891,7 @@ impl CudaDecodeModel {
             )?;
             // v2 attention when the shared budget covers this launch (bit-identical
             // to the rev-1 kernel per (row, head) — gated by to_bits tests).
-            if let Some(f_v2) = self.f_attn_batch_v2.as_ref().filter(|_| {
-                head_dim <= consts::ATTN_V2_HDMAX && causal_offset + m <= consts::ATTN_V2_MAX_CTX
-            }) {
+            if let Some(f_v2) = attn_v2.as_ref() {
                 Self::bl_attn_v2(
                     s,
                     f_v2,

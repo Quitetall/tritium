@@ -2736,6 +2736,7 @@ fn gqa_attention_batch_v2_matches_rev1_bitwise() {
         (4, 4, 64, 0, 33),                           // MHA, small head_dim
         (20, 5, 128, 500, 12),                       // 2B4T-shaped, deep offset
         (8, 2, 128, 0, 1),                           // single row
+        (8, 2, 128, 3500, 84),                       // ctx to exactly ATTN_V2_MAX_CTX
     ];
 
     let mut seed = 0x2f17u64;
@@ -3965,6 +3966,27 @@ fn sparse_kernel_partial_block() {
             "partial block sparse vs cpu [{i}]: sparse={g} cpu={c}"
         );
     }
+}
+
+/// Review-98ab046 nit N2 guardrail: the host-side v2 attention dispatch
+/// bounds (consts.rs) must equal the kernel's shared-sizing `#define`s in
+/// decode.cu — a Rust-side value drifting LARGER than the kernel's would send
+/// out-of-bounds shared indices to production that the (ctx <= 3584) bitwise
+/// gates cannot catch. Parsed from source, no GPU needed.
+#[test]
+fn attn_v2_consts_match_decode_cu_defines() {
+    let src = include_str!("../../kernels/decode.cu");
+    let get = |name: &str| -> usize {
+        src.lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .unwrap_or_else(|| panic!("#define {name} missing from decode.cu"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("#define {name} is not a bare number"))
+    };
+    assert_eq!(get("ATTN_V2_HDMAX"), ATTN_V2_HDMAX);
+    assert_eq!(get("ATTN_V2_MAX_CTX"), ATTN_V2_MAX_CTX);
+    assert_eq!(get("ATTN_V2_THREADS"), ATTN_V2_THREADS as usize);
 }
 
 /// ADR 0022 guardrail with teeth: the twin-kernel family table must match
