@@ -3266,6 +3266,12 @@ pub struct DeviceTape<'backend, 'leaf> {
     ones: CudaSlice<f32>,
     checkpoint_policy: CheckpointPolicy,
     packed_compute_policy: PackedSaltComputePolicy,
+    /// Optional tensor-core GEMM tier (Lever 1). When set, dense `Matmul` forward + both
+    /// backward GEMMs run on tf32 tensor cores instead of the f32 `--fmad=false` kernels
+    /// (~65× per GEMM). Borrowed so one cuBLASLt handle is reused across every per-step tape.
+    /// `None` ⇒ the bit-exact f32 path (unchanged); the tier is gated on recovery, not
+    /// bit-exactness.
+    tc: Option<&'backend TensorCoreGemm>,
     checkpoint_interval: Option<usize>,
     checkpoint_markers: usize,
     last_checkpoint_op: usize,
@@ -3325,6 +3331,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
             ones,
             checkpoint_policy,
             packed_compute_policy,
+            tc: None,
             checkpoint_interval,
             checkpoint_markers: 0,
             last_checkpoint_op: 0,
@@ -3589,6 +3596,59 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     }
 
     /// `Y[m,n] = X[m,k]·W[n,k]ᵀ` (fp dense).
+    /// Route this tape's dense `Matmul` GEMMs (forward + both backward) through the tf32
+    /// tensor-core tier. Builder-style so existing constructors are untouched (default `None`
+    /// = f32 path). The handle is created once (e.g. per training run) and shared by every
+    /// per-step tape.
+    #[must_use]
+    pub fn with_tensor_core(mut self, tc: &'backend TensorCoreGemm) -> Self {
+        self.tc = Some(tc);
+        self
+    }
+
+    /// Dense-matmul forward `Y = X·Wᵀ`: tf32 tensor cores when the tier is attached, else the
+    /// f32 `--fmad=false` kernel (with `s = ones`, so the two are the same operation).
+    fn mm_forward(
+        &self,
+        xs: &CudaSlice<f32>,
+        ws: &CudaSlice<f32>,
+        shape: GemmShape,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        match self.tc {
+            Some(tc) => tc.forward(xs, ws, shape, out),
+            None => self.b.matmul_forward_dev(xs, ws, &self.ones, shape, out),
+        }
+    }
+
+    /// Dense-matmul activation grad `gA = gY·W`: tf32 tier or f32 kernel.
+    fn mm_grad_a(
+        &self,
+        gy: &CudaSlice<f32>,
+        ws: &CudaSlice<f32>,
+        shape: GemmShape,
+        ga: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        match self.tc {
+            Some(tc) => tc.grad_a(gy, ws, shape, ga),
+            None => self.b.grad_a_dev(gy, ws, &self.ones, shape, ga),
+        }
+    }
+
+    /// Dense-matmul weight grad `gW = gYᵀ·X`: tf32 tier or f32 kernel.
+    fn mm_grad_w(
+        &self,
+        gy: &CudaSlice<f32>,
+        xs: &CudaSlice<f32>,
+        shape: GemmShape,
+        gw: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        match self.tc {
+            Some(tc) => tc.grad_w(gy, xs, shape, gw),
+            None => self.b.grad_w_dev(gy, xs, &self.ones, shape, gw),
+        }
+    }
+
     pub fn matmul(
         &mut self,
         x: usize,
@@ -3598,10 +3658,9 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         k: usize,
     ) -> Result<usize, BackendError> {
         let mut out = self.b.dev_alloc_zeros(m * n)?;
-        self.b.matmul_forward_dev(
+        self.mm_forward(
             self.value_slice(x)?,
             self.value_slice(w)?,
-            &self.ones,
             GemmShape { m, n, k },
             &mut out,
         )?;
@@ -4173,10 +4232,9 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                 out: _,
             } => {
                 let mut output = self.b.dev_alloc_zeros(m * n)?;
-                self.b.matmul_forward_dev(
+                self.mm_forward(
                     self.value_slice(x)?,
                     self.value_slice(w)?,
-                    &self.ones,
                     GemmShape { m, n, k },
                     &mut output,
                 )?;
@@ -4683,13 +4741,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                     } => {
                         let shape = GemmShape { m, n, k };
                         let mut gx = self.b.dev_alloc_zeros(m * k)?;
-                        self.b.grad_a_dev(
-                            &grad_out,
-                            self.value_slice(w)?,
-                            &self.ones,
-                            shape,
-                            &mut gx,
-                        )?;
+                        self.mm_grad_a(&grad_out, self.value_slice(w)?, shape, &mut gx)?;
                         self.accumulate_grad_slot(
                             &mut grads,
                             &retain,
@@ -4699,13 +4751,7 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
                             &mut peak_persistent_grad_elements,
                         )?;
                         let mut gw = self.b.dev_alloc_zeros(n * k)?;
-                        self.b.grad_w_dev(
-                            &grad_out,
-                            self.value_slice(x)?,
-                            &self.ones,
-                            shape,
-                            &mut gw,
-                        )?;
+                        self.mm_grad_w(&grad_out, self.value_slice(x)?, shape, &mut gw)?;
                         self.accumulate_grad_slot(
                             &mut grads,
                             &retain,
@@ -9921,6 +9967,152 @@ mod tests {
         eprintln!(
             "tensor-core tier all 3 GEMMs match f32 (m={m} k={k} n={n}): \
              fwd {r_fwd:.2e}, grad_a {r_ga:.2e}, grad_w {r_gw:.2e}"
+        );
+    }
+
+    /// Tensor-core tier — WHOLE MODEL. Builds a multi-layer transformer (embed → GQA attention
+    /// + SwiGLU blocks → tied head) twice on a `DeviceTape` — once on the f32 kernels, once with
+    /// `.with_tensor_core(...)` so every dense GEMM (qkv/o, gate/up/down, head) runs on tf32
+    /// tensor cores — and asserts logits and gradients agree within tf32 tolerance accumulated
+    /// across the full depth. This is the wiring gate: the tier changes speed, not the trained
+    /// result. (Embed/norm/softmax stay f32 in both; only the dense matmuls switch.)
+    #[test]
+    fn device_tape_tf32_matches_f32_whole_model() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping device_tape_tf32_matches_f32_whole_model: no CUDA ({e})");
+                return;
+            }
+        };
+        let tc = match TensorCoreGemm::new(&backend) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping device_tape_tf32_matches_f32_whole_model: no cuBLASLt ({e:?})");
+                return;
+            }
+        };
+
+        const VOCAB: usize = 256;
+        const N_EMBD: usize = 64;
+        const N_HEAD: usize = 4;
+        const N_KV: usize = 2;
+        const HEAD_DIM: usize = 16;
+        const FF: usize = 128;
+        const SEQ: usize = 16;
+        const N_LAYERS: usize = 2;
+        const EPS: f32 = 1e-5;
+        const THETA: f32 = 10000.0;
+        let qd = N_HEAD * HEAD_DIM;
+        let kvd = N_KV * HEAD_DIM;
+
+        let tokens: Vec<i32> = (0..SEQ).map(|i| ((i * 37 + 11) % VOCAB) as i32).collect();
+        let cot = seeded_uniform(0xA00, SEQ * VOCAB, -1.0, 1.0);
+
+        // Build + run the model on `dt` (tf32 if `use_tc`), returning logits and the retained
+        // grads for [tied embed, layer0 wq, layer0 gate]. Weights are seeded identically per run.
+        let run = |use_tc: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+            let mut dt =
+                DeviceTape::new(&backend, (SEQ * N_EMBD).max(FF).max(qd).max(VOCAB)).unwrap();
+            if use_tc {
+                dt = dt.with_tensor_core(&tc);
+            }
+            let embed_w = seeded_uniform(0xA01, VOCAB * N_EMBD, -0.1, 0.1);
+            let emb = dt.leaf(&embed_w).unwrap();
+            let mut hidden = dt.embed(emb, &tokens, SEQ, N_EMBD, VOCAB).unwrap();
+            let mut wq0 = 0usize;
+            let mut wg0 = 0usize;
+            for l in 0..N_LAYERS {
+                let an = dt
+                    .leaf(&seeded_uniform(0xB00 + l as u64, N_EMBD, 0.5, 1.5))
+                    .unwrap();
+                let xn = dt.rmsnorm(hidden, an, SEQ, N_EMBD, EPS).unwrap();
+                let wq = dt
+                    .leaf(&seeded_uniform(0xB10 + l as u64, qd * N_EMBD, -0.1, 0.1))
+                    .unwrap();
+                let wk = dt
+                    .leaf(&seeded_uniform(0xB20 + l as u64, kvd * N_EMBD, -0.1, 0.1))
+                    .unwrap();
+                let wv = dt
+                    .leaf(&seeded_uniform(0xB30 + l as u64, kvd * N_EMBD, -0.1, 0.1))
+                    .unwrap();
+                let wo = dt
+                    .leaf(&seeded_uniform(0xB40 + l as u64, N_EMBD * qd, -0.1, 0.1))
+                    .unwrap();
+                let attn = dt
+                    .attention(
+                        xn, wq, wk, wv, wo, SEQ, N_EMBD, N_HEAD, N_KV, HEAD_DIM, THETA,
+                    )
+                    .unwrap();
+                hidden = dt.add(hidden, attn).unwrap();
+                let fnw = dt
+                    .leaf(&seeded_uniform(0xB50 + l as u64, N_EMBD, 0.5, 1.5))
+                    .unwrap();
+                let hn = dt.rmsnorm(hidden, fnw, SEQ, N_EMBD, EPS).unwrap();
+                let wg = dt
+                    .leaf(&seeded_uniform(0xB60 + l as u64, FF * N_EMBD, -0.1, 0.1))
+                    .unwrap();
+                let wu = dt
+                    .leaf(&seeded_uniform(0xB70 + l as u64, FF * N_EMBD, -0.1, 0.1))
+                    .unwrap();
+                let wd = dt
+                    .leaf(&seeded_uniform(0xB80 + l as u64, N_EMBD * FF, -0.1, 0.1))
+                    .unwrap();
+                let g = dt.matmul(hn, wg, SEQ, FF, N_EMBD).unwrap();
+                let u = dt.matmul(hn, wu, SEQ, FF, N_EMBD).unwrap();
+                let ga = dt.silu(g).unwrap();
+                let gated = dt.mul(ga, u).unwrap();
+                let down = dt.matmul(gated, wd, SEQ, N_EMBD, FF).unwrap();
+                hidden = dt.add(hidden, down).unwrap();
+                if l == 0 {
+                    wq0 = wq;
+                    wg0 = wg;
+                }
+            }
+            let onw = dt.leaf(&seeded_uniform(0xA02, N_EMBD, 0.5, 1.5)).unwrap();
+            let fnorm = dt.rmsnorm(hidden, onw, SEQ, N_EMBD, EPS).unwrap();
+            let logits = dt.matmul(fnorm, emb, SEQ, VOCAB, N_EMBD).unwrap(); // tied head
+            let logits_v = dt.value(logits).unwrap();
+            let seed = backend.dev_upload(&cot).unwrap();
+            let res = dt.backward_retain(logits, &seed, &[emb, wq0, wg0]).unwrap();
+            let dl = |id: usize, n: usize| {
+                let mut h = vec![0.0f32; n];
+                backend
+                    .dev_download(res.grads[id].as_ref().expect("grad retained"), &mut h)
+                    .unwrap();
+                h
+            };
+            (
+                logits_v,
+                dl(emb, VOCAB * N_EMBD),
+                dl(wq0, qd * N_EMBD),
+                dl(wg0, FF * N_EMBD),
+            )
+        };
+
+        let (lf, gef, gqf, ggf) = run(false);
+        let (lt, get, gqt, ggt) = run(true);
+        let rel = |a: &[f32], b: &[f32]| {
+            let range = b.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                - b.iter().copied().fold(f32::INFINITY, f32::min);
+            max_abs_diff(a, b) / range.max(1e-6)
+        };
+        let r_log = rel(&lt, &lf);
+        let r_emb = rel(&get, &gef);
+        let r_wq = rel(&gqt, &gqf);
+        let r_wg = rel(&ggt, &ggf);
+        for (name, r) in [
+            ("logits", r_log),
+            ("embed grad", r_emb),
+            ("wq grad", r_wq),
+            ("gate grad", r_wg),
+        ] {
+            assert!(r < 2e-2, "tf32 whole-model {name} rel {r:.2e} exceeds 2e-2");
+        }
+        eprintln!(
+            "tensor-core tier whole model ({N_LAYERS}L, vocab={VOCAB} n_embd={N_EMBD} seq={SEQ}): \
+             tf32 vs f32 — logits {r_log:.2e}, embed grad {r_emb:.2e}, wq grad {r_wq:.2e}, \
+             gate grad {r_wg:.2e}"
         );
     }
 
