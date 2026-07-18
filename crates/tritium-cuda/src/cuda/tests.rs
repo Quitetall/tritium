@@ -2590,6 +2590,113 @@ fn tuned_config_matches_reference_and_is_stable() {
     }
 }
 
+/// rev-4 staging coverage: JIT tiles must match the AOT anchor **bit-for-bit**
+/// on shapes the sweep never visits — `k % 16 != 0` (the cp.async fast path is
+/// invalid there; the per-byte staging fallback must produce the identical
+/// shared bytes) and `k % 32 != 0` with `k % 16 == 0` (a full zero-filled
+/// cp.async tail chunk inside the last k-tile). Tiles are chosen to exercise
+/// every rev-4 geometry regime: multi-subtile warp rectangles (WM_PER and
+/// WN_PER above 1), deep pipelines (stages 3/4), and oversubscribed warps
+/// (stage-only warps). The AOT kernel (`kernels/tq2_0_imma.cu`) is the
+/// unchanged pinned anchor, so `to_bits` equality here proves the rev-4
+/// staging rewrite is a pure perf change.
+#[test]
+fn imma_jit_staging_matches_aot_bitwise_at_unaligned_k() {
+    let cuda = match CudaBackend::new(0) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping rev-4 staging gate: no device ({e})");
+            return;
+        }
+    };
+
+    let tiles = [
+        // 2x2 warp grid, one sub-tile each.
+        TileConfig {
+            tile_m: 32,
+            tile_n: 16,
+            tile_k: 64,
+            warps: 4,
+            stages: 2,
+        },
+        // 1x8 warp grid, WM_PER=8, triple-buffered.
+        TileConfig {
+            tile_m: 128,
+            tile_n: 64,
+            tile_k: 64,
+            warps: 8,
+            stages: 3,
+        },
+        // WN_PER=2, quad-buffered.
+        TileConfig {
+            tile_m: 128,
+            tile_n: 128,
+            tile_k: 32,
+            warps: 8,
+            stages: 4,
+        },
+        // Oversubscribed: 4 warps, single sub-tile (3 warps stage-only).
+        TileConfig::BASELINE,
+    ];
+
+    // k=40/88: k%16 != 0 (byte-staging fallback); k=48: k%16 == 0 but
+    // k%32 != 0 (cp.async path with a zero-filled tail chunk in k-tile 1).
+    // n*k stays a 128-multiple (the I2_S payload packer's granularity).
+    for &(m, n, k) in &[(33usize, 32usize, 40usize), (16, 16, 88), (20, 24, 48)] {
+        let shape = GemmShape::new(m, n, k);
+        let raw: Vec<i8> = (0..n * k).map(|i| ((i * 7 + m) % 3) as i8 - 1).collect();
+        let qact: Vec<i8> = (0..m * k)
+            .map(|i| (((i * 31 + k) % 255) as i32 - 127) as i8)
+            .collect();
+        let act_scale: Vec<f32> = (0..m).map(|i| 0.01 + (i % 5) as f32 * 0.007).collect();
+        let wscale: Vec<f32> = (0..n).map(|j| 1.0 + (j % 3) as f32 * 0.25).collect();
+        let num_ktiles = k.div_ceil(32);
+
+        let d_qact = cuda.stream.clone_htod(&qact).expect("qact htod");
+        let d_weights = cuda
+            .stream
+            .clone_htod(&pack_i2s_int8(&raw, shape))
+            .expect("weights htod");
+        let d_as = cuda.stream.clone_htod(&act_scale).expect("as htod");
+        let d_ws = cuda.stream.clone_htod(&wscale).expect("ws htod");
+
+        let run = |tile: TileConfig| -> Vec<f32> {
+            let func = cuda.imma_function_for_tile(tile).expect("tile function");
+            let mut d_out: cudarc::driver::CudaSlice<f32> =
+                cuda.stream.alloc_zeros(m * n).expect("out alloc");
+            launch_imma_tile_on(
+                &cuda.stream,
+                &func,
+                tile,
+                &d_qact,
+                &d_weights,
+                &d_as,
+                &d_ws,
+                &mut d_out,
+                m as i32,
+                n as i32,
+                k as i32,
+                num_ktiles as i32,
+            )
+            .expect("launch");
+            cuda.stream.clone_dtoh(&d_out).expect("out dtoh")
+        };
+
+        let anchor = run(TileConfig::AOT_EQUIVALENT);
+        for tile in tiles {
+            let got = run(tile);
+            for (i, (&g, &a)) in got.iter().zip(&anchor).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    a.to_bits(),
+                    "tile {tile:?} diverges from AOT anchor at ({m},{n},{k})[{i}]: \
+                     jit={g} aot={a}"
+                );
+            }
+        }
+    }
+}
+
 /// v0.3.1 de-risk: the device `rmsnorm_f32` decode kernel must reproduce the host
 /// `tritium_nn::ops::rmsnorm` **bit-for-bit** (`to_bits` equal), so the fully
 /// device-resident forward keeps greedy 256/256. This is the proof that a

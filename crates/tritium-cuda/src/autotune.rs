@@ -88,8 +88,10 @@ impl TileConfig {
     };
 
     /// Whether this config is a launchable IMMA tile: every tile dim a positive
-    /// multiple of the corresponding `mma` dimension (16/8/32), and at least one
-    /// warp and one pipeline stage. Codegen and the launcher both require this.
+    /// multiple of the corresponding `mma` dimension (16/8/32), at least one
+    /// warp, and at least two pipeline stages (the rev-4 `cp.async` pipeline's
+    /// `wait_group(STAGES-2)` immediate needs a double buffer minimum). Codegen
+    /// and the launcher both require this.
     pub(crate) const fn is_valid(&self) -> bool {
         self.tile_m != 0
             && self.tile_m.is_multiple_of(16)
@@ -98,7 +100,7 @@ impl TileConfig {
             && self.tile_k != 0
             && self.tile_k.is_multiple_of(32)
             && self.warps >= 1
-            && self.stages >= 1
+            && self.stages >= 2
     }
 
     /// Threads per block this config launches (`warps · 32`).
@@ -106,12 +108,37 @@ impl TileConfig {
         self.warps as u32 * 32
     }
 
-    /// Dynamic + static shared bytes the rendered kernel stages: `stages` deep, each
-    /// holding the int8 A (`tile_m·tile_k`) and B (`tile_n·tile_k`) staging regions.
-    /// Used to prune candidates that would exceed the per-block shared budget.
+    /// The contiguous `(warps_m, warps_n)` warp-grid partition of the block's
+    /// `M_SUBTILES × N_SUBTILES` sub-tile grid (rev-4 codegen). Deterministic:
+    /// the largest divisor of `n_subtiles` that is `<= warps` becomes `warps_n`
+    /// (splitting across N first maximises B-fragment locality), then the
+    /// largest divisor of `m_subtiles` that fits the remaining warps becomes
+    /// `warps_m`. Always well-formed (both `>= 1`, product `<= warps`); warps
+    /// beyond the grid stage but do not compute.
+    pub(crate) const fn warp_grid(&self) -> (u16, u16) {
+        let m_sub = self.tile_m / 16;
+        let n_sub = self.tile_n / 8;
+        let w = self.warps as u16;
+        let mut wn = if w < n_sub { w } else { n_sub };
+        while !n_sub.is_multiple_of(wn) {
+            wn -= 1;
+        }
+        let cap = w / wn;
+        let mut wm = if cap < m_sub { cap } else { m_sub };
+        while !m_sub.is_multiple_of(wm) {
+            wm -= 1;
+        }
+        (wm, wn)
+    }
+
+    /// Static shared bytes the rendered kernel stages: `stages` deep, each holding
+    /// the unpacked int8 A (`tile_m·tile_k`) and the PACKED I2sInt8 B tiles
+    /// (`tile_n·tile_k/4` — rev-4 codegen keeps B 2-bit-packed in shared and
+    /// expands at fragment-load time). Used to prune candidates that would exceed
+    /// the per-block shared budget.
     pub(crate) const fn shared_bytes(&self) -> u32 {
         let per_stage =
-            self.tile_m as u32 * self.tile_k as u32 + self.tile_n as u32 * self.tile_k as u32;
+            self.tile_m as u32 * self.tile_k as u32 + self.tile_n as u32 * self.tile_k as u32 / 4;
         per_stage * self.stages as u32
     }
 }
@@ -250,6 +277,58 @@ pub(crate) fn candidate_tiles() -> Vec<TileConfig> {
             warps: 8,
             stages: 2,
         },
+        // rev-4 (cp.async pipeline + packed-B shared): deeper pipelines and the
+        // genuinely large tiles the quartered B footprint now affords. These are
+        // where a compute-bound M>=256 prefill wants to land.
+        TileConfig {
+            tile_m: 128,
+            tile_n: 64,
+            tile_k: 64,
+            warps: 8,
+            stages: 3,
+        },
+        TileConfig {
+            tile_m: 128,
+            tile_n: 64,
+            tile_k: 64,
+            warps: 8,
+            stages: 4,
+        },
+        TileConfig {
+            tile_m: 128,
+            tile_n: 128,
+            tile_k: 64,
+            warps: 8,
+            stages: 3,
+        },
+        TileConfig {
+            tile_m: 128,
+            tile_n: 64,
+            tile_k: 128,
+            warps: 8,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 256,
+            tile_n: 64,
+            tile_k: 64,
+            warps: 8,
+            stages: 2,
+        },
+        TileConfig {
+            tile_m: 64,
+            tile_n: 64,
+            tile_k: 64,
+            warps: 4,
+            stages: 3,
+        },
+        TileConfig {
+            tile_m: 128,
+            tile_n: 128,
+            tile_k: 32,
+            warps: 8,
+            stages: 4,
+        },
     ];
     RAW.iter()
         .copied()
@@ -315,11 +394,13 @@ pub(crate) struct CacheKey {
 /// rev 3 = epilogue association unified with the dp4a family
 /// ((float)acc * weight_scale * act_scale) — the ADR 0026 Track P
 /// bit-identity contract; outputs shift at ULP level vs rev 2.
-pub(crate) const CODEGEN_REV: u32 = 3;
+/// rev 4 = cp.async staging pipeline + packed-B shared + contiguous warp-grid
+/// ownership + full unrolls (outputs bit-identical to rev 3; perf only).
+pub(crate) const CODEGEN_REV: u32 = 4;
 
 impl CacheKey {
     /// Stable filesystem-safe string form, e.g.
-    /// `sm_89-i2sint8-m5-n2560-k2560-cuda13030-r3`. The CUDA version and codegen
+    /// `sm_89-i2sint8-m5-n2560-k2560-cuda13030-r4`. The CUDA version and codegen
     /// revision suffixes mean a driver bump or a codegen change keys a *different*
     /// file, transparently invalidating stale entries.
     pub(crate) fn to_key_string(&self) -> String {
@@ -580,7 +661,7 @@ mod tests {
         // driver bump invalidates the on-disk entry.
         assert_eq!(
             sample_key().to_key_string(),
-            "sm_89-i2sint8-m5-n2560-k2560-cuda13030-r3"
+            "sm_89-i2sint8-m5-n2560-k2560-cuda13030-r4"
         );
     }
 
@@ -629,10 +710,12 @@ mod tests {
         assert!(!TileConfig { tile_m: 24, ..ok }.is_valid());
         assert!(!TileConfig { tile_n: 12, ..ok }.is_valid());
         assert!(!TileConfig { tile_k: 48, ..ok }.is_valid());
-        // Zero dims / no warps / no stages.
+        // Zero dims / no warps / not enough pipeline stages for the cp.async
+        // wait_group immediate (rev 4 requires a double buffer minimum).
         assert!(!TileConfig { tile_m: 0, ..ok }.is_valid());
         assert!(!TileConfig { warps: 0, ..ok }.is_valid());
         assert!(!TileConfig { stages: 0, ..ok }.is_valid());
+        assert!(!TileConfig { stages: 1, ..ok }.is_valid());
     }
 
     #[test]
