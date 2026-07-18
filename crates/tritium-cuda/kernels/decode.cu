@@ -1941,6 +1941,9 @@ static __device__ __forceinline__ void gqa_attention_batch_v3_body(
         const float vv = s_kv[jj * kstride + d];
 #pragma unroll
         for (int r = 0; r < ATTN_V3_BQ; ++r) {
+          // Rows >= nrows read UNSTAGED s_w garbage here — safe by design:
+          // their acc[r] can only poison a register that the nrows-guarded
+          // store below never emits (no FP traps on this path).
           const float w = s_w[r][jj];
           if (w != 0.0f) {
             acc[r] = __fadd_rn(acc[r], __fmul_rn(w, vv));

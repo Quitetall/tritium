@@ -27,7 +27,7 @@ families by the rung count:
 | `gqa_attention_batch_v3` | 2 (f32/f16; i8/t2 fall back to rev 1) |
 | `lm_head_warp` | 2 (f32/f16 table) |
 
-That is 29 kernel symbols across these families — 20 duplicates beyond one
+That is 33 kernel symbols across these families — 22 duplicates beyond one
 canonical body each. The
 Phase-2 architecture question: consolidate via C++ templates with
 `extern "C"` shims (one body, N instantiations), or keep the explicit
