@@ -10101,6 +10101,14 @@ mod tests {
         let r_emb = rel(&get, &gef);
         let r_wq = rel(&gqt, &gqf);
         let r_wg = rel(&ggt, &ggf);
+        // Lower-bound sentinel: tf32 truncates the mantissa, so it MUST measurably diverge from
+        // f32. If `with_tensor_core` ever silently became a no-op, both runs would be bit-identical
+        // (rel = 0) and the upper-bound checks below would still pass — this catches that.
+        assert!(
+            r_log > 1e-7,
+            "tf32 must measurably diverge from f32 — else the tier is silently un-wired \
+             (logits rel {r_log:.2e})"
+        );
         for (name, r) in [
             ("logits", r_log),
             ("embed grad", r_emb),
