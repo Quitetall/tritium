@@ -9529,6 +9529,137 @@ mod tests {
         }
     }
 
+    /// Tensor-core training tier (Lever 1) — smoke gate. cuBLASLt's `Matmul<f32>` uses
+    /// `CUBLAS_COMPUTE_32F_FAST_TF32`: tf32 tensor cores, fp32 accumulate, **f32 in/out**
+    /// (no cast kernels). This proves the whole approach end-to-end — the dlopened
+    /// cuBLASLt engages the 4090's tensor cores, the tf32 result matches the f32 kernel
+    /// within tf32's ~10-bit-mantissa tolerance, and it is faster on a realistic MLP-gate
+    /// GEMM — before wiring it in as a DeviceTape compute policy. Row-major `Y=X·Wᵀ` maps to
+    /// column-major cuBLASLt as `a=W, b=X, transa, m=n, n=m, k=k, lda=ldb=k, ldc=n`.
+    #[test]
+    fn tf32_tensor_core_matmul_matches_f32() {
+        use std::time::Instant;
+
+        use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping tf32_tensor_core_matmul_matches_f32: no CUDA device ({e})");
+                return;
+            }
+        };
+        let blas = match CudaBlasLT::new(backend.stream().clone()) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping tf32_tensor_core_matmul_matches_f32: no cuBLASLt ({e:?})");
+                return;
+            }
+        };
+        // MLP-gate shape: Y[m,n] = X[m,k]·Wᵀ, X=[batch*seq, n_embd], W=[ff, n_embd].
+        let (m, k, n) = (512usize, 576usize, 1536usize);
+        let x = seeded_uniform(0x900, m * k, -1.0, 1.0);
+        let w = seeded_uniform(0x901, n * k, -0.1, 0.1);
+        let ones = vec![1.0f32; n];
+
+        // f32 reference (the bit-exact --fmad=false kernel), s=ones ⇒ plain X·Wᵀ.
+        let d_x = backend.dev_upload(&x).unwrap();
+        let d_w = backend.dev_upload(&w).unwrap();
+        let d_s = backend.dev_upload(&ones).unwrap();
+        let mut d_yf = backend.dev_alloc_zeros(m * n).unwrap();
+        backend
+            .matmul_forward_dev(&d_x, &d_w, &d_s, GemmShape { m, n, k }, &mut d_yf)
+            .unwrap();
+        let mut y_f32 = vec![0.0f32; m * n];
+        backend.dev_download(&d_yf, &mut y_f32).unwrap();
+
+        // tf32 tensor-core path.
+        let cfg = MatmulConfig {
+            transa: true,
+            transb: false,
+            transc: false,
+            m: n as u64,
+            n: m as u64,
+            k: k as u64,
+            alpha: 1.0,
+            lda: k as i64,
+            ldb: k as i64,
+            beta: 0.0,
+            ldc: n as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+        let mut d_yt = backend.dev_alloc_zeros(m * n).unwrap();
+        // SAFETY: shapes/leading-dims match the uploaded row-major buffers per the mapping above.
+        #[allow(unsafe_code)]
+        unsafe {
+            blas.matmul(
+                cfg,
+                &d_w,
+                &d_x,
+                &mut d_yt,
+                Option::<&CudaSlice<f32>>::None,
+                None,
+            )
+            .unwrap();
+        }
+        backend.stream().synchronize().unwrap();
+        let mut y_tf32 = vec![0.0f32; m * n];
+        backend.dev_download(&d_yt, &mut y_tf32).unwrap();
+
+        let range = y_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - y_f32.iter().copied().fold(f32::INFINITY, f32::min);
+        let rel = max_abs_diff(&y_tf32, &y_f32) / range.max(1e-6);
+        assert!(
+            rel < 5e-3,
+            "tf32 tensor-core GEMM must match f32 within tf32 tolerance: rel {rel:.2e}"
+        );
+
+        // Timing: warm, then time many iterations with one sync at the end.
+        let time = |iters: usize, run: &mut dyn FnMut()| -> f64 {
+            for _ in 0..3 {
+                run();
+            }
+            backend.stream().synchronize().unwrap();
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                run();
+            }
+            backend.stream().synchronize().unwrap();
+            t0.elapsed().as_secs_f64() / iters as f64
+        };
+        let iters = 100;
+        let f32_s = time(iters, &mut || {
+            backend
+                .matmul_forward_dev(&d_x, &d_w, &d_s, GemmShape { m, n, k }, &mut d_yf)
+                .unwrap();
+        });
+        let tf32_s = time(iters, &mut || {
+            #[allow(unsafe_code)]
+            unsafe {
+                blas.matmul(
+                    cfg,
+                    &d_w,
+                    &d_x,
+                    &mut d_yt,
+                    Option::<&CudaSlice<f32>>::None,
+                    None,
+                )
+                .unwrap();
+            }
+        });
+        eprintln!(
+            "tf32 tensor-core GEMM [{m}×{k}]·[{n}×{k}]ᵀ: rel {rel:.2e} vs f32 kernel; \
+             f32 {:.3} ms, tf32 {:.3} ms → {:.1}× faster",
+            f32_s * 1e3,
+            tf32_s * 1e3,
+            f32_s / tf32_s
+        );
+    }
+
     /// Gate + payoff (plan 0043 P2.4a): a full **device-resident SwiGLU MLP block** — rmsnorm →
     /// gate/up matmul → silu → mul → down matmul → residual — run forward AND backward entirely on
     /// resident VRAM buffers (activations never leave the device; grads of a value with two

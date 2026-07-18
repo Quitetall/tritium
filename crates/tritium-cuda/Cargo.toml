@@ -54,6 +54,11 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
     "std",
     "fallback-dynamic-loading",
     "cuda-13020",
+    # cuBLASLt (dlopened via fallback-dynamic-loading) for the tensor-core training
+    # tier: its `Matmul<f32>` uses CUBLAS_COMPUTE_32F_FAST_TF32 — tf32 tensor cores
+    # with f32 I/O and fp32 accumulate. Only needs the driver; the lean default build
+    # (no `cuda` feature) still pulls in no cudarc at all.
+    "cublaslt",
 ] }
 # `linkme` backs the `BACKENDS` self-registration in the (cuda-only) host module —
 # same distributed-slice mechanism `tritium-cpu`/`tritium-runtime` use. Only pulled

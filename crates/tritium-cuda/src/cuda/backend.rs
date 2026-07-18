@@ -2152,6 +2152,13 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// The backend's default CUDA stream. Exposed so the tensor-core training tier in
+    /// `crate::train` can build a cuBLASLt handle on the same stream — that module lives
+    /// outside `crate::cuda` and cannot reach the `pub(super)` field directly.
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     /// `Y[m,n] = s[n]·Σ_k A[m,k]·W[n,k]` on ALREADY-RESIDENT buffers — the device-resident companion
     /// to [`train_forward`](Self::train_forward): same kernel, same `--fmad=false` sequential
     /// reduction, no htod/dtoh. `d_y` must be preallocated `m*n` (e.g. via [`dev_alloc_zeros`]).
