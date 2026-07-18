@@ -28,6 +28,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
 use cudarc::driver::{CudaSlice, CudaStream, PinnedHostSlice};
 use tritium_core::GemmShape;
 use tritium_spec::BackendError;
@@ -151,6 +152,186 @@ impl TrainGemm for GpuGemm {
             .grad_w(gy, x, &ones, shape, &mut g_w)
             .expect("GpuGemm dense_backward grad_w: device error");
         (g_x, g_w)
+    }
+}
+
+/// Tensor-core training GEMMs via cuBLASLt (Lever 1). All three training GEMMs — forward
+/// `Y=X·Wᵀ`, activation grad `gA=gY·W`, weight grad `gW=gYᵀ·X` — run on the 4090's tf32
+/// tensor cores (`CUBLAS_COMPUTE_32F_FAST_TF32`, fp32 accumulate, f32 in/out), a drop-in
+/// replacement for the naive `--fmad=false` f32 kernels that is ~65× faster on realistic
+/// shapes. Not bit-exact vs the CPU oracle (tf32 truncates the mantissa to ~10 bits); the
+/// tier is gated on end-to-end distillation recovery, with the f32 kernels kept as the
+/// correctness oracle.
+///
+/// Row-major → column-major cuBLASLt mapping (cuBLASLt is column-major; a row-major
+/// `[r,c]` buffer with leading dim `c` is a column-major `[c,r]` buffer with ld `c`):
+/// - forward  `Y[m,n]=X[m,k]·Wᵀ`      → `a=W,  b=X,  transa,        m=n, n=m, k=k, lda=k, ldb=k, ldc=n`
+/// - grad_a   `gA[m,k]=gY[m,n]·W[n,k]` → `a=W,  b=gY,                m=k, n=m, k=n, lda=k, ldb=n, ldc=k`
+/// - grad_w   `gW[n,k]=gYᵀ·X`          → `a=X,  b=gY, transb,        m=k, n=n, k=m, lda=k, ldb=n, ldc=k`
+pub struct TensorCoreGemm {
+    blas: CudaBlasLT,
+}
+
+impl std::fmt::Debug for TensorCoreGemm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TensorCoreGemm").finish_non_exhaustive()
+    }
+}
+
+impl TensorCoreGemm {
+    /// Build a cuBLASLt handle on the backend's stream. Fails closed if cuBLASLt cannot be
+    /// loaded (e.g. `libcublasLt` absent), so callers can fall back to the f32 kernels.
+    pub fn new(backend: &CudaBackend) -> Result<Self, BackendError> {
+        let blas = CudaBlasLT::new(backend.stream().clone()).map_err(|e| {
+            BackendError::InvalidInput(format!("cuBLASLt handle init failed: {e:?}"))
+        })?;
+        Ok(Self { blas })
+    }
+
+    fn run(
+        &self,
+        cfg: MatmulConfig,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        // SAFETY: every call site fixes `cfg`'s shapes/leading-dims to the row-major→column-major
+        // mapping documented on the type, and the buffers are sized by the shape guards below.
+        #[allow(unsafe_code)]
+        unsafe {
+            self.blas
+                .matmul(cfg, a, b, c, Option::<&CudaSlice<f32>>::None, None)
+                .map_err(|e| BackendError::InvalidInput(format!("cuBLASLt matmul failed: {e:?}")))
+        }
+    }
+
+    /// `Y[m,n] = X[m,k]·Wᵀ` (`W` is `[n,k]`), tf32 tensor cores. `d_y` preallocated `m*n`.
+    pub fn forward(
+        &self,
+        d_x: &CudaSlice<f32>,
+        d_w: &CudaSlice<f32>,
+        shape: GemmShape,
+        d_y: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if d_x.len() < m * k || d_w.len() < n * k || d_y.len() < m * n {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * n,
+                got: d_y.len(),
+            });
+        }
+        if m * n == 0 || k == 0 {
+            return Ok(());
+        }
+        self.run(
+            MatmulConfig {
+                transa: true,
+                transb: false,
+                transc: false,
+                m: n as u64,
+                n: m as u64,
+                k: k as u64,
+                alpha: 1.0,
+                lda: k as i64,
+                ldb: k as i64,
+                beta: 0.0,
+                ldc: n as i64,
+                stride_a: None,
+                stride_b: None,
+                stride_c: None,
+                stride_bias: None,
+                batch_size: None,
+            },
+            d_w,
+            d_x,
+            d_y,
+        )
+    }
+
+    /// `gA[m,k] = gY[m,n]·W[n,k]` (activation grad), tf32 tensor cores. `d_ga` preallocated `m*k`.
+    pub fn grad_a(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        d_w: &CudaSlice<f32>,
+        shape: GemmShape,
+        d_ga: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if d_gy.len() < m * n || d_w.len() < n * k || d_ga.len() < m * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: m * k,
+                got: d_ga.len(),
+            });
+        }
+        if m * k == 0 || n == 0 {
+            return Ok(());
+        }
+        self.run(
+            MatmulConfig {
+                transa: false,
+                transb: false,
+                transc: false,
+                m: k as u64,
+                n: m as u64,
+                k: n as u64,
+                alpha: 1.0,
+                lda: k as i64,
+                ldb: n as i64,
+                beta: 0.0,
+                ldc: k as i64,
+                stride_a: None,
+                stride_b: None,
+                stride_c: None,
+                stride_bias: None,
+                batch_size: None,
+            },
+            d_w,
+            d_gy,
+            d_ga,
+        )
+    }
+
+    /// `gW[n,k] = Σ_m gY[m,n]·X[m,k]` (weight grad), tf32 tensor cores. `d_gw` preallocated `n*k`.
+    pub fn grad_w(
+        &self,
+        d_gy: &CudaSlice<f32>,
+        d_x: &CudaSlice<f32>,
+        shape: GemmShape,
+        d_gw: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        if d_gy.len() < m * n || d_x.len() < m * k || d_gw.len() < n * k {
+            return Err(BackendError::ShapeMismatch {
+                expected: n * k,
+                got: d_gw.len(),
+            });
+        }
+        if n * k == 0 || m == 0 {
+            return Ok(());
+        }
+        self.run(
+            MatmulConfig {
+                transa: false,
+                transb: true,
+                transc: false,
+                m: k as u64,
+                n: n as u64,
+                k: m as u64,
+                alpha: 1.0,
+                lda: k as i64,
+                ldb: n as i64,
+                beta: 0.0,
+                ldc: k as i64,
+                stride_a: None,
+                stride_b: None,
+                stride_c: None,
+                stride_bias: None,
+                batch_size: None,
+            },
+            d_x,
+            d_gy,
+            d_gw,
+        )
     }
 }
 
@@ -9657,6 +9838,89 @@ mod tests {
             f32_s * 1e3,
             tf32_s * 1e3,
             f32_s / tf32_s
+        );
+    }
+
+    /// Tensor-core tier — all three training GEMMs. Validates `TensorCoreGemm`'s forward,
+    /// grad_a, and grad_w against the f32 `--fmad=false` kernels (with `s = ones`, so the
+    /// ternary scale is identity). Distinct m/k/n so a transposed/wrong mapping mismatches
+    /// dimensions (cuBLASLt errors) or produces values far above the tf32 tolerance — it
+    /// cannot pass by luck. grad_a and grad_w are the mappings the forward smoke test does
+    /// not cover.
+    #[test]
+    fn tensor_core_gemm_all_three_match_f32() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping tensor_core_gemm_all_three_match_f32: no CUDA device ({e})");
+                return;
+            }
+        };
+        let tc = match TensorCoreGemm::new(&backend) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skipping tensor_core_gemm_all_three_match_f32: no cuBLASLt ({e:?})");
+                return;
+            }
+        };
+        let (m, k, n) = (384usize, 576usize, 1536usize);
+        let shape = GemmShape { m, n, k };
+        let x = seeded_uniform(0x910, m * k, -1.0, 1.0);
+        let w = seeded_uniform(0x911, n * k, -0.1, 0.1);
+        let gy = seeded_uniform(0x912, m * n, -1.0, 1.0);
+        let ones = vec![1.0f32; n];
+        let d_x = backend.dev_upload(&x).unwrap();
+        let d_w = backend.dev_upload(&w).unwrap();
+        let d_gy = backend.dev_upload(&gy).unwrap();
+        let d_s = backend.dev_upload(&ones).unwrap();
+
+        let dl = |d: &CudaSlice<f32>, len: usize| {
+            let mut h = vec![0.0f32; len];
+            backend.dev_download(d, &mut h).unwrap();
+            h
+        };
+        let rel = |a: &[f32], b: &[f32]| {
+            let range = b.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                - b.iter().copied().fold(f32::INFINITY, f32::min);
+            max_abs_diff(a, b) / range.max(1e-6)
+        };
+
+        // forward Y = X·Wᵀ
+        let mut d_yf = backend.dev_alloc_zeros(m * n).unwrap();
+        backend
+            .matmul_forward_dev(&d_x, &d_w, &d_s, shape, &mut d_yf)
+            .unwrap();
+        let mut d_yt = backend.dev_alloc_zeros(m * n).unwrap();
+        tc.forward(&d_x, &d_w, shape, &mut d_yt).unwrap();
+        backend.stream().synchronize().unwrap();
+        let r_fwd = rel(&dl(&d_yt, m * n), &dl(&d_yf, m * n));
+
+        // grad_a = gY·W
+        let mut d_gaf = backend.dev_alloc_zeros(m * k).unwrap();
+        backend
+            .grad_a_dev(&d_gy, &d_w, &d_s, shape, &mut d_gaf)
+            .unwrap();
+        let mut d_gat = backend.dev_alloc_zeros(m * k).unwrap();
+        tc.grad_a(&d_gy, &d_w, shape, &mut d_gat).unwrap();
+        backend.stream().synchronize().unwrap();
+        let r_ga = rel(&dl(&d_gat, m * k), &dl(&d_gaf, m * k));
+
+        // grad_w = gYᵀ·X
+        let mut d_gwf = backend.dev_alloc_zeros(n * k).unwrap();
+        backend
+            .grad_w_dev(&d_gy, &d_x, &d_s, shape, &mut d_gwf)
+            .unwrap();
+        let mut d_gwt = backend.dev_alloc_zeros(n * k).unwrap();
+        tc.grad_w(&d_gy, &d_x, shape, &mut d_gwt).unwrap();
+        backend.stream().synchronize().unwrap();
+        let r_gw = rel(&dl(&d_gwt, n * k), &dl(&d_gwf, n * k));
+
+        assert!(r_fwd < 5e-3, "tf32 forward rel {r_fwd:.2e}");
+        assert!(r_ga < 5e-3, "tf32 grad_a rel {r_ga:.2e}");
+        assert!(r_gw < 5e-3, "tf32 grad_w rel {r_gw:.2e}");
+        eprintln!(
+            "tensor-core tier all 3 GEMMs match f32 (m={m} k={k} n={n}): \
+             fwd {r_fwd:.2e}, grad_a {r_ga:.2e}, grad_w {r_gw:.2e}"
         );
     }
 
