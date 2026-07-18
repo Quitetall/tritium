@@ -1777,6 +1777,190 @@ static __device__ __forceinline__ void gqa_attention_batch_v2_body(
 }
 
 
+
+// ---- v3 Q-blocked prefill attention (order-preserving; round 23 lever) ----
+//
+// v2 made attention 74% of prefill by fixing everything EXCEPT data reuse:
+// each (row, head) block re-reads the full K/V. v3 blocks ATTN_V3_BQ query
+// rows per (block, head): K chunks are staged ONCE and feed all BQ rows'
+// dot chains; V values are loaded once per (thread, key) and folded into
+// all BQ rows' accumulators — K/V traffic drops ~BQ x. Scores return to the
+// global [m, n_head, ctx_max] scratch (their traffic is ~2 orders below the
+// K/V traffic being amortized, and it lifts v2's ctx <= 3584 shared cap:
+// v3 handles ANY ctx).
+//
+// Every pinned fold order is rev-1's, verbatim per row:
+//   * per-key d-order dot chain (inputs staged bit-preserving);
+//   * max via fmaxf reduction (exact under any order, NaN/-0.0 corners
+//     argued at the v2 body); exp/scale elementwise;
+//   * the softmax SUM: sequential j on one lane per row;
+//   * the V fold: per (row, d) sequential-j chain across ascending chunks
+//     with the `w == 0.0f` skip. Keys past a row's causal limit stage a 0
+//     weight and take the same skip — the accumulator chain is untouched,
+//     exactly as if the iteration never ran.
+//
+// => BIT-IDENTICAL per (row, head) to gqa_attention_batch_{f32,h} (and so
+// to v2). Gate: to_bits equality, both dtypes, staircase/tail/deep-ctx
+// regimes. Host contract: head_dim <= ATTN_V2_HDMAX only (no ctx bound).
+#define ATTN_V3_THREADS 128
+#define ATTN_V3_BQ 8
+#define ATTN_V3_KCH 32
+
+template <class C>
+static __device__ __forceinline__ void gqa_attention_batch_v3_body(
+    const float* __restrict__ q, const typename C::T* __restrict__ k,
+    const typename C::T* __restrict__ v, float* __restrict__ out,
+    float* __restrict__ scores, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale,
+    const int causal_offset, const int m) {
+  const int h = blockIdx.x;
+  const int row0 = blockIdx.y * ATTN_V3_BQ;
+  const int tid = threadIdx.x;
+  const int nrows = min(ATTN_V3_BQ, m - row0);
+  if (nrows <= 0 || h >= n_head) return;  // blockIdx-uniform: no barrier hazard
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+  // One past the highest key any row of this block attends.
+  const int ctx_top = causal_offset + row0 + nrows;
+
+  // K/V chunk stage (reused between phases 1 and 3), the BQ query rows, and
+  // the per-chunk score strip phase 3 reads broadcast from shared.
+  __shared__ __align__(16) float s_kv[ATTN_V3_KCH * (ATTN_V2_HDMAX + 1)];
+  __shared__ __align__(16) float s_q[ATTN_V3_BQ * ATTN_V2_HDMAX];
+  __shared__ float s_w[ATTN_V3_BQ][ATTN_V3_KCH + 1];
+
+  for (int idx = tid; idx < nrows * head_dim; idx += ATTN_V3_THREADS) {
+    const int r = idx / head_dim;
+    const int d = idx - r * head_dim;
+    s_q[r * ATTN_V2_HDMAX + d] =
+        q[((long long)(row0 + r) * n_head + h) * head_dim + d];
+  }
+  __syncthreads();
+
+  const int kstride = head_dim + 1;
+
+  // Phase 1: scaled dots. Each staged KCH-key chunk feeds all BQ rows:
+  // thread t owns key t&31 for rows t>>5 and (t>>5)+4 (4 threads share a
+  // key row -> broadcast shared reads; 32 threads share a query row ->
+  // broadcast s_q reads). Keys past a row's causal limit write nothing.
+  for (int c0 = 0; c0 < ctx_top; c0 += ATTN_V3_KCH) {
+    const int nk = min(ATTN_V3_KCH, ctx_top - c0);
+    for (int idx = tid; idx < nk * head_dim; idx += ATTN_V3_THREADS) {
+      const int j = idx / head_dim;
+      const int d = idx - j * head_dim;
+      s_kv[j * kstride + d] =
+          C::load(&k[((long long)(c0 + j) * n_head_kv + kv) * head_dim + d]);
+    }
+    __syncthreads();
+    const int key = tid & 31;
+    if (key < nk) {
+      const float* kr = &s_kv[key * kstride];
+      const int jglob = c0 + key;
+#pragma unroll
+      for (int rr = 0; rr < 2; ++rr) {
+        const int r = (tid >> 5) + rr * 4;
+        if (r < nrows && jglob <= causal_offset + row0 + r) {
+          const float* qr = &s_q[r * ATTN_V2_HDMAX];
+          float dot = 0.0f;
+          for (int d = 0; d < head_dim; ++d) {
+            dot = __fadd_rn(dot, __fmul_rn(qr[d], kr[d]));
+          }
+          scores[((long long)(row0 + r) * n_head + h) * ctx_max + jglob] =
+              __fmul_rn(dot, scale);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // Phase 2: per-row softmax; warp w owns rows w and w+4. Butterfly fmaxf
+  // (exact any order), elementwise exp, ORDER-PINNED sequential sum on
+  // lane 0, elementwise inv scale.
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+#pragma unroll
+  for (int rr = 0; rr < 2; ++rr) {
+    const int r = warp + rr * 4;
+    if (r < nrows) {
+      float* sc = scores + ((long long)(row0 + r) * n_head + h) * ctx_max;
+      const int ctx = causal_offset + row0 + r + 1;
+      float local = -INFINITY;
+      for (int j = lane; j < ctx; j += 32) local = fmaxf(local, sc[j]);
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        local = fmaxf(local, __shfl_xor_sync(0xffffffffu, local, off));
+      }
+      const float mx = local;
+      for (int j = lane; j < ctx; j += 32) {
+        sc[j] = exp_f32(__fsub_rn(sc[j], mx));
+      }
+      __syncwarp();
+      float inv = 0.0f;
+      if (lane == 0) {
+        float sum = 0.0f;
+        for (int j = 0; j < ctx; ++j) {
+          sum = __fadd_rn(sum, sc[j]);
+        }
+        inv = __fdiv_rn(1.0f, sum);
+      }
+      inv = __shfl_sync(0xffffffffu, inv, 0);
+      for (int j = lane; j < ctx; j += 32) {
+        sc[j] = __fmul_rn(sc[j], inv);
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase 3: V fold. Per chunk: stage V into the reused s_kv, stage the
+  // chunk's normalized weights for all rows into s_w (0 past a row's causal
+  // limit), then thread d folds every row — one V load feeds BQ chains, each
+  // chain j-ascending with the rev-1 zero-skip.
+  float acc[ATTN_V3_BQ];
+#pragma unroll
+  for (int r = 0; r < ATTN_V3_BQ; ++r) acc[r] = 0.0f;
+  for (int c0 = 0; c0 < ctx_top; c0 += ATTN_V3_KCH) {
+    const int nk = min(ATTN_V3_KCH, ctx_top - c0);
+    for (int idx = tid; idx < nk * head_dim; idx += ATTN_V3_THREADS) {
+      const int j = idx / head_dim;
+      const int d = idx - j * head_dim;
+      s_kv[j * kstride + d] =
+          C::load(&v[((long long)(c0 + j) * n_head_kv + kv) * head_dim + d]);
+    }
+    for (int idx = tid; idx < nrows * nk; idx += ATTN_V3_THREADS) {
+      const int r = idx / nk;
+      const int jj = idx - r * nk;
+      const int jglob = c0 + jj;
+      s_w[r][jj] = (jglob <= causal_offset + row0 + r)
+          ? scores[((long long)(row0 + r) * n_head + h) * ctx_max + jglob]
+          : 0.0f;
+    }
+    __syncthreads();
+    if (tid < head_dim) {
+      const int d = tid;
+      for (int jj = 0; jj < nk; ++jj) {
+        const float vv = s_kv[jj * kstride + d];
+#pragma unroll
+        for (int r = 0; r < ATTN_V3_BQ; ++r) {
+          const float w = s_w[r][jj];
+          if (w != 0.0f) {
+            acc[r] = __fadd_rn(acc[r], __fmul_rn(w, vv));
+          }
+        }
+      }
+    }
+    __syncthreads();  // fold reads done before the next chunk restages s_kv/s_w
+  }
+  if (tid < head_dim) {
+#pragma unroll
+    for (int r = 0; r < ATTN_V3_BQ; ++r) {
+      if (r < nrows) {
+        out[((long long)(row0 + r) * n_head + h) * head_dim + tid] = acc[r];
+      }
+    }
+  }
+}
+
+
 template <class C>
 static __device__ __forceinline__ void lm_head_warp_body(
     const float* __restrict__ h, const typename C::T* __restrict__ embd,
@@ -2131,6 +2315,16 @@ __global__ void __launch_bounds__(ATTN_V2_THREADS) gqa_attention_batch_v2_h(
     const float scale, const int causal_offset, const int m) {
   gqa_attention_batch_v2_body<KvLoadF16>(q, k, v, out, n_head, n_head_kv, head_dim, scale,
       causal_offset, m);
+}
+
+// gqa_attention_batch_v3_h — f16-KV twin of gqa_attention_batch_v3_f32.
+__global__ void __launch_bounds__(ATTN_V3_THREADS) gqa_attention_batch_v3_h(
+    const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    float* __restrict__ out, float* __restrict__ scores, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale, const int causal_offset,
+    const int m) {
+  gqa_attention_batch_v3_body<KvLoadF16>(q, k, v, out, scores, ctx_max, n_head, n_head_kv,
+      head_dim, scale, causal_offset, m);
 }
 
 __global__ void gqa_attention_tree_scores_h(
@@ -2999,6 +3193,20 @@ __global__ void __launch_bounds__(ATTN_V2_THREADS) gqa_attention_batch_v2_f32(
     const float scale, const int causal_offset, const int m) {
   gqa_attention_batch_v2_body<KvLoadF32>(q, k, v, out, n_head, n_head_kv, head_dim, scale,
       causal_offset, m);
+}
+
+// gqa_attention_batch_v3_f32 — Q-blocked prefill attention (see the v3 body
+// doc): grid (n_head, ceil(m/ATTN_V3_BQ)), block ATTN_V3_THREADS, scores is
+// the [m, n_head, ctx_max] scratch. Bit-identical to gqa_attention_batch_f32
+// per (row, head). Host dispatches when head_dim <= ATTN_V2_HDMAX (no ctx
+// bound).
+__global__ void __launch_bounds__(ATTN_V3_THREADS) gqa_attention_batch_v3_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, float* __restrict__ scores, const int ctx_max, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale, const int causal_offset,
+    const int m) {
+  gqa_attention_batch_v3_body<KvLoadF32>(q, k, v, out, scores, ctx_max, n_head, n_head_kv,
+      head_dim, scale, causal_offset, m);
 }
 
 // gqa_attention_tree_f32 — BASTION tree-verify attention (ADR 0014).

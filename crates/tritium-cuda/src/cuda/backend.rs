@@ -4599,26 +4599,36 @@ impl CudaBackend {
             map
         };
 
-        // v2 prefill attention twin for this KV dtype (f32/f16 only; the i8/t2
-        // rungs keep the rev-1 kernel). TRITIUM_ATTN_V2=0 disables — loud
-        // reject on anything else (the TRITIUM_IMMA_PREFILL pattern).
-        let f_attn_batch_v2 = match std::env::var("TRITIUM_ATTN_V2") {
-            Err(_) => true,
-            Ok(v) if v == "1" => true,
-            Ok(v) if v == "0" => false,
-            Ok(v) => {
-                return Err(BackendError::InvalidInput(format!(
-                    "TRITIUM_ATTN_V2={v:?} — use 1 (default) or 0"
-                )));
+        // v2/v3 prefill attention twins for this KV dtype (f32/f16 only; the
+        // i8/t2 rungs keep the rev-1 kernel). TRITIUM_ATTN_V2=0 /
+        // TRITIUM_ATTN_V3=0 disable — loud reject on anything else (the
+        // TRITIUM_IMMA_PREFILL pattern).
+        let attn_env = |var: &str| -> Result<bool, BackendError> {
+            match std::env::var(var) {
+                Err(_) => Ok(true),
+                Ok(v) if v == "1" => Ok(true),
+                Ok(v) if v == "0" => Ok(false),
+                Ok(v) => Err(BackendError::InvalidInput(format!(
+                    "{var}={v:?} — use 1 (default) or 0"
+                ))),
             }
-        }
-        .then(|| match kv_dtype {
-            KvDtype::F32 => Some(f(dm, KERNEL_NAME_ATTN_BATCH_V2)),
-            KvDtype::F16 => Some(f(dm, KERNEL_NAME_ATTN_BATCH_V2_H)),
-            KvDtype::I8 | KvDtype::T2 => None,
-        })
-        .flatten()
-        .transpose()?;
+        };
+        let f_attn_batch_v2 = attn_env("TRITIUM_ATTN_V2")?
+            .then(|| match kv_dtype {
+                KvDtype::F32 => Some(f(dm, KERNEL_NAME_ATTN_BATCH_V2)),
+                KvDtype::F16 => Some(f(dm, KERNEL_NAME_ATTN_BATCH_V2_H)),
+                KvDtype::I8 | KvDtype::T2 => None,
+            })
+            .flatten()
+            .transpose()?;
+        let f_attn_batch_v3 = attn_env("TRITIUM_ATTN_V3")?
+            .then(|| match kv_dtype {
+                KvDtype::F32 => Some(f(dm, KERNEL_NAME_ATTN_BATCH_V3)),
+                KvDtype::F16 => Some(f(dm, KERNEL_NAME_ATTN_BATCH_V3_H)),
+                KvDtype::I8 | KvDtype::T2 => None,
+            })
+            .flatten()
+            .transpose()?;
 
         Ok(CudaDecodeModel {
             stream: Arc::clone(&self.stream),
@@ -4676,6 +4686,7 @@ impl CudaBackend {
                 ),
             )?,
             f_attn_batch_v2,
+            f_attn_batch_v3,
             f_attn_tree: f(dm, KERNEL_NAME_ATTN_TREE)?,
             f_attn_tree_scores,
             f_attn_tree_reduce,

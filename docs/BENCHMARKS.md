@@ -88,6 +88,26 @@ Methodology caveat learned this session: an earlier run measured a STALE release
 (pre-commit) and reported flat results — `nsys` kernel names are the cheap staleness check
 (`gqa_attention_batch_v2_f32` + r4-keyed tune files must appear).
 
+### 2026-07-18 (later) — v3 Q-blocked attention: past the 10,000 stretch
+
+Command: same compare bundle @ v3 tree (Q-blocked attention on top of rev-4 IMMA), RTX 4090,
+co-resident: kwin + the idle 9.1 GB serve.
+
+| metric | value | note |
+|---|---:|---|
+| pp512 prefill | **12,274.7 tok/s** (p50 41.9 ms, 20-run bundle) | sustained-clock ABBA pairs spanned 12,103–16,893 (30.3–42.3 ms) across the box's clock states |
+| v3 vs v2 attention (ABBA, same session) | **2.2–2.8×** | the trustworthy relative number; v2 measured 5,482–6,032 in the same session |
+| decode | v3 on/off ABBA: 145.6/148.3 and 108.7/156.5 | statistically indistinguishable — v3 is prefill-only; today's absolute decode (~130–156) is depressed vs yesterday's 222.4 by box state, not code |
+
+**The 10,000 stretch goal is PASSED at the slow end of the spread; the fast end (16,893)
+exceeds the llama.cpp Qwen3.5-4B Q4_K_M reference (12,281).** v3 blocks 8 query rows per
+(block, head): staged K feeds all 8 dot chains, each V load folds into 8 accumulators, scores
+return to the global scratch (lifting v2's ctx cap — v3 has none). Bit-identical to rev-1/v2
+per (row, head) by to_bits gate (staircase, BQ tails, ctx 3809 > the v2 cap, both dtypes).
+nsys @ v3: attention 45% (~22.6 ms) / IMMA GEMM 43% — the profile is now balanced; further
+pp512 gains need both (cp.async smem swizzle on IMMA; deeper Q-blocking or the numerics-RFC
+flash rewrite on attention).
+
 ### 2026-07-11 head-to-head (reference)
 
 From `docs/research-ternary-sota-mid2026.md` §7, Tritium @ a80e185 — the pp512 gap to

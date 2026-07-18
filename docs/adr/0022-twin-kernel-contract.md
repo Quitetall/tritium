@@ -8,12 +8,14 @@ different scale-stream contractions, tuning-sensitive).
 
 ## Context
 
-`decode.cu` holds 68 `__global__` kernels (65 at this ADR's writing; −1
+`decode.cu` holds 70 `__global__` kernels (65 at this ADR's writing; −1
 `gqa_attention_mdecode_f32` retired + +2 paged-KV twins, ADR 0025; +2
 `gqa_attention_batch_v2` f32/f16 twins, 2026-07-17 — an order-preserving
-prefill-attention rewrite, bit-identical to rev 1 by `to_bits` gate — the
-drift test pins the count with the cause chain). Ten families exist in 2–4
-dtype variants — the ADR 0020 KV precision ladder multiplied the KV-touching
+prefill-attention rewrite, bit-identical to rev 1 by `to_bits` gate; +2
+`gqa_attention_batch_v3` Q-blocked twins, 2026-07-18 — same bit-identity
+gate, BQ rows amortize the staged K/V — the
+drift test pins the count with the cause chain). Eleven families exist in
+2–4 dtype variants — the ADR 0020 KV precision ladder multiplied the KV-touching
 families by the rung count:
 
 | family | variants |
@@ -22,6 +24,7 @@ families by the rung count:
 | `kv_append`, `kv_append_batch` | 4 each (same axes) |
 | `gqa_attention_{scores,reduce,batch,tree_scores,tree_reduce}` | 3 each (f32/f16/i8) |
 | `gqa_attention_batch_v2` | 2 (f32/f16; i8/t2 fall back to rev 1) |
+| `gqa_attention_batch_v3` | 2 (f32/f16; i8/t2 fall back to rev 1) |
 | `lm_head_warp` | 2 (f32/f16 table) |
 
 That is 29 kernel symbols across these families — 20 duplicates beyond one

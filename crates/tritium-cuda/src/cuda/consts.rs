@@ -173,6 +173,16 @@ pub(super) const ATTN_V2_HDMAX: usize = 128;
 pub(super) const ATTN_V2_MAX_CTX: usize = 3584;
 /// Threads per v2 attention block.
 pub(super) const ATTN_V2_THREADS: u32 = 128;
+/// v3 Q-blocked prefill attention twins (BQ query rows share each staged
+/// K/V chunk; scores in the global scratch, so NO ctx bound — only the
+/// head_dim <= ATTN_V2_HDMAX cap applies). Values below MUST mirror the
+/// decode.cu `ATTN_V3_*` defines (pinned by test).
+pub(super) const KERNEL_NAME_ATTN_BATCH_V3: &str = "gqa_attention_batch_v3_f32";
+pub(super) const KERNEL_NAME_ATTN_BATCH_V3_H: &str = "gqa_attention_batch_v3_h";
+/// Query rows per v3 attention block.
+pub(super) const ATTN_V3_BQ: usize = 8;
+/// Threads per v3 attention block.
+pub(super) const ATTN_V3_THREADS: u32 = 128;
 /// v0.3.7 batched M=N decode (N concurrent sequences, per-sequence KV).
 /// The direct M=N attention (`gqa_attention_mdecode_f32`) was retired in ADR
 /// 0025 step 2 — the split partial+combine pair is the only batch attention

@@ -1171,3 +1171,31 @@ STALE release binary (built pre-commit) and read flat — the ABBA matrix
 showed A==B on a toggle that could not be a no-op, and nsys showed rev-1
 kernel names + r3 tune keys. Kernel-name check via nsys is now the
 staleness gate before any ledger entry.
+
+## Round 24 (2026-07-18): v3 Q-blocked attention — the 10,000 stretch falls
+
+Round 23's singular lever, executed same-day: v3 blocks ATTN_V3_BQ=8 query
+rows per (block, head). Staged K chunks feed all 8 rows' dot chains; each
+V value is loaded once per (thread, key) and folded into 8 accumulators
+(the K/V L2 traffic that dominated v2 drops ~8×); scores return to the
+global [m, n_head, ctx_max] scratch — 2 orders below the traffic being
+saved, and it LIFTS v2's ctx<=3584 cap (v3 has no ctx bound). Every pinned
+per-row order is rev-1's verbatim (dot d-chain, lane-0 sequential softmax
+sum, per-dim j-ascending V fold with the zero-skip; keys past a row's
+causal limit stage a 0 weight and take the skip — the chain is untouched).
+Bit-identical by gate: to_bits vs rev-1, both dtypes, staircase-from-0 /
+BQ-tail / ctx-3809 regimes. Dispatch priority v3 → v2 → rev-1
+(TRITIUM_ATTN_V3 kill switch; i8/t2 rungs stay rev-1).
+
+Measured (see BENCHMARKS.md): **pp512 12,275 tok/s on the canonical
+bundle; sustained ABBA spanned 12.1–16.9K across clock states; v3/v2
+ratio 2.2–2.8×. The 10,000 stretch is PASSED; the fast end exceeds the
+llama.cpp Q4_K_M reference.** Decode: v3-on/off ABBA indistinguishable
+(prefill-only dispatch); today's depressed decode absolutes are box
+state. Profile at v3: attention 45% / GEMM 43% — balanced; next gains
+need both legs (IMMA smem swizzle + deeper Q-blocking or the flash
+numerics RFC).
+
+Bench discipline note: short ttft runs at idle clocks (1.1 of 3.1 GHz,
+GPU_IDLE throttle flag) produced a 3× spread — sustained 40-run p50s and
+in-session relative ratios are the reportable numbers on this box.

@@ -2888,6 +2888,165 @@ fn gqa_attention_batch_v2_matches_rev1_bitwise() {
     }
 }
 
+/// v3 Q-blocked prefill attention gate: bit-identical to rev-1 per
+/// (row, head) — same license as the v2 gate, plus the regimes v3 uniquely
+/// owns: BQ-tail blocks (m % 8 != 0), the causal staircase from offset 0
+/// (rows attending 1..m keys, exercising the per-(row, key) predicate and
+/// the zero-staged weights past each row's limit), and ctx BEYOND the v2
+/// shared cap (v3 has no ctx bound — scores live in the global scratch).
+#[test]
+fn gqa_attention_batch_v3_matches_rev1_bitwise() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping attn v3 gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+
+    // (n_head, n_head_kv, head_dim, causal_offset, m)
+    let regimes = [
+        (8usize, 2usize, 128usize, 0usize, 70usize), // staircase from 0, BQ tail (70 = 8*8+6)
+        (20, 5, 128, 500, 12),                       // 2B4T-shaped, tail block of 4
+        (4, 4, 64, 130, 33),                         // MHA, hd 64, tail of 1
+        (8, 2, 128, 3800, 9),                        // ctx 3809 — PAST the v2 cap
+        (8, 2, 128, 0, 1),                           // single row
+    ];
+
+    let mut seed = 0x3a11u64;
+    let mut nextf = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
+    };
+
+    for (n_head, n_head_kv, head_dim, causal_offset, m) in regimes {
+        let ctx_end = causal_offset + m;
+        let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| nextf()).collect();
+        let kv_len = ctx_end * n_head_kv * head_dim;
+        let kf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let vf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let kh: Vec<u16> = kf
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let vh: Vec<u16> = vf
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+
+        let d_q = stream.clone_htod(&q).expect("q");
+        let out_len = m * n_head * head_dim;
+        let scores_len = m * n_head * ctx_end;
+        let (cm_i, nh_i, nhkv_i, hd_i, co_i, m_i) = (
+            ctx_end as i32,
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+            causal_offset as i32,
+            m as i32,
+        );
+
+        let cfg1 = LaunchConfig {
+            grid_dim: (((m * n_head) as u32).div_ceil(8), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let cfg3 = LaunchConfig {
+            grid_dim: (n_head as u32, (m as u32).div_ceil(8), 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        for dtype in ["f32", "h"] {
+            let f_rev1 = dm
+                .load_function(&format!("gqa_attention_batch_{dtype}"))
+                .expect("rev1 fn");
+            let f_v3 = dm
+                .load_function(&format!("gqa_attention_batch_v3_{dtype}"))
+                .expect("v3 fn");
+            let mut d_out1: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out1");
+            let mut d_out3: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out3");
+            let mut d_sc1: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(scores_len).expect("sc1");
+            let mut d_sc3: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(scores_len).expect("sc3");
+
+            macro_rules! launch_pair {
+                ($dk:expr, $dv:expr) => {{
+                    let mut l1 = stream.launch_builder(&f_rev1);
+                    l1.arg(&d_q)
+                        .arg($dk)
+                        .arg($dv)
+                        .arg(&mut d_out1)
+                        .arg(&mut d_sc1)
+                        .arg(&cm_i)
+                        .arg(&nh_i)
+                        .arg(&nhkv_i)
+                        .arg(&hd_i)
+                        .arg(&scale)
+                        .arg(&co_i)
+                        .arg(&m_i);
+                    // SAFETY: rev-1 batch signature, ctx_max == ctx_end stride.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        l1.launch(cfg1).expect("rev1")
+                    };
+                    let mut l3 = stream.launch_builder(&f_v3);
+                    l3.arg(&d_q)
+                        .arg($dk)
+                        .arg($dv)
+                        .arg(&mut d_out3)
+                        .arg(&mut d_sc3)
+                        .arg(&cm_i)
+                        .arg(&nh_i)
+                        .arg(&nhkv_i)
+                        .arg(&hd_i)
+                        .arg(&scale)
+                        .arg(&co_i)
+                        .arg(&m_i);
+                    // SAFETY: v3 signature (same as rev-1's).
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        l3.launch(cfg3).expect("v3")
+                    };
+                }};
+            }
+            if dtype == "f32" {
+                let d_k = stream.clone_htod(&kf).expect("k32");
+                let d_v = stream.clone_htod(&vf).expect("v32");
+                launch_pair!(&d_k, &d_v);
+            } else {
+                let d_k = stream.clone_htod(&kh).expect("k16");
+                let d_v = stream.clone_htod(&vh).expect("v16");
+                launch_pair!(&d_k, &d_v);
+            }
+
+            let o1 = stream.clone_dtoh(&d_out1).expect("dtoh 1");
+            let o3 = stream.clone_dtoh(&d_out3).expect("dtoh 3");
+            for (i, (&a, &b)) in o1.iter().zip(&o3).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "attn v3 diverges from rev1 ({dtype}, nh={n_head} nhkv={n_head_kv} \
+                     hd={head_dim} co={causal_offset} m={m}) at [{i}]: rev1={a} v3={b}"
+                );
+            }
+        }
+    }
+}
+
 /// v0.3.1 de-risk: the device `rmsnorm_f32` decode kernel must reproduce the host
 /// `tritium_nn::ops::rmsnorm` **bit-for-bit** (`to_bits` equal), so the fully
 /// device-resident forward keeps greedy 256/256. This is the proof that a
@@ -3987,6 +4146,8 @@ fn attn_v2_consts_match_decode_cu_defines() {
     assert_eq!(get("ATTN_V2_HDMAX"), ATTN_V2_HDMAX);
     assert_eq!(get("ATTN_V2_MAX_CTX"), ATTN_V2_MAX_CTX);
     assert_eq!(get("ATTN_V2_THREADS"), ATTN_V2_THREADS as usize);
+    assert_eq!(get("ATTN_V3_BQ"), ATTN_V3_BQ);
+    assert_eq!(get("ATTN_V3_THREADS"), ATTN_V3_THREADS as usize);
 }
 
 /// ADR 0022 guardrail with teeth: the twin-kernel family table must match
@@ -4032,6 +4193,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
         ("gqa_attention_reduce", 3),
         ("gqa_attention_batch", 3),
         ("gqa_attention_batch_v2", 2),
+        ("gqa_attention_batch_v3", 2),
         ("gqa_attention_tree_scores", 3),
         ("gqa_attention_tree_reduce", 3),
         ("lm_head_warp", 2),
@@ -4046,13 +4208,14 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        68,
+        70,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
          DELETED by measurement — ADR 0023 rejected, +1.75% < the 3% bar; \
          66 → 68: gqa_attention_batch_v2 f32/h twins added — order-preserving \
-         prefill attention, bit-identical to rev 1 by to_bits gate)"
+         prefill attention, bit-identical to rev 1 by to_bits gate; 68 → 70: \
+         gqa_attention_batch_v3 Q-blocked twins, same bit-identity gate)"
     );
 }
 
