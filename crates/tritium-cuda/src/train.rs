@@ -3779,6 +3779,53 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         Ok(id)
     }
 
+    /// Extract a contiguous block of `n_rows` rows starting at `start_row` from an
+    /// `[total_rows, cols]` row-major activation → `[n_rows, cols]`.
+    ///
+    /// Row-major rows are contiguous, so a row-block is exactly a column-slice of the
+    /// flattened `[1, total_rows*cols]` view. This is the batching primitive: it carves
+    /// one sequence out of a `[batch*seq, cols]` stack so attention (which mixes across
+    /// the seq dim and must not attend across sequences) can run per-sequence while the
+    /// row-independent stages (embed/norm/MLP/head) run once over the whole batch. Its
+    /// vjp scatters the grad back into the block's offset — the exact `SliceCols` vjp.
+    pub fn slice_rows(
+        &mut self,
+        x: usize,
+        total_rows: usize,
+        cols: usize,
+        start_row: usize,
+        n_rows: usize,
+    ) -> Result<usize, BackendError> {
+        if start_row + n_rows > total_rows {
+            return Err(BackendError::InvalidInput(format!(
+                "slice_rows [{start_row}, {}) exceeds {total_rows} rows",
+                start_row + n_rows
+            )));
+        }
+        self.slice_cols(x, 1, total_rows * cols, start_row * cols, n_rows * cols)
+    }
+
+    /// Stack row-blocks (each `[part_rows[i], cols]`) into `[Σ part_rows, cols]` — the
+    /// inverse of [`Self::slice_rows`], recombining per-sequence attention outputs into
+    /// the batched `[batch*seq, cols]` activation. Reuses column `concat` on the
+    /// flattened single-row view, so its vjp is the exact `Concat` vjp.
+    pub fn concat_rows(
+        &mut self,
+        parts: &[usize],
+        part_rows: &[usize],
+        cols: usize,
+    ) -> Result<usize, BackendError> {
+        if parts.len() != part_rows.len() {
+            return Err(BackendError::InvalidInput(format!(
+                "concat_rows got {} parts but {} row counts",
+                parts.len(),
+                part_rows.len()
+            )));
+        }
+        let lens: Vec<usize> = part_rows.iter().map(|r| r * cols).collect();
+        self.concat(parts, 1, &lens)
+    }
+
     /// Multi-head causal self-attention with GQA — the device analogue of `tritium_train::nn::attention`.
     /// `x` is `[seq, n_embd]` (normed). Returns the attention output `[seq, n_embd]`.
     #[allow(clippy::too_many_arguments)]
@@ -9088,6 +9135,398 @@ mod tests {
             liveness.saved_grad_elements(),
             liveness.recomputed_ops
         );
+    }
+
+    /// Throughput lever (batching): a **batched** attention+MLP block — `[batch*seq, n_embd]`
+    /// hidden, one batched rmsnorm/MLP/residual over all `batch*seq` rows, and per-sequence
+    /// `attention` carved out with [`DeviceTape::slice_rows`] then restacked with
+    /// [`DeviceTape::concat_rows`] — must equal running the `batch` sequences **separately**.
+    /// This is the correctness contract that lets one step process `batch×` the tokens by
+    /// saturating the linear GEMMs (M = batch*seq) instead of the seq=32/batch=1 starvation
+    /// config. Forward is bit-exact per row (every row's compute is independent); shared-weight
+    /// gradients match within 1e-4 (the only difference is the float summation order across the
+    /// batch dimension — one grad_w over batch*seq rows vs `batch` grad_w sums added on the host).
+    #[test]
+    fn device_tape_batched_block_matches_per_sequence() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skipping device_tape_batched_block_matches_per_sequence: no CUDA device ({e})"
+                );
+                return;
+            }
+        };
+        let (n_embd, n_head, n_kv_head, head_dim, ff, eps, theta) = (
+            64usize, 4usize, 2usize, 16usize, 128usize, 1e-5f32, 10000.0f32,
+        );
+        let (qd, kvd) = (n_head * head_dim, n_kv_head * head_dim);
+        let (batch, seq) = (3usize, 5usize);
+        let bs = batch * seq;
+        let attn_norm = seeded_uniform(0x301, n_embd, 0.5, 1.5);
+        let ffn_norm = seeded_uniform(0x302, n_embd, 0.5, 1.5);
+        let wq = seeded_uniform(0x303, qd * n_embd, -0.1, 0.1);
+        let wk = seeded_uniform(0x304, kvd * n_embd, -0.1, 0.1);
+        let wv = seeded_uniform(0x305, kvd * n_embd, -0.1, 0.1);
+        let wo = seeded_uniform(0x306, n_embd * qd, -0.1, 0.1);
+        let wg = seeded_uniform(0x307, ff * n_embd, -0.1, 0.1);
+        let wu = seeded_uniform(0x308, ff * n_embd, -0.1, 0.1);
+        let wd = seeded_uniform(0x309, n_embd * ff, -0.1, 0.1);
+        let hidden = seeded_uniform(0x300, bs * n_embd, -1.0, 1.0);
+        let cot = seeded_uniform(0x30A, bs * n_embd, -1.0, 1.0); // dL/dout for L = Σ out·cot
+
+        // One attention+MLP block, forward+backward on its own tape, returning the block output
+        // and the downloaded grads in order [hidden, attn_norm, ffn_norm, wq, wk, wv, wo, wg, wu, wd].
+        #[allow(clippy::too_many_arguments)]
+        fn run_block(
+            backend: &CudaBackend,
+            hidden: &[f32],
+            cot: &[f32],
+            attn_norm: &[f32],
+            ffn_norm: &[f32],
+            wq: &[f32],
+            wk: &[f32],
+            wv: &[f32],
+            wo: &[f32],
+            wg: &[f32],
+            wu: &[f32],
+            wd: &[f32],
+            rows: usize, // batch*seq for the batched path, seq for one sequence
+            attn: impl FnOnce(
+                &mut DeviceTape,
+                usize,
+                usize,
+                usize,
+                usize,
+                usize,
+            ) -> Result<usize, BackendError>, // (normed hidden, wq, wk, wv, wo) → attention out id
+            n_embd: usize,
+            qd: usize,
+            kvd: usize,
+            ff: usize,
+            eps: f32,
+        ) -> (Vec<f32>, Vec<Vec<f32>>) {
+            let ones_max = (rows * n_embd).max(ff).max(qd);
+            let mut dt = DeviceTape::new(backend, ones_max).unwrap();
+            let dh = dt.leaf(hidden).unwrap();
+            let dan = dt.leaf(attn_norm).unwrap();
+            let xn = dt.rmsnorm(dh, dan, rows, n_embd, eps).unwrap();
+            let dwq = dt.leaf(wq).unwrap();
+            let dwk = dt.leaf(wk).unwrap();
+            let dwv = dt.leaf(wv).unwrap();
+            let dwo = dt.leaf(wo).unwrap();
+            let attn_out = attn(&mut dt, xn, dwq, dwk, dwv, dwo).unwrap();
+            let h1 = dt.add(dh, attn_out).unwrap();
+            let dfn = dt.leaf(ffn_norm).unwrap();
+            let hn = dt.rmsnorm(h1, dfn, rows, n_embd, eps).unwrap();
+            let dwg = dt.leaf(wg).unwrap();
+            let dwu = dt.leaf(wu).unwrap();
+            let dwd = dt.leaf(wd).unwrap();
+            let g = dt.matmul(hn, dwg, rows, ff, n_embd).unwrap();
+            let u = dt.matmul(hn, dwu, rows, ff, n_embd).unwrap();
+            let ga = dt.silu(g).unwrap();
+            let gated = dt.mul(ga, u).unwrap();
+            let down = dt.matmul(gated, dwd, rows, n_embd, ff).unwrap();
+            let out = dt.add(h1, down).unwrap();
+            let out_vec = dt.value(out).unwrap();
+            let seed = backend.dev_upload(cot).unwrap();
+            let retain = [dh, dan, dfn, dwq, dwk, dwv, dwo, dwg, dwu, dwd];
+            let res = dt.backward_retain(out, &seed, &retain).unwrap();
+            let grads = res.grads;
+            let dl = |id: usize, n: usize| {
+                let mut b = vec![0.0f32; n];
+                backend
+                    .dev_download(grads[id].as_ref().expect("gradient retained"), &mut b)
+                    .unwrap();
+                b
+            };
+            let gv = vec![
+                dl(dh, rows * n_embd),
+                dl(dan, n_embd),
+                dl(dfn, n_embd),
+                dl(dwq, qd * n_embd),
+                dl(dwk, kvd * n_embd),
+                dl(dwv, kvd * n_embd),
+                dl(dwo, n_embd * qd),
+                dl(dwg, ff * n_embd),
+                dl(dwu, ff * n_embd),
+                dl(dwd, n_embd * ff),
+            ];
+            (out_vec, gv)
+        }
+
+        // ── Reference: run each of the `batch` sequences separately, concatenate outputs and
+        //    hidden grads (per-sequence), sum the shared-weight grads. ──
+        let mut ref_out: Vec<f32> = Vec::with_capacity(bs * n_embd);
+        let mut ref_grads: Vec<Vec<f32>> = vec![Vec::new(); 10];
+        for b in 0..batch {
+            let slice = |v: &[f32]| v[b * seq * n_embd..(b + 1) * seq * n_embd].to_vec();
+            let (o, g) = run_block(
+                &backend,
+                &slice(&hidden),
+                &slice(&cot),
+                &attn_norm,
+                &ffn_norm,
+                &wq,
+                &wk,
+                &wv,
+                &wo,
+                &wg,
+                &wu,
+                &wd,
+                seq,
+                |dt, xn, dwq, dwk, dwv, dwo| {
+                    dt.attention(
+                        xn, dwq, dwk, dwv, dwo, seq, n_embd, n_head, n_kv_head, head_dim, theta,
+                    )
+                },
+                n_embd,
+                qd,
+                kvd,
+                ff,
+                eps,
+            );
+            ref_out.extend_from_slice(&o);
+            ref_grads[0].extend_from_slice(&g[0]); // hidden grad is per-sequence → concatenate
+            for i in 1..10 {
+                if ref_grads[i].is_empty() {
+                    ref_grads[i] = g[i].clone();
+                } else {
+                    for (acc, v) in ref_grads[i].iter_mut().zip(&g[i]) {
+                        *acc += v;
+                    }
+                }
+            }
+        }
+
+        // ── Batched: one tape, batched norm/MLP over all bs rows, per-sequence attention. ──
+        let (bat_out, bat_grads) = run_block(
+            &backend,
+            &hidden,
+            &cot,
+            &attn_norm,
+            &ffn_norm,
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            &wg,
+            &wu,
+            &wd,
+            bs,
+            |dt, xn, dwq, dwk, dwv, dwo| {
+                // per-sequence attention on row-blocks (same weight leaves), restacked
+                let mut parts = Vec::with_capacity(batch);
+                for b in 0..batch {
+                    let xn_b = dt.slice_rows(xn, bs, n_embd, b * seq, seq)?;
+                    parts.push(dt.attention(
+                        xn_b, dwq, dwk, dwv, dwo, seq, n_embd, n_head, n_kv_head, head_dim, theta,
+                    )?);
+                }
+                dt.concat_rows(&parts, &vec![seq; batch], n_embd)
+            },
+            n_embd,
+            qd,
+            kvd,
+            ff,
+            eps,
+        );
+
+        let rel = |a: &[f32], b: &[f32]| {
+            let range = b.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                - b.iter().copied().fold(f32::INFINITY, f32::min);
+            max_abs_diff(a, b) / range.max(1e-6)
+        };
+        let names = [
+            "hidden",
+            "attn_norm",
+            "ffn_norm",
+            "wq",
+            "wk",
+            "wv",
+            "wo",
+            "wg",
+            "wu",
+            "wd",
+        ];
+        let out_rel = rel(&bat_out, &ref_out);
+        assert!(
+            out_rel < 1e-6,
+            "batched forward must be bit-exact per row vs per-sequence: rel {out_rel:.2e}"
+        );
+        let mut worst = out_rel;
+        let mut wn = "out";
+        for i in 0..10 {
+            let r = rel(&bat_grads[i], &ref_grads[i]);
+            if r > worst {
+                worst = r;
+                wn = names[i];
+            }
+            assert!(
+                r < 1e-4,
+                "batched grad[{}] must match per-sequence within 1e-4: rel {r:.2e}",
+                names[i]
+            );
+        }
+        eprintln!(
+            "batching: batched attention+MLP block (batch={batch} seq={seq} n_embd={n_embd} \
+             ff={ff}) == {batch} separate sequences (fwd rel {out_rel:.2e}, worst grad rel \
+             {worst:.2e} at {wn}); one step now processes {bs} tokens vs {seq}"
+        );
+    }
+
+    /// Throughput measurement (batching lever): time batched fwd+bwd at SmolLM2-135M layer
+    /// shapes across batch sizes. The linear GEMMs batch (M = batch*seq) but `attention` is
+    /// looped per sequence, so this reveals the honest tradeoff — how much the FLOP-dominant
+    /// linears + head gain from saturation vs how much the per-sequence attention launches cost
+    /// at high batch. Tokens/s is the bottom line; it includes per-step weight-upload
+    /// amortization (fewer, larger steps re-upload the same weights fewer times).
+    #[test]
+    #[ignore = "throughput bench; run with --ignored --nocapture"]
+    fn bench_batched_throughput() {
+        use std::time::Instant;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping bench_batched_throughput: no CUDA device ({e})");
+                return;
+            }
+        };
+        let (n_embd, n_head, n_kv_head, head_dim, ff, eps, theta) = (
+            576usize, 9usize, 3usize, 64usize, 1536usize, 1e-5f32, 10000.0f32,
+        );
+        let (qd, kvd) = (n_head * head_dim, n_kv_head * head_dim);
+        let n_layers = 4usize;
+        let mkw = |salt: u64, n: usize, lo: f32, hi: f32| seeded_uniform(salt, n, lo, hi);
+        let attn_norm: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x400 + l as u64, n_embd, 0.5, 1.5))
+            .collect();
+        let ffn_norm: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x410 + l as u64, n_embd, 0.5, 1.5))
+            .collect();
+        let wq: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x420 + l as u64, qd * n_embd, -0.1, 0.1))
+            .collect();
+        let wk: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x430 + l as u64, kvd * n_embd, -0.1, 0.1))
+            .collect();
+        let wv: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x440 + l as u64, kvd * n_embd, -0.1, 0.1))
+            .collect();
+        let wo: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x450 + l as u64, n_embd * qd, -0.1, 0.1))
+            .collect();
+        let wg: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x460 + l as u64, ff * n_embd, -0.1, 0.1))
+            .collect();
+        let wu: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x470 + l as u64, ff * n_embd, -0.1, 0.1))
+            .collect();
+        let wd: Vec<Vec<f32>> = (0..n_layers)
+            .map(|l| mkw(0x480 + l as u64, n_embd * ff, -0.1, 0.1))
+            .collect();
+
+        let mut time_step = |batch: usize, seq: usize, iters: usize| -> f64 {
+            let bs = batch * seq;
+            let ones_max = (bs * n_embd).max(ff).max(qd);
+            let hidden0 = mkw(0x4F0, bs * n_embd, -1.0, 1.0);
+            let cot = mkw(0x4F1, bs * n_embd, -1.0, 1.0);
+            let mut total = 0.0;
+            for it in 0..(iters + 2) {
+                let t0 = Instant::now();
+                let mut dt = DeviceTape::new(&backend, ones_max).unwrap();
+                let h0 = dt.leaf(&hidden0).unwrap();
+                let mut hidden = h0;
+                for l in 0..n_layers {
+                    let an = dt.leaf(&attn_norm[l]).unwrap();
+                    let xn = dt.rmsnorm(hidden, an, bs, n_embd, eps).unwrap();
+                    let dwq = dt.leaf(&wq[l]).unwrap();
+                    let dwk = dt.leaf(&wk[l]).unwrap();
+                    let dwv = dt.leaf(&wv[l]).unwrap();
+                    let dwo = dt.leaf(&wo[l]).unwrap();
+                    let mut parts = Vec::with_capacity(batch);
+                    for b in 0..batch {
+                        let xn_b = dt.slice_rows(xn, bs, n_embd, b * seq, seq).unwrap();
+                        parts.push(
+                            dt.attention(
+                                xn_b, dwq, dwk, dwv, dwo, seq, n_embd, n_head, n_kv_head, head_dim,
+                                theta,
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    let attn = dt.concat_rows(&parts, &vec![seq; batch], n_embd).unwrap();
+                    hidden = dt.add(hidden, attn).unwrap();
+                    let fnw = dt.leaf(&ffn_norm[l]).unwrap();
+                    let hn = dt.rmsnorm(hidden, fnw, bs, n_embd, eps).unwrap();
+                    let dwg = dt.leaf(&wg[l]).unwrap();
+                    let dwu = dt.leaf(&wu[l]).unwrap();
+                    let dwd = dt.leaf(&wd[l]).unwrap();
+                    let g = dt.matmul(hn, dwg, bs, ff, n_embd).unwrap();
+                    let u = dt.matmul(hn, dwu, bs, ff, n_embd).unwrap();
+                    let ga = dt.silu(g).unwrap();
+                    let gated = dt.mul(ga, u).unwrap();
+                    let down = dt.matmul(gated, dwd, bs, n_embd, ff).unwrap();
+                    hidden = dt.add(hidden, down).unwrap();
+                }
+                let seed = backend.dev_upload(&cot).unwrap();
+                let res = dt.backward_retain(hidden, &seed, &[h0]).unwrap();
+                // Force GPU completion before stopping the clock (dev_download synchronizes).
+                let mut sink = vec![0.0f32; bs * n_embd];
+                backend
+                    .dev_download(res.grads[h0].as_ref().expect("retained h0 grad"), &mut sink)
+                    .unwrap();
+                std::hint::black_box(&sink);
+                if it >= 2 {
+                    total += t0.elapsed().as_secs_f64();
+                }
+            }
+            total / iters as f64
+        };
+
+        eprintln!(
+            "throughput ({n_layers} layers, SmolLM2-135M shapes: n_embd={n_embd} ff={ff} \
+             n_head={n_head}); per-sequence attention, batched linears:"
+        );
+        eprintln!("── batch sweep at seq=32 (many tiny attentions) ──");
+        let base = time_step(1, 32, 5); // s/step at 32 tok, the starvation baseline
+        let base_tps = 32.0 / base;
+        for &(batch, seq) in &[(1, 32), (8, 32), (16, 32), (32, 32), (64, 32)] {
+            let s = time_step(batch, seq, 5);
+            let toks = (batch * seq) as f64;
+            eprintln!(
+                "  batch={batch:3} seq={seq:4} ({:5} tok/step): {:8.2} ms/step  →  {:8.0} tok/s  ({:4.1}× vs base)",
+                batch * seq,
+                s * 1e3,
+                toks / s,
+                (toks / s) / base_tps
+            );
+        }
+        eprintln!("── seq sweep at batch=1 (one big attention) ──");
+        for &(batch, seq) in &[(1, 32), (1, 128), (1, 512), (1, 1024), (1, 2048)] {
+            let s = time_step(batch, seq, 3);
+            let toks = (batch * seq) as f64;
+            eprintln!(
+                "  batch={batch:3} seq={seq:4} ({:5} tok/step): {:8.2} ms/step  →  {:8.0} tok/s  ({:4.1}× vs base)",
+                batch * seq,
+                s * 1e3,
+                toks / s,
+                (toks / s) / base_tps
+            );
+        }
+        eprintln!("── fixed 2048-token budget: batch × seq trade ──");
+        for &(batch, seq) in &[(64, 32), (16, 128), (4, 512), (2, 1024), (1, 2048)] {
+            let s = time_step(batch, seq, 3);
+            let toks = (batch * seq) as f64;
+            eprintln!(
+                "  batch={batch:3} seq={seq:4} ({:5} tok/step): {:8.2} ms/step  →  {:8.0} tok/s  ({:4.1}× vs base)",
+                batch * seq,
+                s * 1e3,
+                toks / s,
+                (toks / s) / base_tps
+            );
+        }
     }
 
     /// Gate + payoff (plan 0043 P2.4a): a full **device-resident SwiGLU MLP block** — rmsnorm →
