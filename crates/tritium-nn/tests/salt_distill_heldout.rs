@@ -320,7 +320,9 @@ fn salt_distillation_device_trainer_recovers_heldout() {
 
     use common::{device_forward, device_forward_resident};
     use tritium_cuda::CudaBackend;
-    use tritium_cuda::train::{DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer};
+    use tritium_cuda::train::{
+        DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer, TensorCoreGemm,
+    };
     use tritium_format::TeacherCacheHeader;
     use tritium_nn::{
         ModelWeights, TeacherCacheReader, TiedSwiGluTrainingModel, hash_teacher_corpus,
@@ -356,6 +358,12 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     assert!(!windows.is_empty(), "train corpus shorter than one window");
 
     let backend = CudaBackend::new(0).expect("open CUDA device");
+    // Opt-in tensor-core tier (Lever 1): route the resident trainer's dense forward + backward
+    // GEMMs through tf32 tensor cores. Off by default so the committed recovery gate stays on the
+    // bit-exact f32 path; set TRITIUM_DISTILL_TF32=1 to validate that recovery still holds on tf32.
+    let tc = std::env::var("TRITIUM_DISTILL_TF32")
+        .is_ok()
+        .then(|| TensorCoreGemm::new(&backend).expect("cuBLASLt tensor-core tier"));
     let ppl_fp = perplexity(&logits_of(&fp, &a, &eval_ids), &eval_ids, a.vocab);
     let ptq: Vec<Vec<f32>> = fp
         .iter()
@@ -415,6 +423,9 @@ fn salt_distillation_device_trainer_recovers_heldout() {
             .collect();
         let grads = {
             let mut tape = DeviceTape::new(&backend, a.vocab).unwrap();
+            if let Some(tc) = tc.as_ref() {
+                tape = tape.with_tensor_core(tc);
+            }
             let (logits, wids) =
                 device_forward_resident(&mut tape, &a, &resident, &tokens_i32, TRAIN_SEQ);
             tape.xent_backward_device(logits, &target, TRAIN_SEQ, a.vocab, &wids)
