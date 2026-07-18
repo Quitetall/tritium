@@ -54,11 +54,44 @@ Numerics: IMMA prefill is BIT-IDENTICAL to dp4a (gate: 128,256 logits to_bits, o
 4×128-chunked == dp4a). The ≥6,000 pp512 campaign gate remains open — gap analysis in
 OPTIMIZATION-LOG round 22.
 
-### (pending) 2026-07-XX — post-Track-P run
+### 2026-07-18 — rev-4 IMMA + v2 prefill attention (the pp512 gate falls)
 
-To be recorded by re-running the command above on a quiet box once ADR 0026 Track P (IMMA
-prefill) gates pass. Baseline to beat, from the 2026-07-11 head-to-head
-(`docs/research-ternary-sota-mid2026.md` §7, Tritium @ a80e185):
+Command: `tritium report compare --model ggml-model-i2_s.gguf --tokens <ids> --backend cuda
+--prompt-len 512 --decode-steps 256 --warmup 16 --reps 3 --runs 5` @ b20f78f-era tree
+(rev-4 IMMA JIT a3e8a49 + v2 attention 98ab046 + nit fold b20f78f), RTX 4090, driver
+610.43.02, co-resident: kwin + one idle tritium-serve holding 9.1 GB VRAM (0% compute).
+
+| metric | value | vs 2026-07-12 | vs 2026-07-11 baseline |
+|---|---:|---|---|
+| pp512 prefill | **9,068.8 tok/s** (p50 56.4 ms) | 1,969.7 → **4.6×** | 1,068 → **8.5×** |
+| decode (256 steps after the 512-token prefill) | 222.4 tok/s median | 221.5 → unchanged | — |
+
+Run-to-run clock variance puts pp512 at 8,400–9,100 across the session (the order-alternated
+5-run ttft matrix measured p50 60.6/60.7 ms on the A/A2 pair); the compare-bundle line above
+is the reproducible-command artifact. **The ADR 0026 ≥6,000 gate is PASSED** (stretch 10,000
+within reach — attention is now 74% of prefill; see OPTIMIZATION-LOG round 23).
+
+Config isolation (same command, env kill switches, order-alternated ABBA):
+
+| config | p50 ms | pp512 tok/s |
+|---|---:|---:|
+| dp4a + rev-1 attention (`TRITIUM_IMMA_PREFILL=0 TRITIUM_ATTN_V2=0`) | 318.3–320.4 | ~1,600 |
+| rev-4 IMMA only (`TRITIUM_ATTN_V2=0`) | 126.9–127.1 | ~4,030 |
+| v2 attention only (`TRITIUM_IMMA_PREFILL=0`) | 225.6–259.0 | ~2,100 |
+| both (defaults) | 60.6–60.7 | **~8,440** |
+
+Numerics: BOTH legs are bit-identical to their predecessors by gate (rev-4 IMMA: to_bits vs
+dp4a over 128,256 logits incl. one-shot == 4×128 chunked; v2 attention: to_bits vs rev-1 per
+(row, head), 6 regimes incl. the ctx=3584 shared-budget boundary) — zero numerics re-gating.
+
+Methodology caveat learned this session: an earlier run measured a STALE release binary
+(pre-commit) and reported flat results — `nsys` kernel names are the cheap staleness check
+(`gqa_attention_batch_v2_f32` + r4-keyed tune files must appear).
+
+### 2026-07-11 head-to-head (reference)
+
+From `docs/research-ternary-sota-mid2026.md` §7, Tritium @ a80e185 — the pp512 gap to
+mainstream was 11.5×; at 2026-07-18 it is **1.35×**:
 
 | engine | model | decode tok/s | pp512 tok/s |
 |---|---|---:|---:|

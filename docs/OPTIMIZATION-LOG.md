@@ -1125,3 +1125,49 @@ v0.4.x era and never wired to the model) now serves prefill.
 Also: `tritium report compare` + docs/BENCHMARKS.md shipped (Track R) —
 one-command ledger with environment capture (it disclosed the co-resident
 llama-server on its first run).
+
+## Round 23 (2026-07-18): the pp512 gate falls — rev-4 IMMA + v2 attention
+
+Round 22 named the two levers; both shipped in one day and BOTH landed
+bit-identical to their predecessors (zero numerics re-gating — the whole
+design constraint of the campaign):
+
+- **rev-4 IMMA JIT** (a3e8a49): cp.async 16-byte staging pipeline (empty-
+  group prologue padding, wait_group(S-2) certification), B kept 2-bit
+  PACKED in shared and expanded at fragment-load (¼ the shared traffic —
+  zero-fill safety: OOB k-tiles meet all-zero staged A, OOB n-tiles are
+  store-masked), contiguous warp-grid ownership replacing the st%WARPS
+  scan, full unrolls replacing `#pragma unroll 1`, 7 new large/deep tile
+  candidates. **GEMM: 197 ms → ~8.8 ms per prefill (22×).** The round-22
+  ask was 5.6×.
+- **v2 prefill attention** (98ab046): the flash-style rewrite stays OFF
+  the table (sum orders pinned by decode parity + the ADR 0014 tree gate);
+  v2 is an order-preserving mechanics rewrite — one 128-thread block per
+  (row, head), K staged coalesced into padded shared (rev-1's lane-per-key
+  walk was fully uncoalesced), scores in shared (the global scratch round-
+  tripped ~2.6 GB/prefill), parallel max/exp with the order-pinned
+  sequential sum kept on one thread. **Attention: 109 ms → ~44.7 ms
+  (2.4×).** Bit-identical to rev-1 by to_bits gate (6 regimes incl. the
+  ctx=3584 shared boundary).
+
+Result (quiet box, ABBA, fresh binary — see BENCHMARKS.md 2026-07-18):
+**pp512 1,969.7 → 8,440–9,069 tok/s (p50 60.6 → 56.4 ms on the ledger
+command); decode unchanged at 222.4. The ≥6,000 campaign gate is PASSED;
+the mainstream gap is now 1.35× (was 11.5× at the head-to-head).**
+
+nsys at the new HEAD: the profile FLIPPED — gqa_attention_batch_v2 is now
+~74% of prefill (median 1.49 ms × 30 layers ≈ 44.7 ms), IMMA ~15%
+(~8.8 ms), rest ~5 ms. Next lever, singular: **Q-blocked v3 attention** —
+each v2 block re-reads the full K/V for its one (row, head); blocking BQ
+rows per (block, head) amortizes the staged K/V across rows and the
+order-preserving trick EXTENDS (per-row dot/sum/fold orders unchanged;
+V folded in ascending-j chunks). ~4-6× on the attention share ⇒ pp512
+11-12K projected — past the 10,000 stretch. After that: mma.sp 2:4
+(needs the plan-0039 trained checkpoint) and the batch/tree GEMM IMMA
+follow-up.
+
+Process trap recorded: the first "measurement" of this round benched a
+STALE release binary (built pre-commit) and read flat — the ABBA matrix
+showed A==B on a toggle that could not be a no-op, and nsys showed rev-1
+kernel names + r3 tune keys. Kernel-name check via nsys is now the
+staleness gate before any ledger entry.
