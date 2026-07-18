@@ -160,6 +160,19 @@ pub(super) const KERNEL_NAME_ROPE_BATCH: &str = "rope_apply_batch_f32";
 pub(super) const KERNEL_NAME_SCALE_BATCH: &str = "scale_mul_batch_f32";
 pub(super) const KERNEL_NAME_KV_APPEND_BATCH: &str = "kv_append_batch_f32";
 pub(super) const KERNEL_NAME_ATTN_BATCH: &str = "gqa_attention_batch_f32";
+/// v2 order-preserving prefill attention twins (one block per (row, head),
+/// shared-staged K + shared scores; bit-identical to the rev-1 batch kernels).
+/// The host-side dispatch bounds below MUST mirror decode.cu's
+/// `ATTN_V2_HDMAX` / `ATTN_V2_MAX_CTX` / `ATTN_V2_THREADS` defines.
+pub(super) const KERNEL_NAME_ATTN_BATCH_V2: &str = "gqa_attention_batch_v2_f32";
+pub(super) const KERNEL_NAME_ATTN_BATCH_V2_H: &str = "gqa_attention_batch_v2_h";
+/// Max head_dim the v2 attention kernel's shared K stage is sized for.
+pub(super) const ATTN_V2_HDMAX: usize = 128;
+/// Max context (causal_offset + m) the v2 attention kernel's shared score
+/// buffer holds; larger prefill launches fall back to the rev-1 kernel.
+pub(super) const ATTN_V2_MAX_CTX: usize = 3584;
+/// Threads per v2 attention block.
+pub(super) const ATTN_V2_THREADS: u32 = 128;
 /// v0.3.7 batched M=N decode (N concurrent sequences, per-sequence KV).
 /// The direct M=N attention (`gqa_attention_mdecode_f32`) was retired in ADR
 /// 0025 step 2 — the split partial+combine pair is the only batch attention

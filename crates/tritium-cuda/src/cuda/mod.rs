@@ -692,6 +692,13 @@ pub struct CudaDecodeModel {
     f_scale_batch: CudaFunction,
     f_kv_append_batch: CudaFunction,
     f_attn_batch: CudaFunction,
+    /// v2 order-preserving prefill attention (one block per (row, head),
+    /// shared-staged K + shared scores in place of the global scratch;
+    /// bit-identical per (row, head) to `f_attn_batch`). `None` when the KV
+    /// dtype has no v2 twin (i8/t2 rungs) or `TRITIUM_ATTN_V2=0`; dispatch
+    /// additionally requires `head_dim <= ATTN_V2_HDMAX` and
+    /// `causal_offset + m <= ATTN_V2_MAX_CTX` (the kernel's shared budget).
+    f_attn_batch_v2: Option<CudaFunction>,
     /// Tree-verify attention (ADR 0014) + the batched LM head/argmax it shares
     /// with the batch-decode graph, resolved eagerly for `tree_verify_greedy`.
     f_attn_tree: CudaFunction,
@@ -1870,32 +1877,53 @@ impl CudaDecodeModel {
                     None
                 },
             )?;
-            Self::bl_attn(
-                s,
-                &self.f_attn_batch,
-                &d_q,
-                &self.kv_k[li],
-                &self.kv_v[li],
-                if self.kv_dtype.has_scales() {
-                    Some(&self.kv_k_scales[li])
-                } else {
-                    None
-                },
-                if self.kv_dtype.has_scales() {
-                    Some(&self.kv_v_scales[li])
-                } else {
-                    None
-                },
-                &mut d_attn,
-                &mut d_scores,
-                ctx_max,
-                n_head,
-                n_head_kv,
-                head_dim,
-                self.attn_scale,
-                causal_offset,
-                m,
-            )?;
+            // v2 attention when the shared budget covers this launch (bit-identical
+            // to the rev-1 kernel per (row, head) — gated by to_bits tests).
+            if let Some(f_v2) = self.f_attn_batch_v2.as_ref().filter(|_| {
+                head_dim <= consts::ATTN_V2_HDMAX && causal_offset + m <= consts::ATTN_V2_MAX_CTX
+            }) {
+                Self::bl_attn_v2(
+                    s,
+                    f_v2,
+                    &d_q,
+                    &self.kv_k[li],
+                    &self.kv_v[li],
+                    &mut d_attn,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    self.attn_scale,
+                    causal_offset,
+                    m,
+                )?;
+            } else {
+                Self::bl_attn(
+                    s,
+                    &self.f_attn_batch,
+                    &d_q,
+                    &self.kv_k[li],
+                    &self.kv_v[li],
+                    if self.kv_dtype.has_scales() {
+                        Some(&self.kv_k_scales[li])
+                    } else {
+                        None
+                    },
+                    if self.kv_dtype.has_scales() {
+                        Some(&self.kv_v_scales[li])
+                    } else {
+                        None
+                    },
+                    &mut d_attn,
+                    &mut d_scores,
+                    ctx_max,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    self.attn_scale,
+                    causal_offset,
+                    m,
+                )?;
+            }
             let attn_in: &CudaSlice<f32> = if let Some(sn) = self.layers[li].attn_sub_norm.as_ref()
             {
                 Self::bl_rmsnorm(
@@ -2599,6 +2627,61 @@ impl CudaDecodeModel {
         unsafe {
             l.launch(cfg)
                 .map_err(|e| driver_err("launch kv_append (prefill/step/tree)", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Launch the v2 prefill attention: grid `(n_head, m)`, one
+    /// `ATTN_V2_THREADS`-thread block per (row, head). Caller guarantees
+    /// `head_dim <= ATTN_V2_HDMAX` and `causal_offset + m <= ATTN_V2_MAX_CTX`
+    /// (the kernel's static shared sizing) and that `f` matches the KV dtype.
+    #[allow(clippy::too_many_arguments)]
+    fn bl_attn_v2(
+        s: &Arc<CudaStream>,
+        f: &CudaFunction,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<u8>,
+        v: &CudaSlice<u8>,
+        out: &mut CudaSlice<f32>,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        causal_offset: usize,
+        m: usize,
+    ) -> Result<(), BackendError> {
+        let (nh_i, nhkv_i, hd_i, co_i, m_i) = (
+            n_head as i32,
+            n_head_kv as i32,
+            head_dim as i32,
+            causal_offset as i32,
+            m as i32,
+        );
+        let cfg = LaunchConfig {
+            grid_dim: (n_head as u32, m as u32, 1),
+            block_dim: (consts::ATTN_V2_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut l = s.launch_builder(f);
+        l.arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(out)
+            .arg(&nh_i)
+            .arg(&nhkv_i)
+            .arg(&hd_i)
+            .arg(&scale)
+            .arg(&co_i)
+            .arg(&m_i);
+        // SAFETY: `gqa_attention_batch_v2_{f32,h}(q, k, v, out, n_head,
+        // n_head_kv, head_dim, scale, causal_offset, m)` — the KV arena bytes
+        // reinterpret as the dtype the resolved function was compiled for
+        // (build_decode_model pairs f_attn_batch_v2 with kv_dtype), and the
+        // caller-enforced ATTN_V2 bounds keep every shared index in range.
+        #[allow(unsafe_code)]
+        unsafe {
+            l.launch(cfg)
+                .map_err(|e| driver_err("launch prefill attn v2", &e))?;
         }
         Ok(())
     }

@@ -1646,6 +1646,137 @@ static __device__ __forceinline__ void gqa_attention_batch_body(
   }
 }
 
+// ---- v2 batched prefill attention (order-preserving rewrite; ADR 0022) ----
+//
+// One ATTN_V2_THREADS-thread block per (query row, q-head): grid (n_head, m).
+// Motivation (nsys round 22): gqa_attention_batch_* is 35% of a 512-token
+// prefill. Its lane-per-key K walk is fully uncoalesced (32 lanes stride 32
+// different KV rows), lane 0 runs the whole softmax alone, and the global
+// `scores` scratch round-trips ~4x per (row, head). v2 fixes the mechanics
+// WITHOUT touching any pinned fold order:
+//
+//   * K is staged into padded shared memory in coalesced ATTN_V2_KCHUNK-key
+//     chunks (pad kills the bank conflicts a head_dim-stride walk would hit);
+//     each staged value is C::load of the same element the rev-1 kernel read,
+//     so the per-key d-order dot chain sees identical inputs in identical
+//     order.
+//   * Scores live in shared (no global scratch traffic).
+//   * The max scan is a parallel fmaxf tree — max is EXACT under any order
+//     (NaNs included: both the rev-1 sequential `>` scan and fmaxf skip NaNs,
+//     yielding the max of the non-NaN elements). exp and the inv scale are
+//     elementwise. The softmax SUM keeps the rev-1 sequential j-order fold on
+//     a single thread — that order is pinned (decode-parity + ADR 0014 tree
+//     gates compare against it).
+//   * The V pass keeps the per-dim sequential-j fold and the `w == 0.0f` skip
+//     (load-bearing: skipping avoids `-0.0 + +0.0 == +0.0` flips).
+//
+// Everything above makes v2 BIT-IDENTICAL per (row, head) to
+// gqa_attention_batch_{f32,h} — the gate is `to_bits` equality against them.
+//
+// Host contract (dispatch in mod.rs): head_dim <= ATTN_V2_HDMAX and
+// causal_offset + m <= ATTN_V2_MAX_CTX (the shared budget), else the rev-1
+// kernel launches. Shared: scores 14,336 + K stage 33,024 + q 512 + red 512
+// + inv 4 = 48,388 B, under the 48 KiB static ceiling.
+#define ATTN_V2_THREADS 128
+#define ATTN_V2_KCHUNK 64
+#define ATTN_V2_HDMAX 128
+#define ATTN_V2_MAX_CTX 3584
+
+template <class C>
+static __device__ __forceinline__ void gqa_attention_batch_v2_body(
+    const float* __restrict__ q, const typename C::T* __restrict__ k,
+    const typename C::T* __restrict__ v, float* __restrict__ out, const int n_head,
+    const int n_head_kv, const int head_dim, const float scale, const int causal_offset,
+    const int m) {
+  const int h = blockIdx.x;
+  const int row = blockIdx.y;
+  if (row >= m || h >= n_head) return;
+  const int tid = threadIdx.x;
+  const int ctx = causal_offset + row + 1;
+  const int n_rep = n_head / n_head_kv;
+  const int kv = h / n_rep;
+
+  __shared__ float s_scores[ATTN_V2_MAX_CTX];
+  __shared__ float s_k[ATTN_V2_KCHUNK * (ATTN_V2_HDMAX + 1)];
+  __shared__ float s_q[ATTN_V2_HDMAX];
+  __shared__ float s_red[ATTN_V2_THREADS];
+  __shared__ float s_inv;
+
+  const float* q_row = q + ((long long)row * n_head + h) * head_dim;
+  for (int d = tid; d < head_dim; d += ATTN_V2_THREADS) s_q[d] = q_row[d];
+  __syncthreads();
+
+  // Phase 1: scaled dots. Stage a key chunk coalesced (consecutive threads
+  // read consecutive d of one KV row), then thread t folds key c0+t with the
+  // rev-1 sequential d-order chain from shared. Row pad (+1) spreads the
+  // per-thread rows across banks.
+  const int kstride = head_dim + 1;
+  for (int c0 = 0; c0 < ctx; c0 += ATTN_V2_KCHUNK) {
+    const int nk = min(ATTN_V2_KCHUNK, ctx - c0);
+    for (int idx = tid; idx < nk * head_dim; idx += ATTN_V2_THREADS) {
+      const int j = idx / head_dim;
+      const int d = idx - j * head_dim;
+      s_k[j * kstride + d] =
+          C::load(&k[((long long)(c0 + j) * n_head_kv + kv) * head_dim + d]);
+    }
+    __syncthreads();
+    for (int t = tid; t < nk; t += ATTN_V2_THREADS) {
+      const float* kr = &s_k[t * kstride];
+      float dot = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        dot = __fadd_rn(dot, __fmul_rn(s_q[d], kr[d]));
+      }
+      s_scores[c0 + t] = __fmul_rn(dot, scale);
+    }
+    __syncthreads();
+  }
+
+  // Phase 2: softmax. Parallel max (exact under any order), elementwise exp,
+  // ORDER-PINNED sequential sum on thread 0, elementwise scale.
+  float local = -INFINITY;
+  for (int j = tid; j < ctx; j += ATTN_V2_THREADS) local = fmaxf(local, s_scores[j]);
+  s_red[tid] = local;
+  __syncthreads();
+  for (int off = ATTN_V2_THREADS / 2; off > 0; off >>= 1) {
+    if (tid < off) s_red[tid] = fmaxf(s_red[tid], s_red[tid + off]);
+    __syncthreads();
+  }
+  const float mx = s_red[0];
+
+  for (int j = tid; j < ctx; j += ATTN_V2_THREADS) {
+    s_scores[j] = exp_f32(__fsub_rn(s_scores[j], mx));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float sum = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      sum = __fadd_rn(sum, s_scores[j]);
+    }
+    s_inv = __fdiv_rn(1.0f, sum);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int j = tid; j < ctx; j += ATTN_V2_THREADS) {
+    s_scores[j] = __fmul_rn(s_scores[j], inv);
+  }
+  __syncthreads();
+
+  // Phase 3: weighted V sum — per-dim sequential-j fold, coalesced across
+  // threads (consecutive d), identical order + zero-skip to rev 1.
+  float* o_row = out + ((long long)row * n_head + h) * head_dim;
+  for (int d = tid; d < head_dim; d += ATTN_V2_THREADS) {
+    float acc = 0.0f;
+    for (int j = 0; j < ctx; ++j) {
+      const float w = s_scores[j];
+      if (w == 0.0f) continue;
+      acc = __fadd_rn(
+          acc, __fmul_rn(w, C::load(&v[((long long)j * n_head_kv + kv) * head_dim + d])));
+    }
+    o_row[d] = acc;
+  }
+}
+
+
 template <class C>
 static __device__ __forceinline__ void lm_head_warp_body(
     const float* __restrict__ h, const typename C::T* __restrict__ embd,
@@ -1989,6 +2120,16 @@ __global__ void gqa_attention_batch_h(const float* __restrict__ q, const __half*
                                       const int n_head, const int n_head_kv, const int head_dim,
                                       const float scale, const int causal_offset, const int m) {
   gqa_attention_batch_body<KvLoadF16>(q, k, v, out, scores, ctx_max, n_head, n_head_kv, head_dim, scale,
+      causal_offset, m);
+}
+
+// gqa_attention_batch_v2_h — f16-KV twin of gqa_attention_batch_v2_f32 (the
+// C::load conversion happens at the shared stage; values are identical).
+__global__ void __launch_bounds__(ATTN_V2_THREADS) gqa_attention_batch_v2_h(
+    const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    float* __restrict__ out, const int n_head, const int n_head_kv, const int head_dim,
+    const float scale, const int causal_offset, const int m) {
+  gqa_attention_batch_v2_body<KvLoadF16>(q, k, v, out, n_head, n_head_kv, head_dim, scale,
       causal_offset, m);
 }
 
@@ -2844,6 +2985,19 @@ __global__ void gqa_attention_batch_f32(const float* __restrict__ q, const float
                                         const int n_head, const int n_head_kv, const int head_dim,
                                         const float scale, const int causal_offset, const int m) {
   gqa_attention_batch_body<KvLoadF32>(q, k, v, out, scores, ctx_max, n_head, n_head_kv, head_dim, scale,
+      causal_offset, m);
+}
+
+// gqa_attention_batch_v2_f32 — the v2 prefill attention (see the v2 body doc):
+// one block per (row, head), shared-staged K + shared scores, bit-identical
+// per (row, head) to gqa_attention_batch_f32. Grid (n_head, m), block
+// ATTN_V2_THREADS. Host dispatches v2 only when head_dim <= ATTN_V2_HDMAX and
+// causal_offset + m <= ATTN_V2_MAX_CTX.
+__global__ void __launch_bounds__(ATTN_V2_THREADS) gqa_attention_batch_v2_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, const int n_head, const int n_head_kv, const int head_dim,
+    const float scale, const int causal_offset, const int m) {
+  gqa_attention_batch_v2_body<KvLoadF32>(q, k, v, out, n_head, n_head_kv, head_dim, scale,
       causal_offset, m);
 }
 

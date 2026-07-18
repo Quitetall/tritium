@@ -2640,9 +2640,16 @@ fn imma_jit_staging_matches_aot_bitwise_at_unaligned_k() {
     ];
 
     // k=40/88: k%16 != 0 (byte-staging fallback); k=48: k%16 == 0 but
-    // k%32 != 0 (cp.async path with a zero-filled tail chunk in k-tile 1).
-    // n*k stays a 128-multiple (the I2_S payload packer's granularity).
-    for &(m, n, k) in &[(33usize, 32usize, 40usize), (16, 16, 88), (20, 24, 48)] {
+    // k%32 != 0 (cp.async path with a zero-filled tail chunk in k-tile 1);
+    // k=96: k%32 == 0 with num_ktiles=3, odd against tile_k=64 — a WHOLE
+    // out-of-range k-tile on the cp.async path (B zfill annihilated by zero
+    // A; review nit N1). n*k stays a 128-multiple (the I2_S packer's grain).
+    for &(m, n, k) in &[
+        (33usize, 32usize, 40usize),
+        (16, 16, 88),
+        (20, 24, 48),
+        (20, 24, 96),
+    ] {
         let shape = GemmShape::new(m, n, k);
         let raw: Vec<i8> = (0..n * k).map(|i| ((i * 7 + m) % 3) as i8 - 1).collect();
         let qact: Vec<i8> = (0..m * k)
@@ -2691,6 +2698,189 @@ fn imma_jit_staging_matches_aot_bitwise_at_unaligned_k() {
                     a.to_bits(),
                     "tile {tile:?} diverges from AOT anchor at ({m},{n},{k})[{i}]: \
                      jit={g} aot={a}"
+                );
+            }
+        }
+    }
+}
+
+/// v2 prefill attention gate: `gqa_attention_batch_v2_{f32,h}` must reproduce
+/// the rev-1 `gqa_attention_batch_{f32,h}` **bit-for-bit** per (row, head) —
+/// the v2 kernel's whole license is that it changes the launch/staging
+/// mechanics (shared K chunks, shared scores, parallel max/exp) while keeping
+/// every pinned fold order (per-key d-order dots, sequential-j softmax sum,
+/// per-dim sequential-j V fold with the zero-skip). Regimes: head_dim 64/128,
+/// GQA 4:1 and MHA, causal_offset 0 and chunk-continuation offsets, m
+/// spanning multiple 64-key stage chunks.
+#[test]
+fn gqa_attention_batch_v2_matches_rev1_bitwise() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping attn v2 gate: no device ({e})");
+            return;
+        }
+    };
+    let stream = ctx.default_stream();
+    let dm = ctx
+        .load_module(Ptx::from_src(DECODE_PTX))
+        .expect("load decode module");
+
+    // (n_head, n_head_kv, head_dim, causal_offset, m)
+    let regimes = [
+        (8usize, 2usize, 128usize, 0usize, 70usize), // GQA 4:1, fresh prefill, 2+ chunks
+        (8, 2, 128, 130, 70),                        // chunk continuation (ctx to 200)
+        (4, 4, 64, 0, 33),                           // MHA, small head_dim
+        (20, 5, 128, 500, 12),                       // 2B4T-shaped, deep offset
+        (8, 2, 128, 0, 1),                           // single row
+    ];
+
+    let mut seed = 0x2f17u64;
+    let mut nextf = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((seed >> 33) as i32 % 1000) as f32) * 1e-3 - 0.5
+    };
+
+    for (n_head, n_head_kv, head_dim, causal_offset, m) in regimes {
+        let ctx_end = causal_offset + m;
+        let q: Vec<f32> = (0..m * n_head * head_dim).map(|_| nextf()).collect();
+        let kv_len = ctx_end * n_head_kv * head_dim;
+        let kf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let vf: Vec<f32> = (0..kv_len).map(|_| nextf()).collect();
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let d_q = stream.clone_htod(&q).expect("q");
+        let out_len = m * n_head * head_dim;
+        let scores_len = m * n_head * ctx_end;
+
+        // f32 pair, then f16 pair (same values through the f16 lattice).
+        let kh: Vec<u16> = kf
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let vh: Vec<u16> = vf
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+
+        for dtype in ["f32", "h"] {
+            let (f_rev1, f_v2) = (
+                dm.load_function(&format!("gqa_attention_batch_{dtype}"))
+                    .expect("rev1 fn"),
+                dm.load_function(&format!("gqa_attention_batch_v2_{dtype}"))
+                    .expect("v2 fn"),
+            );
+            // Upload KV in the dtype under test.
+            let (d_k32, d_v32);
+            let (d_k16, d_v16);
+            let (cm_i, nh_i, nhkv_i, hd_i, co_i, m_i) = (
+                ctx_end as i32,
+                n_head as i32,
+                n_head_kv as i32,
+                head_dim as i32,
+                causal_offset as i32,
+                m as i32,
+            );
+
+            let mut d_out1: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out1");
+            let mut d_out2: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(out_len).expect("out2");
+            let mut d_scores: cudarc::driver::CudaSlice<f32> =
+                stream.alloc_zeros(scores_len).expect("scores");
+
+            let cfg1 = LaunchConfig {
+                grid_dim: (((m * n_head) as u32).div_ceil(8), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let cfg2 = LaunchConfig {
+                grid_dim: (n_head as u32, m as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            #[allow(unsafe_code)]
+            match dtype {
+                "f32" => {
+                    d_k32 = stream.clone_htod(&kf).expect("k32");
+                    d_v32 = stream.clone_htod(&vf).expect("v32");
+                    let mut l1 = stream.launch_builder(&f_rev1);
+                    l1.arg(&d_q)
+                        .arg(&d_k32)
+                        .arg(&d_v32)
+                        .arg(&mut d_out1)
+                        .arg(&mut d_scores)
+                        .arg(&cm_i)
+                        .arg(&nh_i)
+                        .arg(&nhkv_i)
+                        .arg(&hd_i)
+                        .arg(&scale)
+                        .arg(&co_i)
+                        .arg(&m_i);
+                    // SAFETY: rev-1 batch signature with ctx_max == ctx_end scratch.
+                    unsafe { l1.launch(cfg1).expect("rev1 f32") };
+                    let mut l2 = stream.launch_builder(&f_v2);
+                    l2.arg(&d_q)
+                        .arg(&d_k32)
+                        .arg(&d_v32)
+                        .arg(&mut d_out2)
+                        .arg(&nh_i)
+                        .arg(&nhkv_i)
+                        .arg(&hd_i)
+                        .arg(&scale)
+                        .arg(&co_i)
+                        .arg(&m_i);
+                    // SAFETY: v2 signature (no scores scratch).
+                    unsafe { l2.launch(cfg2).expect("v2 f32") };
+                }
+                _ => {
+                    d_k16 = stream.clone_htod(&kh).expect("k16");
+                    d_v16 = stream.clone_htod(&vh).expect("v16");
+                    let mut l1 = stream.launch_builder(&f_rev1);
+                    l1.arg(&d_q)
+                        .arg(&d_k16)
+                        .arg(&d_v16)
+                        .arg(&mut d_out1)
+                        .arg(&mut d_scores)
+                        .arg(&cm_i)
+                        .arg(&nh_i)
+                        .arg(&nhkv_i)
+                        .arg(&hd_i)
+                        .arg(&scale)
+                        .arg(&co_i)
+                        .arg(&m_i);
+                    // SAFETY: rev-1 f16 batch signature.
+                    unsafe { l1.launch(cfg1).expect("rev1 h") };
+                    let mut l2 = stream.launch_builder(&f_v2);
+                    l2.arg(&d_q)
+                        .arg(&d_k16)
+                        .arg(&d_v16)
+                        .arg(&mut d_out2)
+                        .arg(&nh_i)
+                        .arg(&nhkv_i)
+                        .arg(&hd_i)
+                        .arg(&scale)
+                        .arg(&co_i)
+                        .arg(&m_i);
+                    // SAFETY: v2 f16 signature.
+                    unsafe { l2.launch(cfg2).expect("v2 h") };
+                }
+            }
+
+            let o1 = stream.clone_dtoh(&d_out1).expect("dtoh 1");
+            let o2 = stream.clone_dtoh(&d_out2).expect("dtoh 2");
+            for (i, (&a, &b)) in o1.iter().zip(&o2).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "attn v2 diverges from rev1 ({dtype}, nh={n_head} nhkv={n_head_kv} \
+                     hd={head_dim} co={causal_offset} m={m}) at [{i}]: rev1={a} v2={b}"
                 );
             }
         }
@@ -3787,7 +3977,17 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     let names: Vec<&str> = src
         .lines()
         .filter_map(|l| l.strip_prefix("__global__ void "))
-        .map(|l| l.split('(').next().unwrap_or(l).trim())
+        .map(|l| {
+            // Skip an optional `__launch_bounds__(N)` qualifier before the name
+            // (the v2 attention twins carry one).
+            let l = l.trim_start();
+            let l = l.strip_prefix("__launch_bounds__").map_or(l, |rest| {
+                rest.split_once(')')
+                    .map_or(rest, |(_, after)| after)
+                    .trim_start()
+            });
+            l.split('(').next().unwrap_or(l).trim()
+        })
         .collect();
     let count = |prefix: &str| {
         names
@@ -3809,6 +4009,7 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
         ("gqa_attention_scores", 3),
         ("gqa_attention_reduce", 3),
         ("gqa_attention_batch", 3),
+        ("gqa_attention_batch_v2", 2),
         ("gqa_attention_tree_scores", 3),
         ("gqa_attention_tree_reduce", 3),
         ("lm_head_warp", 2),
@@ -3823,11 +4024,13 @@ fn adr_0022_twin_family_table_matches_decode_cu() {
     }
     assert_eq!(
         names.len(),
-        66,
+        68,
         "decode.cu kernel count drifted from ADR 0022 — update the ADR \
          (65 → 64: gqa_attention_mdecode_f32 retired; 64 → 66: paged KV \
          twins added, ADR 0025 step 2; rmsnorm_quant_i8_fast was added and \
-         DELETED by measurement — ADR 0023 rejected, +1.75% < the 3% bar)"
+         DELETED by measurement — ADR 0023 rejected, +1.75% < the 3% bar; \
+         66 → 68: gqa_attention_batch_v2 f32/h twins added — order-preserving \
+         prefill attention, bit-identical to rev 1 by to_bits gate)"
     );
 }
 
