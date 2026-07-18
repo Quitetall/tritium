@@ -10116,6 +10116,128 @@ mod tests {
         );
     }
 
+    /// Tensor-core tier — full-step speedup. Times a whole multi-layer transformer fwd+bwd
+    /// (embed → GQA+SwiGLU blocks → tied head) on the f32 kernels vs the tf32 tensor-core tier.
+    /// This is the end-to-end payoff — Amdahl-limited by the non-GEMM ops (embed/norm/softmax/
+    /// elementwise/launch) that stay f32, so it is below the ~65× per-GEMM figure but is the
+    /// number that matters for the training step.
+    #[test]
+    #[ignore = "throughput bench; run with --ignored --nocapture"]
+    fn bench_tf32_whole_model_step() {
+        use std::time::Instant;
+
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping bench_tf32_whole_model_step: no CUDA ({e})");
+                return;
+            }
+        };
+        let tc = TensorCoreGemm::new(&backend).expect("cuBLASLt");
+        const VOCAB: usize = 8192;
+        const N_EMBD: usize = 576;
+        const N_HEAD: usize = 9;
+        const N_KV: usize = 3;
+        const HEAD_DIM: usize = 64;
+        const FF: usize = 1536;
+        const N_LAYERS: usize = 8;
+        const EPS: f32 = 1e-5;
+        const THETA: f32 = 10000.0;
+        let qd = N_HEAD * HEAD_DIM;
+        let kvd = N_KV * HEAD_DIM;
+
+        let step = |seq: usize, use_tc: bool, iters: usize| -> f64 {
+            let tokens: Vec<i32> = (0..seq).map(|i| ((i * 37 + 11) % VOCAB) as i32).collect();
+            let cot = seeded_uniform(0xC00, seq * VOCAB, -1.0, 1.0);
+            let embed_w = seeded_uniform(0xC01, VOCAB * N_EMBD, -0.1, 0.1);
+            let mut total = 0.0;
+            for it in 0..(iters + 1) {
+                let t0 = Instant::now();
+                let mut dt =
+                    DeviceTape::new(&backend, (seq * N_EMBD).max(FF).max(qd).max(VOCAB)).unwrap();
+                if use_tc {
+                    dt = dt.with_tensor_core(&tc);
+                }
+                let emb = dt.leaf(&embed_w).unwrap();
+                let mut hidden = dt.embed(emb, &tokens, seq, N_EMBD, VOCAB).unwrap();
+                for l in 0..N_LAYERS {
+                    let an = dt
+                        .leaf(&seeded_uniform(0xD00 + l as u64, N_EMBD, 0.5, 1.5))
+                        .unwrap();
+                    let xn = dt.rmsnorm(hidden, an, seq, N_EMBD, EPS).unwrap();
+                    let wq = dt
+                        .leaf(&seeded_uniform(0xD10 + l as u64, qd * N_EMBD, -0.1, 0.1))
+                        .unwrap();
+                    let wk = dt
+                        .leaf(&seeded_uniform(0xD20 + l as u64, kvd * N_EMBD, -0.1, 0.1))
+                        .unwrap();
+                    let wv = dt
+                        .leaf(&seeded_uniform(0xD30 + l as u64, kvd * N_EMBD, -0.1, 0.1))
+                        .unwrap();
+                    let wo = dt
+                        .leaf(&seeded_uniform(0xD40 + l as u64, N_EMBD * qd, -0.1, 0.1))
+                        .unwrap();
+                    let attn = dt
+                        .attention(
+                            xn, wq, wk, wv, wo, seq, N_EMBD, N_HEAD, N_KV, HEAD_DIM, THETA,
+                        )
+                        .unwrap();
+                    hidden = dt.add(hidden, attn).unwrap();
+                    let fnw = dt
+                        .leaf(&seeded_uniform(0xD50 + l as u64, N_EMBD, 0.5, 1.5))
+                        .unwrap();
+                    let hn = dt.rmsnorm(hidden, fnw, seq, N_EMBD, EPS).unwrap();
+                    let wg = dt
+                        .leaf(&seeded_uniform(0xD60 + l as u64, FF * N_EMBD, -0.1, 0.1))
+                        .unwrap();
+                    let wu = dt
+                        .leaf(&seeded_uniform(0xD70 + l as u64, FF * N_EMBD, -0.1, 0.1))
+                        .unwrap();
+                    let wd = dt
+                        .leaf(&seeded_uniform(0xD80 + l as u64, N_EMBD * FF, -0.1, 0.1))
+                        .unwrap();
+                    let g = dt.matmul(hn, wg, seq, FF, N_EMBD).unwrap();
+                    let u = dt.matmul(hn, wu, seq, FF, N_EMBD).unwrap();
+                    let ga = dt.silu(g).unwrap();
+                    let gated = dt.mul(ga, u).unwrap();
+                    let down = dt.matmul(gated, wd, seq, N_EMBD, FF).unwrap();
+                    hidden = dt.add(hidden, down).unwrap();
+                }
+                let onw = dt.leaf(&seeded_uniform(0xC02, N_EMBD, 0.5, 1.5)).unwrap();
+                let fnorm = dt.rmsnorm(hidden, onw, seq, N_EMBD, EPS).unwrap();
+                let logits = dt.matmul(fnorm, emb, seq, VOCAB, N_EMBD).unwrap();
+                let seed = backend.dev_upload(&cot).unwrap();
+                let res = dt.backward_retain(logits, &seed, &[emb]).unwrap();
+                let mut sink = vec![0.0f32; VOCAB * N_EMBD];
+                backend
+                    .dev_download(res.grads[emb].as_ref().unwrap(), &mut sink)
+                    .unwrap();
+                std::hint::black_box(&sink);
+                if it >= 1 {
+                    total += t0.elapsed().as_secs_f64();
+                }
+            }
+            total / iters as f64
+        };
+
+        eprintln!(
+            "tf32 tier full-step ({N_LAYERS}L SmolLM2-ish: n_embd={N_EMBD} ff={FF} n_head={N_HEAD} \
+             vocab={VOCAB}), fwd+bwd:"
+        );
+        for &seq in &[128usize, 512] {
+            let f = step(seq, false, 3);
+            let t = step(seq, true, 3);
+            eprintln!(
+                "  seq={seq:4}: f32 {:8.1} ms  |  tf32 {:7.2} ms  →  {:5.1}× faster  ({:.0} vs {:.0} tok/s)",
+                f * 1e3,
+                t * 1e3,
+                f / t,
+                seq as f64 / f,
+                seq as f64 / t,
+            );
+        }
+    }
+
     /// Gate + payoff (plan 0043 P2.4a): a full **device-resident SwiGLU MLP block** — rmsnorm →
     /// gate/up matmul → silu → mul → down matmul → residual — run forward AND backward entirely on
     /// resident VRAM buffers (activations never leave the device; grads of a value with two
