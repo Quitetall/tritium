@@ -32,9 +32,9 @@ mod trit;
 
 pub use dtype::{DType, TernaryFormat};
 pub use error::TritError;
-pub use reference::reference_mpgemm;
+pub use reference::{reference_conv1d, reference_fsq, reference_mpgemm};
 pub use scale::{ScaleGranularity, absmean};
-pub use shape::GemmShape;
+pub use shape::{ConvShape, GemmShape};
 pub use trit::Trit;
 
 /// log2(3): the information-theoretic floor for one ternary value, in bits.

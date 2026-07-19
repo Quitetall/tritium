@@ -1,6 +1,6 @@
 //! The correctness ground truth.
 
-use crate::{GemmShape, Trit, error::TritError};
+use crate::{ConvShape, GemmShape, Trit, error::TritError};
 
 /// Reference mixed-precision GEMM: ternary weights × `f32` activations, with a
 /// per-output-channel scale.
@@ -61,6 +61,124 @@ fn check(got: usize, expected: usize) -> Result<(), TritError> {
     } else {
         Err(TritError::ShapeMismatch { expected, got })
     }
+}
+
+/// Reference ternary 1-D convolution — the multiply-free (add / subtract / skip) oracle every backend
+/// (CPU / CUDA / MCU) is measured against, and the numeric truth the codec conformance vectors freeze.
+///
+/// ```text
+/// out[b, co, l] = scale[co] · Σ_{ci',kk}  x[b, g·(C_in/groups)+ci', l·stride + kk·dilation − pad_left] · w[co, ci'·K + kk]
+/// ```
+/// with out-of-range (padding) taps skipped and group `g = co / (C_out/groups)`. Accumulation runs in
+/// the pinned order `ci' → kk` — the same order as the training im2col column index `ci'·K + kk` — so it
+/// is bit-reproducible across every backend (the ADR 0018 reduction-order discipline), and bit-identical
+/// to the training `conv1d` forward at ternary weights (float `×{−1,0,1}` equals add/sub/skip exactly).
+///
+/// Layout — all row-major: `x` `[B, C_in, L_in]`; `weights` `[C_out, (C_in/groups)·K]` ternary;
+/// `scale_n` `[C_out]`; `out` `[B, C_out, L_out]`, overwritten.
+///
+/// # Errors
+/// [`TritError::ShapeMismatch`] on any buffer-length or geometry disagreement (bad groups divisibility,
+/// or a kernel wider than the padded input).
+pub fn reference_conv1d(
+    x: &[f32],
+    weights: &[Trit],
+    scale_n: &[f32],
+    shape: ConvShape,
+    out: &mut [f32],
+) -> Result<(), TritError> {
+    let l_out = shape.l_out();
+    if !shape.buffers_fit(x.len(), weights.len(), scale_n.len(), out.len()) {
+        return Err(TritError::ShapeMismatch {
+            expected: shape.batch * shape.c_out * l_out,
+            got: out.len(),
+        });
+    }
+    let (c_in_pg, n_g, k_g, k) = (shape.c_in_pg(), shape.n_g(), shape.k_g(), shape.k);
+    for b in 0..shape.batch {
+        for g in 0..shape.groups {
+            for n in 0..n_g {
+                let co = g * n_g + n;
+                let wrow = &weights[co * k_g..co * k_g + k_g];
+                let s = scale_n[co];
+                for l in 0..l_out {
+                    let mut acc = 0.0f32;
+                    for ci_local in 0..c_in_pg {
+                        let ci = g * c_in_pg + ci_local;
+                        let xbase = (b * shape.c_in + ci) * shape.l_in;
+                        for kk in 0..k {
+                            let p = l as isize * shape.stride as isize
+                                + kk as isize * shape.dilation as isize
+                                - shape.pad_left as isize;
+                            if p >= 0 && (p as usize) < shape.l_in {
+                                let xv = x[xbase + p as usize];
+                                match wrow[ci_local * k + kk].get() {
+                                    1 => acc += xv,
+                                    -1 => acc -= xv,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    out[(b * shape.c_out + co) * l_out + l] = acc * s;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reference FSQ (finite scalar quantization) — the byte-exact **clamp** deploy grid, the oracle for the
+/// codec latent quantizer. Per element (channel `c = i / len`, `L = levels[c]`):
+///
+/// ```text
+/// b = clamp(x, -1, 1);  code = round_half_away((b+1)/2·(L−1)) ∈ [0, L−1];  q = code/(L−1)·2 − 1
+/// ```
+///
+/// The round is an explicit non-negative truncation (`(v + 0.5) as i32`), never `libm`'s `rintf`
+/// (half-to-even) — so the grid is bit-identical across CPU / CUDA / MCU (and matches the training
+/// `fsq` clamp path). The `tanh` bound is training-only and deliberately not part of this deploy oracle.
+///
+/// # Errors
+/// [`TritError::ShapeMismatch`] if `x.len() != channels·len`, `levels.len() != channels`,
+/// `out.len() != x.len()`, or any level `L < 2`.
+pub fn reference_fsq(
+    x: &[f32],
+    levels: &[u32],
+    channels: usize,
+    len: usize,
+    out: &mut [f32],
+) -> Result<(), TritError> {
+    check(x.len(), channels * len)?;
+    check(levels.len(), channels)?;
+    check(out.len(), channels * len)?;
+    for (i, (&xi, o)) in x.iter().zip(out.iter_mut()).enumerate() {
+        let l = levels[i / len];
+        if l < 2 {
+            return Err(TritError::ShapeMismatch {
+                expected: 2,
+                got: l as usize,
+            });
+        }
+        let lm1 = (l - 1) as f32;
+        let b = if xi < -1.0 {
+            -1.0
+        } else if xi > 1.0 {
+            1.0
+        } else {
+            xi
+        };
+        // (b+1)/2·(L−1) ≥ 0, so truncating (v + 0.5) is round-half-away-from-zero without libm.
+        let mut code = ((b + 1.0) * 0.5 * lm1 + 0.5) as i32;
+        if code < 0 {
+            code = 0;
+        }
+        if code > (l - 1) as i32 {
+            code = (l - 1) as i32;
+        }
+        *o = code as f32 / lm1 * 2.0 - 1.0;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
