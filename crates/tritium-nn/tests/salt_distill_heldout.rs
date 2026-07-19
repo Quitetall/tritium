@@ -397,6 +397,20 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     });
     let mut cached_target = vec![0.0; TRAIN_SEQ * a.vocab];
 
+    // Step-1 recovery-vs-tokens curve (plan 0042): set TRITIUM_DISTILL_CURVE=K to evaluate held-out
+    // ppl every K steps and print one curve point per checkpoint, tracing the whole convergence in a
+    // single run instead of re-training from scratch per budget. Off by default so the committed gate
+    // (40 steps, one final eval) is unchanged.
+    let curve_every: Option<u64> = std::env::var("TRITIUM_DISTILL_CURVE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&k| k > 0);
+    if curve_every.is_some() {
+        println!(
+            "curve: step,tokens,distilled_ppl,recovery_vs_ptq,gap_to_fp (fp {ppl_fp:.3}, ptq {ppl_ptq:.3e})"
+        );
+    }
+
     let mut step_ms = 0.0f64;
     for step in 1..=steps {
         let t0 = Instant::now();
@@ -437,6 +451,25 @@ fn salt_distillation_device_trainer_recovers_heldout() {
         step_ms += t0.elapsed().as_secs_f64() * 1e3;
         if step % 10 == 0 || step == 1 {
             eprintln!("  resident step {step}/{steps} (win {wi})");
+        }
+
+        // Checkpoint eval: download the resident masters (read-only copy — training state is
+        // untouched), quantize, and score the disjoint held-out set. One point on the curve.
+        if let Some(k) = curve_every {
+            if step % k == 0 || step == steps {
+                let ckpt: Vec<Vec<f32>> = (0..fp.len())
+                    .map(|i| trainer.download_master(i).unwrap())
+                    .zip(&shapes)
+                    .map(|(wf, &(n, kk))| ste::salt_quantize_forward(&wf, n, kk, T))
+                    .collect();
+                let ppl = perplexity(&logits_of(&ckpt, &a, &eval_ids), &eval_ids, a.vocab);
+                let tokens = step as usize * TRAIN_SEQ;
+                println!(
+                    "curve: {step},{tokens},{ppl:.3},{:.1},{:.3}",
+                    ppl_ptq / ppl,
+                    ppl / ppl_fp as f64
+                );
+            }
         }
     }
 
