@@ -4363,6 +4363,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tritium-mcu"
+version = "1.0.0"
+dependencies = [
+ "tritium-core",
+ "tritium-testkit",
+]
+
+[[package]]
 name = "tritium-metal"
 version = "1.0.0"
 dependencies = [
@@ -4418,6 +4426,7 @@ dependencies = [
  "tritium-nn",
  "tritium-runtime",
  "tritium-spec",
+ "tritium-train",
 ]
 
 [[package]]
