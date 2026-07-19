@@ -35,9 +35,11 @@ pub use qwen36_source_admission::{
 pub use qwen36_tensor_work::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
     Qwen36AdditiveMasterReceipt, Qwen36AdditiveSlotState, Qwen36AdditiveWorkSlot,
-    Qwen36CompleteWorkspaceReceipt, Qwen36LanguageMtpWorkspaceReceipt, Qwen36PreservedVisitError,
-    Qwen36ScaleOnlyCampaignStore, Qwen36TensorWorkError, Qwen36TensorWorkStore,
-    Qwen36TensorWorkSummary,
+    Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt,
+    Qwen36LanguageMtpWorkspaceReceipt, Qwen36PreservedVisitError, Qwen36ScaleOnlyCampaignStore,
+    Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
+    Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt, Qwen36TensorWorkError,
+    Qwen36TensorWorkStore, Qwen36TensorWorkSummary,
 };
 pub use tensor_work_store::{
     TensorPayloadValidator, TensorPayloadWriter, TensorPutError, TensorRecordInfo,

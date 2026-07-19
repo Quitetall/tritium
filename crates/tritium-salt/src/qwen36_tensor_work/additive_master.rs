@@ -1,5 +1,12 @@
 //! Immutable additive-master campaigns layered over one preserved-source workspace.
 
+mod selected_allocation;
+
+pub use selected_allocation::{
+    Qwen36AllocatedCampaignStore, Qwen36SelectedAllocationBindError,
+    Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
+};
+
 use core::fmt;
 #[cfg(unix)]
 use std::fs::OpenOptions;
@@ -2366,6 +2373,7 @@ impl<'a> CanonicalCursor<'a> {
 mod tests {
     use std::{
         cell::Cell,
+        convert::Infallible,
         io::{self, Write},
     };
 
@@ -2379,7 +2387,10 @@ mod tests {
         salt_v2_package::SaltV2Plane,
     };
     use tritium_nn::{NnError, Qwen35TensorStreamError};
-    use tritium_quantize::{Qwen35SourceDtype, Qwen35TensorRole, Qwen35TensorScope};
+    use tritium_quantize::{
+        ByteDelta, NestedProfileBudgets, PhysicalBytes, ProfileBudget, Qwen35SourceDtype,
+        Qwen35TensorRole, Qwen35TensorScope,
+    };
 
     use super::super::{
         PreservedTensorSource, Qwen36AdditiveSlotState, Qwen36AdditiveWorkSlot, WorkspacePlan,
@@ -2388,6 +2399,9 @@ mod tests {
 
     #[derive(Debug)]
     struct EmptySource;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AllocationSourceError;
 
     impl PreservedTensorSource for EmptySource {
         fn try_visit_tensor_bytes(
@@ -2489,6 +2503,53 @@ mod tests {
             fixture_master("mtp.weight", [22; 32], 1, [52; 32]),
         ])
         .expect("valid fixture campaign")
+    }
+
+    fn fixture_selection_spec() -> Qwen36SelectedAllocationSpec {
+        let metadata = ByteDelta::measured(
+            PhysicalBytes {
+                serialized: 32,
+                resident: 16,
+            },
+            PhysicalBytes {
+                serialized: 32,
+                resident: 16,
+            },
+        );
+        Qwen36SelectedAllocationSpec::new(
+            tritium_format::salt_v2::SaltV2Codec::D2,
+            [81; 32],
+            [82; 32],
+            NestedProfileBudgets {
+                compact: ProfileBudget {
+                    maximum: PhysicalBytes {
+                        serialized: 128,
+                        resident: 128,
+                    },
+                    metadata,
+                },
+                near_lossless: ProfileBudget {
+                    maximum: PhysicalBytes {
+                        serialized: 256,
+                        resident: 256,
+                    },
+                    metadata,
+                },
+            },
+        )
+        .expect("valid fixture selection spec")
+    }
+
+    fn fixture_allocation_counts() -> impl Iterator<Item = Result<(u8, u8), Infallible>> {
+        [(1, 1), (1, 2)].into_iter().map(Ok)
+    }
+
+    fn bind_fixture_allocation<'parent, 'store, 'source>(
+        parent: &'parent Qwen36AdditiveCampaignStore<'store, 'source>,
+    ) -> Qwen36AllocatedCampaignStore<'parent, 'store, 'source> {
+        parent
+            .bind_selected_allocation(fixture_selection_spec(), fixture_allocation_counts())
+            .expect("bind fixture selected allocation")
     }
 
     fn fixture_scale_only_master(
@@ -3054,6 +3115,167 @@ mod tests {
         ));
 
         drop(child);
+        drop(parent);
+        drop(base);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_allocation_reopens_and_rejects_invalid_or_changed_maps() {
+        let root = fixture_root("selected-allocation-binding");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open base workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let parent_spec = fixture_campaign_spec();
+        let parent = base
+            .open_master_campaign(parent_spec.clone())
+            .expect("open PTQ parent campaign");
+        for (ordinal, expected) in parent_spec.expected_masters().iter().enumerate() {
+            parent
+                .install_master(expected, |writer| {
+                    write_fixture_master(expected, writer, if ordinal == 0 { 1 } else { 2 })
+                })
+                .expect("install PTQ parent master");
+        }
+        parent.seal_complete().expect("seal PTQ parent");
+
+        assert!(matches!(
+            parent.bind_selected_allocation(
+                fixture_selection_spec(),
+                [Ok::<_, AllocationSourceError>((1, 1))]
+            ),
+            Err(Qwen36SelectedAllocationBindError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch("selected allocation source is short")
+            ))
+        ));
+        assert!(matches!(
+            parent.bind_selected_allocation(
+                fixture_selection_spec(),
+                [
+                    Ok::<_, AllocationSourceError>((1, 1)),
+                    Ok((1, 2)),
+                    Ok((1, 2)),
+                ]
+            ),
+            Err(Qwen36SelectedAllocationBindError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch("selected allocation source is long")
+            ))
+        ));
+        assert!(matches!(
+            parent.bind_selected_allocation(
+                fixture_selection_spec(),
+                [Ok((1, 1)), Err(AllocationSourceError)]
+            ),
+            Err(Qwen36SelectedAllocationBindError::Source(
+                AllocationSourceError
+            ))
+        ));
+        assert!(matches!(
+            parent.bind_selected_allocation(
+                fixture_selection_spec(),
+                [(2, 1), (1, 2)].into_iter().map(Ok::<_, Infallible>)
+            ),
+            Err(Qwen36SelectedAllocationBindError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch("selected nested admissible prefixes")
+            ))
+        ));
+        assert!(matches!(
+            parent.bind_selected_allocation(
+                fixture_selection_spec(),
+                [(1, 2), (1, 2)].into_iter().map(Ok::<_, Infallible>)
+            ),
+            Err(Qwen36SelectedAllocationBindError::Campaign(
+                Qwen36TensorWorkError::WorkspaceMismatch("selected nested admissible prefixes")
+            ))
+        ));
+        assert!(
+            !parent
+                .root()
+                .join("selected-allocation/selected-allocation.tq36a")
+                .exists()
+        );
+        let failed_store = TensorWorkStore::open(&parent.root().join("selected-allocation"))
+            .expect("open failed selected allocation store");
+        assert_eq!(object_record_count(failed_store.objects_dir()), 0);
+        assert_eq!(
+            fs::read_dir(failed_store.temporary_dir())
+                .expect("read selected allocation staging")
+                .count(),
+            0
+        );
+
+        let allocated = bind_fixture_allocation(&parent);
+        let mut receipt = allocated.receipt().clone();
+        assert_eq!(receipt.tensor_count(), 2);
+        assert_eq!(receipt.tile_count(), 2);
+        assert_eq!(receipt.compact().map_record().info().payload_bytes(), 1);
+        assert_eq!(
+            receipt.near_lossless().map_record().info().payload_bytes(),
+            1
+        );
+        assert_ne!(
+            receipt.compact().allocation_map_id(),
+            receipt.near_lossless().allocation_map_id()
+        );
+        drop(allocated);
+
+        let reopened = parent
+            .reopen_selected_allocation()
+            .expect("reopen selected allocation");
+        assert_eq!(reopened.receipt(), &receipt);
+        drop(reopened);
+
+        selected_allocation::rewrite_selected_allocation_for_test(&parent, &[1, 1], &[2, 2], None)
+            .expect("publish canonical inadmissible selection");
+        assert!(matches!(
+            parent.reopen_selected_allocation(),
+            Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected nested admissible prefixes"
+            ))
+        ));
+        selected_allocation::rewrite_selected_allocation_for_test(&parent, &[2, 1], &[1, 2], None)
+            .expect("publish canonical non-nested selection");
+        assert!(matches!(
+            parent.reopen_selected_allocation(),
+            Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected nested admissible prefixes"
+            ))
+        ));
+        selected_allocation::rewrite_selected_allocation_for_test(
+            &parent,
+            &[1, 1],
+            &[1, 2],
+            Some(ContentId::of_bytes(b"forged nested allocation")),
+        )
+        .expect("publish canonical forged nested identity");
+        assert!(matches!(
+            parent.reopen_selected_allocation(),
+            Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "selected allocation semantic receipt"
+            ))
+        ));
+        receipt = selected_allocation::rewrite_selected_allocation_for_test(
+            &parent,
+            &[1, 1],
+            &[1, 2],
+            None,
+        )
+        .expect("restore canonical valid selection");
+        parent
+            .reopen_selected_allocation()
+            .expect("reopen restored selected allocation");
+
+        let selection_store = TensorWorkStore::open(&parent.root().join("selected-allocation"))
+            .expect("open selected allocation CAS");
+        fs::write(
+            selection_store.record_path(receipt.compact().map_record().record_id()),
+            b"changed map record",
+        )
+        .expect("tamper selected map record");
+        assert!(parent.reopen_selected_allocation().is_err());
+
         drop(parent);
         drop(base);
         let _ = fs::remove_dir_all(root);
