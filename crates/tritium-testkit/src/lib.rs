@@ -34,6 +34,7 @@
 // v0.90 hardening: every public item must carry a doc comment.
 #![deny(missing_docs)]
 
+mod codec_vectors;
 mod frozen;
 mod generate;
 mod jsonl;
@@ -41,6 +42,9 @@ mod reference_backend;
 mod runner;
 mod vector;
 
+pub use codec_vectors::{
+    Conv1dVector, FsqVector, generate_conv_vectors, generate_fsq_vectors, grade_conv, grade_fsq,
+};
 pub use frozen::{
     FROZEN_COUNT, FROZEN_SEED, VECTOR_SET_VERSION, frozen_vectors, frozen_vectors_path,
 };
