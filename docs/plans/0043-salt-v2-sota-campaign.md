@@ -837,7 +837,9 @@ The following work deliberately remains open and keeps this plan in progress:
   and selection validation, and performs terminal package mutation checks. Only
   this package-admitted capability exposes the v2 scale-only opener; its campaign
   catalog binds the admission ID, selection ID, and both package IDs, and its
-  install/progress/seal paths revalidate admission around child work.
+  install/progress paths use stable package-record inode/version pins plus small
+  manifest checks around child work, while open, seal, and completion reopen
+  repeat full cryptographic package and parent-prefix validation.
   This remains **structural fixture evidence**, not checkpoint-scale or quality
   evidence. PV/KL execution over real tensors remains unimplemented. The
   production fitter/refinement driver must still stream real checkpoint output

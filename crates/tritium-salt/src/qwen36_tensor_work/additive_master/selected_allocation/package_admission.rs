@@ -25,12 +25,12 @@ use super::super::{
     CHECKSUM_BYTES, CanonicalCursor, FixedCampaignMode, MASTER_STREAM_CHUNK_BYTES,
     PackageScaleOnlyBinding, PinnedDirectory, Qwen36AdditiveCampaignSpec,
     Qwen36AdditiveInstallError, Qwen36AdditiveMasterReceipt, Qwen36CompleteWorkspaceReceipt,
-    Qwen36ScaleOnlyCampaignStore, SaltV2MasterTensorSpec,
+    Qwen36ScaleOnlyCampaignStore, SaltV2MasterTensorSpec, same_file_identity,
 };
 use super::{
     Qwen36AllocatedCampaignStore, Qwen36SelectedAllocationReceipt, Qwen36TensorWorkError,
-    codec_tag, persist_exact, read_regular_bounded, reclaim_selection_orphans, stage_verified_map,
-    validate_directories, work_io,
+    codec_tag, persist_exact, read_regular_bounded, read_selection_receipt,
+    reclaim_selection_orphans, stage_verified_map, validate_directories, work_io,
 };
 
 const ADMISSION_FILE: &str = "package-admission.tq36p";
@@ -360,7 +360,8 @@ impl Qwen36PackageAdmissionReceipt {
 pub struct Qwen36PackageAdmittedCampaignStore<'allocated, 'parent, 'store, 'source> {
     allocated: &'allocated Qwen36AllocatedCampaignStore<'parent, 'store, 'source>,
     receipt: Qwen36PackageAdmissionReceipt,
-    _directories: Vec<PinnedDirectory>,
+    directories: Vec<PinnedDirectory>,
+    package_records: [PinnedPackageRecord; 2],
 }
 
 /// Package-bound scale-only campaign; refinement cannot outlive its admitted packages.
@@ -368,6 +369,43 @@ pub struct Qwen36PackageAdmittedCampaignStore<'allocated, 'parent, 'store, 'sour
 pub struct Qwen36PackageScaleOnlyCampaignStore<'admission, 'allocated, 'parent, 'store, 'source> {
     admission: &'admission Qwen36PackageAdmittedCampaignStore<'allocated, 'parent, 'store, 'source>,
     campaign: Qwen36ScaleOnlyCampaignStore<'parent, 'store, 'source>,
+}
+
+#[derive(Debug)]
+struct PinnedPackageRecord {
+    path: PathBuf,
+    identity: fs::Metadata,
+}
+
+impl PinnedPackageRecord {
+    fn pin(path: PathBuf, expected_bytes: u64) -> Result<Self, Qwen36TensorWorkError> {
+        let identity = fs::symlink_metadata(&path)
+            .map_err(|error| work_io("pin admitted package record", error))?;
+        if identity.file_type().is_symlink()
+            || !identity.is_file()
+            || identity.len() != expected_bytes
+        {
+            return Err(Qwen36TensorWorkError::InvalidPath(
+                "admitted package record",
+            ));
+        }
+        Ok(Self { path, identity })
+    }
+
+    fn validate(&self) -> Result<(), Qwen36TensorWorkError> {
+        let current = fs::symlink_metadata(&self.path)
+            .map_err(|error| work_io("reinspect admitted package record", error))?;
+        if current.file_type().is_symlink()
+            || !current.is_file()
+            || !same_file_identity(&self.identity, &current)
+            || !same_file_version(&self.identity, &current)
+        {
+            return Err(Qwen36TensorWorkError::InvalidPath(
+                "changed admitted package record",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_> {
@@ -379,6 +417,31 @@ impl Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_> {
     /// Strictly revalidate selection lineage, package CAS records, semantics, and budgets.
     pub fn verify_current(&self) -> Result<(), Qwen36PackageAdmissionError> {
         verify_admission(self.allocated, &self.receipt)
+    }
+
+    fn verify_cheap_current(&self) -> Result<(), Qwen36PackageAdmissionError> {
+        validate_directories(&self.directories)?;
+        for record in &self.package_records {
+            record.validate()?;
+        }
+        let root = self.allocated.parent.root.join(super::SELECTION_DIRECTORY);
+        let current = read_admission(&root.join(ADMISSION_FILE))?;
+        if current != self.receipt
+            || read_selection_receipt(&root.join(super::SELECTION_FILE))? != self.allocated.receipt
+        {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "package admission cheap receipt check",
+            )
+            .into());
+        }
+        self.allocated
+            .parent
+            .verify_completion_receipt(&self.allocated.parent_completion)?;
+        validate_directories(&self.directories)?;
+        for record in &self.package_records {
+            record.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -494,9 +557,9 @@ impl Qwen36PackageScaleOnlyCampaignStore<'_, '_, '_, '_, '_> {
 
     /// Seal only after full terminal package-admission revalidation.
     pub fn seal_complete(&self) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
-        self.verify_admission_for_refinement()?;
+        self.verify_admission_full_for_refinement()?;
         let receipt = self.campaign.seal_complete()?;
-        self.verify_admission_for_refinement()?;
+        self.verify_admission_full_for_refinement()?;
         Ok(receipt)
     }
 
@@ -504,13 +567,21 @@ impl Qwen36PackageScaleOnlyCampaignStore<'_, '_, '_, '_, '_> {
     pub fn require_complete(
         &self,
     ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError> {
-        self.verify_admission_for_refinement()?;
+        self.verify_admission_full_for_refinement()?;
         let receipt = self.campaign.require_complete()?;
-        self.verify_admission_for_refinement()?;
+        self.verify_admission_full_for_refinement()?;
         Ok(receipt)
     }
 
     fn verify_admission_for_refinement(&self) -> Result<(), Qwen36TensorWorkError> {
+        self.admission.verify_cheap_current().map_err(|_| {
+            Qwen36TensorWorkError::WorkspaceMismatch(
+                "package-admitted scale-only package admission",
+            )
+        })
+    }
+
+    fn verify_admission_full_for_refinement(&self) -> Result<(), Qwen36TensorWorkError> {
         self.admission.verify_current().map_err(|_| {
             Qwen36TensorWorkError::WorkspaceMismatch(
                 "package-admitted scale-only package admission",
@@ -611,10 +682,12 @@ impl<'parent, 'store, 'source> Qwen36AllocatedCampaignStore<'parent, 'store, 'so
             }
             verify_admission_records(self, &objects, &receipt)?;
             validate_directories(&directories)?;
+            let package_records = pin_package_records(&objects, &receipt)?;
             Ok(Qwen36PackageAdmittedCampaignStore {
                 allocated: self,
                 receipt,
-                _directories: directories,
+                directories,
+                package_records,
             })
         }
     }
@@ -638,10 +711,12 @@ impl<'parent, 'store, 'source> Qwen36AllocatedCampaignStore<'parent, 'store, 'so
             validate_admission_binding(&receipt, &self.receipt)?;
             verify_admission_records(self, &objects, &receipt)?;
             validate_directories(&directories)?;
+            let package_records = pin_package_records(&objects, &receipt)?;
             Ok(Qwen36PackageAdmittedCampaignStore {
                 allocated: self,
                 receipt,
-                _directories: directories,
+                directories,
+                package_records,
             })
         }
     }
@@ -661,6 +736,38 @@ fn verify_admission(
     verify_admission_records(allocated, &objects, &current)?;
     validate_directories(&directories)?;
     Ok(())
+}
+
+fn pin_package_records(
+    objects: &TensorWorkStore,
+    receipt: &Qwen36PackageAdmissionReceipt,
+) -> Result<[PinnedPackageRecord; 2], Qwen36TensorWorkError> {
+    Ok([
+        PinnedPackageRecord::pin(
+            objects.record_path(receipt.compact.record.record_id()),
+            receipt.compact.record.record_bytes(),
+        )?,
+        PinnedPackageRecord::pin(
+            objects.record_path(receipt.near_lossless.record.record_id()),
+            receipt.near_lossless.record.record_bytes(),
+        )?,
+    ])
+}
+
+#[cfg(unix)]
+fn same_file_version(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_file_version(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn validate_package_pair<R1: Read + Seek, R2: Read + Seek>(

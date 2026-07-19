@@ -1,12 +1,27 @@
 # ADR 0030 — Ternary codec substrate: Conv1d, FSQ, and PyTorch autograd bindings
 
-Status: **ACCEPTED — Tier 0 IMPLEMENTED** (2026-07-18) — onboarding contract, co-authored with **LamQuant**
+Status: **ACCEPTED — Tiers 0–4 IMPLEMENTED (CPU/host legs)** (2026-07-18) — onboarding contract,
+co-authored with **LamQuant**
 
-> **Tier-0 gate landed** (commits `1cab228` conv1d, `e129c5d` fsq, `fd2404c` py bindings): ternary
-> `Conv1d` + `FSQ` autograd ops in `tritium-train` (Gate-C gradchecked) and PyTorch `autograd.Function`
-> wrappers in `tritium-py` (`TernaryConv1d`/`FSQ` nn.Modules; conv matches `torch.nn.functional.conv1d`
-> in forward + gradients across 5 geometries; 9/9 torch-parity tests green under torch 2.11). LamQuant
-> can start swapping codec layers now. Tiers 1–6 below are in progress / roadmap.
+> **The whole CPU/host-validatable substrate has landed.** Every piece below is committed, gated, and
+> (for the load-bearing ops) reviewed clean:
+> - **Tier 0 — gate** (`1cab228`/`e129c5d`/`fd2404c`/`5f313d7`): ternary `Conv1d` + `FSQ` autograd ops
+>   (Gate-C gradchecked) + PyTorch `autograd.Function` wrappers (`TernaryConv1d`/`FSQ`; conv matches
+>   `F.conv1d` fwd+grad across 5 geometries; 12/12 torch-parity under torch 2.11).
+> - **Tier 1 — QAT** (`500e4fe`/`930dad6`/`b85c25e`): LSQ learned-α (`lsq_ste`), `CautiousAdamW`,
+>   Python `LearnedTernaryConv1d`, joint conv+FSQ recipe. (distillation primitive = existing `ops::mse`.)
+> - **Tier 2 — format** (`86c2134`): `codec_bundle.rs` (`TCDC`) codec-complete artifact.
+> - **Tier 3 — MCU** (`ca80c1e`): `tritium-mcu` — a `no_std` fixed-arena executor on the `tritium-core`
+>   oracles, host-compiled + conformance-gated.
+> - **Tier 4 — conformance** (`92a45a4`/`25458e9`/`f0ace64`): `reference_conv1d`/`reference_fsq` oracles
+>   in `tritium-core` (bit-identical to the training ops), typed conformance vectors + graders in
+>   `tritium-testkit`.
+>
+> **Resource-gated follow-ons** (built-but-not-hardware-validated, or deferred): CUDA conv/FSQ kernels
+> (shared 4090 VRAM-blocked); `thumbv8m` cross-compile + on-board MCU run + fixed-point int path (needs
+> the embedded toolchain + board + LamQuant's golden EEG vectors); `tritium-spec` no_std (deliberately
+> avoided to protect a shared foundation crate mid-parallel-work); Tier 5 (ONNX/candle/burn/wasm codec
+> ops) and Tier 6 (ternary SSM). LamQuant can integrate the codec end-to-end on the host today.
 
 - **Deciders:** Brian Lam + LamQuant
 - **Relates:** extends the STE/QAT autograd substrate of ADR 0007 (tape) + ADR 0016 (ternary training)
