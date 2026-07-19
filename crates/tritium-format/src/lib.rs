@@ -36,6 +36,7 @@ use half::f16;
 use tritium_core::TritError;
 
 mod artifact;
+mod codec_bundle;
 mod gguf;
 mod gguf_write;
 mod i2s;
@@ -62,6 +63,11 @@ mod tqidx;
 pub use artifact::{
     ArtifactError, ModelId, PackageHasher, PackageId, SemanticModelManifest, SemanticTensor,
     SemanticTensorHasher,
+};
+pub use codec_bundle::{
+    CODEC_BUNDLE_MAGIC, CODEC_BUNDLE_VERSION, CdfLut, CodecBundle, CodecBundleError,
+    Conv1dTensorMeta, FsqLayerMeta, LsqAlpha, MAX_CODEC_BUNDLE_BYTES, RotationMatrix,
+    read_codec_bundle, write_codec_bundle,
 };
 pub use gguf::{
     DEFAULT_ALIGNMENT, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GgufError, GgufFile, GgufValue,
