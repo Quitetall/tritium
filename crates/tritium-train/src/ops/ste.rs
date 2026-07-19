@@ -161,3 +161,87 @@ pub fn salt_quantize_vjp(
 ) -> Vec<f32> {
     grad_out.to_vec()
 }
+
+// ── LSQ (Learned Step-Size Quantization) ─────────────────────────────────────────────────────────
+// A *trainable* per-row step size `α` replacing the fixed AbsMean scale (Esser et al. 2020,
+// specialized to the ternary grid `Qn=Qp=1`). Both the latent weight `Wf` and `α` receive gradients:
+// `Wf` through the standard round-clamp STE, `α` through the LSQ step-size estimator. LamQuant uses
+// this to calibrate the quantizer scale end-to-end instead of pinning AbsMean (ADR 0030 Tier 1).
+
+/// LSQ QAT forward: `q = round(clamp(Wf/α, -1, 1))·α` — the ternary reconstruction with a **learned**
+/// per-row scale `α` (`[rows]`). A degenerate `α[r] <= 0` yields an all-zero row.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn lsq_forward(wf: &[f32], alpha: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        let a = alpha[r];
+        if a <= 0.0 {
+            continue;
+        }
+        for c in 0..cols {
+            let i = r * cols + c;
+            out[i] = (wf[i] / a).round().clamp(-1.0, 1.0) * a;
+        }
+    }
+    out
+}
+
+/// The straight-through **weight-surrogate** `clamp(Wf/α, -1, 1)·α`. Its exact gradient w.r.t. `Wf` is
+/// the LSQ `gWf` (`grad·1[|Wf/α|<1]`), so it is the finite-difference oracle for the *weight* gradient.
+/// Its `α` gradient is **not** the LSQ `α` estimator (LSQ's uses the rounded value and is not the
+/// gradient of any smooth surrogate) — validate `gAlpha` by its closed form + a descent test instead.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn lsq_surrogate(wf: &[f32], alpha: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        let a = alpha[r];
+        if a <= 0.0 {
+            continue;
+        }
+        for c in 0..cols {
+            let i = r * cols + c;
+            out[i] = (wf[i] / a).clamp(-1.0, 1.0) * a;
+        }
+    }
+    out
+}
+
+/// LSQ backward → `[gWf, gAlpha]`. `gWf[i] = grad·1[|v|<1]` (STE through round, `v=Wf/α`).
+/// `gAlpha[r] = (1/√cols)·Σ_i grad_i·( round(v_i)−v_i  if |v_i|<1  else  sign(v_i) )` — the LSQ
+/// step-size estimator summed over the row, with the paper's `1/√(Qp·features)` gradient scale
+/// (`Qp=1`, `features=cols`) so `α`'s update magnitude tracks the weight grad.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn lsq_vjp(
+    wf: &[f32],
+    alpha: &[f32],
+    rows: usize,
+    cols: usize,
+    grad_out: &[f32],
+) -> Vec<Vec<f32>> {
+    let mut g_wf = vec![0.0f32; rows * cols];
+    let mut g_a = vec![0.0f32; rows];
+    let grad_scale = 1.0 / (cols as f32).sqrt();
+    for r in 0..rows {
+        let a = alpha[r];
+        if a <= 0.0 {
+            continue;
+        }
+        let mut ga = 0.0f32;
+        for c in 0..cols {
+            let i = r * cols + c;
+            let v = wf[i] / a;
+            let g = grad_out[i];
+            if v.abs() < 1.0 {
+                g_wf[i] = g; // STE: dq/dWf = 1 in-band
+                ga += g * (v.round() - v);
+            } else {
+                ga += g * v.signum(); // saturated: dq/dα = clamped level ±1
+            }
+        }
+        g_a[r] = ga * grad_scale;
+    }
+    vec![g_wf, g_a]
+}

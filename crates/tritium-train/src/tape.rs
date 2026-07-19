@@ -170,6 +170,26 @@ impl Tape {
         )
     }
 
+    /// LSQ STE: the ternary reconstruction `round(clamp(Wf/α))·α` with a **learned** per-row step size
+    /// `α` (`[rows]`), replacing the fixed AbsMean scale. Both `wf` and `alpha` are trainable — the
+    /// straight-through weight grad routes to `wf`, the LSQ step-size estimator to `alpha`. Use the
+    /// output as a dense weight (e.g. via [`conv1d`](Self::conv1d) or [`dense_matmul`](Self::dense_matmul)).
+    pub fn lsq_ste(&mut self, wf: ValueId, alpha: ValueId, rows: usize, cols: usize) -> ValueId {
+        let out = ste::lsq_forward(&self.values[wf], &self.values[alpha], rows, cols);
+        self.record(
+            vec![wf, alpha],
+            out,
+            Box::new(move |ins, g, grads, ids| {
+                let gs = ste::lsq_vjp(ins[0], ins[1], rows, cols, g);
+                for (k, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k]][j] += v;
+                    }
+                }
+            }),
+        )
+    }
+
     /// Plain dense matmul `Y[m,n] = Σ_k X[m,k]·W[n,k]` (no scale, real `f32`).
     pub fn dense_matmul(
         &mut self,
