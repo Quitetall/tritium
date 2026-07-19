@@ -66,8 +66,22 @@ Top-k only shrinks the teacher *disk cache* (~500×) and makes precompute feasib
 the head grad needs sampled-softmax/NCE (deeper, quality risk) — not before Step 1. Add a KD
 temperature knob (currently absent) as a near-free quality lever.
 
-**Lever 5 — Optimizer VRAM (deferred to 1.7B+).** bf16 master + 8-bit Adam cut ~21GB → ~6GB. Irrelevant
-at 135M (model+optimizer tiny); needed only at scale to fit bigger batches.
+**Lever 5 — Optimizer VRAM (IN PROGRESS 2026-07-19; user-prioritized before the corpus run).** bf16
+master + 8-bit Adam cut the resident optimizer state ~4× (moments dominate: `m`+`v` f32 ≈ 2× the
+model). Invisible at 135M (model+optimizer tiny) but validated there so it is proven before scaling.
+Landed so far, CPU-oracle-first then device-mirrored and gated:
+- `tritium_train::Int8AdamW` (commit 98074cb, reviewed clean): block-wise int8 moments, block 256. **The
+  second moment is stored in sqrt-space** (`v_q = round(√v/scale)`) — a naive linear-`v` quantizer
+  underflows small values while `m` keeps its history and the step `m/(√v+eps)` explodes (the descent
+  gate caught it: linear-`v` diverged to loss 4958, sqrt-space converges within 3× of f32).
+- `tritium_train::bf16` stochastic-rounding master (commit 811f49b, reviewed clean): SR keeps a sub-ULP
+  update alive in expectation where nearest rounding stalls (gated: unbiased over 200k draws; a
+  coarse-grid weight climbs to target under SR, stalls under nearest).
+- Device `adamw_step_8bit` CUDA kernel + `adamw_step_8bit_dev` (commit 85f6c58): one CUDA block per
+  256-element optimizer block, bit-identical to the oracle (all correctly-rounded ops, `--fmad=false`);
+  parity gate `adamw_step_8bit_matches_cpu_oracle` (5 steps, ragged tail) — params tight, codes within ±1.
+Remaining: wire the int8 state + bf16 master into `DeviceTrainer` behind a mode flag + a 135M recovery
+gate (does the quantized optimizer still recover ~960×, unlike tf32 which dropped to 920×?).
 
 **Lever 6 — Launch-overhead reduction (queued; the biggest remaining full-step lever).** Since the
 step is launch-bound, the payoff of tf32 *and* 2:4 is unlocked here: **CUDA graphs** (capture+replay the
@@ -118,10 +132,12 @@ the Step-1 recovery-vs-tokens curve runs next on the f32 path.
 - **tf32 recovery A/B — DONE (2026-07-19):** `salt_distillation_device_trainer_recovers_heldout`,
   40 steps. f32 = **960×** (gate ✅), tf32 = **920×** (below the 950× gate). tf32 does *not* preserve
   recovery at this scale; the numbers land in the honest-findings note above.
-- **Step 1 — recovery-vs-tokens curve, first run DONE (2026-07-19, f32).** `TRITIUM_DISTILL_CURVE=48`,
-  768 steps (3 epochs over the committed 8k-token Alice corpus), held-out (disjoint) ppl vs fp 19.73:
-  2205 → 729 → 439 → 419 → **298** (tokens 1.5k → 7.7k → 15k → 21.5k → 24.6k); recovery-vs-PTQ
-  963× → 7124×. **Monotone descent, still dropping steeply at the tail (404→298 over the last 48
-  steps) — not converged; the 8k-token corpus is the ceiling.** The falling held-out curve is genuine
-  generalization (eval is disjoint from train). A longer run traces the held-out plateau; a bigger
-  corpus is needed for an fp-competitive, paper-grade generalization number.
+- **Step 1 — recovery-vs-tokens curve DONE (2026-07-19, f32).** `TRITIUM_DISTILL_CURVE=K` traces the
+  held-out (disjoint) ppl vs fp 19.73 in a single run. 768 steps (3 epochs, 8k-token Alice corpus):
+  2205 → 729 → 439 → **298**, still descending. A 2304-step / 9-epoch plateau run then bottomed out:
+  final **224.8 ppl (11.4× fp)**, recovery-vs-PTQ **9453×**, oscillating in a 220–290 floor. **So on
+  the 8k-token corpus, SALT distillation drives ternary-135M monotonically down but plateaus at
+  ~11–13× fp — the generalization ceiling of the data, not the method** (the falling held-out curve is
+  genuine generalization; the plateau is data-bound). Closing toward fp needs a **bigger, recognized
+  corpus** (WikiText/C4) so the number can be positioned against the field — the chosen next step,
+  after Lever 5.
