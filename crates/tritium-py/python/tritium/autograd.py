@@ -191,9 +191,24 @@ class FSQ(nn.Module):
         self.seed = int(seed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        channels, length = x.shape[-2], x.shape[-1]
+        # FSQ is elementwise with a per-channel level, so any leading batch dims are folded into the
+        # per-channel length: [..., C, L] → channel-major [C, prod(...)·L] → quantize → restore. The
+        # codec latent is 2-D [C, L]; the decoder feeds 3-D [B, C, L].
+        channels = x.shape[-2]
         if len(self.levels) != channels:
             raise ValueError(f"levels has {len(self.levels)} entries but x has {channels} channels")
-        return _FSQFn.apply(
-            x, channels, length, self.levels, self.bound, self.ste, self.alpha, self.seed
+        if x.dim() == 2:
+            return _FSQFn.apply(
+                x, channels, x.shape[-1], self.levels, self.bound, self.ste, self.alpha, self.seed
+            )
+        ndim = x.dim()
+        lead = x.shape[:-2]
+        length = x.shape[-1]
+        to_front = (ndim - 2, *range(ndim - 2), ndim - 1)  # [C, lead..., L]
+        xp = x.permute(to_front).reshape(channels, -1)
+        q = _FSQFn.apply(
+            xp, channels, xp.shape[1], self.levels, self.bound, self.ste, self.alpha, self.seed
         )
+        q = q.reshape(channels, *lead, length)
+        back = (*range(1, ndim - 1), 0, ndim - 1)  # [lead..., C, L]
+        return q.permute(back).contiguous()

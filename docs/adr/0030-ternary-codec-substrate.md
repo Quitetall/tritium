@@ -1,6 +1,12 @@
 # ADR 0030 — Ternary codec substrate: Conv1d, FSQ, and PyTorch autograd bindings
 
-Status: **PROPOSED** (2026-07-18) — onboarding contract, to be co-authored with **LamQuant**
+Status: **ACCEPTED — Tier 0 IMPLEMENTED** (2026-07-18) — onboarding contract, co-authored with **LamQuant**
+
+> **Tier-0 gate landed** (commits `1cab228` conv1d, `e129c5d` fsq, `fd2404c` py bindings): ternary
+> `Conv1d` + `FSQ` autograd ops in `tritium-train` (Gate-C gradchecked) and PyTorch `autograd.Function`
+> wrappers in `tritium-py` (`TernaryConv1d`/`FSQ` nn.Modules; conv matches `torch.nn.functional.conv1d`
+> in forward + gradients across 5 geometries; 9/9 torch-parity tests green under torch 2.11). LamQuant
+> can start swapping codec layers now. Tiers 1–6 below are in progress / roadmap.
 
 - **Deciders:** Brian Lam + LamQuant
 - **Relates:** extends the STE/QAT autograd substrate of ADR 0007 (tape) + ADR 0016 (ternary training)

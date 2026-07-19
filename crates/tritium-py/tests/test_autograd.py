@@ -64,6 +64,20 @@ def test_fsq_saturated_clamp_zeroes_gradient():
     assert x.grad.flatten().tolist() == [0.0, 0.0, 1.0]
 
 
+def test_fsq_batched_bcl_matches_per_sample():
+    # The decoder feeds [B, C, L]; FSQ must apply per-channel L over the batch and match a per-sample
+    # 2-D application, with STE gradients flowing.
+    torch.manual_seed(3)
+    fsq = FSQ(levels=[3, 5], bound="clamp", ste="hard")
+    x = torch.randn(4, 2, 7, requires_grad=True)
+    q = fsq(x)
+    assert q.shape == x.shape
+    ref = torch.stack([fsq(x[b].detach()) for b in range(4)])
+    assert torch.allclose(q, ref, atol=1e-6)
+    q.sum().backward()
+    assert x.grad is not None and x.grad.abs().sum() > 0
+
+
 def test_ternary_conv1d_module_trains():
     torch.manual_seed(1)
     m = TernaryConv1d(4, 6, 3, padding=1)
