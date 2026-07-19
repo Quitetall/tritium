@@ -321,7 +321,8 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     use common::{device_forward, device_forward_resident};
     use tritium_cuda::CudaBackend;
     use tritium_cuda::train::{
-        DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer, TensorCoreGemm,
+        DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer, DeviceTrainerWeightStorage,
+        MomentPrecision, TensorCoreGemm,
     };
     use tritium_format::TeacherCacheHeader;
     use tritium_nn::{
@@ -384,7 +385,20 @@ fn salt_distillation_device_trainer_recovers_heldout() {
             optimizer: opt,
         })
         .collect();
-    let mut trainer = DeviceTrainer::new(&backend, &specs).expect("upload resident state");
+    // Lever 5: TRITIUM_DISTILL_INT8=1 holds the AdamW moments block-wise int8 (the A/B against the
+    // committed f32 gate — does the quantized optimizer still recover ~960× on the real model?).
+    let moment_precision = if std::env::var("TRITIUM_DISTILL_INT8").is_ok() {
+        MomentPrecision::Int8
+    } else {
+        MomentPrecision::F32
+    };
+    let mut trainer = DeviceTrainer::new_with_options(
+        &backend,
+        &specs,
+        DeviceTrainerWeightStorage::DenseQuantized,
+        moment_precision,
+    )
+    .expect("upload resident state");
     let mut teacher_cache = std::env::var_os("TRITIUM_TEACHER_CACHE").map(|path| {
         let expected = TeacherCacheHeader {
             seq_len: TRAIN_SEQ as u32,

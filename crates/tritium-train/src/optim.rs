@@ -739,6 +739,34 @@ mod muon_tests {
         );
     }
 
+    /// Regression: a coordinate that goes quiet (g→0) with residual momentum, sharing a block with a
+    /// huge-gradient coordinate, must NOT explode. Its second moment would round to int8 code 0 under
+    /// a plain absmax grid (the big coordinate dominates the block scale); then `vi` collapses to 0 and
+    /// AdamW's `m/(√v+eps)` step blows up. The code-1 floor on a nonzero √v keeps the denominator
+    /// bounded. (This is the real-135M divergence, reproduced at unit scale.)
+    #[test]
+    fn int8_adam_quiet_coord_in_wide_block_does_not_explode() {
+        let n = 2usize; // one block; coord 0 dominates the √v absmax, coord 1 underflows
+        let opt = Int8AdamW::new(0.01);
+        let mut w = vec![0.0f32, 0.0];
+        let mut st = opt.init_state(n);
+        for step in 1..=20u64 {
+            // Coord 0: persistent huge gradient (holds the block √v absmax ~1000× coord 1's).
+            // Coord 1: builds moment for 4 steps, then goes silent — the trap.
+            let g = if step <= 4 {
+                vec![1000.0f32, 1.0]
+            } else {
+                vec![1000.0f32, 0.0]
+            };
+            opt.step(step, &mut w, &g, &mut st);
+            assert!(
+                w[1].is_finite() && w[1].abs() < 100.0,
+                "quiet coord exploded at step {step}: w[1] = {}",
+                w[1]
+            );
+        }
+    }
+
     /// Block-wise int8 state (signed m, unsigned v, per-block scales, ragged tail) round-trips through
     /// the checkpoint serializer byte-for-byte.
     #[test]

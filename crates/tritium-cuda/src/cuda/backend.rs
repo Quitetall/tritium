@@ -1361,6 +1361,22 @@ impl CudaBackend {
             .map_err(|e| driver_err("dev_alloc_zeros", &e))
     }
 
+    /// Allocate `n` zeroed signed int8 (Lever 5 int8-Adam first-moment codes).
+    #[allow(dead_code)] // consumed by the DeviceTrainer int8 moment path
+    pub(crate) fn dev_alloc_zeros_i8(&self, n: usize) -> Result<CudaSlice<i8>, BackendError> {
+        self.stream
+            .alloc_zeros::<i8>(n)
+            .map_err(|e| driver_err("dev_alloc_zeros_i8", &e))
+    }
+
+    /// Allocate `n` zeroed unsigned int8 (Lever 5 int8-Adam sqrt-space second-moment codes).
+    #[allow(dead_code)] // consumed by the DeviceTrainer int8 moment path
+    pub(crate) fn dev_alloc_zeros_u8(&self, n: usize) -> Result<CudaSlice<u8>, BackendError> {
+        self.stream
+            .alloc_zeros::<u8>(n)
+            .map_err(|e| driver_err("dev_alloc_zeros_u8", &e))
+    }
+
     /// Download a resident device buffer to host (dtoh). The single copy at the end of the step.
     ///
     /// # Errors
@@ -4786,6 +4802,7 @@ impl CudaBackend {
             f_attn_tree_reduce,
             f_argmax_partial: f(dm, KERNEL_NAME_ARGMAX_PARTIAL)?,
             f_argmax_combine: f(dm, KERNEL_NAME_ARGMAX_COMBINE)?,
+            am_scratch: None,
             f_lm_head_tiled: f(dm, KERNEL_NAME_LM_HEAD_TILED_F16)?,
             f_lm_head_f16: f(dm, KERNEL_NAME_LM_HEAD_WARP_F16)?,
             f_kv_append_mdecode: f(dm, KERNEL_NAME_KV_APPEND_MDECODE)?,

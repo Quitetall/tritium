@@ -1259,6 +1259,26 @@ pub enum DeviceTrainerWeightStorage {
     Packed,
 }
 
+/// Precision of the resident AdamW moment state (Lever 5).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MomentPrecision {
+    /// Full f32 first/second moments — the bit-exact default.
+    #[default]
+    F32,
+    /// Block-wise int8 moments (signed `m`, sqrt-space unsigned `v`) via `adamw_step_8bit`,
+    /// a 4× shrink of the moment state. Mirrors `tritium_train::Int8AdamW`.
+    Int8,
+}
+
+/// Resident block-wise int8 AdamW moment state (Lever 5): the two moments quantized plus their
+/// per-block scales. Present only when a [`DeviceTrainer`] is built with [`MomentPrecision::Int8`].
+struct Int8Moments {
+    m_q: CudaSlice<i8>,
+    v_q: CudaSlice<u8>,
+    m_scale: CudaSlice<f32>,
+    v_scale: CudaSlice<f32>,
+}
+
 /// Owned host description of one trainable SALT weight.
 ///
 /// Passing this to [`HostOffloadTrainer::new_owned`] moves the latent master
@@ -1282,6 +1302,10 @@ struct ResidentTrainParam {
     quantized: Option<DeviceTensor>,
     m: CudaSlice<f32>,
     v: CudaSlice<f32>,
+    /// Opt-in block-wise int8 moments (Lever 5). When present, `step` routes through the int8 kernel
+    /// and `m`/`v` are unused; when `None`, the f32 `m`/`v` above are the moment state. Kept additive
+    /// so the f32 checkpoint/inspection/offload paths stay byte-identical.
+    int8: Option<Int8Moments>,
     rows: usize,
     cols: usize,
     salt_planes: usize,
@@ -1349,11 +1373,24 @@ impl<'a> DeviceTrainer<'a> {
     }
 
     /// Construct a resident trainer with an explicit dense or packed weight
-    /// storage contract.
+    /// storage contract (f32 moments).
     pub fn new_with_weight_storage(
         backend: &'a CudaBackend,
         params: &[DeviceTrainParam<'_>],
         weight_storage: DeviceTrainerWeightStorage,
+    ) -> Result<Self, BackendError> {
+        Self::new_with_options(backend, params, weight_storage, MomentPrecision::F32)
+    }
+
+    /// Construct a resident trainer choosing both the weight storage and the AdamW moment precision
+    /// (Lever 5: [`MomentPrecision::Int8`] holds the moments block-wise int8 via `adamw_step_8bit`).
+    /// The f32 `m`/`v` buffers are still allocated (so checkpoint/inspection stay valid) but unused
+    /// when int8 moments are active.
+    pub fn new_with_options(
+        backend: &'a CudaBackend,
+        params: &[DeviceTrainParam<'_>],
+        weight_storage: DeviceTrainerWeightStorage,
+        moment_precision: MomentPrecision,
     ) -> Result<Self, BackendError> {
         let mut leaf_lens = Vec::with_capacity(params.len());
         let mut parameter_elements = 0usize;
@@ -1391,6 +1428,19 @@ impl<'a> DeviceTrainer<'a> {
                 },
                 m: backend.dev_alloc_zeros(param.master.len())?,
                 v: backend.dev_alloc_zeros(param.master.len())?,
+                int8: match moment_precision {
+                    MomentPrecision::F32 => None,
+                    MomentPrecision::Int8 => {
+                        let len = param.master.len();
+                        let nblocks = len.div_ceil(tritium_train::INT8_ADAM_BLOCK);
+                        Some(Int8Moments {
+                            m_q: backend.dev_alloc_zeros_i8(len)?,
+                            v_q: backend.dev_alloc_zeros_u8(len)?,
+                            m_scale: backend.dev_alloc_zeros(nblocks)?,
+                            v_scale: backend.dev_alloc_zeros(nblocks)?,
+                        })
+                    }
+                },
                 rows: param.rows,
                 cols: param.cols,
                 salt_planes: param.salt_planes,
@@ -1630,14 +1680,26 @@ impl<'a> DeviceTrainer<'a> {
         self.quantized_prepared = false;
         self.poisoned = true;
         for (param, grad) in self.params.iter_mut().zip(grads.bufs) {
-            self.backend.adamw_step_dev(
-                &mut param.master.buf,
-                &grad,
-                &mut param.m,
-                &mut param.v,
-                step,
-                &param.optimizer,
-            )?;
+            match &mut param.int8 {
+                Some(i8m) => self.backend.adamw_step_8bit_dev(
+                    &mut param.master.buf,
+                    &grad,
+                    &mut i8m.m_q,
+                    &mut i8m.v_q,
+                    &mut i8m.m_scale,
+                    &mut i8m.v_scale,
+                    step,
+                    &param.optimizer,
+                )?,
+                None => self.backend.adamw_step_dev(
+                    &mut param.master.buf,
+                    &grad,
+                    &mut param.m,
+                    &mut param.v,
+                    step,
+                    &param.optimizer,
+                )?,
+            }
         }
         self.poisoned = false;
         self.completed_step = step;
@@ -6637,6 +6699,111 @@ mod tests {
         assert!(
             max_abs_diff(&got, &expected) < 1e-5,
             "resident trainer diverged from host oracle"
+        );
+    }
+
+    /// Lever 5: a `DeviceTrainer` built with [`MomentPrecision::Int8`] trains the toy SALT-distill
+    /// problem end-to-end through the block-wise int8 kernel — quantized moments and all — and drives
+    /// the teacher-forced xent loss down comparably to the f32 trainer on the same seed. This is the
+    /// functional gate for the wired int8 path; the kernel↔oracle numerics are gated separately by
+    /// `adamw_step_8bit_matches_cpu_oracle`.
+    #[test]
+    fn device_trainer_int8_moments_train_like_f32() {
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping device_trainer_int8_moments_train_like_f32: no CUDA ({e})");
+                return;
+            }
+        };
+        let (batch, rows, cols, planes) = (4usize, 6usize, 8usize, 2usize);
+        let input = seeded_uniform(0x1817, batch * cols, -1.0, 1.0);
+        // A fixed soft target the student is distilled toward (teacher-forced).
+        let target = {
+            let raw = seeded_uniform(0x1818, batch * rows, 0.0, 1.0);
+            let mut t = vec![0.0f32; batch * rows];
+            for b in 0..batch {
+                let s: f32 = raw[b * rows..(b + 1) * rows].iter().sum::<f32>().max(1e-6);
+                for r in 0..rows {
+                    t[b * rows + r] = raw[b * rows + r] / s;
+                }
+            }
+            t
+        };
+        let master = seeded_uniform(0x1819, rows * cols, -1.5, 1.5);
+        let d_input = DeviceTensor::upload(&backend, &input).unwrap();
+        let d_target = DeviceTensor::upload(&backend, &target).unwrap();
+
+        // Run the toy distill for `steps` steps at the given moment precision, returning the loss
+        // trajectory (device xent value each step, pre-update).
+        let run = |precision: MomentPrecision| -> Vec<f32> {
+            let mut trainer = DeviceTrainer::new_with_options(
+                &backend,
+                &[DeviceTrainParam {
+                    master: &master,
+                    rows,
+                    cols,
+                    salt_planes: planes,
+                    optimizer: AdamW::new(0.05),
+                }],
+                DeviceTrainerWeightStorage::DenseQuantized,
+                precision,
+            )
+            .unwrap();
+            let mut losses = Vec::new();
+            for step in 1..=30u64 {
+                trainer.prepare_quantized().unwrap();
+                let (loss, grads) = {
+                    let mut tape = DeviceTape::new(&backend, rows).unwrap();
+                    let x = tape.leaf_device(&d_input).unwrap();
+                    let w = tape.leaf_device(trainer.quantized(0).unwrap()).unwrap();
+                    let logits = tape.matmul(x, w, batch, rows, cols).unwrap();
+                    // Teacher-forced cross-entropy H(target, softmax(logits)), averaged over the batch.
+                    let logits_h = tape.value(logits).unwrap();
+                    let mut loss = 0.0f32;
+                    for b in 0..batch {
+                        let row = &logits_h[b * rows..(b + 1) * rows];
+                        let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let z: f32 = row.iter().map(|&v| (v - mx).exp()).sum();
+                        let logz = mx + z.ln();
+                        for r in 0..rows {
+                            loss -= target[b * rows + r] * (row[r] - logz);
+                        }
+                    }
+                    let loss = loss / batch as f32;
+                    let d_tgt = DeviceTensor::upload(&backend, &target).unwrap();
+                    let grads = tape
+                        .xent_backward_device(logits, &d_tgt, batch, rows, &[w])
+                        .unwrap();
+                    (loss, grads)
+                };
+                trainer.step(grads, step).unwrap();
+                losses.push(loss);
+            }
+            let _ = &d_target;
+            losses
+        };
+
+        let f32_losses = run(MomentPrecision::F32);
+        let int8_losses = run(MomentPrecision::Int8);
+        let (f0, f1) = (f32_losses[0], *f32_losses.last().unwrap());
+        let (i0, i1) = (int8_losses[0], *int8_losses.last().unwrap());
+        eprintln!("int8 DeviceTrainer distill: f32 {f0:.4}→{f1:.4}, int8 {i0:.4}→{i1:.4}");
+        assert_eq!(i0, f0, "same seed ⇒ identical starting loss");
+        assert!(
+            f1 < 0.95 * f0,
+            "f32 trainer must descend: {f0:.4} → {f1:.4}"
+        );
+        assert!(
+            i1 < 0.95 * i0,
+            "int8 trainer must descend: {i0:.4} → {i1:.4}"
+        );
+        // The point of Lever 5: int8 moments train *like* f32 — the final losses stay close relative
+        // to how far f32 travelled (int8 within ~20% of f32's descent, either side).
+        assert!(
+            (i1 - f1).abs() < 0.2 * (f0 - f1).abs().max(1e-3),
+            "int8 final {i1:.4} must track f32 {f1:.4} (descent {:.4} from {f0:.4})",
+            f0 - f1
         );
     }
 
