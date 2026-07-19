@@ -226,6 +226,165 @@ impl Optimizer for CautiousAdamW {
     }
 }
 
+/// Block size for block-wise int8 moment quantization (Dettmers et al. 2022, "8-bit Optimizers via
+/// Block-wise Quantization"): each contiguous run of this many elements shares one f32 absmax scale,
+/// so a spike in one block never inflates another's quantization grid. 256 matches the bitsandbytes
+/// default and keeps a block's requantization reduction inside one CUDA block for the device mirror.
+pub const INT8_ADAM_BLOCK: usize = 256;
+
+/// [`Int8AdamW`] per-parameter state: the two AdamW moments stored **block-wise int8** rather than
+/// f32 — a 4× shrink of the optimizer state, which is the dominant resident VRAM cost at ≥1.7B
+/// (`m`+`v` in f32 is ~2× the model itself). `m` is signed (`i8`, symmetric absmax); `v ≥ 0` so it
+/// uses the full unsigned range (`u8`). Each block carries its own scale; every step dequantizes to
+/// f32, runs the exact AdamW update, and requantizes with a fresh per-block absmax.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Int8AdamState {
+    /// First-moment EMA, signed int8 (dequantize `m = m_q · m_scale[block]`).
+    pub m_q: Vec<i8>,
+    /// Second moment stored in **sqrt-space**, unsigned int8: `√v = v_q · v_scale[block]`, so
+    /// `v = (v_q · v_scale)²`. Quantizing `√v` (the quantity the denominator actually uses) halves
+    /// the second moment's exponent range, so a small `v` no longer underflows to 0 while `m` keeps
+    /// its history — the asymmetry that makes a naive linear-`v` quantizer produce exploding steps.
+    pub v_q: Vec<u8>,
+    /// Per-block absmax scale for `m` (`len = ceil(n / INT8_ADAM_BLOCK)`).
+    pub m_scale: Vec<f32>,
+    /// Per-block absmax scale for `√v` (sqrt-space; dequantize `v = (v_q · v_scale)²`).
+    pub v_scale: Vec<f32>,
+    /// Parameter element count (the final block may be shorter than `INT8_ADAM_BLOCK`).
+    pub len: usize,
+}
+
+/// AdamW with **block-wise int8 moment state** (Dettmers et al. 2022). Numerically identical to
+/// [`AdamW`] except the two moments are held quantized between steps: dequantize → exact f32 update →
+/// requantize, block by block. The parameter buffer itself stays f32 (bf16-master storage is a
+/// separate, device-side lever). Exposed as its own type over the same [`AdamW`] config so no
+/// existing call site changes; the CUDA `adamw_step_8bit` kernel mirrors this reference exactly
+/// (same block size, same round-half-away requantization) and is gated against it.
+#[derive(Clone, Copy, Debug)]
+pub struct Int8AdamW(pub AdamW);
+
+impl Int8AdamW {
+    /// Block-wise int8 AdamW at learning rate `lr` with `torch.optim.AdamW` defaults.
+    #[must_use]
+    pub fn new(lr: f32) -> Self {
+        Self(AdamW::new(lr))
+    }
+}
+
+impl Optimizer for Int8AdamW {
+    type State = Int8AdamState;
+
+    fn init_state(&self, len: usize) -> Int8AdamState {
+        let nblocks = len.div_ceil(INT8_ADAM_BLOCK);
+        Int8AdamState {
+            m_q: vec![0; len],
+            v_q: vec![0; len],
+            m_scale: vec![0.0; nblocks],
+            v_scale: vec![0.0; nblocks],
+            len,
+        }
+    }
+
+    fn step(&self, t: u64, param: &mut [f32], grad: &[f32], state: &mut Int8AdamState) {
+        debug_assert!(t >= 1, "step index t is 1-based; t=0 gives bc=0 ⇒ NaN");
+        assert_eq!(param.len(), grad.len(), "param/grad length mismatch");
+        assert_eq!(param.len(), state.len, "param/state length mismatch");
+        assert_eq!(state.m_q.len(), state.len, "state m_q length mismatch");
+        assert_eq!(state.v_q.len(), state.len, "state v_q length mismatch");
+        let a = &self.0;
+        let exp = i32::try_from(t).unwrap_or(i32::MAX);
+        let bc1 = 1.0 - a.beta1.powi(exp);
+        let bc2 = 1.0 - a.beta2.powi(exp);
+        let shrink = 1.0 - a.lr * a.weight_decay;
+        let n = param.len();
+        // One block at a time: dequantize its moments, run the exact AdamW element update collecting
+        // the new f32 moments, then requantize the block against its own fresh absmax. The device
+        // mirror does the identical dequant→update→requant with a per-block reduction.
+        for (b, base) in (0..n).step_by(INT8_ADAM_BLOCK).enumerate() {
+            let hi = (base + INT8_ADAM_BLOCK).min(n);
+            let (ms, vs) = (state.m_scale[b], state.v_scale[b]);
+            let mut m_new = vec![0.0f32; hi - base];
+            let mut v_new = vec![0.0f32; hi - base];
+            for (k, i) in (base..hi).enumerate() {
+                let g = grad[i];
+                let m_old = f32::from(state.m_q[i]) * ms;
+                // v is stored in sqrt-space: dequantize √v then square back to v.
+                let root_old = f32::from(state.v_q[i]) * vs;
+                let v_old = root_old * root_old;
+                let mi = a.beta1 * m_old + (1.0 - a.beta1) * g;
+                let vi = a.beta2 * v_old + (1.0 - a.beta2) * g * g;
+                param[i] = param[i] * shrink - a.lr * (mi / bc1 / ((vi / bc2).sqrt() + a.eps));
+                m_new[k] = mi;
+                v_new[k] = vi.sqrt(); // requantize √v, not v
+            }
+            // Requantize: signed absmax grid for m (÷127); unsigned absmax grid for √v (÷255, ≥0). A
+            // zero block keeps scale 0 and codes 0 (dequantizes back to 0 — no division by zero).
+            let m_absmax = m_new.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
+            let root_absmax = v_new.iter().fold(0.0f32, |acc, &x| acc.max(x));
+            let new_ms = if m_absmax > 0.0 {
+                m_absmax / 127.0
+            } else {
+                0.0
+            };
+            let new_vs = if root_absmax > 0.0 {
+                root_absmax / 255.0
+            } else {
+                0.0
+            };
+            state.m_scale[b] = new_ms;
+            state.v_scale[b] = new_vs;
+            for (k, i) in (base..hi).enumerate() {
+                state.m_q[i] = if new_ms > 0.0 {
+                    (m_new[k] / new_ms).round().clamp(-127.0, 127.0) as i8
+                } else {
+                    0
+                };
+                state.v_q[i] = if new_vs > 0.0 {
+                    (v_new[k] / new_vs).round().clamp(0.0, 255.0) as u8
+                } else {
+                    0
+                };
+            }
+        }
+    }
+
+    fn write_state(&self, state: &Int8AdamState, out: &mut Vec<u8>) {
+        out.extend(state.m_q.iter().map(|&q| q as u8));
+        out.extend_from_slice(&state.v_q);
+        for &x in &state.m_scale {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for &x in &state.v_scale {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+
+    fn read_state(
+        &self,
+        len: usize,
+        cursor: &mut Cursor,
+    ) -> Result<Int8AdamState, CheckpointError> {
+        let mut m_q = Vec::with_capacity(len);
+        for _ in 0..len {
+            m_q.push(cursor.u8()? as i8);
+        }
+        let mut v_q = Vec::with_capacity(len);
+        for _ in 0..len {
+            v_q.push(cursor.u8()?);
+        }
+        let nblocks = len.div_ceil(INT8_ADAM_BLOCK);
+        let m_scale = cursor.f32_vec(nblocks)?;
+        let v_scale = cursor.f32_vec(nblocks)?;
+        Ok(Int8AdamState {
+            m_q,
+            v_q,
+            m_scale,
+            v_scale,
+            len,
+        })
+    }
+}
+
 /// Newton–Schulz quintic orthogonalization (Muon): drives the singular values of a `[rows, cols]`
 /// matrix toward 1 (returns `≈ U·Vᵀ`), using ONLY matmuls — no SVD — so it runs on the same device
 /// as training. The iteration operates on the smaller Gram matrix (transpose if `rows > cols`), so
@@ -503,5 +662,99 @@ mod muon_tests {
             l1 < 0.05 * l0,
             "Cautious AdamW must reduce the quadratic: {l0} → {l1}"
         );
+    }
+
+    /// After one step the stored int8 moments must sit within one quantization grid step of the true
+    /// f32 AdamW moments — block by block, including the short ragged final block (300 = 256 + 44).
+    /// (Step 1 also leaves the *parameters* bit-identical to f32 AdamW: the zero initial state
+    /// dequantizes to 0, so the update uses the same full-precision mᵢ,vᵢ; quantization only diverges
+    /// the trajectory from step 2.)
+    #[test]
+    fn int8_adam_moments_track_f32_within_grid() {
+        let n = 300usize;
+        let grad = seeded(11, n);
+        let opt8 = Int8AdamW::new(0.01);
+        let optf = AdamW::new(0.01);
+        let mut p8 = seeded(22, n);
+        let mut pf = p8.clone();
+        let mut s8 = opt8.init_state(n);
+        let mut sf = optf.init_state(n);
+        opt8.step(1, &mut p8, &grad, &mut s8);
+        optf.step(1, &mut pf, &grad, &mut sf);
+        assert_eq!(
+            p8, pf,
+            "step-1 params must match f32 (zero initial moments)"
+        );
+        for b in 0..n.div_ceil(INT8_ADAM_BLOCK) {
+            let lo = b * INT8_ADAM_BLOCK;
+            let hi = (lo + INT8_ADAM_BLOCK).min(n);
+            let (ms, vs) = (s8.m_scale[b], s8.v_scale[b]);
+            for i in lo..hi {
+                let m_dq = f32::from(s8.m_q[i]) * ms;
+                // v is stored in sqrt-space, so compare √v to √v_true within one sqrt-grid step.
+                let root_dq = f32::from(s8.v_q[i]) * vs;
+                assert!(
+                    (m_dq - sf.m[i]).abs() <= ms + 1e-9,
+                    "m off-grid at {i}: {m_dq} vs {} (step {ms})",
+                    sf.m[i]
+                );
+                assert!(
+                    (root_dq - sf.v[i].sqrt()).abs() <= vs + 1e-9,
+                    "√v off-grid at {i}: {root_dq} vs {} (step {vs})",
+                    sf.v[i].sqrt()
+                );
+            }
+        }
+    }
+
+    /// The 4×-smaller int8 moment state must still drive a quadratic to near-zero, comparably to full
+    /// f32 AdamW — the quality bar that makes the VRAM shrink usable, not just cheap.
+    #[test]
+    fn int8_adam_descends_like_f32() {
+        let n = 512usize;
+        let target = seeded(5, n);
+        let loss = |w: &[f32]| {
+            w.iter()
+                .zip(&target)
+                .map(|(&a, &b)| (a - b) * (a - b))
+                .sum::<f32>()
+        };
+        let opt8 = Int8AdamW::new(0.05);
+        let mut w8 = seeded(77, n);
+        let mut s8 = opt8.init_state(n);
+        let optf = AdamW::new(0.05);
+        let mut wf = seeded(77, n);
+        let mut sf = optf.init_state(n);
+        for t in 1..=300u64 {
+            let g8: Vec<f32> = w8.iter().zip(&target).map(|(&a, &b)| a - b).collect();
+            opt8.step(t, &mut w8, &g8, &mut s8);
+            let gf: Vec<f32> = wf.iter().zip(&target).map(|(&a, &b)| a - b).collect();
+            optf.step(t, &mut wf, &gf, &mut sf);
+        }
+        let (l8, lf) = (loss(&w8), loss(&wf));
+        assert!(l8 < 1e-3, "int8 Adam must converge the quadratic: {l8}");
+        assert!(
+            l8 < 3.0 * lf.max(1e-12) + 1e-4,
+            "int8 Adam must stay within a small factor of f32: {l8} vs {lf}"
+        );
+    }
+
+    /// Block-wise int8 state (signed m, unsigned v, per-block scales, ragged tail) round-trips through
+    /// the checkpoint serializer byte-for-byte.
+    #[test]
+    fn int8_adam_state_survives_checkpoint() {
+        let n = 300usize;
+        let opt = Int8AdamW::new(0.01);
+        let mut s = opt.init_state(n);
+        let mut w = seeded(1, n);
+        let g = seeded(2, n);
+        opt.step(1, &mut w, &g, &mut s);
+        opt.step(2, &mut w, &g, &mut s);
+        let mut bytes = Vec::new();
+        opt.write_state(&s, &mut bytes);
+        let mut cur = Cursor::new(&bytes);
+        let s2 = opt.read_state(n, &mut cur).expect("read int8 adam state");
+        assert_eq!(s, s2, "int8 adam state must round-trip");
+        assert_eq!(cur.remaining(), 0, "no trailing bytes");
     }
 }
