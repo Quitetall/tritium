@@ -16,8 +16,9 @@
 use std::rc::Rc;
 
 use crate::gemm::TrainGemm;
+pub use crate::ops::conv1d::Conv1dCfg;
 use crate::ops::{
-    act, bias, dense, elementwise, embed, loss, matmul, norm, rope, shape, softmax, ste,
+    act, bias, conv1d, dense, elementwise, embed, loss, matmul, norm, rope, shape, softmax, ste,
 };
 
 /// Index of a value buffer in a [`Tape`]'s arena.
@@ -341,6 +342,29 @@ impl Tape {
             out,
             Box::new(move |ins, g, grads, ids| {
                 let gs = matmul::vjp(ins[0], ins[1], ins[2], m, n, k, g);
+                for (k_idx, gv) in gs.into_iter().enumerate() {
+                    for (j, &v) in gv.iter().enumerate() {
+                        grads[ids[k_idx]][j] += v;
+                    }
+                }
+            }),
+        )
+    }
+
+    /// Ternary 1-D convolution `Y = s ⊙ conv1d(X, W)` (im2col → ternary matmul → col2im).
+    ///
+    /// `x` is `[batch, C_in, L_in]`, `w` is the flattened `[C_out, (C_in/groups)·K]` weight, `scale`
+    /// is `[C_out]`. Differentiable in `x`, `w`, and `scale`. Compose the ternary student exactly as
+    /// the linear path does — `s_q = leaf(absmean_scale_per_row(wf, C_out, K_g))`,
+    /// `w_surr = ste_surrogate(wf, s_q, C_out, K_g)`, `conv1d(x, w_surr, s_q, cfg)` — so the STE
+    /// weight grad and the per-output-channel scale fold match [`matmul`](Self::matmul).
+    pub fn conv1d(&mut self, x: ValueId, w: ValueId, scale: ValueId, cfg: Conv1dCfg) -> ValueId {
+        let out = conv1d::forward(&self.values[x], &self.values[w], &self.values[scale], &cfg);
+        self.record(
+            vec![x, w, scale],
+            out,
+            Box::new(move |ins, g, grads, ids| {
+                let gs = conv1d::vjp(ins[0], ins[1], ins[2], &cfg, g);
                 for (k_idx, gv) in gs.into_iter().enumerate() {
                     for (j, &v) in gv.iter().enumerate() {
                         grads[ids[k_idx]][j] += v;
