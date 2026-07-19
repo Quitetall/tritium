@@ -97,16 +97,25 @@ even better.
 - 2:4 sparsity's payoff is gated on launch-reduction + scale, not immediate.
 - The tensor-core tier is bit-exact-*relaxed* (tf32), gated on **recovery-PPL**, with the f32
   `--fmad=false` path retained as the correctness oracle (ADR 0023 precedent).
+- **tf32 is a net loss at 135M/seq=32 (validated 2026-07-19, VRAM freed).** Controlled A/B on the
+  real SmolLM2-135M resident recovery gate (40 steps, one variable — `TRITIUM_DISTILL_TF32` on/off,
+  everything else identical): **f32 recovers 960× at 518 ms/step; tf32 recovers 920× at 488 ms/step.**
+  So tf32 buys only **~6% full-step time** (the GEMMs it accelerates are ~14% of a launch-bound step)
+  while **costing ~4% recovery** (reduced mantissa perturbs the SALT master updates). Verdict: keep
+  the committed gate on f32 (the design already defaults there); do **not** enable tf32 for the 135M
+  distill. tf32 may still pay off at 1.7B/32B where GEMMs dominate the step and 4% recovery is
+  amortized against a larger speedup — but that is **unverified** and separately VRAM-gated.
 
-## Current blocker
-The shared RTX 4090 is VRAM-starved (~0.7–1.7GB free of 24GB; held by an unrelated python3 process,
-ComfyUI, and the parallel session's `tritium-serve`). The tf32 recovery validation and Step-1 run
-resume the moment ~3–4GB is freed.
+## Blocker cleared
+The shared RTX 4090 VRAM freed (13.5GB of 24GB now free; the parallel Q-blocked-attention python3
+process exited, leaving only the user's `tritium-serve`). The tf32 recovery A/B ran (result above);
+the Step-1 recovery-vs-tokens curve runs next on the f32 path.
 
 ## Verification
 - Batching + tf32 gates green (`cargo test -p tritium-cuda --features cuda`), all 55 train tests pass
   (f32 path unregressed). Benches `bench_batched_throughput`, `bench_tf32_whole_model_step` are
   regression-recorded.
-- Acceptance: `TRITIUM_DISTILL_TF32=1` resident recovery gate still recovers ~957× (tf32 doesn't break
-  distillation) — **pending GPU headroom.**
-- Step 1: recovery-vs-tokens curve on a real corpus; report the plateau (or fp-approach) point.
+- **tf32 recovery A/B — DONE (2026-07-19):** `salt_distillation_device_trainer_recovers_heldout`,
+  40 steps. f32 = **960×** (gate ✅), tf32 = **920×** (below the 950× gate). tf32 does *not* preserve
+  recovery at this scale; the numbers land in the honest-findings note above.
+- Step 1: recovery-vs-tokens curve on a real corpus (f32 path); report the plateau (or fp-approach) point.
