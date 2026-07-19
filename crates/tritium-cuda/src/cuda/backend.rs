@@ -526,6 +526,9 @@ pub struct CudaBackend {
     /// Lever 5: block-wise int8 AdamW update (int8 moments + per-block scales).
     #[allow(dead_code)] // consumed by the int8-Adam gate and DeviceTrainer int8 path
     pub(super) func_adamw_step_8bit: CudaFunction,
+    /// Lever 5: AdamW on a bf16 master with stochastic rounding.
+    #[allow(dead_code)] // consumed by the bf16-master gate and DeviceTrainer bf16 path
+    pub(super) func_adamw_step_bf16_master: CudaFunction,
     /// ADR 0027 Track D: compact SALT pack, forward, and activation gradient.
     #[allow(dead_code)] // consumed by the Track D backend entry points below
     pub(super) func_salt_pack_training: CudaFunction,
@@ -716,6 +719,9 @@ impl CudaBackend {
         let func_adamw_step_8bit = grad_module
             .load_function(KERNEL_NAME_ADAMW_STEP_8BIT)
             .map_err(|e| driver_err("resolve adamw_step_8bit kernel", &e))?;
+        let func_adamw_step_bf16_master = grad_module
+            .load_function(KERNEL_NAME_ADAMW_STEP_BF16_MASTER)
+            .map_err(|e| driver_err("resolve adamw_step_bf16_master kernel", &e))?;
         let func_salt_pack_training = grad_module
             .load_function(KERNEL_NAME_SALT_PACK_TRAINING)
             .map_err(|e| driver_err("resolve salt_pack_training kernel", &e))?;
@@ -877,6 +883,7 @@ impl CudaBackend {
             func_salt_quantize_fwd,
             func_adamw_step,
             func_adamw_step_8bit,
+            func_adamw_step_bf16_master,
             func_salt_pack_training,
             func_salt_training_forward,
             func_salt_training_grad_a,
@@ -2177,6 +2184,78 @@ impl CudaBackend {
             launch
                 .launch(cfg)
                 .map_err(|e| driver_err("launch adamw_step_8bit_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// AdamW on a bf16 master with stochastic rounding (Lever 5). `d_master` is a `u16` bf16 buffer
+    /// updated in place; `d_grad`/`d_m`/`d_v` are f32. `seed` is the stochastic-rounding base seed;
+    /// the step index is folded in so each step draws a fresh dither. Mirrors `tritium_train::bf16`.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a 0 step index, a length mismatch, or a launch failure.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // exercised by the bf16-master gate; wired into DeviceTrainer next
+    pub(crate) fn adamw_step_bf16_master_dev(
+        &self,
+        d_master: &mut CudaSlice<u16>,
+        d_grad: &CudaSlice<f32>,
+        d_m: &mut CudaSlice<f32>,
+        d_v: &mut CudaSlice<f32>,
+        step: u64,
+        seed: u64,
+        opt: &tritium_train::AdamW,
+    ) -> Result<(), BackendError> {
+        if step == 0 {
+            return Err(BackendError::InvalidInput(
+                "AdamW step index is 1-based".into(),
+            ));
+        }
+        let len = d_master.len();
+        for got in [d_grad.len(), d_m.len(), d_v.len()] {
+            if got != len {
+                return Err(BackendError::ShapeMismatch { expected: len, got });
+            }
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let len_i = i32::try_from(len)
+            .map_err(|_| BackendError::InvalidInput("AdamW length exceeds i32::MAX".into()))?;
+        let exp = i32::try_from(step).unwrap_or(i32::MAX);
+        let bc1 = 1.0 - opt.beta1.powi(exp);
+        let bc2 = 1.0 - opt.beta2.powi(exp);
+        let shrink = 1.0 - opt.lr * opt.weight_decay;
+        let one_minus_beta1 = 1.0 - opt.beta1;
+        let one_minus_beta2 = 1.0 - opt.beta2;
+        // Fold the step into the dither seed so consecutive steps draw independent rounding noise.
+        let dither_seed = seed ^ step;
+
+        let mut launch = self
+            .stream
+            .launch_builder(&self.func_adamw_step_bf16_master);
+        launch
+            .arg(d_master)
+            .arg(d_grad)
+            .arg(d_m)
+            .arg(d_v)
+            .arg(&len_i)
+            .arg(&dither_seed)
+            .arg(&opt.lr)
+            .arg(&opt.beta1)
+            .arg(&opt.beta2)
+            .arg(&one_minus_beta1)
+            .arg(&one_minus_beta2)
+            .arg(&bc1)
+            .arg(&bc2)
+            .arg(&opt.eps)
+            .arg(&shrink);
+        // SAFETY: all buffers are length `len`; one thread per element; scalars match the kernel ABI.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(len))
+                .map_err(|e| driver_err("launch adamw_step_bf16_master_dev", &e))?;
         }
         Ok(())
     }

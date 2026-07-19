@@ -212,6 +212,8 @@ pub(super) const KERNEL_NAME_SALT_QUANTIZE_FWD: &str = "salt_quantize_forward";
 pub(super) const KERNEL_NAME_ADAMW_STEP: &str = "adamw_step";
 /// Lever 5: block-wise int8 AdamW (signed-int8 m, sqrt-space uint8 v) — mirrors `Int8AdamW`.
 pub(super) const KERNEL_NAME_ADAMW_STEP_8BIT: &str = "adamw_step_8bit";
+/// Lever 5: AdamW on a bf16 master with stochastic rounding — mirrors `tritium_train::bf16`.
+pub(super) const KERNEL_NAME_ADAMW_STEP_BF16_MASTER: &str = "adamw_step_bf16_master";
 /// ADR 0027 Track D: master-to-compact-plane pack and fused packed contractions.
 pub(super) const KERNEL_NAME_SALT_PACK_TRAINING: &str = "salt_pack_training";
 pub(super) const KERNEL_NAME_SALT_TRAINING_FORWARD: &str = "salt_training_forward";

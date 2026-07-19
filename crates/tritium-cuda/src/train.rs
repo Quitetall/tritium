@@ -10227,6 +10227,85 @@ mod tests {
         );
     }
 
+    /// Lever 5: the device `adamw_step_bf16_master` kernel must be bit-identical to a host AdamW loop
+    /// that keeps the master in bf16 and stochastic-rounds each update via `tritium_train::bf16`. Same
+    /// dither stream (seed ^ step, index), same `--fmad=false` correctly-rounded ops ⇒ exact match on
+    /// the bf16 master codes and the f32 moments over 5 steps.
+    #[test]
+    fn adamw_step_bf16_master_matches_host() {
+        use tritium_train::bf16;
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping adamw_step_bf16_master_matches_host: no CUDA device ({e})");
+                return;
+            }
+        };
+        let n = 257usize; // spills a warp boundary; not a power of two
+        let seed = 0xBF16_5EEDu64;
+        let opt = AdamW::new(0.02);
+        let master_f32 = seeded_uniform(0xBF01, n, -2.0, 2.0);
+        let master0: Vec<u16> = master_f32
+            .iter()
+            .map(|&w| bf16::from_f32_nearest(w))
+            .collect();
+        let grads: Vec<Vec<f32>> = (0..5)
+            .map(|t| seeded_uniform(0x7b00 + t as u64, n, -0.4, 0.4))
+            .collect();
+
+        // Host reference: bf16 master + f32 moments, AdamW with stochastic-rounded write-back.
+        let mut hm = master0.clone();
+        let (mut h_m, mut h_v) = (vec![0.0f32; n], vec![0.0f32; n]);
+        // Device.
+        let stream = backend.stream();
+        let mut d_master = stream.clone_htod(&master0).unwrap();
+        let mut d_m = stream.clone_htod(&vec![0.0f32; n]).unwrap();
+        let mut d_v = stream.clone_htod(&vec![0.0f32; n]).unwrap();
+
+        for (t, g) in grads.iter().enumerate() {
+            let step = (t + 1) as u64;
+            let exp = step as i32;
+            let bc1 = 1.0 - opt.beta1.powi(exp);
+            let bc2 = 1.0 - opt.beta2.powi(exp);
+            let shrink = 1.0 - opt.lr * opt.weight_decay;
+            for i in 0..n {
+                let w = bf16::to_f32(hm[i]);
+                let mi = opt.beta1 * h_m[i] + (1.0 - opt.beta1) * g[i];
+                let vi = opt.beta2 * h_v[i] + (1.0 - opt.beta2) * g[i] * g[i];
+                h_m[i] = mi;
+                h_v[i] = vi;
+                let w_new = w * shrink - opt.lr * (mi / bc1 / ((vi / bc2).sqrt() + opt.eps));
+                hm[i] = bf16::from_f32_stochastic(w_new, bf16::dither16(seed ^ step, i));
+            }
+            let d_grad = stream.clone_htod(g).unwrap();
+            backend
+                .adamw_step_bf16_master_dev(
+                    &mut d_master,
+                    &d_grad,
+                    &mut d_m,
+                    &mut d_v,
+                    step,
+                    seed,
+                    &opt,
+                )
+                .unwrap();
+        }
+
+        let mut dev_master = vec![0u16; n];
+        let mut dev_m = vec![0.0f32; n];
+        let mut dev_v = vec![0.0f32; n];
+        stream.memcpy_dtoh(&d_master, &mut dev_master).unwrap();
+        stream.memcpy_dtoh(&d_m, &mut dev_m).unwrap();
+        stream.memcpy_dtoh(&d_v, &mut dev_v).unwrap();
+        assert_eq!(
+            dev_master, hm,
+            "bf16 master codes must match the host SR loop exactly"
+        );
+        assert_eq!(dev_m, h_m, "first moment must match exactly");
+        assert_eq!(dev_v, h_v, "second moment must match exactly");
+        eprintln!("adamw_step_bf16_master bit-matches the host bf16 SR loop over 5 steps (n={n})");
+    }
+
     /// Tensor-core tier — WHOLE MODEL. Builds a multi-layer transformer (embed → GQA attention
     /// + SwiGLU blocks → tied head) twice on a `DeviceTape` — once on the f32 kernels, once with
     /// `.with_tensor_core(...)` so every dense GEMM (qkv/o, gate/up/down, head) runs on tf32

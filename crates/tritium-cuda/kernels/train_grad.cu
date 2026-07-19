@@ -804,6 +804,64 @@ extern "C" __global__ void adamw_step_8bit(
     }
 }
 
+// ── Lever 5: bf16 master (stochastic rounding). Mirrors tritium_train::bf16 bit-for-bit. ──
+// bf16 = the high 16 bits of an f32, so widen with a shift and stochastic-round by adding a 16-bit
+// dither to the low bits and truncating (the carry out IS the round-up). The dither stream is the
+// same xorshift64(seed, idx) as the FSQ STE and the Rust `dither16`, so host and device produce
+// identical codes for the same (seed, index).
+__device__ __forceinline__ float bf16_to_f32(unsigned short bits) {
+    return __uint_as_float(((unsigned int)bits) << 16);
+}
+__device__ __forceinline__ unsigned short f32_to_bf16_stochastic(float x, unsigned short dither) {
+    unsigned int bits = __float_as_uint(x);
+    if (!isfinite(x)) {
+        // from_f32_nearest fallback: preserve inf; keep a NaN a NaN.
+        unsigned short hi = (unsigned short)(bits >> 16);
+        return (x != x) ? (unsigned short)(hi | 0x0040) : hi;
+    }
+    return (unsigned short)((bits + (unsigned int)dither) >> 16);
+}
+__device__ __forceinline__ unsigned short bf16_dither16(unsigned long long seed,
+                                                        unsigned long long idx) {
+    unsigned long long s = (seed ^ (idx * 0x9E3779B97F4A7C15ULL)) | 1ULL;
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return (unsigned short)(s >> 32);
+}
+
+// AdamW on a bf16 master (Lever 5): dequantize the bf16 weight, apply the exact f32 AdamW update, and
+// stochastic-round back to bf16 so a sub-ULP update survives in expectation. Moments stay f32. One
+// thread per element; `dither_seed` should already fold in the step index (host passes seed ^ step).
+extern "C" __global__ void adamw_step_bf16_master(
+    unsigned short* __restrict__ master, // bf16 in/out
+    const float* __restrict__ grad,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    int n,
+    unsigned long long dither_seed,
+    float lr,
+    float beta1,
+    float beta2,
+    float one_minus_beta1,
+    float one_minus_beta2,
+    float bc1,
+    float bc2,
+    float eps,
+    float shrink)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float w = bf16_to_f32(master[i]);
+    float g = grad[i];
+    float mi = beta1 * m[i] + one_minus_beta1 * g;
+    float vi = beta2 * v[i] + one_minus_beta2 * g * g;
+    m[i] = mi;
+    v[i] = vi;
+    float w_new = w * shrink - lr * (mi / bc1 / (sqrtf(vi / bc2) + eps));
+    master[i] = f32_to_bf16_stochastic(w_new, bf16_dither16(dither_seed, (unsigned long long)i));
+}
+
 // ───────────────────────── device-resident glue ops (plan 0043 P2.2) ─────────────────────────
 // Elementwise forward/backward for the tape's non-matmul ops, run on the resident activation
 // buffers so a whole block chains fwd→bwd without host round-trips. One thread per element.
