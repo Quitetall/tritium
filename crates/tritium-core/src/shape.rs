@@ -112,8 +112,8 @@ impl ConvShape {
             && self.k != 0
             && self.stride != 0
             && self.dilation != 0
-            && self.c_in % self.groups == 0
-            && self.c_out % self.groups == 0
+            && self.c_in.is_multiple_of(self.groups)
+            && self.c_out.is_multiple_of(self.groups)
             && self.l_out() > 0
             && x_len == self.batch * self.c_in * self.l_in
             && weight_len == self.c_out * self.k_g()

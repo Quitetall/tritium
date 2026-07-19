@@ -161,21 +161,9 @@ pub fn reference_fsq(
             });
         }
         let lm1 = (l - 1) as f32;
-        let b = if xi < -1.0 {
-            -1.0
-        } else if xi > 1.0 {
-            1.0
-        } else {
-            xi
-        };
+        let b = xi.clamp(-1.0, 1.0);
         // (b+1)/2·(L−1) ≥ 0, so truncating (v + 0.5) is round-half-away-from-zero without libm.
-        let mut code = ((b + 1.0) * 0.5 * lm1 + 0.5) as i32;
-        if code < 0 {
-            code = 0;
-        }
-        if code > (l - 1) as i32 {
-            code = (l - 1) as i32;
-        }
+        let code = (((b + 1.0) * 0.5 * lm1 + 0.5) as i32).clamp(0, (l - 1) as i32);
         *o = code as f32 / lm1 * 2.0 - 1.0;
     }
     Ok(())
