@@ -720,6 +720,90 @@ extern "C" __global__ void adamw_step(
     param[i] = param[i] * shrink - lr * (mi / bc1 / (sqrtf(vi / bc2) + eps));
 }
 
+// Block-wise int8 AdamW (Lever 5): one CUDA block per ADAMW8_BLOCK-element optimizer block. Mirrors
+// the CPU oracle tritium_train::optim::Int8AdamW BIT-FOR-BIT — m signed int8 (per-block absmax/127);
+// the second moment stored in SQRT-SPACE unsigned int8 (v_q = round(sqrt(v)/scale), v = (v_q·scale)²)
+// so its wide dynamic range does not underflow while m keeps its history. The param buffer stays f32
+// and the update uses the full-precision mi,vi — only the persisted STATE is quantized. All ops are
+// +,−,×,÷,sqrtf,roundf,fmaxf (IEEE correctly-rounded) and the kernel builds --fmad=false, so it is
+// bit-identical to the host oracle; the requant reduction (max) is order-independent. Launch with
+// exactly ADAMW8_BLOCK threads per block and ceil(n/ADAMW8_BLOCK) blocks.
+#define ADAMW8_BLOCK 256
+extern "C" __global__ void adamw_step_8bit(
+    float* __restrict__ param,
+    const float* __restrict__ grad,
+    signed char* __restrict__ m_q,
+    unsigned char* __restrict__ v_q,
+    float* __restrict__ m_scale, // [nblocks]
+    float* __restrict__ v_scale, // [nblocks]
+    int n,
+    float lr,
+    float beta1,
+    float beta2,
+    float one_minus_beta1,
+    float one_minus_beta2,
+    float bc1,
+    float bc2,
+    float eps,
+    float shrink)
+{
+    int blk = blockIdx.x;
+    int tid = threadIdx.x;
+    int i = blk * ADAMW8_BLOCK + tid;
+    __shared__ float s_mabs[ADAMW8_BLOCK];
+    __shared__ float s_rabs[ADAMW8_BLOCK];
+    __shared__ float new_ms;
+    __shared__ float new_vs;
+
+    float mi = 0.0f;
+    float root_i = 0.0f; // sqrt(vi) — the value requantized in sqrt-space
+    bool active = (i < n);
+    if (active) {
+        float g = grad[i];
+        float ms = m_scale[blk];
+        float vs = v_scale[blk];
+        float m_old = (float)m_q[i] * ms;
+        float root_old = (float)v_q[i] * vs;
+        float v_old = root_old * root_old;
+        mi = beta1 * m_old + one_minus_beta1 * g;
+        float vi = beta2 * v_old + one_minus_beta2 * g * g;
+        param[i] = param[i] * shrink - lr * (mi / bc1 / (sqrtf(vi / bc2) + eps));
+        root_i = sqrtf(vi);
+    }
+    // Per-block absmax of m and of sqrt(v). Inactive tail threads contribute 0.
+    s_mabs[tid] = active ? fabsf(mi) : 0.0f;
+    s_rabs[tid] = active ? root_i : 0.0f;
+    __syncthreads();
+    for (int stride = ADAMW8_BLOCK / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_mabs[tid] = fmaxf(s_mabs[tid], s_mabs[tid + stride]);
+            s_rabs[tid] = fmaxf(s_rabs[tid], s_rabs[tid + stride]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        new_ms = s_mabs[0] > 0.0f ? s_mabs[0] / 127.0f : 0.0f;
+        new_vs = s_rabs[0] > 0.0f ? s_rabs[0] / 255.0f : 0.0f;
+        m_scale[blk] = new_ms;
+        v_scale[blk] = new_vs;
+    }
+    __syncthreads();
+    if (active) {
+        // roundf is round-half-away-from-zero, matching Rust f32::round; a zero-absmax block keeps
+        // scale 0 and code 0 (dequantizes back to 0 — no division by zero).
+        if (new_ms > 0.0f) {
+            m_q[i] = (signed char)fminf(fmaxf(roundf(mi / new_ms), -127.0f), 127.0f);
+        } else {
+            m_q[i] = 0;
+        }
+        if (new_vs > 0.0f) {
+            v_q[i] = (unsigned char)fminf(fmaxf(roundf(root_i / new_vs), 0.0f), 255.0f);
+        } else {
+            v_q[i] = 0;
+        }
+    }
+}
+
 // ───────────────────────── device-resident glue ops (plan 0043 P2.2) ─────────────────────────
 // Elementwise forward/backward for the tape's non-matmul ops, run on the resident activation
 // buffers so a whole block chains fwd→bwd without host round-trips. One thread per element.

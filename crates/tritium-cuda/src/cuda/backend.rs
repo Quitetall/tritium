@@ -523,6 +523,9 @@ pub struct CudaBackend {
     /// ADR 0027 Track A: fused AdamW update on resident master/moment buffers.
     #[allow(dead_code)] // consumed by DeviceTrainer in the next Track A slice
     pub(super) func_adamw_step: CudaFunction,
+    /// Lever 5: block-wise int8 AdamW update (int8 moments + per-block scales).
+    #[allow(dead_code)] // consumed by the int8-Adam gate and DeviceTrainer int8 path
+    pub(super) func_adamw_step_8bit: CudaFunction,
     /// ADR 0027 Track D: compact SALT pack, forward, and activation gradient.
     #[allow(dead_code)] // consumed by the Track D backend entry points below
     pub(super) func_salt_pack_training: CudaFunction,
@@ -710,6 +713,9 @@ impl CudaBackend {
         let func_adamw_step = grad_module
             .load_function(KERNEL_NAME_ADAMW_STEP)
             .map_err(|e| driver_err("resolve adamw_step kernel", &e))?;
+        let func_adamw_step_8bit = grad_module
+            .load_function(KERNEL_NAME_ADAMW_STEP_8BIT)
+            .map_err(|e| driver_err("resolve adamw_step_8bit kernel", &e))?;
         let func_salt_pack_training = grad_module
             .load_function(KERNEL_NAME_SALT_PACK_TRAINING)
             .map_err(|e| driver_err("resolve salt_pack_training kernel", &e))?;
@@ -870,6 +876,7 @@ impl CudaBackend {
             func_grad_s,
             func_salt_quantize_fwd,
             func_adamw_step,
+            func_adamw_step_8bit,
             func_salt_pack_training,
             func_salt_training_forward,
             func_salt_training_grad_a,
@@ -2067,6 +2074,93 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(len))
                 .map_err(|e| driver_err("launch adamw_step_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Block-wise int8 AdamW (Lever 5): update `d_param` (f32) in place from `d_grad`, with the two
+    /// moments held quantized — `d_m_q` signed int8, `d_v_q` unsigned int8 in sqrt-space — plus their
+    /// per-block scales. One CUDA block per `INT8_ADAM_BLOCK`-element optimizer block; bit-identical
+    /// to the `tritium_train::Int8AdamW` CPU oracle.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a 0 step index, a length mismatch, or a launch failure.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // exercised by the int8-Adam parity gate; wired into DeviceTrainer next
+    pub(crate) fn adamw_step_8bit_dev(
+        &self,
+        d_param: &mut CudaSlice<f32>,
+        d_grad: &CudaSlice<f32>,
+        d_m_q: &mut CudaSlice<i8>,
+        d_v_q: &mut CudaSlice<u8>,
+        d_m_scale: &mut CudaSlice<f32>,
+        d_v_scale: &mut CudaSlice<f32>,
+        step: u64,
+        opt: &tritium_train::AdamW,
+    ) -> Result<(), BackendError> {
+        if step == 0 {
+            return Err(BackendError::InvalidInput(
+                "AdamW step index is 1-based".into(),
+            ));
+        }
+        let len = d_param.len();
+        for got in [d_grad.len(), d_m_q.len(), d_v_q.len()] {
+            if got != len {
+                return Err(BackendError::ShapeMismatch { expected: len, got });
+            }
+        }
+        let block = tritium_train::INT8_ADAM_BLOCK;
+        let nblocks = len.div_ceil(block);
+        for got in [d_m_scale.len(), d_v_scale.len()] {
+            if got != nblocks {
+                return Err(BackendError::ShapeMismatch {
+                    expected: nblocks,
+                    got,
+                });
+            }
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let len_i = i32::try_from(len)
+            .map_err(|_| BackendError::InvalidInput("AdamW length exceeds i32::MAX".into()))?;
+        let exp = i32::try_from(step).unwrap_or(i32::MAX);
+        let bc1 = 1.0 - opt.beta1.powi(exp);
+        let bc2 = 1.0 - opt.beta2.powi(exp);
+        let shrink = 1.0 - opt.lr * opt.weight_decay;
+        let one_minus_beta1 = 1.0 - opt.beta1;
+        let one_minus_beta2 = 1.0 - opt.beta2;
+
+        let cfg = LaunchConfig {
+            grid_dim: (u32::try_from(nblocks).unwrap_or(u32::MAX), 1, 1),
+            block_dim: (u32::try_from(block).unwrap_or(u32::MAX), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&self.func_adamw_step_8bit);
+        launch
+            .arg(d_param)
+            .arg(d_grad)
+            .arg(d_m_q)
+            .arg(d_v_q)
+            .arg(d_m_scale)
+            .arg(d_v_scale)
+            .arg(&len_i)
+            .arg(&opt.lr)
+            .arg(&opt.beta1)
+            .arg(&opt.beta2)
+            .arg(&one_minus_beta1)
+            .arg(&one_minus_beta2)
+            .arg(&bc1)
+            .arg(&bc2)
+            .arg(&opt.eps)
+            .arg(&shrink);
+        // SAFETY: one block per optimizer block, exactly `block` threads each (matches the kernel's
+        // static shared arrays); every buffer length is validated above and the scalars match the ABI.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|e| driver_err("launch adamw_step_8bit_dev", &e))?;
         }
         Ok(())
     }

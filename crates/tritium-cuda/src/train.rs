@@ -9970,6 +9970,96 @@ mod tests {
         );
     }
 
+    /// Lever 5: the device `adamw_step_8bit` kernel must match the `tritium_train::Int8AdamW` CPU
+    /// oracle. Runs 5 steps of block-wise int8 AdamW on both (n = 300 → two blocks with a ragged
+    /// 44-element tail, so the reduction, the tail guard, and cross-step requant are all exercised)
+    /// and checks the f32 parameters agree tightly and every int8 moment code agrees within ±1 (the
+    /// only slack a boundary-straddling requantization could introduce — the update math is the same
+    /// correctly-rounded ops built `--fmad=false`).
+    #[test]
+    fn adamw_step_8bit_matches_cpu_oracle() {
+        use tritium_train::{Int8AdamW, Optimizer};
+        let backend = match CudaBackend::new(0) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping adamw_step_8bit_matches_cpu_oracle: no CUDA device ({e})");
+                return;
+            }
+        };
+        let n = 300usize;
+        let block = tritium_train::INT8_ADAM_BLOCK;
+        let nblocks = n.div_ceil(block);
+        let lr = 0.01;
+        let opt8 = Int8AdamW::new(lr);
+        let opt_f = AdamW::new(lr); // same config the device wrapper consumes
+
+        // Deterministic param + a distinct grad per step (varying absmax dynamics per block).
+        let param = seeded_uniform(0x8b17, n, -1.0, 1.0);
+        let grads: Vec<Vec<f32>> = (0..5)
+            .map(|t| seeded_uniform(0x6a00 + t as u64, n, -0.5, 0.5))
+            .collect();
+
+        // CPU oracle.
+        let mut cpu_param = param.clone();
+        let mut cpu_state = opt8.init_state(n);
+        // Device state: param + zeroed int8 moments + zeroed per-block scales.
+        let stream = backend.stream();
+        let mut d_param = stream.clone_htod(&param).unwrap();
+        let mut d_mq = stream.clone_htod(&vec![0i8; n]).unwrap();
+        let mut d_vq = stream.clone_htod(&vec![0u8; n]).unwrap();
+        let mut d_ms = stream.clone_htod(&vec![0.0f32; nblocks]).unwrap();
+        let mut d_vs = stream.clone_htod(&vec![0.0f32; nblocks]).unwrap();
+
+        for (t, g) in grads.iter().enumerate() {
+            let step = (t + 1) as u64;
+            opt8.step(step, &mut cpu_param, g, &mut cpu_state);
+            let d_grad = stream.clone_htod(g).unwrap();
+            backend
+                .adamw_step_8bit_dev(
+                    &mut d_param,
+                    &d_grad,
+                    &mut d_mq,
+                    &mut d_vq,
+                    &mut d_ms,
+                    &mut d_vs,
+                    step,
+                    &opt_f,
+                )
+                .unwrap();
+        }
+
+        let mut dev_param = vec![0.0f32; n];
+        let mut dev_mq = vec![0i8; n];
+        let mut dev_vq = vec![0u8; n];
+        stream.memcpy_dtoh(&d_param, &mut dev_param).unwrap();
+        stream.memcpy_dtoh(&d_mq, &mut dev_mq).unwrap();
+        stream.memcpy_dtoh(&d_vq, &mut dev_vq).unwrap();
+
+        for i in 0..n {
+            assert!(
+                (dev_param[i] - cpu_param[i]).abs() <= 1e-4 * (1.0 + cpu_param[i].abs()),
+                "param[{i}] device {} vs cpu {}",
+                dev_param[i],
+                cpu_param[i]
+            );
+            assert!(
+                (i32::from(dev_mq[i]) - i32::from(cpu_state.m_q[i])).abs() <= 1,
+                "m_q[{i}] device {} vs cpu {}",
+                dev_mq[i],
+                cpu_state.m_q[i]
+            );
+            assert!(
+                (i32::from(dev_vq[i]) - i32::from(cpu_state.v_q[i])).abs() <= 1,
+                "v_q[{i}] device {} vs cpu {}",
+                dev_vq[i],
+                cpu_state.v_q[i]
+            );
+        }
+        eprintln!(
+            "adamw_step_8bit matches the Int8AdamW oracle over 5 steps (n={n}, {nblocks} blocks)"
+        );
+    }
+
     /// Tensor-core tier — WHOLE MODEL. Builds a multi-layer transformer (embed → GQA attention
     /// + SwiGLU blocks → tied head) twice on a `DeviceTape` — once on the f32 kernels, once with
     /// `.with_tensor_core(...)` so every dense GEMM (qkv/o, gate/up/down, head) runs on tf32
