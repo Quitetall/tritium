@@ -400,6 +400,103 @@ impl RunnerGenerator {
     }
 }
 
+/// Adaptive draft-length policy for the two-runner spec loops.
+///
+/// The accept walk is per-token Bernoulli-like: each drafted token survives
+/// with roughly the drafter's per-token acceptance rate `a` (position- and
+/// content-dependent in truth; an EWMA over recent per-token outcomes tracks
+/// the mixture). Drafting the k-th token pays one fixed drafter step and is
+/// only worth it while the chance the walk still lives at k — `a^k` — clears
+/// the step's cost share, so the policy drafts while `a^k >= THRESHOLD`:
+/// `k = ln(THRESHOLD)/ln(a)`, clamped to [1, MAX].
+///
+/// Replaces the old double-on-full-accept / reset-on-any-reject rule, which
+/// pinned k at its floor of 6 for any drafter whose full-6 acceptance is rare
+/// (a tau~4 drafter wastes ~5 draft steps per cycle on weak prose) and could
+/// never drop below 6 where weak content wants k~1-2. The draft length NEVER
+/// affects outputs — the accept rule is lossless for any k (greedy: verify
+/// recomputes the argmax chain; sampled: the residual-distribution rule) —
+/// so this is purely a cost policy with no numerics gate.
+enum DraftPolicy {
+    /// Acceptance-adaptive (the default; see the doc above).
+    Adaptive {
+        /// EWMA of per-token acceptance outcomes in [0, 1].
+        acc: f64,
+    },
+    /// The pre-2026-07-19 rule: double on full acceptance, reset to 6 on any
+    /// rejection. Kept selectable (`TRITIUM_DRAFT_K=legacy`) as the A/B
+    /// baseline and kill switch.
+    Legacy { len: usize },
+}
+
+impl DraftPolicy {
+    /// Per-token EWMA decay — ~20-token memory (a few verify cycles), fast
+    /// enough to track topic shifts inside one request.
+    const LAMBDA: f64 = 0.95;
+    /// Draft while the survival probability `a^k` clears this. 0.25 sits at
+    /// the measured drafter-step / verify-cycle cost band (~0.75 ms draft
+    /// step vs ~4 ms verify-side cost per committed token, 2026-07-19 stage-3
+    /// runs): a marginal draft with under 1-in-4 use odds costs more than it
+    /// can save.
+    const THRESHOLD: f64 = 0.25;
+    /// Hard cap (the old DRAFT_MAX; also bounded per cycle by KV room and
+    /// the emission budget at the call sites).
+    const MAX: usize = 40;
+
+    const LEGACY_MIN: usize = 6;
+
+    /// Optimistic start: strong content ramps immediately; weak content
+    /// converges down within a couple of cycles. `TRITIUM_DRAFT_K=legacy`
+    /// selects the old fixed rule (loud-reject on anything else).
+    fn from_env() -> Result<Self, GenError> {
+        match std::env::var("TRITIUM_DRAFT_K") {
+            Err(_) => Ok(Self::Adaptive { acc: 0.75 }),
+            Ok(v) if v == "adaptive" => Ok(Self::Adaptive { acc: 0.75 }),
+            Ok(v) if v == "legacy" => Ok(Self::Legacy {
+                len: Self::LEGACY_MIN,
+            }),
+            Ok(v) => Err(GenError::Backend(format!(
+                "TRITIUM_DRAFT_K={v:?} — use adaptive (default) or legacy"
+            ))),
+        }
+    }
+
+    /// Fold one verify cycle: `offered` drafts went in, `accepted` of them
+    /// survived the walk (accepted < offered means the walk died at draft
+    /// accepted+1 — one observed failure; accepted == offered is truncation,
+    /// not a failure).
+    fn update(&mut self, offered: usize, accepted: usize) {
+        match self {
+            Self::Adaptive { acc } => {
+                for _ in 0..accepted {
+                    *acc = Self::LAMBDA * *acc + (1.0 - Self::LAMBDA);
+                }
+                if accepted < offered {
+                    *acc *= Self::LAMBDA;
+                }
+            }
+            Self::Legacy { len } => {
+                *len = if accepted == offered {
+                    (*len * 2).min(Self::MAX)
+                } else {
+                    Self::LEGACY_MIN
+                };
+            }
+        }
+    }
+
+    /// Draft length for the next cycle.
+    fn len(&self) -> usize {
+        match self {
+            Self::Adaptive { acc } => {
+                let a = acc.clamp(0.05, 0.98);
+                ((Self::THRESHOLD.ln() / a.ln()) as usize).clamp(1, Self::MAX)
+            }
+            Self::Legacy { len } => *len,
+        }
+    }
+}
+
 impl RunnerGenerator {
     /// Draft continuation via prompt lookup: find the LONGEST match (up to an
     /// 8-gram, at least a 2-gram — 1-gram matches draft noise and measured
@@ -528,8 +625,6 @@ impl RunnerGenerator {
         prefill_logits: Vec<f32>,
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError> {
-        const DRAFT_MIN: usize = 6;
-        const DRAFT_MAX: usize = 40;
         let n_ctx = self.runner.config.n_ctx as usize;
         let mut history: Vec<u32> = req.prompt_tokens.clone();
         let mut emitted = 0usize;
@@ -539,10 +634,8 @@ impl RunnerGenerator {
             return Ok(());
         }
         let stats = std::env::var("TRITIUM_SPEC_STATS").as_deref() == Ok("1");
-        // Verify cost is ~flat in tree size next to its fixed overhead, so when
-        // drafts keep being fully accepted, longer chains amortize it; an early
-        // rejection resets the length.
-        let mut draft_len = DRAFT_MIN;
+        // Acceptance-adaptive draft length (see DraftPolicy).
+        let mut policy = DraftPolicy::from_env()?;
         let (mut n_verify, mut n_committed, mut n_plain, mut t_verify, mut t_plain) = (
             0usize,
             0usize,
@@ -589,7 +682,7 @@ impl RunnerGenerator {
             // committed tokens (<= drafts + 1) must fit the emission budget.
             let kv_room = n_ctx.saturating_sub(history.len());
             let budget = max_new - emitted;
-            let max_draft = draft_len.min(kv_room).min(budget.saturating_sub(1));
+            let max_draft = policy.len().min(kv_room).min(budget.saturating_sub(1));
             let drafts = if self.draft.is_some() {
                 self.model_draft(&history, max_draft)
             } else {
@@ -625,11 +718,9 @@ impl RunnerGenerator {
             SPEC_VERIFIES.fetch_add(1, Ordering::Relaxed);
             SPEC_COMMITTED.fetch_add(committed.len() as u64, Ordering::Relaxed);
             t_verify += t0.elapsed();
-            draft_len = if committed.len() == tokens.len() {
-                (draft_len * 2).min(DRAFT_MAX)
-            } else {
-                DRAFT_MIN
-            };
+            // committed = accepted drafts + the final token, so accepted
+            // drafts = committed.len() - 1; offered = drafts.len().
+            policy.update(drafts.len(), committed.len() - 1);
             // committed[..L-1] extend history as fully-processed tokens; the
             // last committed becomes the new pending (top of the next loop
             // emits it and pushes it into history).
@@ -758,8 +849,6 @@ impl RunnerGenerator {
         prefill_logits: Vec<f32>,
         on_step: &mut dyn FnMut(Step) -> bool,
     ) -> Result<(), GenError> {
-        const DRAFT_MIN: usize = 6;
-        const DRAFT_MAX: usize = 40;
         let n_ctx = self.runner.config.n_ctx as usize;
         let seed = match req.sampling {
             Sampling::TopK { seed, .. } | Sampling::TopP { seed, .. } => seed,
@@ -770,7 +859,8 @@ impl RunnerGenerator {
         }
         let mut history: Vec<u32> = req.prompt_tokens.clone();
         let mut emitted = 0usize;
-        let mut draft_len = DRAFT_MIN;
+        // Acceptance-adaptive draft length (see DraftPolicy).
+        let mut policy = DraftPolicy::from_env()?;
         // Every random decision gets a fresh salt so draws are independent.
         let mut salt = 0u64;
 
@@ -803,7 +893,7 @@ impl RunnerGenerator {
 
             let kv_room = n_ctx.saturating_sub(history.len());
             let budget = max_new - emitted;
-            let max_draft = draft_len.min(kv_room).min(budget.saturating_sub(1));
+            let max_draft = policy.len().min(kv_room).min(budget.saturating_sub(1));
             let drafts = if self.draft.is_some() {
                 self.model_draft(&history, max_draft)
             } else {
@@ -878,11 +968,9 @@ impl RunnerGenerator {
             // Committed = accepted drafts (path[1..]) + the resampled/bonus
             // final token — same accounting as the greedy path's `committed`.
             SPEC_COMMITTED.fetch_add(path.len() as u64, Ordering::Relaxed);
-            draft_len = if path.len() == tokens.len() {
-                (draft_len * 2).min(DRAFT_MAX)
-            } else {
-                DRAFT_MIN
-            };
+            // path = root + accepted drafts, so accepted = path.len() - 1;
+            // offered = drafts.len().
+            policy.update(drafts.len(), path.len() - 1);
 
             // Emit the accepted draft tokens; the final (resampled or bonus)
             // token becomes the new pending, emitted at the top of the loop.
@@ -1087,6 +1175,63 @@ impl Generator for RunnerGenerator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draft_policy_converges_down_on_rejections() {
+        let mut p = super::DraftPolicy::Adaptive { acc: 0.75 };
+        assert!(p.len() >= 4, "optimistic start should offer >= 4");
+        // Weak content: offer whatever the policy says, accept 1, reject.
+        for _ in 0..12 {
+            let k = p.len();
+            p.update(k, 1.min(k.saturating_sub(1)));
+        }
+        assert!(
+            p.len() <= 3,
+            "sustained low acceptance must shrink the draft (got {})",
+            p.len()
+        );
+    }
+
+    #[test]
+    fn draft_policy_ramps_on_full_acceptance() {
+        let mut p = super::DraftPolicy::Adaptive { acc: 0.75 };
+        for _ in 0..40 {
+            let k = p.len();
+            p.update(k, k); // truncation, not failure
+        }
+        assert!(
+            p.len() >= 12,
+            "sustained full acceptance must grow the draft (got {})",
+            p.len()
+        );
+        assert!(p.len() <= super::DraftPolicy::MAX);
+    }
+
+    #[test]
+    fn draft_policy_len_always_in_bounds() {
+        let mut p = super::DraftPolicy::Adaptive { acc: 0.75 };
+        for i in 0..200 {
+            let k = p.len();
+            assert!((1..=super::DraftPolicy::MAX).contains(&k));
+            // Alternate hostile patterns incl. zero-offered cycles.
+            match i % 3 {
+                0 => p.update(k, 0),
+                1 => p.update(0, 0),
+                _ => p.update(k, k),
+            }
+        }
+    }
+
+    #[test]
+    fn draft_policy_known_rates() {
+        // Directly pin the k = ln(theta)/ln(a) mapping at the clamp edges.
+        let mk = |a: f64| super::DraftPolicy::Adaptive { acc: a }.len();
+        assert_eq!(mk(0.5), 2);
+        assert_eq!(mk(0.8), 6);
+        assert!(mk(0.95) >= 13);
+        assert_eq!(mk(0.01), 1); // clamped floor
+        assert_eq!(mk(1.5), super::DraftPolicy::MAX); // clamped ceiling
+    }
+
     /// Monte-Carlo gate for the deterministic-drafter accept rule: over many
     /// independent (u, resample) draws, the per-position output distribution
     /// must equal p̃ regardless of which token the drafter proposed. Pure host
