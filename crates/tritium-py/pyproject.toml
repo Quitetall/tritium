@@ -22,7 +22,10 @@ Repository = "https://github.com/Quitetall/tritium"
 
 [tool.maturin]
 # The crate lives in the Cargo workspace; point maturin at its manifest and build
-# an abi3 wheel (one wheel for CPython 3.9+).
+# an abi3 wheel (one wheel for CPython 3.9+). Mixed layout: the compiled extension is
+# `tritium._tritium`, and the pure-Python `tritium` package (with the torch `autograd`
+# wrappers) lives under `python/`.
 manifest-path = "Cargo.toml"
-module-name = "tritium"
+module-name = "tritium._tritium"
+python-source = "python"
 features = ["pyo3/extension-module"]

@@ -28,6 +28,8 @@
 #![forbid(unsafe_code)]
 #![allow(unreachable_pub)] // pyo3's `#[pymethods]` expansion emits `pub` items.
 
+mod ops;
+
 use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -236,15 +238,27 @@ fn cpu_backend() -> Result<Box<dyn TernaryBackend>, String> {
     Err("no `cpu` backend registered in the runtime".to_owned())
 }
 
-/// The `tritium` Python module.
+/// The compiled `tritium._tritium` extension module.
 ///
-/// Exposes [`Model`] and the [`ternary_matmul`] helper. Building it links
-/// `tritium-cpu`, whose `linkme` self-registration makes the CPU backend visible to
-/// the runtime registry that [`Model::load`] and [`ternary_matmul`] consult.
+/// Exposes [`Model`], the [`ternary_matmul`] helper, and the autograd-op forward/vjp functions
+/// (`conv1d_*`, `fsq_*`, `ste_*`) that the pure-Python `tritium.autograd` layer wraps in
+/// `torch.autograd.Function`s. Building it links `tritium-cpu`, whose `linkme` self-registration makes
+/// the CPU backend visible to the runtime registry that [`Model::load`] / [`ternary_matmul`] consult.
 #[pymodule]
-fn tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Model>()?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
-    m.add("__doc__", "Tritium: ternary-model inference from Python.")?;
+    // Autograd-op primitives (ADR 0030): forward/vjp for ternary Conv1d, FSQ, and STE.
+    m.add_function(wrap_pyfunction!(ops::conv1d_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::conv1d_vjp, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::fsq_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::fsq_vjp, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::ste_absmean_scale, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::ste_quantize_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::ste_quantize_vjp, m)?)?;
+    m.add(
+        "__doc__",
+        "Tritium: ternary-model inference + autograd ops from Python.",
+    )?;
     Ok(())
 }

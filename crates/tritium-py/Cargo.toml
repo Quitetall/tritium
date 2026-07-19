@@ -26,6 +26,8 @@ tritium-spec = { workspace = true }
 tritium-cpu = { workspace = true }
 # Used by the low-level `ternary_matmul` helper to express problem geometry.
 tritium-core = { workspace = true }
+# The autograd tape ops (ternary Conv1d, FSQ, STE) exposed to PyTorch via `src/ops.rs` (ADR 0030).
+tritium-train = { workspace = true }
 # `abi3-py39`: build one wheel that works on CPython 3.9+ (forward-compatible).
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py39"] }
 
