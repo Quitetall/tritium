@@ -50,9 +50,12 @@ impl Conv1dCfg {
     /// or `0` when the (dilated) kernel is wider than the padded input.
     #[must_use]
     pub fn l_out(&self) -> usize {
+        if self.k == 0 || self.stride == 0 {
+            return 0; // guard before `k - 1` underflows
+        }
         let eff = self.dilation * (self.k - 1) + 1; // dilated kernel span
         let padded = self.l_in + self.pad_left + self.pad_right;
-        if self.k == 0 || self.stride == 0 || padded < eff {
+        if padded < eff {
             return 0;
         }
         (padded - eff) / self.stride + 1
@@ -89,8 +92,8 @@ impl Conv1dCfg {
             && self.k != 0
             && self.stride != 0
             && self.dilation != 0
-            && self.c_in % self.groups == 0
-            && self.c_out % self.groups == 0
+            && self.c_in.is_multiple_of(self.groups)
+            && self.c_out.is_multiple_of(self.groups)
             && self.l_out() > 0
             && x_len == self.batch * self.c_in * self.l_in
             && w_len == self.c_out * self.k_g()

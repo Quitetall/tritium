@@ -6,6 +6,7 @@ pub mod conv1d;
 pub mod dense;
 pub mod elementwise;
 pub mod embed;
+pub mod fsq;
 pub mod loss;
 pub mod matmul;
 pub mod norm;

@@ -17,8 +17,10 @@ use std::rc::Rc;
 
 use crate::gemm::TrainGemm;
 pub use crate::ops::conv1d::Conv1dCfg;
+pub use crate::ops::fsq::{FsqBound, FsqCfg, FsqSte};
 use crate::ops::{
-    act, bias, conv1d, dense, elementwise, embed, loss, matmul, norm, rope, shape, softmax, ste,
+    act, bias, conv1d, dense, elementwise, embed, fsq, loss, matmul, norm, rope, shape, softmax,
+    ste,
 };
 
 /// Index of a value buffer in a [`Tape`]'s arena.
@@ -369,6 +371,25 @@ impl Tape {
                     for (j, &v) in gv.iter().enumerate() {
                         grads[ids[k_idx]][j] += v;
                     }
+                }
+            }),
+        )
+    }
+
+    /// Finite scalar quantization: round `x` `[channels, len]` to each channel's `L`-level grid, with a
+    /// straight-through backward. The stored value is the rounded (QAT/deploy) activation — this is the
+    /// trainable activation-quant node — while the backward is the exact gradient of the chosen
+    /// surrogate (`Hard`/`Stochastic` → `bound'`; `SoftRound` → annealed). The rate knob for the codec
+    /// latent.
+    pub fn fsq(&mut self, x: ValueId, cfg: FsqCfg, ste: FsqSte) -> ValueId {
+        let out = fsq::forward(&self.values[x], &cfg, ste);
+        self.record(
+            vec![x],
+            out,
+            Box::new(move |ins, g, grads, ids| {
+                let gs = fsq::vjp(ins[0], &cfg, ste, g);
+                for (j, &v) in gs[0].iter().enumerate() {
+                    grads[ids[0]][j] += v;
                 }
             }),
         )
