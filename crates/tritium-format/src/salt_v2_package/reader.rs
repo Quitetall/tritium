@@ -717,6 +717,25 @@ impl<R: Read + Seek> SaltV2PackageReader<R> {
         self.ledger
     }
 
+    /// Exact indexed-runtime requirements summed across all package tensors.
+    ///
+    /// This preserves each tensor's independently allocated map tail and rank
+    /// prefixes; it is therefore not interchangeable with package-file byte
+    /// accounting from [`Self::ledger`].
+    ///
+    /// # Errors
+    /// Returns a format error if an aggregate counter overflows.
+    pub fn indexed_runtime_ledger(
+        &self,
+    ) -> Result<SaltV2IndexedRuntimeLedger, SaltV2PackageReadError> {
+        self.tensors
+            .iter()
+            .try_fold(SaltV2IndexedRuntimeLedger::zero(), |total, tensor| {
+                total.checked_add(tensor.info.runtime_ledger())
+            })
+            .map_err(Into::into)
+    }
+
     /// Number of indexed tensors.
     #[must_use]
     pub fn len(&self) -> usize {

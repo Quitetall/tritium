@@ -1,5 +1,12 @@
 //! Parent-bound CompactV1/NearLosslessV1 allocation selection.
 
+mod package_admission;
+
+pub use package_admission::{
+    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
+    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
+};
+
 use std::{
     error::Error,
     fmt,
@@ -2035,10 +2042,14 @@ fn reclaim_selection_orphans(
                 .open_verified(&receipt.near_lossless.map_record)
                 .map_err(Qwen36TensorWorkError::TensorStore)?;
             drop((compact, near));
-            vec![
+            let mut retained = vec![
                 receipt.compact.map_record.record_id(),
                 receipt.near_lossless.map_record.record_id(),
-            ]
+            ];
+            retained.extend(package_admission::admission_record_ids_if_present(
+                root, objects,
+            )?);
+            retained
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(work_io("inspect selected allocation manifest", error)),

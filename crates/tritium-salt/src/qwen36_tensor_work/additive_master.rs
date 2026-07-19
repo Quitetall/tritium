@@ -3,7 +3,9 @@
 mod selected_allocation;
 
 pub use selected_allocation::{
-    Qwen36AllocatedCampaignStore, Qwen36SelectedAllocationBindError,
+    Qwen36AllocatedCampaignStore, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
+    Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
     Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
 
@@ -57,6 +59,8 @@ const CAMPAIGN_MAGIC: [u8; 8] = *b"TSQ36CP\0";
 const CATALOG_MAGIC: [u8; 8] = *b"TSQ36SC\0";
 #[cfg(unix)]
 const SCALE_ONLY_CATALOG_MAGIC: [u8; 8] = *b"TSQ36SL\0";
+#[cfg(unix)]
+const PACKAGE_SCALE_ONLY_CATALOG_MAGIC: [u8; 8] = *b"TSQ36S2\0";
 const SLOT_MAGIC: [u8; 8] = *b"TSQ36AR\0";
 const COMPLETION_MAGIC: [u8; 8] = *b"TSQ36CM\0";
 const FORMAT_VERSION: u16 = 1;
@@ -69,6 +73,15 @@ const SLOT_KEY_CONTEXT: &str = "tritium qwen3.6 additive campaign slot key v1";
 const FIXED_MASTER_CONTEXT: &str = "tritium qwen3.6 scale-only fixed master v1";
 const MASTER_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SLOT_RECEIPT_BYTES: u64 = 512 * 1024;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct PackageScaleOnlyBinding {
+    admission_id: ContentId,
+    selection_id: ContentId,
+    compact_package_id: [u8; 32],
+    near_package_id: [u8; 32],
+}
 
 /// Exact ordered tensor-master metadata that defines one rate-free Qwen additive campaign.
 ///
@@ -140,6 +153,37 @@ impl Qwen36AdditiveCampaignSpec {
             parent_completion,
             parent_masters,
             parent_fixed_ids,
+            &expected_masters,
+        )?;
+        let spec_id = ContentId::of_bytes(&catalog_bytes);
+        expected_masters.shrink_to_fit();
+        Ok(Self {
+            expected_masters,
+            catalog_bytes,
+            spec_id,
+        })
+    }
+
+    #[cfg(unix)]
+    fn new_package_admitted_scale_only(
+        parent_completion: &Qwen36CompleteWorkspaceReceipt,
+        parent_specs: &[SaltV2MasterTensorSpec],
+        parent_masters: &[Qwen36AdditiveMasterReceipt],
+        parent_fixed_ids: &[[u8; 32]],
+        binding: PackageScaleOnlyBinding,
+        mut expected_masters: Vec<SaltV2MasterTensorSpec>,
+    ) -> Result<Self, Qwen36TensorWorkError> {
+        validate_scale_only_masters(parent_specs, parent_masters, &expected_masters)?;
+        if parent_fixed_ids.len() != parent_masters.len() {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "scale-only fixed master count",
+            ));
+        }
+        let catalog_bytes = encode_package_scale_only_master_catalog(
+            parent_completion,
+            parent_masters,
+            parent_fixed_ids,
+            binding,
             &expected_masters,
         )?;
         let spec_id = ContentId::of_bytes(&catalog_bytes);
@@ -2250,6 +2294,62 @@ fn encode_scale_only_master_catalog(
     Ok(output)
 }
 
+#[cfg(unix)]
+fn encode_package_scale_only_master_catalog(
+    parent: &Qwen36CompleteWorkspaceReceipt,
+    parent_masters: &[Qwen36AdditiveMasterReceipt],
+    parent_fixed_ids: &[[u8; 32]],
+    binding: PackageScaleOnlyBinding,
+    masters: &[SaltV2MasterTensorSpec],
+) -> Result<Vec<u8>, Qwen36TensorWorkError> {
+    let mut output = Vec::new();
+    reserve_catalog_append(
+        &mut output,
+        8 + 2 + 2 + (8 * 32) + 4,
+        "package-admitted scale-only catalog too large",
+    )?;
+    output.extend_from_slice(&PACKAGE_SCALE_ONLY_CATALOG_MAGIC);
+    output.extend_from_slice(&2_u16.to_le_bytes());
+    output.extend_from_slice(&0_u16.to_le_bytes());
+    output.extend_from_slice(parent.completion_id().as_bytes());
+    output.extend_from_slice(parent.base_workspace_id().as_bytes());
+    output.extend_from_slice(parent.campaign_id().as_bytes());
+    output.extend_from_slice(&parent.master_set_id());
+    output.extend_from_slice(binding.admission_id.as_bytes());
+    output.extend_from_slice(binding.selection_id.as_bytes());
+    output.extend_from_slice(&binding.compact_package_id);
+    output.extend_from_slice(&binding.near_package_id);
+    let count = u32::try_from(masters.len()).map_err(|_| {
+        Qwen36TensorWorkError::LengthOverflow("package-admitted scale-only master catalog count")
+    })?;
+    output.extend_from_slice(&count.to_le_bytes());
+    for ((parent_master, parent_fixed_id), master) in
+        parent_masters.iter().zip(parent_fixed_ids).zip(masters)
+    {
+        let bytes = master
+            .canonical_bytes()
+            .map_err(Qwen36TensorWorkError::Master)?;
+        let length = u32::try_from(bytes.len()).map_err(|_| {
+            Qwen36TensorWorkError::LengthOverflow("package-admitted scale-only master metadata")
+        })?;
+        reserve_catalog_append(
+            &mut output,
+            (2_usize * 32)
+                .checked_add(4)
+                .and_then(|length| length.checked_add(bytes.len()))
+                .ok_or(Qwen36TensorWorkError::LengthOverflow(
+                    "package-admitted scale-only master catalog",
+                ))?,
+            "package-admitted scale-only catalog too large",
+        )?;
+        output.extend_from_slice(&parent_master.tensor_master_id());
+        output.extend_from_slice(parent_fixed_id);
+        output.extend_from_slice(&length.to_le_bytes());
+        output.extend_from_slice(&bytes);
+    }
+    Ok(output)
+}
+
 fn reserve_catalog_append(
     output: &mut Vec<u8>,
     additional: usize,
@@ -2374,7 +2474,7 @@ mod tests {
     use std::{
         cell::Cell,
         convert::Infallible,
-        io::{self, Write},
+        io::{self, Cursor, Write},
     };
 
     use half::f16;
@@ -2384,7 +2484,9 @@ mod tests {
             SaltV2FitConstraint, SaltV2MasterError, SaltV2MasterEvidence, SaltV2MasterGeometry,
             SaltV2MasterTensorEncoder, SaltV2MasterTrack, SaltV2PrefixLoss,
         },
-        salt_v2_package::SaltV2Plane,
+        salt_v2_package::{
+            SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
+        },
     };
     use tritium_nn::{NnError, Qwen35TensorStreamError};
     use tritium_quantize::{
@@ -2523,15 +2625,15 @@ mod tests {
             NestedProfileBudgets {
                 compact: ProfileBudget {
                     maximum: PhysicalBytes {
-                        serialized: 128,
-                        resident: 128,
+                        serialized: 16 * 1024,
+                        resident: 4 * 1024,
                     },
                     metadata,
                 },
                 near_lossless: ProfileBudget {
                     maximum: PhysicalBytes {
-                        serialized: 256,
-                        resident: 256,
+                        serialized: 16 * 1024,
+                        resident: 4 * 1024,
                     },
                     metadata,
                 },
@@ -2542,6 +2644,37 @@ mod tests {
 
     fn fixture_allocation_counts() -> impl Iterator<Item = Result<(u8, u8), Infallible>> {
         [(1, 1), (1, 2)].into_iter().map(Ok)
+    }
+
+    fn fixture_selected_package(near_lossless: bool) -> Vec<u8> {
+        let first = SaltV2Plane::new(vec![-1, 0, 1, -1], vec![f16::from_f32(0.5)]).unwrap();
+        let second = SaltV2Plane::new(vec![1, -1, 0, 1], vec![f16::from_f32(0.25)]).unwrap();
+        let language = SaltV2Tensor::new(
+            "language.weight",
+            vec![1, 4],
+            vec![SaltV2Tile::new(vec![first.clone()]).unwrap()],
+        )
+        .unwrap();
+        let mtp_planes = if near_lossless {
+            vec![first, second]
+        } else {
+            vec![first]
+        };
+        let mtp = SaltV2Tensor::new(
+            "mtp.weight",
+            vec![1, 4],
+            vec![SaltV2Tile::new(mtp_planes).unwrap()],
+        )
+        .unwrap();
+        write_salt_v2_package(
+            &SaltV2Package::new(
+                tritium_format::salt_v2::SaltV2Codec::D2,
+                vec![language, mtp],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .bytes
     }
 
     fn bind_fixture_allocation<'parent, 'store, 'source>(
@@ -3276,6 +3409,114 @@ mod tests {
         .expect("tamper selected map record");
         assert!(parent.reopen_selected_allocation().is_err());
 
+        drop(parent);
+        drop(base);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_packages_require_exact_maps_parent_prefixes_and_budget_ledgers() {
+        let root = fixture_root("selected-package-admission");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open base workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let parent_spec = fixture_campaign_spec();
+        let parent = base
+            .open_master_campaign(parent_spec.clone())
+            .expect("open PTQ parent campaign");
+        let mut parent_masters = Vec::new();
+        for (ordinal, expected) in parent_spec.expected_masters().iter().enumerate() {
+            parent_masters.push(
+                parent
+                    .install_master(expected, |writer| {
+                        write_fixture_master(expected, writer, if ordinal == 0 { 1 } else { 2 })
+                    })
+                    .expect("install PTQ parent master"),
+            );
+        }
+        parent.seal_complete().expect("seal PTQ parent");
+        let allocated = bind_fixture_allocation(&parent);
+        let compact = fixture_selected_package(false);
+        let near = fixture_selected_package(true);
+
+        let mismatched = allocated
+            .admit_packages(Cursor::new(compact.clone()), Cursor::new(compact.clone()))
+            .expect_err("NearLosslessV1 must match its selected refinement map");
+        assert!(
+            matches!(
+                mismatched,
+                Qwen36PackageAdmissionError::Campaign(Qwen36TensorWorkError::WorkspaceMismatch(
+                    "selected package present-plane ledger"
+                ))
+            ),
+            "unexpected mismatch error: {mismatched:?}"
+        );
+        let admitted = allocated
+            .admit_packages(Cursor::new(compact), Cursor::new(near))
+            .expect("admit exact selected packages");
+        assert_eq!(
+            admitted.receipt().selection_id(),
+            allocated.receipt().selection_id()
+        );
+        assert_ne!(
+            admitted.receipt().compact().package_id(),
+            admitted.receipt().near_lossless().package_id()
+        );
+        assert_eq!(
+            admitted
+                .receipt()
+                .compact()
+                .runtime_ledger()
+                .present_planes(),
+            2
+        );
+        assert_eq!(
+            admitted
+                .receipt()
+                .near_lossless()
+                .runtime_ledger()
+                .present_planes(),
+            3
+        );
+        let child_specs = vec![
+            fixture_scale_only_master(&parent_masters[0], "language.weight", [21; 32], 0, [51; 32]),
+            fixture_scale_only_master(&parent_masters[1], "mtp.weight", [22; 32], 1, [52; 32]),
+        ];
+        let refinement = admitted
+            .open_scale_only_campaign(child_specs)
+            .expect("open package-admitted scale-only campaign");
+        assert_eq!(
+            refinement.package_admission_id(),
+            admitted.receipt().admission_id()
+        );
+        assert_ne!(refinement.campaign_id(), parent.campaign_id());
+        drop(refinement);
+        admitted.verify_current().expect("reverify admission");
+        let admission_receipt = admitted.receipt().clone();
+        drop(admitted);
+        drop(allocated);
+
+        let allocated = parent
+            .reopen_selected_allocation()
+            .expect("reopen selection without scavenging package records");
+        let admitted = allocated
+            .reopen_package_admission()
+            .expect("reopen exact package admission");
+        assert_eq!(admitted.receipt(), &admission_receipt);
+
+        let selection_store = TensorWorkStore::open(&parent.root().join("selected-allocation"))
+            .expect("open selected allocation CAS");
+        fs::write(
+            selection_store.record_path(admission_receipt.compact().record().record_id()),
+            b"changed package record",
+        )
+        .expect("tamper admitted package record");
+        assert!(admitted.verify_current().is_err());
+
+        drop(admitted);
+        drop(allocated);
         drop(parent);
         drop(base);
         let _ = fs::remove_dir_all(root);

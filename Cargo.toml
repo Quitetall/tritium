@@ -19,6 +19,7 @@ members = [
     "crates/tritium-metal",    # MSL mpGEMM over Apple Metal (macOS-gated; empty lib off macOS)
     "crates/tritium-rocm",     # AMD ROCm/HIP host (raw FFI) + add-only .hip kernel (rocm-feature-gated)
     "crates/tritium-wgpu",     # WGSL mpGEMM over wgpu (Vulkan)
+    "crates/tritium-mcu",      # no_std fixed-arena ternary-codec executor for Cortex-M (ADR 0030)
     # L2 runtime + functional
     # "crates/tritium-runtime",  # registry, dispatch, mem pools, autotune cache
     "crates/tritium-quantize", # SALT: fp -> ternary plane stacks (ADR 0001/0006)

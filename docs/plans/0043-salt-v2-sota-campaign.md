@@ -1,7 +1,8 @@
 # 0043 — SALT V2 implementation and SOTA campaign
 
-Status: **IN PROGRESS** (Qwen family/MTP fixture gate implemented 2026-07-17;
-checkpoint-scale and empirical campaign gates remain open)
+Status: **IN PROGRESS** (Qwen family/MTP fixture and selected-package structural
+admission implemented through 2026-07-19; checkpoint-scale and empirical
+campaign gates remain open)
 
 - **Decision:** [ADR 0028](../adr/0028-salt-v2-additive-ternarization.md)
 - **Research cutoff:** 2026-07-14, inclusive
@@ -821,12 +822,27 @@ The following work deliberately remains open and keeps this plan in progress:
   the typed refined capability. Ordinary PTQ lifecycle scans skip the new fixed
   projection and its additional trit hashing, preserving their existing bytes
   and identities.
-  This is only **master-layer structural admission**: the parent completion has no
-  selected Compact/NearLossless allocation map, so fixed selected allocation and
-  refined package admission remain unproved and fail closed. PV/KL children also
-  remain rejected. The production fitter/refinement driver must still stream real
-  checkpoint output into the store and the package layer must bind the selected
-  allocation before Stage 5 can advance. CAS installation otherwise stages one
+  The sealed parent can now bind one immutable Compact/NearLossless allocation
+  pair. Both two-bit maps are streamed through bounded temporary storage into CAS;
+  the receipt binds the parent completion, allocation policy, map/loss identities,
+  selected-plane totals, and nesting. Strict reopen replays every verified map
+  count against every canonical parent master and rederives all identities. A
+  second typed capability now admits the exact Compact and NearLossless SALT V2
+  packages. It requires exact codec, tensor order, names, shapes, tile geometry,
+  selected plane counts, parent-prefix semantic tensor identities, serialized
+  ledger, indexed-runtime ledger, and both byte ceilings. Exact package bytes are
+  retained as CAS records; the small admission manifest is published last and
+  binds both package IDs and both selected map/loss identities. Reopen restages
+  the records with bounded memory, reparses the complete packages, repeats parent
+  and selection validation, and performs terminal package mutation checks. Only
+  this package-admitted capability exposes the v2 scale-only opener; its campaign
+  catalog binds the admission ID, selection ID, and both package IDs, and its
+  install/progress/seal paths revalidate admission around child work.
+  This remains **structural fixture evidence**, not checkpoint-scale or quality
+  evidence. PV/KL execution over real tensors remains unimplemented. The
+  production fitter/refinement driver must still stream real checkpoint output
+  into these stores and produce a measured flagship receipt before Stage 5 can
+  advance. CAS master installation otherwise stages one
   exact record, fuses generic byte validation with canonical SALT semantic decoding
   through the retained file handle, requires decoder completion before
   sync/publication, and returns both generic and semantic receipts without an

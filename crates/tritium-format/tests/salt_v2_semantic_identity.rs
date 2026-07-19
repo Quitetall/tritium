@@ -3,8 +3,8 @@ use std::io::Cursor;
 use half::f16;
 use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
-    SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile, SaltV2Transform,
-    write_salt_v2_package,
+    SaltV2Package, SaltV2PackageError, SaltV2PackageReader, SaltV2Plane,
+    SaltV2SemanticTensorStream, SaltV2Tensor, SaltV2Tile, SaltV2Transform, write_salt_v2_package,
 };
 
 fn plane(len: usize, phase: usize, scale_bits: u16) -> SaltV2Plane {
@@ -64,6 +64,75 @@ fn eager_and_seek_semantics_are_codec_independent() {
         assert_eq!(actual, expected, "codec {codec:?}");
         assert_eq!(*actual.content_digest(), golden_v1, "codec {codec:?}");
     }
+}
+
+#[test]
+fn checked_stream_matches_owned_and_seek_semantics_without_tensor_materialization() {
+    let transform = SaltV2Transform::SignedRht {
+        seed: 0x1234_5678_9abc_def0,
+        domain: 0x5341_4c54_5f52_4854,
+    };
+    let tensor = semantic_tensor("layer.weight", transform);
+    let mut stream =
+        SaltV2SemanticTensorStream::new(tensor.name(), tensor.dims().to_vec(), transform).unwrap();
+    for tile in tensor.tiles() {
+        stream.push_tile(tile.planes()).unwrap();
+    }
+
+    let streamed = stream.finish().unwrap();
+    assert_eq!(streamed, tensor.semantic_tensor());
+    for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+        let package = SaltV2Package::new(codec, vec![tensor.clone()]).unwrap();
+        assert_eq!(streamed, seek_identity(&package, tensor.name()));
+    }
+}
+
+#[test]
+fn checked_stream_rejects_incomplete_extra_and_misshaped_tiles() {
+    let tensor = semantic_tensor("layer.weight", SaltV2Transform::None);
+    let stream = SaltV2SemanticTensorStream::new(
+        tensor.name(),
+        tensor.dims().to_vec(),
+        SaltV2Transform::None,
+    )
+    .unwrap();
+    assert_eq!(
+        stream.finish(),
+        Err(SaltV2PackageError::WrongTileCount {
+            expected: 2,
+            got: 0,
+        })
+    );
+
+    let mut stream = SaltV2SemanticTensorStream::new(
+        tensor.name(),
+        tensor.dims().to_vec(),
+        SaltV2Transform::None,
+    )
+    .unwrap();
+    assert_eq!(
+        stream.push_tile(&[]),
+        Err(SaltV2PackageError::InvalidPlaneCount { got: 0 })
+    );
+    let short = plane(4, 0, 0x3800);
+    assert_eq!(
+        stream.push_tile(&[short]),
+        Err(SaltV2PackageError::WrongTileLength {
+            tile_index: 0,
+            expected: 256,
+            got: 4,
+        })
+    );
+    for tile in tensor.tiles() {
+        stream.push_tile(tile.planes()).unwrap();
+    }
+    assert_eq!(
+        stream.push_tile(tensor.tiles()[1].planes()),
+        Err(SaltV2PackageError::WrongTileCount {
+            expected: 2,
+            got: 3,
+        })
+    );
 }
 
 #[test]

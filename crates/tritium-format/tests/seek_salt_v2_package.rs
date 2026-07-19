@@ -182,6 +182,10 @@ fn strict_seek_reader_visits_canonical_planes_in_arbitrary_tensor_order() {
     assert_eq!(reader.codec(), SaltV2Codec::D2);
     assert_eq!(reader.package_id(), expected_package_id);
     assert_eq!(reader.ledger(), encoded.ledger);
+    assert_eq!(
+        reader.indexed_runtime_ledger().unwrap(),
+        SaltV2IndexedRuntimeLedger::for_package(&eager.package).unwrap()
+    );
     assert_eq!(reader.tensor_names().collect::<Vec<_>>(), ["a", "z"]);
     assert_eq!(
         reader.tensor_names_encoded_order().collect::<Vec<_>>(),

@@ -1,0 +1,25 @@
+[package]
+name = "tritium-mcu"
+description = "no_std fixed-arena executor for the ternary codec on a $2 MCU (Cortex-M55/M33), backed by the bit-exact tritium-core reference ops (ADR 0030)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# The no_std numeric oracle (reference_mpgemm/conv1d/fsq). Declared by path (not the workspace
+# inheritance) so `default-features = false` sticks — this crate, and any firmware linking it, stays
+# no_std with no `alloc`; the reference ops write into caller-provided buffers.
+tritium-core = { path = "../tritium-core", version = "1.0.0", default-features = false }
+
+[dev-dependencies]
+# Host-side conformance: drive the codec vectors through the arena executor and grade bit-exact.
+# (Pulls in tritium-core with std for the test build via feature unification.)
+tritium-testkit = { workspace = true }
+
+[lints]
+workspace = true

@@ -228,6 +228,7 @@ pub enum SaltV2Transform {
 /// coefficient and tile counts, then each tile's index, length, and plane count.
 /// Each ordered plane contributes its index, trit count, trits encoded as
 /// `-1 => 0`, `0 => 1`, `+1 => 2`, scale count, and exact f16 scale bits.
+#[derive(Debug)]
 struct SaltV2SemanticTensorHasher {
     inner: SemanticTensorHasher,
 }
@@ -317,6 +318,123 @@ impl SaltV2SemanticTensorHasher {
 
     fn finalize_content_digest(self) -> [u8; 32] {
         self.inner.finalize_content_digest()
+    }
+}
+
+/// Checked incremental builder for one codec-independent SALT V2 tensor identity.
+///
+/// This is the bounded-memory counterpart of [`SaltV2Tensor::semantic_tensor`].
+/// Callers provide one complete allocation tile at a time; each tile contains at
+/// most three 256-coefficient planes, so no whole-tensor ternary buffer is needed.
+/// The stream validates tensor geometry, tile order, selected prefix width, and
+/// plane lengths before adding each tile to the canonical semantic hash.
+#[derive(Debug)]
+pub struct SaltV2SemanticTensorStream {
+    hasher: SaltV2SemanticTensorHasher,
+    logical_coefficients: usize,
+    expected_tiles: usize,
+    next_tile: usize,
+}
+
+impl SaltV2SemanticTensorStream {
+    /// Start a checked semantic stream for one named tensor.
+    ///
+    /// # Errors
+    /// Rejects an empty or oversized name, an invalid shape, or geometry that
+    /// cannot be represented on this host.
+    pub fn new(
+        name: impl Into<String>,
+        dims: Vec<u64>,
+        transform: SaltV2Transform,
+    ) -> Result<Self, SaltV2PackageError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(SaltV2PackageError::EmptyTensorName);
+        }
+        if name.len() > u32::MAX as usize {
+            return Err(SaltV2PackageError::TensorNameTooLong { got: name.len() });
+        }
+        if dims.is_empty() {
+            return Err(SaltV2PackageError::EmptyDimensions);
+        }
+        if dims.len() > u32::MAX as usize {
+            return Err(SaltV2PackageError::TooManyDimensions { got: dims.len() });
+        }
+        let logical_u64 = checked_dimension_product(&dims)?;
+        let logical_coefficients = usize::try_from(logical_u64)
+            .map_err(|_| SaltV2PackageError::DimensionProductTooLarge(logical_u64))?;
+        let expected_tiles = logical_coefficients.div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
+        u64::try_from(expected_tiles).map_err(|_| SaltV2PackageError::LengthOverflow)?;
+        let hasher = SaltV2SemanticTensorHasher::new(
+            &name,
+            &dims,
+            logical_coefficients,
+            transform,
+            expected_tiles,
+        );
+        Ok(Self {
+            hasher,
+            logical_coefficients,
+            expected_tiles,
+            next_tile: 0,
+        })
+    }
+
+    /// Add the next tile's nonempty, dense plane prefix.
+    ///
+    /// # Errors
+    /// Rejects too many tiles, a plane count outside one through three, or a
+    /// plane whose logical length differs from the shape-derived tile length.
+    pub fn push_tile(&mut self, planes: &[SaltV2Plane]) -> Result<(), SaltV2PackageError> {
+        if !(1..=SALT_V2_MAX_PLANES).contains(&planes.len()) {
+            return Err(SaltV2PackageError::InvalidPlaneCount { got: planes.len() });
+        }
+        if self.next_tile >= self.expected_tiles {
+            return Err(SaltV2PackageError::WrongTileCount {
+                expected: self.expected_tiles,
+                got: self
+                    .next_tile
+                    .checked_add(1)
+                    .ok_or(SaltV2PackageError::LengthOverflow)?,
+            });
+        }
+        let consumed = self
+            .next_tile
+            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+            .ok_or(SaltV2PackageError::LengthOverflow)?;
+        let expected_len = (self.logical_coefficients - consumed).min(SALT_V2_ALLOCATION_TILE_SIZE);
+        for plane in planes {
+            if plane.trits.len() != expected_len {
+                return Err(SaltV2PackageError::WrongTileLength {
+                    tile_index: self.next_tile,
+                    expected: expected_len,
+                    got: plane.trits.len(),
+                });
+            }
+        }
+
+        self.hasher
+            .update_tile(self.next_tile, expected_len, planes.len());
+        for (plane_index, plane) in planes.iter().enumerate() {
+            self.hasher
+                .update_plane(plane_index, &plane.trits, &plane.scales);
+        }
+        self.next_tile += 1;
+        Ok(())
+    }
+
+    /// Finish the exact semantic tensor identity.
+    ///
+    /// # Errors
+    /// Rejects a stream that did not supply every shape-derived tile.
+    pub fn finish(self) -> Result<SemanticTensor, SaltV2PackageError> {
+        if self.next_tile != self.expected_tiles {
+            return Err(SaltV2PackageError::WrongTileCount {
+                expected: self.expected_tiles,
+                got: self.next_tile,
+            });
+        }
+        Ok(self.hasher.finalize())
     }
 }
 

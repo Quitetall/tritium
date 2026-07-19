@@ -9,6 +9,8 @@ mod additive_master;
 pub use additive_master::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
     Qwen36AdditiveMasterReceipt, Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt,
+    Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
+    Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
     Qwen36ScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
     Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
