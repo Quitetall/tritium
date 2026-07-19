@@ -157,6 +157,75 @@ impl Optimizer for AdamW {
     }
 }
 
+/// Cautious AdamW (Liang et al. 2024, "Cautious Optimizers"): AdamW whose adaptive update is applied
+/// **only where it agrees with the current gradient sign**, rescaled by `n/(aligned+1)` so the average
+/// step magnitude is preserved; the decoupled weight decay is unchanged. Elements where the momentum-
+/// driven update opposes the gradient are held (they still get the WD shrink). Exposed as a distinct
+/// type wrapping [`AdamW`] — same [`AdamState`] and serialization — so **no existing AdamW call site
+/// changes** (ADR 0030 Tier 1: an optimizer hook LamQuant can toggle; STE stays optimizer-agnostic).
+///
+/// Serial by construction: the alignment count is a per-parameter reduction. It is opt-in, so the
+/// standard [`AdamW`] hot path (and its parallelism) is untouched.
+#[derive(Clone, Copy, Debug)]
+pub struct CautiousAdamW(pub AdamW);
+
+impl CautiousAdamW {
+    /// Cautious AdamW at learning rate `lr` with `torch.optim.AdamW` defaults.
+    #[must_use]
+    pub fn new(lr: f32) -> Self {
+        Self(AdamW::new(lr))
+    }
+}
+
+impl Optimizer for CautiousAdamW {
+    type State = AdamState;
+
+    fn init_state(&self, len: usize) -> AdamState {
+        self.0.init_state(len)
+    }
+
+    fn step(&self, t: u64, param: &mut [f32], grad: &[f32], state: &mut AdamState) {
+        debug_assert!(t >= 1, "step index t is 1-based");
+        assert_eq!(param.len(), grad.len(), "param/grad length mismatch");
+        assert_eq!(param.len(), state.m.len(), "param/state m length mismatch");
+        assert_eq!(param.len(), state.v.len(), "param/state v length mismatch");
+        let a = &self.0;
+        let exp = i32::try_from(t).unwrap_or(i32::MAX);
+        let bc1 = 1.0 - a.beta1.powi(exp);
+        let bc2 = 1.0 - a.beta2.powi(exp);
+        let shrink = 1.0 - a.lr * a.weight_decay;
+        let n = param.len();
+        // Pass 1: update the moments, form the masked adaptive update, count aligned elements.
+        let mut upd = vec![0.0f32; n];
+        let mut aligned = 0usize;
+        for i in 0..n {
+            let g = grad[i];
+            let mi = a.beta1 * state.m[i] + (1.0 - a.beta1) * g;
+            let vi = a.beta2 * state.v[i] + (1.0 - a.beta2) * g * g;
+            state.m[i] = mi;
+            state.v[i] = vi;
+            let u = (mi / bc1) / ((vi / bc2).sqrt() + a.eps);
+            if u * g > 0.0 {
+                upd[i] = u;
+                aligned += 1;
+            }
+        }
+        // Pass 2: rescale to preserve the step magnitude, apply decoupled WD to every element.
+        let rescale = n as f32 / (aligned as f32 + 1.0);
+        for i in 0..n {
+            param[i] = param[i] * shrink - a.lr * upd[i] * rescale;
+        }
+    }
+
+    fn write_state(&self, state: &AdamState, out: &mut Vec<u8>) {
+        self.0.write_state(state, out);
+    }
+
+    fn read_state(&self, len: usize, cursor: &mut Cursor) -> Result<AdamState, CheckpointError> {
+        self.0.read_state(len, cursor)
+    }
+}
+
 /// Newton–Schulz quintic orthogonalization (Muon): drives the singular values of a `[rows, cols]`
 /// matrix toward 1 (returns `≈ U·Vᵀ`), using ONLY matmuls — no SVD — so it runs on the same device
 /// as training. The iteration operates on the smaller Gram matrix (transpose if `rows > cols`), so
@@ -372,6 +441,67 @@ mod muon_tests {
         assert!(
             l1 < 0.05 * l0,
             "Muon must reduce the quadratic: {l0} → {l1}"
+        );
+    }
+
+    #[test]
+    fn cautious_holds_updates_that_oppose_the_gradient() {
+        // wd=0 so a masked element does not move at all. Momentum opposes the gradient on elems 0 & 2.
+        let no_wd = AdamW {
+            lr: 0.1,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        };
+        let grad = vec![-1.0f32, 1.0, 1.0, -1.0];
+        let m0 = vec![3.0f32, 3.0, -3.0, -3.0];
+
+        let opt = CautiousAdamW(no_wd);
+        let mut p = vec![1.0f32; 4];
+        let mut st = AdamState {
+            m: m0.clone(),
+            v: vec![0.04; 4],
+        };
+        opt.step(1, &mut p, &grad, &mut st);
+        assert_eq!(p[0], 1.0, "elem 0 opposes the grad → held");
+        assert_eq!(p[2], 1.0, "elem 2 opposes the grad → held");
+        assert!(p[1] < 1.0, "elem 1 aligned (grad>0) → decreases: {}", p[1]);
+        assert!(p[3] > 1.0, "elem 3 aligned (grad<0) → increases: {}", p[3]);
+
+        // Standard AdamW moves the opposing element instead of holding it.
+        let mut p2 = vec![1.0f32; 4];
+        let mut st2 = AdamState {
+            m: m0,
+            v: vec![0.04; 4],
+        };
+        no_wd.step(1, &mut p2, &grad, &mut st2);
+        assert!((p2[0] - 1.0).abs() > 1e-6, "standard AdamW moves elem 0");
+    }
+
+    #[test]
+    fn cautious_minimizes_a_quadratic() {
+        // On a clean descent the update aligns with the gradient, so Cautious still converges.
+        let n = 64usize;
+        let target = seeded(5, n);
+        let mut w = seeded(77, n);
+        let opt = CautiousAdamW::new(0.05);
+        let mut st = opt.init_state(n);
+        let loss = |w: &[f32]| {
+            w.iter()
+                .zip(&target)
+                .map(|(&a, &b)| (a - b) * (a - b))
+                .sum::<f32>()
+        };
+        let l0 = loss(&w);
+        for t in 1..=300u64 {
+            let grad: Vec<f32> = w.iter().zip(&target).map(|(&a, &b)| a - b).collect();
+            opt.step(t, &mut w, &grad, &mut st);
+        }
+        let l1 = loss(&w);
+        assert!(
+            l1 < 0.05 * l0,
+            "Cautious AdamW must reduce the quadratic: {l0} → {l1}"
         );
     }
 }

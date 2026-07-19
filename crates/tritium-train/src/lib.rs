@@ -39,7 +39,7 @@ pub use gemm::TrainGemm;
 pub use grow::{GrowError, Net2WiderPlan, QualityBytesPoint, QualityBytesReport};
 pub use lora::Lora;
 pub use lr::LrSchedule;
-pub use optim::{AdamState, AdamW, Muon, MuonState, Optimizer, newton_schulz};
+pub use optim::{AdamState, AdamW, CautiousAdamW, Muon, MuonState, Optimizer, newton_schulz};
 pub use salt_v2_recovery::{
     BypassSchedule, BypassUsageFlag, EarlyStopDecision, EarlyStopGate, EarlyStopPoint,
     FinalRecoveryMetrics, HiddenCosineTerm, LossMode, PlateauConfig, PromotionCheckpoint,
