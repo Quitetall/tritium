@@ -11,6 +11,7 @@
 //! (AdamW), the bit-exact training [`checkpoint`], and [`lora`] adapters on a frozen base.
 #![forbid(unsafe_code)]
 
+pub mod bf16;
 pub mod checkpoint;
 pub mod data;
 pub mod dcp;
