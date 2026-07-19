@@ -118,4 +118,10 @@ the Step-1 recovery-vs-tokens curve runs next on the f32 path.
 - **tf32 recovery A/B — DONE (2026-07-19):** `salt_distillation_device_trainer_recovers_heldout`,
   40 steps. f32 = **960×** (gate ✅), tf32 = **920×** (below the 950× gate). tf32 does *not* preserve
   recovery at this scale; the numbers land in the honest-findings note above.
-- Step 1: recovery-vs-tokens curve on a real corpus (f32 path); report the plateau (or fp-approach) point.
+- **Step 1 — recovery-vs-tokens curve, first run DONE (2026-07-19, f32).** `TRITIUM_DISTILL_CURVE=48`,
+  768 steps (3 epochs over the committed 8k-token Alice corpus), held-out (disjoint) ppl vs fp 19.73:
+  2205 → 729 → 439 → 419 → **298** (tokens 1.5k → 7.7k → 15k → 21.5k → 24.6k); recovery-vs-PTQ
+  963× → 7124×. **Monotone descent, still dropping steeply at the tail (404→298 over the last 48
+  steps) — not converged; the 8k-token corpus is the ceiling.** The falling held-out curve is genuine
+  generalization (eval is disjoint from train). A longer run traces the held-out plateau; a bigger
+  corpus is needed for an fp-competitive, paper-grade generalization number.
