@@ -256,3 +256,37 @@ pub(crate) fn ste_quantize_vjp(
         .next()
         .expect("quantize_vjp returns [gWf, gs]"))
 }
+
+/// LSQ forward: `q = round(clamp(Wf/α, -1, 1))·α` with a **learned** per-row step size `alpha:[rows]`.
+#[pyfunction]
+pub(crate) fn lsq_forward(
+    wf: Vec<f32>,
+    alpha: Vec<f32>,
+    rows: usize,
+    cols: usize,
+) -> PyResult<Vec<f32>> {
+    if wf.len() != rows * cols || alpha.len() != rows {
+        return Err(PyValueError::new_err(
+            "shape mismatch (wf=rows*cols, alpha=rows)",
+        ));
+    }
+    Ok(ste::lsq_forward(&wf, &alpha, rows, cols))
+}
+
+/// LSQ backward: returns `(gWf, gAlpha)` — the STE weight gradient and the LSQ step-size estimator.
+#[pyfunction]
+pub(crate) fn lsq_vjp(
+    wf: Vec<f32>,
+    alpha: Vec<f32>,
+    rows: usize,
+    cols: usize,
+    grad_out: Vec<f32>,
+) -> PyResult<(Vec<f32>, Vec<f32>)> {
+    if wf.len() != rows * cols || alpha.len() != rows || grad_out.len() != rows * cols {
+        return Err(PyValueError::new_err("shape mismatch"));
+    }
+    let mut g = ste::lsq_vjp(&wf, &alpha, rows, cols, &grad_out);
+    let g_alpha = g.pop().expect("lsq_vjp returns [gWf, gAlpha]");
+    let g_wf = g.pop().expect("lsq_vjp returns [gWf, gAlpha]");
+    Ok((g_wf, g_alpha))
+}

@@ -256,6 +256,8 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::ste_absmean_scale, m)?)?;
     m.add_function(wrap_pyfunction!(ops::ste_quantize_forward, m)?)?;
     m.add_function(wrap_pyfunction!(ops::ste_quantize_vjp, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::lsq_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::lsq_vjp, m)?)?;
     m.add(
         "__doc__",
         "Tritium: ternary-model inference + autograd ops from Python.",

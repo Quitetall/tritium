@@ -21,6 +21,8 @@ from ._tritium import (
     conv1d_vjp,
     fsq_forward,
     fsq_vjp,
+    lsq_forward,
+    lsq_vjp,
     ste_absmean_scale,
     ste_quantize_forward,
     ste_quantize_vjp,
@@ -79,6 +81,26 @@ class _TernarizeSTE(torch.autograd.Function):
         rows, cols = ctx.shape
         gwf = ste_quantize_vjp(_flat(wf), _flat(s_q), rows, cols, _flat(grad_out))
         return _to(gwf, wf.shape, wf), None, None, None
+
+
+class _LSQTernarizeFn(torch.autograd.Function):
+    """Latent weight ``wf`` → ternary reconstruction ``round(clamp(wf/α))·α`` with a **learned** per-row
+    step size ``alpha``. Backward routes the STE weight grad to ``wf`` and the LSQ step-size gradient to
+    ``alpha`` (both train)."""
+
+    @staticmethod
+    def forward(ctx, wf, alpha, rows, cols):
+        ctx.save_for_backward(wf, alpha)
+        ctx.shape = (rows, cols)
+        q = lsq_forward(_flat(wf), _flat(alpha), rows, cols)
+        return _to(q, wf.shape, wf)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        wf, alpha = ctx.saved_tensors
+        rows, cols = ctx.shape
+        gwf, ga = lsq_vjp(_flat(wf), _flat(alpha), rows, cols, _flat(grad_out))
+        return _to(gwf, wf.shape, wf), _to(ga, alpha.shape, alpha), None, None
 
 
 class _FSQFn(torch.autograd.Function):
@@ -162,6 +184,70 @@ class TernaryConv1d(nn.Module):
             self.groups,
         )
         y = ternary_conv1d(x, self.weight, cfg)
+        if self.bias is not None:
+            y = y + self.bias.view(1, -1, 1)
+        return y
+
+
+class LearnedTernaryConv1d(nn.Module):
+    """Ternary Conv1d with an **LSQ learned** per-output-channel step size ``alpha`` instead of the fixed
+    AbsMean scale (ADR 0030 Tier 1). ``alpha`` is a trained parameter, initialized to the AbsMean of the
+    initial weight; both the latent weight and ``alpha`` receive gradients. Same constructor as
+    :class:`TernaryConv1d`."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding=0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if in_channels % groups or out_channels % groups:
+            raise ValueError("in_channels and out_channels must be divisible by groups")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.dilation = dilation
+        self.groups = groups
+        if isinstance(padding, (tuple, list)):
+            self.pad_left, self.pad_right = int(padding[0]), int(padding[1])
+        else:
+            self.pad_left = self.pad_right = int(padding)
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kernel_size))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        k_g = (in_channels // groups) * kernel_size
+        with torch.no_grad():
+            wf = self.weight.reshape(out_channels, k_g)
+            init_alpha = ste_absmean_scale(_flat(wf), out_channels, k_g)
+        self.alpha = nn.Parameter(torch.tensor(init_alpha, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, c_in, l_in = x.shape
+        c_out = self.out_channels
+        k_g = (self.in_channels // self.groups) * self.kernel_size
+        cfg = (
+            batch,
+            self.in_channels,
+            c_out,
+            l_in,
+            self.kernel_size,
+            self.stride,
+            self.dilation,
+            self.pad_left,
+            self.pad_right,
+            self.groups,
+        )
+        wf = self.weight.reshape(c_out, k_g)
+        w_ternary = _LSQTernarizeFn.apply(wf, self.alpha, c_out, k_g)  # round(clamp(wf/α))·α
+        ones = torch.ones(c_out, dtype=torch.float32, device=x.device)
+        y = _Conv1dFn.apply(x, w_ternary, ones, cfg)  # α already folded into the weight ⇒ scale = 1
         if self.bias is not None:
             y = y + self.bias.view(1, -1, 1)
         return y

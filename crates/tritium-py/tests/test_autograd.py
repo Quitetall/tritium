@@ -10,7 +10,12 @@ import pytest
 torch = pytest.importorskip("torch")
 import torch.nn.functional as F  # noqa: E402
 
-from tritium.autograd import FSQ, TernaryConv1d, _Conv1dFn  # noqa: E402
+from tritium.autograd import (  # noqa: E402
+    FSQ,
+    LearnedTernaryConv1d,
+    TernaryConv1d,
+    _Conv1dFn,
+)
 
 
 @pytest.mark.parametrize(
@@ -87,6 +92,41 @@ def test_ternary_conv1d_module_trains():
     y.pow(2).mean().backward()
     assert m.weight.grad is not None and m.weight.grad.abs().sum() > 0
     assert x.grad is not None and x.grad.abs().sum() > 0
+
+
+def test_learned_ternary_conv1d_trains_alpha_and_weight():
+    torch.manual_seed(4)
+    m = LearnedTernaryConv1d(4, 6, 3, padding=1)
+    x = torch.randn(2, 4, 10)
+    y = m(x)
+    assert y.shape == (2, 6, 10)
+    y.pow(2).mean().backward()
+    assert m.weight.grad is not None and m.weight.grad.abs().sum() > 0
+    assert m.alpha.grad is not None and m.alpha.grad.abs().sum() > 0, "LSQ alpha must receive gradient"
+
+
+def test_joint_ternary_conv_and_fsq_reduces_loss():
+    # A tiny encoder: TernaryConv1d -> FSQ latent, fit a target. Gradients flow through both the
+    # activation-FSQ STE and the weight-ternary STE, so training reduces the reconstruction loss.
+    torch.manual_seed(5)
+    conv = TernaryConv1d(2, 4, 3, padding=1)
+    fsq = FSQ(levels=[16, 16, 16, 16], bound="tanh", ste="hard")
+    x = torch.randn(1, 2, 16)
+    target = torch.rand(4, 16) * 1.6 - 0.8  # within the FSQ range
+    opt = torch.optim.SGD(conv.parameters(), lr=0.1)
+
+    def loss_fn():
+        z = conv(x)[0]  # [4, 16]
+        return (fsq(z) - target).pow(2).mean()
+
+    l0 = loss_fn().item()
+    for _ in range(40):
+        opt.zero_grad()
+        loss = loss_fn()
+        loss.backward()
+        opt.step()
+    l1 = loss_fn().item()
+    assert l1 < l0, f"joint conv+FSQ training must reduce loss: {l0} -> {l1}"
 
 
 def test_ternary_conv1d_weights_are_effectively_ternary():
