@@ -417,6 +417,7 @@ impl RunnerGenerator {
 /// affects outputs — the accept rule is lossless for any k (greedy: verify
 /// recomputes the argmax chain; sampled: the residual-distribution rule) —
 /// so this is purely a cost policy with no numerics gate.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 enum DraftPolicy {
     /// Acceptance-adaptive (the default; see the doc above).
     Adaptive {
@@ -429,6 +430,7 @@ enum DraftPolicy {
     Legacy { len: usize },
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl DraftPolicy {
     /// Per-token EWMA decay — ~20-token memory (a few verify cycles), fast
     /// enough to track topic shifts inside one request.
@@ -450,7 +452,10 @@ impl DraftPolicy {
     /// selects the old fixed rule (loud-reject on anything else).
     fn from_env() -> Result<Self, GenError> {
         match std::env::var("TRITIUM_DRAFT_K") {
-            Err(_) => Ok(Self::Adaptive { acc: 0.75 }),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Adaptive { acc: 0.75 }),
+            Err(std::env::VarError::NotUnicode(v)) => Err(GenError::Backend(format!(
+                "TRITIUM_DRAFT_K={v:?} — use adaptive (default) or legacy"
+            ))),
             Ok(v) if v == "adaptive" => Ok(Self::Adaptive { acc: 0.75 }),
             Ok(v) if v == "legacy" => Ok(Self::Legacy {
                 len: Self::LEGACY_MIN,
@@ -719,8 +724,10 @@ impl RunnerGenerator {
             SPEC_COMMITTED.fetch_add(committed.len() as u64, Ordering::Relaxed);
             t_verify += t0.elapsed();
             // committed = accepted drafts + the final token, so accepted
-            // drafts = committed.len() - 1; offered = drafts.len().
-            policy.update(drafts.len(), committed.len() - 1);
+            // drafts = committed.len() - 1 (saturating: an empty `committed`
+            // violates tree_verify_greedy's contract and is caught below, but
+            // a wrapped usize here would spin the EWMA fold first).
+            policy.update(drafts.len(), committed.len().saturating_sub(1));
             // committed[..L-1] extend history as fully-processed tokens; the
             // last committed becomes the new pending (top of the next loop
             // emits it and pushes it into history).
