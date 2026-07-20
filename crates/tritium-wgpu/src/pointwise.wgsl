@@ -155,6 +155,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             result[index] = params.scalar * 2.0 * (left[index] - right[index])
                 / f32(params.len);
         }
+        case 18u: { result[index] = left[index] + right[index % params.auxiliary]; }
+        case 19u: { result[index] = extra[index]; }
+        case 20u: {
+            if (index >= params.auxiliary) { return; }
+            let rows = params.len / params.auxiliary;
+            var gradient = 0.0;
+            for (var row = 0u; row < rows; row = row + 1u) {
+                gradient = gradient + extra[row * params.auxiliary + index];
+            }
+            result[index] = gradient;
+        }
         default: { result[index] = 0.0; }
     }
 }

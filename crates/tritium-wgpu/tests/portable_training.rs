@@ -18,12 +18,13 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 35);
+    assert_eq!(report.passed.len(), 37);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
             "graph.detach",
             "graph.scale_const",
+            "graph.bias",
             "graph.add",
             "graph.mul",
             "graph.relu2",

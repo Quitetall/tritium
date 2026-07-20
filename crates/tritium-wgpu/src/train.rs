@@ -12,6 +12,7 @@ use crate::WgpuBackend;
 const OPERATIONS: &[&str] = &[
     "graph.detach",
     "graph.scale_const",
+    "graph.bias",
     "graph.add",
     "graph.mul",
     "graph.relu2",
@@ -394,6 +395,77 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_bias(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) = match request.execution {
+            TrainExecutionV1::Forward => (&["x", "bias"], &["result"]),
+            TrainExecutionV1::Vjp => (&["x", "bias", "grad_output"], &["grad_x", "grad_bias"]),
+            _ => return Err(invariant("bias received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        if rows == 0 || cols == 0 || rows > u32::MAX as u64 || cols > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let matrix_shape = [rows, cols];
+        let bias_shape = [cols];
+        let (x_shape, x) = input_f32(request, "x")?;
+        let (actual_bias_shape, bias) = input_f32(request, "bias")?;
+        if x_shape != matrix_shape || actual_bias_shape != bias_shape {
+            return Err(shape_error());
+        }
+        require_finite("x", x)?;
+        require_finite("bias", bias)?;
+        let gradient = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != matrix_shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            x
+        };
+        if request.execution == TrainExecutionV1::Forward {
+            let result = self
+                .backend
+                .pointwise(x, bias, gradient, 18, 0.0, cols as u32)
+                .map_err(wgpu_error)?;
+            output_f32(output, "result", &matrix_shape, x.len())?.copy_from_slice(&result);
+        } else {
+            let grad_x = self
+                .backend
+                .pointwise(x, bias, gradient, 19, 0.0, cols as u32)
+                .map_err(wgpu_error)?;
+            let grad_bias_full = self
+                .backend
+                .pointwise(x, bias, gradient, 20, 0.0, cols as u32)
+                .map_err(wgpu_error)?;
+            output_f32(output, "grad_x", &matrix_shape, x.len())?.copy_from_slice(&grad_x);
+            output_f32(output, "grad_bias", &bias_shape, bias.len())?
+                .copy_from_slice(&grad_bias_full[..bias.len()]);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -432,6 +504,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "loss.mse" {
             self.execute_mse(&request, output)?;
+            0
+        } else if request.operation == "graph.bias" {
+            self.execute_bias(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
