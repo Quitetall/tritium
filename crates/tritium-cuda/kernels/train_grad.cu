@@ -1236,6 +1236,45 @@ extern "C" __global__ void relu2_backward(
     if (i < n) { float v = x[i]; gx[i] = v > 0.0f ? gy[i] * (2.0f * v) : 0.0f; }
 }
 
+extern "C" __global__ void mse_forward(
+    const float* __restrict__ prediction, const float* __restrict__ target,
+    float* __restrict__ loss, long n)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    float sum = 0.0f;
+    for (long i = 0; i < n; ++i) { float d = prediction[i] - target[i]; sum += d * d; }
+    loss[0] = sum / (float)n;
+}
+
+extern "C" __global__ void mse_backward(
+    const float* __restrict__ prediction, const float* __restrict__ target,
+    const float* __restrict__ upstream, float* __restrict__ gradient, long n)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) gradient[i] = upstream[0] * 2.0f * (prediction[i] - target[i]) / (float)n;
+}
+
+extern "C" __global__ void softmax_xent_forward(
+    const float* __restrict__ logits, const float* __restrict__ target,
+    float* __restrict__ loss, int rows, int cols)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    float total = 0.0f;
+    for (int row = 0; row < rows; ++row) {
+        const float* lr = logits + (long)row * cols;
+        const float* tr = target + (long)row * cols;
+        float maximum = -INFINITY;
+        for (int col = 0; col < cols; ++col) maximum = fmaxf(maximum, lr[col]);
+        float sum = 0.0f;
+        for (int col = 0; col < cols; ++col) sum += expf(lr[col] - maximum);
+        for (int col = 0; col < cols; ++col) {
+            float probability = expf(lr[col] - maximum) / sum;
+            total -= tr[col] * logf(fmaxf(probability, 1.17549435e-38f));
+        }
+    }
+    loss[0] = total / (float)rows;
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(

@@ -257,6 +257,9 @@ pub(super) const KERNEL_NAME_BIAS_FWD: &str = "bias_forward";
 pub(super) const KERNEL_NAME_BIAS_BWD: &str = "bias_backward";
 pub(super) const KERNEL_NAME_RELU2_FWD: &str = "relu2_forward";
 pub(super) const KERNEL_NAME_RELU2_BWD: &str = "relu2_backward";
+pub(super) const KERNEL_NAME_MSE_FWD: &str = "mse_forward";
+pub(super) const KERNEL_NAME_MSE_BWD: &str = "mse_backward";
+pub(super) const KERNEL_NAME_SOFTMAX_XENT_FWD: &str = "softmax_xent_forward";
 /// Plan 0043 Stage 6: direct scalar-correct SALT V2 D2/B3/S34 execution.
 pub(super) const KERNEL_NAME_SALT_V2_EXACT: &str = "salt_v2_forward_exact";
 /// Plan 0043 Stage 6: exact selected-row reconstruction for token embeddings.

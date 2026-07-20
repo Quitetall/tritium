@@ -584,6 +584,9 @@ pub struct CudaBackend {
     pub(super) func_bias_bwd: CudaFunction,
     pub(super) func_relu2_fwd: CudaFunction,
     pub(super) func_relu2_bwd: CudaFunction,
+    pub(super) func_mse_fwd: CudaFunction,
+    pub(super) func_mse_bwd: CudaFunction,
+    pub(super) func_softmax_xent_fwd: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -845,6 +848,15 @@ impl CudaBackend {
         let func_relu2_bwd = grad_module
             .load_function(KERNEL_NAME_RELU2_BWD)
             .map_err(|e| driver_err("resolve relu2_backward kernel", &e))?;
+        let func_mse_fwd = grad_module
+            .load_function(KERNEL_NAME_MSE_FWD)
+            .map_err(|e| driver_err("resolve mse_forward kernel", &e))?;
+        let func_mse_bwd = grad_module
+            .load_function(KERNEL_NAME_MSE_BWD)
+            .map_err(|e| driver_err("resolve mse_backward kernel", &e))?;
+        let func_softmax_xent_fwd = grad_module
+            .load_function(KERNEL_NAME_SOFTMAX_XENT_FWD)
+            .map_err(|e| driver_err("resolve softmax_xent_forward kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -944,6 +956,9 @@ impl CudaBackend {
             func_bias_bwd,
             func_relu2_fwd,
             func_relu2_bwd,
+            func_mse_fwd,
+            func_mse_bwd,
+            func_softmax_xent_fwd,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -3119,6 +3134,99 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(n))
                 .map_err(|e| driver_err("launch relu2_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mse_forward_dev(
+        &self,
+        prediction: &CudaSlice<f32>,
+        target: &CudaSlice<f32>,
+        loss: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if n == 0 || prediction.len() < n || target.len() < n || loss.is_empty() {
+            return Err(BackendError::ShapeMismatch {
+                expected: n.max(1),
+                got: loss.len(),
+            });
+        }
+        let ni = n as i64;
+        let mut launch = self.stream.launch_builder(&self.func_mse_fwd);
+        launch.arg(prediction).arg(target).arg(loss).arg(&ni);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; exactly one reduction thread launched.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(1))
+                .map_err(|e| driver_err("launch mse_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mse_backward_dev(
+        &self,
+        prediction: &CudaSlice<f32>,
+        target: &CudaSlice<f32>,
+        upstream: &CudaSlice<f32>,
+        gradient: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if n == 0
+            || prediction.len() < n
+            || target.len() < n
+            || upstream.is_empty()
+            || gradient.len() < n
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: n.max(1),
+                got: gradient.len(),
+            });
+        }
+        let ni = n as i64;
+        let mut launch = self.stream.launch_builder(&self.func_mse_bwd);
+        launch
+            .arg(prediction)
+            .arg(target)
+            .arg(upstream)
+            .arg(gradient)
+            .arg(&ni);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread per gradient element.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch mse_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn softmax_xent_forward_dev(
+        &self,
+        logits: &CudaSlice<f32>,
+        target: &CudaSlice<f32>,
+        loss: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("xent geometry overflows usize".into()))?;
+        if rows == 0 || cols == 0 || logits.len() < n || target.len() < n || loss.is_empty() {
+            return Err(BackendError::ShapeMismatch {
+                expected: n.max(1),
+                got: loss.len(),
+            });
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_softmax_xent_fwd);
+        launch.arg(logits).arg(target).arg(loss).arg(&ri).arg(&ci);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; exactly one deterministic reduction thread.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(1))
+                .map_err(|e| driver_err("launch softmax_xent_forward_dev", &e))?;
         }
         Ok(())
     }

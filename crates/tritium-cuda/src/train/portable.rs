@@ -30,6 +30,8 @@ const OPERATIONS: &[&str] = &[
     "graph.softmax",
     "graph.causal_mask",
     "graph.rope",
+    "loss.mse",
+    "loss.softmax_cross_entropy",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -1171,6 +1173,157 @@ impl CudaTrainBackendV1 {
         output_f32(output, output_name, &shape, elements)?.copy_from_slice(&result);
         Ok(())
     }
+
+    fn execute_mse(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["prediction", "target"],
+            TrainExecutionV1::Vjp => &["prediction", "target", "grad_output"],
+            _ => return Err(invariant("mse received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(request.attributes.iter().map(|a| a.name), &[], "attributes")?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_prediction"
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let (shape, prediction) = input_f32_any_shape(request, "prediction")?;
+        let (target_shape, target) = input_f32_any_shape(request, "target")?;
+        if shape != target_shape || prediction.is_empty() {
+            return Err(shape_error());
+        }
+        require_finite("prediction", prediction)?;
+        require_finite("target", target)?;
+        let shape = shape.to_vec();
+        let device_prediction = self.backend.dev_upload(prediction).map_err(cuda_error)?;
+        let device_target = self.backend.dev_upload(target).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_loss = self.backend.dev_alloc_zeros(1).map_err(cuda_error)?;
+            self.backend
+                .mse_forward_dev(
+                    &device_prediction,
+                    &device_target,
+                    &mut device_loss,
+                    prediction.len(),
+                )
+                .map_err(cuda_error)?;
+            let loss = download_device(&self.backend, &device_loss, 1)?;
+            output_f32(output, "result", &[], 1)?.copy_from_slice(&loss);
+        } else {
+            let upstream = input_f32(request, "grad_output", &[])?;
+            require_finite("grad_output", upstream)?;
+            let device_upstream = self.backend.dev_upload(upstream).map_err(cuda_error)?;
+            let mut device_gradient = self
+                .backend
+                .dev_alloc_zeros(prediction.len())
+                .map_err(cuda_error)?;
+            self.backend
+                .mse_backward_dev(
+                    &device_prediction,
+                    &device_target,
+                    &device_upstream,
+                    &mut device_gradient,
+                    prediction.len(),
+                )
+                .map_err(cuda_error)?;
+            let gradient = download_device(&self.backend, &device_gradient, prediction.len())?;
+            output_f32(output, "grad_prediction", &shape, prediction.len())?
+                .copy_from_slice(&gradient);
+        }
+        Ok(())
+    }
+
+    fn execute_softmax_xent(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["logits", "target"],
+            TrainExecutionV1::Vjp => &["logits", "target", "grad_output"],
+            _ => return Err(invariant("softmax_cross_entropy received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_logits"
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        if rows == 0 {
+            return Err(attribute_value("rows", "positive"));
+        }
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let shape = [rows as u64, cols as u64];
+        let logits = input_f32(request, "logits", &shape)?;
+        let target = input_f32(request, "target", &shape)?;
+        require_finite("logits", logits)?;
+        require_finite("target", target)?;
+        let device_logits = self.backend.dev_upload(logits).map_err(cuda_error)?;
+        let device_target = self.backend.dev_upload(target).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_loss = self.backend.dev_alloc_zeros(1).map_err(cuda_error)?;
+            self.backend
+                .softmax_xent_forward_dev(
+                    &device_logits,
+                    &device_target,
+                    &mut device_loss,
+                    rows,
+                    cols,
+                )
+                .map_err(cuda_error)?;
+            let loss = download_device(&self.backend, &device_loss, 1)?;
+            output_f32(output, "result", &[], 1)?.copy_from_slice(&loss);
+        } else {
+            let upstream = input_f32(request, "grad_output", &[])?;
+            require_finite("grad_output", upstream)?;
+            let mut device_gradient = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .softmax_xent_backward_dev(
+                    &device_logits,
+                    &device_target,
+                    &mut device_gradient,
+                    rows,
+                    cols,
+                    upstream[0] / rows as f32,
+                )
+                .map_err(cuda_error)?;
+            let gradient = download_device(&self.backend, &device_gradient, elements)?;
+            output_f32(output, "grad_logits", &shape, elements)?.copy_from_slice(&gradient);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -1213,6 +1366,8 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "graph.softmax" => self.execute_softmax(&request, output)?,
             "graph.causal_mask" => self.execute_causal_mask(&request, output)?,
             "graph.rope" => self.execute_rope(&request, output)?,
+            "loss.mse" => self.execute_mse(&request, output)?,
+            "loss.softmax_cross_entropy" => self.execute_softmax_xent(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
