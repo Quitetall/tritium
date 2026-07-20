@@ -147,6 +147,130 @@ test("resident WebGPU transactions cache bindings and never map or read back", a
   assert.equal(device.destroyed, true);
 });
 
+test("auxiliary resources stay resident and receive same-submission GPU copies", async () => {
+  const device = new FakeDevice();
+  const auxiliaryBytes = Uint8Array.of(9, 10, 11, 12, 13, 14, 15, 16);
+  const preparing = WebGpuResidentRuntimeV1.prepare(
+    device,
+    plan(),
+    [{ bufferId: "left", bytes: Uint8Array.of(1, 2, 3, 4) }],
+    {
+      maxBytes: 8,
+      resources: [{ id: "scratch", byteLength: 8, initialBytes: auxiliaryBytes }],
+    },
+  );
+  auxiliaryBytes.fill(99);
+  const runtime = await preparing;
+  runtime.dispatch(
+    [{ ...command, storageBindings: { ...command.storageBindings, 3: "scratch" } }],
+    [{
+      source: "left",
+      sourceOffset: 0,
+      destination: "scratch",
+      destinationOffset: 4,
+      byteLength: 4,
+    }],
+  );
+  assert.deepEqual(
+    await runtime.read("scratch"),
+    Uint8Array.of(9, 10, 11, 12, 1, 2, 3, 4),
+  );
+  assert.equal(device.submits, 2, "copy and dispatch share one submission; read is explicit");
+  runtime.dispose();
+});
+
+test("auxiliary getters are captured exactly once before preparation awaits", async () => {
+  const reads = new Map();
+  const once = (name, value) => ({
+    enumerable: true,
+    get() {
+      const count = (reads.get(name) ?? 0) + 1;
+      reads.set(name, count);
+      if (count !== 1) throw new Error(`${name} read twice`);
+      return value;
+    },
+  });
+  const resource = {};
+  Object.defineProperties(resource, {
+    id: once("resource.id", "scratch"),
+    byteLength: once("resource.byteLength", 4),
+    initialBytes: once("resource.initialBytes", Uint8Array.of(1, 2, 3, 4)),
+  });
+  const auxiliary = {};
+  Object.defineProperties(auxiliary, {
+    maxBytes: once("set.maxBytes", 4),
+    resources: once("set.resources", [resource]),
+  });
+  const runtime = await WebGpuResidentRuntimeV1.prepare(
+    new FakeDevice(), plan(), [], auxiliary,
+  );
+  assert.deepEqual([...reads.values()], [1, 1, 1, 1, 1]);
+  assert.deepEqual(await runtime.read("scratch"), Uint8Array.of(1, 2, 3, 4));
+  runtime.dispose();
+});
+
+test("auxiliary and copy admission reject collisions, drift, and unsafe ranges", async () => {
+  for (const auxiliary of [
+    [{ id: "left", byteLength: 4, initialBytes: null }],
+    [{ id: "scratch", byteLength: 3, initialBytes: null }],
+    [{ id: "scratch", byteLength: 4, initialBytes: Uint8Array.of(1) }],
+  ]) {
+    await assert.rejects(
+      WebGpuResidentRuntimeV1.prepare(new FakeDevice(), plan(), [], {
+        maxBytes: 8,
+        resources: auxiliary,
+      }),
+      (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+    );
+  }
+  await assert.rejects(
+    WebGpuResidentRuntimeV1.prepare(new FakeDevice(), plan(), [], {
+      maxBytes: 4,
+      resources: [
+        { id: "one", byteLength: 4, initialBytes: null },
+        { id: "two", byteLength: 4, initialBytes: null },
+      ],
+    }),
+    (error) => error instanceof WebTrainingError && error.code === "memory_limit",
+  );
+  const forgedAliasPlan = {
+    ...plan(),
+    buffers: [
+      ...plan().buffers,
+      { ...buffer("forged", 48), ownerId: "scratch" },
+    ],
+  };
+  await assert.rejects(
+    WebGpuResidentRuntimeV1.prepare(new FakeDevice(), forgedAliasPlan, [], {
+      maxBytes: 4,
+      resources: [{ id: "scratch", byteLength: 4, initialBytes: null }],
+    }),
+    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+  );
+  const device = new FakeDevice();
+  const runtime = await WebGpuResidentRuntimeV1.prepare(
+    device,
+    plan(),
+    [],
+    {
+      maxBytes: 8,
+      resources: [{ id: "scratch", byteLength: 8, initialBytes: null }],
+    },
+  );
+  for (const copy of [
+    { source: "missing", sourceOffset: 0, destination: "scratch", destinationOffset: 0, byteLength: 4 },
+    { source: "left", sourceOffset: 0, destination: "scratch", destinationOffset: 6, byteLength: 4 },
+    { source: "scratch", sourceOffset: 0, destination: "scratch", destinationOffset: 4, byteLength: 4 },
+  ]) {
+    assert.throws(
+      () => runtime.dispatch([command], [copy]),
+      (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+    );
+  }
+  assert.equal(device.submits, 0);
+  runtime.dispose();
+});
+
 test("resident WebGPU admission and loss fail closed", async () => {
   await assert.rejects(
     WebGpuResidentRuntimeV1.prepare(

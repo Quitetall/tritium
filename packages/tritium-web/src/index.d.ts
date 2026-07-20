@@ -594,6 +594,25 @@ export interface WebGpuResidentTensorV1 {
   readonly bytes: Uint8Array;
 }
 
+export interface WebGpuResidentAuxiliaryV1 {
+  readonly id: string;
+  readonly byteLength: number;
+  readonly initialBytes: Uint8Array | null;
+}
+
+export interface WebGpuResidentAuxiliarySetV1 {
+  readonly maxBytes: number;
+  readonly resources: readonly WebGpuResidentAuxiliaryV1[];
+}
+
+export interface WebGpuResidentCopyV1 {
+  readonly source: string;
+  readonly sourceOffset: number;
+  readonly destination: string;
+  readonly destinationOffset: number;
+  readonly byteLength: number;
+}
+
 export interface WebGpuResidentDispatchV1 {
   readonly operation: string;
   readonly execution: WebGpuDispatchExecutionV1;
@@ -610,8 +629,12 @@ export declare class WebGpuResidentRuntimeV1 {
     device: WebGpuDevicePortV1,
     plan: CompiledTrainingPlanV1,
     initial: readonly WebGpuResidentTensorV1[],
+    auxiliary?: WebGpuResidentAuxiliarySetV1,
   ): Promise<WebGpuResidentRuntimeV1>;
-  dispatch(commands: readonly WebGpuResidentDispatchV1[]): void;
+  dispatch(
+    commands: readonly WebGpuResidentDispatchV1[],
+    copies?: readonly WebGpuResidentCopyV1[],
+  ): void;
   read(bufferId: string): Promise<Uint8Array>;
   dispose(): void;
 }

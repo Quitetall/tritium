@@ -100,6 +100,25 @@ export interface WebGpuResidentTensorV1 {
   readonly bytes: Uint8Array;
 }
 
+export interface WebGpuResidentAuxiliaryV1 {
+  readonly id: string;
+  readonly byteLength: number;
+  readonly initialBytes: Uint8Array | null;
+}
+
+export interface WebGpuResidentAuxiliarySetV1 {
+  readonly maxBytes: number;
+  readonly resources: readonly WebGpuResidentAuxiliaryV1[];
+}
+
+export interface WebGpuResidentCopyV1 {
+  readonly source: string;
+  readonly sourceOffset: number;
+  readonly destination: string;
+  readonly destinationOffset: number;
+  readonly byteLength: number;
+}
+
 export interface WebGpuResidentDispatchV1 {
   readonly operation: string;
   readonly execution: WebGpuDispatchExecutionV1;
@@ -110,7 +129,11 @@ export interface WebGpuResidentDispatchV1 {
   readonly workgroups: readonly [number, number, number];
 }
 
-type ResidentBuffer = CompiledTrainingPlanV1["buffers"][number];
+type ResidentBuffer = Readonly<{
+  id: string;
+  ownerId: string;
+  byteLength: number;
+}>;
 type PreparedStage = Readonly<{
   pipeline: WebGpuPipelinePortV1;
   bindings: readonly WebGpuKernelBindingV1[];
@@ -146,6 +169,18 @@ function denseArray(value: unknown): value is readonly unknown[] {
 
 function record(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function property(
+  value: Readonly<Record<string, unknown>>,
+  key: string,
+  name: string,
+): unknown {
+  try {
+    return Reflect.get(value, key);
+  } catch {
+    fail("invalid_schema", `${name}.${key} could not be read`);
+  }
 }
 
 /** Derive the uniform arena capacity from a fully compiled plan. */
@@ -219,9 +254,21 @@ export class WebGpuResidentRuntimeV1 {
     device: WebGpuDevicePortV1,
     plan: CompiledTrainingPlanV1,
     initial: readonly WebGpuResidentTensorV1[],
+    auxiliary: WebGpuResidentAuxiliarySetV1 = Object.freeze({
+      maxBytes: 0,
+      resources: Object.freeze([]),
+    }),
   ): Promise<WebGpuResidentRuntimeV1> {
+    const auxiliaryMaxBytes = record(auxiliary)
+      ? property(auxiliary, "maxBytes", "WebGPU auxiliary set")
+      : undefined;
+    const auxiliaryResources = record(auxiliary)
+      ? property(auxiliary, "resources", "WebGPU auxiliary set")
+      : undefined;
     if (!record(plan) || !denseArray(plan.buffers) || !denseArray(plan.operations) ||
-        !denseArray(plan.backwardOperations) || !denseArray(initial)) {
+        !denseArray(plan.backwardOperations) || !denseArray(initial) ||
+        !record(auxiliary) || !Number.isSafeInteger(auxiliaryMaxBytes) ||
+        (auxiliaryMaxBytes as number) < 0 || !denseArray(auxiliaryResources)) {
       fail("invalid_schema", "WebGPU runtime inputs must be compiled arrays");
     }
     const capturedBuffers = plan.buffers.map((buffer) => {
@@ -244,6 +291,30 @@ export class WebGpuResidentRuntimeV1 {
       return Object.freeze({
         bufferId: tensor.bufferId,
         bytes: Uint8Array.from(tensor.bytes),
+      });
+    });
+    const admittedAuxiliary = auxiliaryResources.map((resource) => {
+      const id = record(resource)
+        ? property(resource, "id", "WebGPU auxiliary resource")
+        : undefined;
+      const byteLength = record(resource)
+        ? property(resource, "byteLength", "WebGPU auxiliary resource")
+        : undefined;
+      const initialBytes = record(resource)
+        ? property(resource, "initialBytes", "WebGPU auxiliary resource")
+        : undefined;
+      if (!record(resource) || typeof id !== "string" || id.length === 0 ||
+          !Number.isSafeInteger(byteLength) || (byteLength as number) <= 0 ||
+          (byteLength as number) % 4 !== 0 ||
+          !(initialBytes === null || initialBytes instanceof Uint8Array) ||
+          (initialBytes !== null && initialBytes.byteLength !== byteLength)) {
+        fail("invalid_schema", "WebGPU auxiliary resource is invalid");
+      }
+      return Object.freeze({
+        id,
+        ownerId: id,
+        byteLength: byteLength as number,
+        initialBytes,
       });
     });
     const uniformSlots = webGpuUniformSlotCapacityV1(plan);
@@ -304,26 +375,54 @@ export class WebGpuResidentRuntimeV1 {
     if (maxUniform < UNIFORM_BYTES) {
       fail("capability_mismatch", "WebGPU uniform binding limit is below 256 bytes");
     }
-    const buffers = new Map<string, ResidentBuffer>();
+    let auxiliaryBytes = 0;
+    for (const resource of admittedAuxiliary) {
+      if (paddedBytes(resource.byteLength) > maxStorage ||
+          paddedBytes(resource.byteLength) > maxBufferSize) {
+        fail("memory_limit", `${resource.id} exceeds WebGPU storage binding limit`);
+      }
+      if (auxiliaryBytes > (auxiliaryMaxBytes as number) - resource.byteLength) {
+        fail("memory_limit", "WebGPU auxiliary resources exceed declared budget");
+      }
+      auxiliaryBytes += resource.byteLength;
+    }
+    const compiledBuffers = new Map<string, ResidentBuffer>();
     for (const buffer of capturedBuffers) {
       if (typeof buffer.id !== "string" || buffer.id.length === 0 ||
           typeof buffer.ownerId !== "string" ||
           !Number.isSafeInteger(buffer.byteLength) || buffer.byteLength < 0 ||
-          buffers.has(buffer.id)) {
+          compiledBuffers.has(buffer.id)) {
         fail("invalid_schema", "WebGPU compiled buffer ownership is invalid");
       }
-      buffers.set(buffer.id, buffer);
+      compiledBuffers.set(buffer.id, buffer);
       if (paddedBytes(buffer.byteLength) > maxStorage ||
           paddedBytes(buffer.byteLength) > maxBufferSize) {
         fail("memory_limit", `${buffer.id} exceeds WebGPU storage binding limit`);
       }
     }
     for (const buffer of capturedBuffers) {
-      const owner = buffers.get(buffer.ownerId);
+      const owner = compiledBuffers.get(buffer.ownerId);
       if (owner === undefined || owner.ownerId !== owner.id ||
           owner.byteLength !== buffer.byteLength) {
         fail("invalid_schema", `${buffer.id} has invalid WebGPU root ownership`);
       }
+    }
+    const auxiliaryIds = new Set<string>();
+    for (const resource of admittedAuxiliary) {
+      if (compiledBuffers.has(resource.id) || auxiliaryIds.has(resource.id)) {
+        fail("invalid_schema", `WebGPU auxiliary resource ${resource.id} collides`);
+      }
+      auxiliaryIds.add(resource.id);
+    }
+    const capturedAuxiliary = admittedAuxiliary.map((resource) => Object.freeze({
+      ...resource,
+      initialBytes: resource.initialBytes === null
+        ? null
+        : Uint8Array.from(resource.initialBytes),
+    }));
+    const buffers = new Map(compiledBuffers);
+    for (const resource of capturedAuxiliary) {
+      buffers.set(resource.id, resource);
     }
     const bundle = webGpuKernelCandidateBundleV1();
     const stages = new Map<string, PreparedStage>();
@@ -384,6 +483,17 @@ export class WebGpuResidentRuntimeV1 {
           usage: STORAGE | COPY_SRC | COPY_DST,
         }));
       }
+      for (const resource of capturedAuxiliary) {
+        const allocated = device.createBuffer({
+          label: `tritium:auxiliary:${resource.id}`,
+          size: paddedBytes(resource.byteLength),
+          usage: STORAGE | COPY_SRC | COPY_DST,
+        });
+        resident.set(resource.id, allocated);
+        if (resource.initialBytes !== null) {
+          device.queue.writeBuffer(allocated, 0, resource.initialBytes);
+        }
+      }
       const zero = device.createBuffer({
         label: "tritium:zero-binding",
         size: 4,
@@ -402,7 +512,8 @@ export class WebGpuResidentRuntimeV1 {
       const seen = new Set<string>();
       for (const tensor of capturedInitial) {
         const buffer = buffers.get(tensor.bufferId);
-        if (buffer === undefined || buffer.ownerId !== buffer.id) {
+        if (buffer === undefined || buffer.ownerId !== buffer.id ||
+            auxiliaryIds.has(tensor.bufferId)) {
           fail("invalid_schema", `initial tensor ${tensor.bufferId} is not a root buffer`);
         }
         if (seen.has(buffer.id) || tensor.bytes.byteLength !== buffer.byteLength) {
@@ -437,9 +548,61 @@ export class WebGpuResidentRuntimeV1 {
     }
   }
 
-  dispatch(commands: readonly WebGpuResidentDispatchV1[]): void {
+  dispatch(
+    commands: readonly WebGpuResidentDispatchV1[],
+    copies: readonly WebGpuResidentCopyV1[] = [],
+  ): void {
     this.#ready();
-    if (!denseArray(commands)) fail("invalid_schema", "WebGPU commands must be a dense array");
+    if (!denseArray(commands) || !denseArray(copies)) {
+      fail("invalid_schema", "WebGPU transaction inputs must be dense arrays");
+    }
+    const capturedCopies = copies.map((copy) => {
+      const sourceId = record(copy) ? property(copy, "source", "WebGPU resident copy") : undefined;
+      const destinationId = record(copy)
+        ? property(copy, "destination", "WebGPU resident copy")
+        : undefined;
+      const sourceOffset = record(copy)
+        ? property(copy, "sourceOffset", "WebGPU resident copy")
+        : undefined;
+      const destinationOffset = record(copy)
+        ? property(copy, "destinationOffset", "WebGPU resident copy")
+        : undefined;
+      const byteLength = record(copy)
+        ? property(copy, "byteLength", "WebGPU resident copy")
+        : undefined;
+      if (!record(copy) || typeof sourceId !== "string" ||
+          typeof destinationId !== "string" ||
+          !Number.isSafeInteger(sourceOffset) || (sourceOffset as number) < 0 ||
+          !Number.isSafeInteger(destinationOffset) || (destinationOffset as number) < 0 ||
+          !Number.isSafeInteger(byteLength) || (byteLength as number) <= 0 ||
+          (sourceOffset as number) % 4 !== 0 ||
+          (destinationOffset as number) % 4 !== 0 ||
+          (byteLength as number) % 4 !== 0) {
+        fail("invalid_schema", "WebGPU resident copy is malformed");
+      }
+      const safeSourceOffset = sourceOffset as number;
+      const safeDestinationOffset = destinationOffset as number;
+      const safeByteLength = byteLength as number;
+      const source = this.#buffers.get(sourceId);
+      const destination = this.#buffers.get(destinationId);
+      const sourceEnd = safeSourceOffset + safeByteLength;
+      const destinationEnd = safeDestinationOffset + safeByteLength;
+      if (source === undefined || destination === undefined ||
+          !Number.isSafeInteger(sourceEnd) || sourceEnd > source.byteLength ||
+          !Number.isSafeInteger(destinationEnd) || destinationEnd > destination.byteLength) {
+        fail("invalid_schema", "WebGPU resident copy exceeds a resource view");
+      }
+      if (source.ownerId === destination.ownerId) {
+        fail("invalid_schema", "WebGPU resident copy requires distinct physical buffers");
+      }
+      return Object.freeze({
+        source: sourceId,
+        sourceOffset: safeSourceOffset,
+        destination: destinationId,
+        destinationOffset: safeDestinationOffset,
+        byteLength: safeByteLength,
+      });
+    });
     const capturedCommands = commands.map((command) => {
       if (!record(command)) fail("invalid_schema", "WebGPU dispatch command is malformed");
       const fields = Object.keys(command).sort();
@@ -475,6 +638,15 @@ export class WebGpuResidentRuntimeV1 {
       });
     });
     const encoder = this.#device.createCommandEncoder({ label: "tritium:transaction" });
+    for (const copy of capturedCopies) {
+      encoder.copyBufferToBuffer(
+        this.#physicalBuffer(copy.source),
+        copy.sourceOffset,
+        this.#physicalBuffer(copy.destination),
+        copy.destinationOffset,
+        copy.byteLength,
+      );
+    }
     const pass = encoder.beginComputePass({ label: "tritium:resident-dispatch" });
     const usedUniformSlots = new Set<number>();
     for (const command of capturedCommands) {
@@ -638,6 +810,15 @@ export class WebGpuResidentRuntimeV1 {
       offset: 0,
       size: paddedBytes(buffer.byteLength),
     }) });
+  }
+
+  #physicalBuffer(bufferId: string): WebGpuBufferPortV1 {
+    const buffer = this.#buffers.get(bufferId);
+    const resident = buffer === undefined ? undefined : this.#resident.get(buffer.ownerId);
+    if (buffer === undefined || resident === undefined) {
+      fail("invalid_schema", `WebGPU resident resource ${bufferId} is missing`);
+    }
+    return resident;
   }
 
   #ready(): void {

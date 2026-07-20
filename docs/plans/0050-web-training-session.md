@@ -241,7 +241,10 @@ running all 114 portable-training vectors. A low-level resident runtime now
 admits declared WebGPU limits, compiles
 catalog pipelines, allocates zero-offset GPU buffers per root tensor owner,
 uses a device-aligned uniform arena, caches bind groups and submits multi-stage
-transactions without mapping or readback. Only its explicit `read` boundary
+transactions without mapping or readback. It now owns declared auxiliary
+constant/scratch resources and checked resident-to-resident copies in the same
+submission as dependent compute, enabling specialized kernel packing without
+CPU tensor staging. Only its explicit `read` boundary
 creates and maps a staging buffer; device loss invalidates dispatch. Generated
 operation-to-uniform/binding lowering, session-adapter integration and physical
 browser execution remain open.
