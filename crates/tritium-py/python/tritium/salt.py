@@ -66,10 +66,10 @@ def reconcile_qwen36_ptq_packages(
     """Resume PTQ and atomically publish two admitted matrix packages.
 
     The output directory must not exist. Tritium stages both exact SALT V2
-    profiles and their receipt manifest beside the destination, syncs them, and
-    publishes the complete directory with one rename. This artifact intentionally
-    excludes preserved BF16 tensors and is therefore not yet a self-contained
-    Hugging Face model directory.
+    profiles, the exact preserved BF16 safetensors companion, and their receipt
+    manifest beside the destination. It syncs and strictly reopens them before
+    publishing the complete directory with one rename. Hugging Face configuration,
+    tokenizer assets, and runtime wiring remain separate release gates.
     """
 
     return _reconcile_qwen36_ptq_packages(

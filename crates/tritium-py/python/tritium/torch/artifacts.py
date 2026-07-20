@@ -13,13 +13,15 @@ from typing import Any, Dict, Optional, Union
 from .. import _tritium
 from .errors import TritiumError
 
-_ARTIFACT_KIND = "qwen3.6-language-mtp-salt-v2-matrix-profiles"
+_ARTIFACT_KIND_V1 = "qwen3.6-language-mtp-salt-v2-matrix-profiles"
+_ARTIFACT_KIND_V2 = "qwen3.6-language-mtp-salt-v2-model-weights"
 _MANIFEST = "tritium.json"
+_PRESERVED_FILE = "preserved.safetensors"
 _PROFILE_FILES = {
     "compact-v1": "compact.tsalt2",
     "near-lossless-v1": "near-lossless.tsalt2",
 }
-_TOP_LEVEL_FIELDS = {
+_TOP_LEVEL_FIELDS_V1 = {
     "schema_version",
     "artifact_kind",
     "complete_model",
@@ -33,11 +35,19 @@ _TOP_LEVEL_FIELDS = {
     "official_payload_authenticated",
     "profiles",
 }
+_TOP_LEVEL_FIELDS_V2 = _TOP_LEVEL_FIELDS_V1 | {"preserved"}
 _PROFILE_FIELDS = {
     "file",
     "package_id",
     "serialized_bytes",
     "resident_bytes",
+}
+_PRESERVED_FIELDS = {
+    "file",
+    "package_id",
+    "tensors",
+    "payload_bytes",
+    "serialized_bytes",
 }
 
 
@@ -66,6 +76,26 @@ class ArtifactRef:
 
 
 @dataclass(frozen=True)
+class PreservedRef:
+    """One content-bound exact-BF16 safetensors companion."""
+
+    path: Path
+    package_id: str
+    tensors: int
+    payload_bytes: int
+    serialized_bytes: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "package_id": self.package_id,
+            "tensors": self.tensors,
+            "payload_bytes": self.payload_bytes,
+            "serialized_bytes": self.serialized_bytes,
+        }
+
+
+@dataclass(frozen=True)
 class ExportReceipt:
     """Proof that a complete bundle directory was atomically published."""
 
@@ -74,6 +104,7 @@ class ExportReceipt:
     admission_id: str
     compact_package_id: str
     near_lossless_package_id: str
+    preserved_package_id: Optional[str] = None
     schema_version: int = 1
 
 
@@ -81,10 +112,10 @@ class ExportReceipt:
 class QuantizationResult:
     """Verified two-profile PTQ result for Qwen3.6 language and MTP matrices.
 
-    ``complete_model`` is intentionally false until preserved BF16 tensors and
-    Hugging Face configuration are promoted into the artifact directory. The
-    contained matrix packages are nevertheless exact, native-reopenable SALT V2
-    artifacts with measured serialized and indexed-runtime ledgers.
+    ``complete_model`` is intentionally false until Hugging Face configuration,
+    tokenizer assets, and the Qwen3.6 runtime adapter are present. Schema-v2
+    results carry all exact preserved BF16 tensors alongside exact,
+    native-reopenable SALT V2 packages with measured physical ledgers.
     """
 
     artifact_dir: Path
@@ -98,6 +129,7 @@ class QuantizationResult:
     official_payload_authenticated: bool
     compact: ArtifactRef
     near_lossless: ArtifactRef
+    preserved: Optional[PreservedRef] = None
     complete_model: bool = False
     schema_version: int = 1
 
@@ -112,12 +144,15 @@ class QuantizationResult:
         return export(self, output_dir)
 
     def save_pretrained(self, output_dir: Union[os.PathLike[str], str]) -> None:
+        missing = ["config", "tokenizer_assets", "qwen3.6_runtime_adapter"]
+        if self.preserved is None:
+            missing.insert(0, "preserved_bf16_tensors")
         raise TritiumError(
             "this matrix-profile result is not a self-contained Hugging Face model",
             code="incomplete_artifact",
             stage="export",
             details={
-                "missing": ["preserved_bf16_tensors", "config", "tokenizer_assets"],
+                "missing": missing,
                 "requested_output": str(output_dir),
             },
         )
@@ -139,11 +174,16 @@ def _read_manifest(directory: Path) -> Dict[str, Any]:
         raise ValueError("tritium.json must be an ordinary manifest no larger than 1 MiB")
     with manifest.open("r", encoding="utf-8") as stream:
         value = json.load(stream, object_pairs_hook=_pairs_without_duplicates)
-    if not isinstance(value, dict) or set(value) != _TOP_LEVEL_FIELDS:
-        raise ValueError("tritium.json fields do not match bundle schema version 1")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
+        raise ValueError("tritium.json must declare an integer schema_version")
+    version = value["schema_version"]
+    if version not in {1, 2}:
         raise ValueError("unsupported Tritium bundle schema_version")
-    if value["artifact_kind"] != _ARTIFACT_KIND or value["complete_model"] is not False:
+    fields = _TOP_LEVEL_FIELDS_V1 if version == 1 else _TOP_LEVEL_FIELDS_V2
+    if set(value) != fields:
+        raise ValueError(f"tritium.json fields do not match bundle schema version {version}")
+    expected_kind = _ARTIFACT_KIND_V1 if version == 1 else _ARTIFACT_KIND_V2
+    if value["artifact_kind"] != expected_kind or value["complete_model"] is not False:
         raise ValueError("unsupported Tritium artifact kind")
     if value["packing"] not in {"d2", "b3", "s34"}:
         raise ValueError("invalid Tritium package codec")
@@ -163,6 +203,28 @@ def _read_manifest(directory: Path) -> Dict[str, Any]:
     if not isinstance(profiles, dict) or set(profiles) != set(_PROFILE_FILES):
         raise ValueError("bundle must contain exactly both governed profiles")
     return value
+
+
+def _load_preserved(directory: Path, value: Any) -> PreservedRef:
+    if not isinstance(value, dict) or set(value) != _PRESERVED_FIELDS:
+        raise ValueError("preserved fields do not match bundle schema version 2")
+    if value["file"] != _PRESERVED_FILE:
+        raise ValueError("preserved tensors use a non-canonical filename")
+    package_id = value["package_id"]
+    integers = (value["tensors"], value["payload_bytes"], value["serialized_bytes"])
+    if not isinstance(package_id, str) or not package_id:
+        raise ValueError("preserved package_id must be a non-empty string")
+    if any(type(item) is not int or item <= 0 for item in integers):
+        raise ValueError("preserved tensor and byte ledgers must be positive integers")
+    path = directory / _PRESERVED_FILE
+    actual = _tritium.verify_preserved_safetensors(path.as_posix(), package_id, *integers)
+    return PreservedRef(
+        path=path,
+        package_id=actual[0],
+        tensors=actual[1],
+        payload_bytes=actual[2],
+        serialized_bytes=actual[3],
+    )
 
 
 def _load_profile(directory: Path, packing: str, profile: str, value: Any) -> ArtifactRef:
@@ -230,6 +292,11 @@ def load(
         "near-lossless-v1",
         value["profiles"]["near-lossless-v1"],
     )
+    preserved = (
+        _load_preserved(directory, value["preserved"])
+        if value["schema_version"] == 2
+        else None
+    )
     return QuantizationResult(
         artifact_dir=directory,
         packing=value["packing"],
@@ -242,13 +309,15 @@ def load(
         official_payload_authenticated=value["official_payload_authenticated"],
         compact=compact,
         near_lossless=near,
+        preserved=preserved,
+        schema_version=value["schema_version"],
     )
 
 
 def _manifest_bytes(result: QuantizationResult) -> bytes:
     value = {
-        "schema_version": 1,
-        "artifact_kind": _ARTIFACT_KIND,
+        "schema_version": result.schema_version,
+        "artifact_kind": _ARTIFACT_KIND_V2 if result.preserved is not None else _ARTIFACT_KIND_V1,
         "complete_model": False,
         "packing": result.packing,
         "completion_id": result.completion_id,
@@ -273,6 +342,14 @@ def _manifest_bytes(result: QuantizationResult) -> bytes:
             },
         },
     }
+    if result.preserved is not None:
+        value["preserved"] = {
+            "file": _PRESERVED_FILE,
+            "package_id": result.preserved.package_id,
+            "tensors": result.preserved.tensors,
+            "payload_bytes": result.preserved.payload_bytes,
+            "serialized_bytes": result.preserved.serialized_bytes,
+        }
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -302,6 +379,11 @@ def export(
             shutil.copyfile(artifact.path, destination)
             with destination.open("rb") as stream:
                 os.fsync(stream.fileno())
+        if current.preserved is not None:
+            destination = staging / _PRESERVED_FILE
+            shutil.copyfile(current.preserved.path, destination)
+            with destination.open("rb") as stream:
+                os.fsync(stream.fileno())
         manifest = staging / _MANIFEST
         with manifest.open("xb") as stream:
             stream.write(_manifest_bytes(current))
@@ -313,6 +395,16 @@ def export(
         finally:
             os.close(directory_fd)
         staged = load(staging)
+        if current.preserved is None:
+            preserved_changed = staged.preserved is not None
+        else:
+            preserved_changed = (
+                staged.preserved is None
+                or staged.preserved.package_id != current.preserved.package_id
+                or staged.preserved.tensors != current.preserved.tensors
+                or staged.preserved.payload_bytes != current.preserved.payload_bytes
+                or staged.preserved.serialized_bytes != current.preserved.serialized_bytes
+            )
         if (
             staged.completion_id != current.completion_id
             or staged.campaign_id != current.campaign_id
@@ -320,6 +412,7 @@ def export(
             or staged.selection_id != current.selection_id
             or staged.compact.package_id != current.compact.package_id
             or staged.near_lossless.package_id != current.near_lossless.package_id
+            or preserved_changed
         ):
             raise TritiumError(
                 "staged bundle identity differs from source artifact",
@@ -343,7 +436,18 @@ def export(
         admission_id=reopened.admission_id,
         compact_package_id=reopened.compact.package_id,
         near_lossless_package_id=reopened.near_lossless.package_id,
+        preserved_package_id=(
+            reopened.preserved.package_id if reopened.preserved is not None else None
+        ),
+        schema_version=reopened.schema_version,
     )
 
 
-__all__ = ["ArtifactRef", "ExportReceipt", "QuantizationResult", "export", "load"]
+__all__ = [
+    "ArtifactRef",
+    "ExportReceipt",
+    "PreservedRef",
+    "QuantizationResult",
+    "export",
+    "load",
+]

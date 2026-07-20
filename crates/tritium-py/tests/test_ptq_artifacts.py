@@ -25,9 +25,10 @@ def _write_bundle(root: Path) -> None:
     root.mkdir()
     (root / "compact.tsalt2").write_bytes(b"compact")
     (root / "near-lossless.tsalt2").write_bytes(b"near")
+    (root / "preserved.safetensors").write_bytes(b"preserved")
     manifest = {
-        "schema_version": 1,
-        "artifact_kind": "qwen3.6-language-mtp-salt-v2-matrix-profiles",
+        "schema_version": 2,
+        "artifact_kind": "qwen3.6-language-mtp-salt-v2-model-weights",
         "complete_model": False,
         "packing": "b3",
         "completion_id": "completion",
@@ -51,6 +52,13 @@ def _write_bundle(root: Path) -> None:
                 "resident_bytes": 13,
             },
         },
+        "preserved": {
+            "file": "preserved.safetensors",
+            "package_id": "preserved-id",
+            "tensors": 360,
+            "payload_bytes": 5_343_232,
+            "serialized_bytes": 9,
+        },
     }
     (root / "tritium.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
@@ -62,6 +70,11 @@ def _fake_verify(path, package_id, serialized, resident):
     return package_id, "b3", serialized, resident
 
 
+def _fake_verify_preserved(path, package_id, tensors, payload, serialized):
+    assert Path(path).stat().st_size == serialized
+    return package_id, tensors, payload, serialized
+
+
 def test_bundle_load_and_export_reverify_exact_profiles(monkeypatch, tmp_path):
     source = tmp_path / "source"
     _write_bundle(source)
@@ -71,9 +84,13 @@ def test_bundle_load_and_export_reverify_exact_profiles(monkeypatch, tmp_path):
         verified.append(Path(path))
         return _fake_verify(path, package_id, serialized, resident)
 
+    def tracking_verify_preserved(path, package_id, tensors, payload, serialized):
+        verified.append(Path(path))
+        return _fake_verify_preserved(path, package_id, tensors, payload, serialized)
+
     def publish_after_staged_verification(staging, target):
         staging = Path(staging)
-        assert sum(path.parent == staging for path in verified) == 2
+        assert sum(path.parent == staging for path in verified) == 3
         staging.rename(target)
 
     monkeypatch.setattr(
@@ -83,21 +100,31 @@ def test_bundle_load_and_export_reverify_exact_profiles(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         artifacts._tritium,
+        "verify_preserved_safetensors",
+        tracking_verify_preserved,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        artifacts._tritium,
         "publish_directory_noreplace",
         publish_after_staged_verification,
     )
 
     result = load(source)
     assert result.complete_model is False
+    assert result.schema_version == 2
+    assert result.preserved.tensors == 360
     assert result.artifact("compact-v1").serialized_bytes == 7
     assert result.near_lossless.resident_bytes == 13
     with pytest.raises(TritiumError) as caught:
         result.save_pretrained(tmp_path / "hf")
     assert caught.value.code == "incomplete_artifact"
+    assert "preserved_bf16_tensors" not in caught.value.details["missing"]
 
     receipt = result.export(tmp_path / "copy")
     assert receipt.admission_id == "admission"
     assert (receipt.artifact_dir / "compact.tsalt2").read_bytes() == b"compact"
+    assert receipt.preserved_package_id == "preserved-id"
     assert load(receipt.artifact_dir).compact.package_id == "compact-id"
     with pytest.raises(FileExistsError):
         result.export(receipt.artifact_dir)
@@ -113,6 +140,12 @@ def test_bundle_schema_rejects_unknown_fields_before_native_load(monkeypatch, tm
         artifacts._tritium,
         "verify_salt_v2_package",
         lambda *args: pytest.fail("native load must follow schema validation"),
+    )
+    monkeypatch.setattr(
+        artifacts._tritium,
+        "verify_preserved_safetensors",
+        lambda *args: pytest.fail("native load must follow schema validation"),
+        raising=False,
     )
     with pytest.raises(ValueError, match="fields"):
         load(source)
