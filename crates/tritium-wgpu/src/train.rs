@@ -19,6 +19,7 @@ const OPERATIONS: &[&str] = &[
     "graph.causal_mask",
     "graph.rmsnorm",
     "graph.softmax",
+    "loss.mse",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -330,6 +331,69 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_mse(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) = match request.execution {
+            TrainExecutionV1::Forward => (&["prediction", "target"], &["result"]),
+            TrainExecutionV1::Vjp => (
+                &["prediction", "target", "grad_output"],
+                &["grad_prediction"],
+            ),
+            _ => return Err(invariant("MSE received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &[],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let (shape, prediction) = input_f32(request, "prediction")?;
+        let (target_shape, target) = input_f32(request, "target")?;
+        if shape != target_shape || prediction.is_empty() {
+            return Err(shape_error());
+        }
+        require_finite("prediction", prediction)?;
+        require_finite("target", target)?;
+        let grad_output = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if !gradient_shape.is_empty() || gradient.len() != 1 {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient[0]
+        } else {
+            0.0
+        };
+        let operation = if request.execution == TrainExecutionV1::Forward {
+            16
+        } else {
+            17
+        };
+        let result = self
+            .backend
+            .pointwise(prediction, target, prediction, operation, grad_output, 0)
+            .map_err(wgpu_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            output_f32(output, "result", &[], 1)?[0] = result[0];
+        } else {
+            output_f32(output, "grad_prediction", shape, prediction.len())?
+                .copy_from_slice(&result);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -365,6 +429,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             tritium_train::portable::lifecycle_control_plane_scratch_bytes(&request)?
         } else if request.operation == "graph.rmsnorm" {
             self.execute_rmsnorm(&request, output)?;
+            0
+        } else if request.operation == "loss.mse" {
+            self.execute_mse(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;

@@ -142,6 +142,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             result[index] = gradient;
         }
+        case 16u: {
+            if (index != 0u) { return; }
+            var loss = 0.0;
+            for (var item = 0u; item < params.len; item = item + 1u) {
+                let difference = left[item] - right[item];
+                loss = loss + difference * difference;
+            }
+            result[0] = loss / f32(params.len);
+        }
+        case 17u: {
+            result[index] = params.scalar * 2.0 * (left[index] - right[index])
+                / f32(params.len);
+        }
         default: { result[index] = 0.0; }
     }
 }

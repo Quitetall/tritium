@@ -175,8 +175,8 @@ This closes WASI/WASM semantic parity; browser WASM packaging remains plan 0050,
 and MCU constrained-target parity remains open.
 
 Native wgpu work has begun on the RTX 4090 Vulkan adapter. Current evidence
-covers 33 vectors across detach, constant scale, add, multiply, ReLU2, SiLU,
-RMSNorm, causal masking, row softmax, and all four lifecycle operations. Pointwise tensor work executes through resident WGSL
+covers 35 vectors across detach, constant scale, add, multiply, ReLU2, SiLU,
+RMSNorm, causal masking, row softmax, MSE loss, and all four lifecycle operations. Pointwise tensor work executes through resident WGSL
 storage buffers; lifecycle uses the shared canonical control-plane byte
 implementation. Receipts bind the physical NVIDIA adapter, and no additional
 tensor operation is advertised before its WGSL path passes the corpus. ROCm
