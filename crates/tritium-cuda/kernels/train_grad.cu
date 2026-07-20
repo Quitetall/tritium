@@ -1098,7 +1098,7 @@ extern "C" __global__ void causal_mask_backward(
 // Angles in double to track ops::rope (which uses f64 sin_cos/powf then casts). One thread per
 // rotation pair (token, head, j<half). ops::rope::{forward,vjp}.
 extern "C" __global__ void rope_apply(
-    const float* __restrict__ x, float* __restrict__ y, const int* __restrict__ positions,
+    const float* __restrict__ x, float* __restrict__ y, const unsigned int* __restrict__ positions,
     int n_head, int head_dim, float theta, int n_token, float sign)
 {
     int half = head_dim / 2;

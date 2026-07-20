@@ -2896,6 +2896,13 @@ impl CudaBackend {
             .map_err(|e| driver_err("dev_upload_i32 htod", &e))
     }
 
+    /// Upload unsigned portable positions for resident training RoPE.
+    pub(crate) fn dev_upload_u32(&self, host: &[u32]) -> Result<CudaSlice<u32>, BackendError> {
+        self.stream
+            .clone_htod(host)
+            .map_err(|e| driver_err("dev_upload_u32 htod", &e))
+    }
+
     /// Multiply a resident buffer by a constant scalar: `y[i] = x[i]·c` (attention's `1/√head_dim`;
     /// bit-exact). Its own vjp shape (backward = `scale_const_dev(gy, c)`).
     ///
@@ -3072,7 +3079,7 @@ impl CudaBackend {
 
     /// RoPE apply on a resident [n_token, n_head, head_dim] buffer (`ops::rope`; sin/cos ⇒ within
     /// 1e-4). `sign = +1.0` forward, `-1.0` for the vjp (inverse rotation). `positions` is a resident
-    /// i32 buffer of length `n_token`.
+    /// u32 buffer of length `n_token`.
     ///
     /// # Errors
     /// [`BackendError::ShapeMismatch`] on undersized buffer / odd head_dim; device failure via cudarc.
@@ -3082,7 +3089,7 @@ impl CudaBackend {
         &self,
         d_x: &CudaSlice<f32>,
         d_y: &mut CudaSlice<f32>,
-        d_positions: &CudaSlice<i32>,
+        d_positions: &CudaSlice<u32>,
         n_head: usize,
         head_dim: usize,
         theta: f32,
@@ -3116,7 +3123,7 @@ impl CudaBackend {
             .arg(&theta)
             .arg(&nt)
             .arg(&sign);
-        // SAFETY: `(const float* x, float* y, const int* positions, int n_head, int head_dim,
+        // SAFETY: `(const float* x, float* y, const unsigned int* positions, int n_head, int head_dim,
         // float theta, int n_token, float sign)`; one thread per rotation pair.
         #[allow(unsafe_code)]
         unsafe {

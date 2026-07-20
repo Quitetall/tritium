@@ -681,7 +681,7 @@ enum DevOp<'leaf> {
     },
     Rope {
         x: usize,
-        pos: CudaSlice<i32>,
+        pos: CudaSlice<u32>,
         n_head: usize,
         head_dim: usize,
         theta: f32,
@@ -3487,7 +3487,7 @@ fn validate_fixed_attention_parameters(
     Ok(())
 }
 
-fn attention_positions(sequence: usize) -> Result<Vec<i32>, BackendError> {
+fn attention_positions(sequence: usize) -> Result<Vec<u32>, BackendError> {
     let mut positions = Vec::new();
     positions
         .try_reserve_exact(sequence)
@@ -3495,8 +3495,8 @@ fn attention_positions(sequence: usize) -> Result<Vec<i32>, BackendError> {
             requested: sequence.saturating_mul(core::mem::size_of::<i32>()),
         })?;
     for position in 0..sequence {
-        positions.push(i32::try_from(position).map_err(|_| {
-            BackendError::InvalidInput("attention position exceeds i32::MAX".into())
+        positions.push(u32::try_from(position).map_err(|_| {
+            BackendError::InvalidInput("attention position exceeds u32::MAX".into())
         })?);
     }
     Ok(positions)
@@ -4086,14 +4086,14 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
     pub(crate) fn rope(
         &mut self,
         x: usize,
-        positions: &[i32],
+        positions: &[u32],
         n_head: usize,
         head_dim: usize,
         theta: f32,
         n_token: usize,
     ) -> Result<usize, BackendError> {
         let n = self.lens[x];
-        let pos = self.b.dev_upload_i32(positions)?;
+        let pos = self.b.dev_upload_u32(positions)?;
         let mut out = self.b.dev_alloc_zeros(n)?;
         self.b.rope_apply_dev(
             self.value_slice(x)?,
@@ -9167,9 +9167,9 @@ mod tests {
         let rx = seeded_uniform(0x83, rn, -1.0, 1.0);
         let rgy = seeded_uniform(0x84, rn, -1.0, 1.0);
         let positions: Vec<usize> = (0..n_token).collect();
-        let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let pos_u32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let d_rx = backend.dev_upload(&rx).unwrap();
-        let d_pos = backend.dev_upload_i32(&pos_i32).unwrap();
+        let d_pos = backend.dev_upload_u32(&pos_u32).unwrap();
         let mut d_ry = backend.dev_alloc_zeros(rn).unwrap();
         backend
             .rope_apply_dev(

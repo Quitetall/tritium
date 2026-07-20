@@ -23,6 +23,7 @@ const OPERATIONS: &[&str] = &[
     "graph.rmsnorm",
     "graph.softmax",
     "graph.causal_mask",
+    "graph.rope",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -739,6 +740,90 @@ impl CudaTrainBackendV1 {
         output_f32(output, output_name, &shape, elements)?.copy_from_slice(&result);
         Ok(())
     }
+
+    fn execute_rope(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, output_name) = match request.execution {
+            TrainExecutionV1::Forward => ("x", "result"),
+            TrainExecutionV1::Vjp => ("grad_output", "grad_x"),
+            _ => return Err(invariant("rope received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["positions", "n_head", "head_dim", "theta"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let positions: Vec<u32> = attribute_u64_list(request, "positions")?
+            .iter()
+            .map(|&position| {
+                u32::try_from(position).map_err(|_| attribute_value("positions", "u32"))
+            })
+            .collect::<Result<_, _>>()?;
+        let n_head = attribute_usize(request, "n_head")?;
+        let head_dim = attribute_usize(request, "head_dim")?;
+        let theta = attribute_f32(request, "theta")?;
+        if !head_dim.is_multiple_of(2) {
+            return Err(attribute_value("head_dim", "even"));
+        }
+        if n_head == 0 || head_dim == 0 || !theta.is_finite() || theta <= 0.0 {
+            return Err(attribute_value("theta", "positive"));
+        }
+        let n_token = positions.len();
+        let elements = n_token
+            .checked_mul(n_head)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(shape_error)?;
+        let shape = [n_token as u64, n_head as u64, head_dim as u64];
+        let input = input_f32(request, input_name, &shape)?;
+        require_finite(input_name, input)?;
+        let result = if request.execution == TrainExecutionV1::Forward {
+            let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+            let input_id = tape.leaf(input).map_err(cuda_error)?;
+            let result_id = tape
+                .rope(input_id, &positions, n_head, head_dim, theta, n_token)
+                .map_err(cuda_error)?;
+            tape.value(result_id).map_err(cuda_error)?
+        } else {
+            let device_input = self.backend.dev_upload(input).map_err(cuda_error)?;
+            let device_positions = self
+                .backend
+                .dev_upload_u32(&positions)
+                .map_err(cuda_error)?;
+            let mut device_result = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .rope_apply_dev(
+                    &device_input,
+                    &mut device_result,
+                    &device_positions,
+                    n_head,
+                    head_dim,
+                    theta,
+                    n_token,
+                    -1.0,
+                )
+                .map_err(cuda_error)?;
+            let mut host = vec![0.0; elements];
+            self.backend
+                .dev_download(&device_result, &mut host)
+                .map_err(cuda_error)?;
+            host
+        };
+        output_f32(output, output_name, &shape, elements)?.copy_from_slice(&result);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -775,6 +860,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "graph.rmsnorm" => self.execute_rmsnorm(&request, output)?,
             "graph.softmax" => self.execute_softmax(&request, output)?,
             "graph.causal_mask" => self.execute_causal_mask(&request, output)?,
+            "graph.rope" => self.execute_rope(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
