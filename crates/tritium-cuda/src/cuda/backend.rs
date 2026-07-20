@@ -587,6 +587,11 @@ pub struct CudaBackend {
     pub(super) func_mse_fwd: CudaFunction,
     pub(super) func_mse_bwd: CudaFunction,
     pub(super) func_softmax_xent_fwd: CudaFunction,
+    pub(super) func_ste_fwd: CudaFunction,
+    pub(super) func_ste_bwd: CudaFunction,
+    pub(super) func_lsq_fwd: CudaFunction,
+    pub(super) func_lsq_bwd_weight: CudaFunction,
+    pub(super) func_lsq_bwd_alpha: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -857,6 +862,21 @@ impl CudaBackend {
         let func_softmax_xent_fwd = grad_module
             .load_function(KERNEL_NAME_SOFTMAX_XENT_FWD)
             .map_err(|e| driver_err("resolve softmax_xent_forward kernel", &e))?;
+        let func_ste_fwd = grad_module
+            .load_function(KERNEL_NAME_STE_FWD)
+            .map_err(|e| driver_err("resolve ste_surrogate_forward kernel", &e))?;
+        let func_ste_bwd = grad_module
+            .load_function(KERNEL_NAME_STE_BWD)
+            .map_err(|e| driver_err("resolve ste_surrogate_backward kernel", &e))?;
+        let func_lsq_fwd = grad_module
+            .load_function(KERNEL_NAME_LSQ_FWD)
+            .map_err(|e| driver_err("resolve lsq_forward kernel", &e))?;
+        let func_lsq_bwd_weight = grad_module
+            .load_function(KERNEL_NAME_LSQ_BWD_WEIGHT)
+            .map_err(|e| driver_err("resolve lsq_backward_weight kernel", &e))?;
+        let func_lsq_bwd_alpha = grad_module
+            .load_function(KERNEL_NAME_LSQ_BWD_ALPHA)
+            .map_err(|e| driver_err("resolve lsq_backward_alpha kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -959,6 +979,11 @@ impl CudaBackend {
             func_mse_fwd,
             func_mse_bwd,
             func_softmax_xent_fwd,
+            func_ste_fwd,
+            func_ste_bwd,
+            func_lsq_fwd,
+            func_lsq_bwd_weight,
+            func_lsq_bwd_alpha,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -3227,6 +3252,170 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(1))
                 .map_err(|e| driver_err("launch softmax_xent_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ste_surrogate_forward_dev(
+        &self,
+        weight: &CudaSlice<f32>,
+        scale: &CudaSlice<f32>,
+        result: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("STE geometry overflows usize".into()))?;
+        if weight.len() < n || scale.len() < rows || result.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: result.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_ste_fwd);
+        launch.arg(weight).arg(scale).arg(result).arg(&ri).arg(&ci);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread per weight.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch ste_surrogate_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ste_surrogate_backward_dev(
+        &self,
+        weight: &CudaSlice<f32>,
+        scale: &CudaSlice<f32>,
+        upstream: &CudaSlice<f32>,
+        grad_weight: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("STE geometry overflows usize".into()))?;
+        if weight.len() < n || scale.len() < rows || upstream.len() < n || grad_weight.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: grad_weight.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_ste_bwd);
+        launch
+            .arg(weight)
+            .arg(scale)
+            .arg(upstream)
+            .arg(grad_weight)
+            .arg(&ri)
+            .arg(&ci);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread per weight gradient.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch ste_surrogate_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lsq_forward_dev(
+        &self,
+        weight: &CudaSlice<f32>,
+        alpha: &CudaSlice<f32>,
+        result: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("LSQ geometry overflows usize".into()))?;
+        if weight.len() < n || alpha.len() < rows || result.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: result.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_lsq_fwd);
+        launch.arg(weight).arg(alpha).arg(result).arg(&ri).arg(&ci);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread per weight.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch lsq_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // two inputs, upstream, two outputs, and matrix geometry
+    pub(crate) fn lsq_backward_dev(
+        &self,
+        weight: &CudaSlice<f32>,
+        alpha: &CudaSlice<f32>,
+        upstream: &CudaSlice<f32>,
+        grad_weight: &mut CudaSlice<f32>,
+        grad_alpha: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("LSQ geometry overflows usize".into()))?;
+        if weight.len() < n
+            || alpha.len() < rows
+            || upstream.len() < n
+            || grad_weight.len() < n
+            || grad_alpha.len() < rows
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: grad_weight.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut weight_launch = self.stream.launch_builder(&self.func_lsq_bwd_weight);
+        weight_launch
+            .arg(weight)
+            .arg(alpha)
+            .arg(upstream)
+            .arg(grad_weight)
+            .arg(&ri)
+            .arg(&ci);
+        let mut alpha_launch = self.stream.launch_builder(&self.func_lsq_bwd_alpha);
+        alpha_launch
+            .arg(weight)
+            .arg(alpha)
+            .arg(upstream)
+            .arg(grad_alpha)
+            .arg(&ri)
+            .arg(&ci);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; independent one-thread-per-weight and one-thread-per-row kernels.
+        unsafe {
+            weight_launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch lsq_backward_weight_dev", &e))?;
+            alpha_launch
+                .launch(Self::elementwise_cfg(rows))
+                .map_err(|e| driver_err("launch lsq_backward_alpha_dev", &e))?;
         }
         Ok(())
     }

@@ -13,6 +13,8 @@ use crate::CudaBackend;
 
 const BACKEND_FAMILY: &str = "cuda.portable.v1";
 const OPERATIONS: &[&str] = &[
+    "graph.ste_surrogate",
+    "graph.lsq_ste",
     "graph.dense_matmul",
     "graph.ternary_matmul",
     "graph.transpose",
@@ -152,6 +154,164 @@ impl CudaTrainBackendV1 {
                     .copy_from_slice(&grad_weight);
             }
             _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn execute_ste_surrogate(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["weight", "scale"],
+            TrainExecutionV1::Vjp => &["weight", "scale", "grad_output"],
+            _ => return Err(invariant("ste_surrogate received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_weight", "grad_scale"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let shape = [rows as u64, cols as u64];
+        let weight = input_f32(request, "weight", &shape)?;
+        let scale = input_f32(request, "scale", &[rows as u64])?;
+        require_finite("weight", weight)?;
+        require_finite("scale", scale)?;
+        let device_weight = self.backend.dev_upload(weight).map_err(cuda_error)?;
+        let device_scale = self.backend.dev_upload(scale).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_result = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .ste_surrogate_forward_dev(
+                    &device_weight,
+                    &device_scale,
+                    &mut device_result,
+                    rows,
+                    cols,
+                )
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, elements)?;
+            output_f32(output, "result", &shape, elements)?.copy_from_slice(&result);
+        } else {
+            let upstream = input_f32(request, "grad_output", &shape)?;
+            require_finite("grad_output", upstream)?;
+            let device_upstream = self.backend.dev_upload(upstream).map_err(cuda_error)?;
+            let mut device_grad_weight =
+                self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .ste_surrogate_backward_dev(
+                    &device_weight,
+                    &device_scale,
+                    &device_upstream,
+                    &mut device_grad_weight,
+                    rows,
+                    cols,
+                )
+                .map_err(cuda_error)?;
+            let grad_weight = download_device(&self.backend, &device_grad_weight, elements)?;
+            output_f32(output, "grad_weight", &shape, elements)?.copy_from_slice(&grad_weight);
+            output_f32(output, "grad_scale", &[rows as u64], rows)?.fill(0.0);
+        }
+        Ok(())
+    }
+
+    fn execute_lsq(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["weight", "alpha"],
+            TrainExecutionV1::Vjp => &["weight", "alpha", "grad_output"],
+            _ => return Err(invariant("lsq_ste received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_weight", "grad_alpha"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let shape = [rows as u64, cols as u64];
+        let weight = input_f32(request, "weight", &shape)?;
+        let alpha = input_f32(request, "alpha", &[rows as u64])?;
+        require_finite("weight", weight)?;
+        require_finite("alpha", alpha)?;
+        let device_weight = self.backend.dev_upload(weight).map_err(cuda_error)?;
+        let device_alpha = self.backend.dev_upload(alpha).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_result = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .lsq_forward_dev(
+                    &device_weight,
+                    &device_alpha,
+                    &mut device_result,
+                    rows,
+                    cols,
+                )
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, elements)?;
+            output_f32(output, "result", &shape, elements)?.copy_from_slice(&result);
+        } else {
+            let upstream = input_f32(request, "grad_output", &shape)?;
+            require_finite("grad_output", upstream)?;
+            let device_upstream = self.backend.dev_upload(upstream).map_err(cuda_error)?;
+            let mut device_grad_weight =
+                self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            let mut device_grad_alpha = self.backend.dev_alloc_zeros(rows).map_err(cuda_error)?;
+            self.backend
+                .lsq_backward_dev(
+                    &device_weight,
+                    &device_alpha,
+                    &device_upstream,
+                    &mut device_grad_weight,
+                    &mut device_grad_alpha,
+                    rows,
+                    cols,
+                )
+                .map_err(cuda_error)?;
+            let grad_weight = download_device(&self.backend, &device_grad_weight, elements)?;
+            let grad_alpha = download_device(&self.backend, &device_grad_alpha, rows)?;
+            output_f32(output, "grad_weight", &shape, elements)?.copy_from_slice(&grad_weight);
+            output_f32(output, "grad_alpha", &[rows as u64], rows)?.copy_from_slice(&grad_alpha);
         }
         Ok(())
     }
@@ -1349,6 +1509,8 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         request.validate_with_limits(output, LIMITS)?;
         let input_digest = train_request_digest_v1(&request);
         match request.operation {
+            "graph.ste_surrogate" => self.execute_ste_surrogate(&request, output)?,
+            "graph.lsq_ste" => self.execute_lsq(&request, output)?,
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
             "graph.ternary_matmul" => self.execute_ternary_matmul(&request, output)?,
             "graph.transpose" => self.execute_transpose(&request, output)?,

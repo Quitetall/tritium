@@ -1275,6 +1275,71 @@ extern "C" __global__ void softmax_xent_forward(
     loss[0] = total / (float)rows;
 }
 
+extern "C" __global__ void ste_surrogate_forward(
+    const float* __restrict__ weight, const float* __restrict__ scale,
+    float* __restrict__ result, int rows, int cols)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * cols) return;
+    float s = scale[i / cols];
+    result[i] = s == 0.0f ? 0.0f : fminf(1.0f, fmaxf(-1.0f, weight[i] / s));
+}
+
+extern "C" __global__ void ste_surrogate_backward(
+    const float* __restrict__ weight, const float* __restrict__ scale,
+    const float* __restrict__ upstream, float* __restrict__ grad_weight,
+    int rows, int cols)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * cols) return;
+    float s = scale[i / cols];
+    grad_weight[i] = s != 0.0f && fabsf(weight[i] / s) < 1.0f ? upstream[i] / s : 0.0f;
+}
+
+extern "C" __global__ void lsq_forward(
+    const float* __restrict__ weight, const float* __restrict__ alpha,
+    float* __restrict__ result, int rows, int cols)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * cols) return;
+    float a = alpha[i / cols];
+    result[i] = a > 0.0f ? fminf(1.0f, fmaxf(-1.0f, roundf(weight[i] / a))) * a : 0.0f;
+}
+
+extern "C" __global__ void lsq_backward_weight(
+    const float* __restrict__ weight, const float* __restrict__ alpha,
+    const float* __restrict__ upstream, float* __restrict__ grad_weight,
+    int rows, int cols)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * cols) return;
+    float a = alpha[i / cols];
+    grad_weight[i] = a > 0.0f && fabsf(weight[i] / a) < 1.0f ? upstream[i] : 0.0f;
+}
+
+extern "C" __global__ void lsq_backward_alpha(
+    const float* __restrict__ weight, const float* __restrict__ alpha,
+    const float* __restrict__ upstream, float* __restrict__ grad_alpha,
+    int rows, int cols)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float a = alpha[row];
+    float gradient = 0.0f;
+    if (a > 0.0f) {
+        for (int col = 0; col < cols; ++col) {
+            long i = (long)row * cols + col;
+            float normalized = weight[i] / a;
+            float local = fabsf(normalized) < 1.0f
+                ? roundf(normalized) - normalized
+                : copysignf(1.0f, normalized);
+            gradient += upstream[i] * local;
+        }
+        gradient *= 1.0f / sqrtf((float)cols);
+    }
+    grad_alpha[row] = gradient;
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(
