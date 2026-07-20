@@ -11,7 +11,9 @@ use tritium_train::CpuTrainBackendV1;
 #[test]
 fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
     let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json()).unwrap();
-    let report = run_training_conformance(&CpuTrainBackendV1::new(), &vectors);
+    let report =
+        std::panic::catch_unwind(|| run_training_conformance(&CpuTrainBackendV1::new(), &vectors))
+            .expect("canonical valid/error corpus must never panic the CPU request path");
     assert!(report.is_ok(), "{:#?}", report.failed);
     assert_eq!(report.passed.len(), 114);
     let mut receipt_count = 0;
@@ -62,8 +64,8 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
             let lifecycle_scratch = [
                 ("lifecycle.checkpoint.adamw_multileaf", 153),
                 ("lifecycle.resume.adamw_multileaf", 60),
-                ("lifecycle.export.salt_v2_package", 240),
-                ("lifecycle.reload.salt_v2_package", 240),
+                ("lifecycle.export.salt_v2_package", 132032),
+                ("lifecycle.reload.salt_v2_package", 132032),
             ];
             for (index, &(case_id, scratch_bytes)) in lifecycle_scratch.iter().enumerate() {
                 if passed.case_id == case_id {

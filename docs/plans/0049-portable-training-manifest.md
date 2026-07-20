@@ -110,7 +110,8 @@ Status: **DONE** — the Rust registry/parser and exhaustive source audit are
 landed, and Python plus dependency-free TypeScript parsers accept the same
 semantics, reject duplicate/unknown/type/order drift, and re-emit byte-identical
 canonical JSON. Python passed the complete 92-test suite; Deno type-check and
-three parser tests passed. Slice 2 is next.
+three parser tests passed. Slice 2 and the CPU semantic matrix are complete;
+accelerator adapters are next.
 
 The Slice 2 tracer corpus now carries 114 cases across all 35 operations. In
 addition to the primitive and shape clusters, it covers `graph.ste_surrogate`,

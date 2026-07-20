@@ -2,6 +2,7 @@
 
 use core::f32::consts::PI;
 use std::io::Cursor as IoCursor;
+use std::sync::OnceLock;
 
 use blake3::Hasher;
 use tritium_format::salt_v2_package::SaltV2PackageReader;
@@ -24,6 +25,11 @@ const MAX_SALT_PLANES: u64 = 64;
 const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONV_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ATTENTION_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+// `SaltV2PackageReader::new_strict` retains parsed tensor/index metadata and uses
+// a bounded 1,024-plane validation batch. Eight input bytes of allowance per
+// encoded byte cover persistent metadata plus batch payload/scales; 128 KiB
+// covers descriptors, one decoded allocation tile, and fixed hash state.
+const SALT_V2_VALIDATION_FIXED_SCRATCH_BYTES: u64 = 128 * 1024;
 const MAX_LIFECYCLE_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const CPU_LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: u32::MAX,
@@ -537,11 +543,11 @@ const RELOAD: OperationSchema = OperationSchema {
     outputs: &["package"],
 };
 
-/// Honest partial CPU reference adapter for `TrainBackendV1`.
+/// Complete CPU semantic-reference adapter for `TrainBackendV1` manifest v1.
 ///
-/// Capability coverage grows only when forward/VJP or state-transition vectors
-/// pass through this exact seam. It is not v1-conforming until it advertises
-/// every operation in [`TrainingOpManifestV1`].
+/// Every advertised forward/VJP, optimizer and lifecycle operation passes the
+/// canonical corpus through this exact seam. Accelerator residency and physical
+/// device receipts are separate backend gates.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuTrainBackendV1;
 
@@ -792,7 +798,7 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
         Ok(TrainReceiptV1 {
             backend_id: BACKEND_ID.to_owned(),
             backend_build: backend_build_identity(),
-            physical_device: None,
+            physical_device: Some(cpu_physical_device().to_owned()),
             manifest_digest: TrainingOpManifestV1::digest(),
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
@@ -3840,11 +3846,11 @@ fn operation_scratch_bytes(
         }
         (CpuOperation::Export, TrainExecutionV1::Export) => {
             let (_, package) = input_bytes(request, "package")?;
-            return payload_bytes(package.len(), 2);
+            return salt_v2_validation_scratch_bytes(package.len());
         }
         (CpuOperation::Reload, TrainExecutionV1::Reload) => {
             let (_, artifact) = input_bytes(request, "artifact")?;
-            return payload_bytes(artifact.len(), 2);
+            return salt_v2_validation_scratch_bytes(artifact.len());
         }
         _ => 0,
     };
@@ -3859,18 +3865,7 @@ fn checkpoint_encoded_bytes(
 ) -> Result<u64, TrainBackendError> {
     let mut bytes = 4_u64 + 1 + 8 + 4;
     for &len in leaf_lens {
-        let blocks = len.div_ceil(INT8_ADAM_BLOCK as u64);
-        let state = match optimizer {
-            CheckpointOptimizer::Sgd => 0,
-            CheckpointOptimizer::AdamW | CheckpointOptimizer::CautiousAdamW => {
-                checked_scratch_product(&[len, 8])?
-            }
-            CheckpointOptimizer::Int8AdamW => checked_scratch_sum(&[
-                checked_scratch_product(&[len, 2])?,
-                checked_scratch_product(&[blocks, 8])?,
-            ])?,
-            CheckpointOptimizer::Muon => checked_scratch_product(&[len, 4])?,
-        };
+        let state = checkpoint_state_bytes(optimizer, len)?;
         bytes = checked_scratch_sum(&[bytes, 8, checked_scratch_product(&[len, 4])?, state])?;
     }
     Ok(bytes)
@@ -3882,21 +3877,66 @@ fn checkpoint_payload_bytes(
 ) -> Result<u64, TrainBackendError> {
     let mut bytes = 0_u64;
     for &len in leaf_lens {
-        let blocks = len.div_ceil(INT8_ADAM_BLOCK as u64);
-        let state = match optimizer {
-            CheckpointOptimizer::Sgd => 0,
-            CheckpointOptimizer::AdamW | CheckpointOptimizer::CautiousAdamW => {
-                checked_scratch_product(&[len, 8])?
-            }
-            CheckpointOptimizer::Int8AdamW => checked_scratch_sum(&[
-                checked_scratch_product(&[len, 2])?,
-                checked_scratch_product(&[blocks, 8])?,
-            ])?,
-            CheckpointOptimizer::Muon => checked_scratch_product(&[len, 4])?,
-        };
+        let state = checkpoint_state_bytes(optimizer, len)?;
         bytes = checked_scratch_sum(&[bytes, checked_scratch_product(&[len, 4])?, state])?;
     }
     Ok(bytes)
+}
+
+fn checkpoint_state_bytes(
+    optimizer: CheckpointOptimizer,
+    len: u64,
+) -> Result<u64, TrainBackendError> {
+    match optimizer {
+        CheckpointOptimizer::Sgd => Ok(0),
+        CheckpointOptimizer::AdamW | CheckpointOptimizer::CautiousAdamW => {
+            checked_scratch_product(&[len, 8])
+        }
+        CheckpointOptimizer::Int8AdamW => checked_scratch_sum(&[
+            checked_scratch_product(&[len, 2])?,
+            checked_scratch_product(&[len.div_ceil(INT8_ADAM_BLOCK as u64), 8])?,
+        ]),
+        CheckpointOptimizer::Muon => checked_scratch_product(&[len, 4]),
+    }
+}
+
+fn salt_v2_validation_scratch_bytes(package_len: usize) -> Result<u64, TrainBackendError> {
+    checked_scratch_sum(&[
+        payload_bytes(package_len, 8)?,
+        SALT_V2_VALIDATION_FIXED_SCRATCH_BYTES,
+    ])
+}
+
+fn cpu_physical_device() -> &'static str {
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        let model = linux_cpu_model().unwrap_or_else(|| "unknown-model".to_owned());
+        let logical_cpus = std::thread::available_parallelism()
+            .map(core::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        format!(
+            "cpu:{}:{}:{model}:{logical_cpus}-logical",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })
+}
+
+fn linux_cpu_model() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        cpuinfo.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            matches!(key.trim(), "model name" | "hardware")
+                .then(|| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 fn embedding_attributes(

@@ -2251,7 +2251,7 @@ fn main() {
                         &[hard_artifact.len() as u64],
                         &hard_artifact,
                     )],
-                    scratch_bytes_max: (hard_artifact.len() * 2) as u64,
+                    scratch_bytes_max: (hard_artifact.len() * 8 + 128 * 1024) as u64,
                 },
             },
             Case {
@@ -2271,7 +2271,7 @@ fn main() {
                         &[hard_artifact.len() as u64],
                         &hard_artifact,
                     )],
-                    scratch_bytes_max: (hard_artifact.len() * 2) as u64,
+                    scratch_bytes_max: (hard_artifact.len() * 8 + 128 * 1024) as u64,
                 },
             },
             Case {

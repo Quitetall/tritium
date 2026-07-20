@@ -388,6 +388,11 @@ fn grade_receipt(
             "backend_build".to_owned(),
         ));
     }
+    if !matches!(receipt.physical_device.as_deref(), Some(device) if !device.is_empty()) {
+        return Err(TrainingVectorFailureReason::Receipt(
+            "physical_device".to_owned(),
+        ));
+    }
     if receipt.manifest_digest != vectors.manifest_digest() {
         return Err(TrainingVectorFailureReason::Receipt(
             "manifest_digest".to_owned(),

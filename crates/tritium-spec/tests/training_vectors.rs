@@ -235,6 +235,6 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "d5e3c4f3a9e33e5e2649e0ab3fd4e0e89899a1d4f68ad418ac2f91844c9c56ab"
+        "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6"
     );
 }

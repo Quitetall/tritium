@@ -86,7 +86,12 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
         .unwrap();
     assert_eq!(build_digest.len(), 64);
     assert!(build_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_eq!(receipt.physical_device, None);
+    assert!(
+        receipt
+            .physical_device
+            .as_deref()
+            .is_some_and(|device| device.starts_with("cpu:"))
+    );
     assert_eq!(receipt.vector_digest, None);
     assert_eq!(
         receipt.input_digest,

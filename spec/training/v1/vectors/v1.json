@@ -9049,7 +9049,7 @@
             }
           }
         ],
-        "scratch_bytes_max": 240
+        "scratch_bytes_max": 132032
       }
     },
     {
@@ -9334,7 +9334,7 @@
             }
           }
         ],
-        "scratch_bytes_max": 240
+        "scratch_bytes_max": 132032
       }
     },
     {
