@@ -6,7 +6,7 @@ contains the frozen language-neutral training identities and the checked
 schema, backend-policy, capability, receipt, memory, ordering and concurrency
 violations. Recipes compile before `adapter.prepare` may allocate into an immutable,
 16-byte-aligned buffer/schedule plan. Tensor owners are explicit, tied
-parameters share one allocation, batch names/dtypes/shapes are checked against
+parameters share one allocation and one compiled gradient/optimizer owner, batch names/dtypes/shapes are checked against
 the plan, and allocation-free validation plus non-retaining preparation close
 operation-specific geometry/attribute rules before persistent preparation.
 Model/batch bytes are isolated from adapter mutation. Failed

@@ -422,8 +422,10 @@ function validateModel(model: WebTrainingModelV1): void {
     model.recipe.schemaId !== "tritium.training_recipe" ||
     model.recipe.schemaVersion !== 1 ||
     !Array.isArray(model.recipe.tensors) ||
+    !isDenseArray(model.recipe.tensors) ||
     model.recipe.tensors.length === 0 ||
     !Array.isArray(model.recipe.operations) ||
+    !isDenseArray(model.recipe.operations) ||
     model.recipe.operations.length === 0
   ) {
     fail("invalid_schema", "recipe schema identity is not v1");
@@ -444,6 +446,7 @@ function validateModel(model: WebTrainingModelV1): void {
         "result",
       ] as const).includes(tensor.role) ||
       !Array.isArray(tensor.shape) ||
+      !isDenseArray(tensor.shape) ||
       tensor.shape.some(
         (dimension: unknown) =>
           typeof dimension !== "number" ||
@@ -472,7 +475,10 @@ function validateModel(model: WebTrainingModelV1): void {
     }
     uniqueStrings(operation.inputs, `${operation.id}.inputs`, true);
     uniqueStrings(operation.outputs, `${operation.id}.outputs`, true);
-    if (!Array.isArray(operation.attributes)) {
+    if (
+      !Array.isArray(operation.attributes) ||
+      !isDenseArray(operation.attributes)
+    ) {
       fail("invalid_schema", `${operation.id}.attributes must be an array`);
     }
     for (const attribute of operation.attributes) {
@@ -718,12 +724,14 @@ export function compileTrainingPlan(
       ) {
         fail("invalid_schema", `${operation.id} illegally writes persistent tensor ${tensorId}`);
       }
-      if (
-        descriptor.category === "optimizer" &&
-        tensor.role !== "parameter" &&
-        tensor.role !== "optimizer-state"
-      ) {
-        fail("invalid_schema", `${operation.id} output ${tensorId} is not optimizer-owned`);
+      if (descriptor.category === "optimizer") {
+        const expectedRole = index === 0 ? "parameter" : "optimizer-state";
+        if (tensor.role !== expectedRole) {
+          fail(
+            "invalid_schema",
+            `${operation.id} output ${tensorId} must be ${expectedRole}`,
+          );
+        }
       }
       if (
         descriptor.category === "optimizer" &&
@@ -776,6 +784,96 @@ export function compileTrainingPlan(
       ),
     });
   });
+  const parameterGroupsByOwner = new Map<string, string>();
+  const claimedGradients = new Set<string>();
+  const claimedOptimizerStates = new Set<string>();
+  for (const operation of operations) {
+    if (!operation.operation.startsWith("optimizer.")) continue;
+    const parameter = tensors.get(operation.inputs[0]!);
+    const gradient = tensors.get(operation.inputs[1]!);
+    if (
+      parameter === undefined ||
+      parameter.role !== "parameter" ||
+      parameter.aliasOf !== null ||
+      operation.outputs[0] !== parameter.id
+    ) {
+      fail(
+        "invalid_schema",
+        `${operation.id} must update a canonical parameter owner in place`,
+      );
+    }
+    if (
+      gradient === undefined ||
+      gradient.role !== "gradient" ||
+      gradient.aliasOf !== null ||
+      gradient.dtype !== parameter.dtype ||
+      !sameShape(gradient, parameter)
+    ) {
+      fail(
+        "invalid_schema",
+        `${operation.id} gradient does not match parameter owner ${parameter.id}`,
+      );
+    }
+    if (parameterGroupsByOwner.has(parameter.id)) {
+      fail("invalid_schema", `parameter owner ${parameter.id} has multiple optimizers`);
+    }
+    if (claimedGradients.has(gradient.id)) {
+      fail("invalid_schema", `gradient ${gradient.id} has multiple parameter owners`);
+    }
+    claimedGradients.add(gradient.id);
+    const stateInputIds = operation.inputs.slice(2);
+    const stateOutputIds = operation.outputs.slice(1);
+    if (
+      stateInputIds.length !== stateOutputIds.length ||
+      stateInputIds.some((stateId, index) => stateOutputIds[index] !== stateId)
+    ) {
+      fail("invalid_schema", `${operation.id} optimizer state is not positionally in place`);
+    }
+    const parameterElements = tensorByteLength(parameter) / 4;
+    for (const [index, stateId] of stateInputIds.entries()) {
+      const state = tensors.get(stateId);
+      if (
+        state === undefined ||
+        state.role !== "optimizer-state" ||
+        state.aliasOf !== null
+      ) {
+        fail("invalid_schema", `${operation.id} has invalid optimizer state ${stateId}`);
+      }
+      const expectedScale =
+        operation.operation === "optimizer.int8_adamw" && index >= 2;
+      const shapeMatches = expectedScale
+        ? state.shape.length === 1 &&
+          state.shape[0] === Math.ceil(parameterElements / 256)
+        : sameShape(state, parameter);
+      if (!shapeMatches) {
+        fail("invalid_schema", `${operation.id} optimizer state ${stateId} has wrong shape`);
+      }
+      if (claimedOptimizerStates.has(stateId)) {
+        fail("invalid_schema", `optimizer state ${stateId} has multiple owners`);
+      }
+      claimedOptimizerStates.add(stateId);
+    }
+    parameterGroupsByOwner.set(parameter.id, operation.id);
+  }
+  const parameterOwners = model.recipe.tensors.filter(
+    (tensor) => tensor.role === "parameter" && tensor.aliasOf === null,
+  );
+  for (const parameter of parameterOwners) {
+    if (!parameterGroupsByOwner.has(parameter.id)) {
+      fail("invalid_schema", `parameter owner ${parameter.id} has no optimizer`);
+    }
+  }
+  for (const tensor of model.recipe.tensors) {
+    if (tensor.role === "gradient" && !claimedGradients.has(tensor.id)) {
+      fail("invalid_schema", `gradient ${tensor.id} has no parameter owner`);
+    }
+    if (
+      tensor.role === "optimizer-state" &&
+      !claimedOptimizerStates.has(tensor.id)
+    ) {
+      fail("invalid_schema", `optimizer state ${tensor.id} has no parameter owner`);
+    }
+  }
   const isolatedPayloadBytes = checkedMultiply(
     model.payload.byteLength,
     2,

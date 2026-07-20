@@ -116,13 +116,13 @@ transitions, checkpoint/resume/export byte isolation and idempotent terminal
 dispose are implemented and tested. Recipes now compile before `adapter.prepare`
 may allocate into an immutable operation schedule and 16-byte-aligned static
 buffer plan; tensor ownership, tied-parameter allocation, exact batch staging,
-safe-integer byte accounting and preparation peak ceilings fail closed.
+safe-integer byte accounting, preparation peak ceilings, and one-gradient /
+one-optimizer ownership for each tied-parameter group fail closed.
 The adapter boundary now separates allocation-free, non-mutating, non-retaining
 operation-specific geometry/attribute validation from persistent preparation;
 preparation may allocate decoded state but may not mutate or retain its inputs.
 Preparation peak accounting includes the isolated validation and preparation
-payloads. Gradient
-accumulation ownership for tied parameters, canonical WASM
+payloads. Adapter execution of compiled tied-gradient accumulation, canonical WASM
 checkpoint/artifact execution and device-loss transactions remain open.
 
 Compile a `TrainingRecipeV1` into an immutable operation schedule, buffer plan

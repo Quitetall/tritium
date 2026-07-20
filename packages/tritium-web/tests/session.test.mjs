@@ -196,6 +196,10 @@ test("checked session executes the complete lifecycle in order", async () => {
   assert.equal(tied.byteLength, weight.byteLength);
   assert.ok(Object.isFrozen(session.plan));
   assert.ok(Object.isFrozen(session.plan.buffers));
+  assert.deepEqual(
+    session.plan.operations.find((operation) => operation.id === "sgd").inputs,
+    ["weight", "grad"],
+  );
 
   await rejectsCode(session.step(), "invalid_state");
   const callerBatch = batch();
@@ -313,6 +317,269 @@ test("planner rejects non-representable and sparse typed attributes", async () =
     await rejectsCode(prepareTraining(badModel, config, adapter), "invalid_schema");
     assert.deepEqual(adapter.calls, []);
   }
+});
+
+test("planner enforces one optimizer and gradient per tied parameter owner", async () => {
+  const aliasUpdate = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      operations: model.recipe.operations.map((operation) =>
+        operation.id === "sgd"
+          ? {
+              ...operation,
+              inputs: ["tied-weight", "grad"],
+              outputs: ["tied-weight"],
+            }
+          : operation,
+      ),
+    },
+  };
+  const aliasAdapter = new MockAdapter();
+  await rejectsCode(prepareTraining(aliasUpdate, config, aliasAdapter), "invalid_schema");
+  assert.deepEqual(aliasAdapter.calls, []);
+
+  const duplicateUpdate = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      operations: [
+        ...model.recipe.operations,
+        {
+          ...model.recipe.operations[2],
+          id: "sgd-again",
+        },
+      ],
+    },
+  };
+  const duplicateAdapter = new MockAdapter();
+  await rejectsCode(
+    prepareTraining(duplicateUpdate, config, duplicateAdapter),
+    "invalid_schema",
+  );
+  assert.deepEqual(duplicateAdapter.calls, []);
+
+  const wrongGradientShape = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: model.recipe.tensors.map((tensor) =>
+        tensor.id === "grad" ? { ...tensor, shape: [2] } : tensor,
+      ),
+    },
+  };
+  const shapeAdapter = new MockAdapter();
+  await rejectsCode(
+    prepareTraining(wrongGradientShape, config, shapeAdapter),
+    "invalid_schema",
+  );
+  assert.deepEqual(shapeAdapter.calls, []);
+
+  const orphanGradient = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: [
+        ...model.recipe.tensors,
+        { id: "orphan-grad", dtype: "f32", shape: [1], role: "gradient", aliasOf: null },
+      ],
+    },
+  };
+  const orphanAdapter = new MockAdapter();
+  await rejectsCode(
+    prepareTraining(orphanGradient, config, orphanAdapter),
+    "invalid_schema",
+  );
+  assert.deepEqual(orphanAdapter.calls, []);
+});
+
+test("planner binds stateful optimizer slots exclusively and positionally", async () => {
+  const adamModel = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: [
+        ...model.recipe.tensors,
+        { id: "moment1", dtype: "f32", shape: [1], role: "optimizer-state", aliasOf: null },
+        { id: "moment2", dtype: "f32", shape: [1], role: "optimizer-state", aliasOf: null },
+      ],
+      operations: model.recipe.operations.map((operation) =>
+        operation.id === "sgd"
+          ? {
+              ...operation,
+              operation: "optimizer.adamw",
+              inputs: ["weight", "grad", "moment1", "moment2"],
+              outputs: ["weight", "moment1", "moment2"],
+            }
+          : operation,
+      ),
+    },
+  };
+  const adapter = new MockAdapter();
+  const session = await prepareTraining(adamModel, config, adapter);
+  assert.deepEqual(session.plan.operations.find((item) => item.id === "sgd").inputs.slice(2), [
+    "moment1",
+    "moment2",
+  ]);
+  await session.dispose();
+
+  const wrongStateRole = {
+    ...adamModel,
+    recipe: {
+      ...adamModel.recipe,
+      operations: adamModel.recipe.operations.map((operation) =>
+        operation.id === "sgd"
+          ? {
+              ...operation,
+              inputs: ["weight", "grad", "tied-weight", "moment2"],
+              outputs: ["weight", "tied-weight", "moment2"],
+            }
+          : operation,
+      ),
+    },
+  };
+  await rejectsCode(
+    prepareTraining(wrongStateRole, config, new MockAdapter()),
+    "invalid_schema",
+  );
+
+  const wrongStateShape = {
+    ...adamModel,
+    recipe: {
+      ...adamModel.recipe,
+      tensors: adamModel.recipe.tensors.map((tensor) =>
+        tensor.id === "moment2" ? { ...tensor, shape: [2] } : tensor,
+      ),
+    },
+  };
+  await rejectsCode(
+    prepareTraining(wrongStateShape, config, new MockAdapter()),
+    "invalid_schema",
+  );
+});
+
+test("planner orders multiple groups and rejects shared optimizer state", async () => {
+  const secondParameter = [
+    { id: "weight2", dtype: "f32", shape: [1], role: "parameter", aliasOf: null },
+    { id: "grad2", dtype: "f32", shape: [1], role: "gradient", aliasOf: null },
+  ];
+  const twoGroupModel = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: [...model.recipe.tensors, ...secondParameter],
+      operations: [
+        ...model.recipe.operations,
+        {
+          id: "sgd-second",
+          operation: "optimizer.sgd",
+          inputs: ["weight2", "grad2"],
+          outputs: ["weight2"],
+          attributes: [],
+        },
+      ],
+    },
+  };
+  const session = await prepareTraining(twoGroupModel, config, new MockAdapter());
+  assert.deepEqual(
+    session.plan.operations
+      .filter((operation) => operation.operation.startsWith("optimizer."))
+      .map((operation) => operation.inputs[0]),
+    ["weight", "weight2"],
+  );
+  await session.dispose();
+
+  const sharedStateModel = {
+    ...twoGroupModel,
+    recipe: {
+      ...twoGroupModel.recipe,
+      tensors: [
+        ...twoGroupModel.recipe.tensors,
+        { id: "shared-momentum", dtype: "f32", shape: [1], role: "optimizer-state", aliasOf: null },
+      ],
+      operations: twoGroupModel.recipe.operations.map((operation) =>
+        operation.operation === "optimizer.sgd"
+          ? {
+              ...operation,
+              operation: "optimizer.muon",
+              inputs: [operation.inputs[0], operation.inputs[1], "shared-momentum"],
+              outputs: [operation.outputs[0], "shared-momentum"],
+            }
+          : operation,
+      ),
+    },
+  };
+  await rejectsCode(
+    prepareTraining(sharedStateModel, config, new MockAdapter()),
+    "invalid_schema",
+  );
+});
+
+test("planner validates int8 AdamW block-state geometry", async () => {
+  const tensors = [
+    { id: "wide-weight", dtype: "f32", shape: [260], role: "parameter", aliasOf: null },
+    { id: "wide-grad", dtype: "f32", shape: [260], role: "gradient", aliasOf: null },
+    { id: "moment1-q8", dtype: "bytes", shape: [260], role: "optimizer-state", aliasOf: null },
+    { id: "moment2-q8", dtype: "bytes", shape: [260], role: "optimizer-state", aliasOf: null },
+    { id: "moment1-scale", dtype: "f32", shape: [2], role: "optimizer-state", aliasOf: null },
+    { id: "moment2-scale", dtype: "f32", shape: [2], role: "optimizer-state", aliasOf: null },
+  ];
+  const operation = {
+    id: "int8-adamw",
+    operation: "optimizer.int8_adamw",
+    inputs: [
+      "wide-weight",
+      "wide-grad",
+      "moment1-q8",
+      "moment2-q8",
+      "moment1-scale",
+      "moment2-scale",
+    ],
+    outputs: [
+      "wide-weight",
+      "moment1-q8",
+      "moment2-q8",
+      "moment1-scale",
+      "moment2-scale",
+    ],
+    attributes: [],
+  };
+  const int8Model = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: [...model.recipe.tensors, ...tensors],
+      operations: [...model.recipe.operations, operation],
+    },
+  };
+  const int8Config = { ...config, maxResidentBytes: 4096 };
+  const int8Adapter = new MockAdapter();
+  int8Adapter.prepare = async (_preparedModel, _preparedConfig, plan) =>
+    receipt("session.prepare", "webgpu", {
+      peakResidentBytes: plan.residentBytes,
+    });
+  const session = await prepareTraining(int8Model, int8Config, int8Adapter);
+  assert.deepEqual(session.plan.operations.find((item) => item.id === "int8-adamw").inputs.slice(2), [
+    "moment1-q8",
+    "moment2-q8",
+    "moment1-scale",
+    "moment2-scale",
+  ]);
+  await session.dispose();
+
+  const badScaleModel = {
+    ...int8Model,
+    recipe: {
+      ...int8Model.recipe,
+      tensors: int8Model.recipe.tensors.map((tensor) =>
+        tensor.id === "moment2-scale" ? { ...tensor, shape: [1] } : tensor,
+      ),
+    },
+  };
+  await rejectsCode(
+    prepareTraining(badScaleModel, int8Config, new MockAdapter()),
+    "invalid_schema",
+  );
 });
 
 test("prepare uses one pre-await caller snapshot", async () => {
