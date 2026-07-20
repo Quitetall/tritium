@@ -33,6 +33,7 @@ const TAPE_METHODS: &[(&str, &str)] = &[
 ];
 
 const OPTIMIZERS: &[(&str, &str)] = &[
+    ("Sgd", "optimizer.sgd"),
     ("AdamW", "optimizer.adamw"),
     ("CautiousAdamW", "optimizer.cautious_adamw"),
     ("Int8AdamW", "optimizer.int8_adamw"),
@@ -115,7 +116,6 @@ fn every_optimizer_implementation_has_one_frozen_manifest_id() {
             "missing manifest operation {operation}"
         );
     }
-    assert!(manifest.contains("optimizer.sgd"));
 }
 
 #[test]

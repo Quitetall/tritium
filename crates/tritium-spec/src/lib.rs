@@ -31,6 +31,13 @@ pub use tritium_core::{DType, GemmShape, TernaryFormat, TritError};
 
 mod caps;
 pub use caps::DeviceCaps;
+mod train_backend;
+pub use train_backend::{
+    TrainAttributeV1, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
+    TrainBufferDataMutV1, TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1,
+    TrainExecutionV1, TrainNamedBufferMutV1, TrainNamedBufferRefV1, TrainOutputV1, TrainReceiptV1,
+    TrainRequestError, TrainRequestV1,
+};
 mod training;
 pub use training::{
     TrainingManifestError, TrainingOpCategoryV1, TrainingOpDescriptorV1, TrainingOpManifestV1,

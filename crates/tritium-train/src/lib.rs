@@ -26,6 +26,7 @@ pub mod lr;
 pub mod nn;
 pub mod ops;
 pub mod optim;
+pub mod portable;
 pub mod salt_v2_recovery;
 pub mod tape;
 pub mod value;
@@ -42,8 +43,9 @@ pub use lora::Lora;
 pub use lr::LrSchedule;
 pub use optim::{
     AdamState, AdamW, CautiousAdamW, INT8_ADAM_BLOCK, Int8AdamState, Int8AdamW, Muon, MuonState,
-    Optimizer, newton_schulz,
+    Optimizer, Sgd, SgdState, newton_schulz,
 };
+pub use portable::CpuTrainBackendV1;
 pub use salt_v2_recovery::{
     BypassSchedule, BypassUsageFlag, EarlyStopDecision, EarlyStopGate, EarlyStopPoint,
     FinalRecoveryMetrics, HiddenCosineTerm, LossMode, PlateauConfig, PromotionCheckpoint,

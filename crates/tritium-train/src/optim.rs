@@ -47,6 +47,61 @@ pub trait Optimizer {
     fn read_state(&self, len: usize, cursor: &mut Cursor) -> Result<Self::State, CheckpointError>;
 }
 
+/// Stateless stochastic gradient descent with decoupled weight decay.
+///
+/// This portable reference intentionally excludes momentum: momentum SGD is a
+/// distinct future optimizer identity rather than an ambiguous stateful mode of
+/// `optimizer.sgd`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sgd {
+    /// Learning rate.
+    pub lr: f32,
+    /// Decoupled weight-decay coefficient.
+    pub weight_decay: f32,
+}
+
+impl Sgd {
+    /// Plain SGD at learning rate `lr`, without weight decay.
+    #[must_use]
+    pub const fn new(lr: f32) -> Self {
+        Self {
+            lr,
+            weight_decay: 0.0,
+        }
+    }
+}
+
+/// Zero-sized persistent state for stateless [`Sgd`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SgdState;
+
+impl Optimizer for Sgd {
+    type State = SgdState;
+
+    fn init_state(&self, _len: usize) -> Self::State {
+        SgdState
+    }
+
+    fn step(&self, t: u64, param: &mut [f32], grad: &[f32], _state: &mut Self::State) {
+        debug_assert!(t >= 1, "step index t is 1-based");
+        assert_eq!(param.len(), grad.len(), "param/grad length mismatch");
+        let shrink = 1.0 - self.lr * self.weight_decay;
+        for (parameter, &gradient) in param.iter_mut().zip(grad) {
+            *parameter = *parameter * shrink - self.lr * gradient;
+        }
+    }
+
+    fn write_state(&self, _state: &Self::State, _out: &mut Vec<u8>) {}
+
+    fn read_state(
+        &self,
+        _len: usize,
+        _cursor: &mut Cursor,
+    ) -> Result<Self::State, CheckpointError> {
+        Ok(SgdState)
+    }
+}
+
 /// Decoupled-weight-decay Adam (Loshchilov & Hutter, 2019). Weight decay is applied to
 /// the parameter directly (`w·(1 − lr·wd)`), never folded into the moment buffers, and
 /// `eps` sits outside the square root (`√v̂ + eps`) — matching `torch.optim.AdamW`.

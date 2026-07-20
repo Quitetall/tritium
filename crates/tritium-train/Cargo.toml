@@ -13,6 +13,7 @@ categories.workspace = true
 [dependencies]
 blake3 = { workspace = true }
 tritium-core = { workspace = true }
+tritium-spec = { workspace = true }
 tritium-testkit = { workspace = true }
 # Row-parallel dense matmul forward/vjp — the training hot path. Parallelizing over OUTPUT rows
 # leaves each element's k-accumulation order untouched, so results are bit-identical to the serial
@@ -28,7 +29,6 @@ proptest = { workspace = true }
 # so this dev-dep is acyclic. Also pulls the SALT dequant helper via tritium-format.
 tritium-quantize = { workspace = true }
 tritium-format = { workspace = true }
-tritium-spec = { workspace = true }
 
 [lints]
 workspace = true
