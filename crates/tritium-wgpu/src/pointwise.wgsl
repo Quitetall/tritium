@@ -279,6 +279,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             result[index] = gradient;
         }
+        case 33u: {
+            let row = index / params.auxiliary;
+            let row_scale = right[row];
+            if (row_scale == 0.0) {
+                result[index] = 0.0;
+            } else {
+                result[index] = clamp(left[index] / row_scale, -1.0, 1.0);
+            }
+        }
+        case 34u: {
+            let row = index / params.auxiliary;
+            let row_scale = right[row];
+            if (row_scale != 0.0 && abs(left[index] / row_scale) < 1.0) {
+                result[index] = extra[index] / row_scale;
+            } else {
+                result[index] = 0.0;
+            }
+        }
         default: { result[index] = 0.0; }
     }
 }

@@ -10,6 +10,7 @@ use tritium_spec::{
 use crate::WgpuBackend;
 
 const OPERATIONS: &[&str] = &[
+    "graph.ste_surrogate",
     "graph.dense_matmul",
     "graph.ternary_matmul",
     "graph.embedding_gather",
@@ -1073,6 +1074,81 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_ste_surrogate(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) = match request.execution {
+            TrainExecutionV1::Forward => (&["weight", "scale"], &["result"]),
+            TrainExecutionV1::Vjp => (
+                &["weight", "scale", "grad_output"],
+                &["grad_weight", "grad_scale"],
+            ),
+            _ => return Err(invariant("STE surrogate received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        if rows > u32::MAX as u64 || cols == 0 || cols > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let weight_shape = [rows, cols];
+        let scale_shape = [rows];
+        let (actual_weight_shape, weight) = input_f32(request, "weight")?;
+        let (actual_scale_shape, scale) = input_f32(request, "scale")?;
+        if actual_weight_shape != weight_shape || actual_scale_shape != scale_shape {
+            return Err(shape_error());
+        }
+        require_finite("weight", weight)?;
+        require_finite("scale", scale)?;
+        let gradient = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != weight_shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            weight
+        };
+        if request.execution == TrainExecutionV1::Forward {
+            let result = self
+                .backend
+                .pointwise(weight, scale, gradient, 33, 0.0, cols as u32)
+                .map_err(wgpu_error)?;
+            output_f32(output, "result", &weight_shape, weight.len())?.copy_from_slice(&result);
+        } else {
+            let grad_weight = self
+                .backend
+                .pointwise(weight, scale, gradient, 34, 0.0, cols as u32)
+                .map_err(wgpu_error)?;
+            let grad_scale = self
+                .backend
+                .pointwise(scale, scale, scale, 1, 0.0, 0)
+                .map_err(wgpu_error)?;
+            output_f32(output, "grad_weight", &weight_shape, weight.len())?
+                .copy_from_slice(&grad_weight);
+            output_f32(output, "grad_scale", &scale_shape, scale.len())?
+                .copy_from_slice(&grad_scale);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -1135,6 +1211,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.embedding_gather" {
             self.execute_embedding(&request, output)?;
+            0
+        } else if request.operation == "graph.ste_surrogate" {
+            self.execute_ste_surrogate(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
