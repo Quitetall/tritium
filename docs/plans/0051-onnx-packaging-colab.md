@@ -96,11 +96,13 @@ tables stream into final storage with checked allocation; impossible geometry
 returns a typed error before allocation.
 The first architecture tensor-map adapter now maps canonical SmolLM2
 Hugging Face names into the tied-head, bias-free, full-RoPE SwiGLU graph and
-rejects missing names or config/tensor geometry drift. BitNet still requires
-ReLU2 plus subnorm graph semantics; Qwen3.6 still requires its heterogeneous
+rejects missing names or config/tensor geometry drift. The causal graph now
+also represents BitNet's ReLU2 gate activation plus attention-output and
+FFN-intermediate subnorms, with real ORT/reference parity; the BitNet GGUF
+tensor-map adapter remains open. Qwen3.6 still requires its heterogeneous
 DeltaNet/full-attention schedule, untied head, output gate, biases and partial
-RoPE. Multi-layer large-model external-data packaging, those graph extensions,
-dynamic axes and end-user generation APIs remain open.
+RoPE. Multi-layer large-model external-data packaging, those Qwen graph
+extensions, dynamic axes and end-user generation APIs remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

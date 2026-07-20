@@ -138,13 +138,19 @@ pub struct CausalLmDecoderLayer<'a> {
     pub value: PackedTernaryMatrix<'a>,
     /// Attention output projection.
     pub attention_output: PackedTernaryMatrix<'a>,
+    /// Optional RMSNorm over attention context before the output projection.
+    pub attention_sub_norm: Option<&'a [f32]>,
     /// Pre-FFN RMSNorm weight.
     pub ffn_norm: &'a [f32],
-    /// SwiGLU gate projection.
+    /// Gate projection.
     pub gate: PackedTernaryMatrix<'a>,
-    /// SwiGLU up projection.
+    /// Up projection multiplied by the activated gate.
     pub up: PackedTernaryMatrix<'a>,
-    /// SwiGLU down projection.
+    /// Optional RMSNorm over the gated intermediate before the down projection.
+    pub ffn_sub_norm: Option<&'a [f32]>,
+    /// Gate activation semantics.
+    pub activation: CausalActivation,
+    /// Down projection.
     pub down: PackedTernaryMatrix<'a>,
 }
 
@@ -308,9 +314,12 @@ pub fn map_smollm2_causal_lm<'a>(
             key: source.matrix(&format!("{prefix}.self_attn.k_proj.weight"))?,
             value: source.matrix(&format!("{prefix}.self_attn.v_proj.weight"))?,
             attention_output: source.matrix(&format!("{prefix}.self_attn.o_proj.weight"))?,
+            attention_sub_norm: None,
             ffn_norm: source.vector(&format!("{prefix}.post_attention_layernorm.weight"))?,
             gate: source.matrix(&format!("{prefix}.mlp.gate_proj.weight"))?,
             up: source.matrix(&format!("{prefix}.mlp.up_proj.weight"))?,
+            ffn_sub_norm: None,
+            activation: CausalActivation::SwiGlu,
             down: source.matrix(&format!("{prefix}.mlp.down_proj.weight"))?,
         });
     }
@@ -1035,8 +1044,8 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
         ("", "ReduceMean") => &["keepdims"],
         (
             "",
-            "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Reshape" | "Tile" | "Identity"
-            | "Slice" | "Neg",
+            "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Relu" | "Reshape" | "Tile"
+            | "Identity" | "Slice" | "Neg",
         ) => &[],
         _ => &[],
     }
@@ -1093,8 +1102,9 @@ fn node_supported(
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => tritium_opset == Some(2),
         (
             "",
-            "Transpose" | "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Reshape"
-            | "Tile" | "Identity" | "Slice" | "Neg" | "Concat" | "ReduceMean" | "Softmax",
+            "Transpose" | "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Relu"
+            | "Reshape" | "Tile" | "Identity" | "Slice" | "Neg" | "Concat" | "ReduceMean"
+            | "Softmax",
         ) => standard_opset == Some(ONNX_OPSET),
         _ => false,
     }
@@ -2801,34 +2811,67 @@ impl CausalGraphBuilder {
             &format!("{prefix}.up"),
             layer.up,
         )?;
-        let sigmoid = format!("{prefix}.gate_sigmoid");
-        self.standard(
-            format!("{prefix}.sigmoid"),
-            "Sigmoid",
-            &[&gate],
-            &[&sigmoid],
-            Vec::new(),
-        );
-        let silu = format!("{prefix}.silu");
-        self.standard(
-            format!("{prefix}.silu_mul"),
-            "Mul",
-            &[&gate, &sigmoid],
-            &[&silu],
-            Vec::new(),
-        );
+        let activated_gate = format!("{prefix}.activated_gate");
+        match layer.activation {
+            CausalActivation::SwiGlu => {
+                let sigmoid = format!("{prefix}.gate_sigmoid");
+                self.standard(
+                    format!("{prefix}.sigmoid"),
+                    "Sigmoid",
+                    &[&gate],
+                    &[&sigmoid],
+                    Vec::new(),
+                );
+                self.standard(
+                    format!("{prefix}.silu"),
+                    "Mul",
+                    &[&gate, &sigmoid],
+                    &[&activated_gate],
+                    Vec::new(),
+                );
+            }
+            CausalActivation::Relu2 => {
+                let relu = format!("{prefix}.gate_relu");
+                self.standard(
+                    format!("{prefix}.relu"),
+                    "Relu",
+                    &[&gate],
+                    &[&relu],
+                    Vec::new(),
+                );
+                self.standard(
+                    format!("{prefix}.relu_square"),
+                    "Mul",
+                    &[&relu, &relu],
+                    &[&activated_gate],
+                    Vec::new(),
+                );
+            }
+        }
         let gated = format!("{prefix}.gated");
         self.standard(
-            format!("{prefix}.swiglu"),
+            format!("{prefix}.gated_multiply"),
             "Mul",
-            &[&silu, &up],
+            &[&activated_gate, &up],
             &[&gated],
             Vec::new(),
         );
+        let mut down_input = gated;
+        if let Some(weight) = layer.ffn_sub_norm {
+            let normalized = format!("{prefix}.ffn_sub_norm.output");
+            self.rms_norm(
+                &format!("{prefix}.ffn_sub_norm"),
+                &down_input,
+                &normalized,
+                weight,
+                epsilon,
+            );
+            down_input = normalized;
+        }
         let ffn_output = format!("{prefix}.ffn_output");
         self.projection(
             &format!("{prefix}.down_projection"),
-            &gated,
+            &down_input,
             &ffn_output,
             &format!("{prefix}.down"),
             layer.down,
@@ -3117,10 +3160,22 @@ fn build_causal_lm_graph(
             &[&context],
             Vec::new(),
         );
+        let mut output_input = context;
+        if let Some(weight) = layer.attention_sub_norm {
+            let normalized = format!("{prefix}.attention_sub_norm.output");
+            graph.rms_norm(
+                &format!("{prefix}.attention_sub_norm"),
+                &output_input,
+                &normalized,
+                weight,
+                model.rms_epsilon,
+            );
+            output_input = normalized;
+        }
         let attention_output = format!("{prefix}.attention_output");
         graph.projection(
             &format!("{prefix}.output"),
-            &context,
+            &output_input,
             &attention_output,
             &format!("{prefix}.attention_output"),
             layer.attention_output,
@@ -3578,12 +3633,18 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             hidden,
             hidden,
         )?;
+        if let Some(weight) = layer.attention_sub_norm {
+            validate_vector(&format!("layer.{index}.attention_sub_norm"), weight, hidden)?;
+        }
         if layer.gate.rows == 0 || layer.gate.rows != layer.up.rows {
             return Err(OnnxModelError::InvalidModel(format!(
                 "layer.{index} gate/up intermediate widths disagree"
             )));
         }
         let intermediate = layer.gate.rows;
+        if let Some(weight) = layer.ffn_sub_norm {
+            validate_vector(&format!("layer.{index}.ffn_sub_norm"), weight, intermediate)?;
+        }
         validate_matrix_shape(
             &format!("layer.{index}.gate"),
             layer.gate,
@@ -3641,7 +3702,13 @@ fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), O
         if let Some(weight) = layer.key_norm {
             add_vector(&mut total, weight)?;
         }
+        if let Some(weight) = layer.attention_sub_norm {
+            add_vector(&mut total, weight)?;
+        }
         add_vector(&mut total, layer.ffn_norm)?;
+        if let Some(weight) = layer.ffn_sub_norm {
+            add_vector(&mut total, weight)?;
+        }
         for matrix in [
             layer.query,
             layer.key,

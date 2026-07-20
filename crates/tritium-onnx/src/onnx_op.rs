@@ -959,6 +959,9 @@ mod tests {
         query_norm: &[f32],
         key_norm: &[f32],
         ffn_norm: &[f32],
+        attention_sub_norm: Option<&[f32]>,
+        ffn_sub_norm: Option<&[f32]>,
+        activation: crate::CausalActivation,
         final_norm: &[f32],
         n_head: usize,
         n_kv_head: usize,
@@ -1001,7 +1004,10 @@ mod tests {
             past_k.len() / (n_kv_head * head_dim),
         )
         .unwrap();
-        let attention_output = dense_project(&context, o);
+        let output_input = attention_sub_norm.map_or(context.clone(), |weight| {
+            rms_norm(&context, weight, epsilon)
+        });
+        let attention_output = dense_project(&output_input, o);
         let post_attention: Vec<f32> = hidden
             .iter()
             .zip(attention_output)
@@ -1013,9 +1019,18 @@ mod tests {
         let activated: Vec<f32> = gate_values
             .into_iter()
             .zip(up_values)
-            .map(|(gate, up)| gate * (1.0 / (1.0 + (-gate).exp())) * up)
+            .map(|(gate, up)| {
+                let activated_gate = match activation {
+                    crate::CausalActivation::SwiGlu => gate * (1.0 / (1.0 + (-gate).exp())),
+                    crate::CausalActivation::Relu2 => gate.max(0.0).powi(2),
+                };
+                activated_gate * up
+            })
             .collect();
-        let ffn_output = dense_project(&activated, down);
+        let down_input = ffn_sub_norm.map_or(activated.clone(), |weight| {
+            rms_norm(&activated, weight, epsilon)
+        });
+        let ffn_output = dense_project(&down_input, down);
         let post_ffn: Vec<f32> = post_attention
             .iter()
             .zip(ffn_output)
@@ -1132,9 +1147,12 @@ mod tests {
             key: packed_matrix(8, 16, &k_packed, &eight_scales, format),
             value: packed_matrix(8, 16, &v_packed, &eight_scales, format),
             attention_output: packed_matrix(16, 16, &o_packed, &sixteen_scales, format),
+            attention_sub_norm: None,
             ffn_norm: &ffn_norm,
             gate: packed_matrix(16, 16, &gate_packed, &sixteen_scales, format),
             up: packed_matrix(16, 16, &up_packed, &sixteen_scales, format),
+            ffn_sub_norm: None,
+            activation: crate::CausalActivation::SwiGlu,
             down: packed_matrix(16, 16, &down_packed, &sixteen_scales, format),
         };
         let identity = crate::OnnxArtifactIdentityV2 {
@@ -1222,6 +1240,9 @@ mod tests {
             &query_norm,
             &key_norm,
             &ffn_norm,
+            None,
+            None,
+            crate::CausalActivation::SwiGlu,
             &final_norm,
             4,
             2,
@@ -1231,6 +1252,79 @@ mod tests {
         );
         let prompt_model = encode(2, 0);
         assert_eq!(prompt_model, encode(2, 0));
+        let attention_sub_norm = (0..16)
+            .map(|lane| 0.8 + 0.03 * lane as f32)
+            .collect::<Vec<_>>();
+        let ffn_sub_norm = (0..16)
+            .map(|lane| 1.2 - 0.02 * lane as f32)
+            .collect::<Vec<_>>();
+        let bitnet_layer = crate::CausalLmDecoderLayer {
+            attention_sub_norm: Some(&attention_sub_norm),
+            ffn_sub_norm: Some(&ffn_sub_norm),
+            activation: crate::CausalActivation::Relu2,
+            ..layer
+        };
+        let bitnet_model = encode_result(
+            2,
+            0,
+            bitnet_layer,
+            Some(crate::RotaryEmbedding { theta: rope_theta }),
+        )
+        .unwrap();
+        assert!(
+            crate::diagnose_unsupported_graph(&bitnet_model)
+                .unwrap()
+                .is_empty()
+        );
+        let (bitnet_expected, _, _) = reference_causal_lm(
+            &prompt_tokens,
+            &[],
+            &[],
+            &dense_embedding,
+            &dense_q,
+            &dense_k,
+            &dense_v,
+            &dense_o,
+            &dense_gate,
+            &dense_up,
+            &dense_down,
+            &attention_norm,
+            &query_norm,
+            &key_norm,
+            &ffn_norm,
+            Some(&attention_sub_norm),
+            Some(&ffn_sub_norm),
+            crate::CausalActivation::Relu2,
+            &final_norm,
+            4,
+            2,
+            4,
+            rope_theta,
+            epsilon,
+        );
+        let mut bitnet_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&bitnet_model)
+            .unwrap();
+        let bitnet_tokens =
+            Tensor::from_array(([2], prompt_tokens.clone().into_boxed_slice())).unwrap();
+        let bitnet_outputs = bitnet_session.run(ort::inputs![&bitnet_tokens]).unwrap();
+        let (_, bitnet_logits) = bitnet_outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(bitnet_logits, &bitnet_expected, 2.0e-5);
+        assert!(
+            encode_result(
+                1,
+                0,
+                crate::CausalLmDecoderLayer {
+                    ffn_sub_norm: Some(&short_norm),
+                    ..bitnet_layer
+                },
+                Some(crate::RotaryEmbedding { theta: rope_theta }),
+            )
+            .is_err()
+        );
         let external = crate::encode_external_causal_lm(crate::CausalLmModel {
             tokens: 2,
             past_tokens: 0,
@@ -1375,6 +1469,9 @@ mod tests {
             &query_norm,
             &key_norm,
             &ffn_norm,
+            None,
+            None,
+            crate::CausalActivation::SwiGlu,
             &final_norm,
             4,
             2,
