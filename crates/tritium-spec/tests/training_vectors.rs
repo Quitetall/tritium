@@ -167,6 +167,9 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.causal_mask.vjp.basic",
             "graph.rope.forward.basic",
             "graph.rope.vjp.basic",
+            "graph.attention.forward.causal_gqa",
+            "graph.attention.forward.noncausal_gqa",
+            "graph.attention.vjp.causal_gqa",
             "loss.mse.forward.basic",
             "loss.mse.vjp.basic",
             "loss.softmax_cross_entropy.forward.basic",
@@ -201,13 +204,16 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.fsq.forward.unknown_ste",
             "graph.conv1d.forward.zero_groups",
             "graph.conv1d.forward.ragged_groups",
+            "graph.conv1d.forward.axis_u32_overflow",
+            "graph.conv1d.forward.scratch_limit",
             "graph.conv2d.forward.zero_groups",
             "graph.conv2d.forward.oversized_kernel",
+            "graph.attention.forward.ragged_gqa",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "0d74bc21e902874603cdbaf45098a22218aa1f209ed9be590b2ade04b49cf132"
+        "ae3e3fa0b5a08a6db8da1b4f2e7b0148437392ce6379be17dc18e1acc164061c"
     );
 }

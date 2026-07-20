@@ -1,11 +1,11 @@
 //! Canonical plan-0049 vectors replayed through the public CPU backend seam.
 
 use tritium_spec::{
-    TrainBackendError, TrainBackendV1, TrainCapabilitiesV1, TrainDTypeV1, TrainOutputV1,
-    TrainReceiptV1, TrainRequestV1, TrainingVectorSetV1, train_output_digest_v1,
-    train_request_digest_v1,
+    train_output_digest_v1, train_request_digest_v1, TrainBackendError, TrainBackendV1,
+    TrainCapabilitiesV1, TrainDTypeV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1,
+    TrainingVectorSetV1,
 };
-use tritium_testkit::{TrainingVectorFailureReason, run_training_conformance};
+use tritium_testkit::{run_training_conformance, TrainingVectorFailureReason};
 use tritium_train::CpuTrainBackendV1;
 
 #[test]
@@ -13,16 +13,34 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
     let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json()).unwrap();
     let report = run_training_conformance(&CpuTrainBackendV1::new(), &vectors);
     assert!(report.is_ok(), "{:#?}", report.failed);
-    assert_eq!(report.passed.len(), 87);
+    assert_eq!(report.passed.len(), 93);
     let mut receipt_count = 0;
+    let mut checked_conv2d_scratch = false;
+    let mut checked_attention_forward_scratch = false;
+    let mut checked_attention_vjp_scratch = false;
     for passed in report.passed {
         if let Some(receipt) = passed.receipt {
             receipt_count += 1;
             assert_eq!(receipt.vector_digest, Some(vectors.source_digest()));
             assert_eq!(receipt.manifest_digest, vectors.manifest_digest());
+            if passed.case_id == "graph.conv2d.forward.depthwise_asymmetric" {
+                assert_eq!(receipt.scratch_bytes, 168);
+                checked_conv2d_scratch = true;
+            }
+            if passed.case_id == "graph.attention.forward.causal_gqa" {
+                assert_eq!(receipt.scratch_bytes, 84);
+                checked_attention_forward_scratch = true;
+            }
+            if passed.case_id == "graph.attention.vjp.causal_gqa" {
+                assert_eq!(receipt.scratch_bytes, 168);
+                checked_attention_vjp_scratch = true;
+            }
         }
     }
-    assert_eq!(receipt_count, 56);
+    assert_eq!(receipt_count, 59);
+    assert!(checked_conv2d_scratch);
+    assert!(checked_attention_forward_scratch);
+    assert!(checked_attention_vjp_scratch);
     assert_eq!(
         CpuTrainBackendV1::new().capabilities().supported_operations,
         [
@@ -49,6 +67,7 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
             "graph.softmax",
             "graph.causal_mask",
             "graph.rope",
+            "graph.attention",
             "loss.mse",
             "loss.softmax_cross_entropy",
             "optimizer.sgd",

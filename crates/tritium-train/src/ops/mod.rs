@@ -1,6 +1,7 @@
 //! Per-op forward + `vjp` (vector-Jacobian product) functions.
 
 pub mod act;
+pub mod attention;
 pub mod bias;
 pub mod conv1d;
 pub mod conv2d;

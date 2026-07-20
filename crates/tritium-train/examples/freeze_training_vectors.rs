@@ -13,7 +13,7 @@ use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
 use tritium_train::{
     Optimizer, Sgd,
     ops::{
-        act, bias, conv1d, conv2d, dense, elementwise, embed,
+        act, attention, bias, conv1d, conv2d, dense, elementwise, embed,
         fsq::{self, FsqBound, FsqCfg, FsqSte},
         loss, matmul, norm, rope, shape, softmax, ste,
     },
@@ -72,6 +72,10 @@ enum Attribute {
     U64 {
         name: &'static str,
         value: u64,
+    },
+    Bool {
+        name: &'static str,
+        value: bool,
     },
     U64List {
         name: &'static str,
@@ -254,6 +258,24 @@ fn main() {
         groups: 3,
         ..conv1d_cfg
     };
+    let conv1d_axis_boundary = conv1d::Conv1dCfg {
+        batch: 1,
+        c_in: 1,
+        c_out: 1,
+        l_in: 1,
+        k: 1,
+        stride: u32::MAX as usize,
+        dilation: 1,
+        pad_left: 0,
+        pad_right: u32::MAX as usize,
+        groups: 1,
+    };
+    let conv1d_scratch_overflow = conv1d::Conv1dCfg {
+        l_in: 20_000_000,
+        stride: 1,
+        pad_right: 0,
+        ..conv1d_axis_boundary
+    };
 
     let conv2d_cfg = conv2d::Conv2dCfg {
         batch: 1,
@@ -298,6 +320,46 @@ fn main() {
         kernel_h: 8,
         ..conv2d_cfg
     };
+
+    let attention_cfg = attention::AttentionCfg {
+        seq: 3,
+        n_head: 2,
+        n_kv_head: 1,
+        head_dim: 2,
+        causal: true,
+    };
+    let attention_noncausal_cfg = attention::AttentionCfg {
+        causal: false,
+        ..attention_cfg
+    };
+    let attention_ragged_gqa_cfg = attention::AttentionCfg {
+        n_head: 3,
+        n_kv_head: 2,
+        ..attention_cfg
+    };
+    let attention_q = [
+        0.2_f32, -0.1, 0.4, 0.3, -0.5, 0.7, 0.1, -0.2, 0.6, 0.8, -0.3, 0.9,
+    ];
+    let attention_k = [0.5_f32, -0.4, 0.2, 0.1, -0.6, 0.7];
+    let attention_v = [1.0_f32, -1.0, 0.5, 0.25, -0.75, 1.5];
+    let attention_grad_output = [
+        0.25_f32, -0.5, 0.75, 0.1, -0.2, 0.4, -0.6, 0.3, 0.9, -0.8, 0.2, 0.5,
+    ];
+    let attention_result =
+        attention::forward(&attention_q, &attention_k, &attention_v, attention_cfg);
+    let attention_noncausal_result = attention::forward(
+        &attention_q,
+        &attention_k,
+        &attention_v,
+        attention_noncausal_cfg,
+    );
+    let attention_grads = attention::vjp(
+        &attention_q,
+        &attention_k,
+        &attention_v,
+        attention_cfg,
+        &attention_grad_output,
+    );
 
     let mul_left = [2.0_f32, -3.0, 0.0];
     let mul_right = [-4.0_f32, 0.5, 7.0];
@@ -1614,6 +1676,72 @@ fn main() {
                 },
             },
             Case {
+                case_id: "graph.attention.forward.causal_gqa",
+                operation: "graph.attention",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("q", &[3, 2, 2], &attention_q),
+                    f32_buffer("k", &[3, 1, 2], &attention_k),
+                    f32_buffer("v", &[3, 1, 2], &attention_v),
+                ],
+                attributes: attention_attributes(&attention_cfg),
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[3, 2, 2], &attention_result)],
+                    scratch_bytes_max: 84,
+                },
+            },
+            Case {
+                case_id: "graph.attention.forward.noncausal_gqa",
+                operation: "graph.attention",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("q", &[3, 2, 2], &attention_q),
+                    f32_buffer("k", &[3, 1, 2], &attention_k),
+                    f32_buffer("v", &[3, 1, 2], &attention_v),
+                ],
+                attributes: attention_attributes(&attention_noncausal_cfg),
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer(
+                        "result",
+                        &[3, 2, 2],
+                        &attention_noncausal_result,
+                    )],
+                    scratch_bytes_max: 84,
+                },
+            },
+            Case {
+                case_id: "graph.attention.vjp.causal_gqa",
+                operation: "graph.attention",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("q", &[3, 2, 2], &attention_q),
+                    f32_buffer("k", &[3, 1, 2], &attention_k),
+                    f32_buffer("v", &[3, 1, 2], &attention_v),
+                    f32_buffer("grad_output", &[3, 2, 2], &attention_grad_output),
+                ],
+                attributes: attention_attributes(&attention_cfg),
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_q", &[3, 2, 2], &attention_grads[0]),
+                        f32_buffer("grad_k", &[3, 1, 2], &attention_grads[1]),
+                        f32_buffer("grad_v", &[3, 1, 2], &attention_grads[2]),
+                    ],
+                    scratch_bytes_max: 168,
+                },
+            },
+            Case {
                 case_id: "loss.mse.forward.basic",
                 operation: "loss.mse",
                 execution: "forward",
@@ -2429,6 +2557,40 @@ fn main() {
                 },
             },
             Case {
+                case_id: "graph.conv1d.forward.axis_u32_overflow",
+                operation: "graph.conv1d",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("x", &[1, 1, 1], &[0.5]),
+                    f32_buffer("weight", &[1, 1, 1], &[1.0]),
+                    f32_buffer("scale", &[1], &[1.0]),
+                ],
+                attributes: conv1d_attributes(&conv1d_axis_boundary),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.k.axis_u32",
+                    outputs: vec![f32_buffer("result", &[], &[123.0])],
+                },
+            },
+            Case {
+                case_id: "graph.conv1d.forward.scratch_limit",
+                operation: "graph.conv1d",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("x", &[1, 1, 1], &[0.5]),
+                    f32_buffer("weight", &[1, 1, 1], &[1.0]),
+                    f32_buffer("scale", &[1], &[1.0]),
+                ],
+                attributes: conv1d_attributes(&conv1d_scratch_overflow),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.scratch.limit_64_mib",
+                    outputs: vec![f32_buffer("result", &[], &[123.0])],
+                },
+            },
+            Case {
                 case_id: "graph.conv2d.forward.zero_groups",
                 operation: "graph.conv2d",
                 execution: "forward",
@@ -2460,6 +2622,23 @@ fn main() {
                     category: "invalid_operation",
                     code: "attribute_value.kernel_h.output_nonzero",
                     outputs: vec![f32_buffer("result", &[1, 2, 3, 2], &[123.0; 12])],
+                },
+            },
+            Case {
+                case_id: "graph.attention.forward.ragged_gqa",
+                operation: "graph.attention",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("q", &[3, 2, 2], &attention_q),
+                    f32_buffer("k", &[3, 1, 2], &attention_k),
+                    f32_buffer("v", &[3, 1, 2], &attention_v),
+                ],
+                attributes: attention_attributes(&attention_ragged_gqa_cfg),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.n_kv_head.divides_n_head",
+                    outputs: vec![f32_buffer("result", &[3, 2, 2], &[123.0; 12])],
                 },
             },
         ],
@@ -2531,4 +2710,29 @@ fn conv2d_attributes(cfg: &conv2d::Conv2dCfg) -> Vec<Attribute> {
         value: value as u64,
     })
     .collect()
+}
+
+fn attention_attributes(cfg: &attention::AttentionCfg) -> Vec<Attribute> {
+    vec![
+        Attribute::U64 {
+            name: "seq",
+            value: cfg.seq as u64,
+        },
+        Attribute::U64 {
+            name: "n_head",
+            value: cfg.n_head as u64,
+        },
+        Attribute::U64 {
+            name: "n_kv_head",
+            value: cfg.n_kv_head as u64,
+        },
+        Attribute::U64 {
+            name: "head_dim",
+            value: cfg.head_dim as u64,
+        },
+        Attribute::Bool {
+            name: "causal",
+            value: cfg.causal,
+        },
+    ]
 }

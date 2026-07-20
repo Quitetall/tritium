@@ -12,12 +12,14 @@ use tritium_spec::{
 
 use crate::{
     Optimizer, Sgd,
-    ops::{conv1d, conv2d},
+    ops::{attention, conv1d, conv2d},
 };
 
 const BACKEND_ID: &str = "cpu.reference.v1";
 const MAX_SALT_PLANES: u64 = 64;
 const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CONV_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ATTENTION_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const CPU_LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: u32::MAX,
     max_elements: usize::MAX as u64,
@@ -49,6 +51,7 @@ enum CpuOperation {
     Softmax,
     CausalMask,
     Rope,
+    Attention,
     Mse,
     SoftmaxCrossEntropy,
     Sgd,
@@ -152,6 +155,10 @@ const CPU_OPERATIONS: &[CpuOperationEntry] = &[
     CpuOperationEntry {
         id: "graph.rope",
         operation: CpuOperation::Rope,
+    },
+    CpuOperationEntry {
+        id: "graph.attention",
+        operation: CpuOperation::Attention,
     },
     CpuOperationEntry {
         id: "loss.mse",
@@ -413,6 +420,16 @@ const ROPE_VJP: OperationSchema = OperationSchema {
     attributes: &["positions", "n_head", "head_dim", "theta"],
     outputs: &["grad_x"],
 };
+const ATTENTION_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["q", "k", "v"],
+    attributes: &["seq", "n_head", "n_kv_head", "head_dim", "causal"],
+    outputs: &["result"],
+};
+const ATTENTION_VJP: OperationSchema = OperationSchema {
+    inputs: &["q", "k", "v", "grad_output"],
+    attributes: ATTENTION_FORWARD.attributes,
+    outputs: &["grad_q", "grad_k", "grad_v"],
+};
 const SOFTMAX_XENT_FORWARD: OperationSchema = OperationSchema {
     inputs: &["logits", "target"],
     attributes: &["rows", "cols"],
@@ -471,6 +488,44 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             .iter()
             .find(|entry| entry.id == request.operation)
             .ok_or_else(|| TrainBackendError::UnsupportedOperation(request.operation.to_owned()))?;
+        match (operation.operation, request.execution) {
+            (CpuOperation::SaltSte, TrainExecutionV1::Forward) => {
+                require_contract(&request, output, &SALT_FORWARD)?;
+            }
+            (CpuOperation::Conv1d, TrainExecutionV1::Forward) => {
+                require_contract(&request, output, &CONV1D_FORWARD)?;
+            }
+            (CpuOperation::Conv1d, TrainExecutionV1::Vjp) => {
+                require_contract(&request, output, &CONV1D_VJP)?;
+            }
+            (CpuOperation::Conv2d, TrainExecutionV1::Forward) => {
+                require_contract(&request, output, &CONV2D_FORWARD)?;
+            }
+            (CpuOperation::Conv2d, TrainExecutionV1::Vjp) => {
+                require_contract(&request, output, &CONV2D_VJP)?;
+            }
+            (CpuOperation::Attention, TrainExecutionV1::Forward) => {
+                require_contract(&request, output, &ATTENTION_FORWARD)?;
+            }
+            (CpuOperation::Attention, TrainExecutionV1::Vjp) => {
+                require_contract(&request, output, &ATTENTION_VJP)?;
+            }
+            _ => {}
+        }
+        let scratch_bytes =
+            operation_scratch_bytes(operation.operation, request.execution, &request)?;
+        if matches!(
+            operation.operation,
+            CpuOperation::Conv1d | CpuOperation::Conv2d
+        ) && scratch_bytes > MAX_CONV_SCRATCH_BYTES
+        {
+            return Err(attribute_value("scratch", "limit_64_mib"));
+        }
+        if matches!(operation.operation, CpuOperation::Attention)
+            && scratch_bytes > MAX_ATTENTION_SCRATCH_BYTES
+        {
+            return Err(attribute_value("scratch", "limit_64_mib"));
+        }
         match (operation.operation, request.execution) {
             (CpuOperation::SteSurrogate, TrainExecutionV1::Forward) => {
                 ste_surrogate_forward(&request, output)?;
@@ -570,6 +625,12 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             }
             (CpuOperation::Rope, TrainExecutionV1::Forward) => rope_forward(&request, output)?,
             (CpuOperation::Rope, TrainExecutionV1::Vjp) => rope_vjp(&request, output)?,
+            (CpuOperation::Attention, TrainExecutionV1::Forward) => {
+                attention_forward(&request, output)?;
+            }
+            (CpuOperation::Attention, TrainExecutionV1::Vjp) => {
+                attention_vjp(&request, output)?;
+            }
             (CpuOperation::Mse, TrainExecutionV1::Forward) => mse_forward(&request, output)?,
             (CpuOperation::Mse, TrainExecutionV1::Vjp) => mse_vjp(&request, output)?,
             (CpuOperation::SoftmaxCrossEntropy, TrainExecutionV1::Forward) => {
@@ -586,8 +647,6 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
                 });
             }
         }
-        let scratch_bytes =
-            operation_scratch_bytes(operation.operation, request.execution, &request)?;
         Ok(TrainReceiptV1 {
             backend_id: BACKEND_ID.to_owned(),
             backend_build: backend_build_identity(),
@@ -1920,6 +1979,62 @@ fn rope_vjp(
     Ok(())
 }
 
+fn attention_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &ATTENTION_FORWARD)?;
+    let (q_shape, q) = input_f32(request, "q")?;
+    let (k_shape, k) = input_f32(request, "k")?;
+    let (v_shape, v) = input_f32(request, "v")?;
+    let cfg = attention_attributes(request)?;
+    let query_shape = [cfg.seq as u64, cfg.n_head as u64, cfg.head_dim as u64];
+    let kv_shape = [cfg.seq as u64, cfg.n_kv_head as u64, cfg.head_dim as u64];
+    if q_shape != query_shape || k_shape != kv_shape || v_shape != kv_shape {
+        return Err(shape_error());
+    }
+    reject_nonfinite("q", q)?;
+    reject_nonfinite("k", k)?;
+    reject_nonfinite("v", v)?;
+    require_f32_output(output, "result", &query_shape)?;
+    let reference = attention::forward(q, k, v, cfg);
+    output_f32(output, "result")?.copy_from_slice(&reference);
+    Ok(())
+}
+
+fn attention_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &ATTENTION_VJP)?;
+    let (q_shape, q) = input_f32(request, "q")?;
+    let (k_shape, k) = input_f32(request, "k")?;
+    let (v_shape, v) = input_f32(request, "v")?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let cfg = attention_attributes(request)?;
+    let query_shape = [cfg.seq as u64, cfg.n_head as u64, cfg.head_dim as u64];
+    let kv_shape = [cfg.seq as u64, cfg.n_kv_head as u64, cfg.head_dim as u64];
+    if q_shape != query_shape
+        || k_shape != kv_shape
+        || v_shape != kv_shape
+        || grad_shape != query_shape
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("q", q)?;
+    reject_nonfinite("k", k)?;
+    reject_nonfinite("v", v)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_q", &query_shape)?;
+    require_f32_output(output, "grad_k", &kv_shape)?;
+    require_f32_output(output, "grad_v", &kv_shape)?;
+    let gradients = attention::vjp(q, k, v, cfg, grad_output);
+    output_f32(output, "grad_q")?.copy_from_slice(&gradients[0]);
+    output_f32(output, "grad_k")?.copy_from_slice(&gradients[1]);
+    output_f32(output, "grad_v")?.copy_from_slice(&gradients[2]);
+    Ok(())
+}
+
 fn apply_rope_in_place(
     buffer: &mut [f32],
     positions: &[u64],
@@ -2450,18 +2565,24 @@ fn checked_output_axis(
     pad_after: usize,
     name: &str,
 ) -> Result<usize, TrainBackendError> {
-    let effective = dilation
-        .checked_mul(kernel - 1)
+    let effective = (dilation as u64)
+        .checked_mul((kernel - 1) as u64)
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| attribute_value(name, "arithmetic"))?;
-    let padded = input
-        .checked_add(pad_before)
-        .and_then(|value| value.checked_add(pad_after))
+    let padded = (input as u64)
+        .checked_add(pad_before as u64)
+        .and_then(|value| value.checked_add(pad_after as u64))
         .ok_or_else(|| attribute_value(name, "arithmetic"))?;
+    if effective > u32::MAX as u64 || padded > u32::MAX as u64 {
+        return Err(attribute_value(name, "axis_u32"));
+    }
     if padded < effective {
         return Err(attribute_value(name, "output_nonzero"));
     }
-    Ok((padded - effective) / stride + 1)
+    let output = (padded - effective) / stride as u64 + 1;
+    u32::try_from(output)
+        .map(|value| value as usize)
+        .map_err(|_| attribute_value(name, "axis_u32"))
 }
 
 fn bounded_product(values: &[usize], name: &str) -> Result<usize, TrainBackendError> {
@@ -2517,6 +2638,13 @@ fn conv1d_attributes(
         cfg.pad_right,
         "k",
     )?;
+    let maximum_position = ((l_out - 1) as u64)
+        .checked_mul(cfg.stride as u64)
+        .and_then(|value| value.checked_add((cfg.k - 1) as u64 * cfg.dilation as u64))
+        .ok_or_else(|| attribute_value("k", "index_arithmetic"))?;
+    if maximum_position > i32::MAX as u64 || cfg.pad_left > i32::MAX as usize {
+        return Err(attribute_value("k", "index_i32"));
+    }
     let channels_per_group = cfg.c_in / cfg.groups;
     bounded_product(&[cfg.batch, cfg.c_in, cfg.l_in], "batch")?;
     bounded_product(&[cfg.c_out, channels_per_group, cfg.k], "c_out")?;
@@ -2592,6 +2720,38 @@ fn conv2d_attributes(
     )?;
     bounded_product(&[cfg.batch, cfg.c_out, height_out, width_out], "batch")?;
     Ok((cfg, height_out, width_out))
+}
+
+fn attention_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<attention::AttentionCfg, TrainBackendError> {
+    let seq = portable_usize_attribute(request, "seq")?;
+    let n_head = portable_usize_attribute(request, "n_head")?;
+    let n_kv_head = portable_usize_attribute(request, "n_kv_head")?;
+    let head_dim = portable_usize_attribute(request, "head_dim")?;
+    for (name, value) in [
+        ("seq", seq),
+        ("n_head", n_head),
+        ("n_kv_head", n_kv_head),
+        ("head_dim", head_dim),
+    ] {
+        if value == 0 {
+            return Err(attribute_value(name, "positive"));
+        }
+    }
+    if !n_head.is_multiple_of(n_kv_head) {
+        return Err(attribute_value("n_kv_head", "divides_n_head"));
+    }
+    bounded_product(&[seq, n_head, head_dim], "seq")?;
+    bounded_product(&[seq, n_kv_head, head_dim], "seq")?;
+    bounded_product(&[seq, seq], "seq")?;
+    Ok(attention::AttentionCfg {
+        seq,
+        n_head,
+        n_kv_head,
+        head_dim,
+        causal: attribute_bool(request, "causal")?,
+    })
 }
 
 fn conv2d_reference_error(error: conv2d::Conv2dError) -> TrainBackendError {
@@ -2681,7 +2841,15 @@ fn operation_scratch_bytes(
             let columns = checked_scratch_product(&[tile_rows, patch_columns])?;
             let group_output = checked_scratch_product(&[tile_rows, group_channels])?;
             match phase {
-                TrainExecutionV1::Forward => checked_scratch_sum(&[columns, group_output])?,
+                TrainExecutionV1::Forward => {
+                    let output = checked_scratch_product(&[
+                        cfg.batch as u64,
+                        cfg.c_out as u64,
+                        height_out as u64,
+                        width_out as u64,
+                    ])?;
+                    checked_scratch_sum(&[output, columns, group_output])?
+                }
                 TrainExecutionV1::Vjp => {
                     let input = checked_scratch_product(&[
                         cfg.batch as u64,
@@ -2705,6 +2873,25 @@ fn operation_scratch_bytes(
                         matmul_gradients,
                     ])?
                 }
+                _ => 0,
+            }
+        }
+        (CpuOperation::Attention, phase) => {
+            let cfg = attention_attributes(request)?;
+            let query = u64::try_from(
+                cfg.query_elements()
+                    .ok_or_else(|| attribute_value("seq", "query_elements"))?,
+            )
+            .map_err(|_| attribute_value("seq", "query_elements"))?;
+            let kv = u64::try_from(
+                cfg.kv_elements()
+                    .ok_or_else(|| attribute_value("seq", "kv_elements"))?,
+            )
+            .map_err(|_| attribute_value("seq", "kv_elements"))?;
+            let scores = checked_scratch_product(&[cfg.seq as u64, cfg.seq as u64])?;
+            match phase {
+                TrainExecutionV1::Forward => checked_scratch_sum(&[query, scores])?,
+                TrainExecutionV1::Vjp => checked_scratch_sum(&[query, kv, kv, scores, scores])?,
                 _ => 0,
             }
         }
@@ -2904,6 +3091,18 @@ fn attribute_f32(request: &TrainRequestV1<'_>, name: &str) -> Result<f32, TrainB
     {
         Some(TrainAttributeValueV1::F32(value)) => Ok(value),
         _ => Err(attribute_type(name, "f32")),
+    }
+}
+
+fn attribute_bool(request: &TrainRequestV1<'_>, name: &str) -> Result<bool, TrainBackendError> {
+    match request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .map(|attribute| attribute.value)
+    {
+        Some(TrainAttributeValueV1::Bool(value)) => Ok(value),
+        _ => Err(attribute_type(name, "bool")),
     }
 }
 

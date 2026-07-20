@@ -96,9 +96,11 @@ operations declare mutation and checkpoint planes explicitly.
 - `lifecycle.checkpoint`, `lifecycle.resume`
 - `lifecycle.export`, `lifecycle.reload`
 
-Composed attention remains a registered semantic operation even though the Rust
-reference currently composes primitive Tape nodes. SGD receives a portable
-reference implementation before registry closure. `optimizer.sgd` is stateless
+`graph.attention` is a projection-free scaled-dot-product attention boundary:
+Q/K/V projection and RoPE remain separate graph operations, while causal or
+noncausal GQA forward/VJP can map directly to a fused backend kernel. SGD
+receives a portable reference implementation before registry closure.
+`optimizer.sgd` is stateless
 plain SGD with `parameter -= lr * gradient` in f32 order; momentum and weight
 decay require distinct future operation identities.
 
@@ -110,12 +112,15 @@ semantics, reject duplicate/unknown/type/order drift, and re-emit byte-identical
 canonical JSON. Python passed the complete 92-test suite; Deno type-check and
 three parser tests passed. Slice 2 is next.
 
-The Slice 2 tracer corpus now carries 87 cases across 26 of 35 operations. In
+The Slice 2 tracer corpus now carries 93 cases across 27 of 35 operations. In
 addition to the primitive and shape clusters, it covers `graph.ste_surrogate`,
 bounded multi-plane `graph.salt_ste`, `graph.lsq_ste`, configurable `graph.fsq`,
 grouped/depthwise asymmetric `graph.conv1d` and `graph.conv2d`, `graph.dense_matmul`,
 scale-bearing `graph.ternary_matmul`, `graph.rmsnorm`, row-wise `graph.softmax`,
-`graph.causal_mask`, zero-scratch `graph.rope` with target-independent `u32` positions, and `loss.softmax_cross_entropy` forward/VJP semantics, plus `graph.transpose`, repeated
+`graph.causal_mask`, zero-scratch `graph.rope` with target-independent `u32`
+positions, and projection-free causal/noncausal grouped-query
+`graph.attention`, plus `loss.softmax_cross_entropy` forward/VJP semantics,
+`graph.transpose`, repeated
 `graph.embedding_gather`, `graph.slice_cols`, and dynamic-role
 `graph.concat_cols`, each in forward and VJP phases. Error sentinels cover shape
 mismatch, invalid quantizer geometry/configuration, out-of-range tokens, slice
@@ -124,7 +129,7 @@ duplicate-input request.
 A generic testkit runner poisons success outputs, preserves error sentinels,
 grades structured error identity, independently recomputes request/output
 receipt digests, and binds every successful receipt to the exact corpus bytes.
-This is incremental evidence, not Slice 2 closure: the remaining 9 operations
+This is incremental evidence, not Slice 2 closure: the remaining 8 operations
 and their adversarial/error matrices are still required.
 
 Edits:

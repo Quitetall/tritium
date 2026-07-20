@@ -39,6 +39,7 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
             "graph.softmax",
             "graph.causal_mask",
             "graph.rope",
+            "graph.attention",
             "loss.mse",
             "loss.softmax_cross_entropy",
             "optimizer.sgd",
@@ -180,7 +181,7 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
         &[1],
         TrainBufferDataRefV1::F32(&input),
     )];
-    let request = TrainRequestV1::new("graph.attention", TrainExecutionV1::Forward, &inputs, &[]);
+    let request = TrainRequestV1::new("optimizer.adamw", TrainExecutionV1::Step, &inputs, &[]);
     let mut sentinel = [123.0_f32];
     let mut buffers = [TrainNamedBufferMutV1::new(
         "result",
@@ -190,7 +191,7 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
     let mut output = TrainOutputV1::new(&mut buffers);
     assert!(matches!(
         backend.execute(request, &mut output),
-        Err(TrainBackendError::UnsupportedOperation(operation)) if operation == "graph.attention"
+        Err(TrainBackendError::UnsupportedOperation(operation)) if operation == "optimizer.adamw"
     ));
     assert_eq!(sentinel, [123.0]);
 
