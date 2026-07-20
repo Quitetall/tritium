@@ -96,6 +96,19 @@ struct RopeParams {
     padding_2: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SoftmaxXentParams {
+    rows: u32,
+    cols: u32,
+    execution: u32,
+    padding: u32,
+    gradient_scale: f32,
+    padding_1: f32,
+    padding_2: f32,
+    padding_3: f32,
+}
+
 impl FsqParams {
     /// Build packed FSQ shader parameters after adapter validation.
     pub(crate) fn new(
@@ -280,6 +293,8 @@ pub struct WgpuBackend {
     fsq_bind_group_layout: wgpu::BindGroupLayout,
     rope_pipeline: wgpu::ComputePipeline,
     rope_bind_group_layout: wgpu::BindGroupLayout,
+    softmax_xent_pipeline: wgpu::ComputePipeline,
+    softmax_xent_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -746,6 +761,30 @@ impl WgpuBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+            let softmax_xent_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-softmax-xent"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("softmax_xent.wgsl").into()),
+            });
+            let softmax_xent_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-softmax-xent-bgl"),
+                    entries: &[entry(0, uni), entry(1, ro), entry(2, ro), entry(3, rw)],
+                });
+            let softmax_xent_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("portable-softmax-xent-pl"),
+                    bind_group_layouts: &[&softmax_xent_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+            let softmax_xent_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-softmax-xent-pipe"),
+                    layout: Some(&softmax_xent_layout),
+                    module: &softmax_xent_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
             Ok(WgpuBackend {
                 device,
@@ -774,6 +813,8 @@ impl WgpuBackend {
                 fsq_bind_group_layout,
                 rope_pipeline,
                 rope_bind_group_layout,
+                softmax_xent_pipeline,
+                softmax_xent_bind_group_layout,
                 device_name,
             })
         }
@@ -2217,6 +2258,127 @@ impl WgpuBackend {
         if let Some(error) = self.device.pop_error_scope().block_on() {
             return Err(BackendError::Backend(format!(
                 "wgpu RoPE device error: {error}"
+            )));
+        }
+        rx.recv()
+            .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+            .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        let data = slice.get_mapped_range();
+        let values = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(values)
+    }
+
+    /// Execute mean softmax cross-entropy forward or logits VJP on device.
+    pub(crate) fn softmax_xent(
+        &self,
+        logits: &[f32],
+        target: &[f32],
+        rows: u32,
+        cols: u32,
+        gradient_scale: f32,
+        backward: bool,
+    ) -> Result<Vec<f32>, BackendError> {
+        let elements = (rows as usize)
+            .checked_mul(cols as usize)
+            .ok_or_else(|| BackendError::InvalidInput("softmax xent shape overflow".to_owned()))?;
+        if logits.len() != elements || target.len() != elements || elements == 0 {
+            return Err(BackendError::ShapeMismatch {
+                expected: elements,
+                got: logits.len(),
+            });
+        }
+        let params = SoftmaxXentParams {
+            rows,
+            cols,
+            execution: u32::from(backward),
+            padding: 0,
+            gradient_scale,
+            padding_1: 0.0,
+            padding_2: 0.0,
+            padding_3: 0.0,
+        };
+        let storage = wgpu::BufferUsages::STORAGE;
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-softmax-xent-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let input = |label, values: &[f32]| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(values),
+                    usage: storage,
+                })
+        };
+        let logits_buf = input("portable-softmax-xent-logits", logits);
+        let target_buf = input("portable-softmax-xent-target", target);
+        let output_len = if backward { elements } else { 1 };
+        let bytes = (output_len * core::mem::size_of::<f32>()) as u64;
+        let result = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-softmax-xent-result"),
+            size: bytes,
+            usage: storage | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-softmax-xent-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-softmax-xent-bg"),
+            layout: &self.softmax_xent_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: logits_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: target_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: result.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-softmax-xent-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-softmax-xent-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.softmax_xent_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            let _ = tx.send(mapped);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu softmax xent device error: {error}"
             )));
         }
         rx.recv()

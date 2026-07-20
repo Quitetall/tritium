@@ -35,6 +35,7 @@ const OPERATIONS: &[&str] = &[
     "graph.rmsnorm",
     "graph.softmax",
     "loss.mse",
+    "loss.softmax_cross_entropy",
     "optimizer.sgd",
     "optimizer.adamw",
     "optimizer.cautious_adamw",
@@ -675,6 +676,91 @@ impl WgpuTrainBackendV1 {
             output_f32(output, "grad_prediction", shape, prediction.len())?
                 .copy_from_slice(&result);
         }
+        Ok(())
+    }
+
+    fn execute_softmax_xent(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["logits", "target"],
+            TrainExecutionV1::Vjp => &["logits", "target", "grad_output"],
+            _ => return Err(invariant("softmax cross-entropy received an illegal phase")),
+        };
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_logits"
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        if rows == 0 {
+            return Err(attribute_value("rows", "positive"));
+        }
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        if rows > u32::MAX as u64 || cols > u32::MAX as u64 || elements > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let shape = [rows, cols];
+        let (logits_shape, logits) = input_f32(request, "logits")?;
+        let (target_shape, target) = input_f32(request, "target")?;
+        if logits_shape != shape
+            || target_shape != shape
+            || logits.len() != elements as usize
+            || target.len() != elements as usize
+        {
+            return Err(shape_error());
+        }
+        require_finite("logits", logits)?;
+        require_finite("target", target)?;
+        let gradient_scale = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if !gradient_shape.is_empty() || gradient.len() != 1 {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient[0] / rows as f32
+        } else {
+            0.0
+        };
+        let result = self
+            .backend
+            .softmax_xent(
+                logits,
+                target,
+                rows as u32,
+                cols as u32,
+                gradient_scale,
+                request.execution == TrainExecutionV1::Vjp,
+            )
+            .map_err(wgpu_error)?;
+        let (output_shape, output_len): (&[u64], usize) =
+            if request.execution == TrainExecutionV1::Forward {
+                (&[], 1)
+            } else {
+                (&shape, elements as usize)
+            };
+        output_f32(output, output_name, output_shape, output_len)?.copy_from_slice(&result);
         Ok(())
     }
 
@@ -1866,6 +1952,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "loss.mse" {
             self.execute_mse(&request, output)?;
+            0
+        } else if request.operation == "loss.softmax_cross_entropy" {
+            self.execute_softmax_xent(&request, output)?;
             0
         } else if request.operation == "graph.bias" {
             self.execute_bias(&request, output)?;
