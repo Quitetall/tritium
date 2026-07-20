@@ -81,22 +81,29 @@ Landed so far, CPU-oracle-first then device-mirrored and gated:
   256-element optimizer block, bit-identical to the oracle (all correctly-rounded ops, `--fmad=false`);
   parity gate `adamw_step_8bit_matches_cpu_oracle` (5 steps, ragged tail) — params tight, codes within ±1.
 - `DeviceTrainer` int8 path: `MomentPrecision::Int8` + `new_with_options`, opt-in (F32 default byte-
-  identical), moments dispatched to the int8 kernel. Unit gate `device_trainer_int8_moments_train_like_f32`
-  passes (int8 tracks f32 on a toy SALT distill, 2.13→1.69 vs 1.70). `TRITIUM_DISTILL_INT8=1` runs the
-  real-135M A/B.
+  identical), moments dispatched to the int8 kernel.
+- `DeviceTrainer` bf16-master path (commit 7693255): `MasterPrecision::Bf16` confines the master to the
+  bf16 grid with SR after each step (`sr_round_to_bf16grid`) — numerically a real bf16 master without
+  swapping the storage type through the reconstruction path (the u16 VRAM-halving swap is a mechanical
+  follow-up gated on this). Unit gate `device_trainer_reduced_precision_trains_like_f32` covers
+  f32/int8/bf16-master all tracking f32 on a toy distill.
 
-**Open problem — int8 end-to-end is NOT yet stable on the real 135M (2026-07-19).** The A/B (40 steps,
-constant LR 2e-3, online teacher) tracks f32 faithfully through step 24 (ppl 2635, recovery 806×) then
-destabilizes (step 28–36) and blows up at step 40 (ppl 3.9e25, recovers 0×) while f32 recovers to ~960×.
-Root cause is **not** the obvious v-underflow denominator collapse — sqrt-space stores `√v` at 255 levels
-vs `m` at 127, so `v` underflows *later* than `m` (a `v_q=0, m_q≠0` explosion is impossible; the
-unit repro `int8_adam_quiet_coord_in_wide_block_does_not_explode` confirms it stays bounded). The f32
-control itself swings to ppl 4.4e9 by step 3 — **this recipe is numerically chaotic early**, and int8's
-quantization perturbation, though small, eventually tips the trajectory into a divergent basin. Not a
-guessable one-line fix; needs real instrumentation (per-param max|w|/|m|/|v| traces) + likely LR warmup
-and a deterministic teacher cache. **This does NOT block the standard-corpus 135M run** — that uses the
-f32 path (int8's VRAM win is a 1.7B/32B-scale concern, invisible at 135M). Remaining Lever 5: root-cause
-the int8 instability, then wire the bf16 master into `DeviceTrainer`.
+**Int8 divergence — ROOT-CAUSED AND FIXED (commit 6fea28c).** The int8 A/B first blew up (tracked f32 to
+step 24 then exploded to ppl 3.9e25). Root cause: a block's `m` absmax and `√v` absmax can be dominated
+by **different** coordinates — a huge-magnitude *oscillating* coord has `m≈0` (sign cancellation) but a
+large `√v` (RMS), so it dominates the `√v` grid but not the `m` grid; a steady neighbour's `v` then rounds
+to code 0 while its `m` survives, and when it goes quiet (`g≈0`, residual `m`) `vi` collapses to 0 and the
+`m/(√v+eps)` step explodes. (The first repro used a *steady* dominant coord, which dominates both grids, so
+it missed this; the oscillating repro reproduces the blow-up.) Fix: a nonzero `√v` never dequantizes to 0
+— floor its code at 1, in both the CPU oracle and the kernel (still bit-identical). **Result: int8 135M
+recovery A/B now recovers 939× (stable), vs f32's 960×** — a ~2% precision tax, matching bf16-master (907×)
+and tf32 (920×). Both Lever-5 halves now work end-to-end.
+
+**Lever 5 status.** int8 moments and bf16 master both validated end-to-end on the real 135M (939× / 907×,
+stable, ~2–5% recovery tax for cutting optimizer-state / master VRAM). Remaining is mechanical: the actual
+u16 bf16-master storage swap through the SALT reconstruction path (VRAM realization; numerically identical
+to the validated grid mode) and, at 1.7B/32B, combining bf16 master with int8 moments. The recovery cost is
+invisible at 135M and the standard-corpus run uses f32; these buy headroom at scale.
 
 **Lever 6 — Launch-overhead reduction (queued; the biggest remaining full-step lever).** Since the
 step is launch-bound, the payoff of tf32 *and* 2:4 is unlocked here: **CUDA graphs** (capture+replay the
