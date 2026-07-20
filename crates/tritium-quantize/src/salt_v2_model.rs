@@ -196,6 +196,58 @@ impl Default for SaltV2Config {
 enum CurvatureValues<'a> {
     Diagonal(&'a [f32]),
     DenseGroups(&'a [DensePsdMetric]),
+    Kronecker(KroneckerCurvature<'a>),
+}
+
+/// Borrowed input/output factors for exact Kronecker curvature.
+///
+/// `input_groups` stores one shared G128 input-side PSD block per input-column
+/// group. `output_weights` stores one non-negative Fisher/KL scalar per output
+/// row. The effective metric for row `r`, input group `g` is
+/// `output_weights[r] * input_groups[g] + damping * I`, so callers do not
+/// materialize that dense matrix once per row.
+#[derive(Clone, Copy, Debug)]
+pub struct KroneckerCurvature<'a> {
+    input_groups: &'a [DensePsdMetric],
+    output_weights: &'a [f64],
+    damping: f64,
+}
+
+impl<'a> KroneckerCurvature<'a> {
+    /// Bind shared input-side blocks, output-side scalars, and diagonal damping.
+    ///
+    /// Complete tensor-relative geometry and numerical validation occurs at the
+    /// fit boundary, where the tensor's row and column counts are available.
+    #[must_use]
+    pub const fn new(
+        input_groups: &'a [DensePsdMetric],
+        output_weights: &'a [f64],
+        damping: f64,
+    ) -> Self {
+        Self {
+            input_groups,
+            output_weights,
+            damping,
+        }
+    }
+
+    /// Shared input-side G128 PSD blocks in input-column order.
+    #[must_use]
+    pub const fn input_groups(self) -> &'a [DensePsdMetric] {
+        self.input_groups
+    }
+
+    /// Output-side Fisher/KL scalars in output-row order.
+    #[must_use]
+    pub const fn output_weights(self) -> &'a [f64] {
+        self.output_weights
+    }
+
+    /// Non-negative diagonal damping applied to every effective block.
+    #[must_use]
+    pub const fn damping(self) -> f64 {
+        self.damping
+    }
 }
 
 /// Digest-bound, validated-at-use curvature evidence for one source tensor.
@@ -261,6 +313,28 @@ impl<'a> CurvatureArtifact<'a> {
         }
     }
 
+    /// Bind factorized input-Hessian curvature without row-wise dense expansion.
+    #[must_use]
+    pub fn input_hessian_kronecker(
+        source_id: CurvatureSourceId,
+        evidence_digest: [u8; 32],
+        factors: KroneckerCurvature<'a>,
+    ) -> Self {
+        let values = CurvatureValues::Kronecker(factors);
+        Self {
+            kind: SaltV2Curvature::InputHessian,
+            source_id,
+            evidence_digest,
+            content_digest: bound_curvature_digest(
+                SaltV2Curvature::InputHessian,
+                source_id,
+                evidence_digest,
+                values,
+            ),
+            values,
+        }
+    }
+
     /// Bind groupwise dense guided-Fisher blocks to their canonical artifact digest.
     #[must_use]
     pub fn guided_fisher(
@@ -283,6 +357,28 @@ impl<'a> CurvatureArtifact<'a> {
         }
     }
 
+    /// Bind factorized guided-Fisher curvature without row-wise dense expansion.
+    #[must_use]
+    pub fn guided_fisher_kronecker(
+        source_id: CurvatureSourceId,
+        evidence_digest: [u8; 32],
+        factors: KroneckerCurvature<'a>,
+    ) -> Self {
+        let values = CurvatureValues::Kronecker(factors);
+        Self {
+            kind: SaltV2Curvature::GuidedFisher,
+            source_id,
+            evidence_digest,
+            content_digest: bound_curvature_digest(
+                SaltV2Curvature::GuidedFisher,
+                source_id,
+                evidence_digest,
+                values,
+            ),
+            values,
+        }
+    }
+
     /// Bind groupwise forward-KL Kronecker blocks to their canonical artifact digest.
     #[must_use]
     pub fn forward_kl_kronecker(
@@ -291,6 +387,28 @@ impl<'a> CurvatureArtifact<'a> {
         groups: &'a [DensePsdMetric],
     ) -> Self {
         let values = CurvatureValues::DenseGroups(groups);
+        Self {
+            kind: SaltV2Curvature::ForwardKlKronecker,
+            source_id,
+            evidence_digest,
+            content_digest: bound_curvature_digest(
+                SaltV2Curvature::ForwardKlKronecker,
+                source_id,
+                evidence_digest,
+                values,
+            ),
+            values,
+        }
+    }
+
+    /// Bind factorized forward-KL Kronecker curvature without row-wise dense expansion.
+    #[must_use]
+    pub fn forward_kl_kronecker_factors(
+        source_id: CurvatureSourceId,
+        evidence_digest: [u8; 32],
+        factors: KroneckerCurvature<'a>,
+    ) -> Self {
+        let values = CurvatureValues::Kronecker(factors);
         Self {
             kind: SaltV2Curvature::ForwardKlKronecker,
             source_id,
@@ -2148,6 +2266,32 @@ fn validate_curvature_geometry(
                 }
             }
         }
+        CurvatureValues::Kronecker(factors) => {
+            let groups_per_row = tensor.cols / SALT_V2_SCALE_GROUP_SIZE;
+            let valid = tensor.cols.is_multiple_of(SALT_V2_SCALE_GROUP_SIZE)
+                && groups_per_row > 0
+                && factors.input_groups.len() == groups_per_row
+                && factors
+                    .input_groups
+                    .iter()
+                    .all(|group| group.dimension() == SALT_V2_SCALE_GROUP_SIZE)
+                && factors.output_weights.len() == tensor.rows
+                && factors
+                    .output_weights
+                    .iter()
+                    .all(|value| value.is_finite() && *value >= 0.0)
+                && factors.damping.is_finite()
+                && factors.damping >= 0.0
+                && factors
+                    .output_weights
+                    .iter()
+                    .all(|value| *value > 0.0 || factors.damping > 0.0);
+            if !valid {
+                return Err(SaltV2Error::CurvatureGeometry {
+                    tensor: tensor_index,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -2384,7 +2528,15 @@ fn fit_feedback_group(
             }
             let global_group = global_start / SALT_V2_SCALE_GROUP_SIZE;
             let tile_index = global_start / SALT_V2_ALLOCATION_TILE_SIZE;
-            let metric = curvature_metric(tensor.curvature, global_start, global_end, global_group);
+            let resolved_metric = curvature_metric(
+                tensor_index,
+                tensor.curvature,
+                tensor.cols,
+                global_start,
+                global_end,
+                global_group,
+            )?;
+            let metric = resolved_metric.as_joint_metric();
             let fit_config = JointFitConfig {
                 planes: FULL_PLANES,
                 max_iterations: if provisional {
@@ -2539,7 +2691,15 @@ fn materialize_feedback_tile_frontier(
     while group_start < tile_end {
         let group_end = (group_start + SALT_V2_SCALE_GROUP_SIZE).min(tile_end);
         let group = group_start / SALT_V2_SCALE_GROUP_SIZE;
-        let metric = curvature_metric(tensor.curvature, group_start, group_end, group);
+        let resolved_metric = curvature_metric(
+            tensor_index,
+            tensor.curvature,
+            tensor.cols,
+            group_start,
+            group_end,
+            group,
+        )?;
+        let metric = resolved_metric.as_joint_metric();
         let source = &tensor.weights[group_start..group_end];
         let mut reconstruction = vec![0.0f32; source.len()];
         for plane in 0..FULL_PLANES {
@@ -2641,7 +2801,15 @@ fn fit_tile_frontier(
     while group_start < tile_end {
         let group_end = (group_start + SALT_V2_SCALE_GROUP_SIZE).min(tile_end);
         let group_index = group_start / SALT_V2_SCALE_GROUP_SIZE;
-        let metric = curvature_metric(tensor.curvature, group_start, group_end, group_index);
+        let resolved_metric = curvature_metric(
+            tensor_index,
+            tensor.curvature,
+            tensor.cols,
+            group_start,
+            group_end,
+            group_index,
+        )?;
+        let metric = resolved_metric.as_joint_metric();
         let weights = &tensor.weights[group_start..group_end];
         let (scales, trits, order) = if config.packing.fit_constraint() == SaltV2FitConstraint::S34
         {
@@ -3477,15 +3645,48 @@ fn reconstruction_objective(
     }
 }
 
+enum ResolvedCurvatureMetric<'a> {
+    Borrowed(JointFitMetric<'a>),
+    Owned(DensePsdMetric),
+}
+
+impl ResolvedCurvatureMetric<'_> {
+    fn as_joint_metric(&self) -> JointFitMetric<'_> {
+        match self {
+            Self::Borrowed(metric) => *metric,
+            Self::Owned(metric) => JointFitMetric::Dense(metric),
+        }
+    }
+}
+
 fn curvature_metric<'a>(
+    tensor_index: usize,
     artifact: CurvatureArtifact<'a>,
+    columns: usize,
     start: usize,
     end: usize,
     group_index: usize,
-) -> JointFitMetric<'a> {
+) -> Result<ResolvedCurvatureMetric<'a>, SaltV2Error> {
     match artifact.values {
-        CurvatureValues::Diagonal(diagonal) => JointFitMetric::Diagonal(&diagonal[start..end]),
-        CurvatureValues::DenseGroups(groups) => JointFitMetric::Dense(&groups[group_index]),
+        CurvatureValues::Diagonal(diagonal) => Ok(ResolvedCurvatureMetric::Borrowed(
+            JointFitMetric::Diagonal(&diagonal[start..end]),
+        )),
+        CurvatureValues::DenseGroups(groups) => Ok(ResolvedCurvatureMetric::Borrowed(
+            JointFitMetric::Dense(&groups[group_index]),
+        )),
+        CurvatureValues::Kronecker(factors) => {
+            let groups_per_row = columns / SALT_V2_SCALE_GROUP_SIZE;
+            let output_row = group_index / groups_per_row;
+            let input_group = group_index % groups_per_row;
+            let input = &factors.input_groups[input_group];
+            let scale = factors.output_weights[output_row];
+            input
+                .scaled_with_diagonal(scale, factors.damping)
+                .map(ResolvedCurvatureMetric::Owned)
+                .ok_or(SaltV2Error::CurvatureGeometry {
+                    tensor: tensor_index,
+                })
+        }
     }
 }
 
@@ -3625,6 +3826,21 @@ fn bound_curvature_digest(
                     hasher.update(&value.to_bits().to_le_bytes());
                 }
             }
+        }
+        CurvatureValues::Kronecker(factors) => {
+            hasher.update(&[3]);
+            write_len_hash(&mut hasher, factors.input_groups.len());
+            for group in factors.input_groups {
+                write_len_hash(&mut hasher, group.dimension());
+                for value in group.as_slice() {
+                    hasher.update(&value.to_bits().to_le_bytes());
+                }
+            }
+            write_len_hash(&mut hasher, factors.output_weights.len());
+            for value in factors.output_weights {
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+            hasher.update(&factors.damping.to_bits().to_le_bytes());
         }
     }
     *hasher.finalize().as_bytes()
@@ -4492,6 +4708,43 @@ mod tests {
     }
 
     #[test]
+    fn kronecker_curvature_digest_binds_input_output_and_damping() {
+        fn artifact<'a>(
+            source: CurvatureSourceId,
+            input: &'a DensePsdMetric,
+            output: &'a [f64],
+            damping: f64,
+        ) -> CurvatureArtifact<'a> {
+            CurvatureArtifact::guided_fisher_kronecker(
+                source,
+                [45; 32],
+                KroneckerCurvature::new(std::slice::from_ref(input), output, damping),
+            )
+        }
+
+        let cache = activation_cache();
+        let source = curvature_source(source_model_id(), &cache);
+        let input = DensePsdMetric::new(2, &[2.0, 0.25, 0.25, 1.0]).expect("input metric");
+        let changed_input =
+            DensePsdMetric::new(2, &[2.0, 0.5, 0.5, 1.0]).expect("changed input metric");
+        let outputs = [0.5, 1.0];
+        let changed_outputs = [0.5, 1.25];
+        let base = artifact(source, &input, &outputs, 0.125);
+        assert_ne!(
+            base.digest(),
+            artifact(source, &changed_input, &outputs, 0.125).digest()
+        );
+        assert_ne!(
+            base.digest(),
+            artifact(source, &input, &changed_outputs, 0.125).digest()
+        );
+        assert_ne!(
+            base.digest(),
+            artifact(source, &input, &outputs, 0.25).digest()
+        );
+    }
+
+    #[test]
     fn receipt_transitively_binds_curvature_provenance() {
         let weights = weights(1);
         let diagonal = vec![1.0; weights.len()];
@@ -5123,6 +5376,121 @@ mod tests {
         assert!(matches!(
             plan_salt_v2_tensor_master(input, &config(10_000)),
             Err(SaltV2Error::CurvatureSourceModelMismatch { tensor: 505 })
+        ));
+    }
+
+    #[test]
+    fn factorized_kronecker_stream_matches_materialized_dense_curvature() {
+        let source_weights = weights(2);
+        let mut input_values = vec![0.0; 128 * 128];
+        for row in 0..128 {
+            input_values[row * 128 + row] = 2.0;
+            if row + 1 < 128 {
+                input_values[row * 128 + row + 1] = 0.25;
+                input_values[(row + 1) * 128 + row] = 0.25;
+            }
+        }
+        let input_metric = DensePsdMetric::new(128, &input_values).expect("input metric");
+        let output_weights = [0.5, 1.0, 1.5, 2.0];
+        let damping = 0.125;
+        let materialized = output_weights
+            .iter()
+            .map(|output_weight| {
+                let mut values = input_metric
+                    .as_slice()
+                    .iter()
+                    .map(|value| value * output_weight)
+                    .collect::<Vec<_>>();
+                for index in 0..128 {
+                    values[index * 128 + index] += damping;
+                }
+                DensePsdMetric::new(128, &values).expect("row metric")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|group| group.as_slice().len())
+                .sum::<usize>(),
+            65_536
+        );
+        assert_eq!(input_metric.as_slice().len() + output_weights.len(), 16_388);
+
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let mut recipe = config(100_000);
+        recipe.curvature = SaltV2Curvature::GuidedFisher;
+        let dense_tensor = SaltV2TensorFitInput {
+            name: "model.layers.0.mlp.gate_proj.weight",
+            weights: &source_weights,
+            rows: 4,
+            cols: 128,
+            curvature: CurvatureArtifact::guided_fisher(source_id, [91; 32], &materialized),
+        };
+        let factorized_tensor = SaltV2TensorFitInput {
+            curvature: CurvatureArtifact::guided_fisher_kronecker(
+                source_id,
+                [91; 32],
+                KroneckerCurvature::new(
+                    std::slice::from_ref(&input_metric),
+                    &output_weights,
+                    damping,
+                ),
+            ),
+            ..dense_tensor
+        };
+        let base = |tensor| SaltV2TensorMasterFitInput {
+            tensor,
+            activations: &cache,
+            source_model_id: model_id,
+            tensor_index: 0,
+            source_tensor_digest: [92; 32],
+        };
+        let mut dense_payload = Vec::new();
+        fit_salt_v2_tensor_master(base(dense_tensor), &recipe, &mut dense_payload)
+            .expect("materialized tensor fit");
+        let mut factorized_payload = Vec::new();
+        fit_salt_v2_tensor_master(base(factorized_tensor), &recipe, &mut factorized_payload)
+            .expect("factorized tensor fit");
+        assert_eq!(factorized_payload, dense_payload);
+    }
+
+    #[test]
+    fn factorized_kronecker_geometry_fails_at_the_global_tensor_ordinal() {
+        let source_weights = weights(1);
+        let input_values = (0..128 * 128)
+            .map(|index| if index / 128 == index % 128 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let input_metric = DensePsdMetric::new(128, &input_values).expect("input metric");
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let tensor = SaltV2TensorFitInput {
+            name: "model.layers.0.mlp.gate_proj.weight",
+            weights: &source_weights,
+            rows: 2,
+            cols: 128,
+            curvature: CurvatureArtifact::guided_fisher_kronecker(
+                source_id,
+                [93; 32],
+                KroneckerCurvature::new(std::slice::from_ref(&input_metric), &[1.0], 0.0),
+            ),
+        };
+        let mut recipe = config(100_000);
+        recipe.curvature = SaltV2Curvature::GuidedFisher;
+        assert!(matches!(
+            plan_salt_v2_tensor_master(
+                SaltV2TensorMasterFitInput {
+                    tensor,
+                    activations: &cache,
+                    source_model_id: model_id,
+                    tensor_index: 77,
+                    source_tensor_digest: [94; 32],
+                },
+                &recipe,
+            ),
+            Err(SaltV2Error::CurvatureGeometry { tensor: 77 })
         ));
     }
 

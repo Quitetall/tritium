@@ -194,6 +194,37 @@ impl DensePsdMetric {
     pub fn as_slice(&self) -> &[f64] {
         &self.values
     }
+
+    /// Materialize `scale * self + diagonal_shift * I` without repeating PSD factorization.
+    ///
+    /// `self` already passed the full constructor. Non-negative scaling and a
+    /// non-negative diagonal shift preserve symmetry and positive
+    /// semidefiniteness, so only scalar validity, finite arithmetic, and a
+    /// nonzero scored direction remain to check.
+    pub(crate) fn scaled_with_diagonal(&self, scale: f64, diagonal_shift: f64) -> Option<Self> {
+        if !scale.is_finite() || scale < 0.0 || !diagonal_shift.is_finite() || diagonal_shift < 0.0
+        {
+            return None;
+        }
+        let mut values = Vec::new();
+        values.try_reserve_exact(self.values.len()).ok()?;
+        let mut any_positive = false;
+        for row in 0..self.dimension {
+            for column in 0..self.dimension {
+                let value = self.values[row * self.dimension + column] * scale
+                    + if row == column { diagonal_shift } else { 0.0 };
+                if !value.is_finite() {
+                    return None;
+                }
+                any_positive |= row == column && value > 0.0;
+                values.push(value);
+            }
+        }
+        any_positive.then_some(Self {
+            dimension: self.dimension,
+            values,
+        })
+    }
 }
 
 /// Reconstruction curvature used by [`fit_joint_ternary`].

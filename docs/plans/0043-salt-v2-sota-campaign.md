@@ -792,6 +792,14 @@ streams and receipts are byte-identical to the corresponding outputs of the
 whole-model solver. This removes model-wide master residency from the PTQ
 producer boundary; it does not yet supply the checkpoint/evidence reader that
 feeds all 506 Qwen tensors into the campaign store.
+Guided-Fisher, input-Hessian, and forward-KL curvature can now retain exact
+Kronecker structure instead of expanding one dense G128 matrix per output row.
+The solver materializes only the active G128
+`output_scalar * input_block + damping * I` work block, and bit-exact goldens
+match fully expanded curvature and the emitted master payload. Evidence
+residency is therefore one shared
+input block per input group plus one scalar per output row; durable factor-file
+encoding and checkpoint-scale collection remain open.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
@@ -807,7 +815,8 @@ The following work deliberately remains open and keeps this plan in progress:
   and KV-cache allocations. The compiled MTP authorization ledger contains no
   production evidence row, so fixture success cannot admit Stage 8;
 - the production model driver does not yet connect block-output reconstruction,
-  scale-only teacher-KL, or hard PV updates to real checkpoint tensors;
+  durable factorized-curvature evidence, scale-only teacher-KL, or hard PV
+  updates to real checkpoint tensors;
 - `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense
   BlockLDLQ path, then
   `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult` slices exact

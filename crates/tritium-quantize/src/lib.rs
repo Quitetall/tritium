@@ -101,16 +101,16 @@ pub use salt_v2_feedback::{
     GroupFitRequest, fit_with_feedback,
 };
 pub use salt_v2_model::{
-    CurvatureArtifact, PhysicalRateTarget, SaltV2Config, SaltV2Curvature, SaltV2DriverError,
-    SaltV2Error, SaltV2ExternalStage, SaltV2ExternalStageRequest, SaltV2FeedbackArtifact,
-    SaltV2FeedbackGroupReceipt, SaltV2FitConstraint, SaltV2FitTrack, SaltV2MasterFit,
-    SaltV2MasterFitInput, SaltV2ModelFeedbackReceipt, SaltV2ModelFitInput, SaltV2ModelFitMetrics,
-    SaltV2ModelFitReceipt, SaltV2ModelFitResult, SaltV2ModelPhysicalInput, SaltV2ModelStageDriver,
-    SaltV2Packing, SaltV2PhysicalSize, SaltV2Refinement, SaltV2TensorFeedbackReceipt,
-    SaltV2TensorFitInput, SaltV2TensorFitReceipt, SaltV2TensorMasterFitInput,
-    SaltV2TensorMasterFitResult, SaltV2TileCandidateMetrics, allocate_and_pack_salt_v2_master,
-    allocate_and_pack_salt_v2_master_with_packing, fit_salt_v2_master, fit_salt_v2_model,
-    fit_salt_v2_tensor_master, plan_salt_v2_tensor_master,
+    CurvatureArtifact, KroneckerCurvature, PhysicalRateTarget, SaltV2Config, SaltV2Curvature,
+    SaltV2DriverError, SaltV2Error, SaltV2ExternalStage, SaltV2ExternalStageRequest,
+    SaltV2FeedbackArtifact, SaltV2FeedbackGroupReceipt, SaltV2FitConstraint, SaltV2FitTrack,
+    SaltV2MasterFit, SaltV2MasterFitInput, SaltV2ModelFeedbackReceipt, SaltV2ModelFitInput,
+    SaltV2ModelFitMetrics, SaltV2ModelFitReceipt, SaltV2ModelFitResult, SaltV2ModelPhysicalInput,
+    SaltV2ModelStageDriver, SaltV2Packing, SaltV2PhysicalSize, SaltV2Refinement,
+    SaltV2TensorFeedbackReceipt, SaltV2TensorFitInput, SaltV2TensorFitReceipt,
+    SaltV2TensorMasterFitInput, SaltV2TensorMasterFitResult, SaltV2TileCandidateMetrics,
+    allocate_and_pack_salt_v2_master, allocate_and_pack_salt_v2_master_with_packing,
+    fit_salt_v2_master, fit_salt_v2_model, fit_salt_v2_tensor_master, plan_salt_v2_tensor_master,
 };
 pub use training_export::{
     TrainingSaltExportError, TrainingSaltExportStats, export_training_salt_row,
