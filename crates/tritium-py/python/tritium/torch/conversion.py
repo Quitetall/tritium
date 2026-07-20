@@ -12,7 +12,7 @@ from torch import nn
 from .config import TernaryConfig
 from .coverage import CoverageEntry, CoverageReport
 from .errors import TritiumError
-from .estimators import Estimator, create_estimator
+from .estimators import AdditiveEstimator, Estimator, create_estimator
 
 
 @dataclass(frozen=True)
@@ -33,14 +33,10 @@ class PreparedModel:
 
 
 def _new_estimator(config: TernaryConfig) -> Estimator:
-    if config.planes != 1:
-        raise TritiumError(
-            "the QAT estimator catalog currently supports one hard ternary plane",
-            code="unsupported_recipe",
-            stage="inspect",
-            details={"planes": config.planes},
-        )
-    return create_estimator(config.estimator)
+    estimators = tuple(create_estimator(config.estimator) for _ in range(config.planes))
+    if len(estimators) == 1:
+        return estimators[0]
+    return AdditiveEstimator(estimators)
 
 
 def _parameter_coverage(
@@ -263,7 +259,6 @@ def prepare(
         raise TypeError("prepare requires a TernaryConfig")
     if not isinstance(inplace, bool):
         raise TypeError("prepare inplace must be a bool")
-
     selected = _selected_weights(model, config, strict=strict)
     target = model if inplace else copy.deepcopy(model)
     if config.mode == "qat":

@@ -6,6 +6,7 @@ from .coverage import CoverageEntry, CoverageReport
 from .errors import TritiumError
 from .estimators import (
     AbsMeanSTE,
+    AdditiveEstimator,
     AnnealedSTE,
     Estimator,
     LSQEstimator,
@@ -26,10 +27,16 @@ except ImportError:  # transformers is an optional integration dependency
 else:
     register_huggingface()
 from .ops import reference_ternary_linear, ternary_linear
-from .projection import ProjectionContext, TernaryProjection, validate_projection
+from .projection import (
+    ProjectionContext,
+    TernaryPlane,
+    TernaryProjection,
+    validate_projection,
+)
 
 __all__ = [
     "AbsMeanSTE",
+    "AdditiveEstimator",
     "AnnealedSTE",
     "CoverageEntry",
     "CoverageReport",
@@ -42,6 +49,7 @@ __all__ = [
     "SaltSTE",
     "SparseTernaryEstimator",
     "TernaryConfig",
+    "TernaryPlane",
     "TernaryProjection",
     "TritiumError",
     "TritiumTrainer",

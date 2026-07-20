@@ -9,6 +9,7 @@ from tritium.torch import (  # noqa: E402
     CoverageReport,
     Estimator,
     TernaryConfig,
+    TernaryPlane,
     TernaryProjection,
     TritiumError,
     inspect,
@@ -134,9 +135,13 @@ def test_custom_estimator_contract_fails_closed():
             del context
             return TernaryProjection(
                 dense=master,
-                trits=torch.full_like(master, 2, dtype=torch.int8),
-                scales=torch.ones(master.shape[0], 1),
-                group_size=master.shape[1],
+                planes=(
+                    TernaryPlane(
+                        torch.full_like(master, 2, dtype=torch.int8),
+                        torch.ones(master.shape[0], 1),
+                        master.shape[1],
+                    ),
+                ),
                 algorithm_id=self.algorithm_id,
                 schema_version=self.schema_version,
             )
@@ -181,9 +186,7 @@ def test_estimator_cannot_mislabel_its_projection_identity():
             trits = torch.zeros_like(master, dtype=torch.int8)
             return TernaryProjection(
                 dense=trits.to(master.dtype) * scales,
-                trits=trits,
-                scales=scales,
-                group_size=master.shape[1],
+                planes=(TernaryPlane(trits, scales, master.shape[1]),),
                 algorithm_id="example.lie",
                 schema_version=1,
             )

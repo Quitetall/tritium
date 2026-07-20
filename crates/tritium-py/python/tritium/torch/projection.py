@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 
@@ -20,15 +21,77 @@ class ProjectionContext:
 
 
 @dataclass(frozen=True)
-class TernaryProjection:
-    """Validated hard ternary planes and differentiable decoded forward value."""
+class TernaryPlane:
+    """One exportable hard ternary plane."""
 
-    dense: torch.Tensor
     trits: torch.Tensor
     scales: torch.Tensor
     group_size: int
+    structure: str = "dense"
+
+
+@dataclass(frozen=True)
+class TernaryProjection:
+    """One-to-three hard planes plus their differentiable summed decode."""
+
+    dense: torch.Tensor
+    planes: Tuple[TernaryPlane, ...]
     algorithm_id: str
     schema_version: int
+
+    @property
+    def trits(self) -> torch.Tensor:
+        """Single-plane compatibility view."""
+
+        if len(self.planes) != 1:
+            raise TritiumError(
+                "multi-plane projection has no singular trits tensor",
+                code="estimator_contract",
+                stage="project",
+            )
+        return self.planes[0].trits
+
+    @property
+    def scales(self) -> torch.Tensor:
+        """Single-plane compatibility view."""
+
+        if len(self.planes) != 1:
+            raise TritiumError(
+                "multi-plane projection has no singular scales tensor",
+                code="estimator_contract",
+                stage="project",
+            )
+        return self.planes[0].scales
+
+    @property
+    def group_size(self) -> int:
+        """Single-plane compatibility view."""
+
+        if len(self.planes) != 1:
+            raise TritiumError(
+                "multi-plane projection has no singular group size",
+                code="estimator_contract",
+                stage="project",
+            )
+        return self.planes[0].group_size
+
+
+def _require_tensor_contract(
+    condition: torch.Tensor,
+    message: str,
+    *,
+    details=None,
+) -> None:
+    if torch.compiler.is_compiling():
+        torch._assert_async(condition, message)
+        return
+    if not bool(condition):
+        raise TritiumError(
+            message,
+            code="estimator_contract",
+            stage="project",
+            details=details,
+        )
 
 
 def validate_projection(
@@ -60,7 +123,7 @@ def validate_projection(
             stage="project",
             details={"expected": schema_version, "observed": projection.schema_version},
         )
-    if projection.dense.shape != master.shape or projection.trits.shape != master.shape:
+    if projection.dense.shape != master.shape:
         raise TritiumError(
             "projection shape does not match master weight",
             code="estimator_contract",
@@ -68,45 +131,65 @@ def validate_projection(
             details={
                 "master_shape": tuple(master.shape),
                 "dense_shape": tuple(projection.dense.shape),
-                "trit_shape": tuple(projection.trits.shape),
             },
         )
-    if projection.trits.dtype != torch.int8:
+    if not 1 <= len(projection.planes) <= 3:
         raise TritiumError(
-            "projection trits must use torch.int8",
-            code="estimator_contract",
-            stage="project",
-        )
-    if not torch.all((projection.trits >= -1) & (projection.trits <= 1)):
-        raise TritiumError(
-            "projection contains a value outside {-1, 0, +1}",
-            code="estimator_contract",
-            stage="project",
-        )
-    if not torch.isfinite(projection.scales).all() or torch.any(projection.scales < 0):
-        raise TritiumError(
-            "projection scales must be finite and nonnegative",
-            code="estimator_contract",
-            stage="project",
-        )
-    if projection.group_size <= 0:
-        raise TritiumError(
-            "projection group_size must be positive",
+            "projection must contain between one and three planes",
             code="estimator_contract",
             stage="project",
         )
 
-    try:
-        decoded = projection.trits.to(master.dtype) * projection.scales
-    except RuntimeError as error:
-        raise TritiumError(
-            "projection scales are not broadcastable over trits",
-            code="estimator_contract",
-            stage="project",
-        ) from error
-    if not torch.equal(projection.dense.detach(), decoded):
-        raise TritiumError(
-            "projection forward value is not its canonical ternary decode",
-            code="estimator_contract",
-            stage="project",
+    decoded = torch.zeros_like(master)
+    for index, plane in enumerate(projection.planes):
+        if plane.trits.shape != master.shape:
+            raise TritiumError(
+                "projection trit shape does not match master weight",
+                code="estimator_contract",
+                stage="project",
+                details={"plane": index, "trit_shape": tuple(plane.trits.shape)},
+            )
+        if plane.trits.dtype != torch.int8:
+            raise TritiumError(
+                "projection trits must use torch.int8",
+                code="estimator_contract",
+                stage="project",
+                details={"plane": index},
+            )
+        _require_tensor_contract(
+            torch.all((plane.trits >= -1) & (plane.trits <= 1)),
+            "projection contains a value outside {-1, 0, +1}",
+            details={"plane": index},
         )
+        _require_tensor_contract(
+            torch.isfinite(plane.scales).all() & torch.all(plane.scales >= 0),
+            "projection scales must be finite and nonnegative",
+            details={"plane": index},
+        )
+        if plane.group_size <= 0:
+            raise TritiumError(
+                "projection group_size must be positive",
+                code="estimator_contract",
+                stage="project",
+                details={"plane": index},
+            )
+        if plane.structure not in {"dense", "s34"}:
+            raise TritiumError(
+                "projection structure must be 'dense' or 's34'",
+                code="estimator_contract",
+                stage="project",
+                details={"plane": index},
+            )
+        try:
+            decoded = decoded + plane.trits.to(master.dtype) * plane.scales
+        except RuntimeError as error:
+            raise TritiumError(
+                "projection scales are not broadcastable over trits",
+                code="estimator_contract",
+                stage="project",
+                details={"plane": index},
+            ) from error
+    _require_tensor_contract(
+        torch.all(projection.dense.detach() == decoded),
+        "projection forward value is not its canonical ternary decode",
+    )

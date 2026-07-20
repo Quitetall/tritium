@@ -6,9 +6,11 @@ torch = pytest.importorskip("torch")
 
 from tritium.nn import TernaryLinear  # noqa: E402
 from tritium.torch import (  # noqa: E402
+    AdditiveEstimator,
     Estimator,
     ProjectionContext,
     TernaryConfig,
+    TernaryPlane,
     TernaryProjection,
     TritiumError,
     create_estimator,
@@ -18,6 +20,65 @@ from tritium.torch import (  # noqa: E402
     registered_estimators,
     validate_projection,
 )
+
+
+@pytest.mark.parametrize("planes", [2, 3])
+def test_additive_qat_planes_have_exact_hard_decode_and_finite_backward(planes):
+    torch.manual_seed(97 + planes)
+    config = TernaryConfig.qat(estimator="salt-ste", planes=planes)
+    model = prepare_qat(torch.nn.Sequential(torch.nn.Linear(8, 4)), config)
+    layer = model[0]
+    assert isinstance(layer.estimator, AdditiveEstimator)
+
+    projection = layer.estimator.project(
+        layer.weight,
+        context=ProjectionContext(step=0, training=True, role="weight"),
+    )
+    validate_projection(
+        projection,
+        layer.weight,
+        algorithm_id=layer.estimator.algorithm_id,
+        schema_version=layer.estimator.schema_version,
+    )
+    assert len(projection.planes) == planes
+    decoded = sum(
+        (
+            plane.trits.to(layer.weight.dtype) * plane.scales
+            for plane in projection.planes
+        ),
+        torch.zeros_like(layer.weight),
+    )
+    assert torch.equal(projection.dense.detach(), decoded)
+
+    sample = torch.randn(3, 8, requires_grad=True)
+    model(sample).square().mean().backward()
+    assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+    assert sample.grad is not None and torch.isfinite(sample.grad).all()
+
+
+def test_additive_qat_state_dict_round_trip_is_exact():
+    torch.manual_seed(103)
+    config = TernaryConfig.qat(estimator="lsq", planes=3)
+    source = prepare_qat(torch.nn.Sequential(torch.nn.Linear(8, 4)), config)
+    sample = torch.randn(2, 8)
+    source(sample).square().mean().backward()
+    torch.optim.AdamW(source.parameters(), lr=1e-3).step()
+    expected = source(sample).detach()
+
+    restored = prepare_qat(torch.nn.Sequential(torch.nn.Linear(8, 4)), config)
+    restored.load_state_dict(source.state_dict())
+    assert torch.equal(restored(sample), expected)
+
+
+def test_additive_qat_compiles_as_one_full_graph():
+    torch.manual_seed(107)
+    model = prepare_qat(
+        torch.nn.Linear(8, 4),
+        TernaryConfig.qat(estimator="salt-ste", planes=3),
+    )
+    sample = torch.randn(2, 8)
+    compiled = torch.compile(model, backend="eager", fullgraph=True)
+    assert torch.equal(compiled(sample), model(sample))
 
 
 @pytest.mark.parametrize(
@@ -123,9 +184,7 @@ def test_external_estimator_factory_registers_without_source_edits():
             scales = torch.zeros((master.shape[0], 1), dtype=master.dtype, device=master.device)
             return TernaryProjection(
                 dense=master * 0,
-                trits=trits,
-                scales=scales,
-                group_size=master.shape[1],
+                planes=(TernaryPlane(trits, scales, master.shape[1]),),
                 algorithm_id=self.algorithm_id,
                 schema_version=self.schema_version,
             )

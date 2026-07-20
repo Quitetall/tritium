@@ -9,7 +9,12 @@ from typing import Callable, Dict, Tuple
 import torch
 from torch import nn
 
-from .projection import ProjectionContext, TernaryProjection
+from .projection import (
+    ProjectionContext,
+    TernaryPlane,
+    TernaryProjection,
+    validate_projection,
+)
 from .errors import TritiumError
 
 
@@ -60,16 +65,20 @@ class AbsMeanSTE(Estimator):
         dense = decoded + (master - master.detach()) * mask
         return TernaryProjection(
             dense=dense,
-            trits=hard.detach().to(torch.int8),
-            scales=scales,
-            group_size=master.shape[1],
+            planes=(
+                TernaryPlane(
+                    trits=hard.detach().to(torch.int8),
+                    scales=scales,
+                    group_size=master.shape[1],
+                ),
+            ),
             algorithm_id=self.algorithm_id,
             schema_version=self.schema_version,
         )
 
 
 class SaltSTE(AbsMeanSTE):
-    """Single-plane SALT QAT reference; additive planes land in plan 0048."""
+    """SALT QAT base estimator, composable into residual additive planes."""
 
     algorithm_id = "tritium.salt-ste"
 
@@ -102,12 +111,71 @@ def _projection(
     dense = decoded.detach() + (surrogate - surrogate.detach())
     return TernaryProjection(
         dense=dense,
-        trits=trits.detach().to(torch.int8),
-        scales=scales,
-        group_size=master.shape[1],
+        planes=(
+            TernaryPlane(
+                trits=trits.detach().to(torch.int8),
+                scales=scales,
+                group_size=master.shape[1],
+            ),
+        ),
         algorithm_id=estimator.algorithm_id,
         schema_version=estimator.schema_version,
     )
+
+
+class AdditiveEstimator(Estimator):
+    """Residual composition of two or three independently stateful estimators."""
+
+    schema_version = 1
+
+    def __init__(self, estimators: Tuple[Estimator, ...]) -> None:
+        super().__init__()
+        if not 2 <= len(estimators) <= 3:
+            raise ValueError("AdditiveEstimator requires two or three planes")
+        first = estimators[0]
+        if any(
+            estimator.algorithm_id != first.algorithm_id
+            or estimator.schema_version != first.schema_version
+            for estimator in estimators
+        ):
+            raise ValueError(
+                "additive plane estimators must share one algorithm schema"
+            )
+        self.estimators = nn.ModuleList(estimators)
+        self.algorithm_id = (
+            f"tritium.additive-{len(estimators)}/"
+            f"{first.algorithm_id}@{first.schema_version}"
+        )
+
+    def project(
+        self, master: torch.Tensor, *, context: ProjectionContext
+    ) -> TernaryProjection:
+        residual = master
+        dense = torch.zeros_like(master)
+        planes = []
+        for estimator in self.estimators:
+            projection = estimator.project(residual, context=context)
+            validate_projection(
+                projection,
+                residual,
+                algorithm_id=estimator.algorithm_id,
+                schema_version=estimator.schema_version,
+            )
+            if len(projection.planes) != 1:
+                raise TritiumError(
+                    "nested additive estimators are not supported",
+                    code="estimator_contract",
+                    stage="project",
+                )
+            planes.append(projection.planes[0])
+            dense = dense + projection.dense
+            residual = master - dense
+        return TernaryProjection(
+            dense=dense,
+            planes=tuple(planes),
+            algorithm_id=self.algorithm_id,
+            schema_version=self.schema_version,
+        )
 
 
 class AnnealedSTE(Estimator):
