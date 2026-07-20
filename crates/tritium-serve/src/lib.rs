@@ -27,6 +27,8 @@ pub mod dto;
 pub mod generator;
 pub mod tokenizer_passthrough;
 
+#[cfg(feature = "serve")]
+mod admission;
 #[cfg(feature = "cuda")]
 mod batch;
 #[cfg(feature = "serve")]
@@ -43,8 +45,13 @@ pub use generator::{
 pub use tokenizer_passthrough::IdPassthroughTokenizer;
 
 #[cfg(feature = "serve")]
+pub use admission::{AdmissionPolicy, MAX_BEARER_TOKENS, PrincipalRateLimit};
+#[cfg(feature = "serve")]
 pub use router::{
-    ChatTemplate, RequestLimits, ServeConfig, build_router, build_router_with_limits,
+    ChatTemplate, RequestLimits, ServeConfig, build_router, build_router_governed,
+    build_router_with_limits,
 };
 #[cfg(feature = "cuda")]
-pub use router::{build_router_batched, build_router_batched_with_limits};
+pub use router::{
+    build_router_batched, build_router_batched_governed, build_router_batched_with_limits,
+};

@@ -105,8 +105,12 @@ lifetime now also runs inside lazy SSE bodies from queue admission: expiry
 emits a typed OpenAI `request_timeout` event, records
 `tritium_stream_timeouts_total`, terminates framing and drops the receiver so
 the worker cancels. Non-streaming expiry returns HTTP 408 with the same typed
-OpenAI envelope. Per-principal rate limits, auth rotation, explicit KV
-reclamation receipts and the full adversarial matrix remain open.
+OpenAI envelope. A startup-validated rotation set of at most 32 bearer keys is
+stored as fixed-size BLAKE3 digests; expensive routes use independent,
+fixed-point token buckets by key (or one anonymous loopback bucket), so
+attacker-controlled principal growth and eviction churn are impossible.
+`Retry-After` and `tritium_rate_rejections_total` are contract-tested. Explicit
+KV reclamation receipts and the full adversarial matrix remain open.
 
 ## Slice 3 — metrics, logs and traces
 

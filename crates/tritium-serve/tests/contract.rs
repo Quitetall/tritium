@@ -18,8 +18,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use tritium_nn::Tokenizer;
 use tritium_serve::{
-    FinishReason, GenError, GenRequest, Generator, IdPassthroughTokenizer, MockGenerator,
-    RequestLimits, ServeConfig, Step, build_router, build_router_with_limits,
+    AdmissionPolicy, FinishReason, GenError, GenRequest, Generator, IdPassthroughTokenizer,
+    MockGenerator, PrincipalRateLimit, RequestLimits, ServeConfig, Step, build_router,
+    build_router_governed, build_router_with_limits,
 };
 
 /// A generator that always fails (for the backend-error / panic-resilience tests).
@@ -825,6 +826,63 @@ async fn bearer_auth_enforced_when_configured() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// Rotating keys are separate bounded principals: exhausting one bucket does
+/// not affect another, probe routes do not consume generation credit, and a
+/// rejection carries stable OpenAI/Retry-After/metric semantics.
+#[tokio::test]
+async fn rotating_auth_has_per_principal_rate_buckets() {
+    let (router, _d) = build_router_governed(
+        Box::new(MockGenerator::new(vec![10])),
+        shared_tok(),
+        ServeConfig::default(),
+        RequestLimits::default(),
+        AdmissionPolicy {
+            bearer_tokens: vec!["old-key".into(), "new-key".into()],
+            rate_limit: Some(PrincipalRateLimit {
+                requests_per_minute: 1,
+                burst: 1,
+            }),
+        },
+    )
+    .expect("valid governed router");
+
+    let request = |token: &'static str| {
+        Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                json!({"model":"tritium","messages":[{"role":"user","content":"1"}]}).to_string(),
+            ))
+            .unwrap()
+    };
+    assert_eq!(send(&router, request("old-key")).await.0, StatusCode::OK);
+
+    let response = router.clone().oneshot(request("old-key")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "60");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_exceeded");
+
+    // Probe access is authenticated but never charged against generation.
+    let health = Request::get("/healthz")
+        .header("authorization", "Bearer old-key")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&router, health).await.0, StatusCode::OK);
+
+    // The rotating replacement key has its own fixed bucket.
+    assert_eq!(send(&router, request("new-key")).await.0, StatusCode::OK);
+    let metrics = Request::get("/metrics")
+        .header("authorization", "Bearer new-key")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&router, metrics).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("tritium_rate_rejections_total 1\n"), "{text}");
+}
+
 /// Body limit: an over-2MiB request body is rejected, not buffered.
 #[tokio::test]
 async fn oversized_body_rejected() {
@@ -966,6 +1024,7 @@ async fn metrics_exposition() {
         text.contains("tritium_queue_rejections_total 0\n"),
         "{text}"
     );
+    assert!(text.contains("tritium_rate_rejections_total 0\n"), "{text}");
     assert!(text.contains("tritium_stream_timeouts_total 0\n"), "{text}");
     assert!(text.contains("tritium_worker_alive 1\n"), "{text}");
     assert!(text.contains("# TYPE tritium_queue_depth gauge"), "{text}");

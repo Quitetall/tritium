@@ -9,7 +9,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tritium_serve::{IdPassthroughTokenizer, RequestLimits, RunnerGenerator, ServeConfig};
+use tritium_serve::{
+    AdmissionPolicy, IdPassthroughTokenizer, PrincipalRateLimit, RequestLimits, RunnerGenerator,
+    ServeConfig,
+};
 
 // Force-link the backends so their `linkme` registrations populate the runtime
 // registry consulted below.
@@ -32,6 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_prompt_tokens: usize = 128 * 1024;
     let mut max_new_tokens: usize = 4096;
     let mut max_total_tokens: usize = 128 * 1024;
+    let mut rate_limit_rpm: u32 = 120;
+    let mut rate_limit_burst: u32 = 8;
     let mut eos: u32 = 128_001;
     let mut raw_tokens = false;
     let mut draft_model: Option<String> = None;
@@ -72,6 +77,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--max-total-tokens" => {
                 max_total_tokens = val(args.next(), "--max-total-tokens")?;
             }
+            "--rate-limit-rpm" => {
+                rate_limit_rpm = val(args.next(), "--rate-limit-rpm")?;
+            }
+            "--rate-limit-burst" => {
+                rate_limit_burst = val(args.next(), "--rate-limit-burst")?;
+            }
             "--eos" => eos = val(args.next(), "--eos")?,
             "--raw-tokens" => raw_tokens = true,
             "--draft-model" => draft_model = Some(val(args.next(), "--draft-model")?),
@@ -88,9 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      [--batch-slots N] [--host 127.0.0.1] [--port 8080] [--model-id tritium] \
                      [--max-new 256] [--max-messages 128] [--max-prompt-bytes 1048576] \
                      [--max-prompt-tokens 131072] [--max-completion-tokens 4096] \
-                     [--max-total-tokens 131072] [--eos 128001] [--raw-tokens] \
+                     [--max-total-tokens 131072] [--rate-limit-rpm 120] \
+                     [--rate-limit-burst 8] [--eos 128001] [--raw-tokens] \
                      [--draft-model <gguf>] [--kv-pool-tokens N]  (non-loopback \
-                     --host requires TRITIUM_AUTH_TOKEN)"
+                     --host requires TRITIUM_AUTH_TOKEN or TRITIUM_AUTH_TOKENS)"
                 );
                 return Ok(());
             }
@@ -154,16 +166,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-    // Binding beyond loopback requires a bearer token (TRITIUM_AUTH_TOKEN):
-    // the server is otherwise an unauthenticated code-adjacent surface.
+    // Binding beyond loopback requires at least one bearer key. The singular
+    // variable preserves compatibility; the plural comma-separated variable
+    // supports bounded rotation without a restart-time authentication gap.
     let host_ip: std::net::IpAddr = host.parse().map_err(|e| format!("--host {host:?}: {e}"))?;
-    let auth_token = std::env::var("TRITIUM_AUTH_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
+    let mut auth_tokens = Vec::new();
+    if let Ok(token) = std::env::var("TRITIUM_AUTH_TOKEN")
+        && !token.is_empty()
+    {
+        auth_tokens.push(token);
+    }
+    if let Ok(tokens) = std::env::var("TRITIUM_AUTH_TOKENS")
+        && !tokens.is_empty()
+    {
+        for token in tokens.split(',') {
+            if token.is_empty() {
+                return Err("TRITIUM_AUTH_TOKENS contains an empty comma-separated entry".into());
+            }
+            auth_tokens.push(token.to_owned());
+        }
+    }
     if !host_ip.is_loopback() {
-        if auth_token.is_none() {
+        if auth_tokens.is_empty() {
             return Err(format!(
-                "--host {host} binds beyond loopback; set TRITIUM_AUTH_TOKEN to require \
+                "--host {host} binds beyond loopback; set TRITIUM_AUTH_TOKEN or \
+                 TRITIUM_AUTH_TOKENS to require \
                  `Authorization: Bearer <token>` on every request (refusing to serve \
                  an open endpoint)"
             )
@@ -171,8 +198,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!(
             "tritium-serve: WARNING — binding {host} (non-loopback). Bearer auth is \
-             enforced; requests time out after 600s to first byte; body limit 2 MiB."
+             enforced; requests and streams time out after 600s; body limit 2 MiB."
         );
+    }
+    if rate_limit_rpm > 0 && rate_limit_burst == 0 {
+        return Err("--rate-limit-burst must be >= 1 when rate limiting is enabled".into());
     }
     if kv_pool_tokens.is_some() && batch_slots <= 1 {
         return Err(
@@ -203,7 +233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_id,
         queue_cap: 32,
         max_new_default: max_new,
-        auth_token,
+        // The v1.1 governed constructor owns rotating authentication. Keep the
+        // legacy single-key field empty to make precedence unambiguous.
+        auth_token: None,
         kv_pool_tokens,
         chat_template,
         ..ServeConfig::default()
@@ -214,6 +246,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_prompt_tokens,
         max_new_tokens,
         max_total_tokens,
+    };
+    let admission = AdmissionPolicy {
+        bearer_tokens: auth_tokens,
+        rate_limit: (rate_limit_rpm > 0).then_some(PrincipalRateLimit {
+            requests_per_minute: rate_limit_rpm,
+            burst: rate_limit_burst,
+        }),
     };
     // ADR 0021 model drafter: a SECOND runner in-process on the same device
     // (its own KV + decode graphs). Load failures are loud — a missing or
@@ -264,20 +303,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into(),
             );
         }
-        tritium_serve::build_router_batched_with_limits(
+        tritium_serve::build_router_batched_governed(
             runner,
             eos,
             batch_slots,
             tok,
             cfg,
             request_limits,
+            admission,
         )?
     } else {
         let mut generator = RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup);
         if let Some(d) = draft_runner {
             generator = generator.with_draft_model(d);
         }
-        tritium_serve::build_router_with_limits(Box::new(generator), tok, cfg, request_limits)
+        tritium_serve::build_router_governed(
+            Box::new(generator),
+            tok,
+            cfg,
+            request_limits,
+            admission,
+        )?
     };
     #[cfg(not(feature = "cuda"))]
     let (router, draining) = {
@@ -288,7 +334,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(d) = draft_runner {
             generator = generator.with_draft_model(d);
         }
-        tritium_serve::build_router_with_limits(Box::new(generator), tok, cfg, request_limits)
+        tritium_serve::build_router_governed(
+            Box::new(generator),
+            tok,
+            cfg,
+            request_limits,
+            admission,
+        )?
     };
 
     let addr = std::net::SocketAddr::new(host_ip, port);

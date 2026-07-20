@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use tokio::sync::mpsc;
 use tritium_nn::Tokenizer;
 
+use crate::admission::{Admission, AdmissionDecision, AdmissionPolicy};
 use crate::dto::{
     ApiError, ChatChunk, ChatCompletion, ChatMessage, ChatRequest, Choice, ModelEntry, ModelList,
     StopField, Usage,
@@ -155,6 +156,8 @@ pub(crate) struct Metrics {
     pub(crate) chat_requests: AtomicU64,
     /// 429s returned because the job queue was full.
     pub(crate) queue_rejections: AtomicU64,
+    /// 429s returned by per-principal admission control.
+    pub(crate) rate_rejections: AtomicU64,
     /// Completion tokens emitted to clients across all requests.
     pub(crate) tokens_out: AtomicU64,
     /// Streaming generations cancelled after exceeding their lifetime budget.
@@ -205,7 +208,40 @@ pub fn build_router_with_limits(
         worker_alive.clone(),
         cfg.queue_cap,
     );
-    build_router_inner(jobs, tok, cfg, limits, draining, worker_alive)
+    let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
+    build_router_inner(jobs, tok, cfg, limits, admission, draining, worker_alive)
+}
+
+/// Build the router with explicit request ceilings, rotating bearer keys and
+/// fixed-cardinality per-principal admission control.
+///
+/// Policy errors are returned before the worker is spawned or a listener can
+/// be bound.
+pub fn build_router_governed(
+    generator: Box<dyn Generator>,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    limits: RequestLimits,
+    policy: AdmissionPolicy,
+) -> std::io::Result<(Router, Arc<AtomicBool>)> {
+    let admission = Arc::new(Admission::new(cfg.auth_token.as_deref(), policy)?);
+    let draining = Arc::new(AtomicBool::new(false));
+    let worker_alive = Arc::new(AtomicBool::new(true));
+    let jobs = spawn_worker(
+        generator,
+        draining.clone(),
+        worker_alive.clone(),
+        cfg.queue_cap,
+    );
+    Ok(build_router_inner(
+        jobs,
+        tok,
+        cfg,
+        limits,
+        admission,
+        draining,
+        worker_alive,
+    ))
 }
 
 /// Continuous-batching router (`--batch-slots > 1`): spawns the batched
@@ -232,6 +268,36 @@ pub fn build_router_batched_with_limits(
     tok: Arc<dyn Tokenizer + Send + Sync>,
     cfg: ServeConfig,
     limits: RequestLimits,
+) -> std::io::Result<(Router, Arc<AtomicBool>)> {
+    let admission = Arc::new(Admission::legacy(cfg.auth_token.as_deref()));
+    build_router_batched_inner(runner, eos, slots, tok, cfg, limits, admission)
+}
+
+/// Build the continuous-batching router with rotating bearer keys and
+/// fixed-cardinality per-principal admission control.
+#[cfg(feature = "cuda")]
+pub fn build_router_batched_governed(
+    runner: tritium_nn::ModelRunner,
+    eos: u32,
+    slots: usize,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    limits: RequestLimits,
+    policy: AdmissionPolicy,
+) -> std::io::Result<(Router, Arc<AtomicBool>)> {
+    let admission = Arc::new(Admission::new(cfg.auth_token.as_deref(), policy)?);
+    build_router_batched_inner(runner, eos, slots, tok, cfg, limits, admission)
+}
+
+#[cfg(feature = "cuda")]
+fn build_router_batched_inner(
+    runner: tritium_nn::ModelRunner,
+    eos: u32,
+    slots: usize,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    limits: RequestLimits,
+    admission: Arc<Admission>,
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     use std::sync::atomic::Ordering;
     if slots == 0 {
@@ -265,6 +331,7 @@ pub fn build_router_batched_with_limits(
         tok,
         cfg,
         limits,
+        admission,
         draining,
         worker_alive,
     ))
@@ -275,9 +342,11 @@ fn build_router_inner(
     tok: Arc<dyn Tokenizer + Send + Sync>,
     cfg: ServeConfig,
     limits: RequestLimits,
+    admission: Arc<Admission>,
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
 ) -> (Router, Arc<AtomicBool>) {
+    let metrics_state = Arc::new(Metrics::default());
     let state = AppState {
         jobs,
         tok,
@@ -293,9 +362,8 @@ fn build_router_inner(
         request_timeout: (cfg.request_timeout_secs > 0)
             .then(|| Duration::from_secs(cfg.request_timeout_secs)),
         chat_template: cfg.chat_template,
-        metrics: Arc::new(Metrics::default()),
+        metrics: metrics_state.clone(),
     };
-    let auth_token: Option<Arc<str>> = cfg.auth_token.as_deref().map(Arc::from);
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
@@ -333,44 +401,59 @@ fn build_router_inner(
             cfg.max_concurrent_requests,
         ));
     }
-    if let Some(token) = auth_token {
-        router = router.layer(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let token = token.clone();
-                async move {
-                    let ok = req
-                        .headers()
-                        .get(axum::http::header::AUTHORIZATION)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.strip_prefix("Bearer "))
-                        .is_some_and(|t| {
-                            // Constant-time-ish compare (length + bytes).
-                            t.len() == token.len()
-                                && t.bytes()
-                                    .zip(token.bytes())
-                                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                                    == 0
-                        });
-                    if ok {
-                        next.run(req).await
-                    } else {
-                        let mut resp = api_error(
-                            StatusCode::UNAUTHORIZED,
-                            "invalid_request_error",
-                            "missing or invalid bearer token",
-                            None,
-                        )
-                        .into_response();
-                        resp.headers_mut().insert(
-                            axum::http::header::WWW_AUTHENTICATE,
-                            axum::http::HeaderValue::from_static("Bearer"),
-                        );
-                        resp
+    // Authentication and admission share one bounded principal resolution.
+    // The middleware covers every endpoint for uniform auth, but charges only
+    // routes that can enqueue model work; health and metrics remain probeable
+    // by an authenticated operator even when the generation bucket is empty.
+    router = router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let admission = admission.clone();
+            let metrics = metrics_state.clone();
+            async move {
+                let presented = req
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.strip_prefix("Bearer "));
+                let Some(principal) = admission.authenticate(presented) else {
+                    let mut response = api_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_request_error",
+                        "missing or invalid bearer token",
+                        None,
+                    );
+                    response.headers_mut().insert(
+                        axum::http::header::WWW_AUTHENTICATE,
+                        axum::http::HeaderValue::from_static("Bearer"),
+                    );
+                    return response;
+                };
+
+                let governed = req.method() == axum::http::Method::POST
+                    && matches!(
+                        req.uri().path(),
+                        "/v1/chat/completions" | "/v1/tree/session" | "/v1/tree/verify"
+                    );
+                if governed
+                    && let AdmissionDecision::Reject { retry_after_secs } =
+                        admission.admit(principal)
+                {
+                    metrics.rate_rejections.fetch_add(1, Ordering::Relaxed);
+                    let mut response = api_error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_exceeded",
+                        "principal request rate exceeded; retry later",
+                        None,
+                    );
+                    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                        response.headers_mut().insert(header::RETRY_AFTER, value);
                     }
+                    return response;
                 }
-            },
-        ));
-    }
+                next.run(req).await
+            }
+        },
+    ));
     (router, draining)
 }
 
@@ -991,6 +1074,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_queue_rejections_total Requests 429'd because the job queue was full.\n\
          # TYPE tritium_queue_rejections_total counter\n\
          tritium_queue_rejections_total {}\n\
+         # HELP tritium_rate_rejections_total Requests 429'd by per-principal admission control.\n\
+         # TYPE tritium_rate_rejections_total counter\n\
+         tritium_rate_rejections_total {}\n\
          # HELP tritium_tokens_out_total Completion tokens emitted to clients.\n\
          # TYPE tritium_tokens_out_total counter\n\
          tritium_tokens_out_total {}\n\
@@ -1011,6 +1097,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
          tritium_spec_committed_total {}\n",
         st.metrics.chat_requests.load(Ordering::Relaxed),
         st.metrics.queue_rejections.load(Ordering::Relaxed),
+        st.metrics.rate_rejections.load(Ordering::Relaxed),
         st.metrics.tokens_out.load(Ordering::Relaxed),
         st.metrics.stream_timeouts.load(Ordering::Relaxed),
         queue_depth,

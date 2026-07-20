@@ -18,6 +18,7 @@ tritium-nn = { workspace = true }
 tritium-spec = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+blake3 = { workspace = true, optional = true }
 
 # The HTTP/SSE server, behind the `serve` feature (mirrors tritium-cuda/wgpu's gate).
 tokio = { workspace = true, optional = true }
@@ -33,7 +34,7 @@ tritium-format = { workspace = true, optional = true }
 
 [features]
 default = []
-serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
+serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:blake3", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
 # Link the CUDA backend so `--backend cuda` can resolve (needs nvcc at build time).
 cuda = ["serve", "dep:tritium-cuda", "tritium-nn/cuda"]
 # Gated real-model end-to-end test (needs TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH).

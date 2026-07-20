@@ -20,7 +20,10 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 
 No GPU? Use `--backend cpu` (and build without the `cuda` feature). No
 network exposure by default: the server binds loopback; `--host` beyond
-loopback refuses to start unless `TRITIUM_AUTH_TOKEN` is set.
+loopback refuses to start unless `TRITIUM_AUTH_TOKEN` or the comma-separated
+rotation set `TRITIUM_AUTH_TOKENS` is set. Expensive generation routes use a
+fixed-cardinality per-key token bucket by default (`--rate-limit-rpm 120`,
+`--rate-limit-burst 8`; set RPM to `0` only for a trusted local deployment).
 
 ### Docker
 
