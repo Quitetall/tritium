@@ -19,7 +19,8 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "typecheck": "npm run build:wasm && tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "check": "npm run typecheck && npm test"
   },

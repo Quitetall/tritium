@@ -4,3 +4,10 @@
 # WASI sandbox. Only affects builds that explicitly --target wasm32-wasip1.
 [target.wasm32-wasip1]
 runner = "wasmtime --dir=."
+
+# Browser/WASI-free training guests have one declared 192 MiB linear-memory
+# ceiling. The portable adapter independently admits at most 64 MiB of caller
+# buffers before mutation; operation scratch and controller state share the
+# remaining envelope.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--max-memory=201326592"]

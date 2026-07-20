@@ -10,15 +10,22 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-format = { workspace = true }
 tritium-train = { workspace = true }
+tritium-testkit = { workspace = true }
 half = { workspace = true }
+blake3 = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.126"
 
 [dev-dependencies]
-tritium-testkit = { workspace = true }
 
 [build-dependencies]
 tritium-build-info = { workspace = true }

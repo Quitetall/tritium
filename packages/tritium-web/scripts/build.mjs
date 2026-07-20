@@ -4,11 +4,14 @@ import { fileURLToPath } from "node:url";
 
 import { build } from "esbuild";
 
+import { buildPortableWasm } from "./build-wasm.mjs";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(root, "dist");
 
 await rm(output, { force: true, recursive: true });
 await mkdir(output, { recursive: true });
+await buildPortableWasm(output);
 await build({
   bundle: true,
   entryPoints: [resolve(root, "src/index.ts")],

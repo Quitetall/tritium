@@ -35,6 +35,33 @@ export declare const TRAINING_MANIFEST_DIGEST_V1:
 export declare const TRAINING_VECTOR_DIGEST_V1:
   "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6";
 
+export interface PortableWasmConformanceReceiptV1 {
+  readonly schemaId: "tritium.portable_wasm_conformance_receipt";
+  readonly schemaVersion: 1;
+  readonly implementation: "wasm-fallback";
+  readonly engine: "wasm32-unknown-unknown";
+  readonly buildId: string;
+  readonly guestDigest: string;
+  readonly executionDigest: string;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly operationCount: number;
+  readonly caseCount: number;
+  readonly maxCallerBytes: number;
+  readonly maxLinearMemoryBytes: number;
+  readonly repeatedExecutions: 2;
+}
+
+export declare function runPortableWasmConformance(
+  source?: PortableWasmSourceV1,
+): Promise<PortableWasmConformanceReceiptV1>;
+
+export type PortableWasmSourceV1 =
+  | RequestInfo
+  | URL
+  | Response
+  | BufferSource;
+
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";
 export type WebTrainingState =

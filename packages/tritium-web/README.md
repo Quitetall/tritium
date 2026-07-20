@@ -10,12 +10,20 @@ parameters share one allocation and one compiled gradient/optimizer owner, batch
 the plan, and allocation-free validation plus non-retaining preparation close
 operation-specific geometry/attribute rules before persistent preparation.
 Model/batch bytes are isolated from adapter mutation. Failed
-adapter calls do not advance session state.
+adapter calls do not advance session state. The archive also bundles a real
+`wasm32-unknown-unknown` guest; `runPortableWasmConformance()` executes all 114
+canonical cases twice inside that guest and returns a source-bound structural
+receipt.
 
-The generated WASM and WebGPU adapters are still under construction. Until one
-is supplied, `prepareTraining(model, config)` returns a typed
+The lifecycle WASM controller and WebGPU adapter are still under construction;
+the conformance guest is not mislabeled as either. Until a lifecycle adapter is
+supplied, `prepareTraining(model, config)` returns a typed
 `adapter_unavailable` error; this package never labels a JavaScript fallback as
 WebGPU execution.
 
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.
+Building the archive from source requires the pinned
+`wasm32-unknown-unknown` Rust target and `wasm-bindgen-cli 0.2.126`; the build
+fails on tool drift and verifies the guest's 192 MiB maximum-memory declaration.
+Archive consumers need neither Rust nor wasm-bindgen.

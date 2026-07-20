@@ -1,4 +1,4 @@
-//! # tritium-wasm — scalar [`TernaryBackend`] for `wasm32-wasip1`.
+//! # tritium-wasm — scalar [`TernaryBackend`] for WebAssembly.
 //!
 //! The kernel is [`tritium_core::reference_mpgemm`] itself, run over weights
 //! unpacked with `tritium-format`'s row unpackers. It is therefore **bit-exact**
@@ -34,6 +34,181 @@ use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBacken
 
 mod portable;
 pub use portable::WasmTrainBackendV1;
+
+#[cfg(target_arch = "wasm32")]
+fn portable_training_conformance_report()
+-> Result<tritium_testkit::TrainingConformanceReport, String> {
+    use tritium_spec::TrainingVectorSetV1;
+    use tritium_testkit::run_training_conformance;
+
+    let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json())
+        .map_err(|error| error.to_string())?;
+    let backend =
+        WasmTrainBackendV1::new("wasm32-unknown-unknown").map_err(|error| error.to_string())?;
+    Ok(run_training_conformance(&backend, &vectors))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn digest_hex(bytes: [u8; 32]) -> String {
+    let mut result = String::with_capacity(64);
+    for byte in bytes {
+        use core::fmt::Write;
+        write!(&mut result, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+fn hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn portable_training_report_digest() -> Result<String, String> {
+    let report = portable_training_conformance_report()?;
+    let expected_cases = tritium_spec::TrainingVectorSetV1::parse_json(
+        tritium_spec::TrainingVectorSetV1::canonical_json(),
+    )
+    .map_err(|error| error.to_string())?
+    .cases()
+    .len();
+    if !report.failed.is_empty() || report.passed.len() != expected_cases {
+        return Err(format!(
+            "portable conformance incomplete: passed={}, failed={}, expected={expected_cases}",
+            report.passed.len(),
+            report.failed.len(),
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tritium.portable-wasm-conformance-report.v1\0");
+    hasher.update(&tritium_spec::TrainingOpManifestV1::digest());
+    hasher.update(&tritium_spec::TrainingVectorSetV1::digest());
+    hasher.update(&(report.passed.len() as u64).to_le_bytes());
+    hasher.update(&(report.failed.len() as u64).to_le_bytes());
+    for pass in report.passed {
+        hash_field(&mut hasher, pass.case_id.as_bytes());
+        match pass.receipt {
+            Some(receipt) => {
+                hasher.update(&[1]);
+                hash_field(&mut hasher, receipt.backend_id.as_bytes());
+                hash_field(&mut hasher, receipt.backend_build.as_bytes());
+                hash_field(
+                    &mut hasher,
+                    receipt.physical_device.as_deref().unwrap_or("").as_bytes(),
+                );
+                hasher.update(&receipt.manifest_digest);
+                hasher.update(&receipt.vector_digest.unwrap_or([0; 32]));
+                hash_field(&mut hasher, receipt.operation.as_bytes());
+                hash_field(&mut hasher, format!("{:?}", receipt.execution).as_bytes());
+                hash_field(&mut hasher, format!("{:?}", receipt.dtype).as_bytes());
+                hasher.update(&receipt.limits.max_rank.to_le_bytes());
+                hasher.update(&receipt.limits.max_elements.to_le_bytes());
+                hasher.update(&receipt.limits.max_bytes.to_le_bytes());
+                hasher.update(&receipt.input_digest);
+                hasher.update(&receipt.output_digest);
+                hasher.update(&receipt.peak_resident_bytes.to_le_bytes());
+                hasher.update(&receipt.scratch_bytes.to_le_bytes());
+                hasher.update(&receipt.host_transfers.to_le_bytes());
+                hasher.update(&[u8::from(receipt.device_resident)]);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    for failure in report.failed {
+        hash_field(&mut hasher, failure.case_id.as_bytes());
+        hash_field(&mut hasher, format!("{:?}", failure.reason).as_bytes());
+    }
+    Ok(digest_hex(*hasher.finalize().as_bytes()))
+}
+
+/// Execute the complete canonical portable-training corpus inside the guest.
+///
+/// Zero means all cases passed. A nonzero value is one plus the number of
+/// failed cases, capped to `u32::MAX`; `u32::MAX` also represents setup failure.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_conformance_status() -> u32 {
+    match portable_training_conformance_report() {
+        Ok(report)
+            if report.failed.is_empty()
+                && report.passed.len() == tritium_portable_conformance_case_count() as usize =>
+        {
+            0
+        }
+        Ok(report) => u32::try_from(report.failed.len())
+            .unwrap_or(u32::MAX - 1)
+            .saturating_add(1),
+        Err(_) => u32::MAX,
+    }
+}
+
+/// Number of canonical cases the bundled guest must execute.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_conformance_case_count() -> u32 {
+    use tritium_spec::TrainingVectorSetV1;
+
+    TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json()).map_or(0, |vectors| {
+        u32::try_from(vectors.cases().len()).unwrap_or(0)
+    })
+}
+
+/// Number of frozen manifest operations advertised by the guest.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_operation_count() -> u32 {
+    u32::try_from(tritium_spec::TrainingOpManifestV1::operations().len()).unwrap_or(0)
+}
+
+/// Combined caller-buffer ceiling enforced by the portable guest.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_max_caller_bytes() -> u32 {
+    u32::try_from(WasmTrainBackendV1::max_caller_bytes()).unwrap_or(u32::MAX)
+}
+
+/// Linker-enforced maximum WebAssembly linear memory in bytes.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_max_linear_memory_bytes() -> u32 {
+    192 * 1024 * 1024
+}
+
+/// Source-bound build identity embedded in portable-training receipts.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_build_id() -> String {
+    format!(
+        "{}@{}+{}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        env!("TRITIUM_SOURCE_ID")
+    )
+}
+
+/// Guest-embedded digest of the exact frozen operation manifest.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_manifest_digest() -> String {
+    digest_hex(tritium_spec::TrainingOpManifestV1::digest())
+}
+
+/// Guest-embedded digest of the exact canonical semantic-vector corpus.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_vector_digest() -> String {
+    digest_hex(tritium_spec::TrainingVectorSetV1::digest())
+}
+
+/// Digest of ordered case identities and every normalized execution receipt.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_portable_report_digest() -> String {
+    portable_training_report_digest().unwrap_or_default()
+}
 
 /// Owned host-memory buffer of packed weight bytes (the wasm linear-memory copy).
 #[derive(Debug, Clone)]

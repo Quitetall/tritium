@@ -90,6 +90,16 @@ npm --prefix packages/tritium-web pack --dry-run
 
 ## Slice 2 — deterministic WASM controller
 
+Status: **IN PROGRESS** — `tritium-wasm` now builds as an actual
+`wasm32-unknown-unknown` cdylib, the local npm archive bundles the bindgen guest,
+and Node instantiation executes all 35 operations / 114 canonical cases twice
+with zero failures under the guest's 64 MiB caller-buffer ceiling. The receipt
+binds the exact guest bytes, embedded manifest/vector identities, deterministic
+normalized execution digest and linker-enforced 192 MiB linear-memory maximum.
+It remains explicitly structural (`wasm-fallback`); request execution,
+checkpoint/artifact controller exports and physical Chrome/Firefox runs remain
+open.
+
 Compile `tritium-spec`, the bounded portable executor and SALT V2 strict reader
 to `wasm32-unknown-unknown`. JavaScript owns only lifecycle orchestration and
 typed-array views; Rust owns validation, request digests, execution semantics,
