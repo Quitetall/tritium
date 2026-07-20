@@ -43,8 +43,12 @@ saves with safe serialization, automatically reloads through
 - [x] Verify Trainer and direct Accelerate steps use ordinary optimizers.
 - [x] Verify single-process gradient accumulation and checkpoint/resume.
 - [ ] Verify mixed precision and exact RNG continuation.
-- Run real two-rank DDP and FSDP tests; skipped distributed tests are failures
-  in the release lane.
+- [x] Run real two-rank DDP and FSDP semantic tests on CPU/Gloo; skipped
+  distributed tests are failures in the release lane. FSDP uses native sharded
+  distributed-checkpoint resume; PyTorch 2.11 CPU full-state materialization
+  currently segfaults on rank 0 and remains a red export gate.
+- [ ] Run accelerator DDP/FSDP mixed-precision and throughput gates on distinct
+  physical devices.
 
 ## Step 3 — resumable PTQ facade
 
