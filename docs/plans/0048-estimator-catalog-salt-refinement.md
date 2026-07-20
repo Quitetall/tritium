@@ -21,6 +21,8 @@ accounting and matched-byte evaluation.
 - `AnnealedSTE`, `LSQEstimator`, `TWNEstimator`, `TTQEstimator`, and
   `SparseTernaryEstimator`
 - `TernaryConfig.qat(estimator=...)`
+- `RefinementConfig.scale_only(...)` and `RefinementConfig.hard_pv(...)`
+- `tritium.torch.refine`, `RefinementResult`, and artifact ancestry
 
 ## Step 1 — differentiable estimator catalog and plugins
 
@@ -54,10 +56,17 @@ coverage and duplicate-plugin tests.
 
 ## Step 3 — separate refinement tracks
 
-- Implement scale-only, true alternating hard PV and S34 refinement as distinct
-  work identities.
+- Remove refinement from `TernaryConfig.ptq`; reject ambiguous legacy non-none
+  refinement values instead of silently migrating them.
+- Implement `refine(parent, teacher, training, validation, config, work_dir)`.
+  Scale-only, true alternating hard PV and S34 refinement are distinct child
+  work identities and result discriminants.
+- Bind every child to its immediate parent and complete ancestry. Scale-only
+  freezes trits/allocation; hard PV may change assignments only under its
+  declared structure and frozen nested-prefix constraints.
 - Export the hard package and prove reload parity; no latent residual may enter
-  a PTQ claim.
+  a PTQ claim. QAT checkpoint, QAT export, PTQ, scale-only and hard-PV artifacts
+  remain separately typed.
 - Run matched-physical-byte ablations against RTN/AbsMean, GPTQ/AWQ-style
   second-order baselines and the frozen SALT variants.
 

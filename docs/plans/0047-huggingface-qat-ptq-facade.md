@@ -19,9 +19,12 @@ represented by a QAT checkpoint.
 - `tritium.nn.TernaryEmbedding`
 - `tritium.nn.TernaryConv1d` and `tritium.nn.TernaryConv2d`
 - `tritium.torch.HfTritiumConfig`
-- `tritium.torch.prepare_qat`
+- primitive `tritium.torch.prepare`, `calibrate`, `convert`, `export`, `load`,
+  and `inspect`
+- convenience `tritium.torch.prepare_qat` and `quantize` facades
 - Hugging Face `AutoModelForCausalLM.from_pretrained`
-- `tritium.torch.quantize`, `QuantizationResult`, and `load`
+- `PreparedModel`, `CalibrationReceipt`, `ConversionResult`,
+  `QuantizationResult`, and `ExportReceipt`
 
 ## Step 1 — trainable Hugging Face QAT checkpoint
 
@@ -76,13 +79,27 @@ saves with safe serialization, automatically reloads through
   callback-driven compact allocator, and durably bind nested two-bit maps. The
   solver retains exact non-concave global optimality and deterministic ties;
   ragged or runtime-unindexable geometry fails closed.
-- Bind the Rust SALT pipeline to `quantize(model_or_id, calibration, config,
-  work_dir)` without a Python-list weight bridge.
+- Bind the Rust SALT pipeline to explicit `prepare` → `calibrate` → `convert`
+  phases without a Python-list weight bridge. `quantize(model_or_id, ...)`
+  composes those exact primitives.
 - Expose immutable `QuantizationResult` model/coverage/report plus atomic
   `export` and `save_pretrained`.
 - Implement `load` for exact Tritium packages and supported HF directories.
-- Keep `refinement="none"` PTQ and refined runs in distinct work identities,
-  receipts and claims.
+- Remove refinement from `TernaryConfig.ptq`. PTQ can produce only a PTQ
+  result; plan 0048's separate `refine` primitive produces scale-only or
+  hard-PV child results with bound ancestry.
+
+## Step 4 — phase and schema closure
+
+- Freeze canonical Rust/Python representations for prepared state,
+  calibration receipts, conversion results, artifact references, export
+  receipts, coverage and errors; TypeScript fixtures land before plan 0050.
+- Require explicit `inplace` on `prepare`; validate before mutation and preserve
+  rollback. QAT supports additive plane counts 1, 2 and 3 before v1.1.
+- Prove primitive and convenience paths emit identical recipe, coverage and
+  artifact identities.
+- Treat existing `prepare_qat` as a convenience compatibility seam, not the
+  sole stable lifecycle.
 
 ## Verification
 
@@ -100,5 +117,6 @@ verify every finding before applying it.
 
 ## Done criterion
 
-Tiny and representative Hugging Face causal LMs pass QAT, Trainer/Accelerate,
-DDP/FSDP, resume, PTQ/refinement, atomic export/reload and generation gates.
+Tiny and representative Hugging Face causal LMs pass independent phased QAT
+and PTQ lineages, Trainer/Accelerate, DDP/FSDP, resume, atomic export/reload and
+generation gates. Refinement remains a separately typed plan-0048 lineage.

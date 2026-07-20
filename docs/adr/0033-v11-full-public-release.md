@@ -1,6 +1,6 @@
 # ADR 0033 — Tritium v1.1 full public release: ternary research platform
 
-Status: **PROPOSED** (2026-07-20)
+Status: **ACCEPTED** (2026-07-20; interface and release-gate reconciliation)
 
 - **Decider:** Brian Lam
 - **Research cutoff:** 2026-07-20, inclusive
@@ -31,13 +31,15 @@ Tritium already has more than an inference-kernel skeleton:
 - CPU, CUDA, Metal, ROCm, wgpu, WASI, C, Candle, Burn, ONNX, Python and serving
   integration substrate.
 
-Those capabilities do not form a public research product. The Python wrappers
-currently convert tensors to host lists and reconstruct new tensors, so CUDA
-training crosses a synchronous device-to-host-to-device boundary. There is no
-`TernaryLinear`, recursive `nn.Module` conversion, Hugging Face quantizer,
-stable state/export contract, published CUDA wheel, browser training SDK, or
-production-scale Python PTQ/refinement facade. Plan 0043 has not yet produced
-the pinned 27B artifact or its empirical evidence.
+Those capabilities did not form a public research product when this decision
+started. The legacy Conv1d/FSQ wrappers still cross host lists, but the first
+v1.1 slices have since landed a device-resident reference `TernaryLinear`,
+recursive QAT conversion, direct ternary Conv1d/Conv2d/Embedding modules,
+Hugging Face QAT checkpoint integration, Trainer/Accelerate gates and the core
+estimator catalog. Native fused dispatch, the phased PTQ/refinement facade,
+portable whole-Tape training, browser training, public packages and the
+production/community surface remain open. Plan 0043 has not yet produced the
+pinned 27B artifact or its empirical evidence.
 
 PyTorch won research adoption through an imperative graph, familiar modules,
 debugging, packaging and a five-minute path to a real experiment. Tritium should
@@ -46,7 +48,7 @@ general tensor, optimizer, data and distributed ecosystems.
 
 ## Decision
 
-### 1. Product architecture: PyTorch first, Tritium-native next
+### 1. Product architecture and fixed release sequence
 
 For v1.1:
 
@@ -58,10 +60,19 @@ For v1.1:
 - Rust `Tape` and `DeviceTape` remain production campaign/reference engines.
   They are not described as missing and are not replaced by Python.
 
-Native Tritium becomes an equally first-class research frontend during the 1.x
-line. v1.1 therefore freezes language-neutral recipe, artifact, coverage and
-error schemas now. A safe Rust `Tensor`/`Module` frontend later consumes those
-same contracts instead of inventing a second ternary ecosystem.
+The release sequence is binding:
+
+- **v1.1:** PyTorch/Hugging Face research frontend, whole-Tape semantic parity
+  on every inference backend, compiled TypeScript/WebGPU training, ONNX
+  inference, and the complete production/community surface in this ADR.
+- **v1.2:** safe typed native Rust `Tensor`/`Module`/dynamic-autograd frontend
+  plus Python bindings that run without PyTorch, both at v1.1 semantic parity.
+- **v1.3:** trainable whole-model ONNX import for supported graphs.
+
+v1.1 therefore freezes language-neutral recipe, artifact, coverage, error,
+backend-capability and training-operation schemas now. Native and ONNX
+frontends consume those contracts instead of inventing separate ternary
+ecosystems.
 
 This architecture deliberately rejects a complete `torch.nn` mirror. Tritium
 ships deep modules for supported ternary operations and reuses ordinary PyTorch
@@ -74,50 +85,67 @@ Distribution name is **`tritium-torch`**. Import namespace remains
 `tritium.nn`. PyTorch is an optional dependency of the Rust/Python runtime, not
 a dependency of frozen core crates.
 
-Stable golden-path API:
+Stable primitive workflow follows PyTorch/JAX-style explicit phases:
 
 ```python
-from tritium.torch import TernaryConfig, inspect, load, prepare_qat, quantize
+import tritium.torch as tt
 
-qat_model = prepare_qat(
+prepared = tt.prepare(
     dense_model,
-    TernaryConfig.qat(
-        estimator="salt-ste",
-        target_modules=("Linear", "Embedding", "Conv1d"),
-        planes=1,
-    ),
+    tt.TernaryConfig.qat(estimator="salt-ste", planes=1),
+    strict=True,
+    inplace=True,
 )
-
-loss = qat_model(**batch).loss
+loss = prepared.model(**batch).loss
 loss.backward()
 optimizer.step()
+qat_export = tt.convert(prepared)
+qat_receipt = tt.export(qat_export, "./model.qat.tsalt2")
 
-result = quantize(
+prepared = tt.prepare(
     dense_model,
-    calibration=calibration_data,
-    config=TernaryConfig.ptq(profile="near-lossless-v1"),
-    work_dir="./tritium-work",
+    tt.TernaryConfig.ptq(profile="near-lossless-v1"),
+    strict=True,
+    inplace=True,
 )
-receipt = result.export("./model.salt.gguf")
-reloaded = load("./model.salt.gguf", device="cuda")
-coverage = inspect(reloaded)
+calibration = tt.calibrate(prepared, calibration_data, work_dir="./ptq-work")
+ptq = tt.convert(prepared, calibration=calibration)
+ptq_receipt = tt.export(ptq, "./model.ptq.tsalt2")
+
+refined = tt.refine(
+    ptq,
+    teacher=dense_model,
+    training=refinement_data,
+    validation=validation_data,
+    config=tt.RefinementConfig.hard_pv(structure="dense"),
+    work_dir="./refine-work",
+)
+refined_receipt = tt.export(refined, "./model.refined.tsalt2")
+reloaded = tt.load("./model.refined.tsalt2", device="cuda")
+coverage = tt.inspect(reloaded)
 ```
 
 Required stable types and behavior:
 
+- `prepare`, `calibrate`, `convert`, `refine`, `export`, `load`, and `inspect`
+  are the primitive contracts. `prepare_qat` and one-call `quantize` remain
+  convenience compositions over those phases, not separate implementations.
+- `prepare` validates the whole graph before mutation. `inplace` is mandatory,
+  not defaulted: `True` consumes the supplied view without cloning 27B masters;
+  `False` must preserve independent ownership. Callers rebind the return value
+  because a root module may be replaced.
 - `TernaryConfig.qat(...)` and `TernaryConfig.ptq(...)` describe versioned
-  recipes. `profile`, `planes` and measured `target_bpw` replace misleading
-  `bits=2` controls.
-- `prepare_qat(model, config) -> torch.nn.Module` validates the whole graph,
-  then replaces supported leaves in the supplied model before optimizer
-  creation. It does not clone 27B masters; after conversion the caller must not
-  use the pre-conversion view concurrently. FP16/FP32 latent masters remain
-  ordinary `Parameter`s; hard ternary projections run in forward; registered
-  estimators define backward behavior.
-- `quantize(model_or_id, calibration, config, work_dir) -> QuantizationResult`
-  drives resumable SALT PTQ and separately labeled refinement tracks.
-- `QuantizationResult` exposes `model`, `coverage`, `report`, `export(...)` and
-  `save_pretrained(...)`.
+  recipes. QAT supports one to three additive planes. `profile`, `planes` and
+  measured `target_bpw` replace misleading `bits=2` controls.
+- `TernaryConfig.ptq` has no refinement field. `RefinementConfig` owns
+  scale-only and hard-PV choices. QAT exports, PTQ artifacts, scale-only
+  children and hard-PV children have distinct discriminants, ancestry, costs
+  and claim labels; none may be relabeled as another.
+- `PreparedModel`, `CalibrationReceipt`, `ConversionResult`,
+  `QuantizationResult`, `RefinementResult`, `ArtifactRef`, `ExportReceipt`, and
+  `CoverageReport` have versioned schemas shared by Rust, Python and
+  TypeScript. Non-replayable calibration iterables are materialized and hashed
+  before fitting or resume.
 - `load(...)` accepts a Tritium artifact or Hugging Face directory/ID and
   returns a supported `nn.Module` using the selected Tritium runtime.
 - `inspect(...) -> CoverageReport` accounts for every tensor exactly once.
@@ -141,24 +169,42 @@ class Estimator(torch.nn.Module):
     def project(self, master, *, context) -> TernaryProjection: ...
 ```
 
-`TernaryProjection` contains exact `{-1,0,+1}` planes, finite nonnegative
-scales, canonical hard decoded value and grouping metadata. Tritium validates
-the contract, provides pure-Torch reference execution, selects optimized
-adapters, and rejects unexportable projections. Researchers may add estimators
-without rebuilding Tritium; custom deployment kernels remain an explicit
-separate adapter.
+`TernaryProjection` contains a non-empty tuple of one to three
+`TernaryPlane { trits, scales, group_size, structure }` values plus the
+canonical hard decoded tensor. Trits are exactly `{-1,0,+1}`; scales are finite
+and nonnegative; structure is `dense` or `s34`; decoded shape equals the latent
+master. No residual, bias, zero point, codebook or decoder field exists.
+Tritium validates the contract, provides pure-Torch reference execution,
+selects optimized adapters, and rejects unregistered or unexportable
+projections. Researchers may add estimators without rebuilding Tritium;
+custom fused kernels remain a separate runtime-adapter seam.
+
+Public-interface maturity is explicit. All rows block v1.1:
+
+| Phase | Required surface |
+|---|---|
+| Core | modules, configuration, structured errors, coverage and schemas |
+| Eager research | QAT, estimator catalog/plugins, planes 1–3 and state round-trip |
+| Ecosystem | Hugging Face Trainer/Accelerate, DDP/FSDP and diagnostics |
+| Conversion | phased PTQ/refinement, load/export and seek-backed artifacts |
+| Optimized | native dispatch, AMP/vmap/compile and performance/no-copy gates |
 
 ### 3. Correctness, performance and failure contracts
 
 - Conversion is two-phase: inspect/validate the entire module graph, then
   commit replacements. Failure cannot expose a partially converted model.
-- Strict coverage is default. Unsupported modules, duplicate/shared ownership,
-  dense fallbacks and preserved tensors fail closed unless a policy explicitly
-  permits them; every permitted exception and byte is recorded.
+- Strict coverage is default. Every unique tensor is receipted exactly once
+  with all aliases, scope, role, shape, source bytes, disposition and packed
+  bytes. Unsupported modules, duplicate/shared ownership and targeted dense
+  fallbacks fail closed. Explicitly required preserved norms/biases and deferred
+  vision tensors are allowed only under named policy and remain visible.
 - QAT never destroys latent masters during `eval()`. Export performs explicit
   hard conversion from a consistent parameter snapshot.
-- Export is transactional and content-addressed. Reload binds recipe version,
-  source identity, tensor dispositions, physical bytes and runtime profile.
+- Export is transactional and content-addressed. Canonical SALT V2 uses
+  `.tsalt2`; seek-backed SALT-GGUF is an explicit export adapter admitted only
+  when it preserves recipe, coverage, lineage and physical-ledger identity.
+  Reload binds recipe version, source identity, tensor dispositions, physical
+  bytes and runtime profile.
 - Parameter version changes invalidate packed caches before next forward.
 - No Rust panic crosses Python/JS/C boundaries. `TritiumError` carries stable
   `code`, `stage`, qualified module/tensor and safe partial receipt fields.
@@ -224,40 +270,59 @@ v1.1 does not clone `DataLoader` or optimizers. It provides:
 - a deterministic calibration-data seam, dataset fingerprints and replayable
   experiment receipts.
 
-### 6. Portable training and browser product
+### 6. Whole-Tape portable training and browser product
 
-v1.1 targets the same **release-core training semantics** across CPU, CUDA,
-ROCm, Metal, wgpu/WebGPU and WASI. The portable core is:
+v1.1 freezes a language-neutral `TrainingOpManifestV1` and a fallible internal
+`TrainBackendV1` conformance seam. This is not the public native Tensor frontend
+scheduled for v1.2. The manifest covers every current public `Tape` operation
+and first-order VJP:
 
-- Linear, Embedding, Conv1d/Conv2d, normalization and required transformer
-  reshapes/activations;
-- supported losses, STE/LSQ/SALT projection, SGD/AdamW and checkpoint/resume;
-- forward, first-order backward, optimizer step and artifact export/reload.
+- STE surrogate, SALT STE, LSQ STE and FSQ;
+- dense and ternary matmul, transpose, embedding gather, column slice/concat,
+  detach, constant scale, bias, add and multiply;
+- Conv1d plus the v1.1 Conv2d extension;
+- ReLU-squared, SiLU, RMSNorm, softmax, causal mask, RoPE and composed
+  attention;
+- MSE and softmax cross-entropy;
+- SGD plus AdamW, CautiousAdamW, Int8AdamW and Muon steps;
+- checkpoint/resume and canonical artifact export/reload.
 
-Semantic parity is mandatory; performance is tiered by hardware. CUDA, ROCm,
-Metal and WebGPU carry native accelerator performance gates. CPU/WASI and any
-MCU training profile carry bounded-shape correctness and memory gates. A backend
-that cannot implement the core must remain explicitly inference-only and blocks
-v1.1 until this ADR is amended; documentation cannot call inference parity
-training parity.
+CPU, CUDA, ROCm, Metal, native wgpu, WASI/WASM and MCU must pass the same
+versioned semantic vectors on actual targets. Browser WebGPU consumes the same
+manifest. F32 is mandatory; additional dtypes are capability-receipted.
+Bounded shapes and memory ceilings are allowed on constrained targets, but an
+operation cannot silently become inference-only or a host round trip. Semantic
+parity is mandatory; performance is tiered by hardware. Failure on any declared
+backend blocks v1.1 until this ADR is explicitly amended.
 
-Browser support is a product, not the current WASI scalar build:
+Browser support is a product, not the current WASI scalar build. Intended npm
+distribution is `@tritium-ai/web`; name reservation and publication remain
+separately authorized external actions. The public surface is a compiled
+`WebTrainingSession`, not arbitrary JavaScript dynamic autograd:
 
-- an npm package exposes a TypeScript high-level Module/Trainer API;
-- WebGPU executes the portable training core, including optimizer/checkpoint;
-- WASM provides orchestration, validation and fallback;
-- browser and native paths import/export the same versioned Tritium artifact;
-- conformance runs in Chrome and Firefox-capable CI, with feature detection and
-  deterministic CPU fallback;
-- an install-free tutorial performs forward, backward, optimizer step,
-  checkpoint/resume and inference entirely in-browser.
+```typescript
+const session = await tritium.prepareTraining(model, config);
+await session.forward(batch);
+await session.backward();
+await session.step();
+const checkpoint = await session.checkpoint();
+await session.resume(checkpoint);
+await session.export("model.tsalt2");
+```
+
+WebGPU owns accelerator execution; WASM owns validation, orchestration and a
+separately labeled deterministic fallback. `npm pack` must install into an empty
+strict-TypeScript project, pass `tsc --noEmit`, produce a release bundle and run
+load through native reload without a per-step GPU-to-CPU tensor transfer.
+Current Chrome, Firefox and Safari must each prove real WebGPU execution. A
+fallback run never satisfies a WebGPU gate.
 
 ### 7. Interop, packaging, production and community
 
 v1.1 requirements:
 
 - whole-model ONNX import/export for supported ternary graphs and a real ORT
-  inference session; arbitrary trainable ONNX is binding later-1.x work;
+  inference session; arbitrary trainable ONNX is binding v1.3 work;
 - reference Candle/Burn paths upgraded or clearly capability-tiered—no host
   round trip advertised as accelerated training;
 - trusted PyPI publication, ordered crates.io publication, CPU/CUDA wheels,
@@ -269,13 +334,26 @@ v1.1 requirements:
 - hardened OpenAI-compatible serving, authentication, limits, backpressure,
   graceful shutdown, Prometheus/OpenTelemetry metrics and health/readiness;
 - OCI image, Helm chart, KEDA autoscaling, Knative serverless example, Grafana
-  dashboard and documented GPU scheduling/cache/storage patterns;
+  dashboard, OpenTelemetry traces and documented GPU scheduling/cache/storage
+  patterns;
 - current README/book/API reference, definitive ternary guide, PTQ/QAT/estimator
   tutorials, architecture/format/benchmark documentation and release migration
   guide;
 - `CONTRIBUTING`, Code of Conduct, governance, citation, support policy,
-  security process, GitHub templates/Discussions and a documented community
-  chat channel.
+  security process, GitHub templates/Discussions and a moderated Discord. GitHub
+  remains the authoritative archive for decisions and support outcomes.
+
+Release validation has three non-circular stages:
+
+1. **Local RC:** build candidate wheels, crates, npm archives, OCI images,
+   signatures, SBOMs and attestations; install and test them from clean local
+   environments without registry publication.
+2. **Authorized activation:** publish immutable registry artifacts, create
+   public community surfaces and deploy public references only after explicit
+   approval.
+3. **Post-publication smoke:** install exact registry artifacts and regenerate
+   smoke receipts. A failure does not rewrite `v1.1.0`; it advances to a
+   corrective `v1.1.1`.
 
 ### 8. Audited model zoo and launch evidence
 
@@ -309,19 +387,22 @@ verdicts.
       separately labeled refined evidence; refined NearLossless is within 1%
       relative held-out perplexity, task-retention gates pass, and native
       runtime/memory/physical-byte receipts exist.
-- [ ] One-call PyTorch/HF PTQ plus QAT works through ordinary `loss.backward()`
-      and optimizer step, preserves tied weights/state, compiles, distributes,
-      exports and reloads.
+- [ ] Explicit prepare/calibrate-or-train/convert/refine/export/load phases and
+      their one-call PyTorch/HF facades preserve tied weights/state, compile,
+      distribute, export and reload. PTQ and refined lineages remain distinct.
 - [ ] Steady-state optimized CPU/CUDA paths show no hidden host transfer or
-      dense runtime shadow; backend conformance and performance tiers pass.
+      dense runtime shadow; `TrainingOpManifestV1` passes every declared native
+      backend and performance tiers are receipted.
 - [ ] Core estimator catalog, external-estimator validation, production SALT
       reconstruction/refinement and reproduced baseline harness pass.
-- [ ] Portable training core passes every declared backend, including browser
-      WebGPU forward/backward/optimizer/checkpoint/export.
+- [ ] Compiled TypeScript `WebTrainingSession` passes the whole manifest in
+      Chrome, Firefox and Safari WebGPU, including checkpoint/export/native
+      reload; WASM fallback is reported separately.
 - [ ] Whole-model ONNX inference interoperability passes; trainable ONNX remains
-      labeled later-1.x.
-- [ ] PyPI/crates/wheels/Colab/browser packages install from published artifacts
-      without a source checkout.
+      labeled v1.3.
+- [ ] Local RC archives install without a source checkout or compiler; after
+      explicit activation, exact PyPI/crates/npm/container artifacts pass the
+      same post-publication smoke.
 - [ ] Hardened serving, OCI/Kubernetes/serverless/observability artifacts pass
       deployment and failure-injection gates.
 - [ ] Three-tier model zoo, guides, governance/community and compatibility docs
@@ -331,16 +412,14 @@ verdicts.
 
 ## Binding post-v1.1 work
 
-These are required in the 1.x line, designed against v1.1 schemas, but do not
-block `v1.1.0`:
-
-1. safe, typed, first-class native Rust `Tensor`/`Module`/dynamic-autograd API
-   with no panic contracts and parity against the PyTorch reference frontend;
-2. arbitrary trainable ONNX graph import where supported ops retain gradients;
-3. Qwen3.6 vision/multimodal completion, then MoE and independent-family
-   flagship expansion;
-4. higher-order gradients and broader compiler/graph IR only after two real
-   frontends and two execution consumers justify the seam.
+- **v1.2:** safe typed native Rust `Tensor`/`Module`/dynamic-autograd API with
+  no panic contracts, plus Python bindings that run without PyTorch. Both must
+  consume v1.1 schemas and match the PyTorch reference frontend.
+- **v1.3:** arbitrary trainable ONNX graph import for supported operations,
+  including gradients, optimizer/checkpoint lifecycle and artifact identity.
+- **Ordered but unversioned:** Qwen3.6 vision/multimodal completion, then
+  Qwen3.6-35B-A3B MoE and an independent-family flagship. Higher-order
+  gradients and broader compiler/graph IR remain evidence-gated.
 
 ## Rejected alternatives
 

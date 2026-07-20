@@ -14,27 +14,33 @@ Turn Tritium's existing kernels, training substrate and SALT V2 campaign engine
 into a differentiable, installable, portable and production-ready ternary
 research platform. Success means every ADR 0033 gate passes from published
 artifacts in fresh environments and the pinned Qwen3.6-27B language-plus-MTP
-proof is independently reproduced.
+proof is independently reproduced. Before activation, identical gates run on
+signed local RC archives; registry publication is not a prerequisite for local
+release readiness.
 
 ## Fixed decisions
 
 - PyTorch/Hugging Face is the first public dynamic-training frontend.
-- Native Rust becomes equally first-class later in 1.x against shared v1.1
-  recipe/artifact/coverage/error schemas.
-- Trainable ONNX is later-1.x; whole-model ONNX inference is v1.1.
+- v1.2 ships a safe typed native Rust frontend plus Python bindings that run
+  without PyTorch, against shared v1.1 schemas.
+- v1.3 ships trainable whole-model ONNX; ONNX inference is v1.1.
 - PTQ and refinement remain different runs, artifacts, costs and claims.
+- Stable Python primitives are `prepare`, `calibrate`, `convert`, `refine`,
+  `export`, `load`, and `inspect`; one-call QAT/PTQ functions are facades.
 - Browser WebGPU training and the complete production/community suite block
   v1.1.
 - Model zoo uses three audited tiers, not an arbitrary model count.
-- Backend parity means common semantics plus honest capability/performance tiers.
+- Backend parity means the whole current Tape operation/optimizer manifest on
+  CPU, CUDA, ROCm, Metal, wgpu, WASI/WASM, MCU and browser WebGPU. Semantics are
+  common; performance and bounded shapes are capability-tiered.
 - No paid 27B run is authorized by this plan.
 
 ## Dependency order
 
 ```text
-shared schemas + reference modules
+shared schema fixtures + reference modules
         |
-        +--> torch dispatcher/autograd --> HF/QAT/PTQ facade --> Colab/zoo
+        +--> torch dispatcher/autograd --> phased HF/QAT/PTQ/refine --> Colab/zoo
         |
         +--> estimator registry --------> SALT production refinement --> 0043
         |
@@ -56,15 +62,19 @@ hardware labels before execution.
 
 | Plan | Deliverable | Entry gate | Exit gate |
 |---|---|---|---|
-| 0045 | Shared recipe/artifact/coverage/error schemas; pure-PyTorch `TernaryLinear` and conversion reference | ADR 0033 committed | forward/gradient/state/coverage tests |
+| 0045 | Pure-PyTorch `TernaryLinear` and reference conversion; initial config/error/coverage types | ADR 0033 committed | forward/gradient/state/coverage tests; **done**, but cross-language schema freeze remains 0049 |
 | 0046 | Zero-copy Torch dispatcher ops for CPU/CUDA; fake/meta/autocast/compile | 0045 | no-host-transfer profile; opcheck/grad parity |
-| 0047 | HF quantizer, `prepare_qat`, `quantize`, `load`, `inspect`, Trainer/Accelerate and export/reload | 0046 | tiny HF e2e, tied weights, DDP/FSDP, resume |
-| 0048 | Estimator catalog/plugins and production SALT block reconstruction, PV/S34 refinement, baseline harness | 0045 + plan-0043 driver seams | recipe ablations and hard-artifact parity |
-| 0049 | Portable training conformance spec and CPU/CUDA/ROCm/Metal/wgpu/WASI implementation | 0045 schemas | per-backend forward/backward/step/checkpoint gates |
-| 0050 | npm TypeScript SDK, WASM orchestration and WebGPU training core | 0049 | real-browser e2e and cross-backend artifact parity |
-| 0051 | Whole-model ONNX inference, wheels/crates/PyPI, compatibility matrix, Colab | 0046 + 0047 | install-only fresh-env gates |
+| 0047 | HF quantizer plus phased `prepare`/`calibrate`/`convert`/`refine`/`export`/`load`/`inspect`; QAT/PTQ facades; Trainer/Accelerate | 0046 | independent QAT, PTQ and refined e2e; tied weights, DDP/FSDP, resume |
+| 0048 | Estimator catalog/plugins and production SALT block reconstruction; separately typed scale-only/PV/S34 refinement; baseline harness | 0045 + plan-0043 driver seams | recipe ablations, lineage separation and hard-artifact parity |
+| 0049 | Canonical Rust/Python/TypeScript schema fixtures; exhaustive `TrainingOpManifestV1`; CPU/CUDA/ROCm/Metal/wgpu/WASI/MCU implementation | 0045 types | unknown-schema gates plus per-backend forward/VJP/optimizer/checkpoint/export receipts |
+| 0050 | `@tritium-ai/web` compiled TypeScript session, WASM orchestration and whole-manifest WebGPU training | 0049 schema/manifest freeze | strict-TS package plus Chrome/Firefox/Safari WebGPU and cross-backend artifact parity |
+| 0051 | Whole-model ONNX inference, wheels/crates/PyPI/npm, compatibility matrix and Colab | 0046 + 0047 + 0049 schemas | local-RC fresh-env gates, then authorized registry smoke |
 | 0052 | Hardened serving, OCI/Helm/KEDA/Knative, auth, observability, failure injection | stable artifact/load API | deployment e2e and rollback gates |
-| 0053 | Guides, governance/community, three-tier zoo, independent reproduction and release | 0043 + 0045–0052 | all ADR 0033 boxes green; signed `v1.1.0` |
+| 0053 | Guides, governance/community, three-tier zoo, independent reproduction and release | 0043 + 0045–0052 | all ADR 0033 boxes green; local signed RC, authorized activation, post-publish smoke |
+
+Plans 0049–0053 are reserved work-order numbers, not completed or executable
+documents. Each file must be written and accepted before its implementation
+starts; this index must not link a nonexistent plan.
 
 ## Cross-cutting contracts
 
@@ -80,7 +90,9 @@ Every child plan preserves these rules:
    validated, hashed and atomically published.
 5. **Reproducible identity.** Source, tokenizer, data, recipe, code, backend,
    seed and hardware identities bind every result.
-6. **PTQ/refined separation.** A refined result cannot be reported as PTQ.
+6. **PTQ/refined separation.** `TernaryConfig.ptq` contains no refinement
+   choice. PTQ, scale-only and hard-PV results have distinct types, parents and
+   claims.
 7. **Reference first.** Pure Rust/PyTorch reference behavior lands before an
    optimized adapter and remains its conformance oracle.
 8. **Review every commit.** After each commit, run lamu DeepSeek V4 Pro commit
@@ -98,8 +110,9 @@ Every child plan preserves these rules:
   CPU/CUDA matrices without graph breaks.
 - Profiler sees zero steady-state H2D/D2H copies on CUDA and wrapper overhead is
   within 5% of direct Tritium execution after warmup.
-- HF load → QAT step → PTQ/refine → save/reload → generate works with ordinary
-  optimizers and Trainer/Accelerate DDP/FSDP.
+- `prepare` → calibrate or ordinary QAT step → `convert` → optional `refine` →
+  `export`/reload/generate works with Trainer/Accelerate DDP/FSDP. QAT, PTQ and
+  refined lineages have independent tests and receipts.
 
 ### Algorithms and artifacts
 
@@ -115,20 +128,24 @@ Every child plan preserves these rules:
 
 ### Portable and browser training
 
-- Frozen release-core vectors cover forward, first-order backward, AdamW/SGD,
+- An exhaustive registry proves `TrainingOpManifestV1` covers every current
+  public Tape op/VJP, Conv2d, SGD, AdamW, CautiousAdamW, Int8AdamW, Muon,
   checkpoint/resume and export/reload.
-- CPU, CUDA, ROCm, Metal, wgpu/WebGPU and WASI run their declared vectors on
-  actual targets; constrained profiles use bounded shapes, never skipped tests.
-- Browser CI performs TypeScript load, forward, backward, optimizer step,
-  save/resume, export/reload and inference in real WebGPU-capable browsers.
+- CPU, CUDA, ROCm, Metal, wgpu, WASI/WASM and MCU run frozen vectors on actual
+  targets; constrained profiles use bounded shapes, never skipped tests.
+- `npm pack` installs into an empty strict-TypeScript project and passes type
+  check, production bundle and the full session lifecycle. Chrome, Firefox and
+  Safari each prove actual WebGPU; fallback never greens that gate.
 - Capability and performance tables are generated from receipts, not prose.
 
 ### Interop, package and operations
 
 - Supported whole-model ONNX export/import executes through a real ORT session;
-  unsupported gradient import says trainable ONNX is later-1.x.
-- Published wheels/crates/npm/container artifacts install without repository or
-  compiler and run their smoke suites.
+  unsupported gradient import says trainable ONNX is v1.3.
+- Local RC wheels/crates/npm/container archives install without repository or
+  compiler and run their smoke suites. Registry publication and community
+  creation require explicit activation approval; exact published artifacts then
+  run a separate smoke.
 - Colab tutorial finishes within five minutes on the tiny model, excluding first
   model download.
 - Serve tests cover auth, limits, backpressure, cancellation, shutdown,
@@ -180,15 +197,16 @@ Skipped or zero-test hardware lanes are failures, not green gates.
 ## Done criterion
 
 Every ADR 0033 v1.1 checkbox is green; plan 0043 flagship evidence is admitted;
-all child plans are reviewed and committed; public artifacts reproduce in fresh
-environments; version is `1.1.0`; changelog/migration/compatibility/model cards
-match shipped behavior; clean signed release commit and tag exist locally. Final
-publication/push occurs only with explicit authorization.
+all child plans are reviewed and committed; local RC artifacts reproduce in
+fresh environments; version is `1.1.0`; changelog/migration/compatibility/model
+cards match shipped behavior; clean signed release commit and tag candidate
+exist locally. Final publication, public tag/push and community activation occur
+only with explicit authorization, followed by registry smoke receipts.
 
 ## Commit
 
-First decision/work-order slice:
+Decision reconciliation:
 
 ```text
-docs(adr-0033): define Tritium v1.1 full public release
+docs(adr-0033): reconcile Tritium v1.1 release contracts
 ```

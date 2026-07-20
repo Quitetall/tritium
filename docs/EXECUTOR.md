@@ -12,10 +12,11 @@ file + everything under `docs/` is all you need.
 3. Each plan is `docs/plans/NNNN-*.md`. Execute it **top to bottom**.
 
 Right now the active plans are **0043** (Qwen3.6-27B SALT V2 empirical
-capstone) and **0044** (v1.1 full public-release work order). Start 0044 with
-child plan 0045; continue only through child plans whose entry gates are green.
-Plan 0043 may run structural and local gates in parallel, but its paid 27B run
-still requires separate explicit approval.
+capstone) and **0044** (v1.1 full public-release work order). Child plan 0045 is
+done; 0046–0048 are in progress and must retain independent entry/exit gates.
+Plans 0049–0053 are reserved but do not become executable until their detailed
+files are written and accepted. Plan 0043 may run structural and local gates in
+parallel, but its paid 27B run still requires separate explicit approval.
 
 ## The rules (non-negotiable)
 
