@@ -18,7 +18,7 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 93);
+    assert_eq!(report.passed.len(), 97);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
@@ -38,6 +38,7 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
             "graph.add",
             "graph.mul",
             "graph.conv1d",
+            "graph.conv2d",
             "graph.relu2",
             "graph.silu",
             "graph.rmsnorm",

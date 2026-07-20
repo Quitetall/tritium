@@ -1638,6 +1638,155 @@ extern "C" __global__ void conv1d_backward_portable(
     }
 }
 
+__device__ __forceinline__ float conv2d_input_value(
+    const float* x, int batch, int channel, int oh, int ow, int kh, int kw,
+    int c_in, int input_h, int input_w, int stride_h, int stride_w,
+    int dilation_h, int dilation_w, int pad_top, int pad_left)
+{
+    int ih = oh * stride_h + kh * dilation_h - pad_top;
+    int iw = ow * stride_w + kw * dilation_w - pad_left;
+    if (ih < 0 || ih >= input_h || iw < 0 || iw >= input_w) return 0.0f;
+    return x[((batch * c_in + channel) * input_h + ih) * input_w + iw];
+}
+
+extern "C" __global__ void conv2d_forward_portable(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    const float* __restrict__ scale, float* __restrict__ result,
+    int batch, int c_in, int c_out, int input_h, int input_w,
+    int kernel_h, int kernel_w, int stride_h, int stride_w,
+    int dilation_h, int dilation_w, int pad_top, int pad_left,
+    int groups, int height_out, int width_out)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    int c_in_pg = c_in / groups;
+    int n_g = c_out / groups;
+    int patch_columns = c_in_pg * kernel_h * kernel_w;
+    int patch_rows = height_out * width_out;
+    for (int b = 0; b < batch; ++b) {
+        for (int group = 0; group < groups; ++group) {
+            for (int row_start = 0; row_start < patch_rows; row_start += 32) {
+                int row_count = patch_rows - row_start;
+                if (row_count > 32) row_count = 32;
+                for (int local_row = 0; local_row < row_count; ++local_row) {
+                    int row = row_start + local_row;
+                    int oh = row / width_out, ow = row - oh * width_out;
+                    for (int n = 0; n < n_g; ++n) {
+                        int co = group * n_g + n;
+                        float acc = 0.0f;
+                        for (int column = 0; column < patch_columns; ++column) {
+                            int kw = column % kernel_w;
+                            int rest = column / kernel_w;
+                            int kh = rest % kernel_h;
+                            int ci_local = rest / kernel_h;
+                            int channel = group * c_in_pg + ci_local;
+                            float activation = conv2d_input_value(
+                                x, b, channel, oh, ow, kh, kw, c_in, input_h, input_w,
+                                stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_left);
+                            acc += activation * weight[co * patch_columns + column];
+                        }
+                        int out_index = ((b * c_out + co) * height_out + oh) * width_out + ow;
+                        result[out_index] = scale[co] * acc;
+                    }
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void conv2d_backward_portable(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    const float* __restrict__ scale, const float* __restrict__ grad_output,
+    float* __restrict__ grad_x, float* __restrict__ grad_weight,
+    float* __restrict__ grad_scale, float* __restrict__ columns,
+    float* __restrict__ group_gradient, float* __restrict__ grad_columns,
+    float* __restrict__ grad_weight_group, float* __restrict__ grad_scale_group,
+    int batch, int c_in, int c_out, int input_h, int input_w,
+    int kernel_h, int kernel_w, int stride_h, int stride_w,
+    int dilation_h, int dilation_w, int pad_top, int pad_left,
+    int groups, int height_out, int width_out)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    int c_in_pg = c_in / groups;
+    int n_g = c_out / groups;
+    int patch_columns = c_in_pg * kernel_h * kernel_w;
+    int patch_rows = height_out * width_out;
+    for (int b = 0; b < batch; ++b) {
+        for (int group = 0; group < groups; ++group) {
+            for (int row_start = 0; row_start < patch_rows; row_start += 32) {
+                int row_count = patch_rows - row_start;
+                if (row_count > 32) row_count = 32;
+                for (int local_row = 0; local_row < row_count; ++local_row) {
+                    int row = row_start + local_row;
+                    int oh = row / width_out, ow = row - oh * width_out;
+                    for (int ci_local = 0; ci_local < c_in_pg; ++ci_local) {
+                        int channel = group * c_in_pg + ci_local;
+                        for (int kh = 0; kh < kernel_h; ++kh) {
+                            for (int kw = 0; kw < kernel_w; ++kw) {
+                                int column = (ci_local * kernel_h + kh) * kernel_w + kw;
+                                columns[local_row * patch_columns + column] = conv2d_input_value(
+                                    x, b, channel, oh, ow, kh, kw, c_in, input_h, input_w,
+                                    stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_left);
+                            }
+                        }
+                    }
+                }
+                for (int n = 0; n < n_g; ++n) {
+                    int co = group * n_g + n;
+                    for (int local_row = 0; local_row < row_count; ++local_row) {
+                        int row = row_start + local_row;
+                        int oh = row / width_out, ow = row - oh * width_out;
+                        int out_index = ((b * c_out + co) * height_out + oh) * width_out + ow;
+                        group_gradient[local_row * n_g + n] = grad_output[out_index];
+                    }
+                }
+                for (int i = 0; i < row_count * patch_columns; ++i) grad_columns[i] = 0.0f;
+                for (int i = 0; i < n_g * patch_columns; ++i) grad_weight_group[i] = 0.0f;
+                for (int i = 0; i < n_g; ++i) grad_scale_group[i] = 0.0f;
+                for (int local_row = 0; local_row < row_count; ++local_row) {
+                    for (int n = 0; n < n_g; ++n) {
+                        float gy = group_gradient[local_row * n_g + n];
+                        float s = scale[group * n_g + n];
+                        float product = 0.0f;
+                        for (int column = 0; column < patch_columns; ++column) {
+                            float activation = columns[local_row * patch_columns + column];
+                            float w = weight[(group * n_g + n) * patch_columns + column];
+                            product += activation * w;
+                            grad_columns[local_row * patch_columns + column] += gy * s * w;
+                            grad_weight_group[n * patch_columns + column] += gy * s * activation;
+                        }
+                        grad_scale_group[n] += gy * product;
+                    }
+                }
+                for (int n = 0; n < n_g; ++n) {
+                    int co = group * n_g + n;
+                    grad_scale[co] += grad_scale_group[n];
+                    for (int column = 0; column < patch_columns; ++column)
+                        grad_weight[co * patch_columns + column]
+                            += grad_weight_group[n * patch_columns + column];
+                }
+                for (int local_row = 0; local_row < row_count; ++local_row) {
+                    int row = row_start + local_row;
+                    int oh = row / width_out, ow = row - oh * width_out;
+                    for (int ci_local = 0; ci_local < c_in_pg; ++ci_local) {
+                        int channel = group * c_in_pg + ci_local;
+                        for (int kh = 0; kh < kernel_h; ++kh) {
+                            for (int kw = 0; kw < kernel_w; ++kw) {
+                                int ih = oh * stride_h + kh * dilation_h - pad_top;
+                                int iw = ow * stride_w + kw * dilation_w - pad_left;
+                                if (ih >= 0 && ih < input_h && iw >= 0 && iw < input_w) {
+                                    int input_index = ((b * c_in + channel) * input_h + ih) * input_w + iw;
+                                    int column = (ci_local * kernel_h + kh) * kernel_w + kw;
+                                    grad_x[input_index] += grad_columns[local_row * patch_columns + column];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(

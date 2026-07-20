@@ -34,6 +34,7 @@ const OPERATIONS: &[&str] = &[
     "graph.add",
     "graph.mul",
     "graph.conv1d",
+    "graph.conv2d",
     "graph.relu2",
     "graph.silu",
     "graph.rmsnorm",
@@ -2180,6 +2181,149 @@ impl CudaTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_conv2d(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["x", "weight", "scale"],
+            TrainExecutionV1::Vjp => &["x", "weight", "scale", "grad_output"],
+            _ => return Err(invariant("Conv2d received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &[
+                "batch",
+                "c_in",
+                "c_out",
+                "input_h",
+                "input_w",
+                "kernel_h",
+                "kernel_w",
+                "stride_h",
+                "stride_w",
+                "dilation_h",
+                "dilation_w",
+                "pad_top",
+                "pad_bottom",
+                "pad_left",
+                "pad_right",
+                "groups",
+            ],
+            "attributes",
+        )?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_x", "grad_weight", "grad_scale"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let (config, height_out, width_out) = conv2d_attributes(request)?;
+        if conv2d_contract_scratch(&config, height_out, width_out, request.execution)?
+            > MAX_CONV_SCRATCH_BYTES
+        {
+            return Err(attribute_value("scratch", "limit_64_mib"));
+        }
+        let input_shape = [
+            config.batch as u64,
+            config.c_in as u64,
+            config.input_h as u64,
+            config.input_w as u64,
+        ];
+        let weight_shape = [
+            config.c_out as u64,
+            config.c_in_per_group() as u64,
+            config.kernel_h as u64,
+            config.kernel_w as u64,
+        ];
+        let scale_shape = [config.c_out as u64];
+        let result_shape = [
+            config.batch as u64,
+            config.c_out as u64,
+            height_out as u64,
+            width_out as u64,
+        ];
+        let x = input_f32(request, "x", &input_shape)?;
+        let weight = input_f32(request, "weight", &weight_shape)?;
+        let scale = input_f32(request, "scale", &scale_shape)?;
+        require_finite("x", x)?;
+        require_finite("weight", weight)?;
+        require_finite("scale", scale)?;
+        let device_x = self.backend.dev_upload(x).map_err(cuda_error)?;
+        let device_weight = self.backend.dev_upload(weight).map_err(cuda_error)?;
+        let device_scale = self.backend.dev_upload(scale).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let result_len = config.output_elements();
+            output_f32(output, "result", &result_shape, result_len)?;
+            let mut device_result = self
+                .backend
+                .dev_alloc_zeros(result_len)
+                .map_err(cuda_error)?;
+            self.backend
+                .conv2d_forward_portable_dev(
+                    &device_x,
+                    &device_weight,
+                    &device_scale,
+                    &mut device_result,
+                    &config,
+                    height_out,
+                    width_out,
+                )
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, result_len)?;
+            output_f32(output, "result", &result_shape, result_len)?.copy_from_slice(&result);
+        } else {
+            let grad_output = input_f32(request, "grad_output", &result_shape)?;
+            require_finite("grad_output", grad_output)?;
+            output_f32(output, "grad_x", &input_shape, x.len())?;
+            output_f32(output, "grad_weight", &weight_shape, weight.len())?;
+            output_f32(output, "grad_scale", &scale_shape, scale.len())?;
+            let device_grad_output = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let mut device_grad_x = self.backend.dev_alloc_zeros(x.len()).map_err(cuda_error)?;
+            let mut device_grad_weight = self
+                .backend
+                .dev_alloc_zeros(weight.len())
+                .map_err(cuda_error)?;
+            let mut device_grad_scale = self
+                .backend
+                .dev_alloc_zeros(scale.len())
+                .map_err(cuda_error)?;
+            self.backend
+                .conv2d_backward_portable_dev(
+                    &device_x,
+                    &device_weight,
+                    &device_scale,
+                    &device_grad_output,
+                    &mut device_grad_x,
+                    &mut device_grad_weight,
+                    &mut device_grad_scale,
+                    &config,
+                    height_out,
+                    width_out,
+                )
+                .map_err(cuda_error)?;
+            let grad_x = download_device(&self.backend, &device_grad_x, x.len())?;
+            let grad_weight = download_device(&self.backend, &device_grad_weight, weight.len())?;
+            let grad_scale = download_device(&self.backend, &device_grad_scale, scale.len())?;
+            output_f32(output, "grad_x", &input_shape, x.len())?.copy_from_slice(&grad_x);
+            output_f32(output, "grad_weight", &weight_shape, weight.len())?
+                .copy_from_slice(&grad_weight);
+            output_f32(output, "grad_scale", &scale_shape, scale.len())?
+                .copy_from_slice(&grad_scale);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -2221,6 +2365,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "graph.add" => self.execute_add(&request, output)?,
             "graph.mul" => self.execute_mul(&request, output)?,
             "graph.conv1d" => self.execute_conv1d(&request, output)?,
+            "graph.conv2d" => self.execute_conv2d(&request, output)?,
             "graph.relu2" => self.execute_relu2(&request, output)?,
             "graph.silu" => self.execute_silu(&request, output)?,
             "graph.rmsnorm" => self.execute_rmsnorm(&request, output)?,
@@ -2276,6 +2421,10 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
                 (elements as u64)
                     .checked_mul(size_of::<f32>() as u64)
                     .ok_or_else(shape_error)?
+            }
+            ("graph.conv2d", TrainExecutionV1::Vjp) => {
+                let (config, height_out, width_out) = conv2d_attributes(&request)?;
+                conv2d_actual_scratch(&config, height_out, width_out)?
             }
             _ => 0,
         };
@@ -2441,6 +2590,168 @@ fn conv1d_contract_scratch(
         _ => Some(0),
     }
     .ok_or_else(shape_error)?;
+    (elements as u64)
+        .checked_mul(size_of::<f32>() as u64)
+        .ok_or_else(shape_error)
+}
+
+fn conv2d_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<(tritium_train::ops::conv2d::Conv2dCfg, usize, usize), TrainBackendError> {
+    let config = tritium_train::ops::conv2d::Conv2dCfg {
+        batch: attribute_usize(request, "batch")?,
+        c_in: attribute_usize(request, "c_in")?,
+        c_out: attribute_usize(request, "c_out")?,
+        input_h: attribute_usize(request, "input_h")?,
+        input_w: attribute_usize(request, "input_w")?,
+        kernel_h: attribute_usize(request, "kernel_h")?,
+        kernel_w: attribute_usize(request, "kernel_w")?,
+        stride_h: attribute_usize(request, "stride_h")?,
+        stride_w: attribute_usize(request, "stride_w")?,
+        dilation_h: attribute_usize(request, "dilation_h")?,
+        dilation_w: attribute_usize(request, "dilation_w")?,
+        pad_top: attribute_usize(request, "pad_top")?,
+        pad_bottom: attribute_usize(request, "pad_bottom")?,
+        pad_left: attribute_usize(request, "pad_left")?,
+        pad_right: attribute_usize(request, "pad_right")?,
+        groups: attribute_usize(request, "groups")?,
+    };
+    for (name, value) in [
+        ("batch", config.batch),
+        ("c_in", config.c_in),
+        ("c_out", config.c_out),
+        ("input_h", config.input_h),
+        ("input_w", config.input_w),
+        ("kernel_h", config.kernel_h),
+        ("kernel_w", config.kernel_w),
+        ("stride_h", config.stride_h),
+        ("stride_w", config.stride_w),
+        ("dilation_h", config.dilation_h),
+        ("dilation_w", config.dilation_w),
+        ("groups", config.groups),
+    ] {
+        if value == 0 {
+            return Err(attribute_value(name, "positive"));
+        }
+    }
+    if !config.c_in.is_multiple_of(config.groups) || !config.c_out.is_multiple_of(config.groups) {
+        return Err(attribute_value("groups", "divides_channels"));
+    }
+    let height_out = checked_conv_output_axis(
+        config.input_h,
+        config.kernel_h,
+        config.stride_h,
+        config.dilation_h,
+        config.pad_top,
+        config.pad_bottom,
+        "kernel_h",
+    )?;
+    let width_out = checked_conv_output_axis(
+        config.input_w,
+        config.kernel_w,
+        config.stride_w,
+        config.dilation_w,
+        config.pad_left,
+        config.pad_right,
+        "kernel_w",
+    )?;
+    bounded_u32_product(
+        &[config.batch, config.c_in, config.input_h, config.input_w],
+        "batch",
+    )?;
+    bounded_u32_product(
+        &[
+            config.c_out,
+            config.c_in_per_group(),
+            config.kernel_h,
+            config.kernel_w,
+        ],
+        "c_out",
+    )?;
+    bounded_u32_product(
+        &[config.batch, config.c_out, height_out, width_out],
+        "batch",
+    )?;
+    Ok((config, height_out, width_out))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checked_conv_output_axis(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    pad_before: usize,
+    pad_after: usize,
+    name: &str,
+) -> Result<usize, TrainBackendError> {
+    let effective = (dilation as u64)
+        .checked_mul((kernel - 1) as u64)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| attribute_value(name, "arithmetic"))?;
+    let padded = (input as u64)
+        .checked_add(pad_before as u64)
+        .and_then(|value| value.checked_add(pad_after as u64))
+        .ok_or_else(|| attribute_value(name, "arithmetic"))?;
+    if effective > u32::MAX as u64 || padded > u32::MAX as u64 {
+        return Err(attribute_value(name, "axis_u32"));
+    }
+    if padded < effective {
+        return Err(attribute_value(name, "output_nonzero"));
+    }
+    usize::try_from((padded - effective) / stride as u64 + 1)
+        .map_err(|_| attribute_value(name, "axis_u32"))
+}
+
+fn conv2d_contract_scratch(
+    config: &tritium_train::ops::conv2d::Conv2dCfg,
+    height_out: usize,
+    width_out: usize,
+    execution: TrainExecutionV1,
+) -> Result<u64, TrainBackendError> {
+    let tile_rows =
+        (height_out * width_out).min(tritium_train::ops::conv2d::CONV2D_PATCH_TILE_ROWS);
+    let patch_columns = config.kernel_elements_per_output();
+    let group_channels = config.c_out_per_group();
+    let columns = tile_rows * patch_columns;
+    let group_output = tile_rows * group_channels;
+    let elements = match execution {
+        TrainExecutionV1::Forward => config
+            .output_elements()
+            .checked_add(columns)
+            .and_then(|value| value.checked_add(group_output)),
+        TrainExecutionV1::Vjp => config
+            .input_elements()
+            .checked_add(config.weight_elements())
+            .and_then(|value| value.checked_add(config.c_out))
+            .and_then(|value| value.checked_add(columns))
+            .and_then(|value| value.checked_add(group_output))
+            .and_then(|value| value.checked_add(columns))
+            .and_then(|value| value.checked_add(config.c_out_per_group() * patch_columns))
+            .and_then(|value| value.checked_add(group_channels)),
+        _ => Some(0),
+    }
+    .ok_or_else(shape_error)?;
+    (elements as u64)
+        .checked_mul(size_of::<f32>() as u64)
+        .ok_or_else(shape_error)
+}
+
+fn conv2d_actual_scratch(
+    config: &tritium_train::ops::conv2d::Conv2dCfg,
+    height_out: usize,
+    width_out: usize,
+) -> Result<u64, TrainBackendError> {
+    let tile_rows =
+        (height_out * width_out).min(tritium_train::ops::conv2d::CONV2D_PATCH_TILE_ROWS);
+    let patch_columns = config.kernel_elements_per_output();
+    let group_channels = config.c_out_per_group();
+    let elements = (tile_rows * patch_columns)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(tile_rows * group_channels))
+        .and_then(|value| value.checked_add(group_channels * patch_columns))
+        .and_then(|value| value.checked_add(group_channels))
+        .ok_or_else(shape_error)?;
     (elements as u64)
         .checked_mul(size_of::<f32>() as u64)
         .ok_or_else(shape_error)

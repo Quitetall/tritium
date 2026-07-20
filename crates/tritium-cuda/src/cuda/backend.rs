@@ -97,6 +97,37 @@ fn conv1d_kernel_geometry(
     Ok(result)
 }
 
+fn conv2d_kernel_geometry(
+    config: &tritium_train::ops::conv2d::Conv2dCfg,
+    height_out: usize,
+    width_out: usize,
+) -> Result<[i32; 16], BackendError> {
+    let values = [
+        config.batch,
+        config.c_in,
+        config.c_out,
+        config.input_h,
+        config.input_w,
+        config.kernel_h,
+        config.kernel_w,
+        config.stride_h,
+        config.stride_w,
+        config.dilation_h,
+        config.dilation_w,
+        config.pad_top,
+        config.pad_left,
+        config.groups,
+        height_out,
+        width_out,
+    ];
+    let mut result = [0_i32; 16];
+    for (target, value) in result.iter_mut().zip(values) {
+        *target = i32::try_from(value)
+            .map_err(|_| BackendError::InvalidInput("Conv2d geometry exceeds i32::MAX".into()))?;
+    }
+    Ok(result)
+}
+
 #[derive(Clone, Copy)]
 enum TrainingSaltDispatch {
     Exact,
@@ -625,6 +656,8 @@ pub struct CudaBackend {
     pub(super) func_muon_step: CudaFunction,
     pub(super) func_conv1d_fwd: CudaFunction,
     pub(super) func_conv1d_bwd: CudaFunction,
+    pub(super) func_conv2d_fwd: CudaFunction,
+    pub(super) func_conv2d_bwd: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -937,6 +970,12 @@ impl CudaBackend {
         let func_conv1d_bwd = grad_module
             .load_function(KERNEL_NAME_CONV1D_BWD)
             .map_err(|e| driver_err("resolve conv1d_backward_portable kernel", &e))?;
+        let func_conv2d_fwd = grad_module
+            .load_function(KERNEL_NAME_CONV2D_FWD)
+            .map_err(|e| driver_err("resolve conv2d_forward_portable kernel", &e))?;
+        let func_conv2d_bwd = grad_module
+            .load_function(KERNEL_NAME_CONV2D_BWD)
+            .map_err(|e| driver_err("resolve conv2d_backward_portable kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -1053,6 +1092,8 @@ impl CudaBackend {
             func_muon_step,
             func_conv1d_fwd,
             func_conv1d_bwd,
+            func_conv2d_fwd,
+            func_conv2d_bwd,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -2616,6 +2657,130 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| driver_err("launch conv1d_backward_portable", &e))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn conv2d_forward_portable_dev(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        scale: &CudaSlice<f32>,
+        result: &mut CudaSlice<f32>,
+        config: &tritium_train::ops::conv2d::Conv2dCfg,
+        height_out: usize,
+        width_out: usize,
+    ) -> Result<(), BackendError> {
+        if x.len() != config.input_elements()
+            || weight.len() != config.weight_elements()
+            || scale.len() != config.c_out
+            || result.len() != config.output_elements()
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: config.output_elements(),
+                got: result.len(),
+            });
+        }
+        let geometry = conv2d_kernel_geometry(config, height_out, width_out)?;
+        let mut launch = self.stream.launch_builder(&self.func_conv2d_fwd);
+        launch.arg(x).arg(weight).arg(scale).arg(result);
+        for value in &geometry {
+            launch.arg(value);
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: exact validated spans and signed kernel geometry; serial deterministic kernel.
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| driver_err("launch conv2d_forward_portable", &e))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn conv2d_backward_portable_dev(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        scale: &CudaSlice<f32>,
+        grad_output: &CudaSlice<f32>,
+        grad_x: &mut CudaSlice<f32>,
+        grad_weight: &mut CudaSlice<f32>,
+        grad_scale: &mut CudaSlice<f32>,
+        config: &tritium_train::ops::conv2d::Conv2dCfg,
+        height_out: usize,
+        width_out: usize,
+    ) -> Result<(), BackendError> {
+        if x.len() != config.input_elements()
+            || weight.len() != config.weight_elements()
+            || scale.len() != config.c_out
+            || grad_output.len() != config.output_elements()
+            || grad_x.len() != x.len()
+            || grad_weight.len() != weight.len()
+            || grad_scale.len() != scale.len()
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: config.output_elements(),
+                got: grad_output.len(),
+            });
+        }
+        let patch_rows = height_out * width_out;
+        let tile_rows = patch_rows.min(tritium_train::ops::conv2d::CONV2D_PATCH_TILE_ROWS);
+        let patch_columns = config.kernel_elements_per_output();
+        let group_channels = config.c_out_per_group();
+        let mut columns = self
+            .stream
+            .alloc_zeros::<f32>(tile_rows * patch_columns)
+            .map_err(|e| driver_err("allocate Conv2d columns", &e))?;
+        let mut group_gradient = self
+            .stream
+            .alloc_zeros::<f32>(tile_rows * group_channels)
+            .map_err(|e| driver_err("allocate Conv2d group gradient", &e))?;
+        let mut grad_columns = self
+            .stream
+            .alloc_zeros::<f32>(tile_rows * patch_columns)
+            .map_err(|e| driver_err("allocate Conv2d grad columns", &e))?;
+        let mut grad_weight_group = self
+            .stream
+            .alloc_zeros::<f32>(group_channels * patch_columns)
+            .map_err(|e| driver_err("allocate Conv2d group weight gradient", &e))?;
+        let mut grad_scale_group = self
+            .stream
+            .alloc_zeros::<f32>(group_channels)
+            .map_err(|e| driver_err("allocate Conv2d group scale gradient", &e))?;
+        let geometry = conv2d_kernel_geometry(config, height_out, width_out)?;
+        let mut launch = self.stream.launch_builder(&self.func_conv2d_bwd);
+        launch
+            .arg(x)
+            .arg(weight)
+            .arg(scale)
+            .arg(grad_output)
+            .arg(grad_x)
+            .arg(grad_weight)
+            .arg(grad_scale)
+            .arg(&mut columns)
+            .arg(&mut group_gradient)
+            .arg(&mut grad_columns)
+            .arg(&mut grad_weight_group)
+            .arg(&mut grad_scale_group);
+        for value in &geometry {
+            launch.arg(value);
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: exact validated spans and tile scratch geometry; serial deterministic kernel.
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| driver_err("launch conv2d_backward_portable", &e))?;
         }
         Ok(())
     }
