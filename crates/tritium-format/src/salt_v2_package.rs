@@ -2129,6 +2129,33 @@ pub fn unpack_salt_v2_plane(
     Ok(decoded)
 }
 
+/// Unpack one canonical package-codec plane into reusable caller storage.
+///
+/// The output is cleared before decoding and contains exactly `logical_len`
+/// trits on success. Callers can reserve one 256-trit buffer and reuse it across
+/// an entire seek-backed package without allocating per plane.
+///
+/// # Errors
+/// Returns the same validation errors as [`unpack_salt_v2_plane`], including a
+/// typed allocation failure if the caller buffer cannot grow to the bounded
+/// codec storage requirement.
+pub fn unpack_salt_v2_plane_into(
+    codec: SaltV2Codec,
+    packed: &[u8],
+    logical_len: usize,
+    decoded: &mut Vec<Trit>,
+) -> Result<(), SaltV2PackageError> {
+    if logical_len == 0 || logical_len > SALT_V2_ALLOCATION_TILE_SIZE {
+        return Err(SaltV2PackageError::InvalidPlaneLength { got: logical_len });
+    }
+    let stored_len = stored_trit_count(codec, logical_len)?;
+    decoded.clear();
+    decoded
+        .try_reserve(stored_len)
+        .map_err(|_| SaltV2PackageError::AllocationFailed)?;
+    unpack_semantic_plane_into(codec, packed, logical_len, decoded)
+}
+
 fn unpack_semantic_plane_into(
     codec: SaltV2Codec,
     packed: &[u8],
@@ -2708,6 +2735,21 @@ mod tests {
                 .collect(),
         )
         .expect("valid test tile")
+    }
+
+    #[test]
+    fn reusable_plane_decode_matches_allocating_decode_for_every_codec() {
+        let source = plane(252, 3);
+        let mut reusable = Vec::new();
+        reusable.try_reserve_exact(256).unwrap();
+        let initial_capacity = reusable.capacity();
+        for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+            let packed = pack_salt_v2_plane(codec, source.trits()).unwrap();
+            let allocated = unpack_salt_v2_plane(codec, &packed, source.trits().len()).unwrap();
+            unpack_salt_v2_plane_into(codec, &packed, source.trits().len(), &mut reusable).unwrap();
+            assert_eq!(reusable, allocated);
+            assert_eq!(reusable.capacity(), initial_capacity);
+        }
     }
 
     fn ragged_tensor(name: &str) -> SaltV2Tensor {
