@@ -42,6 +42,7 @@ const OPERATIONS: &[&str] = &[
     "loss.softmax_cross_entropy",
     "optimizer.sgd",
     "optimizer.adamw",
+    "optimizer.cautious_adamw",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -1748,9 +1749,10 @@ impl CudaTrainBackendV1 {
         &self,
         request: &TrainRequestV1<'_>,
         output: &mut TrainOutputV1<'_>,
+        cautious: bool,
     ) -> Result<(), TrainBackendError> {
         if request.execution != TrainExecutionV1::Step {
-            return Err(invariant("adamw received an illegal phase"));
+            return Err(invariant("AdamW received an illegal phase"));
         }
         require_names(
             request.inputs.iter().map(|b| b.name),
@@ -1812,16 +1814,29 @@ impl CudaTrainBackendV1 {
         let device_gradient = self.backend.dev_upload(gradient).map_err(cuda_error)?;
         let mut device_moment1 = self.backend.dev_upload(moment1).map_err(cuda_error)?;
         let mut device_moment2 = self.backend.dev_upload(moment2).map_err(cuda_error)?;
-        self.backend
-            .adamw_step_dev(
-                &mut device_parameter,
-                &device_gradient,
-                &mut device_moment1,
-                &mut device_moment2,
-                step,
-                &optimizer,
-            )
-            .map_err(cuda_error)?;
+        if cautious {
+            self.backend
+                .cautious_adamw_step_dev(
+                    &mut device_parameter,
+                    &device_gradient,
+                    &mut device_moment1,
+                    &mut device_moment2,
+                    step,
+                    &optimizer,
+                )
+                .map_err(cuda_error)?;
+        } else {
+            self.backend
+                .adamw_step_dev(
+                    &mut device_parameter,
+                    &device_gradient,
+                    &mut device_moment1,
+                    &mut device_moment2,
+                    step,
+                    &optimizer,
+                )
+                .map_err(cuda_error)?;
+        }
         let parameter = download_device(&self.backend, &device_parameter, parameter.len())?;
         let moment1 = download_device(&self.backend, &device_moment1, moment1.len())?;
         let moment2 = download_device(&self.backend, &device_moment2, moment2.len())?;
@@ -1879,21 +1894,26 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "loss.mse" => self.execute_mse(&request, output)?,
             "loss.softmax_cross_entropy" => self.execute_softmax_xent(&request, output)?,
             "optimizer.sgd" => self.execute_sgd(&request, output)?,
-            "optimizer.adamw" => self.execute_adamw(&request, output)?,
+            "optimizer.adamw" => self.execute_adamw(&request, output, false)?,
+            "optimizer.cautious_adamw" => self.execute_adamw(&request, output, true)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
                 ));
             }
         }
-        let scratch_bytes = if request.operation == "graph.salt_ste"
-            && request.execution == TrainExecutionV1::Forward
-        {
-            attribute_u64(&request, "cols")?
+        let scratch_bytes = match (request.operation, request.execution) {
+            ("graph.salt_ste", TrainExecutionV1::Forward) => attribute_u64(&request, "cols")?
                 .checked_mul(size_of::<f32>() as u64)
-                .ok_or_else(shape_error)?
-        } else {
-            0
+                .ok_or_else(shape_error)?,
+            ("optimizer.cautious_adamw", TrainExecutionV1::Step) => {
+                let (_, parameter) = input_f32_any_shape(&request, "parameter")?;
+                (parameter.len() as u64)
+                    .checked_mul(size_of::<f32>() as u64)
+                    .and_then(|bytes| bytes.checked_add(size_of::<u32>() as u64))
+                    .ok_or_else(shape_error)?
+            }
+            _ => 0,
         };
         Ok(TrainReceiptV1 {
             backend_id: self.backend_id.clone(),

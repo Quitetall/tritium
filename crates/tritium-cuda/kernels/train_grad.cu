@@ -1438,6 +1438,38 @@ extern "C" __global__ void sgd_step(
     if (i < n) updated[i] = parameter[i] - lr * gradient[i];
 }
 
+extern "C" __global__ void cautious_adamw_prepare(
+    const float* __restrict__ grad, float* __restrict__ m,
+    float* __restrict__ v, float* __restrict__ update,
+    unsigned int* __restrict__ aligned, int n, float beta1, float beta2,
+    float one_minus_beta1, float one_minus_beta2, float bc1, float bc2, float eps)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = grad[i];
+    float mi = beta1 * m[i] + one_minus_beta1 * g;
+    float vi = beta2 * v[i] + one_minus_beta2 * g * g;
+    m[i] = mi;
+    v[i] = vi;
+    float u = (mi / bc1) / (sqrtf(vi / bc2) + eps);
+    if (u * g > 0.0f) {
+        update[i] = u;
+        atomicAdd(aligned, 1U);
+    } else {
+        update[i] = 0.0f;
+    }
+}
+
+extern "C" __global__ void cautious_adamw_apply(
+    float* __restrict__ param, const float* __restrict__ update,
+    const unsigned int* __restrict__ aligned, int n, float lr, float shrink)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float rescale = (float)n / ((float)aligned[0] + 1.0f);
+    param[i] = param[i] * shrink - lr * update[i] * rescale;
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(

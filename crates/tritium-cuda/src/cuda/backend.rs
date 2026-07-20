@@ -596,6 +596,8 @@ pub struct CudaBackend {
     pub(super) func_fsq_bwd: CudaFunction,
     pub(super) func_salt_bounded_fwd: CudaFunction,
     pub(super) func_sgd_step: CudaFunction,
+    pub(super) func_cautious_adamw_prepare: CudaFunction,
+    pub(super) func_cautious_adamw_apply: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -893,6 +895,12 @@ impl CudaBackend {
         let func_sgd_step = grad_module
             .load_function(KERNEL_NAME_SGD_STEP)
             .map_err(|e| driver_err("resolve sgd_step kernel", &e))?;
+        let func_cautious_adamw_prepare = grad_module
+            .load_function(KERNEL_NAME_CAUTIOUS_ADAMW_PREPARE)
+            .map_err(|e| driver_err("resolve cautious_adamw_prepare kernel", &e))?;
+        let func_cautious_adamw_apply = grad_module
+            .load_function(KERNEL_NAME_CAUTIOUS_ADAMW_APPLY)
+            .map_err(|e| driver_err("resolve cautious_adamw_apply kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -1004,6 +1012,8 @@ impl CudaBackend {
             func_fsq_bwd,
             func_salt_bounded_fwd,
             func_sgd_step,
+            func_cautious_adamw_prepare,
+            func_cautious_adamw_apply,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -2239,6 +2249,89 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(len))
                 .map_err(|e| driver_err("launch adamw_step_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Apply one cautious AdamW update with resident masked-update scratch.
+    pub(crate) fn cautious_adamw_step_dev(
+        &self,
+        parameter: &mut CudaSlice<f32>,
+        gradient: &CudaSlice<f32>,
+        moment1: &mut CudaSlice<f32>,
+        moment2: &mut CudaSlice<f32>,
+        step: u64,
+        optimizer: &tritium_train::AdamW,
+    ) -> Result<(), BackendError> {
+        if step == 0 {
+            return Err(BackendError::InvalidInput(
+                "cautious AdamW step index is 1-based".into(),
+            ));
+        }
+        let len = parameter.len();
+        for got in [gradient.len(), moment1.len(), moment2.len()] {
+            if got != len {
+                return Err(BackendError::ShapeMismatch { expected: len, got });
+            }
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let len_i = i32::try_from(len).map_err(|_| {
+            BackendError::InvalidInput("cautious AdamW length exceeds i32::MAX".into())
+        })?;
+        let exponent = i32::try_from(step).unwrap_or(i32::MAX);
+        let bc1 = 1.0 - optimizer.beta1.powi(exponent);
+        let bc2 = 1.0 - optimizer.beta2.powi(exponent);
+        let shrink = 1.0 - optimizer.lr * optimizer.weight_decay;
+        let one_minus_beta1 = 1.0 - optimizer.beta1;
+        let one_minus_beta2 = 1.0 - optimizer.beta2;
+        let mut update = self
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|e| driver_err("allocate cautious AdamW update", &e))?;
+        let mut aligned = self
+            .stream
+            .alloc_zeros::<u32>(1)
+            .map_err(|e| driver_err("allocate cautious AdamW aligned count", &e))?;
+        let mut prepare = self
+            .stream
+            .launch_builder(&self.func_cautious_adamw_prepare);
+        prepare
+            .arg(gradient)
+            .arg(moment1)
+            .arg(moment2)
+            .arg(&mut update)
+            .arg(&mut aligned)
+            .arg(&len_i)
+            .arg(&optimizer.beta1)
+            .arg(&optimizer.beta2)
+            .arg(&one_minus_beta1)
+            .arg(&one_minus_beta2)
+            .arg(&bc1)
+            .arg(&bc2)
+            .arg(&optimizer.eps);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; prepare owns one element and atomically counts aligned updates.
+        unsafe {
+            prepare
+                .launch(Self::elementwise_cfg(len))
+                .map_err(|e| driver_err("launch cautious_adamw_prepare", &e))?;
+        }
+        let mut apply = self.stream.launch_builder(&self.func_cautious_adamw_apply);
+        apply
+            .arg(parameter)
+            .arg(&update)
+            .arg(&aligned)
+            .arg(&len_i)
+            .arg(&optimizer.lr)
+            .arg(&shrink);
+        #[allow(unsafe_code)]
+        // SAFETY: same stream orders count completion before apply; validated parameter/update spans.
+        unsafe {
+            apply
+                .launch(Self::elementwise_cfg(len))
+                .map_err(|e| driver_err("launch cautious_adamw_apply", &e))?;
         }
         Ok(())
     }
