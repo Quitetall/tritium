@@ -3,10 +3,43 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  executePortableWasmRequest,
   runPortableWasmConformance,
   TRAINING_MANIFEST_DIGEST_V1,
   TRAINING_VECTOR_DIGEST_V1,
 } from "../dist/index.js";
+
+const sgdRequest = {
+  schemaId: "tritium.portable_training_request",
+  schemaVersion: 1,
+  physicalDevice: "node:test-wasm",
+  operation: "optimizer.sgd",
+  execution: "step",
+  vectorDigest: null,
+  inputs: [
+    {
+      name: "parameter",
+      shape: [2],
+      data: { dtype: "f32", bits: [1065353216, 3221225472] },
+    },
+    {
+      name: "gradient",
+      shape: [2],
+      data: { dtype: "f32", bits: [1056964608, 3196059648] },
+    },
+  ],
+  attributes: [
+    { kind: "u64", name: "step", value: 1 },
+    { kind: "f32", name: "lr", bits: 1036831949 },
+  ],
+  outputs: [
+    {
+      name: "parameter",
+      shape: [2],
+      data: { dtype: "f32", bits: [0, 0] },
+    },
+  ],
+};
 
 test("bundled wasm32-unknown guest passes the complete corpus twice", async () => {
   const guest = await readFile(
@@ -39,5 +72,55 @@ test("bundled wasm32-unknown guest passes the complete corpus twice", async () =
   assert.match(receipt.guestDigest, /^[0-9a-f]{64}$/);
   assert.match(receipt.executionDigest, /^[0-9a-f]{64}$/);
   assert.ok(Object.isFrozen(receipt));
+});
 
+test("bundled guest executes strict portable requests", async () => {
+  const guest = await readFile(
+    new URL("../dist/tritium_wasm_bg.wasm", import.meta.url),
+  );
+  const response = await executePortableWasmRequest(sgdRequest, guest);
+  assert.equal(response.status, "ok");
+  assert.deepEqual(response.outputs[0].data.bits, [1064514355, 3221015757]);
+  assert.equal(response.receipt.backendId, "wasm.portable.v1");
+  assert.equal(response.receipt.physicalDevice, "node:test-wasm");
+  assert.equal(response.receipt.hostTransfers, 0);
+  assert.equal(response.receipt.deviceResident, true);
+  assert.ok(Object.isFrozen(response));
+  assert.ok(Object.isFrozen(response.outputs));
+  assert.ok(Object.isFrozen(response.outputs[0].data.bits));
+
+  const mutableRequest = structuredClone(sgdRequest);
+  const pending = executePortableWasmRequest(mutableRequest, guest);
+  mutableRequest.operation = "graph.not-real";
+  mutableRequest.outputs[0].data.bits[0] = 99;
+  const snapshotted = await pending;
+  assert.equal(snapshotted.status, "ok");
+  assert.deepEqual(snapshotted.outputs[0].data.bits, [1064514355, 3221015757]);
+
+  const invalid = structuredClone(sgdRequest);
+  invalid.inputs[0].shape = [3];
+  invalid.outputs[0].data.bits = [0x7fc00001, 0x7fc00002];
+  const failure = await executePortableWasmRequest(invalid, guest);
+  assert.equal(failure.status, "error");
+  assert.equal(failure.error.code, "buffer_length");
+  assert.deepEqual(failure.outputs[0].data.bits, [0x7fc00001, 0x7fc00002]);
+
+  const unsafeInteger = structuredClone(sgdRequest);
+  unsafeInteger.attributes[0].value = Number.MAX_SAFE_INTEGER + 1;
+  const rejected = await executePortableWasmRequest(unsafeInteger, guest);
+  assert.equal(rejected.status, "error");
+  assert.equal(rejected.error.code, "unsafe_integer");
+  assert.deepEqual(rejected.outputs, []);
+
+  const missingDigest = structuredClone(sgdRequest);
+  delete missingDigest.vectorDigest;
+  const missing = await executePortableWasmRequest(missingDigest, guest);
+  assert.equal(missing.status, "error");
+  assert.equal(missing.error.code, "missing_field");
+
+  const bigint = structuredClone(sgdRequest);
+  bigint.attributes[0].value = 1n;
+  const nonJson = await executePortableWasmRequest(bigint, guest);
+  assert.equal(nonJson.status, "error");
+  assert.equal(nonJson.error.code, "invalid_json");
 });

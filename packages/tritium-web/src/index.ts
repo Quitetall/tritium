@@ -19,8 +19,16 @@ export {
   compileTrainingPlan,
   prepareTraining,
 } from "./session.ts";
-export { runPortableWasmConformance } from "./wasm.ts";
+export { executePortableWasmRequest, runPortableWasmConformance } from "./wasm.ts";
 export type {
+  PortableAttributeV1,
+  PortableBufferDataV1,
+  PortableBufferV1,
+  PortableExecutionV1,
+  PortableTrainingErrorV1,
+  PortableTrainingReceiptV1,
+  PortableTrainingRequestV1,
+  PortableTrainingResponseV1,
   PortableWasmConformanceReceiptV1,
   PortableWasmSourceV1,
 } from "./wasm.ts";

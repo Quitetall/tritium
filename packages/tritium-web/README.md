@@ -13,9 +13,15 @@ Model/batch bytes are isolated from adapter mutation. Failed
 adapter calls do not advance session state. The archive also bundles a real
 `wasm32-unknown-unknown` guest; `runPortableWasmConformance()` executes all 114
 canonical cases twice inside that guest and returns a source-bound structural
-receipt.
+receipt. `executePortableWasmRequest()` sends strict bit-pattern JSON through
+the same admitted guest; Rust owns schema validation, typed capacity/error
+codes, execution, request/output digests and atomic output mutation. Request
+JSON is capped at 8 MiB before guest entry, caller buffers at 64 MiB, and V1
+`u64` JSON values are restricted to non-negative JavaScript safe integers.
+Expected failures are structured responses; a release-profile guest abort is
+mapped by the JavaScript boundary to the stable `guest_trap` error code.
 
-The lifecycle WASM controller and WebGPU adapter are still under construction;
+The compiled lifecycle WASM controller and WebGPU adapter are still under construction;
 the conformance guest is not mislabeled as either. Until a lifecycle adapter is
 supplied, `prepareTraining(model, config)` returns a typed
 `adapter_unavailable` error; this package never labels a JavaScript fallback as

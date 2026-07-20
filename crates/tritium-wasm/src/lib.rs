@@ -33,7 +33,9 @@ use tritium_format::{
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
 mod portable;
+mod request;
 pub use portable::WasmTrainBackendV1;
+pub use request::tritium_execute_portable_request_json;
 
 #[cfg(target_arch = "wasm32")]
 fn portable_training_conformance_report()

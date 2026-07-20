@@ -96,9 +96,14 @@ and Node instantiation executes all 35 operations / 114 canonical cases twice
 with zero failures under the guest's 64 MiB caller-buffer ceiling. The receipt
 binds the exact guest bytes, embedded manifest/vector identities, deterministic
 normalized execution digest and linker-enforced 192 MiB linear-memory maximum.
-It remains explicitly structural (`wasm-fallback`); request execution,
-checkpoint/artifact controller exports and physical Chrome/Firefox runs remain
-open.
+The guest now exposes a strict V1 request/response ABI using exact f32 bit
+patterns, canonical request/output digests, structured stable errors and
+pre-mutation output preservation. Its JSON transport is capped at 8 MiB, its
+caller buffers at 64 MiB, and V1 `u64` fields are JavaScript-safe integers;
+the JavaScript boundary maps release-profile guest aborts to `guest_trap`.
+It remains explicitly `wasm-fallback`;
+compiled lifecycle state, checkpoint/artifact controller exports and physical
+Chrome/Firefox runs remain open.
 
 Compile `tritium-spec`, the bounded portable executor and SALT V2 strict reader
 to `wasm32-unknown-unknown`. JavaScript owns only lifecycle orchestration and
