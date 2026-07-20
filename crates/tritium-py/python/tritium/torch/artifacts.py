@@ -144,10 +144,11 @@ class ExportReceipt:
 class QuantizationResult:
     """Verified two-profile PTQ result for Qwen3.6 language and MTP matrices.
 
-    ``complete_model`` is intentionally false until Hugging Face configuration,
-    tokenizer assets, and the Qwen3.6 runtime adapter are present. Schema-v2
-    adds exact preserved BF16 tensors; schema-v3 adds the pinned language-side
-    Hugging Face asset catalog. SALT V2 packages retain measured physical ledgers.
+    ``complete_model`` remains false because the source checkpoint's vision
+    graph is deliberately outside this artifact. Schema-v2 adds exact preserved
+    BF16 tensors; schema-v3 adds the pinned language-side Hugging Face assets and
+    is reloadable by Tritium's Qwen runtime. SALT V2 packages retain measured
+    physical ledgers.
     """
 
     artifact_dir: Path
@@ -177,21 +178,45 @@ class QuantizationResult:
     def export(self, output_dir: Union[os.PathLike[str], str]) -> ExportReceipt:
         return export(self, output_dir)
 
+    def load_model(
+        self, *, profile: str = "compact-v1", device: str = "cpu"
+    ) -> Any:
+        """Materialize the packed language runtime for one governed profile."""
+        if self.schema_version != 3 or self.preserved is None or not self.hf_assets:
+            raise TritiumError(
+                "packed Qwen runtime requires a complete schema-v3 bundle",
+                code="incomplete_artifact",
+                stage="load",
+                details={"schema_version": self.schema_version},
+            )
+        self.artifact(profile)
+        return _tritium.QwenModel.load(
+            str(self.artifact_dir), profile=profile, device=device
+        )
+
     def save_pretrained(self, output_dir: Union[os.PathLike[str], str]) -> None:
-        missing = ["qwen3.6_runtime_adapter"]
+        """Atomically save a Tritium-reloadable Hugging Face bundle.
+
+        The result is consumed by :func:`tritium.torch.load`; it intentionally
+        does not claim compatibility with ``transformers.AutoModel`` while the
+        original checkpoint's vision graph remains deferred.
+        """
+        missing = []
         if not self.hf_assets:
-            missing[:0] = ["config", "tokenizer_assets"]
+            missing.extend(["config", "tokenizer_assets"])
         if self.preserved is None:
             missing.insert(0, "preserved_bf16_tensors")
-        raise TritiumError(
-            "this matrix-profile result is not a self-contained Hugging Face model",
-            code="incomplete_artifact",
-            stage="export",
-            details={
-                "missing": missing,
-                "requested_output": str(output_dir),
-            },
-        )
+        if self.schema_version != 3 or missing:
+            raise TritiumError(
+                "this PTQ result is not a reloadable language-plus-MTP bundle",
+                code="incomplete_artifact",
+                stage="export",
+                details={
+                    "missing": missing,
+                    "requested_output": str(output_dir),
+                },
+            )
+        self.export(output_dir)
 
 
 def _pairs_without_duplicates(pairs):
@@ -336,28 +361,30 @@ def _load_profile(directory: Path, packing: str, profile: str, value: Any) -> Ar
 
 
 def load(
-    artifact: Union[os.PathLike[str], str], *, device: Optional[str] = None
-) -> QuantizationResult:
+    artifact: Union[os.PathLike[str], str],
+    *,
+    device: Optional[str] = None,
+    profile: str = "compact-v1",
+) -> Union[QuantizationResult, Any]:
     """Strictly reopen a two-profile Tritium PTQ bundle.
 
     Loading re-parses and hashes every package through the native seek-backed
-    reader. It returns artifact evidence, not an inference model; device
-    placement is therefore rejected until the Qwen3.6 runtime adapter lands.
+    reader. Without ``device`` it returns artifact evidence. With ``device`` it
+    additionally materializes the selected packed Qwen language runtime.
     """
-
-    if device is not None:
-        raise TritiumError(
-            "matrix-bundle load does not perform device placement",
-            code="unsupported_device_load",
-            stage="load",
-            details={"device": device},
-        )
     requested = Path(artifact)
     if requested.is_symlink():
         raise ValueError("artifact must be an ordinary Tritium bundle directory")
     directory = requested.resolve(strict=True)
     if not directory.is_dir():
         raise ValueError("artifact must be an ordinary Tritium bundle directory")
+    if device is not None:
+        # The native runtime performs the complete schema, identity, physical-
+        # ledger, and selected-profile reopen itself. Avoid hashing both very
+        # large profiles here and then hashing the selected profile again.
+        return _tritium.QwenModel.load(
+            str(directory), profile=profile, device=device
+        )
     value = _read_manifest(directory)
     compact = _load_profile(
         directory, value["packing"], "compact-v1", value["profiles"]["compact-v1"]
@@ -378,7 +405,7 @@ def load(
         if value["schema_version"] >= 3
         else ()
     )
-    return QuantizationResult(
+    result = QuantizationResult(
         artifact_dir=directory,
         packing=value["packing"],
         completion_id=value["completion_id"],
@@ -395,6 +422,7 @@ def load(
         source_revision=value.get("source_revision"),
         schema_version=value["schema_version"],
     )
+    return result
 
 
 def _manifest_bytes(result: QuantizationResult) -> bytes:

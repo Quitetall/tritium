@@ -107,10 +107,10 @@ pub struct Qwen35SaltV2LoadReceipt {
     manifest_package_id: String,
     profile: String,
     source_revision: String,
-    admission_id: String,
-    source_model_id: String,
-    source_identity_status: String,
-    official_payload_authenticated: bool,
+    declared_admission_id: String,
+    declared_source_model_id: String,
+    declared_source_identity_status: String,
+    declared_official_payload_authenticated: bool,
     config_package_id: String,
     package_id: String,
     preserved_package_id: String,
@@ -143,24 +143,29 @@ impl Qwen35SaltV2LoadReceipt {
         &self.source_revision
     }
 
+    /// Untrusted manifest declaration. External admission must authorize
+    /// [`Self::manifest_package_id`] before relying on this value.
     #[must_use]
-    pub fn admission_id(&self) -> &str {
-        &self.admission_id
+    pub fn declared_admission_id(&self) -> &str {
+        &self.declared_admission_id
     }
 
+    /// Untrusted manifest declaration; not an independently authenticated ID.
     #[must_use]
-    pub fn source_model_id(&self) -> &str {
-        &self.source_model_id
+    pub fn declared_source_model_id(&self) -> &str {
+        &self.declared_source_model_id
     }
 
+    /// Untrusted manifest declaration; not an admission verdict.
     #[must_use]
-    pub fn source_identity_status(&self) -> &str {
-        &self.source_identity_status
+    pub fn declared_source_identity_status(&self) -> &str {
+        &self.declared_source_identity_status
     }
 
+    /// Untrusted manifest declaration. This boolean never authenticates a load.
     #[must_use]
-    pub const fn official_payload_authenticated(&self) -> bool {
-        self.official_payload_authenticated
+    pub const fn declared_official_payload_authenticated(&self) -> bool {
+        self.declared_official_payload_authenticated
     }
 
     /// Exact-byte identity of the pinned execution configuration.
@@ -270,6 +275,15 @@ impl Qwen35SaltV2LanguageMtpModel {
         profile: &str,
         backend: Box<dyn TernaryBackend>,
     ) -> Result<Self, NnError> {
+        Self::load_bundle_profile_with_policy(bundle_dir, profile, backend, true)
+    }
+
+    fn load_bundle_profile_with_policy(
+        bundle_dir: &Path,
+        profile: &str,
+        backend: Box<dyn TernaryBackend>,
+        require_pinned_config: bool,
+    ) -> Result<Self, NnError> {
         if !matches!(profile, "compact-v1" | "near-lossless-v1") {
             return Err(NnError::InvalidArtifact(
                 "profile must be `compact-v1` or `near-lossless-v1`".into(),
@@ -292,7 +306,9 @@ impl Qwen35SaltV2LanguageMtpModel {
         let config_text = std::str::from_utf8(&config_bytes)
             .map_err(|_| NnError::MissingConfig("config.json is not UTF-8".into()))?;
         let config = Qwen35CheckpointConfig::from_hf_config(config_text)?;
-        config.validate_pinned_qwen36_27b(&manifest.source_revision)?;
+        if require_pinned_config {
+            config.validate_pinned_qwen36_27b(&manifest.source_revision)?;
+        }
         let package_path = bundle_dir.join(&profile_manifest.file);
         let package_file = open_regular(&package_path, "SALT V2 profile")?;
         let preserved_bytes = read_regular(
@@ -384,10 +400,10 @@ impl Qwen35SaltV2LanguageMtpModel {
                 manifest_package_id,
                 profile: profile.to_owned(),
                 source_revision: manifest.source_revision,
-                admission_id: manifest.admission_id,
-                source_model_id: manifest.source_model_id,
-                source_identity_status: manifest.source_identity_status,
-                official_payload_authenticated: manifest.official_payload_authenticated,
+                declared_admission_id: manifest.admission_id,
+                declared_source_model_id: manifest.source_model_id,
+                declared_source_identity_status: manifest.source_identity_status,
+                declared_official_payload_authenticated: manifest.official_payload_authenticated,
                 config_package_id,
                 package_id,
                 preserved_package_id,
@@ -947,7 +963,6 @@ mod tests {
     fn complete_bundle_loads_language_and_mtp_without_dense_matrix_shadows() {
         let files = TestFiles::new();
         let config_json = family_config_json();
-        fs::write(files.directory.join(CONFIG_FILE), &config_json).unwrap();
         let config = Qwen35CheckpointConfig::from_hf_config(&config_json).unwrap();
         let schema = combined_schema(&config).unwrap();
 
@@ -965,50 +980,119 @@ mod tests {
         let encoded =
             write_salt_v2_package(&SaltV2Package::new(SaltV2Codec::B3, matrices).unwrap()).unwrap();
         let profile_id = PackageId::from_package_bytes(&encoded.bytes).to_string();
-        fs::write(files.directory.join("compact.tsalt2"), encoded.bytes).unwrap();
+        fs::write(files.directory.join("compact.tsalt2"), &encoded.bytes).unwrap();
+        fs::write(files.directory.join("near-lossless.tsalt2"), &encoded.bytes).unwrap();
         let preserved_bytes = zero_bf16_safetensors(&preserved);
         let preserved_id = PackageId::from_package_bytes(&preserved_bytes).to_string();
-        fs::write(files.directory.join(PRESERVED_FILE), preserved_bytes).unwrap();
+        let preserved_payload_bytes = safetensors_payload_bytes(&preserved_bytes).unwrap();
+        let preserved_serialized_bytes = preserved_bytes.len() as u64;
+        fs::write(files.directory.join(PRESERVED_FILE), &preserved_bytes).unwrap();
 
         let package = SaltV2PackageReader::new_strict(
             File::open(files.directory.join("compact.tsalt2")).unwrap(),
         )
         .unwrap();
         assert_eq!(package.package_id().to_string(), profile_id);
-        let preserved_reader = SafeTensorsReader::new(Cursor::new(
-            fs::read(files.directory.join(PRESERVED_FILE))
-                .unwrap()
-                .into_boxed_slice(),
-        ))
-        .unwrap();
-        let source = SaltV2QwenSource {
-            package: RefCell::new(package),
-            preserved: RefCell::new(preserved_reader),
-        };
-        let (loaded_matrices, loaded_preserved, preserved_fp32_bytes) =
-            validate_coverage(&source, &schema).unwrap();
-        assert_eq!(loaded_matrices, matrix_count);
-        assert_eq!(loaded_preserved, schema.len() - matrix_count);
-        assert!(preserved_fp32_bytes > 0);
-        assert_eq!(
-            hash_bytes(&fs::read(files.directory.join(PRESERVED_FILE)).unwrap()),
-            preserved_id
-        );
+        let package_serialized_bytes = package.ledger().total_bytes;
+        let package_resident_bytes = package
+            .indexed_runtime_ledger()
+            .unwrap()
+            .steady_resident_bytes();
 
-        let language = load_language_weights(&source, &config.text).unwrap();
-        let mtp_weights = load_mtp_weights(&source, &config.text).unwrap();
-        source.package.borrow_mut().verify_unchanged().unwrap();
-        let runner = Qwen35TextRunner::new(
-            &config.text,
-            language,
+        let mut hf_assets = Vec::new();
+        let mut hf_asset_bytes = 0u64;
+        for (file, _) in HF_ASSET_SPECS {
+            let bytes = if file == CONFIG_FILE {
+                config_json.as_bytes()
+            } else {
+                b"{}"
+            };
+            fs::write(files.directory.join(file), bytes).unwrap();
+            hf_asset_bytes += bytes.len() as u64;
+            hf_assets.push(serde_json::json!({
+                "file": file,
+                "package_id": hash_bytes(bytes),
+                "bytes": bytes.len(),
+            }));
+        }
+        let manifest = serde_json::json!({
+            "schema_version": 3,
+            "artifact_kind": ARTIFACT_KIND,
+            "complete_model": false,
+            "packing": "b3",
+            "completion_id": "test-completion",
+            "campaign_id": "test-campaign",
+            "admission_id": "test-admission",
+            "selection_id": "test-selection",
+            "source_model_id": "test-source",
+            "source_revision": QWEN36_27B_REVISION,
+            "source_identity_status": "test-only",
+            "official_payload_authenticated": false,
+            "preserved": {
+                "file": PRESERVED_FILE,
+                "package_id": preserved_id,
+                "tensors": preserved.len(),
+                "payload_bytes": preserved_payload_bytes,
+                "serialized_bytes": preserved_serialized_bytes,
+            },
+            "hf_assets": hf_assets,
+            "profiles": {
+                "compact-v1": {
+                    "file": "compact.tsalt2",
+                    "package_id": profile_id,
+                    "serialized_bytes": package_serialized_bytes,
+                    "resident_bytes": package_resident_bytes,
+                },
+                "near-lossless-v1": {
+                    "file": "near-lossless.tsalt2",
+                    "package_id": profile_id,
+                    "serialized_bytes": package_serialized_bytes,
+                    "resident_bytes": package_resident_bytes,
+                },
+            },
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(files.directory.join(MANIFEST_FILE), &manifest_bytes).unwrap();
+
+        let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile_with_policy(
+            &files.directory,
+            "compact-v1",
             Box::new(tritium_cpu::CpuBackend::new()),
+            false,
         )
         .unwrap();
-        let _mtp = UnverifiedQwen35Mtp::new(&runner, mtp_weights).unwrap();
-        let mut cache = runner.new_cache(4).unwrap();
-        let output = runner.forward(&[1, 2], &mut cache).unwrap();
+        let receipt = model.receipt();
+        assert_eq!(receipt.profile(), "compact-v1");
+        assert_eq!(receipt.package_id(), profile_id);
+        assert_eq!(receipt.preserved_package_id(), preserved_id);
+        assert_eq!(receipt.matrix_tensors(), matrix_count);
+        assert_eq!(receipt.preserved_tensors(), preserved.len());
+        assert_eq!(receipt.serialized_bytes(), package_serialized_bytes);
+        assert_eq!(
+            receipt.preserved_serialized_bytes(),
+            preserved_serialized_bytes
+        );
+        assert_eq!(receipt.manifest_bytes(), manifest_bytes.len() as u64);
+        assert_eq!(receipt.hf_asset_bytes(), hf_asset_bytes);
+        assert_eq!(receipt.salt_resident_bytes(), package_resident_bytes);
+        assert!(receipt.preserved_fp32_bytes() > 0);
+        assert_eq!(
+            receipt.resident_bytes(),
+            receipt.salt_resident_bytes() + receipt.preserved_fp32_bytes()
+        );
+        assert_eq!(
+            receipt.loaded_bundle_bytes(),
+            manifest_bytes.len() as u64
+                + hf_asset_bytes
+                + package_serialized_bytes
+                + preserved_serialized_bytes
+        );
+
+        let mut cache = model.runner().new_cache(4).unwrap();
+        let output = model.runner().forward(&[1, 2], &mut cache).unwrap();
         assert_eq!(output.last_logits(), &[0.0; 7]);
         assert_eq!(cache.len(), 2);
+        assert!(!model.mtp().status().reason().is_empty());
     }
 
     #[test]

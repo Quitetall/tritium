@@ -7,6 +7,7 @@ PyTorch is installed — the :mod:`tritium.torch` research facade, :mod:`tritium
 
 from ._tritium import (
     Model,
+    QwenModel,
     conv1d_forward,
     conv1d_vjp,
     fsq_forward,
@@ -22,6 +23,7 @@ from . import salt
 
 __all__ = [
     "Model",
+    "QwenModel",
     "ternary_matmul",
     "conv1d_forward",
     "conv1d_vjp",

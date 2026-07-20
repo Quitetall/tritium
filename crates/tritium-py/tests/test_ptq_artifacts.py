@@ -207,14 +207,52 @@ def test_v3_hf_assets_are_strictly_loaded_and_exported(monkeypatch, tmp_path):
     result = load(source)
     assert result.schema_version == 3
     assert tuple(asset.file for asset in result.hf_assets) == artifacts._HF_ASSET_FILES
-    with pytest.raises(TritiumError) as caught:
-        result.save_pretrained(tmp_path / "hf")
-    assert caught.value.details["missing"] == ["qwen3.6_runtime_adapter"]
+    result.save_pretrained(tmp_path / "hf")
+    saved = load(tmp_path / "hf")
+    assert saved.compact.package_id == result.compact.package_id
+    assert tuple(asset.file for asset in saved.hf_assets) == artifacts._HF_ASSET_FILES
 
     receipt = result.export(tmp_path / "copy")
     assert receipt.schema_version == 3
     assert (receipt.artifact_dir / "tokenizer.json").read_bytes() == b"asset:tokenizer.json"
     assert sum(path.parent == receipt.artifact_dir for path in verified_assets) == 8
+
+
+def test_v3_device_load_dispatches_governed_profile_to_native_runtime(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "source"
+    _write_bundle(source)
+    _upgrade_bundle_to_v3(source)
+    monkeypatch.setattr(
+        artifacts._tritium,
+        "verify_salt_v2_package",
+        lambda *args: pytest.fail("native device load must not pre-hash both profiles"),
+    )
+    monkeypatch.setattr(
+        artifacts._tritium,
+        "verify_preserved_safetensors",
+        lambda *args: pytest.fail("native device load owns preserved verification"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        artifacts._tritium,
+        "verify_hf_asset",
+        lambda *args: pytest.fail("native device load owns HF asset verification"),
+        raising=False,
+    )
+
+    class FakeQwenModel:
+        @staticmethod
+        def load(path, *, profile, device):
+            return Path(path), profile, device
+
+    monkeypatch.setattr(artifacts._tritium, "QwenModel", FakeQwenModel)
+    assert load(source, device="cpu", profile="near-lossless-v1") == (
+        source.resolve(),
+        "near-lossless-v1",
+        "cpu",
+    )
 
 
 def test_v3_hf_asset_catalog_rejects_reordering_before_asset_io(monkeypatch, tmp_path):

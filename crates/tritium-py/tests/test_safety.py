@@ -34,9 +34,11 @@ FIXTURE = os.path.join(
 def test_module_surface():
     """The module exposes exactly the documented public API."""
     assert hasattr(tritium, "Model")
+    assert hasattr(tritium, "QwenModel")
     assert hasattr(tritium, "ternary_matmul")
     assert callable(tritium.ternary_matmul)
     assert callable(tritium.Model.load)
+    assert callable(tritium.QwenModel.load)
 
 
 def test_ternary_matmul_correct():
