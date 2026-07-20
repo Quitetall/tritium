@@ -1,14 +1,19 @@
 //! Portable-training lifecycle adapter for the native wgpu device.
 
 use tritium_spec::{
-    BackendError, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1, TrainBufferDataRefV1,
-    TrainCapabilitiesV1, TrainDTypeV1, TrainLimitsV1, TrainOutputV1, TrainReceiptV1,
-    TrainRequestV1, TrainingOpManifestV1, train_output_digest_v1, train_request_digest_v1,
+    BackendError, TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
+    TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
+    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV1,
+    train_output_digest_v1, train_request_digest_v1,
 };
 
 use crate::WgpuBackend;
 
 const OPERATIONS: &[&str] = &[
+    "graph.detach",
+    "graph.scale_const",
+    "graph.add",
+    "graph.mul",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -28,7 +33,7 @@ const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
 /// kernels pass the frozen corpus on an actual adapter.
 #[derive(Debug)]
 pub struct WgpuTrainBackendV1 {
-    _backend: WgpuBackend,
+    backend: WgpuBackend,
     physical_device: String,
 }
 
@@ -41,9 +46,114 @@ impl WgpuTrainBackendV1 {
         let backend = WgpuBackend::new()?;
         let physical_device = backend.physical_device().to_owned();
         Ok(Self {
-            _backend: backend,
+            backend,
             physical_device,
         })
+    }
+
+    fn execute_pointwise(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) =
+            match (request.operation, request.execution) {
+                ("graph.detach", TrainExecutionV1::Forward) => (&["x"], &["result"]),
+                ("graph.detach", TrainExecutionV1::Vjp) => (&["grad_output"], &["grad_x"]),
+                ("graph.scale_const", TrainExecutionV1::Forward) => (&["x"], &["result"]),
+                ("graph.scale_const", TrainExecutionV1::Vjp) => (&["grad_output"], &["grad_x"]),
+                ("graph.add", TrainExecutionV1::Forward) => (&["left", "right"], &["result"]),
+                ("graph.add", TrainExecutionV1::Vjp) => {
+                    (&["grad_output"], &["grad_left", "grad_right"])
+                }
+                ("graph.mul", TrainExecutionV1::Forward) => (&["left", "right"], &["result"]),
+                ("graph.mul", TrainExecutionV1::Vjp) => (
+                    &["left", "right", "grad_output"],
+                    &["grad_left", "grad_right"],
+                ),
+                _ => return Err(invariant("pointwise operation received an illegal phase")),
+            };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let expected_attributes: &[&str] = if request.operation == "graph.scale_const" {
+            &["scale"]
+        } else {
+            &[]
+        };
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            expected_attributes,
+            "attributes",
+        )?;
+        let (shape, first) = input_f32(request, input_names[0])?;
+        require_finite(input_names[0], first)?;
+        let scalar = if request.operation == "graph.scale_const" {
+            attribute_f32(request, "scale")?
+        } else {
+            0.0
+        };
+        let second = if matches!(request.operation, "graph.add" | "graph.mul")
+            && request.execution == TrainExecutionV1::Forward
+        {
+            let (second_shape, second) = input_f32(request, "right")?;
+            if second_shape != shape {
+                return Err(shape_error());
+            }
+            require_finite("right", second)?;
+            second
+        } else {
+            first
+        };
+        let results = match (request.operation, request.execution) {
+            ("graph.detach", TrainExecutionV1::Forward) => {
+                vec![self.backend.pointwise(first, second, 0, 0.0)]
+            }
+            ("graph.detach", TrainExecutionV1::Vjp) => {
+                vec![self.backend.pointwise(first, second, 1, 0.0)]
+            }
+            ("graph.scale_const", _) => {
+                vec![self.backend.pointwise(first, second, 2, scalar)]
+            }
+            ("graph.add", TrainExecutionV1::Forward) => {
+                vec![self.backend.pointwise(first, second, 3, 0.0)]
+            }
+            ("graph.add", TrainExecutionV1::Vjp) => vec![
+                self.backend.pointwise(first, second, 0, 0.0),
+                self.backend.pointwise(first, second, 0, 0.0),
+            ],
+            ("graph.mul", TrainExecutionV1::Forward) => {
+                vec![self.backend.pointwise(first, second, 4, 0.0)]
+            }
+            ("graph.mul", TrainExecutionV1::Vjp) => {
+                let (left_shape, left) = input_f32(request, "left")?;
+                let (right_shape, right) = input_f32(request, "right")?;
+                let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+                if left_shape != right_shape || left_shape != gradient_shape {
+                    return Err(shape_error());
+                }
+                require_finite("left", left)?;
+                require_finite("right", right)?;
+                require_finite("grad_output", gradient)?;
+                vec![
+                    self.backend.pointwise(gradient, right, 4, 0.0),
+                    self.backend.pointwise(gradient, left, 4, 0.0),
+                ]
+            }
+            _ => unreachable!(),
+        };
+        for (name, result) in output_names.iter().zip(results) {
+            let result = result.map_err(wgpu_error)?;
+            output_f32(output, name, shape, first.len())?.copy_from_slice(&result);
+        }
+        Ok(())
     }
 }
 
@@ -56,7 +166,7 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
                 .iter()
                 .map(|operation| (*operation).to_owned())
                 .collect(),
-            dtypes: vec![TrainDTypeV1::Bytes],
+            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::Bytes],
             limits: LIMITS,
             device_resident: true,
         }
@@ -74,9 +184,14 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             ));
         }
         let input_digest = train_request_digest_v1(&request);
-        tritium_train::portable::execute_lifecycle_control_plane(&request, output)?;
-        let scratch_bytes =
-            tritium_train::portable::lifecycle_control_plane_scratch_bytes(&request)?;
+        let lifecycle = request.operation.starts_with("lifecycle.");
+        let scratch_bytes = if lifecycle {
+            tritium_train::portable::execute_lifecycle_control_plane(&request, output)?;
+            tritium_train::portable::lifecycle_control_plane_scratch_bytes(&request)?
+        } else {
+            self.execute_pointwise(&request, output)?;
+            0
+        };
         Ok(TrainReceiptV1 {
             backend_id: "wgpu.portable.v1:wgpu".to_owned(),
             backend_build: format!("tritium-wgpu-{}", env!("CARGO_PKG_VERSION")),
@@ -85,7 +200,11 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
             execution: request.execution,
-            dtype: TrainDTypeV1::Bytes,
+            dtype: if lifecycle {
+                TrainDTypeV1::Bytes
+            } else {
+                TrainDTypeV1::F32
+            },
             limits: LIMITS,
             input_digest,
             output_digest: train_output_digest_v1(output),
@@ -122,5 +241,127 @@ fn resident_bytes(
 }
 
 fn shape_error() -> TrainBackendError {
-    TrainBackendError::InvalidOperation(tritium_spec::TrainOperationErrorV1::Shape)
+    TrainBackendError::InvalidOperation(TrainOperationErrorV1::Shape)
+}
+
+fn require_names<'a>(
+    actual: impl Iterator<Item = &'a str>,
+    expected: &[&str],
+    namespace: &'static str,
+) -> Result<(), TrainBackendError> {
+    if actual.eq(expected.iter().copied()) {
+        Ok(())
+    } else {
+        Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::Roles { namespace },
+        ))
+    }
+}
+
+fn input_f32<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<(&'a [u64], &'a [f32]), TrainBackendError> {
+    let buffer = request
+        .inputs
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "inputs",
+            })
+        })?;
+    match buffer.data {
+        TrainBufferDataRefV1::F32(data) => Ok((buffer.shape, data)),
+        TrainBufferDataRefV1::U32(_) => Err(dtype_error(name, TrainDTypeV1::U32)),
+        TrainBufferDataRefV1::Bytes(_) => Err(dtype_error(name, TrainDTypeV1::Bytes)),
+    }
+}
+
+fn output_f32<'a>(
+    output: &'a mut TrainOutputV1<'_>,
+    name: &str,
+    shape: &[u64],
+    len: usize,
+) -> Result<&'a mut [f32], TrainBackendError> {
+    let buffer = output
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "outputs",
+            })
+        })?;
+    if buffer.shape != shape {
+        return Err(shape_error());
+    }
+    match &mut buffer.data {
+        TrainBufferDataMutV1::F32(data) if data.len() == len => Ok(data),
+        TrainBufferDataMutV1::F32(_) => Err(shape_error()),
+        TrainBufferDataMutV1::U32(_) => Err(dtype_error(name, TrainDTypeV1::U32)),
+        TrainBufferDataMutV1::Bytes(_) => Err(dtype_error(name, TrainDTypeV1::Bytes)),
+    }
+}
+
+fn attribute_f32(request: &TrainRequestV1<'_>, name: &str) -> Result<f32, TrainBackendError> {
+    let attribute = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "attributes",
+            })
+        })?;
+    let TrainAttributeValueV1::F32(value) = attribute.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "f32",
+            },
+        ));
+    };
+    if !value.is_finite() {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::NonFinite {
+                name: name.to_owned(),
+            },
+        ));
+    }
+    Ok(value)
+}
+
+fn require_finite(name: &str, values: &[f32]) -> Result<(), TrainBackendError> {
+    if values.iter().any(|value| !value.is_finite()) {
+        Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::NonFinite {
+                name: name.to_owned(),
+            },
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn dtype_error(name: &str, got: TrainDTypeV1) -> TrainBackendError {
+    TrainBackendError::InvalidOperation(TrainOperationErrorV1::DType {
+        name: name.to_owned(),
+        expected: TrainDTypeV1::F32,
+        got,
+    })
+}
+
+fn invariant(message: &str) -> TrainBackendError {
+    TrainBackendError::Backend {
+        code: "dispatch_invariant".to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+fn wgpu_error(error: BackendError) -> TrainBackendError {
+    TrainBackendError::Backend {
+        code: "wgpu".to_owned(),
+        message: error.to_string(),
+    }
 }

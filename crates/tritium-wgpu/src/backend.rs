@@ -29,6 +29,15 @@ struct Dims {
     lane_stride: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PointwiseParams {
+    len: u32,
+    operation: u32,
+    scalar: f32,
+    padding: u32,
+}
+
 // std140 uniform structs round up to a 16-byte multiple; pin both the size AND
 // the field offsets so a field reorder (which preserves size) can't silently land
 // `n` where the shader reads `k`.
@@ -69,6 +78,8 @@ pub struct WgpuBackend {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    pointwise_pipeline: wgpu::ComputePipeline,
+    pointwise_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -195,11 +206,37 @@ impl WgpuBackend {
                 cache: None,
             });
 
+            let pointwise_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-pointwise"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("pointwise.wgsl").into()),
+            });
+            let pointwise_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-pointwise-bgl"),
+                    entries: &[entry(0, uni), entry(1, ro), entry(2, ro), entry(3, rw)],
+                });
+            let pointwise_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-pointwise-pl"),
+                bind_group_layouts: &[&pointwise_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let pointwise_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-pointwise-pipe"),
+                    layout: Some(&pointwise_layout),
+                    module: &pointwise_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+
             Ok(WgpuBackend {
                 device,
                 queue,
                 pipeline,
                 bind_group_layout,
+                pointwise_pipeline,
+                pointwise_bind_group_layout,
                 device_name,
             })
         }
@@ -209,6 +246,126 @@ impl WgpuBackend {
     /// Physical adapter identity used to bind portable-training receipts.
     pub(crate) fn physical_device(&self) -> &str {
         &self.device_name
+    }
+
+    /// Run one frozen portable pointwise opcode on resident storage buffers.
+    pub(crate) fn pointwise(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        operation: u32,
+        scalar: f32,
+    ) -> Result<Vec<f32>, BackendError> {
+        if left.len() != right.len() || left.len() > u32::MAX as usize {
+            return Err(BackendError::ShapeMismatch {
+                expected: left.len(),
+                got: right.len(),
+            });
+        }
+        if left.is_empty() {
+            return Ok(Vec::new());
+        }
+        let params = PointwiseParams {
+            len: left.len() as u32,
+            operation,
+            scalar,
+            padding: 0,
+        };
+        let usage = wgpu::BufferUsages::STORAGE;
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-pointwise-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let left_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-pointwise-left"),
+                contents: bytemuck::cast_slice(left),
+                usage,
+            });
+        let right_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-pointwise-right"),
+                contents: bytemuck::cast_slice(right),
+                usage,
+            });
+        let bytes = core::mem::size_of_val(left) as u64;
+        let result_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-pointwise-result"),
+            size: bytes,
+            usage: usage | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-pointwise-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-pointwise-bg"),
+            layout: &self.pointwise_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: left_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: right_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: result_buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-pointwise-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-pointwise-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pointwise_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((left.len() as u32).div_ceil(WG_SIZE), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result_buf, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu pointwise device error: {error}"
+            )));
+        }
+        rx.recv()
+            .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+            .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        let mut result = vec![0.0_f32; left.len()];
+        {
+            let data = slice.get_mapped_range();
+            result.copy_from_slice(bytemuck::cast_slice(&data));
+        }
+        staging.unmap();
+        Ok(result)
     }
 }
 
