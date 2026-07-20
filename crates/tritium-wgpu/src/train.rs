@@ -9,7 +9,7 @@ use tritium_spec::{
 
 use crate::{
     WgpuBackend,
-    backend::{AdamWParams, AdamWScalars},
+    backend::{AdamWParams, AdamWScalars, MuonParams},
 };
 
 const OPERATIONS: &[&str] = &[
@@ -36,6 +36,7 @@ const OPERATIONS: &[&str] = &[
     "optimizer.adamw",
     "optimizer.cautious_adamw",
     "optimizer.int8_adamw",
+    "optimizer.muon",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -1460,6 +1461,107 @@ impl WgpuTrainBackendV1 {
             .copy_from_slice(&updated.moment2_scale);
         Ok(())
     }
+
+    fn execute_muon(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        if request.execution != TrainExecutionV1::Step {
+            return Err(invariant("Muon received an illegal phase"));
+        }
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &["parameter", "gradient", "momentum"],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &[
+                "step",
+                "lr",
+                "momentum",
+                "weight_decay",
+                "rows",
+                "cols",
+                "ns_steps",
+            ],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &["parameter", "momentum"],
+            "outputs",
+        )?;
+        let step = attribute_u64(request, "step")?;
+        let learning_rate = attribute_f32(request, "lr")?;
+        let momentum_decay = attribute_f32(request, "momentum")?;
+        let weight_decay = attribute_f32(request, "weight_decay")?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        let steps = attribute_u64(request, "ns_steps")?;
+        if step == 0 {
+            return Err(attribute_value("step", "one_based"));
+        }
+        if learning_rate < 0.0 {
+            return Err(attribute_value("lr", "nonnegative"));
+        }
+        if !(0.0..1.0).contains(&momentum_decay) {
+            return Err(attribute_value("momentum", "unit_interval_open"));
+        }
+        if weight_decay < 0.0 {
+            return Err(attribute_value("weight_decay", "nonnegative"));
+        }
+        if rows == 0 || rows > u32::MAX as u64 {
+            return Err(attribute_value("rows", "positive_u32"));
+        }
+        if cols == 0 || cols > u32::MAX as u64 {
+            return Err(attribute_value("cols", "positive_u32"));
+        }
+        if steps == 0 {
+            return Err(attribute_value("ns_steps", "positive"));
+        }
+        if steps > 32 {
+            return Err(attribute_value("ns_steps", "max_32"));
+        }
+        let len = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        if len > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let expected_shape = [rows, cols];
+        let (parameter_shape, parameter) = input_f32(request, "parameter")?;
+        let (gradient_shape, gradient) = input_f32(request, "gradient")?;
+        let (momentum_shape, momentum) = input_f32(request, "momentum")?;
+        if parameter_shape != expected_shape
+            || gradient_shape != expected_shape
+            || momentum_shape != expected_shape
+            || parameter.len() != len as usize
+        {
+            return Err(shape_error());
+        }
+        require_finite("parameter", parameter)?;
+        require_finite("gradient", gradient)?;
+        require_finite("momentum", momentum)?;
+        let scale = learning_rate * (rows.max(cols) as f32).sqrt();
+        let shrink = 1.0 - learning_rate * weight_decay;
+        let params = MuonParams::new(
+            rows as u32,
+            cols as u32,
+            steps as u32,
+            momentum_decay,
+            scale,
+            shrink,
+        );
+        let (updated_parameter, updated_momentum) = self
+            .backend
+            .muon(parameter, gradient, momentum, params)
+            .map_err(wgpu_error)?;
+        output_f32(output, "parameter", &expected_shape, len as usize)?
+            .copy_from_slice(&updated_parameter);
+        output_f32(output, "momentum", &expected_shape, len as usize)?
+            .copy_from_slice(&updated_momentum);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -1537,6 +1639,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "optimizer.int8_adamw" {
             self.execute_int8_adamw(&request, output)?;
+            0
+        } else if request.operation == "optimizer.muon" {
+            self.execute_muon(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;

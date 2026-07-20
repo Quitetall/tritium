@@ -110,6 +110,7 @@ impl AdamWParams {
 }
 
 type AdamWOutput = (Vec<f32>, Vec<f32>, Vec<f32>);
+type MuonOutput = (Vec<f32>, Vec<f32>);
 
 /// Host-visible state produced after one native int8 AdamW step.
 pub(crate) struct Int8AdamWOutput {
@@ -118,6 +119,43 @@ pub(crate) struct Int8AdamWOutput {
     pub(crate) moment2_q8: Vec<u8>,
     pub(crate) moment1_scale: Vec<f32>,
     pub(crate) moment2_scale: Vec<f32>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+/// Validated dimensions and scalars for one portable Muon step.
+pub(crate) struct MuonParams {
+    len: u32,
+    rows: u32,
+    cols: u32,
+    steps: u32,
+    momentum_decay: f32,
+    scale: f32,
+    shrink: f32,
+    padding: f32,
+}
+
+impl MuonParams {
+    /// Build packed shader parameters.
+    pub(crate) fn new(
+        rows: u32,
+        cols: u32,
+        steps: u32,
+        momentum_decay: f32,
+        scale: f32,
+        shrink: f32,
+    ) -> Self {
+        Self {
+            len: rows * cols,
+            rows,
+            cols,
+            steps,
+            momentum_decay,
+            scale,
+            shrink,
+            padding: 0.0,
+        }
+    }
 }
 
 // std140 uniform structs round up to a 16-byte multiple; pin both the size AND
@@ -174,6 +212,8 @@ pub struct WgpuBackend {
     adamw_bind_group_layout: wgpu::BindGroupLayout,
     int8_adamw_pipelines: [wgpu::ComputePipeline; 8],
     int8_adamw_bind_group_layout: wgpu::BindGroupLayout,
+    muon_pipeline: wgpu::ComputePipeline,
+    muon_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -540,6 +580,34 @@ impl WgpuBackend {
                     cache: None,
                 })
             });
+            let muon_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-muon"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("muon.wgsl").into()),
+            });
+            let muon_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-muon-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, rw),
+                        entry(2, ro),
+                        entry(3, rw),
+                        entry(4, rw),
+                    ],
+                });
+            let muon_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-muon-pl"),
+                bind_group_layouts: &[&muon_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let muon_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("portable-muon-pipe"),
+                layout: Some(&muon_layout),
+                module: &muon_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
             Ok(WgpuBackend {
                 device,
@@ -560,6 +628,8 @@ impl WgpuBackend {
                 adamw_bind_group_layout,
                 int8_adamw_pipelines,
                 int8_adamw_bind_group_layout,
+                muon_pipeline,
+                muon_bind_group_layout,
                 device_name,
             })
         }
@@ -1511,6 +1581,154 @@ impl WgpuBackend {
             moment1_scale,
             moment2_scale,
         })
+    }
+
+    /// Execute one Muon step with momentum and Newton-Schulz workspace on device.
+    pub(crate) fn muon(
+        &self,
+        parameter: &[f32],
+        gradient: &[f32],
+        momentum: &[f32],
+        params: MuonParams,
+    ) -> Result<MuonOutput, BackendError> {
+        let len = parameter.len();
+        if len == 0 || gradient.len() != len || momentum.len() != len || params.len as usize != len
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: gradient.len(),
+            });
+        }
+        let r = params.rows.min(params.cols) as usize;
+        let square = r
+            .checked_mul(r)
+            .ok_or_else(|| BackendError::InvalidInput("Muon workspace overflow".to_owned()))?;
+        let workspace_len = len
+            .checked_mul(3)
+            .and_then(|value| {
+                square
+                    .checked_mul(3)
+                    .and_then(|extra| value.checked_add(extra))
+            })
+            .and_then(|value| value.checked_add(2))
+            .ok_or_else(|| BackendError::InvalidInput("Muon workspace overflow".to_owned()))?;
+        let storage = wgpu::BufferUsages::STORAGE;
+        let input = |label, values: &[f32], copy_src| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(values),
+                    usage: storage
+                        | if copy_src {
+                            wgpu::BufferUsages::COPY_SRC
+                        } else {
+                            wgpu::BufferUsages::empty()
+                        },
+                })
+        };
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-muon-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let parameter_buf = input("portable-muon-parameter", parameter, true);
+        let gradient_buf = input("portable-muon-gradient", gradient, false);
+        let momentum_buf = input("portable-muon-momentum", momentum, true);
+        let workspace = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-muon-workspace"),
+            size: (workspace_len * core::mem::size_of::<f32>()) as u64,
+            usage: storage,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-muon-bg"),
+            layout: &self.muon_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: parameter_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: gradient_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: momentum_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: workspace.as_entire_binding(),
+                },
+            ],
+        });
+        let bytes = core::mem::size_of_val(parameter) as u64;
+        let staging = |label| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let parameter_staging = staging("portable-muon-parameter-staging");
+        let momentum_staging = staging("portable-muon-momentum-staging");
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-muon-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-muon-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.muon_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&parameter_buf, 0, &parameter_staging, 0, bytes);
+        encoder.copy_buffer_to_buffer(&momentum_buf, 0, &momentum_staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let parameter_slice = parameter_staging.slice(..);
+        let momentum_slice = momentum_staging.slice(..);
+        let (parameter_tx, parameter_rx) = std::sync::mpsc::channel();
+        let (momentum_tx, momentum_rx) = std::sync::mpsc::channel();
+        parameter_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = parameter_tx.send(result);
+        });
+        momentum_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = momentum_tx.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu Muon device error: {error}"
+            )));
+        }
+        for received in [parameter_rx.recv(), momentum_rx.recv()] {
+            received
+                .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+                .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        }
+        let read = |slice: &wgpu::BufferSlice<'_>| {
+            let data = slice.get_mapped_range();
+            let result = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            result
+        };
+        let parameter = read(&parameter_slice);
+        let momentum = read(&momentum_slice);
+        parameter_staging.unmap();
+        momentum_staging.unmap();
+        Ok((parameter, momentum))
     }
 }
 
