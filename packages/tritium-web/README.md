@@ -27,6 +27,12 @@ Typed lifecycle compilers build canonical checkpoint/resume buffers for SGD,
 AdamW, cautious AdamW, int8 AdamW and Muon, and strict SALT V2 export/reload
 requests without exposing backend role names or encoded-size arithmetic.
 
+`PortableWasmLifecycleState.create(...)` owns copied optimizer planes, commits
+and resumes atomically through that guest. Its separate `admitExport(...)`
+boundary strict-reloads caller-supplied SALT packages before returning them.
+Compiled forward/backward adapter execution and state-derived model export
+remain separate release gates.
+
 The compiled lifecycle WASM controller and WebGPU adapter are still under construction;
 the conformance guest is not mislabeled as either. Until a lifecycle adapter is
 supplied, `prepareTraining(model, config)` returns a typed

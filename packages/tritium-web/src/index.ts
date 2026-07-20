@@ -27,6 +27,10 @@ export {
   compilePortableReloadRequest,
   compilePortableResumeRequest,
 } from "./lifecycle.ts";
+export {
+  PortableWasmLifecycleError,
+  PortableWasmLifecycleState,
+} from "./portable-state.ts";
 export type {
   PortableAdamLeafV1,
   PortableCheckpointOptimizerV1,
@@ -35,6 +39,12 @@ export type {
   PortableMuonLeafV1,
   PortableSgdLeafV1,
 } from "./lifecycle.ts";
+export type {
+  PortableWasmLifecycleBinaryV1,
+  PortableWasmLifecycleErrorCode,
+  PortableWasmLifecycleOptionsV1,
+  PortableWasmLifecycleStateV1,
+} from "./portable-state.ts";
 export type {
   PortableAttributeV1,
   PortableBufferDataV1,

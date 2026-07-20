@@ -1,5 +1,6 @@
 import type {
   PortableTrainingRequestV1,
+  PortableTrainingReceiptV1,
   PortableTrainingResponseV1,
   PortableWasmConformanceReceiptV1,
   PortableWasmSourceV1,
@@ -8,6 +9,11 @@ import type {
   PortableCheckpointOptimizerV1,
   PortableCheckpointStateV1,
 } from "./lifecycle-types.js";
+import type {
+  PortableWasmLifecycleBinaryV1,
+  PortableWasmLifecycleErrorCode,
+  PortableWasmLifecycleOptionsV1,
+} from "./portable-state-types.js";
 
 export type {
   PortableAdamLeafV1,
@@ -30,6 +36,13 @@ export type {
   PortableWasmConformanceReceiptV1,
   PortableWasmSourceV1,
 } from "./portable.js";
+
+export type {
+  PortableWasmLifecycleBinaryV1,
+  PortableWasmLifecycleErrorCode,
+  PortableWasmLifecycleOptionsV1,
+  PortableWasmLifecycleStateV1,
+} from "./portable-state-types.js";
 
 export type TrainingOpCategoryV1 =
   | "graph"
@@ -103,6 +116,23 @@ export declare function compilePortableReloadRequest(
   artifact: Uint8Array,
   physicalDevice?: string,
 ): PortableTrainingRequestV1;
+
+export declare class PortableWasmLifecycleError extends Error {
+  readonly code: PortableWasmLifecycleErrorCode;
+  constructor(code: PortableWasmLifecycleErrorCode, message: string);
+}
+
+export declare class PortableWasmLifecycleState {
+  static create(
+    options: PortableWasmLifecycleOptionsV1,
+  ): Promise<PortableWasmLifecycleState>;
+  get state(): PortableCheckpointStateV1;
+  checkpoint(): Promise<PortableWasmLifecycleBinaryV1>;
+  commit(state: PortableCheckpointStateV1): Promise<PortableTrainingReceiptV1>;
+  resume(checkpoint: Uint8Array): Promise<PortableTrainingReceiptV1>;
+  admitExport(packageBytes: Uint8Array): Promise<PortableWasmLifecycleBinaryV1>;
+  dispose(): void;
+}
 
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";

@@ -28,6 +28,10 @@ await cp(
   resolve(root, "src/lifecycle-types.d.ts"),
   resolve(output, "lifecycle-types.d.ts"),
 );
+await cp(
+  resolve(root, "src/portable-state-types.d.ts"),
+  resolve(output, "portable-state-types.d.ts"),
+);
 await cp(resolve(root, "src/portable.d.ts"), resolve(output, "portable.d.ts"));
 await cp(resolve(root, "../../LICENSE"), resolve(output, "LICENSE"));
 await cp(resolve(root, "../../NOTICE"), resolve(output, "NOTICE"));

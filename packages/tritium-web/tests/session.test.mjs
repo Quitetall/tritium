@@ -428,6 +428,34 @@ test("planner enforces one optimizer and gradient per tied parameter owner", asy
     "invalid_schema",
   );
   assert.deepEqual(orphanAdapter.calls, []);
+
+  const disconnected = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: [
+        ...model.recipe.tensors,
+        { id: "weight2", dtype: "f32", shape: [1], role: "parameter", aliasOf: null },
+        { id: "grad2", dtype: "f32", shape: [1], role: "gradient", aliasOf: null },
+      ],
+      operations: [
+        ...model.recipe.operations,
+        {
+          id: "sgd2",
+          operation: "optimizer.sgd",
+          inputs: ["weight2", "grad2"],
+          outputs: ["weight2"],
+          attributes: [],
+        },
+      ],
+    },
+  };
+  const disconnectedAdapter = new MockAdapter();
+  await rejectsCode(
+    prepareTraining(disconnected, config, disconnectedAdapter),
+    "invalid_schema",
+  );
+  assert.deepEqual(disconnectedAdapter.calls, []);
 });
 
 test("planner emits deterministic fan-in accumulation for tied parameters", async () => {
@@ -473,9 +501,36 @@ test("planner emits deterministic fan-in accumulation for tied parameters", asyn
     2,
   );
   await session.dispose();
+
+  const syntheticAddModel = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      operations: [
+        {
+          id: "mul-tied",
+          operation: "graph.mul",
+          inputs: ["weight", "tied-weight"],
+          outputs: ["sum"],
+          attributes: [],
+        },
+        model.recipe.operations[1],
+        model.recipe.operations[2],
+      ],
+    },
+  };
+  const partial = new MockAdapter();
+  partial.capabilities = {
+    ...partial.capabilities,
+    supportedOperations: partial.capabilities.supportedOperations.filter(
+      (operation) => operation !== "graph.add",
+    ),
+  };
+  await rejectsCode(prepareTraining(syntheticAddModel, config, partial), "capability_mismatch");
+  assert.deepEqual(partial.calls, []);
 });
 
-test("planner treats detach as a reverse-reachability barrier", async () => {
+test("planner rejects an optimized parameter behind a detach barrier", async () => {
   const detachedModel = {
     ...model,
     recipe: {
@@ -493,16 +548,12 @@ test("planner treats detach as a reverse-reachability barrier", async () => {
       ],
     },
   };
-  const session = await prepareTraining(detachedModel, config, new MockAdapter());
-  assert.deepEqual(
-    session.plan.backwardOperations.map((operation) => operation.sourceOperationId),
-    ["mse"],
+  const adapter = new MockAdapter();
+  await rejectsCode(
+    prepareTraining(detachedModel, config, adapter),
+    "invalid_schema",
   );
-  assert.equal(
-    session.plan.buffers.find((buffer) => buffer.id === "grad").backwardInitialization,
-    "zero",
-  );
-  await session.dispose();
+  assert.deepEqual(adapter.calls, []);
 });
 
 test("planner binds stateful optimizer slots exclusively and positionally", async () => {
@@ -574,6 +625,7 @@ test("planner orders multiple groups and rejects shared optimizer state", async 
   const secondParameter = [
     { id: "weight2", dtype: "f32", shape: [1], role: "parameter", aliasOf: null },
     { id: "grad2", dtype: "f32", shape: [1], role: "gradient", aliasOf: null },
+    { id: "sum2", dtype: "f32", shape: [1], role: "activation", aliasOf: null },
   ];
   const twoGroupModel = {
     ...model,
@@ -581,7 +633,16 @@ test("planner orders multiple groups and rejects shared optimizer state", async 
       ...model.recipe,
       tensors: [...model.recipe.tensors, ...secondParameter],
       operations: [
-        ...model.recipe.operations,
+        model.recipe.operations[0],
+        {
+          id: "add-second",
+          operation: "graph.add",
+          inputs: ["sum", "weight2"],
+          outputs: ["sum2"],
+          attributes: [],
+        },
+        { ...model.recipe.operations[1], inputs: ["sum2", "target"] },
+        model.recipe.operations[2],
         {
           id: "sgd-second",
           operation: "optimizer.sgd",
@@ -660,12 +721,32 @@ test("planner validates int8 AdamW block-state geometry", async () => {
     ...model,
     recipe: {
       ...model.recipe,
-      tensors: [...model.recipe.tensors, ...tensors],
-      operations: [...model.recipe.operations, operation],
+      tensors: [
+        ...model.recipe.tensors
+          .filter((tensor) => !["weight", "tied-weight", "grad"].includes(tensor.id))
+          .map((tensor) =>
+            ["x", "target", "sum"].includes(tensor.id)
+              ? { ...tensor, shape: [260] }
+              : tensor,
+          ),
+        ...tensors,
+      ],
+      operations: [
+        {
+          ...model.recipe.operations[0],
+          inputs: ["x", "wide-weight"],
+        },
+        model.recipe.operations[1],
+        operation,
+      ],
     },
   };
-  const int8Config = { ...config, maxResidentBytes: 4096 };
+  const int8Config = { ...config, maxResidentBytes: 65536 };
   const int8Adapter = new MockAdapter();
+  int8Adapter.capabilities = {
+    ...int8Adapter.capabilities,
+    maxResidentBytes: 65536,
+  };
   int8Adapter.prepare = async (_preparedModel, _preparedConfig, plan) =>
     receipt("session.prepare", "webgpu", {
       peakResidentBytes: plan.residentBytes,

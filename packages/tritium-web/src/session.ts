@@ -1108,6 +1108,14 @@ export function compileTrainingPlan(
       contributionKeys,
     });
   }
+  for (const ownerId of parameterGradientByOwner.keys()) {
+    if (!neededGradients.has(ownerId)) {
+      fail(
+        "invalid_schema",
+        `optimized parameter owner ${ownerId} is disconnected from the loss`,
+      );
+    }
+  }
 
   const contributionCounts = new Map<string, number>();
   for (const node of activeBackwardNodes) {
@@ -1257,6 +1265,7 @@ function validateCapabilities(
   capabilities: WebTrainingCapabilitiesV1,
   config: WebTrainingConfigV1,
   recipe: TrainingRecipeV1,
+  plan: CompiledTrainingPlanV1,
 ): void {
   exactKeys(
     capabilities,
@@ -1324,6 +1333,7 @@ function validateCapabilities(
   for (const operation of [
     ...config.requiredOperations,
     ...recipe.operations.map((operation) => operation.operation),
+    ...plan.backwardOperations.map((operation) => operation.operation),
   ]) {
     if (!canonical.has(operation)) {
       fail("invalid_schema", `unknown training operation ${operation}`);
@@ -1476,7 +1486,7 @@ export class WebTrainingSession {
     });
     const plan = compileTrainingPlan(model, safeConfig);
     const capabilities = snapshotCapabilities(adapter.capabilities);
-    validateCapabilities(capabilities, safeConfig, model.recipe);
+    validateCapabilities(capabilities, safeConfig, model.recipe, plan);
     const capturedPayload = Uint8Array.from(model.payload);
     const safeModel: WebTrainingModelV1 = Object.freeze({
       schemaId: model.schemaId,
