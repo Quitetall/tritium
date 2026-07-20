@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from .torch.errors import TritiumError
-from .torch.estimators import AbsMeanSTE, Estimator
+from .torch.estimators import AbsMeanSTE, Estimator, SaltSTE
+from .torch.ops import ternary_linear
 from .torch.projection import ProjectionContext, validate_projection
 
 
@@ -65,6 +66,8 @@ class TernaryLinear(nn.Module):
         return converted
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if type(self.estimator) in {AbsMeanSTE, SaltSTE}:
+            return ternary_linear(input, self.weight, self.bias)
         projection = self.estimator.project(
             self.weight,
             context=ProjectionContext(training=self.training, role="weight"),

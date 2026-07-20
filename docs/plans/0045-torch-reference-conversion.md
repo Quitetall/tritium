@@ -1,6 +1,6 @@
 # 0045 — PyTorch reference ternary module and conversion contract
 
-Status: **IN PROGRESS** (2026-07-20)
+Status: **DONE** (2026-07-20; commit `67fb0c9`)
 
 - **Decision:** [ADR 0033](../adr/0033-v11-full-public-release.md)
 - **Parent:** [plan 0044](./0044-v11-full-public-release.md)
@@ -97,3 +97,16 @@ feat(torch): add reference ternary linear conversion
 Focused gates pass, commit review has a verdict or an explicitly recorded
 provider blocker, worktree is clean, and plan 0046 can replace the reference
 execution without changing public behavior.
+
+## Result
+
+- Python package suite: **34 passed**.
+- New device-resident reference path contains no `.tolist()` bridge.
+- Hard forward, strict masked STE, root/nested conversion, shared modules,
+  tied parameters, state identity, structured estimator errors and coverage
+  round-trip are gated.
+- Mandatory lamu `review_commit` was invoked after commit but its cloud provider
+  returned HTTP 402 credit exhaustion before a verdict. Local lamu fallback
+  returned `PASS`; all eight emitted nits were verified false positives or
+  intentional contracts. Cloud review remains an infrastructure limitation,
+  not a substituted PASS claim.
