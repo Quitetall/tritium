@@ -942,12 +942,15 @@ The following work deliberately remains open and keeps this plan in progress:
   verifies both physical ledgers and every language sidecar, assembles the full
   language/MTP graph from a selected seek-backed package, and is reachable from
   the Python wheel for greedy token generation without dense matrix shadows.
-  This is synthetic host-runtime evidence, not pinned-checkpoint or MTP-oracle
+  Feature-gated CUDA wheels now stream those matrices into final device SALT V2
+  allocations; a full synthetic graph emitted a device-resident receipt and ran
+  on an RTX 4090, while CPU-only wheels reject CUDA placement. This is synthetic
+  runtime evidence, not pinned-checkpoint, large-K performance, or MTP-oracle
   promotion evidence. It remains a host-orchestrated correctness path: the
   fused resident decoder does not yet accept SALT V2 projections, and the
   training architecture does not yet retain Qwen QKV biases or QK-normalization
-  vectors. Those two
-  device/training integrations must precede a Qwen refinement campaign;
+  vectors. Those two device/training integrations must precede a Qwen refinement
+  campaign;
 - optimized resident large-K CUDA SALT kernels, SALT V2 fused decoder/prefill
   dispatch, and Qwen3.6's device-resident hybrid recurrent/KV cache remain
   required for practical 27B serving;

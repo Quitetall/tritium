@@ -95,9 +95,13 @@ saves with safe serialization, automatically reloads through
   device load of schema-v3 directories into the Qwen3.6 packed runtime. The
   native loader derives identities from `tritium.json`, verifies all eight HF
   assets and exact physical ledgers, assembles language plus MTP without dense
-  matrix shadows, and supports token-ID greedy generation. A release wheel was
-  built and imported from a fresh environment. This is synthetic graph/packaging
-  evidence; the pinned 27B run and MTP production-oracle promotion remain open.
+  matrix shadows, and supports token-ID greedy generation. CPU and feature-gated
+  CUDA abi3 wheels were built and imported from fresh environments. On an RTX
+  4090 the synthetic full graph streamed every matrix into final CUDA SALT V2
+  allocations, emitted `device_resident_salt=true`, and generated successfully;
+  the CPU wheel rejects CUDA placement explicitly. This is synthetic
+  graph/packaging/device evidence; the pinned 27B run, optimized large-K kernels,
+  and MTP production-oracle promotion remain open.
 - [x] Remove refinement from `TernaryConfig.ptq`. PTQ can produce only a PTQ
   result; `RefinementConfig` owns separately versioned scale-only and hard-PV
   recipes. Plan 0048's `refine` primitive and bound child ancestry remain open.
