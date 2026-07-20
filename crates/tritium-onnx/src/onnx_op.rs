@@ -1134,6 +1134,28 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let dense_o = identity_matrix(16);
+        let dense_attention_gate = (0..8)
+            .map(|row| {
+                let mut values = vec![0.0; 16];
+                values[(row + 3) % 16] = if row % 2 == 0 { 1.0 } else { -1.0 };
+                values
+            })
+            .collect::<Vec<_>>();
+        let dense_fused_query_gate = (0..2)
+            .flat_map(|head| {
+                dense_q[head * 4..head * 4 + 4]
+                    .iter()
+                    .chain(&dense_attention_gate[head * 4..head * 4 + 4])
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let dense_fused_output = (0..16)
+            .map(|row| {
+                let mut values = vec![0.0; 8];
+                values[row % 8] = if row < 8 { 1.0 } else { -1.0 };
+                values
+            })
+            .collect::<Vec<_>>();
         let dense_gate = identity_matrix(16);
         let dense_up = identity_matrix(16);
         let dense_down = identity_matrix(16);
@@ -1152,12 +1174,17 @@ mod tests {
         let k_packed = pack_rows(&trits(&dense_k), format);
         let v_packed = pack_rows(&trits(&dense_v), format);
         let o_packed = pack_rows(&trits(&dense_o), format);
+        let fused_query_gate_packed = pack_rows(&trits(&dense_fused_query_gate), format);
+        let fused_k_packed = pack_rows(&trits(&dense_k[..4]), format);
+        let fused_v_packed = pack_rows(&trits(&dense_v[..4]), format);
+        let fused_output_packed = pack_rows(&trits(&dense_fused_output), format);
         let gate_packed = pack_rows(&trits(&dense_gate), format);
         let up_packed = pack_rows(&trits(&dense_up), format);
         let down_packed = pack_rows(&trits(&dense_down), format);
         let embedding_scales = [1.0; 3];
         let sixteen_scales = vec![1.0; 16];
         let eight_scales = vec![1.0; 8];
+        let four_scales = vec![1.0; 4];
         let attention_norm = (0..16)
             .map(|lane| 0.5 + 0.1 * (lane % 10) as f32)
             .collect::<Vec<_>>();
@@ -1175,11 +1202,13 @@ mod tests {
             attention_norm: &attention_norm,
             query_norm: Some(&query_norm),
             key_norm: Some(&key_norm),
-            query: packed_matrix(16, 16, &q_packed, &sixteen_scales, format),
+            query: crate::CausalQueryProjection::Separate {
+                query: packed_matrix(16, 16, &q_packed, &sixteen_scales, format),
+                gate: None,
+            },
             key: packed_matrix(8, 16, &k_packed, &eight_scales, format),
             value: packed_matrix(8, 16, &v_packed, &eight_scales, format),
             attention_output: packed_matrix(16, 16, &o_packed, &sixteen_scales, format),
-            attention_gate: None,
             attention_sub_norm: None,
             ffn_norm: &ffn_norm,
             gate: packed_matrix(16, 16, &gate_packed, &sixteen_scales, format),
@@ -1472,7 +1501,10 @@ mod tests {
             2,
             0,
             crate::CausalLmDecoderLayer {
-                attention_gate: Some(packed_matrix(16, 16, &q_packed, &sixteen_scales, format)),
+                query: crate::CausalQueryProjection::Separate {
+                    query: packed_matrix(16, 16, &q_packed, &sixteen_scales, format),
+                    gate: Some(packed_matrix(16, 16, &q_packed, &sixteen_scales, format)),
+                },
                 attention_sub_norm: Some(&gate_sub_norm),
                 ..layer
             },
@@ -1499,6 +1531,80 @@ mod tests {
             .unwrap();
         assert_f32_close(attention_gate_logits, &attention_gate_expected, 2.0e-5);
         assert_ne!(attention_gate_logits, expected_logits.as_slice());
+        let fused_attention_sub_norm = [0.7, 1.1, 0.8, 1.2, 0.9, 1.3, 0.6, 1.4];
+        let (fused_query_gate_expected, _, _) = reference_causal_lm(
+            &prompt_tokens,
+            &[],
+            &[],
+            &dense_embedding,
+            &dense_q[..8],
+            &dense_k[..4],
+            &dense_v[..4],
+            &dense_fused_output,
+            Some(&dense_attention_gate),
+            &dense_gate,
+            &dense_up,
+            &dense_down,
+            &attention_norm,
+            &query_norm,
+            &key_norm,
+            &ffn_norm,
+            Some(&fused_attention_sub_norm),
+            None,
+            crate::CausalActivation::SwiGlu,
+            &final_norm,
+            None,
+            2,
+            1,
+            4,
+            4,
+            rope_theta,
+            epsilon,
+            false,
+        );
+        let fused_layer = crate::CausalLmDecoderLayer {
+            query: crate::CausalQueryProjection::HeadInterleavedQueryGate {
+                fused: packed_matrix(16, 16, &fused_query_gate_packed, &sixteen_scales, format),
+            },
+            key: packed_matrix(4, 16, &fused_k_packed, &four_scales, format),
+            value: packed_matrix(4, 16, &fused_v_packed, &four_scales, format),
+            attention_output: packed_matrix(16, 8, &fused_output_packed, &sixteen_scales, format),
+            attention_sub_norm: Some(&fused_attention_sub_norm),
+            ..layer
+        };
+        let fused_query_gate_model = crate::encode_causal_lm(crate::CausalLmModel {
+            tokens: 2,
+            past_tokens: 0,
+            n_head: 2,
+            n_kv_head: 1,
+            head_dim: 4,
+            rotary: Some(crate::RotaryEmbedding {
+                theta: rope_theta,
+                dimensions: 4,
+            }),
+            rms_epsilon: epsilon,
+            zero_centered_norm: false,
+            embedding,
+            lm_head: None,
+            layers: std::slice::from_ref(&fused_layer),
+            final_norm: &final_norm,
+            identity,
+        })
+        .unwrap();
+        let fused_diagnostics = crate::diagnose_unsupported_graph(&fused_query_gate_model).unwrap();
+        assert!(fused_diagnostics.is_empty(), "{fused_diagnostics:#?}");
+        let mut fused_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&fused_query_gate_model)
+            .unwrap();
+        let fused_tokens =
+            Tensor::from_array(([2], prompt_tokens.clone().into_boxed_slice())).unwrap();
+        let fused_outputs = fused_session.run(ort::inputs![&fused_tokens]).unwrap();
+        let (_, fused_logits) = fused_outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(fused_logits, &fused_query_gate_expected, 2.0e-5);
+        assert_ne!(fused_logits, attention_gate_logits);
         let attention_sub_norm = (0..16)
             .map(|lane| 0.8 + 0.03 * lane as f32)
             .collect::<Vec<_>>();

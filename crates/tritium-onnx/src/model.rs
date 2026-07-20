@@ -123,6 +123,23 @@ pub struct RotaryEmbedding {
     pub dimensions: usize,
 }
 
+/// Query and optional output-gate projection layout for one attention layer.
+#[derive(Debug, Clone, Copy)]
+pub enum CausalQueryProjection<'a> {
+    /// Independent query and optional sigmoid output-gate projections.
+    Separate {
+        /// Query projection `[query_width, hidden]`.
+        query: PackedTernaryMatrix<'a>,
+        /// Optional gate projection `[query_width, hidden]`.
+        gate: Option<PackedTernaryMatrix<'a>>,
+    },
+    /// Qwen head-interleaved `[query lanes..., gate lanes...]` projection.
+    HeadInterleavedQueryGate {
+        /// Fused projection `[2 * query_width, hidden]`.
+        fused: PackedTernaryMatrix<'a>,
+    },
+}
+
 /// Packed weights and preserved RMSNorm vectors for one causal decoder layer.
 #[derive(Debug, Clone, Copy)]
 pub struct CausalLmDecoderLayer<'a> {
@@ -132,16 +149,14 @@ pub struct CausalLmDecoderLayer<'a> {
     pub query_norm: Option<&'a [f32]>,
     /// Optional per-key-head RMSNorm weight applied before RoPE/cache write.
     pub key_norm: Option<&'a [f32]>,
-    /// Query projection.
-    pub query: PackedTernaryMatrix<'a>,
+    /// Query and optional sigmoid output-gate projection layout.
+    pub query: CausalQueryProjection<'a>,
     /// Key projection.
     pub key: PackedTernaryMatrix<'a>,
     /// Value projection.
     pub value: PackedTernaryMatrix<'a>,
     /// Attention output projection.
     pub attention_output: PackedTernaryMatrix<'a>,
-    /// Optional sigmoid gate projected from normalized attention input.
-    pub attention_gate: Option<PackedTernaryMatrix<'a>>,
     /// Optional RMSNorm over attention context before the output projection.
     pub attention_sub_norm: Option<&'a [f32]>,
     /// Pre-FFN RMSNorm weight.
@@ -323,11 +338,13 @@ pub fn map_smollm2_causal_lm<'a>(
             attention_norm: source.vector(&format!("{prefix}.input_layernorm.weight"))?,
             query_norm: None,
             key_norm: None,
-            query: source.matrix(&format!("{prefix}.self_attn.q_proj.weight"))?,
+            query: CausalQueryProjection::Separate {
+                query: source.matrix(&format!("{prefix}.self_attn.q_proj.weight"))?,
+                gate: None,
+            },
             key: source.matrix(&format!("{prefix}.self_attn.k_proj.weight"))?,
             value: source.matrix(&format!("{prefix}.self_attn.v_proj.weight"))?,
             attention_output: source.matrix(&format!("{prefix}.self_attn.o_proj.weight"))?,
-            attention_gate: None,
             attention_sub_norm: None,
             ffn_norm: source.vector(&format!("{prefix}.post_attention_layernorm.weight"))?,
             gate: source.matrix(&format!("{prefix}.mlp.gate_proj.weight"))?,
@@ -618,11 +635,13 @@ pub fn map_bitnet_gguf_causal_lm<'a>(
             attention_norm: source.vector(&format!("{prefix}.attn_norm.weight"))?,
             query_norm: None,
             key_norm: None,
-            query: source.matrix(&format!("{prefix}.attn_q.weight"))?,
+            query: CausalQueryProjection::Separate {
+                query: source.matrix(&format!("{prefix}.attn_q.weight"))?,
+                gate: None,
+            },
             key: source.matrix(&format!("{prefix}.attn_k.weight"))?,
             value: source.matrix(&format!("{prefix}.attn_v.weight"))?,
             attention_output: source.matrix(&format!("{prefix}.attn_output.weight"))?,
-            attention_gate: None,
             attention_sub_norm: Some(source.vector(&format!("{prefix}.attn_sub_norm.weight"))?),
             ffn_norm: source.vector(&format!("{prefix}.ffn_norm.weight"))?,
             gate: source.matrix(&format!("{prefix}.ffn_gate.weight"))?,
@@ -2721,6 +2740,75 @@ impl CausalGraphBuilder {
         Ok(())
     }
 
+    fn deinterleave_query_gate(
+        &mut self,
+        prefix: &str,
+        fused: &str,
+        tokens: i64,
+        n_head: i64,
+        head_dim: i64,
+        query_width: i64,
+    ) -> (String, String) {
+        let fused_shape = format!("{prefix}.fused_shape");
+        let flat_shape = format!("{prefix}.flat_shape");
+        let first_start = format!("{prefix}.first_start");
+        let first_end = format!("{prefix}.first_end");
+        let second_start = format!("{prefix}.second_start");
+        let second_end = format!("{prefix}.second_end");
+        let axes = format!("{prefix}.axes");
+        let steps = format!("{prefix}.steps");
+        self.add_i64(&fused_shape, vec![4], &[tokens, n_head, 2, head_dim]);
+        self.add_i64(&flat_shape, vec![2], &[tokens, query_width]);
+        self.add_i64(&first_start, vec![1], &[0]);
+        self.add_i64(&first_end, vec![1], &[1]);
+        self.add_i64(&second_start, vec![1], &[1]);
+        self.add_i64(&second_end, vec![1], &[2]);
+        self.add_i64(&axes, vec![1], &[2]);
+        self.add_i64(&steps, vec![1], &[1]);
+
+        let heads = format!("{prefix}.heads");
+        self.standard(
+            format!("{prefix}.reshape"),
+            "Reshape",
+            &[fused, &fused_shape],
+            &[&heads],
+            Vec::new(),
+        );
+        let query_heads = format!("{prefix}.query_heads");
+        let gate_heads = format!("{prefix}.gate_heads");
+        self.standard(
+            format!("{prefix}.slice_query"),
+            "Slice",
+            &[&heads, &first_start, &first_end, &axes, &steps],
+            &[&query_heads],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.slice_gate"),
+            "Slice",
+            &[&heads, &second_start, &second_end, &axes, &steps],
+            &[&gate_heads],
+            Vec::new(),
+        );
+        let query = format!("{prefix}.query");
+        let gate = format!("{prefix}.gate");
+        self.standard(
+            format!("{prefix}.flatten_query"),
+            "Reshape",
+            &[&query_heads, &flat_shape],
+            &[&query],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.flatten_gate"),
+            "Reshape",
+            &[&gate_heads, &flat_shape],
+            &[&gate],
+            Vec::new(),
+        );
+        (query, gate)
+    }
+
     fn rms_norm_with_semantics(
         &mut self,
         prefix: &str,
@@ -3247,6 +3335,9 @@ fn build_causal_lm_graph(
     let n_head = as_i64(model.n_head, "attention head count")?;
     let n_kv_head = as_i64(model.n_kv_head, "KV head count")?;
     let head_dim = as_i64(model.head_dim, "head dimension")?;
+    let query_width = n_head
+        .checked_mul(head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("query width"))?;
     let gqa_repeat = as_i64(model.n_head / model.n_kv_head, "GQA repeat")?;
     let geometry = CausalGraphGeometry {
         past_tokens,
@@ -3317,16 +3408,56 @@ fn build_causal_lm_graph(
             model.rms_epsilon,
             model.zero_centered_norm,
         );
-        let query_flat = format!("{prefix}.query_flat");
         let current_k_flat = format!("{prefix}.current_k_flat");
         let current_v_flat = format!("{prefix}.current_v_flat");
-        graph.projection(
-            &format!("{prefix}.query"),
-            &attention_input,
-            &query_flat,
-            &format!("{prefix}.query"),
-            layer.query,
-        )?;
+        let (query_flat, attention_gate) = match layer.query {
+            CausalQueryProjection::HeadInterleavedQueryGate { fused: weight } => {
+                let fused = format!("{prefix}.fused_query_gate");
+                graph.projection(
+                    &format!("{prefix}.fused_query_gate_projection"),
+                    &attention_input,
+                    &fused,
+                    &format!("{prefix}.fused_query_gate"),
+                    weight,
+                )?;
+                let (query, gate) = graph.deinterleave_query_gate(
+                    &format!("{prefix}.query_gate_split"),
+                    &fused,
+                    tokens,
+                    n_head,
+                    head_dim,
+                    query_width,
+                );
+                (query, Some(gate))
+            }
+            CausalQueryProjection::Separate {
+                query: weight,
+                gate,
+            } => {
+                let query = format!("{prefix}.query_flat");
+                graph.projection(
+                    &format!("{prefix}.query"),
+                    &attention_input,
+                    &query,
+                    &format!("{prefix}.query"),
+                    weight,
+                )?;
+                let gate = if let Some(weight) = gate {
+                    let gate = format!("{prefix}.attention_gate");
+                    graph.projection(
+                        &format!("{prefix}.attention_gate_projection"),
+                        &attention_input,
+                        &gate,
+                        &format!("{prefix}.attention_gate"),
+                        weight,
+                    )?;
+                    Some(gate)
+                } else {
+                    None
+                };
+                (query, gate)
+            }
+        };
         graph.projection(
             &format!("{prefix}.key"),
             &attention_input,
@@ -3341,19 +3472,6 @@ fn build_causal_lm_graph(
             &format!("{prefix}.value"),
             layer.value,
         )?;
-        let attention_gate = if let Some(weight) = layer.attention_gate {
-            let gate = format!("{prefix}.attention_gate");
-            graph.projection(
-                &format!("{prefix}.attention_gate_projection"),
-                &attention_input,
-                &gate,
-                &format!("{prefix}.attention_gate"),
-                weight,
-            )?;
-            Some(gate)
-        } else {
-            None
-        };
         let query_shape = format!("{prefix}.query_shape");
         let kv_shape = format!("{prefix}.kv_shape");
         graph.add_i64(&query_shape, vec![3], &[tokens, n_head, head_dim]);
@@ -3509,13 +3627,13 @@ fn build_causal_lm_graph(
             &[&context_tokens],
             vec![ints_attribute("perm", &[1, 0, 2])],
         );
-        let hidden_shape = format!("{prefix}.hidden_shape");
-        graph.add_i64(&hidden_shape, vec![2], &[tokens, hidden]);
+        let context_shape = format!("{prefix}.context_shape");
+        graph.add_i64(&context_shape, vec![2], &[tokens, query_width]);
         let context = format!("{prefix}.context");
         graph.standard(
             format!("{prefix}.context_reshape"),
             "Reshape",
-            &[&context_tokens, &hidden_shape],
+            &[&context_tokens, &context_shape],
             &[&context],
             Vec::new(),
         );
@@ -3631,6 +3749,14 @@ fn build_causal_lm_graph(
         metadata("tritium.n_head", &model.n_head.to_string()),
         metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
         metadata("tritium.head_dim", &model.head_dim.to_string()),
+        metadata(
+            "tritium.query_width",
+            &model
+                .n_head
+                .checked_mul(model.head_dim)
+                .expect("validated query width")
+                .to_string(),
+        ),
         metadata(
             "tritium.rms_norm_weight_semantics",
             if model.zero_centered_norm {
@@ -3979,16 +4105,11 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             model.n_head, model.n_kv_head
         )));
     }
-    let hidden = model
+    let query_width = model
         .n_head
         .checked_mul(model.head_dim)
-        .ok_or(OnnxModelError::ShapeOverflow("attention hidden size"))?;
-    if hidden != model.embedding.columns {
-        return Err(OnnxModelError::InvalidModel(format!(
-            "n_head * head_dim is {hidden}, hidden size is {}",
-            model.embedding.columns
-        )));
-    }
+        .ok_or(OnnxModelError::ShapeOverflow("query width"))?;
+    let hidden = model.embedding.columns;
     if let Some(rotary) = model.rotary {
         if !rotary.theta.is_finite() || rotary.theta <= 0.0 {
             return Err(OnnxModelError::InvalidModel(
@@ -4027,7 +4148,30 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             .n_kv_head
             .checked_mul(model.head_dim)
             .ok_or(OnnxModelError::ShapeOverflow("KV projection width"))?;
-        validate_matrix_shape(&format!("layer.{index}.query"), layer.query, hidden, hidden)?;
+        match layer.query {
+            CausalQueryProjection::HeadInterleavedQueryGate { fused } => {
+                let fused_width = query_width
+                    .checked_mul(2)
+                    .ok_or(OnnxModelError::ShapeOverflow("fused query/gate width"))?;
+                validate_matrix_shape(
+                    &format!("layer.{index}.fused_query_gate"),
+                    fused,
+                    fused_width,
+                    hidden,
+                )?;
+            }
+            CausalQueryProjection::Separate { query, gate } => {
+                validate_matrix_shape(&format!("layer.{index}.query"), query, query_width, hidden)?;
+                if let Some(gate) = gate {
+                    validate_matrix_shape(
+                        &format!("layer.{index}.attention_gate"),
+                        gate,
+                        query_width,
+                        hidden,
+                    )?;
+                }
+            }
+        }
         validate_matrix_shape(&format!("layer.{index}.key"), layer.key, kv_width, hidden)?;
         validate_matrix_shape(
             &format!("layer.{index}.value"),
@@ -4039,18 +4183,14 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             &format!("layer.{index}.attention_output"),
             layer.attention_output,
             hidden,
-            hidden,
+            query_width,
         )?;
-        if let Some(gate) = layer.attention_gate {
-            validate_matrix_shape(
-                &format!("layer.{index}.attention_gate"),
-                gate,
-                hidden,
-                hidden,
-            )?;
-        }
         if let Some(weight) = layer.attention_sub_norm {
-            validate_vector(&format!("layer.{index}.attention_sub_norm"), weight, hidden)?;
+            validate_vector(
+                &format!("layer.{index}.attention_sub_norm"),
+                weight,
+                query_width,
+            )?;
         }
         if layer.gate.rows == 0 || layer.gate.rows != layer.up.rows {
             return Err(OnnxModelError::InvalidModel(format!(
@@ -4124,15 +4264,22 @@ fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), O
         if let Some(weight) = layer.attention_sub_norm {
             add_vector(&mut total, weight)?;
         }
-        if let Some(gate) = layer.attention_gate {
-            add_matrix(&mut total, gate)?;
+        match layer.query {
+            CausalQueryProjection::Separate { query, gate } => {
+                add_matrix(&mut total, query)?;
+                if let Some(gate) = gate {
+                    add_matrix(&mut total, gate)?;
+                }
+            }
+            CausalQueryProjection::HeadInterleavedQueryGate { fused } => {
+                add_matrix(&mut total, fused)?;
+            }
         }
         add_vector(&mut total, layer.ffn_norm)?;
         if let Some(weight) = layer.ffn_sub_norm {
             add_vector(&mut total, weight)?;
         }
         for matrix in [
-            layer.query,
             layer.key,
             layer.value,
             layer.attention_output,

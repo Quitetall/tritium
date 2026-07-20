@@ -103,13 +103,18 @@ namespace adapter maps ternarized packed embeddings/projections and preserved
 norms, rejecting missing/duplicate/extra tensors including an untied
 `output.weight`. Raw dense-embedding/I2_S conversion remains an upstream
 quantization/import concern. Qwen3.6 still requires its heterogeneous
-DeltaNet/full-attention schedule, fused query/gate tensor mapping and MTP
+DeltaNet/full-attention schedule, exact architecture tensor-map adapter and MTP
 composition. Conventional causal graphs now support an untied packed LM head,
 prefix-only RoPE, model-wide zero-centered RMSNorm weights and sigmoid
 attention-output gating, each with independent-reference ORT parity. The
 zero-centered graph retains source offsets and emits the effective `1 + weight`
 scale explicitly, with artifact metadata distinguishing it from ordinary
-RMSNorm. Multi-layer large-model external-data
+RMSNorm. Qwen's native fused query projection is consumed without repacking:
+head-interleaved query/gate rows are split in graph before Q normalization and
+sigmoid output gating, with independent-reference ORT parity and a typed
+projection contract that makes contradictory separate gate weights
+unrepresentable. Residual and query widths are independent, covering Qwen's
+5120-wide stream and 24x256 query geometry. Multi-layer large-model external-data
 packaging, remaining Qwen graph extensions, dynamic axes and end-user
 generation APIs remain open.
 
