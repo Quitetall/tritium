@@ -7,7 +7,10 @@ use tritium_spec::{
     train_output_digest_v1, train_request_digest_v1,
 };
 
-use crate::WgpuBackend;
+use crate::{
+    WgpuBackend,
+    backend::{AdamWParams, AdamWScalars},
+};
 
 const OPERATIONS: &[&str] = &[
     "graph.ste_surrogate",
@@ -30,6 +33,7 @@ const OPERATIONS: &[&str] = &[
     "graph.softmax",
     "loss.mse",
     "optimizer.sgd",
+    "optimizer.adamw",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -1238,6 +1242,96 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_adamw(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        if request.execution != TrainExecutionV1::Step {
+            return Err(invariant("AdamW received an illegal phase"));
+        }
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &["parameter", "gradient", "moment1", "moment2"],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["step", "lr", "beta1", "beta2", "eps", "weight_decay"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &["parameter", "moment1", "moment2"],
+            "outputs",
+        )?;
+        let step = attribute_u64(request, "step")?;
+        let learning_rate = attribute_f32(request, "lr")?;
+        let beta1 = attribute_f32(request, "beta1")?;
+        let beta2 = attribute_f32(request, "beta2")?;
+        let epsilon = attribute_f32(request, "eps")?;
+        let weight_decay = attribute_f32(request, "weight_decay")?;
+        if step == 0 {
+            return Err(attribute_value("step", "one_based"));
+        }
+        if learning_rate < 0.0 {
+            return Err(attribute_value("lr", "nonnegative"));
+        }
+        if !(0.0..1.0).contains(&beta1) {
+            return Err(attribute_value("beta1", "unit_interval_open"));
+        }
+        if !(0.0..1.0).contains(&beta2) {
+            return Err(attribute_value("beta2", "unit_interval_open"));
+        }
+        if epsilon <= 0.0 {
+            return Err(attribute_value("eps", "positive"));
+        }
+        if weight_decay < 0.0 {
+            return Err(attribute_value("weight_decay", "nonnegative"));
+        }
+        let (shape, parameter) = input_f32(request, "parameter")?;
+        let (gradient_shape, gradient) = input_f32(request, "gradient")?;
+        let (moment1_shape, moment1) = input_f32(request, "moment1")?;
+        let (moment2_shape, moment2) = input_f32(request, "moment2")?;
+        if parameter.is_empty()
+            || gradient_shape != shape
+            || moment1_shape != shape
+            || moment2_shape != shape
+            || parameter.len() > u32::MAX as usize
+        {
+            return Err(shape_error());
+        }
+        require_finite("parameter", parameter)?;
+        require_finite("gradient", gradient)?;
+        require_finite("moment1", moment1)?;
+        require_finite("moment2", moment2)?;
+        let exponent = i32::try_from(step).unwrap_or(i32::MAX);
+        let correction1 = 1.0 - beta1.powi(exponent);
+        let correction2 = 1.0 - beta2.powi(exponent);
+        let shrink = 1.0 - learning_rate * weight_decay;
+        let params = AdamWParams::new(
+            parameter.len() as u32,
+            AdamWScalars {
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+                correction1,
+                correction2,
+                shrink,
+            },
+        );
+        let (updated_parameter, updated_moment1, updated_moment2) = self
+            .backend
+            .adamw(parameter, gradient, moment1, moment2, params)
+            .map_err(wgpu_error)?;
+        output_f32(output, "parameter", shape, parameter.len())?
+            .copy_from_slice(&updated_parameter);
+        output_f32(output, "moment1", shape, parameter.len())?.copy_from_slice(&updated_moment1);
+        output_f32(output, "moment2", shape, parameter.len())?.copy_from_slice(&updated_moment2);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -1306,6 +1400,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.lsq_ste" {
             self.execute_lsq(&request, output)?;
+            0
+        } else if request.operation == "optimizer.adamw" {
+            self.execute_adamw(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;

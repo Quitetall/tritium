@@ -60,6 +60,57 @@ struct EmbeddingParams {
     operation: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+/// Precomputed scalar state for one portable AdamW dispatch.
+pub(crate) struct AdamWParams {
+    len: u32,
+    padding_0: u32,
+    padding_1: u32,
+    padding_2: u32,
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    correction1: f32,
+    correction2: f32,
+    shrink: f32,
+    padding_3: f32,
+}
+
+/// Validated AdamW scalars, including host-computed bias correction.
+pub(crate) struct AdamWScalars {
+    pub(crate) learning_rate: f32,
+    pub(crate) beta1: f32,
+    pub(crate) beta2: f32,
+    pub(crate) epsilon: f32,
+    pub(crate) correction1: f32,
+    pub(crate) correction2: f32,
+    pub(crate) shrink: f32,
+}
+
+impl AdamWParams {
+    /// Build parameters after host-side validation and bias correction.
+    pub(crate) fn new(len: u32, scalars: AdamWScalars) -> Self {
+        Self {
+            len,
+            padding_0: 0,
+            padding_1: 0,
+            padding_2: 0,
+            learning_rate: scalars.learning_rate,
+            beta1: scalars.beta1,
+            beta2: scalars.beta2,
+            epsilon: scalars.epsilon,
+            correction1: scalars.correction1,
+            correction2: scalars.correction2,
+            shrink: scalars.shrink,
+            padding_3: 0.0,
+        }
+    }
+}
+
+type AdamWOutput = (Vec<f32>, Vec<f32>, Vec<f32>);
+
 // std140 uniform structs round up to a 16-byte multiple; pin both the size AND
 // the field offsets so a field reorder (which preserves size) can't silently land
 // `n` where the shader reads `k`.
@@ -106,6 +157,11 @@ pub struct WgpuBackend {
     concat_bind_group_layout: wgpu::BindGroupLayout,
     embedding_pipeline: wgpu::ComputePipeline,
     embedding_bind_group_layout: wgpu::BindGroupLayout,
+    adamw_pipeline: wgpu::ComputePipeline,
+    adamw_terms_pipeline: wgpu::ComputePipeline,
+    adamw_variance_pipeline: wgpu::ComputePipeline,
+    adamw_finish_pipeline: wgpu::ComputePipeline,
+    adamw_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -319,6 +375,78 @@ impl WgpuBackend {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+            let adamw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-adamw"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("adamw.wgsl").into()),
+            });
+            let adamw_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-adamw-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, ro),
+                        entry(5, rw),
+                        entry(6, rw),
+                        entry(7, rw),
+                        entry(8, rw),
+                        entry(9, rw),
+                    ],
+                });
+            let adamw_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-adamw-pl"),
+                bind_group_layouts: &[&adamw_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let adamw_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("portable-adamw-pipe"),
+                layout: Some(&adamw_layout),
+                module: &adamw_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+            let adamw_finish_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-adamw-finish"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("adamw_finish.wgsl").into()),
+            });
+            let adamw_terms_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-adamw-terms"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("adamw_terms.wgsl").into()),
+            });
+            let adamw_terms_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-adamw-terms-pipe"),
+                    layout: Some(&adamw_layout),
+                    module: &adamw_terms_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            let adamw_variance_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-adamw-variance"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("adamw_variance.wgsl").into()),
+            });
+            let adamw_variance_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-adamw-variance-pipe"),
+                    layout: Some(&adamw_layout),
+                    module: &adamw_variance_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            let adamw_finish_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-adamw-finish-pipe"),
+                    layout: Some(&adamw_layout),
+                    module: &adamw_finish_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
             Ok(WgpuBackend {
                 device,
@@ -331,6 +459,11 @@ impl WgpuBackend {
                 concat_bind_group_layout,
                 embedding_pipeline,
                 embedding_bind_group_layout,
+                adamw_pipeline,
+                adamw_terms_pipeline,
+                adamw_variance_pipeline,
+                adamw_finish_pipeline,
+                adamw_bind_group_layout,
                 device_name,
             })
         }
@@ -826,6 +959,202 @@ impl WgpuBackend {
         }
         staging.unmap();
         Ok(result)
+    }
+
+    /// Execute one AdamW update with all state resident through dispatch.
+    pub(crate) fn adamw(
+        &self,
+        parameter: &[f32],
+        gradient: &[f32],
+        moment1: &[f32],
+        moment2: &[f32],
+        params: AdamWParams,
+    ) -> Result<AdamWOutput, BackendError> {
+        let len = parameter.len();
+        if len == 0
+            || gradient.len() != len
+            || moment1.len() != len
+            || moment2.len() != len
+            || params.len as usize != len
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: gradient.len(),
+            });
+        }
+        let storage = wgpu::BufferUsages::STORAGE;
+        let input = |label, values: &[f32]| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(values),
+                    usage: storage,
+                })
+        };
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-adamw-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let parameter_buf = input("portable-adamw-parameter", parameter);
+        let gradient_buf = input("portable-adamw-gradient", gradient);
+        let moment1_buf = input("portable-adamw-moment1", moment1);
+        let moment2_buf = input("portable-adamw-moment2", moment2);
+        let bytes = core::mem::size_of_val(parameter) as u64;
+        let output = |label| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage: storage | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let staging = |label| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let updated_parameter = output("portable-adamw-updated-parameter");
+        let updated_moment1 = output("portable-adamw-updated-moment1");
+        let updated_moment2 = output("portable-adamw-updated-moment2");
+        let scratch1 = output("portable-adamw-scratch1");
+        let scratch2 = output("portable-adamw-scratch2");
+        let parameter_staging = staging("portable-adamw-parameter-staging");
+        let moment1_staging = staging("portable-adamw-moment1-staging");
+        let moment2_staging = staging("portable-adamw-moment2-staging");
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-adamw-bg"),
+            layout: &self.adamw_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: parameter_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: gradient_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: moment1_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: moment2_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: updated_parameter.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: updated_moment1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: updated_moment2.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: scratch1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: scratch2.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-adamw-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-adamw-moments-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.adamw_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((len as u32).div_ceil(WG_SIZE), 1, 1);
+        }
+        for (label, pipeline) in [
+            ("portable-adamw-terms-pass", &self.adamw_terms_pipeline),
+            (
+                "portable-adamw-variance-pass",
+                &self.adamw_variance_pipeline,
+            ),
+        ] {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((len as u32).div_ceil(WG_SIZE), 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-adamw-finish-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.adamw_finish_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((len as u32).div_ceil(WG_SIZE), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&updated_parameter, 0, &parameter_staging, 0, bytes);
+        encoder.copy_buffer_to_buffer(&updated_moment1, 0, &moment1_staging, 0, bytes);
+        encoder.copy_buffer_to_buffer(&updated_moment2, 0, &moment2_staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let parameter_slice = parameter_staging.slice(..);
+        let moment1_slice = moment1_staging.slice(..);
+        let moment2_slice = moment2_staging.slice(..);
+        let (parameter_tx, parameter_rx) = std::sync::mpsc::channel();
+        let (moment1_tx, moment1_rx) = std::sync::mpsc::channel();
+        let (moment2_tx, moment2_rx) = std::sync::mpsc::channel();
+        parameter_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = parameter_tx.send(result);
+        });
+        moment1_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = moment1_tx.send(result);
+        });
+        moment2_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = moment2_tx.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu AdamW device error: {error}"
+            )));
+        }
+        for received in [parameter_rx.recv(), moment1_rx.recv(), moment2_rx.recv()] {
+            received
+                .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+                .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        }
+        let read = |slice: &wgpu::BufferSlice<'_>| {
+            let data = slice.get_mapped_range();
+            let result = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            result
+        };
+        let parameter = read(&parameter_slice);
+        let moment1 = read(&moment1_slice);
+        let moment2 = read(&moment2_slice);
+        parameter_staging.unmap();
+        moment1_staging.unmap();
+        moment2_staging.unmap();
+        Ok((parameter, moment1, moment2))
     }
 }
 
