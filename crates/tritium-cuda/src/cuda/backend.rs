@@ -598,6 +598,7 @@ pub struct CudaBackend {
     pub(super) func_sgd_step: CudaFunction,
     pub(super) func_cautious_adamw_prepare: CudaFunction,
     pub(super) func_cautious_adamw_apply: CudaFunction,
+    pub(super) func_muon_step: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -901,6 +902,9 @@ impl CudaBackend {
         let func_cautious_adamw_apply = grad_module
             .load_function(KERNEL_NAME_CAUTIOUS_ADAMW_APPLY)
             .map_err(|e| driver_err("resolve cautious_adamw_apply kernel", &e))?;
+        let func_muon_step = grad_module
+            .load_function(KERNEL_NAME_MUON_STEP)
+            .map_err(|e| driver_err("resolve muon_step kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -1014,6 +1018,7 @@ impl CudaBackend {
             func_sgd_step,
             func_cautious_adamw_prepare,
             func_cautious_adamw_apply,
+            func_muon_step,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -2364,6 +2369,94 @@ impl CudaBackend {
             apply
                 .launch(Self::elementwise_cfg(len))
                 .map_err(|e| driver_err("launch cautious_adamw_apply", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Apply one deterministic Muon step using global resident work buffers.
+    pub(crate) fn muon_step_portable_dev(
+        &self,
+        parameter: &mut CudaSlice<f32>,
+        gradient: &CudaSlice<f32>,
+        momentum: &mut CudaSlice<f32>,
+        optimizer: &tritium_train::Muon,
+    ) -> Result<(), BackendError> {
+        let len = optimizer
+            .rows
+            .checked_mul(optimizer.cols)
+            .ok_or_else(|| BackendError::InvalidInput("Muon shape overflows usize".into()))?;
+        for got in [parameter.len(), gradient.len(), momentum.len()] {
+            if got != len {
+                return Err(BackendError::ShapeMismatch { expected: len, got });
+            }
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let rows = i32::try_from(optimizer.rows)
+            .map_err(|_| BackendError::InvalidInput("Muon rows exceed i32::MAX".into()))?;
+        let cols = i32::try_from(optimizer.cols)
+            .map_err(|_| BackendError::InvalidInput("Muon cols exceed i32::MAX".into()))?;
+        let steps = i32::try_from(optimizer.ns_steps)
+            .map_err(|_| BackendError::InvalidInput("Muon steps exceed i32::MAX".into()))?;
+        let gram_len = optimizer
+            .rows
+            .min(optimizer.cols)
+            .checked_pow(2)
+            .ok_or_else(|| BackendError::InvalidInput("Muon Gram shape overflows usize".into()))?;
+        let mut x = self
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|e| driver_err("allocate Muon x", &e))?;
+        let mut xt = self
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|e| driver_err("allocate Muon transpose", &e))?;
+        let mut bx = self
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|e| driver_err("allocate Muon product", &e))?;
+        let mut gram = self
+            .stream
+            .alloc_zeros::<f32>(gram_len)
+            .map_err(|e| driver_err("allocate Muon Gram", &e))?;
+        let mut gram2 = self
+            .stream
+            .alloc_zeros::<f32>(gram_len)
+            .map_err(|e| driver_err("allocate Muon Gram square", &e))?;
+        let mut bmat = self
+            .stream
+            .alloc_zeros::<f32>(gram_len)
+            .map_err(|e| driver_err("allocate Muon B", &e))?;
+        let scale = optimizer.lr * (optimizer.rows.max(optimizer.cols) as f32).sqrt();
+        let shrink = 1.0 - optimizer.lr * optimizer.weight_decay;
+        let mut launch = self.stream.launch_builder(&self.func_muon_step);
+        launch
+            .arg(parameter)
+            .arg(gradient)
+            .arg(momentum)
+            .arg(&mut x)
+            .arg(&mut xt)
+            .arg(&mut bx)
+            .arg(&mut gram)
+            .arg(&mut gram2)
+            .arg(&mut bmat)
+            .arg(&rows)
+            .arg(&cols)
+            .arg(&steps)
+            .arg(&optimizer.momentum)
+            .arg(&scale)
+            .arg(&shrink);
+        #[allow(unsafe_code)]
+        // SAFETY: validated resident spans and exact scratch geometry; serial deterministic kernel.
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| driver_err("launch muon_step", &e))?;
         }
         Ok(())
     }

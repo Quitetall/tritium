@@ -18,7 +18,7 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 85);
+    assert_eq!(report.passed.len(), 87);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
@@ -48,7 +48,8 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
             "optimizer.sgd",
             "optimizer.adamw",
             "optimizer.cautious_adamw",
-            "optimizer.int8_adamw"
+            "optimizer.int8_adamw",
+            "optimizer.muon"
         ]
     );
     assert!(

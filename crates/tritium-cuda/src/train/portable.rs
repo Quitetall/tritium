@@ -44,6 +44,7 @@ const OPERATIONS: &[&str] = &[
     "optimizer.adamw",
     "optimizer.cautious_adamw",
     "optimizer.int8_adamw",
+    "optimizer.muon",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -1957,6 +1958,104 @@ impl CudaTrainBackendV1 {
         output_f32(output, "moment2_scale", &scale_shape, blocks)?.copy_from_slice(&moment2_scale);
         Ok(())
     }
+
+    fn execute_muon(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        if request.execution != TrainExecutionV1::Step {
+            return Err(invariant("Muon received an illegal phase"));
+        }
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            &["parameter", "gradient", "momentum"],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &[
+                "step",
+                "lr",
+                "momentum",
+                "weight_decay",
+                "rows",
+                "cols",
+                "ns_steps",
+            ],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &["parameter", "momentum"],
+            "outputs",
+        )?;
+        let step = attribute_u64(request, "step")?;
+        let optimizer = tritium_train::Muon {
+            lr: attribute_f32(request, "lr")?,
+            momentum: attribute_f32(request, "momentum")?,
+            weight_decay: attribute_f32(request, "weight_decay")?,
+            rows: attribute_usize(request, "rows")?,
+            cols: attribute_usize(request, "cols")?,
+            ns_steps: attribute_usize(request, "ns_steps")?,
+        };
+        if step == 0 {
+            return Err(attribute_value("step", "one_based"));
+        }
+        if optimizer.lr < 0.0 {
+            return Err(attribute_value("lr", "nonnegative"));
+        }
+        if !(0.0..1.0).contains(&optimizer.momentum) {
+            return Err(attribute_value("momentum", "unit_interval_open"));
+        }
+        if optimizer.weight_decay < 0.0 {
+            return Err(attribute_value("weight_decay", "nonnegative"));
+        }
+        if optimizer.rows == 0 {
+            return Err(attribute_value("rows", "positive"));
+        }
+        if optimizer.cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        if optimizer.ns_steps == 0 {
+            return Err(attribute_value("ns_steps", "positive"));
+        }
+        if optimizer.ns_steps > 32 {
+            return Err(attribute_value("ns_steps", "max_32"));
+        }
+        let len = optimizer
+            .rows
+            .checked_mul(optimizer.cols)
+            .ok_or_else(|| attribute_value("rows", "arithmetic"))?;
+        if len > u32::MAX as usize {
+            return Err(attribute_value("rows", "max_elements"));
+        }
+        let shape = [optimizer.rows as u64, optimizer.cols as u64];
+        let parameter = input_f32(request, "parameter", &shape)?;
+        let gradient = input_f32(request, "gradient", &shape)?;
+        let momentum = input_f32(request, "momentum", &shape)?;
+        require_finite("parameter", parameter)?;
+        require_finite("gradient", gradient)?;
+        require_finite("momentum", momentum)?;
+        output_f32(output, "parameter", &shape, len)?;
+        output_f32(output, "momentum", &shape, len)?;
+        let mut device_parameter = self.backend.dev_upload(parameter).map_err(cuda_error)?;
+        let device_gradient = self.backend.dev_upload(gradient).map_err(cuda_error)?;
+        let mut device_momentum = self.backend.dev_upload(momentum).map_err(cuda_error)?;
+        self.backend
+            .muon_step_portable_dev(
+                &mut device_parameter,
+                &device_gradient,
+                &mut device_momentum,
+                &optimizer,
+            )
+            .map_err(cuda_error)?;
+        let parameter = download_device(&self.backend, &device_parameter, len)?;
+        let momentum = download_device(&self.backend, &device_momentum, len)?;
+        output_f32(output, "parameter", &shape, len)?.copy_from_slice(&parameter);
+        output_f32(output, "momentum", &shape, len)?.copy_from_slice(&momentum);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -2009,6 +2108,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "optimizer.adamw" => self.execute_adamw(&request, output, false)?,
             "optimizer.cautious_adamw" => self.execute_adamw(&request, output, true)?,
             "optimizer.int8_adamw" => self.execute_int8_adamw(&request, output)?,
+            "optimizer.muon" => self.execute_muon(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
@@ -2024,6 +2124,18 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
                 (parameter.len() as u64)
                     .checked_mul(size_of::<f32>() as u64)
                     .and_then(|bytes| bytes.checked_add(size_of::<u32>() as u64))
+                    .ok_or_else(shape_error)?
+            }
+            ("optimizer.muon", TrainExecutionV1::Step) => {
+                let rows = attribute_u64(&request, "rows")?;
+                let cols = attribute_u64(&request, "cols")?;
+                let matrix = rows.checked_mul(cols).ok_or_else(shape_error)?;
+                let axis = rows.min(cols);
+                let gram = axis.checked_mul(axis).ok_or_else(shape_error)?;
+                matrix
+                    .checked_mul(3)
+                    .and_then(|value| gram.checked_mul(3).and_then(|g| value.checked_add(g)))
+                    .and_then(|elements| elements.checked_mul(size_of::<f32>() as u64))
                     .ok_or_else(shape_error)?
             }
             _ => 0,

@@ -271,6 +271,7 @@ pub(super) const KERNEL_NAME_SALT_BOUNDED_FWD: &str = "salt_quantize_forward_bou
 pub(super) const KERNEL_NAME_SGD_STEP: &str = "sgd_step";
 pub(super) const KERNEL_NAME_CAUTIOUS_ADAMW_PREPARE: &str = "cautious_adamw_prepare";
 pub(super) const KERNEL_NAME_CAUTIOUS_ADAMW_APPLY: &str = "cautious_adamw_apply";
+pub(super) const KERNEL_NAME_MUON_STEP: &str = "muon_step";
 /// Plan 0043 Stage 6: direct scalar-correct SALT V2 D2/B3/S34 execution.
 pub(super) const KERNEL_NAME_SALT_V2_EXACT: &str = "salt_v2_forward_exact";
 /// Plan 0043 Stage 6: exact selected-row reconstruction for token embeddings.

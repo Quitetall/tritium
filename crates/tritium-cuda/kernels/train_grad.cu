@@ -1470,6 +1470,69 @@ extern "C" __global__ void cautious_adamw_apply(
     param[i] = param[i] * shrink - lr * update[i] * rescale;
 }
 
+extern "C" __global__ void muon_step(
+    float* __restrict__ parameter, const float* __restrict__ gradient,
+    float* __restrict__ momentum, float* __restrict__ x,
+    float* __restrict__ xt, float* __restrict__ bx,
+    float* __restrict__ gram, float* __restrict__ gram2,
+    float* __restrict__ bmat, int rows, int cols, int steps,
+    float momentum_decay, float scale, float shrink)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    const float qa = 3.4445f, qb = -4.7750f, qc = 2.0315f;
+    int n = rows * cols;
+    float norm2 = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float value = momentum_decay * momentum[i] + gradient[i];
+        momentum[i] = value;
+        norm2 += value * value;
+    }
+    float fnorm = sqrtf(norm2) + 1.0e-7f;
+    int r = rows <= cols ? rows : cols;
+    int c = rows <= cols ? cols : rows;
+    bool transposed = rows > cols;
+    for (int row = 0; row < r; ++row) {
+        for (int col = 0; col < c; ++col) {
+            int source = transposed ? col * cols + row : row * cols + col;
+            x[row * c + col] = momentum[source] / fnorm;
+        }
+    }
+    for (int iteration = 0; iteration < steps; ++iteration) {
+        for (int row = 0; row < r; ++row) {
+            for (int col = 0; col < r; ++col) {
+                float sum = 0.0f;
+                for (int k = 0; k < c; ++k) sum += x[row * c + k] * x[col * c + k];
+                gram[row * r + col] = sum;
+            }
+        }
+        for (int row = 0; row < r; ++row) {
+            for (int col = 0; col < r; ++col) {
+                float sum = 0.0f;
+                for (int k = 0; k < r; ++k) sum += gram[row * r + k] * gram[col * r + k];
+                gram2[row * r + col] = sum;
+            }
+        }
+        for (int i = 0; i < r * r; ++i) bmat[i] = qb * gram[i] + qc * gram2[i];
+        for (int row = 0; row < c; ++row)
+            for (int col = 0; col < r; ++col) xt[row * r + col] = x[col * c + row];
+        for (int row = 0; row < r; ++row) {
+            for (int col = 0; col < c; ++col) {
+                float sum = 0.0f;
+                for (int k = 0; k < r; ++k) sum += bmat[row * r + k] * xt[col * r + k];
+                bx[row * c + col] = sum;
+            }
+        }
+        for (int i = 0; i < r * c; ++i) x[i] = qa * x[i] + bx[i];
+    }
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            int i = row * cols + col;
+            int ortho = transposed ? col * c + row : i;
+            parameter[i] = parameter[i] * shrink - scale * x[ortho];
+        }
+    }
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(
