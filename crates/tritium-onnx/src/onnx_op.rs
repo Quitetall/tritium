@@ -927,7 +927,7 @@ mod tests {
             .collect()
     }
 
-    fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {
+    fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32, zero_centered: bool) -> Vec<f32> {
         let width = weight.len();
         input
             .chunks_exact(width)
@@ -935,9 +935,10 @@ mod tests {
                 let denominator =
                     (row.iter().map(|value| value * value).sum::<f32>() / width as f32 + epsilon)
                         .sqrt();
-                row.iter()
-                    .zip(weight)
-                    .map(move |(value, weight)| value * weight / denominator)
+                row.iter().zip(weight).map(move |(value, weight)| {
+                    let scale = if zero_centered { 1.0 + weight } else { *weight };
+                    value * scale / denominator
+                })
             })
             .collect()
     }
@@ -971,14 +972,20 @@ mod tests {
         rotary_dim: usize,
         rope_theta: f32,
         epsilon: f32,
+        zero_centered_norm: bool,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let hidden: Vec<f32> = tokens
             .iter()
             .flat_map(|&token| embedding[usize::try_from(token).unwrap()].iter().copied())
             .collect();
-        let attention_input = rms_norm(&hidden, attention_norm, epsilon);
+        let attention_input = rms_norm(&hidden, attention_norm, epsilon, zero_centered_norm);
         let query = apply_rope(
-            &rms_norm(&dense_project(&attention_input, q), query_norm, epsilon),
+            &rms_norm(
+                &dense_project(&attention_input, q),
+                query_norm,
+                epsilon,
+                zero_centered_norm,
+            ),
             tokens.len(),
             n_head,
             head_dim,
@@ -987,7 +994,12 @@ mod tests {
             rope_theta,
         );
         let current_k = apply_rope(
-            &rms_norm(&dense_project(&attention_input, k), key_norm, epsilon),
+            &rms_norm(
+                &dense_project(&attention_input, k),
+                key_norm,
+                epsilon,
+                zero_centered_norm,
+            ),
             tokens.len(),
             n_kv_head,
             head_dim,
@@ -1018,7 +1030,7 @@ mod tests {
                 .collect()
         });
         let output_input = attention_sub_norm.map_or(gated_context.clone(), |weight| {
-            rms_norm(&gated_context, weight, epsilon)
+            rms_norm(&gated_context, weight, epsilon, zero_centered_norm)
         });
         let attention_output = dense_project(&output_input, o);
         let post_attention: Vec<f32> = hidden
@@ -1026,7 +1038,7 @@ mod tests {
             .zip(attention_output)
             .map(|(residual, update)| residual + update)
             .collect();
-        let ffn_input = rms_norm(&post_attention, ffn_norm, epsilon);
+        let ffn_input = rms_norm(&post_attention, ffn_norm, epsilon, zero_centered_norm);
         let gate_values = dense_project(&ffn_input, gate);
         let up_values = dense_project(&ffn_input, up);
         let activated: Vec<f32> = gate_values
@@ -1041,7 +1053,7 @@ mod tests {
             })
             .collect();
         let down_input = ffn_sub_norm.map_or(activated.clone(), |weight| {
-            rms_norm(&activated, weight, epsilon)
+            rms_norm(&activated, weight, epsilon, zero_centered_norm)
         });
         let ffn_output = dense_project(&down_input, down);
         let post_ffn: Vec<f32> = post_attention
@@ -1049,7 +1061,7 @@ mod tests {
             .zip(ffn_output)
             .map(|(residual, update)| residual + update)
             .collect();
-        let final_hidden = rms_norm(&post_ffn, final_norm, epsilon);
+        let final_hidden = rms_norm(&post_ffn, final_norm, epsilon, zero_centered_norm);
         let logits = dense_project(&final_hidden, lm_head.unwrap_or(embedding));
         (logits, present_k, present_v)
     }
@@ -1202,6 +1214,7 @@ mod tests {
                 head_dim: 4,
                 rotary,
                 rms_epsilon: epsilon,
+                zero_centered_norm: false,
                 embedding,
                 lm_head,
                 layers: std::slice::from_ref(&layer),
@@ -1293,6 +1306,7 @@ mod tests {
             4,
             rope_theta,
             epsilon,
+            false,
         );
         let prompt_model = encode(2, 0);
         assert_eq!(prompt_model, encode(2, 0));
@@ -1324,6 +1338,7 @@ mod tests {
             4,
             rope_theta,
             epsilon,
+            false,
         );
         let untied_model = encode_result(
             2,
@@ -1378,6 +1393,7 @@ mod tests {
             4,
             rope_theta,
             epsilon,
+            true,
         );
         let partial_rope_layer = crate::CausalLmDecoderLayer {
             query_norm: Some(&partial_query_norm),
@@ -1390,6 +1406,7 @@ mod tests {
             n_head: 2,
             n_kv_head: 1,
             head_dim: 8,
+            zero_centered_norm: true,
             rotary: Some(crate::RotaryEmbedding {
                 theta: rope_theta,
                 dimensions: 4,
@@ -1402,6 +1419,8 @@ mod tests {
             identity,
         })
         .unwrap();
+        let partial_diagnostics = crate::diagnose_unsupported_graph(&partial_rope_model).unwrap();
+        assert!(partial_diagnostics.is_empty(), "{partial_diagnostics:#?}");
         let mut partial_rope_session = ort::session::Session::builder()
             .unwrap()
             .with_operators(tritium_operator_domain().unwrap())
@@ -1447,6 +1466,7 @@ mod tests {
             4,
             rope_theta,
             epsilon,
+            false,
         );
         let attention_gate_model = encode_result(
             2,
@@ -1535,6 +1555,7 @@ mod tests {
             4,
             rope_theta,
             epsilon,
+            false,
         );
         let mut bitnet_session = ort::session::Session::builder()
             .unwrap()
@@ -1574,6 +1595,7 @@ mod tests {
                 dimensions: 4,
             }),
             rms_epsilon: epsilon,
+            zero_centered_norm: false,
             embedding,
             lm_head: None,
             layers: std::slice::from_ref(&layer),
@@ -1630,6 +1652,7 @@ mod tests {
                 dimensions: 4,
             }),
             rms_epsilon: epsilon,
+            zero_centered_norm: false,
             embedding,
             lm_head: None,
             layers: std::slice::from_ref(&layer),
@@ -1650,6 +1673,7 @@ mod tests {
                     dimensions: 4,
                 }),
                 rms_epsilon: epsilon,
+                zero_centered_norm: false,
                 embedding,
                 lm_head: None,
                 layers: std::slice::from_ref(&layer),
@@ -1735,6 +1759,7 @@ mod tests {
             4,
             rope_theta,
             epsilon,
+            false,
         );
         let decode_model = encode(1, 2);
         let diagnostics = crate::diagnose_unsupported_graph(&decode_model).unwrap();

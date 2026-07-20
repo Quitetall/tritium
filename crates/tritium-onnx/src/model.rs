@@ -179,6 +179,10 @@ pub struct CausalLmModel<'a> {
     pub rotary: Option<RotaryEmbedding>,
     /// Positive finite RMSNorm epsilon.
     pub rms_epsilon: f32,
+    /// Interpret every preserved RMSNorm parameter as a zero-centered offset.
+    ///
+    /// When true, the effective scale is `1 + weight`, matching Qwen3.5.
+    pub zero_centered_norm: bool,
     /// Tied token embedding and language-model head table.
     pub embedding: PackedTernaryMatrix<'a>,
     /// Optional untied language-model head; `None` reuses [`Self::embedding`].
@@ -283,6 +287,7 @@ impl<'a> MappedSmolLm2<'a> {
                 dimensions: self.config.head_dim,
             }),
             rms_epsilon: self.config.rms_epsilon,
+            zero_centered_norm: false,
             embedding: self.embedding,
             lm_head: None,
             layers: &self.layers,
@@ -574,6 +579,7 @@ impl<'a> MappedBitNet<'a> {
                 dimensions: self.config.head_dim,
             }),
             rms_epsilon: self.config.rms_epsilon,
+            zero_centered_norm: false,
             embedding: self.embedding,
             lm_head: None,
             layers: &self.layers,
@@ -1159,6 +1165,7 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".scales")
                 || name.ends_with(".weight")
                 || name.ends_with(".epsilon")
+                || name.ends_with(".unit")
                 || name.ends_with(".attention_scale")
                 || name.ends_with(".attention_mask")
                 || name.ends_with(".cos")
@@ -2714,7 +2721,15 @@ impl CausalGraphBuilder {
         Ok(())
     }
 
-    fn rms_norm(&mut self, prefix: &str, input: &str, output: &str, weight: &[f32], epsilon: f32) {
+    fn rms_norm_with_semantics(
+        &mut self,
+        prefix: &str,
+        input: &str,
+        output: &str,
+        weight: &[f32],
+        epsilon: f32,
+        zero_centered: bool,
+    ) {
         let squared = format!("{prefix}.squared");
         let mean = format!("{prefix}.mean");
         let stabilized = format!("{prefix}.stabilized");
@@ -2730,6 +2745,21 @@ impl CausalGraphBuilder {
             vec![i64::try_from(weight.len()).expect("validated norm width")],
             weight,
         );
+        let effective_weight = if zero_centered {
+            let unit_name = format!("{prefix}.unit");
+            let effective_name = format!("{prefix}.effective_weight");
+            self.add_f32(&unit_name, Vec::new(), &[1.0]);
+            self.standard(
+                format!("{prefix}.zero_centered_scale"),
+                "Add",
+                &[&weight_name, &unit_name],
+                &[&effective_name],
+                Vec::new(),
+            );
+            effective_name
+        } else {
+            weight_name
+        };
         self.standard(
             format!("{prefix}.square"),
             "Mul",
@@ -2768,7 +2798,7 @@ impl CausalGraphBuilder {
         self.standard(
             format!("{prefix}.scale"),
             "Mul",
-            &[&normalized, &weight_name],
+            &[&normalized, &effective_weight],
             &[output],
             Vec::new(),
         );
@@ -3095,14 +3125,16 @@ impl CausalGraphBuilder {
         output: &str,
         layer: CausalLmDecoderLayer<'_>,
         epsilon: f32,
+        zero_centered_norm: bool,
     ) -> Result<(), OnnxModelError> {
         let ffn_input = format!("{prefix}.ffn_input");
-        self.rms_norm(
+        self.rms_norm_with_semantics(
             &format!("{prefix}.ffn_norm"),
             input,
             &ffn_input,
             layer.ffn_norm,
             epsilon,
+            zero_centered_norm,
         );
         let gate = format!("{prefix}.gate");
         let up = format!("{prefix}.up");
@@ -3168,12 +3200,13 @@ impl CausalGraphBuilder {
         let mut down_input = gated;
         if let Some(weight) = layer.ffn_sub_norm {
             let normalized = format!("{prefix}.ffn_sub_norm.output");
-            self.rms_norm(
+            self.rms_norm_with_semantics(
                 &format!("{prefix}.ffn_sub_norm"),
                 &down_input,
                 &normalized,
                 weight,
                 epsilon,
+                zero_centered_norm,
             );
             down_input = normalized;
         }
@@ -3276,12 +3309,13 @@ fn build_causal_lm_graph(
     for (index, layer) in model.layers.iter().copied().enumerate() {
         let prefix = format!("layer.{index}");
         let attention_input = format!("{prefix}.attention_input");
-        graph.rms_norm(
+        graph.rms_norm_with_semantics(
             &format!("{prefix}.attention_norm"),
             &hidden_name,
             &attention_input,
             layer.attention_norm,
             model.rms_epsilon,
+            model.zero_centered_norm,
         );
         let query_flat = format!("{prefix}.query_flat");
         let current_k_flat = format!("{prefix}.current_k_flat");
@@ -3352,24 +3386,26 @@ fn build_causal_lm_graph(
         let mut query_ready = query_tokens;
         if let Some(weight) = layer.query_norm {
             let normalized = format!("{prefix}.query_norm.output");
-            graph.rms_norm(
+            graph.rms_norm_with_semantics(
                 &format!("{prefix}.query_norm"),
                 &query_ready,
                 &normalized,
                 weight,
                 model.rms_epsilon,
+                model.zero_centered_norm,
             );
             query_ready = normalized;
         }
         let mut key_ready = current_k;
         if let Some(weight) = layer.key_norm {
             let normalized = format!("{prefix}.key_norm.output");
-            graph.rms_norm(
+            graph.rms_norm_with_semantics(
                 &format!("{prefix}.key_norm"),
                 &key_ready,
                 &normalized,
                 weight,
                 model.rms_epsilon,
+                model.zero_centered_norm,
             );
             key_ready = normalized;
         }
@@ -3505,12 +3541,13 @@ fn build_causal_lm_graph(
         }
         if let Some(weight) = layer.attention_sub_norm {
             let normalized = format!("{prefix}.attention_sub_norm.output");
-            graph.rms_norm(
+            graph.rms_norm_with_semantics(
                 &format!("{prefix}.attention_sub_norm"),
                 &output_input,
                 &normalized,
                 weight,
                 model.rms_epsilon,
+                model.zero_centered_norm,
             );
             output_input = normalized;
         }
@@ -3537,16 +3574,18 @@ fn build_causal_lm_graph(
             &layer_output,
             layer,
             model.rms_epsilon,
+            model.zero_centered_norm,
         )?;
         hidden_name = layer_output;
     }
     let final_hidden = "final_norm.output";
-    graph.rms_norm(
+    graph.rms_norm_with_semantics(
         "final_norm",
         &hidden_name,
         final_hidden,
         model.final_norm,
         model.rms_epsilon,
+        model.zero_centered_norm,
     );
     let (head_packed, head_scales, head_format) = if let Some(head) = model.lm_head {
         graph.add_matrix("lm_head", head);
@@ -3592,6 +3631,14 @@ fn build_causal_lm_graph(
         metadata("tritium.n_head", &model.n_head.to_string()),
         metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
         metadata("tritium.head_dim", &model.head_dim.to_string()),
+        metadata(
+            "tritium.rms_norm_weight_semantics",
+            if model.zero_centered_norm {
+                "zero-centered-offset"
+            } else {
+                "scale"
+            },
+        ),
         metadata(
             "tritium.tied_embedding_head",
             if model.lm_head.is_none() {
@@ -5206,6 +5253,7 @@ mod tests {
             head_dim: 1,
             rotary: None,
             rms_epsilon: 1.0e-5,
+            zero_centered_norm: false,
             embedding: empty_matrix,
             lm_head: None,
             final_norm: &[],
