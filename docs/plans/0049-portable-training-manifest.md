@@ -139,9 +139,10 @@ This closes Slice 2 corpus coverage and the CPU semantic matrix; accelerator and
 constrained-target receipts remain required for release closure.
 
 CUDA adapter work has started against the same seam. Current actual-RTX-4090
-evidence covers 45 canonical cases across 16/35 operations: dense matmul,
-transpose, embedding, column slice/concat, detach, scale, bias, add, multiply,
-ReLU2, SiLU, RMSNorm, softmax, causal mask, and RoPE. Bias and ReLU2 use dedicated
+evidence covers 48 canonical cases across 17/35 operations: dense and
+scale-bearing ternary matmul, transpose, embedding, column slice/concat, detach,
+scale, bias, add, multiply, ReLU2, SiLU, RMSNorm, softmax, causal mask, and RoPE.
+Bias and ReLU2 use dedicated
 resident kernels; training RoPE positions are unsigned end-to-end, matching the
 frozen `u32` contract rather than narrowing to signed indices. Each success
 emits a physical-device-bound receipt; the adapter advertises only this proved
