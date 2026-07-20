@@ -18,11 +18,12 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 41);
+    assert_eq!(report.passed.len(), 44);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
             "graph.transpose",
+            "graph.slice_cols",
             "graph.detach",
             "graph.scale_const",
             "graph.bias",

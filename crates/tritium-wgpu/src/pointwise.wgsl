@@ -3,6 +3,10 @@ struct Params {
     operation: u32,
     scalar: f32,
     auxiliary: u32,
+    secondary: u32,
+    tertiary: u32,
+    padding_0: u32,
+    padding_1: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -174,6 +178,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 23u: {
             let rows = params.len / params.auxiliary;
             result[index] = left[(index % params.auxiliary) * rows + index / params.auxiliary];
+        }
+        case 24u: {
+            let sliced_columns = params.tertiary;
+            let row = index / sliced_columns;
+            let column = index % sliced_columns;
+            result[index] = left[row * params.auxiliary + params.secondary + column];
+        }
+        case 25u: {
+            let row = index / params.auxiliary;
+            let column = index % params.auxiliary;
+            if (column >= params.secondary && column < params.secondary + params.tertiary) {
+                result[index] = left[row * params.tertiary + column - params.secondary];
+            } else {
+                result[index] = 0.0;
+            }
         }
         default: { result[index] = 0.0; }
     }

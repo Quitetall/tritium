@@ -11,6 +11,7 @@ use crate::WgpuBackend;
 
 const OPERATIONS: &[&str] = &[
     "graph.transpose",
+    "graph.slice_cols",
     "graph.detach",
     "graph.scale_const",
     "graph.bias",
@@ -572,6 +573,86 @@ impl WgpuTrainBackendV1 {
         output_f32(output, output_name, &output_shape, input.len())?.copy_from_slice(&result);
         Ok(())
     }
+
+    fn execute_slice_cols(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, output_name) = match request.execution {
+            TrainExecutionV1::Forward => ("x", "result"),
+            TrainExecutionV1::Vjp => ("grad_output", "grad_x"),
+            _ => return Err(invariant("column slice received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols", "start", "len"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        let start = attribute_u64(request, "start")?;
+        let len = attribute_u64(request, "len")?;
+        if start.checked_add(len).is_none_or(|end| end > cols) {
+            return Err(attribute_value("start", "slice_bounds"));
+        }
+        if rows > u32::MAX as u64
+            || cols > u32::MAX as u64
+            || start > u32::MAX as u64
+            || len > u32::MAX as u64
+        {
+            return Err(shape_error());
+        }
+        let input_shape = if request.execution == TrainExecutionV1::Forward {
+            [rows, cols]
+        } else {
+            [rows, len]
+        };
+        let output_shape = if request.execution == TrainExecutionV1::Forward {
+            [rows, len]
+        } else {
+            [rows, cols]
+        };
+        let (actual_shape, input) = input_f32(request, input_name)?;
+        if actual_shape != input_shape {
+            return Err(shape_error());
+        }
+        require_finite(input_name, input)?;
+        let output_len =
+            usize::try_from(rows.checked_mul(output_shape[1]).ok_or_else(shape_error)?)
+                .map_err(|_| shape_error())?;
+        let operation = if request.execution == TrainExecutionV1::Forward {
+            24
+        } else {
+            25
+        };
+        let result = self
+            .backend
+            .pointwise_sized(
+                input,
+                input,
+                input,
+                operation,
+                0.0,
+                cols as u32,
+                start as u32,
+                len as u32,
+                output_len,
+            )
+            .map_err(wgpu_error)?;
+        output_f32(output, output_name, &output_shape, output_len)?.copy_from_slice(&result);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -619,6 +700,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.transpose" {
             self.execute_transpose(&request, output)?;
+            0
+        } else if request.operation == "graph.slice_cols" {
+            self.execute_slice_cols(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;

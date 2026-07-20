@@ -36,6 +36,10 @@ struct PointwiseParams {
     operation: u32,
     scalar: f32,
     auxiliary: u32,
+    secondary: u32,
+    tertiary: u32,
+    padding_0: u32,
+    padding_1: u32,
 }
 
 // std140 uniform structs round up to a 16-byte multiple; pin both the size AND
@@ -264,21 +268,55 @@ impl WgpuBackend {
         scalar: f32,
         auxiliary: u32,
     ) -> Result<Vec<f32>, BackendError> {
-        if left.len() > u32::MAX as usize || right.is_empty() || extra.is_empty() {
-            return Err(BackendError::InvalidInput(
-                "pointwise buffers exceed u32 or contain an empty read binding".into(),
-            ));
-        }
-        if left.is_empty() {
-            return Ok(Vec::new());
-        }
-        let params = PointwiseParams {
-            len: left.len() as u32,
+        self.pointwise_sized(
+            left,
+            right,
+            extra,
             operation,
             scalar,
             auxiliary,
+            0,
+            0,
+            left.len(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pointwise_sized(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        extra: &[f32],
+        operation: u32,
+        scalar: f32,
+        auxiliary: u32,
+        secondary: u32,
+        tertiary: u32,
+        output_len: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        if output_len > u32::MAX as usize {
+            return Err(BackendError::InvalidInput(
+                "pointwise output exceeds u32".into(),
+            ));
+        }
+        if output_len == 0 {
+            return Ok(Vec::new());
+        }
+        let params = PointwiseParams {
+            len: output_len as u32,
+            operation,
+            scalar,
+            auxiliary,
+            secondary,
+            tertiary,
+            padding_0: 0,
+            padding_1: 0,
         };
         let usage = wgpu::BufferUsages::STORAGE;
+        let dummy = [0.0_f32];
+        let left_binding = if left.is_empty() { &dummy } else { left };
+        let right_binding = if right.is_empty() { &dummy } else { right };
+        let extra_binding = if extra.is_empty() { &dummy } else { extra };
         let params_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -290,24 +328,24 @@ impl WgpuBackend {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("portable-pointwise-left"),
-                contents: bytemuck::cast_slice(left),
+                contents: bytemuck::cast_slice(left_binding),
                 usage,
             });
         let right_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("portable-pointwise-right"),
-                contents: bytemuck::cast_slice(right),
+                contents: bytemuck::cast_slice(right_binding),
                 usage,
             });
         let extra_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("portable-pointwise-extra"),
-                contents: bytemuck::cast_slice(extra),
+                contents: bytemuck::cast_slice(extra_binding),
                 usage,
             });
-        let bytes = core::mem::size_of_val(left) as u64;
+        let bytes = (output_len * core::mem::size_of::<f32>()) as u64;
         let result_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("portable-pointwise-result"),
             size: bytes,
@@ -359,7 +397,7 @@ impl WgpuBackend {
             });
             pass.set_pipeline(&self.pointwise_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((left.len() as u32).div_ceil(WG_SIZE), 1, 1);
+            pass.dispatch_workgroups((output_len as u32).div_ceil(WG_SIZE), 1, 1);
         }
         encoder.copy_buffer_to_buffer(&result_buf, 0, &staging, 0, bytes);
         self.queue.submit(Some(encoder.finish()));
@@ -377,7 +415,7 @@ impl WgpuBackend {
         rx.recv()
             .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
             .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
-        let mut result = vec![0.0_f32; left.len()];
+        let mut result = vec![0.0_f32; output_len];
         {
             let data = slice.get_mapped_range();
             result.copy_from_slice(bytemuck::cast_slice(&data));
