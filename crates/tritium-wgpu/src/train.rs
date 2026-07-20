@@ -11,6 +11,7 @@ use crate::WgpuBackend;
 
 const OPERATIONS: &[&str] = &[
     "graph.dense_matmul",
+    "graph.ternary_matmul",
     "graph.transpose",
     "graph.slice_cols",
     "graph.detach",
@@ -751,6 +752,129 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_ternary_matmul(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) = match request.execution {
+            TrainExecutionV1::Forward => (&["activation", "weight", "scale"], &["result"]),
+            TrainExecutionV1::Vjp => (
+                &["activation", "weight", "scale", "grad_output"],
+                &["grad_activation", "grad_weight", "grad_scale"],
+            ),
+            _ => return Err(invariant("ternary matmul received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["m", "n", "k"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let m = attribute_u64(request, "m")?;
+        let n = attribute_u64(request, "n")?;
+        let k = attribute_u64(request, "k")?;
+        if m > u32::MAX as u64 || n > u32::MAX as u64 || k > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let activation_shape = [m, k];
+        let weight_shape = [n, k];
+        let scale_shape = [n];
+        let result_shape = [m, n];
+        let (actual_activation_shape, activation) = input_f32(request, "activation")?;
+        let (actual_weight_shape, weight) = input_f32(request, "weight")?;
+        let (actual_scale_shape, scale) = input_f32(request, "scale")?;
+        if actual_activation_shape != activation_shape
+            || actual_weight_shape != weight_shape
+            || actual_scale_shape != scale_shape
+        {
+            return Err(shape_error());
+        }
+        require_finite("activation", activation)?;
+        require_finite("weight", weight)?;
+        require_finite("scale", scale)?;
+        let result_len = usize::try_from(m.checked_mul(n).ok_or_else(shape_error)?)
+            .map_err(|_| shape_error())?;
+        if request.execution == TrainExecutionV1::Forward {
+            let result = self
+                .backend
+                .pointwise_sized(
+                    activation, weight, scale, 29, 0.0, m as u32, n as u32, k as u32, result_len,
+                )
+                .map_err(wgpu_error)?;
+            output_f32(output, "result", &result_shape, result_len)?.copy_from_slice(&result);
+        } else {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != result_shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            let grad_activation = self
+                .backend
+                .pointwise_sized(
+                    gradient,
+                    weight,
+                    scale,
+                    30,
+                    0.0,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    activation.len(),
+                )
+                .map_err(wgpu_error)?;
+            let grad_weight = self
+                .backend
+                .pointwise_sized(
+                    gradient,
+                    activation,
+                    scale,
+                    31,
+                    0.0,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    weight.len(),
+                )
+                .map_err(wgpu_error)?;
+            let grad_scale = self
+                .backend
+                .pointwise_sized(
+                    gradient,
+                    activation,
+                    weight,
+                    32,
+                    0.0,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    scale.len(),
+                )
+                .map_err(wgpu_error)?;
+            output_f32(
+                output,
+                "grad_activation",
+                &activation_shape,
+                activation.len(),
+            )?
+            .copy_from_slice(&grad_activation);
+            output_f32(output, "grad_weight", &weight_shape, weight.len())?
+                .copy_from_slice(&grad_weight);
+            output_f32(output, "grad_scale", &scale_shape, scale.len())?
+                .copy_from_slice(&grad_scale);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -804,6 +928,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.dense_matmul" {
             self.execute_dense_matmul(&request, output)?;
+            0
+        } else if request.operation == "graph.ternary_matmul" {
+            self.execute_ternary_matmul(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
