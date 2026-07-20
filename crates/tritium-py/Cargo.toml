@@ -24,6 +24,9 @@ tritium-runtime = { workspace = true }
 tritium-spec = { workspace = true }
 # Linked so the CPU backend self-registers into the runtime registry.
 tritium-cpu = { workspace = true }
+# Optional resident SALT V2 path for CUDA wheels. CPU-only abi3 wheels retain
+# the lean default and fail closed on device="cuda".
+tritium-cuda = { workspace = true, optional = true }
 # Used by the low-level `ternary_matmul` helper to express problem geometry.
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
@@ -38,6 +41,10 @@ pyo3 = { workspace = true, features = ["extension-module", "abi3-py39"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
+
+[features]
+default = []
+cuda = ["dep:tritium-cuda", "tritium-cuda/cuda", "tritium-nn/cuda"]
 
 [lints]
 workspace = true

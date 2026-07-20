@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use tritium_nn::{Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt};
+use tritium_spec::TernaryBackend;
 
 /// Immutable identities, coverage, and physical ledgers for a packed Qwen load.
 #[pyclass(module = "tritium", frozen, skip_from_py_object)]
@@ -29,6 +30,7 @@ pub(crate) struct QwenLoadReceipt {
     manifest_bytes: u64,
     hf_asset_bytes: u64,
     loaded_bundle_bytes: u64,
+    device_resident_salt: bool,
     salt_resident_bytes: u64,
     preserved_fp32_bytes: u64,
     resident_bytes: u64,
@@ -56,6 +58,7 @@ impl From<&Qwen35SaltV2LoadReceipt> for QwenLoadReceipt {
             manifest_bytes: receipt.manifest_bytes(),
             hf_asset_bytes: receipt.hf_asset_bytes(),
             loaded_bundle_bytes: receipt.loaded_bundle_bytes(),
+            device_resident_salt: receipt.device_resident_salt(),
             salt_resident_bytes: receipt.salt_resident_bytes(),
             preserved_fp32_bytes: receipt.preserved_fp32_bytes(),
             resident_bytes: receipt.resident_bytes(),
@@ -160,6 +163,11 @@ impl QwenLoadReceipt {
     }
 
     #[getter]
+    fn device_resident_salt(&self) -> bool {
+        self.device_resident_salt
+    }
+
+    #[getter]
     fn salt_resident_bytes(&self) -> u64 {
         self.salt_resident_bytes
     }
@@ -203,16 +211,13 @@ impl QwenModel {
     #[staticmethod]
     #[pyo3(signature = (bundle_dir, profile = "compact-v1", device = "cpu"))]
     fn load(py: Python<'_>, bundle_dir: &str, profile: &str, device: &str) -> PyResult<Self> {
-        if device != "cpu" {
-            return Err(PyValueError::new_err(format!(
-                "Qwen SALT V2 runtime currently supports device='cpu', got {device:?}"
-            )));
-        }
+        let (device_kind, device) = parse_device(device)?;
         let bundle_dir = bundle_dir.to_owned();
         let profile = profile.to_owned();
         let selected_profile = profile.clone();
+        let selected_device = device.clone();
         let model = py.detach(move || {
-            let backend = crate::cpu_backend()?;
+            let backend = qwen_backend(device_kind)?;
             Qwen35SaltV2LanguageMtpModel::load_bundle_profile(
                 Path::new(&bundle_dir),
                 &profile,
@@ -224,7 +229,7 @@ impl QwenModel {
             .map(|model| Self {
                 model: Mutex::new(model),
                 profile: selected_profile,
-                device: device.to_owned(),
+                device: selected_device,
             })
             .map_err(PyRuntimeError::new_err)
     }
@@ -347,6 +352,47 @@ impl QwenModel {
     }
 }
 
+#[derive(Clone, Copy)]
+enum QwenDevice {
+    Cpu,
+    #[cfg(feature = "cuda")]
+    Cuda(usize),
+}
+
+fn parse_device(device: &str) -> PyResult<(QwenDevice, String)> {
+    if device == "cpu" {
+        return Ok((QwenDevice::Cpu, "cpu".to_owned()));
+    }
+    if device == "cuda" {
+        #[cfg(feature = "cuda")]
+        return Ok((QwenDevice::Cuda(0), "cuda:0".to_owned()));
+    }
+    #[cfg(feature = "cuda")]
+    if let Some(ordinal) = device.strip_prefix("cuda:") {
+        let ordinal = ordinal.parse::<usize>().map_err(|_| {
+            PyValueError::new_err("CUDA device must be `cuda` or `cuda:<ordinal>`")
+        })?;
+        return Ok((QwenDevice::Cuda(ordinal), format!("cuda:{ordinal}")));
+    }
+    #[cfg(feature = "cuda")]
+    let expected = "'cpu', 'cuda', or 'cuda:<ordinal>'";
+    #[cfg(not(feature = "cuda"))]
+    let expected = "'cpu' (this wheel was built without CUDA)";
+    Err(PyValueError::new_err(format!(
+        "Qwen SALT V2 device must be {expected}, got {device:?}"
+    )))
+}
+
+fn qwen_backend(device: QwenDevice) -> Result<Box<dyn TernaryBackend>, String> {
+    match device {
+        QwenDevice::Cpu => crate::cpu_backend(),
+        #[cfg(feature = "cuda")]
+        QwenDevice::Cuda(ordinal) => tritium_cuda::CudaBackend::new(ordinal)
+            .map(|backend| Box::new(backend) as Box<dyn TernaryBackend>)
+            .map_err(|error| error.to_string()),
+    }
+}
+
 fn greedy_token(logits: &[f32]) -> Result<u32, String> {
     let (&first, remaining) = logits
         .split_first()
@@ -370,12 +416,26 @@ fn greedy_token(logits: &[f32]) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::greedy_token;
+    use super::{greedy_token, parse_device};
 
     #[test]
     fn greedy_token_uses_first_maximum_and_rejects_nonfinite_logits() {
         assert_eq!(greedy_token(&[-2.0, 3.0, 3.0, 1.0]).unwrap(), 1);
         assert!(greedy_token(&[]).is_err());
         assert!(greedy_token(&[0.0, f32::NAN]).is_err());
+    }
+
+    #[test]
+    fn device_parser_is_explicit_about_compiled_cuda_support() {
+        assert_eq!(parse_device("cpu").unwrap().1, "cpu");
+        #[cfg(feature = "cuda")]
+        {
+            assert_eq!(parse_device("cuda").unwrap().1, "cuda:0");
+            assert_eq!(parse_device("cuda:3").unwrap().1, "cuda:3");
+        }
+        #[cfg(not(feature = "cuda"))]
+        assert!(parse_device("cuda").is_err());
+        assert!(parse_device("cuda:not-an-ordinal").is_err());
+        assert!(parse_device("metal").is_err());
     }
 }

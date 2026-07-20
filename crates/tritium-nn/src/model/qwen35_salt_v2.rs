@@ -6,6 +6,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
+#[cfg(not(feature = "cuda"))]
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -122,6 +124,7 @@ pub struct Qwen35SaltV2LoadReceipt {
     manifest_bytes: u64,
     hf_asset_bytes: u64,
     loaded_bundle_bytes: u64,
+    device_resident_salt: bool,
     salt_resident_bytes: u64,
     preserved_fp32_bytes: u64,
     resident_bytes: u64,
@@ -225,6 +228,12 @@ impl Qwen35SaltV2LoadReceipt {
     #[must_use]
     pub const fn loaded_bundle_bytes(&self) -> u64 {
         self.loaded_bundle_bytes
+    }
+
+    /// Whether every SALT matrix was streamed into final device allocations.
+    #[must_use]
+    pub const fn device_resident_salt(&self) -> bool {
+        self.device_resident_salt
     }
 
     /// Descriptor-free SALT payload, scale, map, and rank-prefix bytes.
@@ -358,10 +367,7 @@ impl Qwen35SaltV2LanguageMtpModel {
                 "preserved tensor count differs from bundle manifest".into(),
             ));
         }
-        let source = SaltV2QwenSource {
-            package: RefCell::new(package),
-            preserved: RefCell::new(preserved),
-        };
+        let source = SaltV2QwenSource::for_backend(package, preserved, backend.as_ref());
         let schema = combined_schema(&config)?;
         let (matrix_tensors, preserved_tensors, preserved_fp32_bytes) =
             validate_coverage(&source, &schema)?;
@@ -370,11 +376,13 @@ impl Qwen35SaltV2LanguageMtpModel {
 
         let language = load_language_weights(&source, &config.text)?;
         let mtp_weights = load_mtp_weights(&source, &config.text)?;
+        let device_resident_salt = source.device_resident_salt();
         source
             .package
             .borrow_mut()
             .verify_unchanged()
             .map_err(|error| NnError::Provenance(format!("SALT V2 profile changed: {error}")))?;
+        drop(source);
         let runner = Qwen35TextRunner::new(&config.text, language, backend)?;
         let mtp = UnverifiedQwen35Mtp::new(&runner, mtp_weights)?;
         let salt_resident_bytes = runtime_ledger.steady_resident_bytes();
@@ -415,6 +423,7 @@ impl Qwen35SaltV2LanguageMtpModel {
                 manifest_bytes,
                 hf_asset_bytes,
                 loaded_bundle_bytes,
+                device_resident_salt,
                 salt_resident_bytes,
                 preserved_fp32_bytes,
                 resident_bytes,
@@ -443,12 +452,65 @@ impl Qwen35SaltV2LanguageMtpModel {
     }
 }
 
-struct SaltV2QwenSource {
+struct SaltV2QwenSource<'backend> {
     package: RefCell<SaltV2PackageReader<File>>,
     preserved: RefCell<SafeTensorsReader<Cursor<Box<[u8]>>>>,
+    #[cfg(feature = "cuda")]
+    cuda: Option<&'backend tritium_cuda::CudaBackend>,
+    #[cfg(not(feature = "cuda"))]
+    _backend: PhantomData<&'backend dyn TernaryBackend>,
 }
 
-impl Qwen35HfTensorSource for SaltV2QwenSource {
+impl<'backend> SaltV2QwenSource<'backend> {
+    fn for_backend(
+        package: SaltV2PackageReader<File>,
+        preserved: SafeTensorsReader<Cursor<Box<[u8]>>>,
+        backend: &'backend dyn TernaryBackend,
+    ) -> Self {
+        #[cfg(feature = "cuda")]
+        let cuda = backend
+            .as_concrete()
+            .and_then(|concrete| concrete.downcast_ref::<tritium_cuda::CudaBackend>());
+        #[cfg(not(feature = "cuda"))]
+        let _ = backend;
+        Self {
+            package: RefCell::new(package),
+            preserved: RefCell::new(preserved),
+            #[cfg(feature = "cuda")]
+            cuda,
+            #[cfg(not(feature = "cuda"))]
+            _backend: PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    fn host(
+        package: SaltV2PackageReader<File>,
+        preserved: SafeTensorsReader<Cursor<Box<[u8]>>>,
+    ) -> SaltV2QwenSource<'static> {
+        SaltV2QwenSource {
+            package: RefCell::new(package),
+            preserved: RefCell::new(preserved),
+            #[cfg(feature = "cuda")]
+            cuda: None,
+            #[cfg(not(feature = "cuda"))]
+            _backend: PhantomData,
+        }
+    }
+
+    fn device_resident_salt(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda.is_some()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+}
+
+impl Qwen35HfTensorSource for SaltV2QwenSource<'_> {
     fn tensor_f32_exact(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, NnError> {
         let mut preserved = self
             .preserved
@@ -483,6 +545,11 @@ impl Qwen35HfTensorSource for SaltV2QwenSource {
             .package
             .try_borrow_mut()
             .map_err(|_| NnError::Backend("reentrant SALT V2 matrix read".into()))?;
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = self.cuda {
+            let matrix = upload_cuda_matrix(&mut package, cuda, name, rows, columns)?;
+            return Ok(Projection::SaltV2(matrix));
+        }
         let matrix = HostSaltV2Linear::from_reader(&mut package, name)?;
         require_matrix_geometry(name, &matrix, rows, columns)?;
         Ok(Projection::HostSaltV2(Arc::new(matrix)))
@@ -498,10 +565,46 @@ impl Qwen35HfTensorSource for SaltV2QwenSource {
             .package
             .try_borrow_mut()
             .map_err(|_| NnError::Backend("reentrant SALT V2 token-table read".into()))?;
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = self.cuda {
+            let matrix = upload_cuda_matrix(&mut package, cuda, name, rows, columns)?;
+            return TokenEmbedding::from_salt_v2_resident(matrix);
+        }
         let matrix = Arc::new(HostSaltV2Linear::from_reader(&mut package, name)?);
         require_matrix_geometry(name, &matrix, rows, columns)?;
         TokenEmbedding::from_host_salt_v2(matrix)
     }
+}
+
+#[cfg(feature = "cuda")]
+fn upload_cuda_matrix(
+    package: &mut SaltV2PackageReader<File>,
+    cuda: &tritium_cuda::CudaBackend,
+    name: &str,
+    rows: usize,
+    columns: usize,
+) -> Result<Arc<tritium_cuda::SaltV2ResidentTensor>, NnError> {
+    let info = package
+        .tensor_info(name)
+        .cloned()
+        .ok_or_else(|| NnError::MissingTensor(name.to_owned()))?;
+    if info.transform() != SaltV2Transform::None || info.dims() != [rows as u64, columns as u64] {
+        return Err(NnError::InvalidArtifact(format!(
+            "SALT V2 matrix `{name}` geometry or transform differs from the Qwen schema"
+        )));
+    }
+    let codec = package.codec();
+    let planned = info.runtime_ledger();
+    let resident = cuda
+        .upload_salt_v2_from_reader(package, name)
+        .map_err(|error| NnError::Backend(format!("upload SALT V2 matrix `{name}`: {error}")))?;
+    let measured = resident.allocation_receipt();
+    if measured.codec() != codec || measured.runtime_ledger() != planned {
+        return Err(NnError::Backend(format!(
+            "resident SALT V2 receipt for `{name}` differs from the package ledger"
+        )));
+    }
+    Ok(Arc::new(resident))
 }
 
 fn require_matrix_geometry(
@@ -535,7 +638,7 @@ fn combined_schema(
 }
 
 fn validate_coverage(
-    source: &SaltV2QwenSource,
+    source: &SaltV2QwenSource<'_>,
     schema: &BTreeMap<String, TensorSpec>,
 ) -> Result<(usize, usize, u64), NnError> {
     let package = source.package.borrow();
@@ -846,7 +949,7 @@ mod tests {
             Self { directory }
         }
 
-        fn source(&self) -> SaltV2QwenSource {
+        fn source(&self) -> SaltV2QwenSource<'static> {
             let plane = SaltV2Plane::new(vec![1, 0, -1, 1], vec![f16::from_f32(0.5)]).unwrap();
             let tensor = SaltV2Tensor::new(
                 "matrix",
@@ -860,17 +963,13 @@ mod tests {
             fs::write(&package_path, encoded.bytes).unwrap();
             let preserved_path = self.directory.join("preserved.safetensors");
             fs::write(&preserved_path, safetensors()).unwrap();
-            SaltV2QwenSource {
-                package: RefCell::new(
-                    SaltV2PackageReader::new_strict(File::open(package_path).unwrap()).unwrap(),
-                ),
-                preserved: RefCell::new(
-                    SafeTensorsReader::new(Cursor::new(
-                        fs::read(preserved_path).unwrap().into_boxed_slice(),
-                    ))
-                    .unwrap(),
-                ),
-            }
+            SaltV2QwenSource::host(
+                SaltV2PackageReader::new_strict(File::open(package_path).unwrap()).unwrap(),
+                SafeTensorsReader::new(Cursor::new(
+                    fs::read(preserved_path).unwrap().into_boxed_slice(),
+                ))
+                .unwrap(),
+            )
         }
     }
 
@@ -1075,6 +1174,7 @@ mod tests {
         assert_eq!(receipt.manifest_bytes(), manifest_bytes.len() as u64);
         assert_eq!(receipt.hf_asset_bytes(), hf_asset_bytes);
         assert_eq!(receipt.salt_resident_bytes(), package_resident_bytes);
+        assert!(!receipt.device_resident_salt());
         assert!(receipt.preserved_fp32_bytes() > 0);
         assert_eq!(
             receipt.resident_bytes(),
@@ -1093,6 +1193,27 @@ mod tests {
         assert_eq!(output.last_logits(), &[0.0; 7]);
         assert_eq!(cache.len(), 2);
         assert!(!model.mtp().status().reason().is_empty());
+
+        #[cfg(feature = "cuda")]
+        {
+            let cuda = Box::new(tritium_cuda::CudaBackend::new(0).unwrap());
+            let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile_with_policy(
+                &files.directory,
+                "compact-v1",
+                cuda,
+                false,
+            )
+            .unwrap();
+            assert!(model.receipt().device_resident_salt());
+            assert_eq!(
+                model.receipt().salt_resident_bytes(),
+                package_resident_bytes
+            );
+            let mut cache = model.runner().new_cache(4).unwrap();
+            let output = model.runner().forward(&[1, 2], &mut cache).unwrap();
+            assert_eq!(output.last_logits(), &[0.0; 7]);
+            assert_eq!(cache.len(), 2);
+        }
     }
 
     #[test]
