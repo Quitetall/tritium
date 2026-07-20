@@ -79,6 +79,16 @@ slice-constant set are shared across every layer/Q/K application; extreme valid
 theta/position regression requires every serialized table value to remain finite.
 The causal mask is shared across layers, and aggregate initializer plus exact
 protobuf bounds reject oversized inline graphs before publication.
+Complete causal graphs now have an additive authenticated external-data API:
+64-byte-aligned packed/value ranges bind exact length and BLAKE3, strict
+verification rejects corrupt data/ranges before session creation, and real ORT
+executes file-backed prompt inference against the independent logits oracle.
+Verification requires model and weights BLAKE3 trust roots from the admitted
+package manifest; candidate files cannot nominate their own expected digests,
+so graph rewiring and internally rehashed payload mutations fail closed.
+Shape-driving `int64` constants remain inline because ORT shape inference needs
+their values while loading. Current writer first forms the bounded inline graph;
+a direct streaming writer is still required for multi-gigabyte models.
 Multi-layer large-model external-data packaging, architecture tensor-map
 adapters, sliding/local/partial RoPE variants, dynamic axes and end-user
 generation APIs remain open.

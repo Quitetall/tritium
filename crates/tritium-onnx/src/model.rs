@@ -257,6 +257,34 @@ pub struct VerifiedExternalOnnxModelV2 {
     pub identity: VerifiedOnnxArtifactIdentityV2,
 }
 
+/// Receipt from strict external causal-LM graph/data verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedExternalCausalLmModel {
+    /// BLAKE3 digest of canonical `model.onnx` bytes.
+    pub model_blake3: [u8; 32],
+    /// BLAKE3 digest of authenticated `weights.bin` bytes.
+    pub weights_blake3: [u8; 32],
+    /// Exact external-data byte count.
+    pub weights_bytes: usize,
+    /// Fixed query-token count.
+    pub tokens: usize,
+    /// Fixed prefix-cache token count.
+    pub past_tokens: usize,
+    /// Decoder-layer count.
+    pub layers: usize,
+    /// Complete bound artifact identity.
+    pub identity: VerifiedOnnxArtifactIdentityV2,
+}
+
+/// Exact causal-LM file identities copied from an independently trusted package manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedExternalCausalLmDigests {
+    /// Admitted `model.onnx` BLAKE3.
+    pub model_blake3: [u8; 32],
+    /// Admitted `weights.bin` BLAKE3.
+    pub weights_blake3: [u8; 32],
+}
+
 /// Category of one unsupported ONNX graph item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -924,6 +952,306 @@ pub fn encode_tied_embedding_head_v2(
 pub fn encode_causal_lm(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
     validate_causal_lm(&model)?;
     encode_causal_lm_graph(model)
+}
+
+/// Encode a causal LM with weight/value initializers in authenticated `weights.bin`.
+///
+/// Initializers retain packed ternary representation; no dense weight shadow is
+/// emitted. Shape-driving `int64` constants remain inline for ONNX shape
+/// inference. External ranges are 64-byte aligned and graph metadata binds
+/// exact byte length plus BLAKE3 digest.
+///
+/// # Errors
+/// [`OnnxModelError`] if model validation, range arithmetic, allocation, or
+/// protobuf bounds fail.
+pub fn encode_external_causal_lm(
+    model: CausalLmModel<'_>,
+) -> Result<ExternalOnnxModel, OnnxModelError> {
+    let inline = encode_causal_lm(model)?;
+    let mut protobuf = ModelProto::decode(inline.as_slice())
+        .map_err(|error| OnnxModelError::InvalidModel(error.to_string()))?;
+    let graph = protobuf
+        .graph
+        .as_mut()
+        .ok_or_else(|| OnnxModelError::InvalidModel("model has no graph".to_owned()))?;
+    let mut weights_bytes = Vec::new();
+    for initializer in &mut graph.initializer {
+        if initializer.data_type == TENSOR_INT64 {
+            continue;
+        }
+        let offset = align_up(weights_bytes.len(), EXTERNAL_ALIGNMENT)?;
+        weights_bytes.resize(offset, 0);
+        let raw_data = core::mem::take(&mut initializer.raw_data);
+        weights_bytes
+            .try_reserve_exact(raw_data.len())
+            .map_err(|_| OnnxModelError::ShapeOverflow("external weight allocation"))?;
+        weights_bytes.extend_from_slice(&raw_data);
+        initializer.external_data = vec![
+            metadata("location", EXTERNAL_WEIGHTS_FILE),
+            metadata("offset", &offset.to_string()),
+            metadata("length", &raw_data.len().to_string()),
+        ];
+        initializer.data_location = EXTERNAL_DATA;
+    }
+    let weights_blake3 = *blake3::hash(&weights_bytes).as_bytes();
+    let digest = blake3::Hash::from_bytes(weights_blake3)
+        .to_hex()
+        .to_string();
+    protobuf.metadata_props.extend([
+        metadata("tritium.external_data.file", EXTERNAL_WEIGHTS_FILE),
+        metadata(
+            "tritium.external_data.bytes",
+            &weights_bytes.len().to_string(),
+        ),
+        metadata("tritium.external_data.blake3", &digest),
+    ]);
+    let model_bytes = protobuf.encode_to_vec();
+    if model_bytes.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(ExternalOnnxModel {
+        model_bytes,
+        weights_bytes,
+        weights_blake3,
+    })
+}
+
+/// Verify an external causal-LM model before ONNX Runtime session creation.
+///
+/// # Security
+/// `admitted` must come from an independently authenticated package manifest.
+/// Never compute it from `model_bytes` or `weights_bytes`: doing so removes the
+/// trust root and turns integrity verification into a self-consistency check.
+///
+/// # Errors
+/// [`OnnxModelError`] for malformed metadata, unsupported graph semantics,
+/// noncanonical/overlapping ranges, nonzero padding, or manifest digest/length
+/// mismatch.
+pub fn verify_external_causal_lm(
+    model_bytes: &[u8],
+    weights_bytes: &[u8],
+    admitted: AdmittedExternalCausalLmDigests,
+) -> Result<VerifiedExternalCausalLmModel, OnnxModelError> {
+    if model_bytes.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    let actual_model_hash = blake3::hash(model_bytes);
+    if actual_model_hash.as_bytes() != &admitted.model_blake3 {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "model BLAKE3 differs from admitted package manifest".to_owned(),
+        ));
+    }
+    let actual_hash = blake3::hash(weights_bytes);
+    if actual_hash.as_bytes() != &admitted.weights_blake3 {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "weights BLAKE3 differs from admitted package manifest".to_owned(),
+        ));
+    }
+    let protobuf = ModelProto::decode(model_bytes)
+        .map_err(|error| OnnxModelError::InvalidModel(error.to_string()))?;
+    let mut metadata = BTreeMap::new();
+    for entry in &protobuf.metadata_props {
+        if metadata
+            .insert(entry.key.clone(), entry.value.clone())
+            .is_some()
+        {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "duplicate metadata key {}",
+                entry.key
+            )));
+        }
+    }
+    require_metadata(&metadata, "tritium.schema_version", "2")?;
+    require_metadata(&metadata, "tritium.graph_kind", "causal-lm")?;
+    require_metadata(
+        &metadata,
+        "tritium.external_data.file",
+        EXTERNAL_WEIGHTS_FILE,
+    )?;
+    let declared_weights = parse_usize(&metadata, "tritium.external_data.bytes")?;
+    if declared_weights != weights_bytes.len() {
+        return Err(OnnxModelError::ExternalDataMismatch(format!(
+            "byte length {} differs from declared {declared_weights}",
+            weights_bytes.len()
+        )));
+    }
+    if metadata_value(&metadata, "tritium.external_data.blake3")?
+        != actual_hash.to_hex().to_string()
+    {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "BLAKE3 digest differs from model metadata".to_owned(),
+        ));
+    }
+    let diagnostics = diagnose_unsupported_graph(model_bytes)?;
+    if !diagnostics.is_empty() {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "graph has {} unsupported items",
+            diagnostics.len()
+        )));
+    }
+    let graph = protobuf
+        .graph
+        .as_ref()
+        .ok_or_else(|| OnnxModelError::InvalidModel("model has no graph".to_owned()))?;
+    let mut cursor = 0_usize;
+    let mut names = BTreeMap::new();
+    for initializer in &graph.initializer {
+        if names.insert(initializer.name.as_str(), ()).is_some() {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "duplicate initializer {}",
+                initializer.name
+            )));
+        }
+        let element_bytes = match initializer.data_type {
+            TENSOR_UINT8 => 1,
+            TENSOR_FLOAT => core::mem::size_of::<f32>(),
+            TENSOR_INT64 => core::mem::size_of::<i64>(),
+            other => {
+                return Err(OnnxModelError::ExternalDataMismatch(format!(
+                    "initializer {} has unsupported dtype {other}",
+                    initializer.name
+                )));
+            }
+        };
+        let expected_length =
+            initializer
+                .dims
+                .iter()
+                .try_fold(element_bytes, |bytes, &dimension| {
+                    let dimension = usize::try_from(dimension).map_err(|_| {
+                        OnnxModelError::ExternalDataMismatch(format!(
+                            "initializer {} has negative dimension",
+                            initializer.name
+                        ))
+                    })?;
+                    bytes
+                        .checked_mul(dimension)
+                        .ok_or(OnnxModelError::ShapeOverflow(
+                            "external initializer byte count",
+                        ))
+                })?;
+        if initializer.data_type == TENSOR_INT64 {
+            if initializer.data_location != 0
+                || !initializer.external_data.is_empty()
+                || initializer.raw_data.len() != expected_length
+            {
+                return Err(OnnxModelError::ExternalDataMismatch(format!(
+                    "shape initializer {} is not canonical inline data",
+                    initializer.name
+                )));
+            }
+            continue;
+        }
+        if initializer.data_location != EXTERNAL_DATA || !initializer.raw_data.is_empty() {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} is not exclusively external",
+                initializer.name
+            )));
+        }
+        let mut entries = BTreeMap::new();
+        for entry in &initializer.external_data {
+            if entries
+                .insert(entry.key.as_str(), entry.value.as_str())
+                .is_some()
+            {
+                return Err(OnnxModelError::ExternalDataMismatch(format!(
+                    "initializer {} has duplicate external-data key {}",
+                    initializer.name, entry.key
+                )));
+            }
+        }
+        if entries.len() != 3 || entries.get("location") != Some(&EXTERNAL_WEIGHTS_FILE) {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} external-data descriptor is not canonical",
+                initializer.name
+            )));
+        }
+        let parse_range = |key: &str| {
+            let value = entries.get(key).ok_or_else(|| {
+                OnnxModelError::ExternalDataMismatch(format!(
+                    "initializer {} missing {key}",
+                    initializer.name
+                ))
+            })?;
+            let parsed = value.parse::<usize>().map_err(|_| {
+                OnnxModelError::ExternalDataMismatch(format!(
+                    "initializer {} {key} is not usize",
+                    initializer.name
+                ))
+            })?;
+            if parsed.to_string() != *value {
+                return Err(OnnxModelError::ExternalDataMismatch(format!(
+                    "initializer {} {key} is not canonical decimal",
+                    initializer.name
+                )));
+            }
+            Ok(parsed)
+        };
+        let offset = parse_range("offset")?;
+        let length = parse_range("length")?;
+        if length != expected_length {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} length {length} differs from shape-derived {expected_length}",
+                initializer.name
+            )));
+        }
+        let expected_offset = align_up(cursor, EXTERNAL_ALIGNMENT)?;
+        if offset != expected_offset {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} offset {offset} is not canonical {expected_offset}",
+                initializer.name
+            )));
+        }
+        if offset > weights_bytes.len() {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} offset exceeds weights.bin",
+                initializer.name
+            )));
+        }
+        if weights_bytes[cursor..offset].iter().any(|&byte| byte != 0) {
+            return Err(OnnxModelError::ExternalDataMismatch(
+                "alignment padding is not zero".to_owned(),
+            ));
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or(OnnxModelError::ShapeOverflow("external initializer range"))?;
+        if end > weights_bytes.len() {
+            return Err(OnnxModelError::ExternalDataMismatch(format!(
+                "initializer {} range exceeds weights.bin",
+                initializer.name
+            )));
+        }
+        cursor = end;
+    }
+    if cursor != weights_bytes.len() {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "weights.bin has unreferenced trailing bytes".to_owned(),
+        ));
+    }
+    let identity = VerifiedOnnxArtifactIdentityV2 {
+        source_model_id: metadata_value(&metadata, "tritium.source_model_id")?.to_owned(),
+        tokenizer_id: metadata_value(&metadata, "tritium.tokenizer_id")?.to_owned(),
+        recipe_id: metadata_value(&metadata, "tritium.recipe_id")?.to_owned(),
+        tritium_build_id: metadata_value(&metadata, "tritium.build_id")?.to_owned(),
+        package_id: metadata_value(&metadata, "tritium.package_id")?.to_owned(),
+        converted_coverage_id: metadata_value(&metadata, "tritium.coverage.converted_id")?
+            .to_owned(),
+        deferred_coverage_id: metadata_value(&metadata, "tritium.coverage.deferred_id")?.to_owned(),
+    };
+    Ok(VerifiedExternalCausalLmModel {
+        model_blake3: *actual_model_hash.as_bytes(),
+        weights_blake3: *actual_hash.as_bytes(),
+        weights_bytes: weights_bytes.len(),
+        tokens: parse_usize(&metadata, "tritium.tokens")?,
+        past_tokens: parse_usize(&metadata, "tritium.past_tokens")?,
+        layers: parse_usize(&metadata, "tritium.layers")?,
+        identity,
+    })
 }
 
 /// Encode a tied packed embedding/head graph with 64-byte-aligned initializers

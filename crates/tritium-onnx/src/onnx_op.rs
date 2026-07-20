@@ -1231,6 +1231,71 @@ mod tests {
         );
         let prompt_model = encode(2, 0);
         assert_eq!(prompt_model, encode(2, 0));
+        let external = crate::encode_external_causal_lm(crate::CausalLmModel {
+            tokens: 2,
+            past_tokens: 0,
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 4,
+            rotary: Some(crate::RotaryEmbedding { theta: rope_theta }),
+            rms_epsilon: epsilon,
+            embedding,
+            layers: std::slice::from_ref(&layer),
+            final_norm: &final_norm,
+            identity,
+        })
+        .unwrap();
+        // Simulate digests copied from package admission, before load-time verification.
+        let admitted = crate::AdmittedExternalCausalLmDigests {
+            model_blake3: *blake3::hash(&external.model_bytes).as_bytes(),
+            weights_blake3: external.weights_blake3,
+        };
+        let verified = crate::verify_external_causal_lm(
+            &external.model_bytes,
+            &external.weights_bytes,
+            admitted,
+        )
+        .unwrap();
+        assert_eq!(verified.weights_blake3, external.weights_blake3);
+        let mut corrupt = external.weights_bytes.clone();
+        corrupt[0] ^= 1;
+        assert!(
+            crate::verify_external_causal_lm(&external.model_bytes, &corrupt, admitted,).is_err()
+        );
+        let mut rewired_model = external.model_bytes.clone();
+        let last = rewired_model.len() - 1;
+        rewired_model[last] ^= 1;
+        assert!(
+            crate::verify_external_causal_lm(&rewired_model, &external.weights_bytes, admitted,)
+                .is_err()
+        );
+        let external_dir = std::env::temp_dir().join(format!(
+            "tritium-onnx-causal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&external_dir).unwrap();
+        let external_model_path = external_dir.join("model.onnx");
+        std::fs::write(&external_model_path, &external.model_bytes).unwrap();
+        std::fs::write(external_dir.join("weights.bin"), &external.weights_bytes).unwrap();
+        let mut external_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&external_model_path)
+            .unwrap();
+        let external_tokens = Tensor::from_array(([2], vec![0_i64, 1].into_boxed_slice())).unwrap();
+        let external_outputs = external_session
+            .run(ort::inputs![&external_tokens])
+            .unwrap();
+        let (_, external_logits) = external_outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(external_logits, &expected_logits, 2.0e-5);
+        drop(external_outputs);
+        drop(external_session);
+        std::fs::remove_dir_all(external_dir).unwrap();
         let diagnostics = crate::diagnose_unsupported_graph(&prompt_model).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         let mut prompt = ort::session::Session::builder()
