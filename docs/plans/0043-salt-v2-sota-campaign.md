@@ -790,16 +790,21 @@ cataloged before fitting, then its canonical rate-free Pmax master is emitted
 one 256-coefficient tile at a time. Two-tensor goldens prove those independent
 streams and receipts are byte-identical to the corresponding outputs of the
 whole-model solver. This removes model-wide master residency from the PTQ
-producer boundary; it does not yet supply the checkpoint/evidence reader that
-feeds all 506 Qwen tensors into the campaign store.
+producer boundary; it does not yet supply the sharded-checkpoint reader and
+collector that feeds all 506 Qwen tensors into the campaign store.
 Guided-Fisher, input-Hessian, and forward-KL curvature can now retain exact
 Kronecker structure instead of expanding one dense G128 matrix per output row.
 The solver materializes only the active G128
 `output_scalar * input_block + damping * I` work block, and bit-exact goldens
 match fully expanded curvature and the emitted master payload. Evidence
 residency is therefore one shared
-input block per input group plus one scalar per output row; durable factor-file
-encoding and checkpoint-scale collection remain open.
+input block per input group plus one scalar per output row. The canonical
+`S2KF` record now binds source model/cache/token identities, global tensor
+ordinal, tensor geometry, upstream evidence, every input block, every output
+scalar, and damping behind a domain-separated checksum. Its bounded reader
+rejects corruption, truncation, noncanonical encodings, forged allocation
+counts, and provenance drift before the reopened record can drive an exact
+tensor-master fit. Checkpoint-scale evidence collection remains open.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
@@ -814,9 +819,9 @@ The following work deliberately remains open and keeps this plan in progress:
   set, Tritium host/CUDA parity, full serving lifecycle, or practical recurrent
   and KV-cache allocations. The compiled MTP authorization ledger contains no
   production evidence row, so fixture success cannot admit Stage 8;
-- the production model driver does not yet connect block-output reconstruction,
-  durable factorized-curvature evidence, scale-only teacher-KL, or hard PV
-  updates to real checkpoint tensors;
+- the production model driver does not yet collect and connect reopened
+  factorized-curvature evidence, block-output reconstruction, scale-only
+  teacher-KL, or hard PV updates to real checkpoint tensors;
 - `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense
   BlockLDLQ path, then
   `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult` slices exact

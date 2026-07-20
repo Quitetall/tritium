@@ -42,6 +42,8 @@ coverage and duplicate-plugin tests.
 - [x] Consume guided-Fisher/input-Hessian/forward-KL Kronecker factors without
   row-wise dense expansion; prove bit-exact solver and tensor-master parity with
   the materialized metric.
+- [x] Canonically persist and bounded-reopen those per-tensor factors with
+  source/evidence identity and adversarial corruption/count rejection.
 - Bind block/sliding reconstruction, output-aware initialization and final
   teacher-logit loss into the resumable plan-0043 driver.
 - Keep calibration, reconstruction and validation datasets source-bound and

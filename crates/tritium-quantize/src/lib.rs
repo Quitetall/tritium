@@ -46,6 +46,7 @@ mod salt_v2;
 mod salt_v2_activation;
 mod salt_v2_allocator;
 mod salt_v2_curvature;
+mod salt_v2_evidence;
 mod salt_v2_feedback;
 mod salt_v2_model;
 mod training_export;
@@ -95,6 +96,9 @@ pub use salt_v2_allocator::{
 pub use salt_v2_curvature::{
     CurvatureError, CurvatureSourceId, InputGram, InputGramAccumulator, KfacMetric, OutputFisher,
     OutputFisherAccumulator, build_kfac_metric,
+};
+pub use salt_v2_evidence::{
+    SaltV2KroneckerEvidence, SaltV2KroneckerEvidenceError, SaltV2KroneckerEvidenceReceipt,
 };
 pub use salt_v2_feedback::{
     ColumnGroup, FeedbackError, FeedbackMetric, FeedbackProblem, FeedbackRunError, FeedbackState,
