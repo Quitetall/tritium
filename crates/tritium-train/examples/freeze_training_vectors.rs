@@ -12,7 +12,7 @@ use serde::Serialize;
 use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
 use tritium_train::{
     Optimizer, Sgd,
-    ops::{act, bias, dense, elementwise, embed, loss, matmul, norm, shape, softmax},
+    ops::{act, bias, dense, elementwise, embed, loss, matmul, norm, rope, shape, softmax},
 };
 
 #[derive(Serialize)]
@@ -212,6 +212,13 @@ fn main() {
     let xent_grad_output = [0.75_f32];
     let xent = loss::softmax_xent_forward(&logits, &class_target, 2, 3);
     let xent_grad = loss::softmax_xent_vjp(&logits, &class_target, 2, 3, &xent_grad_output);
+
+    let rope_input = [1.0_f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0];
+    let rope_positions = [0_usize, 3];
+    let rope_theta = 10_000.0_f32;
+    let rope_result = rope::forward(&rope_input, &rope_positions, 1, 4, rope_theta);
+    let rope_grad_output = [0.5_f32, -1.0, 2.0, 0.25, 1.5, -0.5, 0.75, -2.0];
+    let rope_grad = rope::vjp(&rope_positions, 1, 4, rope_theta, &rope_grad_output);
 
     let parameter = [1.0_f32, -2.0];
     let gradient = [0.5_f32, -0.25];
@@ -965,6 +972,70 @@ fn main() {
                 },
             },
             Case {
+                case_id: "graph.rope.forward.basic",
+                operation: "graph.rope",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![f32_buffer("x", &[2, 1, 4], &rope_input)],
+                attributes: vec![
+                    Attribute::U64List {
+                        name: "positions",
+                        values: vec![0, 3],
+                    },
+                    Attribute::U64 {
+                        name: "n_head",
+                        value: 1,
+                    },
+                    Attribute::U64 {
+                        name: "head_dim",
+                        value: 4,
+                    },
+                    Attribute::F32 {
+                        name: "theta",
+                        bits: rope_theta.to_bits(),
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 1, 4], &rope_result)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.rope.vjp.basic",
+                operation: "graph.rope",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![f32_buffer("grad_output", &[2, 1, 4], &rope_grad_output)],
+                attributes: vec![
+                    Attribute::U64List {
+                        name: "positions",
+                        values: vec![0, 3],
+                    },
+                    Attribute::U64 {
+                        name: "n_head",
+                        value: 1,
+                    },
+                    Attribute::U64 {
+                        name: "head_dim",
+                        value: 4,
+                    },
+                    Attribute::F32 {
+                        name: "theta",
+                        bits: rope_theta.to_bits(),
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_x", &[2, 1, 4], &rope_grad[0])],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
                 case_id: "loss.mse.forward.basic",
                 operation: "loss.mse",
                 execution: "forward",
@@ -1368,6 +1439,86 @@ fn main() {
                 expected: Expected::Error {
                     category: "invalid_operation",
                     code: "shape",
+                    outputs: vec![f32_buffer("result", &[], &[123.0])],
+                },
+            },
+            Case {
+                case_id: "graph.rope.forward.odd_head_dim",
+                operation: "graph.rope",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[2, 1, 3], &rope_input[..6])],
+                attributes: vec![
+                    Attribute::U64List {
+                        name: "positions",
+                        values: vec![0, 3],
+                    },
+                    Attribute::U64 {
+                        name: "n_head",
+                        value: 1,
+                    },
+                    Attribute::U64 {
+                        name: "head_dim",
+                        value: 3,
+                    },
+                    Attribute::F32 {
+                        name: "theta",
+                        bits: rope_theta.to_bits(),
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.head_dim.even",
+                    outputs: vec![f32_buffer("result", &[2, 1, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "loss.softmax_cross_entropy.forward.zero_rows",
+                operation: "loss.softmax_cross_entropy",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("logits", &[0, 3], &[]),
+                    f32_buffer("target", &[0, 3], &[]),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 0,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.rows.positive",
+                    outputs: vec![f32_buffer("result", &[], &[123.0])],
+                },
+            },
+            Case {
+                case_id: "loss.softmax_cross_entropy.forward.zero_cols",
+                operation: "loss.softmax_cross_entropy",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("logits", &[1, 0], &[]),
+                    f32_buffer("target", &[1, 0], &[]),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 1,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 0,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.cols.positive",
                     outputs: vec![f32_buffer("result", &[], &[123.0])],
                 },
             },

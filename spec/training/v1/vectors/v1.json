@@ -2468,6 +2468,176 @@
       }
     },
     {
+      "case_id": "graph.rope.forward.basic",
+      "operation": "graph.rope",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 925353388,
+        "relative_bits": 925353388
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            1,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              1073741824,
+              1077936128,
+              1082130432,
+              3212836864,
+              1056964608,
+              1073741824,
+              3225419776
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64_list",
+          "name": "positions",
+          "values": [
+            0,
+            3
+          ]
+        },
+        {
+          "type": "u64",
+          "name": "n_head",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "head_dim",
+          "value": 4
+        },
+        {
+          "type": "f32",
+          "name": "theta",
+          "bits": 1176256512
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              2,
+              1,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1065353216,
+                1073741824,
+                1077936128,
+                1082130432,
+                1060450116,
+                1058470556,
+                3221733423,
+                3225351209
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.rope.vjp.basic",
+      "operation": "graph.rope",
+      "execution": "vjp",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 925353388,
+        "relative_bits": 925353388
+      },
+      "inputs": [
+        {
+          "name": "grad_output",
+          "shape": [
+            2,
+            1,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              3212836864,
+              1073741824,
+              1048576000,
+              1069547520,
+              3204448256,
+              1061158912,
+              3221225472
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64_list",
+          "name": "positions",
+          "values": [
+            0,
+            3
+          ]
+        },
+        {
+          "type": "u64",
+          "name": "n_head",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "head_dim",
+          "value": 4
+        },
+        {
+          "type": "f32",
+          "name": "theta",
+          "bits": 1176256512
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "grad_x",
+            "shape": [
+              2,
+              1,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1056964608,
+                3212836864,
+                1073741824,
+                1048576000,
+                3216017394,
+                3205450964,
+                3212068037,
+                3221092113
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
       "case_id": "loss.mse.forward.basic",
       "operation": "loss.mse",
       "execution": "forward",
@@ -3695,6 +3865,208 @@
         "kind": "error",
         "category": "invalid_operation",
         "code": "shape",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.rope.forward.odd_head_dim",
+      "operation": "graph.rope",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            1,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              1073741824,
+              1077936128,
+              1082130432,
+              3212836864,
+              1056964608
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64_list",
+          "name": "positions",
+          "values": [
+            0,
+            3
+          ]
+        },
+        {
+          "type": "u64",
+          "name": "n_head",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "head_dim",
+          "value": 3
+        },
+        {
+          "type": "f32",
+          "name": "theta",
+          "bits": 1176256512
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.head_dim.even",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              2,
+              1,
+              3
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "loss.softmax_cross_entropy.forward.zero_rows",
+      "operation": "loss.softmax_cross_entropy",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "logits",
+          "shape": [
+            0,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": []
+          }
+        },
+        {
+          "name": "target",
+          "shape": [
+            0,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": []
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "rows",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "cols",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.rows.positive",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "loss.softmax_cross_entropy.forward.zero_cols",
+      "operation": "loss.softmax_cross_entropy",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "logits",
+          "shape": [
+            1,
+            0
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": []
+          }
+        },
+        {
+          "name": "target",
+          "shape": [
+            1,
+            0
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": []
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "rows",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "cols",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.cols.positive",
         "outputs": [
           {
             "name": "result",

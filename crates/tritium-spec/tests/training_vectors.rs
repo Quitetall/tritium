@@ -149,6 +149,8 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.softmax.vjp.basic",
             "graph.causal_mask.forward.basic",
             "graph.causal_mask.vjp.basic",
+            "graph.rope.forward.basic",
+            "graph.rope.vjp.basic",
             "loss.mse.forward.basic",
             "loss.mse.vjp.basic",
             "loss.softmax_cross_entropy.forward.basic",
@@ -166,11 +168,14 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.softmax.forward.shape_error",
             "graph.causal_mask.forward.shape_error",
             "loss.softmax_cross_entropy.forward.shape_error",
+            "graph.rope.forward.odd_head_dim",
+            "loss.softmax_cross_entropy.forward.zero_rows",
+            "loss.softmax_cross_entropy.forward.zero_cols",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "7adc028d7f05c839de3deb4e4e0a40929ecdf5a100c1f32dad024eb55c104527"
+        "fc067141cdb083803dd35f89a44dd348c14493f68efc5000d191f863d615f292"
     );
 }

@@ -35,6 +35,7 @@ enum CpuOperation {
     Rmsnorm,
     Softmax,
     CausalMask,
+    Rope,
     Mse,
     SoftmaxCrossEntropy,
     Sgd,
@@ -110,6 +111,10 @@ const CPU_OPERATIONS: &[CpuOperationEntry] = &[
     CpuOperationEntry {
         id: "graph.causal_mask",
         operation: CpuOperation::CausalMask,
+    },
+    CpuOperationEntry {
+        id: "graph.rope",
+        operation: CpuOperation::Rope,
     },
     CpuOperationEntry {
         id: "loss.mse",
@@ -272,6 +277,16 @@ const CAUSAL_MASK_VJP: OperationSchema = OperationSchema {
     attributes: &["rows", "cols"],
     outputs: &["grad_x"],
 };
+const ROPE_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x"],
+    attributes: &["positions", "n_head", "head_dim", "theta"],
+    outputs: &["result"],
+};
+const ROPE_VJP: OperationSchema = OperationSchema {
+    inputs: &["grad_output"],
+    attributes: &["positions", "n_head", "head_dim", "theta"],
+    outputs: &["grad_x"],
+};
 const SOFTMAX_XENT_FORWARD: OperationSchema = OperationSchema {
     inputs: &["logits", "target"],
     attributes: &["rows", "cols"],
@@ -399,6 +414,8 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             (CpuOperation::CausalMask, TrainExecutionV1::Vjp) => {
                 causal_mask_vjp(&request, output)?;
             }
+            (CpuOperation::Rope, TrainExecutionV1::Forward) => rope_forward(&request, output)?,
+            (CpuOperation::Rope, TrainExecutionV1::Vjp) => rope_vjp(&request, output)?,
             (CpuOperation::Mse, TrainExecutionV1::Forward) => mse_forward(&request, output)?,
             (CpuOperation::Mse, TrainExecutionV1::Vjp) => mse_vjp(&request, output)?,
             (CpuOperation::SoftmaxCrossEntropy, TrainExecutionV1::Forward) => {
@@ -1257,6 +1274,81 @@ fn causal_mask_vjp(
     Ok(())
 }
 
+fn rope_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &ROPE_FORWARD)?;
+    let (shape, x) = input_f32(request, "x")?;
+    let (positions, n_token, n_head, head_dim, n_head_usize, head_dim_usize, theta) =
+        rope_attributes(request)?;
+    if shape != [n_token, n_head, head_dim] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    require_f32_output(output, "result", shape)?;
+    let result = output_f32(output, "result")?;
+    result.copy_from_slice(x);
+    apply_rope_in_place(
+        result,
+        positions,
+        n_head_usize,
+        head_dim_usize,
+        theta,
+        false,
+    );
+    Ok(())
+}
+
+fn rope_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &ROPE_VJP)?;
+    let (shape, grad_output) = input_f32(request, "grad_output")?;
+    let (positions, n_token, n_head, head_dim, n_head_usize, head_dim_usize, theta) =
+        rope_attributes(request)?;
+    if shape != [n_token, n_head, head_dim] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", shape)?;
+    let grad_x = output_f32(output, "grad_x")?;
+    grad_x.copy_from_slice(grad_output);
+    apply_rope_in_place(grad_x, positions, n_head_usize, head_dim_usize, theta, true);
+    Ok(())
+}
+
+fn apply_rope_in_place(
+    buffer: &mut [f32],
+    positions: &[u64],
+    n_head: usize,
+    head_dim: usize,
+    theta: f32,
+    inverse: bool,
+) {
+    let half = head_dim / 2;
+    let theta = f64::from(theta);
+    let inverse_head_dim = 1.0 / head_dim as f64;
+    let sine_sign = if inverse { -1.0_f32 } else { 1.0_f32 };
+    for (token, &position) in positions.iter().enumerate() {
+        let token_base = token * n_head * head_dim;
+        for head in 0..n_head {
+            let head_base = token_base + head * head_dim;
+            for lane in 0..half {
+                let frequency = theta.powf(-2.0 * lane as f64 * inverse_head_dim);
+                let (sine, cosine) = (position as f64 * frequency).sin_cos();
+                let sine = sine_sign * sine as f32;
+                let cosine = cosine as f32;
+                let left = buffer[head_base + lane];
+                let right = buffer[head_base + lane + half];
+                buffer[head_base + lane] = left * cosine - right * sine;
+                buffer[head_base + lane + half] = right * cosine + left * sine;
+            }
+        }
+    }
+}
+
 fn softmax_xent_forward(
     request: &TrainRequestV1<'_>,
     output: &mut TrainOutputV1<'_>,
@@ -1265,8 +1357,11 @@ fn softmax_xent_forward(
     let (logits_shape, logits) = input_f32(request, "logits")?;
     let (target_shape, target) = input_f32(request, "target")?;
     let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
-    if rows_usize == 0 || cols_usize == 0 {
-        return Err(attribute_value("rows", "positive_geometry"));
+    if rows_usize == 0 {
+        return Err(attribute_value("rows", "positive"));
+    }
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
     }
     if logits_shape != [rows, cols] || target_shape != logits_shape {
         return Err(shape_error());
@@ -1301,8 +1396,11 @@ fn softmax_xent_vjp(
     let (target_shape, target) = input_f32(request, "target")?;
     let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
     let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
-    if rows_usize == 0 || cols_usize == 0 {
-        return Err(attribute_value("rows", "positive_geometry"));
+    if rows_usize == 0 {
+        return Err(attribute_value("rows", "positive"));
+    }
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
     }
     if logits_shape != [rows, cols] || target_shape != logits_shape || !grad_shape.is_empty() {
         return Err(shape_error());
@@ -1652,6 +1750,50 @@ fn concat_attributes<'a>(
         .checked_mul(total_usize)
         .ok_or_else(|| attribute_value("rows", "rows_times_lens"))?;
     Ok((rows, rows_usize, lens, total, total_usize))
+}
+
+#[allow(clippy::type_complexity)]
+fn rope_attributes<'a>(
+    request: &'a TrainRequestV1<'_>,
+) -> Result<(&'a [u64], u64, u64, u64, usize, usize, f32), TrainBackendError> {
+    let positions = attribute_u64_list(request, "positions")?;
+    for &position in positions {
+        usize::try_from(position).map_err(|_| attribute_value("positions", "usize"))?;
+    }
+    let n_token =
+        u64::try_from(positions.len()).map_err(|_| attribute_value("positions", "u64"))?;
+    let n_head = attribute_u64(request, "n_head")?;
+    let head_dim = attribute_u64(request, "head_dim")?;
+    if n_head == 0 {
+        return Err(attribute_value("n_head", "positive"));
+    }
+    if head_dim == 0 {
+        return Err(attribute_value("head_dim", "positive"));
+    }
+    let n_head_usize = usize::try_from(n_head).map_err(|_| attribute_value("n_head", "usize"))?;
+    let head_dim_usize =
+        usize::try_from(head_dim).map_err(|_| attribute_value("head_dim", "usize"))?;
+    if !head_dim_usize.is_multiple_of(2) {
+        return Err(attribute_value("head_dim", "even"));
+    }
+    positions
+        .len()
+        .checked_mul(n_head_usize)
+        .and_then(|elements| elements.checked_mul(head_dim_usize))
+        .ok_or_else(|| attribute_value("positions", "tensor_elements"))?;
+    let theta = attribute_f32(request, "theta")?;
+    if theta <= 0.0 {
+        return Err(attribute_value("theta", "positive"));
+    }
+    Ok((
+        positions,
+        n_token,
+        n_head,
+        head_dim,
+        n_head_usize,
+        head_dim_usize,
+        theta,
+    ))
 }
 
 fn require_concat_roles(
