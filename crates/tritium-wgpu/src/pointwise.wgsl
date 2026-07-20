@@ -8,7 +8,8 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> left: array<f32>;
 @group(0) @binding(2) var<storage, read> right: array<f32>;
-@group(0) @binding(3) var<storage, read_write> result: array<f32>;
+@group(0) @binding(3) var<storage, read> extra: array<f32>;
+@group(0) @binding(4) var<storage, read_write> result: array<f32>;
 
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -85,6 +86,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let probability = exp(left[base + column] - maximum) / sum;
                 result[base + column] = probability * (right[base + column] - contraction);
             }
+        }
+        case 13u: {
+            let rows = params.len / params.auxiliary;
+            if (index >= rows) { return; }
+            let base = index * params.auxiliary;
+            var mean_square = 0.0;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                let value = left[base + column];
+                mean_square = mean_square + value * value;
+            }
+            mean_square = mean_square / f32(params.auxiliary);
+            let inverse = 1.0 / sqrt(mean_square + params.scalar);
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                result[base + column] = left[base + column] * inverse * right[column];
+            }
+        }
+        case 14u: {
+            let rows = params.len / params.auxiliary;
+            if (index >= rows) { return; }
+            let base = index * params.auxiliary;
+            var mean_square = 0.0;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                let value = left[base + column];
+                mean_square = mean_square + value * value;
+            }
+            mean_square = mean_square / f32(params.auxiliary);
+            let inverse = 1.0 / sqrt(mean_square + params.scalar);
+            var contraction = 0.0;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                contraction = contraction
+                    + extra[base + column] * right[column] * left[base + column];
+            }
+            let correction = inverse * inverse * inverse * contraction
+                / f32(params.auxiliary);
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                result[base + column] = inverse * extra[base + column] * right[column]
+                    - correction * left[base + column];
+            }
+        }
+        case 15u: {
+            if (index >= params.auxiliary) { return; }
+            let rows = params.len / params.auxiliary;
+            var gradient = 0.0;
+            for (var row = 0u; row < rows; row = row + 1u) {
+                let base = row * params.auxiliary;
+                var mean_square = 0.0;
+                for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                    let value = left[base + column];
+                    mean_square = mean_square + value * value;
+                }
+                mean_square = mean_square / f32(params.auxiliary);
+                let inverse = 1.0 / sqrt(mean_square + params.scalar);
+                gradient = gradient + extra[base + index] * left[base + index] * inverse;
+            }
+            result[index] = gradient;
         }
         default: { result[index] = 0.0; }
     }

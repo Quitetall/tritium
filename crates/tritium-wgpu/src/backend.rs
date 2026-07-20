@@ -213,7 +213,13 @@ impl WgpuBackend {
             let pointwise_bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("portable-pointwise-bgl"),
-                    entries: &[entry(0, uni), entry(1, ro), entry(2, ro), entry(3, rw)],
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, rw),
+                    ],
                 });
             let pointwise_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("portable-pointwise-pl"),
@@ -253,15 +259,15 @@ impl WgpuBackend {
         &self,
         left: &[f32],
         right: &[f32],
+        extra: &[f32],
         operation: u32,
         scalar: f32,
         auxiliary: u32,
     ) -> Result<Vec<f32>, BackendError> {
-        if left.len() != right.len() || left.len() > u32::MAX as usize {
-            return Err(BackendError::ShapeMismatch {
-                expected: left.len(),
-                got: right.len(),
-            });
+        if left.len() > u32::MAX as usize || right.is_empty() || extra.is_empty() {
+            return Err(BackendError::InvalidInput(
+                "pointwise buffers exceed u32 or contain an empty read binding".into(),
+            ));
         }
         if left.is_empty() {
             return Ok(Vec::new());
@@ -292,6 +298,13 @@ impl WgpuBackend {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("portable-pointwise-right"),
                 contents: bytemuck::cast_slice(right),
+                usage,
+            });
+        let extra_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-pointwise-extra"),
+                contents: bytemuck::cast_slice(extra),
                 usage,
             });
         let bytes = core::mem::size_of_val(left) as u64;
@@ -325,6 +338,10 @@ impl WgpuBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: extra_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: result_buf.as_entire_binding(),
                 },
             ],

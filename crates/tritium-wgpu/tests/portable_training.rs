@@ -18,7 +18,7 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 30);
+    assert_eq!(report.passed.len(), 33);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
@@ -29,6 +29,7 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
             "graph.relu2",
             "graph.silu",
             "graph.causal_mask",
+            "graph.rmsnorm",
             "graph.softmax",
             "lifecycle.checkpoint",
             "lifecycle.resume",

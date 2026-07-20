@@ -17,6 +17,7 @@ const OPERATIONS: &[&str] = &[
     "graph.relu2",
     "graph.silu",
     "graph.causal_mask",
+    "graph.rmsnorm",
     "graph.softmax",
     "lifecycle.checkpoint",
     "lifecycle.resume",
@@ -143,23 +144,40 @@ impl WgpuTrainBackendV1 {
         };
         let results = match (request.operation, request.execution) {
             ("graph.detach", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 0, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 0, 0.0, auxiliary),
+                ]
             }
             ("graph.detach", TrainExecutionV1::Vjp) => {
-                vec![self.backend.pointwise(first, second, 1, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 1, 0.0, auxiliary),
+                ]
             }
             ("graph.scale_const", _) => {
-                vec![self.backend.pointwise(first, second, 2, scalar, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 2, scalar, auxiliary),
+                ]
             }
             ("graph.add", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 3, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 3, 0.0, auxiliary),
+                ]
             }
             ("graph.add", TrainExecutionV1::Vjp) => vec![
-                self.backend.pointwise(first, second, 0, 0.0, auxiliary),
-                self.backend.pointwise(first, second, 0, 0.0, auxiliary),
+                self.backend
+                    .pointwise(first, second, first, 0, 0.0, auxiliary),
+                self.backend
+                    .pointwise(first, second, first, 0, 0.0, auxiliary),
             ],
             ("graph.mul", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 4, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 4, 0.0, auxiliary),
+                ]
             }
             ("graph.mul", TrainExecutionV1::Vjp) => {
                 let (left_shape, left) = input_f32(request, "left")?;
@@ -172,39 +190,143 @@ impl WgpuTrainBackendV1 {
                 require_finite("right", right)?;
                 require_finite("grad_output", gradient)?;
                 vec![
-                    self.backend.pointwise(gradient, right, 4, 0.0, auxiliary),
-                    self.backend.pointwise(gradient, left, 4, 0.0, auxiliary),
+                    self.backend
+                        .pointwise(gradient, right, gradient, 4, 0.0, auxiliary),
+                    self.backend
+                        .pointwise(gradient, left, gradient, 4, 0.0, auxiliary),
                 ]
             }
             ("graph.relu2", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 5, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 5, 0.0, auxiliary),
+                ]
             }
             ("graph.relu2", TrainExecutionV1::Vjp) => {
-                vec![self.backend.pointwise(first, second, 6, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 6, 0.0, auxiliary),
+                ]
             }
             ("graph.silu", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 7, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 7, 0.0, auxiliary),
+                ]
             }
             ("graph.silu", TrainExecutionV1::Vjp) => {
-                vec![self.backend.pointwise(first, second, 8, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 8, 0.0, auxiliary),
+                ]
             }
             ("graph.causal_mask", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 9, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 9, 0.0, auxiliary),
+                ]
             }
             ("graph.causal_mask", TrainExecutionV1::Vjp) => {
-                vec![self.backend.pointwise(first, second, 10, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 10, 0.0, auxiliary),
+                ]
             }
             ("graph.softmax", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 11, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 11, 0.0, auxiliary),
+                ]
             }
             ("graph.softmax", TrainExecutionV1::Vjp) => {
-                vec![self.backend.pointwise(first, second, 12, 0.0, auxiliary)]
+                vec![
+                    self.backend
+                        .pointwise(first, second, first, 12, 0.0, auxiliary),
+                ]
             }
             _ => unreachable!(),
         };
         for (name, result) in output_names.iter().zip(results) {
             let result = result.map_err(wgpu_error)?;
             output_f32(output, name, shape, first.len())?.copy_from_slice(&result);
+        }
+        Ok(())
+    }
+
+    fn execute_rmsnorm(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) = match request.execution {
+            TrainExecutionV1::Forward => (&["x", "weight"], &["result"]),
+            TrainExecutionV1::Vjp => (&["x", "weight", "grad_output"], &["grad_x", "grad_weight"]),
+            _ => return Err(invariant("RMSNorm received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols", "eps"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        let eps = attribute_f32(request, "eps")?;
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        if eps < 0.0 {
+            return Err(attribute_value("eps", "nonnegative"));
+        }
+        if rows > u32::MAX as u64 || cols > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let matrix_shape = [rows, cols];
+        let weight_shape = [cols];
+        let (x_shape, x) = input_f32(request, "x")?;
+        let (actual_weight_shape, weight) = input_f32(request, "weight")?;
+        if x_shape != matrix_shape || actual_weight_shape != weight_shape {
+            return Err(shape_error());
+        }
+        require_finite("x", x)?;
+        require_finite("weight", weight)?;
+        let gradient = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != matrix_shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            x
+        };
+        if request.execution == TrainExecutionV1::Forward {
+            let result = self
+                .backend
+                .pointwise(x, weight, gradient, 13, eps, cols as u32)
+                .map_err(wgpu_error)?;
+            output_f32(output, "result", &matrix_shape, x.len())?.copy_from_slice(&result);
+        } else {
+            let grad_x = self
+                .backend
+                .pointwise(x, weight, gradient, 14, eps, cols as u32)
+                .map_err(wgpu_error)?;
+            let grad_weight_full = self
+                .backend
+                .pointwise(x, weight, gradient, 15, eps, cols as u32)
+                .map_err(wgpu_error)?;
+            output_f32(output, "grad_x", &matrix_shape, x.len())?.copy_from_slice(&grad_x);
+            output_f32(output, "grad_weight", &weight_shape, weight.len())?
+                .copy_from_slice(&grad_weight_full[..weight.len()]);
         }
         Ok(())
     }
@@ -241,6 +363,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
         let scratch_bytes = if lifecycle {
             tritium_train::portable::execute_lifecycle_control_plane(&request, output)?;
             tritium_train::portable::lifecycle_control_plane_scratch_bytes(&request)?
+        } else if request.operation == "graph.rmsnorm" {
+            self.execute_rmsnorm(&request, output)?;
+            0
         } else {
             self.execute_pointwise(&request, output)?;
             0
@@ -423,6 +548,13 @@ fn dtype_error(name: &str, got: TrainDTypeV1) -> TrainBackendError {
         name: name.to_owned(),
         expected: TrainDTypeV1::F32,
         got,
+    })
+}
+
+fn attribute_value(name: &str, constraint: &'static str) -> TrainBackendError {
+    TrainBackendError::InvalidOperation(TrainOperationErrorV1::AttributeValue {
+        name: name.to_owned(),
+        constraint,
     })
 }
 
