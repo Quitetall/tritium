@@ -22,7 +22,7 @@ pub use ptq_driver::{
     reconcile_qwen36_ptq_packages,
 };
 
-use core::{convert::Infallible, fmt};
+use core::{convert::Infallible, fmt, fmt::Write as _};
 use std::{
     error::Error,
     fs::{self, File},
@@ -30,7 +30,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use tritium_format::{ModelId, SemanticTensorHasher, salt_v2_master::SaltV2MasterError};
+use tritium_format::{
+    ModelId, PackageHasher, PackageId, SemanticTensorHasher, salt_v2_master::SaltV2MasterError,
+};
 use tritium_nn::{NnError, Qwen35TensorStreamError};
 use tritium_quantize::{
     Qwen35CoverageDisposition, Qwen35CoverageEntry, Qwen35SourceDtype, Qwen35TensorRole,
@@ -252,6 +254,110 @@ pub struct Qwen36LanguageMtpWorkspaceReceipt {
     summary: Qwen36TensorWorkSummary,
 }
 
+/// Immutable descriptor for one exact-BF16 tensor retained by the workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen36PreservedTensorDescriptor {
+    name: String,
+    shape: Vec<u64>,
+    source_tensor_digest: [u8; 32],
+    payload_bytes: u64,
+}
+
+impl Qwen36PreservedTensorDescriptor {
+    /// Canonical Hugging Face tensor name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Logical row-major tensor dimensions.
+    #[must_use]
+    pub fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+
+    /// Architecture-framed source semantic digest.
+    #[must_use]
+    pub const fn source_tensor_digest(&self) -> &[u8; 32] {
+        &self.source_tensor_digest
+    }
+
+    /// Exact raw BF16 payload bytes.
+    #[must_use]
+    pub const fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+}
+
+/// Exact identity and byte ledger for one deterministic preserved safetensors file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen36PreservedSafetensorsReceipt {
+    package_id: PackageId,
+    tensor_count: u64,
+    header_bytes: u64,
+    payload_bytes: u64,
+    total_bytes: u64,
+}
+
+impl Qwen36PreservedSafetensorsReceipt {
+    /// Identity of every exact safetensors byte.
+    #[must_use]
+    pub const fn package_id(self) -> PackageId {
+        self.package_id
+    }
+
+    /// Number of exact-BF16 tensors in canonical name order.
+    #[must_use]
+    pub const fn tensor_count(self) -> u64 {
+        self.tensor_count
+    }
+
+    /// Eight-byte prefix plus padded JSON header bytes.
+    #[must_use]
+    pub const fn header_bytes(self) -> u64 {
+        self.header_bytes
+    }
+
+    /// Exact concatenated raw BF16 tensor payload bytes.
+    #[must_use]
+    pub const fn payload_bytes(self) -> u64 {
+        self.payload_bytes
+    }
+
+    /// Complete safetensors file bytes.
+    #[must_use]
+    pub const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+}
+
+/// Failure while streaming the deterministic preserved safetensors artifact.
+#[derive(Debug)]
+pub enum Qwen36PreservedSafetensorsError<E> {
+    /// Workspace, record, source-semantic, or bounded-header validation failed.
+    Workspace(Qwen36TensorWorkError),
+    /// The caller-owned staged output rejected bytes.
+    Sink(E),
+}
+
+impl<E: fmt::Display> fmt::Display for Qwen36PreservedSafetensorsError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workspace(error) => write!(formatter, "preserved safetensors failed: {error}"),
+            Self::Sink(error) => write!(formatter, "preserved safetensors sink failed: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for Qwen36PreservedSafetensorsError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Workspace(error) => Some(error),
+            Self::Sink(error) => Some(error),
+        }
+    }
+}
+
 impl Qwen36LanguageMtpWorkspaceReceipt {
     /// Content identity of exact canonical workspace-manifest bytes.
     #[must_use]
@@ -369,6 +475,116 @@ impl<'a> Qwen36TensorWorkStore<'a> {
     /// Canonical names of the 360 exact-BF16 tensors retained by this workspace.
     pub fn preserved_tensor_names(&self) -> impl ExactSizeIterator<Item = &str> {
         self.plan.preserved.iter().map(|entry| entry.spec.name())
+    }
+
+    /// Clone the bounded canonical descriptor catalog for exact-BF16 tensors.
+    ///
+    /// # Errors
+    /// Returns [`Qwen36TensorWorkError::AllocationFailed`] if the small bounded
+    /// descriptor catalog cannot be allocated.
+    pub fn preserved_tensor_descriptors(
+        &self,
+    ) -> Result<Vec<Qwen36PreservedTensorDescriptor>, Qwen36TensorWorkError> {
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(self.plan.preserved.len())
+            .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+        for entry in &self.plan.preserved {
+            descriptors.push(Qwen36PreservedTensorDescriptor {
+                name: entry.spec.name().to_owned(),
+                shape: entry.spec.shape().to_vec(),
+                source_tensor_digest: *entry.spec.source_tensor_digest(),
+                payload_bytes: entry.spec.payload_bytes(),
+            });
+        }
+        Ok(descriptors)
+    }
+
+    /// Stream a deterministic single-file BF16 safetensors artifact.
+    ///
+    /// Tensors are ordered by canonical name, offsets are exact raw BF16 byte
+    /// offsets, and the JSON header is space-padded to an eight-byte boundary.
+    /// Callback effects are nontransactional; export callers must stage and
+    /// publish only after the final receipt is returned.
+    ///
+    /// # Errors
+    /// Fails closed on a zero chunk bound, corrupt or changed workspace record,
+    /// source-semantic mismatch, bounded-header overflow/allocation failure, or
+    /// caller sink failure.
+    pub fn try_write_preserved_safetensors<E>(
+        &self,
+        max_chunk_bytes: usize,
+        mut write: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<Qwen36PreservedSafetensorsReceipt, Qwen36PreservedSafetensorsError<E>> {
+        if max_chunk_bytes == 0 {
+            return Err(Qwen36PreservedSafetensorsError::Workspace(
+                Qwen36TensorWorkError::WorkspaceMalformed("preserved safetensors chunk bound"),
+            ));
+        }
+        let (_, manifest) = self
+            .read_workspace_manifest()
+            .map_err(Qwen36PreservedSafetensorsError::Workspace)?;
+        let header = preserved_safetensors_header(&self.plan.preserved)
+            .map_err(Qwen36PreservedSafetensorsError::Workspace)?;
+        let header_len = u64::try_from(header.len()).map_err(|_| {
+            Qwen36PreservedSafetensorsError::Workspace(Qwen36TensorWorkError::LengthOverflow(
+                "preserved safetensors header",
+            ))
+        })?;
+        let prefix = header_len.to_le_bytes();
+        let mut hasher = PackageHasher::new();
+        for bytes in [&prefix[..], &header] {
+            hasher.update(bytes);
+            write(bytes).map_err(Qwen36PreservedSafetensorsError::Sink)?;
+        }
+        let mut payload_bytes = 0_u64;
+        for (receipt, expected) in manifest.preserved.iter().zip(&self.plan.preserved) {
+            let visited = self
+                .visit_preserved_receipt(receipt, expected, max_chunk_bytes, |chunk| {
+                    hasher.update(chunk);
+                    write(chunk)
+                })
+                .map_err(|error| match error {
+                    Qwen36PreservedVisitError::Workspace(error) => {
+                        Qwen36PreservedSafetensorsError::Workspace(error)
+                    }
+                    Qwen36PreservedVisitError::Sink(error) => {
+                        Qwen36PreservedSafetensorsError::Sink(error)
+                    }
+                })?;
+            payload_bytes = payload_bytes.checked_add(visited).ok_or_else(|| {
+                Qwen36PreservedSafetensorsError::Workspace(Qwen36TensorWorkError::LengthOverflow(
+                    "preserved safetensors payload",
+                ))
+            })?;
+        }
+        if payload_bytes != self.plan.summary.preserved_payload_bytes() {
+            return Err(Qwen36PreservedSafetensorsError::Workspace(
+                Qwen36TensorWorkError::WorkspaceMismatch("preserved safetensors payload ledger"),
+            ));
+        }
+        let header_bytes = 8_u64.checked_add(header_len).ok_or_else(|| {
+            Qwen36PreservedSafetensorsError::Workspace(Qwen36TensorWorkError::LengthOverflow(
+                "preserved safetensors bytes",
+            ))
+        })?;
+        let total_bytes = header_bytes.checked_add(payload_bytes).ok_or_else(|| {
+            Qwen36PreservedSafetensorsError::Workspace(Qwen36TensorWorkError::LengthOverflow(
+                "preserved safetensors bytes",
+            ))
+        })?;
+        let tensor_count = u64::try_from(self.plan.preserved.len()).map_err(|_| {
+            Qwen36PreservedSafetensorsError::Workspace(Qwen36TensorWorkError::LengthOverflow(
+                "preserved safetensors tensor count",
+            ))
+        })?;
+        Ok(Qwen36PreservedSafetensorsReceipt {
+            package_id: hasher.finalize(),
+            tensor_count,
+            header_bytes,
+            payload_bytes,
+            total_bytes,
+        })
     }
 
     /// Canonical verified descriptors for all 360 retained BF16 tensors.
@@ -1161,6 +1377,94 @@ fn preserved_schema_id() -> ContentId {
     ContentId::of_bytes(PRESERVED_SCHEMA_BYTES)
 }
 
+fn preserved_safetensors_header(
+    entries: &[PreservedPlanEntry],
+) -> Result<Vec<u8>, Qwen36TensorWorkError> {
+    let mut capacity = 64_usize;
+    for entry in entries {
+        capacity = capacity
+            .checked_add(entry.spec.name().len().checked_mul(6).ok_or(
+                Qwen36TensorWorkError::LengthOverflow("preserved safetensors header"),
+            )?)
+            .and_then(|value| {
+                entry
+                    .spec
+                    .shape()
+                    .len()
+                    .checked_mul(24)
+                    .and_then(|shape| value.checked_add(shape))
+            })
+            .and_then(|value| value.checked_add(128))
+            .ok_or(Qwen36TensorWorkError::LengthOverflow(
+                "preserved safetensors header",
+            ))?;
+    }
+    if capacity > MAX_WORKSPACE_BYTES {
+        return Err(Qwen36TensorWorkError::WorkspaceMalformed(
+            "preserved safetensors header size",
+        ));
+    }
+    let mut header = String::new();
+    header
+        .try_reserve_exact(capacity)
+        .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+    header.push_str("{\"__metadata__\":{\"format\":\"pt\"}");
+    let mut offset = 0_u64;
+    for entry in entries {
+        let end = offset.checked_add(entry.spec.payload_bytes()).ok_or(
+            Qwen36TensorWorkError::LengthOverflow("preserved safetensors offset"),
+        )?;
+        header.push(',');
+        push_json_string(&mut header, entry.spec.name());
+        header.push_str(":{\"dtype\":\"BF16\",\"shape\":[");
+        for (index, dimension) in entry.spec.shape().iter().enumerate() {
+            if index != 0 {
+                header.push(',');
+            }
+            write!(&mut header, "{dimension}").map_err(|_| {
+                Qwen36TensorWorkError::WorkspaceMalformed("preserved safetensors header")
+            })?;
+        }
+        write!(&mut header, "],\"data_offsets\":[{offset},{end}]}}").map_err(|_| {
+            Qwen36TensorWorkError::WorkspaceMalformed("preserved safetensors header")
+        })?;
+        offset = end;
+    }
+    header.push('}');
+    let padding = (8 - header.len() % 8) % 8;
+    header.extend(core::iter::repeat_n(' ', padding));
+    if header.len() > capacity || header.len() > MAX_WORKSPACE_BYTES {
+        return Err(Qwen36TensorWorkError::WorkspaceMalformed(
+            "preserved safetensors header size",
+        ));
+    }
+    Ok(header.into_bytes())
+}
+
+fn push_json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character <= '\u{1f}' => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let value = character as u8;
+                output.push_str("\\u00");
+                output.push(HEX[usize::from(value >> 4)] as char);
+                output.push(HEX[usize::from(value & 0x0f)] as char);
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+}
+
 fn preserved_schema_metadata(
     proof_id: ContentId,
     manifest_content_id: ContentId,
@@ -1912,6 +2216,52 @@ mod tests {
             .expect("visit verified preserved tensor");
         assert_eq!(payload_bytes, 8);
         assert_eq!(payload, b"abcdefgh");
+        let descriptors = reopened
+            .preserved_tensor_descriptors()
+            .expect("clone preserved descriptors");
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].name(), "model.a.weight");
+        assert_eq!(descriptors[0].shape(), &[2, 2]);
+        assert_eq!(descriptors[0].payload_bytes(), 8);
+        let mut safetensors = Vec::new();
+        let safetensors_receipt = reopened
+            .try_write_preserved_safetensors(3, |chunk| {
+                safetensors.extend_from_slice(chunk);
+                Ok::<(), core::convert::Infallible>(())
+            })
+            .expect("write exact preserved safetensors");
+        assert_eq!(safetensors_receipt.tensor_count(), 2);
+        assert_eq!(safetensors_receipt.payload_bytes(), 16);
+        assert_eq!(safetensors_receipt.total_bytes(), safetensors.len() as u64);
+        assert_eq!(
+            safetensors_receipt.package_id(),
+            PackageId::from_package_bytes(&safetensors)
+        );
+        let header_len = usize::try_from(u64::from_le_bytes(
+            safetensors[..8].try_into().expect("safetensors prefix"),
+        ))
+        .expect("bounded header length");
+        assert_eq!(header_len % 8, 0);
+        let header: serde_json::Value = serde_json::from_slice(&safetensors[8..8 + header_len])
+            .expect("parse safetensors header");
+        assert_eq!(header["model.a.weight"]["dtype"], "BF16");
+        assert_eq!(header["model.a.weight"]["shape"], serde_json::json!([2, 2]));
+        assert_eq!(
+            header["model.a.weight"]["data_offsets"],
+            serde_json::json!([0, 8])
+        );
+        assert_eq!(
+            header["model.b.weight"]["data_offsets"],
+            serde_json::json!([8, 16])
+        );
+        assert_eq!(&safetensors[8 + header_len..], b"abcdefghijklmnop");
+        assert!(matches!(
+            reopened
+                .try_write_preserved_safetensors(0, |_| Ok::<(), core::convert::Infallible>(())),
+            Err(Qwen36PreservedSafetensorsError::Workspace(
+                Qwen36TensorWorkError::WorkspaceMalformed("preserved safetensors chunk bound")
+            ))
+        ));
         assert!(matches!(
             reopened.try_visit_preserved_tensor("model.missing.weight", 3, |_| Ok::<
                 (),
