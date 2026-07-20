@@ -1,8 +1,8 @@
-"""Tritium: ternary-model inference + autograd ops from Python.
+"""Tritium: ternary-model inference, conversion and differentiable ops from Python.
 
 The compiled extension is ``tritium._tritium``; this package re-exports its surface and — when
-PyTorch is installed — the :mod:`tritium.autograd` wrappers that expose the ternary Conv1d / FSQ /
-STE ops as ``torch.autograd.Function`` layers (ADR 0030).
+PyTorch is installed — the :mod:`tritium.torch` research facade, :mod:`tritium.nn` modules and
+:mod:`tritium.autograd` compatibility wrappers (ADR 0030 / ADR 0033).
 """
 
 from ._tritium import (
@@ -37,7 +37,9 @@ __all__ = [
 # and the raw op primitives work without torch.
 try:  # pragma: no cover - trivial import guard
     from . import autograd  # noqa: F401
+    from . import nn  # noqa: F401
+    from . import torch  # noqa: F401
 
-    __all__.append("autograd")
+    __all__.extend(["autograd", "nn", "torch"])
 except ImportError:
     pass
