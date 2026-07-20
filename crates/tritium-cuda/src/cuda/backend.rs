@@ -2563,6 +2563,49 @@ impl CudaBackend {
         Ok(())
     }
 
+    pub(crate) fn grad_s_dev(
+        &self,
+        gy: &CudaSlice<f32>,
+        activation: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        shape: GemmShape,
+        grad_scale: &mut CudaSlice<f32>,
+    ) -> Result<(), BackendError> {
+        let GemmShape { m, n, k } = shape;
+        Self::check_grad_launch_bounds(m, n, k)?;
+        if gy.len() < m * n
+            || activation.len() < m * k
+            || weight.len() < n * k
+            || grad_scale.len() < n
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: grad_scale.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        let mut launch = self.stream.launch_builder(&self.func_grad_s);
+        launch
+            .arg(gy)
+            .arg(activation)
+            .arg(weight)
+            .arg(grad_scale)
+            .arg(&mi)
+            .arg(&ni)
+            .arg(&ki);
+        #[allow(unsafe_code)]
+        // SAFETY: all resident spans and launch dimensions were validated above.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch grad_s_dev", &e))?;
+        }
+        Ok(())
+    }
+
     /// Launch config for a 1-thread-per-element elementwise kernel over `n` f32.
     fn elementwise_cfg(n: usize) -> LaunchConfig {
         let threads = THREADS_PER_BLOCK;

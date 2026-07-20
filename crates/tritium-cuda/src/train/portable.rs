@@ -1,5 +1,6 @@
 //! Plan-0049 portable-training adapter backed by resident CUDA kernels.
 
+use tritium_core::GemmShape;
 use tritium_spec::{
     BackendError, TernaryBackend, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
     TrainBufferDataMutV1, TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1,
@@ -13,6 +14,7 @@ use crate::CudaBackend;
 const BACKEND_FAMILY: &str = "cuda.portable.v1";
 const OPERATIONS: &[&str] = &[
     "graph.dense_matmul",
+    "graph.ternary_matmul",
     "graph.transpose",
     "graph.embedding_gather",
     "graph.slice_cols",
@@ -148,6 +150,115 @@ impl CudaTrainBackendV1 {
                     .copy_from_slice(&grad_weight);
             }
             _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn execute_ternary_matmul(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["activation", "weight", "scale"],
+            TrainExecutionV1::Vjp => &["activation", "weight", "scale", "grad_output"],
+            _ => {
+                return Err(invariant(
+                    "ternary_matmul received an illegal execution phase",
+                ));
+            }
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["m", "n", "k"],
+            "attributes",
+        )?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_activation", "grad_weight", "grad_scale"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let m = attribute_usize(request, "m")?;
+        let n = attribute_usize(request, "n")?;
+        let k = attribute_usize(request, "k")?;
+        let mk = m.checked_mul(k).ok_or_else(shape_error)?;
+        let nk = n.checked_mul(k).ok_or_else(shape_error)?;
+        let mn = m.checked_mul(n).ok_or_else(shape_error)?;
+        let activation = input_f32(request, "activation", &[m as u64, k as u64])?;
+        let weight = input_f32(request, "weight", &[n as u64, k as u64])?;
+        let scale = input_f32(request, "scale", &[n as u64])?;
+        require_finite("activation", activation)?;
+        require_finite("weight", weight)?;
+        require_finite("scale", scale)?;
+        let device_activation = self.backend.dev_upload(activation).map_err(cuda_error)?;
+        let device_weight = self.backend.dev_upload(weight).map_err(cuda_error)?;
+        let device_scale = self.backend.dev_upload(scale).map_err(cuda_error)?;
+        let shape = GemmShape { m, n, k };
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_result = self.backend.dev_alloc_zeros(mn).map_err(cuda_error)?;
+            self.backend
+                .matmul_forward_dev(
+                    &device_activation,
+                    &device_weight,
+                    &device_scale,
+                    shape,
+                    &mut device_result,
+                )
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, mn)?;
+            output_f32(output, "result", &[m as u64, n as u64], mn)?.copy_from_slice(&result);
+        } else {
+            let grad_output = input_f32(request, "grad_output", &[m as u64, n as u64])?;
+            require_finite("grad_output", grad_output)?;
+            let device_grad = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let mut grad_activation = self.backend.dev_alloc_zeros(mk).map_err(cuda_error)?;
+            let mut grad_weight = self.backend.dev_alloc_zeros(nk).map_err(cuda_error)?;
+            let mut grad_scale = self.backend.dev_alloc_zeros(n).map_err(cuda_error)?;
+            self.backend
+                .grad_a_dev(
+                    &device_grad,
+                    &device_weight,
+                    &device_scale,
+                    shape,
+                    &mut grad_activation,
+                )
+                .map_err(cuda_error)?;
+            self.backend
+                .grad_w_dev(
+                    &device_grad,
+                    &device_activation,
+                    &device_scale,
+                    shape,
+                    &mut grad_weight,
+                )
+                .map_err(cuda_error)?;
+            self.backend
+                .grad_s_dev(
+                    &device_grad,
+                    &device_activation,
+                    &device_weight,
+                    shape,
+                    &mut grad_scale,
+                )
+                .map_err(cuda_error)?;
+            let grad_activation = download_device(&self.backend, &grad_activation, mk)?;
+            let grad_weight = download_device(&self.backend, &grad_weight, nk)?;
+            let grad_scale = download_device(&self.backend, &grad_scale, n)?;
+            output_f32(output, "grad_activation", &[m as u64, k as u64], mk)?
+                .copy_from_slice(&grad_activation);
+            output_f32(output, "grad_weight", &[n as u64, k as u64], nk)?
+                .copy_from_slice(&grad_weight);
+            output_f32(output, "grad_scale", &[n as u64], n)?.copy_from_slice(&grad_scale);
         }
         Ok(())
     }
@@ -1086,6 +1197,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         let input_digest = train_request_digest_v1(&request);
         match request.operation {
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
+            "graph.ternary_matmul" => self.execute_ternary_matmul(&request, output)?,
             "graph.transpose" => self.execute_transpose(&request, output)?,
             "graph.embedding_gather" => self.execute_embedding_gather(&request, output)?,
             "graph.slice_cols" => self.execute_slice_cols(&request, output)?,
