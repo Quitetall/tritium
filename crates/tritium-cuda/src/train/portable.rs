@@ -14,6 +14,8 @@ const BACKEND_FAMILY: &str = "cuda.portable.v1";
 const OPERATIONS: &[&str] = &[
     "graph.dense_matmul",
     "graph.transpose",
+    "graph.slice_cols",
+    "graph.concat_cols",
     "graph.scale_const",
     "graph.add",
     "graph.mul",
@@ -189,6 +191,176 @@ impl CudaTrainBackendV1 {
             .map_err(cuda_error)?;
         let result = tape.value(result_id).map_err(cuda_error)?;
         output_f32(output, output_name, &expected_output, elements)?.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn execute_slice_cols(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, output_name) = match request.execution {
+            TrainExecutionV1::Forward => ("x", "result"),
+            TrainExecutionV1::Vjp => ("grad_output", "grad_x"),
+            _ => return Err(invariant("slice_cols received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols", "start", "len"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let start = attribute_usize(request, "start")?;
+        let len = attribute_usize(request, "len")?;
+        if start.checked_add(len).is_none_or(|end| end > cols) {
+            return Err(attribute_value("start", "slice_bounds"));
+        }
+        let input_shape = if request.execution == TrainExecutionV1::Forward {
+            [rows as u64, cols as u64]
+        } else {
+            [rows as u64, len as u64]
+        };
+        let output_shape = if request.execution == TrainExecutionV1::Forward {
+            [rows as u64, len as u64]
+        } else {
+            [rows as u64, cols as u64]
+        };
+        let input = input_f32(request, input_name, &input_shape)?;
+        require_finite(input_name, input)?;
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let (result, result_len) = if request.execution == TrainExecutionV1::Forward {
+            let input_id = tape.leaf(input).map_err(cuda_error)?;
+            let result_id = tape
+                .slice_cols(input_id, rows, cols, start, len)
+                .map_err(cuda_error)?;
+            (tape.value(result_id).map_err(cuda_error)?, rows * len)
+        } else {
+            let dummy = vec![0.0; rows.checked_mul(cols).ok_or_else(shape_error)?];
+            let input_id = tape.leaf(&dummy).map_err(cuda_error)?;
+            let result_id = tape
+                .slice_cols(input_id, rows, cols, start, len)
+                .map_err(cuda_error)?;
+            let seed = self.backend.dev_upload(input).map_err(cuda_error)?;
+            let gradients = tape
+                .backward_retain(result_id, &seed, &[input_id])
+                .map_err(cuda_error)?;
+            (
+                download_gradient(&self.backend, &gradients, input_id, dummy.len())?,
+                dummy.len(),
+            )
+        };
+        output_f32(output, output_name, &output_shape, result_len)?.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn execute_concat_cols(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "lens"],
+            "attributes",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let lens_u64 = attribute_u64_list(request, "lens")?;
+        if lens_u64.is_empty() {
+            return Err(attribute_value("lens", "nonempty"));
+        }
+        let lens: Vec<usize> = lens_u64
+            .iter()
+            .map(|&len| usize::try_from(len).map_err(|_| shape_error()))
+            .collect::<Result<_, _>>()?;
+        let total = lens.iter().try_fold(0_usize, |total, &len| {
+            total.checked_add(len).ok_or_else(shape_error)
+        })?;
+        let output_elements = rows.checked_mul(total).ok_or_else(shape_error)?;
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        match request.execution {
+            TrainExecutionV1::Forward => {
+                if request.inputs.len() != lens.len() {
+                    return Err(roles("inputs"));
+                }
+                require_names(
+                    output.buffers.iter().map(|buffer| buffer.name),
+                    &["result"],
+                    "outputs",
+                )?;
+                let mut ids = Vec::with_capacity(lens.len());
+                for (index, &len) in lens.iter().enumerate() {
+                    let expected_name = format!("part.{index}");
+                    let buffer = request.inputs.get(index).ok_or_else(|| roles("inputs"))?;
+                    if buffer.name != expected_name {
+                        return Err(roles("inputs"));
+                    }
+                    let part = input_f32(request, &expected_name, &[rows as u64, len as u64])?;
+                    require_finite(&expected_name, part)?;
+                    ids.push(tape.leaf(part).map_err(cuda_error)?);
+                }
+                let result_id = tape.concat(&ids, rows, &lens).map_err(cuda_error)?;
+                let result = tape.value(result_id).map_err(cuda_error)?;
+                output_f32(
+                    output,
+                    "result",
+                    &[rows as u64, total as u64],
+                    output_elements,
+                )?
+                .copy_from_slice(&result);
+            }
+            TrainExecutionV1::Vjp => {
+                require_names(
+                    request.inputs.iter().map(|buffer| buffer.name),
+                    &["grad_output"],
+                    "inputs",
+                )?;
+                if output.buffers.len() != lens.len() {
+                    return Err(roles("outputs"));
+                }
+                let grad_output = input_f32(request, "grad_output", &[rows as u64, total as u64])?;
+                require_finite("grad_output", grad_output)?;
+                let mut storage = Vec::with_capacity(lens.len());
+                for &len in &lens {
+                    storage.push(vec![0.0; rows.checked_mul(len).ok_or_else(shape_error)?]);
+                }
+                let ids: Vec<_> = storage
+                    .iter()
+                    .map(|part| tape.leaf(part).map_err(cuda_error))
+                    .collect::<Result<_, _>>()?;
+                let result_id = tape.concat(&ids, rows, &lens).map_err(cuda_error)?;
+                let seed = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+                let gradients = tape
+                    .backward_retain(result_id, &seed, &ids)
+                    .map_err(cuda_error)?;
+                for (index, (&id, &len)) in ids.iter().zip(&lens).enumerate() {
+                    let expected_name = format!("grad_part.{index}");
+                    if output.buffers[index].name != expected_name {
+                        return Err(roles("outputs"));
+                    }
+                    let part_elements = rows.checked_mul(len).ok_or_else(shape_error)?;
+                    let gradient = download_gradient(&self.backend, &gradients, id, part_elements)?;
+                    output_f32(
+                        output,
+                        &expected_name,
+                        &[rows as u64, len as u64],
+                        part_elements,
+                    )?
+                    .copy_from_slice(&gradient);
+                }
+            }
+            _ => return Err(invariant("concat_cols received an illegal execution phase")),
+        }
         Ok(())
     }
 
@@ -594,6 +766,8 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         match request.operation {
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
             "graph.transpose" => self.execute_transpose(&request, output)?,
+            "graph.slice_cols" => self.execute_slice_cols(&request, output)?,
+            "graph.concat_cols" => self.execute_concat_cols(&request, output)?,
             "graph.scale_const" => self.execute_scale_const(&request, output)?,
             "graph.add" => self.execute_add(&request, output)?,
             "graph.mul" => self.execute_mul(&request, output)?,
@@ -668,6 +842,26 @@ fn attribute_f32(request: &TrainRequestV1<'_>, name: &str) -> Result<f32, TrainB
             TrainOperationErrorV1::AttributeType {
                 name: name.to_owned(),
                 expected: "f32",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn attribute_u64_list<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a [u64], TrainBackendError> {
+    let value = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or_else(|| roles("attributes"))?;
+    let TrainAttributeValueV1::U64List(value) = value.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "u64_list",
             },
         ));
     };
