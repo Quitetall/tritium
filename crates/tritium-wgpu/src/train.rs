@@ -17,6 +17,7 @@ const OPERATIONS: &[&str] = &[
     "graph.relu2",
     "graph.silu",
     "graph.causal_mask",
+    "graph.softmax",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -80,6 +81,8 @@ impl WgpuTrainBackendV1 {
                 }
                 ("graph.causal_mask", TrainExecutionV1::Forward) => (&["x"], &["result"]),
                 ("graph.causal_mask", TrainExecutionV1::Vjp) => (&["grad_output"], &["grad_x"]),
+                ("graph.softmax", TrainExecutionV1::Forward) => (&["x"], &["result"]),
+                ("graph.softmax", TrainExecutionV1::Vjp) => (&["x", "grad_output"], &["grad_x"]),
                 _ => return Err(invariant("pointwise operation received an illegal phase")),
             };
         require_names(
@@ -94,7 +97,7 @@ impl WgpuTrainBackendV1 {
         )?;
         let expected_attributes: &[&str] = match request.operation {
             "graph.scale_const" => &["scale"],
-            "graph.causal_mask" => &["rows", "cols"],
+            "graph.causal_mask" | "graph.softmax" => &["rows", "cols"],
             _ => &[],
         };
         require_names(
@@ -112,6 +115,7 @@ impl WgpuTrainBackendV1 {
         let second_name = match (request.operation, request.execution) {
             ("graph.add" | "graph.mul", TrainExecutionV1::Forward) => Some("right"),
             ("graph.relu2" | "graph.silu", TrainExecutionV1::Vjp) => Some("grad_output"),
+            ("graph.softmax", TrainExecutionV1::Vjp) => Some("grad_output"),
             _ => None,
         };
         let second = if let Some(second_name) = second_name {
@@ -124,7 +128,7 @@ impl WgpuTrainBackendV1 {
         } else {
             first
         };
-        let auxiliary = if request.operation == "graph.causal_mask" {
+        let auxiliary = if matches!(request.operation, "graph.causal_mask" | "graph.softmax") {
             let rows = attribute_u64(request, "rows")?;
             let cols = attribute_u64(request, "cols")?;
             if rows == 0 || cols == 0 || rows > u32::MAX as u64 || cols > u32::MAX as u64 {
@@ -189,6 +193,12 @@ impl WgpuTrainBackendV1 {
             }
             ("graph.causal_mask", TrainExecutionV1::Vjp) => {
                 vec![self.backend.pointwise(first, second, 10, 0.0, auxiliary)]
+            }
+            ("graph.softmax", TrainExecutionV1::Forward) => {
+                vec![self.backend.pointwise(first, second, 11, 0.0, auxiliary)]
+            }
+            ("graph.softmax", TrainExecutionV1::Vjp) => {
+                vec![self.backend.pointwise(first, second, 12, 0.0, auxiliary)]
             }
             _ => unreachable!(),
         };

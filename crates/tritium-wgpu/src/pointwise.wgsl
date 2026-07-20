@@ -46,6 +46,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let column = index % params.auxiliary;
             result[index] = select(0.0, left[index], column <= row);
         }
+        case 11u: {
+            let rows = params.len / params.auxiliary;
+            if (index >= rows) { return; }
+            let base = index * params.auxiliary;
+            var maximum = -3.402823466e38;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                maximum = max(maximum, left[base + column]);
+            }
+            var sum = 0.0;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                let exponential = exp(left[base + column] - maximum);
+                result[base + column] = exponential;
+                sum = sum + exponential;
+            }
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                result[base + column] = result[base + column] / sum;
+            }
+        }
+        case 12u: {
+            let rows = params.len / params.auxiliary;
+            if (index >= rows) { return; }
+            let base = index * params.auxiliary;
+            var maximum = -3.402823466e38;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                maximum = max(maximum, left[base + column]);
+            }
+            var sum = 0.0;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                sum = sum + exp(left[base + column] - maximum);
+            }
+            var contraction = 0.0;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                let probability = exp(left[base + column] - maximum) / sum;
+                contraction = contraction + probability * right[base + column];
+            }
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                let probability = exp(left[base + column] - maximum) / sum;
+                result[base + column] = probability * (right[base + column] - contraction);
+            }
+        }
         default: { result[index] = 0.0; }
     }
 }
