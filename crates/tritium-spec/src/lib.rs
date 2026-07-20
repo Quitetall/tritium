@@ -44,6 +44,12 @@ pub use training::{
     TrainingManifestError, TrainingOpCategoryV1, TrainingOpDescriptorV1, TrainingOpManifestV1,
     TrainingVjpV1,
 };
+mod training_vectors;
+pub use training_vectors::{
+    TrainingToleranceV1, TrainingVectorAttributeV1, TrainingVectorAttributeValueV1,
+    TrainingVectorBufferDataV1, TrainingVectorBufferV1, TrainingVectorCaseV1, TrainingVectorError,
+    TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1, TrainingVectorSetV1,
+};
 
 /// Parameters for a ternary mixed-precision GEMM call.
 ///

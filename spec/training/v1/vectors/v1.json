@@ -1,0 +1,246 @@
+{
+  "schema_id": "tritium.training_vectors",
+  "schema_version": 1,
+  "manifest_digest": "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083",
+  "cases": [
+    {
+      "case_id": "graph.add.forward.basic",
+      "operation": "graph.add",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "left",
+          "shape": [
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608
+            ]
+          }
+        },
+        {
+          "name": "right",
+          "shape": [
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1077936128,
+              1082130432,
+              3217031168
+            ]
+          }
+        }
+      ],
+      "attributes": [],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              3
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1082130432,
+                1073741824,
+                3212836864
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.add.vjp.basic",
+      "operation": "graph.add",
+      "execution": "vjp",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "grad_output",
+          "shape": [
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1048576000,
+              3204448256,
+              1073741824
+            ]
+          }
+        }
+      ],
+      "attributes": [],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "grad_left",
+            "shape": [
+              3
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1048576000,
+                3204448256,
+                1073741824
+              ]
+            }
+          },
+          {
+            "name": "grad_right",
+            "shape": [
+              3
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1048576000,
+                3204448256,
+                1073741824
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "optimizer.sgd.step.basic",
+      "operation": "optimizer.sgd",
+      "execution": "step",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "parameter",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472
+            ]
+          }
+        },
+        {
+          "name": "gradient",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              3196059648
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "step",
+          "value": 1
+        },
+        {
+          "type": "f32",
+          "name": "lr",
+          "bits": 1036831949
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "parameter",
+            "shape": [
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1064514355,
+                3221015757
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.add.forward.nonfinite",
+      "operation": "graph.add",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "left",
+          "shape": [
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              2143289344
+            ]
+          }
+        },
+        {
+          "name": "right",
+          "shape": [
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216
+            ]
+          }
+        }
+      ],
+      "attributes": [],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "non_finite",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

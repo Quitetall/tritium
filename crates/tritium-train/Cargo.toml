@@ -24,6 +24,8 @@ rayon = { workspace = true }
 # Property-based gates for LoRA (frozen-base zero-grad, merge correctness, rank edges) —
 # ADR 0007. Workspace-pinned; already used by tritium-core/-cpu/-nn/-format/-quantize.
 proptest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # Fisher-driven SALT plane allocation gate (plan 0039): the training-side diagonal Fisher feeds
 # the quantize allocator's Sensitivity::Custom. tritium-quantize does NOT depend on tritium-train,
 # so this dev-dep is acyclic. Also pulls the SALT dequant helper via tritium-format.

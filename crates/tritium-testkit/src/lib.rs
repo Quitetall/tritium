@@ -38,6 +38,7 @@ mod codec_vectors;
 mod frozen;
 mod generate;
 mod jsonl;
+mod portable_training;
 mod reference_backend;
 mod runner;
 mod vector;
@@ -50,6 +51,10 @@ pub use frozen::{
 };
 pub use generate::generate_vectors;
 pub use jsonl::{JsonlError, load_vectors, save_vectors};
+pub use portable_training::{
+    TrainingConformanceReport, TrainingVectorFailure, TrainingVectorFailureReason,
+    TrainingVectorPass, run_training_conformance,
+};
 pub use runner::{FailedCase, FailureReason, Report, run_conformance, run_fused_fallback_contract};
 pub use vector::{ConformanceVector, Tolerance};
 

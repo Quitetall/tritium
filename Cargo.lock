@@ -4532,6 +4532,8 @@ dependencies = [
  "blake3",
  "proptest",
  "rayon",
+ "serde",
+ "serde_json",
  "tritium-core",
  "tritium-format",
  "tritium-quantize",
