@@ -10111,7 +10111,7 @@ mod tests {
             .map(|l| mkw(0x480 + l as u64, n_embd * ff, -0.1, 0.1))
             .collect();
 
-        let mut time_step = |batch: usize, seq: usize, iters: usize| -> f64 {
+        let time_step = |batch: usize, seq: usize, iters: usize| -> f64 {
             let bs = batch * seq;
             let ones_max = (bs * n_embd).max(ff).max(qd);
             let hidden0 = mkw(0x4F0, bs * n_embd, -1.0, 1.0);
@@ -10323,6 +10323,8 @@ mod tests {
         });
         let tf32_s = time(iters, &mut || {
             #[allow(unsafe_code)]
+            // SAFETY: the device buffers were allocated for this exact GEMM geometry and remain
+            // alive until the stream is synchronized below.
             unsafe {
                 blas.matmul(
                     cfg,
@@ -10598,10 +10600,10 @@ mod tests {
 
     /// Tensor-core tier — WHOLE MODEL. Builds a multi-layer transformer (embed → GQA attention
     /// + SwiGLU blocks → tied head) twice on a `DeviceTape` — once on the f32 kernels, once with
-    /// `.with_tensor_core(...)` so every dense GEMM (qkv/o, gate/up/down, head) runs on tf32
-    /// tensor cores — and asserts logits and gradients agree within tf32 tolerance accumulated
-    /// across the full depth. This is the wiring gate: the tier changes speed, not the trained
-    /// result. (Embed/norm/softmax stay f32 in both; only the dense matmuls switch.)
+    ///   `.with_tensor_core(...)` so every dense GEMM (qkv/o, gate/up/down, head) runs on tf32
+    ///   tensor cores — and asserts logits and gradients agree within tf32 tolerance accumulated
+    ///   across the full depth. This is the wiring gate: the tier changes speed, not the trained
+    ///   result. (Embed/norm/softmax stay f32 in both; only the dense matmuls switch.)
     #[test]
     fn device_tape_tf32_matches_f32_whole_model() {
         let backend = match CudaBackend::new(0) {
