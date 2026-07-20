@@ -11,8 +11,11 @@ file + everything under `docs/` is all you need.
    (independent files) vs sequentially. A `blocked-by` plan waits for its deps.
 3. Each plan is `docs/plans/NNNN-*.md`. Execute it **top to bottom**.
 
-Right now the ready plans are **0002** (doctests + example — CPU) and **0003** (IMMA OOB fix — CUDA).
-They are independent; do both (concurrently via separate git worktrees, or one then the other).
+Right now the active plans are **0043** (Qwen3.6-27B SALT V2 empirical
+capstone) and **0044** (v1.1 full public-release work order). Start 0044 with
+child plan 0045; continue only through child plans whose entry gates are green.
+Plan 0043 may run structural and local gates in parallel, but its paid 27B run
+still requires separate explicit approval.
 
 ## The rules (non-negotiable)
 
