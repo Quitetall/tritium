@@ -21,6 +21,8 @@ use tritium_salt::{
     Qwen36PtqPackagesReceipt, Qwen36TensorWorkStore,
 };
 
+use crate::hf_assets::{HfAssetReceipt, stage_language_assets};
+
 const COMPACT_PACKAGE_FILE: &str = "compact.tsalt2";
 const NEAR_LOSSLESS_PACKAGE_FILE: &str = "near-lossless.tsalt2";
 const PRESERVED_TENSORS_FILE: &str = "preserved.safetensors";
@@ -179,6 +181,7 @@ pub(crate) struct Qwen36PtqPackageReceipt {
     preserved_header_bytes: u64,
     preserved_payload_bytes: u64,
     preserved_total_bytes: u64,
+    hf_assets: Vec<HfAssetReceipt>,
 }
 
 impl Qwen36PtqPackageReceipt {
@@ -186,6 +189,7 @@ impl Qwen36PtqPackageReceipt {
         artifact_dir: &Path,
         receipt: &Qwen36PtqPackagesReceipt,
         preserved: Qwen36PreservedSafetensorsReceipt,
+        hf_assets: Vec<HfAssetReceipt>,
     ) -> Self {
         let completion = receipt.completion();
         let admission = receipt.admission();
@@ -212,13 +216,25 @@ impl Qwen36PtqPackageReceipt {
             preserved_header_bytes: preserved.header_bytes(),
             preserved_payload_bytes: preserved.payload_bytes(),
             preserved_total_bytes: preserved.total_bytes(),
+            hf_assets,
         }
     }
 
     fn manifest_bytes(&self, packing: &str) -> Result<Vec<u8>, String> {
+        let hf_assets = self
+            .hf_assets
+            .iter()
+            .map(|asset| {
+                serde_json::json!({
+                    "file": asset.file(),
+                    "package_id": asset.package_id().to_string(),
+                    "bytes": asset.bytes(),
+                })
+            })
+            .collect::<Vec<_>>();
         let value = serde_json::json!({
-            "schema_version": 2,
-            "artifact_kind": "qwen3.6-language-mtp-salt-v2-model-weights",
+            "schema_version": 3,
+            "artifact_kind": "qwen3.6-language-mtp-salt-v2-hf-bundle",
             "complete_model": false,
             "packing": packing,
             "completion_id": self.completion_id,
@@ -235,6 +251,7 @@ impl Qwen36PtqPackageReceipt {
                 "payload_bytes": self.preserved_payload_bytes,
                 "serialized_bytes": self.preserved_total_bytes,
             },
+            "hf_assets": hf_assets,
             "profiles": {
                 "compact-v1": {
                     "file": COMPACT_PACKAGE_FILE,
@@ -919,149 +936,165 @@ pub(crate) fn verify_preserved_safetensors(
     expected_payload_bytes: u64,
     expected_total_bytes: u64,
 ) -> PyResult<(String, u64, u64, u64)> {
-    if path.is_empty() || expected_package_id.is_empty() {
-        return Err(PyValueError::new_err(
-            "preserved path and expected identity must not be empty",
-        ));
-    }
     let path = path.to_owned();
     let expected_package_id = expected_package_id.to_owned();
     py.detach(move || {
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("inspect preserved file failed: {:?}", error.kind()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err("preserved path must be an ordinary non-symlink file".to_owned());
-        }
-        if metadata.len() != expected_total_bytes {
-            return Err("preserved file length differs from manifest".to_owned());
-        }
-        let mut file = File::open(&path)
-            .map_err(|error| format!("open preserved file failed: {:?}", error.kind()))?;
-        let mut prefix = [0_u8; 8];
-        file.read_exact(&mut prefix)
-            .map_err(|error| format!("read preserved header length failed: {:?}", error.kind()))?;
-        let header_len = u64::from_le_bytes(prefix);
-        let expected_header_bytes = expected_total_bytes
-            .checked_sub(expected_payload_bytes)
-            .ok_or_else(|| "preserved payload exceeds total byte ledger".to_owned())?;
-        let header_bytes = header_len
-            .checked_add(8)
-            .filter(|bytes| {
-                *bytes == expected_header_bytes
-                    && header_len != 0
-                    && header_len.is_multiple_of(8)
-                    && header_len <= MAX_SAFETENSORS_HEADER_BYTES
-            })
-            .ok_or_else(|| "preserved header ledger differs from manifest or bound".to_owned())?;
-        let header_len_usize = usize::try_from(header_len)
-            .map_err(|_| "preserved header length exceeds platform bounds".to_owned())?;
-        let mut header = Vec::new();
-        header
-            .try_reserve_exact(header_len_usize)
-            .map_err(|_| "allocate preserved header failed".to_owned())?;
-        header.resize(header_len_usize, 0);
-        file.read_exact(&mut header)
-            .map_err(|error| format!("read preserved header failed: {:?}", error.kind()))?;
-        let value: serde_json::Value = serde_json::from_slice(&header)
-            .map_err(|error| format!("parse preserved header failed: {error}"))?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| "preserved header must be a JSON object".to_owned())?;
-        object
-            .get("__metadata__")
-            .and_then(serde_json::Value::as_object)
-            .filter(|metadata| {
-                metadata.len() == 1
-                    && metadata.get("format").and_then(serde_json::Value::as_str) == Some("pt")
-            })
-            .ok_or_else(|| "preserved metadata is invalid".to_owned())?;
-        let mut tensor_count = 0_u64;
-        let mut offset = 0_u64;
-        for (name, tensor) in object {
-            if name == "__metadata__" {
-                continue;
-            }
-            let tensor = tensor
-                .as_object()
-                .filter(|tensor| tensor.len() == 3)
-                .ok_or_else(|| "preserved tensor descriptor fields are invalid".to_owned())?;
-            if tensor.get("dtype").and_then(serde_json::Value::as_str) != Some("BF16") {
-                return Err("preserved tensor dtype or shape is invalid".to_owned());
-            }
-            let shape = tensor
-                .get("shape")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| "preserved tensor shape is invalid".to_owned())?;
-            let coefficients = shape.iter().try_fold(1_u64, |product, dimension| {
-                product
-                    .checked_mul(
-                        dimension
-                            .as_u64()
-                            .ok_or_else(|| "preserved tensor dimension is invalid".to_owned())?,
-                    )
-                    .ok_or_else(|| "preserved tensor shape overflows".to_owned())
-            })?;
-            let offsets = tensor
-                .get("data_offsets")
-                .and_then(serde_json::Value::as_array)
-                .filter(|offsets| offsets.len() == 2)
-                .ok_or_else(|| "preserved tensor offsets are invalid".to_owned())?;
-            let start = offsets[0]
-                .as_u64()
-                .ok_or_else(|| "preserved tensor start offset is invalid".to_owned())?;
-            let end = offsets[1]
-                .as_u64()
-                .filter(|end| *end >= start)
-                .ok_or_else(|| "preserved tensor end offset is invalid".to_owned())?;
-            if start != offset {
-                return Err("preserved tensor offsets are not contiguous".to_owned());
-            }
-            if end - start
-                != coefficients
-                    .checked_mul(2)
-                    .ok_or_else(|| "preserved tensor byte length overflows".to_owned())?
-            {
-                return Err("preserved tensor shape and byte range differ".to_owned());
-            }
-            offset = end;
-            tensor_count = tensor_count
-                .checked_add(1)
-                .ok_or_else(|| "preserved tensor count overflow".to_owned())?;
-        }
-        if tensor_count != expected_tensor_count || offset != expected_payload_bytes {
-            return Err("preserved tensor or payload ledger differs from manifest".to_owned());
-        }
-        if header_bytes
-            .checked_add(expected_payload_bytes)
-            .filter(|bytes| *bytes == expected_total_bytes)
-            .is_none()
-        {
-            return Err("preserved total byte ledger differs from manifest".to_owned());
-        }
-        let mut hasher = PackageHasher::new();
-        hasher.update(&prefix);
-        hasher.update(&header);
-        let mut payload_read = 0_u64;
-        let mut chunk = [0_u8; 64 * 1024];
-        loop {
-            let count = file
-                .read(&mut chunk)
-                .map_err(|error| format!("read preserved payload failed: {:?}", error.kind()))?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&chunk[..count]);
-            payload_read = payload_read
-                .checked_add(count as u64)
-                .ok_or_else(|| "preserved payload length overflow".to_owned())?;
-        }
-        let actual_id = hasher.finalize().to_string();
-        if payload_read != expected_payload_bytes || actual_id != expected_package_id {
-            return Err("preserved payload length or identity differs from manifest".to_owned());
-        }
-        Ok((actual_id, tensor_count, payload_read, expected_total_bytes))
+        verify_preserved_safetensors_file(
+            &path,
+            &expected_package_id,
+            expected_tensor_count,
+            expected_payload_bytes,
+            expected_total_bytes,
+        )
     })
     .map_err(PyValueError::new_err)
+}
+
+fn verify_preserved_safetensors_file(
+    path: &str,
+    expected_package_id: &str,
+    expected_tensor_count: u64,
+    expected_payload_bytes: u64,
+    expected_total_bytes: u64,
+) -> Result<(String, u64, u64, u64), String> {
+    if path.is_empty() || expected_package_id.is_empty() {
+        return Err("preserved path and expected identity must not be empty".to_owned());
+    }
+    let path = path.to_owned();
+    let expected_package_id = expected_package_id.to_owned();
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("inspect preserved file failed: {:?}", error.kind()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("preserved path must be an ordinary non-symlink file".to_owned());
+    }
+    if metadata.len() != expected_total_bytes {
+        return Err("preserved file length differs from manifest".to_owned());
+    }
+    let mut file = File::open(&path)
+        .map_err(|error| format!("open preserved file failed: {:?}", error.kind()))?;
+    let mut prefix = [0_u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|error| format!("read preserved header length failed: {:?}", error.kind()))?;
+    let header_len = u64::from_le_bytes(prefix);
+    let expected_header_bytes = expected_total_bytes
+        .checked_sub(expected_payload_bytes)
+        .ok_or_else(|| "preserved payload exceeds total byte ledger".to_owned())?;
+    let header_bytes = header_len
+        .checked_add(8)
+        .filter(|bytes| {
+            *bytes == expected_header_bytes
+                && header_len != 0
+                && header_len.is_multiple_of(8)
+                && header_len <= MAX_SAFETENSORS_HEADER_BYTES
+        })
+        .ok_or_else(|| "preserved header ledger differs from manifest or bound".to_owned())?;
+    let header_len_usize = usize::try_from(header_len)
+        .map_err(|_| "preserved header length exceeds platform bounds".to_owned())?;
+    let mut header = Vec::new();
+    header
+        .try_reserve_exact(header_len_usize)
+        .map_err(|_| "allocate preserved header failed".to_owned())?;
+    header.resize(header_len_usize, 0);
+    file.read_exact(&mut header)
+        .map_err(|error| format!("read preserved header failed: {:?}", error.kind()))?;
+    let value: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|error| format!("parse preserved header failed: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "preserved header must be a JSON object".to_owned())?;
+    object
+        .get("__metadata__")
+        .and_then(serde_json::Value::as_object)
+        .filter(|metadata| {
+            metadata.len() == 1
+                && metadata.get("format").and_then(serde_json::Value::as_str) == Some("pt")
+        })
+        .ok_or_else(|| "preserved metadata is invalid".to_owned())?;
+    let mut tensor_count = 0_u64;
+    let mut offset = 0_u64;
+    for (name, tensor) in object {
+        if name == "__metadata__" {
+            continue;
+        }
+        let tensor = tensor
+            .as_object()
+            .filter(|tensor| tensor.len() == 3)
+            .ok_or_else(|| "preserved tensor descriptor fields are invalid".to_owned())?;
+        if tensor.get("dtype").and_then(serde_json::Value::as_str) != Some("BF16") {
+            return Err("preserved tensor dtype or shape is invalid".to_owned());
+        }
+        let shape = tensor
+            .get("shape")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "preserved tensor shape is invalid".to_owned())?;
+        let coefficients = shape.iter().try_fold(1_u64, |product, dimension| {
+            product
+                .checked_mul(
+                    dimension
+                        .as_u64()
+                        .ok_or_else(|| "preserved tensor dimension is invalid".to_owned())?,
+                )
+                .ok_or_else(|| "preserved tensor shape overflows".to_owned())
+        })?;
+        let offsets = tensor
+            .get("data_offsets")
+            .and_then(serde_json::Value::as_array)
+            .filter(|offsets| offsets.len() == 2)
+            .ok_or_else(|| "preserved tensor offsets are invalid".to_owned())?;
+        let start = offsets[0]
+            .as_u64()
+            .ok_or_else(|| "preserved tensor start offset is invalid".to_owned())?;
+        let end = offsets[1]
+            .as_u64()
+            .filter(|end| *end >= start)
+            .ok_or_else(|| "preserved tensor end offset is invalid".to_owned())?;
+        if start != offset {
+            return Err("preserved tensor offsets are not contiguous".to_owned());
+        }
+        if end - start
+            != coefficients
+                .checked_mul(2)
+                .ok_or_else(|| "preserved tensor byte length overflows".to_owned())?
+        {
+            return Err("preserved tensor shape and byte range differ".to_owned());
+        }
+        offset = end;
+        tensor_count = tensor_count
+            .checked_add(1)
+            .ok_or_else(|| "preserved tensor count overflow".to_owned())?;
+    }
+    if tensor_count != expected_tensor_count || offset != expected_payload_bytes {
+        return Err("preserved tensor or payload ledger differs from manifest".to_owned());
+    }
+    if header_bytes
+        .checked_add(expected_payload_bytes)
+        .filter(|bytes| *bytes == expected_total_bytes)
+        .is_none()
+    {
+        return Err("preserved total byte ledger differs from manifest".to_owned());
+    }
+    let mut hasher = PackageHasher::new();
+    hasher.update(&prefix);
+    hasher.update(&header);
+    let mut payload_read = 0_u64;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut chunk)
+            .map_err(|error| format!("read preserved payload failed: {:?}", error.kind()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&chunk[..count]);
+        payload_read = payload_read
+            .checked_add(count as u64)
+            .ok_or_else(|| "preserved payload length overflow".to_owned())?;
+    }
+    let actual_id = hasher.finalize().to_string();
+    if payload_read != expected_payload_bytes || actual_id != expected_package_id {
+        return Err("preserved payload length or identity differs from manifest".to_owned());
+    }
+    Ok((actual_id, tensor_count, payload_read, expected_total_bytes))
 }
 
 /// Validate and content-bind the complete pinned 506-record evidence namespace.
@@ -1146,7 +1179,10 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 mod tests {
     use std::{fs, io::Write};
 
-    use super::{hex_digest, publish_package_directory, rename_directory_noreplace};
+    use super::{
+        PackageHasher, hex_digest, publish_package_directory, rename_directory_noreplace,
+        verify_preserved_safetensors_file,
+    };
 
     #[test]
     fn digest_hex_is_fixed_width_and_lowercase() {
@@ -1157,6 +1193,50 @@ mod tests {
         assert_eq!(encoded.len(), 64);
         assert_eq!(&encoded[..2], "ab");
         assert_eq!(&encoded[62..], "cd");
+    }
+
+    #[test]
+    fn preserved_safetensors_verifier_checks_structure_ledgers_and_identity() {
+        let parent = std::env::temp_dir().join(format!(
+            "tritium-py-preserved-verify-{}-{}",
+            std::process::id(),
+            super::STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("preserved.safetensors");
+        let mut header = br#"{"__metadata__":{"format":"pt"},"model.a":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#.to_vec();
+        header.resize(header.len().next_multiple_of(8), b' ');
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(b"abcd");
+        fs::write(&path, &bytes).unwrap();
+        let mut hasher = PackageHasher::new();
+        hasher.update(&bytes);
+        let package_id = hasher.finalize().to_string();
+
+        let verified = verify_preserved_safetensors_file(
+            path.to_str().unwrap(),
+            &package_id,
+            1,
+            4,
+            bytes.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(verified, (package_id.clone(), 1, 4, bytes.len() as u64));
+
+        fs::write(&path, [&bytes[..bytes.len() - 1], b"z"].concat()).unwrap();
+        assert!(
+            verify_preserved_safetensors_file(
+                path.to_str().unwrap(),
+                &package_id,
+                1,
+                4,
+                bytes.len() as u64,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
