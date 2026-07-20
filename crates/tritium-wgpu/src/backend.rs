@@ -161,6 +161,7 @@ pub struct WgpuBackend {
     adamw_terms_pipeline: wgpu::ComputePipeline,
     adamw_variance_pipeline: wgpu::ComputePipeline,
     adamw_finish_pipeline: wgpu::ComputePipeline,
+    cautious_adamw_pipelines: [wgpu::ComputePipeline; 4],
     adamw_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
@@ -393,6 +394,7 @@ impl WgpuBackend {
                         entry(7, rw),
                         entry(8, rw),
                         entry(9, rw),
+                        entry(10, rw),
                     ],
                 });
             let adamw_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -438,6 +440,41 @@ impl WgpuBackend {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+            let cautious_shader = |label: &'static str, source: &'static str| {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(label),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                })
+            };
+            let cautious_adamw_pipelines = [
+                (
+                    "portable-cautious-adamw-mask",
+                    include_str!("cautious_adamw_mask.wgsl"),
+                ),
+                (
+                    "portable-cautious-adamw-lr",
+                    include_str!("cautious_adamw_lr.wgsl"),
+                ),
+                (
+                    "portable-cautious-adamw-rescale",
+                    include_str!("cautious_adamw_rescale.wgsl"),
+                ),
+                (
+                    "portable-cautious-adamw-finish",
+                    include_str!("cautious_adamw_finish.wgsl"),
+                ),
+            ]
+            .map(|(label, source)| {
+                let shader = cautious_shader(label, source);
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&adamw_layout),
+                    module: &shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                })
+            });
             let adamw_finish_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("portable-adamw-finish-pipe"),
@@ -463,6 +500,7 @@ impl WgpuBackend {
                 adamw_terms_pipeline,
                 adamw_variance_pipeline,
                 adamw_finish_pipeline,
+                cautious_adamw_pipelines,
                 adamw_bind_group_layout,
                 device_name,
             })
@@ -969,6 +1007,7 @@ impl WgpuBackend {
         moment1: &[f32],
         moment2: &[f32],
         params: AdamWParams,
+        cautious: bool,
     ) -> Result<AdamWOutput, BackendError> {
         let len = parameter.len();
         if len == 0
@@ -1024,6 +1063,13 @@ impl WgpuBackend {
         let updated_moment2 = output("portable-adamw-updated-moment2");
         let scratch1 = output("portable-adamw-scratch1");
         let scratch2 = output("portable-adamw-scratch2");
+        let aligned = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-cautious-adamw-aligned"),
+                contents: bytemuck::bytes_of(&0_u32),
+                usage: storage,
+            });
         let parameter_staging = staging("portable-adamw-parameter-staging");
         let moment1_staging = staging("portable-adamw-moment1-staging");
         let moment2_staging = staging("portable-adamw-moment2-staging");
@@ -1071,6 +1117,10 @@ impl WgpuBackend {
                     binding: 9,
                     resource: scratch2.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: aligned.as_entire_binding(),
+                },
             ],
         });
         self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -1103,7 +1153,22 @@ impl WgpuBackend {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups((len as u32).div_ceil(WG_SIZE), 1, 1);
         }
-        {
+        if cautious {
+            for (index, pipeline) in self.cautious_adamw_pipelines.iter().enumerate() {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(match index {
+                        0 => "portable-cautious-adamw-mask-pass",
+                        1 => "portable-cautious-adamw-lr-pass",
+                        2 => "portable-cautious-adamw-rescale-pass",
+                        _ => "portable-cautious-adamw-finish-pass",
+                    }),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups((len as u32).div_ceil(WG_SIZE), 1, 1);
+            }
+        } else {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("portable-adamw-finish-pass"),
                 timestamp_writes: None,

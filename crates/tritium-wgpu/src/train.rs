@@ -34,6 +34,7 @@ const OPERATIONS: &[&str] = &[
     "loss.mse",
     "optimizer.sgd",
     "optimizer.adamw",
+    "optimizer.cautious_adamw",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -1247,6 +1248,7 @@ impl WgpuTrainBackendV1 {
         &self,
         request: &TrainRequestV1<'_>,
         output: &mut TrainOutputV1<'_>,
+        cautious: bool,
     ) -> Result<(), TrainBackendError> {
         if request.execution != TrainExecutionV1::Step {
             return Err(invariant("AdamW received an illegal phase"));
@@ -1324,7 +1326,7 @@ impl WgpuTrainBackendV1 {
         );
         let (updated_parameter, updated_moment1, updated_moment2) = self
             .backend
-            .adamw(parameter, gradient, moment1, moment2, params)
+            .adamw(parameter, gradient, moment1, moment2, params, cautious)
             .map_err(wgpu_error)?;
         output_f32(output, "parameter", shape, parameter.len())?
             .copy_from_slice(&updated_parameter);
@@ -1402,7 +1404,10 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             self.execute_lsq(&request, output)?;
             0
         } else if request.operation == "optimizer.adamw" {
-            self.execute_adamw(&request, output)?;
+            self.execute_adamw(&request, output, false)?;
+            0
+        } else if request.operation == "optimizer.cautious_adamw" {
+            self.execute_adamw(&request, output, true)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
