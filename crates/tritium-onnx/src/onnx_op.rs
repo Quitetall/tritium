@@ -38,9 +38,11 @@ use ort::value::TensorElementType;
 use tritium_core::TernaryFormat;
 
 use crate::{
-    ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_PAST_TOKENS, ONNX_DOMAIN,
-    ONNX_EMBEDDING_OP_NAME, ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME, kv_attention_kernel,
-    ternary_embedding_kernel, ternary_mpgemm_kernel,
+    ATTR_CONV_KERNEL_DIM, ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_KEY_HEAD_DIM, ATTR_N_HEAD,
+    ATTR_N_KV_HEAD, ATTR_NUM_KEY_HEADS, ATTR_NUM_VALUE_HEADS, ATTR_PAST_TOKENS,
+    ATTR_VALUE_HEAD_DIM, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME, ONNX_KV_ATTENTION_OP_NAME,
+    ONNX_OP_NAME, ONNX_QWEN_DELTANET_OP_NAME, QwenDeltaNetInput, QwenDeltaNetOutputSlot,
+    kv_attention_kernel, ternary_embedding_kernel, ternary_mpgemm_kernel,
 };
 
 /// Map the integer `format` node attribute to a [`TernaryFormat`].
@@ -375,6 +377,600 @@ impl Kernel for TritiumKvAttentionKernel {
     }
 }
 
+/// Custom operator descriptor for projected Qwen3.5 Gated DeltaNet recurrence.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TritiumQwenDeltaNetOp;
+
+impl Operator for TritiumQwenDeltaNetOp {
+    fn name(&self) -> &str {
+        ONNX_QWEN_DELTANET_OP_NAME
+    }
+
+    fn inputs(&self) -> Vec<OperatorInput> {
+        QwenDeltaNetInput::ALL
+            .iter()
+            .map(|_| OperatorInput::required(TensorElementType::Float32))
+            .collect()
+    }
+
+    fn outputs(&self) -> Vec<OperatorOutput> {
+        QwenDeltaNetOutputSlot::ALL
+            .iter()
+            .map(|_| OperatorOutput::required(TensorElementType::Float32))
+            .collect()
+    }
+
+    fn min_version(&self) -> i32 {
+        2
+    }
+
+    fn max_version(&self) -> i32 {
+        2
+    }
+
+    fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
+        let geometry = QwenDeltaNetGeometry::new(
+            usize_attribute(attributes, ATTR_CONV_KERNEL_DIM, false)?,
+            usize_attribute(attributes, ATTR_NUM_KEY_HEADS, false)?,
+            usize_attribute(attributes, ATTR_NUM_VALUE_HEADS, false)?,
+            usize_attribute(attributes, ATTR_KEY_HEAD_DIM, false)?,
+            usize_attribute(attributes, ATTR_VALUE_HEAD_DIM, false)?,
+        )?;
+        Ok(Box::new(TritiumQwenDeltaNetKernel::new(geometry)))
+    }
+}
+
+/// Validated head and convolution dimensions for projected Qwen3.5 DeltaNet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QwenDeltaNetGeometry {
+    conv_kernel_dim: usize,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+}
+
+impl QwenDeltaNetGeometry {
+    /// Validate and bind one DeltaNet geometry.
+    ///
+    /// # Errors
+    /// Returns an [`ort::Error`] for zero dimensions, invalid head grouping, or
+    /// any derived-width overflow.
+    pub fn new(
+        conv_kernel_dim: usize,
+        num_key_heads: usize,
+        num_value_heads: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+    ) -> Result<Self, OrtError> {
+        let geometry = Self {
+            conv_kernel_dim,
+            num_key_heads,
+            num_value_heads,
+            key_head_dim,
+            value_head_dim,
+        };
+        geometry.dimensions()?;
+        Ok(geometry)
+    }
+
+    fn dimensions(self) -> Result<QwenDeltaNetDimensions, OrtError> {
+        if self.conv_kernel_dim == 0
+            || self.num_key_heads == 0
+            || self.num_value_heads == 0
+            || self.key_head_dim == 0
+            || self.value_head_dim == 0
+            || !self.num_value_heads.is_multiple_of(self.num_key_heads)
+        {
+            return Err(OrtError::new("tritium-onnx: invalid DeltaNet geometry"));
+        }
+        let key_width = self
+            .num_key_heads
+            .checked_mul(self.key_head_dim)
+            .ok_or_else(|| OrtError::new("tritium-onnx: DeltaNet key width overflow"))?;
+        let value_width = self
+            .num_value_heads
+            .checked_mul(self.value_head_dim)
+            .ok_or_else(|| OrtError::new("tritium-onnx: DeltaNet value width overflow"))?;
+        let conv_width = key_width
+            .checked_mul(2)
+            .and_then(|width| width.checked_add(value_width))
+            .ok_or_else(|| OrtError::new("tritium-onnx: DeltaNet convolution width overflow"))?;
+        let conv_state_len = conv_width
+            .checked_mul(self.conv_kernel_dim)
+            .ok_or_else(|| OrtError::new("tritium-onnx: DeltaNet conv-state overflow"))?;
+        let recurrent_state_len = self
+            .num_value_heads
+            .checked_mul(self.key_head_dim)
+            .and_then(|len| len.checked_mul(self.value_head_dim))
+            .ok_or_else(|| OrtError::new("tritium-onnx: DeltaNet recurrent-state overflow"))?;
+        Ok(QwenDeltaNetDimensions {
+            key_width,
+            value_width,
+            conv_width,
+            conv_state_len,
+            recurrent_state_len,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QwenDeltaNetDimensions {
+    key_width: usize,
+    value_width: usize,
+    conv_width: usize,
+    conv_state_len: usize,
+    recurrent_state_len: usize,
+}
+
+/// One borrowed projected DeltaNet tensor with its exact ONNX shape.
+#[derive(Debug, Clone, Copy)]
+pub struct QwenDeltaNetTensor<'a> {
+    /// Exact ONNX tensor shape.
+    pub shape: &'a [i64],
+    /// Flat row-major tensor elements.
+    pub values: &'a [f32],
+}
+
+/// Borrowed projected operands, parameters, and prior state for one transition.
+#[derive(Debug, Clone, Copy)]
+pub struct QwenDeltaNetInputs<'a> {
+    /// Raw globally split Q/K/V projection.
+    pub raw_qkv: QwenDeltaNetTensor<'a>,
+    /// Swish output-gate projection.
+    pub z: QwenDeltaNetTensor<'a>,
+    /// Per-value-head beta logits.
+    pub beta_logits: QwenDeltaNetTensor<'a>,
+    /// Per-value-head decay logits.
+    pub decay_logits: QwenDeltaNetTensor<'a>,
+    /// Depthwise convolution weights and exact `[conv_width, kernel]` shape.
+    pub conv_weight: QwenDeltaNetTensor<'a>,
+    /// Gated RMSNorm weights and exact `[value_head_dim]` shape.
+    pub norm_weight: QwenDeltaNetTensor<'a>,
+    /// Per-value-head delta-time bias and exact `[num_value_heads]` shape.
+    pub dt_bias: QwenDeltaNetTensor<'a>,
+    /// Per-value-head log decay and exact `[num_value_heads]` shape.
+    pub a_log: QwenDeltaNetTensor<'a>,
+    /// Prior depthwise history and exact `[conv_width, kernel]` shape.
+    pub conv_state: QwenDeltaNetTensor<'a>,
+    /// Prior recurrence and exact `[num_value_heads, key_head_dim, value_head_dim]` shape.
+    pub recurrent_state: QwenDeltaNetTensor<'a>,
+    /// Positive finite RMSNorm epsilon from a scalar tensor.
+    pub epsilon: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Projected Qwen3.5 Gated DeltaNet recurrent core.
+///
+/// Packed QKV/gate/output projections remain separate Tritium mpGEMM nodes.
+/// This kernel owns depthwise causal convolution, normalized delta-rule state,
+/// gated RMSNorm, and explicit next-state publication.
+pub struct TritiumQwenDeltaNetKernel {
+    geometry: QwenDeltaNetGeometry,
+}
+
+/// Owned outputs from one projected DeltaNet state transition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QwenDeltaNetOutput {
+    /// Gated normalized recurrent output `[tokens, value_width]`.
+    pub normalized_core: Vec<f32>,
+    /// Updated depthwise history `[conv_width, conv_kernel_dim]`.
+    pub conv_state: Vec<f32>,
+    /// Updated delta-rule memory `[num_value_heads, key_head_dim, value_head_dim]`.
+    pub recurrent_state: Vec<f32>,
+}
+
+impl TritiumQwenDeltaNetKernel {
+    /// Construct a direct-execution kernel from validated geometry.
+    #[must_use]
+    pub const fn new(geometry: QwenDeltaNetGeometry) -> Self {
+        Self { geometry }
+    }
+
+    /// Execute one or more projected rows and publish complete next state.
+    ///
+    /// # Errors
+    /// Returns an [`ort::Error`] for invalid shapes, non-finite preserved
+    /// parameters, zero tokens, or invalid RMSNorm epsilon.
+    pub fn run(&self, inputs: QwenDeltaNetInputs<'_>) -> Result<QwenDeltaNetOutput, OrtError> {
+        let dimensions = self.geometry.dimensions()?;
+        if !inputs.epsilon.is_finite() || inputs.epsilon <= 0.0 {
+            return Err(OrtError::new(
+                "tritium-onnx: DeltaNet RMSNorm epsilon must be finite and positive",
+            ));
+        }
+        let tokens = matrix_tokens(inputs.raw_qkv.shape, dimensions.conv_width, "raw_qkv")?;
+        if tokens == 0 {
+            return Err(OrtError::new(
+                "tritium-onnx: DeltaNet token count must be positive",
+            ));
+        }
+        require_len(
+            inputs.raw_qkv.values,
+            tokens,
+            dimensions.conv_width,
+            "raw_qkv",
+        )?;
+        require_matrix(inputs.z, tokens, dimensions.value_width, "z")?;
+        require_matrix(
+            inputs.beta_logits,
+            tokens,
+            self.geometry.num_value_heads,
+            "beta_logits",
+        )?;
+        require_matrix(
+            inputs.decay_logits,
+            tokens,
+            self.geometry.num_value_heads,
+            "decay_logits",
+        )?;
+        require_shaped(
+            inputs.conv_weight,
+            &[dimensions.conv_width, self.geometry.conv_kernel_dim],
+            "conv_weight",
+        )?;
+        require_shaped(
+            inputs.conv_state,
+            &[dimensions.conv_width, self.geometry.conv_kernel_dim],
+            "conv_state",
+        )?;
+        require_shaped(
+            inputs.recurrent_state,
+            &[
+                self.geometry.num_value_heads,
+                self.geometry.key_head_dim,
+                self.geometry.value_head_dim,
+            ],
+            "recurrent_state",
+        )?;
+        require_shaped(
+            inputs.norm_weight,
+            &[self.geometry.value_head_dim],
+            "norm_weight",
+        )?;
+        require_shaped(inputs.dt_bias, &[self.geometry.num_value_heads], "dt_bias")?;
+        require_shaped(inputs.a_log, &[self.geometry.num_value_heads], "a_log")?;
+        debug_assert_eq!(inputs.conv_weight.values.len(), dimensions.conv_state_len);
+        debug_assert_eq!(
+            inputs.recurrent_state.values.len(),
+            dimensions.recurrent_state_len
+        );
+        if inputs
+            .conv_weight
+            .values
+            .iter()
+            .chain(inputs.norm_weight.values)
+            .chain(inputs.dt_bias.values)
+            .chain(inputs.a_log.values)
+            .any(|value| !value.is_finite())
+        {
+            return Err(OrtError::new(
+                "tritium-onnx: DeltaNet preserved parameters must be finite",
+            ));
+        }
+
+        let mut next_conv = inputs.conv_state.values.to_vec();
+        let mut next_recurrent = inputs.recurrent_state.values.to_vec();
+        let mut convolved = vec![0.0; inputs.raw_qkv.values.len()];
+        for token in 0..tokens {
+            for channel in 0..dimensions.conv_width {
+                let state_start = channel * self.geometry.conv_kernel_dim;
+                let state =
+                    &mut next_conv[state_start..state_start + self.geometry.conv_kernel_dim];
+                state.copy_within(1..self.geometry.conv_kernel_dim, 0);
+                state[self.geometry.conv_kernel_dim - 1] =
+                    inputs.raw_qkv.values[token * dimensions.conv_width + channel];
+                let weight = &inputs.conv_weight.values
+                    [state_start..state_start + self.geometry.conv_kernel_dim];
+                let sum = state
+                    .iter()
+                    .zip(weight)
+                    .map(|(value, weight)| value * weight)
+                    .sum::<f32>();
+                convolved[token * dimensions.conv_width + channel] = deltanet_silu(sum);
+            }
+        }
+
+        let mut normalized = vec![0.0; tokens * dimensions.value_width];
+        let mut core = vec![0.0; dimensions.value_width];
+        let group_size = self.geometry.num_value_heads / self.geometry.num_key_heads;
+        let query_scale = 1.0 / (self.geometry.key_head_dim as f32).sqrt();
+        for token in 0..tokens {
+            let qkv =
+                &convolved[token * dimensions.conv_width..(token + 1) * dimensions.conv_width];
+            let query = &qkv[..dimensions.key_width];
+            let key = &qkv[dimensions.key_width..2 * dimensions.key_width];
+            let value = &qkv[2 * dimensions.key_width..];
+            let gate_base = token * self.geometry.num_value_heads;
+            let value_base = token * dimensions.value_width;
+            for value_head in 0..self.geometry.num_value_heads {
+                let key_head = value_head / group_size;
+                let q = &query[key_head * self.geometry.key_head_dim
+                    ..(key_head + 1) * self.geometry.key_head_dim];
+                let k = &key[key_head * self.geometry.key_head_dim
+                    ..(key_head + 1) * self.geometry.key_head_dim];
+                let v = &value[value_head * self.geometry.value_head_dim
+                    ..(value_head + 1) * self.geometry.value_head_dim];
+                let q_inverse = l2_inverse(q) * query_scale;
+                let k_inverse = l2_inverse(k);
+                let beta = deltanet_sigmoid(inputs.beta_logits.values[gate_base + value_head]);
+                let g = -inputs.a_log.values[value_head].exp()
+                    * deltanet_softplus(
+                        inputs.decay_logits.values[gate_base + value_head]
+                            + inputs.dt_bias.values[value_head],
+                    );
+                let decay = g.exp();
+                let state_base =
+                    value_head * self.geometry.key_head_dim * self.geometry.value_head_dim;
+                for state in &mut next_recurrent[state_base
+                    ..state_base + self.geometry.key_head_dim * self.geometry.value_head_dim]
+                {
+                    *state *= decay;
+                }
+                for value_lane in 0..self.geometry.value_head_dim {
+                    let mut memory = 0.0;
+                    for key_lane in 0..self.geometry.key_head_dim {
+                        memory += k[key_lane]
+                            * k_inverse
+                            * next_recurrent
+                                [state_base + key_lane * self.geometry.value_head_dim + value_lane];
+                    }
+                    let delta = beta * (v[value_lane] - memory);
+                    for key_lane in 0..self.geometry.key_head_dim {
+                        next_recurrent
+                            [state_base + key_lane * self.geometry.value_head_dim + value_lane] +=
+                            k[key_lane] * k_inverse * delta;
+                    }
+                    let mut mixed = 0.0;
+                    for key_lane in 0..self.geometry.key_head_dim {
+                        mixed += q[key_lane]
+                            * q_inverse
+                            * next_recurrent
+                                [state_base + key_lane * self.geometry.value_head_dim + value_lane];
+                    }
+                    core[value_head * self.geometry.value_head_dim + value_lane] = mixed;
+                }
+            }
+            for value_head in 0..self.geometry.num_value_heads {
+                let row_start = value_head * self.geometry.value_head_dim;
+                let variance = core[row_start..row_start + self.geometry.value_head_dim]
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    / self.geometry.value_head_dim as f32;
+                let inverse_rms = 1.0 / (variance + inputs.epsilon).sqrt();
+                for (value_lane, &weight) in inputs.norm_weight.values.iter().enumerate() {
+                    let source = row_start + value_lane;
+                    let destination = value_base + source;
+                    normalized[destination] = core[source]
+                        * inverse_rms
+                        * weight
+                        * deltanet_silu(inputs.z.values[destination]);
+                }
+            }
+        }
+        Ok(QwenDeltaNetOutput {
+            normalized_core: normalized,
+            conv_state: next_conv,
+            recurrent_state: next_recurrent,
+        })
+    }
+}
+
+impl Kernel for TritiumQwenDeltaNetKernel {
+    fn compute(&mut self, ctx: &KernelContext) -> ort::Result<()> {
+        let raw_qkv_value = required_input(ctx, QwenDeltaNetInput::RawQkv)?;
+        let z_value = required_input(ctx, QwenDeltaNetInput::Z)?;
+        let beta_value = required_input(ctx, QwenDeltaNetInput::BetaLogits)?;
+        let decay_value = required_input(ctx, QwenDeltaNetInput::DecayLogits)?;
+        let conv_weight_value = required_input(ctx, QwenDeltaNetInput::ConvWeight)?;
+        let norm_weight_value = required_input(ctx, QwenDeltaNetInput::NormWeight)?;
+        let dt_bias_value = required_input(ctx, QwenDeltaNetInput::DtBias)?;
+        let a_log_value = required_input(ctx, QwenDeltaNetInput::ALog)?;
+        let conv_state_value = required_input(ctx, QwenDeltaNetInput::ConvState)?;
+        let recurrent_state_value = required_input(ctx, QwenDeltaNetInput::RecurrentState)?;
+        let epsilon_value = required_input(ctx, QwenDeltaNetInput::Epsilon)?;
+
+        let (raw_qkv_shape, raw_qkv) = raw_qkv_value.try_extract_tensor::<f32>()?;
+        let (z_shape, z) = z_value.try_extract_tensor::<f32>()?;
+        let (beta_shape, beta) = beta_value.try_extract_tensor::<f32>()?;
+        let (decay_shape, decay) = decay_value.try_extract_tensor::<f32>()?;
+        let (conv_weight_shape, conv_weight) = conv_weight_value.try_extract_tensor::<f32>()?;
+        let (norm_weight_shape, norm_weight) = norm_weight_value.try_extract_tensor::<f32>()?;
+        let (dt_bias_shape, dt_bias) = dt_bias_value.try_extract_tensor::<f32>()?;
+        let (a_log_shape, a_log) = a_log_value.try_extract_tensor::<f32>()?;
+        let (conv_state_shape, conv_state) = conv_state_value.try_extract_tensor::<f32>()?;
+        let (recurrent_state_shape, recurrent_state) =
+            recurrent_state_value.try_extract_tensor::<f32>()?;
+        let (epsilon_shape, epsilon) = epsilon_value.try_extract_tensor::<f32>()?;
+        if !epsilon_shape.is_empty() || epsilon.len() != 1 {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: DeltaNet epsilon must be scalar, got shape {:?}",
+                epsilon_shape.as_ref()
+            )));
+        }
+        let raw_qkv_dimensions = raw_qkv_shape.to_vec();
+        let z_dimensions = z_shape.to_vec();
+        let beta_dimensions = beta_shape.to_vec();
+        let decay_dimensions = decay_shape.to_vec();
+        let conv_weight_dimensions = conv_weight_shape.to_vec();
+        let norm_weight_dimensions = norm_weight_shape.to_vec();
+        let dt_bias_dimensions = dt_bias_shape.to_vec();
+        let a_log_dimensions = a_log_shape.to_vec();
+        let conv_state_dimensions = conv_state_shape.to_vec();
+        let recurrent_state_dimensions = recurrent_state_shape.to_vec();
+        let output = self.run(QwenDeltaNetInputs {
+            raw_qkv: borrowed_tensor(&raw_qkv_dimensions, raw_qkv),
+            z: borrowed_tensor(&z_dimensions, z),
+            beta_logits: borrowed_tensor(&beta_dimensions, beta),
+            decay_logits: borrowed_tensor(&decay_dimensions, decay),
+            conv_weight: borrowed_tensor(&conv_weight_dimensions, conv_weight),
+            norm_weight: borrowed_tensor(&norm_weight_dimensions, norm_weight),
+            dt_bias: borrowed_tensor(&dt_bias_dimensions, dt_bias),
+            a_log: borrowed_tensor(&a_log_dimensions, a_log),
+            conv_state: borrowed_tensor(&conv_state_dimensions, conv_state),
+            recurrent_state: borrowed_tensor(&recurrent_state_dimensions, recurrent_state),
+            epsilon: epsilon[0],
+        })?;
+        let dimensions = self.geometry.dimensions()?;
+        let mut core_value = ctx
+            .output(
+                QwenDeltaNetOutputSlot::NormalizedCore as usize,
+                z_dimensions,
+            )?
+            .ok_or_else(|| missing_output(QwenDeltaNetOutputSlot::NormalizedCore))?;
+        core_value
+            .try_extract_tensor_mut::<f32>()?
+            .1
+            .copy_from_slice(&output.normalized_core);
+        let mut conv_value = ctx
+            .output(
+                QwenDeltaNetOutputSlot::ConvState as usize,
+                vec![
+                    dimensions.conv_width as i64,
+                    self.geometry.conv_kernel_dim as i64,
+                ],
+            )?
+            .ok_or_else(|| missing_output(QwenDeltaNetOutputSlot::ConvState))?;
+        conv_value
+            .try_extract_tensor_mut::<f32>()?
+            .1
+            .copy_from_slice(&output.conv_state);
+        let mut recurrent_value = ctx
+            .output(
+                QwenDeltaNetOutputSlot::RecurrentState as usize,
+                vec![
+                    self.geometry.num_value_heads as i64,
+                    self.geometry.key_head_dim as i64,
+                    self.geometry.value_head_dim as i64,
+                ],
+            )?
+            .ok_or_else(|| missing_output(QwenDeltaNetOutputSlot::RecurrentState))?;
+        recurrent_value
+            .try_extract_tensor_mut::<f32>()?
+            .1
+            .copy_from_slice(&output.recurrent_state);
+        Ok(())
+    }
+}
+
+fn required_input<'a>(
+    ctx: &'a KernelContext,
+    slot: QwenDeltaNetInput,
+) -> ort::Result<ort::value::ValueRef<'a>> {
+    ctx.input(slot as usize)?.ok_or_else(|| {
+        OrtError::new(format!(
+            "tritium-onnx: missing input {} ({})",
+            slot as usize,
+            slot.name()
+        ))
+    })
+}
+
+fn missing_output(slot: QwenDeltaNetOutputSlot) -> OrtError {
+    OrtError::new(format!(
+        "tritium-onnx: missing output {} ({})",
+        slot as usize,
+        slot.name()
+    ))
+}
+
+fn borrowed_tensor<'a>(shape: &'a [i64], values: &'a [f32]) -> QwenDeltaNetTensor<'a> {
+    QwenDeltaNetTensor { shape, values }
+}
+
+fn matrix_tokens(shape: &[i64], width: usize, name: &str) -> Result<usize, OrtError> {
+    if shape.len() != 2 || usize::try_from(shape[1]) != Ok(width) {
+        return Err(OrtError::new(format!(
+            "tritium-onnx: DeltaNet {name} shape {shape:?} must be [tokens, {width}]"
+        )));
+    }
+    usize::try_from(shape[0]).map_err(|_| {
+        OrtError::new(format!(
+            "tritium-onnx: DeltaNet {name} token count must be nonnegative"
+        ))
+    })
+}
+
+fn require_matrix(
+    matrix: QwenDeltaNetTensor<'_>,
+    tokens: usize,
+    width: usize,
+    name: &str,
+) -> Result<(), OrtError> {
+    if matrix.shape != [tokens as i64, width as i64] {
+        return Err(OrtError::new(format!(
+            "tritium-onnx: DeltaNet {name} shape {:?} must be [{tokens}, {width}]",
+            matrix.shape
+        )));
+    }
+    require_len(matrix.values, tokens, width, name)
+}
+
+fn require_shaped(
+    matrix: QwenDeltaNetTensor<'_>,
+    expected_shape: &[usize],
+    name: &str,
+) -> Result<(), OrtError> {
+    let exact_shape = matrix.shape.len() == expected_shape.len()
+        && matrix
+            .shape
+            .iter()
+            .zip(expected_shape)
+            .all(|(&actual, &expected)| usize::try_from(actual) == Ok(expected));
+    if !exact_shape {
+        return Err(OrtError::new(format!(
+            "tritium-onnx: DeltaNet {name} shape {:?} must be {expected_shape:?}",
+            matrix.shape
+        )));
+    }
+    let expected_len = expected_shape
+        .iter()
+        .try_fold(1_usize, |size, &dimension| {
+            size.checked_mul(dimension)
+                .ok_or_else(|| OrtError::new("tritium-onnx: DeltaNet input length overflow"))
+        })?;
+    require_exact_len(matrix.values, expected_len, name)
+}
+
+fn require_len(values: &[f32], rows: usize, columns: usize, name: &str) -> Result<(), OrtError> {
+    let expected = rows
+        .checked_mul(columns)
+        .ok_or_else(|| OrtError::new("tritium-onnx: DeltaNet input length overflow"))?;
+    require_exact_len(values, expected, name)
+}
+
+fn require_exact_len(values: &[f32], expected: usize, name: &str) -> Result<(), OrtError> {
+    if values.len() == expected {
+        Ok(())
+    } else {
+        Err(OrtError::new(format!(
+            "tritium-onnx: DeltaNet {name} has {} elements, expected {expected}",
+            values.len()
+        )))
+    }
+}
+
+fn l2_inverse(values: &[f32]) -> f32 {
+    1.0 / (values.iter().map(|value| value * value).sum::<f32>() + 1.0e-6).sqrt()
+}
+
+fn deltanet_sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
+}
+
+fn deltanet_silu(value: f32) -> f32 {
+    value * deltanet_sigmoid(value)
+}
+
+fn deltanet_softplus(value: f32) -> f32 {
+    if value > 20.0 {
+        value
+    } else {
+        value.exp().ln_1p()
+    }
+}
+
 /// The per-node kernel produced by [`TritiumTernaryMpGemmOp::create_kernel`],
 /// carrying the node's resolved `K` and packing `format`. Its
 /// [`compute`](Kernel::compute) extracts the three input tensors and runs the
@@ -466,7 +1062,8 @@ pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
     OperatorDomain::new(ONNX_DOMAIN)?
         .add(TritiumTernaryMpGemmOp)?
         .add(TritiumTernaryEmbeddingOp)?
-        .add(TritiumKvAttentionOp)
+        .add(TritiumKvAttentionOp)?
+        .add(TritiumQwenDeltaNetOp)
 }
 
 #[cfg(test)]
@@ -633,6 +1230,126 @@ mod tests {
             )
             .unwrap();
         assert!((output[0] - 70.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn qwen_deltanet_kernel_matches_frozen_recurrent_oracle() {
+        let kernel = super::TritiumQwenDeltaNetKernel::new(
+            super::QwenDeltaNetGeometry::new(2, 1, 1, 1, 1).unwrap(),
+        );
+        let raw_qkv = [0.2, -0.3, 0.4];
+        let z = [0.5];
+        let beta = [0.1];
+        let decay = [-0.2];
+        let conv_weight = [0.2, 0.8, -0.1, 0.7, 0.3, 0.9];
+        let norm_weight = [1.1];
+        let dt_bias = [0.2];
+        let a_log = [-0.3];
+        let conv_state = [0.0; 6];
+        let recurrent_state = [0.0];
+        let inputs = super::QwenDeltaNetInputs {
+            raw_qkv: super::borrowed_tensor(&[1, 3], &raw_qkv),
+            z: super::borrowed_tensor(&[1, 1], &z),
+            beta_logits: super::borrowed_tensor(&[1, 1], &beta),
+            decay_logits: super::borrowed_tensor(&[1, 1], &decay),
+            conv_weight: super::borrowed_tensor(&[3, 2], &conv_weight),
+            norm_weight: super::borrowed_tensor(&[1], &norm_weight),
+            dt_bias: super::borrowed_tensor(&[1], &dt_bias),
+            a_log: super::borrowed_tensor(&[1], &a_log),
+            conv_state: super::borrowed_tensor(&[3, 2], &conv_state),
+            recurrent_state: super::borrowed_tensor(&[1, 1, 1], &recurrent_state),
+            epsilon: 1.0e-6,
+        };
+        let output = kernel.run(inputs).unwrap();
+        assert_f32_close(&output.normalized_core, &[-0.342_338_83], 1.0e-6);
+        assert_f32_close(&output.conv_state, &[0.0, 0.2, 0.0, -0.3, 0.0, 0.4], 0.0);
+        assert_f32_close(&output.recurrent_state, &[-0.111_317_93], 1.0e-6);
+
+        let mut wrong_shape = inputs;
+        wrong_shape.conv_weight.shape = &[2, 3];
+        assert!(kernel.run(wrong_shape).is_err());
+        let mut zero_tokens = inputs;
+        zero_tokens.raw_qkv = super::borrowed_tensor(&[0, 3], &[]);
+        assert!(kernel.run(zero_tokens).is_err());
+    }
+
+    #[test]
+    fn qwen_deltanet_custom_op_executes_frozen_recurrent_oracle() {
+        use ort::value::Tensor;
+
+        let model = crate::model::encode_qwen_deltanet_test_graph();
+        let diagnostics = crate::diagnose_unsupported_graph(&model).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&model)
+            .unwrap();
+        let raw_qkv = Tensor::from_array(([1, 3], vec![0.2_f32, -0.3, 0.4])).unwrap();
+        let z = Tensor::from_array(([1, 1], vec![0.5_f32])).unwrap();
+        let beta = Tensor::from_array(([1, 1], vec![0.1_f32])).unwrap();
+        let decay = Tensor::from_array(([1, 1], vec![-0.2_f32])).unwrap();
+        let conv_weight =
+            Tensor::from_array(([3, 2], vec![0.2_f32, 0.8, -0.1, 0.7, 0.3, 0.9])).unwrap();
+        let norm_weight = Tensor::from_array(([1], vec![1.1_f32])).unwrap();
+        let dt_bias = Tensor::from_array(([1], vec![0.2_f32])).unwrap();
+        let a_log = Tensor::from_array(([1], vec![-0.3_f32])).unwrap();
+        let conv_state = Tensor::from_array(([3, 2], vec![0.0_f32; 6])).unwrap();
+        let recurrent_state = Tensor::from_array(([1, 1, 1], vec![0.0_f32])).unwrap();
+        let epsilon = Tensor::from_array((Vec::<usize>::new(), vec![1.0e-6_f32])).unwrap();
+        let outputs = session
+            .run(ort::inputs![
+                &raw_qkv,
+                &z,
+                &beta,
+                &decay,
+                &conv_weight,
+                &norm_weight,
+                &dt_bias,
+                &a_log,
+                &conv_state,
+                &recurrent_state,
+                &epsilon,
+            ])
+            .unwrap();
+        let (_, core) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        let (_, next_conv) = outputs[1].try_extract_tensor::<f32>().unwrap();
+        let (_, next_recurrent) = outputs[2].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(core, &[-0.342_338_83], 1.0e-6);
+        assert_f32_close(next_conv, &[0.0, 0.2, 0.0, -0.3, 0.0, 0.4], 0.0);
+        assert_f32_close(next_recurrent, &[-0.111_317_93], 1.0e-6);
+        let next_conv = next_conv.to_vec();
+        let next_recurrent = next_recurrent.to_vec();
+        drop(outputs);
+
+        let decode_raw_qkv = Tensor::from_array(([1, 3], vec![-0.1_f32, 0.25, -0.2])).unwrap();
+        let decode_z = Tensor::from_array(([1, 1], vec![-0.3_f32])).unwrap();
+        let decode_beta = Tensor::from_array(([1, 1], vec![-0.4_f32])).unwrap();
+        let decode_decay = Tensor::from_array(([1, 1], vec![0.6_f32])).unwrap();
+        let decode_conv_state = Tensor::from_array(([3, 2], next_conv)).unwrap();
+        let decode_recurrent_state = Tensor::from_array(([1, 1, 1], next_recurrent)).unwrap();
+        let decode_outputs = session
+            .run(ort::inputs![
+                &decode_raw_qkv,
+                &decode_z,
+                &decode_beta,
+                &decode_decay,
+                &conv_weight,
+                &norm_weight,
+                &dt_bias,
+                &a_log,
+                &decode_conv_state,
+                &decode_recurrent_state,
+                &epsilon,
+            ])
+            .unwrap();
+        let (_, decode_core) = decode_outputs[0].try_extract_tensor::<f32>().unwrap();
+        let (_, decode_conv) = decode_outputs[1].try_extract_tensor::<f32>().unwrap();
+        let (_, decode_recurrent) = decode_outputs[2].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(decode_core, &[-0.140_389_25], 1.0e-6);
+        assert_f32_close(decode_conv, &[0.2, -0.1, -0.3, 0.25, 0.4, -0.2], 0.0);
+        assert_f32_close(decode_recurrent, &[-0.039_668_053], 1.0e-6);
     }
 
     #[test]

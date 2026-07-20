@@ -9,8 +9,9 @@
 //!
 //! - **Layer 2 (feature `onnx`, pulls `ort`).** Packed projection/embedding
 //!   operators retain `com.tritium` opset 1. Experimental cache attention uses
-//!   [`TritiumKvAttentionOp`] at opset 2. Enabling the feature fetches ONNX
-//!   Runtime.
+//!   [`TritiumKvAttentionOp`] and projected recurrent
+//!   [`TritiumQwenDeltaNetOp`] cores at opset 2. Enabling the feature fetches
+//!   ONNX Runtime.
 //!
 //! With feature `model`, [`encode_causal_lm`] serializes packed decoder layers
 //! using opset-1 Tritium projection/embedding nodes plus standard opset-21
@@ -45,6 +46,9 @@ pub const ONNX_EMBEDDING_OP_NAME: &str = "TritiumTernaryEmbedding";
 /// Experimental opset-2 cache-aware grouped-query attention node name.
 pub const ONNX_KV_ATTENTION_OP_NAME: &str = "TritiumKvAttention";
 
+/// Experimental opset-2 projected Qwen Gated DeltaNet recurrent-core node.
+pub const ONNX_QWEN_DELTANET_OP_NAME: &str = "TritiumQwenDeltaNet";
+
 /// Node-attribute name for the contraction/embedding dimension `K`.
 pub const ATTR_K: &str = "K";
 
@@ -62,6 +66,93 @@ pub const ATTR_HEAD_DIM: &str = "head_dim";
 
 /// Cache-aware attention prefix-length attribute.
 pub const ATTR_PAST_TOKENS: &str = "past_tokens";
+
+/// DeltaNet depthwise convolution kernel width attribute.
+pub const ATTR_CONV_KERNEL_DIM: &str = "conv_kernel_dim";
+
+/// DeltaNet query/key head-count attribute.
+pub const ATTR_NUM_KEY_HEADS: &str = "num_key_heads";
+
+/// DeltaNet value/recurrent head-count attribute.
+pub const ATTR_NUM_VALUE_HEADS: &str = "num_value_heads";
+
+/// DeltaNet per-head query/key width attribute.
+pub const ATTR_KEY_HEAD_DIM: &str = "key_head_dim";
+
+/// DeltaNet per-head value width attribute.
+pub const ATTR_VALUE_HEAD_DIM: &str = "value_head_dim";
+
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum QwenDeltaNetInput {
+    RawQkv,
+    Z,
+    BetaLogits,
+    DecayLogits,
+    ConvWeight,
+    NormWeight,
+    DtBias,
+    ALog,
+    ConvState,
+    RecurrentState,
+    Epsilon,
+}
+
+#[cfg(feature = "onnx")]
+impl QwenDeltaNetInput {
+    pub(crate) const ALL: [Self; 11] = [
+        Self::RawQkv,
+        Self::Z,
+        Self::BetaLogits,
+        Self::DecayLogits,
+        Self::ConvWeight,
+        Self::NormWeight,
+        Self::DtBias,
+        Self::ALog,
+        Self::ConvState,
+        Self::RecurrentState,
+        Self::Epsilon,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::RawQkv => "raw_qkv",
+            Self::Z => "z",
+            Self::BetaLogits => "beta_logits",
+            Self::DecayLogits => "decay_logits",
+            Self::ConvWeight => "conv_weight",
+            Self::NormWeight => "norm_weight",
+            Self::DtBias => "dt_bias",
+            Self::ALog => "a_log",
+            Self::ConvState => "conv_state",
+            Self::RecurrentState => "recurrent_state",
+            Self::Epsilon => "epsilon",
+        }
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum QwenDeltaNetOutputSlot {
+    NormalizedCore,
+    ConvState,
+    RecurrentState,
+}
+
+#[cfg(feature = "onnx")]
+impl QwenDeltaNetOutputSlot {
+    pub(crate) const ALL: [Self; 3] = [Self::NormalizedCore, Self::ConvState, Self::RecurrentState];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::NormalizedCore => "normalized_core",
+            Self::ConvState => "next_conv",
+            Self::RecurrentState => "next_recurrent",
+        }
+    }
+}
 
 /// Errors from the always-on ternary mpGEMM kernel.
 ///
@@ -532,9 +623,10 @@ pub fn kv_attention_kernel(
 
 #[cfg(feature = "onnx")]
 pub use onnx_op::{
-    TritiumKvAttentionKernel, TritiumKvAttentionOp, TritiumTernaryEmbeddingKernel,
-    TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel, TritiumTernaryMpGemmOp,
-    tritium_operator_domain,
+    QwenDeltaNetGeometry, QwenDeltaNetInputs, QwenDeltaNetOutput, QwenDeltaNetTensor,
+    TritiumKvAttentionKernel, TritiumKvAttentionOp, TritiumQwenDeltaNetKernel,
+    TritiumQwenDeltaNetOp, TritiumTernaryEmbeddingKernel, TritiumTernaryEmbeddingOp,
+    TritiumTernaryMpGemmKernel, TritiumTernaryMpGemmOp, tritium_operator_domain,
 };
 
 #[cfg(feature = "onnx")]

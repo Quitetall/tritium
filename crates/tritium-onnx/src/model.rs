@@ -982,7 +982,10 @@ pub fn diagnose_unsupported_graph(
         let supported = node_supported(node, tritium_opset, standard_opset);
         if !supported {
             let reason = if node.domain == ONNX_DOMAIN
-                && node.op_type == ONNX_KV_ATTENTION_OP_NAME
+                && matches!(
+                    node.op_type.as_str(),
+                    ONNX_KV_ATTENTION_OP_NAME | crate::ONNX_QWEN_DELTANET_OP_NAME
+                )
                 && tritium_opset != Some(2)
             {
                 format!(
@@ -1049,7 +1052,14 @@ pub fn diagnose_unsupported_graph(
                 });
             } else if matches!(
                 attribute.name.as_str(),
-                ATTR_N_HEAD | ATTR_N_KV_HEAD | ATTR_HEAD_DIM
+                ATTR_N_HEAD
+                    | ATTR_N_KV_HEAD
+                    | ATTR_HEAD_DIM
+                    | crate::ATTR_CONV_KERNEL_DIM
+                    | crate::ATTR_NUM_KEY_HEADS
+                    | crate::ATTR_NUM_VALUE_HEADS
+                    | crate::ATTR_KEY_HEAD_DIM
+                    | crate::ATTR_VALUE_HEAD_DIM
             ) && attribute.value <= 0
             {
                 diagnostics.push(UnsupportedGraphDiagnostic {
@@ -1143,20 +1153,18 @@ pub fn diagnose_unsupported_graph(
                     }),
                 }
             }
+            let positive_value = |name: &str| {
+                let mut attributes = node.attribute.iter().filter(|attribute| {
+                    attribute.name == name && attribute.kind == ATTRIBUTE_INT && attribute.value > 0
+                });
+                let value = attributes.next().map(|attribute| attribute.value);
+                if attributes.next().is_none() {
+                    value
+                } else {
+                    None
+                }
+            };
             if node.op_type == ONNX_KV_ATTENTION_OP_NAME {
-                let positive_value = |name: &str| {
-                    let mut attributes = node.attribute.iter().filter(|attribute| {
-                        attribute.name == name
-                            && attribute.kind == ATTRIBUTE_INT
-                            && attribute.value > 0
-                    });
-                    let value = attributes.next().map(|attribute| attribute.value);
-                    if attributes.next().is_none() {
-                        value
-                    } else {
-                        None
-                    }
-                };
                 if let (Some(n_head), Some(n_kv_head)) =
                     (positive_value(ATTR_N_HEAD), positive_value(ATTR_N_KV_HEAD))
                     && n_head % n_kv_head != 0
@@ -1173,6 +1181,24 @@ pub fn diagnose_unsupported_graph(
                         ),
                     });
                 }
+            } else if node.op_type == crate::ONNX_QWEN_DELTANET_OP_NAME
+                && let (Some(num_key_heads), Some(num_value_heads)) = (
+                    positive_value(crate::ATTR_NUM_KEY_HEADS),
+                    positive_value(crate::ATTR_NUM_VALUE_HEADS),
+                )
+                && num_value_heads % num_key_heads != 0
+            {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: format!(
+                        "{}.{}",
+                        diagnostic_subject(&node.name, "<unnamed node>"),
+                        crate::ATTR_NUM_VALUE_HEADS
+                    ),
+                    reason: format!(
+                        "num_value_heads {num_value_heads} is not divisible by num_key_heads {num_key_heads}"
+                    ),
+                });
             }
         }
     }
@@ -1223,6 +1249,20 @@ pub fn diagnose_unsupported_graph(
             ),
         }
     }
+    let is_deltanet_input = |name: &str| {
+        graph.node.iter().any(|node| {
+            node.domain == ONNX_DOMAIN
+                && node.op_type == crate::ONNX_QWEN_DELTANET_OP_NAME
+                && node.input.iter().any(|input| input == name)
+        })
+    };
+    let is_deltanet_output = |name: &str| {
+        graph.node.iter().any(|node| {
+            node.domain == ONNX_DOMAIN
+                && node.op_type == crate::ONNX_QWEN_DELTANET_OP_NAME
+                && node.output.iter().any(|output| output == name)
+        })
+    };
     for input in &graph.input {
         let subject = format!("input {}", input.name);
         match input.name.as_str() {
@@ -1233,6 +1273,12 @@ pub fn diagnose_unsupported_graph(
                 TENSOR_INT64,
             ),
             "q" | "k_cache" | "v_cache" | "attention_mask" => push_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(input),
+                TENSOR_FLOAT,
+            ),
+            name if is_deltanet_input(name) => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
                 tensor_elem_type(input),
@@ -1257,6 +1303,12 @@ pub fn diagnose_unsupported_graph(
         let subject = format!("output {}", output.name);
         match output.name.as_str() {
             "logits" | "context" => push_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(output),
+                TENSOR_FLOAT,
+            ),
+            name if is_deltanet_output(name) => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
                 tensor_elem_type(output),
@@ -1311,6 +1363,13 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => {
             &[ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_HEAD_DIM, ATTR_PAST_TOKENS]
         }
+        (ONNX_DOMAIN, crate::ONNX_QWEN_DELTANET_OP_NAME) => &[
+            crate::ATTR_CONV_KERNEL_DIM,
+            crate::ATTR_NUM_KEY_HEADS,
+            crate::ATTR_NUM_VALUE_HEADS,
+            crate::ATTR_KEY_HEAD_DIM,
+            crate::ATTR_VALUE_HEAD_DIM,
+        ],
         ("", "Transpose") => &["perm"],
         ("", "Softmax") => &["axis"],
         ("", "Concat") => &["axis"],
@@ -1384,6 +1443,7 @@ fn node_supported(
             matches!(tritium_opset, Some(1 | 2))
         }
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => tritium_opset == Some(2),
+        (ONNX_DOMAIN, crate::ONNX_QWEN_DELTANET_OP_NAME) => tritium_opset == Some(2),
         (
             "",
             "Transpose" | "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Relu"
@@ -3899,6 +3959,109 @@ pub(crate) fn encode_kv_attention_test_graph(
     .encode_to_vec()
 }
 
+#[cfg(all(test, feature = "onnx"))]
+pub(crate) fn encode_qwen_deltanet_test_graph() -> Vec<u8> {
+    let input_names = crate::QwenDeltaNetInput::ALL.map(|slot| slot.name().to_owned());
+    let output_names = crate::QwenDeltaNetOutputSlot::ALL.map(|slot| slot.name().to_owned());
+    let graph = GraphProto {
+        node: vec![NodeProto {
+            input: input_names.to_vec(),
+            output: output_names.to_vec(),
+            name: "tritium.qwen_deltanet".to_owned(),
+            op_type: crate::ONNX_QWEN_DELTANET_OP_NAME.to_owned(),
+            attribute: vec![
+                int_attribute(crate::ATTR_CONV_KERNEL_DIM, 2),
+                int_attribute(crate::ATTR_NUM_KEY_HEADS, 1),
+                int_attribute(crate::ATTR_NUM_VALUE_HEADS, 1),
+                int_attribute(crate::ATTR_KEY_HEAD_DIM, 1),
+                int_attribute(crate::ATTR_VALUE_HEAD_DIM, 1),
+            ],
+            domain: ONNX_DOMAIN.to_owned(),
+        }],
+        name: "tritium.qwen_deltanet_test".to_owned(),
+        initializer: Vec::new(),
+        input: vec![
+            tensor_value(
+                crate::QwenDeltaNetInput::RawQkv.name(),
+                TENSOR_FLOAT,
+                &[1, 3],
+            ),
+            tensor_value(crate::QwenDeltaNetInput::Z.name(), TENSOR_FLOAT, &[1, 1]),
+            tensor_value(
+                crate::QwenDeltaNetInput::BetaLogits.name(),
+                TENSOR_FLOAT,
+                &[1, 1],
+            ),
+            tensor_value(
+                crate::QwenDeltaNetInput::DecayLogits.name(),
+                TENSOR_FLOAT,
+                &[1, 1],
+            ),
+            tensor_value(
+                crate::QwenDeltaNetInput::ConvWeight.name(),
+                TENSOR_FLOAT,
+                &[3, 2],
+            ),
+            tensor_value(
+                crate::QwenDeltaNetInput::NormWeight.name(),
+                TENSOR_FLOAT,
+                &[1],
+            ),
+            tensor_value(crate::QwenDeltaNetInput::DtBias.name(), TENSOR_FLOAT, &[1]),
+            tensor_value(crate::QwenDeltaNetInput::ALog.name(), TENSOR_FLOAT, &[1]),
+            tensor_value(
+                crate::QwenDeltaNetInput::ConvState.name(),
+                TENSOR_FLOAT,
+                &[3, 2],
+            ),
+            tensor_value(
+                crate::QwenDeltaNetInput::RecurrentState.name(),
+                TENSOR_FLOAT,
+                &[1, 1, 1],
+            ),
+            tensor_value(crate::QwenDeltaNetInput::Epsilon.name(), TENSOR_FLOAT, &[]),
+        ],
+        output: vec![
+            tensor_value(
+                crate::QwenDeltaNetOutputSlot::NormalizedCore.name(),
+                TENSOR_FLOAT,
+                &[1, 1],
+            ),
+            tensor_value(
+                crate::QwenDeltaNetOutputSlot::ConvState.name(),
+                TENSOR_FLOAT,
+                &[3, 2],
+            ),
+            tensor_value(
+                crate::QwenDeltaNetOutputSlot::RecurrentState.name(),
+                TENSOR_FLOAT,
+                &[1, 1, 1],
+            ),
+        ],
+        value_info: Vec::new(),
+    };
+    ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx-test".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: String::new(),
+        model_version: 1,
+        graph: Some(graph),
+        opset_import: vec![
+            OperatorSetIdProto {
+                domain: String::new(),
+                version: ONNX_OPSET,
+            },
+            OperatorSetIdProto {
+                domain: ONNX_DOMAIN.to_owned(),
+                version: 2,
+            },
+        ],
+        metadata_props: Vec::new(),
+    }
+    .encode_to_vec()
+}
+
 #[cfg(test)]
 pub(crate) fn encode_standard_attention_test_graph(
     query_tokens: usize,
@@ -5296,6 +5459,61 @@ mod tests {
                 kind: UnsupportedGraphItemKind::Attribute,
                 subject: "tritium.kv_attention.n_kv_head".to_owned(),
                 reason: "n_head 3 is not divisible by n_kv_head 2".to_owned(),
+            }]
+        );
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn qwen_deltanet_diagnostics_reject_nondivisible_head_groups() {
+        let encoded = encode_qwen_deltanet_test_graph();
+        let mut protobuf = ModelProto::decode(encoded.as_slice()).unwrap();
+        let node = &mut protobuf.graph.as_mut().unwrap().node[0];
+        node.attribute
+            .iter_mut()
+            .find(|attribute| attribute.name == crate::ATTR_NUM_VALUE_HEADS)
+            .unwrap()
+            .value = 3;
+        node.attribute
+            .iter_mut()
+            .find(|attribute| attribute.name == crate::ATTR_NUM_KEY_HEADS)
+            .unwrap()
+            .value = 2;
+
+        assert_eq!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap(),
+            vec![UnsupportedGraphDiagnostic {
+                kind: UnsupportedGraphItemKind::Attribute,
+                subject: "tritium.qwen_deltanet.num_value_heads".to_owned(),
+                reason: "num_value_heads 3 is not divisible by num_key_heads 2".to_owned(),
+            }]
+        );
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn qwen_deltanet_dtype_diagnostics_follow_topology_after_renaming() {
+        let encoded = encode_qwen_deltanet_test_graph();
+        let mut protobuf = ModelProto::decode(encoded.as_slice()).unwrap();
+        let graph = protobuf.graph.as_mut().unwrap();
+        for (index, input) in graph.input.iter_mut().enumerate() {
+            let name = format!("renamed_input_{index}");
+            graph.node[0].input[index] = name.clone();
+            input.name = name;
+        }
+        for (index, output) in graph.output.iter_mut().enumerate() {
+            let name = format!("renamed_output_{index}");
+            graph.node[0].output[index] = name.clone();
+            output.name = name;
+        }
+        graph.input[0] = tensor_value("renamed_input_0", TENSOR_INT64, &[1, 3]);
+
+        assert_eq!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap(),
+            vec![UnsupportedGraphDiagnostic {
+                kind: UnsupportedGraphItemKind::Dtype,
+                subject: "input renamed_input_0".to_owned(),
+                reason: "expected ONNX dtype 1, got 7".to_owned(),
             }]
         );
     }

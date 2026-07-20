@@ -118,6 +118,14 @@ unrepresentable. Residual and query widths are independent, covering Qwen's
 packaging, remaining Qwen graph extensions, dynamic axes and end-user
 generation APIs remain open.
 
+The projected Qwen Gated DeltaNet recurrent core is now a registered opset-2
+custom operator. Packed QKV/Z/beta/decay/output projections remain composable
+Tritium mpGEMMs; the core consumes explicit convolution and recurrent state and
+publishes both next states. Frozen independent numeric vectors cover prompt and
+cached-token transitions through real ORT, including depthwise history order,
+decay-before-delta, normalized state feedback and gated RMSNorm. Whole-layer
+emission and heterogeneous schedule composition remain open.
+
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
 
