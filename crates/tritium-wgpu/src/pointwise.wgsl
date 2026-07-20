@@ -194,6 +194,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 result[index] = 0.0;
             }
         }
+        case 26u: {
+            let row = index / params.secondary;
+            let output_column = index % params.secondary;
+            var accumulator = 0.0;
+            for (var inner = 0u; inner < params.tertiary; inner = inner + 1u) {
+                accumulator = accumulator
+                    + left[row * params.tertiary + inner]
+                    * right[output_column * params.tertiary + inner];
+            }
+            result[index] = accumulator;
+        }
+        case 27u: {
+            let row = index / params.tertiary;
+            let inner = index % params.tertiary;
+            var accumulator = 0.0;
+            for (var output_column = 0u; output_column < params.secondary;
+                 output_column = output_column + 1u) {
+                accumulator = accumulator
+                    + extra[row * params.secondary + output_column]
+                    * right[output_column * params.tertiary + inner];
+            }
+            result[index] = accumulator;
+        }
+        case 28u: {
+            let output_column = index / params.tertiary;
+            let inner = index % params.tertiary;
+            var accumulator = 0.0;
+            for (var row = 0u; row < params.auxiliary; row = row + 1u) {
+                accumulator = accumulator
+                    + extra[row * params.secondary + output_column]
+                    * left[row * params.tertiary + inner];
+            }
+            result[index] = accumulator;
+        }
         default: { result[index] = 0.0; }
     }
 }

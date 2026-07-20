@@ -10,6 +10,7 @@ use tritium_spec::{
 use crate::WgpuBackend;
 
 const OPERATIONS: &[&str] = &[
+    "graph.dense_matmul",
     "graph.transpose",
     "graph.slice_cols",
     "graph.detach",
@@ -653,6 +654,103 @@ impl WgpuTrainBackendV1 {
         output_f32(output, output_name, &output_shape, output_len)?.copy_from_slice(&result);
         Ok(())
     }
+
+    fn execute_dense_matmul(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) = match request.execution {
+            TrainExecutionV1::Forward => (&["x", "weight"], &["result"]),
+            TrainExecutionV1::Vjp => (&["x", "weight", "grad_output"], &["grad_x", "grad_weight"]),
+            _ => return Err(invariant("dense matmul received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["m", "n", "k"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let m = attribute_u64(request, "m")?;
+        let n = attribute_u64(request, "n")?;
+        let k = attribute_u64(request, "k")?;
+        if m > u32::MAX as u64 || n > u32::MAX as u64 || k > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let x_shape = [m, k];
+        let weight_shape = [n, k];
+        let result_shape = [m, n];
+        let (actual_x_shape, x) = input_f32(request, "x")?;
+        let (actual_weight_shape, weight) = input_f32(request, "weight")?;
+        if actual_x_shape != x_shape || actual_weight_shape != weight_shape {
+            return Err(shape_error());
+        }
+        require_finite("x", x)?;
+        require_finite("weight", weight)?;
+        let gradient = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != result_shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            x
+        };
+        if request.execution == TrainExecutionV1::Forward {
+            let result_len = usize::try_from(m.checked_mul(n).ok_or_else(shape_error)?)
+                .map_err(|_| shape_error())?;
+            let result = self
+                .backend
+                .pointwise_sized(
+                    x, weight, gradient, 26, 0.0, m as u32, n as u32, k as u32, result_len,
+                )
+                .map_err(wgpu_error)?;
+            output_f32(output, "result", &result_shape, result_len)?.copy_from_slice(&result);
+        } else {
+            let grad_x = self
+                .backend
+                .pointwise_sized(
+                    x,
+                    weight,
+                    gradient,
+                    27,
+                    0.0,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    x.len(),
+                )
+                .map_err(wgpu_error)?;
+            let grad_weight = self
+                .backend
+                .pointwise_sized(
+                    x,
+                    weight,
+                    gradient,
+                    28,
+                    0.0,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    weight.len(),
+                )
+                .map_err(wgpu_error)?;
+            output_f32(output, "grad_x", &x_shape, x.len())?.copy_from_slice(&grad_x);
+            output_f32(output, "grad_weight", &weight_shape, weight.len())?
+                .copy_from_slice(&grad_weight);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -703,6 +801,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.slice_cols" {
             self.execute_slice_cols(&request, output)?;
+            0
+        } else if request.operation == "graph.dense_matmul" {
+            self.execute_dense_matmul(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
