@@ -21,7 +21,7 @@ use tritium_salt::{
     Qwen36PtqPackagesReceipt, Qwen36TensorWorkStore,
 };
 
-use crate::hf_assets::{HfAssetReceipt, stage_language_assets};
+use crate::hf_assets::{HfAssetReceipt, stage_language_assets, verify_language_asset};
 
 const COMPACT_PACKAGE_FILE: &str = "compact.tsalt2";
 const NEAR_LOSSLESS_PACKAGE_FILE: &str = "near-lossless.tsalt2";
@@ -157,8 +157,9 @@ impl Qwen36PtqMasterReceipt {
 /// Immutable receipt for atomically exported SALT profiles and preserved tensors.
 ///
 /// The package pair contains quantized language/MTP matrices and the safetensors
-/// companion contains every exact preserved BF16 language/MTP tensor. Model
-/// configuration and tokenizer assets remain a later governed export step.
+/// companion contains every exact preserved BF16 language/MTP tensor. Schema-v3
+/// bundles also bind the pinned Hugging Face language configuration and tokenizer
+/// sidecars; runtime integration remains a separate release gate.
 #[pyclass(frozen, module = "tritium._tritium", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub(crate) struct Qwen36PtqPackageReceipt {
@@ -564,7 +565,8 @@ pub(crate) fn reconcile_qwen36_ptq_packages(
         };
         publish_package_directory(
             &output_dir,
-            |compact, near, preserved_output| {
+            |staging, compact, near, preserved_output| {
+                let hf_assets = stage_language_assets(&model_dir, staging)?;
                 let native = tritium_salt::reconcile_qwen36_ptq_packages(
                     &admitted, &evidence, &config, limits, compact, near,
                 )
@@ -576,7 +578,12 @@ pub(crate) fn reconcile_qwen36_ptq_packages(
                         preserved_output.write_all(chunk)
                     })
                     .map_err(|error| error.to_string())?;
-                let receipt = Qwen36PtqPackageReceipt::from_native(&output_dir, &native, preserved);
+                let receipt = Qwen36PtqPackageReceipt::from_native(
+                    &output_dir,
+                    &native,
+                    preserved,
+                    hf_assets,
+                );
                 let manifest = receipt.manifest_bytes(&packing_label)?;
                 Ok((receipt, manifest))
             },
@@ -627,7 +634,7 @@ fn validate_output_location<'a>(
 
 fn publish_package_directory<R>(
     output: &Path,
-    produce: impl FnOnce(&mut File, &mut File, &mut File) -> Result<(R, Vec<u8>), String>,
+    produce: impl FnOnce(&Path, &mut File, &mut File, &mut File) -> Result<(R, Vec<u8>), String>,
     validate: impl FnOnce(&Path, &R) -> Result<(), String>,
 ) -> Result<R, String> {
     let name = output
@@ -648,7 +655,7 @@ fn publish_package_directory<R>(
             .map_err(|error| format!("create near-lossless output failed: {:?}", error.kind()))?;
         let mut preserved = File::create(staging.join(PRESERVED_TENSORS_FILE))
             .map_err(|error| format!("create preserved output failed: {:?}", error.kind()))?;
-        let (receipt, manifest) = produce(&mut compact, &mut near, &mut preserved)?;
+        let (receipt, manifest) = produce(&staging, &mut compact, &mut near, &mut preserved)?;
         compact
             .sync_all()
             .map_err(|error| format!("sync compact output failed: {:?}", error.kind()))?;
@@ -716,6 +723,13 @@ fn validate_staged_packages(
         }
     }
     validate_staged_preserved(staging, receipt)?;
+    for asset in &receipt.hf_assets {
+        verify_language_asset(
+            &staging.join(asset.file()),
+            &asset.package_id().to_string(),
+            asset.bytes(),
+        )?;
+    }
     Ok(())
 }
 
@@ -948,6 +962,23 @@ pub(crate) fn verify_preserved_safetensors(
         )
     })
     .map_err(PyValueError::new_err)
+}
+
+/// Strictly hash one manifest-bound Hugging Face sidecar.
+#[pyfunction]
+pub(crate) fn verify_hf_asset(
+    py: Python<'_>,
+    path: &str,
+    expected_package_id: &str,
+    expected_bytes: u64,
+) -> PyResult<(String, u64)> {
+    if path.is_empty() {
+        return Err(PyValueError::new_err("HF asset path must not be empty"));
+    }
+    let path = PathBuf::from(path);
+    let expected_package_id = expected_package_id.to_owned();
+    py.detach(move || verify_language_asset(&path, &expected_package_id, expected_bytes))
+        .map_err(PyValueError::new_err)
 }
 
 fn verify_preserved_safetensors_file(
@@ -1250,7 +1281,7 @@ mod tests {
         let output = parent.join("artifact");
         let receipt = publish_package_directory(
             &output,
-            |compact, near, preserved| {
+            |_, compact, near, preserved| {
                 compact.write_all(b"compact").unwrap();
                 near.write_all(b"near").unwrap();
                 preserved.write_all(b"preserved").unwrap();
@@ -1271,7 +1302,7 @@ mod tests {
         );
         assert_eq!(fs::read(output.join("tritium.json")).unwrap(), b"{}\n");
         assert!(
-            publish_package_directory(&output, |_, _, _| Ok(((), Vec::new())), |_, _| Ok(()))
+            publish_package_directory(&output, |_, _, _, _| Ok(((), Vec::new())), |_, _| Ok(()))
                 .unwrap_err()
                 .contains("already exists")
         );
@@ -1289,7 +1320,7 @@ mod tests {
         let output = parent.join("artifact");
         let error = publish_package_directory::<()>(
             &output,
-            |compact, _, _| {
+            |_, compact, _, _| {
                 compact.write_all(b"partial").unwrap();
                 Err("producer stopped".to_owned())
             },
@@ -1313,7 +1344,7 @@ mod tests {
         let output = parent.join("artifact");
         let error = publish_package_directory(
             &output,
-            |compact, near, preserved| {
+            |_, compact, near, preserved| {
                 compact.write_all(b"compact").unwrap();
                 near.write_all(b"near").unwrap();
                 preserved.write_all(b"preserved").unwrap();

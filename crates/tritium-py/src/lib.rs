@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 #![allow(unreachable_pub)] // pyo3's `#[pymethods]` expansion emits `pub` items.
 
+mod hf_assets;
 mod ops;
 mod salt;
 
@@ -265,6 +266,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(salt::reconcile_qwen36_ptq_packages, m)?)?;
     m.add_function(wrap_pyfunction!(salt::verify_salt_v2_package, m)?)?;
     m.add_function(wrap_pyfunction!(salt::verify_preserved_safetensors, m)?)?;
+    m.add_function(wrap_pyfunction!(salt::verify_hf_asset, m)?)?;
     m.add_function(wrap_pyfunction!(salt::inspect_qwen36_ptq_evidence, m)?)?;
     m.add_function(wrap_pyfunction!(salt::publish_directory_noreplace, m)?)?;
     m.add(

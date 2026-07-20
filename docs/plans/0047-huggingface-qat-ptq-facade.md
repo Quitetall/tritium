@@ -89,9 +89,11 @@ saves with safe serialization, automatically reloads through
   tensors, config, and tokenizer assets are promoted.
 - [x] Strictly reload the two exact Tritium matrix packages by re-parsing,
   re-hashing, and re-deriving indexed-runtime bytes through the native reader.
-- Promote preserved tensors and HF assets into a self-contained directory,
-  implement successful `save_pretrained`, and load supported complete HF
-  directories into the Qwen3.6 runtime adapter.
+- [x] Promote preserved tensors and the pinned, bounded, content-bound HF
+  language asset catalog into the same atomically published schema-v3 directory.
+- Implement successful `save_pretrained` and load supported complete HF
+  directories into the Qwen3.6 runtime adapter. Vision assets and weights remain
+  deferred under the plan 0043 scope boundary.
 - Remove refinement from `TernaryConfig.ptq`. PTQ can produce only a PTQ
   result; plan 0048's separate `refine` primitive produces scale-only or
   hard-PV child results with bound ancestry.

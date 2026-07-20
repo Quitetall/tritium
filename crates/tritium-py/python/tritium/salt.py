@@ -68,8 +68,9 @@ def reconcile_qwen36_ptq_packages(
     The output directory must not exist. Tritium stages both exact SALT V2
     profiles, the exact preserved BF16 safetensors companion, and their receipt
     manifest beside the destination. It syncs and strictly reopens them before
-    publishing the complete directory with one rename. Hugging Face configuration,
-    tokenizer assets, and runtime wiring remain separate release gates.
+    publishing the complete directory with one rename. Schema-v3 bundles include
+    bounded, content-bound Hugging Face language configuration and tokenizer
+    assets. Qwen3.6 runtime wiring remains a separate release gate.
     """
 
     return _reconcile_qwen36_ptq_packages(

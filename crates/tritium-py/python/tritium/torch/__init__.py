@@ -1,6 +1,13 @@
 """Differentiable PyTorch frontend for Tritium ternary models."""
 
-from .artifacts import ArtifactRef, ExportReceipt, QuantizationResult, export, load
+from .artifacts import (
+    ArtifactRef,
+    ExportReceipt,
+    HfAssetRef,
+    QuantizationResult,
+    export,
+    load,
+)
 from .config import RefinementConfig, TernaryConfig
 from .conversion import PreparedModel, inspect, prepare, prepare_qat
 from .coverage import CoverageEntry, CoverageReport
@@ -47,6 +54,7 @@ __all__ = [
     "Estimator",
     "ExportReceipt",
     "HfTritiumConfig",
+    "HfAssetRef",
     "LSQEstimator",
     "ProjectionContext",
     "PreparedModel",

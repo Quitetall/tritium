@@ -75,6 +75,28 @@ def _fake_verify_preserved(path, package_id, tensors, payload, serialized):
     return package_id, tensors, payload, serialized
 
 
+def _upgrade_bundle_to_v3(root: Path) -> None:
+    manifest_path = root / "tritium.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assets = []
+    for filename in artifacts._HF_ASSET_FILES:
+        payload = f"asset:{filename}".encode()
+        (root / filename).write_bytes(payload)
+        assets.append(
+            {
+                "file": filename,
+                "package_id": f"id:{filename}",
+                "bytes": len(payload),
+            }
+        )
+    manifest.update(
+        schema_version=3,
+        artifact_kind="qwen3.6-language-mtp-salt-v2-hf-bundle",
+        hf_assets=assets,
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
 def test_bundle_load_and_export_reverify_exact_profiles(monkeypatch, tmp_path):
     source = tmp_path / "source"
     _write_bundle(source)
@@ -148,6 +170,77 @@ def test_bundle_schema_rejects_unknown_fields_before_native_load(monkeypatch, tm
         raising=False,
     )
     with pytest.raises(ValueError, match="fields"):
+        load(source)
+
+
+def test_v3_hf_assets_are_strictly_loaded_and_exported(monkeypatch, tmp_path):
+    source = tmp_path / "source"
+    _write_bundle(source)
+    _upgrade_bundle_to_v3(source)
+
+    monkeypatch.setattr(artifacts._tritium, "verify_salt_v2_package", _fake_verify)
+    monkeypatch.setattr(
+        artifacts._tritium,
+        "verify_preserved_safetensors",
+        _fake_verify_preserved,
+        raising=False,
+    )
+
+    verified_assets = []
+
+    def verify_asset(path, package_id, byte_count):
+        path = Path(path)
+        assert path.stat().st_size == byte_count
+        verified_assets.append(path)
+        return package_id, byte_count
+
+    monkeypatch.setattr(
+        artifacts._tritium, "verify_hf_asset", verify_asset, raising=False
+    )
+    monkeypatch.setattr(
+        artifacts._tritium,
+        "publish_directory_noreplace",
+        lambda staging, target: Path(staging).rename(target),
+    )
+
+    result = load(source)
+    assert result.schema_version == 3
+    assert tuple(asset.file for asset in result.hf_assets) == artifacts._HF_ASSET_FILES
+    with pytest.raises(TritiumError) as caught:
+        result.save_pretrained(tmp_path / "hf")
+    assert caught.value.details["missing"] == ["qwen3.6_runtime_adapter"]
+
+    receipt = result.export(tmp_path / "copy")
+    assert receipt.schema_version == 3
+    assert (receipt.artifact_dir / "tokenizer.json").read_bytes() == b"asset:tokenizer.json"
+    assert sum(path.parent == receipt.artifact_dir for path in verified_assets) == 8
+
+
+def test_v3_hf_asset_catalog_rejects_reordering_before_asset_io(monkeypatch, tmp_path):
+    source = tmp_path / "source"
+    _write_bundle(source)
+    _upgrade_bundle_to_v3(source)
+    manifest_path = source / "tritium.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["hf_assets"][0], manifest["hf_assets"][1] = (
+        manifest["hf_assets"][1],
+        manifest["hf_assets"][0],
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(artifacts._tritium, "verify_salt_v2_package", _fake_verify)
+    monkeypatch.setattr(
+        artifacts._tritium,
+        "verify_preserved_safetensors",
+        _fake_verify_preserved,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        artifacts._tritium,
+        "verify_hf_asset",
+        lambda *args: pytest.fail("asset verifier must follow catalog validation"),
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="canonical order"):
         load(source)
 
 

@@ -8,13 +8,14 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from .. import _tritium
 from .errors import TritiumError
 
 _ARTIFACT_KIND_V1 = "qwen3.6-language-mtp-salt-v2-matrix-profiles"
 _ARTIFACT_KIND_V2 = "qwen3.6-language-mtp-salt-v2-model-weights"
+_ARTIFACT_KIND_V3 = "qwen3.6-language-mtp-salt-v2-hf-bundle"
 _MANIFEST = "tritium.json"
 _PRESERVED_FILE = "preserved.safetensors"
 _PROFILE_FILES = {
@@ -36,6 +37,7 @@ _TOP_LEVEL_FIELDS_V1 = {
     "profiles",
 }
 _TOP_LEVEL_FIELDS_V2 = _TOP_LEVEL_FIELDS_V1 | {"preserved"}
+_TOP_LEVEL_FIELDS_V3 = _TOP_LEVEL_FIELDS_V2 | {"hf_assets"}
 _PROFILE_FIELDS = {
     "file",
     "package_id",
@@ -49,6 +51,17 @@ _PRESERVED_FIELDS = {
     "payload_bytes",
     "serialized_bytes",
 }
+_HF_ASSET_FIELDS = {"file", "package_id", "bytes"}
+_HF_ASSET_FILES = (
+    "chat_template.jinja",
+    "config.json",
+    "configuration.json",
+    "generation_config.json",
+    "merges.txt",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+)
 
 
 @dataclass(frozen=True)
@@ -96,6 +109,24 @@ class PreservedRef:
 
 
 @dataclass(frozen=True)
+class HfAssetRef:
+    """One exact, bounded Hugging Face language sidecar."""
+
+    file: str
+    path: Path
+    package_id: str
+    bytes: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "file": self.file,
+            "path": str(self.path),
+            "package_id": self.package_id,
+            "bytes": self.bytes,
+        }
+
+
+@dataclass(frozen=True)
 class ExportReceipt:
     """Proof that a complete bundle directory was atomically published."""
 
@@ -114,8 +145,8 @@ class QuantizationResult:
 
     ``complete_model`` is intentionally false until Hugging Face configuration,
     tokenizer assets, and the Qwen3.6 runtime adapter are present. Schema-v2
-    results carry all exact preserved BF16 tensors alongside exact,
-    native-reopenable SALT V2 packages with measured physical ledgers.
+    adds exact preserved BF16 tensors; schema-v3 adds the pinned language-side
+    Hugging Face asset catalog. SALT V2 packages retain measured physical ledgers.
     """
 
     artifact_dir: Path
@@ -130,6 +161,7 @@ class QuantizationResult:
     compact: ArtifactRef
     near_lossless: ArtifactRef
     preserved: Optional[PreservedRef] = None
+    hf_assets: Tuple[HfAssetRef, ...] = ()
     complete_model: bool = False
     schema_version: int = 1
 
@@ -144,7 +176,9 @@ class QuantizationResult:
         return export(self, output_dir)
 
     def save_pretrained(self, output_dir: Union[os.PathLike[str], str]) -> None:
-        missing = ["config", "tokenizer_assets", "qwen3.6_runtime_adapter"]
+        missing = ["qwen3.6_runtime_adapter"]
+        if not self.hf_assets:
+            missing[:0] = ["config", "tokenizer_assets"]
         if self.preserved is None:
             missing.insert(0, "preserved_bf16_tensors")
         raise TritiumError(
@@ -177,12 +211,20 @@ def _read_manifest(directory: Path) -> Dict[str, Any]:
     if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
         raise ValueError("tritium.json must declare an integer schema_version")
     version = value["schema_version"]
-    if version not in {1, 2}:
+    if version not in {1, 2, 3}:
         raise ValueError("unsupported Tritium bundle schema_version")
-    fields = _TOP_LEVEL_FIELDS_V1 if version == 1 else _TOP_LEVEL_FIELDS_V2
+    fields = {
+        1: _TOP_LEVEL_FIELDS_V1,
+        2: _TOP_LEVEL_FIELDS_V2,
+        3: _TOP_LEVEL_FIELDS_V3,
+    }[version]
     if set(value) != fields:
         raise ValueError(f"tritium.json fields do not match bundle schema version {version}")
-    expected_kind = _ARTIFACT_KIND_V1 if version == 1 else _ARTIFACT_KIND_V2
+    expected_kind = {
+        1: _ARTIFACT_KIND_V1,
+        2: _ARTIFACT_KIND_V2,
+        3: _ARTIFACT_KIND_V3,
+    }[version]
     if value["artifact_kind"] != expected_kind or value["complete_model"] is not False:
         raise ValueError("unsupported Tritium artifact kind")
     if value["packing"] not in {"d2", "b3", "s34"}:
@@ -203,6 +245,36 @@ def _read_manifest(directory: Path) -> Dict[str, Any]:
     if not isinstance(profiles, dict) or set(profiles) != set(_PROFILE_FILES):
         raise ValueError("bundle must contain exactly both governed profiles")
     return value
+
+
+def _load_hf_assets(directory: Path, value: Any) -> Tuple[HfAssetRef, ...]:
+    if not isinstance(value, list) or len(value) != len(_HF_ASSET_FILES):
+        raise ValueError("hf_assets must contain exact language asset catalog")
+    assets = []
+    for expected_file, item in zip(_HF_ASSET_FILES, value):
+        if not isinstance(item, dict) or set(item) != _HF_ASSET_FIELDS:
+            raise ValueError("HF asset fields do not match bundle schema version 3")
+        if item["file"] != expected_file:
+            raise ValueError("HF assets are missing, duplicated, or out of canonical order")
+        package_id = item["package_id"]
+        byte_count = item["bytes"]
+        if not isinstance(package_id, str) or not package_id:
+            raise ValueError(f"HF asset {expected_file} package_id must be non-empty")
+        if type(byte_count) is not int or byte_count <= 0:
+            raise ValueError(f"HF asset {expected_file} bytes must be positive")
+        path = directory / expected_file
+        actual_id, actual_bytes = _tritium.verify_hf_asset(
+            str(path), package_id, byte_count
+        )
+        assets.append(
+            HfAssetRef(
+                file=expected_file,
+                path=path,
+                package_id=actual_id,
+                bytes=actual_bytes,
+            )
+        )
+    return tuple(assets)
 
 
 def _load_preserved(directory: Path, value: Any) -> PreservedRef:
@@ -294,8 +366,13 @@ def load(
     )
     preserved = (
         _load_preserved(directory, value["preserved"])
-        if value["schema_version"] == 2
+        if value["schema_version"] >= 2
         else None
+    )
+    hf_assets = (
+        _load_hf_assets(directory, value["hf_assets"])
+        if value["schema_version"] >= 3
+        else ()
     )
     return QuantizationResult(
         artifact_dir=directory,
@@ -310,14 +387,22 @@ def load(
         compact=compact,
         near_lossless=near,
         preserved=preserved,
+        hf_assets=hf_assets,
         schema_version=value["schema_version"],
     )
 
 
 def _manifest_bytes(result: QuantizationResult) -> bytes:
+    artifact_kind = {
+        1: _ARTIFACT_KIND_V1,
+        2: _ARTIFACT_KIND_V2,
+        3: _ARTIFACT_KIND_V3,
+    }.get(result.schema_version)
+    if artifact_kind is None:
+        raise ValueError("unsupported Tritium bundle schema_version")
     value = {
         "schema_version": result.schema_version,
-        "artifact_kind": _ARTIFACT_KIND_V2 if result.preserved is not None else _ARTIFACT_KIND_V1,
+        "artifact_kind": artifact_kind,
         "complete_model": False,
         "packing": result.packing,
         "completion_id": result.completion_id,
@@ -350,6 +435,17 @@ def _manifest_bytes(result: QuantizationResult) -> bytes:
             "payload_bytes": result.preserved.payload_bytes,
             "serialized_bytes": result.preserved.serialized_bytes,
         }
+    if result.schema_version == 3:
+        if len(result.hf_assets) != len(_HF_ASSET_FILES):
+            raise ValueError("schema version 3 requires exact HF asset catalog")
+        value["hf_assets"] = [
+            {
+                "file": asset.file,
+                "package_id": asset.package_id,
+                "bytes": asset.bytes,
+            }
+            for asset in result.hf_assets
+        ]
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -384,6 +480,11 @@ def export(
             shutil.copyfile(current.preserved.path, destination)
             with destination.open("rb") as stream:
                 os.fsync(stream.fileno())
+        for asset in current.hf_assets:
+            destination = staging / asset.file
+            shutil.copyfile(asset.path, destination)
+            with destination.open("rb") as stream:
+                os.fsync(stream.fileno())
         manifest = staging / _MANIFEST
         with manifest.open("xb") as stream:
             stream.write(_manifest_bytes(current))
@@ -405,6 +506,12 @@ def export(
                 or staged.preserved.payload_bytes != current.preserved.payload_bytes
                 or staged.preserved.serialized_bytes != current.preserved.serialized_bytes
             )
+        staged_assets = tuple(
+            (asset.file, asset.package_id, asset.bytes) for asset in staged.hf_assets
+        )
+        current_assets = tuple(
+            (asset.file, asset.package_id, asset.bytes) for asset in current.hf_assets
+        )
         if (
             staged.completion_id != current.completion_id
             or staged.campaign_id != current.campaign_id
@@ -413,6 +520,7 @@ def export(
             or staged.compact.package_id != current.compact.package_id
             or staged.near_lossless.package_id != current.near_lossless.package_id
             or preserved_changed
+            or staged_assets != current_assets
         ):
             raise TritiumError(
                 "staged bundle identity differs from source artifact",
@@ -446,6 +554,7 @@ def export(
 __all__ = [
     "ArtifactRef",
     "ExportReceipt",
+    "HfAssetRef",
     "PreservedRef",
     "QuantizationResult",
     "export",
