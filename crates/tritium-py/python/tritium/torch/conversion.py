@@ -101,7 +101,7 @@ def prepare_qat(
 ) -> nn.Module:
     """Validate then convert selected modules without cloning master parameters."""
 
-    from ..nn import TernaryLinear
+    from ..nn import TernaryEmbedding, TernaryLinear
 
     if not isinstance(model, nn.Module):
         raise TypeError("prepare_qat requires a torch.nn.Module")
@@ -111,7 +111,7 @@ def prepare_qat(
             code="invalid_config",
             stage="inspect",
         )
-    supported_targets = {"Linear"}
+    supported_targets = {"Embedding", "Linear"}
     unknown_targets = set(config.target_modules) - supported_targets
     if unknown_targets:
         raise TritiumError(
@@ -130,6 +130,14 @@ def prepare_qat(
             if converted is None:
                 estimator = _new_estimator(config)
                 converted = TernaryLinear.from_float(module, estimator=estimator)
+                converted_modules[id(module)] = converted
+            replacements.append(_Replacement(path, module, converted))
+            converted_weights.add(f"{path}.weight" if path else "weight")
+        elif isinstance(module, nn.Embedding) and "Embedding" in config.target_modules:
+            converted = converted_modules.get(id(module))
+            if converted is None:
+                estimator = _new_estimator(config)
+                converted = TernaryEmbedding.from_float(module, estimator=estimator)
                 converted_modules[id(module)] = converted
             replacements.append(_Replacement(path, module, converted))
             converted_weights.add(f"{path}.weight" if path else "weight")
@@ -165,6 +173,13 @@ def prepare_qat(
         result = model
 
     result._tritium_coverage = coverage
+    if hasattr(result, "config"):
+        # Hugging Face serializes this exact dictionary into config.json. The
+        # quantizer registration is optional and imported only when
+        # transformers is installed.
+        from .hf import attach_huggingface_recipe
+
+        attach_huggingface_recipe(result, config)
     return result
 
 
