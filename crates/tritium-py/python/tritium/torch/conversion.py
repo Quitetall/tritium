@@ -11,7 +11,7 @@ from torch import nn
 from .config import TernaryConfig
 from .coverage import CoverageEntry, CoverageReport
 from .errors import TritiumError
-from .estimators import AbsMeanSTE, Estimator, SaltSTE
+from .estimators import Estimator, create_estimator
 
 
 @dataclass(frozen=True)
@@ -22,29 +22,14 @@ class _Replacement:
 
 
 def _new_estimator(config: TernaryConfig) -> Estimator:
-    if config.estimator == "salt-ste":
-        if config.planes != 1:
-            raise TritiumError(
-                "reference salt-ste currently supports one plane",
-                code="unsupported_recipe",
-                stage="inspect",
-                details={"planes": config.planes},
-            )
-        return SaltSTE()
-    if config.estimator == "absmean-ste":
-        if config.planes != 1:
-            raise TritiumError(
-                "absmean-ste supports exactly one plane",
-                code="unsupported_recipe",
-                stage="inspect",
-                details={"planes": config.planes},
-            )
-        return AbsMeanSTE()
-    raise TritiumError(
-        f"unknown estimator {config.estimator!r}",
-        code="unsupported_recipe",
-        stage="inspect",
-    )
+    if config.planes != 1:
+        raise TritiumError(
+            "the QAT estimator catalog currently supports one hard ternary plane",
+            code="unsupported_recipe",
+            stage="inspect",
+            details={"planes": config.planes},
+        )
+    return create_estimator(config.estimator)
 
 
 def _parameter_coverage(model: nn.Module, converted_weights: set) -> CoverageReport:
@@ -71,6 +56,8 @@ def _parameter_coverage(model: nn.Module, converted_weights: set) -> CoverageRep
         disposition = "converted" if converted_aliases else "preserved"
         if converted_aliases:
             reason = "target_weight"
+        elif any(".estimator." in alias or alias.startswith("estimator.") for alias in aliases):
+            reason = "estimator_state"
         elif any(alias.endswith(".bias") or alias == "bias" for alias in aliases):
             reason = "bias_preserved"
         else:
@@ -124,11 +111,15 @@ def prepare_qat(
     replacements: List[_Replacement] = []
     converted_weights = set()
     converted_modules: Dict[int, nn.Module] = {}
+    estimators_by_weight: Dict[int, Estimator] = {}
     for path, module in model.named_modules(remove_duplicate=False):
         if isinstance(module, nn.Linear) and "Linear" in config.target_modules:
             converted = converted_modules.get(id(module))
             if converted is None:
-                estimator = _new_estimator(config)
+                estimator = estimators_by_weight.get(id(module.weight))
+                if estimator is None:
+                    estimator = _new_estimator(config)
+                    estimators_by_weight[id(module.weight)] = estimator
                 converted = TernaryLinear.from_float(module, estimator=estimator)
                 converted_modules[id(module)] = converted
             replacements.append(_Replacement(path, module, converted))
@@ -136,7 +127,10 @@ def prepare_qat(
         elif isinstance(module, nn.Embedding) and "Embedding" in config.target_modules:
             converted = converted_modules.get(id(module))
             if converted is None:
-                estimator = _new_estimator(config)
+                estimator = estimators_by_weight.get(id(module.weight))
+                if estimator is None:
+                    estimator = _new_estimator(config)
+                    estimators_by_weight[id(module.weight)] = estimator
                 converted = TernaryEmbedding.from_float(module, estimator=estimator)
                 converted_modules[id(module)] = converted
             replacements.append(_Replacement(path, module, converted))
@@ -149,7 +143,7 @@ def prepare_qat(
             stage="inspect",
         )
 
-    coverage = _parameter_coverage(model, converted_weights)
+    _parameter_coverage(model, converted_weights)
 
     root_replacement = next((item for item in replacements if not item.path), None)
     if root_replacement is not None:
@@ -172,7 +166,7 @@ def prepare_qat(
             ) from error
         result = model
 
-    result._tritium_coverage = coverage
+    result._tritium_coverage = _parameter_coverage(result, converted_weights)
     if hasattr(result, "config"):
         # Hugging Face serializes this exact dictionary into config.json. The
         # quantizer registration is optional and imported only when

@@ -99,6 +99,7 @@ class TernaryLinear(nn.Module):
             nn.Parameter(torch.empty(out_features, **factory_kwargs)) if bias else None
         )
         self.estimator = estimator if estimator is not None else AbsMeanSTE()
+        self.estimator.to(device=self.weight.device)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -123,6 +124,7 @@ class TernaryLinear(nn.Module):
         converted.weight = module.weight
         converted.bias = module.bias
         converted.estimator = estimator if estimator is not None else AbsMeanSTE()
+        converted.estimator.to(device=module.weight.device)
         converted.train(module.training)
         return converted
 
@@ -194,6 +196,7 @@ class TernaryEmbedding(nn.Module):
             torch.empty((num_embeddings, embedding_dim), device=device, dtype=dtype)
         )
         self.estimator = estimator if estimator is not None else AbsMeanSTE()
+        self.estimator.to(device=self.weight.device)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -221,6 +224,7 @@ class TernaryEmbedding(nn.Module):
         converted.sparse = module.sparse
         converted.weight = module.weight
         converted.estimator = estimator if estimator is not None else AbsMeanSTE()
+        converted.estimator.to(device=module.weight.device)
         converted.train(module.training)
         return converted
 

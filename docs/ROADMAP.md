@@ -107,6 +107,7 @@ Ordered. `todo` = not started, `in-progress` = executor running it, `done` = acc
 | 0045 | `docs/plans/0045-torch-reference-conversion.md` | Pure-PyTorch reference seam: typed config/errors/coverage/projection, `TernaryLinear`, transactional recursive `prepare_qat`, tied-weight/state preservation and exact parameter accounting | ADR 0033 / plan 0044 | **done** (`67fb0c9`; 34 Python tests pass; cloud review provider blocked, local fallback PASS after FP verification) | CPU Python reference; unblocks 0046 and 0047 |
 | 0046 | `docs/plans/0046-torch-dispatcher-zero-copy.md` | Dispatcher-visible device-resident ternary Linear: custom autograd, fake/meta, autocast, compile/opcheck, then native fused CPU/CUDA adapter and packed-cache invalidation | ADR 0033 / plan 0044 | **in progress** | composite operator → native adapter/perf gate |
 | 0047 | `docs/plans/0047-huggingface-qat-ptq-facade.md` | Hugging Face QAT/Trainer/PTQ/export/reload facade | v1.1 / ADR 0033 | **in progress** — trainable HF checkpoint slice first | 0046 semantic gate |
+| 0048 | `docs/plans/0048-estimator-catalog-salt-refinement.md` | Differentiable estimator/plugin catalog plus production SALT reconstruction and separate refinement tracks | v1.1 / ADR 0033; plan 0043 | **in progress** — estimator catalog first | 0045 schemas + 0043 driver seams |
 
 > **0002 (A) and 0003 (B) are independent** — disjoint files (format/quantize+examples vs the CUDA
 > JIT codegen) → safe to run concurrently. For true parallelism use a **git worktree per plan**

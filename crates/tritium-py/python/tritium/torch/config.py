@@ -29,6 +29,8 @@ class TernaryConfig:
             raise ValueError("planes must be between 1 and 3")
         if not self.target_modules:
             raise ValueError("target_modules must not be empty")
+        if not self.estimator:
+            raise ValueError("estimator must not be empty")
         if any(not name for name in self.target_modules):
             raise ValueError("target_modules cannot contain an empty name")
         if self.mode == "ptq" and self.profile not in {"compact-v1", "near-lossless-v1"}:

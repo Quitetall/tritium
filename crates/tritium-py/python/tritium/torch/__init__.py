@@ -4,7 +4,19 @@ from .config import TernaryConfig
 from .conversion import inspect, prepare_qat
 from .coverage import CoverageEntry, CoverageReport
 from .errors import TritiumError
-from .estimators import AbsMeanSTE, Estimator, SaltSTE
+from .estimators import (
+    AbsMeanSTE,
+    AnnealedSTE,
+    Estimator,
+    LSQEstimator,
+    SaltSTE,
+    SparseTernaryEstimator,
+    TTQEstimator,
+    TWNEstimator,
+    create_estimator,
+    register_estimator,
+    registered_estimators,
+)
 try:
     from .hf import HfTritiumConfig, TritiumTrainer, register_huggingface
 except ImportError:  # transformers is an optional integration dependency
@@ -18,20 +30,28 @@ from .projection import ProjectionContext, TernaryProjection, validate_projectio
 
 __all__ = [
     "AbsMeanSTE",
+    "AnnealedSTE",
     "CoverageEntry",
     "CoverageReport",
     "Estimator",
     "HfTritiumConfig",
+    "LSQEstimator",
     "ProjectionContext",
     "SaltSTE",
+    "SparseTernaryEstimator",
     "TernaryConfig",
     "TernaryProjection",
     "TritiumError",
     "TritiumTrainer",
+    "TTQEstimator",
+    "TWNEstimator",
+    "create_estimator",
     "inspect",
     "prepare_qat",
     "reference_ternary_linear",
+    "register_estimator",
     "register_huggingface",
+    "registered_estimators",
     "ternary_linear",
     "validate_projection",
 ]
