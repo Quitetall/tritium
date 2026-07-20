@@ -17,6 +17,7 @@ represented by a QAT checkpoint.
 ## Public seams under test
 
 - `tritium.nn.TernaryEmbedding`
+- `tritium.nn.TernaryConv1d` and `tritium.nn.TernaryConv2d`
 - `tritium.torch.HfTritiumConfig`
 - `tritium.torch.prepare_qat`
 - Hugging Face `AutoModelForCausalLM.from_pretrained`

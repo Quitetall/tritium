@@ -260,3 +260,180 @@ class TernaryEmbedding(nn.Module):
             options.append("sparse=True")
         options.append(f"estimator={self.estimator.algorithm_id!r}")
         return ", ".join(options)
+
+
+class _TernaryConvNd(nn.Module):
+    """Shared parameter/state mechanics for direct ternary convolutions."""
+
+    def _adopt(self, module, estimator: Optional[Estimator]) -> None:
+        self.in_channels = module.in_channels
+        self.out_channels = module.out_channels
+        self.kernel_size = module.kernel_size
+        self.stride = module.stride
+        self.padding = module.padding
+        self.dilation = module.dilation
+        self.transposed = module.transposed
+        self.output_padding = module.output_padding
+        self.groups = module.groups
+        self.padding_mode = module.padding_mode
+        self._reversed_padding_repeated_twice = module._reversed_padding_repeated_twice
+        self.weight = module.weight
+        self.bias = module.bias
+        self.estimator = estimator if estimator is not None else AbsMeanSTE()
+        self.estimator.to(device=self.weight.device)
+        self.train(module.training)
+
+    def _projected_weight(self) -> torch.Tensor:
+        flat = self.weight.flatten(start_dim=1)
+        return _project(self.estimator, flat, training=self.training).reshape_as(self.weight)
+
+    def _padded_input(self, input: torch.Tensor):
+        if self.padding_mode == "zeros":
+            return input, self.padding
+        return (
+            F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+            0,
+        )
+
+    def get_extra_state(self):
+        return _estimator_extra_state(self.estimator)
+
+    def set_extra_state(self, state) -> None:
+        _validate_estimator_extra_state(self.estimator, state)
+
+    def extra_repr(self) -> str:
+        options = [
+            f"{self.in_channels}",
+            f"{self.out_channels}",
+            f"kernel_size={self.kernel_size}",
+            f"stride={self.stride}",
+            f"padding={self.padding}",
+        ]
+        if self.dilation != (1,) * len(self.kernel_size):
+            options.append(f"dilation={self.dilation}")
+        if self.groups != 1:
+            options.append(f"groups={self.groups}")
+        if self.bias is None:
+            options.append("bias=False")
+        if self.padding_mode != "zeros":
+            options.append(f"padding_mode={self.padding_mode!r}")
+        options.append(f"estimator={self.estimator.algorithm_id!r}")
+        return ", ".join(options)
+
+
+class TernaryConv1d(_TernaryConvNd):
+    """One-dimensional convolution with hard ternary kernel weights."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        *,
+        estimator: Optional[Estimator] = None,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        source = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+            device=device,
+            dtype=dtype,
+        )
+        self._adopt(source, estimator)
+
+    @classmethod
+    def from_float(
+        cls, module: nn.Conv1d, *, estimator: Optional[Estimator] = None
+    ) -> "TernaryConv1d":
+        if not isinstance(module, nn.Conv1d):
+            raise TypeError("TernaryConv1d.from_float requires torch.nn.Conv1d")
+        converted = cls.__new__(cls)
+        nn.Module.__init__(converted)
+        converted._adopt(module, estimator)
+        return converted
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input, padding = self._padded_input(input)
+        return F.conv1d(
+            input,
+            self._projected_weight(),
+            self.bias,
+            self.stride,
+            padding,
+            self.dilation,
+            self.groups,
+        )
+
+
+class TernaryConv2d(_TernaryConvNd):
+    """Two-dimensional convolution with hard ternary kernel weights."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        *,
+        estimator: Optional[Estimator] = None,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        source = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+            device=device,
+            dtype=dtype,
+        )
+        self._adopt(source, estimator)
+
+    @classmethod
+    def from_float(
+        cls, module: nn.Conv2d, *, estimator: Optional[Estimator] = None
+    ) -> "TernaryConv2d":
+        if not isinstance(module, nn.Conv2d):
+            raise TypeError("TernaryConv2d.from_float requires torch.nn.Conv2d")
+        converted = cls.__new__(cls)
+        nn.Module.__init__(converted)
+        converted._adopt(module, estimator)
+        return converted
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input, padding = self._padded_input(input)
+        return F.conv2d(
+            input,
+            self._projected_weight(),
+            self.bias,
+            self.stride,
+            padding,
+            self.dilation,
+            self.groups,
+        )

@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from tritium.nn import TernaryLinear  # noqa: E402
+from tritium.nn import TernaryConv1d, TernaryConv2d, TernaryLinear  # noqa: E402
 from tritium.torch import (  # noqa: E402
     CoverageReport,
     Estimator,
@@ -118,7 +118,7 @@ def test_failed_inspection_leaves_module_graph_unchanged():
     original_linear = model[0]
 
     with pytest.raises(TritiumError) as caught:
-        prepare_qat(model, TernaryConfig.qat(target_modules=("Conv1d",)))
+        prepare_qat(model, TernaryConfig.qat(target_modules=("Conv3d",)))
 
     assert caught.value.code == "unsupported_module"
     assert model[0] is original_linear
@@ -191,3 +191,65 @@ def test_estimator_cannot_mislabel_its_projection_identity():
     with pytest.raises(TritiumError) as caught:
         TernaryLinear(3, 2, estimator=MislabelledEstimator())(torch.randn(1, 3))
     assert caught.value.code == "estimator_contract"
+
+
+@pytest.mark.parametrize(
+    ("source", "sample", "expected_type", "target"),
+    [
+        (
+            torch.nn.Conv1d(4, 6, kernel_size=3, stride=2, padding=2, dilation=2, groups=2),
+            torch.randn(2, 4, 11),
+            TernaryConv1d,
+            "Conv1d",
+        ),
+        (
+            torch.nn.Conv2d(
+                4,
+                6,
+                kernel_size=(3, 2),
+                stride=(2, 1),
+                padding=(1, 2),
+                dilation=(1, 2),
+                groups=2,
+                padding_mode="reflect",
+            ),
+            torch.randn(2, 4, 9, 10),
+            TernaryConv2d,
+            "Conv2d",
+        ),
+    ],
+)
+def test_convolution_conversion_preserves_options_identity_and_gradients(
+    source, sample, expected_type, target
+):
+    weight = source.weight
+    bias = source.bias
+    converted = prepare_qat(
+        source,
+        TernaryConfig.qat(estimator="twn", target_modules=(target,)),
+    )
+
+    assert isinstance(converted, expected_type)
+    assert converted.weight is weight
+    assert converted.bias is bias
+    assert converted.stride == source.stride
+    assert converted.padding == source.padding
+    assert converted.dilation == source.dilation
+    assert converted.groups == source.groups
+    assert converted.padding_mode == source.padding_mode
+
+    output = converted(sample.requires_grad_())
+    output.square().mean().backward()
+    assert output.numel() > 0
+    assert converted.weight.grad is not None
+    assert sample.grad is not None
+    assert inspect(converted).converted_parameters == 1
+
+
+def test_convolution_state_dict_round_trip_is_exact():
+    config = TernaryConfig.qat(estimator="sparse-ternary", target_modules=("Conv2d",))
+    source = prepare_qat(torch.nn.Conv2d(3, 5, 3, padding="same"), config)
+    restored = prepare_qat(torch.nn.Conv2d(3, 5, 3, padding="same"), config)
+    restored.load_state_dict(source.state_dict())
+    sample = torch.randn(2, 3, 7, 7)
+    assert torch.equal(restored(sample), source(sample))

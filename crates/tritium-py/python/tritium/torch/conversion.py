@@ -88,7 +88,7 @@ def prepare_qat(
 ) -> nn.Module:
     """Validate then convert selected modules without cloning master parameters."""
 
-    from ..nn import TernaryEmbedding, TernaryLinear
+    from ..nn import TernaryConv1d, TernaryConv2d, TernaryEmbedding, TernaryLinear
 
     if not isinstance(model, nn.Module):
         raise TypeError("prepare_qat requires a torch.nn.Module")
@@ -98,7 +98,7 @@ def prepare_qat(
             code="invalid_config",
             stage="inspect",
         )
-    supported_targets = {"Embedding", "Linear"}
+    supported_targets = {"Conv1d", "Conv2d", "Embedding", "Linear"}
     unknown_targets = set(config.target_modules) - supported_targets
     if unknown_targets:
         raise TritiumError(
@@ -132,6 +132,28 @@ def prepare_qat(
                     estimator = _new_estimator(config)
                     estimators_by_weight[id(module.weight)] = estimator
                 converted = TernaryEmbedding.from_float(module, estimator=estimator)
+                converted_modules[id(module)] = converted
+            replacements.append(_Replacement(path, module, converted))
+            converted_weights.add(f"{path}.weight" if path else "weight")
+        elif isinstance(module, nn.Conv1d) and "Conv1d" in config.target_modules:
+            converted = converted_modules.get(id(module))
+            if converted is None:
+                estimator = estimators_by_weight.get(id(module.weight))
+                if estimator is None:
+                    estimator = _new_estimator(config)
+                    estimators_by_weight[id(module.weight)] = estimator
+                converted = TernaryConv1d.from_float(module, estimator=estimator)
+                converted_modules[id(module)] = converted
+            replacements.append(_Replacement(path, module, converted))
+            converted_weights.add(f"{path}.weight" if path else "weight")
+        elif isinstance(module, nn.Conv2d) and "Conv2d" in config.target_modules:
+            converted = converted_modules.get(id(module))
+            if converted is None:
+                estimator = estimators_by_weight.get(id(module.weight))
+                if estimator is None:
+                    estimator = _new_estimator(config)
+                    estimators_by_weight[id(module.weight)] = estimator
+                converted = TernaryConv2d.from_float(module, estimator=estimator)
                 converted_modules[id(module)] = converted
             replacements.append(_Replacement(path, module, converted))
             converted_weights.add(f"{path}.weight" if path else "weight")
