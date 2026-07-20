@@ -26,12 +26,18 @@ canonical request/output digests, exact dtype, build identity and memory bounds.
 Typed lifecycle compilers build canonical checkpoint/resume buffers for SGD,
 AdamW, cautious AdamW, int8 AdamW and Muon, and strict SALT V2 export/reload
 requests without exposing backend role names or encoded-size arithmetic.
+The canonical vectors also generate all 31 non-lifecycle operation bindings
+(57 forward/VJP/step signatures). Typed schedule compilers copy caller-owned
+buffers into immutable portable requests, resolve tied tensors through their
+canonical owner, preserve exact f32 bits, return explicit destination buffer
+IDs and fail closed on binding, dtype, shape or compiled-plan drift. Generated
+binding freshness is part of `npm run check`.
 
 `PortableWasmLifecycleState.create(...)` owns copied optimizer planes, commits
 and resumes atomically through that guest. Its separate `admitExport(...)`
 boundary strict-reloads caller-supplied SALT packages before returning them.
-Compiled forward/backward adapter execution and state-derived model export
-remain separate release gates.
+Initial model-to-buffer decoding, session-owned compiled dispatch execution and
+state-derived model export remain separate release gates.
 
 The compiled lifecycle WASM controller and WebGPU adapter are still under construction;
 the conformance guest is not mislabeled as either. Until a lifecycle adapter is

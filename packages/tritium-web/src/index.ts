@@ -31,6 +31,11 @@ export {
   PortableWasmLifecycleError,
   PortableWasmLifecycleState,
 } from "./portable-state.ts";
+export {
+  PortableSchedulePlanError,
+  compilePortableBackwardOperationRequest,
+  compilePortablePlanOperationRequest,
+} from "./portable-schedule.ts";
 export type {
   PortableAdamLeafV1,
   PortableCheckpointOptimizerV1,
@@ -45,6 +50,12 @@ export type {
   PortableWasmLifecycleOptionsV1,
   PortableWasmLifecycleStateV1,
 } from "./portable-state.ts";
+export type {
+  PortableCompiledDispatchV1,
+  PortableSchedulePlanErrorCode,
+  PortableScheduleTensorStoreV1,
+  PortableScheduleTensorV1,
+} from "./portable-schedule.ts";
 export type {
   PortableAttributeV1,
   PortableBufferDataV1,

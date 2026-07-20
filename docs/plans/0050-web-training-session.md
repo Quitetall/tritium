@@ -109,8 +109,13 @@ all five optimizers and strict SALT V2 export/reload requests, with exact-state
 round trips through the admitted guest. A bounded lifecycle state owner copies
 optimizer planes and commits and resumes only after canonical guest success; a
 separate boundary admits caller-supplied SALT packages through strict reload.
-It remains explicitly `wasm-fallback`; schedule adapter execution, state-derived
-model export and physical Chrome/Firefox runs remain open.
+The canonical corpus now generates the 31-operation / 57-execution role
+registry used to compile immutable typed-array stores into exact forward, VJP
+and optimizer-step portable requests. The package gate rejects registry drift,
+unknown buffers, role drift, dtype/shape mismatches and malformed compiled
+plans before guest entry. It remains explicitly `wasm-fallback`; session-owned
+execution, the initial model-to-buffer payload contract, state-derived model
+export and physical Chrome/Firefox runs remain open.
 
 Compile `tritium-spec`, the bounded portable executor and SALT V2 strict reader
 to `wasm32-unknown-unknown`. JavaScript owns only lifecycle orchestration and
@@ -148,8 +153,11 @@ payloads. The compiler now derives the reachable reverse-mode VJP schedule from
 the single declared loss, assigns canonical backend roles to saved inputs and
 cotangents, reserves the loss seed, marks declared gradients for clearing at
 each backward boundary, and emits deterministic `graph.add` fan-in reductions
-into each tied parameter owner's sole gradient buffer. Adapter execution of that frozen
-schedule and device-loss transactions remain open; canonical WASM
+into each tied parameter owner's sole gradient buffer. Generated canonical
+bindings now lower every frozen forward, VJP, fan-in and optimizer step into a
+typed portable dispatch with copied inputs and explicit output buffer IDs.
+Session execution of that frozen schedule, initial parameter decoding and
+device-loss transactions remain open; canonical WASM
 checkpoint/resume state transactions are owned and failure-stable, while SALT
 package admission is canonical but state-derived export remains open.
 

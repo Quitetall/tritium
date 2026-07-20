@@ -20,7 +20,9 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
-    "typecheck": "npm run build:wasm && tsc -p tsconfig.json --noEmit",
+    "generate:bindings": "node scripts/generate-operation-bindings.mjs",
+    "check:generated": "node scripts/generate-operation-bindings.mjs --check",
+    "typecheck": "npm run check:generated && npm run build:wasm && tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "check": "npm run typecheck && npm test"
   },

@@ -14,6 +14,11 @@ import type {
   PortableWasmLifecycleErrorCode,
   PortableWasmLifecycleOptionsV1,
 } from "./portable-state-types.js";
+import type {
+  PortableCompiledDispatchV1,
+  PortableSchedulePlanErrorCode,
+  PortableScheduleTensorStoreV1,
+} from "./portable-schedule-types.js";
 
 export type {
   PortableAdamLeafV1,
@@ -43,6 +48,13 @@ export type {
   PortableWasmLifecycleOptionsV1,
   PortableWasmLifecycleStateV1,
 } from "./portable-state-types.js";
+
+export type {
+  PortableCompiledDispatchV1,
+  PortableSchedulePlanErrorCode,
+  PortableScheduleTensorStoreV1,
+  PortableScheduleTensorV1,
+} from "./portable-schedule-types.js";
 
 export type TrainingOpCategoryV1 =
   | "graph"
@@ -133,6 +145,25 @@ export declare class PortableWasmLifecycleState {
   admitExport(packageBytes: Uint8Array): Promise<PortableWasmLifecycleBinaryV1>;
   dispose(): void;
 }
+
+export declare class PortableSchedulePlanError extends Error {
+  readonly code: PortableSchedulePlanErrorCode;
+  constructor(code: PortableSchedulePlanErrorCode, message: string);
+}
+
+export declare function compilePortablePlanOperationRequest(
+  plan: CompiledTrainingPlanV1,
+  operationId: string,
+  store: PortableScheduleTensorStoreV1,
+  physicalDevice?: string,
+): PortableCompiledDispatchV1;
+
+export declare function compilePortableBackwardOperationRequest(
+  plan: CompiledTrainingPlanV1,
+  operationId: string,
+  store: PortableScheduleTensorStoreV1,
+  physicalDevice?: string,
+): PortableCompiledDispatchV1;
 
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";
