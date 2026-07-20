@@ -110,13 +110,16 @@ semantics, reject duplicate/unknown/type/order drift, and re-emit byte-identical
 canonical JSON. Python passed the complete 92-test suite; Deno type-check and
 three parser tests passed. Slice 2 is next.
 
-The first Slice 2 tracer seed now covers `graph.add` forward/VJP, an exact-zero
-forward, plain-SGD step, and non-finite rejection. A generic testkit runner
-poisons success outputs, preserves error sentinels, grades structured error
-identity, independently recomputes request/output receipt digests, and binds
-every successful receipt to the exact corpus bytes. This is incremental
-evidence, not Slice 2 closure: all remaining operations and an envelope capable
-of carrying intentionally malformed shared-request vectors are still required.
+The Slice 2 tracer corpus now carries 20 cases across 9 of 35 operations:
+`graph.detach`, `graph.scale_const`, `graph.bias`, `graph.add`, `graph.mul`,
+`graph.relu2`, `graph.silu`, `loss.mse`, and plain `optimizer.sgd`. Every graph
+primitive has forward and VJP coverage; the corpus also covers exact zero,
+non-finite rejection, and an intentionally malformed duplicate-input request.
+A generic testkit runner poisons success outputs, preserves error sentinels,
+grades structured error identity, independently recomputes request/output
+receipt digests, and binds every successful receipt to the exact corpus bytes.
+This is incremental evidence, not Slice 2 closure: the remaining 26 operations
+and their adversarial/error matrices are still required.
 
 Edits:
 

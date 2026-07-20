@@ -2,11 +2,54 @@
 
 use tritium_spec::{
     TrainExecutionV1, TrainingOpManifestV1, TrainingToleranceV1, TrainingVectorBufferDataV1,
-    TrainingVectorExpectedV1, TrainingVectorSetV1,
+    TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1, TrainingVectorSetV1,
 };
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn expected_invalid_request_preserves_duplicate_roles_for_backend_replay() {
+    let manifest_digest = hex(&TrainingOpManifestV1::digest());
+    let json = format!(
+        r#"{{
+  "schema_id": "tritium.training_vectors",
+  "schema_version": 1,
+  "manifest_digest": "{manifest_digest}",
+  "cases": [
+    {{
+      "case_id": "graph.add.forward.duplicate_input",
+      "operation": "graph.add",
+      "execution": "forward",
+      "tolerance": {{"kind": "bit_exact"}},
+      "inputs": [
+        {{"name": "left", "shape": [1], "data": {{"dtype": "f32", "bits": [1065353216]}}}},
+        {{"name": "left", "shape": [1], "data": {{"dtype": "f32", "bits": [1073741824]}}}}
+      ],
+      "attributes": [],
+      "expected": {{
+        "kind": "error",
+        "category": "invalid_request",
+        "code": "duplicate_name.input.left",
+        "outputs": [
+          {{"name": "result", "shape": [1], "data": {{"dtype": "f32", "bits": [1123418112]}}}}
+        ]
+      }}
+    }}
+  ]
+}}"#
+    );
+
+    let vectors = TrainingVectorSetV1::parse_json(json.as_bytes()).unwrap();
+    assert!(matches!(
+        &vectors.cases()[0].expected,
+        TrainingVectorExpectedV1::Error {
+            category: TrainingVectorErrorCategoryV1::InvalidRequest,
+            code,
+            outputs,
+        } if code == "duplicate_name.input.left" && outputs.len() == 1
+    ));
 }
 
 #[test]
@@ -70,19 +113,34 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
         vectors
             .cases()
             .iter()
-            .map(|case| (case.operation.as_str(), case.execution))
+            .map(|case| case.case_id.as_str())
             .collect::<Vec<_>>(),
         [
-            ("graph.add", TrainExecutionV1::Forward),
-            ("graph.add", TrainExecutionV1::Forward),
-            ("graph.add", TrainExecutionV1::Vjp),
-            ("optimizer.sgd", TrainExecutionV1::Step),
-            ("graph.add", TrainExecutionV1::Forward),
+            "graph.add.forward.basic",
+            "graph.add.forward.zero",
+            "graph.add.vjp.basic",
+            "graph.mul.forward.basic",
+            "graph.mul.vjp.basic",
+            "graph.detach.forward.basic",
+            "graph.detach.vjp.zero",
+            "graph.scale_const.forward.basic",
+            "graph.scale_const.vjp.basic",
+            "graph.bias.forward.basic",
+            "graph.bias.vjp.basic",
+            "graph.relu2.forward.basic",
+            "graph.relu2.vjp.basic",
+            "graph.silu.forward.basic",
+            "graph.silu.vjp.basic",
+            "loss.mse.forward.basic",
+            "loss.mse.vjp.basic",
+            "optimizer.sgd.step.basic",
+            "graph.add.forward.nonfinite",
+            "graph.add.forward.duplicate_input",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "4f5ab35ea2a77dec22cff12e134466fb0b86bfa882cd9b904dc64cc9dc751a78"
+        "18b6efd5cf2c91c723b5e176d19e6e276d7de81c88b07707f8d9c9494a7f5a02"
     );
 }

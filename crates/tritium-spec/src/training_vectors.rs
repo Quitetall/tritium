@@ -211,8 +211,15 @@ impl TrainingVectorSetV1 {
                 });
             }
             let tolerance = validate_tolerance(case.tolerance)?;
-            let inputs = validate_buffers("input", case.inputs)?;
-            let attributes = validate_attributes(case.attributes)?;
+            let carries_invalid_request = matches!(
+                &case.expected,
+                ExpectedWire::Error {
+                    category: ErrorCategoryWire::InvalidRequest,
+                    ..
+                }
+            );
+            let inputs = validate_buffers("input", case.inputs, carries_invalid_request)?;
+            let attributes = validate_attributes(case.attributes, carries_invalid_request)?;
             let expected = validate_expected(case.expected)?;
             cases.push(TrainingVectorCaseV1 {
                 case_id: case.case_id,
@@ -507,12 +514,13 @@ fn validate_tolerance(wire: ToleranceWire) -> Result<TrainingToleranceV1, Traini
 fn validate_buffers(
     namespace: &'static str,
     buffers: Vec<BufferWire>,
+    allow_duplicate_names: bool,
 ) -> Result<Vec<TrainingVectorBufferV1>, TrainingVectorError> {
     let mut names = HashSet::with_capacity(buffers.len());
     let mut parsed = Vec::with_capacity(buffers.len());
     for buffer in buffers {
         validate_identifier(namespace, &buffer.name, false)?;
-        if !names.insert(buffer.name.clone()) {
+        if !names.insert(buffer.name.clone()) && !allow_duplicate_names {
             return Err(TrainingVectorError::DuplicateName {
                 namespace,
                 name: buffer.name,
@@ -548,6 +556,7 @@ fn validate_buffers(
 
 fn validate_attributes(
     attributes: Vec<AttributeWire>,
+    allow_duplicate_names: bool,
 ) -> Result<Vec<TrainingVectorAttributeV1>, TrainingVectorError> {
     let mut names = HashSet::with_capacity(attributes.len());
     let mut parsed = Vec::with_capacity(attributes.len());
@@ -576,7 +585,7 @@ fn validate_attributes(
             }
         };
         validate_identifier("attribute", &name, false)?;
-        if !names.insert(name.clone()) {
+        if !names.insert(name.clone()) && !allow_duplicate_names {
             return Err(TrainingVectorError::DuplicateName {
                 namespace: "attribute",
                 name,
@@ -593,7 +602,7 @@ fn validate_expected(wire: ExpectedWire) -> Result<TrainingVectorExpectedV1, Tra
             outputs,
             scratch_bytes_max,
         } => Ok(TrainingVectorExpectedV1::Success {
-            outputs: validate_buffers("output", outputs)?,
+            outputs: validate_buffers("output", outputs, false)?,
             scratch_bytes_max,
         }),
         ExpectedWire::Error {
@@ -612,7 +621,7 @@ fn validate_expected(wire: ExpectedWire) -> Result<TrainingVectorExpectedV1, Tra
             Ok(TrainingVectorExpectedV1::Error {
                 category,
                 code,
-                outputs: validate_buffers("output", outputs)?,
+                outputs: validate_buffers("output", outputs, false)?,
             })
         }
     }
