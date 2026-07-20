@@ -1,0 +1,238 @@
+# 0049 — Portable training manifest and native backend conformance
+
+Status: **IN PROGRESS** (2026-07-20)
+
+- **Decision:** [ADR 0033](../adr/0033-v11-full-public-release.md)
+- **Parent:** [plan 0044](./0044-v11-full-public-release.md)
+- **Dependencies:** [plan 0045](./0045-torch-reference-conversion.md) schema
+  vocabulary; portable Conv2d reference in `tritium-train`
+- **Successor:** plan 0050 browser `WebTrainingSession`
+
+## Goal
+
+Freeze one language-neutral `TrainingOpManifestV1`, one fallible
+`TrainBackendV1` seam and one canonical vector corpus. Every declared training
+backend must execute that same corpus without hidden host execution. Receipts,
+not compile success or skipped tests, prove support.
+
+This plan owns semantic portability. Plan 0050 owns browser product packaging
+and WebGPU session orchestration; plan 0051 owns public package publication.
+
+## Non-goals
+
+- No public native dynamic `Tensor`/`Module` interface; ADR 0033 reserves that
+  for v1.2.
+- No arbitrary JavaScript autograd graph; plan 0050 exposes a compiled session.
+- No inference-only fallback counted as training support.
+- No relaxed operation set for constrained targets. Shape ceilings may differ;
+  semantics may not.
+
+## Contract placement
+
+`tritium-spec` owns language-neutral descriptors and strict schema parsing. It
+is the seam shared by training and all backend adapters; no backend
+implementation enters that crate. `tritium-train` owns reference semantics and
+the CPU reference adapter. Device crates own their adapters.
+
+Canonical fixtures live under `spec/training/v1/`. Source-tree tests read that
+one copy; packaged copies must be byte-identical and digest-verified. Divergent
+generated fixtures are forbidden.
+
+Stable interface:
+
+```rust
+pub struct TrainingOpManifestV1;
+
+impl TrainingOpManifestV1 {
+    pub const SCHEMA_ID: &'static str;
+    pub const SCHEMA_VERSION: u32;
+    pub fn operations() -> &'static [TrainingOpDescriptorV1];
+    pub fn parse_json(bytes: &[u8]) -> Result<Self, TrainingManifestError>;
+    pub fn canonical_json() -> &'static [u8];
+}
+
+pub trait TrainBackendV1 {
+    fn capabilities(&self) -> TrainCapabilitiesV1;
+    fn execute(
+        &self,
+        request: TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<TrainReceiptV1, TrainBackendError>;
+}
+```
+
+`execute` is intentionally one deep interface. Operation dispatch, validation,
+buffer ownership, first-order VJP, optimizer state mutation and receipt
+construction remain behind it. Backend-specific convenience methods stay
+private.
+
+Manifest JSON uses UTF-8, LF, two-space indentation, one terminal newline and
+fixed field/descriptor order. It contains no JSON floats. Its identity is the
+BLAKE3 digest of exact canonical bytes. Each descriptor contains exactly
+`id`, `category`, `forward`, `vjp`, `mutates`, and `checkpoint_planes`; parsers
+reject unknown or missing fields rather than normalize them.
+
+## Frozen operation registry
+
+Every ID is lowercase ASCII and permanent within schema v1. Descriptor order is
+canonical. Graph operations declare `forward` and `first_order_vjp`; stateful
+operations declare mutation and checkpoint planes explicitly.
+
+### Graph
+
+- `graph.ste_surrogate`, `graph.salt_ste`, `graph.lsq_ste`, `graph.fsq`
+- `graph.dense_matmul`, `graph.ternary_matmul`, `graph.transpose`
+- `graph.embedding_gather`, `graph.slice_cols`, `graph.concat_cols`
+- `graph.detach`, `graph.scale_const`, `graph.bias`, `graph.add`, `graph.mul`
+- `graph.conv1d`, `graph.conv2d`
+- `graph.relu2`, `graph.silu`, `graph.rmsnorm`, `graph.softmax`
+- `graph.causal_mask`, `graph.rope`, `graph.attention`
+- `loss.mse`, `loss.softmax_cross_entropy`
+
+### Optimizer and lifecycle
+
+- `optimizer.sgd`, `optimizer.adamw`, `optimizer.cautious_adamw`
+- `optimizer.int8_adamw`, `optimizer.muon`
+- `lifecycle.checkpoint`, `lifecycle.resume`
+- `lifecycle.export`, `lifecycle.reload`
+
+Composed attention remains a registered semantic operation even though the Rust
+reference currently composes primitive Tape nodes. SGD receives a portable
+reference implementation before registry closure.
+
+## Slice 1 — schema, registry and exhaustive audit
+
+Edits:
+
+- Add strict manifest types/parser to `tritium-spec/src/training.rs`.
+- Add `spec/training/v1/manifest.json` as canonical bytes.
+- Add Python dataclasses/parser under
+  `crates/tritium-py/python/tritium/portable/manifest.py`.
+- Add dependency-free strict TypeScript parser under
+  `bindings/typescript/src/training_manifest.ts` with a strict `tsconfig.json`.
+- Add a source audit in `tritium-train` mapping every public Tape operation,
+  optimizer and lifecycle seam to one manifest ID. Additions without registry
+  entries fail CI.
+
+Failure gates:
+
+- unknown schema ID/version, fields, operation IDs, duplicates or order fail;
+- missing/extra registry entries fail;
+- malformed UTF-8, JSON, booleans or capability fields fail;
+- Rust/Python/TypeScript re-emit byte-identical canonical JSON.
+
+## Slice 2 — canonical semantic vectors
+
+Add `spec/training/v1/vectors/` with small, adversarial f32 cases for every
+operation. Each case binds:
+
+- manifest digest, operation ID and deterministic case ID;
+- exact input/output shapes and little-endian f32 payload digests;
+- forward output, every first-order input gradient and mutated state;
+- tolerance policy (`bit_exact` or fixed absolute/relative bounds);
+- expected structured error for invalid cases;
+- peak temporary-byte ceiling where bounded scratch is contractual.
+
+Vectors include zeros, ties, non-finite rejection, ragged groups, grouped and
+depthwise convolution, asymmetric padding, stride/dilation, repeated embedding
+indices, masked rows, optimizer quiet/spike blocks, resume after mutation and
+export/reload parity. Vector generation is a checked-in tool; fixture review
+uses its human-readable source plus output digest.
+
+## Slice 3 — fallible seam and CPU reference adapter
+
+- Add owned/borrowed tensor descriptors with checked dtype, rank, shape, byte
+  count, aliasing and mutability rules.
+- Add structured `TrainBackendError`; no public request path may panic.
+- Route all current Tape forward/VJP semantics through a CPU adapter without
+  changing numeric order.
+- Add portable SGD. Adapt AdamW, CautiousAdamW, Int8AdamW and Muon through the
+  same request interface.
+- Adapt `TOPT` checkpoint/resume and canonical hard-artifact export/reload.
+- Emit receipts binding backend build, physical device, manifest/vector digest,
+  executed operation set, dtype, shape ceilings, host-transfer counters, peak
+  resident/scratch bytes and result digest.
+
+Gate: CPU executes every valid and invalid vector. Direct existing reference
+tests and adapter results match. Catch-unwind tests prove malformed requests
+return errors.
+
+## Slice 4 — accelerator adapters
+
+Implement adapters in this order:
+
+1. CUDA
+2. ROCm
+3. Metal
+4. native wgpu
+
+No adapter may call CPU reference execution after setup. Profilers must show
+zero steady-state device-to-host/host-to-device tensor transfers and zero
+global synchronization not required by receipt finalization. Unsupported dtype
+or shape returns a capability error; fallback never greens a device gate.
+
+Each adapter runs full vectors on actual hardware and emits a signed or
+content-addressed receipt. CI artifact presence without device identity fails.
+
+## Slice 5 — constrained adapters
+
+- WASI/WASM: deterministic f32 fallback, bounded arena, no filesystem or clock
+  dependence inside execution.
+- MCU: no allocator during prepared execution; declared static arena and shape
+  ceilings; full operation set exercised at bounded shapes.
+
+Cross-compile or emulator evidence is labeled structural only. v1.1 requires
+actual target receipts. Zero-test or skipped lanes fail.
+
+## Slice 6 — capability and release evidence
+
+- Validate all receipts against exact manifest/vector digests.
+- Generate capability/performance tables solely from admitted receipts.
+- Reject duplicate backend identities, stale builds, fallback identities,
+  partial operation sets and missing physical-memory counters.
+- Feed canonical schema and backend contract into plan 0050 without widening
+  it from TypeScript.
+
+## Verification cadence
+
+```bash
+cargo fmt --check
+cargo test -p tritium-spec -p tritium-train
+cargo clippy -p tritium-spec -p tritium-train --all-targets -- -D warnings
+PYTHONPATH=crates/tritium-py/python pytest -q \
+  crates/tritium-py/tests/test_training_manifest.py
+npx tsc -p bindings/typescript/tsconfig.json --noEmit
+git diff --check
+```
+
+Backend lanes additionally run their feature-gated conformance binary on real
+hardware. Final gate admits receipts with one exact manifest/vector digest.
+
+## Review and commits
+
+Every commit receives mandatory lamu `review_commit` with this file as
+`plan_file`; findings are verified before fixes.
+
+Expected commit series:
+
+```text
+docs(plan-0049): freeze portable training work order
+feat(spec): freeze training operation manifest v1
+test(train): publish canonical training semantic vectors
+feat(train): add portable CPU training adapter
+feat(cuda): conform portable training backend
+feat(rocm): conform portable training backend
+feat(metal): conform portable training backend
+feat(wgpu): conform portable training backend
+feat(wasm): conform portable training backend
+feat(mcu): conform portable training backend
+docs(training): generate backend receipts and capability table
+```
+
+## Done criterion
+
+Rust, Python and TypeScript accept and re-emit one canonical schema; exhaustive
+audit covers every frozen operation; all valid/error vectors pass through the
+fallible seam; CPU, CUDA, ROCm, Metal, wgpu, WASI/WASM and MCU produce actual
+target receipts for every operation; generated capability tables match those
+receipts; plan 0050 consumes the frozen contract unchanged.
