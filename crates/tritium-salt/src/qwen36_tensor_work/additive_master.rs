@@ -2479,7 +2479,7 @@ mod tests {
 
     use half::f16;
     use tritium_format::{
-        SemanticTensorHasher,
+        PackageId, SemanticTensorHasher,
         salt_v2_master::{
             SaltV2FitConstraint, SaltV2MasterError, SaltV2MasterEvidence, SaltV2MasterGeometry,
             SaltV2MasterTensorEncoder, SaltV2MasterTrack, SaltV2PrefixLoss,
@@ -3514,6 +3514,83 @@ mod tests {
         )
         .expect("tamper admitted package record");
         assert!(admitted.verify_current().is_err());
+
+        drop(admitted);
+        drop(allocated);
+        drop(parent);
+        drop(base);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_parent_masters_stream_to_byte_exact_admitted_packages() {
+        let root = fixture_root("selected-package-materialization");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), fixture_plan())
+            .expect("open base workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let parent_spec = fixture_campaign_spec();
+        let parent = base
+            .open_master_campaign(parent_spec.clone())
+            .expect("open PTQ parent campaign");
+        for (ordinal, expected) in parent_spec.expected_masters().iter().enumerate() {
+            parent
+                .install_master(expected, |writer| {
+                    write_fixture_master(expected, writer, if ordinal == 0 { 1 } else { 2 })
+                })
+                .expect("install PTQ parent master");
+        }
+        parent.seal_complete().expect("seal PTQ parent");
+        let allocated = bind_fixture_allocation(&parent);
+        let compact = fixture_selected_package(false);
+        let near = fixture_selected_package(true);
+
+        let admitted = allocated
+            .materialize_and_admit_packages()
+            .expect("materialize and admit selected packages");
+        assert_eq!(
+            admitted.receipt().compact().package_id(),
+            PackageId::from_package_bytes(&compact)
+        );
+        assert_eq!(
+            admitted.receipt().near_lossless().package_id(),
+            PackageId::from_package_bytes(&near)
+        );
+        assert_eq!(
+            admitted.receipt().compact().package_ledger().total_bytes,
+            compact.len() as u64
+        );
+        assert_eq!(
+            admitted
+                .receipt()
+                .near_lossless()
+                .package_ledger()
+                .total_bytes,
+            near.len() as u64
+        );
+        admitted
+            .verify_current()
+            .expect("verify materialized admission");
+        let receipt = admitted.receipt().clone();
+        drop(admitted);
+        drop(allocated);
+
+        let allocated = parent
+            .reopen_selected_allocation()
+            .expect("reopen materialized selection");
+        let admitted = allocated
+            .reopen_package_admission()
+            .expect("reopen materialized package admission");
+        assert_eq!(admitted.receipt(), &receipt);
+        let selection_store = TensorWorkStore::open(&parent.root().join("selected-allocation"))
+            .expect("open selection store");
+        assert_eq!(
+            fs::read_dir(selection_store.temporary_dir())
+                .expect("read selection staging")
+                .count(),
+            0
+        );
 
         drop(admitted);
         drop(allocated);

@@ -1,6 +1,6 @@
 //! Bounded-memory, seek-backed canonical SALT V2 package writing.
 
-use core::fmt;
+use core::{convert::Infallible, fmt};
 use std::{
     collections::BTreeSet,
     io::{self, Seek, SeekFrom, Write},
@@ -11,7 +11,7 @@ use super::{
     SALT_V2_PACKAGE_ALIGNMENT, SALT_V2_PACKAGE_HEADER_BYTES, SALT_V2_PACKAGE_MAGIC,
     SALT_V2_PACKAGE_VERSION, SALT_V2_SCALE_GROUP_SIZE, SALT_V2_TENSOR_COUNT_BITS,
     SALT_V2_TENSOR_HEADER_BYTES, SALT_V2_TILE_COUNT_BITS, SALT_V2_TRANSFORM_METADATA_BYTES,
-    SaltV2Codec, SaltV2PackageError, SaltV2PackageLedger, SaltV2Tile, SaltV2Transform,
+    SaltV2Codec, SaltV2PackageError, SaltV2PackageLedger, SaltV2Plane, SaltV2Tile, SaltV2Transform,
     alignment_padding, checked_dimension_product, codec_tag, pack_salt_v2_plane,
     plane_count_map_value, set_global_map_bit, stored_trit_count,
 };
@@ -131,16 +131,36 @@ impl SaltV2PackageStreamPlan {
         specs: Vec<SaltV2StreamTensorSpec>,
         plane_counts: impl IntoIterator<Item = u8>,
     ) -> Result<Self, SaltV2PackageError> {
+        match Self::try_new(
+            codec,
+            specs,
+            plane_counts.into_iter().map(Ok::<_, Infallible>),
+        ) {
+            Ok(plan) => Ok(plan),
+            Err(SaltV2PackageStreamPlanError::Package(error)) => Err(error),
+            Err(SaltV2PackageStreamPlanError::Source(never)) => match never {},
+        }
+    }
+
+    /// Plan one package from a fallible selected-count stream.
+    ///
+    /// This is the seek-backed counterpart of [`Self::new`]. A source error is
+    /// returned without being collapsed into a shape or count mismatch.
+    pub fn try_new<E>(
+        codec: SaltV2Codec,
+        specs: Vec<SaltV2StreamTensorSpec>,
+        plane_counts: impl IntoIterator<Item = Result<u8, E>>,
+    ) -> Result<Self, SaltV2PackageStreamPlanError<E>> {
         if specs.is_empty() {
-            return Err(SaltV2PackageError::EmptyPackage);
+            return Err(SaltV2PackageError::EmptyPackage.into());
         }
         if specs.len() > SALT_V2_MAX_TENSORS {
-            return Err(SaltV2PackageError::TooManyTensors { got: specs.len() });
+            return Err(SaltV2PackageError::TooManyTensors { got: specs.len() }.into());
         }
         let mut names = BTreeSet::new();
         for spec in &specs {
             if !names.insert(spec.name.clone()) {
-                return Err(SaltV2PackageError::DuplicateTensorName(spec.name.clone()));
+                return Err(SaltV2PackageError::DuplicateTensorName(spec.name.clone()).into());
             }
         }
 
@@ -224,17 +244,25 @@ impl SaltV2PackageStreamPlan {
             let mut codec_padding_bits = 0u64;
             let mut ragged_plane_count = None;
             for tile_index in 0..tile_count {
-                let count = counts.next().ok_or(SaltV2PackageError::WrongTileCount {
-                    expected: total_tiles,
-                    got: consumed_counts,
-                })?;
+                let count = match counts.next() {
+                    Some(Ok(count)) => count,
+                    Some(Err(error)) => return Err(SaltV2PackageStreamPlanError::Source(error)),
+                    None => {
+                        return Err(SaltV2PackageError::WrongTileCount {
+                            expected: total_tiles,
+                            got: consumed_counts,
+                        }
+                        .into());
+                    }
+                };
                 consumed_counts = consumed_counts
                     .checked_add(1)
                     .ok_or(SaltV2PackageError::LengthOverflow)?;
                 if !(1..=SALT_V2_MAX_PLANES as u8).contains(&count) {
                     return Err(SaltV2PackageError::InvalidPlaneCount {
                         got: usize::from(count),
-                    });
+                    }
+                    .into());
                 }
                 let consumed = tile_index
                     .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
@@ -242,7 +270,9 @@ impl SaltV2PackageStreamPlan {
                 let logical_len =
                     (logical_coefficients - consumed).min(SALT_V2_ALLOCATION_TILE_SIZE);
                 let stored_trits = stored_trit_count(codec, logical_len)?;
-                let plane_ledger = codec.ledger(stored_trits)?;
+                let plane_ledger = codec
+                    .ledger(stored_trits)
+                    .map_err(SaltV2PackageError::from)?;
                 let count_u64 = u64::from(count);
                 payload_bytes = payload_bytes
                     .checked_add(
@@ -351,11 +381,16 @@ impl SaltV2PackageStreamPlan {
                 scales_bytes,
             });
         }
-        if counts.next().is_some() {
-            return Err(SaltV2PackageError::WrongTileCount {
-                expected: total_tiles,
-                got: total_tiles.saturating_add(1),
-            });
+        match counts.next() {
+            Some(Ok(_)) => {
+                return Err(SaltV2PackageError::WrongTileCount {
+                    expected: total_tiles,
+                    got: total_tiles.saturating_add(1),
+                }
+                .into());
+            }
+            Some(Err(error)) => return Err(SaltV2PackageStreamPlanError::Source(error)),
+            None => {}
         }
         debug_assert_eq!(full_tile_ordinal, total_full_tiles);
 
@@ -460,6 +495,39 @@ impl SaltV2PackageStreamPlan {
     }
 }
 
+/// Failure while deriving a stream plan from a fallible selected-count source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaltV2PackageStreamPlanError<E> {
+    /// Tensor metadata, count, codec, or physical-layout validation failed.
+    Package(SaltV2PackageError),
+    /// The caller-owned selected-count source failed.
+    Source(E),
+}
+
+impl<E: fmt::Display> fmt::Display for SaltV2PackageStreamPlanError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Package(error) => write!(formatter, "SALT V2 stream planning failed: {error}"),
+            Self::Source(error) => write!(formatter, "SALT V2 count source failed: {error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for SaltV2PackageStreamPlanError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Package(error) => Some(error),
+            Self::Source(error) => Some(error),
+        }
+    }
+}
+
+impl<E> From<SaltV2PackageError> for SaltV2PackageStreamPlanError<E> {
+    fn from(error: SaltV2PackageError) -> Self {
+        Self::Package(error)
+    }
+}
+
 /// Failure while initializing or incrementally filling a seek-backed package.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SaltV2PackageStreamError {
@@ -520,7 +588,18 @@ impl fmt::Display for SaltV2PackageStreamError {
     }
 }
 
-impl std::error::Error for SaltV2PackageStreamError {}
+impl std::error::Error for SaltV2PackageStreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Package(error) => Some(error),
+            Self::Io(_)
+            | Self::OutputNotEmpty { .. }
+            | Self::TooManyTiles
+            | Self::TooFewTiles { .. }
+            | Self::PlaneCountMismatch { .. } => None,
+        }
+    }
+}
 
 impl From<SaltV2PackageError> for SaltV2PackageStreamError {
     fn from(error: SaltV2PackageError) -> Self {
@@ -644,6 +723,14 @@ impl<W: Write + Seek> SaltV2PackageStreamWriter<W> {
 
     /// Write the next selected semantic tile in package order.
     pub fn push_tile(&mut self, tile: &SaltV2Tile) -> Result<(), SaltV2PackageStreamError> {
+        self.push_planes(tile.planes())
+    }
+
+    /// Write the next selected dense plane prefix without constructing an owned tile.
+    ///
+    /// This lets a decoded Pmax master feed multiple profile writers by borrowing
+    /// different prefixes of the same tile.
+    pub fn push_planes(&mut self, planes: &[SaltV2Plane]) -> Result<(), SaltV2PackageStreamError> {
         let tensor = self
             .plan
             .tensors
@@ -659,11 +746,11 @@ impl<W: Write + Seek> SaltV2PackageStreamWriter<W> {
                     .expect("only the final ragged tile is not full"),
             )
         };
-        if tile.planes().len() != expected_planes {
+        if planes.len() != expected_planes {
             return Err(SaltV2PackageStreamError::PlaneCountMismatch {
                 tile: self.written_tiles,
                 expected: expected_planes,
-                actual: tile.planes().len(),
+                actual: planes.len(),
             });
         }
         let consumed = self
@@ -672,16 +759,18 @@ impl<W: Write + Seek> SaltV2PackageStreamWriter<W> {
             .ok_or(SaltV2PackageError::LengthOverflow)?;
         let expected_len =
             (tensor.logical_coefficients - consumed).min(SALT_V2_ALLOCATION_TILE_SIZE);
-        if tile.logical_len() != expected_len {
-            return Err(SaltV2PackageError::WrongTileLength {
-                tile_index: self.local_tile,
-                expected: expected_len,
-                got: tile.logical_len(),
+        for plane in planes {
+            if plane.trits().len() != expected_len {
+                return Err(SaltV2PackageError::WrongTileLength {
+                    tile_index: self.local_tile,
+                    expected: expected_len,
+                    got: plane.trits().len(),
+                }
+                .into());
             }
-            .into());
         }
 
-        for plane in tile.planes() {
+        for plane in planes {
             let packed = pack_salt_v2_plane(self.plan.codec, plane.trits())?;
             self.output
                 .seek(SeekFrom::Start(self.payload_cursor))
@@ -858,7 +947,7 @@ mod tests {
             let mut writer =
                 SaltV2PackageStreamWriter::new(Cursor::new(Vec::new()), plan).expect("writer");
             for tile in package.tensors().iter().flat_map(|tensor| tensor.tiles()) {
-                writer.push_tile(tile).expect("push");
+                writer.push_planes(tile.planes()).expect("push");
             }
             let (output, ledger) = writer.finish().expect("finish");
             assert_eq!(ledger, canonical.ledger);
@@ -876,6 +965,14 @@ mod tests {
                 expected: 2,
                 got: 1
             })
+        ));
+        assert!(matches!(
+            SaltV2PackageStreamPlan::try_new(
+                SaltV2Codec::D2,
+                vec![spec.clone()],
+                [Ok(1), Err("count source")]
+            ),
+            Err(SaltV2PackageStreamPlanError::Source("count source"))
         ));
         assert!(matches!(
             SaltV2PackageStreamPlan::new(SaltV2Codec::D2, vec![spec.clone()], [1, 1, 1]),

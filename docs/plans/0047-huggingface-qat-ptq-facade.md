@@ -68,6 +68,9 @@ saves with safe serialization, automatically reloads through
   masters and sealing only after strict canonical reopen.
 - [x] Expose that expert master-campaign primitive and immutable structural
   receipt through the abi3 Python wheel without a Python-list weight bridge.
+- [x] Stream selected Compact/NearLossless parent prefixes into byte-exact
+  seek-backed packages and exact package admission without constructing a
+  whole-model semantic package or duplicating the caller source artifact.
 - Bind the Rust SALT pipeline to `quantize(model_or_id, calibration, config,
   work_dir)` without a Python-list weight bridge.
 - Expose immutable `QuantizationResult` model/coverage/report plus atomic

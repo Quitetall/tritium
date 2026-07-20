@@ -883,8 +883,13 @@ The following work deliberately remains open and keeps this plan in progress:
   tile at a time directly into disjoint payload/scale regions. D2, B3, and S34
   goldens are byte-identical to the canonical in-memory encoder. Its retained
   state is tensor metadata plus two bits per full allocation tile; it does not
-  materialize a whole-model `SaltV2Package`. Wiring the selected campaign maps
-  and parent masters into this writer remains the next package-producer step.
+  materialize a whole-model `SaltV2Package`. The selected campaign now drives
+  both Compact and NearLossless writers in one verified parent-master pass,
+  borrowing both prefixes from the same decoded tile. Exact outputs flow
+  directly into package admission without a second caller-source copy, and the
+  Compact staging file is released before NearLossless CAS publication. The
+  governed fixture is byte-identical to the canonical packages and reopens with
+  no temporary files. Checkpoint-scale allocation-map production remains open.
   This remains **structural fixture evidence**, not checkpoint-scale or quality
   evidence. The pure-PTQ checkpoint/evidence driver now targets these stores,
   but has not been run on the pinned checkpoint; PV/KL execution over real

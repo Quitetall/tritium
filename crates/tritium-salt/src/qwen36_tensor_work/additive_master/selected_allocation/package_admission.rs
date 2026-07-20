@@ -11,7 +11,8 @@ use std::{
 use tritium_format::salt_v2_master::{SaltV2MasterTensorDecoder, SaltV2MasterVisitError};
 use tritium_format::salt_v2_package::{
     SaltV2IndexedRuntimeLedger, SaltV2PackageLedger, SaltV2PackageReadError, SaltV2PackageReader,
-    SaltV2SemanticTensorStream, SaltV2Transform,
+    SaltV2PackageStreamError, SaltV2PackageStreamPlan, SaltV2PackageStreamPlanError,
+    SaltV2PackageStreamWriter, SaltV2SemanticTensorStream, SaltV2StreamTensorSpec, SaltV2Transform,
 };
 use tritium_format::{PackageHasher, PackageId};
 use tritium_quantize::{PhysicalBytes, SaltV2Profile};
@@ -61,6 +62,13 @@ pub enum Qwen36PackageAdmissionError {
         /// Portable I/O category.
         kind: io::ErrorKind,
     },
+    /// Exact selected-prefix materialization failed before admission publication.
+    Materialization {
+        /// Profile whose canonical package could not be produced.
+        profile: SaltV2Profile,
+        /// Typed seek-writer failure.
+        error: SaltV2PackageStreamError,
+    },
 }
 
 impl fmt::Display for Qwen36PackageAdmissionError {
@@ -73,6 +81,12 @@ impl fmt::Display for Qwen36PackageAdmissionError {
             Self::Source { profile, kind } => {
                 write!(formatter, "{profile:?} package source failed: {kind}")
             }
+            Self::Materialization { profile, error } => {
+                write!(
+                    formatter,
+                    "{profile:?} package materialization failed: {error}"
+                )
+            }
         }
     }
 }
@@ -83,6 +97,7 @@ impl Error for Qwen36PackageAdmissionError {
             Self::Campaign(error) => Some(error),
             Self::Package { error, .. } => Some(error),
             Self::Source { .. } => None,
+            Self::Materialization { error, .. } => Some(error),
         }
     }
 }
@@ -621,75 +636,300 @@ impl<'parent, 'store, 'source> Qwen36AllocatedCampaignStore<'parent, 'store, 'so
                 Some((&self.parent_completion, self.receipt.campaign_id)),
             )?;
             let budgets = self.receipt.spec.budgets();
-            let mut compact_staged = StagedPackage::from_source(
+            let compact_staged = StagedPackage::from_source(
                 objects.temporary_dir(),
                 "compact.package",
                 compact_source,
                 budgets.compact.maximum.serialized,
                 SaltV2Profile::CompactV1,
             )?;
-            let mut near_staged = StagedPackage::from_source(
+            let near_staged = StagedPackage::from_source(
                 objects.temporary_dir(),
                 "near.package",
                 near_lossless_source,
                 budgets.near_lossless.maximum.serialized,
                 SaltV2Profile::NearLosslessV1,
             )?;
-            let mut compact_reader = compact_staged.strict_reader(SaltV2Profile::CompactV1)?;
-            let mut near_reader = near_staged.strict_reader(SaltV2Profile::NearLosslessV1)?;
-            validate_package_pair(self, &objects, &mut compact_reader, &mut near_reader)?;
-            compact_reader
-                .verify_unchanged()
-                .map_err(|error| package_error(SaltV2Profile::CompactV1, error))?;
-            near_reader
-                .verify_unchanged()
-                .map_err(|error| package_error(SaltV2Profile::NearLosslessV1, error))?;
+            self.admit_staged_packages(&root, &objects, directories, compact_staged, near_staged)
+        }
+    }
 
-            let compact_profile = publish_staged_profile(
-                &objects,
-                &self.receipt,
-                SaltV2Profile::CompactV1,
-                &mut compact_staged,
-                &compact_reader,
-            )?;
-            let near_profile = publish_staged_profile(
-                &objects,
-                &self.receipt,
-                SaltV2Profile::NearLosslessV1,
-                &mut near_staged,
-                &near_reader,
-            )?;
-            drop((compact_reader, near_reader));
-            let receipt = Qwen36PackageAdmissionReceipt::from_selection(
-                &self.receipt,
-                compact_profile,
-                near_profile,
-            )?;
-            validate_admission_binding(&receipt, &self.receipt)?;
-            verify_admission_records(self, &objects, &receipt)?;
+    /// Materialize both selected parent prefixes and admit their exact packages.
+    ///
+    /// The producer reuses one decoded Pmax master tile for both profiles and
+    /// writes directly into seek-backed temporary package files. Retained memory
+    /// is the two canonical two-bit maps, `O(tensors)` layout metadata, and one
+    /// decoded master tile; no whole-model semantic package or second source copy
+    /// is constructed before CAS publication.
+    pub fn materialize_and_admit_packages<'allocated>(
+        &'allocated self,
+    ) -> Result<
+        Qwen36PackageAdmittedCampaignStore<'allocated, 'parent, 'store, 'source>,
+        Qwen36PackageAdmissionError,
+    > {
+        #[cfg(not(unix))]
+        {
+            return Err(Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform.into());
+        }
+        #[cfg(unix)]
+        {
+            let _mutation = self.parent.begin_mutation()?;
             self.verify_current()?;
-            let bytes = receipt.canonical_bytes()?;
-            persist_exact(
-                &root.join(ADMISSION_FILE),
-                &bytes,
-                "selected package admission",
+            let (root, objects, directories) = self.parent.open_selection_store()?;
+            reclaim_selection_orphans(
+                &root,
+                &objects,
+                Some((&self.parent_completion, self.receipt.campaign_id)),
             )?;
-            let current = read_admission(&root.join(ADMISSION_FILE))?;
-            if current != receipt {
-                return Err(
-                    Qwen36TensorWorkError::WorkspaceMismatch("package admission receipt").into(),
+            let (completion, manifest, _) = self
+                .parent
+                .require_complete_verified(FixedCampaignMode::Capture)?;
+            if completion != self.parent_completion
+                || manifest.masters.len() != self.parent.spec.expected_masters.len()
+            {
+                return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                    "package materialization parent",
+                )
+                .into());
+            }
+
+            let mut stream_specs = Vec::new();
+            stream_specs
+                .try_reserve_exact(self.parent.spec.expected_masters.len())
+                .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+            for master in &self.parent.spec.expected_masters {
+                stream_specs.push(
+                    SaltV2StreamTensorSpec::new(
+                        master.name(),
+                        master.shape().to_vec(),
+                        SaltV2Transform::None,
+                    )
+                    .map_err(|error| {
+                        materialization_package_error(SaltV2Profile::CompactV1, error)
+                    })?,
                 );
             }
-            verify_admission_records(self, &objects, &receipt)?;
-            validate_directories(&directories)?;
-            let package_records = pin_package_records(&objects, &receipt)?;
-            Ok(Qwen36PackageAdmittedCampaignStore {
-                allocated: self,
-                receipt,
-                directories,
-                package_records,
-            })
+
+            let mut compact_map = stage_verified_map(
+                &objects,
+                &self.receipt.compact.map_record,
+                "compact.materialize.map",
+            )?;
+            let mut near_map = stage_verified_map(
+                &objects,
+                &self.receipt.near_lossless.map_record,
+                "near.materialize.map",
+            )?;
+            let compact_plan = streamed_profile_plan(
+                self.receipt.spec.codec(),
+                stream_specs.clone(),
+                &mut compact_map,
+                self.receipt.tile_count,
+                SaltV2Profile::CompactV1,
+            )?;
+            let near_plan = streamed_profile_plan(
+                self.receipt.spec.codec(),
+                stream_specs,
+                &mut near_map,
+                self.receipt.tile_count,
+                SaltV2Profile::NearLosslessV1,
+            )?;
+            let budgets = self.receipt.spec.budgets();
+            if compact_plan.ledger().total_bytes > budgets.compact.maximum.serialized
+                || near_plan.ledger().total_bytes > budgets.near_lossless.maximum.serialized
+            {
+                return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                    "materialized package serialized ceiling",
+                )
+                .into());
+            }
+
+            let mut compact_staged = StagedPackage::empty(
+                objects.temporary_dir(),
+                "compact.materialized.package",
+                SaltV2Profile::CompactV1,
+            )?;
+            let mut near_staged = StagedPackage::empty(
+                objects.temporary_dir(),
+                "near.materialized.package",
+                SaltV2Profile::NearLosslessV1,
+            )?;
+            let compact_output = compact_staged.clone_file(SaltV2Profile::CompactV1)?;
+            let near_output = near_staged.clone_file(SaltV2Profile::NearLosslessV1)?;
+            let mut compact_writer =
+                SaltV2PackageStreamWriter::new(compact_output, compact_plan)
+                    .map_err(|error| materialization_error(SaltV2Profile::CompactV1, error))?;
+            let mut near_writer = SaltV2PackageStreamWriter::new(near_output, near_plan)
+                .map_err(|error| materialization_error(SaltV2Profile::NearLosslessV1, error))?;
+            let mut compact_counts = compact_map.cursor(self.receipt.tile_count)?;
+            let mut near_counts = near_map.cursor(self.receipt.tile_count)?;
+
+            for (master, parent_master) in self
+                .parent
+                .spec
+                .expected_masters
+                .iter()
+                .zip(&manifest.masters)
+            {
+                let mut decoder = SaltV2MasterTensorDecoder::new(master)
+                    .map_err(Qwen36TensorWorkError::Master)?;
+                let mut visited = 0usize;
+                self.parent
+                    .objects
+                    .try_visit_verified(&parent_master.record, MASTER_STREAM_CHUNK_BYTES, |chunk| {
+                        decoder
+                            .try_push(chunk, &mut |tile| {
+                                let compact = compact_counts.next_count()?.ok_or(
+                                    Qwen36TensorWorkError::WorkspaceMismatch(
+                                        "CompactV1 materialization map is short",
+                                    ),
+                                )?;
+                                let near = near_counts.next_count()?.ok_or(
+                                    Qwen36TensorWorkError::WorkspaceMismatch(
+                                        "NearLosslessV1 materialization map is short",
+                                    ),
+                                )?;
+                                if compact > near
+                                    || near > tile.admissible_planes()
+                                    || usize::from(near) > tile.planes().len()
+                                {
+                                    return Err(Qwen36PackageAdmissionError::Campaign(
+                                        Qwen36TensorWorkError::WorkspaceMismatch(
+                                            "materialized selected plane prefix",
+                                        ),
+                                    ));
+                                }
+                                compact_writer
+                                    .push_planes(&tile.planes()[..usize::from(compact)])
+                                    .map_err(|error| {
+                                        materialization_error(SaltV2Profile::CompactV1, error)
+                                    })?;
+                                near_writer
+                                    .push_planes(&tile.planes()[..usize::from(near)])
+                                    .map_err(|error| {
+                                        materialization_error(SaltV2Profile::NearLosslessV1, error)
+                                    })?;
+                                visited += 1;
+                                Ok(())
+                            })
+                            .map_err(|error| match error {
+                                SaltV2MasterVisitError::Master(error) => {
+                                    Qwen36PackageAdmissionError::Campaign(
+                                        Qwen36TensorWorkError::Master(error),
+                                    )
+                                }
+                                SaltV2MasterVisitError::Visitor(error) => error,
+                            })
+                    })
+                    .map_err(|error| match error {
+                        TensorVisitError::Store(error) => Qwen36PackageAdmissionError::Campaign(
+                            Qwen36TensorWorkError::TensorStore(error),
+                        ),
+                        TensorVisitError::Sink(error) => error,
+                    })?;
+                let decoded = decoder.finish().map_err(Qwen36TensorWorkError::Master)?;
+                if visited != master.tile_count()
+                    || decoded.tensor_master_id() != parent_master.tensor_master_id()
+                {
+                    return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                        "materialized package parent master",
+                    )
+                    .into());
+                }
+            }
+            if compact_counts.next_count()?.is_some() || near_counts.next_count()?.is_some() {
+                return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                    "materialized package map coverage",
+                )
+                .into());
+            }
+            compact_counts.finish()?;
+            near_counts.finish()?;
+            let (compact_output, compact_ledger) = compact_writer
+                .finish()
+                .map_err(|error| materialization_error(SaltV2Profile::CompactV1, error))?;
+            let (near_output, near_ledger) = near_writer
+                .finish()
+                .map_err(|error| materialization_error(SaltV2Profile::NearLosslessV1, error))?;
+            drop((compact_output, near_output));
+            compact_staged
+                .finish_materialized(compact_ledger.total_bytes, SaltV2Profile::CompactV1)?;
+            near_staged
+                .finish_materialized(near_ledger.total_bytes, SaltV2Profile::NearLosslessV1)?;
+            self.parent.verify_completion_receipt(&completion)?;
+            self.admit_staged_packages(&root, &objects, directories, compact_staged, near_staged)
         }
+    }
+
+    #[cfg(unix)]
+    fn admit_staged_packages<'allocated>(
+        &'allocated self,
+        root: &Path,
+        objects: &TensorWorkStore,
+        directories: Vec<PinnedDirectory>,
+        mut compact_staged: StagedPackage,
+        mut near_staged: StagedPackage,
+    ) -> Result<
+        Qwen36PackageAdmittedCampaignStore<'allocated, 'parent, 'store, 'source>,
+        Qwen36PackageAdmissionError,
+    > {
+        let mut compact_reader = compact_staged.strict_reader(SaltV2Profile::CompactV1)?;
+        let mut near_reader = near_staged.strict_reader(SaltV2Profile::NearLosslessV1)?;
+        validate_package_pair(self, objects, &mut compact_reader, &mut near_reader)?;
+        compact_reader
+            .verify_unchanged()
+            .map_err(|error| package_error(SaltV2Profile::CompactV1, error))?;
+        near_reader
+            .verify_unchanged()
+            .map_err(|error| package_error(SaltV2Profile::NearLosslessV1, error))?;
+
+        let compact_profile = publish_staged_profile(
+            objects,
+            &self.receipt,
+            SaltV2Profile::CompactV1,
+            &mut compact_staged,
+            &compact_reader,
+        )?;
+        drop(compact_reader);
+        drop(compact_staged);
+        let near_profile = publish_staged_profile(
+            objects,
+            &self.receipt,
+            SaltV2Profile::NearLosslessV1,
+            &mut near_staged,
+            &near_reader,
+        )?;
+        drop(near_reader);
+        drop(near_staged);
+        let receipt = Qwen36PackageAdmissionReceipt::from_selection(
+            &self.receipt,
+            compact_profile,
+            near_profile,
+        )?;
+        validate_admission_binding(&receipt, &self.receipt)?;
+        verify_admission_records(self, objects, &receipt)?;
+        self.verify_current()?;
+        let bytes = receipt.canonical_bytes()?;
+        persist_exact(
+            &root.join(ADMISSION_FILE),
+            &bytes,
+            "selected package admission",
+        )?;
+        let current = read_admission(&root.join(ADMISSION_FILE))?;
+        if current != receipt {
+            return Err(
+                Qwen36TensorWorkError::WorkspaceMismatch("package admission receipt").into(),
+            );
+        }
+        verify_admission_records(self, objects, &receipt)?;
+        validate_directories(&directories)?;
+        let package_records = pin_package_records(objects, &receipt)?;
+        Ok(Qwen36PackageAdmittedCampaignStore {
+            allocated: self,
+            receipt,
+            directories,
+            package_records,
+        })
     }
 
     /// Strictly reopen the already-published exact selected package admission.
@@ -720,6 +960,47 @@ impl<'parent, 'store, 'source> Qwen36AllocatedCampaignStore<'parent, 'store, 'so
             })
         }
     }
+}
+
+#[cfg(unix)]
+fn streamed_profile_plan(
+    codec: tritium_format::salt_v2::SaltV2Codec,
+    specs: Vec<SaltV2StreamTensorSpec>,
+    staged_map: &mut super::StagedPackedMap,
+    tile_count: u64,
+    profile: SaltV2Profile,
+) -> Result<SaltV2PackageStreamPlan, Qwen36PackageAdmissionError> {
+    let mut cursor = staged_map.cursor(tile_count)?;
+    let counts = std::iter::from_fn(|| match cursor.next_count() {
+        Ok(Some(count)) => Some(Ok(count)),
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    });
+    let plan =
+        SaltV2PackageStreamPlan::try_new(codec, specs, counts).map_err(|error| match error {
+            SaltV2PackageStreamPlanError::Package(error) => {
+                materialization_package_error(profile, error)
+            }
+            SaltV2PackageStreamPlanError::Source(error) => {
+                Qwen36PackageAdmissionError::Campaign(error)
+            }
+        })?;
+    cursor.finish()?;
+    Ok(plan)
+}
+
+fn materialization_package_error(
+    profile: SaltV2Profile,
+    error: tritium_format::salt_v2_package::SaltV2PackageError,
+) -> Qwen36PackageAdmissionError {
+    materialization_error(profile, SaltV2PackageStreamError::Package(error))
+}
+
+fn materialization_error(
+    profile: SaltV2Profile,
+    error: SaltV2PackageStreamError,
+) -> Qwen36PackageAdmissionError {
+    Qwen36PackageAdmissionError::Materialization { profile, error }
 }
 
 fn verify_admission(
@@ -1205,6 +1486,24 @@ impl StagedPackage {
         }
         staged.finish(staged.bytes, profile)?;
         Ok(staged)
+    }
+
+    fn clone_file(&self, profile: SaltV2Profile) -> Result<File, Qwen36PackageAdmissionError> {
+        self.file
+            .try_clone()
+            .map_err(|error| Qwen36PackageAdmissionError::Source {
+                profile,
+                kind: error.kind(),
+            })
+    }
+
+    fn finish_materialized(
+        &mut self,
+        expected: u64,
+        profile: SaltV2Profile,
+    ) -> Result<(), Qwen36PackageAdmissionError> {
+        self.bytes = expected;
+        self.finish(expected, profile)
     }
 
     fn push(
