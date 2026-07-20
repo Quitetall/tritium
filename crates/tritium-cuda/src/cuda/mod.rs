@@ -714,6 +714,9 @@ pub struct CudaDecodeModel {
     f_attn_tree_reduce: CudaFunction,
     f_argmax_partial: CudaFunction,
     f_argmax_combine: CudaFunction,
+    /// Lazy m=1 argmax scratch for `step_graph_argmax`:
+    /// (pvals `[1, ARGMAX_CHUNKS]`, pidx `[1, ARGMAX_CHUNKS]`, out `[1]`).
+    am_scratch: Option<(CudaSlice<f32>, CudaSlice<i32>, CudaSlice<i32>)>,
     f_lm_head_tiled: CudaFunction,
     f_lm_head_f16: CudaFunction,
     f_kv_append_mdecode: CudaFunction,
@@ -1653,6 +1656,78 @@ impl CudaDecodeModel {
     /// # Errors
     /// [`BackendError`] on capacity overflow, a `pos`/token guard, or a device failure.
     pub fn step_graph(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, BackendError> {
+        self.step_graph_replay(token, pos)?;
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("decode graph sync", &e))?;
+
+        let mut logits = vec![0.0f32; self.vocab];
+        self.cap_stream
+            .memcpy_dtoh(&self.d_logits, &mut logits)
+            .map_err(|e| driver_err("decode graph logits dtoh", &e))?;
+        self.cache_len += 1;
+        Ok(logits)
+    }
+
+    /// One graph decode step returning the **argmax token id** instead of the
+    /// logits: replay the captured graph, run the chunked device argmax on the
+    /// resident `d_logits` (the partial/combine pair whose tie rule the batch
+    /// argmax gate pins equal to the host `sample_greedy` scan), and cross the
+    /// host boundary with 4 bytes instead of `vocab * 4` (~513 KB at the
+    /// LLaMA-3 vocab). The drafter's in-loop greedy steps are the consumer
+    /// (round 25): per drafted token the logits download + host scan + Vec
+    /// alloc dominated the graph replay itself.
+    ///
+    /// # Errors
+    /// As [`step_graph`](Self::step_graph); an error after the graph launch
+    /// leaves `cache_len` unadvanced, so the next step rewrites the same KV
+    /// row (state stays consistent).
+    pub fn step_graph_argmax(&mut self, token: u32, pos: usize) -> Result<u32, BackendError> {
+        self.step_graph_replay(token, pos)?;
+        // Lazy m=1 scratch: pvals/pidx are [1, ARGMAX_CHUNKS], out one i32.
+        if self.am_scratch.is_none() {
+            let pvals = self
+                .cap_stream
+                .alloc_zeros::<f32>(ARGMAX_CHUNKS)
+                .map_err(|e| driver_err("argmax pvals alloc", &e))?;
+            let pidx = self
+                .cap_stream
+                .alloc_zeros::<i32>(ARGMAX_CHUNKS)
+                .map_err(|e| driver_err("argmax pidx alloc", &e))?;
+            let out = self
+                .cap_stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| driver_err("argmax out alloc", &e))?;
+            self.am_scratch = Some((pvals, pidx, out));
+        }
+        let (pvals, pidx, out) = self.am_scratch.as_mut().expect("just seeded");
+        // Same stream as the graph replay, so ordering needs no sync.
+        Self::bl_argmax_rows_chunked(
+            &self.cap_stream,
+            &self.f_argmax_partial,
+            &self.f_argmax_combine,
+            &self.d_logits,
+            self.vocab,
+            1,
+            pvals,
+            pidx,
+            out,
+        )?;
+        self.cap_stream
+            .synchronize()
+            .map_err(|e| driver_err("decode graph argmax sync", &e))?;
+        let mut id = [0i32; 1];
+        self.cap_stream
+            .memcpy_dtoh(&*out, &mut id)
+            .map_err(|e| driver_err("decode graph argmax dtoh", &e))?;
+        self.cache_len += 1;
+        Ok(id[0] as u32)
+    }
+
+    /// The shared [`step_graph`]/[`step_graph_argmax`] core: guards, lazy
+    /// capture, ctrl rewrite, and the graph launch — WITHOUT the trailing
+    /// sync/readback or the `cache_len` advance (callers own both).
+    fn step_graph_replay(&mut self, token: u32, pos: usize) -> Result<(), BackendError> {
         // A cache-advancing op invalidates any uncommitted tree.
         self.pending_tree = None;
         if self.cache_len >= self.max_ctx {
@@ -1697,16 +1772,7 @@ impl CudaDecodeModel {
             .expect("graph captured above")
             .launch()
             .map_err(|e| driver_err("decode graph launch", &e))?;
-        self.cap_stream
-            .synchronize()
-            .map_err(|e| driver_err("decode graph sync", &e))?;
-
-        let mut logits = vec![0.0f32; self.vocab];
-        self.cap_stream
-            .memcpy_dtoh(&self.d_logits, &mut logits)
-            .map_err(|e| driver_err("decode graph logits dtoh", &e))?;
-        self.cache_len += 1;
-        Ok(logits)
+        Ok(())
     }
 
     /// **Batched (M>1) prefill** — process all `tokens` (`positions[r]` absolute) in ONE

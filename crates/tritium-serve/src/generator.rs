@@ -597,14 +597,32 @@ impl RunnerGenerator {
         let mut out = Vec::with_capacity(max_draft);
         let mut tok = history[p];
         for i in 0..max_draft {
-            let logits = match draft.forward(&[tok], &[p + i]) {
-                Ok(l) => l,
+            // Fast path: graph replay + device argmax, 4 bytes back per step
+            // (the logits download + host scan dominated the drafter's cost).
+            // `Ok(None)` = no resident decoder -> eager logits + host argmax
+            // (same token by the pinned tie rule).
+            let next = match draft.decode_greedy_step(tok, p + i) {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    let Ok(logits) = draft.forward(&[tok], &[p + i]) else {
+                        break;
+                    };
+                    // The forward advanced the drafter's KV — record the fed
+                    // token BEFORE any bail (the reconcile logic needs it).
+                    self.draft_fed.push(tok);
+                    let Some(next) = tritium_nn::sample_greedy(&logits) else {
+                        break;
+                    };
+                    out.push(next);
+                    if next == self.eos {
+                        break;
+                    }
+                    tok = next;
+                    continue;
+                }
                 Err(_) => break,
             };
             self.draft_fed.push(tok);
-            let Some(next) = tritium_nn::sample_greedy(&logits) else {
-                break;
-            };
             out.push(next);
             if next == self.eos {
                 break; // the draft believes the turn ends here

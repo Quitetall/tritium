@@ -1195,3 +1195,42 @@ fn cuda_batch_and_graph_single_token_bit_identical() {
         );
     }
 }
+
+/// Round 25 gate: `decode_greedy_step` (graph replay + DEVICE argmax, 4-byte
+/// readback) must produce the exact token `forward` (graph replay + full
+/// logits download + HOST argmax) produces, step for step over a greedy
+/// chain — the drafter's fast path may not change a single drafted token.
+/// Two runners over the same GGUF: identical weights, independent KV.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_decode_greedy_step_matches_host_argmax() {
+    let _gpu = gpu_serial();
+    let Some((reference, bytes)) = maybe_load() else {
+        return;
+    };
+    let Some(mut r_logits) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let Some(mut r_argmax) = load_on("cuda", &bytes) else {
+        return;
+    };
+    let prompt: Vec<u32> = reference.token_ids.clone();
+    let positions: Vec<usize> = (0..prompt.len()).collect();
+    let l0 = r_logits.forward(&prompt, &positions).expect("prefill A");
+    let _ = r_argmax.forward(&prompt, &positions).expect("prefill B");
+    let mut tok = argmax(&l0) as u32;
+    for i in 0..48 {
+        let pos = prompt.len() + i;
+        let logits = r_logits.forward(&[tok], &[pos]).expect("logits step");
+        let host_next = argmax(&logits) as u32;
+        let dev_next = r_argmax
+            .decode_greedy_step(tok, pos)
+            .expect("argmax step")
+            .expect("resident decoder available on the cuda backend");
+        assert_eq!(
+            dev_next, host_next,
+            "device argmax step diverged from host argmax at decode step {i}"
+        );
+        tok = host_next;
+    }
+}

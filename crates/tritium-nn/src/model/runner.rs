@@ -635,6 +635,34 @@ impl ModelRunner {
         Ok(Some(logits))
     }
 
+    /// (cuda) One greedy decode step returning just the **argmax token id**:
+    /// the captured-graph replay plus a device-side argmax, crossing the host
+    /// boundary with 4 bytes instead of the full logits row (the drafter's
+    /// in-loop steps are the consumer). `Ok(None)` when no resident decoder
+    /// is available — the caller falls back to [`forward`](Self::forward) +
+    /// a host argmax (identical token by the batch argmax gate's tie rule).
+    ///
+    /// # Errors
+    /// As [`forward`](Self::forward) on device failures / position guards.
+    #[cfg(feature = "cuda")]
+    pub fn decode_greedy_step(
+        &mut self,
+        token: u32,
+        position: usize,
+    ) -> Result<Option<u32>, NnError> {
+        if !self.ensure_resident()? {
+            return Ok(None);
+        }
+        let model = self
+            .resident
+            .as_mut()
+            .expect("ensure_resident returned true so resident is built");
+        model
+            .step_graph_argmax(token, position)
+            .map(Some)
+            .map_err(|e| NnError::Backend(e.to_string()))
+    }
+
     /// (cuda) Build the device-resident decoder on first use. Returns `true` if a
     /// resident decoder is available (already built or built now), `false` if the
     /// backend is not a CUDA backend (probed once, then cached).
