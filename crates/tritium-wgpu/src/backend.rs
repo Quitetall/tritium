@@ -42,6 +42,15 @@ struct PointwiseParams {
     padding_1: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ConcatParams {
+    rows: u32,
+    part_count: u32,
+    total_columns: u32,
+    padding: u32,
+}
+
 // std140 uniform structs round up to a 16-byte multiple; pin both the size AND
 // the field offsets so a field reorder (which preserves size) can't silently land
 // `n` where the shader reads `k`.
@@ -84,6 +93,8 @@ pub struct WgpuBackend {
     bind_group_layout: wgpu::BindGroupLayout,
     pointwise_pipeline: wgpu::ComputePipeline,
     pointwise_bind_group_layout: wgpu::BindGroupLayout,
+    concat_pipeline: wgpu::ComputePipeline,
+    concat_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -239,6 +250,35 @@ impl WgpuBackend {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+            let concat_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-concat"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("concat.wgsl").into()),
+            });
+            let concat_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-concat-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, rw),
+                    ],
+                });
+            let concat_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-concat-pl"),
+                bind_group_layouts: &[&concat_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let concat_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-concat-pipe"),
+                    layout: Some(&concat_layout),
+                    module: &concat_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
             Ok(WgpuBackend {
                 device,
@@ -247,6 +287,8 @@ impl WgpuBackend {
                 bind_group_layout,
                 pointwise_pipeline,
                 pointwise_bind_group_layout,
+                concat_pipeline,
+                concat_bind_group_layout,
                 device_name,
             })
         }
@@ -410,6 +452,174 @@ impl WgpuBackend {
         if let Some(error) = self.device.pop_error_scope().block_on() {
             return Err(BackendError::Backend(format!(
                 "wgpu pointwise device error: {error}"
+            )));
+        }
+        rx.recv()
+            .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+            .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        let mut result = vec![0.0_f32; output_len];
+        {
+            let data = slice.get_mapped_range();
+            result.copy_from_slice(bytemuck::cast_slice(&data));
+        }
+        staging.unmap();
+        Ok(result)
+    }
+
+    pub(crate) fn concat_cols(
+        &self,
+        parts: &[&[f32]],
+        rows: usize,
+        lengths: &[usize],
+    ) -> Result<Vec<f32>, BackendError> {
+        if parts.len() != lengths.len() || parts.is_empty() {
+            return Err(BackendError::InvalidInput(
+                "concat requires one length per nonempty part list".into(),
+            ));
+        }
+        let total_columns = lengths.iter().try_fold(0_usize, |total, &length| {
+            total.checked_add(length).ok_or_else(|| {
+                BackendError::InvalidInput("concat column total overflows usize".into())
+            })
+        })?;
+        let output_len = rows.checked_mul(total_columns).ok_or_else(|| {
+            BackendError::InvalidInput("concat output size overflows usize".into())
+        })?;
+        if output_len == 0 {
+            return Ok(Vec::new());
+        }
+        if rows > u32::MAX as usize
+            || total_columns > u32::MAX as usize
+            || parts.len() > u32::MAX as usize
+        {
+            return Err(BackendError::InvalidInput(
+                "concat geometry exceeds u32".into(),
+            ));
+        }
+        let mut values = Vec::new();
+        let mut offsets = Vec::with_capacity(parts.len());
+        let mut lengths_u32 = Vec::with_capacity(parts.len());
+        for (part, &width) in parts.iter().zip(lengths) {
+            let expected_part = rows.checked_mul(width).ok_or_else(|| {
+                BackendError::InvalidInput("concat part size overflows usize".into())
+            })?;
+            if part.len() != expected_part || width > u32::MAX as usize {
+                return Err(BackendError::ShapeMismatch {
+                    expected: expected_part,
+                    got: part.len(),
+                });
+            }
+            offsets.push(u32::try_from(values.len()).map_err(|_| {
+                BackendError::InvalidInput("concat staging offset exceeds u32".into())
+            })?);
+            lengths_u32.push(width as u32);
+            values.extend_from_slice(part);
+            if values.len() > u32::MAX as usize {
+                return Err(BackendError::InvalidInput(
+                    "concat flattened input exceeds u32".into(),
+                ));
+            }
+        }
+        let params = ConcatParams {
+            rows: rows as u32,
+            part_count: parts.len() as u32,
+            total_columns: total_columns as u32,
+            padding: 0,
+        };
+        let storage = wgpu::BufferUsages::STORAGE;
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-concat-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let values_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-concat-values"),
+                contents: bytemuck::cast_slice(&values),
+                usage: storage,
+            });
+        let lengths_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-concat-lengths"),
+                contents: bytemuck::cast_slice(&lengths_u32),
+                usage: storage,
+            });
+        let offsets_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-concat-offsets"),
+                contents: bytemuck::cast_slice(&offsets),
+                usage: storage,
+            });
+        let bytes = (output_len * core::mem::size_of::<f32>()) as u64;
+        let result_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-concat-result"),
+            size: bytes,
+            usage: storage | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-concat-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-concat-bg"),
+            layout: &self.concat_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: values_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lengths_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: offsets_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: result_buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-concat-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-concat-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.concat_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((output_len as u32).div_ceil(WG_SIZE), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result_buf, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu concat device error: {error}"
             )));
         }
         rx.recv()

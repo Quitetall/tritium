@@ -14,6 +14,7 @@ const OPERATIONS: &[&str] = &[
     "graph.ternary_matmul",
     "graph.transpose",
     "graph.slice_cols",
+    "graph.concat_cols",
     "graph.detach",
     "graph.scale_const",
     "graph.bias",
@@ -875,6 +876,131 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_concat_cols(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "lens"],
+            "attributes",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let lens = attribute_u64_list(request, "lens")?;
+        if lens.is_empty() {
+            return Err(attribute_value("lens", "nonempty"));
+        }
+        if rows > u32::MAX as u64 || lens.iter().any(|&length| length > u32::MAX as u64) {
+            return Err(shape_error());
+        }
+        let total = lens.iter().try_fold(0_u64, |sum, &length| {
+            sum.checked_add(length).ok_or_else(shape_error)
+        })?;
+        if total > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let lengths = lens
+            .iter()
+            .map(|&length| usize::try_from(length).map_err(|_| shape_error()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows_usize = usize::try_from(rows).map_err(|_| shape_error())?;
+        match request.execution {
+            TrainExecutionV1::Forward => {
+                if request.inputs.len() != lens.len()
+                    || request
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .any(|(index, buffer)| buffer.name != format!("part.{index}"))
+                {
+                    return Err(TrainBackendError::InvalidOperation(
+                        TrainOperationErrorV1::Roles {
+                            namespace: "inputs",
+                        },
+                    ));
+                }
+                require_names(
+                    output.buffers.iter().map(|buffer| buffer.name),
+                    &["result"],
+                    "outputs",
+                )?;
+                let mut parts = Vec::with_capacity(lens.len());
+                for (index, (&length, buffer)) in lens.iter().zip(request.inputs.iter()).enumerate()
+                {
+                    if buffer.shape != [rows, length] {
+                        return Err(shape_error());
+                    }
+                    let (_, values) = input_f32(request, &format!("part.{index}"))?;
+                    require_finite(buffer.name, values)?;
+                    parts.push(values);
+                }
+                let result = self
+                    .backend
+                    .concat_cols(&parts, rows_usize, &lengths)
+                    .map_err(wgpu_error)?;
+                let result_len = usize::try_from(rows.checked_mul(total).ok_or_else(shape_error)?)
+                    .map_err(|_| shape_error())?;
+                output_f32(output, "result", &[rows, total], result_len)?.copy_from_slice(&result);
+            }
+            TrainExecutionV1::Vjp => {
+                require_names(
+                    request.inputs.iter().map(|buffer| buffer.name),
+                    &["grad_output"],
+                    "inputs",
+                )?;
+                if output.buffers.len() != lens.len()
+                    || output
+                        .buffers
+                        .iter()
+                        .enumerate()
+                        .any(|(index, buffer)| buffer.name != format!("grad_part.{index}"))
+                {
+                    return Err(TrainBackendError::InvalidOperation(
+                        TrainOperationErrorV1::Roles {
+                            namespace: "outputs",
+                        },
+                    ));
+                }
+                let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+                if gradient_shape != [rows, total] {
+                    return Err(shape_error());
+                }
+                require_finite("grad_output", gradient)?;
+                let mut start = 0_u64;
+                for (index, &length) in lens.iter().enumerate() {
+                    let output_len =
+                        usize::try_from(rows.checked_mul(length).ok_or_else(shape_error)?)
+                            .map_err(|_| shape_error())?;
+                    let part = self
+                        .backend
+                        .pointwise_sized(
+                            gradient,
+                            gradient,
+                            gradient,
+                            24,
+                            0.0,
+                            total as u32,
+                            start as u32,
+                            length as u32,
+                            output_len,
+                        )
+                        .map_err(wgpu_error)?;
+                    output_f32(
+                        output,
+                        &format!("grad_part.{index}"),
+                        &[rows, length],
+                        output_len,
+                    )?
+                    .copy_from_slice(&part);
+                    start += length;
+                }
+            }
+            _ => return Err(invariant("column concat received an illegal phase")),
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -931,6 +1057,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.ternary_matmul" {
             self.execute_ternary_matmul(&request, output)?;
+            0
+        } else if request.operation == "graph.concat_cols" {
+            self.execute_concat_cols(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
@@ -1091,6 +1220,30 @@ fn attribute_u64(request: &TrainRequestV1<'_>, name: &str) -> Result<u64, TrainB
             TrainOperationErrorV1::AttributeType {
                 name: name.to_owned(),
                 expected: "u64",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn attribute_u64_list<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a [u64], TrainBackendError> {
+    let attribute = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "attributes",
+            })
+        })?;
+    let TrainAttributeValueV1::U64List(value) = attribute.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "u64_list",
             },
         ));
     };
