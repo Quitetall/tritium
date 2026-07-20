@@ -19,7 +19,7 @@ use tower::ServiceExt;
 use tritium_nn::Tokenizer;
 use tritium_serve::{
     FinishReason, GenError, GenRequest, Generator, IdPassthroughTokenizer, MockGenerator,
-    ServeConfig, Step, build_router,
+    RequestLimits, ServeConfig, Step, build_router, build_router_with_limits,
 };
 
 /// A generator that always fails (for the backend-error / panic-resilience tests).
@@ -323,6 +323,64 @@ async fn invalid_requests_rejected() {
     )
     .await;
     assert_eq!(s3, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn request_resource_limits_reject_before_queue_admission() {
+    let (router, _) = build_router_with_limits(
+        Box::new(MockGenerator::new(vec![1])),
+        shared_tok(),
+        ServeConfig::default(),
+        RequestLimits {
+            max_messages: 1,
+            max_prompt_bytes: 8,
+            max_prompt_tokens: 2,
+            max_new_tokens: 2,
+            max_total_tokens: 3,
+        },
+    );
+
+    let cases = [
+        (
+            json!({"model":"tritium","messages":[
+                {"role":"user","content":"1"},
+                {"role":"user","content":"2"}
+            ]}),
+            "messages",
+        ),
+        (
+            json!({"model":"tritium","messages":[
+                {"role":"user","content":"12345"}
+            ]}),
+            "messages",
+        ),
+        (
+            json!({"model":"tritium","messages":[
+                {"role":"u","content":"1 2 3"}
+            ]}),
+            "messages",
+        ),
+        (
+            json!({"model":"tritium","max_tokens":3,"messages":[
+                {"role":"u","content":"1"}
+            ]}),
+            "max_tokens",
+        ),
+        (
+            json!({"model":"tritium","max_tokens":2,"messages":[
+                {"role":"u","content":"1 2"}
+            ]}),
+            "max_tokens",
+        ),
+    ];
+
+    for (body, expected_param) in cases {
+        let (status, response) = send(&router, chat(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let value: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["param"], expected_param);
+    }
 }
 
 #[tokio::test]

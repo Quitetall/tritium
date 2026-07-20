@@ -42,7 +42,9 @@ pub use generator::{
 };
 pub use tokenizer_passthrough::IdPassthroughTokenizer;
 
-#[cfg(feature = "cuda")]
-pub use router::build_router_batched;
 #[cfg(feature = "serve")]
-pub use router::{ChatTemplate, ServeConfig, build_router};
+pub use router::{
+    ChatTemplate, RequestLimits, ServeConfig, build_router, build_router_with_limits,
+};
+#[cfg(feature = "cuda")]
+pub use router::{build_router_batched, build_router_batched_with_limits};

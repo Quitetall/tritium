@@ -116,6 +116,37 @@ impl Default for ServeConfig {
     }
 }
 
+/// Pre-admission resource ceilings for one chat-completion request.
+///
+/// This is passed separately from [`ServeConfig`] so adding v1.1 governance did
+/// not break downstream exhaustive literals of the existing public config.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestLimits {
+    /// Maximum number of chat messages accepted before prompt rendering.
+    pub max_messages: usize,
+    /// Maximum aggregate UTF-8 bytes across message roles and contents.
+    pub max_prompt_bytes: usize,
+    /// Maximum tokenized prompt length accepted before queue admission.
+    pub max_prompt_tokens: usize,
+    /// Maximum requested completion length. Larger explicit values are
+    /// rejected rather than silently clamped.
+    pub max_new_tokens: usize,
+    /// Maximum combined prompt and requested completion token budget.
+    pub max_total_tokens: usize,
+}
+
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self {
+            max_messages: 128,
+            max_prompt_bytes: 1024 * 1024,
+            max_prompt_tokens: 128 * 1024,
+            max_new_tokens: 4096,
+            max_total_tokens: 128 * 1024,
+        }
+    }
+}
+
 /// Serve-level counters for `/metrics` (Prometheus text format, no deps).
 /// Counters are monotone; gauges are computed at scrape time.
 #[derive(Debug, Default)]
@@ -136,6 +167,11 @@ struct AppState {
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
     max_new_default: usize,
+    max_messages: usize,
+    max_prompt_bytes: usize,
+    max_prompt_tokens: usize,
+    max_new_tokens: usize,
+    max_total_tokens: usize,
     chat_template: ChatTemplate,
     metrics: Arc<Metrics>,
 }
@@ -148,6 +184,16 @@ pub fn build_router(
     tok: Arc<dyn Tokenizer + Send + Sync>,
     cfg: ServeConfig,
 ) -> (Router, Arc<AtomicBool>) {
+    build_router_with_limits(generator, tok, cfg, RequestLimits::default())
+}
+
+/// Build the router with explicit pre-admission request ceilings.
+pub fn build_router_with_limits(
+    generator: Box<dyn Generator>,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    limits: RequestLimits,
+) -> (Router, Arc<AtomicBool>) {
     let draining = Arc::new(AtomicBool::new(false));
     let worker_alive = Arc::new(AtomicBool::new(true));
     let jobs = spawn_worker(
@@ -156,7 +202,7 @@ pub fn build_router(
         worker_alive.clone(),
         cfg.queue_cap,
     );
-    build_router_inner(jobs, tok, cfg, draining, worker_alive)
+    build_router_inner(jobs, tok, cfg, limits, draining, worker_alive)
 }
 
 /// Continuous-batching router (`--batch-slots > 1`): spawns the batched
@@ -170,6 +216,19 @@ pub fn build_router_batched(
     slots: usize,
     tok: Arc<dyn Tokenizer + Send + Sync>,
     cfg: ServeConfig,
+) -> std::io::Result<(Router, Arc<AtomicBool>)> {
+    build_router_batched_with_limits(runner, eos, slots, tok, cfg, RequestLimits::default())
+}
+
+/// Build the continuous-batching router with explicit request ceilings.
+#[cfg(feature = "cuda")]
+pub fn build_router_batched_with_limits(
+    runner: tritium_nn::ModelRunner,
+    eos: u32,
+    slots: usize,
+    tok: Arc<dyn Tokenizer + Send + Sync>,
+    cfg: ServeConfig,
+    limits: RequestLimits,
 ) -> std::io::Result<(Router, Arc<AtomicBool>)> {
     use std::sync::atomic::Ordering;
     if slots == 0 {
@@ -202,6 +261,7 @@ pub fn build_router_batched(
         jobs_tx,
         tok,
         cfg,
+        limits,
         draining,
         worker_alive,
     ))
@@ -211,6 +271,7 @@ fn build_router_inner(
     jobs: tokio::sync::mpsc::Sender<crate::worker::Job>,
     tok: Arc<dyn Tokenizer + Send + Sync>,
     cfg: ServeConfig,
+    limits: RequestLimits,
     draining: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
 ) -> (Router, Arc<AtomicBool>) {
@@ -221,6 +282,11 @@ fn build_router_inner(
         draining: draining.clone(),
         worker_alive,
         max_new_default: cfg.max_new_default,
+        max_messages: limits.max_messages,
+        max_prompt_bytes: limits.max_prompt_bytes,
+        max_prompt_tokens: limits.max_prompt_tokens,
+        max_new_tokens: limits.max_new_tokens,
+        max_total_tokens: limits.max_total_tokens,
         chat_template: cfg.chat_template,
         metrics: Arc::new(Metrics::default()),
     };
@@ -378,6 +444,30 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
             Some("messages"),
         );
     }
+    if req.messages.len() > st.max_messages {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("messages supports at most {} entries", st.max_messages),
+            Some("messages"),
+        );
+    }
+    let prompt_bytes = req.messages.iter().try_fold(0_usize, |total, message| {
+        total
+            .checked_add(message.role.len())?
+            .checked_add(message.content.len())
+    });
+    if prompt_bytes.is_none_or(|bytes| bytes > st.max_prompt_bytes) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "message roles and contents exceed the {} byte prompt limit",
+                st.max_prompt_bytes
+            ),
+            Some("messages"),
+        );
+    }
     if !(0.0..=2.0).contains(&req.temperature) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -460,6 +550,42 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
     }
     let prompt_len = prompt_tokens.len();
     let max_new = req.max_tokens.map_or(st.max_new_default, |m| m as usize);
+    if prompt_len > st.max_prompt_tokens {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "tokenized prompt exceeds the {} token limit",
+                st.max_prompt_tokens
+            ),
+            Some("messages"),
+        );
+    }
+    if max_new > st.max_new_tokens {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "max_tokens exceeds the {} token completion limit",
+                st.max_new_tokens
+            ),
+            Some("max_tokens"),
+        );
+    }
+    if prompt_len
+        .checked_add(max_new)
+        .is_none_or(|tokens| tokens > st.max_total_tokens)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "prompt plus max_tokens exceeds the {} token request limit",
+                st.max_total_tokens
+            ),
+            Some("max_tokens"),
+        );
+    }
     let logprobs_k = req.logprobs.then(|| req.top_logprobs.unwrap_or(0) as usize);
     let gen_req = GenRequest {
         prompt_tokens,

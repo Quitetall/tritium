@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tritium_serve::{IdPassthroughTokenizer, RunnerGenerator, ServeConfig, build_router};
+use tritium_serve::{IdPassthroughTokenizer, RequestLimits, RunnerGenerator, ServeConfig};
 
 // Force-link the backends so their `linkme` registrations populate the runtime
 // registry consulted below.
@@ -27,6 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut port: u16 = 8080;
     let mut model_id = "tritium".to_owned();
     let mut max_new: usize = 256;
+    let mut max_messages: usize = 128;
+    let mut max_prompt_bytes: usize = 1024 * 1024;
+    let mut max_prompt_tokens: usize = 128 * 1024;
+    let mut max_new_tokens: usize = 4096;
+    let mut max_total_tokens: usize = 128 * 1024;
     let mut eos: u32 = 128_001;
     let mut raw_tokens = false;
     let mut draft_model: Option<String> = None;
@@ -54,6 +59,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--port" => port = val(args.next(), "--port")?,
             "--model-id" => model_id = val::<String>(args.next(), "--model-id")?,
             "--max-new" => max_new = val(args.next(), "--max-new")?,
+            "--max-messages" => max_messages = val(args.next(), "--max-messages")?,
+            "--max-prompt-bytes" => {
+                max_prompt_bytes = val(args.next(), "--max-prompt-bytes")?;
+            }
+            "--max-prompt-tokens" => {
+                max_prompt_tokens = val(args.next(), "--max-prompt-tokens")?;
+            }
+            "--max-completion-tokens" => {
+                max_new_tokens = val(args.next(), "--max-completion-tokens")?;
+            }
+            "--max-total-tokens" => {
+                max_total_tokens = val(args.next(), "--max-total-tokens")?;
+            }
             "--eos" => eos = val(args.next(), "--eos")?,
             "--raw-tokens" => raw_tokens = true,
             "--draft-model" => draft_model = Some(val(args.next(), "--draft-model")?),
@@ -68,7 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "usage: tritium-serve --model <gguf> [--backend cpu|cuda] [--spec lookup] \
                      [--batch-slots N] [--host 127.0.0.1] [--port 8080] [--model-id tritium] \
-                     [--max-new 256] [--eos 128001] [--raw-tokens] \
+                     [--max-new 256] [--max-messages 128] [--max-prompt-bytes 1048576] \
+                     [--max-prompt-tokens 131072] [--max-completion-tokens 4096] \
+                     [--max-total-tokens 131072] [--eos 128001] [--raw-tokens] \
                      [--draft-model <gguf>] [--kv-pool-tokens N]  (non-loopback \
                      --host requires TRITIUM_AUTH_TOKEN)"
                 );
@@ -161,6 +181,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    if [
+        max_new,
+        max_messages,
+        max_prompt_bytes,
+        max_prompt_tokens,
+        max_new_tokens,
+        max_total_tokens,
+    ]
+    .contains(&0)
+    {
+        return Err("all request and prompt limits must be >= 1".into());
+    }
+    if max_new > max_new_tokens {
+        return Err("--max-new must not exceed --max-completion-tokens".into());
+    }
+    if max_new > max_total_tokens {
+        return Err("--max-new must not exceed --max-total-tokens".into());
+    }
     let cfg = ServeConfig {
         model_id,
         queue_cap: 32,
@@ -169,6 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv_pool_tokens,
         chat_template,
         ..ServeConfig::default()
+    };
+    let request_limits = RequestLimits {
+        max_messages,
+        max_prompt_bytes,
+        max_prompt_tokens,
+        max_new_tokens,
+        max_total_tokens,
     };
     // ADR 0021 model drafter: a SECOND runner in-process on the same device
     // (its own KV + decode graphs). Load failures are loud — a missing or
@@ -219,13 +264,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into(),
             );
         }
-        tritium_serve::build_router_batched(runner, eos, batch_slots, tok, cfg)?
+        tritium_serve::build_router_batched_with_limits(
+            runner,
+            eos,
+            batch_slots,
+            tok,
+            cfg,
+            request_limits,
+        )?
     } else {
         let mut generator = RunnerGenerator::new(runner, eos).with_spec_lookup(spec_lookup);
         if let Some(d) = draft_runner {
             generator = generator.with_draft_model(d);
         }
-        build_router(Box::new(generator), tok, cfg)
+        tritium_serve::build_router_with_limits(Box::new(generator), tok, cfg, request_limits)
     };
     #[cfg(not(feature = "cuda"))]
     let (router, draining) = {
@@ -236,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(d) = draft_runner {
             generator = generator.with_draft_model(d);
         }
-        build_router(Box::new(generator), tok, cfg)
+        tritium_serve::build_router_with_limits(Box::new(generator), tok, cfg, request_limits)
     };
 
     let addr = std::net::SocketAddr::new(host_ip, port);
