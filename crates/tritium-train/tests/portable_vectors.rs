@@ -13,7 +13,7 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
     let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json()).unwrap();
     let report = run_training_conformance(&CpuTrainBackendV1::new(), &vectors);
     assert!(report.is_ok(), "{:#?}", report.failed);
-    assert_eq!(report.passed.len(), 55);
+    assert_eq!(report.passed.len(), 68);
     let mut receipt_count = 0;
     for passed in report.passed {
         if let Some(receipt) = passed.receipt {
@@ -22,10 +22,14 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
             assert_eq!(receipt.manifest_digest, vectors.manifest_digest());
         }
     }
-    assert_eq!(receipt_count, 40);
+    assert_eq!(receipt_count, 48);
     assert_eq!(
         CpuTrainBackendV1::new().capabilities().supported_operations,
         [
+            "graph.ste_surrogate",
+            "graph.salt_ste",
+            "graph.lsq_ste",
+            "graph.fsq",
             "graph.dense_matmul",
             "graph.ternary_matmul",
             "graph.transpose",

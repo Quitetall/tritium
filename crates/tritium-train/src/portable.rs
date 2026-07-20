@@ -1,11 +1,13 @@
 //! CPU reference adapter for the plan-0049 portable-training seam.
 
+use core::f32::consts::PI;
+
 use blake3::Hasher;
 use tritium_spec::{
-    TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
-    TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
-    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV1,
-    train_output_digest_v1, train_request_digest_v1,
+    train_output_digest_v1, train_request_digest_v1, TrainAttributeValueV1, TrainBackendError,
+    TrainBackendV1, TrainBufferDataMutV1, TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1,
+    TrainExecutionV1, TrainLimitsV1, TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1,
+    TrainRequestV1, TrainingOpManifestV1,
 };
 
 use crate::{Optimizer, Sgd};
@@ -19,6 +21,10 @@ const CPU_LIMITS: TrainLimitsV1 = TrainLimitsV1 {
 
 #[derive(Clone, Copy)]
 enum CpuOperation {
+    SteSurrogate,
+    SaltSte,
+    LsqSte,
+    Fsq,
     DenseMatmul,
     TernaryMatmul,
     Transpose,
@@ -48,6 +54,22 @@ struct CpuOperationEntry {
 }
 
 const CPU_OPERATIONS: &[CpuOperationEntry] = &[
+    CpuOperationEntry {
+        id: "graph.ste_surrogate",
+        operation: CpuOperation::SteSurrogate,
+    },
+    CpuOperationEntry {
+        id: "graph.salt_ste",
+        operation: CpuOperation::SaltSte,
+    },
+    CpuOperationEntry {
+        id: "graph.lsq_ste",
+        operation: CpuOperation::LsqSte,
+    },
+    CpuOperationEntry {
+        id: "graph.fsq",
+        operation: CpuOperation::Fsq,
+    },
     CpuOperationEntry {
         id: "graph.dense_matmul",
         operation: CpuOperation::DenseMatmul,
@@ -135,6 +157,47 @@ struct OperationSchema {
     attributes: &'static [&'static str],
     outputs: &'static [&'static str],
 }
+
+const STE_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["weight", "scale"],
+    attributes: &["rows", "cols"],
+    outputs: &["result"],
+};
+const STE_VJP: OperationSchema = OperationSchema {
+    inputs: &["weight", "scale", "grad_output"],
+    attributes: &["rows", "cols"],
+    outputs: &["grad_weight", "grad_scale"],
+};
+const SALT_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["weight"],
+    attributes: &["rows", "cols", "planes"],
+    outputs: &["result"],
+};
+const SALT_VJP: OperationSchema = OperationSchema {
+    inputs: &["weight", "grad_output"],
+    attributes: &["rows", "cols", "planes"],
+    outputs: &["grad_weight"],
+};
+const LSQ_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["weight", "alpha"],
+    attributes: &["rows", "cols"],
+    outputs: &["result"],
+};
+const LSQ_VJP: OperationSchema = OperationSchema {
+    inputs: &["weight", "alpha", "grad_output"],
+    attributes: &["rows", "cols"],
+    outputs: &["grad_weight", "grad_alpha"],
+};
+const FSQ_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x"],
+    attributes: &["channels", "len", "levels", "bound", "ste", "alpha", "seed"],
+    outputs: &["result"],
+};
+const FSQ_VJP: OperationSchema = OperationSchema {
+    inputs: &["x", "grad_output"],
+    attributes: &["channels", "len", "levels", "bound", "ste", "alpha", "seed"],
+    outputs: &["grad_x"],
+};
 
 const ADD_FORWARD: OperationSchema = OperationSchema {
     inputs: &["left", "right"],
@@ -346,6 +409,26 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             .find(|entry| entry.id == request.operation)
             .ok_or_else(|| TrainBackendError::UnsupportedOperation(request.operation.to_owned()))?;
         match (operation.operation, request.execution) {
+            (CpuOperation::SteSurrogate, TrainExecutionV1::Forward) => {
+                ste_surrogate_forward(&request, output)?;
+            }
+            (CpuOperation::SteSurrogate, TrainExecutionV1::Vjp) => {
+                ste_surrogate_vjp(&request, output)?;
+            }
+            (CpuOperation::SaltSte, TrainExecutionV1::Forward) => {
+                salt_ste_forward(&request, output)?;
+            }
+            (CpuOperation::SaltSte, TrainExecutionV1::Vjp) => {
+                salt_ste_vjp(&request, output)?;
+            }
+            (CpuOperation::LsqSte, TrainExecutionV1::Forward) => {
+                lsq_ste_forward(&request, output)?;
+            }
+            (CpuOperation::LsqSte, TrainExecutionV1::Vjp) => {
+                lsq_ste_vjp(&request, output)?;
+            }
+            (CpuOperation::Fsq, TrainExecutionV1::Forward) => fsq_forward(&request, output)?,
+            (CpuOperation::Fsq, TrainExecutionV1::Vjp) => fsq_vjp(&request, output)?,
             (CpuOperation::DenseMatmul, TrainExecutionV1::Forward) => {
                 dense_matmul_forward(&request, output)?;
             }
@@ -432,6 +515,12 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
                 });
             }
         }
+        let scratch_bytes = match (operation.operation, request.execution) {
+            (CpuOperation::SaltSte, TrainExecutionV1::Forward) => attribute_u64(&request, "cols")?
+                .checked_mul(size_of::<f32>() as u64)
+                .ok_or_else(|| attribute_value("cols", "scratch_bytes"))?,
+            _ => 0,
+        };
         Ok(TrainReceiptV1 {
             backend_id: BACKEND_ID.to_owned(),
             backend_build: backend_build_identity(),
@@ -445,11 +534,276 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             input_digest,
             output_digest: train_output_digest_v1(output),
             peak_resident_bytes: resident_bytes(&request, output)?,
-            scratch_bytes: 0,
+            scratch_bytes,
             host_transfers: 0,
             device_resident: true,
         })
     }
+}
+
+fn ste_surrogate_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &STE_FORWARD)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (rows, cols, _, cols_usize) = matrix_attributes(request)?;
+    if weight_shape != [rows, cols] || scale_shape != [rows] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    require_f32_output(output, "result", weight_shape)?;
+    let result = output_f32(output, "result")?;
+    for (row, &row_scale) in scale.iter().enumerate() {
+        for column in 0..cols_usize {
+            let index = row * cols_usize + column;
+            result[index] = if row_scale == 0.0 {
+                0.0
+            } else {
+                (weight[index] / row_scale).clamp(-1.0, 1.0)
+            };
+        }
+    }
+    Ok(())
+}
+
+fn ste_surrogate_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &STE_VJP)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (gradient_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, _, cols_usize) = matrix_attributes(request)?;
+    if weight_shape != [rows, cols] || scale_shape != [rows] || gradient_shape != weight_shape {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    require_f32_output(output, "grad_scale", scale_shape)?;
+    let grad_weight = output_f32(output, "grad_weight")?;
+    grad_weight.fill(0.0);
+    for (row, &row_scale) in scale.iter().enumerate() {
+        if row_scale == 0.0 {
+            continue;
+        }
+        for column in 0..cols_usize {
+            let index = row * cols_usize + column;
+            if (weight[index] / row_scale).abs() < 1.0 {
+                grad_weight[index] = grad_output[index] / row_scale;
+            }
+        }
+    }
+    output_f32(output, "grad_scale")?.fill(0.0);
+    Ok(())
+}
+
+fn salt_ste_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &SALT_FORWARD)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    let planes = positive_usize_attribute(request, "planes")?;
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if weight_shape != [rows, cols] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    require_f32_output(output, "result", weight_shape)?;
+    let result = output_f32(output, "result")?;
+    let mut residual = vec![0.0_f32; cols_usize];
+    for row in 0..rows_usize {
+        let start = row * cols_usize;
+        residual.copy_from_slice(&weight[start..start + cols_usize]);
+        let reconstruction = &mut result[start..start + cols_usize];
+        reconstruction.fill(0.0);
+        for _ in 0..planes {
+            let mut sum = 0.0_f32;
+            for value in &residual {
+                sum += value.abs();
+            }
+            let scale = sum / cols_usize as f32;
+            if scale == 0.0 {
+                continue;
+            }
+            for column in 0..cols_usize {
+                let contribution = scale * (residual[column] / scale).round().clamp(-1.0, 1.0);
+                reconstruction[column] += contribution;
+                residual[column] -= contribution;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn salt_ste_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &SALT_VJP)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (gradient_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, _, cols_usize) = matrix_attributes(request)?;
+    positive_usize_attribute(request, "planes")?;
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if weight_shape != [rows, cols] || gradient_shape != weight_shape {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    output_f32(output, "grad_weight")?.copy_from_slice(grad_output);
+    Ok(())
+}
+
+fn lsq_ste_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &LSQ_FORWARD)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (alpha_shape, alpha) = input_f32(request, "alpha")?;
+    let (rows, cols, _, cols_usize) = matrix_attributes(request)?;
+    if weight_shape != [rows, cols] || alpha_shape != [rows] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("alpha", alpha)?;
+    require_f32_output(output, "result", weight_shape)?;
+    let result = output_f32(output, "result")?;
+    result.fill(0.0);
+    for (row, &row_alpha) in alpha.iter().enumerate() {
+        if row_alpha <= 0.0 {
+            continue;
+        }
+        for column in 0..cols_usize {
+            let index = row * cols_usize + column;
+            result[index] = (weight[index] / row_alpha).round().clamp(-1.0, 1.0) * row_alpha;
+        }
+    }
+    Ok(())
+}
+
+fn lsq_ste_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &LSQ_VJP)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (alpha_shape, alpha) = input_f32(request, "alpha")?;
+    let (gradient_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, _, cols_usize) = matrix_attributes(request)?;
+    if weight_shape != [rows, cols] || alpha_shape != [rows] || gradient_shape != weight_shape {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("alpha", alpha)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    require_f32_output(output, "grad_alpha", alpha_shape)?;
+    let grad_weight = output_f32(output, "grad_weight")?;
+    grad_weight.fill(0.0);
+    for (row, &row_alpha) in alpha.iter().enumerate() {
+        if row_alpha <= 0.0 {
+            continue;
+        }
+        for column in 0..cols_usize {
+            let index = row * cols_usize + column;
+            let normalized = weight[index] / row_alpha;
+            if normalized.abs() < 1.0 {
+                grad_weight[index] = grad_output[index];
+            }
+        }
+    }
+    let grad_alpha = output_f32(output, "grad_alpha")?;
+    grad_alpha.fill(0.0);
+    let gradient_scale = 1.0 / (cols_usize as f32).sqrt();
+    for (row, &row_alpha) in alpha.iter().enumerate() {
+        if row_alpha <= 0.0 {
+            continue;
+        }
+        let mut gradient = 0.0_f32;
+        for column in 0..cols_usize {
+            let index = row * cols_usize + column;
+            let normalized = weight[index] / row_alpha;
+            let local = if normalized.abs() < 1.0 {
+                normalized.round() - normalized
+            } else {
+                normalized.signum()
+            };
+            gradient += grad_output[index] * local;
+        }
+        grad_alpha[row] = gradient * gradient_scale;
+    }
+    Ok(())
+}
+
+fn fsq_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &FSQ_FORWARD)?;
+    let (shape, x) = input_f32(request, "x")?;
+    let config = fsq_attributes(request)?;
+    if shape != [config.channels, config.len] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    require_f32_output(output, "result", shape)?;
+    for (index, (result, &x)) in output_f32(output, "result")?.iter_mut().zip(x).enumerate() {
+        let level = config.levels[index / config.len_usize];
+        let bounded = fsq_bound(x, config.bound);
+        *result = match config.estimator {
+            FsqEstimator::Stochastic => fsq_quantize_stochastic(bounded, level, config.seed, index),
+            FsqEstimator::Hard | FsqEstimator::SoftRound => fsq_quantize(bounded, level),
+        };
+    }
+    Ok(())
+}
+
+fn fsq_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &FSQ_VJP)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (gradient_shape, grad_output) = input_f32(request, "grad_output")?;
+    let config = fsq_attributes(request)?;
+    if x_shape != [config.channels, config.len] || gradient_shape != x_shape {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", x_shape)?;
+    for (index, ((grad_x, &x), &gradient)) in output_f32(output, "grad_x")?
+        .iter_mut()
+        .zip(x)
+        .zip(grad_output)
+        .enumerate()
+    {
+        let derivative = fsq_bound_derivative(x, config.bound);
+        *grad_x = match config.estimator {
+            FsqEstimator::SoftRound => {
+                let bounded = fsq_bound(x, config.bound);
+                let level = config.levels[index / config.len_usize];
+                let position = (bounded + 1.0) * 0.5 * (level - 1) as f32;
+                gradient * (1.0 - config.alpha * (2.0 * PI * position).cos()) * derivative
+            }
+            FsqEstimator::Hard | FsqEstimator::Stochastic => gradient * derivative,
+        };
+    }
+    Ok(())
 }
 
 fn dense_matmul_forward(
@@ -1553,6 +1907,151 @@ fn sgd_step(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum FsqBoundKind {
+    Clamp,
+    Tanh,
+}
+
+#[derive(Clone, Copy)]
+enum FsqEstimator {
+    Hard,
+    SoftRound,
+    Stochastic,
+}
+
+struct FsqAttributes<'a> {
+    channels: u64,
+    len: u64,
+    len_usize: usize,
+    levels: &'a [u32],
+    bound: FsqBoundKind,
+    estimator: FsqEstimator,
+    alpha: f32,
+    seed: u64,
+}
+
+fn fsq_attributes<'a>(
+    request: &'a TrainRequestV1<'_>,
+) -> Result<FsqAttributes<'a>, TrainBackendError> {
+    let channels = attribute_u64(request, "channels")?;
+    let len = attribute_u64(request, "len")?;
+    let channels_usize =
+        usize::try_from(channels).map_err(|_| attribute_value("channels", "usize"))?;
+    let len_usize = usize::try_from(len).map_err(|_| attribute_value("len", "usize"))?;
+    if channels_usize == 0 {
+        return Err(attribute_value("channels", "positive"));
+    }
+    if len_usize == 0 {
+        return Err(attribute_value("len", "positive"));
+    }
+    channels_usize
+        .checked_mul(len_usize)
+        .ok_or_else(|| attribute_value("channels", "channels_times_len"))?;
+    let levels = attribute_u32_list(request, "levels")?;
+    if levels.len() != channels_usize {
+        return Err(attribute_value("levels", "channels"));
+    }
+    if levels.iter().any(|&level| level < 2) {
+        return Err(attribute_value("levels", "min_two"));
+    }
+    let bound = match attribute_text(request, "bound")? {
+        "clamp" => FsqBoundKind::Clamp,
+        "tanh" => FsqBoundKind::Tanh,
+        _ => return Err(attribute_value("bound", "known")),
+    };
+    let estimator = match attribute_text(request, "ste")? {
+        "hard" => FsqEstimator::Hard,
+        "soft_round" => FsqEstimator::SoftRound,
+        "stochastic" => FsqEstimator::Stochastic,
+        _ => return Err(attribute_value("ste", "known")),
+    };
+    let alpha = attribute_f32(request, "alpha")?;
+    if !(0.0..=1.0).contains(&alpha) {
+        return Err(attribute_value("alpha", "unit_interval"));
+    }
+    let seed = attribute_u64(request, "seed")?;
+    Ok(FsqAttributes {
+        channels,
+        len,
+        len_usize,
+        levels,
+        bound,
+        estimator,
+        alpha,
+        seed,
+    })
+}
+
+fn positive_usize_attribute(
+    request: &TrainRequestV1<'_>,
+    name: &str,
+) -> Result<usize, TrainBackendError> {
+    let value = attribute_u64(request, name)?;
+    if value == 0 {
+        return Err(attribute_value(name, "positive"));
+    }
+    usize::try_from(value).map_err(|_| attribute_value(name, "usize"))
+}
+
+fn fsq_bound(value: f32, bound: FsqBoundKind) -> f32 {
+    match bound {
+        FsqBoundKind::Clamp => value.clamp(-1.0, 1.0),
+        FsqBoundKind::Tanh => value.tanh(),
+    }
+}
+
+fn fsq_bound_derivative(value: f32, bound: FsqBoundKind) -> f32 {
+    match bound {
+        FsqBoundKind::Clamp => {
+            if value.abs() < 1.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        FsqBoundKind::Tanh => {
+            let bounded = value.tanh();
+            1.0 - bounded * bounded
+        }
+    }
+}
+
+fn fsq_quantize(value: f32, level: u32) -> f32 {
+    let maximum = (level - 1) as f32;
+    let position = (value + 1.0) * 0.5 * maximum;
+    let code = round_half_away(position).clamp(0.0, maximum);
+    code / maximum * 2.0 - 1.0
+}
+
+fn fsq_quantize_stochastic(value: f32, level: u32, seed: u64, index: usize) -> f32 {
+    let maximum = (level - 1) as f32;
+    let position = ((value + 1.0) * 0.5 * maximum).clamp(0.0, maximum);
+    let floor = position.floor();
+    let increment = if fsq_uniform(seed, index) < position - floor {
+        1.0
+    } else {
+        0.0
+    };
+    (floor + increment).clamp(0.0, maximum) / maximum * 2.0 - 1.0
+}
+
+fn round_half_away(value: f32) -> f32 {
+    if value >= 0.0 {
+        (value + 0.5).floor()
+    } else {
+        (value - 0.5).ceil()
+    }
+}
+
+fn fsq_uniform(seed: u64, index: usize) -> f32 {
+    let mut state = (seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    (state % 1_000_000) as f32 / 1_000_000.0
+}
+
 fn require_contract(
     request: &TrainRequestV1<'_>,
     output: &TrainOutputV1<'_>,
@@ -1758,7 +2257,7 @@ fn rope_attributes<'a>(
 ) -> Result<(&'a [u64], u64, u64, u64, usize, usize, f32), TrainBackendError> {
     let positions = attribute_u64_list(request, "positions")?;
     for &position in positions {
-        usize::try_from(position).map_err(|_| attribute_value("positions", "usize"))?;
+        u32::try_from(position).map_err(|_| attribute_value("positions", "u32"))?;
     }
     let n_token =
         u64::try_from(positions.len()).map_err(|_| attribute_value("positions", "u64"))?;
@@ -1796,6 +2295,7 @@ fn rope_attributes<'a>(
     ))
 }
 
+#[allow(clippy::type_complexity)]
 fn require_concat_roles(
     request: &TrainRequestV1<'_>,
     output: &TrainOutputV1<'_>,
@@ -1888,6 +2388,36 @@ fn attribute_u64_list<'a>(
     {
         Some(TrainAttributeValueV1::U64List(value)) => Ok(value),
         _ => Err(attribute_type(name, "u64_list")),
+    }
+}
+
+fn attribute_u32_list<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a [u32], TrainBackendError> {
+    match request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .map(|attribute| attribute.value)
+    {
+        Some(TrainAttributeValueV1::U32List(value)) => Ok(value),
+        _ => Err(attribute_type(name, "u32_list")),
+    }
+}
+
+fn attribute_text<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a str, TrainBackendError> {
+    match request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .map(|attribute| attribute.value)
+    {
+        Some(TrainAttributeValueV1::Text(value)) => Ok(value),
+        _ => Err(attribute_type(name, "text")),
     }
 }
 

@@ -119,6 +119,14 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.add.forward.basic",
             "graph.add.forward.zero",
             "graph.add.vjp.basic",
+            "graph.ste_surrogate.forward.basic",
+            "graph.ste_surrogate.vjp.basic",
+            "graph.salt_ste.forward.two_planes",
+            "graph.salt_ste.vjp.identity",
+            "graph.lsq_ste.forward.basic",
+            "graph.lsq_ste.vjp.basic",
+            "graph.fsq.forward.soft_round",
+            "graph.fsq.vjp.soft_round",
             "graph.dense_matmul.forward.basic",
             "graph.dense_matmul.vjp.basic",
             "graph.ternary_matmul.forward.basic",
@@ -171,11 +179,16 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.rope.forward.odd_head_dim",
             "loss.softmax_cross_entropy.forward.zero_rows",
             "loss.softmax_cross_entropy.forward.zero_cols",
+            "graph.rope.forward.position_overflow",
+            "graph.ste_surrogate.forward.shape_error",
+            "graph.salt_ste.forward.zero_planes",
+            "graph.lsq_ste.forward.shape_error",
+            "graph.fsq.forward.invalid_levels",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "fc067141cdb083803dd35f89a44dd348c14493f68efc5000d191f863d615f292"
+        "420782acaec46d2915629815c9c082030671b413818880afd1bcf246d2219f13"
     );
 }

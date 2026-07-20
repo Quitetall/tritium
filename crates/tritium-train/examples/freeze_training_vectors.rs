@@ -12,7 +12,11 @@ use serde::Serialize;
 use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
 use tritium_train::{
     Optimizer, Sgd,
-    ops::{act, bias, dense, elementwise, embed, loss, matmul, norm, rope, shape, softmax},
+    ops::{
+        act, bias, dense, elementwise, embed,
+        fsq::{self, FsqBound, FsqCfg, FsqSte},
+        loss, matmul, norm, rope, shape, softmax, ste,
+    },
 };
 
 #[derive(Serialize)]
@@ -73,6 +77,14 @@ enum Attribute {
         name: &'static str,
         values: Vec<u64>,
     },
+    U32List {
+        name: &'static str,
+        values: Vec<u32>,
+    },
+    Text {
+        name: &'static str,
+        value: &'static str,
+    },
 }
 
 #[derive(Serialize)]
@@ -114,6 +126,28 @@ fn main() {
     let right = [3.0_f32, 4.0, -1.5];
     let add: Vec<_> = left.iter().zip(right).map(|(&x, y)| x + y).collect();
     let grad_output = [0.25_f32, -0.5, 2.0];
+
+    let quant_weight = [-1.2_f32, -0.2, 0.6, 0.0, 1.5, -0.75];
+    let quant_scale = [0.8_f32, 1.0];
+    let quant_grad_output = [1.0_f32, -2.0, 0.5, 0.25, 1.5, -1.0];
+    let ste_result = ste::quantize_surrogate(&quant_weight, &quant_scale, 2, 3);
+    let ste_grads = ste::quantize_vjp(&quant_weight, &quant_scale, 2, 3, &quant_grad_output);
+    let salt_result = ste::salt_quantize_forward(&quant_weight, 2, 3, 2);
+    let salt_grad = ste::salt_quantize_vjp(&quant_weight, 2, 3, 2, &quant_grad_output);
+    let learned_scale = [0.75_f32, 1.25];
+    let lsq_result = ste::lsq_forward(&quant_weight, &learned_scale, 2, 3);
+    let lsq_grads = ste::lsq_vjp(&quant_weight, &learned_scale, 2, 3, &quant_grad_output);
+
+    let fsq_input = [-1.2_f32, -0.25, 0.6, 0.9, 0.1, -0.9];
+    let fsq_cfg = FsqCfg {
+        channels: 2,
+        len: 3,
+        levels: vec![3, 5],
+        bound: FsqBound::Clamp,
+    };
+    let fsq_ste = FsqSte::SoftRound { alpha: 0.5 };
+    let fsq_result = fsq::forward(&fsq_input, &fsq_cfg, fsq_ste);
+    let fsq_grads = fsq::vjp(&fsq_input, &fsq_cfg, fsq_ste, &quant_grad_output);
 
     let mul_left = [2.0_f32, -3.0, 0.0];
     let mul_right = [-4.0_f32, 0.5, 7.0];
@@ -277,6 +311,254 @@ fn main() {
                         f32_buffer("grad_left", &[3], &grad_output),
                         f32_buffer("grad_right", &[3], &grad_output),
                     ],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.ste_surrogate.forward.basic",
+                operation: "graph.ste_surrogate",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("scale", &[2], &quant_scale),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &ste_result)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.ste_surrogate.vjp.basic",
+                operation: "graph.ste_surrogate",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("scale", &[2], &quant_scale),
+                    f32_buffer("grad_output", &[2, 3], &quant_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_weight", &[2, 3], &ste_grads[0]),
+                        f32_buffer("grad_scale", &[2], &ste_grads[1]),
+                    ],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.salt_ste.forward.two_planes",
+                operation: "graph.salt_ste",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("weight", &[2, 3], &quant_weight)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::U64 {
+                        name: "planes",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &salt_result)],
+                    scratch_bytes_max: 12,
+                },
+            },
+            Case {
+                case_id: "graph.salt_ste.vjp.identity",
+                operation: "graph.salt_ste",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("grad_output", &[2, 3], &quant_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::U64 {
+                        name: "planes",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_weight", &[2, 3], &salt_grad)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.lsq_ste.forward.basic",
+                operation: "graph.lsq_ste",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("alpha", &[2], &learned_scale),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &lsq_result)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.lsq_ste.vjp.basic",
+                operation: "graph.lsq_ste",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("weight", &[2, 3], &quant_weight),
+                    f32_buffer("alpha", &[2], &learned_scale),
+                    f32_buffer("grad_output", &[2, 3], &quant_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_weight", &[2, 3], &lsq_grads[0]),
+                        f32_buffer("grad_alpha", &[2], &lsq_grads[1]),
+                    ],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.fsq.forward.soft_round",
+                operation: "graph.fsq",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[2, 3], &fsq_input)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "channels",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "len",
+                        value: 3,
+                    },
+                    Attribute::U32List {
+                        name: "levels",
+                        values: vec![3, 5],
+                    },
+                    Attribute::Text {
+                        name: "bound",
+                        value: "clamp",
+                    },
+                    Attribute::Text {
+                        name: "ste",
+                        value: "soft_round",
+                    },
+                    Attribute::F32 {
+                        name: "alpha",
+                        bits: 0.5_f32.to_bits(),
+                    },
+                    Attribute::U64 {
+                        name: "seed",
+                        value: 0,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &fsq_result)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.fsq.vjp.soft_round",
+                operation: "graph.fsq",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("x", &[2, 3], &fsq_input),
+                    f32_buffer("grad_output", &[2, 3], &quant_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "channels",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "len",
+                        value: 3,
+                    },
+                    Attribute::U32List {
+                        name: "levels",
+                        values: vec![3, 5],
+                    },
+                    Attribute::Text {
+                        name: "bound",
+                        value: "clamp",
+                    },
+                    Attribute::Text {
+                        name: "ste",
+                        value: "soft_round",
+                    },
+                    Attribute::F32 {
+                        name: "alpha",
+                        bits: 0.5_f32.to_bits(),
+                    },
+                    Attribute::U64 {
+                        name: "seed",
+                        value: 0,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_x", &[2, 3], &fsq_grads[0])],
                     scratch_bytes_max: 0,
                 },
             },
@@ -1520,6 +1802,154 @@ fn main() {
                     category: "invalid_operation",
                     code: "attribute_value.cols.positive",
                     outputs: vec![f32_buffer("result", &[], &[123.0])],
+                },
+            },
+            Case {
+                case_id: "graph.rope.forward.position_overflow",
+                operation: "graph.rope",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[1, 1, 4], &rope_input[..4])],
+                attributes: vec![
+                    Attribute::U64List {
+                        name: "positions",
+                        values: vec![u64::from(u32::MAX) + 1],
+                    },
+                    Attribute::U64 {
+                        name: "n_head",
+                        value: 1,
+                    },
+                    Attribute::U64 {
+                        name: "head_dim",
+                        value: 4,
+                    },
+                    Attribute::F32 {
+                        name: "theta",
+                        bits: rope_theta.to_bits(),
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.positions.u32",
+                    outputs: vec![f32_buffer("result", &[1, 1, 4], &[123.0; 4])],
+                },
+            },
+            Case {
+                case_id: "graph.ste_surrogate.forward.shape_error",
+                operation: "graph.ste_surrogate",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[1, 6], &quant_weight),
+                    f32_buffer("scale", &[2], &quant_scale),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "graph.salt_ste.forward.zero_planes",
+                operation: "graph.salt_ste",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("weight", &[2, 3], &quant_weight)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::U64 {
+                        name: "planes",
+                        value: 0,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.planes.positive",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "graph.lsq_ste.forward.shape_error",
+                operation: "graph.lsq_ste",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[1, 6], &quant_weight),
+                    f32_buffer("alpha", &[2], &learned_scale),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "graph.fsq.forward.invalid_levels",
+                operation: "graph.fsq",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[2, 3], &fsq_input)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "channels",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "len",
+                        value: 3,
+                    },
+                    Attribute::U32List {
+                        name: "levels",
+                        values: vec![1, 5],
+                    },
+                    Attribute::Text {
+                        name: "bound",
+                        value: "clamp",
+                    },
+                    Attribute::Text {
+                        name: "ste",
+                        value: "soft_round",
+                    },
+                    Attribute::F32 {
+                        name: "alpha",
+                        bits: 0.5_f32.to_bits(),
+                    },
+                    Attribute::U64 {
+                        name: "seed",
+                        value: 0,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.levels.min_two",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
                 },
             },
         ],

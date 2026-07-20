@@ -16,6 +16,10 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
     assert_eq!(
         capabilities.supported_operations,
         [
+            "graph.ste_surrogate",
+            "graph.salt_ste",
+            "graph.lsq_ste",
+            "graph.fsq",
             "graph.dense_matmul",
             "graph.ternary_matmul",
             "graph.transpose",
