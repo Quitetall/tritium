@@ -9,13 +9,14 @@ use tritium_spec::{
 
 use crate::{
     WgpuBackend,
-    backend::{AdamWParams, AdamWScalars, MuonParams},
+    backend::{AdamWParams, AdamWScalars, FsqParams, MuonParams},
 };
 
 const OPERATIONS: &[&str] = &[
     "graph.ste_surrogate",
     "graph.salt_ste",
     "graph.lsq_ste",
+    "graph.fsq",
     "graph.dense_matmul",
     "graph.ternary_matmul",
     "graph.embedding_gather",
@@ -356,6 +357,104 @@ impl WgpuTrainBackendV1 {
             output_f32(output, "grad_weight", &shape, elements as usize)?.copy_from_slice(&result);
             Ok(0)
         }
+    }
+
+    fn execute_fsq(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["x"],
+            TrainExecutionV1::Vjp => &["x", "grad_output"],
+            _ => return Err(invariant("FSQ received an illegal phase")),
+        };
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_x"
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["channels", "len", "levels", "bound", "ste", "alpha", "seed"],
+            "attribute",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let channels = attribute_u64(request, "channels")?;
+        let len = attribute_u64(request, "len")?;
+        if channels == 0 {
+            return Err(attribute_value("channels", "positive"));
+        }
+        if len == 0 {
+            return Err(attribute_value("len", "positive"));
+        }
+        let elements = channels.checked_mul(len).ok_or_else(shape_error)?;
+        if channels > u32::MAX as u64 || len > u32::MAX as u64 || elements > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let levels = attribute_u32_list(request, "levels")?;
+        if levels.len() != channels as usize {
+            return Err(attribute_value("levels", "channels"));
+        }
+        if levels.iter().any(|&level| level < 2) {
+            return Err(attribute_value("levels", "min_two"));
+        }
+        let bound = match attribute_text(request, "bound")? {
+            "clamp" => 0,
+            "tanh" => 1,
+            _ => return Err(attribute_value("bound", "known")),
+        };
+        let estimator = match attribute_text(request, "ste")? {
+            "hard" => 0,
+            "soft_round" => 1,
+            "stochastic" => 2,
+            _ => return Err(attribute_value("ste", "known")),
+        };
+        let alpha = attribute_f32(request, "alpha")?;
+        if !(0.0..=1.0).contains(&alpha) {
+            return Err(attribute_value("alpha", "unit_interval"));
+        }
+        let seed = attribute_u64(request, "seed")?;
+        let shape = [channels, len];
+        let (x_shape, x) = input_f32(request, "x")?;
+        if x_shape != shape || x.len() != elements as usize {
+            return Err(shape_error());
+        }
+        require_finite("x", x)?;
+        let upstream = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            x
+        };
+        let params = FsqParams::new(
+            elements as u32,
+            len as u32,
+            bound,
+            estimator,
+            u32::from(request.execution == TrainExecutionV1::Vjp),
+            alpha,
+            seed,
+        );
+        let result = self
+            .backend
+            .fsq(x, upstream, levels, params)
+            .map_err(wgpu_error)?;
+        output_f32(output, output_name, &shape, elements as usize)?.copy_from_slice(&result);
+        Ok(())
     }
 
     fn execute_rmsnorm(
@@ -1717,6 +1816,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.salt_ste" {
             self.execute_salt(&request, output)?
+        } else if request.operation == "graph.fsq" {
+            self.execute_fsq(&request, output)?;
+            0
         } else if request.operation == "graph.lsq_ste" {
             self.execute_lsq(&request, output)?;
             0
@@ -1969,6 +2071,54 @@ fn attribute_u64(request: &TrainRequestV1<'_>, name: &str) -> Result<u64, TrainB
             TrainOperationErrorV1::AttributeType {
                 name: name.to_owned(),
                 expected: "u64",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn attribute_text<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a str, TrainBackendError> {
+    let attribute = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "attributes",
+            })
+        })?;
+    let TrainAttributeValueV1::Text(value) = attribute.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "text",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn attribute_u32_list<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a [u32], TrainBackendError> {
+    let attribute = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "attributes",
+            })
+        })?;
+    let TrainAttributeValueV1::U32List(value) = attribute.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "u32_list",
             },
         ));
     };

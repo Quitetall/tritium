@@ -71,6 +71,44 @@ struct SaltParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+/// Frozen scalar configuration for one FSQ dispatch.
+pub(crate) struct FsqParams {
+    total: u32,
+    len: u32,
+    bound: u32,
+    estimator: u32,
+    execution: u32,
+    alpha: f32,
+    seed_low: u32,
+    seed_high: u32,
+}
+
+impl FsqParams {
+    /// Build packed FSQ shader parameters after adapter validation.
+    pub(crate) fn new(
+        total: u32,
+        len: u32,
+        bound: u32,
+        estimator: u32,
+        execution: u32,
+        alpha: f32,
+        seed: u64,
+    ) -> Self {
+        Self {
+            total,
+            len,
+            bound,
+            estimator,
+            execution,
+            alpha,
+            seed_low: seed as u32,
+            seed_high: (seed >> 32) as u32,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 /// Precomputed scalar state for one portable AdamW dispatch.
 pub(crate) struct AdamWParams {
     len: u32,
@@ -225,6 +263,8 @@ pub struct WgpuBackend {
     muon_bind_group_layout: wgpu::BindGroupLayout,
     salt_pipeline: wgpu::ComputePipeline,
     salt_bind_group_layout: wgpu::BindGroupLayout,
+    fsq_pipeline: wgpu::ComputePipeline,
+    fsq_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -641,6 +681,34 @@ impl WgpuBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+            let fsq_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-fsq"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("fsq.wgsl").into()),
+            });
+            let fsq_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-fsq-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, rw),
+                    ],
+                });
+            let fsq_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-fsq-pl"),
+                bind_group_layouts: &[&fsq_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let fsq_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("portable-fsq-pipe"),
+                layout: Some(&fsq_layout),
+                module: &fsq_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
             Ok(WgpuBackend {
                 device,
@@ -665,6 +733,8 @@ impl WgpuBackend {
                 muon_bind_group_layout,
                 salt_pipeline,
                 salt_bind_group_layout,
+                fsq_pipeline,
+                fsq_bind_group_layout,
                 device_name,
             })
         }
@@ -1871,6 +1941,116 @@ impl WgpuBackend {
         if let Some(error) = self.device.pop_error_scope().block_on() {
             return Err(BackendError::Backend(format!(
                 "wgpu SALT device error: {error}"
+            )));
+        }
+        rx.recv()
+            .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+            .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        let data = slice.get_mapped_range();
+        let values = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(values)
+    }
+
+    /// Execute FSQ forward or VJP, including seeded stochastic rounding, on device.
+    pub(crate) fn fsq(
+        &self,
+        x: &[f32],
+        upstream: &[f32],
+        levels: &[u32],
+        params: FsqParams,
+    ) -> Result<Vec<f32>, BackendError> {
+        if x.is_empty() || upstream.len() != x.len() || params.total as usize != x.len() {
+            return Err(BackendError::ShapeMismatch {
+                expected: x.len(),
+                got: upstream.len(),
+            });
+        }
+        let storage = wgpu::BufferUsages::STORAGE;
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-fsq-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let input = |label, contents: &[u8]| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents,
+                    usage: storage,
+                })
+        };
+        let x_buf = input("portable-fsq-x", bytemuck::cast_slice(x));
+        let levels_buf = input("portable-fsq-levels", bytemuck::cast_slice(levels));
+        let upstream_buf = input("portable-fsq-upstream", bytemuck::cast_slice(upstream));
+        let bytes = core::mem::size_of_val(x) as u64;
+        let result = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-fsq-result"),
+            size: bytes,
+            usage: storage | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-fsq-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-fsq-bg"),
+            layout: &self.fsq_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: levels_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: upstream_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: result.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-fsq-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-fsq-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.fsq_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((x.len() as u32).div_ceil(WG_SIZE), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            let _ = tx.send(mapped);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu FSQ device error: {error}"
             )));
         }
         rx.recv()
