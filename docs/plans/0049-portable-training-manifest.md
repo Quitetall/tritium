@@ -139,13 +139,13 @@ This closes Slice 2 corpus coverage and the CPU semantic matrix; accelerator and
 constrained-target receipts remain required for release closure.
 
 CUDA adapter work has started against the same seam. Current actual-RTX-4090
-evidence covers 62 canonical cases across 21/35 operations: STE surrogate, LSQ,
-dense and scale-bearing ternary matmul, transpose, embedding, column
+evidence covers 72 canonical cases across 22/35 operations: STE surrogate, LSQ,
+FSQ, dense and scale-bearing ternary matmul, transpose, embedding, column
 slice/concat, detach,
 scale, bias, add, multiply, ReLU2, SiLU, RMSNorm, softmax, causal mask, and RoPE.
-MSE and softmax cross-entropy forward/VJP are resident as well. STE/LSQ use
-dedicated forward/VJP kernels, including deterministic row-order LSQ alpha
-reduction. Bias and ReLU2 use dedicated
+MSE and softmax cross-entropy forward/VJP are resident as well. STE, LSQ, and
+FSQ use dedicated forward/VJP kernels, including deterministic row-order LSQ
+alpha reduction and seeded stochastic FSQ. Bias and ReLU2 use dedicated
 resident kernels; training RoPE positions are unsigned end-to-end, matching the
 frozen `u32` contract rather than narrowing to signed indices. Each success
 emits a physical-device-bound receipt; the adapter advertises only this proved
