@@ -228,7 +228,7 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
                 .iter()
                 .map(|operation| operation.id.to_owned())
                 .collect(),
-            dtypes: vec![TrainDTypeV1::F32],
+            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::U32],
             limits: CPU_LIMITS,
             device_resident: true,
         }

@@ -2,8 +2,9 @@
 
 use tritium_spec::{
     TrainAttributeV1, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
-    TrainBufferDataMutV1, TrainBufferDataRefV1, TrainExecutionV1, TrainNamedBufferMutV1,
-    TrainNamedBufferRefV1, TrainOutputV1, TrainRequestV1, TrainingOpManifestV1,
+    TrainBufferDataMutV1, TrainBufferDataRefV1, TrainDTypeV1, TrainExecutionV1,
+    TrainNamedBufferMutV1, TrainNamedBufferRefV1, TrainOutputV1, TrainRequestV1,
+    TrainingOpManifestV1,
 };
 use tritium_train::CpuTrainBackendV1;
 
