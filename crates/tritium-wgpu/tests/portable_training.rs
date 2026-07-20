@@ -18,11 +18,12 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 71);
+    assert_eq!(report.passed.len(), 77);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
             "graph.ste_surrogate",
+            "graph.salt_ste",
             "graph.lsq_ste",
             "graph.dense_matmul",
             "graph.ternary_matmul",

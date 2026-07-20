@@ -14,6 +14,7 @@ use crate::{
 
 const OPERATIONS: &[&str] = &[
     "graph.ste_surrogate",
+    "graph.salt_ste",
     "graph.lsq_ste",
     "graph.dense_matmul",
     "graph.ternary_matmul",
@@ -47,6 +48,8 @@ const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_elements: i32::MAX as u64,
     max_bytes: u32::MAX as u64,
 };
+const MAX_SALT_PLANES: u64 = 64;
+const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Native-wgpu implementation of the frozen portable-training seam.
 ///
@@ -269,6 +272,90 @@ impl WgpuTrainBackendV1 {
             output_f32(output, name, shape, first.len())?.copy_from_slice(&result);
         }
         Ok(())
+    }
+
+    fn execute_salt(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<u64, TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["weight"],
+            TrainExecutionV1::Vjp => &["weight", "grad_output"],
+            _ => return Err(invariant("SALT STE received an illegal phase")),
+        };
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_weight"
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols", "planes"],
+            "attribute",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        let planes = attribute_u64(request, "planes")?;
+        if planes == 0 {
+            return Err(attribute_value("planes", "positive"));
+        }
+        if planes > MAX_SALT_PLANES {
+            return Err(attribute_value("planes", "max_64"));
+        }
+        if request.execution == TrainExecutionV1::Forward && rows == 0 {
+            return Err(attribute_value("rows", "positive"));
+        }
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        let scratch_bytes = cols
+            .checked_mul(core::mem::size_of::<f32>() as u64)
+            .ok_or_else(|| attribute_value("cols", "scratch_bytes"))?;
+        if request.execution == TrainExecutionV1::Forward && scratch_bytes > MAX_SALT_SCRATCH_BYTES
+        {
+            return Err(attribute_value("cols", "scratch_limit"));
+        }
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        if rows > u32::MAX as u64 || cols > u32::MAX as u64 || elements > usize::MAX as u64 {
+            return Err(shape_error());
+        }
+        let shape = [rows, cols];
+        let (weight_shape, weight) = input_f32(request, "weight")?;
+        if weight_shape != shape || weight.len() != elements as usize {
+            return Err(shape_error());
+        }
+        require_finite("weight", weight)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let result = self
+                .backend
+                .salt(weight, rows as u32, cols as u32, planes as u32)
+                .map_err(wgpu_error)?;
+            output_f32(output, "result", &shape, elements as usize)?.copy_from_slice(&result);
+            Ok(scratch_bytes)
+        } else {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            let result = self
+                .backend
+                .pointwise(gradient, gradient, gradient, 0, 0.0, 0)
+                .map_err(wgpu_error)?;
+            output_f32(output, "grad_weight", &shape, elements as usize)?.copy_from_slice(&result);
+            Ok(0)
+        }
     }
 
     fn execute_rmsnorm(
@@ -1628,6 +1715,8 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
         } else if request.operation == "graph.ste_surrogate" {
             self.execute_ste_surrogate(&request, output)?;
             0
+        } else if request.operation == "graph.salt_ste" {
+            self.execute_salt(&request, output)?
         } else if request.operation == "graph.lsq_ste" {
             self.execute_lsq(&request, output)?;
             0

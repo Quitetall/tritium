@@ -175,7 +175,7 @@ This closes WASI/WASM semantic parity; browser WASM packaging remains plan 0050,
 and MCU constrained-target parity remains open.
 
 Native wgpu work has begun on the RTX 4090 Vulkan adapter. Current evidence
-covers 71 vectors across STE surrogate, LSQ, dense and scale-bearing ternary matmul, embedding gather, transpose, column slice/concat, detach, constant scale, bias, add, multiply, ReLU2,
+covers 77 vectors across STE surrogate, multi-plane SALT STE, LSQ, dense and scale-bearing ternary matmul, embedding gather, transpose, column slice/concat, detach, constant scale, bias, add, multiply, ReLU2,
 SiLU, RMSNorm, causal masking, row softmax, MSE loss, SGD, AdamW, cautious AdamW, int8 AdamW, Muon, and all four lifecycle operations. Pointwise tensor work executes through resident WGSL
 storage buffers; lifecycle uses the shared canonical control-plane byte
 implementation. AdamW uses ordered storage passes to preserve the frozen f32
@@ -185,6 +185,8 @@ packed state and 256-element scale reductions on device; integer
 guard/round/sticky division removes driver-dependent WGSL quotient drift.
 Muon uses one packed device workspace, serial reference-order folds, and
 storage rounding barriers through Newton-Schulz orthogonalization.
+SALT preserves ascending-column AbsMean folds and the bounded one-row scratch
+contract while keeping all residual planes device-resident.
 Receipts bind the physical NVIDIA adapter, and no additional
 tensor operation is advertised before its WGSL path passes the corpus. ROCm
 implementation/evidence is currently target-blocked on this host: no AMD device

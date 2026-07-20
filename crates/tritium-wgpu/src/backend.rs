@@ -62,6 +62,15 @@ struct EmbeddingParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SaltParams {
+    rows: u32,
+    cols: u32,
+    planes: u32,
+    padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 /// Precomputed scalar state for one portable AdamW dispatch.
 pub(crate) struct AdamWParams {
     len: u32,
@@ -214,6 +223,8 @@ pub struct WgpuBackend {
     int8_adamw_bind_group_layout: wgpu::BindGroupLayout,
     muon_pipeline: wgpu::ComputePipeline,
     muon_bind_group_layout: wgpu::BindGroupLayout,
+    salt_pipeline: wgpu::ComputePipeline,
+    salt_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -608,6 +619,28 @@ impl WgpuBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+            let salt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-salt"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("salt.wgsl").into()),
+            });
+            let salt_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-salt-bgl"),
+                    entries: &[entry(0, uni), entry(1, ro), entry(2, rw), entry(3, rw)],
+                });
+            let salt_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-salt-pl"),
+                bind_group_layouts: &[&salt_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let salt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("portable-salt-pipe"),
+                layout: Some(&salt_layout),
+                module: &salt_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
             Ok(WgpuBackend {
                 device,
@@ -630,6 +663,8 @@ impl WgpuBackend {
                 int8_adamw_bind_group_layout,
                 muon_pipeline,
                 muon_bind_group_layout,
+                salt_pipeline,
+                salt_bind_group_layout,
                 device_name,
             })
         }
@@ -1729,6 +1764,123 @@ impl WgpuBackend {
         parameter_staging.unmap();
         momentum_staging.unmap();
         Ok((parameter, momentum))
+    }
+
+    /// Execute greedy multi-plane SALT reconstruction on device.
+    pub(crate) fn salt(
+        &self,
+        weight: &[f32],
+        rows: u32,
+        cols: u32,
+        planes: u32,
+    ) -> Result<Vec<f32>, BackendError> {
+        let expected = (rows as usize)
+            .checked_mul(cols as usize)
+            .ok_or_else(|| BackendError::InvalidInput("SALT shape overflow".to_owned()))?;
+        if weight.len() != expected || rows == 0 || cols == 0 || planes == 0 {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: weight.len(),
+            });
+        }
+        let storage = wgpu::BufferUsages::STORAGE;
+        let params = SaltParams {
+            rows,
+            cols,
+            planes,
+            padding: 0,
+        };
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-salt-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let weight_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-salt-weight"),
+                contents: bytemuck::cast_slice(weight),
+                usage: storage,
+            });
+        let residual = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-salt-residual"),
+            size: u64::from(cols) * core::mem::size_of::<f32>() as u64,
+            usage: storage,
+            mapped_at_creation: false,
+        });
+        let bytes = core::mem::size_of_val(weight) as u64;
+        let result = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-salt-result"),
+            size: bytes,
+            usage: storage | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-salt-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-salt-bg"),
+            layout: &self.salt_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: weight_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: residual.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: result.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-salt-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-salt-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.salt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            let _ = tx.send(mapped);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu SALT device error: {error}"
+            )));
+        }
+        rx.recv()
+            .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+            .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        let data = slice.get_mapped_range();
+        let values = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(values)
     }
 }
 
