@@ -94,6 +94,7 @@ pyo3 = "0.29"
 # into exactly download-binaries + tls-rustls (fetch a prebuilt onnxruntime at build — no system
 # lib). Exact pin keeps cargo-deny wildcards=deny meaningful. rc.12 wraps ONNX Runtime 1.24.
 ort = { version = "=2.0.0-rc.12", default-features = false }
+prost = "0.14"
 # candle interop (tritium-candle, behind its `candle` feature; CPU-only — no cuda/mkl/accelerate)
 candle-core = { version = "0.9", default-features = false }
 # burn interop (tritium-burn, behind its `burn` feature; CPU-only NdArray backend in the test).

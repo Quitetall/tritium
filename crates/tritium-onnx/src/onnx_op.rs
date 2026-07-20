@@ -20,12 +20,9 @@
 //! compute logic (`run`) calls [`crate::ternary_mpgemm_kernel`] — the same
 //! bit-exact reference path the always-on Layer-1 conformance gate covers — and
 //! `run` is itself tested bit-exact against the frozen vectors
-//! (`kernel_run_matches_reference_on_frozen_set`). CI thus verifies the kernel
-//! logic and that the operator registers into a domain
-//! (`operator_domain_registers`); the full graph dispatch (onnxruntime
-//! extracting a node's tensors and invoking `compute`) is exercised only by the
-//! `#[ignore]`d `end_to_end_session_matches_reference`, which needs the native
-//! runtime and is not run in CI.
+//! (`kernel_run_matches_reference_on_frozen_set`). CI also serializes a real
+//! ONNX graph, registers the production custom domain, opens an ONNX Runtime
+//! session and proves that runtime dispatch invokes the kernel bit-exactly.
 
 use ort::error::Error as OrtError;
 use ort::operator::{
@@ -41,7 +38,7 @@ use crate::ternary_mpgemm_kernel;
 pub const ONNX_OP_NAME: &str = "TritiumTernaryMpGemm";
 
 /// The custom-operator domain Tritium registers [`ONNX_OP_NAME`] under.
-pub const ONNX_DOMAIN: &str = "tritium";
+pub const ONNX_DOMAIN: &str = "com.tritium";
 
 /// Node-attribute name for the contraction dimension `K`.
 pub const ATTR_K: &str = "K";
@@ -203,6 +200,7 @@ pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
 mod tests {
     use super::*;
     use half::f16;
+    use prost::Message;
     use tritium_core::Trit;
     use tritium_format::{num_blocks, pack_tq1_0_row, pack_tq2_0_row};
     use tritium_testkit::{ConformanceVector, FROZEN_COUNT, FROZEN_SEED, generate_vectors};
@@ -215,11 +213,11 @@ mod tests {
         }
     }
 
-    fn format_tag(tag: &str) -> (TernaryFormat, i64) {
-        match tag {
-            "tq2_0" => (TernaryFormat::Tq2_0, 0),
-            "tq1_0" => (TernaryFormat::Tq1_0, 1),
-            other => panic!("unexpected format tag {other}"),
+    fn format_tag(format: TernaryFormat) -> i64 {
+        match format {
+            TernaryFormat::Tq2_0 => 0,
+            TernaryFormat::Tq1_0 => 1,
+            other => panic!("unexpected format {other:?}"),
         }
     }
 
@@ -269,7 +267,8 @@ mod tests {
         let vs = generate_vectors(FROZEN_SEED, FROZEN_COUNT);
         assert!(vs.len() > FROZEN_COUNT, "boundary vectors must be included");
         for v in vs {
-            let (format, code) = format_tag(&v.format);
+            let format = v.format;
+            let code = format_tag(format);
             let packed = pack(&v, format);
             let kernel = TritiumTernaryMpGemmKernel { k: v.k, format };
             // Sanity: the code round-trips to the same format the kernel uses.
@@ -321,38 +320,169 @@ mod tests {
         );
     }
 
-    /// Full end-to-end ONNX session: build an in-memory graph with a single
-    /// `tritium:TritiumTernaryMpGemm` node (Model Editor API, `api-22`), run it,
-    /// and check the output is bit-exact with the reference.
-    ///
-    /// `#[ignore]` for two reasons: (1) it loads + executes the native
-    /// onnxruntime at runtime, which can be flaky in sandboxed CI; and (2) with
-    /// the bundled `download-binaries` onnxruntime build, the Model Editor API's
-    /// opset resolution emits the custom node at domain-version `-1`, which the
-    /// runtime then fails to match against the registered op's `[min_version,
-    /// max_version]` range ("TritiumTernaryMpGemm(-1) is not a registered
-    /// function/op"). The model construction, custom-op registration, kernel
-    /// wiring, and tensor plumbing are all proven independently by the other
-    /// tests in this module; this is left as a runnable scaffold for a runtime
-    /// build where editor-API custom-domain version negotiation behaves. Run it
-    /// explicitly with `--ignored`.
-    #[test]
-    #[ignore = "native onnxruntime + editor-API custom-domain version negotiation; run with --ignored"]
-    fn end_to_end_session_matches_reference() {
-        use ort::editor::{Graph, Model, Node, Opset};
-        use ort::operator::Attribute;
-        use ort::value::{Outlet, SymbolicDimensions, Tensor, ValueType};
+    #[derive(Clone, PartialEq, Message)]
+    struct ModelProto {
+        #[prost(int64, tag = "1")]
+        ir_version: i64,
+        #[prost(string, tag = "2")]
+        producer_name: String,
+        #[prost(message, optional, tag = "7")]
+        graph: Option<GraphProto>,
+        #[prost(message, repeated, tag = "8")]
+        opset_import: Vec<OperatorSetIdProto>,
+    }
 
-        // Build a tensor ValueType with the right number of (empty) symbolic
-        // dimension names for `dims`.
-        fn tensor_ty(ty: TensorElementType, dims: Vec<i64>) -> ValueType {
-            let syms = SymbolicDimensions::new(dims.iter().map(|_| String::new()));
-            ValueType::Tensor {
-                ty,
-                shape: dims.into(),
-                dimension_symbols: syms,
-            }
+    #[derive(Clone, PartialEq, Message)]
+    struct OperatorSetIdProto {
+        #[prost(string, tag = "1")]
+        domain: String,
+        #[prost(int64, tag = "2")]
+        version: i64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct GraphProto {
+        #[prost(message, repeated, tag = "1")]
+        node: Vec<NodeProto>,
+        #[prost(string, tag = "2")]
+        name: String,
+        #[prost(message, repeated, tag = "11")]
+        input: Vec<ValueInfoProto>,
+        #[prost(message, repeated, tag = "12")]
+        output: Vec<ValueInfoProto>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct NodeProto {
+        #[prost(string, repeated, tag = "1")]
+        input: Vec<String>,
+        #[prost(string, repeated, tag = "2")]
+        output: Vec<String>,
+        #[prost(string, tag = "3")]
+        name: String,
+        #[prost(string, tag = "4")]
+        op_type: String,
+        #[prost(message, repeated, tag = "5")]
+        attribute: Vec<AttributeProto>,
+        #[prost(string, tag = "7")]
+        domain: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct AttributeProto {
+        #[prost(string, tag = "1")]
+        name: String,
+        #[prost(int64, tag = "3")]
+        value: i64,
+        #[prost(int32, tag = "20")]
+        kind: i32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct ValueInfoProto {
+        #[prost(string, tag = "1")]
+        name: String,
+        #[prost(message, optional, tag = "2")]
+        r#type: Option<TypeProto>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct TypeProto {
+        #[prost(message, optional, tag = "1")]
+        tensor_type: Option<TensorTypeProto>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct TensorTypeProto {
+        #[prost(int32, tag = "1")]
+        elem_type: i32,
+        #[prost(message, optional, tag = "2")]
+        shape: Option<TensorShapeProto>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct TensorShapeProto {
+        #[prost(message, repeated, tag = "1")]
+        dim: Vec<TensorDimensionProto>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct TensorDimensionProto {
+        #[prost(int64, tag = "1")]
+        dim_value: i64,
+    }
+
+    fn tensor_value(name: &str, elem_type: i32, dimensions: &[usize]) -> ValueInfoProto {
+        ValueInfoProto {
+            name: name.to_owned(),
+            r#type: Some(TypeProto {
+                tensor_type: Some(TensorTypeProto {
+                    elem_type,
+                    shape: Some(TensorShapeProto {
+                        dim: dimensions
+                            .iter()
+                            .map(|&dimension| TensorDimensionProto {
+                                dim_value: dimension as i64,
+                            })
+                            .collect(),
+                    }),
+                }),
+            }),
         }
+    }
+
+    fn session_model_bytes(m: usize, n: usize, k: usize, packed: usize) -> Vec<u8> {
+        ModelProto {
+            ir_version: 10,
+            producer_name: "tritium-onnx-test".to_owned(),
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    input: vec!["act".to_owned(), "packed".to_owned(), "scales".to_owned()],
+                    output: vec!["out".to_owned()],
+                    name: "ternary".to_owned(),
+                    op_type: ONNX_OP_NAME.to_owned(),
+                    attribute: vec![
+                        AttributeProto {
+                            name: ATTR_K.to_owned(),
+                            value: k as i64,
+                            kind: 2,
+                        },
+                        AttributeProto {
+                            name: ATTR_FORMAT.to_owned(),
+                            value: 0,
+                            kind: 2,
+                        },
+                    ],
+                    domain: ONNX_DOMAIN.to_owned(),
+                }],
+                name: "tritium-session-test".to_owned(),
+                input: vec![
+                    tensor_value("act", 1, &[m, k]),
+                    tensor_value("packed", 2, &[packed]),
+                    tensor_value("scales", 1, &[n]),
+                ],
+                output: vec![tensor_value("out", 1, &[m, n])],
+            }),
+            opset_import: vec![
+                OperatorSetIdProto {
+                    domain: String::new(),
+                    version: 21,
+                },
+                OperatorSetIdProto {
+                    domain: ONNX_DOMAIN.to_owned(),
+                    version: 1,
+                },
+            ],
+        }
+        .encode_to_vec()
+    }
+
+    /// Full end-to-end ONNX session: serialize a real opset-1 custom-domain
+    /// graph, load it through ONNX Runtime, execute it and compare the result
+    /// bit-exactly with Tritium's reference kernel.
+    #[test]
+    fn end_to_end_session_matches_reference() {
+        use ort::value::Tensor;
 
         // A small TQ2_0 case: M=1, N=1, K=256, weights all +1, scale 1.0 -> the
         // output is the sum of the activation row.
@@ -371,59 +501,14 @@ mod tests {
         let expected =
             ternary_mpgemm_kernel(&act, &packed, &scales, m, k, format).expect("layer-1 ref");
 
-        // Build the graph: 3 inputs -> our node -> 1 output.
-        let mut graph = Graph::new().unwrap();
-        graph
-            .set_inputs([
-                Outlet::new(
-                    "act",
-                    tensor_ty(TensorElementType::Float32, vec![m as i64, k as i64]),
-                ),
-                Outlet::new(
-                    "packed",
-                    tensor_ty(TensorElementType::Uint8, vec![packed.len() as i64]),
-                ),
-                Outlet::new(
-                    "scales",
-                    tensor_ty(TensorElementType::Float32, vec![n as i64]),
-                ),
-            ])
-            .unwrap();
-        graph
-            .set_outputs([Outlet::new(
-                "out",
-                tensor_ty(TensorElementType::Float32, vec![m as i64, n as i64]),
-            )])
-            .unwrap();
-        let node = Node::new(
-            ONNX_OP_NAME,
-            ONNX_DOMAIN,
-            "tternary",
-            ["act", "packed", "scales"],
-            ["out"],
-            [
-                Attribute::new(ATTR_K, k as i64).unwrap(),
-                Attribute::new(ATTR_FORMAT, 0i64).unwrap(),
-            ],
-        )
-        .unwrap();
-        graph.add_node(node).unwrap();
-
-        // Declare both the standard ONNX domain (empty name) and our custom
-        // `tritium` domain opset — onnxruntime requires the base ONNX opset to be
-        // explicit even for a graph that only uses custom nodes.
-        let mut model = Model::new([
-            Opset::new("", 21).unwrap(),
-            Opset::new(ONNX_DOMAIN, 1).unwrap(),
-        ])
-        .unwrap();
-        model.add_graph(graph).unwrap();
-
-        let builder = ort::session::Session::builder()
+        let model = session_model_bytes(m, n, k, packed.len());
+        let mut session = ort::session::Session::builder()
             .unwrap()
             .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&model)
             .unwrap();
-        let mut session = model.into_session(&builder).unwrap();
+        assert_eq!(session.opset_for_domain(ONNX_DOMAIN).unwrap(), 1);
 
         let act_t = Tensor::from_array(([m, k], act.into_boxed_slice())).unwrap();
         let packed_t = Tensor::from_array(([packed.len()], packed.into_boxed_slice())).unwrap();

@@ -30,7 +30,7 @@ half = { workspace = true }
 #                    system lib, no system OpenSSL; rustls uses `ring`), so a CI
 #                    lane with network builds + tests without a native install
 #   copy-dylibs    — copy the fetched dylib next to the test/bin so it loads at runtime
-#   api-22         — the in-memory Model Editor API the (ignored) e2e session test uses
+#   api-22         — inspect the loaded model's custom-domain opset in the e2e gate
 ort = { workspace = true, optional = true, features = [
     "std",
     "download-binaries",
@@ -41,6 +41,7 @@ ort = { workspace = true, optional = true, features = [
 
 [dev-dependencies]
 tritium-testkit = { workspace = true }
+prost = { workspace = true }
 
 [lints]
 workspace = true
