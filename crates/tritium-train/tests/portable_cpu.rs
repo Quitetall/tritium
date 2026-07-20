@@ -35,8 +35,20 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
     assert_eq!(result, [4.0, 2.0, -1.0]);
     assert_eq!(receipt.operation, "graph.add");
     assert_eq!(receipt.execution, TrainExecutionV1::Forward);
-    assert_ne!(receipt.input_digest, [0; 32]);
-    assert_ne!(receipt.output_digest, [0; 32]);
+    assert_eq!(
+        receipt.input_digest,
+        [
+            82, 83, 162, 16, 153, 77, 48, 152, 28, 138, 66, 39, 163, 176, 131, 161, 245, 101,
+            60, 30, 201, 216, 245, 144, 163, 55, 42, 70, 150, 39, 153, 160,
+        ]
+    );
+    assert_eq!(
+        receipt.output_digest,
+        [
+            30, 138, 229, 175, 36, 160, 192, 254, 105, 221, 118, 2, 39, 115, 132, 122, 145,
+            90, 76, 153, 179, 6, 175, 154, 208, 5, 233, 204, 41, 27, 247, 103,
+        ]
+    );
     assert_eq!(receipt.scratch_bytes, 0);
     assert_eq!(receipt.host_transfers, 0);
     assert!(receipt.device_resident);
