@@ -17,10 +17,11 @@ use std::rc::Rc;
 
 use crate::gemm::TrainGemm;
 pub use crate::ops::conv1d::Conv1dCfg;
+pub use crate::ops::conv2d::{Conv2dCfg, Conv2dError};
 pub use crate::ops::fsq::{FsqBound, FsqCfg, FsqSte};
 use crate::ops::{
-    act, bias, conv1d, dense, elementwise, embed, fsq, loss, matmul, norm, rope, shape, softmax,
-    ste,
+    act, bias, conv1d, conv2d, dense, elementwise, embed, fsq, loss, matmul, norm, rope, shape,
+    softmax, ste,
 };
 
 /// Index of a value buffer in a [`Tape`]'s arena.
@@ -394,6 +395,43 @@ impl Tape {
                 }
             }),
         )
+    }
+
+    /// Fallible grouped NCHW ternary 2-D convolution.
+    ///
+    /// # Errors
+    /// Returns [`Conv2dError`] before recording when geometry or flat buffers
+    /// violate the portable Conv2d contract.
+    pub fn try_conv2d(
+        &mut self,
+        x: ValueId,
+        w: ValueId,
+        scale: ValueId,
+        cfg: Conv2dCfg,
+    ) -> Result<ValueId, Conv2dError> {
+        let out = conv2d::try_forward(&self.values[x], &self.values[w], &self.values[scale], &cfg)?;
+        Ok(self.record(
+            vec![x, w, scale],
+            out,
+            Box::new(move |ins, g, grads, ids| {
+                let gradients = conv2d::try_vjp(ins[0], ins[1], ins[2], &cfg, g)
+                    .expect("recorded Conv2d contract remains valid");
+                for (input_index, gradient) in gradients.into_iter().enumerate() {
+                    for (element, value) in gradient.into_iter().enumerate() {
+                        grads[ids[input_index]][element] += value;
+                    }
+                }
+            }),
+        ))
+    }
+
+    /// Grouped NCHW ternary 2-D convolution with explicit asymmetric padding.
+    ///
+    /// # Panics
+    /// Panics when geometry or flat buffers violate [`Self::try_conv2d`].
+    pub fn conv2d(&mut self, x: ValueId, w: ValueId, scale: ValueId, cfg: Conv2dCfg) -> ValueId {
+        self.try_conv2d(x, w, scale, cfg)
+            .expect("valid Tape Conv2d contract")
     }
 
     /// Finite scalar quantization: round `x` `[channels, len]` to each channel's `L`-level grid, with a
