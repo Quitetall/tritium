@@ -11,7 +11,14 @@ use super::DeviceTape;
 use crate::CudaBackend;
 
 const BACKEND_FAMILY: &str = "cuda.portable.v1";
-const OPERATIONS: &[&str] = &["graph.dense_matmul", "graph.transpose"];
+const OPERATIONS: &[&str] = &[
+    "graph.dense_matmul",
+    "graph.transpose",
+    "graph.scale_const",
+    "graph.add",
+    "graph.mul",
+    "graph.silu",
+];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
     max_elements: u32::MAX as u64,
@@ -181,6 +188,214 @@ impl CudaTrainBackendV1 {
         output_f32(output, output_name, &expected_output, elements)?.copy_from_slice(&result);
         Ok(())
     }
+
+    fn execute_scale_const(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, output_name) = match request.execution {
+            TrainExecutionV1::Forward => ("x", "result"),
+            TrainExecutionV1::Vjp => ("grad_output", "grad_x"),
+            _ => return Err(invariant("scale_const received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["scale"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let scale = attribute_f32(request, "scale")?;
+        let (shape, input) = input_f32_any_shape(request, input_name)?;
+        require_finite(input_name, input)?;
+        let shape = shape.to_vec();
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let input_id = tape.leaf(input).map_err(cuda_error)?;
+        let result_id = tape.scale_const(input_id, scale).map_err(cuda_error)?;
+        let result = tape.value(result_id).map_err(cuda_error)?;
+        output_f32(output, output_name, &shape, result.len())?.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn execute_add(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        match request.execution {
+            TrainExecutionV1::Forward => {
+                require_names(
+                    request.inputs.iter().map(|buffer| buffer.name),
+                    &["left", "right"],
+                    "inputs",
+                )?;
+                require_names(
+                    output.buffers.iter().map(|buffer| buffer.name),
+                    &["result"],
+                    "outputs",
+                )?;
+                require_names(request.attributes.iter().map(|a| a.name), &[], "attributes")?;
+                let (shape, left) = input_f32_any_shape(request, "left")?;
+                let (right_shape, right) = input_f32_any_shape(request, "right")?;
+                if shape != right_shape {
+                    return Err(shape_error());
+                }
+                require_finite("left", left)?;
+                require_finite("right", right)?;
+                let shape = shape.to_vec();
+                let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+                let left_id = tape.leaf(left).map_err(cuda_error)?;
+                let right_id = tape.leaf(right).map_err(cuda_error)?;
+                let result_id = tape.add(left_id, right_id).map_err(cuda_error)?;
+                let result = tape.value(result_id).map_err(cuda_error)?;
+                output_f32(output, "result", &shape, result.len())?.copy_from_slice(&result);
+            }
+            TrainExecutionV1::Vjp => {
+                require_names(
+                    request.inputs.iter().map(|buffer| buffer.name),
+                    &["grad_output"],
+                    "inputs",
+                )?;
+                require_names(
+                    output.buffers.iter().map(|buffer| buffer.name),
+                    &["grad_left", "grad_right"],
+                    "outputs",
+                )?;
+                require_names(request.attributes.iter().map(|a| a.name), &[], "attributes")?;
+                let (shape, grad_output) = input_f32_any_shape(request, "grad_output")?;
+                require_finite("grad_output", grad_output)?;
+                let shape = shape.to_vec();
+                let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+                let grad_id = tape.leaf(grad_output).map_err(cuda_error)?;
+                let result_id = tape.scale_const(grad_id, 1.0).map_err(cuda_error)?;
+                let gradient = tape.value(result_id).map_err(cuda_error)?;
+                output_f32(output, "grad_left", &shape, gradient.len())?.copy_from_slice(&gradient);
+                output_f32(output, "grad_right", &shape, gradient.len())?
+                    .copy_from_slice(&gradient);
+            }
+            _ => return Err(invariant("add received an illegal execution phase")),
+        }
+        Ok(())
+    }
+
+    fn execute_mul(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["left", "right"],
+            TrainExecutionV1::Vjp => &["left", "right", "grad_output"],
+            _ => return Err(invariant("mul received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(request.attributes.iter().map(|a| a.name), &[], "attributes")?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_left", "grad_right"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let (shape, left) = input_f32_any_shape(request, "left")?;
+        let (right_shape, right) = input_f32_any_shape(request, "right")?;
+        if shape != right_shape {
+            return Err(shape_error());
+        }
+        require_finite("left", left)?;
+        require_finite("right", right)?;
+        let shape = shape.to_vec();
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let left_id = tape.leaf(left).map_err(cuda_error)?;
+        let right_id = tape.leaf(right).map_err(cuda_error)?;
+        let result_id = tape.mul(left_id, right_id).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let result = tape.value(result_id).map_err(cuda_error)?;
+            output_f32(output, "result", &shape, result.len())?.copy_from_slice(&result);
+        } else {
+            let (_, grad_output) = input_f32_any_shape(request, "grad_output")?;
+            if grad_output.len() != left.len() {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", grad_output)?;
+            let seed = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let gradients = tape
+                .backward_retain(result_id, &seed, &[left_id, right_id])
+                .map_err(cuda_error)?;
+            let grad_left = download_gradient(&self.backend, &gradients, left_id, left.len())?;
+            let grad_right = download_gradient(&self.backend, &gradients, right_id, right.len())?;
+            output_f32(output, "grad_left", &shape, grad_left.len())?.copy_from_slice(&grad_left);
+            output_f32(output, "grad_right", &shape, grad_right.len())?
+                .copy_from_slice(&grad_right);
+        }
+        Ok(())
+    }
+
+    fn execute_silu(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["x"],
+            TrainExecutionV1::Vjp => &["x", "grad_output"],
+            _ => return Err(invariant("silu received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(request.attributes.iter().map(|a| a.name), &[], "attributes")?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_x"
+        };
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let (shape, x) = input_f32_any_shape(request, "x")?;
+        require_finite("x", x)?;
+        let shape = shape.to_vec();
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let x_id = tape.leaf(x).map_err(cuda_error)?;
+        let result_id = tape.silu(x_id).map_err(cuda_error)?;
+        let result = if request.execution == TrainExecutionV1::Forward {
+            tape.value(result_id).map_err(cuda_error)?
+        } else {
+            let (_, grad_output) = input_f32_any_shape(request, "grad_output")?;
+            if grad_output.len() != x.len() {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", grad_output)?;
+            let seed = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let gradients = tape
+                .backward_retain(result_id, &seed, &[x_id])
+                .map_err(cuda_error)?;
+            download_gradient(&self.backend, &gradients, x_id, x.len())?
+        };
+        output_f32(output, output_name, &shape, result.len())?.copy_from_slice(&result);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -208,6 +423,10 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         match request.operation {
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
             "graph.transpose" => self.execute_transpose(&request, output)?,
+            "graph.scale_const" => self.execute_scale_const(&request, output)?,
+            "graph.add" => self.execute_add(&request, output)?,
+            "graph.mul" => self.execute_mul(&request, output)?,
+            "graph.silu" => self.execute_silu(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
@@ -262,6 +481,39 @@ fn attribute_usize(request: &TrainRequestV1<'_>, name: &str) -> Result<usize, Tr
         ));
     };
     usize::try_from(value).map_err(|_| shape_error())
+}
+
+fn attribute_f32(request: &TrainRequestV1<'_>, name: &str) -> Result<f32, TrainBackendError> {
+    let value = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or_else(|| roles("attributes"))?;
+    let TrainAttributeValueV1::F32(value) = value.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "f32",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn input_f32_any_shape<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<(&'a [u64], &'a [f32]), TrainBackendError> {
+    let buffer = request
+        .inputs
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or_else(|| roles("inputs"))?;
+    match buffer.data {
+        TrainBufferDataRefV1::F32(data) => Ok((buffer.shape, data)),
+        TrainBufferDataRefV1::U32(_) => Err(dtype_error(name, TrainDTypeV1::U32)),
+        TrainBufferDataRefV1::Bytes(_) => Err(dtype_error(name, TrainDTypeV1::Bytes)),
+    }
 }
 
 fn input_f32<'a>(
@@ -348,6 +600,24 @@ fn resident_bytes(
                 .checked_add(bytes.ok_or_else(shape_error)?)
                 .ok_or_else(shape_error)
         })
+}
+
+fn download_gradient(
+    backend: &CudaBackend,
+    gradients: &super::DeviceBackwardResult,
+    id: usize,
+    len: usize,
+) -> Result<Vec<f32>, TrainBackendError> {
+    let mut host = vec![0.0; len];
+    backend
+        .dev_download(
+            gradients.grads[id]
+                .as_ref()
+                .ok_or_else(|| invariant("missing retained gradient"))?,
+            &mut host,
+        )
+        .map_err(cuda_error)?;
+    Ok(host)
 }
 
 fn roles(namespace: &'static str) -> TrainBackendError {

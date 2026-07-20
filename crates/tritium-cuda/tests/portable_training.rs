@@ -18,10 +18,17 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 6);
+    assert_eq!(report.passed.len(), 17);
     assert_eq!(
         backend.capabilities().supported_operations,
-        ["graph.dense_matmul", "graph.transpose"]
+        [
+            "graph.dense_matmul",
+            "graph.transpose",
+            "graph.scale_const",
+            "graph.add",
+            "graph.mul",
+            "graph.silu"
+        ]
     );
     assert!(
         report
