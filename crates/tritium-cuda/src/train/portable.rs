@@ -43,6 +43,7 @@ const OPERATIONS: &[&str] = &[
     "optimizer.sgd",
     "optimizer.adamw",
     "optimizer.cautious_adamw",
+    "optimizer.int8_adamw",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -1777,24 +1778,7 @@ impl CudaTrainBackendV1 {
             eps: attribute_f32(request, "eps")?,
             weight_decay: attribute_f32(request, "weight_decay")?,
         };
-        if step == 0 {
-            return Err(attribute_value("step", "one_based"));
-        }
-        if optimizer.lr < 0.0 {
-            return Err(attribute_value("lr", "nonnegative"));
-        }
-        if !(0.0..1.0).contains(&optimizer.beta1) {
-            return Err(attribute_value("beta1", "unit_interval_open"));
-        }
-        if !(0.0..1.0).contains(&optimizer.beta2) {
-            return Err(attribute_value("beta2", "unit_interval_open"));
-        }
-        if optimizer.eps <= 0.0 {
-            return Err(attribute_value("eps", "positive"));
-        }
-        if optimizer.weight_decay < 0.0 {
-            return Err(attribute_value("weight_decay", "nonnegative"));
-        }
+        validate_adamw_attributes(step, &optimizer)?;
         let (shape, parameter) = input_f32_any_shape(request, "parameter")?;
         let (gradient_shape, gradient) = input_f32_any_shape(request, "gradient")?;
         let (moment1_shape, moment1) = input_f32_any_shape(request, "moment1")?;
@@ -1843,6 +1827,134 @@ impl CudaTrainBackendV1 {
         output_f32(output, "parameter", shape, parameter.len())?.copy_from_slice(&parameter);
         output_f32(output, "moment1", shape, moment1.len())?.copy_from_slice(&moment1);
         output_f32(output, "moment2", shape, moment2.len())?.copy_from_slice(&moment2);
+        Ok(())
+    }
+
+    fn execute_int8_adamw(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        if request.execution != TrainExecutionV1::Step {
+            return Err(invariant("int8 AdamW received an illegal phase"));
+        }
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            &[
+                "parameter",
+                "gradient",
+                "moment1_q8",
+                "moment2_q8",
+                "moment1_scale",
+                "moment2_scale",
+            ],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["step", "lr", "beta1", "beta2", "eps", "weight_decay"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &[
+                "parameter",
+                "moment1_q8",
+                "moment2_q8",
+                "moment1_scale",
+                "moment2_scale",
+            ],
+            "outputs",
+        )?;
+        let step = attribute_u64(request, "step")?;
+        let optimizer = tritium_train::AdamW {
+            lr: attribute_f32(request, "lr")?,
+            beta1: attribute_f32(request, "beta1")?,
+            beta2: attribute_f32(request, "beta2")?,
+            eps: attribute_f32(request, "eps")?,
+            weight_decay: attribute_f32(request, "weight_decay")?,
+        };
+        validate_adamw_attributes(step, &optimizer)?;
+        let (shape, parameter) = input_f32_any_shape(request, "parameter")?;
+        let (gradient_shape, gradient) = input_f32_any_shape(request, "gradient")?;
+        let (moment1_shape, moment1_q8) = input_bytes_any_shape(request, "moment1_q8")?;
+        let (moment2_shape, moment2_q8) = input_bytes_any_shape(request, "moment2_q8")?;
+        let (moment1_scale_shape, moment1_scale) = input_f32_any_shape(request, "moment1_scale")?;
+        let (moment2_scale_shape, moment2_scale) = input_f32_any_shape(request, "moment2_scale")?;
+        let len = parameter.len();
+        let blocks = len.div_ceil(tritium_train::INT8_ADAM_BLOCK);
+        let code_shape = [len as u64];
+        let scale_shape = [blocks as u64];
+        if len == 0
+            || gradient_shape != shape
+            || moment1_shape != code_shape
+            || moment2_shape != code_shape
+            || moment1_scale_shape != scale_shape
+            || moment2_scale_shape != scale_shape
+        {
+            return Err(shape_error());
+        }
+        require_finite("parameter", parameter)?;
+        require_finite("gradient", gradient)?;
+        require_finite("moment1_scale", moment1_scale)?;
+        require_finite("moment2_scale", moment2_scale)?;
+        if moment1_scale.iter().any(|&value| value < 0.0) {
+            return Err(attribute_value("moment1_scale", "nonnegative"));
+        }
+        if moment2_scale.iter().any(|&value| value < 0.0) {
+            return Err(attribute_value("moment2_scale", "nonnegative"));
+        }
+        output_f32(output, "parameter", shape, len)?;
+        output_bytes(output, "moment1_q8", &code_shape, len)?;
+        output_bytes(output, "moment2_q8", &code_shape, len)?;
+        output_f32(output, "moment1_scale", &scale_shape, blocks)?;
+        output_f32(output, "moment2_scale", &scale_shape, blocks)?;
+
+        let moment1_signed: Vec<i8> = moment1_q8.iter().map(|&value| value as i8).collect();
+        let mut device_parameter = self.backend.dev_upload(parameter).map_err(cuda_error)?;
+        let device_gradient = self.backend.dev_upload(gradient).map_err(cuda_error)?;
+        let mut device_moment1 = self
+            .backend
+            .dev_upload_i8(&moment1_signed)
+            .map_err(cuda_error)?;
+        let mut device_moment2 = self.backend.dev_upload_u8(moment2_q8).map_err(cuda_error)?;
+        let mut device_moment1_scale =
+            self.backend.dev_upload(moment1_scale).map_err(cuda_error)?;
+        let mut device_moment2_scale =
+            self.backend.dev_upload(moment2_scale).map_err(cuda_error)?;
+        self.backend
+            .adamw_step_8bit_dev(
+                &mut device_parameter,
+                &device_gradient,
+                &mut device_moment1,
+                &mut device_moment2,
+                &mut device_moment1_scale,
+                &mut device_moment2_scale,
+                step,
+                &optimizer,
+            )
+            .map_err(cuda_error)?;
+        let parameter = download_device(&self.backend, &device_parameter, len)?;
+        let mut moment1 = vec![0_i8; len];
+        let mut moment2 = vec![0_u8; len];
+        self.backend
+            .dev_download_i8(&device_moment1, &mut moment1)
+            .map_err(cuda_error)?;
+        self.backend
+            .dev_download_u8(&device_moment2, &mut moment2)
+            .map_err(cuda_error)?;
+        let moment1_scale = download_device(&self.backend, &device_moment1_scale, blocks)?;
+        let moment2_scale = download_device(&self.backend, &device_moment2_scale, blocks)?;
+        output_f32(output, "parameter", shape, len)?.copy_from_slice(&parameter);
+        for (target, value) in output_bytes(output, "moment1_q8", &code_shape, len)?
+            .iter_mut()
+            .zip(moment1)
+        {
+            *target = value as u8;
+        }
+        output_bytes(output, "moment2_q8", &code_shape, len)?.copy_from_slice(&moment2);
+        output_f32(output, "moment1_scale", &scale_shape, blocks)?.copy_from_slice(&moment1_scale);
+        output_f32(output, "moment2_scale", &scale_shape, blocks)?.copy_from_slice(&moment2_scale);
         Ok(())
     }
 }
@@ -1896,6 +2008,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "optimizer.sgd" => self.execute_sgd(&request, output)?,
             "optimizer.adamw" => self.execute_adamw(&request, output, false)?,
             "optimizer.cautious_adamw" => self.execute_adamw(&request, output, true)?,
+            "optimizer.int8_adamw" => self.execute_int8_adamw(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
@@ -1944,6 +2057,31 @@ fn require_names<'a>(
         return Err(TrainBackendError::InvalidOperation(
             TrainOperationErrorV1::Roles { namespace },
         ));
+    }
+    Ok(())
+}
+
+fn validate_adamw_attributes(
+    step: u64,
+    optimizer: &tritium_train::AdamW,
+) -> Result<(), TrainBackendError> {
+    if step == 0 {
+        return Err(attribute_value("step", "one_based"));
+    }
+    if optimizer.lr < 0.0 {
+        return Err(attribute_value("lr", "nonnegative"));
+    }
+    if !(0.0..1.0).contains(&optimizer.beta1) {
+        return Err(attribute_value("beta1", "unit_interval_open"));
+    }
+    if !(0.0..1.0).contains(&optimizer.beta2) {
+        return Err(attribute_value("beta2", "unit_interval_open"));
+    }
+    if optimizer.eps <= 0.0 {
+        return Err(attribute_value("eps", "positive"));
+    }
+    if optimizer.weight_decay < 0.0 {
+        return Err(attribute_value("weight_decay", "nonnegative"));
     }
     Ok(())
 }
@@ -2075,6 +2213,34 @@ fn input_f32_any_shape<'a>(
     }
 }
 
+fn input_bytes_any_shape<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<(&'a [u64], &'a [u8]), TrainBackendError> {
+    let buffer = request
+        .inputs
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or_else(|| roles("inputs"))?;
+    match buffer.data {
+        TrainBufferDataRefV1::Bytes(data) => Ok((buffer.shape, data)),
+        TrainBufferDataRefV1::F32(_) => Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::DType {
+                name: name.to_owned(),
+                expected: TrainDTypeV1::Bytes,
+                got: TrainDTypeV1::F32,
+            },
+        )),
+        TrainBufferDataRefV1::U32(_) => Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::DType {
+                name: name.to_owned(),
+                expected: TrainDTypeV1::Bytes,
+                got: TrainDTypeV1::U32,
+            },
+        )),
+    }
+}
+
 fn input_u32_any_shape<'a>(
     request: &'a TrainRequestV1<'_>,
     name: &str,
@@ -2151,6 +2317,40 @@ fn output_f32<'a>(
         TrainBufferDataMutV1::F32(_) => Err(shape_error()),
         TrainBufferDataMutV1::U32(_) => Err(dtype_error(name, TrainDTypeV1::U32)),
         TrainBufferDataMutV1::Bytes(_) => Err(dtype_error(name, TrainDTypeV1::Bytes)),
+    }
+}
+
+fn output_bytes<'a>(
+    output: &'a mut TrainOutputV1<'_>,
+    name: &str,
+    shape: &[u64],
+    len: usize,
+) -> Result<&'a mut [u8], TrainBackendError> {
+    let buffer = output
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == name)
+        .ok_or_else(|| roles("outputs"))?;
+    if buffer.shape != shape {
+        return Err(shape_error());
+    }
+    match &mut buffer.data {
+        TrainBufferDataMutV1::Bytes(data) if data.len() == len => Ok(data),
+        TrainBufferDataMutV1::Bytes(_) => Err(shape_error()),
+        TrainBufferDataMutV1::F32(_) => Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::DType {
+                name: name.to_owned(),
+                expected: TrainDTypeV1::Bytes,
+                got: TrainDTypeV1::F32,
+            },
+        )),
+        TrainBufferDataMutV1::U32(_) => Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::DType {
+                name: name.to_owned(),
+                expected: TrainDTypeV1::Bytes,
+                got: TrainDTypeV1::U32,
+            },
+        )),
     }
 }
 

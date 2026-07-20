@@ -1358,6 +1358,18 @@ impl CudaBackend {
             .map_err(|e| driver_err("dev_upload htod", &e))
     }
 
+    pub(crate) fn dev_upload_i8(&self, host: &[i8]) -> Result<CudaSlice<i8>, BackendError> {
+        self.stream
+            .clone_htod(host)
+            .map_err(|e| driver_err("dev_upload_i8 htod", &e))
+    }
+
+    pub(crate) fn dev_upload_u8(&self, host: &[u8]) -> Result<CudaSlice<u8>, BackendError> {
+        self.stream
+            .clone_htod(host)
+            .map_err(|e| driver_err("dev_upload_u8 htod", &e))
+    }
+
     /// Create the non-blocking transfer stream used by host-offloaded AdamW.
     /// This must happen before its persistent device slots are allocated so
     /// cudarc installs per-buffer event tracking for cross-stream ordering.
@@ -1494,6 +1506,26 @@ impl CudaBackend {
         self.stream
             .memcpy_dtoh(d, out)
             .map_err(|e| driver_err("dev_download dtoh", &e))
+    }
+
+    pub(crate) fn dev_download_i8(
+        &self,
+        device: &CudaSlice<i8>,
+        output: &mut [i8],
+    ) -> Result<(), BackendError> {
+        self.stream
+            .memcpy_dtoh(device, output)
+            .map_err(|e| driver_err("dev_download_i8 dtoh", &e))
+    }
+
+    pub(crate) fn dev_download_u8(
+        &self,
+        device: &CudaSlice<u8>,
+        output: &mut [u8],
+    ) -> Result<(), BackendError> {
+        self.stream
+            .memcpy_dtoh(device, output)
+            .map_err(|e| driver_err("dev_download_u8 dtoh", &e))
     }
 
     /// Whether `buffer` belongs to this backend's CUDA context. Context value
