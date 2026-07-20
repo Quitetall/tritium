@@ -529,6 +529,9 @@ pub struct CudaBackend {
     /// Lever 5: AdamW on a bf16 master with stochastic rounding.
     #[allow(dead_code)] // consumed by the bf16-master gate and DeviceTrainer bf16 path
     pub(super) func_adamw_step_bf16_master: CudaFunction,
+    /// Lever 5: in-place stochastic round of an f32 buffer onto the bf16 grid.
+    #[allow(dead_code)] // consumed by the DeviceTrainer bf16-master validation path
+    pub(super) func_sr_round_to_bf16grid: CudaFunction,
     /// ADR 0027 Track D: compact SALT pack, forward, and activation gradient.
     #[allow(dead_code)] // consumed by the Track D backend entry points below
     pub(super) func_salt_pack_training: CudaFunction,
@@ -722,6 +725,9 @@ impl CudaBackend {
         let func_adamw_step_bf16_master = grad_module
             .load_function(KERNEL_NAME_ADAMW_STEP_BF16_MASTER)
             .map_err(|e| driver_err("resolve adamw_step_bf16_master kernel", &e))?;
+        let func_sr_round_to_bf16grid = grad_module
+            .load_function(KERNEL_NAME_SR_ROUND_TO_BF16GRID)
+            .map_err(|e| driver_err("resolve sr_round_to_bf16grid kernel", &e))?;
         let func_salt_pack_training = grad_module
             .load_function(KERNEL_NAME_SALT_PACK_TRAINING)
             .map_err(|e| driver_err("resolve salt_pack_training kernel", &e))?;
@@ -884,6 +890,7 @@ impl CudaBackend {
             func_adamw_step,
             func_adamw_step_8bit,
             func_adamw_step_bf16_master,
+            func_sr_round_to_bf16grid,
             func_salt_pack_training,
             func_salt_training_forward,
             func_salt_training_grad_a,
@@ -2256,6 +2263,36 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(len))
                 .map_err(|e| driver_err("launch adamw_step_bf16_master_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Stochastically round an f32 buffer onto the bf16 grid in place (Lever 5 bf16-master validation).
+    /// `dither_seed` should already fold in the step index so each round draws fresh noise.
+    ///
+    /// # Errors
+    /// [`BackendError`] on a launch failure.
+    #[allow(dead_code)] // consumed by the DeviceTrainer bf16-master validation path
+    pub(crate) fn sr_round_to_bf16grid_dev(
+        &self,
+        buf: &mut CudaSlice<f32>,
+        dither_seed: u64,
+    ) -> Result<(), BackendError> {
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let len_i = i32::try_from(len).map_err(|_| {
+            BackendError::InvalidInput("bf16 grid round length exceeds i32::MAX".into())
+        })?;
+        let mut launch = self.stream.launch_builder(&self.func_sr_round_to_bf16grid);
+        launch.arg(buf).arg(&len_i).arg(&dither_seed);
+        // SAFETY: `buf` has `len` elements; one thread per element; scalars match the kernel ABI.
+        #[allow(unsafe_code)]
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(len))
+                .map_err(|e| driver_err("launch sr_round_to_bf16grid_dev", &e))?;
         }
         Ok(())
     }

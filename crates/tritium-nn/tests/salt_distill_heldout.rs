@@ -322,7 +322,7 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     use tritium_cuda::CudaBackend;
     use tritium_cuda::train::{
         DeviceTape, DeviceTensor, DeviceTrainParam, DeviceTrainer, DeviceTrainerWeightStorage,
-        MomentPrecision, TensorCoreGemm,
+        MasterPrecision, MomentPrecision, TensorCoreGemm,
     };
     use tritium_format::TeacherCacheHeader;
     use tritium_nn::{
@@ -392,11 +392,19 @@ fn salt_distillation_device_trainer_recovers_heldout() {
     } else {
         MomentPrecision::F32
     };
+    // TRITIUM_DISTILL_BF16MASTER=1 confines the master to the bf16 grid with stochastic rounding —
+    // does a bf16 master still recover ~960× on the real model? (numerically a real bf16 master).
+    let master_precision = if std::env::var("TRITIUM_DISTILL_BF16MASTER").is_ok() {
+        MasterPrecision::Bf16
+    } else {
+        MasterPrecision::F32
+    };
     let mut trainer = DeviceTrainer::new_with_options(
         &backend,
         &specs,
         DeviceTrainerWeightStorage::DenseQuantized,
         moment_precision,
+        master_precision,
     )
     .expect("upload resident state");
     let mut teacher_cache = std::env::var_os("TRITIUM_TEACHER_CACHE").map(|path| {

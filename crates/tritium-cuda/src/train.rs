@@ -1270,6 +1270,24 @@ pub enum MomentPrecision {
     Int8,
 }
 
+/// Precision of the resident AdamW latent master (Lever 5).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MasterPrecision {
+    /// Full f32 master — the default.
+    #[default]
+    F32,
+    /// The master's *values* are confined to the bf16 grid with stochastic rounding after every step
+    /// (numerically identical to storing the master in a u16 bf16 buffer and dequantizing it for the
+    /// SALT reconstruction — so this validates a bf16 master's recovery impact without swapping the
+    /// storage type through the reconstruction path; the u16 VRAM-halving swap is a mechanical
+    /// follow-up gated on this result).
+    Bf16,
+}
+
+/// Stochastic-rounding base seed for the bf16 master grid; the step index is folded in per step so
+/// every round draws fresh dither. Fixed so a run is reproducible.
+const BF16_MASTER_SEED: u64 = 0x6D61_7374_6572_5652;
+
 /// Resident block-wise int8 AdamW moment state (Lever 5): the two moments quantized plus their
 /// per-block scales. Present only when a [`DeviceTrainer`] is built with [`MomentPrecision::Int8`].
 struct Int8Moments {
@@ -1351,6 +1369,8 @@ pub struct DeviceTrainer<'a> {
     stats: ResidentTrainerStats,
     poisoned: bool,
     loading: Option<ResidentLoadState>,
+    /// Lever 5: when `Bf16`, each step confines the master to the bf16 grid with stochastic rounding.
+    master_precision: MasterPrecision,
 }
 
 impl core::fmt::Debug for DeviceTrainer<'_> {
@@ -1379,18 +1399,26 @@ impl<'a> DeviceTrainer<'a> {
         params: &[DeviceTrainParam<'_>],
         weight_storage: DeviceTrainerWeightStorage,
     ) -> Result<Self, BackendError> {
-        Self::new_with_options(backend, params, weight_storage, MomentPrecision::F32)
+        Self::new_with_options(
+            backend,
+            params,
+            weight_storage,
+            MomentPrecision::F32,
+            MasterPrecision::F32,
+        )
     }
 
-    /// Construct a resident trainer choosing both the weight storage and the AdamW moment precision
-    /// (Lever 5: [`MomentPrecision::Int8`] holds the moments block-wise int8 via `adamw_step_8bit`).
-    /// The f32 `m`/`v` buffers are still allocated (so checkpoint/inspection stay valid) but unused
-    /// when int8 moments are active.
+    /// Construct a resident trainer choosing the weight storage, the AdamW moment precision, and the
+    /// master precision (Lever 5). [`MomentPrecision::Int8`] holds the moments block-wise int8 via
+    /// `adamw_step_8bit`; [`MasterPrecision::Bf16`] confines the master to the bf16 grid with
+    /// stochastic rounding each step. The f32 `m`/`v` buffers are still allocated (so
+    /// checkpoint/inspection stay valid) but unused when int8 moments are active.
     pub fn new_with_options(
         backend: &'a CudaBackend,
         params: &[DeviceTrainParam<'_>],
         weight_storage: DeviceTrainerWeightStorage,
         moment_precision: MomentPrecision,
+        master_precision: MasterPrecision,
     ) -> Result<Self, BackendError> {
         let mut leaf_lens = Vec::with_capacity(params.len());
         let mut parameter_elements = 0usize;
@@ -1447,6 +1475,13 @@ impl<'a> DeviceTrainer<'a> {
                 optimizer: param.optimizer,
             });
         }
+        if master_precision == MasterPrecision::Bf16 {
+            // Confine the initial master to the bf16 grid so the first step's w_old is already on-grid
+            // (matching a real bf16 master, which would dequantize from bf16 from the very first read).
+            for param in &mut resident {
+                backend.sr_round_to_bf16grid_dev(&mut param.master.buf, BF16_MASTER_SEED)?;
+            }
+        }
         let residual = backend.dev_alloc_zeros(largest_parameter_elements)?;
         let optimizer_elements = parameter_elements.checked_mul(2).ok_or_else(|| {
             BackendError::InvalidInput("resident optimizer elements overflow usize".into())
@@ -1479,6 +1514,7 @@ impl<'a> DeviceTrainer<'a> {
             },
             poisoned: false,
             loading: None,
+            master_precision,
         })
     }
 
@@ -1679,6 +1715,7 @@ impl<'a> DeviceTrainer<'a> {
         }
         self.quantized_prepared = false;
         self.poisoned = true;
+        let master_precision = self.master_precision;
         for (param, grad) in self.params.iter_mut().zip(grads.bufs) {
             match &mut param.int8 {
                 Some(i8m) => self.backend.adamw_step_8bit_dev(
@@ -1699,6 +1736,12 @@ impl<'a> DeviceTrainer<'a> {
                     step,
                     &param.optimizer,
                 )?,
+            }
+            if master_precision == MasterPrecision::Bf16 {
+                // Confine the updated master to the bf16 grid with stochastic rounding — numerically a
+                // real bf16 master. Fresh dither each step so sub-ULP updates survive in expectation.
+                self.backend
+                    .sr_round_to_bf16grid_dev(&mut param.master.buf, BF16_MASTER_SEED ^ step)?;
             }
         }
         self.poisoned = false;
@@ -6702,13 +6745,13 @@ mod tests {
         );
     }
 
-    /// Lever 5: a `DeviceTrainer` built with [`MomentPrecision::Int8`] trains the toy SALT-distill
-    /// problem end-to-end through the block-wise int8 kernel — quantized moments and all — and drives
-    /// the teacher-forced xent loss down comparably to the f32 trainer on the same seed. This is the
-    /// functional gate for the wired int8 path; the kernel↔oracle numerics are gated separately by
-    /// `adamw_step_8bit_matches_cpu_oracle`.
+    /// Lever 5: a `DeviceTrainer` built with reduced-precision optimizer state — int8 moments and/or a
+    /// bf16-grid master — trains the toy SALT-distill problem end-to-end and drives the teacher-forced
+    /// xent loss down comparably to the f32 trainer on the same seed. Functional gate for the wired
+    /// int8 + bf16-master paths; the kernel↔oracle numerics are gated separately
+    /// (`adamw_step_8bit_matches_cpu_oracle`, `adamw_step_bf16_master_matches_host`).
     #[test]
-    fn device_trainer_int8_moments_train_like_f32() {
+    fn device_trainer_reduced_precision_trains_like_f32() {
         let backend = match CudaBackend::new(0) {
             Ok(b) => b,
             Err(e) => {
@@ -6736,7 +6779,7 @@ mod tests {
 
         // Run the toy distill for `steps` steps at the given moment precision, returning the loss
         // trajectory (device xent value each step, pre-update).
-        let run = |precision: MomentPrecision| -> Vec<f32> {
+        let run = |moment: MomentPrecision, master_prec: MasterPrecision| -> Vec<f32> {
             let mut trainer = DeviceTrainer::new_with_options(
                 &backend,
                 &[DeviceTrainParam {
@@ -6747,7 +6790,8 @@ mod tests {
                     optimizer: AdamW::new(0.05),
                 }],
                 DeviceTrainerWeightStorage::DenseQuantized,
-                precision,
+                moment,
+                master_prec,
             )
             .unwrap();
             let mut losses = Vec::new();
@@ -6784,12 +6828,17 @@ mod tests {
             losses
         };
 
-        let f32_losses = run(MomentPrecision::F32);
-        let int8_losses = run(MomentPrecision::Int8);
+        let f32_losses = run(MomentPrecision::F32, MasterPrecision::F32);
+        let int8_losses = run(MomentPrecision::Int8, MasterPrecision::F32);
+        let bf16_losses = run(MomentPrecision::F32, MasterPrecision::Bf16);
         let (f0, f1) = (f32_losses[0], *f32_losses.last().unwrap());
         let (i0, i1) = (int8_losses[0], *int8_losses.last().unwrap());
-        eprintln!("int8 DeviceTrainer distill: f32 {f0:.4}→{f1:.4}, int8 {i0:.4}→{i1:.4}");
-        assert_eq!(i0, f0, "same seed ⇒ identical starting loss");
+        let (b0, b1) = (bf16_losses[0], *bf16_losses.last().unwrap());
+        eprintln!(
+            "reduced-precision DeviceTrainer distill: f32 {f0:.4}→{f1:.4}, int8 {i0:.4}→{i1:.4}, \
+             bf16-master {b0:.4}→{b1:.4}"
+        );
+        assert_eq!(i0, f0, "same seed ⇒ identical starting loss (int8)");
         assert!(
             f1 < 0.95 * f0,
             "f32 trainer must descend: {f0:.4} → {f1:.4}"
@@ -6798,11 +6847,21 @@ mod tests {
             i1 < 0.95 * i0,
             "int8 trainer must descend: {i0:.4} → {i1:.4}"
         );
-        // The point of Lever 5: int8 moments train *like* f32 — the final losses stay close relative
-        // to how far f32 travelled (int8 within ~20% of f32's descent, either side).
         assert!(
-            (i1 - f1).abs() < 0.2 * (f0 - f1).abs().max(1e-3),
+            b1 < 0.95 * b0,
+            "bf16-master trainer must descend: {b0:.4} → {b1:.4}"
+        );
+        // The point of Lever 5: reduced-precision optimizer state trains *like* f32 — final losses stay
+        // close relative to how far f32 travelled (within ~20% of f32's descent, either side).
+        let descent = (f0 - f1).abs().max(1e-3);
+        assert!(
+            (i1 - f1).abs() < 0.2 * descent,
             "int8 final {i1:.4} must track f32 {f1:.4} (descent {:.4} from {f0:.4})",
+            f0 - f1
+        );
+        assert!(
+            (b1 - f1).abs() < 0.2 * descent,
+            "bf16-master final {b1:.4} must track f32 {f1:.4} (descent {:.4} from {f0:.4})",
             f0 - f1
         );
     }

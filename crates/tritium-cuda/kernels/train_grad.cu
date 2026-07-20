@@ -862,6 +862,20 @@ extern "C" __global__ void adamw_step_bf16_master(
     master[i] = f32_to_bf16_stochastic(w_new, bf16_dither16(dither_seed, (unsigned long long)i));
 }
 
+// Stochastically round an f32 buffer onto the bf16 grid in place (Lever 5 bf16-master validation).
+// Confining the f32 master to bf16-representable values with SR is numerically identical to holding
+// the master in a u16 bf16 buffer and dequantizing it for the SALT reconstruction — so this validates
+// the recovery impact of a bf16 master without swapping the storage type through the reconstruction
+// path. One thread per element; `dither_seed` should fold in the step.
+extern "C" __global__ void sr_round_to_bf16grid(
+    float* __restrict__ buf, int n, unsigned long long dither_seed)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned short d = bf16_dither16(dither_seed, (unsigned long long)i);
+    buf[i] = bf16_to_f32(f32_to_bf16_stochastic(buf[i], d));
+}
+
 // ───────────────────────── device-resident glue ops (plan 0043 P2.2) ─────────────────────────
 // Elementwise forward/backward for the tape's non-matmul ops, run on the resident activation
 // buffers so a whole block chains fwd→bwd without host round-trips. One thread per element.
