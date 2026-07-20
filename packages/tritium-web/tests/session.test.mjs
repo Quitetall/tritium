@@ -14,6 +14,28 @@ const operations = parseTrainingManifest(
   canonicalTrainingManifestJson(),
 ).operations.map((operation) => operation.id);
 
+const SGD_ATTRIBUTES = [
+  { name: "step", kind: "u64", value: 0 },
+  { name: "lr", kind: "f32", value: 0.1 },
+];
+const ADAM_ATTRIBUTES = [
+  { name: "step", kind: "u64", value: 0 },
+  { name: "lr", kind: "f32", value: 0.001 },
+  { name: "beta1", kind: "f32", value: 0.9 },
+  { name: "beta2", kind: "f32", value: 0.999 },
+  { name: "eps", kind: "f32", value: 1e-8 },
+  { name: "weight_decay", kind: "f32", value: 0 },
+];
+const MUON_ATTRIBUTES = [
+  { name: "step", kind: "u64", value: 0 },
+  { name: "lr", kind: "f32", value: 0.01 },
+  { name: "momentum", kind: "f32", value: 0.95 },
+  { name: "weight_decay", kind: "f32", value: 0 },
+  { name: "rows", kind: "u64", value: 1 },
+  { name: "cols", kind: "u64", value: 1 },
+  { name: "ns_steps", kind: "u64", value: 5 },
+];
+
 const model = {
   schemaId: "tritium.web_training_model",
   schemaVersion: 1,
@@ -32,7 +54,7 @@ const model = {
     operations: [
       { id: "add", operation: "graph.add", inputs: ["x", "weight"], outputs: ["sum"], attributes: [] },
       { id: "mse", operation: "loss.mse", inputs: ["sum", "target"], outputs: ["loss"], attributes: [] },
-      { id: "sgd", operation: "optimizer.sgd", inputs: ["weight", "grad"], outputs: ["weight"], attributes: [] },
+      { id: "sgd", operation: "optimizer.sgd", inputs: ["weight", "grad"], outputs: ["weight"], attributes: SGD_ATTRIBUTES },
     ],
   },
   payload: Buffer.from([1, 2, 3]),
@@ -356,6 +378,44 @@ test("planner rejects non-representable and sparse typed attributes", async () =
   }
 });
 
+test("planner rejects operation geometry before adapter allocation", async () => {
+  const badShape = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: model.recipe.tensors.map((tensor) =>
+        tensor.id === "sum" ? { ...tensor, shape: [2] } : tensor,
+      ),
+    },
+  };
+  const shapeAdapter = new MockAdapter();
+  await rejectsCode(prepareTraining(badShape, config, shapeAdapter), "invalid_schema");
+  assert.deepEqual(shapeAdapter.calls, []);
+
+  const badHyperparameter = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      operations: model.recipe.operations.map((operation) =>
+        operation.id === "sgd"
+          ? {
+              ...operation,
+              attributes: operation.attributes.map((attribute) =>
+                attribute.name === "lr" ? { ...attribute, value: -1 } : attribute,
+              ),
+            }
+          : operation,
+      ),
+    },
+  };
+  const attributeAdapter = new MockAdapter();
+  await rejectsCode(
+    prepareTraining(badHyperparameter, config, attributeAdapter),
+    "invalid_schema",
+  );
+  assert.deepEqual(attributeAdapter.calls, []);
+});
+
 test("planner enforces one optimizer and gradient per tied parameter owner", async () => {
   const aliasUpdate = {
     ...model,
@@ -445,7 +505,7 @@ test("planner enforces one optimizer and gradient per tied parameter owner", asy
           operation: "optimizer.sgd",
           inputs: ["weight2", "grad2"],
           outputs: ["weight2"],
-          attributes: [],
+          attributes: SGD_ATTRIBUTES,
         },
       ],
     },
@@ -573,6 +633,7 @@ test("planner binds stateful optimizer slots exclusively and positionally", asyn
               operation: "optimizer.adamw",
               inputs: ["weight", "grad", "moment1", "moment2"],
               outputs: ["weight", "moment1", "moment2"],
+              attributes: ADAM_ATTRIBUTES,
             }
           : operation,
       ),
@@ -648,7 +709,7 @@ test("planner orders multiple groups and rejects shared optimizer state", async 
           operation: "optimizer.sgd",
           inputs: ["weight2", "grad2"],
           outputs: ["weight2"],
-          attributes: [],
+          attributes: SGD_ATTRIBUTES,
         },
       ],
     },
@@ -677,6 +738,7 @@ test("planner orders multiple groups and rejects shared optimizer state", async 
               operation: "optimizer.muon",
               inputs: [operation.inputs[0], operation.inputs[1], "shared-momentum"],
               outputs: [operation.outputs[0], "shared-momentum"],
+              attributes: MUON_ATTRIBUTES,
             }
           : operation,
       ),
@@ -715,7 +777,7 @@ test("planner validates int8 AdamW block-state geometry", async () => {
       "moment1-scale",
       "moment2-scale",
     ],
-    attributes: [],
+    attributes: ADAM_ATTRIBUTES,
   };
   const int8Model = {
     ...model,

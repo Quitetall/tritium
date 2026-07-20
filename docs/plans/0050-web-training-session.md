@@ -125,8 +125,10 @@ static portable buffer/request/lifecycle capacity checks fail before guest
 creation. Lower-level schedule/lifecycle compiler failures normalize to the
 stable session error surface. Receipts now carry planner-accounted phase peaks;
 they are not substitutes for the still-open physical browser memory evidence.
-State-derived model export, complete operation-specific pre-allocation geometry
-admission and physical Chrome/Firefox runs remain open.
+All 31 non-lifecycle operations now receive allocation-free canonical ABI,
+forward-shape, attribute-domain and worst-case scratch validation before any
+adapter allocation. State-derived model export and physical Chrome/Firefox
+runs remain open.
 
 Compile `tritium-spec`, the bounded portable executor and SALT V2 strict reader
 to `wasm32-unknown-unknown`. JavaScript owns only lifecycle orchestration and
@@ -158,8 +160,9 @@ safe-integer byte accounting, preparation peak ceilings, and one-gradient /
 one-optimizer ownership for each tied-parameter group fail closed.
 The adapter boundary now separates allocation-free, non-mutating, non-retaining
 structural/subset validation from persistent preparation; preparation may
-allocate decoded state but may not mutate or retain its inputs. Completing the
-operation-specific geometry/attribute catalog remains open.
+allocate decoded state but may not mutate or retain its inputs. The complete
+31-operation geometry/attribute catalog is checked against every canonical
+forward/step success, output-shape drift and bounded attribute failures.
 Preparation peak accounting includes the isolated validation and preparation
 payloads. The compiler now derives the reachable reverse-mode VJP schedule from
 the single declared loss, assigns canonical backend roles to saved inputs and
@@ -174,9 +177,8 @@ guest dispatch only after validated success and commits multi-group optimizer
 steps atomically. Default `backend: "wasm"` and admitted `auto` fallback select
 it without caller adapter wiring. Checkpoint and resume use canonical WASM
 transactions directly; candidate planes and step commit only after every
-returned plane validates. Complete pre-allocation geometry admission and
-device-loss transactions remain open, while SALT package admission is
-canonical but state-derived export remains open.
+returned plane validates. Device-loss transactions remain open, while SALT
+package admission is canonical but state-derived export remains open.
 
 Compile a `TrainingRecipeV1` into an immutable operation schedule, buffer plan
 and optimizer-state layout. Preparation validates all roles, shapes, dtypes,

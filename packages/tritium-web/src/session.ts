@@ -7,6 +7,10 @@ import {
   TRAINING_MANIFEST_DIGEST_V1,
   TRAINING_VECTOR_DIGEST_V1,
 } from "./identity.ts";
+import {
+  TrainingGeometryError,
+  validateTrainingOperationGeometry,
+} from "./geometry.ts";
 
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";
@@ -900,6 +904,12 @@ export function compileTrainingPlan(
       }
       return tensor;
     });
+    try {
+      validateTrainingOperationGeometry(operation, inputTensors, outputTensors, config.seed);
+    } catch (error) {
+      if (error instanceof TrainingGeometryError) fail("invalid_schema", error.message);
+      throw error;
+    }
     if (
       ["graph.add", "graph.mul"].includes(operation.operation) &&
       (!sameShape(inputTensors[0]!, inputTensors[1]!) ||

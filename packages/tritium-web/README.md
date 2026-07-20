@@ -8,9 +8,10 @@ violations. Recipes compile before `adapter.prepare` may allocate into an immuta
 16-byte-aligned buffer/schedule plan. Tensor owners are explicit, tied
 parameters share one allocation and one compiled gradient/optimizer owner, and
 batch names/dtypes/shapes are checked against the plan. Structural planning and
-the built-in adapter's optimizer-subset, portable-buffer, worst-case request
-JSON and lifecycle-capacity gates run before guest creation; complete
-operation-specific geometry/attribute admission remains a release gate.
+all 31 non-lifecycle operations pass allocation-free canonical ABI, shape,
+attribute-domain and scratch-ceiling validation before adapter allocation. The
+built-in adapter additionally applies optimizer-subset, portable-buffer,
+worst-case request JSON and lifecycle-capacity gates before guest creation.
 Model/batch bytes are isolated from adapter mutation. Failed
 adapter calls do not advance session state. The archive also bundles a real
 `wasm32-unknown-unknown` guest; `runPortableWasmConformance()` executes all 114
@@ -50,8 +51,7 @@ receipts remain a separate acceptance gate.
 `PortableWasmLifecycleState.create(...)` owns copied optimizer planes, commits
 and resumes atomically through that guest. Its separate `admitExport(...)`
 boundary strict-reloads caller-supplied SALT packages before returning them.
-Complete pre-allocation operation geometry admission and state-derived model
-export remain release gates.
+State-derived model export remains a release gate.
 
 The built-in adapter remains explicitly `wasm-fallback`; it never satisfies a
 WebGPU gate. WebGPU implementation and state-derived SALT export remain under
