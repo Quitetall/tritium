@@ -796,8 +796,10 @@ extern "C" __global__ void adamw_step_8bit(
         } else {
             m_q[i] = 0;
         }
-        if (new_vs > 0.0f) {
-            v_q[i] = (unsigned char)fminf(fmaxf(roundf(root_i / new_vs), 0.0f), 255.0f);
+        // Floor a nonzero sqrt(v) at code 1: it must never dequantize to 0, or a later quiet step
+        // (g~0, residual m) collapses the AdamW denominator to eps and the step explodes.
+        if (new_vs > 0.0f && root_i > 0.0f) {
+            v_q[i] = (unsigned char)fminf(fmaxf(roundf(root_i / new_vs), 1.0f), 255.0f);
         } else {
             v_q[i] = 0;
         }

@@ -339,8 +339,11 @@ impl Optimizer for Int8AdamW {
                 } else {
                     0
                 };
-                state.v_q[i] = if new_vs > 0.0 {
-                    (v_new[k] / new_vs).round().clamp(0.0, 255.0) as u8
+                // Floor a nonzero √v at code 1: it must never dequantize to 0, or a later quiet step
+                // (g≈0, residual m) collapses AdamW's denominator to eps and the step explodes. Only
+                // an exactly-zero √v (a dead block) keeps code 0.
+                state.v_q[i] = if new_vs > 0.0 && v_new[k] > 0.0 {
+                    (v_new[k] / new_vs).round().clamp(1.0, 255.0) as u8
                 } else {
                     0
                 };
@@ -739,24 +742,26 @@ mod muon_tests {
         );
     }
 
-    /// Regression: a coordinate that goes quiet (g→0) with residual momentum, sharing a block with a
-    /// huge-gradient coordinate, must NOT explode. Its second moment would round to int8 code 0 under
-    /// a plain absmax grid (the big coordinate dominates the block scale); then `vi` collapses to 0 and
-    /// AdamW's `m/(√v+eps)` step blows up. The code-1 floor on a nonzero √v keeps the denominator
-    /// bounded. (This is the real-135M divergence, reproduced at unit scale.)
+    /// Regression for the real-135M int8 divergence, reproduced at unit scale. A block's `m` absmax and
+    /// `√v` absmax can be dominated by DIFFERENT coordinates: a huge-magnitude **oscillating** coord
+    /// (coord 0 here, ±1000) has `m ≈ 0` (sign cancellation) but a huge `√v` (RMS), so it dominates the
+    /// √v grid but NOT the m grid. A steady neighbour (coord 1) then has its `v` rounded to int8 code 0
+    /// while its `m` survives; when coord 1 goes quiet, `vi` collapses to 0 and AdamW's `m/(√v+eps)`
+    /// step explodes. The code-1 floor on a nonzero `√v` keeps the denominator bounded.
     #[test]
     fn int8_adam_quiet_coord_in_wide_block_does_not_explode() {
-        let n = 2usize; // one block; coord 0 dominates the √v absmax, coord 1 underflows
+        let n = 2usize;
         let opt = Int8AdamW::new(0.01);
         let mut w = vec![0.0f32, 0.0];
         let mut st = opt.init_state(n);
         for step in 1..=20u64 {
-            // Coord 0: persistent huge gradient (holds the block √v absmax ~1000× coord 1's).
-            // Coord 1: builds moment for 4 steps, then goes silent — the trap.
+            // Coord 0: huge OSCILLATING gradient → m cancels toward 0, √v stays ~1000 (dominates the
+            // √v grid but not the m grid). Coord 1: builds moment for 4 steps, then goes silent.
+            let osc = if step % 2 == 0 { -1000.0f32 } else { 1000.0 };
             let g = if step <= 4 {
-                vec![1000.0f32, 1.0]
+                vec![osc, 1.0]
             } else {
-                vec![1000.0f32, 0.0]
+                vec![osc, 0.0]
             };
             opt.step(step, &mut w, &g, &mut st);
             assert!(
