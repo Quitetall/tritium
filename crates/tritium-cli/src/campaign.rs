@@ -335,8 +335,8 @@ struct TeacherCacheReport {
 
 /// Hash every semantic input consumed by the tied-SwiGLU graph. The cache header
 /// has one 32-byte model field, so config/spec, names, shapes, masters, and all
-/// norm vectors are domain-separated into this digest rather than hashing only
-/// the 2D master values.
+/// preserved norm/bias vectors are domain-separated into this digest rather
+/// than hashing only the 2D master values.
 fn semantic_model_digest(
     config: &ModelConfig,
     spec: &ArchSpec,
@@ -357,7 +357,7 @@ fn training_parameter_count(model: &TiedSwiGluTrainingModel) -> anyhow::Result<u
                 .checked_add(elements)
                 .with_context(|| format!("parameter count overflows at {}", parameter.name))
         })?;
-    model
+    let with_norms = model
         .architecture()
         .attn_norms
         .iter()
@@ -365,6 +365,26 @@ fn training_parameter_count(model: &TiedSwiGluTrainingModel) -> anyhow::Result<u
         .chain(core::iter::once(&model.architecture().output_norm))
         .try_fold(matrix_count, |total, norm| {
             let elements = u64::try_from(norm.len()).context("norm element count exceeds u64")?;
+            total
+                .checked_add(elements)
+                .context("parameter count overflows")
+        })?;
+    model
+        .architecture()
+        .attention_constants
+        .iter()
+        .flat_map(|constants| {
+            [
+                &constants.q_bias,
+                &constants.k_bias,
+                &constants.v_bias,
+                &constants.q_norm,
+                &constants.k_norm,
+            ]
+        })
+        .try_fold(with_norms, |total, values| {
+            let elements =
+                u64::try_from(values.len()).context("attention constant count exceeds u64")?;
             total
                 .checked_add(elements)
                 .context("parameter count overflows")
@@ -419,6 +439,23 @@ fn semantic_model_digest_parts(
     hash.update(&(architecture.ffn_norms.len() as u64).to_le_bytes());
     for norm in &architecture.ffn_norms {
         hash_f32s(&mut hash, norm);
+    }
+    if architecture.attention_constants.iter().any(|constants| {
+        !constants.q_bias.is_empty()
+            || !constants.k_bias.is_empty()
+            || !constants.v_bias.is_empty()
+            || !constants.q_norm.is_empty()
+            || !constants.k_norm.is_empty()
+    }) {
+        hash.update(b"tritium-standard-qwen-attention-constants-v1");
+        hash.update(&(architecture.attention_constants.len() as u64).to_le_bytes());
+        for constants in &architecture.attention_constants {
+            hash_f32s(&mut hash, &constants.q_bias);
+            hash_f32s(&mut hash, &constants.k_bias);
+            hash_f32s(&mut hash, &constants.v_bias);
+            hash_f32s(&mut hash, &constants.q_norm);
+            hash_f32s(&mut hash, &constants.k_norm);
+        }
     }
     hash_f32s(&mut hash, &architecture.output_norm);
     *hash.finalize().as_bytes()
@@ -4768,6 +4805,7 @@ mod tests {
         let architecture = TiedSwiGluTrainingArchitecture {
             attn_norms: vec![vec![1.0, 1.1]],
             ffn_norms: vec![vec![0.9, 1.2]],
+            attention_constants: vec![tritium_nn::TrainingAttentionConstants::default()],
             output_norm: vec![1.0, 0.8],
             n_embd: 2,
             n_head: 1,
@@ -4800,6 +4838,12 @@ mod tests {
 
         let mut changed = architecture.clone();
         changed.output_norm[0] = f32::from_bits(changed.output_norm[0].to_bits() + 1);
+        assert_ne!(
+            first,
+            semantic_model_digest_parts(&config, &spec, &changed, &parameters)
+        );
+        let mut changed = architecture.clone();
+        changed.attention_constants[0].q_bias = vec![0.125, -0.25];
         assert_ne!(
             first,
             semantic_model_digest_parts(&config, &spec, &changed, &parameters)

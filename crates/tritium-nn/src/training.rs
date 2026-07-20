@@ -1,4 +1,4 @@
-//! Production model adapter for bias-free SwiGLU training campaigns.
+//! Production model adapter for SwiGLU training campaigns.
 //!
 //! The adapter turns the inference model representation into the stable parameter
 //! order consumed by the device-resident training stack:
@@ -86,6 +86,8 @@ pub struct TiedSwiGluTrainingArchitecture {
     pub attn_norms: Vec<Vec<f32>>,
     /// Per-layer pre-MLP RMSNorm weights, each `[n_embd]`.
     pub ffn_norms: Vec<Vec<f32>>,
+    /// Per-layer fixed Qwen attention vectors, in transformer order.
+    pub attention_constants: Vec<TrainingAttentionConstants>,
     /// Final RMSNorm weight, `[n_embd]`.
     pub output_norm: Vec<f32>,
     /// Residual-stream width.
@@ -108,6 +110,26 @@ pub struct TiedSwiGluTrainingArchitecture {
     pub n_layers: usize,
     /// Maximum configured sequence length.
     pub n_ctx: usize,
+}
+
+/// Preserved non-matrix constants consumed by one standard attention layer.
+///
+/// Bias vectors are empty or match their projection output width. Q/K norm
+/// vectors are empty or `[head_dim]` and are shared across heads. They remain
+/// fixed during matrix refinement and therefore do not appear in
+/// [`TiedSwiGluTrainingModel::parameters`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrainingAttentionConstants {
+    /// Query-projection bias, `[n_head * head_dim]`.
+    pub q_bias: Vec<f32>,
+    /// Key-projection bias, `[n_head_kv * head_dim]`.
+    pub k_bias: Vec<f32>,
+    /// Value-projection bias, `[n_head_kv * head_dim]`.
+    pub v_bias: Vec<f32>,
+    /// Per-head query RMSNorm weight, `[head_dim]`.
+    pub q_norm: Vec<f32>,
+    /// Per-head key RMSNorm weight, `[head_dim]`.
+    pub k_norm: Vec<f32>,
 }
 
 /// One canonical HuggingFace 2D trainable tensor and its latent fp32 master.
@@ -274,6 +296,23 @@ pub fn semantic_training_model_digest(
     for norm in &model.arch.ffn_norms {
         digest_f32s(&mut hash, norm);
     }
+    if model.arch.attention_constants.iter().any(|constants| {
+        !constants.q_bias.is_empty()
+            || !constants.k_bias.is_empty()
+            || !constants.v_bias.is_empty()
+            || !constants.q_norm.is_empty()
+            || !constants.k_norm.is_empty()
+    }) {
+        hash.update(b"tritium-standard-qwen-attention-constants-v1");
+        hash.update(&(model.arch.attention_constants.len() as u64).to_le_bytes());
+        for constants in &model.arch.attention_constants {
+            digest_f32s(&mut hash, &constants.q_bias);
+            digest_f32s(&mut hash, &constants.k_bias);
+            digest_f32s(&mut hash, &constants.v_bias);
+            digest_f32s(&mut hash, &constants.q_norm);
+            digest_f32s(&mut hash, &constants.k_norm);
+        }
+    }
     digest_f32s(&mut hash, &model.arch.output_norm);
     *hash.finalize().as_bytes()
 }
@@ -382,8 +421,24 @@ impl TiedSwiGluTrainingModel {
                 arch.ffn_norms.len(),
             ));
         }
+        if arch.attention_constants.len() != arch.n_layers {
+            return Err(tensor_mismatch(
+                "attention constant set count",
+                arch.n_layers,
+                arch.attention_constants.len(),
+            ));
+        }
+        let q_width = arch
+            .n_head
+            .checked_mul(arch.head_dim)
+            .ok_or_else(|| invalid_input("query projection width overflows usize"))?;
+        let kv_width = arch
+            .n_head_kv
+            .checked_mul(arch.head_dim)
+            .ok_or_else(|| invalid_input("key/value projection width overflows usize"))?;
         validate_vector("model.norm.weight", &arch.output_norm, arch.n_embd)?;
         for layer_index in 0..arch.n_layers {
+            let constants = &arch.attention_constants[layer_index];
             validate_vector(
                 &format!("model.layers.{layer_index}.input_layernorm.weight"),
                 &arch.attn_norms[layer_index],
@@ -394,16 +449,33 @@ impl TiedSwiGluTrainingModel {
                 &arch.ffn_norms[layer_index],
                 arch.n_embd,
             )?;
+            validate_optional_vector(
+                &format!("model.layers.{layer_index}.self_attn.q_proj.bias"),
+                &constants.q_bias,
+                q_width,
+            )?;
+            validate_optional_vector(
+                &format!("model.layers.{layer_index}.self_attn.k_proj.bias"),
+                &constants.k_bias,
+                kv_width,
+            )?;
+            validate_optional_vector(
+                &format!("model.layers.{layer_index}.self_attn.v_proj.bias"),
+                &constants.v_bias,
+                kv_width,
+            )?;
+            validate_optional_vector(
+                &format!("model.layers.{layer_index}.self_attn.q_norm.weight"),
+                &constants.q_norm,
+                arch.head_dim,
+            )?;
+            validate_optional_vector(
+                &format!("model.layers.{layer_index}.self_attn.k_norm.weight"),
+                &constants.k_norm,
+                arch.head_dim,
+            )?;
         }
 
-        let q_width = arch
-            .n_head
-            .checked_mul(arch.head_dim)
-            .ok_or_else(|| invalid_input("query projection width overflows usize"))?;
-        let kv_width = arch
-            .n_head_kv
-            .checked_mul(arch.head_dim)
-            .ok_or_else(|| invalid_input("key/value projection width overflows usize"))?;
         let expected_geometry = core::iter::once((arch.vocab, arch.n_embd))
             .chain((0..arch.n_layers).flat_map(|_| {
                 [
@@ -438,6 +510,7 @@ impl TiedSwiGluTrainingModel {
         let mut layers = Vec::with_capacity(arch.n_layers);
         for layer_index in 0..arch.n_layers {
             let base = 1 + 7 * layer_index;
+            let constants = &arch.attention_constants[layer_index];
             layers.push(TransformerBlock {
                 attn_norm: arch.attn_norms[layer_index].clone(),
                 q_proj: dense(base)?,
@@ -445,11 +518,11 @@ impl TiedSwiGluTrainingModel {
                 v_proj: dense(base + 2)?,
                 o_proj: dense(base + 3)?,
                 attn_sub_norm: Vec::new(),
-                q_bias: Vec::new(),
-                k_bias: Vec::new(),
-                v_bias: Vec::new(),
-                q_norm: Vec::new(),
-                k_norm: Vec::new(),
+                q_bias: constants.q_bias.clone(),
+                k_bias: constants.k_bias.clone(),
+                v_bias: constants.v_bias.clone(),
+                q_norm: constants.q_norm.clone(),
+                k_norm: constants.k_norm.clone(),
                 ffn_norm: arch.ffn_norms[layer_index].clone(),
                 mlp: Mlp::SwiGlu(
                     SwiGluMlp::new(dense(base + 4)?, dense(base + 5)?, dense(base + 6)?).map_err(
@@ -676,12 +749,6 @@ impl TiedSwiGluTrainingModel {
                 "attention/FFN sub-norms are not supported by the SwiGLU graph",
             ));
         }
-        if spec.qkv_bias {
-            return Err(unsupported("QKV bias is not supported"));
-        }
-        if spec.qk_norm {
-            return Err(unsupported("QK norm is not supported"));
-        }
         if config.n_layers == 0 {
             return Err(unsupported("num_hidden_layers must be non-zero"));
         }
@@ -810,6 +877,7 @@ impl TiedSwiGluTrainingModel {
         });
         let mut attn_norms = Vec::with_capacity(n_layers);
         let mut ffn_norms = Vec::with_capacity(n_layers);
+        let mut attention_constants = Vec::with_capacity(n_layers);
 
         for (layer_index, layer) in weights.layers.iter().enumerate() {
             let prefix = format!("model.layers.{layer_index}");
@@ -828,12 +896,41 @@ impl TiedSwiGluTrainingModel {
                     "{prefix} contains an attention sub-norm"
                 )));
             }
-            if !layer.q_bias.is_empty() || !layer.k_bias.is_empty() || !layer.v_bias.is_empty() {
-                return Err(unsupported(&format!("{prefix} contains QKV bias")));
-            }
-            if !layer.q_norm.is_empty() || !layer.k_norm.is_empty() {
-                return Err(unsupported(&format!("{prefix} contains QK norm")));
-            }
+            validate_feature_vector(
+                &format!("{prefix}.self_attn.q_proj.bias"),
+                &layer.q_bias,
+                q_width,
+                spec.qkv_bias,
+                "QKV bias",
+            )?;
+            validate_feature_vector(
+                &format!("{prefix}.self_attn.k_proj.bias"),
+                &layer.k_bias,
+                kv_width,
+                spec.qkv_bias,
+                "QKV bias",
+            )?;
+            validate_feature_vector(
+                &format!("{prefix}.self_attn.v_proj.bias"),
+                &layer.v_bias,
+                kv_width,
+                spec.qkv_bias,
+                "QKV bias",
+            )?;
+            validate_feature_vector(
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                &layer.q_norm,
+                head_dim,
+                spec.qk_norm,
+                "QK norm",
+            )?;
+            validate_feature_vector(
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                &layer.k_norm,
+                head_dim,
+                spec.qk_norm,
+                "QK norm",
+            )?;
 
             let (gate, up, down) = match &layer.mlp {
                 Mlp::SwiGlu(mlp) => (&mlp.gate, &mlp.up, &mlp.down),
@@ -876,6 +973,13 @@ impl TiedSwiGluTrainingModel {
             }
             attn_norms.push(layer.attn_norm.clone());
             ffn_norms.push(layer.ffn_norm.clone());
+            attention_constants.push(TrainingAttentionConstants {
+                q_bias: layer.q_bias.clone(),
+                k_bias: layer.k_bias.clone(),
+                v_bias: layer.v_bias.clone(),
+                q_norm: layer.q_norm.clone(),
+                k_norm: layer.k_norm.clone(),
+            });
         }
 
         if let Some(lm_head) = &weights.lm_head {
@@ -891,6 +995,7 @@ impl TiedSwiGluTrainingModel {
             arch: TiedSwiGluTrainingArchitecture {
                 attn_norms,
                 ffn_norms,
+                attention_constants,
                 output_norm: weights.output_norm.clone(),
                 n_embd,
                 n_head,
@@ -909,7 +1014,7 @@ impl TiedSwiGluTrainingModel {
     }
 }
 
-/// Architecture descriptor for a bias-free SwiGLU training campaign.
+/// Architecture descriptor for a SwiGLU training campaign.
 ///
 /// This alias keeps callers using the original tied-head name source compatible.
 pub type SwiGluTrainingArchitecture = TiedSwiGluTrainingArchitecture;
@@ -960,6 +1065,7 @@ pub fn packed_device_forward<'backend, 'leaf>(
 ) -> Result<PackedTrainingForward, TrainingAdapterError> {
     let arch = &model.arch;
     validate_training_tokens(arch, tokens)?;
+    validate_runtime_architecture(arch)?;
     if weights.len() != model.parameters.len() {
         return Err(tensor_mismatch(
             "packed parameter count",
@@ -993,9 +1099,10 @@ pub fn packed_device_forward<'backend, 'leaf>(
 
     for layer_index in 0..arch.n_layers {
         let base = 1 + 7 * layer_index;
+        let constants = &arch.attention_constants[layer_index];
         let attn_norm = tape.leaf(&arch.attn_norms[layer_index])?;
         let normalized = tape.rmsnorm(hidden, attn_norm, sequence, arch.n_embd, arch.rms_eps)?;
-        let attention = tape.salt_attention(
+        let attention = tape.salt_attention_with_fixed(
             normalized,
             masters[base],
             &weights[base],
@@ -1011,6 +1118,14 @@ pub fn packed_device_forward<'backend, 'leaf>(
             arch.n_head_kv,
             arch.head_dim,
             arch.rope_theta,
+            tritium_cuda::train::FixedAttentionParameters {
+                q_bias: &constants.q_bias,
+                k_bias: &constants.k_bias,
+                v_bias: &constants.v_bias,
+                q_norm: &constants.q_norm,
+                k_norm: &constants.k_norm,
+                rms_eps: arch.rms_eps,
+            },
         )?;
         hidden = tape.add(hidden, attention)?;
 
@@ -1059,6 +1174,7 @@ pub fn resident_device_forward<'backend, 'leaf>(
 ) -> Result<ResidentTrainingForward, TrainingAdapterError> {
     let arch = &model.arch;
     validate_training_tokens(arch, tokens)?;
+    validate_runtime_architecture(arch)?;
     if weights.len() != model.parameters.len() {
         return Err(tensor_mismatch(
             "resident parameter count",
@@ -1088,9 +1204,10 @@ pub fn resident_device_forward<'backend, 'leaf>(
 
     for layer_index in 0..arch.n_layers {
         let base = 1 + 7 * layer_index;
+        let constants = &arch.attention_constants[layer_index];
         let attn_norm = tape.leaf(&arch.attn_norms[layer_index])?;
         let normalized = tape.rmsnorm(hidden, attn_norm, sequence, arch.n_embd, arch.rms_eps)?;
-        let attention = tape.attention(
+        let attention = tape.attention_with_fixed(
             normalized,
             masters[base],
             masters[base + 1],
@@ -1102,6 +1219,14 @@ pub fn resident_device_forward<'backend, 'leaf>(
             arch.n_head_kv,
             arch.head_dim,
             arch.rope_theta,
+            tritium_cuda::train::FixedAttentionParameters {
+                q_bias: &constants.q_bias,
+                k_bias: &constants.k_bias,
+                v_bias: &constants.v_bias,
+                q_norm: &constants.q_norm,
+                k_norm: &constants.k_norm,
+                rms_eps: arch.rms_eps,
+            },
         )?;
         hidden = tape.add(hidden, attention)?;
 
@@ -1156,6 +1281,77 @@ fn validate_training_tokens(
             return Err(invalid_input(&format!(
                 "token at position {position} is outside the vocabulary"
             )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn validate_runtime_architecture(
+    arch: &TiedSwiGluTrainingArchitecture,
+) -> Result<(), TrainingAdapterError> {
+    if arch.attn_norms.len() != arch.n_layers {
+        return Err(tensor_mismatch(
+            "attention norm count",
+            arch.n_layers,
+            arch.attn_norms.len(),
+        ));
+    }
+    if arch.ffn_norms.len() != arch.n_layers {
+        return Err(tensor_mismatch(
+            "FFN norm count",
+            arch.n_layers,
+            arch.ffn_norms.len(),
+        ));
+    }
+    if arch.attention_constants.len() != arch.n_layers {
+        return Err(tensor_mismatch(
+            "attention constant set count",
+            arch.n_layers,
+            arch.attention_constants.len(),
+        ));
+    }
+    validate_vector("model.norm.weight", &arch.output_norm, arch.n_embd)?;
+    let q_width = checked_mul(arch.n_head, arch.head_dim, "query projection width")?;
+    let kv_width = checked_mul(arch.n_head_kv, arch.head_dim, "key/value projection width")?;
+    for layer_index in 0..arch.n_layers {
+        let prefix = format!("model.layers.{layer_index}");
+        validate_vector(
+            &format!("{prefix}.input_layernorm.weight"),
+            &arch.attn_norms[layer_index],
+            arch.n_embd,
+        )?;
+        validate_vector(
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &arch.ffn_norms[layer_index],
+            arch.n_embd,
+        )?;
+        let constants = &arch.attention_constants[layer_index];
+        let bias_presence = [
+            !constants.q_bias.is_empty(),
+            !constants.k_bias.is_empty(),
+            !constants.v_bias.is_empty(),
+        ];
+        if bias_presence.iter().any(|present| *present)
+            && !bias_presence.iter().all(|present| *present)
+        {
+            return Err(invalid_input(&format!(
+                "{prefix} QKV bias vectors must be all present or all absent"
+            )));
+        }
+        if constants.q_norm.is_empty() != constants.k_norm.is_empty() {
+            return Err(invalid_input(&format!(
+                "{prefix} Q/K norm vectors must be both present or both absent"
+            )));
+        }
+        for (name, values, width) in [
+            ("q_proj.bias", constants.q_bias.as_slice(), q_width),
+            ("k_proj.bias", constants.k_bias.as_slice(), kv_width),
+            ("v_proj.bias", constants.v_bias.as_slice(), kv_width),
+            ("q_norm.weight", constants.q_norm.as_slice(), arch.head_dim),
+            ("k_norm.weight", constants.k_norm.as_slice(), arch.head_dim),
+        ] {
+            validate_optional_vector(&format!("{prefix}.self_attn.{name}"), values, width)?;
         }
     }
     Ok(())
@@ -1310,10 +1506,44 @@ fn validate_vector(
     vector: &[f32],
     expected: usize,
 ) -> Result<(), TrainingAdapterError> {
-    if vector.len() == expected {
+    if vector.len() != expected {
+        return Err(tensor_mismatch(name, expected, vector.len()));
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(invalid_input(&format!(
+            "{name} contains a non-finite value"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_vector(
+    name: &str,
+    vector: &[f32],
+    expected: usize,
+) -> Result<(), TrainingAdapterError> {
+    if vector.is_empty() {
         Ok(())
     } else {
-        Err(tensor_mismatch(name, expected, vector.len()))
+        validate_vector(name, vector, expected)
+    }
+}
+
+fn validate_feature_vector(
+    name: &str,
+    vector: &[f32],
+    expected: usize,
+    required: bool,
+    feature: &str,
+) -> Result<(), TrainingAdapterError> {
+    if required {
+        validate_vector(name, vector, expected)
+    } else if vector.is_empty() {
+        Ok(())
+    } else {
+        Err(unsupported(&format!(
+            "{name} contains {feature} while the architecture disables it"
+        )))
     }
 }
 
@@ -1419,6 +1649,7 @@ mod tests {
             arch: TiedSwiGluTrainingArchitecture {
                 attn_norms: vec![vec![1.0; n_embd]; n_layers],
                 ffn_norms: vec![vec![1.0; n_embd]; n_layers],
+                attention_constants: vec![TrainingAttentionConstants::default(); n_layers],
                 output_norm: vec![1.0; n_embd],
                 n_embd,
                 n_head: 1,

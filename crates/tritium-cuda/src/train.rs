@@ -3356,6 +3356,27 @@ impl GradientStream<'_, '_> {
     }
 }
 
+/// Fixed non-matrix vectors applied inside standard Qwen attention.
+///
+/// All slices are borrowed only for the duration of graph construction. The
+/// tape uploads their values into ordinary leaf tensors, so checkpoint replay
+/// and reverse mode use the existing `Add` and `Rmsnorm` operations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FixedAttentionParameters<'a> {
+    /// Query projection bias, empty or `[n_head * head_dim]`.
+    pub q_bias: &'a [f32],
+    /// Key projection bias, empty or `[n_kv_head * head_dim]`.
+    pub k_bias: &'a [f32],
+    /// Value projection bias, empty or `[n_kv_head * head_dim]`.
+    pub v_bias: &'a [f32],
+    /// Per-head query RMSNorm weight, empty or `[head_dim]`.
+    pub q_norm: &'a [f32],
+    /// Per-head key RMSNorm weight, empty or `[head_dim]`.
+    pub k_norm: &'a [f32],
+    /// RMSNorm epsilon used when Q/K norm vectors are present.
+    pub rms_eps: f32,
+}
+
 /// A device-resident autograd tape (plan 0043 P2.5): the GPU analogue of [`tritium_train::Tape`].
 /// Leaves upload once, results download once, and the recorded ops chain the resident kernels
 /// ([`super`]'s `*_dev` methods) with no host round-trips. Forward ops append a device buffer to
@@ -3386,6 +3407,95 @@ pub struct DeviceTape<'backend, 'leaf> {
     live_activation_elements: usize,
     peak_live_activation_elements: usize,
     recomputed_ops: usize,
+}
+
+fn validate_attention_geometry(
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+) -> Result<(usize, usize), BackendError> {
+    if n_head == 0 || n_kv_head == 0 || head_dim == 0 {
+        return Err(BackendError::InvalidInput(
+            "attention head counts and head dimension must be non-zero".into(),
+        ));
+    }
+    if !n_head.is_multiple_of(n_kv_head) {
+        return Err(BackendError::InvalidInput(format!(
+            "attention heads {n_head} must be divisible by KV heads {n_kv_head}"
+        )));
+    }
+    let q_width = n_head
+        .checked_mul(head_dim)
+        .ok_or_else(|| BackendError::InvalidInput("attention Q width overflows usize".into()))?;
+    let kv_width = n_kv_head
+        .checked_mul(head_dim)
+        .ok_or_else(|| BackendError::InvalidInput("attention KV width overflows usize".into()))?;
+    Ok((q_width, kv_width))
+}
+
+fn validate_fixed_attention_parameters(
+    fixed: FixedAttentionParameters<'_>,
+    q_width: usize,
+    kv_width: usize,
+    head_dim: usize,
+) -> Result<(), BackendError> {
+    let bias_presence = [
+        !fixed.q_bias.is_empty(),
+        !fixed.k_bias.is_empty(),
+        !fixed.v_bias.is_empty(),
+    ];
+    if bias_presence.iter().any(|present| *present) && !bias_presence.iter().all(|present| *present)
+    {
+        return Err(BackendError::InvalidInput(
+            "QKV bias vectors must be all present or all absent".into(),
+        ));
+    }
+    let norm_presence = [!fixed.q_norm.is_empty(), !fixed.k_norm.is_empty()];
+    if norm_presence[0] != norm_presence[1] {
+        return Err(BackendError::InvalidInput(
+            "Q/K norm vectors must be both present or both absent".into(),
+        ));
+    }
+    for (name, values, expected) in [
+        ("Q bias", fixed.q_bias, q_width),
+        ("K bias", fixed.k_bias, kv_width),
+        ("V bias", fixed.v_bias, kv_width),
+        ("Q norm", fixed.q_norm, head_dim),
+        ("K norm", fixed.k_norm, head_dim),
+    ] {
+        if !values.is_empty() && values.len() != expected {
+            return Err(BackendError::InvalidInput(format!(
+                "attention {name} has {} elements, expected {expected}",
+                values.len()
+            )));
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(BackendError::InvalidInput(format!(
+                "attention {name} contains a non-finite value"
+            )));
+        }
+    }
+    if norm_presence[0] && (!fixed.rms_eps.is_finite() || fixed.rms_eps <= 0.0) {
+        return Err(BackendError::InvalidInput(
+            "attention Q/K norm epsilon must be finite and positive".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn attention_positions(sequence: usize) -> Result<Vec<i32>, BackendError> {
+    let mut positions = Vec::new();
+    positions
+        .try_reserve_exact(sequence)
+        .map_err(|_| BackendError::OutOfMemory {
+            requested: sequence.saturating_mul(core::mem::size_of::<i32>()),
+        })?;
+    for position in 0..sequence {
+        positions.push(i32::try_from(position).map_err(|_| {
+            BackendError::InvalidInput("attention position exceeds i32::MAX".into())
+        })?);
+    }
+    Ok(positions)
 }
 
 impl core::fmt::Debug for DeviceTape<'_, '_> {
@@ -4171,6 +4281,51 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         self.concat(parts, 1, &lens)
     }
 
+    fn add_fixed_attention_bias(
+        &mut self,
+        value: usize,
+        rows: usize,
+        width: usize,
+        bias: &[f32],
+    ) -> Result<usize, BackendError> {
+        if bias.is_empty() {
+            return Ok(value);
+        }
+        let elements = rows.checked_mul(width).ok_or_else(|| {
+            BackendError::InvalidInput("attention bias expansion overflows usize".into())
+        })?;
+        let mut repeated = Vec::new();
+        repeated
+            .try_reserve_exact(elements)
+            .map_err(|_| BackendError::OutOfMemory {
+                requested: elements.saturating_mul(core::mem::size_of::<f32>()),
+            })?;
+        for _ in 0..rows {
+            repeated.extend_from_slice(bias);
+        }
+        let bias = self.leaf(&repeated)?;
+        self.add(value, bias)
+    }
+
+    fn apply_fixed_qk_norm(
+        &mut self,
+        value: usize,
+        sequence: usize,
+        heads: usize,
+        head_dim: usize,
+        weight: &[f32],
+        eps: f32,
+    ) -> Result<usize, BackendError> {
+        if weight.is_empty() {
+            return Ok(value);
+        }
+        let rows = sequence.checked_mul(heads).ok_or_else(|| {
+            BackendError::InvalidInput("Q/K norm row count overflows usize".into())
+        })?;
+        let weight = self.leaf(weight)?;
+        self.rmsnorm(value, weight, rows, head_dim, eps)
+    }
+
     /// Multi-head causal self-attention with GQA — the device analogue of `tritium_train::nn::attention`.
     /// `x` is `[seq, n_embd]` (normed). Returns the attention output `[seq, n_embd]`.
     #[allow(clippy::too_many_arguments)]
@@ -4188,15 +4343,57 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         head_dim: usize,
         theta: f32,
     ) -> Result<usize, BackendError> {
-        let qd = n_head * head_dim;
-        let kvd = n_kv_head * head_dim;
+        self.attention_with_fixed(
+            x,
+            wq,
+            wk,
+            wv,
+            wo,
+            seq,
+            n_embd,
+            n_head,
+            n_kv_head,
+            head_dim,
+            theta,
+            FixedAttentionParameters::default(),
+        )
+    }
+
+    /// Standard causal GQA with optional fixed QKV bias and per-head Q/K RMSNorm.
+    ///
+    /// The numerical order is projection, bias, Q/K norm, RoPE, attention. All
+    /// fixed-vector contracts are validated before the tape is mutated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_with_fixed(
+        &mut self,
+        x: usize,
+        wq: usize,
+        wk: usize,
+        wv: usize,
+        wo: usize,
+        seq: usize,
+        n_embd: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        theta: f32,
+        fixed: FixedAttentionParameters<'_>,
+    ) -> Result<usize, BackendError> {
+        let (qd, kvd) = validate_attention_geometry(n_head, n_kv_head, head_dim)?;
+        validate_fixed_attention_parameters(fixed, qd, kvd, head_dim)?;
         let group = n_head / n_kv_head;
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let pos: Vec<i32> = (0..seq as i32).collect();
+        let pos = attention_positions(seq)?;
 
         let q = self.matmul(x, wq, seq, qd, n_embd)?;
         let k = self.matmul(x, wk, seq, kvd, n_embd)?;
         let v = self.matmul(x, wv, seq, kvd, n_embd)?;
+        let q = self.add_fixed_attention_bias(q, seq, qd, fixed.q_bias)?;
+        let k = self.add_fixed_attention_bias(k, seq, kvd, fixed.k_bias)?;
+        let v = self.add_fixed_attention_bias(v, seq, kvd, fixed.v_bias)?;
+        let q = self.apply_fixed_qk_norm(q, seq, n_head, head_dim, fixed.q_norm, fixed.rms_eps)?;
+        let k =
+            self.apply_fixed_qk_norm(k, seq, n_kv_head, head_dim, fixed.k_norm, fixed.rms_eps)?;
         let q = self.rope(q, &pos, n_head, head_dim, theta, seq)?;
         let k = self.rope(k, &pos, n_kv_head, head_dim, theta, seq)?;
 
@@ -4240,22 +4437,52 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         head_dim: usize,
         theta: f32,
     ) -> Result<usize, BackendError> {
-        if n_head == 0 || n_kv_head == 0 || head_dim == 0 {
-            return Err(BackendError::InvalidInput(
-                "packed attention head counts and head dimension must be non-zero".into(),
-            ));
-        }
-        let qd = n_head.checked_mul(head_dim).ok_or_else(|| {
-            BackendError::InvalidInput("packed attention Q width overflows usize".into())
-        })?;
-        let kvd = n_kv_head.checked_mul(head_dim).ok_or_else(|| {
-            BackendError::InvalidInput("packed attention KV width overflows usize".into())
-        })?;
-        if !n_head.is_multiple_of(n_kv_head) {
-            return Err(BackendError::InvalidInput(format!(
-                "packed attention heads {n_head} must be divisible by KV heads {n_kv_head}"
-            )));
-        }
+        self.salt_attention_with_fixed(
+            x,
+            wq_master,
+            wq,
+            wk_master,
+            wk,
+            wv_master,
+            wv,
+            wo_master,
+            wo,
+            seq,
+            n_embd,
+            n_head,
+            n_kv_head,
+            head_dim,
+            theta,
+            FixedAttentionParameters::default(),
+        )
+    }
+
+    /// Packed-SALT causal GQA with optional fixed QKV bias and Q/K RMSNorm.
+    ///
+    /// Only matrix projections use packed weights. Fixed vectors are uploaded as
+    /// ordinary leaves and composed from existing replayable tape operations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn salt_attention_with_fixed(
+        &mut self,
+        x: usize,
+        wq_master: usize,
+        wq: &'leaf DevicePackedSaltWeight,
+        wk_master: usize,
+        wk: &'leaf DevicePackedSaltWeight,
+        wv_master: usize,
+        wv: &'leaf DevicePackedSaltWeight,
+        wo_master: usize,
+        wo: &'leaf DevicePackedSaltWeight,
+        seq: usize,
+        n_embd: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        theta: f32,
+        fixed: FixedAttentionParameters<'_>,
+    ) -> Result<usize, BackendError> {
+        let (qd, kvd) = validate_attention_geometry(n_head, n_kv_head, head_dim)?;
+        validate_fixed_attention_parameters(fixed, qd, kvd, head_dim)?;
         let input_len = seq.checked_mul(n_embd).ok_or_else(|| {
             BackendError::InvalidInput("packed attention input shape overflows usize".into())
         })?;
@@ -4285,17 +4512,17 @@ impl<'backend, 'leaf> DeviceTape<'backend, 'leaf> {
         }
         let group = n_head / n_kv_head;
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let pos: Vec<i32> = (0..seq)
-            .map(|position| {
-                i32::try_from(position).map_err(|_| {
-                    BackendError::InvalidInput("attention position exceeds i32::MAX".into())
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        let pos = attention_positions(seq)?;
 
         let q = self.salt_matmul(x, wq_master, wq, seq)?;
         let k = self.salt_matmul(x, wk_master, wk, seq)?;
         let v = self.salt_matmul(x, wv_master, wv, seq)?;
+        let q = self.add_fixed_attention_bias(q, seq, qd, fixed.q_bias)?;
+        let k = self.add_fixed_attention_bias(k, seq, kvd, fixed.k_bias)?;
+        let v = self.add_fixed_attention_bias(v, seq, kvd, fixed.v_bias)?;
+        let q = self.apply_fixed_qk_norm(q, seq, n_head, head_dim, fixed.q_norm, fixed.rms_eps)?;
+        let k =
+            self.apply_fixed_qk_norm(k, seq, n_kv_head, head_dim, fixed.k_norm, fixed.rms_eps)?;
         let q = self.rope(q, &pos, n_head, head_dim, theta, seq)?;
         let k = self.rope(k, &pos, n_kv_head, head_dim, theta, seq)?;
 

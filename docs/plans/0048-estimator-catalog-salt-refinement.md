@@ -49,6 +49,10 @@ coverage and duplicate-plugin tests.
 - [x] Connect complete Qwen evidence namespaces to admitted checkpoint matrices
   and the resumable pure-PTQ master campaign with campaign-wide token-stream
   consistency.
+- [x] Preserve standard SwiGLU QKV bias and conventional per-head Q/K RMSNorm
+  constants through semantic identity, exact dense reconstruction, and
+  replayable resident/packed CUDA training graphs. Qwen3.6 hybrid DeltaNet and
+  gated-attention training remain a separate open integration.
 - Bind block/sliding reconstruction, output-aware initialization and final
   teacher-logit loss into the resumable plan-0043 driver.
 - Keep calibration, reconstruction and validation datasets source-bound and

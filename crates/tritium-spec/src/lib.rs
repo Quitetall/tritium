@@ -1,9 +1,9 @@
 //! # tritium-spec
 //!
-//! The contract every Tritium execution backend implements. One trait,
-//! [`TernaryBackend`], plus the buffer and capability types it speaks. No
-//! implementations live here — `tritium-cpu`, `tritium-cuda`, and future backends
-//! implement this trait; `tritium-runtime` stores them as trait objects.
+//! Versioned contracts every Tritium execution backend implements. This crate
+//! owns [`TernaryBackend`], its buffer/capability vocabulary, and the frozen
+//! [`TrainingOpManifestV1`] portable-training registry. No implementations live
+//! here — device crates provide adapters and `tritium-runtime` selects them.
 //!
 //! ## Object safety
 //!
@@ -31,6 +31,11 @@ pub use tritium_core::{DType, GemmShape, TernaryFormat, TritError};
 
 mod caps;
 pub use caps::DeviceCaps;
+mod training;
+pub use training::{
+    TrainingManifestError, TrainingOpCategoryV1, TrainingOpDescriptorV1, TrainingOpManifestV1,
+    TrainingVjpV1,
+};
 
 /// Parameters for a ternary mixed-precision GEMM call.
 ///

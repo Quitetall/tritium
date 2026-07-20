@@ -947,10 +947,12 @@ The following work deliberately remains open and keeps this plan in progress:
   on an RTX 4090, while CPU-only wheels reject CUDA placement. This is synthetic
   runtime evidence, not pinned-checkpoint, large-K performance, or MTP-oracle
   promotion evidence. It remains a host-orchestrated correctness path: the
-  fused resident decoder does not yet accept SALT V2 projections, and the
-  training architecture does not yet retain Qwen QKV biases or QK-normalization
-  vectors. Those two device/training integrations must precede a Qwen refinement
-  campaign;
+  fused resident decoder does not yet accept SALT V2 projections. The standard
+  SwiGLU training adapter now preserves optional QKV bias and conventional
+  per-head Q/K RMSNorm through dense and packed CUDA graphs, but this does not
+  implement Qwen3.6's hybrid DeltaNet/gated-attention training graph or its
+  zero-centered norm semantics. Those specialized device/training integrations
+  must precede a Qwen3.6 refinement campaign;
 - optimized resident large-K CUDA SALT kernels, SALT V2 fused decoder/prefill
   dispatch, and Qwen3.6's device-resident hybrid recurrent/KV cache remain
   required for practical 27B serving;

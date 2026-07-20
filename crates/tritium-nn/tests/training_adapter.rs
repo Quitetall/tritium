@@ -89,6 +89,26 @@ fn untied_spec() -> ArchSpec {
     spec
 }
 
+fn qwen_attention_spec() -> ArchSpec {
+    let mut spec = spec();
+    spec.qkv_bias = true;
+    spec.qk_norm = true;
+    spec
+}
+
+fn qwen_attention_weights() -> ModelWeights {
+    let mut weights = weights();
+    for (layer_index, layer) in weights.layers.iter_mut().enumerate() {
+        let marker = layer_index as f32 / 16.0;
+        layer.q_bias = vec![0.125 + marker, -0.25, 0.375, -0.5];
+        layer.k_bias = vec![0.25 + marker, -0.125];
+        layer.v_bias = vec![-0.375, 0.5 + marker];
+        layer.q_norm = vec![0.75 + marker, 1.25];
+        layer.k_norm = vec![1.125, 0.875 + marker];
+    }
+    weights
+}
+
 fn untied_weights(marker: f32) -> ModelWeights {
     let mut weights = weights();
     weights.lm_head = Some(dense(5, 4, marker));
@@ -810,19 +830,8 @@ fn official_smollm2_135m_360m_and_1_7b_configs_are_supported() {
 }
 
 #[test]
-fn config_validation_rejects_qkv_bias() {
-    let mut unsupported = spec();
-    unsupported.qkv_bias = true;
-    let error = TiedSwiGluTrainingModel::validate_config(&config(), &unsupported).unwrap_err();
-    assert!(error.to_string().contains("QKV bias"), "{error}");
-}
-
-#[test]
-fn config_validation_rejects_qk_norm() {
-    let mut unsupported = spec();
-    unsupported.qk_norm = true;
-    let error = TiedSwiGluTrainingModel::validate_config(&config(), &unsupported).unwrap_err();
-    assert!(error.to_string().contains("QK norm"), "{error}");
+fn config_validation_accepts_standard_qwen_attention_constants() {
+    TiedSwiGluTrainingModel::validate_config(&config(), &qwen_attention_spec()).unwrap();
 }
 
 #[test]
@@ -862,6 +871,24 @@ fn extraction_rejects_hidden_bias_qk_norm_and_untied_weight_mismatches() {
     let error = TiedSwiGluTrainingModel::extract(&config(), &spec(), &qk_normalized).unwrap_err();
     assert!(error.to_string().contains("QK norm"), "{error}");
 
+    let error = TiedSwiGluTrainingModel::extract(&config(), &qwen_attention_spec(), &weights())
+        .unwrap_err();
+    assert!(error.to_string().contains("q_proj.bias"), "{error}");
+
+    let mut malformed_qwen = qwen_attention_weights();
+    malformed_qwen.layers[1].k_norm.pop();
+    let error =
+        TiedSwiGluTrainingModel::extract(&config(), &qwen_attention_spec(), &malformed_qwen)
+            .unwrap_err();
+    assert!(error.to_string().contains("k_norm.weight"), "{error}");
+
+    let mut non_finite_qwen = qwen_attention_weights();
+    non_finite_qwen.layers[0].q_bias[0] = f32::NAN;
+    let error =
+        TiedSwiGluTrainingModel::extract(&config(), &qwen_attention_spec(), &non_finite_qwen)
+            .unwrap_err();
+    assert!(error.to_string().contains("non-finite"), "{error}");
+
     let error =
         TiedSwiGluTrainingModel::extract(&config(), &spec(), &untied_weights(9.0)).unwrap_err();
     assert!(
@@ -878,6 +905,51 @@ fn extraction_rejects_hidden_bias_qk_norm_and_untied_weight_mismatches() {
     let error =
         TiedSwiGluTrainingModel::extract(&config(), &untied_spec(), &wrong_head).unwrap_err();
     assert!(error.to_string().contains("lm_head.weight"), "{error}");
+}
+
+#[test]
+fn extraction_and_dense_reconstruction_preserve_qwen_attention_constants() {
+    let config = config();
+    let spec = qwen_attention_spec();
+    let source = qwen_attention_weights();
+    let model = TiedSwiGluTrainingModel::extract(&config, &spec, &source).unwrap();
+
+    assert_eq!(model.parameters().len(), 15);
+    assert_eq!(model.architecture().attention_constants.len(), 2);
+    assert_eq!(
+        model.architecture().attention_constants[0].q_bias,
+        source.layers[0].q_bias
+    );
+    assert_eq!(
+        model.architecture().attention_constants[1].k_norm,
+        source.layers[1].k_norm
+    );
+
+    let reconstructed = model.to_dense_weights().unwrap();
+    for (expected, actual) in source.layers.iter().zip(&reconstructed.layers) {
+        assert_eq!(actual.q_bias, expected.q_bias);
+        assert_eq!(actual.k_bias, expected.k_bias);
+        assert_eq!(actual.v_bias, expected.v_bias);
+        assert_eq!(actual.q_norm, expected.q_norm);
+        assert_eq!(actual.k_norm, expected.k_norm);
+    }
+
+    let tokens = [0, 3, 4, 1];
+    let positions = [0, 1, 2, 3];
+    let mut source_runner = ModelRunner::from_weights(
+        config.clone(),
+        source,
+        Box::new(tritium_cpu::CpuBackend::new()),
+    );
+    let mut reconstructed_runner = ModelRunner::from_weights(
+        config,
+        reconstructed,
+        Box::new(tritium_cpu::CpuBackend::new()),
+    );
+    assert_eq!(
+        source_runner.forward(&tokens, &positions).unwrap(),
+        reconstructed_runner.forward(&tokens, &positions).unwrap()
+    );
 }
 
 #[cfg(feature = "cuda")]
@@ -925,6 +997,75 @@ fn upload_packed_parameters(
             .expect("upload packed parameter")
         })
         .collect()
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn resident_qwen_attention_constants_match_cpu_and_packed_path_runs() {
+    use tritium_cuda::train::{DeviceTape, DeviceTensor};
+    use tritium_nn::{packed_device_forward, resident_device_forward};
+
+    let Some(backend) =
+        cuda_backend_or_skip("resident_qwen_attention_constants_match_cpu_and_packed_path_runs")
+    else {
+        return;
+    };
+    let config = config();
+    let spec = qwen_attention_spec();
+    let source = qwen_attention_weights();
+    let model = TiedSwiGluTrainingModel::extract(&config, &spec, &source).unwrap();
+    let tokens = [0_i32, 3, 4, 1];
+    let token_ids: Vec<u32> = tokens
+        .iter()
+        .map(|token| u32::try_from(*token).unwrap())
+        .collect();
+    let positions = [0, 1, 2, 3];
+
+    let mut cpu_runner =
+        ModelRunner::from_weights(config, source, Box::new(tritium_cpu::CpuBackend::new()));
+    let expected = cpu_runner.forward(&token_ids, &positions).unwrap();
+
+    let resident = upload_resident_parameters(&backend, &model);
+    let resident_refs: Vec<_> = resident.iter().collect();
+    let arch = model.architecture();
+    let mut resident_tape =
+        DeviceTape::new(&backend, arch.vocab.max(arch.n_ff).max(tokens.len())).unwrap();
+    let resident_forward =
+        resident_device_forward(&mut resident_tape, &model, &resident_refs, &tokens).unwrap();
+    let actual = resident_tape.value(resident_forward.logits).unwrap();
+    let max_error = actual
+        .iter()
+        .zip(&expected)
+        .map(|(&actual, &expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(max_error <= 2e-4, "CUDA Qwen constants error {max_error:e}");
+
+    let packed = upload_packed_parameters(&backend, &model);
+    let mut packed_tape =
+        DeviceTape::new(&backend, arch.vocab.max(arch.n_ff).max(tokens.len())).unwrap();
+    let packed_forward = packed_device_forward(&mut packed_tape, &model, &packed, &tokens).unwrap();
+    let packed_logits = packed_tape.value(packed_forward.logits).unwrap();
+    assert_eq!(packed_logits.len(), tokens.len() * arch.vocab);
+    assert!(packed_logits.iter().all(|value| value.is_finite()));
+    let target = DeviceTensor::upload(
+        &backend,
+        &vec![1.0 / arch.vocab as f32; tokens.len() * arch.vocab],
+    )
+    .unwrap();
+    let gradients = packed_tape
+        .xent_backward_device(
+            packed_forward.logits,
+            &target,
+            tokens.len(),
+            arch.vocab,
+            &packed_forward.master_leaves,
+        )
+        .unwrap();
+    for (index, parameter) in model.parameters().iter().enumerate() {
+        let gradient = gradients.download(&backend, index).unwrap();
+        assert_eq!(gradient.len(), parameter.elements());
+        assert!(gradient.iter().all(|value| value.is_finite()));
+    }
 }
 
 #[cfg(feature = "cuda")]

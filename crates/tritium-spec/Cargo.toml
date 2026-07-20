@@ -1,6 +1,6 @@
 [package]
 name = "tritium-spec"
-description = "The backend contract every Tritium execution backend implements (object-safe TernaryBackend trait)."
+description = "Versioned inference and portable-training contracts for Tritium execution backends."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,12 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# The contract crate: trait definitions only, zero backend implementations.
-# Depends on tritium-core (types) and nothing else.
+# Contract types and strict language-neutral schema parsing only; zero backend
+# implementations. Serialization dependencies never enter device adapters.
 [dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tritium-core = { workspace = true }
 
 [lints]

@@ -4506,6 +4506,9 @@ dependencies = [
 name = "tritium-spec"
 version = "1.0.0"
 dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
  "tritium-core",
 ]
 
@@ -4532,6 +4535,7 @@ dependencies = [
  "tritium-core",
  "tritium-format",
  "tritium-quantize",
+ "tritium-spec",
  "tritium-testkit",
 ]
 
