@@ -3,17 +3,13 @@
 use tritium_train::{Optimizer, Sgd, checkpoint};
 
 #[test]
-fn sgd_step_matches_decoupled_weight_decay_literal() {
-    let optimizer = Sgd {
-        lr: 0.1,
-        weight_decay: 0.2,
-    };
+fn sgd_step_matches_plain_update_literal() {
+    let optimizer = Sgd { lr: 0.1 };
     let mut parameter = [1.0_f32, -2.0];
     let gradient = [0.5_f32, -0.25];
     let mut state = optimizer.init_state(parameter.len());
     optimizer.step(1, &mut parameter, &gradient, &mut state);
-    // Pin f32 evaluation order: shrink multiply, then gradient subtraction.
-    assert_eq!(parameter, [0.93, -1.935_000_1]);
+    assert_eq!(parameter, [0.95, -1.975]);
 }
 
 #[test]

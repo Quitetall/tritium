@@ -47,27 +47,21 @@ pub trait Optimizer {
     fn read_state(&self, len: usize, cursor: &mut Cursor) -> Result<Self::State, CheckpointError>;
 }
 
-/// Stateless stochastic gradient descent with decoupled weight decay.
+/// Stateless plain stochastic gradient descent.
 ///
 /// This portable reference intentionally excludes momentum: momentum SGD is a
-/// distinct future optimizer identity rather than an ambiguous stateful mode of
-/// `optimizer.sgd`.
+/// distinct future optimizer identity rather than an ambiguous stateful mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sgd {
     /// Learning rate.
     pub lr: f32,
-    /// Decoupled weight-decay coefficient.
-    pub weight_decay: f32,
 }
 
 impl Sgd {
     /// Plain SGD at learning rate `lr`, without weight decay.
     #[must_use]
     pub const fn new(lr: f32) -> Self {
-        Self {
-            lr,
-            weight_decay: 0.0,
-        }
+        Self { lr }
     }
 }
 
@@ -85,9 +79,8 @@ impl Optimizer for Sgd {
     fn step(&self, t: u64, param: &mut [f32], grad: &[f32], _state: &mut Self::State) {
         debug_assert!(t >= 1, "step index t is 1-based");
         assert_eq!(param.len(), grad.len(), "param/grad length mismatch");
-        let shrink = 1.0 - self.lr * self.weight_decay;
         for (parameter, &gradient) in param.iter_mut().zip(grad) {
-            *parameter = *parameter * shrink - self.lr * gradient;
+            *parameter -= self.lr * gradient;
         }
     }
 

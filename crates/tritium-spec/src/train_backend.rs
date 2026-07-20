@@ -15,6 +15,15 @@ pub enum TrainDTypeV1 {
     Bytes,
 }
 
+impl TrainDTypeV1 {
+    const fn element_bytes(self) -> u64 {
+        match self {
+            Self::F32 | Self::U32 => 4,
+            Self::Bytes => 1,
+        }
+    }
+}
+
 /// Immutable named request-buffer payload.
 #[derive(Clone, Copy, Debug)]
 pub enum TrainBufferDataRefV1<'a> {
@@ -32,6 +41,14 @@ impl TrainBufferDataRefV1<'_> {
             Self::F32(data) => data.len(),
             Self::U32(data) => data.len(),
             Self::Bytes(data) => data.len(),
+        }
+    }
+
+    const fn dtype(&self) -> TrainDTypeV1 {
+        match self {
+            Self::F32(_) => TrainDTypeV1::F32,
+            Self::U32(_) => TrainDTypeV1::U32,
+            Self::Bytes(_) => TrainDTypeV1::Bytes,
         }
     }
 }
@@ -54,6 +71,64 @@ impl TrainBufferDataMutV1<'_> {
             Self::U32(data) => data.len(),
             Self::Bytes(data) => data.len(),
         }
+    }
+
+    const fn dtype(&self) -> TrainDTypeV1 {
+        match self {
+            Self::F32(_) => TrainDTypeV1::F32,
+            Self::U32(_) => TrainDTypeV1::U32,
+            Self::Bytes(_) => TrainDTypeV1::Bytes,
+        }
+    }
+}
+
+/// Owned payload used by compilers, fixture loaders and FFI adapters.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrainOwnedBufferDataV1 {
+    /// Owned f32 elements.
+    F32(Vec<f32>),
+    /// Owned u32 elements.
+    U32(Vec<u32>),
+    /// Owned canonical bytes.
+    Bytes(Vec<u8>),
+}
+
+/// Owned counterpart of borrowed named request/output buffers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainOwnedBufferV1 {
+    /// Stable operation-local role name.
+    pub name: String,
+    /// Row-major language-neutral dimensions.
+    pub shape: Vec<u64>,
+    /// Owned typed payload.
+    pub data: TrainOwnedBufferDataV1,
+}
+
+impl TrainOwnedBufferV1 {
+    /// Borrow as an immutable request buffer without copying payload data.
+    #[must_use]
+    pub fn as_ref(&self) -> TrainNamedBufferRefV1<'_> {
+        let data = match &self.data {
+            TrainOwnedBufferDataV1::F32(data) => TrainBufferDataRefV1::F32(data),
+            TrainOwnedBufferDataV1::U32(data) => TrainBufferDataRefV1::U32(data),
+            TrainOwnedBufferDataV1::Bytes(data) => TrainBufferDataRefV1::Bytes(data),
+        };
+        TrainNamedBufferRefV1::new(&self.name, &self.shape, data)
+    }
+
+    /// Borrow as a mutable output buffer without copying payload data.
+    ///
+    /// Rust's exclusive borrow enforces v1 aliasing policy: one owned buffer
+    /// cannot simultaneously back immutable input and mutable output views in
+    /// safe code. FFI adapters must reproduce this check before construction.
+    #[must_use]
+    pub fn as_mut(&mut self) -> TrainNamedBufferMutV1<'_> {
+        let data = match &mut self.data {
+            TrainOwnedBufferDataV1::F32(data) => TrainBufferDataMutV1::F32(data),
+            TrainOwnedBufferDataV1::U32(data) => TrainBufferDataMutV1::U32(data),
+            TrainOwnedBufferDataV1::Bytes(data) => TrainBufferDataMutV1::Bytes(data),
+        };
+        TrainNamedBufferMutV1::new(&self.name, &self.shape, data)
     }
 }
 
@@ -148,6 +223,26 @@ pub enum TrainExecutionV1 {
     Reload,
 }
 
+/// Backend-specific validation ceilings for one request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrainLimitsV1 {
+    /// Maximum admitted rank.
+    pub max_rank: u32,
+    /// Maximum admitted elements in any one buffer.
+    pub max_elements: u64,
+    /// Maximum admitted payload bytes in any one buffer.
+    pub max_bytes: u64,
+}
+
+impl TrainLimitsV1 {
+    /// Language-level maximum used by generic validation before adapter limits.
+    pub const UNBOUNDED: Self = Self {
+        max_rank: u32::MAX,
+        max_elements: u64::MAX,
+        max_bytes: u64::MAX,
+    };
+}
+
 /// Borrowed, validated-at-execution portable training request.
 #[derive(Clone, Copy, Debug)]
 pub struct TrainRequestV1<'a> {
@@ -159,6 +254,8 @@ pub struct TrainRequestV1<'a> {
     pub inputs: &'a [TrainNamedBufferRefV1<'a>],
     /// Named typed attributes.
     pub attributes: &'a [TrainAttributeV1<'a>],
+    /// Exact semantic-vector corpus digest when execution is conformance-bound.
+    pub vector_digest: Option<[u8; 32]>,
 }
 
 impl<'a> TrainRequestV1<'a> {
@@ -175,7 +272,15 @@ impl<'a> TrainRequestV1<'a> {
             execution,
             inputs,
             attributes,
+            vector_digest: None,
         }
+    }
+
+    /// Bind this execution to the exact semantic-vector corpus driving it.
+    #[must_use]
+    pub const fn with_vector_digest(mut self, digest: [u8; 32]) -> Self {
+        self.vector_digest = Some(digest);
+        self
     }
 
     /// Validate manifest membership, phase, names, shapes and buffer lengths.
@@ -187,6 +292,18 @@ impl<'a> TrainRequestV1<'a> {
     /// Returns [`TrainRequestError`] for every malformed contract; this method
     /// never indexes tensor data or allocates from untrusted shape products.
     pub fn validate(&self, output: &TrainOutputV1<'_>) -> Result<(), TrainRequestError> {
+        self.validate_with_limits(output, TrainLimitsV1::UNBOUNDED)
+    }
+
+    /// Validate against explicit backend rank, element and byte ceilings.
+    ///
+    /// # Errors
+    /// Returns [`TrainRequestError`] before adapter dispatch or mutation.
+    pub fn validate_with_limits(
+        &self,
+        output: &TrainOutputV1<'_>,
+        limits: TrainLimitsV1,
+    ) -> Result<(), TrainRequestError> {
         let descriptor = TrainingOpManifestV1::operations()
             .iter()
             .find(|descriptor| descriptor.id == self.operation)
@@ -203,8 +320,8 @@ impl<'a> TrainRequestV1<'a> {
                 execution: self.execution,
             });
         }
-        validate_ref_buffers(self.inputs)?;
-        validate_mut_buffers(output.buffers)?;
+        validate_ref_buffers(self.inputs, limits)?;
+        validate_mut_buffers(output.buffers, limits)?;
         validate_attributes(self.attributes)?;
         Ok(())
     }
@@ -256,6 +373,38 @@ pub enum TrainRequestError {
         /// Buffer role.
         name: String,
     },
+    /// Buffer rank exceeds backend ceiling.
+    RankLimit {
+        /// Buffer role.
+        name: String,
+        /// Observed rank.
+        got: usize,
+        /// Backend ceiling.
+        max: u32,
+    },
+    /// Shape element count exceeds backend ceiling.
+    ElementLimit {
+        /// Buffer role.
+        name: String,
+        /// Shape-derived elements.
+        got: u64,
+        /// Backend ceiling.
+        max: u64,
+    },
+    /// Shape-derived payload byte count overflows u64.
+    ByteCountOverflow {
+        /// Buffer role.
+        name: String,
+    },
+    /// Payload byte count exceeds backend ceiling.
+    ByteLimit {
+        /// Buffer role.
+        name: String,
+        /// Shape-derived bytes.
+        got: u64,
+        /// Backend ceiling.
+        max: u64,
+    },
     /// Shape element count differs from payload length.
     BufferLength {
         /// Buffer role.
@@ -289,6 +438,18 @@ impl fmt::Display for TrainRequestError {
                 write!(f, "duplicate {namespace} name {name:?}")
             }
             Self::ShapeOverflow { name } => write!(f, "shape product overflows for {name:?}"),
+            Self::RankLimit { name, got, max } => {
+                write!(f, "buffer {name:?} rank {got} exceeds limit {max}")
+            }
+            Self::ElementLimit { name, got, max } => {
+                write!(f, "buffer {name:?} has {got} elements, limit is {max}")
+            }
+            Self::ByteCountOverflow { name } => {
+                write!(f, "payload byte count overflows for {name:?}")
+            }
+            Self::ByteLimit { name, got, max } => {
+                write!(f, "buffer {name:?} has {got} bytes, limit is {max}")
+            }
             Self::BufferLength {
                 name,
                 expected,
@@ -315,10 +476,8 @@ pub struct TrainCapabilitiesV1 {
     pub supported_operations: Vec<String>,
     /// Supported storage dtypes; f32 is mandatory for conforming v1 backends.
     pub dtypes: Vec<TrainDTypeV1>,
-    /// Maximum admitted tensor rank.
-    pub max_rank: usize,
-    /// Maximum admitted elements in one buffer.
-    pub max_elements: usize,
+    /// Rank, element and byte ceilings enforced before dispatch.
+    pub limits: TrainLimitsV1,
     /// True only when steady-state execution remains on declared device.
     pub device_resident: bool,
 }
@@ -326,25 +485,102 @@ pub struct TrainCapabilitiesV1 {
 /// Content-bound receipt for one backend execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrainReceiptV1 {
-    /// Stable physical/backend identity.
+    /// Stable backend adapter identity.
     pub backend_id: String,
+    /// Version/build identity of adapter implementation.
+    pub backend_build: String,
+    /// Physical device identity when receipted; `None` is never release-admissible.
+    pub physical_device: Option<String>,
     /// Exact manifest digest used for dispatch.
     pub manifest_digest: [u8; 32],
+    /// Canonical semantic-vector corpus digest, when execution is vector-bound.
+    pub vector_digest: Option<[u8; 32]>,
     /// Executed permanent operation ID.
     pub operation: String,
     /// Executed semantic phase.
     pub execution: TrainExecutionV1,
+    /// Storage dtype used by primary numeric tensors.
+    pub dtype: TrainDTypeV1,
+    /// Enforced backend ceilings.
+    pub limits: TrainLimitsV1,
     /// Digest of canonical request buffers/attributes.
     pub input_digest: [u8; 32],
     /// Digest of canonical output buffers.
     pub output_digest: [u8; 32],
-    /// Peak temporary allocation in bytes.
-    pub scratch_bytes: usize,
+    /// Peak caller-visible resident tensor bytes.
+    pub peak_resident_bytes: u64,
+    /// Peak temporary tensor scratch bytes.
+    pub scratch_bytes: u64,
     /// Tensor host-transfer count after setup.
     pub host_transfers: u64,
     /// Whether tensor execution remained on declared device.
     pub device_resident: bool,
 }
+
+/// Structured operation-schema failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrainOperationErrorV1 {
+    /// Named input, attribute or output roles differ from frozen operation schema.
+    Roles {
+        /// Input, attribute or output namespace.
+        namespace: &'static str,
+    },
+    /// Named buffer has wrong dtype.
+    DType {
+        /// Buffer role.
+        name: String,
+        /// Required dtype.
+        expected: TrainDTypeV1,
+        /// Supplied dtype.
+        got: TrainDTypeV1,
+    },
+    /// Operation-specific shapes disagree.
+    Shape,
+    /// Numeric buffer contains NaN or infinity where forbidden.
+    NonFinite {
+        /// Buffer role.
+        name: String,
+    },
+    /// Named attribute has wrong typed variant.
+    AttributeType {
+        /// Attribute role.
+        name: String,
+        /// Required type name.
+        expected: &'static str,
+    },
+    /// Named attribute value violates operation constraints.
+    AttributeValue {
+        /// Attribute role.
+        name: String,
+        /// Stable constraint code.
+        constraint: &'static str,
+    },
+}
+
+impl fmt::Display for TrainOperationErrorV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Roles { namespace } => {
+                write!(f, "{namespace} roles differ from operation schema")
+            }
+            Self::DType {
+                name,
+                expected,
+                got,
+            } => write!(f, "buffer {name:?} has {got:?}, expected {expected:?}"),
+            Self::Shape => write!(f, "operation shapes disagree"),
+            Self::NonFinite { name } => write!(f, "buffer {name:?} contains non-finite values"),
+            Self::AttributeType { name, expected } => {
+                write!(f, "attribute {name:?} must be {expected}")
+            }
+            Self::AttributeValue { name, constraint } => {
+                write!(f, "attribute {name:?} violates {constraint}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TrainOperationErrorV1 {}
 
 /// Fallible backend execution failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -354,9 +590,14 @@ pub enum TrainBackendError {
     /// Manifest operation is valid but adapter does not implement it.
     UnsupportedOperation(String),
     /// Adapter rejected operation-specific roles/attributes.
-    InvalidOperation(String),
+    InvalidOperation(TrainOperationErrorV1),
     /// Device/runtime failure.
-    Backend(String),
+    Backend {
+        /// Stable backend-specific error code.
+        code: String,
+        /// Human-readable diagnostic.
+        message: String,
+    },
 }
 
 impl fmt::Display for TrainBackendError {
@@ -366,8 +607,10 @@ impl fmt::Display for TrainBackendError {
             Self::UnsupportedOperation(operation) => {
                 write!(f, "unsupported training operation {operation:?}")
             }
-            Self::InvalidOperation(message) => write!(f, "invalid operation contract: {message}"),
-            Self::Backend(message) => write!(f, "training backend failed: {message}"),
+            Self::InvalidOperation(error) => write!(f, "invalid operation contract: {error}"),
+            Self::Backend { code, message } => {
+                write!(f, "training backend failed ({code}): {message}")
+            }
         }
     }
 }
@@ -376,6 +619,7 @@ impl std::error::Error for TrainBackendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidRequest(error) => Some(error),
+            Self::InvalidOperation(error) => Some(error),
             _ => None,
         }
     }
@@ -394,8 +638,9 @@ pub trait TrainBackendV1: Send + Sync {
 
     /// Execute one manifest operation into caller-owned buffers.
     ///
-    /// Implementations must call [`TrainRequestV1::validate`] before reading or
-    /// mutating any buffer and must not claim device residency after fallback.
+    /// Implementations must call [`TrainRequestV1::validate_with_limits`] before
+    /// reading or mutating any buffer and must not claim device residency after
+    /// fallback.
     ///
     /// # Errors
     /// Returns [`TrainBackendError`] for malformed contracts, unsupported
@@ -432,29 +677,111 @@ fn valid_name(name: &str) -> bool {
         })
 }
 
-fn checked_elements(name: &str, shape: &[u64]) -> Result<usize, TrainRequestError> {
-    shape.iter().try_fold(1_usize, |elements, &dimension| {
-        let dimension =
-            usize::try_from(dimension).map_err(|_| TrainRequestError::ShapeOverflow {
-                name: name.to_owned(),
-            })?;
+fn checked_elements(
+    name: &str,
+    shape: &[u64],
+    dtype: TrainDTypeV1,
+    limits: TrainLimitsV1,
+) -> Result<usize, TrainRequestError> {
+    if shape.len() > limits.max_rank as usize {
+        return Err(TrainRequestError::RankLimit {
+            name: name.to_owned(),
+            got: shape.len(),
+            max: limits.max_rank,
+        });
+    }
+    let elements = shape.iter().try_fold(1_u64, |elements, &dimension| {
         elements
             .checked_mul(dimension)
             .ok_or_else(|| TrainRequestError::ShapeOverflow {
                 name: name.to_owned(),
             })
+    })?;
+    if elements > limits.max_elements {
+        return Err(TrainRequestError::ElementLimit {
+            name: name.to_owned(),
+            got: elements,
+            max: limits.max_elements,
+        });
+    }
+    let bytes = elements.checked_mul(dtype.element_bytes()).ok_or_else(|| {
+        TrainRequestError::ByteCountOverflow {
+            name: name.to_owned(),
+        }
+    })?;
+    if bytes > limits.max_bytes {
+        return Err(TrainRequestError::ByteLimit {
+            name: name.to_owned(),
+            got: bytes,
+            max: limits.max_bytes,
+        });
+    }
+    usize::try_from(elements).map_err(|_| TrainRequestError::ShapeOverflow {
+        name: name.to_owned(),
     })
 }
 
-fn validate_ref_buffers(buffers: &[TrainNamedBufferRefV1<'_>]) -> Result<(), TrainRequestError> {
+trait BufferMetadata {
+    fn name(&self) -> &str;
+    fn shape(&self) -> &[u64];
+    fn len(&self) -> usize;
+    fn dtype(&self) -> TrainDTypeV1;
+}
+
+impl BufferMetadata for TrainNamedBufferRefV1<'_> {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn shape(&self) -> &[u64] {
+        self.shape
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn dtype(&self) -> TrainDTypeV1 {
+        self.data.dtype()
+    }
+}
+
+impl BufferMetadata for TrainNamedBufferMutV1<'_> {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn shape(&self) -> &[u64] {
+        self.shape
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn dtype(&self) -> TrainDTypeV1 {
+        self.data.dtype()
+    }
+}
+
+fn validate_buffers<T: BufferMetadata>(
+    buffers: &[T],
+    namespace: &'static str,
+    limits: TrainLimitsV1,
+) -> Result<(), TrainRequestError> {
     for (index, buffer) in buffers.iter().enumerate() {
-        validate_name("input", buffer.name)?;
-        reject_prior_name("input", buffer.name, &buffers[..index], |item| item.name)?;
-        let expected = checked_elements(buffer.name, buffer.shape)?;
-        let got = buffer.data.len();
+        validate_name(namespace, buffer.name())?;
+        reject_prior_name(
+            namespace,
+            buffer.name(),
+            &buffers[..index],
+            BufferMetadata::name,
+        )?;
+        let expected = checked_elements(buffer.name(), buffer.shape(), buffer.dtype(), limits)?;
+        let got = buffer.len();
         if expected != got {
             return Err(TrainRequestError::BufferLength {
-                name: buffer.name.to_owned(),
+                name: buffer.name().to_owned(),
                 expected,
                 got,
             });
@@ -463,21 +790,18 @@ fn validate_ref_buffers(buffers: &[TrainNamedBufferRefV1<'_>]) -> Result<(), Tra
     Ok(())
 }
 
-fn validate_mut_buffers(buffers: &[TrainNamedBufferMutV1<'_>]) -> Result<(), TrainRequestError> {
-    for (index, buffer) in buffers.iter().enumerate() {
-        validate_name("output", buffer.name)?;
-        reject_prior_name("output", buffer.name, &buffers[..index], |item| item.name)?;
-        let expected = checked_elements(buffer.name, buffer.shape)?;
-        let got = buffer.data.len();
-        if expected != got {
-            return Err(TrainRequestError::BufferLength {
-                name: buffer.name.to_owned(),
-                expected,
-                got,
-            });
-        }
-    }
-    Ok(())
+fn validate_ref_buffers(
+    buffers: &[TrainNamedBufferRefV1<'_>],
+    limits: TrainLimitsV1,
+) -> Result<(), TrainRequestError> {
+    validate_buffers(buffers, "input", limits)
+}
+
+fn validate_mut_buffers(
+    buffers: &[TrainNamedBufferMutV1<'_>],
+    limits: TrainLimitsV1,
+) -> Result<(), TrainRequestError> {
+    validate_buffers(buffers, "output", limits)
 }
 
 fn validate_attributes(attributes: &[TrainAttributeV1<'_>]) -> Result<(), TrainRequestError> {

@@ -98,7 +98,9 @@ operations declare mutation and checkpoint planes explicitly.
 
 Composed attention remains a registered semantic operation even though the Rust
 reference currently composes primitive Tape nodes. SGD receives a portable
-reference implementation before registry closure.
+reference implementation before registry closure. `optimizer.sgd` is stateless
+plain SGD with `parameter -= lr * gradient` in f32 order; momentum and weight
+decay require distinct future operation identities.
 
 ## Slice 1 — schema, registry and exhaustive audit
 

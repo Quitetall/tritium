@@ -35,21 +35,34 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
     assert_eq!(result, [4.0, 2.0, -1.0]);
     assert_eq!(receipt.operation, "graph.add");
     assert_eq!(receipt.execution, TrainExecutionV1::Forward);
+    let build_digest = receipt
+        .backend_build
+        .strip_prefix(concat!(
+            "tritium-train@",
+            env!("CARGO_PKG_VERSION"),
+            "+source-blake3:"
+        ))
+        .unwrap();
+    assert_eq!(build_digest.len(), 64);
+    assert!(build_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(receipt.physical_device, None);
+    assert_eq!(receipt.vector_digest, None);
     assert_eq!(
         receipt.input_digest,
         [
-            82, 83, 162, 16, 153, 77, 48, 152, 28, 138, 66, 39, 163, 176, 131, 161, 245, 101,
-            60, 30, 201, 216, 245, 144, 163, 55, 42, 70, 150, 39, 153, 160,
+            82, 83, 162, 16, 153, 77, 48, 152, 28, 138, 66, 39, 163, 176, 131, 161, 245, 101, 60,
+            30, 201, 216, 245, 144, 163, 55, 42, 70, 150, 39, 153, 160,
         ]
     );
     assert_eq!(
         receipt.output_digest,
         [
-            30, 138, 229, 175, 36, 160, 192, 254, 105, 221, 118, 2, 39, 115, 132, 122, 145,
-            90, 76, 153, 179, 6, 175, 154, 208, 5, 233, 204, 41, 27, 247, 103,
+            30, 138, 229, 175, 36, 160, 192, 254, 105, 221, 118, 2, 39, 115, 132, 122, 145, 90, 76,
+            153, 179, 6, 175, 154, 208, 5, 233, 204, 41, 27, 247, 103,
         ]
     );
     assert_eq!(receipt.scratch_bytes, 0);
+    assert_eq!(receipt.peak_resident_bytes, 36);
     assert_eq!(receipt.host_transfers, 0);
     assert!(receipt.device_resident);
 
@@ -88,7 +101,6 @@ fn cpu_sgd_step_matches_portable_literal() {
     let attributes = [
         TrainAttributeV1::new("step", TrainAttributeValueV1::U64(1)),
         TrainAttributeV1::new("lr", TrainAttributeValueV1::F32(0.1)),
-        TrainAttributeV1::new("weight_decay", TrainAttributeValueV1::F32(0.2)),
     ];
     let request = TrainRequestV1::new(
         "optimizer.sgd",
@@ -104,7 +116,7 @@ fn cpu_sgd_step_matches_portable_literal() {
     )];
     let mut output = TrainOutputV1::new(&mut buffers);
     backend.execute(request, &mut output).unwrap();
-    assert_eq!(updated, [0.93, -1.935_000_1]);
+    assert_eq!(updated, [0.95, -1.975]);
 }
 
 #[test]
@@ -129,4 +141,49 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
         Err(TrainBackendError::UnsupportedOperation(operation)) if operation == "graph.relu2"
     ));
     assert_eq!(sentinel, [123.0]);
+
+    let left = [1.0_f32];
+    let right = [2.0_f32];
+    let reordered = [
+        TrainNamedBufferRefV1::new("right", &[1], TrainBufferDataRefV1::F32(&right)),
+        TrainNamedBufferRefV1::new("left", &[1], TrainBufferDataRefV1::F32(&left)),
+    ];
+    let request = TrainRequestV1::new("graph.add", TrainExecutionV1::Forward, &reordered, &[]);
+    let mut sentinel = [456.0_f32];
+    let mut buffers = [TrainNamedBufferMutV1::new(
+        "result",
+        &[1],
+        TrainBufferDataMutV1::F32(&mut sentinel),
+    )];
+    let mut output = TrainOutputV1::new(&mut buffers);
+    assert!(matches!(
+        backend.execute(request, &mut output),
+        Err(TrainBackendError::InvalidOperation(_))
+    ));
+    assert_eq!(sentinel, [456.0]);
+
+    let grad_output = [7.0_f32];
+    let inputs = [TrainNamedBufferRefV1::new(
+        "grad_output",
+        &[1],
+        TrainBufferDataRefV1::F32(&grad_output),
+    )];
+    let request = TrainRequestV1::new("graph.add", TrainExecutionV1::Vjp, &inputs, &[]);
+    let mut grad_left = [789.0_f32];
+    let mut wrong_grad_right = [321_u32];
+    let mut buffers = [
+        TrainNamedBufferMutV1::new("grad_left", &[1], TrainBufferDataMutV1::F32(&mut grad_left)),
+        TrainNamedBufferMutV1::new(
+            "grad_right",
+            &[1],
+            TrainBufferDataMutV1::U32(&mut wrong_grad_right),
+        ),
+    ];
+    let mut output = TrainOutputV1::new(&mut buffers);
+    assert!(matches!(
+        backend.execute(request, &mut output),
+        Err(TrainBackendError::InvalidOperation(_))
+    ));
+    assert_eq!(grad_left, [789.0]);
+    assert_eq!(wrong_grad_right, [321]);
 }
