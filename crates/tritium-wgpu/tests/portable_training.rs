@@ -11,6 +11,9 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
     ))
     .expect("parse canonical training vectors");
     let backend = WgpuTrainBackendV1::new().expect("open native wgpu adapter");
+    backend
+        .validate_dispatch_catalog()
+        .expect("compile every shared WebGPU dispatch stage");
     let report = run_supported_training_conformance(&backend, &vectors);
     assert!(
         report.is_ok(),

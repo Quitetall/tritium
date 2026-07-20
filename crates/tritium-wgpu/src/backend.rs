@@ -12,6 +12,8 @@ use tritium_format::{
 };
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
+use crate::dispatch_catalog::{PORTABLE_DISPATCH_FORMS_V1, portable_shader_source_v1};
+
 /// Workgroup size for the 1-D flattened-output dispatch (must match the WGSL
 /// `@workgroup_size`).
 const WG_SIZE: u32 = 64;
@@ -946,6 +948,53 @@ impl WgpuBackend {
             })
         }
         init().block_on()
+    }
+
+    /// Compile every unique module/entry-point pair from shared portable
+    /// dispatch catalog on selected physical adapter.
+    ///
+    /// # Errors
+    /// Returns backend error when catalog references missing source or WGSL
+    /// source/entry point fails device validation.
+    pub fn validate_portable_dispatch_catalog(&self) -> Result<(), BackendError> {
+        let mut compiled = std::collections::BTreeSet::new();
+        for form in PORTABLE_DISPATCH_FORMS_V1 {
+            for stage in form.stages {
+                if !compiled.insert((stage.module_id, stage.entry_point)) {
+                    continue;
+                }
+                let source = portable_shader_source_v1(stage.module_id).ok_or_else(|| {
+                    BackendError::Backend(format!(
+                        "missing portable WebGPU module {}",
+                        stage.module_id
+                    ))
+                })?;
+                self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let shader = self
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("portable-dispatch-catalog-module"),
+                        source: wgpu::ShaderSource::Wgsl(source.into()),
+                    });
+                let _pipeline =
+                    self.device
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("portable-dispatch-catalog-pipeline"),
+                            layout: None,
+                            module: &shader,
+                            entry_point: Some(stage.entry_point),
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            cache: None,
+                        });
+                if let Some(error) = self.device.pop_error_scope().block_on() {
+                    return Err(BackendError::Backend(format!(
+                        "portable WebGPU catalog {}|{} {}.{} failed validation: {error}",
+                        form.operation, form.execution, stage.module_id, stage.entry_point,
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Physical adapter identity used to bind portable-training receipts.

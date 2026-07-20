@@ -230,10 +230,16 @@ candidate set copied byte-for-byte from `tritium-wgpu`, and binds those bytes
 plus a candidate 31-operation module-dependency index into one SHA-256 identity.
 Generation fails on manifest drift or missing candidate modules. The native
 inference-only `mpgemm.wgsl` is intentionally outside this training candidate
-set. The shared execution-aware 57-form catalog—including validated WGSL,
-selectors, entry points, binding layouts, dispatch geometry and repeated
-stages—remains open with browser device admission, resident buffer scheduling,
-pipeline compilation/dispatch and physical conformance.
+set. A generated, schema-versioned catalog now freezes all 57 execution forms,
+including ordered stages, native pointwise selectors, entry points, dispatch
+geometry and repeated-stage policy. The browser bundle derives immutable
+binding declarations and workgroup sizes from the exact bundled WGSL and
+generation rejects missing modules or entry points. Native `tritium-wgpu`
+consumes the same catalog for pointwise selector selection and compiles every
+unique catalog module/entry-point pair on the selected physical adapter before
+running all 114 portable-training vectors. Resident browser buffer scheduling,
+device admission, pipeline dispatch and physical browser conformance remain
+open.
 
 Implement all 35 manifest operations with WGSL compute pipelines and explicit
 VJPs. Kernels may be fused after semantic parity, but the frozen public

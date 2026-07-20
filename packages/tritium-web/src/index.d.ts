@@ -450,6 +450,15 @@ export interface WebGpuKernelModuleV1 {
   readonly id: string;
   readonly sha256: string;
   readonly source: string;
+  readonly bindings: readonly WebGpuKernelBindingV1[];
+  readonly entryPoints: Readonly<Record<string, readonly [number, number, number]>>;
+}
+
+export interface WebGpuKernelBindingV1 {
+  readonly group: number;
+  readonly binding: number;
+  readonly addressSpace: "uniform" | "storage";
+  readonly access: "read" | "read_write" | null;
 }
 
 export interface WebGpuKernelCandidateBundleV1 {
@@ -466,3 +475,42 @@ export declare function webGpuKernelCandidateBundleV1(): WebGpuKernelCandidateBu
 export declare function webGpuCandidateModulesForOperationV1(
   operation: string,
 ): readonly WebGpuKernelModuleV1[];
+
+export type WebGpuDispatchExecutionV1 = "forward" | "vjp" | "step";
+export type WebGpuDispatchRepeatV1 = "once" | "per_output";
+export type WebGpuDispatchGeometryV1 =
+  | "linear_input_64"
+  | "linear_output_64"
+  | "linear_parameter_64"
+  | "linear_primary_input_64"
+  | "linear_rows_64"
+  | "optimizer_blocks_256"
+  | "rope_pairs_64"
+  | "single";
+
+export interface WebGpuDispatchStageV1 {
+  readonly moduleId: string;
+  readonly entryPoint: string;
+  readonly selector: number | null;
+  readonly dispatch: WebGpuDispatchGeometryV1;
+  readonly repeat: WebGpuDispatchRepeatV1;
+}
+
+export interface WebGpuDispatchFormV1 {
+  readonly operation: string;
+  readonly execution: WebGpuDispatchExecutionV1;
+  readonly stages: readonly WebGpuDispatchStageV1[];
+}
+
+export interface WebGpuDispatchCatalogV1 {
+  readonly schemaId: "tritium.webgpu_dispatch_catalog";
+  readonly schemaVersion: 1;
+  readonly sha256: string;
+  readonly forms: Readonly<Record<string, WebGpuDispatchFormV1>>;
+}
+
+export declare function webGpuDispatchCatalogV1(): WebGpuDispatchCatalogV1;
+export declare function webGpuDispatchFormV1(
+  operation: string,
+  execution: WebGpuDispatchExecutionV1,
+): WebGpuDispatchFormV1;

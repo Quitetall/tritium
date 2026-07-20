@@ -15,6 +15,8 @@
 #[cfg(feature = "wgpu")]
 mod backend;
 #[cfg(feature = "wgpu")]
+mod dispatch_catalog;
+#[cfg(feature = "wgpu")]
 pub use backend::{WgpuBackend, WgpuBuffer};
 #[cfg(feature = "wgpu")]
 mod train;

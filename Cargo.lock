@@ -4586,6 +4586,7 @@ dependencies = [
  "half",
  "linkme",
  "pollster",
+ "serde_json",
  "tritium-build-info",
  "tritium-core",
  "tritium-format",

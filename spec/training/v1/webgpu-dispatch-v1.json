@@ -1,0 +1,922 @@
+{
+  "schema_id": "tritium.webgpu_dispatch_catalog",
+  "schema_version": 1,
+  "forms": [
+    {
+      "operation": "graph.ste_surrogate",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 33,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.ste_surrogate",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 34,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 1,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.salt_ste",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "salt",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.salt_ste",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 0,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.lsq_ste",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 35,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.lsq_ste",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 36,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 37,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.fsq",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "fsq",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_input_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.fsq",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "fsq",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_input_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.dense_matmul",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 26,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.dense_matmul",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 27,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 28,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.ternary_matmul",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 29,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.ternary_matmul",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 30,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 31,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 32,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.transpose",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 22,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.transpose",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 23,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.embedding_gather",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "embedding",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.embedding_gather",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "embedding",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.slice_cols",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 24,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.slice_cols",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 25,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.concat_cols",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "concat",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.concat_cols",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 24,
+          "dispatch": "linear_output_64",
+          "repeat": "per_output"
+        }
+      ]
+    },
+    {
+      "operation": "graph.detach",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 0,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.detach",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 1,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.scale_const",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 2,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.scale_const",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 2,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.bias",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 18,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.bias",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 19,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 20,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.add",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 3,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.add",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 0,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 0,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.mul",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 4,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.mul",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 4,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 4,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.conv1d",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "conv",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.conv1d",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "conv",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.conv2d",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "conv",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.conv2d",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "conv",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.relu2",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 5,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.relu2",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 6,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.silu",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 7,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.silu",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 8,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.rmsnorm",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 13,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.rmsnorm",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 14,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 15,
+          "dispatch": "linear_primary_input_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.softmax",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 11,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.softmax",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 12,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.causal_mask",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 9,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.causal_mask",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 10,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.rope",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "rope",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "rope_pairs_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.rope",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "rope",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "rope_pairs_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.attention",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "attention",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "graph.attention",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "attention",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "loss.mse",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 16,
+          "dispatch": "linear_primary_input_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "loss.mse",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 17,
+          "dispatch": "linear_output_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "loss.softmax_cross_entropy",
+      "execution": "forward",
+      "stages": [
+        {
+          "moduleId": "softmax_xent",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "loss.softmax_cross_entropy",
+      "execution": "vjp",
+      "stages": [
+        {
+          "moduleId": "softmax_xent",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "optimizer.sgd",
+      "execution": "step",
+      "stages": [
+        {
+          "moduleId": "pointwise",
+          "entryPoint": "main",
+          "selector": 21,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "optimizer.adamw",
+      "execution": "step",
+      "stages": [
+        {
+          "moduleId": "adamw",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "adamw_terms",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "adamw_variance",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "adamw_finish",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "optimizer.cautious_adamw",
+      "execution": "step",
+      "stages": [
+        {
+          "moduleId": "adamw",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "adamw_terms",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "adamw_variance",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "cautious_adamw_mask",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "cautious_adamw_lr",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "cautious_adamw_rescale",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "cautious_adamw_finish",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "optimizer.int8_adamw",
+      "execution": "step",
+      "stages": [
+        {
+          "moduleId": "int8_adamw",
+          "entryPoint": "dequantize",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "int8_adamw",
+          "entryPoint": "square_variance",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "int8_adamw",
+          "entryPoint": "products",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "int8_adamw",
+          "entryPoint": "finish_products",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "int8_adamw",
+          "entryPoint": "finish_variance",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "int8_adamw",
+          "entryPoint": "update_parameter",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "int8_adamw",
+          "entryPoint": "reduce_scales",
+          "selector": null,
+          "dispatch": "optimizer_blocks_256",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "int8_adamw",
+          "entryPoint": "quantize",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        }
+      ]
+    },
+    {
+      "operation": "optimizer.muon",
+      "execution": "step",
+      "stages": [
+        {
+          "moduleId": "muon",
+          "entryPoint": "main",
+          "selector": null,
+          "dispatch": "single",
+          "repeat": "once"
+        }
+      ]
+    }
+  ]
+}

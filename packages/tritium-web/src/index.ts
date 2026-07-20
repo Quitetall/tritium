@@ -22,6 +22,8 @@ export {
 export { executePortableWasmRequest, runPortableWasmConformance } from "./wasm.ts";
 export { createPortableWasmTrainingAdapter } from "./wasm-adapter.ts";
 export {
+  webGpuDispatchCatalogV1,
+  webGpuDispatchFormV1,
   webGpuCandidateModulesForOperationV1,
   webGpuKernelCandidateBundleV1,
 } from "./webgpu-kernels.ts";
@@ -111,6 +113,13 @@ export type {
   WebTrainingState,
 } from "./session.ts";
 export type {
+  WebGpuDispatchCatalogV1,
+  WebGpuDispatchExecutionV1,
+  WebGpuDispatchFormV1,
+  WebGpuDispatchGeometryV1,
+  WebGpuDispatchRepeatV1,
+  WebGpuDispatchStageV1,
+  WebGpuKernelBindingV1,
   WebGpuKernelCandidateBundleV1,
   WebGpuKernelModuleV1,
 } from "./webgpu-kernels.ts";

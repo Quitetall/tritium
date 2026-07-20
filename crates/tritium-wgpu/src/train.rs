@@ -10,6 +10,7 @@ use tritium_spec::{
 use crate::{
     WgpuBackend,
     backend::{AdamWParams, AdamWScalars, AttentionParams, ConvParams, FsqParams, MuonParams},
+    dispatch_catalog::portable_pointwise_selector_v1,
 };
 
 const OPERATIONS: &[&str] = &[
@@ -59,6 +60,23 @@ const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONV_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ATTENTION_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 
+fn execution_id(execution: TrainExecutionV1) -> &'static str {
+    match execution {
+        TrainExecutionV1::Forward => "forward",
+        TrainExecutionV1::Vjp => "vjp",
+        TrainExecutionV1::Step => "step",
+        TrainExecutionV1::Checkpoint => "checkpoint",
+        TrainExecutionV1::Resume => "resume",
+        TrainExecutionV1::Export => "export",
+        TrainExecutionV1::Reload => "reload",
+    }
+}
+
+fn catalog_selector(request: &TrainRequestV1<'_>, stage: usize) -> Result<u32, TrainBackendError> {
+    portable_pointwise_selector_v1(request.operation, execution_id(request.execution), stage)
+        .ok_or_else(|| invariant("pointwise dispatch selector missing from shared catalog"))
+}
+
 /// Native-wgpu implementation of the frozen portable-training seam.
 ///
 /// The initial proved slice contains lifecycle operations only. These operate
@@ -83,6 +101,16 @@ impl WgpuTrainBackendV1 {
             backend,
             physical_device,
         })
+    }
+
+    /// Compile every shared portable dispatch module/entry point on selected
+    /// physical adapter.
+    ///
+    /// # Errors
+    /// Returns backend error when catalog WGSL or an entry point fails device
+    /// validation.
+    pub fn validate_dispatch_catalog(&self) -> Result<(), BackendError> {
+        self.backend.validate_portable_dispatch_catalog()
     }
 
     fn execute_pointwise(
@@ -173,40 +201,72 @@ impl WgpuTrainBackendV1 {
         };
         let results = match (request.operation, request.execution) {
             ("graph.detach", TrainExecutionV1::Forward) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 0, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.detach", TrainExecutionV1::Vjp) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 1, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.scale_const", _) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 2, scalar, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    scalar,
+                    auxiliary,
+                )]
             }
             ("graph.add", TrainExecutionV1::Forward) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 3, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.add", TrainExecutionV1::Vjp) => vec![
-                self.backend
-                    .pointwise(first, second, first, 0, 0.0, auxiliary),
-                self.backend
-                    .pointwise(first, second, first, 0, 0.0, auxiliary),
+                self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                ),
+                self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 1)?,
+                    0.0,
+                    auxiliary,
+                ),
             ],
             ("graph.mul", TrainExecutionV1::Forward) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 4, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.mul", TrainExecutionV1::Vjp) => {
                 let (left_shape, left) = input_f32(request, "left")?;
@@ -219,59 +279,103 @@ impl WgpuTrainBackendV1 {
                 require_finite("right", right)?;
                 require_finite("grad_output", gradient)?;
                 vec![
-                    self.backend
-                        .pointwise(gradient, right, gradient, 4, 0.0, auxiliary),
-                    self.backend
-                        .pointwise(gradient, left, gradient, 4, 0.0, auxiliary),
+                    self.backend.pointwise(
+                        gradient,
+                        right,
+                        gradient,
+                        catalog_selector(request, 0)?,
+                        0.0,
+                        auxiliary,
+                    ),
+                    self.backend.pointwise(
+                        gradient,
+                        left,
+                        gradient,
+                        catalog_selector(request, 1)?,
+                        0.0,
+                        auxiliary,
+                    ),
                 ]
             }
             ("graph.relu2", TrainExecutionV1::Forward) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 5, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.relu2", TrainExecutionV1::Vjp) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 6, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.silu", TrainExecutionV1::Forward) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 7, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.silu", TrainExecutionV1::Vjp) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 8, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.causal_mask", TrainExecutionV1::Forward) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 9, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.causal_mask", TrainExecutionV1::Vjp) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 10, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.softmax", TrainExecutionV1::Forward) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 11, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             ("graph.softmax", TrainExecutionV1::Vjp) => {
-                vec![
-                    self.backend
-                        .pointwise(first, second, first, 12, 0.0, auxiliary),
-                ]
+                vec![self.backend.pointwise(
+                    first,
+                    second,
+                    first,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    auxiliary,
+                )]
             }
             _ => unreachable!(),
         };
@@ -359,7 +463,14 @@ impl WgpuTrainBackendV1 {
             require_finite("grad_output", gradient)?;
             let result = self
                 .backend
-                .pointwise(gradient, gradient, gradient, 0, 0.0, 0)
+                .pointwise(
+                    gradient,
+                    gradient,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    0,
+                )
                 .map_err(wgpu_error)?;
             output_f32(output, "grad_weight", &shape, elements as usize)?.copy_from_slice(&result);
             Ok(0)
@@ -602,17 +713,38 @@ impl WgpuTrainBackendV1 {
         if request.execution == TrainExecutionV1::Forward {
             let result = self
                 .backend
-                .pointwise(x, weight, gradient, 13, eps, cols as u32)
+                .pointwise(
+                    x,
+                    weight,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    eps,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             output_f32(output, "result", &matrix_shape, x.len())?.copy_from_slice(&result);
         } else {
             let grad_x = self
                 .backend
-                .pointwise(x, weight, gradient, 14, eps, cols as u32)
+                .pointwise(
+                    x,
+                    weight,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    eps,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             let grad_weight_full = self
                 .backend
-                .pointwise(x, weight, gradient, 15, eps, cols as u32)
+                .pointwise(
+                    x,
+                    weight,
+                    gradient,
+                    catalog_selector(request, 1)?,
+                    eps,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             output_f32(output, "grad_x", &matrix_shape, x.len())?.copy_from_slice(&grad_x);
             output_f32(output, "grad_weight", &weight_shape, weight.len())?
@@ -666,11 +798,7 @@ impl WgpuTrainBackendV1 {
         } else {
             0.0
         };
-        let operation = if request.execution == TrainExecutionV1::Forward {
-            16
-        } else {
-            17
-        };
+        let operation = catalog_selector(request, 0)?;
         let result = self
             .backend
             .pointwise(prediction, target, prediction, operation, grad_output, 0)
@@ -821,17 +949,38 @@ impl WgpuTrainBackendV1 {
         if request.execution == TrainExecutionV1::Forward {
             let result = self
                 .backend
-                .pointwise(x, bias, gradient, 18, 0.0, cols as u32)
+                .pointwise(
+                    x,
+                    bias,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             output_f32(output, "result", &matrix_shape, x.len())?.copy_from_slice(&result);
         } else {
             let grad_x = self
                 .backend
-                .pointwise(x, bias, gradient, 19, 0.0, cols as u32)
+                .pointwise(
+                    x,
+                    bias,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             let grad_bias_full = self
                 .backend
-                .pointwise(x, bias, gradient, 20, 0.0, cols as u32)
+                .pointwise(
+                    x,
+                    bias,
+                    gradient,
+                    catalog_selector(request, 1)?,
+                    0.0,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             output_f32(output, "grad_x", &matrix_shape, x.len())?.copy_from_slice(&grad_x);
             output_f32(output, "grad_bias", &bias_shape, bias.len())?
@@ -880,7 +1029,14 @@ impl WgpuTrainBackendV1 {
         require_finite("gradient", gradient)?;
         let updated = self
             .backend
-            .pointwise(parameter, gradient, parameter, 21, learning_rate, 0)
+            .pointwise(
+                parameter,
+                gradient,
+                parameter,
+                catalog_selector(request, 0)?,
+                learning_rate,
+                0,
+            )
             .map_err(wgpu_error)?;
         output_f32(output, "parameter", shape, parameter.len())?.copy_from_slice(&updated);
         Ok(())
@@ -931,11 +1087,7 @@ impl WgpuTrainBackendV1 {
             return Err(shape_error());
         }
         require_finite(input_name, input)?;
-        let operation = if request.execution == TrainExecutionV1::Forward {
-            22
-        } else {
-            23
-        };
+        let operation = catalog_selector(request, 0)?;
         let result = self
             .backend
             .pointwise(input, input, input, operation, 0.0, cols as u32)
@@ -1001,11 +1153,7 @@ impl WgpuTrainBackendV1 {
         let output_len =
             usize::try_from(rows.checked_mul(output_shape[1]).ok_or_else(shape_error)?)
                 .map_err(|_| shape_error())?;
-        let operation = if request.execution == TrainExecutionV1::Forward {
-            24
-        } else {
-            25
-        };
+        let operation = catalog_selector(request, 0)?;
         let result = self
             .backend
             .pointwise_sized(
@@ -1081,7 +1229,15 @@ impl WgpuTrainBackendV1 {
             let result = self
                 .backend
                 .pointwise_sized(
-                    x, weight, gradient, 26, 0.0, m as u32, n as u32, k as u32, result_len,
+                    x,
+                    weight,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    result_len,
                 )
                 .map_err(wgpu_error)?;
             output_f32(output, "result", &result_shape, result_len)?.copy_from_slice(&result);
@@ -1092,7 +1248,7 @@ impl WgpuTrainBackendV1 {
                     x,
                     weight,
                     gradient,
-                    27,
+                    catalog_selector(request, 0)?,
                     0.0,
                     m as u32,
                     n as u32,
@@ -1106,7 +1262,7 @@ impl WgpuTrainBackendV1 {
                     x,
                     weight,
                     gradient,
-                    28,
+                    catalog_selector(request, 1)?,
                     0.0,
                     m as u32,
                     n as u32,
@@ -1177,7 +1333,15 @@ impl WgpuTrainBackendV1 {
             let result = self
                 .backend
                 .pointwise_sized(
-                    activation, weight, scale, 29, 0.0, m as u32, n as u32, k as u32, result_len,
+                    activation,
+                    weight,
+                    scale,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    result_len,
                 )
                 .map_err(wgpu_error)?;
             output_f32(output, "result", &result_shape, result_len)?.copy_from_slice(&result);
@@ -1193,7 +1357,7 @@ impl WgpuTrainBackendV1 {
                     gradient,
                     weight,
                     scale,
-                    30,
+                    catalog_selector(request, 0)?,
                     0.0,
                     m as u32,
                     n as u32,
@@ -1207,7 +1371,7 @@ impl WgpuTrainBackendV1 {
                     gradient,
                     activation,
                     scale,
-                    31,
+                    catalog_selector(request, 1)?,
                     0.0,
                     m as u32,
                     n as u32,
@@ -1221,7 +1385,7 @@ impl WgpuTrainBackendV1 {
                     gradient,
                     activation,
                     weight,
-                    32,
+                    catalog_selector(request, 2)?,
                     0.0,
                     m as u32,
                     n as u32,
@@ -1346,7 +1510,7 @@ impl WgpuTrainBackendV1 {
                             gradient,
                             gradient,
                             gradient,
-                            24,
+                            catalog_selector(request, 0)?,
                             0.0,
                             total as u32,
                             start as u32,
@@ -1495,17 +1659,31 @@ impl WgpuTrainBackendV1 {
         if request.execution == TrainExecutionV1::Forward {
             let result = self
                 .backend
-                .pointwise(weight, scale, gradient, 33, 0.0, cols as u32)
+                .pointwise(
+                    weight,
+                    scale,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             output_f32(output, "result", &weight_shape, weight.len())?.copy_from_slice(&result);
         } else {
             let grad_weight = self
                 .backend
-                .pointwise(weight, scale, gradient, 34, 0.0, cols as u32)
+                .pointwise(
+                    weight,
+                    scale,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             let grad_scale = self
                 .backend
-                .pointwise(scale, scale, scale, 1, 0.0, 0)
+                .pointwise(scale, scale, scale, catalog_selector(request, 1)?, 0.0, 0)
                 .map_err(wgpu_error)?;
             output_f32(output, "grad_weight", &weight_shape, weight.len())?
                 .copy_from_slice(&grad_weight);
@@ -1573,13 +1751,27 @@ impl WgpuTrainBackendV1 {
         if request.execution == TrainExecutionV1::Forward {
             let result = self
                 .backend
-                .pointwise(weight, alpha, gradient, 35, 0.0, cols as u32)
+                .pointwise(
+                    weight,
+                    alpha,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             output_f32(output, "result", &weight_shape, weight.len())?.copy_from_slice(&result);
         } else {
             let grad_weight = self
                 .backend
-                .pointwise(weight, alpha, gradient, 36, 0.0, cols as u32)
+                .pointwise(
+                    weight,
+                    alpha,
+                    gradient,
+                    catalog_selector(request, 0)?,
+                    0.0,
+                    cols as u32,
+                )
                 .map_err(wgpu_error)?;
             let grad_alpha = self
                 .backend
@@ -1587,7 +1779,7 @@ impl WgpuTrainBackendV1 {
                     weight,
                     alpha,
                     gradient,
-                    37,
+                    catalog_selector(request, 1)?,
                     0.0,
                     cols as u32,
                     0,
