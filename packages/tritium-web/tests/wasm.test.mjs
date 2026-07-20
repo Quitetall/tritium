@@ -89,6 +89,43 @@ test("bundled guest executes strict portable requests", async () => {
   assert.ok(Object.isFrozen(response.outputs));
   assert.ok(Object.isFrozen(response.outputs[0].data.bits));
 
+  const u32ListRequest = {
+    schemaId: "tritium.portable_training_request",
+    schemaVersion: 1,
+    physicalDevice: "node:test-wasm",
+    operation: "graph.fsq",
+    execution: "forward",
+    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    inputs: [
+      {
+        name: "x",
+        shape: [2, 3],
+        data: {
+          dtype: "f32",
+          bits: [3214514586, 3196059648, 1058642330, 1063675494, 1036831949, 3211159142],
+        },
+      },
+    ],
+    attributes: [
+      { kind: "u64", name: "channels", value: 2 },
+      { kind: "u64", name: "len", value: 3 },
+      { kind: "u32-list", name: "levels", values: [3, 5] },
+      { kind: "text", name: "bound", value: "clamp" },
+      { kind: "text", name: "ste", value: "soft_round" },
+      { kind: "f32", name: "alpha", bits: 1056964608 },
+      { kind: "u64", name: "seed", value: 0 },
+    ],
+    outputs: [
+      {
+        name: "result",
+        shape: [2, 3],
+        data: { dtype: "f32", bits: [0, 0, 0, 0, 0, 0] },
+      },
+    ],
+  };
+  const u32ListResponse = await executePortableWasmRequest(u32ListRequest, guest);
+  assert.equal(u32ListResponse.status, "ok");
+
   const mutableRequest = structuredClone(sgdRequest);
   const pending = executePortableWasmRequest(mutableRequest, guest);
   mutableRequest.operation = "graph.not-real";
@@ -102,7 +139,7 @@ test("bundled guest executes strict portable requests", async () => {
   invalid.outputs[0].data.bits = [0x7fc00001, 0x7fc00002];
   const failure = await executePortableWasmRequest(invalid, guest);
   assert.equal(failure.status, "error");
-  assert.equal(failure.error.code, "buffer_length");
+  assert.equal(failure.error.code, "buffer_length.parameter.3.2");
   assert.deepEqual(failure.outputs[0].data.bits, [0x7fc00001, 0x7fc00002]);
 
   const unsafeInteger = structuredClone(sgdRequest);
@@ -117,6 +154,19 @@ test("bundled guest executes strict portable requests", async () => {
   const missing = await executePortableWasmRequest(missingDigest, guest);
   assert.equal(missing.status, "error");
   assert.equal(missing.error.code, "missing_field");
+
+  const wrongDigest = structuredClone(sgdRequest);
+  wrongDigest.vectorDigest = "0".repeat(64);
+  const digestMismatch = await executePortableWasmRequest(wrongDigest, guest);
+  assert.equal(digestMismatch.status, "error");
+  assert.equal(digestMismatch.error.code, "vector_digest_mismatch");
+
+  const excessiveRank = structuredClone(sgdRequest);
+  excessiveRank.inputs[0].shape = [1, 1, 1, 1, 1];
+  const rankFailure = await executePortableWasmRequest(excessiveRank, guest);
+  assert.equal(rankFailure.status, "error");
+  assert.equal(rankFailure.error.category, "capacity");
+  assert.equal(rankFailure.error.code, "rank");
 
   const bigint = structuredClone(sgdRequest);
   bigint.attributes[0].value = 1n;

@@ -24,5 +24,10 @@ await build({
   target: ["es2022"],
 });
 await cp(resolve(root, "src/index.d.ts"), resolve(output, "index.d.ts"));
+await cp(
+  resolve(root, "src/lifecycle-types.d.ts"),
+  resolve(output, "lifecycle-types.d.ts"),
+);
+await cp(resolve(root, "src/portable.d.ts"), resolve(output, "portable.d.ts"));
 await cp(resolve(root, "../../LICENSE"), resolve(output, "LICENSE"));
 await cp(resolve(root, "../../NOTICE"), resolve(output, "NOTICE"));

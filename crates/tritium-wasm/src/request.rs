@@ -456,47 +456,78 @@ fn preflight_request(value: &RequestWire) -> Result<(), ErrorResponse> {
     Ok(())
 }
 
-fn request_error_code(error: &TrainRequestError) -> &'static str {
+fn request_error_code(error: &TrainRequestError) -> String {
     match error {
-        TrainRequestError::UnknownOperation(_) => "unknown_operation",
-        TrainRequestError::IllegalExecution { .. } => "illegal_execution",
-        TrainRequestError::InvalidName { .. } => "invalid_name",
-        TrainRequestError::DuplicateName { .. } => "duplicate_name",
-        TrainRequestError::ShapeOverflow { .. } => "shape_overflow",
-        TrainRequestError::RankLimit { .. } => "rank_limit",
-        TrainRequestError::ElementLimit { .. } => "element_limit",
-        TrainRequestError::ByteCountOverflow { .. } => "byte_count_overflow",
-        TrainRequestError::ByteLimit { .. } => "byte_limit",
-        TrainRequestError::BufferLength { .. } => "buffer_length",
-        TrainRequestError::NonFiniteAttribute(_) => "nonfinite_attribute",
+        TrainRequestError::UnknownOperation(operation) => format!("unknown_operation.{operation}"),
+        TrainRequestError::IllegalExecution {
+            operation,
+            execution,
+        } => format!("illegal_execution.{operation}.{execution:?}").to_ascii_lowercase(),
+        TrainRequestError::InvalidName { namespace, name } => {
+            format!("invalid_name.{namespace}.{name}")
+        }
+        TrainRequestError::DuplicateName { namespace, name } => {
+            format!("duplicate_name.{namespace}.{name}")
+        }
+        TrainRequestError::ShapeOverflow { name } => format!("shape_overflow.{name}"),
+        TrainRequestError::RankLimit { name, got, max } => {
+            format!("rank_limit.{name}.{got}.{max}")
+        }
+        TrainRequestError::ElementLimit { name, got, max } => {
+            format!("element_limit.{name}.{got}.{max}")
+        }
+        TrainRequestError::ByteCountOverflow { name } => {
+            format!("byte_count_overflow.{name}")
+        }
+        TrainRequestError::ByteLimit { name, got, max } => {
+            format!("byte_limit.{name}.{got}.{max}")
+        }
+        TrainRequestError::BufferLength {
+            name,
+            expected,
+            got,
+        } => format!("buffer_length.{name}.{expected}.{got}"),
+        TrainRequestError::NonFiniteAttribute(name) => {
+            format!("non_finite_attribute.{name}")
+        }
     }
 }
 
-fn operation_error_code(error: &TrainOperationErrorV1) -> &'static str {
+fn operation_error_code(error: &TrainOperationErrorV1) -> String {
     match error {
-        TrainOperationErrorV1::Roles { .. } => "roles",
-        TrainOperationErrorV1::DType { .. } => "dtype",
-        TrainOperationErrorV1::Shape => "shape",
-        TrainOperationErrorV1::NonFinite { .. } => "nonfinite",
-        TrainOperationErrorV1::AttributeType { .. } => "attribute_type",
-        TrainOperationErrorV1::AttributeValue { .. } => "attribute_value",
+        TrainOperationErrorV1::Roles { namespace } => format!("roles.{namespace}"),
+        TrainOperationErrorV1::DType {
+            name,
+            expected,
+            got,
+        } => format!("dtype.{name}.{expected:?}.{got:?}").to_ascii_lowercase(),
+        TrainOperationErrorV1::Shape => "shape".to_owned(),
+        TrainOperationErrorV1::NonFinite { name } => format!("non_finite.{name}"),
+        TrainOperationErrorV1::AttributeType { name, expected } => {
+            format!("attribute_type.{name}.{expected}")
+        }
+        TrainOperationErrorV1::AttributeValue { name, constraint } => {
+            format!("attribute_value.{name}.{constraint}")
+        }
     }
 }
 
 fn backend_error(value: TrainBackendError) -> ErrorResponse {
     let message = value.to_string();
     match value {
-        TrainBackendError::InvalidRequest(error_value) => {
-            error("invalid_request", request_error_code(&error_value), message)
-        }
+        TrainBackendError::InvalidRequest(error_value) => ErrorResponse {
+            category: "invalid_request",
+            code: request_error_code(&error_value),
+            message,
+        },
         TrainBackendError::UnsupportedOperation(_) => {
             error("unsupported_operation", "unsupported_operation", message)
         }
-        TrainBackendError::InvalidOperation(error_value) => error(
-            "invalid_operation",
-            operation_error_code(&error_value),
+        TrainBackendError::InvalidOperation(error_value) => ErrorResponse {
+            category: "invalid_operation",
+            code: operation_error_code(&error_value),
             message,
-        ),
+        },
         TrainBackendError::Backend { code, .. } => ErrorResponse {
             category: "backend",
             code,
@@ -674,8 +705,9 @@ pub fn tritium_execute_portable_request_json(request_json: &str) -> String {
 mod tests {
     use serde_json::{Value, json};
     use tritium_spec::{
-        TrainingVectorAttributeV1, TrainingVectorAttributeValueV1, TrainingVectorBufferDataV1,
-        TrainingVectorBufferV1, TrainingVectorExpectedV1, TrainingVectorSetV1,
+        TrainingOpManifestV1, TrainingVectorAttributeV1, TrainingVectorAttributeValueV1,
+        TrainingVectorBufferDataV1, TrainingVectorBufferV1, TrainingVectorErrorCategoryV1,
+        TrainingVectorExpectedV1, TrainingVectorSetV1,
     };
 
     use super::*;
@@ -757,6 +789,22 @@ mod tests {
         }
     }
 
+    fn vector_error_category(value: TrainingVectorErrorCategoryV1) -> &'static str {
+        match value {
+            TrainingVectorErrorCategoryV1::InvalidRequest => "invalid_request",
+            TrainingVectorErrorCategoryV1::InvalidOperation => "invalid_operation",
+            TrainingVectorErrorCategoryV1::Backend => "backend",
+        }
+    }
+
+    fn vector_dtype(value: &TrainingVectorBufferV1) -> &'static str {
+        match &value.data {
+            TrainingVectorBufferDataV1::F32Bits(_) => "f32",
+            TrainingVectorBufferDataV1::U32(_) => "u32",
+            TrainingVectorBufferDataV1::Bytes(_) => "bytes",
+        }
+    }
+
     #[test]
     fn executes_strict_sgd_request() {
         let response = execute_value(sgd_request());
@@ -825,7 +873,7 @@ mod tests {
         request["outputs"][0]["data"]["bits"] = json!([0x7fc0_0001_u32, 0x7fc0_0002_u32]);
         let response = execute_value(request);
         assert_eq!(response["status"], "error");
-        assert_eq!(response["error"]["code"], "buffer_length");
+        assert_eq!(response["error"]["code"], "buffer_length.parameter.3.2");
         assert_eq!(
             response["outputs"][0]["data"]["bits"],
             json!([0x7fc0_0001_u32, 0x7fc0_0002_u32])
@@ -853,15 +901,83 @@ mod tests {
                 "outputs": expected_outputs.iter().map(vector_buffer).collect::<Vec<_>>(),
             });
             let response = execute_value(request);
-            let expected_status = match case.expected {
-                TrainingVectorExpectedV1::Success { .. } => "ok",
-                TrainingVectorExpectedV1::Error { .. } => "error",
-            };
-            assert_eq!(
-                response["status"], expected_status,
-                "bridge case {} returned {response}",
-                case.case_id
-            );
+            match &case.expected {
+                TrainingVectorExpectedV1::Success {
+                    outputs,
+                    scratch_bytes_max,
+                } => {
+                    assert_eq!(response["status"], "ok", "case {}", case.case_id);
+                    assert_eq!(
+                        response["outputs"],
+                        Value::Array(outputs.iter().map(vector_buffer).collect()),
+                        "case {} output mismatch",
+                        case.case_id
+                    );
+                    let receipt = &response["receipt"];
+                    assert_eq!(receipt["backendId"], "wasm.portable.v1");
+                    assert_eq!(
+                        receipt["backendBuild"],
+                        format!(
+                            "{}@{}+{}",
+                            env!("CARGO_PKG_NAME"),
+                            env!("CARGO_PKG_VERSION"),
+                            env!("TRITIUM_SOURCE_ID")
+                        )
+                    );
+                    assert_eq!(receipt["physicalDevice"], "wasm32:bridge-test");
+                    assert_eq!(
+                        receipt["manifestDigest"],
+                        digest_hex(TrainingOpManifestV1::digest())
+                    );
+                    assert_eq!(receipt["vectorDigest"], digest_hex(vectors.source_digest()));
+                    assert_eq!(receipt["operation"], case.operation);
+                    assert_eq!(receipt["execution"], execution_name(case.execution));
+                    assert_eq!(receipt["dtype"], vector_dtype(&outputs[0]));
+                    assert_eq!(receipt["maxRank"], 4);
+                    assert_eq!(receipt["maxElements"], 8 * 1024 * 1024);
+                    assert_eq!(receipt["maxBytes"], 8 * 1024 * 1024);
+                    assert_eq!(receipt["hostTransfers"], 0);
+                    assert_eq!(receipt["deviceResident"], true);
+                    assert!(
+                        receipt["peakResidentBytes"]
+                            .as_u64()
+                            .is_some_and(|value| value <= 64 * 1024 * 1024)
+                    );
+                    assert!(
+                        receipt["scratchBytes"]
+                            .as_u64()
+                            .is_some_and(|value| value <= *scratch_bytes_max)
+                    );
+                    assert!(
+                        receipt["inputDigest"]
+                            .as_str()
+                            .is_some_and(|value| value.len() == 64)
+                    );
+                    assert!(
+                        receipt["outputDigest"]
+                            .as_str()
+                            .is_some_and(|value| value.len() == 64)
+                    );
+                }
+                TrainingVectorExpectedV1::Error {
+                    category,
+                    code,
+                    outputs,
+                } => {
+                    assert_eq!(response["status"], "error", "case {}", case.case_id);
+                    assert_eq!(
+                        response["error"]["category"],
+                        vector_error_category(*category)
+                    );
+                    assert_eq!(response["error"]["code"], code.as_str());
+                    assert_eq!(
+                        response["outputs"],
+                        Value::Array(outputs.iter().map(vector_buffer).collect()),
+                        "case {} sentinel mismatch",
+                        case.case_id
+                    );
+                }
+            }
         }
     }
 }

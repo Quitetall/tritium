@@ -101,9 +101,14 @@ patterns, canonical request/output digests, structured stable errors and
 pre-mutation output preservation. Its JSON transport is capped at 8 MiB, its
 caller buffers at 64 MiB, and V1 `u64` fields are JavaScript-safe integers;
 the JavaScript boundary maps release-profile guest aborts to `guest_trap`.
-It remains explicitly `wasm-fallback`;
-compiled lifecycle state, checkpoint/artifact controller exports and physical
-Chrome/Firefox runs remain open.
+The wrapper limits itself to JSON serialization/size checks, validates success
+receipts by recomputing canonical request/output digests, and leaves semantic
+request validation plus stable error identity to Rust.
+Typed lifecycle compilers now derive canonical checkpoint/resume layouts for
+all five optimizers and strict SALT V2 export/reload requests, with exact-state
+round trips through the admitted guest. It remains explicitly `wasm-fallback`;
+session-owned lifecycle state, adapter execution and physical Chrome/Firefox
+runs remain open.
 
 Compile `tritium-spec`, the bounded portable executor and SALT V2 strict reader
 to `wasm32-unknown-unknown`. JavaScript owns only lifecycle orchestration and

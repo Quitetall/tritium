@@ -2,8 +2,8 @@ import init, {
   tritium_execute_portable_request_json,
   tritium_portable_build_id,
   tritium_portable_conformance_case_count,
-  tritium_portable_max_caller_bytes,
   tritium_portable_manifest_digest,
+  tritium_portable_max_caller_bytes,
   tritium_portable_max_linear_memory_bytes,
   tritium_portable_operation_count,
   tritium_portable_report_digest,
@@ -17,123 +17,35 @@ import {
   TRAINING_MANIFEST_DIGEST_V1,
   TRAINING_VECTOR_DIGEST_V1,
 } from "./identity.ts";
+import type {
+  PortableBufferV1,
+  PortableExecutionV1,
+  PortableTrainingRequestV1,
+  PortableTrainingResponseV1,
+  PortableWasmConformanceReceiptV1,
+  PortableWasmSourceV1,
+} from "./portable.js";
+export type {
+  PortableAttributeV1,
+  PortableBufferDataV1,
+  PortableBufferV1,
+  PortableExecutionV1,
+  PortableTrainingErrorV1,
+  PortableTrainingReceiptV1,
+  PortableTrainingRequestV1,
+  PortableTrainingResponseV1,
+  PortableWasmConformanceReceiptV1,
+  PortableWasmSourceV1,
+} from "./portable.js";
 
 const MAX_REQUEST_JSON_BYTES = 8 * 1024 * 1024;
 const MAX_CALLER_BYTES = 64 * 1024 * 1024;
 const MAX_LINEAR_MEMORY_BYTES = 192 * 1024 * 1024;
-const MAX_COLLECTION_ITEMS = 64;
-const MAX_NAME_BYTES = 128;
-const MAX_TEXT_BYTES = 4096;
-const MAX_LIST_ITEMS = 1024;
-
-export interface PortableWasmConformanceReceiptV1 {
-  readonly schemaId: "tritium.portable_wasm_conformance_receipt";
-  readonly schemaVersion: 1;
-  readonly implementation: "wasm-fallback";
-  readonly engine: "wasm32-unknown-unknown";
-  readonly buildId: string;
-  readonly guestDigest: typeof WASM_GUEST_DIGEST_V1;
-  readonly executionDigest: string;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
-  readonly operationCount: number;
-  readonly caseCount: number;
-  readonly maxCallerBytes: number;
-  readonly maxLinearMemoryBytes: number;
-  readonly repeatedExecutions: 2;
-}
-
-export type PortableExecutionV1 =
-  | "forward"
-  | "vjp"
-  | "step"
-  | "checkpoint"
-  | "resume"
-  | "export"
-  | "reload";
-
-export type PortableBufferDataV1 =
-  | { readonly dtype: "f32"; readonly bits: readonly number[] }
-  | { readonly dtype: "u32"; readonly values: readonly number[] }
-  | { readonly dtype: "bytes"; readonly values: readonly number[] };
-
-export interface PortableBufferV1 {
-  readonly name: string;
-  readonly shape: readonly number[];
-  readonly data: PortableBufferDataV1;
-}
-
-export type PortableAttributeV1 =
-  | { readonly kind: "f32"; readonly name: string; readonly bits: number }
-  /** V1 JSON transports u64 values only through Number safe integers. */
-  | { readonly kind: "u64"; readonly name: string; readonly value: number }
-  | { readonly kind: "bool"; readonly name: string; readonly value: boolean }
-  | { readonly kind: "text"; readonly name: string; readonly value: string }
-  /** Every V1 u64-list value must be a non-negative Number safe integer. */
-  | { readonly kind: "u64-list"; readonly name: string; readonly values: readonly number[] }
-  | { readonly kind: "u32-list"; readonly name: string; readonly values: readonly number[] };
-
-export interface PortableTrainingRequestV1 {
-  readonly schemaId: "tritium.portable_training_request";
-  readonly schemaVersion: 1;
-  readonly physicalDevice: string;
-  readonly operation: string;
-  readonly execution: PortableExecutionV1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1 | null;
-  readonly inputs: readonly PortableBufferV1[];
-  readonly attributes: readonly PortableAttributeV1[];
-  readonly outputs: readonly PortableBufferV1[];
-}
-
-export interface PortableTrainingReceiptV1 {
-  readonly backendId: "wasm.portable.v1";
-  readonly backendBuild: string;
-  readonly physicalDevice: string;
-  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
-  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1 | null;
-  readonly operation: string;
-  readonly execution: PortableExecutionV1;
-  readonly dtype: "f32" | "u32" | "bytes";
-  readonly maxRank: number;
-  readonly maxElements: number;
-  readonly maxBytes: number;
-  readonly inputDigest: string;
-  readonly outputDigest: string;
-  readonly peakResidentBytes: number;
-  readonly scratchBytes: number;
-  readonly hostTransfers: 0;
-  readonly deviceResident: true;
-}
-
-export interface PortableTrainingErrorV1 {
-  readonly category: string;
-  readonly code: string;
-  readonly message: string;
-}
-
-export type PortableTrainingResponseV1 =
-  | {
-      readonly status: "ok";
-      readonly schemaId: "tritium.portable_training_response";
-      readonly schemaVersion: 1;
-      readonly outputs: readonly PortableBufferV1[];
-      readonly receipt: PortableTrainingReceiptV1;
-    }
-  | {
-      readonly status: "error";
-      readonly schemaId: "tritium.portable_training_response";
-      readonly schemaVersion: 1;
-      readonly outputs: readonly PortableBufferV1[];
-      readonly error: PortableTrainingErrorV1;
-    };
+const UTF8 = new TextEncoder();
 
 let initialized: Promise<void> | null = null;
 
-export type PortableWasmSourceV1 =
-  | RequestInfo
-  | URL
-  | Response
-  | BufferSource;
+class GuestTrapError extends Error {}
 
 async function readGuestBytes(source: PortableWasmSourceV1): Promise<Uint8Array> {
   if (source instanceof Response) {
@@ -152,7 +64,7 @@ async function readGuestBytes(source: PortableWasmSourceV1): Promise<Uint8Array>
   return new Uint8Array(await response.arrayBuffer());
 }
 
-async function initializeGuest(source: PortableWasmSourceV1): Promise<void> {
+async function initializeGuest(source: PortableWasmSourceV1): Promise<string> {
   const guestBytes = await readGuestBytes(source);
   const guestDigest = bytesToHex(blake3(guestBytes));
   if (guestDigest !== WASM_GUEST_DIGEST_V1) {
@@ -167,19 +79,45 @@ async function initializeGuest(source: PortableWasmSourceV1): Promise<void> {
       await attempt;
     } catch (error) {
       if (initialized === attempt) initialized = null;
-      throw error;
+      throw new GuestTrapError("portable WASM guest failed to initialize", {
+        cause: error,
+      });
     }
   } else {
-    await initialized;
+    try {
+      await initialized;
+    } catch (error) {
+      throw new GuestTrapError("portable WASM guest failed to initialize", {
+        cause: error,
+      });
+    }
+  }
+
+  let buildId: string;
+  let manifestDigest: string;
+  let vectorDigest: string;
+  let maxCallerBytes: number;
+  let maxLinearMemoryBytes: number;
+  try {
+    buildId = tritium_portable_build_id();
+    manifestDigest = tritium_portable_manifest_digest();
+    vectorDigest = tritium_portable_vector_digest();
+    maxCallerBytes = tritium_portable_max_caller_bytes();
+    maxLinearMemoryBytes = tritium_portable_max_linear_memory_bytes();
+  } catch (error) {
+    throw new GuestTrapError("portable WASM identity export trapped", {
+      cause: error,
+    });
   }
   if (
-    tritium_portable_manifest_digest() !== TRAINING_MANIFEST_DIGEST_V1 ||
-    tritium_portable_vector_digest() !== TRAINING_VECTOR_DIGEST_V1 ||
-    tritium_portable_max_caller_bytes() !== 64 * 1024 * 1024 ||
-    tritium_portable_max_linear_memory_bytes() !== 192 * 1024 * 1024
+    manifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
+    vectorDigest !== TRAINING_VECTOR_DIGEST_V1 ||
+    maxCallerBytes !== MAX_CALLER_BYTES ||
+    maxLinearMemoryBytes !== MAX_LINEAR_MEMORY_BYTES
   ) {
     throw new Error("portable WASM guest identity or limits mismatch");
   }
+  return buildId;
 }
 
 function deepFreeze<T>(value: T): T {
@@ -239,24 +177,35 @@ function validOutputBuffer(value: unknown, expected: PortableBufferV1): boolean 
   ) {
     return false;
   }
-  const data = value.data;
-  if (data.dtype === "f32") {
+  if (value.data.dtype === "f32") {
     return (
-      hasExactKeys(data, ["bits", "dtype"]) &&
-      isDenseNumericArray(data.bits, 0xffff_ffff) &&
-      data.bits.length === ("bits" in expected.data ? expected.data.bits.length : -1)
+      hasExactKeys(value.data, ["bits", "dtype"]) &&
+      isDenseNumericArray(value.data.bits, 0xffff_ffff) &&
+      expected.data.dtype === "f32" &&
+      value.data.bits.length === expected.data.bits.length
     );
   }
-  const maximum = data.dtype === "u32" ? 0xffff_ffff : 0xff;
+  if (value.data.dtype === "u32") {
+    return (
+      hasExactKeys(value.data, ["dtype", "values"]) &&
+      isDenseNumericArray(value.data.values, 0xffff_ffff) &&
+      expected.data.dtype === "u32" &&
+      value.data.values.length === expected.data.values.length
+    );
+  }
   return (
-    (data.dtype === "u32" || data.dtype === "bytes") &&
-    hasExactKeys(data, ["dtype", "values"]) &&
-    isDenseNumericArray(data.values, maximum) &&
-    data.values.length === ("values" in expected.data ? expected.data.values.length : -1)
+    value.data.dtype === "bytes" &&
+    hasExactKeys(value.data, ["dtype", "values"]) &&
+    isDenseNumericArray(value.data.values, 0xff) &&
+    expected.data.dtype === "bytes" &&
+    value.data.values.length === expected.data.values.length
   );
 }
 
-function sameNumericArray(value: readonly number[], expected: readonly number[]): boolean {
+function sameNumericArray(
+  value: readonly number[],
+  expected: readonly number[],
+): boolean {
   return (
     value.length === expected.length &&
     value.every((item, index) => item === expected[index])
@@ -266,13 +215,22 @@ function sameNumericArray(value: readonly number[], expected: readonly number[])
 function outputValuesMatch(value: unknown, expected: PortableBufferV1): boolean {
   if (!isRecord(value) || !isRecord(value.data)) return false;
   if (value.data.dtype === "f32" && expected.data.dtype === "f32") {
-    return Array.isArray(value.data.bits) && sameNumericArray(value.data.bits, expected.data.bits);
+    return (
+      Array.isArray(value.data.bits) &&
+      sameNumericArray(value.data.bits, expected.data.bits)
+    );
   }
   if (value.data.dtype === "u32" && expected.data.dtype === "u32") {
-    return Array.isArray(value.data.values) && sameNumericArray(value.data.values, expected.data.values);
+    return (
+      Array.isArray(value.data.values) &&
+      sameNumericArray(value.data.values, expected.data.values)
+    );
   }
   if (value.data.dtype === "bytes" && expected.data.dtype === "bytes") {
-    return Array.isArray(value.data.values) && sameNumericArray(value.data.values, expected.data.values);
+    return (
+      Array.isArray(value.data.values) &&
+      sameNumericArray(value.data.values, expected.data.values)
+    );
   }
   return false;
 }
@@ -294,9 +252,107 @@ function outputsMatch(
   );
 }
 
+interface DigestWriter {
+  update(data: Uint8Array): unknown;
+}
+
+function hashU64(writer: DigestWriter, value: number): void {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setBigUint64(0, BigInt(value), true);
+  writer.update(bytes);
+}
+
+function hashString(writer: DigestWriter, value: string): void {
+  const bytes = UTF8.encode(value);
+  hashU64(writer, bytes.length);
+  writer.update(bytes);
+}
+
+function hashU32Array(writer: DigestWriter, values: readonly number[]): void {
+  const bytes = new Uint8Array(4);
+  const view = new DataView(bytes.buffer);
+  for (const value of values) {
+    view.setUint32(0, value, true);
+    writer.update(bytes);
+  }
+}
+
+function hashBuffer(writer: DigestWriter, buffer: PortableBufferV1): void {
+  hashString(writer, buffer.name);
+  hashU64(writer, buffer.shape.length);
+  for (const dimension of buffer.shape) hashU64(writer, dimension);
+  if (buffer.data.dtype === "f32") {
+    writer.update(Uint8Array.of(0));
+    hashU64(writer, buffer.data.bits.length);
+    hashU32Array(writer, buffer.data.bits);
+  } else if (buffer.data.dtype === "u32") {
+    writer.update(Uint8Array.of(1));
+    hashU64(writer, buffer.data.values.length);
+    hashU32Array(writer, buffer.data.values);
+  } else {
+    writer.update(Uint8Array.of(2));
+    hashU64(writer, buffer.data.values.length);
+    writer.update(Uint8Array.from(buffer.data.values));
+  }
+}
+
+function requestDigest(request: PortableTrainingRequestV1): string {
+  const writer = blake3.create();
+  hashString(writer, request.operation);
+  writer.update(
+    Uint8Array.of(
+      ["forward", "vjp", "step", "checkpoint", "resume", "export", "reload"].indexOf(
+        request.execution,
+      ),
+    ),
+  );
+  hashU64(writer, request.inputs.length);
+  for (const buffer of request.inputs) hashBuffer(writer, buffer);
+  hashU64(writer, request.attributes.length);
+  for (const attribute of request.attributes) {
+    hashString(writer, attribute.name);
+    if (attribute.kind === "f32") {
+      writer.update(Uint8Array.of(0));
+      hashU32Array(writer, [attribute.bits]);
+    } else if (attribute.kind === "u64") {
+      writer.update(Uint8Array.of(1));
+      hashU64(writer, attribute.value);
+    } else if (attribute.kind === "bool") {
+      writer.update(Uint8Array.of(2, Number(attribute.value)));
+    } else if (attribute.kind === "text") {
+      writer.update(Uint8Array.of(3));
+      hashString(writer, attribute.value);
+    } else if (attribute.kind === "u64-list") {
+      writer.update(Uint8Array.of(4));
+      hashU64(writer, attribute.values.length);
+      for (const value of attribute.values) hashU64(writer, value);
+    } else {
+      writer.update(Uint8Array.of(5));
+      writer.update(Uint8Array.of(1));
+      hashU64(writer, attribute.values.length);
+      hashU32Array(writer, attribute.values);
+    }
+  }
+  return bytesToHex(writer.digest());
+}
+
+function outputDigest(outputs: readonly PortableBufferV1[]): string {
+  const writer = blake3.create();
+  hashU64(writer, outputs.length);
+  for (const buffer of outputs) hashBuffer(writer, buffer);
+  return bytesToHex(writer.digest());
+}
+
+function expectedReceiptDtype(execution: PortableExecutionV1): "f32" | "bytes" {
+  return ["checkpoint", "resume", "export", "reload"].includes(execution)
+    ? "bytes"
+    : "f32";
+}
+
 function validateResponse(
   value: unknown,
   request: PortableTrainingRequestV1,
+  backendBuild: string,
 ): PortableTrainingResponseV1 {
   if (
     !isRecord(value) ||
@@ -306,10 +362,6 @@ function validateResponse(
         ? ["outputs", "receipt", "schemaId", "schemaVersion", "status"]
         : ["error", "outputs", "schemaId", "schemaVersion", "status"],
     ) ||
-    !("status" in value) ||
-    !("schemaId" in value) ||
-    !("schemaVersion" in value) ||
-    !("outputs" in value) ||
     (value.status !== "ok" && value.status !== "error") ||
     value.schemaId !== "tritium.portable_training_response" ||
     value.schemaVersion !== 1 ||
@@ -324,8 +376,11 @@ function validateResponse(
     throw new Error("portable WASM returned an invalid response envelope");
   }
   if (value.status === "ok") {
+    const expectedInputDigest = requestDigest(request);
+    const expectedOutputDigest = outputDigest(
+      value.outputs as PortableBufferV1[],
+    );
     if (
-      !("receipt" in value) ||
       !isRecord(value.receipt) ||
       !hasExactKeys(value.receipt, [
         "backendBuild",
@@ -346,18 +401,8 @@ function validateResponse(
         "scratchBytes",
         "vectorDigest",
       ]) ||
-      !("backendId" in value.receipt) ||
-      !("manifestDigest" in value.receipt) ||
-      !("vectorDigest" in value.receipt) ||
-      !("operation" in value.receipt) ||
-      !("execution" in value.receipt) ||
-      !("physicalDevice" in value.receipt) ||
-      !("inputDigest" in value.receipt) ||
-      !("outputDigest" in value.receipt) ||
-      !("hostTransfers" in value.receipt) ||
-      !("deviceResident" in value.receipt) ||
       value.receipt.backendId !== "wasm.portable.v1" ||
-      value.receipt.backendBuild !== tritium_portable_build_id() ||
+      value.receipt.backendBuild !== backendBuild ||
       value.receipt.manifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
       value.receipt.vectorDigest !== request.vectorDigest ||
       value.receipt.operation !== request.operation ||
@@ -365,42 +410,28 @@ function validateResponse(
       value.receipt.physicalDevice !== request.physicalDevice ||
       value.receipt.hostTransfers !== 0 ||
       value.receipt.deviceResident !== true ||
+      value.receipt.dtype !== expectedReceiptDtype(request.execution) ||
       value.receipt.maxRank !== 4 ||
       value.receipt.maxElements !== 8 * 1024 * 1024 ||
       value.receipt.maxBytes !== 8 * 1024 * 1024 ||
       typeof value.receipt.peakResidentBytes !== "number" ||
+      !Number.isSafeInteger(value.receipt.peakResidentBytes) ||
+      value.receipt.peakResidentBytes < 0 ||
       value.receipt.peakResidentBytes > MAX_CALLER_BYTES ||
       typeof value.receipt.scratchBytes !== "number" ||
+      !Number.isSafeInteger(value.receipt.scratchBytes) ||
+      value.receipt.scratchBytes < 0 ||
       value.receipt.scratchBytes > 128 * 1024 * 1024 ||
       value.receipt.peakResidentBytes + value.receipt.scratchBytes >
         MAX_LINEAR_MEMORY_BYTES ||
-      !["f32", "u32", "bytes"].includes(String(value.receipt.dtype)) ||
-      ![
-        value.receipt.maxRank,
-        value.receipt.maxElements,
-        value.receipt.maxBytes,
-        value.receipt.peakResidentBytes,
-        value.receipt.scratchBytes,
-      ].every(
-        (field) =>
-          typeof field === "number" &&
-          Number.isSafeInteger(field) &&
-          field >= 0,
-      ) ||
-      typeof value.receipt.inputDigest !== "string" ||
-      typeof value.receipt.outputDigest !== "string" ||
-      !/^[0-9a-f]{64}$/.test(value.receipt.inputDigest) ||
-      !/^[0-9a-f]{64}$/.test(value.receipt.outputDigest)
+      value.receipt.inputDigest !== expectedInputDigest ||
+      value.receipt.outputDigest !== expectedOutputDigest
     ) {
       throw new Error("portable WASM returned an invalid success receipt");
     }
   } else if (
-    !("error" in value) ||
     !isRecord(value.error) ||
     !hasExactKeys(value.error, ["category", "code", "message"]) ||
-    !("category" in value.error) ||
-    !("code" in value.error) ||
-    !("message" in value.error) ||
     typeof value.error.category !== "string" ||
     typeof value.error.code !== "string" ||
     typeof value.error.message !== "string"
@@ -414,20 +445,21 @@ function validateResponse(
     isRecord(value.error) &&
     typeof value.error.code === "string" &&
     ![
-      "invalid_json",
-      "unsupported_schema",
-      "invalid_digest",
-      "vector_digest_mismatch",
-      "physical_device",
-      "request_bytes",
-      "missing_field",
-      "unsafe_integer",
-      "collection_items",
       "caller_bytes",
-      "rank",
-      "text_bytes",
+      "collection_items",
+      "invalid_digest",
+      "invalid_json",
+      "invalid_name",
       "list_items",
+      "missing_field",
+      "physical_device",
+      "rank",
+      "request_bytes",
       "serialization",
+      "text_bytes",
+      "unsafe_integer",
+      "unsupported_schema",
+      "vector_digest_mismatch",
     ].includes(value.error.code)
   ) {
     throw new Error("portable WASM backend error omitted output sentinels");
@@ -449,247 +481,6 @@ function localError(
   });
 }
 
-function utf8Length(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
-function containsUnsafeNumber(value: unknown): boolean {
-  if (typeof value === "number") {
-    return !Number.isSafeInteger(value) || value < 0;
-  }
-  if (Array.isArray(value)) return value.some(containsUnsafeNumber);
-  if (isRecord(value)) return Object.values(value).some(containsUnsafeNumber);
-  return false;
-}
-
-function validRequestBuffer(value: unknown): value is PortableBufferV1 {
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, ["data", "name", "shape"]) ||
-    typeof value.name !== "string" ||
-    utf8Length(value.name) === 0 ||
-    utf8Length(value.name) > MAX_NAME_BYTES ||
-    !isDenseNumericArray(value.shape, Number.MAX_SAFE_INTEGER) ||
-    value.shape.length > 4 ||
-    !isRecord(value.data)
-  ) {
-    return false;
-  }
-  if (value.data.dtype === "f32") {
-    return (
-      hasExactKeys(value.data, ["bits", "dtype"]) &&
-      isDenseNumericArray(value.data.bits, 0xffff_ffff)
-    );
-  }
-  if (value.data.dtype === "u32") {
-    return (
-      hasExactKeys(value.data, ["dtype", "values"]) &&
-      isDenseNumericArray(value.data.values, 0xffff_ffff)
-    );
-  }
-  return (
-    value.data.dtype === "bytes" &&
-    hasExactKeys(value.data, ["dtype", "values"]) &&
-    isDenseNumericArray(value.data.values, 0xff)
-  );
-}
-
-function validRequestAttribute(value: unknown): value is PortableAttributeV1 {
-  if (
-    !isRecord(value) ||
-    typeof value.name !== "string" ||
-    utf8Length(value.name) === 0 ||
-    utf8Length(value.name) > MAX_NAME_BYTES
-  ) {
-    return false;
-  }
-  if (value.kind === "f32") {
-    return (
-      hasExactKeys(value, ["bits", "kind", "name"]) &&
-      typeof value.bits === "number" &&
-      Number.isSafeInteger(value.bits) &&
-      value.bits >= 0 &&
-      value.bits <= 0xffff_ffff
-    );
-  }
-  if (value.kind === "u64") {
-    return (
-      hasExactKeys(value, ["kind", "name", "value"]) &&
-      typeof value.value === "number" &&
-      Number.isSafeInteger(value.value) &&
-      value.value >= 0
-    );
-  }
-  if (value.kind === "bool") {
-    return (
-      hasExactKeys(value, ["kind", "name", "value"]) &&
-      typeof value.value === "boolean"
-    );
-  }
-  if (value.kind === "text") {
-    return (
-      hasExactKeys(value, ["kind", "name", "value"]) &&
-      typeof value.value === "string" &&
-      utf8Length(value.value) <= MAX_TEXT_BYTES
-    );
-  }
-  if (value.kind === "u64-list") {
-    return (
-      hasExactKeys(value, ["kind", "name", "values"]) &&
-      isDenseNumericArray(value.values, Number.MAX_SAFE_INTEGER) &&
-      value.values.length <= MAX_LIST_ITEMS
-    );
-  }
-  return (
-    value.kind === "u32-list" &&
-    hasExactKeys(value, ["kind", "name", "values"]) &&
-    isDenseNumericArray(value.values, 0xffff_ffff) &&
-    value.values.length <= MAX_LIST_ITEMS
-  );
-}
-
-interface RequestPreflightError {
-  readonly code: string;
-  readonly message: string;
-}
-
-function preflightError(code: string, message: string): RequestPreflightError {
-  return { code, message };
-}
-
-function requestPreflight(value: unknown): RequestPreflightError | null {
-  if (isRecord(value) && !("vectorDigest" in value)) {
-    return preflightError("missing_field", "vectorDigest is required");
-  }
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, [
-      "attributes",
-      "execution",
-      "inputs",
-      "operation",
-      "outputs",
-      "physicalDevice",
-      "schemaId",
-      "schemaVersion",
-      "vectorDigest",
-    ]) ||
-    value.schemaId !== "tritium.portable_training_request" ||
-    value.schemaVersion !== 1 ||
-    !["forward", "vjp", "step", "checkpoint", "resume", "export", "reload"].includes(
-      String(value.execution),
-    ) ||
-    (value.vectorDigest !== null && value.vectorDigest !== TRAINING_VECTOR_DIGEST_V1) ||
-    !Array.isArray(value.inputs) ||
-    !Array.isArray(value.attributes) ||
-    !Array.isArray(value.outputs)
-  ) {
-    return preflightError(
-      "invalid_schema",
-      "request violates portable training schema",
-    );
-  }
-  if (
-    typeof value.physicalDevice !== "string" ||
-    utf8Length(value.physicalDevice) === 0 ||
-    utf8Length(value.physicalDevice) > MAX_TEXT_BYTES
-  ) {
-    return preflightError(
-      "physical_device",
-      "physicalDevice must contain 1..=4096 UTF-8 bytes",
-    );
-  }
-  if (
-    typeof value.operation !== "string" ||
-    utf8Length(value.operation) === 0 ||
-    utf8Length(value.operation) > MAX_NAME_BYTES
-  ) {
-    return preflightError(
-      "invalid_name",
-      "operation must contain 1..=128 UTF-8 bytes",
-    );
-  }
-  if (
-    value.inputs.length > MAX_COLLECTION_ITEMS ||
-    value.attributes.length > MAX_COLLECTION_ITEMS ||
-    value.outputs.length > MAX_COLLECTION_ITEMS
-  ) {
-    return preflightError(
-      "collection_items",
-      "inputs, attributes, or outputs exceed 64 items",
-    );
-  }
-  for (const buffer of [...value.inputs, ...value.outputs]) {
-    if (
-      isRecord(buffer) &&
-      typeof buffer.name === "string" &&
-      (utf8Length(buffer.name) === 0 || utf8Length(buffer.name) > MAX_NAME_BYTES)
-    ) {
-      return preflightError(
-        "invalid_name",
-        "buffer name must contain 1..=128 UTF-8 bytes",
-      );
-    }
-    if (!validRequestBuffer(buffer)) {
-      return preflightError(
-        "unsafe_integer",
-        "buffer fields must use bounded JavaScript safe integers",
-      );
-    }
-  }
-  for (const attribute of value.attributes) {
-    if (isRecord(attribute) && typeof attribute.name === "string") {
-      if (
-        utf8Length(attribute.name) === 0 ||
-        utf8Length(attribute.name) > MAX_NAME_BYTES
-      ) {
-        return preflightError(
-          "invalid_name",
-          "attribute name must contain 1..=128 UTF-8 bytes",
-        );
-      }
-      if (
-        attribute.kind === "text" &&
-        typeof attribute.value === "string" &&
-        utf8Length(attribute.value) > MAX_TEXT_BYTES
-      ) {
-        return preflightError(
-          "text_bytes",
-          "text attribute exceeds 4096 UTF-8 bytes",
-        );
-      }
-      if (
-        (attribute.kind === "u64-list" || attribute.kind === "u32-list") &&
-        Array.isArray(attribute.values) &&
-        attribute.values.length > MAX_LIST_ITEMS
-      ) {
-        return preflightError(
-          "list_items",
-          "attribute list exceeds 1024 items",
-        );
-      }
-    }
-    if (!validRequestAttribute(attribute)) {
-      return preflightError(
-        "unsafe_integer",
-        "attribute fields must use bounded JavaScript safe integers",
-      );
-    }
-  }
-  let callerBytes = 0;
-  for (const buffer of [...value.inputs, ...value.outputs]) {
-    const elements =
-      "bits" in buffer.data ? buffer.data.bits.length : buffer.data.values.length;
-    callerBytes += buffer.data.dtype === "bytes" ? elements : elements * 4;
-  }
-  return callerBytes <= MAX_CALLER_BYTES
-    ? null
-    : preflightError(
-        "caller_bytes",
-        `decoded caller buffers exceed ${MAX_CALLER_BYTES} bytes`,
-      );
-}
-
 /** Execute one strict request through Rust-owned WASM semantics. */
 export async function executePortableWasmRequest(
   request: PortableTrainingRequestV1,
@@ -703,56 +494,40 @@ export async function executePortableWasmRequest(
   try {
     requestJson = JSON.stringify(request);
     if (requestJson === undefined) throw new Error("undefined JSON result");
-    requestSnapshot = deepFreeze(
-      JSON.parse(requestJson) as PortableTrainingRequestV1,
-    );
+    requestSnapshot = JSON.parse(requestJson) as PortableTrainingRequestV1;
   } catch {
     return localError(
       "invalid_json",
       "portable WASM request is not JSON serializable",
     );
   }
-  const requestBytes = new TextEncoder().encode(requestJson).byteLength;
-  if (requestBytes > MAX_REQUEST_JSON_BYTES) {
+  if (UTF8.encode(requestJson).byteLength > MAX_REQUEST_JSON_BYTES) {
     return localError(
       "request_bytes",
       "portable WASM request JSON exceeds 8 MiB",
       "capacity",
     );
   }
-  if (containsUnsafeNumber(requestSnapshot)) {
-    return localError(
-      "unsafe_integer",
-      "portable WASM numeric fields must use non-negative JavaScript safe integers",
-    );
+  let backendBuild: string;
+  try {
+    backendBuild = await initializeGuest(source);
+  } catch (error) {
+    if (error instanceof GuestTrapError) {
+      return localError("guest_trap", "portable WASM guest trapped", "internal");
+    }
+    throw error;
   }
-  const preflightError = requestPreflight(requestSnapshot);
-  if (preflightError !== null) {
-    const category = [
-      "caller_bytes",
-      "collection_items",
-      "list_items",
-      "rank",
-      "text_bytes",
-    ].includes(preflightError.code)
-      ? "capacity"
-      : "invalid_request";
-    return localError(preflightError.code, preflightError.message, category);
-  }
-  await initializeGuest(source);
+
   let responseJson: string;
   try {
     responseJson = tritium_execute_portable_request_json(requestJson);
   } catch {
-    return localError(
-      "guest_trap",
-      "portable WASM guest trapped",
-      "internal",
-    );
+    return localError("guest_trap", "portable WASM guest trapped", "internal");
   }
   return validateResponse(
     JSON.parse(responseJson) as unknown,
     requestSnapshot,
+    backendBuild,
   );
 }
 
@@ -763,20 +538,34 @@ export async function runPortableWasmConformance(
     import.meta.url,
   ),
 ): Promise<PortableWasmConformanceReceiptV1> {
-  await initializeGuest(source);
-  const firstExecutionDigest = tritium_portable_report_digest();
-  const secondExecutionDigest = tritium_portable_report_digest();
-  const operationCount = tritium_portable_operation_count();
-  const caseCount = tritium_portable_conformance_case_count();
-  const maxCallerBytes = tritium_portable_max_caller_bytes();
-  const maxLinearMemoryBytes = tritium_portable_max_linear_memory_bytes();
-  const guestManifestDigest = tritium_portable_manifest_digest();
-  const guestVectorDigest = tritium_portable_vector_digest();
+  const buildId = await initializeGuest(source);
+  let firstExecutionDigest: string;
+  let secondExecutionDigest: string;
+  let operationCount: number;
+  let caseCount: number;
+  let maxCallerBytes: number;
+  let maxLinearMemoryBytes: number;
+  let guestManifestDigest: string;
+  let guestVectorDigest: string;
+  try {
+    firstExecutionDigest = tritium_portable_report_digest();
+    secondExecutionDigest = tritium_portable_report_digest();
+    operationCount = tritium_portable_operation_count();
+    caseCount = tritium_portable_conformance_case_count();
+    maxCallerBytes = tritium_portable_max_caller_bytes();
+    maxLinearMemoryBytes = tritium_portable_max_linear_memory_bytes();
+    guestManifestDigest = tritium_portable_manifest_digest();
+    guestVectorDigest = tritium_portable_vector_digest();
+  } catch (error) {
+    throw new GuestTrapError("portable WASM conformance export trapped", {
+      cause: error,
+    });
+  }
   if (
     operationCount !== 35 ||
     caseCount !== 114 ||
-    maxCallerBytes !== 64 * 1024 * 1024 ||
-    maxLinearMemoryBytes !== 192 * 1024 * 1024 ||
+    maxCallerBytes !== MAX_CALLER_BYTES ||
+    maxLinearMemoryBytes !== MAX_LINEAR_MEMORY_BYTES ||
     guestManifestDigest !== TRAINING_MANIFEST_DIGEST_V1 ||
     guestVectorDigest !== TRAINING_VECTOR_DIGEST_V1 ||
     !/^[0-9a-f]{64}$/.test(firstExecutionDigest) ||
@@ -791,7 +580,7 @@ export async function runPortableWasmConformance(
     schemaVersion: 1,
     implementation: "wasm-fallback",
     engine: "wasm32-unknown-unknown",
-    buildId: tritium_portable_build_id(),
+    buildId,
     guestDigest: WASM_GUEST_DIGEST_V1,
     executionDigest: firstExecutionDigest,
     manifestDigest: TRAINING_MANIFEST_DIGEST_V1,

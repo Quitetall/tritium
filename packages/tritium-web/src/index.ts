@@ -20,6 +20,21 @@ export {
   prepareTraining,
 } from "./session.ts";
 export { executePortableWasmRequest, runPortableWasmConformance } from "./wasm.ts";
+export {
+  PortableLifecyclePlanError,
+  compilePortableCheckpointRequest,
+  compilePortableExportRequest,
+  compilePortableReloadRequest,
+  compilePortableResumeRequest,
+} from "./lifecycle.ts";
+export type {
+  PortableAdamLeafV1,
+  PortableCheckpointOptimizerV1,
+  PortableCheckpointStateV1,
+  PortableInt8AdamLeafV1,
+  PortableMuonLeafV1,
+  PortableSgdLeafV1,
+} from "./lifecycle.ts";
 export type {
   PortableAttributeV1,
   PortableBufferDataV1,
@@ -31,7 +46,7 @@ export type {
   PortableTrainingResponseV1,
   PortableWasmConformanceReceiptV1,
   PortableWasmSourceV1,
-} from "./wasm.ts";
+} from "./portable.js";
 export type {
   CompiledTrainingBufferV1,
   CompiledTrainingOperationV1,

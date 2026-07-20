@@ -20,6 +20,12 @@ JSON is capped at 8 MiB before guest entry, caller buffers at 64 MiB, and V1
 `u64` JSON values are restricted to non-negative JavaScript safe integers.
 Expected failures are structured responses; a release-profile guest abort is
 mapped by the JavaScript boundary to the stable `guest_trap` error code.
+JavaScript gates only JSON serialization and size; Rust remains the semantic
+validator, including safe-integer bounds. Successful receipts are checked against locally recomputed
+canonical request/output digests, exact dtype, build identity and memory bounds.
+Typed lifecycle compilers build canonical checkpoint/resume buffers for SGD,
+AdamW, cautious AdamW, int8 AdamW and Muon, and strict SALT V2 export/reload
+requests without exposing backend role names or encoded-size arithmetic.
 
 The compiled lifecycle WASM controller and WebGPU adapter are still under construction;
 the conformance guest is not mislabeled as either. Until a lifecycle adapter is
