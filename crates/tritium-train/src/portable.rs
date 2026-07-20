@@ -30,7 +30,6 @@ const MAX_ATTENTION_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 // encoded byte cover persistent metadata plus batch payload/scales; 128 KiB
 // covers descriptors, one decoded allocation tile, and fixed hash state.
 const SALT_V2_VALIDATION_FIXED_SCRATCH_BYTES: u64 = 128 * 1024;
-const MAX_LIFECYCLE_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const CPU_LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: u32::MAX,
     max_elements: usize::MAX as u64,
@@ -641,16 +640,6 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
         }
         if matches!(operation.operation, CpuOperation::Attention)
             && scratch_bytes > MAX_ATTENTION_SCRATCH_BYTES
-        {
-            return Err(attribute_value("scratch", "limit_64_mib"));
-        }
-        if matches!(
-            operation.operation,
-            CpuOperation::Checkpoint
-                | CpuOperation::Resume
-                | CpuOperation::Export
-                | CpuOperation::Reload
-        ) && scratch_bytes > MAX_LIFECYCLE_SCRATCH_BYTES
         {
             return Err(attribute_value("scratch", "limit_64_mib"));
         }
