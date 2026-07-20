@@ -139,13 +139,15 @@ This closes Slice 2 corpus coverage and the CPU semantic matrix; accelerator and
 constrained-target receipts remain required for release closure.
 
 CUDA adapter work has started against the same seam. Current actual-RTX-4090
-evidence covers 85 canonical cases across 27/35 operations: STE surrogate, SALT
+evidence covers 87 canonical cases across 28/35 operations: STE surrogate, SALT
 STE, LSQ, FSQ, dense and scale-bearing ternary matmul, transpose, embedding,
 column slice/concat, detach,
 scale, bias, add, multiply, ReLU2, SiLU, RMSNorm, softmax, causal mask, and RoPE.
 MSE and softmax cross-entropy forward/VJP plus SGD, AdamW, cautious AdamW, and
 blockwise int8 AdamW steps are resident as well. Cautious AdamW uses a resident
 two-pass masked update; int8 AdamW keeps blockwise moments and scales resident.
+Muon uses a deterministic resident Newton--Schulz kernel with bounded global
+scratch matching the frozen ledger.
 STE, LSQ, and FSQ use dedicated forward/VJP kernels, including deterministic
 row-order LSQ alpha reduction and seeded stochastic FSQ. SALT supports the full
 1--64-plane contract with row-sequential reductions and one-row scratch. Bias
