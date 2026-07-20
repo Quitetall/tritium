@@ -514,3 +514,104 @@ export declare function webGpuDispatchFormV1(
   operation: string,
   execution: WebGpuDispatchExecutionV1,
 ): WebGpuDispatchFormV1;
+
+export interface WebGpuBufferPortV1 {
+  readonly size: number;
+  mapAsync(mode: number): Promise<void>;
+  getMappedRange(offset?: number, size?: number): ArrayBuffer;
+  unmap(): void;
+  destroy(): void;
+}
+
+export interface WebGpuPipelinePortV1 {
+  getBindGroupLayout(index: number): unknown;
+}
+
+export interface WebGpuComputePassPortV1 {
+  setPipeline(pipeline: WebGpuPipelinePortV1): void;
+  setBindGroup(index: number, bindGroup: unknown): void;
+  dispatchWorkgroups(x: number, y?: number, z?: number): void;
+  end(): void;
+}
+
+export interface WebGpuCommandEncoderPortV1 {
+  beginComputePass(descriptor?: Readonly<Record<string, unknown>>): WebGpuComputePassPortV1;
+  copyBufferToBuffer(
+    source: WebGpuBufferPortV1,
+    sourceOffset: number,
+    destination: WebGpuBufferPortV1,
+    destinationOffset: number,
+    size: number,
+  ): void;
+  finish(): unknown;
+}
+
+export interface WebGpuDevicePortV1 {
+  readonly limits: Readonly<{
+    maxBufferSize: number;
+    maxStorageBufferBindingSize: number;
+    maxComputeWorkgroupsPerDimension: number;
+    maxBindingsPerBindGroup: number;
+    maxStorageBuffersPerShaderStage: number;
+    maxUniformBuffersPerShaderStage: number;
+    maxUniformBufferBindingSize: number;
+    minUniformBufferOffsetAlignment: number;
+  }>;
+  readonly queue: Readonly<{
+    writeBuffer(buffer: WebGpuBufferPortV1, bufferOffset: number, data: Uint8Array): void;
+    submit(commands: readonly unknown[]): void;
+  }>;
+  readonly lost: Promise<unknown>;
+  createShaderModule(descriptor: Readonly<{ label: string; code: string }>): unknown;
+  createComputePipelineAsync(descriptor: Readonly<{
+    label: string;
+    layout: "auto";
+    compute: Readonly<{ module: unknown; entryPoint: string }>;
+  }>): Promise<WebGpuPipelinePortV1>;
+  createBuffer(descriptor: Readonly<{
+    label: string;
+    size: number;
+    usage: number;
+  }>): WebGpuBufferPortV1;
+  createBindGroup(descriptor: Readonly<{
+    label: string;
+    layout: unknown;
+    entries: readonly Readonly<{
+      binding: number;
+      resource: Readonly<{
+        buffer: WebGpuBufferPortV1;
+        offset?: number;
+        size?: number;
+      }>;
+    }>[];
+  }>): unknown;
+  createCommandEncoder(descriptor: Readonly<{ label: string }>): WebGpuCommandEncoderPortV1;
+  destroy(): void;
+}
+
+export interface WebGpuResidentTensorV1 {
+  readonly bufferId: string;
+  readonly bytes: Uint8Array;
+}
+
+export interface WebGpuResidentDispatchV1 {
+  readonly operation: string;
+  readonly execution: WebGpuDispatchExecutionV1;
+  readonly stageIndex: number;
+  readonly uniformSlot: number;
+  readonly uniformBytes: Uint8Array | null;
+  readonly storageBindings: Readonly<Record<number, string>>;
+  readonly workgroups: readonly [number, number, number];
+}
+
+export declare class WebGpuResidentRuntimeV1 {
+  private constructor();
+  static prepare(
+    device: WebGpuDevicePortV1,
+    plan: CompiledTrainingPlanV1,
+    initial: readonly WebGpuResidentTensorV1[],
+  ): Promise<WebGpuResidentRuntimeV1>;
+  dispatch(commands: readonly WebGpuResidentDispatchV1[]): void;
+  read(bufferId: string): Promise<Uint8Array>;
+  dispose(): void;
+}

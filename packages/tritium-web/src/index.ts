@@ -27,6 +27,7 @@ export {
   webGpuCandidateModulesForOperationV1,
   webGpuKernelCandidateBundleV1,
 } from "./webgpu-kernels.ts";
+export { WebGpuResidentRuntimeV1 } from "./webgpu-runtime.ts";
 export {
   PortableLifecyclePlanError,
   compilePortableCheckpointRequest,
@@ -123,3 +124,12 @@ export type {
   WebGpuKernelCandidateBundleV1,
   WebGpuKernelModuleV1,
 } from "./webgpu-kernels.ts";
+export type {
+  WebGpuBufferPortV1,
+  WebGpuCommandEncoderPortV1,
+  WebGpuComputePassPortV1,
+  WebGpuDevicePortV1,
+  WebGpuPipelinePortV1,
+  WebGpuResidentDispatchV1,
+  WebGpuResidentTensorV1,
+} from "./webgpu-runtime.ts";
