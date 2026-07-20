@@ -35,6 +35,10 @@ struct Case {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Tolerance {
     BitExact,
+    AbsoluteRelative {
+        absolute_bits: u32,
+        relative_bits: u32,
+    },
 }
 
 #[derive(Serialize)]
@@ -115,6 +119,24 @@ fn main() {
                 },
             },
             Case {
+                case_id: "graph.add.forward.zero",
+                operation: "graph.add",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-4_f32.to_bits(),
+                    relative_bits: 1.0e-4_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("left", &[1], &[0.0]),
+                    f32_buffer("right", &[1], &[0.0]),
+                ],
+                attributes: vec![],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[1], &[0.0])],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
                 case_id: "graph.add.vjp.basic",
                 operation: "graph.add",
                 execution: "vjp",
@@ -165,7 +187,7 @@ fn main() {
                 attributes: vec![],
                 expected: Expected::Error {
                     category: "invalid_operation",
-                    code: "non_finite",
+                    code: "non_finite.left",
                     outputs: vec![f32_buffer("result", &[1], &[123.0])],
                 },
             },

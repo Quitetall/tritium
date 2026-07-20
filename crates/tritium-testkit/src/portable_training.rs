@@ -6,7 +6,7 @@ use tritium_spec::{
     TrainReceiptV1, TrainRequestError, TrainRequestV1, TrainingToleranceV1,
     TrainingVectorAttributeV1, TrainingVectorAttributeValueV1, TrainingVectorBufferDataV1,
     TrainingVectorBufferV1, TrainingVectorCaseV1, TrainingVectorErrorCategoryV1,
-    TrainingVectorExpectedV1, TrainingVectorSetV1,
+    TrainingVectorExpectedV1, TrainingVectorSetV1, train_output_digest_v1, train_request_digest_v1,
 };
 
 /// One portable-training vector that matched its frozen result.
@@ -141,20 +141,32 @@ fn run_success_case(
     let inputs: Vec<_> = case.inputs.iter().map(materialize_buffer).collect();
     let input_views: Vec<_> = inputs.iter().map(TrainOwnedBufferV1::as_ref).collect();
     let attributes: Vec<_> = case.attributes.iter().map(attribute_view).collect();
-    let mut outputs: Vec<_> = expected_outputs.iter().map(zero_buffer).collect();
-    let receipt = {
+    let mut outputs: Vec<_> = expected_outputs
+        .iter()
+        .map(|buffer| poison_buffer(buffer, case.tolerance))
+        .collect();
+    let (receipt, expected_input_digest, expected_output_digest) = {
         let mut output_views: Vec<_> = outputs.iter_mut().map(TrainOwnedBufferV1::as_mut).collect();
         let mut output = TrainOutputV1::new(&mut output_views);
-        backend
-            .execute(
-                vector_request(case, vectors, &input_views, &attributes),
-                &mut output,
-            )
-            .map_err(TrainingVectorFailureReason::Backend)?
+        let request = vector_request(case, vectors, &input_views, &attributes);
+        let expected_input_digest = train_request_digest_v1(&request);
+        let receipt = backend
+            .execute(request, &mut output)
+            .map_err(TrainingVectorFailureReason::Backend)?;
+        let expected_output_digest = train_output_digest_v1(&output);
+        (receipt, expected_input_digest, expected_output_digest)
     };
 
     grade_outputs(&outputs, expected_outputs, case.tolerance)?;
-    grade_receipt(&receipt, vectors, &case.operation, case.execution)?;
+    grade_receipt(
+        backend,
+        &receipt,
+        vectors,
+        &case.operation,
+        case.execution,
+        expected_input_digest,
+        expected_output_digest,
+    )?;
     if receipt.scratch_bytes > scratch_bytes_max {
         return Err(TrainingVectorFailureReason::ScratchBytes {
             maximum: scratch_bytes_max,
@@ -227,16 +239,26 @@ fn materialize_buffer(buffer: &TrainingVectorBufferV1) -> TrainOwnedBufferV1 {
     }
 }
 
-fn zero_buffer(buffer: &TrainingVectorBufferV1) -> TrainOwnedBufferV1 {
+fn poison_buffer(
+    buffer: &TrainingVectorBufferV1,
+    tolerance: TrainingToleranceV1,
+) -> TrainOwnedBufferV1 {
     let data = match &buffer.data {
         TrainingVectorBufferDataV1::F32Bits(bits) => {
-            TrainOwnedBufferDataV1::F32(vec![0.0; bits.len()])
+            let values = match tolerance {
+                TrainingToleranceV1::BitExact => bits
+                    .iter()
+                    .map(|bits| f32::from_bits(bits ^ 0x0040_0000))
+                    .collect(),
+                TrainingToleranceV1::AbsoluteRelative { .. } => vec![f32::NAN; bits.len()],
+            };
+            TrainOwnedBufferDataV1::F32(values)
         }
         TrainingVectorBufferDataV1::U32(values) => {
-            TrainOwnedBufferDataV1::U32(vec![0; values.len()])
+            TrainOwnedBufferDataV1::U32(values.iter().map(|value| value ^ u32::MAX).collect())
         }
         TrainingVectorBufferDataV1::Bytes(values) => {
-            TrainOwnedBufferDataV1::Bytes(vec![0; values.len()])
+            TrainOwnedBufferDataV1::Bytes(values.iter().map(|value| value ^ u8::MAX).collect())
         }
     };
     TrainOwnedBufferV1 {
@@ -319,11 +341,25 @@ fn accepts(tolerance: TrainingToleranceV1, actual: f32, expected: f32) -> bool {
 }
 
 fn grade_receipt(
+    backend: &dyn TrainBackendV1,
     receipt: &TrainReceiptV1,
     vectors: &TrainingVectorSetV1,
     operation: &str,
     execution: TrainExecutionV1,
+    expected_input_digest: [u8; 32],
+    expected_output_digest: [u8; 32],
 ) -> Result<(), TrainingVectorFailureReason> {
+    let capabilities = backend.capabilities();
+    if receipt.backend_id != capabilities.backend_id {
+        return Err(TrainingVectorFailureReason::Receipt(
+            "backend_id".to_owned(),
+        ));
+    }
+    if receipt.backend_build.is_empty() {
+        return Err(TrainingVectorFailureReason::Receipt(
+            "backend_build".to_owned(),
+        ));
+    }
     if receipt.manifest_digest != vectors.manifest_digest() {
         return Err(TrainingVectorFailureReason::Receipt(
             "manifest_digest".to_owned(),
@@ -340,6 +376,22 @@ fn grade_receipt(
     if receipt.execution != execution {
         return Err(TrainingVectorFailureReason::Receipt("execution".to_owned()));
     }
+    if receipt.input_digest != expected_input_digest {
+        return Err(TrainingVectorFailureReason::Receipt(
+            "input_digest".to_owned(),
+        ));
+    }
+    if receipt.output_digest != expected_output_digest {
+        return Err(TrainingVectorFailureReason::Receipt(
+            "output_digest".to_owned(),
+        ));
+    }
+    if !capabilities.dtypes.contains(&receipt.dtype) {
+        return Err(TrainingVectorFailureReason::Receipt("dtype".to_owned()));
+    }
+    if receipt.limits != capabilities.limits {
+        return Err(TrainingVectorFailureReason::Receipt("limits".to_owned()));
+    }
     if !receipt.device_resident || receipt.host_transfers != 0 {
         return Err(TrainingVectorFailureReason::Receipt("residency".to_owned()));
     }
@@ -350,7 +402,7 @@ fn error_identity(error: &TrainBackendError) -> (TrainingVectorErrorCategoryV1, 
     match error {
         TrainBackendError::InvalidRequest(error) => (
             TrainingVectorErrorCategoryV1::InvalidRequest,
-            request_error_code(error).to_owned(),
+            request_error_code(error),
         ),
         TrainBackendError::InvalidOperation(error) => (
             TrainingVectorErrorCategoryV1::InvalidOperation,
@@ -366,31 +418,58 @@ fn error_identity(error: &TrainBackendError) -> (TrainingVectorErrorCategoryV1, 
     }
 }
 
-const fn request_error_code(error: &TrainRequestError) -> &'static str {
+fn request_error_code(error: &TrainRequestError) -> String {
     match error {
-        TrainRequestError::UnknownOperation(_) => "unknown_operation",
-        TrainRequestError::IllegalExecution { .. } => "illegal_execution",
-        TrainRequestError::InvalidName { .. } => "invalid_name",
-        TrainRequestError::DuplicateName { .. } => "duplicate_name",
-        TrainRequestError::ShapeOverflow { .. } => "shape_overflow",
-        TrainRequestError::RankLimit { .. } => "rank_limit",
-        TrainRequestError::ElementLimit { .. } => "element_limit",
-        TrainRequestError::ByteCountOverflow { .. } => "byte_count_overflow",
-        TrainRequestError::ByteLimit { .. } => "byte_limit",
-        TrainRequestError::BufferLength { .. } => "buffer_length",
-        TrainRequestError::NonFiniteAttribute(_) => "non_finite_attribute",
+        TrainRequestError::UnknownOperation(operation) => format!("unknown_operation.{operation}"),
+        TrainRequestError::IllegalExecution {
+            operation,
+            execution,
+        } => format!("illegal_execution.{operation}.{execution:?}").to_ascii_lowercase(),
+        TrainRequestError::InvalidName { namespace, name } => {
+            format!("invalid_name.{namespace}.{name}")
+        }
+        TrainRequestError::DuplicateName { namespace, name } => {
+            format!("duplicate_name.{namespace}.{name}")
+        }
+        TrainRequestError::ShapeOverflow { name } => format!("shape_overflow.{name}"),
+        TrainRequestError::RankLimit { name, got, max } => {
+            format!("rank_limit.{name}.{got}.{max}")
+        }
+        TrainRequestError::ElementLimit { name, got, max } => {
+            format!("element_limit.{name}.{got}.{max}")
+        }
+        TrainRequestError::ByteCountOverflow { name } => {
+            format!("byte_count_overflow.{name}")
+        }
+        TrainRequestError::ByteLimit { name, got, max } => {
+            format!("byte_limit.{name}.{got}.{max}")
+        }
+        TrainRequestError::BufferLength {
+            name,
+            expected,
+            got,
+        } => format!("buffer_length.{name}.{expected}.{got}"),
+        TrainRequestError::NonFiniteAttribute(name) => {
+            format!("non_finite_attribute.{name}")
+        }
     }
 }
 
 fn operation_error_code(error: &TrainOperationErrorV1) -> String {
     match error {
-        TrainOperationErrorV1::Roles { .. } => "roles".to_owned(),
-        TrainOperationErrorV1::DType { .. } => "dtype".to_owned(),
+        TrainOperationErrorV1::Roles { namespace } => format!("roles.{namespace}"),
+        TrainOperationErrorV1::DType {
+            name,
+            expected,
+            got,
+        } => format!("dtype.{name}.{expected:?}.{got:?}").to_ascii_lowercase(),
         TrainOperationErrorV1::Shape => "shape".to_owned(),
-        TrainOperationErrorV1::NonFinite { .. } => "non_finite".to_owned(),
-        TrainOperationErrorV1::AttributeType { .. } => "attribute_type".to_owned(),
-        TrainOperationErrorV1::AttributeValue { constraint, .. } => {
-            format!("attribute_value.{constraint}")
+        TrainOperationErrorV1::NonFinite { name } => format!("non_finite.{name}"),
+        TrainOperationErrorV1::AttributeType { name, expected } => {
+            format!("attribute_type.{name}.{expected}")
+        }
+        TrainOperationErrorV1::AttributeValue { name, constraint } => {
+            format!("attribute_value.{name}.{constraint}")
         }
     }
 }

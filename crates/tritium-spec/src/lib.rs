@@ -37,7 +37,8 @@ pub use train_backend::{
     TrainBufferDataMutV1, TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1,
     TrainExecutionV1, TrainLimitsV1, TrainNamedBufferMutV1, TrainNamedBufferRefV1,
     TrainOperationErrorV1, TrainOutputV1, TrainOwnedBufferDataV1, TrainOwnedBufferV1,
-    TrainReceiptV1, TrainRequestError, TrainRequestV1,
+    TrainReceiptV1, TrainRequestError, TrainRequestV1, train_output_digest_v1,
+    train_request_digest_v1,
 };
 mod training;
 pub use training::{

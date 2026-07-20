@@ -62,7 +62,7 @@ fn parses_one_exact_forward_vector_bound_to_the_manifest() {
 }
 
 #[test]
-fn canonical_tracer_corpus_is_exact_and_executable_in_manifest_order() {
+fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
     let bytes = TrainingVectorSetV1::canonical_json();
     assert_eq!(bytes.last(), Some(&b'\n'));
     let vectors = TrainingVectorSetV1::parse_json(bytes).unwrap();
@@ -74,6 +74,7 @@ fn canonical_tracer_corpus_is_exact_and_executable_in_manifest_order() {
             .collect::<Vec<_>>(),
         [
             ("graph.add", TrainExecutionV1::Forward),
+            ("graph.add", TrainExecutionV1::Forward),
             ("graph.add", TrainExecutionV1::Vjp),
             ("optimizer.sgd", TrainExecutionV1::Step),
             ("graph.add", TrainExecutionV1::Forward),
@@ -82,6 +83,6 @@ fn canonical_tracer_corpus_is_exact_and_executable_in_manifest_order() {
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "d09723a3f09d9e4b282a25c2e7d086739ea222c7743523f43110bdeef339e4b8"
+        "4f5ab35ea2a77dec22cff12e134466fb0b86bfa882cd9b904dc64cc9dc751a78"
     );
 }

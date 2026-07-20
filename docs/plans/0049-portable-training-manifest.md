@@ -110,6 +110,14 @@ semantics, reject duplicate/unknown/type/order drift, and re-emit byte-identical
 canonical JSON. Python passed the complete 92-test suite; Deno type-check and
 three parser tests passed. Slice 2 is next.
 
+The first Slice 2 tracer seed now covers `graph.add` forward/VJP, an exact-zero
+forward, plain-SGD step, and non-finite rejection. A generic testkit runner
+poisons success outputs, preserves error sentinels, grades structured error
+identity, independently recomputes request/output receipt digests, and binds
+every successful receipt to the exact corpus bytes. This is incremental
+evidence, not Slice 2 closure: all remaining operations and an envelope capable
+of carrying intentionally malformed shared-request vectors are still required.
+
 Edits:
 
 - Add strict manifest types/parser to `tritium-spec/src/training.rs`.

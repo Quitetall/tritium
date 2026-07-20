@@ -63,6 +63,61 @@
       }
     },
     {
+      "case_id": "graph.add.forward.zero",
+      "operation": "graph.add",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 953267991,
+        "relative_bits": 953267991
+      },
+      "inputs": [
+        {
+          "name": "left",
+          "shape": [
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              0
+            ]
+          }
+        },
+        {
+          "name": "right",
+          "shape": [
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              0
+            ]
+          }
+        }
+      ],
+      "attributes": [],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                0
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
       "case_id": "graph.add.vjp.basic",
       "operation": "graph.add",
       "execution": "vjp",
@@ -225,7 +280,7 @@
       "expected": {
         "kind": "error",
         "category": "invalid_operation",
-        "code": "non_finite",
+        "code": "non_finite.left",
         "outputs": [
           {
             "name": "result",

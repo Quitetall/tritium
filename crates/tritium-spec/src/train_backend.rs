@@ -2,6 +2,8 @@
 
 use core::fmt;
 
+use blake3::Hasher;
+
 use crate::{TrainingOpCategoryV1, TrainingOpManifestV1, TrainingVjpV1};
 
 /// Portable tensor/storage dtype.
@@ -843,5 +845,126 @@ fn reject_prior_name<T>(
         })
     } else {
         Ok(())
+    }
+}
+
+/// Compute the canonical BLAKE3 identity of one portable training request.
+///
+/// The encoding is versioned by the `V1` request contract and binds operation,
+/// execution phase, ordered roles, shapes, typed payload bits and attributes.
+#[must_use]
+pub fn train_request_digest_v1(request: &TrainRequestV1<'_>) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hash_str(&mut hasher, request.operation);
+    hasher.update(&[execution_tag(request.execution)]);
+    hash_u64(&mut hasher, request.inputs.len() as u64);
+    for buffer in request.inputs {
+        hash_str(&mut hasher, buffer.name);
+        hash_shape(&mut hasher, buffer.shape);
+        match buffer.data {
+            TrainBufferDataRefV1::F32(data) => hash_f32(&mut hasher, data),
+            TrainBufferDataRefV1::U32(data) => hash_u32(&mut hasher, data),
+            TrainBufferDataRefV1::Bytes(data) => hash_bytes(&mut hasher, data),
+        }
+    }
+    hash_u64(&mut hasher, request.attributes.len() as u64);
+    for attribute in request.attributes {
+        hash_str(&mut hasher, attribute.name);
+        match attribute.value {
+            TrainAttributeValueV1::F32(value) => {
+                hasher.update(&[0]);
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+            TrainAttributeValueV1::U64(value) => {
+                hasher.update(&[1]);
+                hash_u64(&mut hasher, value);
+            }
+            TrainAttributeValueV1::Bool(value) => {
+                hasher.update(&[2, u8::from(value)]);
+            }
+            TrainAttributeValueV1::Text(value) => {
+                hasher.update(&[3]);
+                hash_str(&mut hasher, value);
+            }
+            TrainAttributeValueV1::U64List(values) => {
+                hasher.update(&[4]);
+                hash_u64(&mut hasher, values.len() as u64);
+                for &value in values {
+                    hash_u64(&mut hasher, value);
+                }
+            }
+            TrainAttributeValueV1::U32List(values) => {
+                hasher.update(&[5]);
+                hash_u32(&mut hasher, values);
+            }
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Compute the canonical BLAKE3 identity of portable training outputs.
+#[must_use]
+pub fn train_output_digest_v1(output: &TrainOutputV1<'_>) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hash_u64(&mut hasher, output.buffers.len() as u64);
+    for buffer in output.buffers.iter() {
+        hash_str(&mut hasher, buffer.name);
+        hash_shape(&mut hasher, buffer.shape);
+        match &buffer.data {
+            TrainBufferDataMutV1::F32(data) => hash_f32(&mut hasher, data),
+            TrainBufferDataMutV1::U32(data) => hash_u32(&mut hasher, data),
+            TrainBufferDataMutV1::Bytes(data) => hash_bytes(&mut hasher, data),
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn hash_shape(hasher: &mut Hasher, shape: &[u64]) {
+    hash_u64(hasher, shape.len() as u64);
+    for &dimension in shape {
+        hash_u64(hasher, dimension);
+    }
+}
+
+fn hash_f32(hasher: &mut Hasher, values: &[f32]) {
+    hasher.update(&[0]);
+    hash_u64(hasher, values.len() as u64);
+    for &value in values {
+        hasher.update(&value.to_bits().to_le_bytes());
+    }
+}
+
+fn hash_u32(hasher: &mut Hasher, values: &[u32]) {
+    hasher.update(&[1]);
+    hash_u64(hasher, values.len() as u64);
+    for &value in values {
+        hasher.update(&value.to_le_bytes());
+    }
+}
+
+fn hash_bytes(hasher: &mut Hasher, values: &[u8]) {
+    hasher.update(&[2]);
+    hash_u64(hasher, values.len() as u64);
+    hasher.update(values);
+}
+
+fn hash_str(hasher: &mut Hasher, value: &str) {
+    hash_u64(hasher, value.len() as u64);
+    hasher.update(value.as_bytes());
+}
+
+fn hash_u64(hasher: &mut Hasher, value: u64) {
+    hasher.update(&value.to_le_bytes());
+}
+
+const fn execution_tag(execution: TrainExecutionV1) -> u8 {
+    match execution {
+        TrainExecutionV1::Forward => 0,
+        TrainExecutionV1::Vjp => 1,
+        TrainExecutionV1::Step => 2,
+        TrainExecutionV1::Checkpoint => 3,
+        TrainExecutionV1::Resume => 4,
+        TrainExecutionV1::Export => 5,
+        TrainExecutionV1::Reload => 6,
     }
 }
