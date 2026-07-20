@@ -12,7 +12,7 @@ use serde::Serialize;
 use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
 use tritium_train::{
     Optimizer, Sgd,
-    ops::{act, bias, elementwise, loss},
+    ops::{act, bias, dense, elementwise, embed, loss, shape},
 };
 
 #[derive(Serialize)]
@@ -55,13 +55,24 @@ struct Buffer {
 #[serde(tag = "dtype", rename_all = "snake_case")]
 enum Data {
     F32 { bits: Vec<u32> },
+    U32 { values: Vec<u32> },
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Attribute {
-    F32 { name: &'static str, bits: u32 },
-    U64 { name: &'static str, value: u64 },
+    F32 {
+        name: &'static str,
+        bits: u32,
+    },
+    U64 {
+        name: &'static str,
+        value: u64,
+    },
+    U64List {
+        name: &'static str,
+        values: Vec<u64>,
+    },
 }
 
 #[derive(Serialize)]
@@ -88,6 +99,16 @@ fn f32_buffer(name: &'static str, shape: &[u64], values: &[f32]) -> Buffer {
     }
 }
 
+fn u32_buffer(name: &'static str, shape: &[u64], values: &[u32]) -> Buffer {
+    Buffer {
+        name,
+        shape: shape.to_vec(),
+        data: Data::U32 {
+            values: values.to_vec(),
+        },
+    }
+}
+
 fn main() {
     let left = [1.0_f32, -2.0, 0.5];
     let right = [3.0_f32, 4.0, -1.5];
@@ -99,6 +120,28 @@ fn main() {
     let mul = elementwise::mul_forward(&mul_left, &mul_right);
     let mul_grad_output = [0.25_f32, -2.0, 3.0];
     let mul_grads = elementwise::mul_vjp(&mul_left, &mul_right, &mul_grad_output);
+
+    let matrix = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let transpose = dense::transpose_forward(&matrix, 2, 3);
+    let transpose_grad_output = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let transpose_grad = dense::transpose_vjp(2, 3, &transpose_grad_output);
+
+    let embedding_weight = [0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+    let tokens = [2_u32, 0, 2];
+    let embedding = embed::gather_forward(&embedding_weight, &tokens, 2);
+    let embedding_grad_output = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let embedding_grad = embed::gather_vjp(4, &tokens, 2, &embedding_grad_output);
+
+    let column_matrix = [0.0_f32, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 13.0];
+    let column_slice = shape::slice_cols_forward(&column_matrix, 2, 4, 1, 2);
+    let slice_grad_output = [1.0_f32, 2.0, 3.0, 4.0];
+    let slice_grad = shape::slice_cols_vjp(2, 4, 1, 2, &slice_grad_output);
+
+    let concat_left = [1.0_f32, 2.0, 3.0, 4.0];
+    let concat_right = [5.0_f32, 6.0];
+    let concatenated = shape::concat_cols_forward(&[&concat_left, &concat_right], 2, &[2, 1]);
+    let concat_grad_output = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let concat_grads = shape::concat_cols_vjp(2, &[2, 1], &concat_grad_output);
 
     let unary_input = [-2.0_f32, 0.0, 3.0];
     let unary_grad_output = [1.0_f32, 2.0, 0.5];
@@ -184,6 +227,203 @@ fn main() {
                     outputs: vec![
                         f32_buffer("grad_left", &[3], &grad_output),
                         f32_buffer("grad_right", &[3], &grad_output),
+                    ],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.transpose.forward.basic",
+                operation: "graph.transpose",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[2, 3], &matrix)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[3, 2], &transpose)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.transpose.vjp.basic",
+                operation: "graph.transpose",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("grad_output", &[3, 2], &transpose_grad_output)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_x", &[2, 3], &transpose_grad[0])],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.embedding_gather.forward.repeated",
+                operation: "graph.embedding_gather",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[4, 2], &embedding_weight),
+                    u32_buffer("tokens", &[3], &tokens),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "vocab",
+                        value: 4,
+                    },
+                    Attribute::U64 {
+                        name: "n_embd",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[3, 2], &embedding)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.embedding_gather.vjp.repeated",
+                operation: "graph.embedding_gather",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[4, 2], &embedding_weight),
+                    u32_buffer("tokens", &[3], &tokens),
+                    f32_buffer("grad_output", &[3, 2], &embedding_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "vocab",
+                        value: 4,
+                    },
+                    Attribute::U64 {
+                        name: "n_embd",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_weight", &[4, 2], &embedding_grad)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.slice_cols.forward.basic",
+                operation: "graph.slice_cols",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[2, 4], &column_matrix)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 4,
+                    },
+                    Attribute::U64 {
+                        name: "start",
+                        value: 1,
+                    },
+                    Attribute::U64 {
+                        name: "len",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 2], &column_slice)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.slice_cols.vjp.basic",
+                operation: "graph.slice_cols",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("grad_output", &[2, 2], &slice_grad_output)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 4,
+                    },
+                    Attribute::U64 {
+                        name: "start",
+                        value: 1,
+                    },
+                    Attribute::U64 {
+                        name: "len",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_x", &[2, 4], &slice_grad)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.concat_cols.forward.basic",
+                operation: "graph.concat_cols",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("part.0", &[2, 2], &concat_left),
+                    f32_buffer("part.1", &[2, 1], &concat_right),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64List {
+                        name: "lens",
+                        values: vec![2, 1],
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &concatenated)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.concat_cols.vjp.basic",
+                operation: "graph.concat_cols",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("grad_output", &[2, 3], &concat_grad_output)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64List {
+                        name: "lens",
+                        values: vec![2, 1],
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_part.0", &[2, 2], &concat_grads[0]),
+                        f32_buffer("grad_part.1", &[2, 1], &concat_grads[1]),
                     ],
                     scratch_bytes_max: 0,
                 },
@@ -479,6 +719,108 @@ fn main() {
                     category: "invalid_request",
                     code: "duplicate_name.input.left",
                     outputs: vec![f32_buffer("result", &[1], &[456.0])],
+                },
+            },
+            Case {
+                case_id: "graph.transpose.forward.shape_error",
+                operation: "graph.transpose",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[1, 6], &matrix)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[3, 2], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "graph.embedding_gather.forward.token_oob",
+                operation: "graph.embedding_gather",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("weight", &[4, 2], &embedding_weight),
+                    u32_buffer("tokens", &[1], &[4]),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "vocab",
+                        value: 4,
+                    },
+                    Attribute::U64 {
+                        name: "n_embd",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[1, 2], &[123.0; 2])],
+                },
+            },
+            Case {
+                case_id: "graph.slice_cols.forward.bounds_error",
+                operation: "graph.slice_cols",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[2, 4], &column_matrix)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 4,
+                    },
+                    Attribute::U64 {
+                        name: "start",
+                        value: 3,
+                    },
+                    Attribute::U64 {
+                        name: "len",
+                        value: 2,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.start.slice_bounds",
+                    outputs: vec![f32_buffer("result", &[2, 2], &[123.0; 4])],
+                },
+            },
+            Case {
+                case_id: "graph.concat_cols.forward.shape_error",
+                operation: "graph.concat_cols",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("part.0", &[1, 4], &concat_left),
+                    f32_buffer("part.1", &[2, 1], &concat_right),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64List {
+                        name: "lens",
+                        values: vec![2, 1],
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
                 },
             },
         ],

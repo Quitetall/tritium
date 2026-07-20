@@ -119,6 +119,14 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.add.forward.basic",
             "graph.add.forward.zero",
             "graph.add.vjp.basic",
+            "graph.transpose.forward.basic",
+            "graph.transpose.vjp.basic",
+            "graph.embedding_gather.forward.repeated",
+            "graph.embedding_gather.vjp.repeated",
+            "graph.slice_cols.forward.basic",
+            "graph.slice_cols.vjp.basic",
+            "graph.concat_cols.forward.basic",
+            "graph.concat_cols.vjp.basic",
             "graph.mul.forward.basic",
             "graph.mul.vjp.basic",
             "graph.detach.forward.basic",
@@ -136,11 +144,15 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "optimizer.sgd.step.basic",
             "graph.add.forward.nonfinite",
             "graph.add.forward.duplicate_input",
+            "graph.transpose.forward.shape_error",
+            "graph.embedding_gather.forward.token_oob",
+            "graph.slice_cols.forward.bounds_error",
+            "graph.concat_cols.forward.shape_error",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "18b6efd5cf2c91c723b5e176d19e6e276d7de81c88b07707f8d9c9494a7f5a02"
+        "0a1227c4ba2578c7a86b8a68c26708aeec7456cc5803da9beada995ce6cf711c"
     );
 }

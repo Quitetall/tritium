@@ -19,6 +19,10 @@ const CPU_LIMITS: TrainLimitsV1 = TrainLimitsV1 {
 
 #[derive(Clone, Copy)]
 enum CpuOperation {
+    Transpose,
+    EmbeddingGather,
+    SliceCols,
+    ConcatCols,
     Detach,
     ScaleConst,
     Bias,
@@ -37,6 +41,22 @@ struct CpuOperationEntry {
 }
 
 const CPU_OPERATIONS: &[CpuOperationEntry] = &[
+    CpuOperationEntry {
+        id: "graph.transpose",
+        operation: CpuOperation::Transpose,
+    },
+    CpuOperationEntry {
+        id: "graph.embedding_gather",
+        operation: CpuOperation::EmbeddingGather,
+    },
+    CpuOperationEntry {
+        id: "graph.slice_cols",
+        operation: CpuOperation::SliceCols,
+    },
+    CpuOperationEntry {
+        id: "graph.concat_cols",
+        operation: CpuOperation::ConcatCols,
+    },
     CpuOperationEntry {
         id: "graph.detach",
         operation: CpuOperation::Detach,
@@ -85,6 +105,36 @@ const ADD_FORWARD: OperationSchema = OperationSchema {
     inputs: &["left", "right"],
     attributes: &[],
     outputs: &["result"],
+};
+const TRANSPOSE_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x"],
+    attributes: &["rows", "cols"],
+    outputs: &["result"],
+};
+const TRANSPOSE_VJP: OperationSchema = OperationSchema {
+    inputs: &["grad_output"],
+    attributes: &["rows", "cols"],
+    outputs: &["grad_x"],
+};
+const EMBEDDING_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["weight", "tokens"],
+    attributes: &["vocab", "n_embd"],
+    outputs: &["result"],
+};
+const EMBEDDING_VJP: OperationSchema = OperationSchema {
+    inputs: &["weight", "tokens", "grad_output"],
+    attributes: &["vocab", "n_embd"],
+    outputs: &["grad_weight"],
+};
+const SLICE_COLS_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x"],
+    attributes: &["rows", "cols", "start", "len"],
+    outputs: &["result"],
+};
+const SLICE_COLS_VJP: OperationSchema = OperationSchema {
+    inputs: &["grad_output"],
+    attributes: &["rows", "cols", "start", "len"],
+    outputs: &["grad_x"],
 };
 const ADD_VJP: OperationSchema = OperationSchema {
     inputs: &["grad_output"],
@@ -196,6 +246,28 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             .find(|entry| entry.id == request.operation)
             .ok_or_else(|| TrainBackendError::UnsupportedOperation(request.operation.to_owned()))?;
         match (operation.operation, request.execution) {
+            (CpuOperation::Transpose, TrainExecutionV1::Forward) => {
+                transpose_forward(&request, output)?;
+            }
+            (CpuOperation::Transpose, TrainExecutionV1::Vjp) => transpose_vjp(&request, output)?,
+            (CpuOperation::EmbeddingGather, TrainExecutionV1::Forward) => {
+                embedding_forward(&request, output)?;
+            }
+            (CpuOperation::EmbeddingGather, TrainExecutionV1::Vjp) => {
+                embedding_vjp(&request, output)?;
+            }
+            (CpuOperation::SliceCols, TrainExecutionV1::Forward) => {
+                slice_cols_forward(&request, output)?;
+            }
+            (CpuOperation::SliceCols, TrainExecutionV1::Vjp) => {
+                slice_cols_vjp(&request, output)?;
+            }
+            (CpuOperation::ConcatCols, TrainExecutionV1::Forward) => {
+                concat_cols_forward(&request, output)?;
+            }
+            (CpuOperation::ConcatCols, TrainExecutionV1::Vjp) => {
+                concat_cols_vjp(&request, output)?;
+            }
             (CpuOperation::Detach, TrainExecutionV1::Forward) => {
                 detach_forward(&request, output)?;
             }
@@ -244,6 +316,220 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             device_resident: true,
         })
     }
+}
+
+fn transpose_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &TRANSPOSE_FORWARD)?;
+    let (shape, x) = input_f32(request, "x")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if shape != [rows, cols] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    require_f32_output(output, "result", &[cols, rows])?;
+    let result = output_f32(output, "result")?;
+    for row in 0..rows_usize {
+        for col in 0..cols_usize {
+            result[col * rows_usize + row] = x[row * cols_usize + col];
+        }
+    }
+    Ok(())
+}
+
+fn transpose_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &TRANSPOSE_VJP)?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if grad_shape != [cols, rows] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", &[rows, cols])?;
+    let grad_x = output_f32(output, "grad_x")?;
+    for row in 0..rows_usize {
+        for col in 0..cols_usize {
+            grad_x[row * cols_usize + col] = grad_output[col * rows_usize + row];
+        }
+    }
+    Ok(())
+}
+
+fn embedding_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &EMBEDDING_FORWARD)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (token_shape, tokens) = input_u32(request, "tokens")?;
+    let (vocab, n_embd, vocab_usize, n_embd_usize) = embedding_attributes(request)?;
+    let sequence = u64::try_from(tokens.len()).map_err(|_| shape_error())?;
+    if weight_shape != [vocab, n_embd] || token_shape != [sequence] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_token_bounds(tokens, vocab_usize)?;
+    require_f32_output(output, "result", &[sequence, n_embd])?;
+    let result = output_f32(output, "result")?;
+    for (sequence_index, &token) in tokens.iter().enumerate() {
+        let source = token as usize * n_embd_usize;
+        let destination = sequence_index * n_embd_usize;
+        result[destination..destination + n_embd_usize]
+            .copy_from_slice(&weight[source..source + n_embd_usize]);
+    }
+    debug_assert_eq!(weight.len(), vocab_usize * n_embd_usize);
+    Ok(())
+}
+
+fn embedding_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &EMBEDDING_VJP)?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (token_shape, tokens) = input_u32(request, "tokens")?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (vocab, n_embd, vocab_usize, n_embd_usize) = embedding_attributes(request)?;
+    let sequence = u64::try_from(tokens.len()).map_err(|_| shape_error())?;
+    if weight_shape != [vocab, n_embd]
+        || token_shape != [sequence]
+        || grad_shape != [sequence, n_embd]
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    reject_token_bounds(tokens, vocab_usize)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    let grad_weight = output_f32(output, "grad_weight")?;
+    grad_weight.fill(0.0);
+    for (sequence_index, &token) in tokens.iter().enumerate() {
+        let destination = token as usize * n_embd_usize;
+        let source = sequence_index * n_embd_usize;
+        for column in 0..n_embd_usize {
+            grad_weight[destination + column] += grad_output[source + column];
+        }
+    }
+    debug_assert_eq!(grad_weight.len(), vocab_usize * n_embd_usize);
+    Ok(())
+}
+
+fn slice_cols_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &SLICE_COLS_FORWARD)?;
+    let (shape, x) = input_f32(request, "x")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    let (len, start_usize, len_usize) = slice_attributes(request, cols)?;
+    if shape != [rows, cols] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    require_f32_output(output, "result", &[rows, len])?;
+    let result = output_f32(output, "result")?;
+    for row in 0..rows_usize {
+        let source = row * cols_usize + start_usize;
+        let destination = row * len_usize;
+        result[destination..destination + len_usize]
+            .copy_from_slice(&x[source..source + len_usize]);
+    }
+    Ok(())
+}
+
+fn slice_cols_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &SLICE_COLS_VJP)?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    let (len, start_usize, len_usize) = slice_attributes(request, cols)?;
+    if grad_shape != [rows, len] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", &[rows, cols])?;
+    let grad_x = output_f32(output, "grad_x")?;
+    grad_x.fill(0.0);
+    for row in 0..rows_usize {
+        let destination = row * cols_usize + start_usize;
+        let source = row * len_usize;
+        grad_x[destination..destination + len_usize]
+            .copy_from_slice(&grad_output[source..source + len_usize]);
+    }
+    Ok(())
+}
+
+fn concat_cols_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    let (rows, rows_usize, lens, total, total_usize) = concat_attributes(request)?;
+    require_concat_roles(request, output, lens.len(), false)?;
+    for (buffer, &len) in request.inputs.iter().zip(lens) {
+        if buffer.shape != [rows, len] {
+            return Err(shape_error());
+        }
+        match buffer.data {
+            TrainBufferDataRefV1::F32(data) => reject_nonfinite(buffer.name, data)?,
+            data => return Err(dtype_error(buffer.name, TrainDTypeV1::F32, ref_dtype(data))),
+        }
+    }
+    require_f32_output(output, "result", &[rows, total])?;
+    let result = output_f32(output, "result")?;
+    for row in 0..rows_usize {
+        let mut column_offset = 0;
+        for (buffer, &len) in request.inputs.iter().zip(lens) {
+            let len = len as usize;
+            let data = match buffer.data {
+                TrainBufferDataRefV1::F32(data) => data,
+                _ => unreachable!("all concat inputs validated before mutation"),
+            };
+            let source = row * len;
+            let destination = row * total_usize + column_offset;
+            result[destination..destination + len].copy_from_slice(&data[source..source + len]);
+            column_offset += len;
+        }
+    }
+    Ok(())
+}
+
+fn concat_cols_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    let (rows, rows_usize, lens, total, total_usize) = concat_attributes(request)?;
+    require_concat_roles(request, output, lens.len(), true)?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    if grad_shape != [rows, total] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("grad_output", grad_output)?;
+    for (buffer, &len) in output.buffers.iter().zip(lens) {
+        require_f32_output(output, buffer.name, &[rows, len])?;
+    }
+    let mut column_offset = 0;
+    for (&len, buffer) in lens.iter().zip(output.buffers.iter_mut()) {
+        let len = len as usize;
+        let data = match &mut buffer.data {
+            TrainBufferDataMutV1::F32(data) => data,
+            _ => unreachable!("all concat outputs validated before mutation"),
+        };
+        for row in 0..rows_usize {
+            let source = row * total_usize + column_offset;
+            let destination = row * len;
+            data[destination..destination + len]
+                .copy_from_slice(&grad_output[source..source + len]);
+        }
+        column_offset += len;
+    }
+    Ok(())
 }
 
 fn detach_forward(
@@ -543,13 +829,13 @@ fn mse_vjp(
     reject_nonfinite("target", target)?;
     reject_nonfinite("grad_output", grad_output)?;
     require_f32_output(output, "grad_prediction", prediction_shape)?;
-    let factor = grad_output[0] * 2.0 / prediction.len() as f32;
+    let element_count = prediction.len() as f32;
     for ((grad_prediction, &prediction), &target) in output_f32(output, "grad_prediction")?
         .iter_mut()
         .zip(prediction)
         .zip(target)
     {
-        *grad_prediction = factor * (prediction - target);
+        *grad_prediction = grad_output[0] * 2.0 * (prediction - target) / element_count;
     }
     Ok(())
 }
@@ -659,6 +945,21 @@ fn input_f32<'a>(
     }
 }
 
+fn input_u32<'a>(
+    request: &TrainRequestV1<'a>,
+    name: &str,
+) -> Result<(&'a [u64], &'a [u32]), TrainBackendError> {
+    let buffer = request
+        .inputs
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or_else(|| role_error("input"))?;
+    match buffer.data {
+        TrainBufferDataRefV1::U32(data) => Ok((buffer.shape, data)),
+        data => Err(dtype_error(name, TrainDTypeV1::U32, ref_dtype(data))),
+    }
+}
+
 fn output_f32<'a>(
     output: &'a mut TrainOutputV1<'_>,
     name: &str,
@@ -710,6 +1011,129 @@ fn matrix_attributes(
     Ok((rows, cols, rows_usize, cols_usize))
 }
 
+fn embedding_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<(u64, u64, usize, usize), TrainBackendError> {
+    let vocab = attribute_u64(request, "vocab")?;
+    let n_embd = attribute_u64(request, "n_embd")?;
+    let vocab_usize = usize::try_from(vocab).map_err(|_| attribute_value("vocab", "usize"))?;
+    let n_embd_usize = usize::try_from(n_embd).map_err(|_| attribute_value("n_embd", "usize"))?;
+    vocab_usize
+        .checked_mul(n_embd_usize)
+        .ok_or_else(|| attribute_value("vocab", "vocab_times_n_embd"))?;
+    Ok((vocab, n_embd, vocab_usize, n_embd_usize))
+}
+
+fn reject_token_bounds(tokens: &[u32], vocab: usize) -> Result<(), TrainBackendError> {
+    if tokens.iter().all(|&token| (token as usize) < vocab) {
+        Ok(())
+    } else {
+        Err(shape_error())
+    }
+}
+
+fn slice_attributes(
+    request: &TrainRequestV1<'_>,
+    cols: u64,
+) -> Result<(u64, usize, usize), TrainBackendError> {
+    let start = attribute_u64(request, "start")?;
+    let len = attribute_u64(request, "len")?;
+    if start.checked_add(len).is_none_or(|end| end > cols) {
+        return Err(attribute_value("start", "slice_bounds"));
+    }
+    let start_usize = usize::try_from(start).map_err(|_| attribute_value("start", "usize"))?;
+    let len_usize = usize::try_from(len).map_err(|_| attribute_value("len", "usize"))?;
+    Ok((len, start_usize, len_usize))
+}
+
+fn concat_attributes<'a>(
+    request: &'a TrainRequestV1<'_>,
+) -> Result<(u64, usize, &'a [u64], u64, usize), TrainBackendError> {
+    if !same_names(
+        request.attributes.iter().map(|attribute| attribute.name),
+        &["rows", "lens"],
+    ) {
+        return Err(role_error("attribute"));
+    }
+    let rows = attribute_u64(request, "rows")?;
+    let rows_usize = usize::try_from(rows).map_err(|_| attribute_value("rows", "usize"))?;
+    let lens = attribute_u64_list(request, "lens")?;
+    if lens.is_empty() {
+        return Err(attribute_value("lens", "nonempty"));
+    }
+    let mut total = 0_u64;
+    let mut total_usize = 0_usize;
+    for &len in lens {
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| attribute_value("lens", "sum"))?;
+        let len = usize::try_from(len).map_err(|_| attribute_value("lens", "usize"))?;
+        total_usize = total_usize
+            .checked_add(len)
+            .ok_or_else(|| attribute_value("lens", "sum"))?;
+    }
+    rows_usize
+        .checked_mul(total_usize)
+        .ok_or_else(|| attribute_value("rows", "rows_times_lens"))?;
+    Ok((rows, rows_usize, lens, total, total_usize))
+}
+
+fn require_concat_roles(
+    request: &TrainRequestV1<'_>,
+    output: &TrainOutputV1<'_>,
+    parts: usize,
+    vjp: bool,
+) -> Result<(), TrainBackendError> {
+    let valid_inputs = if vjp {
+        same_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &["grad_output"],
+        )
+    } else {
+        indexed_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            "part.",
+            parts,
+        )
+    };
+    if !valid_inputs {
+        return Err(role_error("input"));
+    }
+    let valid_outputs = if vjp {
+        indexed_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            "grad_part.",
+            parts,
+        )
+    } else {
+        same_names(output.buffers.iter().map(|buffer| buffer.name), &["result"])
+    };
+    if !valid_outputs {
+        return Err(role_error("output"));
+    }
+    Ok(())
+}
+
+fn indexed_names<'a>(
+    observed: impl Iterator<Item = &'a str>,
+    prefix: &str,
+    expected: usize,
+) -> bool {
+    let mut count = 0;
+    for (index, name) in observed.enumerate() {
+        let Some(suffix) = name.strip_prefix(prefix) else {
+            return false;
+        };
+        if suffix.parse::<usize>().ok() != Some(index)
+            || (suffix.len() > 1 && suffix.starts_with('0'))
+        {
+            return false;
+        }
+        count += 1;
+    }
+    count == expected
+}
+
 fn attribute_u64(request: &TrainRequestV1<'_>, name: &str) -> Result<u64, TrainBackendError> {
     match request
         .attributes
@@ -731,6 +1155,21 @@ fn attribute_f32(request: &TrainRequestV1<'_>, name: &str) -> Result<f32, TrainB
     {
         Some(TrainAttributeValueV1::F32(value)) => Ok(value),
         _ => Err(attribute_type(name, "f32")),
+    }
+}
+
+fn attribute_u64_list<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a [u64], TrainBackendError> {
+    match request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .map(|attribute| attribute.value)
+    {
+        Some(TrainAttributeValueV1::U64List(value)) => Ok(value),
+        _ => Err(attribute_type(name, "u64_list")),
     }
 }
 

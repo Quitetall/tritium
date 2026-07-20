@@ -11,9 +11,14 @@ use tritium_train::CpuTrainBackendV1;
 fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
     let backend = CpuTrainBackendV1::new();
     let capabilities = backend.capabilities();
+    assert_eq!(capabilities.dtypes, [TrainDTypeV1::F32, TrainDTypeV1::U32]);
     assert_eq!(
         capabilities.supported_operations,
         [
+            "graph.transpose",
+            "graph.embedding_gather",
+            "graph.slice_cols",
+            "graph.concat_cols",
             "graph.detach",
             "graph.scale_const",
             "graph.bias",
@@ -127,6 +132,29 @@ fn cpu_sgd_step_matches_portable_literal() {
     let mut output = TrainOutputV1::new(&mut buffers);
     backend.execute(request, &mut output).unwrap();
     assert_eq!(updated, [0.95, -1.975]);
+}
+
+#[test]
+fn cpu_mse_vjp_preserves_reference_f32_evaluation_order() {
+    let backend = CpuTrainBackendV1::new();
+    let prediction = [f32::from_bits(0x4fc3_5373); 257];
+    let target = [0.0_f32; 257];
+    let grad_output = [f32::from_bits(0xceb6_cdd2)];
+    let inputs = [
+        TrainNamedBufferRefV1::new("prediction", &[257], TrainBufferDataRefV1::F32(&prediction)),
+        TrainNamedBufferRefV1::new("target", &[257], TrainBufferDataRefV1::F32(&target)),
+        TrainNamedBufferRefV1::new("grad_output", &[], TrainBufferDataRefV1::F32(&grad_output)),
+    ];
+    let request = TrainRequestV1::new("loss.mse", TrainExecutionV1::Vjp, &inputs, &[]);
+    let mut gradient = [0.0_f32; 257];
+    let mut buffers = [TrainNamedBufferMutV1::new(
+        "grad_prediction",
+        &[257],
+        TrainBufferDataMutV1::F32(&mut gradient),
+    )];
+    let mut output = TrainOutputV1::new(&mut buffers);
+    backend.execute(request, &mut output).unwrap();
+    assert!(gradient.iter().all(|value| value.to_bits() == 0xdb8a_ef6f));
 }
 
 #[test]
