@@ -1386,20 +1386,14 @@ pub fn plan_salt_v2_tensor_master(
             tensor: tensor_index,
         });
     }
-    let tensors = [input.tensor];
-    let model = SaltV2ModelFitInput {
-        tensors: &tensors,
-        activations: input.activations,
-        source_model_id: input.source_model_id,
-        physical: SaltV2ModelPhysicalInput {
-            total_model_parameters: u64::try_from(input.tensor.weights.len())
-                .map_err(|_| SaltV2Error::AccountingOverflow)?,
-            preserved_artifact_bytes: 0,
-            preserved_resident_bytes: 0,
-            required_runtime_shadow_bytes: 0,
-        },
-    };
-    validate_model_input(&model, config)?;
+    validate_tensor_input(
+        tensor_index,
+        &input.tensor,
+        config,
+        *input.source_model_id.as_bytes(),
+        input.activations.digest().into_bytes(),
+        input.activations.spec().source_digest().into_bytes(),
+    )?;
     let tensor = input.tensor;
     SaltV2MasterTensorSpec::new(
         tensor.name.to_owned(),
@@ -1985,58 +1979,17 @@ fn validate_model_input(
     let mut names = BTreeSet::new();
     let mut quantized = 0u64;
     for (tensor_index, tensor) in input.tensors.iter().enumerate() {
-        if tensor.name.is_empty() {
-            return Err(SaltV2Error::EmptyTensorName {
-                tensor: tensor_index,
-            });
-        }
         if !names.insert(tensor.name) {
             return Err(SaltV2Error::DuplicateTensorName(tensor.name.to_owned()));
         }
-        let expected = tensor
-            .rows
-            .checked_mul(tensor.cols)
-            .filter(|_| tensor.rows > 0 && tensor.cols > 0)
-            .ok_or(SaltV2Error::InvalidTensorShape {
-                tensor: tensor_index,
-            })?;
-        if expected != tensor.weights.len() {
-            return Err(SaltV2Error::TensorLengthMismatch {
-                tensor: tensor_index,
-                expected,
-                got: tensor.weights.len(),
-            });
-        }
-        if let Some(index) = tensor.weights.iter().position(|weight| !weight.is_finite()) {
-            return Err(SaltV2Error::NonFiniteWeight {
-                tensor: tensor_index,
-                index,
-            });
-        }
-        let curvature_source = tensor.curvature.source_id();
-        if curvature_source.source_model_digest() != source_model_digest {
-            return Err(SaltV2Error::CurvatureSourceModelMismatch {
-                tensor: tensor_index,
-            });
-        }
-        if curvature_source.activation_cache_digest() != activation_cache_digest {
-            return Err(SaltV2Error::CurvatureActivationCacheMismatch {
-                tensor: tensor_index,
-            });
-        }
-        if curvature_source.token_stream_digest() != token_stream_digest {
-            return Err(SaltV2Error::CurvatureTokenStreamMismatch {
-                tensor: tensor_index,
-            });
-        }
-        if tensor.curvature.kind != config.curvature {
-            return Err(SaltV2Error::CurvatureKindMismatch {
-                tensor: tensor_index,
-                expected: config.curvature,
-                got: tensor.curvature.kind,
-            });
-        }
-        validate_curvature_geometry(tensor_index, tensor)?;
+        let expected = validate_tensor_input(
+            tensor_index,
+            tensor,
+            config,
+            source_model_digest,
+            activation_cache_digest,
+            token_stream_digest,
+        )?;
         quantized = quantized
             .checked_add(u64::try_from(expected).map_err(|_| SaltV2Error::AccountingOverflow)?)
             .ok_or(SaltV2Error::AccountingOverflow)?;
@@ -2047,6 +2000,66 @@ fn validate_model_input(
         return Err(SaltV2Error::InvalidTotalModelParameters);
     }
     Ok(quantized)
+}
+
+fn validate_tensor_input(
+    tensor_index: usize,
+    tensor: &SaltV2TensorFitInput<'_>,
+    config: &SaltV2Config,
+    source_model_digest: [u8; 32],
+    activation_cache_digest: [u8; 32],
+    token_stream_digest: [u8; 32],
+) -> Result<usize, SaltV2Error> {
+    if tensor.name.is_empty() {
+        return Err(SaltV2Error::EmptyTensorName {
+            tensor: tensor_index,
+        });
+    }
+    let expected = tensor
+        .rows
+        .checked_mul(tensor.cols)
+        .filter(|_| tensor.rows > 0 && tensor.cols > 0)
+        .ok_or(SaltV2Error::InvalidTensorShape {
+            tensor: tensor_index,
+        })?;
+    if expected != tensor.weights.len() {
+        return Err(SaltV2Error::TensorLengthMismatch {
+            tensor: tensor_index,
+            expected,
+            got: tensor.weights.len(),
+        });
+    }
+    if let Some(index) = tensor.weights.iter().position(|weight| !weight.is_finite()) {
+        return Err(SaltV2Error::NonFiniteWeight {
+            tensor: tensor_index,
+            index,
+        });
+    }
+    let curvature_source = tensor.curvature.source_id();
+    if curvature_source.source_model_digest() != source_model_digest {
+        return Err(SaltV2Error::CurvatureSourceModelMismatch {
+            tensor: tensor_index,
+        });
+    }
+    if curvature_source.activation_cache_digest() != activation_cache_digest {
+        return Err(SaltV2Error::CurvatureActivationCacheMismatch {
+            tensor: tensor_index,
+        });
+    }
+    if curvature_source.token_stream_digest() != token_stream_digest {
+        return Err(SaltV2Error::CurvatureTokenStreamMismatch {
+            tensor: tensor_index,
+        });
+    }
+    if tensor.curvature.kind != config.curvature {
+        return Err(SaltV2Error::CurvatureKindMismatch {
+            tensor: tensor_index,
+            expected: config.curvature,
+            got: tensor.curvature.kind,
+        });
+    }
+    validate_curvature_geometry(tensor_index, tensor)?;
+    Ok(expected)
 }
 
 fn validate_feedback_artifacts(input: &SaltV2MasterFitInput<'_>) -> Result<(), SaltV2Error> {
@@ -5083,6 +5096,33 @@ mod tests {
         assert!(matches!(
             plan_salt_v2_tensor_master(input, &config(10_000)),
             Err(SaltV2Error::MissingSourceTensorDigest { tensor: 0 })
+        ));
+    }
+
+    #[test]
+    fn independent_tensor_validation_reports_the_global_ordinal() {
+        let source_weights = weights(1);
+        let diagonal = vec![1.0; source_weights.len()];
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let other_model_id = ModelId::from_digest(different_digest(*model_id.as_bytes()));
+        let input = SaltV2TensorMasterFitInput {
+            tensor: SaltV2TensorFitInput {
+                name: "model.layers.17.mlp.down_proj.weight",
+                weights: &source_weights,
+                rows: 2,
+                cols: 128,
+                curvature: CurvatureArtifact::diagonal_fisher(source_id, [74; 32], &diagonal),
+            },
+            activations: &cache,
+            source_model_id: other_model_id,
+            tensor_index: 505,
+            source_tensor_digest: [83; 32],
+        };
+        assert!(matches!(
+            plan_salt_v2_tensor_master(input, &config(10_000)),
+            Err(SaltV2Error::CurvatureSourceModelMismatch { tensor: 505 })
         ));
     }
 
