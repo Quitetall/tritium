@@ -371,6 +371,16 @@ impl<'a> Qwen36TensorWorkStore<'a> {
         self.plan.preserved.iter().map(|entry| entry.spec.name())
     }
 
+    /// Canonical verified descriptors for all 360 retained BF16 tensors.
+    ///
+    /// Descriptors remain borrowed from the immutable workspace plan. Callers
+    /// can construct bounded container headers before streaming payloads with
+    /// [`Self::try_visit_preserved_tensor`], without reopening source shards or
+    /// widening BF16 values.
+    pub fn preserved_tensor_specs(&self) -> impl ExactSizeIterator<Item = &TensorRecordSpec> {
+        self.plan.preserved.iter().map(|entry| &entry.spec)
+    }
+
     /// Stream one named preserved tensor after record and source-semantic verification.
     ///
     /// Callback effects are nontransactional because final content and semantic
@@ -1609,6 +1619,24 @@ mod tests {
         assert_eq!(plan.summary.active_coefficients(), 27_320_697_856);
         assert_eq!(plan.summary.preserved_coefficients(), 2_671_616);
         assert_eq!(plan.summary.preserved_payload_bytes(), 5_343_232);
+        let preserved = plan
+            .preserved
+            .iter()
+            .map(|entry| &entry.spec)
+            .collect::<Vec<_>>();
+        assert_eq!(preserved.len(), 360);
+        assert!(
+            preserved
+                .windows(2)
+                .all(|pair| pair[0].name() < pair[1].name())
+        );
+        assert_eq!(
+            preserved
+                .iter()
+                .map(|spec| spec.payload_bytes())
+                .sum::<u64>(),
+            5_343_232
+        );
         assert!(!plan.summary.complete());
         assert_eq!(plan.additive.len(), 506);
         assert!(plan.additive.iter().all(|slot| {
