@@ -12,7 +12,7 @@ use serde::Serialize;
 use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
 use tritium_train::{
     Optimizer, Sgd,
-    ops::{act, bias, dense, elementwise, embed, loss, matmul, shape},
+    ops::{act, bias, dense, elementwise, embed, loss, matmul, norm, shape, softmax},
 };
 
 #[derive(Serialize)]
@@ -188,6 +188,30 @@ fn main() {
     let loss_grad_output = [0.5_f32];
     let mse = loss::mse_forward(&prediction, &target);
     let mse_grad = loss::mse_vjp(&prediction, &target, &loss_grad_output);
+
+    let normalized_input = [1.0_f32, -2.0, 0.5, 0.25, 1.5, -1.0];
+    let norm_weight = [1.0_f32, 0.5, 2.0];
+    let transformer_grad_output = [0.5_f32, -1.0, 2.0, 1.5, 0.25, -0.75];
+    let norm_epsilon = 1.0e-5_f32;
+    let rmsnorm = norm::forward(&normalized_input, &norm_weight, 2, 3, norm_epsilon);
+    let rmsnorm_grads = norm::vjp(
+        &normalized_input,
+        &norm_weight,
+        2,
+        3,
+        norm_epsilon,
+        &transformer_grad_output,
+    );
+
+    let logits = [1.0_f32, 2.0, -1.0, 0.0, -2.0, 3.0];
+    let probabilities = softmax::forward(&logits, 2, 3);
+    let softmax_grad = softmax::vjp(&logits, 2, 3, &transformer_grad_output);
+    let causal = softmax::causal_mask_forward(&logits, 2, 3);
+    let causal_grad = softmax::causal_mask_vjp(2, 3, &transformer_grad_output);
+    let class_target = [0.0_f32, 1.0, 0.0, 1.0, 0.0, 0.0];
+    let xent_grad_output = [0.75_f32];
+    let xent = loss::softmax_xent_forward(&logits, &class_target, 2, 3);
+    let xent_grad = loss::softmax_xent_vjp(&logits, &class_target, 2, 3, &xent_grad_output);
 
     let parameter = [1.0_f32, -2.0];
     let gradient = [0.5_f32, -0.25];
@@ -782,6 +806,165 @@ fn main() {
                 },
             },
             Case {
+                case_id: "graph.rmsnorm.forward.basic",
+                operation: "graph.rmsnorm",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("x", &[2, 3], &normalized_input),
+                    f32_buffer("weight", &[3], &norm_weight),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::F32 {
+                        name: "eps",
+                        bits: norm_epsilon.to_bits(),
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &rmsnorm)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.rmsnorm.vjp.basic",
+                operation: "graph.rmsnorm",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("x", &[2, 3], &normalized_input),
+                    f32_buffer("weight", &[3], &norm_weight),
+                    f32_buffer("grad_output", &[2, 3], &transformer_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::F32 {
+                        name: "eps",
+                        bits: norm_epsilon.to_bits(),
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_x", &[2, 3], &rmsnorm_grads[0]),
+                        f32_buffer("grad_weight", &[3], &rmsnorm_grads[1]),
+                    ],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.softmax.forward.basic",
+                operation: "graph.softmax",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![f32_buffer("x", &[2, 3], &logits)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &probabilities)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.softmax.vjp.basic",
+                operation: "graph.softmax",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("x", &[2, 3], &logits),
+                    f32_buffer("grad_output", &[2, 3], &transformer_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_x", &[2, 3], &softmax_grad[0])],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.causal_mask.forward.basic",
+                operation: "graph.causal_mask",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[2, 3], &logits)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 3], &causal)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.causal_mask.vjp.basic",
+                operation: "graph.causal_mask",
+                execution: "vjp",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("grad_output", &[2, 3], &transformer_grad_output)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_x", &[2, 3], &causal_grad[0])],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
                 case_id: "loss.mse.forward.basic",
                 operation: "loss.mse",
                 execution: "forward",
@@ -815,6 +998,61 @@ fn main() {
                 attributes: vec![],
                 expected: Expected::Success {
                     outputs: vec![f32_buffer("grad_prediction", &[3], &mse_grad[0])],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "loss.softmax_cross_entropy.forward.basic",
+                operation: "loss.softmax_cross_entropy",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("logits", &[2, 3], &logits),
+                    f32_buffer("target", &[2, 3], &class_target),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[], &xent)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "loss.softmax_cross_entropy.vjp.basic",
+                operation: "loss.softmax_cross_entropy",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("logits", &[2, 3], &logits),
+                    f32_buffer("target", &[2, 3], &class_target),
+                    f32_buffer("grad_output", &[], &xent_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("grad_logits", &[2, 3], &xent_grad[0])],
                     scratch_bytes_max: 0,
                 },
             },
@@ -1033,6 +1271,104 @@ fn main() {
                     category: "invalid_operation",
                     code: "non_finite.scale",
                     outputs: vec![f32_buffer("result", &[2, 2], &[123.0; 4])],
+                },
+            },
+            Case {
+                case_id: "graph.rmsnorm.forward.shape_error",
+                operation: "graph.rmsnorm",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("x", &[1, 6], &normalized_input),
+                    f32_buffer("weight", &[3], &norm_weight),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                    Attribute::F32 {
+                        name: "eps",
+                        bits: norm_epsilon.to_bits(),
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "graph.softmax.forward.shape_error",
+                operation: "graph.softmax",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[1, 6], &logits)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "graph.causal_mask.forward.shape_error",
+                operation: "graph.causal_mask",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![f32_buffer("x", &[1, 6], &logits)],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "loss.softmax_cross_entropy.forward.shape_error",
+                operation: "loss.softmax_cross_entropy",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("logits", &[1, 6], &logits),
+                    f32_buffer("target", &[2, 3], &class_target),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "rows",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "cols",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[], &[123.0])],
                 },
             },
         ],

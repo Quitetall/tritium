@@ -143,8 +143,16 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.relu2.vjp.basic",
             "graph.silu.forward.basic",
             "graph.silu.vjp.basic",
+            "graph.rmsnorm.forward.basic",
+            "graph.rmsnorm.vjp.basic",
+            "graph.softmax.forward.basic",
+            "graph.softmax.vjp.basic",
+            "graph.causal_mask.forward.basic",
+            "graph.causal_mask.vjp.basic",
             "loss.mse.forward.basic",
             "loss.mse.vjp.basic",
+            "loss.softmax_cross_entropy.forward.basic",
+            "loss.softmax_cross_entropy.vjp.basic",
             "optimizer.sgd.step.basic",
             "graph.add.forward.nonfinite",
             "graph.add.forward.duplicate_input",
@@ -154,11 +162,15 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.concat_cols.forward.shape_error",
             "graph.dense_matmul.forward.shape_error",
             "graph.ternary_matmul.forward.nonfinite_scale",
+            "graph.rmsnorm.forward.shape_error",
+            "graph.softmax.forward.shape_error",
+            "graph.causal_mask.forward.shape_error",
+            "loss.softmax_cross_entropy.forward.shape_error",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "d8aa086326e5209f6423c467158ccb67ac927fc68460a5d0b0697136f5c2ae66"
+        "7adc028d7f05c839de3deb4e4e0a40929ecdf5a100c1f32dad024eb55c104527"
     );
 }

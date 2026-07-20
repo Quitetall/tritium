@@ -29,7 +29,11 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
             "graph.mul",
             "graph.relu2",
             "graph.silu",
+            "graph.rmsnorm",
+            "graph.softmax",
+            "graph.causal_mask",
             "loss.mse",
+            "loss.softmax_cross_entropy",
             "optimizer.sgd",
         ]
     );
@@ -169,7 +173,7 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
         &[1],
         TrainBufferDataRefV1::F32(&input),
     )];
-    let request = TrainRequestV1::new("graph.rmsnorm", TrainExecutionV1::Forward, &inputs, &[]);
+    let request = TrainRequestV1::new("graph.rope", TrainExecutionV1::Forward, &inputs, &[]);
     let mut sentinel = [123.0_f32];
     let mut buffers = [TrainNamedBufferMutV1::new(
         "result",
@@ -179,7 +183,7 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
     let mut output = TrainOutputV1::new(&mut buffers);
     assert!(matches!(
         backend.execute(request, &mut output),
-        Err(TrainBackendError::UnsupportedOperation(operation)) if operation == "graph.rmsnorm"
+        Err(TrainBackendError::UnsupportedOperation(operation)) if operation == "graph.rope"
     ));
     assert_eq!(sentinel, [123.0]);
 

@@ -32,7 +32,11 @@ enum CpuOperation {
     Mul,
     Relu2,
     Silu,
+    Rmsnorm,
+    Softmax,
+    CausalMask,
     Mse,
+    SoftmaxCrossEntropy,
     Sgd,
 }
 
@@ -96,8 +100,24 @@ const CPU_OPERATIONS: &[CpuOperationEntry] = &[
         operation: CpuOperation::Silu,
     },
     CpuOperationEntry {
+        id: "graph.rmsnorm",
+        operation: CpuOperation::Rmsnorm,
+    },
+    CpuOperationEntry {
+        id: "graph.softmax",
+        operation: CpuOperation::Softmax,
+    },
+    CpuOperationEntry {
+        id: "graph.causal_mask",
+        operation: CpuOperation::CausalMask,
+    },
+    CpuOperationEntry {
         id: "loss.mse",
         operation: CpuOperation::Mse,
+    },
+    CpuOperationEntry {
+        id: "loss.softmax_cross_entropy",
+        operation: CpuOperation::SoftmaxCrossEntropy,
     },
     CpuOperationEntry {
         id: "optimizer.sgd",
@@ -227,6 +247,41 @@ const MSE_VJP: OperationSchema = OperationSchema {
     attributes: &[],
     outputs: &["grad_prediction"],
 };
+const RMSNORM_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x", "weight"],
+    attributes: &["rows", "cols", "eps"],
+    outputs: &["result"],
+};
+const RMSNORM_VJP: OperationSchema = OperationSchema {
+    inputs: &["x", "weight", "grad_output"],
+    attributes: &["rows", "cols", "eps"],
+    outputs: &["grad_x", "grad_weight"],
+};
+const MATRIX_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x"],
+    attributes: &["rows", "cols"],
+    outputs: &["result"],
+};
+const SOFTMAX_VJP: OperationSchema = OperationSchema {
+    inputs: &["x", "grad_output"],
+    attributes: &["rows", "cols"],
+    outputs: &["grad_x"],
+};
+const CAUSAL_MASK_VJP: OperationSchema = OperationSchema {
+    inputs: &["grad_output"],
+    attributes: &["rows", "cols"],
+    outputs: &["grad_x"],
+};
+const SOFTMAX_XENT_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["logits", "target"],
+    attributes: &["rows", "cols"],
+    outputs: &["result"],
+};
+const SOFTMAX_XENT_VJP: OperationSchema = OperationSchema {
+    inputs: &["logits", "target", "grad_output"],
+    attributes: &["rows", "cols"],
+    outputs: &["grad_logits"],
+};
 const SGD_STEP: OperationSchema = OperationSchema {
     inputs: &["parameter", "gradient"],
     attributes: &["step", "lr"],
@@ -330,8 +385,28 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             (CpuOperation::Relu2, TrainExecutionV1::Vjp) => relu2_vjp(&request, output)?,
             (CpuOperation::Silu, TrainExecutionV1::Forward) => silu_forward(&request, output)?,
             (CpuOperation::Silu, TrainExecutionV1::Vjp) => silu_vjp(&request, output)?,
+            (CpuOperation::Rmsnorm, TrainExecutionV1::Forward) => {
+                rmsnorm_forward(&request, output)?;
+            }
+            (CpuOperation::Rmsnorm, TrainExecutionV1::Vjp) => rmsnorm_vjp(&request, output)?,
+            (CpuOperation::Softmax, TrainExecutionV1::Forward) => {
+                softmax_forward(&request, output)?;
+            }
+            (CpuOperation::Softmax, TrainExecutionV1::Vjp) => softmax_vjp(&request, output)?,
+            (CpuOperation::CausalMask, TrainExecutionV1::Forward) => {
+                causal_mask_forward(&request, output)?;
+            }
+            (CpuOperation::CausalMask, TrainExecutionV1::Vjp) => {
+                causal_mask_vjp(&request, output)?;
+            }
             (CpuOperation::Mse, TrainExecutionV1::Forward) => mse_forward(&request, output)?,
             (CpuOperation::Mse, TrainExecutionV1::Vjp) => mse_vjp(&request, output)?,
+            (CpuOperation::SoftmaxCrossEntropy, TrainExecutionV1::Forward) => {
+                softmax_xent_forward(&request, output)?;
+            }
+            (CpuOperation::SoftmaxCrossEntropy, TrainExecutionV1::Vjp) => {
+                softmax_xent_vjp(&request, output)?;
+            }
             (CpuOperation::Sgd, TrainExecutionV1::Step) => sgd_step(&request, output)?,
             _ => {
                 return Err(TrainBackendError::Backend {
@@ -990,6 +1065,283 @@ fn silu_vjp(
         *grad_x = grad_output * (sigmoid + x * sigmoid * (1.0 - sigmoid));
     }
     Ok(())
+}
+
+fn rmsnorm_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &RMSNORM_FORWARD)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    let eps = attribute_f32(request, "eps")?;
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if eps < 0.0 {
+        return Err(attribute_value("eps", "nonnegative"));
+    }
+    if x_shape != [rows, cols] || weight_shape != [cols] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("weight", weight)?;
+    require_f32_output(output, "result", x_shape)?;
+    let result = output_f32(output, "result")?;
+    for row in 0..rows_usize {
+        let row_start = row * cols_usize;
+        let x_row = &x[row_start..row_start + cols_usize];
+        let mean_square = x_row.iter().map(|value| value * value).sum::<f32>() / cols_usize as f32;
+        let inverse = 1.0 / (mean_square + eps).sqrt();
+        for column in 0..cols_usize {
+            result[row_start + column] = x_row[column] * inverse * weight[column];
+        }
+    }
+    Ok(())
+}
+
+fn rmsnorm_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &RMSNORM_VJP)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    let eps = attribute_f32(request, "eps")?;
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if eps < 0.0 {
+        return Err(attribute_value("eps", "nonnegative"));
+    }
+    if x_shape != [rows, cols] || weight_shape != [cols] || grad_shape != x_shape {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", x_shape)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    let grad_x = output_f32(output, "grad_x")?;
+    for row in 0..rows_usize {
+        let row_start = row * cols_usize;
+        let x_row = &x[row_start..row_start + cols_usize];
+        let grad_row = &grad_output[row_start..row_start + cols_usize];
+        let mean_square = x_row.iter().map(|value| value * value).sum::<f32>() / cols_usize as f32;
+        let inverse = 1.0 / (mean_square + eps).sqrt();
+        let mut contraction = 0.0_f32;
+        for column in 0..cols_usize {
+            contraction += grad_row[column] * weight[column] * x_row[column];
+        }
+        let correction = inverse * inverse * inverse * contraction / cols_usize as f32;
+        for column in 0..cols_usize {
+            grad_x[row_start + column] =
+                inverse * grad_row[column] * weight[column] - correction * x_row[column];
+        }
+    }
+    let grad_weight = output_f32(output, "grad_weight")?;
+    grad_weight.fill(0.0);
+    for row in 0..rows_usize {
+        let row_start = row * cols_usize;
+        let x_row = &x[row_start..row_start + cols_usize];
+        let mean_square = x_row.iter().map(|value| value * value).sum::<f32>() / cols_usize as f32;
+        let inverse = 1.0 / (mean_square + eps).sqrt();
+        for column in 0..cols_usize {
+            grad_weight[column] += grad_output[row_start + column] * x_row[column] * inverse;
+        }
+    }
+    Ok(())
+}
+
+fn softmax_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &MATRIX_FORWARD)?;
+    let (shape, x) = input_f32(request, "x")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if shape != [rows, cols] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    require_f32_output(output, "result", shape)?;
+    softmax_rows_into(x, rows_usize, cols_usize, output_f32(output, "result")?);
+    Ok(())
+}
+
+fn softmax_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &SOFTMAX_VJP)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if x_shape != [rows, cols] || grad_shape != x_shape {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", x_shape)?;
+    let grad_x = output_f32(output, "grad_x")?;
+    softmax_rows_into(x, rows_usize, cols_usize, grad_x);
+    for row in 0..rows_usize {
+        let row_start = row * cols_usize;
+        let probabilities = &mut grad_x[row_start..row_start + cols_usize];
+        let grad_row = &grad_output[row_start..row_start + cols_usize];
+        let dot = (0..cols_usize)
+            .map(|column| probabilities[column] * grad_row[column])
+            .sum::<f32>();
+        for column in 0..cols_usize {
+            probabilities[column] *= grad_row[column] - dot;
+        }
+    }
+    Ok(())
+}
+
+fn causal_mask_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &MATRIX_FORWARD)?;
+    let (shape, x) = input_f32(request, "x")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if shape != [rows, cols] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    require_f32_output(output, "result", shape)?;
+    let result = output_f32(output, "result")?;
+    for row in 0..rows_usize {
+        for column in 0..cols_usize {
+            result[row * cols_usize + column] = if column <= row {
+                x[row * cols_usize + column]
+            } else {
+                -1.0e30_f32
+            };
+        }
+    }
+    Ok(())
+}
+
+fn causal_mask_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &CAUSAL_MASK_VJP)?;
+    let (shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if shape != [rows, cols] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", shape)?;
+    let grad_x = output_f32(output, "grad_x")?;
+    grad_x.fill(0.0);
+    for row in 0..rows_usize {
+        for column in 0..cols_usize {
+            if column <= row {
+                grad_x[row * cols_usize + column] = grad_output[row * cols_usize + column];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn softmax_xent_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &SOFTMAX_XENT_FORWARD)?;
+    let (logits_shape, logits) = input_f32(request, "logits")?;
+    let (target_shape, target) = input_f32(request, "target")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if rows_usize == 0 || cols_usize == 0 {
+        return Err(attribute_value("rows", "positive_geometry"));
+    }
+    if logits_shape != [rows, cols] || target_shape != logits_shape {
+        return Err(shape_error());
+    }
+    reject_nonfinite("logits", logits)?;
+    reject_nonfinite("target", target)?;
+    require_f32_output(output, "result", &[])?;
+    let mut loss = 0.0_f32;
+    for row in 0..rows_usize {
+        let row_start = row * cols_usize;
+        let logits_row = &logits[row_start..row_start + cols_usize];
+        let maximum = logits_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum = logits_row
+            .iter()
+            .map(|value| (*value - maximum).exp())
+            .sum::<f32>();
+        for column in 0..cols_usize {
+            let probability = (logits_row[column] - maximum).exp() / sum;
+            loss -= target[row_start + column] * probability.max(f32::MIN_POSITIVE).ln();
+        }
+    }
+    output_f32(output, "result")?[0] = loss / rows_usize as f32;
+    Ok(())
+}
+
+fn softmax_xent_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &SOFTMAX_XENT_VJP)?;
+    let (logits_shape, logits) = input_f32(request, "logits")?;
+    let (target_shape, target) = input_f32(request, "target")?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
+    if rows_usize == 0 || cols_usize == 0 {
+        return Err(attribute_value("rows", "positive_geometry"));
+    }
+    if logits_shape != [rows, cols] || target_shape != logits_shape || !grad_shape.is_empty() {
+        return Err(shape_error());
+    }
+    reject_nonfinite("logits", logits)?;
+    reject_nonfinite("target", target)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_logits", logits_shape)?;
+    let grad_logits = output_f32(output, "grad_logits")?;
+    softmax_rows_into(logits, rows_usize, cols_usize, grad_logits);
+    let upstream = grad_output[0] / rows_usize as f32;
+    for row in 0..rows_usize {
+        let row_start = row * cols_usize;
+        let target_sum = target[row_start..row_start + cols_usize]
+            .iter()
+            .sum::<f32>();
+        for column in 0..cols_usize {
+            let index = row_start + column;
+            grad_logits[index] = upstream * (grad_logits[index] * target_sum - target[index]);
+        }
+    }
+    Ok(())
+}
+
+fn softmax_rows_into(x: &[f32], rows: usize, cols: usize, output: &mut [f32]) {
+    for row in 0..rows {
+        let row_start = row * cols;
+        let x_row = &x[row_start..row_start + cols];
+        let maximum = x_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0_f32;
+        for column in 0..cols {
+            let exponential = (x_row[column] - maximum).exp();
+            output[row_start + column] = exponential;
+            sum += exponential;
+        }
+        for column in 0..cols {
+            output[row_start + column] /= sum;
+        }
+    }
 }
 
 fn mse_forward(
