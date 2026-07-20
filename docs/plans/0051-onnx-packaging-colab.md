@@ -94,9 +94,13 @@ inline limit while inline export rejects the same model; direct f32 emission
 also avoids a second serialized-value buffer. Generated causal masks and RoPE
 tables stream into final storage with checked allocation; impossible geometry
 returns a typed error before allocation.
-Multi-layer large-model external-data packaging, architecture tensor-map
-adapters, sliding/local/partial RoPE variants, dynamic axes and end-user
-generation APIs remain open.
+The first architecture tensor-map adapter now maps canonical SmolLM2
+Hugging Face names into the tied-head, bias-free, full-RoPE SwiGLU graph and
+rejects missing names or config/tensor geometry drift. BitNet still requires
+ReLU2 plus subnorm graph semantics; Qwen3.6 still requires its heterogeneous
+DeltaNet/full-attention schedule, untied head, output gate, biases and partial
+RoPE. Multi-layer large-model external-data packaging, those graph extensions,
+dynamic axes and end-user generation APIs remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

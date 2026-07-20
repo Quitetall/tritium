@@ -179,6 +179,271 @@ pub struct CausalLmModel<'a> {
     pub identity: OnnxArtifactIdentityV2<'a>,
 }
 
+/// SmolLM2/Hugging Face geometry supported by the homogeneous causal exporter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SmolLm2Config {
+    /// Decoder layer count.
+    pub layers: usize,
+    /// Residual-stream width.
+    pub hidden: usize,
+    /// SwiGLU intermediate width.
+    pub intermediate: usize,
+    /// Token vocabulary size.
+    pub vocab: usize,
+    /// Query attention head count.
+    pub n_head: usize,
+    /// Key/value attention head count.
+    pub n_kv_head: usize,
+    /// Elements per attention head.
+    pub head_dim: usize,
+    /// Rotary embedding base.
+    pub rope_theta: f32,
+    /// RMSNorm epsilon.
+    pub rms_epsilon: f32,
+    /// Whether the language-model head aliases the token embedding.
+    pub tied_embeddings: bool,
+    /// Whether attention or MLP projections carry additive biases.
+    pub projection_bias: bool,
+    /// Decoder activation semantics.
+    pub activation: CausalActivation,
+    /// Rotary-position semantics.
+    pub rotary_mode: RotaryMode,
+}
+
+/// Activation families relevant to admitted causal architectures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CausalActivation {
+    /// Gated SiLU (`SiLU(gate) * up`).
+    SwiGlu,
+    /// Squared ReLU used by BitNet-family decoders.
+    Relu2,
+}
+
+/// Rotary-position coverage/scaling modes relevant to causal architectures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotaryMode {
+    /// Unscaled RoPE over the entire attention head.
+    Full,
+    /// RoPE over only a prefix of each attention head.
+    Partial,
+    /// Any position-dependent or context-scaled RoPE variant.
+    Scaled,
+}
+
+/// Borrowed canonical tensor source used by the SmolLM2 ONNX adapter.
+pub trait SmolLm2TensorProvider<'a> {
+    /// Enumerate the complete canonical source tensor set, including unsupported extras.
+    fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError>;
+    /// Resolve one canonical Hugging Face rank-two tensor as packed ternary data.
+    fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError>;
+    /// Resolve one canonical preserved fp32 vector.
+    fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError>;
+}
+
+/// Borrowed SmolLM2 graph after canonical tensor-name mapping.
+#[derive(Debug)]
+pub struct MappedSmolLm2<'a> {
+    config: SmolLm2Config,
+    embedding: PackedTernaryMatrix<'a>,
+    layers: Vec<CausalLmDecoderLayer<'a>>,
+    final_norm: &'a [f32],
+    identity: OnnxArtifactIdentityV2<'a>,
+}
+
+impl<'a> MappedSmolLm2<'a> {
+    /// Canonically ordered decoder layers.
+    #[must_use]
+    pub fn layers(&self) -> &[CausalLmDecoderLayer<'a>] {
+        &self.layers
+    }
+
+    /// Borrow this mapped architecture as a fixed prompt/decode graph.
+    #[must_use]
+    pub fn model(&self, tokens: usize, past_tokens: usize) -> CausalLmModel<'_> {
+        CausalLmModel {
+            tokens,
+            past_tokens,
+            n_head: self.config.n_head,
+            n_kv_head: self.config.n_kv_head,
+            head_dim: self.config.head_dim,
+            rotary: Some(RotaryEmbedding {
+                theta: self.config.rope_theta,
+            }),
+            rms_epsilon: self.config.rms_epsilon,
+            embedding: self.embedding,
+            layers: &self.layers,
+            final_norm: self.final_norm,
+            identity: self.identity,
+        }
+    }
+}
+
+/// Map canonical SmolLM2 Hugging Face tensors into the causal ONNX contract.
+///
+/// # Errors
+/// Returns [`OnnxModelError`] for missing tensors or any geometry/packed-data
+/// mismatch. This adapter deliberately represents only tied-head, bias-free,
+/// full-RoPE SwiGLU SmolLM2 graphs.
+pub fn map_smollm2_causal_lm<'a>(
+    source: &'a impl SmolLm2TensorProvider<'a>,
+    config: SmolLm2Config,
+    identity: OnnxArtifactIdentityV2<'a>,
+) -> Result<MappedSmolLm2<'a>, OnnxModelError> {
+    validate_smollm2_config(config)?;
+    let expected_names = smollm2_tensor_names(config.layers)?;
+    validate_exact_tensor_set(source.tensor_names()?, &expected_names)?;
+    let embedding = source.matrix("model.embed_tokens.weight")?;
+    let final_norm = source.vector("model.norm.weight")?;
+    let mut layers = Vec::new();
+    layers
+        .try_reserve_exact(config.layers)
+        .map_err(|_| OnnxModelError::ShapeOverflow("SmolLM2 layer allocation"))?;
+    for index in 0..config.layers {
+        let prefix = format!("model.layers.{index}");
+        layers.push(CausalLmDecoderLayer {
+            attention_norm: source.vector(&format!("{prefix}.input_layernorm.weight"))?,
+            query_norm: None,
+            key_norm: None,
+            query: source.matrix(&format!("{prefix}.self_attn.q_proj.weight"))?,
+            key: source.matrix(&format!("{prefix}.self_attn.k_proj.weight"))?,
+            value: source.matrix(&format!("{prefix}.self_attn.v_proj.weight"))?,
+            attention_output: source.matrix(&format!("{prefix}.self_attn.o_proj.weight"))?,
+            ffn_norm: source.vector(&format!("{prefix}.post_attention_layernorm.weight"))?,
+            gate: source.matrix(&format!("{prefix}.mlp.gate_proj.weight"))?,
+            up: source.matrix(&format!("{prefix}.mlp.up_proj.weight"))?,
+            down: source.matrix(&format!("{prefix}.mlp.down_proj.weight"))?,
+        });
+    }
+    let mapped = MappedSmolLm2 {
+        config,
+        embedding,
+        layers,
+        final_norm,
+        identity,
+    };
+    validate_causal_lm(&mapped.model(1, 0))?;
+    if mapped.embedding.rows != config.vocab
+        || mapped.embedding.columns != config.hidden
+        || mapped.layers.iter().any(|layer| {
+            layer.gate.rows != config.intermediate || layer.up.rows != config.intermediate
+        })
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "SmolLM2 tensor geometry differs from architecture config".to_owned(),
+        ));
+    }
+    Ok(mapped)
+}
+
+fn validate_smollm2_config(config: SmolLm2Config) -> Result<(), OnnxModelError> {
+    if config.layers == 0
+        || config.hidden == 0
+        || config.intermediate == 0
+        || config.vocab == 0
+        || config.n_head == 0
+        || config.n_kv_head == 0
+        || config.head_dim == 0
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "SmolLM2 config dimensions must be nonzero".to_owned(),
+        ));
+    }
+    let projected_hidden = config
+        .n_head
+        .checked_mul(config.head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("SmolLM2 attention width"))?;
+    if projected_hidden != config.hidden || !config.n_head.is_multiple_of(config.n_kv_head) {
+        return Err(OnnxModelError::InvalidModel(
+            "SmolLM2 attention geometry differs from hidden width or GQA grouping".to_owned(),
+        ));
+    }
+    if !config.rope_theta.is_finite()
+        || config.rope_theta <= 0.0
+        || !config.rms_epsilon.is_finite()
+        || config.rms_epsilon <= 0.0
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "SmolLM2 RoPE theta and RMS epsilon must be positive and finite".to_owned(),
+        ));
+    }
+    if !config.tied_embeddings
+        || config.projection_bias
+        || config.activation != CausalActivation::SwiGlu
+        || config.rotary_mode != RotaryMode::Full
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "SmolLM2 adapter requires tied embeddings, bias-free SwiGLU and full unscaled RoPE"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn smollm2_tensor_names(layers: usize) -> Result<Vec<String>, OnnxModelError> {
+    let count = layers
+        .checked_mul(9)
+        .and_then(|count| count.checked_add(2))
+        .ok_or(OnnxModelError::ShapeOverflow("SmolLM2 tensor-name count"))?;
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(count)
+        .map_err(|_| OnnxModelError::ShapeOverflow("SmolLM2 tensor-name allocation"))?;
+    names.push("model.embed_tokens.weight".to_owned());
+    names.push("model.norm.weight".to_owned());
+    for index in 0..layers {
+        let prefix = format!("model.layers.{index}");
+        names.extend([
+            format!("{prefix}.input_layernorm.weight"),
+            format!("{prefix}.self_attn.q_proj.weight"),
+            format!("{prefix}.self_attn.k_proj.weight"),
+            format!("{prefix}.self_attn.v_proj.weight"),
+            format!("{prefix}.self_attn.o_proj.weight"),
+            format!("{prefix}.post_attention_layernorm.weight"),
+            format!("{prefix}.mlp.gate_proj.weight"),
+            format!("{prefix}.mlp.up_proj.weight"),
+            format!("{prefix}.mlp.down_proj.weight"),
+        ]);
+    }
+    Ok(names)
+}
+
+fn validate_exact_tensor_set(actual: &[String], expected: &[String]) -> Result<(), OnnxModelError> {
+    let mut actual_sorted = Vec::new();
+    actual_sorted
+        .try_reserve_exact(actual.len())
+        .map_err(|_| OnnxModelError::ShapeOverflow("SmolLM2 source manifest allocation"))?;
+    actual_sorted.extend(actual.iter().map(String::as_str));
+    actual_sorted.sort_unstable();
+    if actual_sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(OnnxModelError::InvalidModel(
+            "SmolLM2 source tensor manifest contains duplicate names".to_owned(),
+        ));
+    }
+    let mut expected_sorted = Vec::new();
+    expected_sorted
+        .try_reserve_exact(expected.len())
+        .map_err(|_| OnnxModelError::ShapeOverflow("SmolLM2 expected manifest allocation"))?;
+    expected_sorted.extend(expected.iter().map(String::as_str));
+    expected_sorted.sort_unstable();
+    if let Some(name) = expected_sorted
+        .iter()
+        .find(|name| actual_sorted.binary_search(name).is_err())
+    {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "SmolLM2 source is missing tensor {name}"
+        )));
+    }
+    if let Some(name) = actual_sorted
+        .iter()
+        .find(|name| expected_sorted.binary_search(name).is_err())
+    {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "SmolLM2 source contains unsupported tensor {name}"
+        )));
+    }
+    Ok(())
+}
+
 impl<'a> TiedEmbeddingHeadModelV2<'a> {
     fn legacy(self) -> TiedEmbeddingHeadModel<'a> {
         TiedEmbeddingHeadModel {
@@ -3783,15 +4048,21 @@ mod tests {
     use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
 
     fn unit_packed(format: TernaryFormat, rows: usize) -> Vec<u8> {
-        let trits = vec![Trit::ZERO; 256];
-        let scales = [f16::ONE];
+        unit_packed_shape(format, rows, 256)
+    }
+
+    fn unit_packed_shape(format: TernaryFormat, rows: usize, columns: usize) -> Vec<u8> {
+        let blocks = num_blocks(columns);
+        let trits = vec![Trit::ZERO; columns];
+        let scales = vec![f16::ONE; blocks];
         let block_bytes = match format {
             TernaryFormat::Tq2_0 => TQ2_0_BLOCK_BYTES,
             TernaryFormat::Tq1_0 => TQ1_0_BLOCK_BYTES,
             other => panic!("unsupported test format {other}"),
         };
-        let mut packed = vec![0; block_bytes * rows];
-        for row in packed.chunks_exact_mut(block_bytes) {
+        let row_bytes = block_bytes * blocks;
+        let mut packed = vec![0; row_bytes * rows];
+        for row in packed.chunks_exact_mut(row_bytes) {
             match format {
                 TernaryFormat::Tq2_0 => pack_tq2_0_row(&trits, &scales, row).unwrap(),
                 TernaryFormat::Tq1_0 => pack_tq1_0_row(&trits, &scales, row).unwrap(),
@@ -4488,5 +4759,209 @@ mod tests {
             Err(OnnxModelError::InvalidModel(reason))
                 if reason.contains("causal initializers require at least")
         ));
+    }
+
+    #[test]
+    fn smollm2_tensor_adapter_builds_encodable_canonical_graph() {
+        use std::cell::RefCell;
+
+        struct Source {
+            names: Vec<String>,
+            vocab_packed: Vec<u8>,
+            hidden_packed: Vec<u8>,
+            kv_packed: Vec<u8>,
+            intermediate_packed: Vec<u8>,
+            down_packed: Vec<u8>,
+            vocab_scales: Vec<f32>,
+            hidden_scales: Vec<f32>,
+            kv_scales: Vec<f32>,
+            intermediate_scales: Vec<f32>,
+            down_scales: Vec<f32>,
+            norm: Vec<f32>,
+            requested: RefCell<Vec<String>>,
+        }
+        impl<'a> SmolLm2TensorProvider<'a> for Source {
+            fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError> {
+                Ok(&self.names)
+            }
+
+            fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError> {
+                self.requested.borrow_mut().push(name.to_owned());
+                let (rows, columns, packed, scales) = if name == "model.embed_tokens.weight" {
+                    (
+                        2,
+                        256,
+                        self.vocab_packed.as_slice(),
+                        self.vocab_scales.as_slice(),
+                    )
+                } else if matches!(
+                    name,
+                    "model.layers.0.self_attn.q_proj.weight"
+                        | "model.layers.0.self_attn.o_proj.weight"
+                ) {
+                    (
+                        256,
+                        256,
+                        self.hidden_packed.as_slice(),
+                        self.hidden_scales.as_slice(),
+                    )
+                } else if matches!(
+                    name,
+                    "model.layers.0.self_attn.k_proj.weight"
+                        | "model.layers.0.self_attn.v_proj.weight"
+                ) {
+                    (
+                        128,
+                        256,
+                        self.kv_packed.as_slice(),
+                        self.kv_scales.as_slice(),
+                    )
+                } else if matches!(
+                    name,
+                    "model.layers.0.mlp.gate_proj.weight" | "model.layers.0.mlp.up_proj.weight"
+                ) {
+                    (
+                        512,
+                        256,
+                        self.intermediate_packed.as_slice(),
+                        self.intermediate_scales.as_slice(),
+                    )
+                } else if name == "model.layers.0.mlp.down_proj.weight" {
+                    (
+                        256,
+                        512,
+                        self.down_packed.as_slice(),
+                        self.down_scales.as_slice(),
+                    )
+                } else {
+                    return Err(OnnxModelError::InvalidModel(format!(
+                        "unexpected matrix {name}"
+                    )));
+                };
+                Ok(PackedTernaryMatrix {
+                    rows,
+                    columns,
+                    packed,
+                    scales,
+                    format: TernaryFormat::Tq2_0,
+                })
+            }
+
+            fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError> {
+                self.requested.borrow_mut().push(name.to_owned());
+                match name {
+                    "model.norm.weight"
+                    | "model.layers.0.input_layernorm.weight"
+                    | "model.layers.0.post_attention_layernorm.weight" => Ok(&self.norm),
+                    _ => Err(OnnxModelError::InvalidModel(format!(
+                        "unexpected vector {name}"
+                    ))),
+                }
+            }
+        }
+        let mut source = Source {
+            names: smollm2_tensor_names(1).unwrap(),
+            vocab_packed: unit_packed(TernaryFormat::Tq2_0, 2),
+            hidden_packed: unit_packed(TernaryFormat::Tq2_0, 256),
+            kv_packed: unit_packed(TernaryFormat::Tq2_0, 128),
+            intermediate_packed: unit_packed(TernaryFormat::Tq2_0, 512),
+            down_packed: unit_packed_shape(TernaryFormat::Tq2_0, 256, 512),
+            vocab_scales: vec![1.0; 2],
+            hidden_scales: vec![1.0; 256],
+            kv_scales: vec![1.0; 128],
+            intermediate_scales: vec![1.0; 512],
+            down_scales: vec![1.0; 256],
+            norm: vec![1.0; 256],
+            requested: RefCell::new(Vec::new()),
+        };
+        let config = SmolLm2Config {
+            layers: 1,
+            hidden: 256,
+            intermediate: 512,
+            vocab: 2,
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 64,
+            rope_theta: 10_000.0,
+            rms_epsilon: 1.0e-5,
+            tied_embeddings: true,
+            projection_bias: false,
+            activation: CausalActivation::SwiGlu,
+            rotary_mode: RotaryMode::Full,
+        };
+        let identity = OnnxArtifactIdentityV2 {
+            source_model_id: "smollm2-source@revision",
+            tokenizer_id: "smollm2-tokenizer@revision",
+            recipe_id: "recipe",
+            tritium_build_id: "build",
+            package_id: "package",
+            converted_coverage_id: "converted",
+            deferred_coverage_id: "deferred",
+        };
+        assert!(matches!(
+            map_smollm2_causal_lm(
+                &source,
+                SmolLm2Config {
+                    activation: CausalActivation::Relu2,
+                    ..config
+                },
+                identity,
+            ),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("bias-free SwiGLU")
+        ));
+        assert!(source.requested.borrow().is_empty());
+        source
+            .names
+            .push("model.layers.0.self_attn.q_proj.bias".to_owned());
+        assert!(matches!(
+            map_smollm2_causal_lm(&source, config, identity),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("unsupported tensor") && reason.contains("q_proj.bias")
+        ));
+        source.names.pop();
+        let missing = source.names.pop().unwrap();
+        assert!(matches!(
+            map_smollm2_causal_lm(&source, config, identity),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("missing tensor")
+        ));
+        source.names.push(missing);
+        source.names.push(source.names[0].clone());
+        assert!(matches!(
+            map_smollm2_causal_lm(&source, config, identity),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("duplicate names")
+        ));
+        source.names.pop();
+        assert!(source.requested.borrow().is_empty());
+        assert!(matches!(
+            map_smollm2_causal_lm(
+                &source,
+                SmolLm2Config {
+                    intermediate: 128,
+                    ..config
+                },
+                identity,
+            ),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("architecture config")
+        ));
+        source.requested.borrow_mut().clear();
+        let mapped = map_smollm2_causal_lm(&source, config, identity).unwrap();
+        assert_eq!(mapped.layers().len(), 1);
+        assert!(encode_external_causal_lm(mapped.model(1, 0)).is_ok());
+        assert_eq!(
+            source.requested.into_inner(),
+            [
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "model.layers.0.input_layernorm.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+                "model.layers.0.self_attn.o_proj.weight",
+                "model.layers.0.post_attention_layernorm.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+            ]
+        );
     }
 }
