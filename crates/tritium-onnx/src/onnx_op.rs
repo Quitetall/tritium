@@ -1,4 +1,4 @@
-//! Layer 2 — the `ort` 2.x custom operator wrapping the always-on Layer-1 kernel.
+//! Layer 2 — `ort` 2.x custom operators wrapping the always-on Layer-1 kernels.
 //!
 //! [`TritiumTernaryMpGemmOp`] implements [`ort::operator::Operator`], describing
 //! an ONNX node [`ONNX_OP_NAME`] with three tensor inputs and one output:
@@ -23,6 +23,11 @@
 //! (`kernel_run_matches_reference_on_frozen_set`). CI also serializes a real
 //! ONNX graph, registers the production custom domain, opens an ONNX Runtime
 //! session and proves that runtime dispatch invokes the kernel bit-exactly.
+//!
+//! [`TritiumTernaryEmbeddingOp`] uses the same packed/scales representation but
+//! accepts an arbitrary-rank `i64` token tensor and appends `K` to its output
+//! shape. Only selected rows are unpacked; no dense vocabulary-sized table is
+//! constructed.
 
 use ort::error::Error as OrtError;
 use ort::operator::{
@@ -32,10 +37,13 @@ use ort::operator::{
 use ort::value::TensorElementType;
 use tritium_core::TernaryFormat;
 
-use crate::ternary_mpgemm_kernel;
+use crate::{ternary_embedding_kernel, ternary_mpgemm_kernel};
 
 /// The ONNX node op type this operator registers.
 pub const ONNX_OP_NAME: &str = "TritiumTernaryMpGemm";
+
+/// The ONNX node op type for selected-row packed ternary embedding lookup.
+pub const ONNX_EMBEDDING_OP_NAME: &str = "TritiumTernaryEmbedding";
 
 /// The custom-operator domain Tritium registers [`ONNX_OP_NAME`] under.
 pub const ONNX_DOMAIN: &str = "com.tritium";
@@ -61,6 +69,25 @@ fn format_from_attr(code: i64) -> Result<TernaryFormat, OrtError> {
             "tritium-onnx: unknown format code {other} (expected 0=TQ2_0, 1=TQ1_0)"
         ))),
     }
+}
+
+fn kernel_config(attributes: &KernelAttributes) -> ort::Result<(usize, TernaryFormat)> {
+    let k: i64 = attributes
+        .get(ATTR_K)
+        .ok_or_else(|| OrtError::new(format!("tritium-onnx: missing i64 attribute `{ATTR_K}`")))?;
+    if k <= 0 {
+        return Err(OrtError::new(format!(
+            "tritium-onnx: attribute `{ATTR_K}` must be positive, got {k}"
+        )));
+    }
+    let format_code: i64 = attributes.get(ATTR_FORMAT).ok_or_else(|| {
+        OrtError::new(format!(
+            "tritium-onnx: missing i64 attribute `{ATTR_FORMAT}`"
+        ))
+    })?;
+    let k = usize::try_from(k)
+        .map_err(|_| OrtError::new("tritium-onnx: attribute `K` exceeds usize"))?;
+    Ok((k, format_from_attr(format_code)?))
 }
 
 /// The `ort` custom operator descriptor for Tritium's ternary mpGEMM node.
@@ -96,24 +123,101 @@ impl Operator for TritiumTernaryMpGemmOp {
     fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
         // K and format arrive as i64 node attributes; the byte count alone does
         // not determine K (the last quant block is zero-padded).
-        let k: i64 = attributes.get(ATTR_K).ok_or_else(|| {
-            OrtError::new(format!("tritium-onnx: missing i64 attribute `{ATTR_K}`"))
-        })?;
-        if k <= 0 {
-            return Err(OrtError::new(format!(
-                "tritium-onnx: attribute `{ATTR_K}` must be positive, got {k}"
-            )));
-        }
-        let format_code: i64 = attributes.get(ATTR_FORMAT).ok_or_else(|| {
-            OrtError::new(format!(
-                "tritium-onnx: missing i64 attribute `{ATTR_FORMAT}`"
-            ))
-        })?;
-        let format = format_from_attr(format_code)?;
-        Ok(Box::new(TritiumTernaryMpGemmKernel {
-            k: k as usize,
-            format,
-        }))
+        let (k, format) = kernel_config(attributes)?;
+        Ok(Box::new(TritiumTernaryMpGemmKernel { k, format }))
+    }
+}
+
+/// The custom operator descriptor for packed ternary embedding lookup.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TritiumTernaryEmbeddingOp;
+
+impl Operator for TritiumTernaryEmbeddingOp {
+    fn name(&self) -> &str {
+        ONNX_EMBEDDING_OP_NAME
+    }
+
+    fn inputs(&self) -> Vec<OperatorInput> {
+        vec![
+            OperatorInput::required(TensorElementType::Int64),
+            OperatorInput::required(TensorElementType::Uint8),
+            OperatorInput::required(TensorElementType::Float32),
+        ]
+    }
+
+    fn outputs(&self) -> Vec<OperatorOutput> {
+        vec![OperatorOutput::required(TensorElementType::Float32)]
+    }
+
+    fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
+        let (k, format) = kernel_config(attributes)?;
+        Ok(Box::new(TritiumTernaryEmbeddingKernel { k, format }))
+    }
+}
+
+/// Per-node packed ternary embedding kernel.
+#[derive(Debug, Clone, Copy)]
+pub struct TritiumTernaryEmbeddingKernel {
+    k: usize,
+    format: TernaryFormat,
+}
+
+impl TritiumTernaryEmbeddingKernel {
+    /// Gather selected rows and return `(output_shape, flat_output)`.
+    ///
+    /// # Errors
+    /// An [`ort::Error`] if a token dimension is negative or the Layer-1
+    /// embedding kernel rejects the inputs.
+    pub fn run(
+        &self,
+        token_shape: &[i64],
+        tokens: &[i64],
+        packed: &[u8],
+        scales: &[f32],
+    ) -> Result<(Vec<i64>, Vec<f32>), OrtError> {
+        let dimensions: Vec<usize> = token_shape
+            .iter()
+            .enumerate()
+            .map(|(axis, &dimension)| {
+                usize::try_from(dimension).map_err(|_| {
+                    OrtError::new(format!(
+                        "tritium-onnx: token dimension {axis} must be nonnegative, got {dimension}"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let output =
+            ternary_embedding_kernel(tokens, &dimensions, packed, scales, self.k, self.format)
+                .map_err(|error| OrtError::new(error.to_string()))?;
+        let mut output_shape = token_shape.to_vec();
+        output_shape.push(self.k as i64);
+        Ok((output_shape, output))
+    }
+}
+
+impl Kernel for TritiumTernaryEmbeddingKernel {
+    fn compute(&mut self, ctx: &KernelContext) -> ort::Result<()> {
+        let tokens_v = ctx
+            .input(0)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing input 0 (tokens)"))?;
+        let packed_v = ctx
+            .input(1)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing input 1 (packed)"))?;
+        let scales_v = ctx
+            .input(2)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing input 2 (scales)"))?;
+
+        let (token_shape, tokens) = tokens_v.try_extract_tensor::<i64>()?;
+        let (_, packed) = packed_v.try_extract_tensor::<u8>()?;
+        let (_, scales) = scales_v.try_extract_tensor::<f32>()?;
+        let token_dimensions: Vec<i64> = token_shape.iter().copied().collect();
+        let (output_shape, output) = self.run(&token_dimensions, tokens, packed, scales)?;
+        let mut output_v = ctx
+            .output(0, output_shape)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing output 0"))?;
+        let (_, output_ref) = output_v.try_extract_tensor_mut::<f32>()?;
+        output_ref.copy_from_slice(&output);
+        Ok(())
     }
 }
 
@@ -149,7 +253,18 @@ impl TritiumTernaryMpGemmKernel {
                 "tritium-onnx: activation must be 2-D [M, K], got shape {act_shape:?}"
             )));
         }
-        let m = act_shape[0] as usize;
+        let m = usize::try_from(act_shape[0]).map_err(|_| {
+            OrtError::new(format!(
+                "tritium-onnx: activation M must be nonnegative, got {}",
+                act_shape[0]
+            ))
+        })?;
+        if usize::try_from(act_shape[1]) != Ok(self.k) {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: activation K {} does not match attribute K {}",
+                act_shape[1], self.k
+            )));
+        }
         ternary_mpgemm_kernel(act, packed, scales, m, self.k, self.format)
             .map_err(|e| OrtError::new(e.to_string()))
     }
@@ -186,14 +301,17 @@ impl Kernel for TritiumTernaryMpGemmKernel {
 }
 
 /// Build an [`OperatorDomain`] named [`ONNX_DOMAIN`] with
-/// [`TritiumTernaryMpGemmOp`] registered, ready to pass to
+/// [`TritiumTernaryMpGemmOp`] and [`TritiumTernaryEmbeddingOp`] registered,
+/// ready to pass to
 /// [`ort::session::builder::SessionBuilder::with_operators`].
 ///
 /// # Errors
 /// An [`ort::Error`] if the domain cannot be created or the operator cannot be
 /// added (e.g. the native runtime failed to initialize).
 pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
-    OperatorDomain::new(ONNX_DOMAIN)?.add(TritiumTernaryMpGemmOp)
+    OperatorDomain::new(ONNX_DOMAIN)?
+        .add(TritiumTernaryMpGemmOp)?
+        .add(TritiumTernaryEmbeddingOp)
 }
 
 #[cfg(test)]
@@ -241,6 +359,22 @@ mod tests {
         packed
     }
 
+    fn pack_rows(rows: &[Vec<Trit>], format: TernaryFormat) -> Vec<u8> {
+        let k = rows.first().map_or(0, Vec::len);
+        let nb = num_blocks(k);
+        let unit = vec![f16::ONE; nb];
+        let row_bytes = nb * block_bytes(format);
+        let mut packed = vec![0u8; rows.len() * row_bytes];
+        for (row, output) in rows.iter().zip(packed.chunks_exact_mut(row_bytes)) {
+            match format {
+                TernaryFormat::Tq2_0 => pack_tq2_0_row(row, &unit, output).unwrap(),
+                TernaryFormat::Tq1_0 => pack_tq1_0_row(row, &unit, output).unwrap(),
+                other => panic!("cannot pack {other:?}"),
+            }
+        }
+        packed
+    }
+
     #[test]
     fn format_attr_maps_codes() {
         assert_eq!(format_from_attr(0).unwrap(), TernaryFormat::Tq2_0);
@@ -255,6 +389,10 @@ mod tests {
         assert_eq!(op.name(), ONNX_OP_NAME);
         assert_eq!(op.inputs().len(), 3, "act, packed, scales");
         assert_eq!(op.outputs().len(), 1, "out");
+        let embedding = TritiumTernaryEmbeddingOp;
+        assert_eq!(embedding.name(), ONNX_EMBEDDING_OP_NAME);
+        assert_eq!(embedding.inputs().len(), 3, "tokens, packed, scales");
+        assert_eq!(embedding.outputs().len(), 1, "embedding");
     }
 
     /// The kernel's operand path (`TritiumTernaryMpGemmKernel::run`) reproduces
@@ -304,6 +442,22 @@ mod tests {
         // act [M=1, K=256] is valid, but packed is empty for a real [N=1, K=256].
         let r = kernel.run(&[1, 256], &[0.0; 256], &[], &[1.0]);
         assert!(r.is_err(), "packed length mismatch must error");
+    }
+
+    #[test]
+    fn embedding_kernel_preserves_token_rank_and_values() {
+        let k = 256;
+        let format = TernaryFormat::Tq2_0;
+        let rows = vec![vec![Trit::NEG; k], vec![Trit::ZERO; k], vec![Trit::POS; k]];
+        let packed = pack_rows(&rows, format);
+        let scales = [0.5, 2.0, 1.25];
+        let tokens = [2, 0, 1, 2];
+        let kernel = TritiumTernaryEmbeddingKernel { k, format };
+        let (shape, output) = kernel.run(&[2, 2], &tokens, &packed, &scales).unwrap();
+        assert_eq!(shape, [2, 2, k as i64]);
+        let expected =
+            ternary_embedding_kernel(&tokens, &[2, 2], &packed, &scales, k, format).unwrap();
+        assert_eq!(output, expected);
     }
 
     /// Compile-level registration: the operator binds into a domain. This proves
@@ -477,6 +631,63 @@ mod tests {
         .encode_to_vec()
     }
 
+    fn embedding_session_model_bytes(
+        token_shape: &[usize],
+        vocab: usize,
+        k: usize,
+        packed: usize,
+    ) -> Vec<u8> {
+        let mut output_shape = token_shape.to_vec();
+        output_shape.push(k);
+        ModelProto {
+            ir_version: 10,
+            producer_name: "tritium-onnx-test".to_owned(),
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    input: vec![
+                        "tokens".to_owned(),
+                        "packed".to_owned(),
+                        "scales".to_owned(),
+                    ],
+                    output: vec!["out".to_owned()],
+                    name: "embedding".to_owned(),
+                    op_type: ONNX_EMBEDDING_OP_NAME.to_owned(),
+                    attribute: vec![
+                        AttributeProto {
+                            name: ATTR_K.to_owned(),
+                            value: k as i64,
+                            kind: 2,
+                        },
+                        AttributeProto {
+                            name: ATTR_FORMAT.to_owned(),
+                            value: 0,
+                            kind: 2,
+                        },
+                    ],
+                    domain: ONNX_DOMAIN.to_owned(),
+                }],
+                name: "tritium-embedding-session-test".to_owned(),
+                input: vec![
+                    tensor_value("tokens", 7, token_shape),
+                    tensor_value("packed", 2, &[packed]),
+                    tensor_value("scales", 1, &[vocab]),
+                ],
+                output: vec![tensor_value("out", 1, &output_shape)],
+            }),
+            opset_import: vec![
+                OperatorSetIdProto {
+                    domain: String::new(),
+                    version: 21,
+                },
+                OperatorSetIdProto {
+                    domain: ONNX_DOMAIN.to_owned(),
+                    version: 1,
+                },
+            ],
+        }
+        .encode_to_vec()
+    }
+
     /// Full end-to-end ONNX session: serialize a real opset-1 custom-domain
     /// graph, load it through ONNX Runtime, execute it and compare the result
     /// bit-exactly with Tritium's reference kernel.
@@ -518,5 +729,35 @@ mod tests {
             .unwrap();
         let (_, got) = outputs[0].try_extract_tensor::<f32>().unwrap();
         assert_eq!(got, expected.as_slice(), "e2e onnx output bit-exact");
+    }
+
+    #[test]
+    fn end_to_end_embedding_session_matches_reference() {
+        use ort::value::Tensor;
+
+        let k = 256;
+        let format = TernaryFormat::Tq2_0;
+        let rows = vec![vec![Trit::NEG; k], vec![Trit::ZERO; k], vec![Trit::POS; k]];
+        let packed = pack_rows(&rows, format);
+        let scales = vec![0.5, 2.0, 1.25];
+        let tokens = vec![2i64, 0, 1, 2];
+        let expected =
+            ternary_embedding_kernel(&tokens, &[2, 2], &packed, &scales, k, format).unwrap();
+        let model = embedding_session_model_bytes(&[2, 2], rows.len(), k, packed.len());
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&model)
+            .unwrap();
+        let tokens_t = Tensor::from_array(([2, 2], tokens.into_boxed_slice())).unwrap();
+        let packed_t = Tensor::from_array(([packed.len()], packed.into_boxed_slice())).unwrap();
+        let scales_t = Tensor::from_array(([scales.len()], scales.into_boxed_slice())).unwrap();
+        let outputs = session
+            .run(ort::inputs![&tokens_t, &packed_t, &scales_t])
+            .unwrap();
+        let (shape, got) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(shape.as_ref(), &[2, 2, k as i64]);
+        assert_eq!(got, expected.as_slice(), "e2e embedding bit-exact");
     }
 }

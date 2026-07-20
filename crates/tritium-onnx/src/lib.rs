@@ -1,20 +1,15 @@
-//! # tritium-onnx — Tritium's ternary mpGEMM for ONNX Runtime.
+//! # tritium-onnx — Tritium's ternary operators for ONNX Runtime.
 //!
 //! Two layers, so the always-on CI stays green without the onnxruntime native
 //! library:
 //!
-//! - **Layer 1 (always on, no external deps).** [`ternary_mpgemm_kernel`] is a
-//!   plain function: it unpacks `[N, K]` packed ternary weights (TQ2_0 / TQ1_0,
-//!   like `tritium-candle` / `tritium-wasm`) and runs
-//!   [`tritium_core::reference_mpgemm`] to produce the `[M, N]` f32 output. Its
-//!   conformance test is **bit-exact** with the frozen vector set and pulls
-//!   neither `ort` nor `onnxruntime` — it is the default-feature gate.
+//! - **Layer 1 (always on, no external deps).** [`ternary_mpgemm_kernel`] and
+//!   [`ternary_embedding_kernel`] consume TQ2_0 / TQ1_0 weights directly. Their
+//!   conformance tests pull neither `ort` nor `onnxruntime`.
 //!
-//! - **Layer 2 (feature `onnx`, pulls `ort`).** [`TritiumTernaryMpGemmOp`]
-//!   implements the `ort` 2.x custom-operator traits, registering an ONNX node
-//!   `"TritiumTernaryMpGemm"` whose kernel calls Layer 1. Enabling the feature
-//!   adds `ort` with the `download-binaries` feature so a build with network
-//!   fetches a prebuilt onnxruntime — no system library required.
+//! - **Layer 2 (feature `onnx`, pulls `ort`).** [`TritiumTernaryMpGemmOp`] and
+//!   [`TritiumTernaryEmbeddingOp`] register the corresponding `com.tritium`
+//!   opset-1 nodes. Enabling the feature fetches a prebuilt ONNX Runtime.
 //!
 //! ## Feature gate
 //!
@@ -63,6 +58,29 @@ pub enum OnnxTernaryError {
     /// [`tritium_core::reference_mpgemm`] rejected the call (a shape mismatch the
     /// upfront checks did not catch).
     Kernel(String),
+    /// A dimension or derived byte/element count overflowed `usize`.
+    ShapeOverflow(&'static str),
+    /// A per-output/per-row scale is negative or non-finite.
+    InvalidScale {
+        /// Index of the invalid scale.
+        index: usize,
+    },
+    /// A token tensor's shape does not contain exactly the supplied token count.
+    TokenShapeMismatch {
+        /// Element count implied by the token tensor shape.
+        expected: usize,
+        /// Number of supplied token IDs.
+        got: usize,
+    },
+    /// A token ID is negative or outside the embedding vocabulary.
+    TokenOutOfRange {
+        /// Flat position in the input token tensor.
+        position: usize,
+        /// Rejected token ID.
+        token: i64,
+        /// Number of rows in the embedding table.
+        vocab: usize,
+    },
 }
 
 impl core::fmt::Display for OnnxTernaryError {
@@ -85,6 +103,25 @@ impl core::fmt::Display for OnnxTernaryError {
             }
             OnnxTernaryError::Unpack(msg) => write!(f, "tritium-onnx: unpack: {msg}"),
             OnnxTernaryError::Kernel(msg) => write!(f, "tritium-onnx: mpgemm: {msg}"),
+            OnnxTernaryError::ShapeOverflow(what) => {
+                write!(f, "tritium-onnx: {what} overflows addressable memory")
+            }
+            OnnxTernaryError::InvalidScale { index } => write!(
+                f,
+                "tritium-onnx: scale {index} must be finite and nonnegative"
+            ),
+            OnnxTernaryError::TokenShapeMismatch { expected, got } => write!(
+                f,
+                "tritium-onnx: token shape contains {expected} elements, got {got} token IDs"
+            ),
+            OnnxTernaryError::TokenOutOfRange {
+                position,
+                token,
+                vocab,
+            } => write!(
+                f,
+                "tritium-onnx: token {token} at flat position {position} is outside vocabulary 0..{vocab}"
+            ),
         }
     }
 }
@@ -100,6 +137,52 @@ fn block_bytes(format: TernaryFormat) -> Result<usize, OnnxTernaryError> {
     }
 }
 
+fn packed_layout(
+    rows: usize,
+    k: usize,
+    format: TernaryFormat,
+) -> Result<(usize, usize), OnnxTernaryError> {
+    let row_bytes = num_blocks(k)
+        .checked_mul(block_bytes(format)?)
+        .ok_or(OnnxTernaryError::ShapeOverflow("packed row byte count"))?;
+    let packed_bytes = rows
+        .checked_mul(row_bytes)
+        .ok_or(OnnxTernaryError::ShapeOverflow("packed tensor byte count"))?;
+    Ok((row_bytes, packed_bytes))
+}
+
+fn validate_scales(scales: &[f32]) -> Result<(), OnnxTernaryError> {
+    if let Some((index, _)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, scale)| !scale.is_finite() || **scale < 0.0)
+    {
+        return Err(OnnxTernaryError::InvalidScale { index });
+    }
+    Ok(())
+}
+
+fn unpack_row(
+    packed: &[u8],
+    k: usize,
+    format: TernaryFormat,
+    trits: &mut [Trit],
+    scratch: &mut [f16],
+) -> Result<(), OnnxTernaryError> {
+    let result = match format {
+        TernaryFormat::Tq2_0 => unpack_tq2_0_row(packed, trits, scratch),
+        TernaryFormat::Tq1_0 => unpack_tq1_0_row(packed, trits, scratch),
+        other => return Err(OnnxTernaryError::UnsupportedFormat(other)),
+    };
+    result.map_err(|error| OnnxTernaryError::Unpack(error.to_string()))?;
+    if trits.len() != k {
+        return Err(OnnxTernaryError::Kernel(
+            "internal unpacked-row length mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Unpack `[N, K]` `packed` ternary weights into a flat `Vec<Trit>`, validating
 /// the byte length against `n`, `k`, and `format` (the same pattern as the
 /// candle / wasm backends). The per-block scales are discarded (the packer fixes
@@ -111,25 +194,27 @@ fn unpack_weights(
     format: TernaryFormat,
 ) -> Result<Vec<Trit>, OnnxTernaryError> {
     let nb = num_blocks(k);
-    let row_bytes = nb * block_bytes(format)?;
-    let expected = n * row_bytes;
+    let (row_bytes, expected) = packed_layout(n, k, format)?;
     if packed.len() != expected {
         return Err(OnnxTernaryError::PackedLenMismatch {
             expected,
             got: packed.len(),
         });
     }
-    let mut trits = vec![Trit::ZERO; n * k];
+    let trit_count = n.checked_mul(k).ok_or(OnnxTernaryError::ShapeOverflow(
+        "unpacked weight element count",
+    ))?;
+    let mut trits = vec![Trit::ZERO; trit_count];
     let mut scratch = vec![f16::ONE; nb];
     for ni in 0..n {
         let row = &packed[ni * row_bytes..(ni + 1) * row_bytes];
         let trow = &mut trits[ni * k..ni * k + k];
-        let res = match format {
-            TernaryFormat::Tq2_0 => unpack_tq2_0_row(row, trow, &mut scratch),
-            TernaryFormat::Tq1_0 => unpack_tq1_0_row(row, trow, &mut scratch),
-            other => return Err(OnnxTernaryError::UnsupportedFormat(other)),
-        };
-        res.map_err(|e| OnnxTernaryError::Unpack(format!("row {ni}: {e}")))?;
+        unpack_row(row, k, format, trow, &mut scratch).map_err(|error| match error {
+            OnnxTernaryError::Unpack(message) => {
+                OnnxTernaryError::Unpack(format!("row {ni}: {message}"))
+            }
+            other => other,
+        })?;
     }
     Ok(trits)
 }
@@ -160,23 +245,110 @@ pub fn ternary_mpgemm_kernel(
     k: usize,
     format: TernaryFormat,
 ) -> Result<Vec<f32>, OnnxTernaryError> {
-    if act.len() != m * k {
+    let expected_activation = m
+        .checked_mul(k)
+        .ok_or(OnnxTernaryError::ShapeOverflow("activation element count"))?;
+    if act.len() != expected_activation {
         return Err(OnnxTernaryError::ActivationLenMismatch {
-            expected: m * k,
+            expected: expected_activation,
             got: act.len(),
         });
     }
+    validate_scales(scales)?;
     let n = scales.len();
     let trits = unpack_weights(packed, n, k, format)?;
-    let mut out = vec![0f32; m * n];
+    let output_len = m.checked_mul(n).ok_or(OnnxTernaryError::ShapeOverflow(
+        "mpGEMM output element count",
+    ))?;
+    let mut out = vec![0f32; output_len];
     reference_mpgemm(act, &trits, scales, GemmShape { m, n, k }, &mut out)
         .map_err(|e| OnnxTernaryError::Kernel(e.to_string()))?;
     Ok(out)
 }
 
+/// Gather scaled rows from a packed ternary embedding table without
+/// materializing a dense vocabulary-sized shadow.
+///
+/// `packed` stores `[vocab, K]` output-major TQ2_0/TQ1_0 rows and `scales`
+/// stores one finite nonnegative scale per vocabulary row. `token_shape` may be
+/// scalar or any-rank; the returned flat buffer has logical shape
+/// `token_shape + [K]`.
+///
+/// # Errors
+/// [`OnnxTernaryError`] if the token shape/count, a token ID, a scale, packed
+/// byte length, or a derived size is invalid.
+pub fn ternary_embedding_kernel(
+    tokens: &[i64],
+    token_shape: &[usize],
+    packed: &[u8],
+    scales: &[f32],
+    k: usize,
+    format: TernaryFormat,
+) -> Result<Vec<f32>, OnnxTernaryError> {
+    let token_count = token_shape.iter().try_fold(1usize, |count, &dimension| {
+        count
+            .checked_mul(dimension)
+            .ok_or(OnnxTernaryError::ShapeOverflow("token element count"))
+    })?;
+    if tokens.len() != token_count {
+        return Err(OnnxTernaryError::TokenShapeMismatch {
+            expected: token_count,
+            got: tokens.len(),
+        });
+    }
+    validate_scales(scales)?;
+    let vocab = scales.len();
+    let (row_bytes, expected_packed) = packed_layout(vocab, k, format)?;
+    if packed.len() != expected_packed {
+        return Err(OnnxTernaryError::PackedLenMismatch {
+            expected: expected_packed,
+            got: packed.len(),
+        });
+    }
+    let output_len = token_count
+        .checked_mul(k)
+        .ok_or(OnnxTernaryError::ShapeOverflow(
+            "embedding output element count",
+        ))?;
+    let mut output = vec![0.0f32; output_len];
+    let mut trits = vec![Trit::ZERO; k];
+    let mut scratch = vec![f16::ONE; num_blocks(k)];
+    for (position, &token) in tokens.iter().enumerate() {
+        let row = usize::try_from(token)
+            .ok()
+            .filter(|&row| row < vocab)
+            .ok_or(OnnxTernaryError::TokenOutOfRange {
+                position,
+                token,
+                vocab,
+            })?;
+        let start = row * row_bytes;
+        unpack_row(
+            &packed[start..start + row_bytes],
+            k,
+            format,
+            &mut trits,
+            &mut scratch,
+        )
+        .map_err(|error| match error {
+            OnnxTernaryError::Unpack(message) => {
+                OnnxTernaryError::Unpack(format!("row {row}: {message}"))
+            }
+            other => other,
+        })?;
+        let scale = scales[row];
+        let out = &mut output[position * k..(position + 1) * k];
+        for (value, &trit) in out.iter_mut().zip(&trits) {
+            *value = scale * trit.to_f32();
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(feature = "onnx")]
 pub use onnx_op::{
-    ATTR_FORMAT, ATTR_K, ONNX_DOMAIN, ONNX_OP_NAME, TritiumTernaryMpGemmKernel,
+    ATTR_FORMAT, ATTR_K, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME, ONNX_OP_NAME,
+    TritiumTernaryEmbeddingKernel, TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel,
     TritiumTernaryMpGemmOp, tritium_operator_domain,
 };
 
@@ -207,6 +379,23 @@ mod tests {
                 TernaryFormat::Tq1_0 => pack_tq1_0_row(&trits, &unit, out).unwrap(),
                 other => panic!("cannot pack {other:?}"),
             };
+        }
+        packed
+    }
+
+    fn pack_rows(rows: &[Vec<Trit>], format: TernaryFormat) -> Vec<u8> {
+        let k = rows.first().map_or(0, Vec::len);
+        assert!(rows.iter().all(|row| row.len() == k));
+        let nb = num_blocks(k);
+        let unit = vec![f16::ONE; nb];
+        let row_bytes = nb * block_bytes(format).unwrap();
+        let mut packed = vec![0u8; rows.len() * row_bytes];
+        for (row, output) in rows.iter().zip(packed.chunks_exact_mut(row_bytes)) {
+            match format {
+                TernaryFormat::Tq2_0 => pack_tq2_0_row(row, &unit, output).unwrap(),
+                TernaryFormat::Tq1_0 => pack_tq1_0_row(row, &unit, output).unwrap(),
+                other => panic!("cannot pack {other:?}"),
+            }
         }
         packed
     }
@@ -274,6 +463,58 @@ mod tests {
             matches!(r, Err(OnnxTernaryError::UnsupportedFormat(_))),
             "unsupported format must error, got {r:?}"
         );
+    }
+
+    #[test]
+    fn embedding_gathers_only_selected_scaled_rows() {
+        let k = 260;
+        let rows = vec![
+            (0..k)
+                .map(|column| match column % 3 {
+                    0 => Trit::NEG,
+                    1 => Trit::ZERO,
+                    _ => Trit::POS,
+                })
+                .collect::<Vec<_>>(),
+            vec![Trit::POS; k],
+            vec![Trit::NEG; k],
+        ];
+        let scales = [0.5, 2.0, 1.25];
+        let tokens = [2, 0, 2, 1];
+        for format in [TernaryFormat::Tq2_0, TernaryFormat::Tq1_0] {
+            let packed = pack_rows(&rows, format);
+            let got =
+                ternary_embedding_kernel(&tokens, &[2, 2], &packed, &scales, k, format).unwrap();
+            let expected: Vec<f32> = tokens
+                .iter()
+                .flat_map(|&token| {
+                    rows[token as usize]
+                        .iter()
+                        .map(move |trit| scales[token as usize] * trit.to_f32())
+                })
+                .collect();
+            assert_eq!(got, expected, "selected-row gather must match for {format}");
+        }
+    }
+
+    #[test]
+    fn embedding_rejects_shape_token_and_scale_errors() {
+        let k = 256;
+        let rows = vec![vec![Trit::ZERO; k]];
+        let packed = pack_rows(&rows, TernaryFormat::Tq2_0);
+        let shape = ternary_embedding_kernel(&[0], &[2], &packed, &[1.0], k, TernaryFormat::Tq2_0);
+        assert!(matches!(
+            shape,
+            Err(OnnxTernaryError::TokenShapeMismatch { .. })
+        ));
+        let token = ternary_embedding_kernel(&[-1], &[1], &packed, &[1.0], k, TernaryFormat::Tq2_0);
+        assert!(matches!(
+            token,
+            Err(OnnxTernaryError::TokenOutOfRange { .. })
+        ));
+        let scale =
+            ternary_embedding_kernel(&[0], &[1], &packed, &[f32::NAN], k, TernaryFormat::Tq2_0);
+        assert!(matches!(scale, Err(OnnxTernaryError::InvalidScale { .. })));
     }
 
     #[test]

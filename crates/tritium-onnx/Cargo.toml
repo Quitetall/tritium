@@ -1,6 +1,6 @@
 [package]
 name = "tritium-onnx"
-description = "ONNX Runtime interop for Tritium: a plain ternary (BitNet b1.58) mpGEMM kernel (always-on, bit-exact with the reference) plus an `ort` 2.x custom operator (feature `onnx`) exposing it as the ONNX node `TritiumTernaryMpGemm`."
+description = "ONNX Runtime interop for Tritium: packed ternary mpGEMM and selected-row embedding kernels plus com.tritium custom operators."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
