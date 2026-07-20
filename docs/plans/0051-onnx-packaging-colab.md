@@ -87,8 +87,13 @@ Verification requires model and weights BLAKE3 trust roots from the admitted
 package manifest; candidate files cannot nominate their own expected digests,
 so graph rewiring and internally rehashed payload mutations fail closed.
 Shape-driving `int64` constants remain inline because ORT shape inference needs
-their values while loading. Current writer first forms the bounded inline graph;
-a direct streaming writer is still required for multi-gigabyte models.
+their values while loading. External export now emits packed bytes and f32
+initializers directly into final aligned storage without first forming an inline
+protobuf or cloning packed matrices. A public regression crosses the 64 MiB
+inline limit while inline export rejects the same model; direct f32 emission
+also avoids a second serialized-value buffer. Generated causal masks and RoPE
+tables stream into final storage with checked allocation; impossible geometry
+returns a typed error before allocation.
 Multi-layer large-model external-data packaging, architecture tensor-map
 adapters, sliding/local/partial RoPE variants, dynamic axes and end-user
 generation APIs remain open.

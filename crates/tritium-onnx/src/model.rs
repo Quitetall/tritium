@@ -951,7 +951,16 @@ pub fn encode_tied_embedding_head_v2(
 /// cache sizes, epsilon, or artifact identity violate the causal-LM contract.
 pub fn encode_causal_lm(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
     validate_causal_lm(&model)?;
-    encode_causal_lm_graph(model)
+    validate_causal_initializer_budget(&model)?;
+    let (protobuf, weights) = build_causal_lm_graph(model, false)?;
+    debug_assert!(weights.is_none());
+    let encoded = protobuf.encode_to_vec();
+    if encoded.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
 }
 
 /// Encode a causal LM with weight/value initializers in authenticated `weights.bin`.
@@ -967,32 +976,11 @@ pub fn encode_causal_lm(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelEr
 pub fn encode_external_causal_lm(
     model: CausalLmModel<'_>,
 ) -> Result<ExternalOnnxModel, OnnxModelError> {
-    let inline = encode_causal_lm(model)?;
-    let mut protobuf = ModelProto::decode(inline.as_slice())
-        .map_err(|error| OnnxModelError::InvalidModel(error.to_string()))?;
-    let graph = protobuf
-        .graph
-        .as_mut()
-        .ok_or_else(|| OnnxModelError::InvalidModel("model has no graph".to_owned()))?;
-    let mut weights_bytes = Vec::new();
-    for initializer in &mut graph.initializer {
-        if initializer.data_type == TENSOR_INT64 {
-            continue;
-        }
-        let offset = align_up(weights_bytes.len(), EXTERNAL_ALIGNMENT)?;
-        weights_bytes.resize(offset, 0);
-        let raw_data = core::mem::take(&mut initializer.raw_data);
-        weights_bytes
-            .try_reserve_exact(raw_data.len())
-            .map_err(|_| OnnxModelError::ShapeOverflow("external weight allocation"))?;
-        weights_bytes.extend_from_slice(&raw_data);
-        initializer.external_data = vec![
-            metadata("location", EXTERNAL_WEIGHTS_FILE),
-            metadata("offset", &offset.to_string()),
-            metadata("length", &raw_data.len().to_string()),
-        ];
-        initializer.data_location = EXTERNAL_DATA;
-    }
+    validate_causal_lm(&model)?;
+    let (mut protobuf, weights) = build_causal_lm_graph(model, true)?;
+    let weights_bytes = weights.ok_or_else(|| {
+        OnnxModelError::InvalidModel("external graph builder returned inline storage".to_owned())
+    })?;
     let weights_blake3 = *blake3::hash(&weights_bytes).as_bytes();
     let digest = blake3::Hash::from_bytes(weights_blake3)
         .to_hex()
@@ -1729,10 +1717,42 @@ fn encode_model(
     .encode_to_vec())
 }
 
-#[derive(Default)]
 struct CausalGraphBuilder {
     nodes: Vec<NodeProto>,
     initializers: Vec<TensorProto>,
+    storage: CausalInitializerStorage,
+    failure: Option<OnnxModelError>,
+}
+
+enum CausalInitializerStorage {
+    Inline,
+    External(Vec<u8>),
+}
+
+fn reserve_external_range(weights: &mut Vec<u8>, length: usize) -> Result<usize, OnnxModelError> {
+    let offset = align_up(weights.len(), EXTERNAL_ALIGNMENT)?;
+    let required = offset
+        .checked_sub(weights.len())
+        .and_then(|padding| padding.checked_add(length))
+        .ok_or(OnnxModelError::ShapeOverflow(
+            "external initializer allocation",
+        ))?;
+    weights
+        .try_reserve_exact(required)
+        .map_err(|_| OnnxModelError::ShapeOverflow("external initializer allocation"))?;
+    weights.resize(offset, 0);
+    Ok(offset)
+}
+
+impl Default for CausalGraphBuilder {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            initializers: Vec::new(),
+            storage: CausalInitializerStorage::Inline,
+            failure: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1766,12 +1786,8 @@ struct RotaryGraphState {
 
 fn rotary_tables(config: RotaryGraphConfig) -> Result<(Vec<f32>, Vec<f32>), OnnxModelError> {
     let RotaryGraphConfig {
-        tokens,
-        head_dim,
-        past_tokens,
-        theta,
+        tokens, head_dim, ..
     } = config;
-    let half = head_dim / 2;
     let elements = tokens
         .checked_mul(head_dim)
         .ok_or(OnnxModelError::ShapeOverflow("RoPE table element count"))?;
@@ -1787,22 +1803,32 @@ fn rotary_tables(config: RotaryGraphConfig) -> Result<(Vec<f32>, Vec<f32>), Onnx
     let mut cos = Vec::with_capacity(elements);
     let mut sin = Vec::with_capacity(elements);
     for token in 0..tokens {
-        let position = (past_tokens + token) as f64;
         for lane in 0..head_dim {
-            let frequency_lane = lane % half;
-            let angle =
-                position * f64::from(theta).powf(-2.0 * frequency_lane as f64 / head_dim as f64);
-            if !angle.is_finite() {
-                return Err(OnnxModelError::InvalidModel(format!(
-                    "RoPE angle is non-finite at position {} frequency lane {frequency_lane}",
-                    past_tokens + token
-                )));
-            }
-            let (lane_sin, lane_cos) = angle.sin_cos();
+            let (lane_cos, lane_sin) = rotary_pair(config, token, lane)?;
             cos.push(lane_cos as f32);
             sin.push(lane_sin as f32);
         }
     }
+    Ok((cos, sin))
+}
+
+fn rotary_pair(
+    config: RotaryGraphConfig,
+    token: usize,
+    lane: usize,
+) -> Result<(f64, f64), OnnxModelError> {
+    let half = config.head_dim / 2;
+    let frequency_lane = lane % half;
+    let position = (config.past_tokens + token) as f64;
+    let angle = position
+        * f64::from(config.theta).powf(-2.0 * frequency_lane as f64 / config.head_dim as f64);
+    if !angle.is_finite() {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "RoPE angle is non-finite at position {} frequency lane {frequency_lane}",
+            config.past_tokens + token
+        )));
+    }
+    let (sin, cos) = angle.sin_cos();
     Ok((cos, sin))
 }
 
@@ -1813,6 +1839,62 @@ struct CacheGraphOutputs {
 }
 
 impl CausalGraphBuilder {
+    fn external() -> Self {
+        Self {
+            storage: CausalInitializerStorage::External(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    fn is_external(&self) -> bool {
+        matches!(self.storage, CausalInitializerStorage::External(_))
+    }
+
+    fn storage_result(&self) -> Result<(), OnnxModelError> {
+        self.failure.clone().map_or(Ok(()), Err)
+    }
+
+    fn store_bytes(&mut self, name: &str, data_type: i32, dimensions: Vec<i64>, bytes: &[u8]) {
+        if self.failure.is_some() {
+            return;
+        }
+        let tensor = match &mut self.storage {
+            CausalInitializerStorage::Inline => {
+                inline_tensor(name, data_type, dimensions, bytes.to_vec())
+            }
+            CausalInitializerStorage::External(weights) => {
+                let offset = match reserve_external_range(weights, bytes.len()) {
+                    Ok(offset) => offset,
+                    Err(error) => {
+                        self.failure.get_or_insert(error);
+                        return;
+                    }
+                };
+                weights.extend_from_slice(bytes);
+                let offset = match i64::try_from(offset) {
+                    Ok(offset) => offset,
+                    Err(_) => {
+                        self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                            "external initializer offset",
+                        ));
+                        return;
+                    }
+                };
+                let length = match i64::try_from(bytes.len()) {
+                    Ok(length) => length,
+                    Err(_) => {
+                        self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                            "external initializer length",
+                        ));
+                        return;
+                    }
+                };
+                external_tensor(name, data_type, dimensions, offset, length)
+            }
+        };
+        self.initializers.push(tensor);
+    }
+
     fn standard(
         &mut self,
         name: impl Into<String>,
@@ -1821,6 +1903,9 @@ impl CausalGraphBuilder {
         outputs: &[&str],
         attribute: Vec<AttributeProto>,
     ) {
+        if self.failure.is_some() {
+            return;
+        }
         self.nodes.push(NodeProto {
             input: inputs.iter().map(|value| (*value).to_owned()).collect(),
             output: outputs.iter().map(|value| (*value).to_owned()).collect(),
@@ -1832,15 +1917,215 @@ impl CausalGraphBuilder {
     }
 
     fn add_f32(&mut self, name: &str, dimensions: Vec<i64>, values: &[f32]) {
-        self.initializers.push(inline_tensor(
+        if self.failure.is_some() {
+            return;
+        }
+        if matches!(self.storage, CausalInitializerStorage::Inline) {
+            self.initializers.push(inline_tensor(
+                name,
+                TENSOR_FLOAT,
+                dimensions,
+                scale_bytes(values),
+            ));
+            return;
+        }
+        let length = match values.len().checked_mul(core::mem::size_of::<f32>()) {
+            Some(length) => length,
+            None => {
+                self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                    "external f32 initializer byte count",
+                ));
+                return;
+            }
+        };
+        let CausalInitializerStorage::External(weights) = &mut self.storage else {
+            unreachable!();
+        };
+        let offset = match reserve_external_range(weights, length) {
+            Ok(offset) => offset,
+            Err(error) => {
+                self.failure.get_or_insert(error);
+                return;
+            }
+        };
+        for value in values {
+            weights.extend_from_slice(&value.to_le_bytes());
+        }
+        let Ok(offset) = i64::try_from(offset) else {
+            self.failure
+                .get_or_insert(OnnxModelError::ShapeOverflow("external initializer offset"));
+            return;
+        };
+        let Ok(length) = i64::try_from(length) else {
+            self.failure
+                .get_or_insert(OnnxModelError::ShapeOverflow("external initializer length"));
+            return;
+        };
+        self.initializers.push(external_tensor(
             name,
             TENSOR_FLOAT,
             dimensions,
-            scale_bytes(values),
+            offset,
+            length,
+        ));
+    }
+
+    fn add_causal_mask(
+        &mut self,
+        name: &str,
+        tokens: usize,
+        total_tokens: usize,
+        past_tokens: usize,
+        dimensions: Vec<i64>,
+    ) {
+        if self.failure.is_some() {
+            return;
+        }
+        let elements = match tokens.checked_mul(total_tokens) {
+            Some(elements) => elements,
+            None => {
+                self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                    "attention mask element count",
+                ));
+                return;
+            }
+        };
+        if matches!(self.storage, CausalInitializerStorage::Inline) {
+            let mut values = Vec::new();
+            if values.try_reserve_exact(elements).is_err() {
+                self.failure
+                    .get_or_insert(OnnxModelError::ShapeOverflow("attention mask allocation"));
+                return;
+            }
+            for query_index in 0..tokens {
+                let last_visible = past_tokens + query_index;
+                for key_index in 0..total_tokens {
+                    values.push(if key_index <= last_visible {
+                        0.0
+                    } else {
+                        -1.0e9
+                    });
+                }
+            }
+            self.add_f32(name, dimensions, &values);
+            return;
+        }
+        let length = match elements.checked_mul(core::mem::size_of::<f32>()) {
+            Some(length) => length,
+            None => {
+                self.failure
+                    .get_or_insert(OnnxModelError::ShapeOverflow("attention mask byte count"));
+                return;
+            }
+        };
+        let CausalInitializerStorage::External(weights) = &mut self.storage else {
+            unreachable!();
+        };
+        let offset = match reserve_external_range(weights, length) {
+            Ok(offset) => offset,
+            Err(error) => {
+                self.failure.get_or_insert(error);
+                return;
+            }
+        };
+        let (Ok(offset_i64), Ok(length_i64)) = (i64::try_from(offset), i64::try_from(length))
+        else {
+            self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                "external attention mask range",
+            ));
+            return;
+        };
+        for query_index in 0..tokens {
+            let last_visible = past_tokens + query_index;
+            for key_index in 0..total_tokens {
+                let value = if key_index <= last_visible {
+                    0.0_f32
+                } else {
+                    -1.0e9
+                };
+                weights.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        self.initializers.push(external_tensor(
+            name,
+            TENSOR_FLOAT,
+            dimensions,
+            offset_i64,
+            length_i64,
+        ));
+    }
+
+    fn add_external_rotary_table(
+        &mut self,
+        name: &str,
+        config: RotaryGraphConfig,
+        cosine: bool,
+        dimensions: Vec<i64>,
+    ) {
+        if self.failure.is_some() {
+            return;
+        }
+        let elements = match config.tokens.checked_mul(config.head_dim) {
+            Some(elements) => elements,
+            None => {
+                self.failure
+                    .get_or_insert(OnnxModelError::ShapeOverflow("RoPE table element count"));
+                return;
+            }
+        };
+        let length = match elements.checked_mul(core::mem::size_of::<f32>()) {
+            Some(length) => length,
+            None => {
+                self.failure
+                    .get_or_insert(OnnxModelError::ShapeOverflow("RoPE table byte count"));
+                return;
+            }
+        };
+        let CausalInitializerStorage::External(weights) = &mut self.storage else {
+            self.failure.get_or_insert(OnnxModelError::InvalidModel(
+                "direct RoPE table emission requires external storage".to_owned(),
+            ));
+            return;
+        };
+        let offset = match reserve_external_range(weights, length) {
+            Ok(offset) => offset,
+            Err(error) => {
+                self.failure.get_or_insert(error);
+                return;
+            }
+        };
+        let (Ok(offset_i64), Ok(length_i64)) = (i64::try_from(offset), i64::try_from(length))
+        else {
+            self.failure
+                .get_or_insert(OnnxModelError::ShapeOverflow("external RoPE table range"));
+            return;
+        };
+        for token in 0..config.tokens {
+            for lane in 0..config.head_dim {
+                let pair = match rotary_pair(config, token, lane) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        self.failure.get_or_insert(error);
+                        return;
+                    }
+                };
+                let value = if cosine { pair.0 } else { pair.1 } as f32;
+                weights.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        self.initializers.push(external_tensor(
+            name,
+            TENSOR_FLOAT,
+            dimensions,
+            offset_i64,
+            length_i64,
         ));
     }
 
     fn add_i64(&mut self, name: &str, dimensions: Vec<i64>, values: &[i64]) {
+        if self.failure.is_some() {
+            return;
+        }
         self.initializers.push(inline_tensor(
             name,
             TENSOR_INT64,
@@ -1853,12 +2138,12 @@ impl CausalGraphBuilder {
     }
 
     fn add_matrix(&mut self, prefix: &str, matrix: PackedTernaryMatrix<'_>) {
-        self.initializers.push(inline_tensor(
+        self.store_bytes(
             &format!("{prefix}.packed"),
             TENSOR_UINT8,
             vec![i64::try_from(matrix.packed.len()).expect("validated packed byte count")],
-            matrix.packed.to_vec(),
-        ));
+            matrix.packed,
+        );
         self.add_f32(
             &format!("{prefix}.scales"),
             vec![i64::try_from(matrix.rows).expect("validated matrix rows")],
@@ -1875,6 +2160,7 @@ impl CausalGraphBuilder {
         matrix: PackedTernaryMatrix<'_>,
     ) -> Result<(), OnnxModelError> {
         self.add_matrix(matrix_prefix, matrix);
+        self.storage_result()?;
         self.nodes.push(NodeProto {
             input: vec![
                 input.to_owned(),
@@ -1981,27 +2267,22 @@ impl CausalGraphBuilder {
         );
         self.add_i64(&axes, vec![1], &[-1]);
         self.add_i64(&steps, vec![1], &[1]);
-        let (cos, sin) = rotary_tables(config)?;
         let cos_name = "rope.cos".to_owned();
         let sin_name = "rope.sin".to_owned();
-        self.add_f32(
-            &cos_name,
-            vec![
-                as_i64(tokens, "RoPE token count")?,
-                1,
-                as_i64(head_dim, "RoPE head dimension")?,
-            ],
-            &cos,
-        );
-        self.add_f32(
-            &sin_name,
-            vec![
-                as_i64(tokens, "RoPE token count")?,
-                1,
-                as_i64(head_dim, "RoPE head dimension")?,
-            ],
-            &sin,
-        );
+        let dimensions = vec![
+            as_i64(tokens, "RoPE token count")?,
+            1,
+            as_i64(head_dim, "RoPE head dimension")?,
+        ];
+        if self.is_external() {
+            self.add_external_rotary_table(&cos_name, config, true, dimensions.clone());
+            self.add_external_rotary_table(&sin_name, config, false, dimensions);
+        } else {
+            let (cos, sin) = rotary_tables(config)?;
+            self.add_f32(&cos_name, dimensions.clone(), &cos);
+            self.add_f32(&sin_name, dimensions, &sin);
+        }
+        self.storage_result()?;
         Ok(RotaryGraphState {
             first_start,
             first_end,
@@ -2298,7 +2579,10 @@ impl CausalGraphBuilder {
     }
 }
 
-fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
+fn build_causal_lm_graph(
+    model: CausalLmModel<'_>,
+    external: bool,
+) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "token count")?;
     let past_tokens = as_i64(model.past_tokens, "past token count")?;
     let total_tokens = tokens
@@ -2322,7 +2606,11 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
         head_dim,
         gqa_repeat,
     };
-    let mut graph = CausalGraphBuilder::default();
+    let mut graph = if external {
+        CausalGraphBuilder::external()
+    } else {
+        CausalGraphBuilder::default()
+    };
     let rotary_state = model
         .rotary
         .map(|rotary| {
@@ -2341,24 +2629,19 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
             .ok_or(OnnxModelError::ShapeOverflow(
                 "attention mask element count",
             ))?;
-    if mask_elements > MAX_MODEL_BYTES / core::mem::size_of::<f32>() {
+    if !graph.is_external() && mask_elements > MAX_MODEL_BYTES / core::mem::size_of::<f32>() {
         return Err(OnnxModelError::InvalidModel(format!(
             "attention mask requires {mask_elements} elements, exceeds bounded inline graph"
         )));
     }
     let attention_mask = "attention.attention_mask";
-    let mut mask_values = Vec::with_capacity(mask_elements);
-    for query_index in 0..model.tokens {
-        let last_visible = model.past_tokens + query_index;
-        for key_index in 0..total_tokens_usize {
-            mask_values.push(if key_index <= last_visible {
-                0.0
-            } else {
-                -1.0e9
-            });
-        }
-    }
-    graph.add_f32(attention_mask, vec![1, tokens, total_tokens], &mask_values);
+    graph.add_causal_mask(
+        attention_mask,
+        model.tokens,
+        total_tokens_usize,
+        model.past_tokens,
+        vec![1, tokens, total_tokens],
+    );
     graph.add_matrix("tok_embeddings", model.embedding);
     graph.nodes.push(NodeProto {
         input: strings(["tokens", "tok_embeddings.packed", "tok_embeddings.scales"]),
@@ -2646,7 +2929,14 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
     if let Some(rotary) = model.rotary {
         metadata_props.push(metadata("tritium.rope_theta", &rotary.theta.to_string()));
     }
-    let encoded = ModelProto {
+    if let Some(error) = graph.failure {
+        return Err(error);
+    }
+    let external_weights = match graph.storage {
+        CausalInitializerStorage::Inline => None,
+        CausalInitializerStorage::External(weights) => Some(weights),
+    };
+    let protobuf = ModelProto {
         ir_version: ONNX_IR_VERSION,
         producer_name: "tritium-onnx".to_owned(),
         producer_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -2671,14 +2961,8 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
             },
         ],
         metadata_props,
-    }
-    .encode_to_vec();
-    if encoded.len() > MAX_MODEL_BYTES {
-        return Err(OnnxModelError::InvalidModel(format!(
-            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
-        )));
-    }
-    Ok(encoded)
+    };
+    Ok((protobuf, external_weights))
 }
 
 #[cfg(test)]
@@ -3049,7 +3333,6 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             intermediate,
         )?;
     }
-    validate_causal_initializer_budget(model)?;
     validate_identity_v2(model.identity)
 }
 

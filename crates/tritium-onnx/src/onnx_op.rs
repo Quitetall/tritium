@@ -1269,6 +1269,47 @@ mod tests {
             crate::verify_external_causal_lm(&rewired_model, &external.weights_bytes, admitted,)
                 .is_err()
         );
+        let oversized_past = 16_777_216;
+        assert!(
+            encode_result(
+                1,
+                oversized_past,
+                layer,
+                Some(crate::RotaryEmbedding { theta: rope_theta }),
+            )
+            .is_err()
+        );
+        let large_external = crate::encode_external_causal_lm(crate::CausalLmModel {
+            tokens: 1,
+            past_tokens: oversized_past,
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 4,
+            rotary: Some(crate::RotaryEmbedding { theta: rope_theta }),
+            rms_epsilon: epsilon,
+            embedding,
+            layers: std::slice::from_ref(&layer),
+            final_norm: &final_norm,
+            identity,
+        })
+        .unwrap();
+        assert!(large_external.weights_bytes.len() > 64 * 1024 * 1024);
+        assert!(
+            crate::encode_external_causal_lm(crate::CausalLmModel {
+                tokens: 1,
+                past_tokens: i64::MAX as usize - 1,
+                n_head: 4,
+                n_kv_head: 2,
+                head_dim: 4,
+                rotary: Some(crate::RotaryEmbedding { theta: rope_theta }),
+                rms_epsilon: epsilon,
+                embedding,
+                layers: std::slice::from_ref(&layer),
+                final_norm: &final_norm,
+                identity,
+            })
+            .is_err()
+        );
         let external_dir = std::env::temp_dir().join(format!(
             "tritium-onnx-causal-{}-{}",
             std::process::id(),
