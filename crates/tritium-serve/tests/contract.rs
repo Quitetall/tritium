@@ -868,12 +868,11 @@ async fn nonstream_timeout_408() {
     );
 }
 
-/// Streaming is NOT bounded by the request timeout: the SSE body is lazy, so
-/// the service future resolves at headers and tokens keep flowing past the
-/// deadline. This pins the documented contract (the timeout is a
-/// non-streaming bound, not a streaming TTFB bound).
+/// Streaming has an absolute deadline inside the lazy SSE body. Expiry emits
+/// a typed OpenAI error event, terminates framing, and drops the receiver so
+/// the worker observes cancellation.
 #[tokio::test]
-async fn sse_streams_past_timeout_deadline() {
+async fn sse_deadline_cancels_generation() {
     let mock = MockGenerator {
         step_delay_ms: 400, // total 1.6s of generation vs a 1s deadline
         ..MockGenerator::new(vec![1, 2, 3, 4])
@@ -894,15 +893,27 @@ async fn sse_streams_past_timeout_deadline() {
     assert_eq!(status, StatusCode::OK);
     let events = parse_sse(&body);
     assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
-    assert_eq!(
-        sse_chunks(&events).len(),
-        1 + 4 + 1,
-        "role prelude + 4 tokens + finish chunk"
+    let chunks = sse_chunks(&events);
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    let error = chunks.last().expect("timeout error event");
+    assert_eq!(error["error"]["type"], "request_timeout_error");
+    assert_eq!(error["error"]["code"], "request_timeout");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(900),
+        "deadline fired too early: {:?}",
+        t0.elapsed()
     );
     assert!(
-        t0.elapsed() > Duration::from_secs(1),
-        "stream must have outlived the 1s deadline to prove the point"
+        t0.elapsed() < Duration::from_millis(1500),
+        "stream outlived the configured deadline: {:?}",
+        t0.elapsed()
     );
+
+    let req = Request::get("/metrics").body(Body::empty()).unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("tritium_stream_timeouts_total 1\n"), "{text}");
 }
 
 /// Chat-template rendering: the RoleEot template must reproduce the official
@@ -952,6 +963,7 @@ async fn metrics_exposition() {
         text.contains("tritium_queue_rejections_total 0\n"),
         "{text}"
     );
+    assert!(text.contains("tritium_stream_timeouts_total 0\n"), "{text}");
     assert!(text.contains("tritium_worker_alive 1\n"), "{text}");
     assert!(text.contains("# TYPE tritium_queue_depth gauge"), "{text}");
 

@@ -99,6 +99,14 @@ limits, slow consumers, disconnect at every generation phase, deadline races,
 oversized prompts, malformed JSON/artifacts, auth rotation and drain. After
 each case, queue, KV pool, active jobs and resident bytes return to baseline.
 
+Progress (2026-07-20): message/byte/prompt/completion/combined admission
+ceilings and reject-not-clamp semantics are implemented. The existing request
+lifetime now also runs inside lazy SSE bodies from queue admission: expiry
+emits a typed OpenAI `request_timeout` event, records
+`tritium_stream_timeouts_total`, terminates framing and drops the receiver so
+the worker cancels. Per-principal rate limits, auth rotation, explicit KV
+reclamation receipts and the full adversarial matrix remain open.
+
 ## Slice 3 — metrics, logs and traces
 
 Replace the three-counter diagnostic surface with a versioned telemetry seam:

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -80,12 +80,11 @@ pub struct ServeConfig {
     pub queue_cap: usize,
     /// `max_tokens` used when the request omits it.
     pub max_new_default: usize,
-    /// Per-request service-future budget. For NON-STREAMING requests this
-    /// bounds queue wait + the whole generation. For streaming requests the
-    /// service future resolves at headers (the SSE body is lazy), so the
-    /// timeout bounds essentially nothing — streaming slow-clients are
-    /// instead bounded by the 64-event channel + try_send cancellation.
-    /// 0 disables.
+    /// Per-request lifetime budget. For non-streaming requests the service
+    /// timeout bounds body handling, queue wait and generation. Streaming
+    /// responses additionally enforce the same budget inside the lazy SSE
+    /// body, starting at queue admission; expiry emits a typed error event and
+    /// cancels generation. `0` disables both deadlines.
     pub request_timeout_secs: u64,
     /// Global in-flight request cap (DoS bound on handler memory/FDs).
     /// 0 disables.
@@ -158,6 +157,8 @@ pub(crate) struct Metrics {
     pub(crate) queue_rejections: AtomicU64,
     /// Completion tokens emitted to clients across all requests.
     pub(crate) tokens_out: AtomicU64,
+    /// Streaming generations cancelled after exceeding their lifetime budget.
+    pub(crate) stream_timeouts: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -173,6 +174,7 @@ struct AppState {
     max_prompt_tokens: usize,
     max_new_tokens: usize,
     max_total_tokens: usize,
+    request_timeout: Option<Duration>,
     chat_template: ChatTemplate,
     metrics: Arc<Metrics>,
 }
@@ -288,6 +290,8 @@ fn build_router_inner(
         max_prompt_tokens: limits.max_prompt_tokens,
         max_new_tokens: limits.max_new_tokens,
         max_total_tokens: limits.max_total_tokens,
+        request_timeout: (cfg.request_timeout_secs > 0)
+            .then(|| Duration::from_secs(cfg.request_timeout_secs)),
         chat_template: cfg.chat_template,
         metrics: Arc::new(Metrics::default()),
     };
@@ -633,6 +637,7 @@ async fn chat_completions(State(st): State<AppState>, Json(req): Json<ChatReques
             stops,
             st.metrics.clone(),
             include_usage.then_some(prompt_len),
+            st.request_timeout,
         )
     } else {
         nonstream_response(
@@ -768,11 +773,20 @@ fn stream_response(
     // `Some(prompt_tokens)` when the client asked for
     // `stream_options.include_usage`: emit the final usage chunk.
     usage_prompt_len: Option<usize>,
+    // Absolute lifetime measured from queue admission. Unlike tower's
+    // service-future timeout, this remains active after SSE headers resolve.
+    timeout: Option<Duration>,
 ) -> Response {
     let id = make_id();
     let created = now_secs();
     let detok_eos = tok.eos();
     let stream_tok = tok.clone();
+    let deadline = timeout.map(|budget| {
+        let now = tokio::time::Instant::now();
+        // A pathological public config must fail closed rather than turning
+        // an overflowing lifetime into an unbounded stream.
+        now.checked_add(budget).unwrap_or(now)
+    });
     let stream = async_stream::stream! {
         // 1. role-first chunk
         yield Ok::<Event, std::convert::Infallible>(sse_data(&role_chunk(&id, created, &model)));
@@ -784,8 +798,21 @@ fn stream_response(
         let mut finish = FinishReason::Stop;
         let mut stopped_by_string = false;
         let mut errored = false;
+        let mut timed_out = false;
 
-        while let Some(ev) = rx.recv().await {
+        loop {
+            let next = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(event) => event,
+                    Err(_) => {
+                        timed_out = true;
+                        metrics.stream_timeouts.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                },
+                None => rx.recv().await,
+            };
+            let Some(ev) = next else { break };
             match ev {
                 GenEvent::Token(t, lp) => {
                     // Count like the non-stream path: eos terminates, it is
@@ -829,7 +856,15 @@ fn stream_response(
             }
         }
 
-        if errored {
+        if timed_out {
+            let mut error = ApiError::new(
+                "request_timeout_error",
+                "stream exceeded the configured request lifetime",
+                None,
+            );
+            error.error.code = Some("request_timeout".to_owned());
+            yield Ok(Event::default().data(serde_json::to_string(&error).unwrap_or_default()));
+        } else if errored {
             yield Ok(sse_data(&error_chunk(&id, created, &model)));
         } else {
             if !stopped_by_string {
@@ -946,6 +981,9 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP tritium_tokens_out_total Completion tokens emitted to clients.\n\
          # TYPE tritium_tokens_out_total counter\n\
          tritium_tokens_out_total {}\n\
+         # HELP tritium_stream_timeouts_total Streaming generations cancelled at their lifetime deadline.\n\
+         # TYPE tritium_stream_timeouts_total counter\n\
+         tritium_stream_timeouts_total {}\n\
          # HELP tritium_queue_depth Jobs waiting in the decode queue.\n\
          # TYPE tritium_queue_depth gauge\n\
          tritium_queue_depth {}\n\
@@ -961,6 +999,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
         st.metrics.chat_requests.load(Ordering::Relaxed),
         st.metrics.queue_rejections.load(Ordering::Relaxed),
         st.metrics.tokens_out.load(Ordering::Relaxed),
+        st.metrics.stream_timeouts.load(Ordering::Relaxed),
         queue_depth,
         u8::from(st.worker_alive.load(Ordering::Relaxed)),
         crate::generator::SPEC_VERIFIES.load(Ordering::Relaxed),
