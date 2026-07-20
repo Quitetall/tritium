@@ -251,6 +251,7 @@ fn cpu_backend() -> Result<Box<dyn TernaryBackend>, String> {
 fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Model>()?;
     m.add_class::<qwen::QwenModel>()?;
+    m.add_class::<qwen::QwenLoadReceipt>()?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     // Autograd-op primitives (ADR 0030): forward/vjp for ternary Conv1d, FSQ, and STE.
     m.add_function(wrap_pyfunction!(ops::conv1d_forward, m)?)?;

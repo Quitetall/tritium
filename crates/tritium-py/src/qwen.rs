@@ -5,7 +5,186 @@ use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use tritium_nn::Qwen35SaltV2LanguageMtpModel;
+use tritium_nn::{Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt};
+
+/// Immutable identities, coverage, and physical ledgers for a packed Qwen load.
+#[pyclass(module = "tritium", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub(crate) struct QwenLoadReceipt {
+    manifest_package_id: String,
+    profile: String,
+    source_revision: String,
+    declared_admission_id: String,
+    declared_source_model_id: String,
+    declared_source_identity_status: String,
+    declared_official_payload_authenticated: bool,
+    config_package_id: String,
+    package_id: String,
+    preserved_package_id: String,
+    codec: String,
+    matrix_tensors: usize,
+    preserved_tensors: usize,
+    serialized_bytes: u64,
+    preserved_serialized_bytes: u64,
+    manifest_bytes: u64,
+    hf_asset_bytes: u64,
+    loaded_bundle_bytes: u64,
+    salt_resident_bytes: u64,
+    preserved_fp32_bytes: u64,
+    resident_bytes: u64,
+}
+
+impl From<&Qwen35SaltV2LoadReceipt> for QwenLoadReceipt {
+    fn from(receipt: &Qwen35SaltV2LoadReceipt) -> Self {
+        Self {
+            manifest_package_id: receipt.manifest_package_id().to_owned(),
+            profile: receipt.profile().to_owned(),
+            source_revision: receipt.source_revision().to_owned(),
+            declared_admission_id: receipt.declared_admission_id().to_owned(),
+            declared_source_model_id: receipt.declared_source_model_id().to_owned(),
+            declared_source_identity_status: receipt.declared_source_identity_status().to_owned(),
+            declared_official_payload_authenticated: receipt
+                .declared_official_payload_authenticated(),
+            config_package_id: receipt.config_package_id().to_owned(),
+            package_id: receipt.package_id().to_owned(),
+            preserved_package_id: receipt.preserved_package_id().to_owned(),
+            codec: format!("{:?}", receipt.codec()).to_ascii_lowercase(),
+            matrix_tensors: receipt.matrix_tensors(),
+            preserved_tensors: receipt.preserved_tensors(),
+            serialized_bytes: receipt.serialized_bytes(),
+            preserved_serialized_bytes: receipt.preserved_serialized_bytes(),
+            manifest_bytes: receipt.manifest_bytes(),
+            hf_asset_bytes: receipt.hf_asset_bytes(),
+            loaded_bundle_bytes: receipt.loaded_bundle_bytes(),
+            salt_resident_bytes: receipt.salt_resident_bytes(),
+            preserved_fp32_bytes: receipt.preserved_fp32_bytes(),
+            resident_bytes: receipt.resident_bytes(),
+        }
+    }
+}
+
+#[pymethods]
+impl QwenLoadReceipt {
+    #[getter]
+    fn manifest_package_id(&self) -> &str {
+        &self.manifest_package_id
+    }
+
+    #[getter]
+    fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    #[getter]
+    fn source_revision(&self) -> &str {
+        &self.source_revision
+    }
+
+    /// Untrusted declaration until external admission authorizes the manifest ID.
+    #[getter]
+    fn declared_admission_id(&self) -> &str {
+        &self.declared_admission_id
+    }
+
+    /// Untrusted source-model declaration copied from the content-bound manifest.
+    #[getter]
+    fn declared_source_model_id(&self) -> &str {
+        &self.declared_source_model_id
+    }
+
+    /// Untrusted source status copied from the content-bound manifest.
+    #[getter]
+    fn declared_source_identity_status(&self) -> &str {
+        &self.declared_source_identity_status
+    }
+
+    /// Untrusted manifest boolean; it does not authenticate this load.
+    #[getter]
+    fn declared_official_payload_authenticated(&self) -> bool {
+        self.declared_official_payload_authenticated
+    }
+
+    #[getter]
+    fn config_package_id(&self) -> &str {
+        &self.config_package_id
+    }
+
+    #[getter]
+    fn package_id(&self) -> &str {
+        &self.package_id
+    }
+
+    #[getter]
+    fn preserved_package_id(&self) -> &str {
+        &self.preserved_package_id
+    }
+
+    #[getter]
+    fn codec(&self) -> &str {
+        &self.codec
+    }
+
+    #[getter]
+    fn matrix_tensors(&self) -> usize {
+        self.matrix_tensors
+    }
+
+    #[getter]
+    fn preserved_tensors(&self) -> usize {
+        self.preserved_tensors
+    }
+
+    #[getter]
+    fn serialized_bytes(&self) -> u64 {
+        self.serialized_bytes
+    }
+
+    #[getter]
+    fn preserved_serialized_bytes(&self) -> u64 {
+        self.preserved_serialized_bytes
+    }
+
+    #[getter]
+    fn manifest_bytes(&self) -> u64 {
+        self.manifest_bytes
+    }
+
+    #[getter]
+    fn hf_asset_bytes(&self) -> u64 {
+        self.hf_asset_bytes
+    }
+
+    #[getter]
+    fn loaded_bundle_bytes(&self) -> u64 {
+        self.loaded_bundle_bytes
+    }
+
+    #[getter]
+    fn salt_resident_bytes(&self) -> u64 {
+        self.salt_resident_bytes
+    }
+
+    #[getter]
+    fn preserved_fp32_bytes(&self) -> u64 {
+        self.preserved_fp32_bytes
+    }
+
+    #[getter]
+    fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QwenLoadReceipt(profile='{}', codec='{}', matrix_tensors={}, preserved_tensors={}, resident_bytes={})",
+            self.profile,
+            self.codec,
+            self.matrix_tensors,
+            self.preserved_tensors,
+            self.resident_bytes,
+        )
+    }
+}
 
 /// A content-bound packed Qwen3.6 language runtime.
 ///
@@ -143,6 +322,15 @@ impl QwenModel {
         self.model
             .lock()
             .map(|model| model.receipt().resident_bytes())
+            .map_err(|_| PyRuntimeError::new_err("Qwen model mutex is poisoned"))
+    }
+
+    /// Immutable identities and exact physical ledgers for this load.
+    #[getter]
+    fn receipt(&self) -> PyResult<QwenLoadReceipt> {
+        self.model
+            .lock()
+            .map(|model| QwenLoadReceipt::from(model.receipt()))
             .map_err(|_| PyRuntimeError::new_err("Qwen model mutex is poisoned"))
     }
 
