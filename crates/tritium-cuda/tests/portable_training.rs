@@ -18,7 +18,7 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 79);
+    assert_eq!(report.passed.len(), 81);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
@@ -45,7 +45,8 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
             "graph.rope",
             "loss.mse",
             "loss.softmax_cross_entropy",
-            "optimizer.sgd"
+            "optimizer.sgd",
+            "optimizer.adamw"
         ]
     );
     assert!(

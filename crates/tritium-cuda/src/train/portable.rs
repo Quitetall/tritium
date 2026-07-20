@@ -41,6 +41,7 @@ const OPERATIONS: &[&str] = &[
     "loss.mse",
     "loss.softmax_cross_entropy",
     "optimizer.sgd",
+    "optimizer.adamw",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -1742,6 +1743,93 @@ impl CudaTrainBackendV1 {
         output_f32(output, "parameter", shape, parameter.len())?.copy_from_slice(&updated);
         Ok(())
     }
+
+    fn execute_adamw(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        if request.execution != TrainExecutionV1::Step {
+            return Err(invariant("adamw received an illegal phase"));
+        }
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            &["parameter", "gradient", "moment1", "moment2"],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["step", "lr", "beta1", "beta2", "eps", "weight_decay"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &["parameter", "moment1", "moment2"],
+            "outputs",
+        )?;
+        let step = attribute_u64(request, "step")?;
+        let optimizer = tritium_train::AdamW {
+            lr: attribute_f32(request, "lr")?,
+            beta1: attribute_f32(request, "beta1")?,
+            beta2: attribute_f32(request, "beta2")?,
+            eps: attribute_f32(request, "eps")?,
+            weight_decay: attribute_f32(request, "weight_decay")?,
+        };
+        if step == 0 {
+            return Err(attribute_value("step", "one_based"));
+        }
+        if optimizer.lr < 0.0 {
+            return Err(attribute_value("lr", "nonnegative"));
+        }
+        if !(0.0..1.0).contains(&optimizer.beta1) {
+            return Err(attribute_value("beta1", "unit_interval_open"));
+        }
+        if !(0.0..1.0).contains(&optimizer.beta2) {
+            return Err(attribute_value("beta2", "unit_interval_open"));
+        }
+        if optimizer.eps <= 0.0 {
+            return Err(attribute_value("eps", "positive"));
+        }
+        if optimizer.weight_decay < 0.0 {
+            return Err(attribute_value("weight_decay", "nonnegative"));
+        }
+        let (shape, parameter) = input_f32_any_shape(request, "parameter")?;
+        let (gradient_shape, gradient) = input_f32_any_shape(request, "gradient")?;
+        let (moment1_shape, moment1) = input_f32_any_shape(request, "moment1")?;
+        let (moment2_shape, moment2) = input_f32_any_shape(request, "moment2")?;
+        if parameter.is_empty()
+            || gradient_shape != shape
+            || moment1_shape != shape
+            || moment2_shape != shape
+        {
+            return Err(shape_error());
+        }
+        require_finite("parameter", parameter)?;
+        require_finite("gradient", gradient)?;
+        require_finite("moment1", moment1)?;
+        require_finite("moment2", moment2)?;
+        let mut device_parameter = self.backend.dev_upload(parameter).map_err(cuda_error)?;
+        let device_gradient = self.backend.dev_upload(gradient).map_err(cuda_error)?;
+        let mut device_moment1 = self.backend.dev_upload(moment1).map_err(cuda_error)?;
+        let mut device_moment2 = self.backend.dev_upload(moment2).map_err(cuda_error)?;
+        self.backend
+            .adamw_step_dev(
+                &mut device_parameter,
+                &device_gradient,
+                &mut device_moment1,
+                &mut device_moment2,
+                step,
+                &optimizer,
+            )
+            .map_err(cuda_error)?;
+        let parameter = download_device(&self.backend, &device_parameter, parameter.len())?;
+        let moment1 = download_device(&self.backend, &device_moment1, moment1.len())?;
+        let moment2 = download_device(&self.backend, &device_moment2, moment2.len())?;
+        output_f32(output, "parameter", shape, parameter.len())?.copy_from_slice(&parameter);
+        output_f32(output, "moment1", shape, moment1.len())?.copy_from_slice(&moment1);
+        output_f32(output, "moment2", shape, moment2.len())?.copy_from_slice(&moment2);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -1791,6 +1879,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "loss.mse" => self.execute_mse(&request, output)?,
             "loss.softmax_cross_entropy" => self.execute_softmax_xent(&request, output)?,
             "optimizer.sgd" => self.execute_sgd(&request, output)?,
+            "optimizer.adamw" => self.execute_adamw(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
