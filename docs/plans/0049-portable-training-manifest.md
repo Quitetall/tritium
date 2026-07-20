@@ -102,6 +102,12 @@ reference implementation before registry closure.
 
 ## Slice 1 — schema, registry and exhaustive audit
 
+Status: **DONE** — the Rust registry/parser and exhaustive source audit are
+landed, and Python plus dependency-free TypeScript parsers accept the same
+semantics, reject duplicate/unknown/type/order drift, and re-emit byte-identical
+canonical JSON. Python passed the complete 92-test suite; Deno type-check and
+three parser tests passed. Slice 2 is next.
+
 Edits:
 
 - Add strict manifest types/parser to `tritium-spec/src/training.rs`.
