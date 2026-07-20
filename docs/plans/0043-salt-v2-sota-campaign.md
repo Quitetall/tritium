@@ -1,8 +1,9 @@
 # 0043 — SALT V2 implementation and SOTA campaign
 
-Status: **IN PROGRESS** (Qwen family/MTP fixture and selected-package structural
-admission implemented through 2026-07-19; checkpoint-scale and empirical
-campaign gates remain open)
+Status: **IN PROGRESS** (Qwen family/MTP fixture, resumable tensor-master driver,
+selected-package structural admission, and bounded canonical package writing
+implemented through 2026-07-20; checkpoint-scale and empirical campaign gates
+remain open)
 
 - **Decision:** [ADR 0028](../adr/0028-salt-v2-additive-ternarization.md)
 - **Research cutoff:** 2026-07-14, inclusive
@@ -876,6 +877,14 @@ The following work deliberately remains open and keeps this plan in progress:
   install/progress paths use stable package-record inode/version pins plus small
   manifest checks around child work, while open, seal, and completion reopen
   repeat full cryptographic package and parent-prefix validation.
+  The format layer now also has an exact seek-backed package writer. It plans
+  headers, physical ledgers, offsets, ragged embedded counts, and the canonical
+  full-tile map from a lazy flat count stream, then writes one selected semantic
+  tile at a time directly into disjoint payload/scale regions. D2, B3, and S34
+  goldens are byte-identical to the canonical in-memory encoder. Its retained
+  state is tensor metadata plus two bits per full allocation tile; it does not
+  materialize a whole-model `SaltV2Package`. Wiring the selected campaign maps
+  and parent masters into this writer remains the next package-producer step.
   This remains **structural fixture evidence**, not checkpoint-scale or quality
   evidence. The pure-PTQ checkpoint/evidence driver now targets these stores,
   but has not been run on the pinned checkpoint; PV/KL execution over real

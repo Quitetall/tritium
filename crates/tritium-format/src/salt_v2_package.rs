@@ -22,9 +22,14 @@ use crate::salt_v2::{
 use crate::{SemanticTensor, SemanticTensorHasher};
 
 mod reader;
+mod stream_writer;
 
 pub use reader::{
     PackedSaltV2PlaneRef, SaltV2PackageReadError, SaltV2PackageReader, SaltV2TensorInfo,
+};
+pub use stream_writer::{
+    SaltV2PackageStreamError, SaltV2PackageStreamPlan, SaltV2PackageStreamWriter,
+    SaltV2StreamTensorSpec,
 };
 
 /// Number of coefficients sharing one SALT V2 scale.
