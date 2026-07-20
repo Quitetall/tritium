@@ -2,7 +2,6 @@
 //! and a tied LM head.
 
 use core::mem::size_of;
-#[cfg(feature = "cuda")]
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -10,6 +9,7 @@ use tritium_format::PackedSaltRow;
 use tritium_spec::TernaryBackend;
 
 use crate::error::NnError;
+use crate::layers::HostSaltV2Linear;
 use crate::layers::packed_salt::PackedSaltMatrix;
 #[cfg(feature = "cuda")]
 use crate::layers::projection::{salt_v2_cuda_backend, salt_v2_forward_exact};
@@ -18,6 +18,7 @@ use crate::layers::projection::{salt_v2_cuda_backend, salt_v2_forward_exact};
 enum Storage {
     Dense(Vec<f32>),
     Salt(PackedSaltMatrix),
+    HostSaltV2(Arc<HostSaltV2Linear>),
     #[cfg(feature = "cuda")]
     SaltV2(Arc<tritium_cuda::SaltV2ResidentTensor>),
 }
@@ -36,6 +37,26 @@ pub struct TokenEmbedding {
 }
 
 impl TokenEmbedding {
+    /// Build a token table around compact host SALT V2 storage.
+    ///
+    /// # Errors
+    /// Returns [`NnError::Shape`] when the matrix has empty geometry.
+    pub fn from_host_salt_v2(tensor: Arc<HostSaltV2Linear>) -> Result<Self, NnError> {
+        let rows = tensor.rows();
+        let cols = tensor.columns();
+        if rows == 0 || cols == 0 {
+            return Err(NnError::Shape {
+                expected: 1,
+                got: rows.saturating_mul(cols),
+            });
+        }
+        Ok(Self {
+            rows,
+            cols,
+            storage: Storage::HostSaltV2(tensor),
+        })
+    }
+
     /// Build a token table around an already-published CUDA SALT V2 allocation.
     ///
     /// The [`Arc`] is also suitable for a tied [`Projection::SaltV2`](super::Projection),
@@ -139,7 +160,7 @@ impl TokenEmbedding {
     pub fn as_dense(&self) -> Option<&[f32]> {
         match &self.storage {
             Storage::Dense(values) => Some(values),
-            Storage::Salt(_) => None,
+            Storage::Salt(_) | Storage::HostSaltV2(_) => None,
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => None,
         }
@@ -152,7 +173,7 @@ impl TokenEmbedding {
     #[must_use]
     pub const fn is_packed_salt(&self) -> bool {
         match self.storage {
-            Storage::Salt(_) => true,
+            Storage::Salt(_) | Storage::HostSaltV2(_) => true,
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => true,
             Storage::Dense(_) => false,
@@ -166,6 +187,7 @@ impl TokenEmbedding {
         match &self.storage {
             Storage::Dense(_) => 0,
             Storage::Salt(matrix) => matrix.sparse_plane_count(),
+            Storage::HostSaltV2(_) => 0,
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => 0,
         }
@@ -178,6 +200,7 @@ impl TokenEmbedding {
         match &self.storage {
             Storage::Dense(values) => values.capacity().saturating_mul(size_of::<f32>()),
             Storage::Salt(matrix) => matrix.resident_bytes(),
+            Storage::HostSaltV2(tensor) => tensor.resident_bytes(),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(tensor) => {
                 usize::try_from(tensor.allocation_receipt().steady_resident_bytes())
@@ -194,6 +217,7 @@ impl TokenEmbedding {
     pub fn gather(&self, tokens: &[u32], out: &mut [f32]) -> Result<(), NnError> {
         match &self.storage {
             Storage::Salt(matrix) => matrix.gather(tokens, out),
+            Storage::HostSaltV2(tensor) => tensor.gather_rows(tokens, out),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => Err(NnError::Backend(
                 "resident SALT V2 embedding gather requires the backend-aware gather_with_backend"
@@ -268,7 +292,9 @@ impl TokenEmbedding {
                 let _receipt = cuda.salt_v2_gather_rows(tensor, tokens, out)?;
                 Ok(())
             }
-            Storage::Dense(_) | Storage::Salt(_) => self.gather(tokens, out),
+            Storage::Dense(_) | Storage::Salt(_) | Storage::HostSaltV2(_) => {
+                self.gather(tokens, out)
+            }
         }
     }
 
@@ -294,6 +320,7 @@ impl TokenEmbedding {
         }
         match &self.storage {
             Storage::Salt(matrix) => matrix.project_exact(hidden, logits),
+            Storage::HostSaltV2(tensor) => tensor.forward(hidden, 1, logits),
             #[cfg(feature = "cuda")]
             Storage::SaltV2(_) => Err(NnError::Backend(
                 "resident SALT V2 unembedding requires the backend-aware unembed_exact_with_backend"
@@ -330,8 +357,55 @@ impl TokenEmbedding {
         match &self.storage {
             #[cfg(feature = "cuda")]
             Storage::SaltV2(tensor) => salt_v2_forward_exact(backend, tensor, hidden, 1, logits),
-            Storage::Dense(_) | Storage::Salt(_) => self.unembed_exact(hidden, logits),
+            Storage::Dense(_) | Storage::Salt(_) | Storage::HostSaltV2(_) => {
+                self.unembed_exact(hidden, logits)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use half::f16;
+    use tritium_format::{
+        salt_v2::SaltV2Codec,
+        salt_v2_package::{
+            SaltV2Package, SaltV2PackageReader, SaltV2Plane, SaltV2Tensor, SaltV2Tile,
+            write_salt_v2_package,
+        },
+    };
+
+    use super::TokenEmbedding;
+    use crate::layers::HostSaltV2Linear;
+
+    #[test]
+    fn host_salt_v2_table_gathers_and_unembeds_from_shared_storage() {
+        let plane = SaltV2Plane::new(vec![1, 0, -1, 1], vec![f16::from_f32(0.5)]).unwrap();
+        let tensor = SaltV2Tensor::new(
+            "token_embd.weight",
+            vec![2, 2],
+            vec![SaltV2Tile::new(vec![plane]).unwrap()],
+        )
+        .unwrap();
+        let package = SaltV2Package::new(SaltV2Codec::B3, vec![tensor]).unwrap();
+        let encoded = write_salt_v2_package(&package).unwrap();
+        let mut reader = SaltV2PackageReader::new_strict(Cursor::new(encoded.bytes)).unwrap();
+        let resident =
+            Arc::new(HostSaltV2Linear::from_reader(&mut reader, "token_embd.weight").unwrap());
+        let embedding = TokenEmbedding::from_host_salt_v2(Arc::clone(&resident)).unwrap();
+
+        let mut gathered = [0.0; 4];
+        embedding.gather(&[1, 0], &mut gathered).unwrap();
+        assert_eq!(gathered, [-0.5, 0.5, 0.5, 0.0]);
+
+        let mut logits = [0.0; 2];
+        embedding.unembed_exact(&[2.0, -1.0], &mut logits).unwrap();
+        assert_eq!(logits, [1.0, -1.5]);
+        assert!(embedding.as_dense().is_none());
+        assert_eq!(Arc::strong_count(&resident), 2);
     }
 }
 

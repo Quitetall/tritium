@@ -13,6 +13,7 @@ mod projection;
 mod qwen35_deltanet;
 mod qwen35_full_attention;
 mod salt;
+mod salt_v2_host;
 mod token_embedding;
 mod transformer_block;
 
@@ -27,5 +28,6 @@ pub use qwen35_full_attention::{
     Qwen35FullAttention, Qwen35FullAttentionCache, Qwen35FullAttentionWeights,
 };
 pub use salt::SaltLinear;
+pub use salt_v2_host::HostSaltV2Linear;
 pub use token_embedding::TokenEmbedding;
 pub use transformer_block::{BlockDump, BlockScratch, TransformerBlock};

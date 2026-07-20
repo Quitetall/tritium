@@ -1275,6 +1275,11 @@ fn extract_dense(
                 "{name} is already ternary; a latent fp32 master is required"
             )));
         }
+        Projection::HostSaltV2(_) => {
+            return Err(unsupported(&format!(
+                "{name} is already host SALT V2; a latent fp32 master is required"
+            )));
+        }
         #[cfg(feature = "cuda")]
         Projection::SaltV2(_) => {
             return Err(unsupported(&format!(

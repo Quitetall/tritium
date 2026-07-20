@@ -104,7 +104,7 @@ fn perplexity(runner: &mut ModelRunner, eval_ids: &[u32]) -> f64 {
 fn dense_of(p: &Projection) -> (&[f32], usize, usize) {
     match p {
         Projection::Dense(d) => (&d.weights, d.n_out, d.k_in),
-        Projection::Salt(_) | Projection::Ternary(_) => {
+        Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Ternary(_) => {
             panic!("expected a Dense projection (load_hf builds fp)")
         }
         #[cfg(feature = "cuda")]
@@ -114,7 +114,9 @@ fn dense_of(p: &Projection) -> (&[f32], usize, usize) {
 fn set_dense(p: &mut Projection, w: Vec<f32>) {
     match p {
         Projection::Dense(d) => d.weights = w,
-        Projection::Salt(_) | Projection::Ternary(_) => panic!("expected a Dense projection"),
+        Projection::Salt(_) | Projection::HostSaltV2(_) | Projection::Ternary(_) => {
+            panic!("expected a Dense projection")
+        }
         #[cfg(feature = "cuda")]
         Projection::SaltV2(_) => panic!("expected a Dense projection"),
     }
