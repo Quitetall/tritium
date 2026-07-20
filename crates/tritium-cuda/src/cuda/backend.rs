@@ -592,6 +592,8 @@ pub struct CudaBackend {
     pub(super) func_lsq_fwd: CudaFunction,
     pub(super) func_lsq_bwd_weight: CudaFunction,
     pub(super) func_lsq_bwd_alpha: CudaFunction,
+    pub(super) func_fsq_fwd: CudaFunction,
+    pub(super) func_fsq_bwd: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -877,6 +879,12 @@ impl CudaBackend {
         let func_lsq_bwd_alpha = grad_module
             .load_function(KERNEL_NAME_LSQ_BWD_ALPHA)
             .map_err(|e| driver_err("resolve lsq_backward_alpha kernel", &e))?;
+        let func_fsq_fwd = grad_module
+            .load_function(KERNEL_NAME_FSQ_FWD)
+            .map_err(|e| driver_err("resolve fsq_forward kernel", &e))?;
+        let func_fsq_bwd = grad_module
+            .load_function(KERNEL_NAME_FSQ_BWD)
+            .map_err(|e| driver_err("resolve fsq_backward kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -984,6 +992,8 @@ impl CudaBackend {
             func_lsq_fwd,
             func_lsq_bwd_weight,
             func_lsq_bwd_alpha,
+            func_fsq_fwd,
+            func_fsq_bwd,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -3416,6 +3426,98 @@ impl CudaBackend {
             alpha_launch
                 .launch(Self::elementwise_cfg(rows))
                 .map_err(|e| driver_err("launch lsq_backward_alpha_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fsq_forward_dev(
+        &self,
+        x: &CudaSlice<f32>,
+        levels: &CudaSlice<u32>,
+        result: &mut CudaSlice<f32>,
+        channels: usize,
+        len: usize,
+        bound: i32,
+        estimator: i32,
+        seed: u64,
+    ) -> Result<(), BackendError> {
+        let n = channels
+            .checked_mul(len)
+            .ok_or_else(|| BackendError::InvalidInput("FSQ geometry overflows usize".into()))?;
+        if x.len() < n || levels.len() < channels || result.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: result.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let (channels, len) = (channels as i32, len as i32);
+        let mut launch = self.stream.launch_builder(&self.func_fsq_fwd);
+        launch
+            .arg(x)
+            .arg(levels)
+            .arg(result)
+            .arg(&channels)
+            .arg(&len)
+            .arg(&bound)
+            .arg(&estimator)
+            .arg(&seed);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread per FSQ element.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch fsq_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fsq_backward_dev(
+        &self,
+        x: &CudaSlice<f32>,
+        levels: &CudaSlice<u32>,
+        upstream: &CudaSlice<f32>,
+        grad_x: &mut CudaSlice<f32>,
+        channels: usize,
+        len: usize,
+        bound: i32,
+        estimator: i32,
+        alpha: f32,
+    ) -> Result<(), BackendError> {
+        let n = channels
+            .checked_mul(len)
+            .ok_or_else(|| BackendError::InvalidInput("FSQ geometry overflows usize".into()))?;
+        if x.len() < n || levels.len() < channels || upstream.len() < n || grad_x.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: grad_x.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let (channels, len) = (channels as i32, len as i32);
+        let mut launch = self.stream.launch_builder(&self.func_fsq_bwd);
+        launch
+            .arg(x)
+            .arg(levels)
+            .arg(upstream)
+            .arg(grad_x)
+            .arg(&channels)
+            .arg(&len)
+            .arg(&bound)
+            .arg(&estimator)
+            .arg(&alpha);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread per FSQ gradient element.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch fsq_backward_dev", &e))?;
         }
         Ok(())
     }

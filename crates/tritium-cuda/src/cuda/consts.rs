@@ -265,6 +265,8 @@ pub(super) const KERNEL_NAME_STE_BWD: &str = "ste_surrogate_backward";
 pub(super) const KERNEL_NAME_LSQ_FWD: &str = "lsq_forward";
 pub(super) const KERNEL_NAME_LSQ_BWD_WEIGHT: &str = "lsq_backward_weight";
 pub(super) const KERNEL_NAME_LSQ_BWD_ALPHA: &str = "lsq_backward_alpha";
+pub(super) const KERNEL_NAME_FSQ_FWD: &str = "fsq_forward";
+pub(super) const KERNEL_NAME_FSQ_BWD: &str = "fsq_backward";
 /// Plan 0043 Stage 6: direct scalar-correct SALT V2 D2/B3/S34 execution.
 pub(super) const KERNEL_NAME_SALT_V2_EXACT: &str = "salt_v2_forward_exact";
 /// Plan 0043 Stage 6: exact selected-row reconstruction for token embeddings.

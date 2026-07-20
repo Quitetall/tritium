@@ -1340,6 +1340,66 @@ extern "C" __global__ void lsq_backward_alpha(
     grad_alpha[row] = gradient;
 }
 
+__device__ __forceinline__ float fsq_bound_value(float value, int bound)
+{
+    return bound == 0 ? fminf(1.0f, fmaxf(-1.0f, value)) : tanhf(value);
+}
+
+__device__ __forceinline__ float fsq_bound_gradient(float value, int bound)
+{
+    if (bound == 0) return fabsf(value) < 1.0f ? 1.0f : 0.0f;
+    float bounded = tanhf(value);
+    return 1.0f - bounded * bounded;
+}
+
+__device__ __forceinline__ float fsq_uniform(unsigned long long seed, unsigned long long index)
+{
+    unsigned long long state = (seed ^ index * 0x9E3779B97F4A7C15ULL) | 1ULL;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return (float)(state % 1000000ULL) / 1000000.0f;
+}
+
+extern "C" __global__ void fsq_forward(
+    const float* __restrict__ x, const unsigned int* __restrict__ levels,
+    float* __restrict__ result, int channels, int len, int bound, int estimator,
+    unsigned long long seed)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)channels * len) return;
+    float maximum = (float)(levels[i / len] - 1U);
+    float bounded = fsq_bound_value(x[i], bound);
+    float position = (bounded + 1.0f) * 0.5f * maximum;
+    float code;
+    if (estimator == 2) {
+        position = fminf(maximum, fmaxf(0.0f, position));
+        float base = floorf(position);
+        code = base + (fsq_uniform(seed, (unsigned long long)i) < position - base ? 1.0f : 0.0f);
+    } else {
+        code = floorf(position + 0.5f);
+    }
+    code = fminf(maximum, fmaxf(0.0f, code));
+    result[i] = code / maximum * 2.0f - 1.0f;
+}
+
+extern "C" __global__ void fsq_backward(
+    const float* __restrict__ x, const unsigned int* __restrict__ levels,
+    const float* __restrict__ upstream, float* __restrict__ grad_x,
+    int channels, int len, int bound, int estimator, float alpha)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)channels * len) return;
+    float derivative = fsq_bound_gradient(x[i], bound);
+    if (estimator == 1) {
+        float maximum = (float)(levels[i / len] - 1U);
+        float bounded = fsq_bound_value(x[i], bound);
+        float position = (bounded + 1.0f) * 0.5f * maximum;
+        derivative *= 1.0f - alpha * cosf(2.0f * 3.14159265358979323846f * position);
+    }
+    grad_x[i] = upstream[i] * derivative;
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(

@@ -15,6 +15,7 @@ const BACKEND_FAMILY: &str = "cuda.portable.v1";
 const OPERATIONS: &[&str] = &[
     "graph.ste_surrogate",
     "graph.lsq_ste",
+    "graph.fsq",
     "graph.dense_matmul",
     "graph.ternary_matmul",
     "graph.transpose",
@@ -312,6 +313,114 @@ impl CudaTrainBackendV1 {
             let grad_alpha = download_device(&self.backend, &device_grad_alpha, rows)?;
             output_f32(output, "grad_weight", &shape, elements)?.copy_from_slice(&grad_weight);
             output_f32(output, "grad_alpha", &[rows as u64], rows)?.copy_from_slice(&grad_alpha);
+        }
+        Ok(())
+    }
+
+    fn execute_fsq(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["x"],
+            TrainExecutionV1::Vjp => &["x", "grad_output"],
+            _ => return Err(invariant("fsq received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["channels", "len", "levels", "bound", "ste", "alpha", "seed"],
+            "attributes",
+        )?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_x"
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &[output_name],
+            "outputs",
+        )?;
+
+        let channels = attribute_usize(request, "channels")?;
+        let len = attribute_usize(request, "len")?;
+        if channels == 0 {
+            return Err(attribute_value("channels", "positive"));
+        }
+        if len == 0 {
+            return Err(attribute_value("len", "positive"));
+        }
+        let elements = channels.checked_mul(len).ok_or_else(shape_error)?;
+        let levels = attribute_u32_list(request, "levels")?;
+        if levels.len() != channels {
+            return Err(attribute_value("levels", "channels"));
+        }
+        if levels.iter().any(|&level| level < 2) {
+            return Err(attribute_value("levels", "min_two"));
+        }
+        let bound = match attribute_text(request, "bound")? {
+            "clamp" => 0,
+            "tanh" => 1,
+            _ => return Err(attribute_value("bound", "known")),
+        };
+        let estimator = match attribute_text(request, "ste")? {
+            "hard" => 0,
+            "soft_round" => 1,
+            "stochastic" => 2,
+            _ => return Err(attribute_value("ste", "known")),
+        };
+        let alpha = attribute_f32(request, "alpha")?;
+        if !(0.0..=1.0).contains(&alpha) {
+            return Err(attribute_value("alpha", "unit_interval"));
+        }
+        let seed = attribute_u64(request, "seed")?;
+        let shape = [channels as u64, len as u64];
+        let x = input_f32(request, "x", &shape)?;
+        require_finite("x", x)?;
+        let device_x = self.backend.dev_upload(x).map_err(cuda_error)?;
+        let device_levels = self.backend.dev_upload_u32(levels).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_result = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .fsq_forward_dev(
+                    &device_x,
+                    &device_levels,
+                    &mut device_result,
+                    channels,
+                    len,
+                    bound,
+                    estimator,
+                    seed,
+                )
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, elements)?;
+            output_f32(output, "result", &shape, elements)?.copy_from_slice(&result);
+        } else {
+            let upstream = input_f32(request, "grad_output", &shape)?;
+            require_finite("grad_output", upstream)?;
+            let device_upstream = self.backend.dev_upload(upstream).map_err(cuda_error)?;
+            let mut device_grad_x = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .fsq_backward_dev(
+                    &device_x,
+                    &device_levels,
+                    &device_upstream,
+                    &mut device_grad_x,
+                    channels,
+                    len,
+                    bound,
+                    estimator,
+                    alpha,
+                )
+                .map_err(cuda_error)?;
+            let grad_x = download_device(&self.backend, &device_grad_x, elements)?;
+            output_f32(output, "grad_x", &shape, elements)?.copy_from_slice(&grad_x);
         }
         Ok(())
     }
@@ -1511,6 +1620,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         match request.operation {
             "graph.ste_surrogate" => self.execute_ste_surrogate(&request, output)?,
             "graph.lsq_ste" => self.execute_lsq(&request, output)?,
+            "graph.fsq" => self.execute_fsq(&request, output)?,
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
             "graph.ternary_matmul" => self.execute_ternary_matmul(&request, output)?,
             "graph.transpose" => self.execute_transpose(&request, output)?,
@@ -1586,6 +1696,23 @@ fn attribute_usize(request: &TrainRequestV1<'_>, name: &str) -> Result<usize, Tr
     usize::try_from(value).map_err(|_| shape_error())
 }
 
+fn attribute_u64(request: &TrainRequestV1<'_>, name: &str) -> Result<u64, TrainBackendError> {
+    let value = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or_else(|| roles("attributes"))?;
+    let TrainAttributeValueV1::U64(value) = value.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "u64",
+            },
+        ));
+    };
+    Ok(value)
+}
+
 fn attribute_f32(request: &TrainRequestV1<'_>, name: &str) -> Result<f32, TrainBackendError> {
     let value = request
         .attributes
@@ -1617,6 +1744,46 @@ fn attribute_u64_list<'a>(
             TrainOperationErrorV1::AttributeType {
                 name: name.to_owned(),
                 expected: "u64_list",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn attribute_u32_list<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a [u32], TrainBackendError> {
+    let value = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or_else(|| roles("attributes"))?;
+    let TrainAttributeValueV1::U32List(value) = value.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "u32_list",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn attribute_text<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<&'a str, TrainBackendError> {
+    let value = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or_else(|| roles("attributes"))?;
+    let TrainAttributeValueV1::Text(value) = value.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "text",
             },
         ));
     };
