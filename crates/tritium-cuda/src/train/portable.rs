@@ -18,6 +18,9 @@ const OPERATIONS: &[&str] = &[
     "graph.add",
     "graph.mul",
     "graph.silu",
+    "graph.rmsnorm",
+    "graph.softmax",
+    "graph.causal_mask",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -396,6 +399,174 @@ impl CudaTrainBackendV1 {
         output_f32(output, output_name, &shape, result.len())?.copy_from_slice(&result);
         Ok(())
     }
+
+    fn execute_rmsnorm(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["x", "weight"],
+            TrainExecutionV1::Vjp => &["x", "weight", "grad_output"],
+            _ => return Err(invariant("rmsnorm received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols", "eps"],
+            "attributes",
+        )?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_x", "grad_weight"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let eps = attribute_f32(request, "eps")?;
+        if rows == 0 || cols == 0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(attribute_value("eps", "positive"));
+        }
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let x = input_f32(request, "x", &[rows as u64, cols as u64])?;
+        let weight = input_f32(request, "weight", &[cols as u64])?;
+        require_finite("x", x)?;
+        require_finite("weight", weight)?;
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let x_id = tape.leaf(x).map_err(cuda_error)?;
+        let weight_id = tape.leaf(weight).map_err(cuda_error)?;
+        let result_id = tape
+            .rmsnorm(x_id, weight_id, rows, cols, eps)
+            .map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let result = tape.value(result_id).map_err(cuda_error)?;
+            output_f32(output, "result", &[rows as u64, cols as u64], elements)?
+                .copy_from_slice(&result);
+        } else {
+            let grad_output = input_f32(request, "grad_output", &[rows as u64, cols as u64])?;
+            require_finite("grad_output", grad_output)?;
+            let seed = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let gradients = tape
+                .backward_retain(result_id, &seed, &[x_id, weight_id])
+                .map_err(cuda_error)?;
+            let grad_x = download_gradient(&self.backend, &gradients, x_id, elements)?;
+            let grad_weight = download_gradient(&self.backend, &gradients, weight_id, cols)?;
+            output_f32(output, "grad_x", &[rows as u64, cols as u64], elements)?
+                .copy_from_slice(&grad_x);
+            output_f32(output, "grad_weight", &[cols as u64], cols)?.copy_from_slice(&grad_weight);
+        }
+        Ok(())
+    }
+
+    fn execute_softmax(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["x"],
+            TrainExecutionV1::Vjp => &["x", "grad_output"],
+            _ => return Err(invariant("softmax received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_x"
+        };
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let shape = [rows as u64, cols as u64];
+        let x = input_f32(request, "x", &shape)?;
+        require_finite("x", x)?;
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let x_id = tape.leaf(x).map_err(cuda_error)?;
+        let result_id = tape.softmax(x_id, rows, cols).map_err(cuda_error)?;
+        let result = if request.execution == TrainExecutionV1::Forward {
+            tape.value(result_id).map_err(cuda_error)?
+        } else {
+            let grad_output = input_f32(request, "grad_output", &shape)?;
+            require_finite("grad_output", grad_output)?;
+            let seed = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let gradients = tape
+                .backward_retain(result_id, &seed, &[x_id])
+                .map_err(cuda_error)?;
+            download_gradient(&self.backend, &gradients, x_id, elements)?
+        };
+        output_f32(output, output_name, &shape, elements)?.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn execute_causal_mask(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, output_name) = match request.execution {
+            TrainExecutionV1::Forward => ("x", "result"),
+            TrainExecutionV1::Vjp => ("grad_output", "grad_x"),
+            _ => return Err(invariant("causal_mask received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let shape = [rows as u64, cols as u64];
+        let input = input_f32(request, input_name, &shape)?;
+        require_finite(input_name, input)?;
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let input_id = tape.leaf(input).map_err(cuda_error)?;
+        let result_id = tape.causal_mask(input_id, rows, cols).map_err(cuda_error)?;
+        let result = if request.execution == TrainExecutionV1::Forward {
+            tape.value(result_id).map_err(cuda_error)?
+        } else {
+            let seed = self.backend.dev_upload(input).map_err(cuda_error)?;
+            let gradients = tape
+                .backward_retain(result_id, &seed, &[input_id])
+                .map_err(cuda_error)?;
+            download_gradient(&self.backend, &gradients, input_id, elements)?
+        };
+        output_f32(output, output_name, &shape, elements)?.copy_from_slice(&result);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -427,6 +598,9 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "graph.add" => self.execute_add(&request, output)?,
             "graph.mul" => self.execute_mul(&request, output)?,
             "graph.silu" => self.execute_silu(&request, output)?,
+            "graph.rmsnorm" => self.execute_rmsnorm(&request, output)?,
+            "graph.softmax" => self.execute_softmax(&request, output)?,
+            "graph.causal_mask" => self.execute_causal_mask(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
@@ -633,6 +807,13 @@ fn dtype_error(name: &str, got: TrainDTypeV1) -> TrainBackendError {
         name: name.to_owned(),
         expected: TrainDTypeV1::F32,
         got,
+    })
+}
+
+fn attribute_value(name: &str, constraint: &'static str) -> TrainBackendError {
+    TrainBackendError::InvalidOperation(TrainOperationErrorV1::AttributeValue {
+        name: name.to_owned(),
+        constraint,
     })
 }
 
