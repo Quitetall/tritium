@@ -130,6 +130,36 @@ extern "C" __global__ void salt_quantize_forward(
     }
 }
 
+// Portable-training SALT variant with one-row scratch. A single thread walks
+// rows in contract order so the peak scratch is cols*sizeof(float), independent
+// of row count, while preserving the reference reduction order exactly.
+extern "C" __global__ void salt_quantize_forward_bounded(
+    const float* __restrict__ master, float* __restrict__ residual,
+    float* __restrict__ quantized, int rows, int cols, int planes)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    for (int row = 0; row < rows; ++row) {
+        long base = (long)row * cols;
+        for (int col = 0; col < cols; ++col) {
+            residual[col] = master[base + col];
+            quantized[base + col] = 0.0f;
+        }
+        for (int plane = 0; plane < planes; ++plane) {
+            float sum = 0.0f;
+            for (int col = 0; col < cols; ++col) sum += fabsf(residual[col]);
+            float scale = sum / (float)cols;
+            if (scale == 0.0f) continue;
+            for (int col = 0; col < cols; ++col) {
+                float trit = roundf(residual[col] / scale);
+                trit = fminf(1.0f, fmaxf(-1.0f, trit));
+                float contribution = scale * trit;
+                quantized[base + col] += contribution;
+                residual[col] -= contribution;
+            }
+        }
+    }
+}
+
 // ADR 0027 Track D: compact training-only SALT representation. Each plane keeps
 // the canonical TQ2 2-bit address mapping but omits the inference format's f16
 // block scale. Track A has one f32 AbsMean per (plane,row), so storing those

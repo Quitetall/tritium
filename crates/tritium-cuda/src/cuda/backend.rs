@@ -594,6 +594,7 @@ pub struct CudaBackend {
     pub(super) func_lsq_bwd_alpha: CudaFunction,
     pub(super) func_fsq_fwd: CudaFunction,
     pub(super) func_fsq_bwd: CudaFunction,
+    pub(super) func_salt_bounded_fwd: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -885,6 +886,9 @@ impl CudaBackend {
         let func_fsq_bwd = grad_module
             .load_function(KERNEL_NAME_FSQ_BWD)
             .map_err(|e| driver_err("resolve fsq_backward kernel", &e))?;
+        let func_salt_bounded_fwd = grad_module
+            .load_function(KERNEL_NAME_SALT_BOUNDED_FWD)
+            .map_err(|e| driver_err("resolve salt_quantize_forward_bounded kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -994,6 +998,7 @@ impl CudaBackend {
             func_lsq_bwd_alpha,
             func_fsq_fwd,
             func_fsq_bwd,
+            func_salt_bounded_fwd,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -1562,6 +1567,61 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(rows))
                 .map_err(|e| driver_err("launch salt_quantize_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    /// Contract-preserving SALT reconstruction with one row of reusable scratch.
+    pub(crate) fn salt_quantize_forward_bounded_dev(
+        &self,
+        master: &CudaSlice<f32>,
+        residual: &mut CudaSlice<f32>,
+        quantized: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        planes: usize,
+    ) -> Result<(), BackendError> {
+        if !(1..=64).contains(&planes) {
+            return Err(BackendError::InvalidInput(format!(
+                "SALT plane count must be in 1..=64, got {planes}"
+            )));
+        }
+        let len = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("SALT shape overflows usize".into()))?;
+        let rows = i32::try_from(rows)
+            .map_err(|_| BackendError::InvalidInput("SALT rows exceed i32::MAX".into()))?;
+        let cols_i = i32::try_from(cols)
+            .map_err(|_| BackendError::InvalidInput("SALT cols exceed i32::MAX".into()))?;
+        let planes = i32::try_from(planes)
+            .map_err(|_| BackendError::InvalidInput("SALT planes exceed i32::MAX".into()))?;
+        if master.len() < len || residual.len() < cols || quantized.len() < len {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: master.len().min(quantized.len()),
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let mut launch = self.stream.launch_builder(&self.func_salt_bounded_fwd);
+        launch
+            .arg(master)
+            .arg(residual)
+            .arg(quantized)
+            .arg(&rows)
+            .arg(&cols_i)
+            .arg(&planes);
+        #[allow(unsafe_code)]
+        // SAFETY: validated full input/output spans and one-row scratch; exactly one thread launched.
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| driver_err("launch salt_quantize_forward_bounded_dev", &e))?;
         }
         Ok(())
     }

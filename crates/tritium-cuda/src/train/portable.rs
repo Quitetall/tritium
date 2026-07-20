@@ -1,5 +1,7 @@
 //! Plan-0049 portable-training adapter backed by resident CUDA kernels.
 
+use std::mem::size_of;
+
 use tritium_core::GemmShape;
 use tritium_spec::{
     BackendError, TernaryBackend, TrainAttributeValueV1, TrainBackendError, TrainBackendV1,
@@ -12,8 +14,11 @@ use super::DeviceTape;
 use crate::CudaBackend;
 
 const BACKEND_FAMILY: &str = "cuda.portable.v1";
+const MAX_SALT_PLANES: usize = 64;
+const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const OPERATIONS: &[&str] = &[
     "graph.ste_surrogate",
+    "graph.salt_ste",
     "graph.lsq_ste",
     "graph.fsq",
     "graph.dense_matmul",
@@ -231,6 +236,92 @@ impl CudaTrainBackendV1 {
             let grad_weight = download_device(&self.backend, &device_grad_weight, elements)?;
             output_f32(output, "grad_weight", &shape, elements)?.copy_from_slice(&grad_weight);
             output_f32(output, "grad_scale", &[rows as u64], rows)?.fill(0.0);
+        }
+        Ok(())
+    }
+
+    fn execute_salt_ste(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["weight"],
+            TrainExecutionV1::Vjp => &["weight", "grad_output"],
+            _ => return Err(invariant("salt_ste received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["rows", "cols", "planes"],
+            "attribute",
+        )?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_weight"
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let planes = attribute_usize(request, "planes")?;
+        if planes == 0 {
+            return Err(attribute_value("planes", "positive"));
+        }
+        if planes > MAX_SALT_PLANES {
+            return Err(attribute_value("planes", "max_64"));
+        }
+        if request.execution == TrainExecutionV1::Forward && rows == 0 {
+            return Err(attribute_value("rows", "positive"));
+        }
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        let scratch_bytes = (cols as u64)
+            .checked_mul(size_of::<f32>() as u64)
+            .ok_or_else(|| attribute_value("cols", "scratch_bytes"))?;
+        if request.execution == TrainExecutionV1::Forward && scratch_bytes > MAX_SALT_SCRATCH_BYTES
+        {
+            return Err(attribute_value("cols", "scratch_limit"));
+        }
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let shape = [rows as u64, cols as u64];
+        let weight = input_f32(request, "weight", &shape)?;
+        require_finite("weight", weight)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let device_weight = self.backend.dev_upload(weight).map_err(cuda_error)?;
+            let mut device_residual = self.backend.dev_alloc_zeros(cols).map_err(cuda_error)?;
+            let mut device_result = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .salt_quantize_forward_bounded_dev(
+                    &device_weight,
+                    &mut device_residual,
+                    &mut device_result,
+                    rows,
+                    cols,
+                    planes,
+                )
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, elements)?;
+            output_f32(output, "result", &shape, elements)?.copy_from_slice(&result);
+        } else {
+            let upstream = input_f32(request, "grad_output", &shape)?;
+            require_finite("grad_output", upstream)?;
+            let device_upstream = self.backend.dev_upload(upstream).map_err(cuda_error)?;
+            let mut device_gradient = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .scale_const_dev(&device_upstream, &mut device_gradient, 1.0, elements)
+                .map_err(cuda_error)?;
+            let gradient = download_device(&self.backend, &device_gradient, elements)?;
+            output_f32(output, "grad_weight", &shape, elements)?.copy_from_slice(&gradient);
         }
         Ok(())
     }
@@ -1619,6 +1710,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         let input_digest = train_request_digest_v1(&request);
         match request.operation {
             "graph.ste_surrogate" => self.execute_ste_surrogate(&request, output)?,
+            "graph.salt_ste" => self.execute_salt_ste(&request, output)?,
             "graph.lsq_ste" => self.execute_lsq(&request, output)?,
             "graph.fsq" => self.execute_fsq(&request, output)?,
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
@@ -1646,6 +1738,15 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
                 ));
             }
         }
+        let scratch_bytes = if request.operation == "graph.salt_ste"
+            && request.execution == TrainExecutionV1::Forward
+        {
+            attribute_u64(&request, "cols")?
+                .checked_mul(size_of::<f32>() as u64)
+                .ok_or_else(shape_error)?
+        } else {
+            0
+        };
         Ok(TrainReceiptV1 {
             backend_id: self.backend_id.clone(),
             backend_build: format!("tritium-cuda-{}", env!("CARGO_PKG_VERSION")),
@@ -1659,7 +1760,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             input_digest,
             output_digest: train_output_digest_v1(output),
             peak_resident_bytes: resident_bytes(&request, output)?,
-            scratch_bytes: 0,
+            scratch_bytes,
             host_transfers: 0,
             device_resident: true,
         })
