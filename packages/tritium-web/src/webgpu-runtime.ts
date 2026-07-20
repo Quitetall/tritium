@@ -148,6 +148,36 @@ function record(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Derive the uniform arena capacity from a fully compiled plan. */
+export function webGpuUniformSlotCapacityV1(plan: CompiledTrainingPlanV1): number {
+  if (!record(plan) || !denseArray(plan.operations) || !denseArray(plan.backwardOperations)) {
+    fail("invalid_schema", "WebGPU compiled operations must be dense arrays");
+  }
+  let total = 0;
+  for (const [phase, operations] of [
+    ["forward", plan.operations],
+    ["backward", plan.backwardOperations],
+  ] as const) {
+    for (const operation of operations) {
+      if (!record(operation) || !denseArray(operation.outputs) ||
+          (phase === "forward"
+            ? operation.outputs.some((output) => typeof output !== "string")
+            : operation.outputs.some((output) =>
+              !record(output) || typeof output.role !== "string" ||
+              typeof output.bufferId !== "string"
+            ))) {
+        fail("invalid_schema", `WebGPU compiled ${phase} outputs must be arrays`);
+      }
+      const increment = Math.max(1, operation.outputs.length) * 8;
+      if (!Number.isSafeInteger(increment) || total > Number.MAX_SAFE_INTEGER - increment) {
+        fail("memory_limit", "WebGPU uniform slot capacity exceeds safe integer range");
+      }
+      total += increment;
+    }
+  }
+  return Math.max(1, total);
+}
+
 export class WebGpuResidentRuntimeV1 {
   readonly #device: WebGpuDevicePortV1;
   readonly #resident: ReadonlyMap<string, WebGpuBufferPortV1>;
@@ -216,16 +246,7 @@ export class WebGpuResidentRuntimeV1 {
         bytes: Uint8Array.from(tensor.bytes),
       });
     });
-    const uniformSlots = Math.max(
-      1,
-      [...plan.operations, ...plan.backwardOperations].reduce((total, operation) => {
-        if (!record(operation) || !denseArray(operation.outputs) ||
-            operation.outputs.some((output) => typeof output !== "string")) {
-          fail("invalid_schema", "WebGPU compiled operation outputs must be arrays");
-        }
-        return total + Math.max(1, operation.outputs.length) * 8;
-      }, 0),
-    );
+    const uniformSlots = webGpuUniformSlotCapacityV1(plan);
     const reachableForms = new Set<string>();
     for (const operation of plan.operations) {
       if (!record(operation) || typeof operation.operation !== "string") {

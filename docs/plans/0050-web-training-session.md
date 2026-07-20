@@ -246,6 +246,15 @@ creates and maps a staging buffer; device loss invalidates dispatch. Generated
 operation-to-uniform/binding lowering, session-adapter integration and physical
 browser execution remain open.
 
+The first generated-registry lowering tranche now covers all 34 forward/VJP forms backed
+by the shared pointwise module: exact registry roles, f32/u32 uniform packing,
+stage-specific lengths, workgroups, resident bindings and operation geometry
+are derived from the compiled plan without tensor values. This includes dense
+and ternary matmul, estimator VJPs, normalization and losses. MSE VJP now reads
+its scalar cotangent from a resident storage binding in both native and browser
+WGSL paths instead of requiring a host scalar readback. Specialized WGSL forms,
+optimizer candidate/commit storage and session-adapter integration remain open.
+
 Implement all 35 manifest operations with WGSL compute pipelines and explicit
 VJPs. Kernels may be fused after semantic parity, but the frozen public
 operation IDs and vector behavior cannot change.

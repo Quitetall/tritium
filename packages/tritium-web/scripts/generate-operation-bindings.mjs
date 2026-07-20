@@ -19,7 +19,11 @@ for (const fixture of vectors.cases) {
     inputs: fixture.inputs.map((input) => input.name),
     attributes: fixture.attributes.map((attribute) => ({
       name: attribute.name,
-      kind: attribute.type,
+      kind: attribute.type === "u32_list"
+        ? "u32-list"
+        : attribute.type === "u64_list"
+          ? "u64-list"
+          : attribute.type,
     })),
     outputs: fixture.expected.outputs.map((output) => output.name),
   };

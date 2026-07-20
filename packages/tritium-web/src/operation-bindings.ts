@@ -149,7 +149,7 @@ export const PORTABLE_OPERATION_BINDINGS_V1 = {
         },
         {
           "name": "levels",
-          "kind": "u32_list"
+          "kind": "u32-list"
         },
         {
           "name": "bound",
@@ -188,7 +188,7 @@ export const PORTABLE_OPERATION_BINDINGS_V1 = {
         },
         {
           "name": "levels",
-          "kind": "u32_list"
+          "kind": "u32-list"
         },
         {
           "name": "bound",
@@ -461,7 +461,7 @@ export const PORTABLE_OPERATION_BINDINGS_V1 = {
         },
         {
           "name": "lens",
-          "kind": "u64_list"
+          "kind": "u64-list"
         }
       ],
       "outputs": [
@@ -479,7 +479,7 @@ export const PORTABLE_OPERATION_BINDINGS_V1 = {
         },
         {
           "name": "lens",
-          "kind": "u64_list"
+          "kind": "u64-list"
         }
       ],
       "outputs": [
@@ -1069,7 +1069,7 @@ export const PORTABLE_OPERATION_BINDINGS_V1 = {
       "attributes": [
         {
           "name": "positions",
-          "kind": "u64_list"
+          "kind": "u64-list"
         },
         {
           "name": "n_head",
@@ -1095,7 +1095,7 @@ export const PORTABLE_OPERATION_BINDINGS_V1 = {
       "attributes": [
         {
           "name": "positions",
-          "kind": "u64_list"
+          "kind": "u64-list"
         },
         {
           "name": "n_head",

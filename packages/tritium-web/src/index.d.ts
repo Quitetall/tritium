@@ -615,3 +615,10 @@ export declare class WebGpuResidentRuntimeV1 {
   read(bufferId: string): Promise<Uint8Array>;
   dispose(): void;
 }
+
+export declare function lowerPointwiseWebGpuOperationV1(
+  plan: CompiledTrainingPlanV1,
+  phase: "forward" | "backward",
+  operationId: string,
+  firstUniformSlot: number,
+): readonly WebGpuResidentDispatchV1[];

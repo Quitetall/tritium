@@ -156,7 +156,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             result[0] = loss / f32(params.len);
         }
         case 17u: {
-            result[index] = params.scalar * 2.0 * (left[index] - right[index])
+            result[index] = extra[0] * 2.0 * (left[index] - right[index])
                 / f32(params.len);
         }
         case 18u: { result[index] = left[index] + right[index % params.auxiliary]; }

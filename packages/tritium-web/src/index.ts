@@ -28,6 +28,7 @@ export {
   webGpuKernelCandidateBundleV1,
 } from "./webgpu-kernels.ts";
 export { WebGpuResidentRuntimeV1 } from "./webgpu-runtime.ts";
+export { lowerPointwiseWebGpuOperationV1 } from "./webgpu-lowering.ts";
 export {
   PortableLifecyclePlanError,
   compilePortableCheckpointRequest,

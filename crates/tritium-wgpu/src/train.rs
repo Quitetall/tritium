@@ -794,14 +794,14 @@ impl WgpuTrainBackendV1 {
                 return Err(shape_error());
             }
             require_finite("grad_output", gradient)?;
-            gradient[0]
+            gradient
         } else {
-            0.0
+            prediction
         };
         let operation = catalog_selector(request, 0)?;
         let result = self
             .backend
-            .pointwise(prediction, target, prediction, operation, grad_output, 0)
+            .pointwise(prediction, target, grad_output, operation, 0.0, 0)
             .map_err(wgpu_error)?;
         if request.execution == TrainExecutionV1::Forward {
             output_f32(output, "result", &[], 1)?[0] = result[0];

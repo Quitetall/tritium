@@ -23,7 +23,12 @@ function attribute(item) {
     : "values" in item
       ? [...item.values]
       : item.value;
-  return { name: item.name, kind: item.type, value };
+  const kind = item.type === "u32_list"
+    ? "u32-list"
+    : item.type === "u64_list"
+      ? "u64-list"
+      : item.type;
+  return { name: item.name, kind, value };
 }
 
 function tensor(item, index, namespace) {
