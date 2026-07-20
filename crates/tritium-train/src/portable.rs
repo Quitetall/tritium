@@ -19,6 +19,8 @@ const CPU_LIMITS: TrainLimitsV1 = TrainLimitsV1 {
 
 #[derive(Clone, Copy)]
 enum CpuOperation {
+    DenseMatmul,
+    TernaryMatmul,
     Transpose,
     EmbeddingGather,
     SliceCols,
@@ -41,6 +43,14 @@ struct CpuOperationEntry {
 }
 
 const CPU_OPERATIONS: &[CpuOperationEntry] = &[
+    CpuOperationEntry {
+        id: "graph.dense_matmul",
+        operation: CpuOperation::DenseMatmul,
+    },
+    CpuOperationEntry {
+        id: "graph.ternary_matmul",
+        operation: CpuOperation::TernaryMatmul,
+    },
     CpuOperationEntry {
         id: "graph.transpose",
         operation: CpuOperation::Transpose,
@@ -105,6 +115,26 @@ const ADD_FORWARD: OperationSchema = OperationSchema {
     inputs: &["left", "right"],
     attributes: &[],
     outputs: &["result"],
+};
+const DENSE_MATMUL_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x", "weight"],
+    attributes: &["m", "n", "k"],
+    outputs: &["result"],
+};
+const DENSE_MATMUL_VJP: OperationSchema = OperationSchema {
+    inputs: &["x", "weight", "grad_output"],
+    attributes: &["m", "n", "k"],
+    outputs: &["grad_x", "grad_weight"],
+};
+const TERNARY_MATMUL_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["activation", "weight", "scale"],
+    attributes: &["m", "n", "k"],
+    outputs: &["result"],
+};
+const TERNARY_MATMUL_VJP: OperationSchema = OperationSchema {
+    inputs: &["activation", "weight", "scale", "grad_output"],
+    attributes: &["m", "n", "k"],
+    outputs: &["grad_activation", "grad_weight", "grad_scale"],
 };
 const TRANSPOSE_FORWARD: OperationSchema = OperationSchema {
     inputs: &["x"],
@@ -246,6 +276,18 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             .find(|entry| entry.id == request.operation)
             .ok_or_else(|| TrainBackendError::UnsupportedOperation(request.operation.to_owned()))?;
         match (operation.operation, request.execution) {
+            (CpuOperation::DenseMatmul, TrainExecutionV1::Forward) => {
+                dense_matmul_forward(&request, output)?;
+            }
+            (CpuOperation::DenseMatmul, TrainExecutionV1::Vjp) => {
+                dense_matmul_vjp(&request, output)?;
+            }
+            (CpuOperation::TernaryMatmul, TrainExecutionV1::Forward) => {
+                ternary_matmul_forward(&request, output)?;
+            }
+            (CpuOperation::TernaryMatmul, TrainExecutionV1::Vjp) => {
+                ternary_matmul_vjp(&request, output)?;
+            }
             (CpuOperation::Transpose, TrainExecutionV1::Forward) => {
                 transpose_forward(&request, output)?;
             }
@@ -316,6 +358,167 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             device_resident: true,
         })
     }
+}
+
+fn dense_matmul_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &DENSE_MATMUL_FORWARD)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (m, n, k, m_usize, n_usize, k_usize) = matmul_attributes(request)?;
+    if x_shape != [m, k] || weight_shape != [n, k] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("weight", weight)?;
+    require_f32_output(output, "result", &[m, n])?;
+    let result = output_f32(output, "result")?;
+    for row in 0..m_usize {
+        for output_column in 0..n_usize {
+            let mut accumulator = 0.0_f32;
+            for inner in 0..k_usize {
+                accumulator += x[row * k_usize + inner] * weight[output_column * k_usize + inner];
+            }
+            result[row * n_usize + output_column] = accumulator;
+        }
+    }
+    Ok(())
+}
+
+fn dense_matmul_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &DENSE_MATMUL_VJP)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (m, n, k, m_usize, n_usize, k_usize) = matmul_attributes(request)?;
+    if x_shape != [m, k] || weight_shape != [n, k] || grad_shape != [m, n] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", x_shape)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    let grad_x = output_f32(output, "grad_x")?;
+    grad_x.fill(0.0);
+    for row in 0..m_usize {
+        for output_column in 0..n_usize {
+            let gradient = grad_output[row * n_usize + output_column];
+            for inner in 0..k_usize {
+                grad_x[row * k_usize + inner] += gradient * weight[output_column * k_usize + inner];
+            }
+        }
+    }
+    let grad_weight = output_f32(output, "grad_weight")?;
+    grad_weight.fill(0.0);
+    for output_column in 0..n_usize {
+        for row in 0..m_usize {
+            let gradient = grad_output[row * n_usize + output_column];
+            for inner in 0..k_usize {
+                grad_weight[output_column * k_usize + inner] += gradient * x[row * k_usize + inner];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ternary_matmul_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &TERNARY_MATMUL_FORWARD)?;
+    let (activation_shape, activation) = input_f32(request, "activation")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (m, n, k, m_usize, n_usize, k_usize) = matmul_attributes(request)?;
+    if activation_shape != [m, k] || weight_shape != [n, k] || scale_shape != [n] {
+        return Err(shape_error());
+    }
+    reject_nonfinite("activation", activation)?;
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    require_f32_output(output, "result", &[m, n])?;
+    let result = output_f32(output, "result")?;
+    for row in 0..m_usize {
+        for output_column in 0..n_usize {
+            let mut accumulator = 0.0_f32;
+            for inner in 0..k_usize {
+                accumulator +=
+                    activation[row * k_usize + inner] * weight[output_column * k_usize + inner];
+            }
+            result[row * n_usize + output_column] = scale[output_column] * accumulator;
+        }
+    }
+    Ok(())
+}
+
+fn ternary_matmul_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &TERNARY_MATMUL_VJP)?;
+    let (activation_shape, activation) = input_f32(request, "activation")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (grad_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (m, n, k, m_usize, n_usize, k_usize) = matmul_attributes(request)?;
+    if activation_shape != [m, k]
+        || weight_shape != [n, k]
+        || scale_shape != [n]
+        || grad_shape != [m, n]
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("activation", activation)?;
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_activation", activation_shape)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    require_f32_output(output, "grad_scale", scale_shape)?;
+
+    let grad_activation = output_f32(output, "grad_activation")?;
+    grad_activation.fill(0.0);
+    for row in 0..m_usize {
+        for output_column in 0..n_usize {
+            let gradient = grad_output[row * n_usize + output_column];
+            for inner in 0..k_usize {
+                grad_activation[row * k_usize + inner] +=
+                    gradient * scale[output_column] * weight[output_column * k_usize + inner];
+            }
+        }
+    }
+
+    let grad_weight = output_f32(output, "grad_weight")?;
+    grad_weight.fill(0.0);
+    for output_column in 0..n_usize {
+        for row in 0..m_usize {
+            let gradient = grad_output[row * n_usize + output_column];
+            for inner in 0..k_usize {
+                grad_weight[output_column * k_usize + inner] +=
+                    gradient * scale[output_column] * activation[row * k_usize + inner];
+            }
+        }
+    }
+
+    let grad_scale = output_f32(output, "grad_scale")?;
+    grad_scale.fill(0.0);
+    for row in 0..m_usize {
+        for output_column in 0..n_usize {
+            let mut contraction = 0.0_f32;
+            for inner in 0..k_usize {
+                contraction +=
+                    activation[row * k_usize + inner] * weight[output_column * k_usize + inner];
+            }
+            grad_scale[output_column] += grad_output[row * n_usize + output_column] * contraction;
+        }
+    }
+    Ok(())
 }
 
 fn transpose_forward(
@@ -1009,6 +1212,27 @@ fn matrix_attributes(
         .checked_mul(cols_usize)
         .ok_or_else(|| attribute_value("rows", "rows_times_cols"))?;
     Ok((rows, cols, rows_usize, cols_usize))
+}
+
+fn matmul_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<(u64, u64, u64, usize, usize, usize), TrainBackendError> {
+    let m = attribute_u64(request, "m")?;
+    let n = attribute_u64(request, "n")?;
+    let k = attribute_u64(request, "k")?;
+    let m_usize = usize::try_from(m).map_err(|_| attribute_value("m", "usize"))?;
+    let n_usize = usize::try_from(n).map_err(|_| attribute_value("n", "usize"))?;
+    let k_usize = usize::try_from(k).map_err(|_| attribute_value("k", "usize"))?;
+    m_usize
+        .checked_mul(k_usize)
+        .ok_or_else(|| attribute_value("m", "m_times_k"))?;
+    n_usize
+        .checked_mul(k_usize)
+        .ok_or_else(|| attribute_value("n", "n_times_k"))?;
+    m_usize
+        .checked_mul(n_usize)
+        .ok_or_else(|| attribute_value("m", "m_times_n"))?;
+    Ok((m, n, k, m_usize, n_usize, k_usize))
 }
 
 fn embedding_attributes(

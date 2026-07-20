@@ -16,6 +16,8 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
     assert_eq!(
         capabilities.supported_operations,
         [
+            "graph.dense_matmul",
+            "graph.ternary_matmul",
             "graph.transpose",
             "graph.embedding_gather",
             "graph.slice_cols",

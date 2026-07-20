@@ -12,7 +12,7 @@ use serde::Serialize;
 use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
 use tritium_train::{
     Optimizer, Sgd,
-    ops::{act, bias, dense, elementwise, embed, loss, shape},
+    ops::{act, bias, dense, elementwise, embed, loss, matmul, shape},
 };
 
 #[derive(Serialize)]
@@ -121,6 +121,24 @@ fn main() {
     let mul_grad_output = [0.25_f32, -2.0, 3.0];
     let mul_grads = elementwise::mul_vjp(&mul_left, &mul_right, &mul_grad_output);
 
+    let matmul_x = [1.0_f32, -2.0, 0.5, 0.0, 3.0, -1.0];
+    let dense_weight = [0.5_f32, 1.0, -2.0, -1.0, 0.25, 2.0];
+    let matmul_grad_output = [1.0_f32, -0.5, 2.0, 1.5];
+    let dense_result = dense::forward(&matmul_x, &dense_weight, 2, 2, 3);
+    let dense_grads = dense::vjp(&matmul_x, &dense_weight, 2, 2, 3, &matmul_grad_output);
+    let ternary_weight = [1.0_f32, -1.0, 0.0, 0.0, 1.0, -1.0];
+    let ternary_scale = [0.5_f32, 1.5];
+    let ternary_result = matmul::forward(&matmul_x, &ternary_weight, &ternary_scale, 2, 2, 3);
+    let ternary_grads = matmul::vjp(
+        &matmul_x,
+        &ternary_weight,
+        &ternary_scale,
+        2,
+        2,
+        3,
+        &matmul_grad_output,
+    );
+
     let matrix = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     let transpose = dense::transpose_forward(&matrix, 2, 3);
     let transpose_grad_output = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -227,6 +245,141 @@ fn main() {
                     outputs: vec![
                         f32_buffer("grad_left", &[3], &grad_output),
                         f32_buffer("grad_right", &[3], &grad_output),
+                    ],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.dense_matmul.forward.basic",
+                operation: "graph.dense_matmul",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("x", &[2, 3], &matmul_x),
+                    f32_buffer("weight", &[2, 3], &dense_weight),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "m",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "n",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 2], &dense_result)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.dense_matmul.vjp.basic",
+                operation: "graph.dense_matmul",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("x", &[2, 3], &matmul_x),
+                    f32_buffer("weight", &[2, 3], &dense_weight),
+                    f32_buffer("grad_output", &[2, 2], &matmul_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "m",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "n",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_x", &[2, 3], &dense_grads[0]),
+                        f32_buffer("grad_weight", &[2, 3], &dense_grads[1]),
+                    ],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.ternary_matmul.forward.basic",
+                operation: "graph.ternary_matmul",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("activation", &[2, 3], &matmul_x),
+                    f32_buffer("weight", &[2, 3], &ternary_weight),
+                    f32_buffer("scale", &[2], &ternary_scale),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "m",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "n",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 2], &ternary_result)],
+                    scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "graph.ternary_matmul.vjp.basic",
+                operation: "graph.ternary_matmul",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("activation", &[2, 3], &matmul_x),
+                    f32_buffer("weight", &[2, 3], &ternary_weight),
+                    f32_buffer("scale", &[2], &ternary_scale),
+                    f32_buffer("grad_output", &[2, 2], &matmul_grad_output),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "m",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "n",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_activation", &[2, 3], &ternary_grads[0]),
+                        f32_buffer("grad_weight", &[2, 3], &ternary_grads[1]),
+                        f32_buffer("grad_scale", &[2], &ternary_grads[2]),
                     ],
                     scratch_bytes_max: 0,
                 },
@@ -821,6 +974,65 @@ fn main() {
                     category: "invalid_operation",
                     code: "shape",
                     outputs: vec![f32_buffer("result", &[2, 3], &[123.0; 6])],
+                },
+            },
+            Case {
+                case_id: "graph.dense_matmul.forward.shape_error",
+                operation: "graph.dense_matmul",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("x", &[1, 6], &matmul_x),
+                    f32_buffer("weight", &[2, 3], &dense_weight),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "m",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "n",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![f32_buffer("result", &[2, 2], &[123.0; 4])],
+                },
+            },
+            Case {
+                case_id: "graph.ternary_matmul.forward.nonfinite_scale",
+                operation: "graph.ternary_matmul",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("activation", &[2, 3], &matmul_x),
+                    f32_buffer("weight", &[2, 3], &ternary_weight),
+                    f32_buffer("scale", &[2], &[f32::NAN, 1.5]),
+                ],
+                attributes: vec![
+                    Attribute::U64 {
+                        name: "m",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "n",
+                        value: 2,
+                    },
+                    Attribute::U64 {
+                        name: "k",
+                        value: 3,
+                    },
+                ],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "non_finite.scale",
+                    outputs: vec![f32_buffer("result", &[2, 2], &[123.0; 4])],
                 },
             },
         ],

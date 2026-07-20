@@ -177,6 +177,465 @@
       }
     },
     {
+      "case_id": "graph.dense_matmul.forward.basic",
+      "operation": "graph.dense_matmul",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 925353388,
+        "relative_bits": 925353388
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              0,
+              1077936128,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              1065353216,
+              3221225472,
+              3212836864,
+              1048576000,
+              1073741824
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "m",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "n",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              2,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3223322624,
+                3204448256,
+                1084227584,
+                3214934016
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.dense_matmul.vjp.basic",
+      "operation": "graph.dense_matmul",
+      "execution": "vjp",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 925353388,
+        "relative_bits": 925353388
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              0,
+              1077936128,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              1065353216,
+              3221225472,
+              3212836864,
+              1048576000,
+              1073741824
+            ]
+          }
+        },
+        {
+          "name": "grad_output",
+          "shape": [
+            2,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1073741824,
+              1069547520
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "m",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "n",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "grad_x",
+            "shape": [
+              2,
+              3
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1065353216,
+                1063256064,
+                3225419776,
+                3204448256,
+                1075314688,
+                3212836864
+              ]
+            }
+          },
+          {
+            "name": "grad_weight",
+            "shape": [
+              2,
+              3
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1065353216,
+                1082130432,
+                3217031168,
+                3204448256,
+                1085276160,
+                3219128320
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.ternary_matmul.forward.basic",
+      "operation": "graph.ternary_matmul",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 925353388,
+        "relative_bits": 925353388
+      },
+      "inputs": [
+        {
+          "name": "activation",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              0,
+              1077936128,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3212836864,
+              0,
+              0,
+              1065353216,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              1069547520
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "m",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "n",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              2,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1069547520,
+                3228565504,
+                3217031168,
+                1086324736
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.ternary_matmul.vjp.basic",
+      "operation": "graph.ternary_matmul",
+      "execution": "vjp",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 925353388,
+        "relative_bits": 925353388
+      },
+      "inputs": [
+        {
+          "name": "activation",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              0,
+              1077936128,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3212836864,
+              0,
+              0,
+              1065353216,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              1069547520
+            ]
+          }
+        },
+        {
+          "name": "grad_output",
+          "shape": [
+            2,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1073741824,
+              1069547520
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "m",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "n",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "grad_activation",
+            "shape": [
+              2,
+              3
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1056964608,
+                3214934016,
+                1061158912,
+                1065353216,
+                1067450368,
+                3222274048
+              ]
+            }
+          },
+          {
+            "name": "grad_weight",
+            "shape": [
+              2,
+              3
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1056964608,
+                1073741824,
+                3208642560,
+                3208642560,
+                1090781184,
+                3223846912
+              ]
+            }
+          },
+          {
+            "name": "grad_scale",
+            "shape": [
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3225419776,
+                1088946176
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
       "case_id": "graph.transpose.forward.basic",
       "operation": "graph.transpose",
       "execution": "forward",
@@ -2116,6 +2575,191 @@
               "bits": [
                 1123418112,
                 1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.dense_matmul.forward.shape_error",
+      "operation": "graph.dense_matmul",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            6
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              0,
+              1077936128,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              1065353216,
+              3221225472,
+              3212836864,
+              1048576000,
+              1073741824
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "m",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "n",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "shape",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              2,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.ternary_matmul.forward.nonfinite_scale",
+      "operation": "graph.ternary_matmul",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "activation",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              0,
+              1077936128,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            3
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3212836864,
+              0,
+              0,
+              1065353216,
+              3212836864
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              2143289344,
+              1069547520
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "m",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "n",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "non_finite.scale",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              2,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
                 1123418112,
                 1123418112,
                 1123418112,

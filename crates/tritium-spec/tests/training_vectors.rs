@@ -119,6 +119,10 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.add.forward.basic",
             "graph.add.forward.zero",
             "graph.add.vjp.basic",
+            "graph.dense_matmul.forward.basic",
+            "graph.dense_matmul.vjp.basic",
+            "graph.ternary_matmul.forward.basic",
+            "graph.ternary_matmul.vjp.basic",
             "graph.transpose.forward.basic",
             "graph.transpose.vjp.basic",
             "graph.embedding_gather.forward.repeated",
@@ -148,11 +152,13 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.embedding_gather.forward.token_oob",
             "graph.slice_cols.forward.bounds_error",
             "graph.concat_cols.forward.shape_error",
+            "graph.dense_matmul.forward.shape_error",
+            "graph.ternary_matmul.forward.nonfinite_scale",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "0a1227c4ba2578c7a86b8a68c26708aeec7456cc5803da9beada995ce6cf711c"
+        "d8aa086326e5209f6423c467158ccb67ac927fc68460a5d0b0697136f5c2ae66"
     );
 }
