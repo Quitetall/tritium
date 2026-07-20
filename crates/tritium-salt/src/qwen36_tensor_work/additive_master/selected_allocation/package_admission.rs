@@ -108,6 +108,33 @@ impl From<Qwen36TensorWorkError> for Qwen36PackageAdmissionError {
     }
 }
 
+/// Failure while visiting one verified admitted package payload.
+#[derive(Debug)]
+pub enum Qwen36PackageVisitError<E> {
+    /// Admission, lineage, record, or filesystem verification failed.
+    Admission(Qwen36PackageAdmissionError),
+    /// The caller's bounded-chunk sink failed.
+    Sink(E),
+}
+
+impl<E: fmt::Display> fmt::Display for Qwen36PackageVisitError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Admission(error) => write!(formatter, "admitted package visit failed: {error}"),
+            Self::Sink(error) => write!(formatter, "admitted package sink failed: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for Qwen36PackageVisitError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Sink(error) => Some(error),
+        }
+    }
+}
+
 /// Exact aggregate indexed-runtime counters admitted for one package.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen36PackageRuntimeLedger {
@@ -432,6 +459,43 @@ impl Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_> {
     /// Strictly revalidate selection lineage, package CAS records, semantics, and budgets.
     pub fn verify_current(&self) -> Result<(), Qwen36PackageAdmissionError> {
         verify_admission(self.allocated, &self.receipt)
+    }
+
+    /// Visit one exact admitted package in bounded verified chunks.
+    ///
+    /// Callback effects are nontransactional: callers implementing export must
+    /// stage output and publish only after this method returns successfully.
+    pub fn try_visit_package<E>(
+        &self,
+        profile: SaltV2Profile,
+        max_chunk_bytes: usize,
+        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<u64, Qwen36PackageVisitError<E>> {
+        self.verify_current()
+            .map_err(Qwen36PackageVisitError::Admission)?;
+        let (_, objects, _) = self
+            .allocated
+            .parent
+            .open_selection_store()
+            .map_err(Qwen36PackageAdmissionError::from)
+            .map_err(Qwen36PackageVisitError::Admission)?;
+        let selected = match profile {
+            SaltV2Profile::CompactV1 => self.receipt.compact(),
+            SaltV2Profile::NearLosslessV1 => self.receipt.near_lossless(),
+        };
+        objects
+            .try_visit_verified(selected.record(), max_chunk_bytes, |chunk| visit(chunk))
+            .map_err(|error| match error {
+                TensorVisitError::Store(error) => {
+                    Qwen36PackageVisitError::Admission(Qwen36PackageAdmissionError::Campaign(
+                        Qwen36TensorWorkError::TensorStore(error),
+                    ))
+                }
+                TensorVisitError::Sink(error) => Qwen36PackageVisitError::Sink(error),
+            })?;
+        self.verify_current()
+            .map_err(Qwen36PackageVisitError::Admission)?;
+        Ok(selected.package_ledger().total_bytes)
     }
 
     fn verify_cheap_current(&self) -> Result<(), Qwen36PackageAdmissionError> {

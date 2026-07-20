@@ -1,5 +1,6 @@
 """Differentiable PyTorch frontend for Tritium ternary models."""
 
+from .artifacts import ArtifactRef, ExportReceipt, QuantizationResult, export, load
 from .config import RefinementConfig, TernaryConfig
 from .conversion import PreparedModel, inspect, prepare, prepare_qat
 from .coverage import CoverageEntry, CoverageReport
@@ -27,6 +28,7 @@ except ImportError:  # transformers is an optional integration dependency
 else:
     register_huggingface()
 from .ops import reference_ternary_linear, ternary_linear
+from .ptq import CalibrationReceipt, calibrate, convert, quantize
 from .projection import (
     ProjectionContext,
     TernaryPlane,
@@ -38,13 +40,17 @@ __all__ = [
     "AbsMeanSTE",
     "AdditiveEstimator",
     "AnnealedSTE",
+    "ArtifactRef",
+    "CalibrationReceipt",
     "CoverageEntry",
     "CoverageReport",
     "Estimator",
+    "ExportReceipt",
     "HfTritiumConfig",
     "LSQEstimator",
     "ProjectionContext",
     "PreparedModel",
+    "QuantizationResult",
     "RefinementConfig",
     "SaltSTE",
     "SparseTernaryEstimator",
@@ -56,9 +62,14 @@ __all__ = [
     "TTQEstimator",
     "TWNEstimator",
     "create_estimator",
+    "calibrate",
+    "convert",
+    "export",
     "inspect",
+    "load",
     "prepare",
     "prepare_qat",
+    "quantize",
     "reference_ternary_linear",
     "register_estimator",
     "register_huggingface",

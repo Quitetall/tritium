@@ -5,7 +5,7 @@ mod selected_allocation;
 pub use selected_allocation::{
     Qwen36AllocatedCampaignStore, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
-    Qwen36PackageScaleOnlyCampaignStore, Qwen36PhysicalAllocationError,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36PackageVisitError, Qwen36PhysicalAllocationError,
     Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
     Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
@@ -2494,7 +2494,7 @@ mod tests {
     use tritium_nn::{NnError, Qwen35TensorStreamError};
     use tritium_quantize::{
         ByteDelta, NestedProfileBudgets, PhysicalBytes, ProfileBudget, Qwen35SourceDtype,
-        Qwen35TensorRole, Qwen35TensorScope,
+        Qwen35TensorRole, Qwen35TensorScope, SaltV2Profile,
     };
 
     use super::super::{
@@ -2659,37 +2659,27 @@ mod tests {
     }
 
     fn full_tile_selection_spec() -> Qwen36SelectedAllocationSpec {
+        let campaign = full_tile_campaign_spec();
         let specs = [
             SaltV2StreamTensorSpec::new("language.weight", vec![1, 256], SaltV2Transform::None)
                 .unwrap(),
             SaltV2StreamTensorSpec::new("mtp.weight", vec![1, 256], SaltV2Transform::None).unwrap(),
         ];
         let rate = SaltV2UniformRateModel::new(SaltV2Codec::D2, &specs).unwrap();
-        let metadata = ByteDelta::declared(PhysicalBytes {
-            serialized: rate.fixed_serialized_bytes(),
-            resident: rate.fixed_resident_bytes(),
-        });
         let compact = rate.physical_bytes(2).unwrap();
         let near = rate.physical_bytes(4).unwrap();
-        Qwen36SelectedAllocationSpec::new(
+        Qwen36SelectedAllocationSpec::for_uniform_full_tiles(
             SaltV2Codec::D2,
             [91; 32],
             [92; 32],
-            NestedProfileBudgets {
-                compact: ProfileBudget {
-                    maximum: PhysicalBytes {
-                        serialized: compact.serialized,
-                        resident: compact.resident,
-                    },
-                    metadata,
-                },
-                near_lossless: ProfileBudget {
-                    maximum: PhysicalBytes {
-                        serialized: near.serialized,
-                        resident: near.resident,
-                    },
-                    metadata,
-                },
+            campaign.expected_masters(),
+            PhysicalBytes {
+                serialized: compact.serialized,
+                resident: compact.resident,
+            },
+            PhysicalBytes {
+                serialized: near.serialized,
+                resident: near.resident,
             },
         )
         .expect("valid physical selection spec")
@@ -3519,13 +3509,33 @@ mod tests {
 
     #[test]
     fn verified_masters_allocate_exact_physical_nested_profiles() {
+        let campaign_spec = full_tile_campaign_spec();
+        assert!(matches!(
+            Qwen36SelectedAllocationSpec::for_uniform_full_tiles(
+                SaltV2Codec::D2,
+                [91; 32],
+                [92; 32],
+                campaign_spec.expected_masters(),
+                PhysicalBytes {
+                    serialized: 1,
+                    resident: 1,
+                },
+                PhysicalBytes {
+                    serialized: 1,
+                    resident: 1,
+                },
+            ),
+            Err(Qwen36PhysicalAllocationError::BudgetTooSmall {
+                profile: SaltV2Profile::CompactV1,
+                ..
+            })
+        ));
         let root = fixture_root("physical-selected-allocation");
         let _ = fs::remove_dir_all(&root);
         let source = EmptySource;
         let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), full_tile_plan())
             .expect("open full-tile workspace");
         base.reconcile_preserved().expect("seal empty base");
-        let campaign_spec = full_tile_campaign_spec();
         let parent = base
             .open_master_campaign(campaign_spec.clone())
             .expect("open full-tile campaign");
@@ -3717,6 +3727,22 @@ mod tests {
                 .total_bytes,
             near.len() as u64
         );
+        let mut visited_compact = Vec::new();
+        let visited_bytes = admitted
+            .try_visit_package(SaltV2Profile::CompactV1, 7, |chunk| {
+                visited_compact.extend_from_slice(chunk);
+                Ok::<_, Infallible>(())
+            })
+            .expect("visit exact compact package");
+        assert_eq!(visited_bytes, compact.len() as u64);
+        assert_eq!(visited_compact, compact);
+        let sink_error = admitted.try_visit_package(SaltV2Profile::NearLosslessV1, 7, |_| {
+            Err::<(), _>(AllocationSourceError)
+        });
+        assert!(matches!(
+            sink_error,
+            Err(Qwen36PackageVisitError::Sink(AllocationSourceError))
+        ));
         admitted
             .verify_current()
             .expect("verify materialized admission");

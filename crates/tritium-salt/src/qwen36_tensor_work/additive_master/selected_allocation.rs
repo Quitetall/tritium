@@ -5,6 +5,7 @@ mod package_admission;
 pub use package_admission::{
     Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
+    Qwen36PackageVisitError,
 };
 
 use std::{
@@ -113,6 +114,54 @@ impl Qwen36SelectedAllocationSpec {
             spec_id: ContentId::from_digest([0; 32]),
         };
         spec.spec_id = ContentId::of_bytes(&spec.canonical_bytes()?);
+        Ok(spec)
+    }
+
+    /// Construct exact full-tile package budgets from two physical ceilings.
+    ///
+    /// Canonical file headers/maps and indexed-runtime maps/rank prefixes are
+    /// derived from the complete ordered master catalog. Both minimum one-plane
+    /// packages must fit, and every tensor must be full-tile and representable by
+    /// the indexed runtime.
+    ///
+    /// # Errors
+    /// Returns [`Qwen36PhysicalAllocationError`] for incompatible codec/fit
+    /// constraints, invalid provenance or ceilings, ragged/unindexable geometry,
+    /// or a ceiling below the mandatory prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_uniform_full_tiles(
+        codec: SaltV2Codec,
+        allocator_id: [u8; 32],
+        recipe_id: [u8; 32],
+        masters: &[SaltV2MasterTensorSpec],
+        compact_maximum: PhysicalBytes,
+        near_lossless_maximum: PhysicalBytes,
+    ) -> Result<Self, Qwen36PhysicalAllocationError> {
+        for master in masters {
+            validate_codec_compatibility(codec, master.geometry().constraint)?;
+        }
+        let rate = uniform_rate_model(codec, masters)?;
+        let metadata = ByteDelta::declared(PhysicalBytes {
+            serialized: rate.fixed_serialized_bytes(),
+            resident: rate.fixed_resident_bytes(),
+        });
+        let spec = Self::new(
+            codec,
+            allocator_id,
+            recipe_id,
+            NestedProfileBudgets {
+                compact: ProfileBudget {
+                    maximum: compact_maximum,
+                    metadata,
+                },
+                near_lossless: ProfileBudget {
+                    maximum: near_lossless_maximum,
+                    metadata,
+                },
+            },
+        )?;
+        let _ = maximum_present_planes(rate, compact_maximum, SaltV2Profile::CompactV1)?;
+        let _ = maximum_present_planes(rate, near_lossless_maximum, SaltV2Profile::NearLosslessV1)?;
         Ok(spec)
     }
 
@@ -523,6 +572,27 @@ fn physical_bytes(bytes: SaltV2UniformPhysicalBytes) -> PhysicalBytes {
     }
 }
 
+fn uniform_rate_model(
+    codec: SaltV2Codec,
+    masters: &[SaltV2MasterTensorSpec],
+) -> Result<SaltV2UniformRateModel, Qwen36PhysicalAllocationError> {
+    let mut specs = Vec::new();
+    specs
+        .try_reserve_exact(masters.len())
+        .map_err(|_| Qwen36TensorWorkError::AllocationFailed)?;
+    for master in masters {
+        specs.push(
+            SaltV2StreamTensorSpec::new(
+                master.name(),
+                master.shape().to_vec(),
+                SaltV2Transform::None,
+            )
+            .map_err(SaltV2UniformRateError::from)?,
+        );
+    }
+    SaltV2UniformRateModel::new(codec, &specs).map_err(Into::into)
+}
+
 fn maximum_present_planes(
     rate: SaltV2UniformRateModel,
     maximum: PhysicalBytes,
@@ -573,20 +643,7 @@ impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
     ) -> Result<Qwen36AllocatedCampaignStore<'parent, 'store, 'source>, Qwen36PhysicalAllocationError>
     {
         let (_, parent_manifest, _) = self.require_complete_verified(FixedCampaignMode::Capture)?;
-        let package_specs = self
-            .spec
-            .expected_masters
-            .iter()
-            .map(|master| {
-                SaltV2StreamTensorSpec::new(
-                    master.name(),
-                    master.shape().to_vec(),
-                    SaltV2Transform::None,
-                )
-                .map_err(SaltV2UniformRateError::from)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let rate = SaltV2UniformRateModel::new(spec.codec(), &package_specs)?;
+        let rate = uniform_rate_model(spec.codec(), &self.spec.expected_masters)?;
         let modeled_metadata = PhysicalBytes {
             serialized: rate.fixed_serialized_bytes(),
             resident: rate.fixed_resident_bytes(),

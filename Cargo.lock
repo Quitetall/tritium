@@ -4421,8 +4421,11 @@ name = "tritium-py"
 version = "1.0.0"
 dependencies = [
  "pyo3",
+ "rustix",
+ "serde_json",
  "tritium-core",
  "tritium-cpu",
+ "tritium-format",
  "tritium-nn",
  "tritium-quantize",
  "tritium-runtime",

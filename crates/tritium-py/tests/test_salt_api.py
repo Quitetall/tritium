@@ -38,6 +38,48 @@ def test_python_wrapper_preserves_paths_and_explicit_recipe(monkeypatch, tmp_pat
     }
 
 
+def test_package_wrapper_preserves_exact_ceilings_and_output(monkeypatch, tmp_path):
+    sentinel = object()
+    captured = {}
+
+    def fake(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(salt, "_reconcile_qwen36_ptq_packages", fake)
+    result = salt.reconcile_qwen36_ptq_packages(
+        Path("model"),
+        revision="revision",
+        work_dir=tmp_path / "work",
+        evidence_dir=tmp_path / "evidence",
+        output_dir=tmp_path / "artifact",
+        compact_max_bytes=100,
+        compact_max_resident_bytes=200,
+        near_lossless_max_bytes=300,
+        near_lossless_max_resident_bytes=400,
+        packing="d2",
+        max_evidence_bytes=500,
+    )
+
+    assert result is sentinel
+    assert captured["args"] == (
+        "model",
+        "revision",
+        str(tmp_path / "work"),
+        str(tmp_path / "evidence"),
+        str(tmp_path / "artifact"),
+    )
+    assert captured["kwargs"] == {
+        "compact_max_bytes": 100,
+        "compact_max_resident_bytes": 200,
+        "near_lossless_max_bytes": 300,
+        "near_lossless_max_resident_bytes": 400,
+        "packing": "d2",
+        "max_evidence_bytes": 500,
+    }
+
+
 def test_native_boundary_rejects_revision_before_source_io(tmp_path):
     with pytest.raises(ValueError, match="pinned Qwen3.6 revision"):
         _tritium.reconcile_qwen36_ptq_masters(
@@ -47,7 +89,22 @@ def test_native_boundary_rejects_revision_before_source_io(tmp_path):
             str(tmp_path / "evidence"),
         )
 
+    with pytest.raises(ValueError, match="pinned Qwen3.6 revision"):
+        _tritium.reconcile_qwen36_ptq_packages(
+            str(tmp_path / "missing-model"),
+            "wrong-revision",
+            str(tmp_path / "work"),
+            str(tmp_path / "evidence"),
+            str(tmp_path / "artifact"),
+            compact_max_bytes=1,
+            compact_max_resident_bytes=1,
+            near_lossless_max_bytes=1,
+            near_lossless_max_resident_bytes=1,
+        )
+
 
 def test_master_receipt_is_not_user_constructible():
     with pytest.raises(TypeError):
         _tritium.Qwen36PtqMasterReceipt()
+    with pytest.raises(TypeError):
+        _tritium.Qwen36PtqPackageReceipt()

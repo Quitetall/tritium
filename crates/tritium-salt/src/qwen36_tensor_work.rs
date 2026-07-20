@@ -12,10 +12,15 @@ pub use additive_master::{
     Qwen36AdditiveMasterReceipt, Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt,
     Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt, Qwen36PackageAdmittedCampaignStore,
     Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger, Qwen36PackageScaleOnlyCampaignStore,
-    Qwen36PhysicalAllocationError, Qwen36ScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
-    Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
+    Qwen36PackageVisitError, Qwen36PhysicalAllocationError, Qwen36ScaleOnlyCampaignStore,
+    Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
+    Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
-pub use ptq_driver::{Qwen36PtqDriverError, Qwen36PtqEvidenceDirectory, reconcile_qwen36_ptq};
+pub use ptq_driver::{
+    Qwen36PtqDriverError, Qwen36PtqEvidenceDirectory, Qwen36PtqPackageError,
+    Qwen36PtqPackageLimits, Qwen36PtqPackagesReceipt, reconcile_qwen36_ptq,
+    reconcile_qwen36_ptq_packages,
+};
 
 use core::{convert::Infallible, fmt};
 use std::{

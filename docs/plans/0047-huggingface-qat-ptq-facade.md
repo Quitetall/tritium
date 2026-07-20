@@ -79,12 +79,19 @@ saves with safe serialization, automatically reloads through
   callback-driven compact allocator, and durably bind nested two-bit maps. The
   solver retains exact non-concave global optimality and deterministic ties;
   ragged or runtime-unindexable geometry fails closed.
-- Bind the Rust SALT pipeline to explicit `prepare` → `calibrate` → `convert`
+- [x] Bind the Rust SALT pipeline to explicit `prepare` → `calibrate` → `convert`
   phases without a Python-list weight bridge. `quantize(model_or_id, ...)`
-  composes those exact primitives.
-- Expose immutable `QuantizationResult` model/coverage/report plus atomic
-  `export` and `save_pretrained`.
-- Implement `load` for exact Tritium packages and supported HF directories.
+  composes those exact primitives. The v1 seam admits canonical precomputed
+  evidence; raw activation collection remains an explicit open item.
+- [x] Expose immutable, exact-ledger `ArtifactRef`, `QuantizationResult`, and
+  `ExportReceipt` records plus atomic matrix-bundle export. The bundle is marked
+  `complete_model=false` and refuses `save_pretrained` until preserved BF16
+  tensors, config, and tokenizer assets are promoted.
+- [x] Strictly reload the two exact Tritium matrix packages by re-parsing,
+  re-hashing, and re-deriving indexed-runtime bytes through the native reader.
+- Promote preserved tensors and HF assets into a self-contained directory,
+  implement successful `save_pretrained`, and load supported complete HF
+  directories into the Qwen3.6 runtime adapter.
 - Remove refinement from `TernaryConfig.ptq`. PTQ can produce only a PTQ
   result; plan 0048's separate `refine` primitive produces scale-only or
   hard-PV child results with bound ancestry.

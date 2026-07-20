@@ -3,27 +3,33 @@
 use core::fmt;
 use std::{
     fs::{self, File},
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
-use tritium_format::ModelId;
+use tritium_format::{ModelId, salt_v2::SaltV2Codec};
 use tritium_quantize::{
-    SaltV2Config, SaltV2Error, SaltV2KroneckerEvidence, SaltV2KroneckerEvidenceError,
+    PhysicalBytes, SaltV2Config, SaltV2Error, SaltV2KroneckerEvidence,
+    SaltV2KroneckerEvidenceError, SaltV2Packing, SaltV2Profile,
     SaltV2RestartableTensorMasterFitInput, fit_salt_v2_restartable_tensor_master,
     plan_salt_v2_restartable_tensor_master,
 };
 
 use crate::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveInstallError, Qwen36AdmittedSource,
-    Qwen36CampaignPreflightError, Qwen36CompleteWorkspaceReceipt, Qwen36TensorWorkError,
-    tensor_work_store::absolute_path,
+    Qwen36CampaignPreflightError, Qwen36CompleteWorkspaceReceipt, Qwen36PackageAdmissionError,
+    Qwen36PackageAdmissionReceipt, Qwen36PackageVisitError, Qwen36PhysicalAllocationError,
+    Qwen36SelectedAllocationSpec, Qwen36TensorWorkError, tensor_work_store::absolute_path,
 };
 
 use super::{Qwen36AdditiveWorkSlot, Qwen36TensorWorkStore, same_file_identity};
 
 const DEFAULT_MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 const EVIDENCE_EXTENSION: &str = "s2kf";
+const ALLOCATOR_ID_CONTEXT: &str = "tritium qwen3.6 physical allocator identity v1";
+const ALLOCATION_RECIPE_CONTEXT: &str = "tritium qwen3.6 physical allocation recipe v1";
+const ALLOCATOR_SCHEMA: &[u8] =
+    b"exact full-tile nested Hessian prefix allocator; stable tensor/tile/plane ties; v1";
 
 /// Bounded canonical layout for per-tensor Kronecker evidence records.
 ///
@@ -211,6 +217,127 @@ impl Qwen36PtqEvidenceDirectory {
     }
 }
 
+/// Exact physical ceilings for the two nested deployable profiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen36PtqPackageLimits {
+    compact: PhysicalBytes,
+    near_lossless: PhysicalBytes,
+}
+
+impl Qwen36PtqPackageLimits {
+    /// Construct componentwise serialized and indexed-runtime ceilings.
+    #[must_use]
+    pub const fn new(compact: PhysicalBytes, near_lossless: PhysicalBytes) -> Self {
+        Self {
+            compact,
+            near_lossless,
+        }
+    }
+
+    /// CompactV1 serialized and indexed-runtime ceilings.
+    #[must_use]
+    pub const fn compact(self) -> PhysicalBytes {
+        self.compact
+    }
+
+    /// NearLosslessV1 serialized and indexed-runtime ceilings.
+    #[must_use]
+    pub const fn near_lossless(self) -> PhysicalBytes {
+        self.near_lossless
+    }
+}
+
+/// Owned proof that fitting, exact allocation, admission, and export completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen36PtqPackagesReceipt {
+    completion: Qwen36CompleteWorkspaceReceipt,
+    admission: Qwen36PackageAdmissionReceipt,
+}
+
+impl Qwen36PtqPackagesReceipt {
+    /// Complete verified rate-free language-plus-MTP master campaign.
+    #[must_use]
+    pub const fn completion(&self) -> &Qwen36CompleteWorkspaceReceipt {
+        &self.completion
+    }
+
+    /// Exact durable admission for both selected SALT V2 packages.
+    #[must_use]
+    pub const fn admission(&self) -> &Qwen36PackageAdmissionReceipt {
+        &self.admission
+    }
+}
+
+/// Failure while reconciling and exporting exact Qwen3.6 PTQ packages.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Qwen36PtqPackageError {
+    /// Evidence, source, fitting, or master-campaign reconciliation failed.
+    Driver(Qwen36PtqDriverError),
+    /// Exact physical allocation failed.
+    Physical(Qwen36PhysicalAllocationError),
+    /// Package materialization or durable admission failed.
+    Admission(Qwen36PackageAdmissionError),
+    /// A caller-owned package output rejected bytes or failed to flush.
+    Output {
+        /// Profile being exported.
+        profile: SaltV2Profile,
+        /// Stable output operation.
+        operation: &'static str,
+        /// Portable I/O category.
+        kind: io::ErrorKind,
+    },
+}
+
+impl fmt::Display for Qwen36PtqPackageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Driver(error) => write!(formatter, "Qwen3.6 PTQ reconciliation failed: {error}"),
+            Self::Physical(error) => write!(formatter, "Qwen3.6 PTQ allocation failed: {error}"),
+            Self::Admission(error) => {
+                write!(formatter, "Qwen3.6 package admission failed: {error}")
+            }
+            Self::Output {
+                profile,
+                operation,
+                kind,
+            } => write!(
+                formatter,
+                "Qwen3.6 {profile:?} package {operation} failed: {kind:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Qwen36PtqPackageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Driver(error) => Some(error),
+            Self::Physical(error) => Some(error),
+            Self::Admission(error) => Some(error),
+            Self::Output { .. } => None,
+        }
+    }
+}
+
+impl From<Qwen36PtqDriverError> for Qwen36PtqPackageError {
+    fn from(error: Qwen36PtqDriverError) -> Self {
+        Self::Driver(error)
+    }
+}
+
+impl From<Qwen36PhysicalAllocationError> for Qwen36PtqPackageError {
+    fn from(error: Qwen36PhysicalAllocationError) -> Self {
+        Self::Physical(error)
+    }
+}
+
+impl From<Qwen36PackageAdmissionError> for Qwen36PtqPackageError {
+    fn from(error: Qwen36PackageAdmissionError) -> Self {
+        Self::Admission(error)
+    }
+}
+
 /// Reconcile the pinned Qwen3.6 language-plus-MTP pure-PTQ campaign.
 ///
 /// The driver first plans the immutable 506-master catalog by widening only one
@@ -228,6 +355,69 @@ pub fn reconcile_qwen36_ptq(
     evidence: &Qwen36PtqEvidenceDirectory,
     config: &SaltV2Config,
 ) -> Result<Qwen36CompleteWorkspaceReceipt, Qwen36PtqDriverError> {
+    with_reconciled_qwen36_ptq_campaign(admitted, evidence, config, |_, receipt| Ok(receipt))
+}
+
+/// Reconcile masters, allocate two exact profiles, and export admitted packages.
+///
+/// Both package outputs are visited from their verified content-addressed records
+/// in bounded chunks. Output effects are deliberately nontransactional; callers
+/// that publish files must pass staged outputs and rename them only after this
+/// function returns successfully. Durable campaign and admission records remain
+/// resumable when either output fails.
+///
+/// # Errors
+/// Fails closed on every [`reconcile_qwen36_ptq`] error, incompatible codec or
+/// ceiling, exact allocation failure, package admission failure, or output I/O.
+pub fn reconcile_qwen36_ptq_packages(
+    admitted: &Qwen36AdmittedSource,
+    evidence: &Qwen36PtqEvidenceDirectory,
+    config: &SaltV2Config,
+    limits: Qwen36PtqPackageLimits,
+    mut compact_output: impl Write,
+    mut near_lossless_output: impl Write,
+) -> Result<Qwen36PtqPackagesReceipt, Qwen36PtqPackageError> {
+    with_reconciled_qwen36_ptq_campaign(admitted, evidence, config, |campaign, completion| {
+        let codec = packing_codec(config.packing);
+        let spec = Qwen36SelectedAllocationSpec::for_uniform_full_tiles(
+            codec,
+            physical_allocator_id(),
+            physical_allocation_recipe_id(codec, limits, &completion),
+            campaign.spec().expected_masters(),
+            limits.compact(),
+            limits.near_lossless(),
+        )?;
+        let allocated = campaign.allocate_selected_allocation(spec)?;
+        let admitted_packages = allocated.materialize_and_admit_packages()?;
+        export_admitted_package(
+            &admitted_packages,
+            SaltV2Profile::CompactV1,
+            &mut compact_output,
+        )?;
+        export_admitted_package(
+            &admitted_packages,
+            SaltV2Profile::NearLosslessV1,
+            &mut near_lossless_output,
+        )?;
+        Ok(Qwen36PtqPackagesReceipt {
+            completion,
+            admission: admitted_packages.receipt().clone(),
+        })
+    })
+}
+
+fn with_reconciled_qwen36_ptq_campaign<R, E>(
+    admitted: &Qwen36AdmittedSource,
+    evidence: &Qwen36PtqEvidenceDirectory,
+    config: &SaltV2Config,
+    finish: impl FnOnce(
+        &crate::Qwen36AdditiveCampaignStore<'_, '_>,
+        Qwen36CompleteWorkspaceReceipt,
+    ) -> Result<R, E>,
+) -> Result<R, E>
+where
+    E: From<Qwen36PtqDriverError>,
+{
     let workspace =
         Qwen36TensorWorkStore::open(admitted).map_err(Qwen36PtqDriverError::Workspace)?;
     evidence.validate_complete(
@@ -304,9 +494,69 @@ pub fn reconcile_qwen36_ptq(
             })
             .map_err(map_install_error)?;
     }
-    campaign
+    let receipt = campaign
         .seal_complete()
-        .map_err(Qwen36PtqDriverError::Workspace)
+        .map_err(Qwen36PtqDriverError::Workspace)?;
+    finish(&campaign, receipt)
+}
+
+fn packing_codec(packing: SaltV2Packing) -> SaltV2Codec {
+    match packing {
+        SaltV2Packing::D2 => SaltV2Codec::D2,
+        SaltV2Packing::B3 => SaltV2Codec::B3,
+        SaltV2Packing::S34 => SaltV2Codec::S34,
+    }
+}
+
+fn physical_allocator_id() -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ALLOCATOR_ID_CONTEXT);
+    hasher.update(ALLOCATOR_SCHEMA);
+    *hasher.finalize().as_bytes()
+}
+
+fn physical_allocation_recipe_id(
+    codec: SaltV2Codec,
+    limits: Qwen36PtqPackageLimits,
+    completion: &Qwen36CompleteWorkspaceReceipt,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(ALLOCATION_RECIPE_CONTEXT);
+    hasher.update(completion.completion_id().as_bytes());
+    hasher.update(&completion.master_set_id());
+    hasher.update(&[match codec {
+        SaltV2Codec::D2 => 1,
+        SaltV2Codec::B3 => 2,
+        SaltV2Codec::S34 => 3,
+        _ => 0,
+    }]);
+    for bytes in [limits.compact(), limits.near_lossless()] {
+        hasher.update(&bytes.serialized.to_le_bytes());
+        hasher.update(&bytes.resident.to_le_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn export_admitted_package(
+    admitted: &crate::Qwen36PackageAdmittedCampaignStore<'_, '_, '_, '_>,
+    profile: SaltV2Profile,
+    output: &mut impl Write,
+) -> Result<(), Qwen36PtqPackageError> {
+    admitted
+        .try_visit_package(profile, 64 * 1024, |chunk| output.write_all(chunk))
+        .map_err(|error| match error {
+            Qwen36PackageVisitError::Admission(error) => Qwen36PtqPackageError::Admission(error),
+            Qwen36PackageVisitError::Sink(error) => Qwen36PtqPackageError::Output {
+                profile,
+                operation: "write",
+                kind: error.kind(),
+            },
+        })?;
+    output
+        .flush()
+        .map_err(|error| Qwen36PtqPackageError::Output {
+            profile,
+            operation: "flush",
+            kind: error.kind(),
+        })
 }
 
 fn validate_record(

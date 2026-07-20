@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from torch import nn
 
@@ -26,9 +28,9 @@ class _Replacement:
 class PreparedModel:
     """Validated model plus immutable recipe and graph-coverage receipt."""
 
-    model: nn.Module
+    model: Any
     config: TernaryConfig
-    coverage: CoverageReport
+    coverage: Optional[CoverageReport]
     schema_version: int = 1
 
 
@@ -245,7 +247,7 @@ def _prepare_qat_inplace(
 
 
 def prepare(
-    model: nn.Module,
+    model: Union[nn.Module, str, os.PathLike],
     config: TernaryConfig,
     *,
     strict: bool = True,
@@ -253,12 +255,38 @@ def prepare(
 ) -> PreparedModel:
     """Validate a complete graph, then prepare it with explicit ownership."""
 
-    if not isinstance(model, nn.Module):
-        raise TypeError("prepare requires a torch.nn.Module")
     if not isinstance(config, TernaryConfig):
         raise TypeError("prepare requires a TernaryConfig")
     if not isinstance(inplace, bool):
         raise TypeError("prepare inplace must be a bool")
+    if config.mode == "ptq" and isinstance(model, (str, os.PathLike)):
+        if inplace:
+            raise TritiumError(
+                "PTQ source admission never mutates the source model",
+                code="invalid_inplace",
+                stage="prepare",
+            )
+        try:
+            requested = Path(model)
+            if requested.is_symlink():
+                raise OSError("source directory is a symlink")
+            source = requested.resolve(strict=True)
+        except OSError as error:
+            raise TritiumError(
+                "v1.1 PTQ requires an existing local Hugging Face directory",
+                code="unsupported_source",
+                stage="prepare",
+            ) from error
+        if not source.is_dir():
+            raise TritiumError(
+                "PTQ source must be an ordinary local Hugging Face directory",
+                code="unsupported_source",
+                stage="prepare",
+            )
+        return PreparedModel(model=source, config=config, coverage=None)
+    if not isinstance(model, nn.Module):
+        raise TypeError("prepare requires a torch.nn.Module or local PTQ directory")
+
     selected = _selected_weights(model, config, strict=strict)
     target = model if inplace else copy.deepcopy(model)
     if config.mode == "qat":
@@ -294,7 +322,13 @@ def inspect(model: Union[nn.Module, PreparedModel]) -> CoverageReport:
     """Return the immutable coverage receipt for a prepared model."""
 
     if isinstance(model, PreparedModel):
-        return model.coverage
+        if model.coverage is not None:
+            return model.coverage
+        raise TritiumError(
+            "local PTQ source coverage is admitted during native conversion",
+            code="coverage_pending",
+            stage="inspect",
+        )
 
     report = getattr(model, "_tritium_coverage", None)
     if not isinstance(report, CoverageReport):
