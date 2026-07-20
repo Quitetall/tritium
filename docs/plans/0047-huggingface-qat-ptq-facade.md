@@ -84,19 +84,23 @@ saves with safe serialization, automatically reloads through
   composes those exact primitives. The v1 seam admits canonical precomputed
   evidence; raw activation collection remains an explicit open item.
 - [x] Expose immutable, exact-ledger `ArtifactRef`, `QuantizationResult`, and
-  `ExportReceipt` records plus atomic matrix-bundle export. The bundle is marked
-  `complete_model=false` and refuses `save_pretrained` until preserved BF16
-  tensors, config, and tokenizer assets are promoted.
+  `ExportReceipt` records plus atomic matrix-bundle export. `complete_model`
+  remains false because vision is intentionally outside the language-plus-MTP
+  artifact; it is not used as a proxy for runtime readiness.
 - [x] Strictly reload the two exact Tritium matrix packages by re-parsing,
   re-hashing, and re-deriving indexed-runtime bytes through the native reader.
 - [x] Promote preserved tensors and the pinned, bounded, content-bound HF
   language asset catalog into the same atomically published schema-v3 directory.
-- Implement successful `save_pretrained` and load supported complete HF
-  directories into the Qwen3.6 runtime adapter. Vision assets and weights remain
-  deferred under the plan 0043 scope boundary.
-- Remove refinement from `TernaryConfig.ptq`. PTQ can produce only a PTQ
-  result; plan 0048's separate `refine` primitive produces scale-only or
-  hard-PV child results with bound ancestry.
+- [x] Implement atomic `save_pretrained`, strict evidence-only reload, and direct
+  device load of schema-v3 directories into the Qwen3.6 packed runtime. The
+  native loader derives identities from `tritium.json`, verifies all eight HF
+  assets and exact physical ledgers, assembles language plus MTP without dense
+  matrix shadows, and supports token-ID greedy generation. A release wheel was
+  built and imported from a fresh environment. This is synthetic graph/packaging
+  evidence; the pinned 27B run and MTP production-oracle promotion remain open.
+- [x] Remove refinement from `TernaryConfig.ptq`. PTQ can produce only a PTQ
+  result; `RefinementConfig` owns separately versioned scale-only and hard-PV
+  recipes. Plan 0048's `refine` primitive and bound child ancestry remain open.
 
 ## Step 4 — phase and schema closure
 
