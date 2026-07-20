@@ -445,3 +445,24 @@ export declare function prepareTraining(
   config: WebTrainingConfigV1,
   adapter?: WebTrainingAdapterV1,
 ): Promise<WebTrainingSession>;
+
+export interface WebGpuKernelModuleV1 {
+  readonly id: string;
+  readonly sha256: string;
+  readonly source: string;
+}
+
+export interface WebGpuKernelCandidateBundleV1 {
+  readonly schemaId: "tritium.webgpu_kernel_candidate_bundle";
+  readonly schemaVersion: 1;
+  readonly bundleSha256: string;
+  readonly modules: Readonly<Record<string, WebGpuKernelModuleV1>>;
+  readonly candidateOperationModuleDependencies: Readonly<
+    Record<string, readonly string[]>
+  >;
+}
+
+export declare function webGpuKernelCandidateBundleV1(): WebGpuKernelCandidateBundleV1;
+export declare function webGpuCandidateModulesForOperationV1(
+  operation: string,
+): readonly WebGpuKernelModuleV1[];

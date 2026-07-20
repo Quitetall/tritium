@@ -225,6 +225,16 @@ byte with the CPU adapter.
 
 ## Slice 4 — complete WebGPU backend
 
+Status: **IN PROGRESS** — the npm archive now embeds a curated portable-training
+candidate set copied byte-for-byte from `tritium-wgpu`, and binds those bytes
+plus a candidate 31-operation module-dependency index into one SHA-256 identity.
+Generation fails on manifest drift or missing candidate modules. The native
+inference-only `mpgemm.wgsl` is intentionally outside this training candidate
+set. The shared execution-aware 57-form catalog—including validated WGSL,
+selectors, entry points, binding layouts, dispatch geometry and repeated
+stages—remains open with browser device admission, resident buffer scheduling,
+pipeline compilation/dispatch and physical conformance.
+
 Implement all 35 manifest operations with WGSL compute pipelines and explicit
 VJPs. Kernels may be fused after semantic parity, but the frozen public
 operation IDs and vector behavior cannot change.

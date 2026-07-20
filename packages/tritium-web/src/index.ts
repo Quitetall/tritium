@@ -22,6 +22,10 @@ export {
 export { executePortableWasmRequest, runPortableWasmConformance } from "./wasm.ts";
 export { createPortableWasmTrainingAdapter } from "./wasm-adapter.ts";
 export {
+  webGpuCandidateModulesForOperationV1,
+  webGpuKernelCandidateBundleV1,
+} from "./webgpu-kernels.ts";
+export {
   PortableLifecyclePlanError,
   compilePortableCheckpointRequest,
   compilePortableExportRequest,
@@ -106,3 +110,7 @@ export type {
   WebTrainingReceiptV1,
   WebTrainingState,
 } from "./session.ts";
+export type {
+  WebGpuKernelCandidateBundleV1,
+  WebGpuKernelModuleV1,
+} from "./webgpu-kernels.ts";

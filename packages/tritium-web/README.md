@@ -48,6 +48,14 @@ bytes and resume atomically with exact optimizer planes and step count.
 Receipts report planner-accounted phase peaks; physical browser memory
 receipts remain a separate acceptance gate.
 
+The package bundles a curated portable-training WGSL candidate set copied
+byte-for-byte from `tritium-wgpu`, with a SHA-256-bound candidate dependency
+index for all 31 tensor operations. `webGpuKernelCandidateBundleV1()` exposes
+those staged build inputs. It is not a validated source set or execution plan:
+the shared 57-form phase/selector/entry-point/binding/dispatch catalog, device
+admission, resident dispatch and physical-browser conformance are still release
+gates. Candidate presence alone is not a WebGPU execution receipt.
+
 Forward, backward, step, checkpoint, resume, and export accept `{ signal }`.
 Cancellation before dispatch or a cooperative adapter cancellation returns a
 typed, identity-bound recoverable failure receipt and leaves the previous

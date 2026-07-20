@@ -21,7 +21,8 @@
     "build": "node scripts/build.mjs",
     "build:wasm": "node scripts/build-wasm.mjs",
     "generate:bindings": "node scripts/generate-operation-bindings.mjs",
-    "check:generated": "node scripts/generate-operation-bindings.mjs --check",
+    "generate:webgpu-kernels": "node scripts/generate-webgpu-kernels.mjs",
+    "check:generated": "node scripts/generate-operation-bindings.mjs --check && node scripts/generate-webgpu-kernels.mjs --check",
     "typecheck": "npm run check:generated && npm run build:wasm && tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "check": "npm run typecheck && npm test"
