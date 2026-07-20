@@ -14,11 +14,15 @@ const BACKEND_FAMILY: &str = "cuda.portable.v1";
 const OPERATIONS: &[&str] = &[
     "graph.dense_matmul",
     "graph.transpose",
+    "graph.embedding_gather",
     "graph.slice_cols",
     "graph.concat_cols",
+    "graph.detach",
     "graph.scale_const",
+    "graph.bias",
     "graph.add",
     "graph.mul",
+    "graph.relu2",
     "graph.silu",
     "graph.rmsnorm",
     "graph.softmax",
@@ -27,7 +31,7 @@ const OPERATIONS: &[&str] = &[
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
-    max_elements: u32::MAX as u64,
+    max_elements: i32::MAX as u64,
     max_bytes: u32::MAX as u64,
 };
 
@@ -192,6 +196,238 @@ impl CudaTrainBackendV1 {
             .map_err(cuda_error)?;
         let result = tape.value(result_id).map_err(cuda_error)?;
         output_f32(output, output_name, &expected_output, elements)?.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn execute_embedding_gather(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["weight", "tokens"],
+            TrainExecutionV1::Vjp => &["weight", "tokens", "grad_output"],
+            _ => {
+                return Err(invariant(
+                    "embedding_gather received an illegal execution phase",
+                ));
+            }
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["vocab", "n_embd"],
+            "attributes",
+        )?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_weight"
+        };
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let vocab = attribute_usize(request, "vocab")?;
+        let n_embd = attribute_usize(request, "n_embd")?;
+        let weight = input_f32(request, "weight", &[vocab as u64, n_embd as u64])?;
+        let (token_shape, tokens) = input_u32_any_shape(request, "tokens")?;
+        if token_shape.len() != 1 || tokens.iter().any(|&token| token as usize >= vocab) {
+            return Err(shape_error());
+        }
+        require_finite("weight", weight)?;
+        let seq = tokens.len();
+        let tokens: Vec<i32> = tokens
+            .iter()
+            .map(|&token| i32::try_from(token).map_err(|_| shape_error()))
+            .collect::<Result<_, _>>()?;
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let weight_id = tape.leaf(weight).map_err(cuda_error)?;
+        let result_id = tape
+            .embed(weight_id, &tokens, seq, n_embd, vocab)
+            .map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let result = tape.value(result_id).map_err(cuda_error)?;
+            output_f32(
+                output,
+                "result",
+                &[seq as u64, n_embd as u64],
+                seq.checked_mul(n_embd).ok_or_else(shape_error)?,
+            )?
+            .copy_from_slice(&result);
+        } else {
+            let grad_output = input_f32(request, "grad_output", &[seq as u64, n_embd as u64])?;
+            require_finite("grad_output", grad_output)?;
+            let seed = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let gradients = tape
+                .backward_retain(result_id, &seed, &[weight_id])
+                .map_err(cuda_error)?;
+            let weight_elements = vocab.checked_mul(n_embd).ok_or_else(shape_error)?;
+            let gradient =
+                download_gradient(&self.backend, &gradients, weight_id, weight_elements)?;
+            output_f32(
+                output,
+                "grad_weight",
+                &[vocab as u64, n_embd as u64],
+                weight_elements,
+            )?
+            .copy_from_slice(&gradient);
+        }
+        Ok(())
+    }
+
+    fn execute_detach(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, output_name, scale) = match request.execution {
+            TrainExecutionV1::Forward => ("x", "result", 1.0),
+            TrainExecutionV1::Vjp => ("grad_output", "grad_x", 0.0),
+            _ => return Err(invariant("detach received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(request.attributes.iter().map(|a| a.name), &[], "attributes")?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let (shape, input) = input_f32_any_shape(request, input_name)?;
+        require_finite(input_name, input)?;
+        let shape = shape.to_vec();
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let input_id = tape.leaf(input).map_err(cuda_error)?;
+        let result_id = tape.scale_const(input_id, scale).map_err(cuda_error)?;
+        let result = tape.value(result_id).map_err(cuda_error)?;
+        output_f32(output, output_name, &shape, result.len())?.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn execute_bias(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["x", "bias"],
+            TrainExecutionV1::Vjp => &["x", "bias", "grad_output"],
+            _ => return Err(invariant("bias received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_x", "grad_bias"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let shape = [rows as u64, cols as u64];
+        let x = input_f32(request, "x", &shape)?;
+        let bias = input_f32(request, "bias", &[cols as u64])?;
+        require_finite("x", x)?;
+        require_finite("bias", bias)?;
+        let device_x = self.backend.dev_upload(x).map_err(cuda_error)?;
+        let device_bias = self.backend.dev_upload(bias).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            let mut device_result = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            self.backend
+                .bias_forward_dev(&device_x, &device_bias, &mut device_result, rows, cols)
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, elements)?;
+            output_f32(output, "result", &shape, elements)?.copy_from_slice(&result);
+        } else {
+            let grad_output = input_f32(request, "grad_output", &shape)?;
+            require_finite("grad_output", grad_output)?;
+            let device_grad = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let mut device_grad_x = self.backend.dev_alloc_zeros(elements).map_err(cuda_error)?;
+            let mut device_grad_bias = self.backend.dev_alloc_zeros(cols).map_err(cuda_error)?;
+            self.backend
+                .scale_const_dev(&device_grad, &mut device_grad_x, 1.0, elements)
+                .map_err(cuda_error)?;
+            self.backend
+                .bias_backward_dev(&device_grad, &mut device_grad_bias, rows, cols)
+                .map_err(cuda_error)?;
+            let grad_x = download_device(&self.backend, &device_grad_x, elements)?;
+            let grad_bias = download_device(&self.backend, &device_grad_bias, cols)?;
+            output_f32(output, "grad_x", &shape, elements)?.copy_from_slice(&grad_x);
+            output_f32(output, "grad_bias", &[cols as u64], cols)?.copy_from_slice(&grad_bias);
+        }
+        Ok(())
+    }
+
+    fn execute_relu2(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["x"],
+            TrainExecutionV1::Vjp => &["x", "grad_output"],
+            _ => return Err(invariant("relu2 received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(request.attributes.iter().map(|a| a.name), &[], "attributes")?;
+        let output_name = if request.execution == TrainExecutionV1::Forward {
+            "result"
+        } else {
+            "grad_x"
+        };
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let (shape, x) = input_f32_any_shape(request, "x")?;
+        require_finite("x", x)?;
+        let shape = shape.to_vec();
+        let device_x = self.backend.dev_upload(x).map_err(cuda_error)?;
+        let mut device_result = self.backend.dev_alloc_zeros(x.len()).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            self.backend
+                .relu2_forward_dev(&device_x, &mut device_result, x.len())
+                .map_err(cuda_error)?;
+        } else {
+            let (grad_shape, grad_output) = input_f32_any_shape(request, "grad_output")?;
+            if grad_shape != shape || grad_output.len() != x.len() {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", grad_output)?;
+            let device_grad = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            self.backend
+                .relu2_backward_dev(&device_x, &device_grad, &mut device_result, x.len())
+                .map_err(cuda_error)?;
+        }
+        let result = download_device(&self.backend, &device_result, x.len())?;
+        output_f32(output, output_name, &shape, x.len())?.copy_from_slice(&result);
         Ok(())
     }
 
@@ -851,11 +1087,15 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         match request.operation {
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
             "graph.transpose" => self.execute_transpose(&request, output)?,
+            "graph.embedding_gather" => self.execute_embedding_gather(&request, output)?,
             "graph.slice_cols" => self.execute_slice_cols(&request, output)?,
             "graph.concat_cols" => self.execute_concat_cols(&request, output)?,
+            "graph.detach" => self.execute_detach(&request, output)?,
             "graph.scale_const" => self.execute_scale_const(&request, output)?,
+            "graph.bias" => self.execute_bias(&request, output)?,
             "graph.add" => self.execute_add(&request, output)?,
             "graph.mul" => self.execute_mul(&request, output)?,
+            "graph.relu2" => self.execute_relu2(&request, output)?,
             "graph.silu" => self.execute_silu(&request, output)?,
             "graph.rmsnorm" => self.execute_rmsnorm(&request, output)?,
             "graph.softmax" => self.execute_softmax(&request, output)?,
@@ -970,6 +1210,34 @@ fn input_f32_any_shape<'a>(
     }
 }
 
+fn input_u32_any_shape<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<(&'a [u64], &'a [u32]), TrainBackendError> {
+    let buffer = request
+        .inputs
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or_else(|| roles("inputs"))?;
+    match buffer.data {
+        TrainBufferDataRefV1::U32(data) => Ok((buffer.shape, data)),
+        TrainBufferDataRefV1::F32(_) => Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::DType {
+                name: name.to_owned(),
+                expected: TrainDTypeV1::U32,
+                got: TrainDTypeV1::F32,
+            },
+        )),
+        TrainBufferDataRefV1::Bytes(_) => Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::DType {
+                name: name.to_owned(),
+                expected: TrainDTypeV1::U32,
+                got: TrainDTypeV1::Bytes,
+            },
+        )),
+    }
+}
+
 fn input_f32<'a>(
     request: &'a TrainRequestV1<'_>,
     name: &str,
@@ -1070,6 +1338,18 @@ fn download_gradient(
                 .ok_or_else(|| invariant("missing retained gradient"))?,
             &mut host,
         )
+        .map_err(cuda_error)?;
+    Ok(host)
+}
+
+fn download_device(
+    backend: &CudaBackend,
+    device: &cudarc::driver::CudaSlice<f32>,
+    len: usize,
+) -> Result<Vec<f32>, TrainBackendError> {
+    let mut host = vec![0.0; len];
+    backend
+        .dev_download(device, &mut host)
         .map_err(cuda_error)?;
     Ok(host)
 }

@@ -253,6 +253,10 @@ pub(super) const KERNEL_NAME_EMBED_GATHER_BWD: &str = "embed_gather_backward";
 pub(super) const KERNEL_NAME_EMBED_GATHER_BWD_SEGMENTED: &str = "embed_gather_backward_segmented";
 pub(super) const KERNEL_NAME_SOFTMAX_XENT_BWD: &str = "softmax_xent_backward";
 pub(super) const KERNEL_NAME_SCALE_CONST: &str = "scale_const";
+pub(super) const KERNEL_NAME_BIAS_FWD: &str = "bias_forward";
+pub(super) const KERNEL_NAME_BIAS_BWD: &str = "bias_backward";
+pub(super) const KERNEL_NAME_RELU2_FWD: &str = "relu2_forward";
+pub(super) const KERNEL_NAME_RELU2_BWD: &str = "relu2_backward";
 /// Plan 0043 Stage 6: direct scalar-correct SALT V2 D2/B3/S34 execution.
 pub(super) const KERNEL_NAME_SALT_V2_EXACT: &str = "salt_v2_forward_exact";
 /// Plan 0043 Stage 6: exact selected-row reconstruction for token embeddings.

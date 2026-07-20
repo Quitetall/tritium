@@ -18,17 +18,21 @@ fn cuda_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 36);
+    assert_eq!(report.passed.len(), 45);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
             "graph.dense_matmul",
             "graph.transpose",
+            "graph.embedding_gather",
             "graph.slice_cols",
             "graph.concat_cols",
+            "graph.detach",
             "graph.scale_const",
+            "graph.bias",
             "graph.add",
             "graph.mul",
+            "graph.relu2",
             "graph.silu",
             "graph.rmsnorm",
             "graph.softmax",

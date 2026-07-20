@@ -1202,6 +1202,40 @@ extern "C" __global__ void embed_gather_backward_segmented(
     gw[(long)rows[u] * dim + d] = acc;
 }
 
+// Row-broadcast bias. Backward bias reduction stays ascending-row and bit-matches CPU order.
+extern "C" __global__ void bias_forward(
+    const float* __restrict__ x, const float* __restrict__ bias,
+    float* __restrict__ y, int rows, int cols)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < (long)rows * cols) y[idx] = x[idx] + bias[idx % cols];
+}
+
+extern "C" __global__ void bias_backward(
+    const float* __restrict__ gy, float* __restrict__ gb, int rows, int cols)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    float acc = 0.0f;
+    for (int row = 0; row < rows; ++row) acc += gy[(long)row * cols + col];
+    gb[col] = acc;
+}
+
+extern "C" __global__ void relu2_forward(
+    const float* __restrict__ x, float* __restrict__ y, long n)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { float v = x[i]; y[i] = v > 0.0f ? v * v : 0.0f; }
+}
+
+extern "C" __global__ void relu2_backward(
+    const float* __restrict__ x, const float* __restrict__ gy,
+    float* __restrict__ gx, long n)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { float v = x[i]; gx[i] = v > 0.0f ? gy[i] * (2.0f * v) : 0.0f; }
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(

@@ -580,6 +580,10 @@ pub struct CudaBackend {
     pub(super) func_embed_gather_bwd_segmented: CudaFunction,
     pub(super) func_softmax_xent_bwd: CudaFunction,
     pub(super) func_scale_const: CudaFunction,
+    pub(super) func_bias_fwd: CudaFunction,
+    pub(super) func_bias_bwd: CudaFunction,
+    pub(super) func_relu2_fwd: CudaFunction,
+    pub(super) func_relu2_bwd: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -829,6 +833,18 @@ impl CudaBackend {
         let func_scale_const = grad_module
             .load_function(KERNEL_NAME_SCALE_CONST)
             .map_err(|e| driver_err("resolve scale_const kernel", &e))?;
+        let func_bias_fwd = grad_module
+            .load_function(KERNEL_NAME_BIAS_FWD)
+            .map_err(|e| driver_err("resolve bias_forward kernel", &e))?;
+        let func_bias_bwd = grad_module
+            .load_function(KERNEL_NAME_BIAS_BWD)
+            .map_err(|e| driver_err("resolve bias_backward kernel", &e))?;
+        let func_relu2_fwd = grad_module
+            .load_function(KERNEL_NAME_RELU2_FWD)
+            .map_err(|e| driver_err("resolve relu2_forward kernel", &e))?;
+        let func_relu2_bwd = grad_module
+            .load_function(KERNEL_NAME_RELU2_BWD)
+            .map_err(|e| driver_err("resolve relu2_backward kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -924,6 +940,10 @@ impl CudaBackend {
             func_embed_gather_bwd_segmented,
             func_softmax_xent_bwd,
             func_scale_const,
+            func_bias_fwd,
+            func_bias_bwd,
+            func_relu2_fwd,
+            func_relu2_bwd,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -2934,6 +2954,128 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(n))
                 .map_err(|e| driver_err("launch scale_const_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bias_forward_dev(
+        &self,
+        x: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("bias geometry overflows usize".into()))?;
+        if x.len() < n || bias.len() < cols || y.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: y.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_bias_fwd);
+        launch.arg(x).arg(bias).arg(y).arg(&ri).arg(&ci);
+        #[allow(unsafe_code)]
+        // SAFETY: validated buffers cover rows*cols and cols; one thread per output.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch bias_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bias_backward_dev(
+        &self,
+        gy: &CudaSlice<f32>,
+        gb: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), BackendError> {
+        let n = rows
+            .checked_mul(cols)
+            .ok_or_else(|| BackendError::InvalidInput("bias geometry overflows usize".into()))?;
+        if gy.len() < n || gb.len() < cols {
+            return Err(BackendError::ShapeMismatch {
+                expected: cols,
+                got: gb.len(),
+            });
+        }
+        if cols == 0 {
+            return Ok(());
+        }
+        let (ri, ci) = (rows as i32, cols as i32);
+        let mut launch = self.stream.launch_builder(&self.func_bias_bwd);
+        launch.arg(gy).arg(gb).arg(&ri).arg(&ci);
+        #[allow(unsafe_code)]
+        // SAFETY: validated gy and gb spans; one thread per bias column.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(cols))
+                .map_err(|e| driver_err("launch bias_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn relu2_forward_dev(
+        &self,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if x.len() < n || y.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: y.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i64;
+        let mut launch = self.stream.launch_builder(&self.func_relu2_fwd);
+        launch.arg(x).arg(y).arg(&ni);
+        #[allow(unsafe_code)]
+        // SAFETY: validated x/y spans; one thread per element.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch relu2_forward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn relu2_backward_dev(
+        &self,
+        x: &CudaSlice<f32>,
+        gy: &CudaSlice<f32>,
+        gx: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if x.len() < n || gy.len() < n || gx.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: gx.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let ni = n as i64;
+        let mut launch = self.stream.launch_builder(&self.func_relu2_bwd);
+        launch.arg(x).arg(gy).arg(gx).arg(&ni);
+        #[allow(unsafe_code)]
+        // SAFETY: validated x/gy/gx spans; one thread per element.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n))
+                .map_err(|e| driver_err("launch relu2_backward_dev", &e))?;
         }
         Ok(())
     }
