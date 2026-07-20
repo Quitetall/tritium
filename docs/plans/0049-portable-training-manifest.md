@@ -150,6 +150,15 @@ emits a physical-device-bound receipt; the adapter advertises only this proved
 subset and never delegates to CPU. This is development evidence, not a
 release-admissible CUDA receipt; CUDA remains open until all 35 operations pass.
 
+The constrained WASI/WASM adapter is complete for the frozen corpus. It compiles
+the deterministic scalar semantic executor into the guest rather than calling a
+host fallback, advertises all 35 operations, enforces 8 MiB per-buffer and
+64 MiB aggregate caller-payload ceilings before mutation, and rebinds receipts
+to the actual engine identity. Native structural tests and an actual
+`wasm32-wasip1` run under wasmtime 46.0.0/Cranelift both pass all 114 cases.
+This closes WASI/WASM semantic parity; browser WASM packaging remains plan 0050,
+and MCU constrained-target parity remains open.
+
 Edits:
 
 - Add strict manifest types/parser to `tritium-spec/src/training.rs`.

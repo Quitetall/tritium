@@ -61,6 +61,12 @@ Invalid ordering is a typed error and cannot mutate model or optimizer state.
 
 ## Slice 1 — reproducible package and schema mirror
 
+Status: **DONE** — `@tritium-ai/web@1.1.0-rc.0` is a private local-RC package
+with an exact lockfile, strict TypeScript 7 check, deterministic browser ESM
+bundle, fail-closed manifest tests, BLAKE3-bound manifest/vector identities,
+license/notice payloads and a clean-directory archive import. Publication
+remains disabled.
+
 Create the package without a repository-relative runtime dependency:
 
 - `packages/tritium-web/package.json`, strict `tsconfig` files and deterministic
