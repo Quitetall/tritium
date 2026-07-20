@@ -1,8 +1,13 @@
 //! Deterministic ONNX protobuf serialization for Tritium inference graphs.
 
+use std::collections::BTreeMap;
+
+use half::f16;
 use prost::Message;
-use tritium_core::TernaryFormat;
-use tritium_format::{TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks};
+use tritium_core::{TernaryFormat, Trit};
+use tritium_format::{
+    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
+};
 
 use crate::{ATTR_FORMAT, ATTR_K, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME, ONNX_OP_NAME};
 
@@ -16,6 +21,7 @@ const ATTRIBUTE_INT: i32 = 2;
 const EXTERNAL_DATA: i32 = 1;
 const EXTERNAL_WEIGHTS_FILE: &str = "weights.bin";
 const EXTERNAL_ALIGNMENT: usize = 64;
+const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
 
 /// A deterministic tied packed embedding/head graph.
 ///
@@ -57,6 +63,29 @@ pub struct ExternalOnnxModel {
     pub weights_blake3: [u8; 32],
 }
 
+/// Receipt from strict external ONNX model/data verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedExternalOnnxModel {
+    /// BLAKE3 digest of the canonical serialized ONNX protobuf.
+    pub model_blake3: [u8; 32],
+    /// BLAKE3 digest of the canonical external initializer bytes.
+    pub weights_blake3: [u8; 32],
+    /// Exact external initializer byte count.
+    pub weights_bytes: usize,
+    /// Fixed input token count.
+    pub tokens: usize,
+    /// Vocabulary row count.
+    pub vocab: usize,
+    /// Hidden column count.
+    pub hidden: usize,
+    /// Bound source model identity.
+    pub source_model_id: String,
+    /// Bound conversion recipe identity.
+    pub recipe_id: String,
+    /// Bound artifact package identity.
+    pub package_id: String,
+}
+
 /// Validation or serialization errors from Tritium ONNX model encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -88,6 +117,17 @@ pub enum OnnxModelError {
     },
     /// A derived count cannot be represented by the host or ONNX `int64`.
     ShapeOverflow(&'static str),
+    /// A packed row is malformed or carries a non-unit internal block scale.
+    InvalidPackedRow {
+        /// Rejected table row.
+        row: usize,
+        /// Stable diagnostic from the packed decoder.
+        reason: String,
+    },
+    /// Serialized protobuf or Tritium metadata is malformed.
+    InvalidModel(String),
+    /// The supplied external data does not match its model binding.
+    ExternalDataMismatch(String),
 }
 
 impl core::fmt::Display for OnnxModelError {
@@ -111,6 +151,13 @@ impl core::fmt::Display for OnnxModelError {
                 "ONNX packed table has {got} bytes, expected {expected}"
             ),
             Self::ShapeOverflow(name) => write!(formatter, "ONNX {name} exceeds int64/usize"),
+            Self::InvalidPackedRow { row, reason } => {
+                write!(formatter, "ONNX packed row {row} is invalid: {reason}")
+            }
+            Self::InvalidModel(reason) => write!(formatter, "invalid Tritium ONNX model: {reason}"),
+            Self::ExternalDataMismatch(reason) => {
+                write!(formatter, "Tritium ONNX external data mismatch: {reason}")
+            }
         }
     }
 }
@@ -208,6 +255,178 @@ pub fn encode_external_tied_embedding_head(
     })
 }
 
+/// Verify a serialized external-data graph before it is handed to ONNX Runtime.
+///
+/// Verification is fail-closed: metadata keys must be unique, the fixed
+/// filename and geometry bindings must be canonical, length and BLAKE3 must
+/// match, padding must be zero, scales and packed rows must validate, and a
+/// deterministic re-encode must reproduce both files byte-for-byte.
+///
+/// # Errors
+/// [`OnnxModelError`] for malformed protobuf/metadata, a digest or length
+/// mismatch, invalid packed/scales data, or any non-canonical graph mutation.
+pub fn verify_external_tied_embedding_head(
+    model_bytes: &[u8],
+    weights_bytes: &[u8],
+) -> Result<VerifiedExternalOnnxModel, OnnxModelError> {
+    if model_bytes.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    let protobuf = ModelProto::decode(model_bytes)
+        .map_err(|error| OnnxModelError::InvalidModel(error.to_string()))?;
+    let mut metadata = BTreeMap::new();
+    for entry in protobuf.metadata_props {
+        if metadata.insert(entry.key.clone(), entry.value).is_some() {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "duplicate metadata key {}",
+                entry.key
+            )));
+        }
+    }
+    require_metadata(&metadata, "tritium.schema_version", "1")?;
+    require_metadata(&metadata, "tritium.tied_embedding_head", "true")?;
+    require_metadata(
+        &metadata,
+        "tritium.external_data.file",
+        EXTERNAL_WEIGHTS_FILE,
+    )?;
+    let tokens = parse_usize(&metadata, "tritium.tokens")?;
+    let vocab = parse_usize(&metadata, "tritium.vocab")?;
+    let hidden = parse_usize(&metadata, "tritium.hidden")?;
+    let declared_weights = parse_usize(&metadata, "tritium.external_data.bytes")?;
+    let format = match metadata_value(&metadata, "tritium.weight_format")? {
+        "tq2_0" => TernaryFormat::Tq2_0,
+        "tq1_0" => TernaryFormat::Tq1_0,
+        other => {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "unsupported weight format {other}"
+            )));
+        }
+    };
+    let source_model_id = metadata_value(&metadata, "tritium.source_model_id")?.to_owned();
+    let recipe_id = metadata_value(&metadata, "tritium.recipe_id")?.to_owned();
+    let package_id = metadata_value(&metadata, "tritium.package_id")?.to_owned();
+    let actual_weights_hash = blake3::hash(weights_bytes);
+    let actual_weights_hex = actual_weights_hash.to_hex().to_string();
+    if metadata_value(&metadata, "tritium.external_data.blake3")? != actual_weights_hex {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "BLAKE3 digest differs from model metadata".to_owned(),
+        ));
+    }
+    if weights_bytes.len() != declared_weights {
+        return Err(OnnxModelError::ExternalDataMismatch(format!(
+            "byte length {} differs from declared {declared_weights}",
+            weights_bytes.len()
+        )));
+    }
+    let block_bytes = match format {
+        TernaryFormat::Tq2_0 => TQ2_0_BLOCK_BYTES,
+        TernaryFormat::Tq1_0 => TQ1_0_BLOCK_BYTES,
+        other => return Err(OnnxModelError::UnsupportedFormat(other)),
+    };
+    let packed_len = num_blocks(hidden)
+        .checked_mul(block_bytes)
+        .and_then(|row| row.checked_mul(vocab))
+        .ok_or(OnnxModelError::ShapeOverflow("packed byte count"))?;
+    let scale_offset = align_up(packed_len, EXTERNAL_ALIGNMENT)?;
+    let scale_len = vocab
+        .checked_mul(core::mem::size_of::<f32>())
+        .ok_or(OnnxModelError::ShapeOverflow("scale byte count"))?;
+    let expected_weights = scale_offset
+        .checked_add(scale_len)
+        .ok_or(OnnxModelError::ShapeOverflow("external weight byte count"))?;
+    if weights_bytes.len() != expected_weights {
+        return Err(OnnxModelError::ExternalDataMismatch(format!(
+            "canonical geometry requires {expected_weights} bytes, got {}",
+            weights_bytes.len()
+        )));
+    }
+    if weights_bytes[packed_len..scale_offset]
+        .iter()
+        .any(|&byte| byte != 0)
+    {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "alignment padding is not zero".to_owned(),
+        ));
+    }
+    let scales: Vec<f32> = weights_bytes[scale_offset..]
+        .chunks_exact(core::mem::size_of::<f32>())
+        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .collect();
+    let specification = TiedEmbeddingHeadModel {
+        tokens,
+        vocab,
+        hidden,
+        packed: &weights_bytes[..packed_len],
+        scales: &scales,
+        format,
+        source_model_id: &source_model_id,
+        recipe_id: &recipe_id,
+        package_id: &package_id,
+    };
+    let expected = encode_external_tied_embedding_head(specification)?;
+    if expected.model_bytes != model_bytes {
+        return Err(OnnxModelError::InvalidModel(
+            "graph does not match the canonical bound Tritium graph".to_owned(),
+        ));
+    }
+    if expected.weights_bytes != weights_bytes {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "initializer layout is not canonical".to_owned(),
+        ));
+    }
+    Ok(VerifiedExternalOnnxModel {
+        model_blake3: *blake3::hash(model_bytes).as_bytes(),
+        weights_blake3: *actual_weights_hash.as_bytes(),
+        weights_bytes: weights_bytes.len(),
+        tokens,
+        vocab,
+        hidden,
+        source_model_id,
+        recipe_id,
+        package_id,
+    })
+}
+
+fn metadata_value<'a>(
+    metadata: &'a BTreeMap<String, String>,
+    key: &str,
+) -> Result<&'a str, OnnxModelError> {
+    metadata
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| OnnxModelError::InvalidModel(format!("missing metadata key {key}")))
+}
+
+fn require_metadata(
+    metadata: &BTreeMap<String, String>,
+    key: &str,
+    expected: &str,
+) -> Result<(), OnnxModelError> {
+    let value = metadata_value(metadata, key)?;
+    if value != expected {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "metadata {key} must be {expected:?}, got {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_usize(metadata: &BTreeMap<String, String>, key: &str) -> Result<usize, OnnxModelError> {
+    let value = metadata_value(metadata, key)?;
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| OnnxModelError::InvalidModel(format!("metadata {key} is not usize")))?;
+    if parsed.to_string() != value {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "metadata {key} is not canonical decimal"
+        )));
+    }
+    Ok(parsed)
+}
+
 fn encode_model(
     model: TiedEmbeddingHeadModel<'_>,
     initializer: Vec<TensorProto>,
@@ -249,6 +468,9 @@ fn encode_model(
         metadata("tritium.package_id", model.package_id),
         metadata("tritium.weight_format", &model.format.to_string()),
         metadata("tritium.tied_embedding_head", "true"),
+        metadata("tritium.tokens", &model.tokens.to_string()),
+        metadata("tritium.vocab", &model.vocab.to_string()),
+        metadata("tritium.hidden", &model.hidden.to_string()),
     ];
     metadata_props.append(&mut extra_metadata);
     Ok(ModelProto {
@@ -321,6 +543,7 @@ fn validate(model: &TiedEmbeddingHeadModel<'_>) -> Result<(), OnnxModelError> {
             got: model.packed.len(),
         });
     }
+    validate_packed_payload(model)?;
     for (name, dimension) in [
         ("token count", model.tokens),
         ("vocabulary", model.vocab),
@@ -328,6 +551,43 @@ fn validate(model: &TiedEmbeddingHeadModel<'_>) -> Result<(), OnnxModelError> {
         ("packed byte count", model.packed.len()),
     ] {
         as_i64(dimension, name)?;
+    }
+    Ok(())
+}
+
+fn validate_packed_payload(model: &TiedEmbeddingHeadModel<'_>) -> Result<(), OnnxModelError> {
+    let block_bytes = match model.format {
+        TernaryFormat::Tq2_0 => TQ2_0_BLOCK_BYTES,
+        TernaryFormat::Tq1_0 => TQ1_0_BLOCK_BYTES,
+        other => return Err(OnnxModelError::UnsupportedFormat(other)),
+    };
+    let blocks = num_blocks(model.hidden);
+    let row_bytes = blocks
+        .checked_mul(block_bytes)
+        .ok_or(OnnxModelError::ShapeOverflow("packed row byte count"))?;
+    let mut trits = vec![Trit::ZERO; model.hidden];
+    let mut scales = vec![f16::ONE; blocks];
+    for (row, packed) in model.packed.chunks_exact(row_bytes).enumerate() {
+        let result = match model.format {
+            TernaryFormat::Tq2_0 => unpack_tq2_0_row(packed, &mut trits, &mut scales),
+            TernaryFormat::Tq1_0 => unpack_tq1_0_row(packed, &mut trits, &mut scales),
+            other => return Err(OnnxModelError::UnsupportedFormat(other)),
+        };
+        result.map_err(|error| OnnxModelError::InvalidPackedRow {
+            row,
+            reason: error.to_string(),
+        })?;
+        if let Some((block, scale)) = scales
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, scale)| *scale != f16::ONE)
+        {
+            return Err(OnnxModelError::InvalidPackedRow {
+                row,
+                reason: format!("block {block} has non-unit scale {scale:?}"),
+            });
+        }
     }
     Ok(())
 }
@@ -559,10 +819,30 @@ struct StringStringEntryProto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
+
+    fn unit_packed(format: TernaryFormat, rows: usize) -> Vec<u8> {
+        let trits = vec![Trit::ZERO; 256];
+        let scales = [f16::ONE];
+        let block_bytes = match format {
+            TernaryFormat::Tq2_0 => TQ2_0_BLOCK_BYTES,
+            TernaryFormat::Tq1_0 => TQ1_0_BLOCK_BYTES,
+            other => panic!("unsupported test format {other}"),
+        };
+        let mut packed = vec![0; block_bytes * rows];
+        for row in packed.chunks_exact_mut(block_bytes) {
+            match format {
+                TernaryFormat::Tq2_0 => pack_tq2_0_row(&trits, &scales, row).unwrap(),
+                TernaryFormat::Tq1_0 => pack_tq1_0_row(&trits, &scales, row).unwrap(),
+                other => panic!("unsupported test format {other}"),
+            }
+        }
+        packed
+    }
 
     #[test]
     fn validation_is_fail_closed() {
-        let packed = vec![0; TQ2_0_BLOCK_BYTES];
+        let packed = unit_packed(TernaryFormat::Tq2_0, 1);
         let base = TiedEmbeddingHeadModel {
             tokens: 1,
             vocab: 1,
@@ -600,7 +880,7 @@ mod tests {
 
     #[test]
     fn encoding_is_deterministic() {
-        let packed = vec![0; TQ1_0_BLOCK_BYTES * 2];
+        let packed = unit_packed(TernaryFormat::Tq1_0, 2);
         let model = TiedEmbeddingHeadModel {
             tokens: 3,
             vocab: 2,
@@ -620,7 +900,7 @@ mod tests {
 
     #[test]
     fn external_encoding_binds_layout_and_digest() {
-        let packed = vec![0x55; TQ2_0_BLOCK_BYTES * 2];
+        let packed = unit_packed(TernaryFormat::Tq2_0, 2);
         let model = TiedEmbeddingHeadModel {
             tokens: 2,
             vocab: 2,
@@ -633,6 +913,14 @@ mod tests {
             package_id: "package",
         };
         let encoded = encode_external_tied_embedding_head(model).unwrap();
+        let receipt = verify_external_tied_embedding_head(
+            encoded.model_bytes.as_slice(),
+            encoded.weights_bytes.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(receipt.tokens, 2);
+        assert_eq!(receipt.vocab, 2);
+        assert_eq!(receipt.hidden, 256);
         assert_eq!(
             encoded.weights_blake3,
             *blake3::hash(&encoded.weights_bytes).as_bytes()
@@ -655,5 +943,34 @@ mod tests {
         assert!(protobuf.metadata_props.iter().any(|entry| {
             entry.key == "tritium.external_data.blake3" && entry.value == expected_digest
         }));
+
+        let mut corrupted = encoded.weights_bytes.clone();
+        corrupted[0] ^= 1;
+        assert!(matches!(
+            verify_external_tied_embedding_head(&encoded.model_bytes, &corrupted),
+            Err(OnnxModelError::ExternalDataMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn encoder_rejects_non_unit_internal_scales() {
+        let mut packed = unit_packed(TernaryFormat::Tq2_0, 1);
+        let scale_offset = TQ2_0_BLOCK_BYTES - core::mem::size_of::<f16>();
+        packed[scale_offset..].copy_from_slice(&f16::ZERO.to_le_bytes());
+        let result = encode_tied_embedding_head(TiedEmbeddingHeadModel {
+            tokens: 1,
+            vocab: 1,
+            hidden: 256,
+            packed: &packed,
+            scales: &[1.0],
+            format: TernaryFormat::Tq2_0,
+            source_model_id: "source",
+            recipe_id: "recipe",
+            package_id: "package",
+        });
+        assert!(matches!(
+            result,
+            Err(OnnxModelError::InvalidPackedRow { .. })
+        ));
     }
 }

@@ -191,6 +191,16 @@ fn unpack_row(
         other => return Err(OnnxTernaryError::UnsupportedFormat(other)),
     };
     result.map_err(|error| OnnxTernaryError::Unpack(error.to_string()))?;
+    if let Some((block, scale)) = scratch
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, scale)| *scale != f16::ONE)
+    {
+        return Err(OnnxTernaryError::Unpack(format!(
+            "block {block} carries internal scale {scale:?}; Tritium ONNX requires unit block scales"
+        )));
+    }
     if trits.len() != k {
         return Err(OnnxTernaryError::Kernel(
             "internal unpacked-row length mismatch".to_owned(),
@@ -372,8 +382,9 @@ mod onnx_op;
 
 #[cfg(feature = "model")]
 pub use model::{
-    ExternalOnnxModel, OnnxModelError, TiedEmbeddingHeadModel, encode_external_tied_embedding_head,
-    encode_tied_embedding_head,
+    ExternalOnnxModel, OnnxModelError, TiedEmbeddingHeadModel, VerifiedExternalOnnxModel,
+    encode_external_tied_embedding_head, encode_tied_embedding_head,
+    verify_external_tied_embedding_head,
 };
 
 #[cfg(feature = "model")]
@@ -539,6 +550,17 @@ mod tests {
         let scale =
             ternary_embedding_kernel(&[0], &[1], &packed, &[f32::NAN], k, TernaryFormat::Tq2_0);
         assert!(matches!(scale, Err(OnnxTernaryError::InvalidScale { .. })));
+    }
+
+    #[test]
+    fn kernels_reject_non_unit_internal_block_scales() {
+        let k = 256;
+        let rows = vec![vec![Trit::POS; k]];
+        let mut packed = pack_rows(&rows, TernaryFormat::Tq2_0);
+        let scale_offset = TQ2_0_BLOCK_BYTES - core::mem::size_of::<f16>();
+        packed[scale_offset..].copy_from_slice(&f16::ZERO.to_le_bytes());
+        let result = ternary_embedding_kernel(&[0], &[1], &packed, &[1.0], k, TernaryFormat::Tq2_0);
+        assert!(matches!(result, Err(OnnxTernaryError::Unpack(_))));
     }
 
     #[test]
