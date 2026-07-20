@@ -13,6 +13,7 @@ categories.workspace = true
 [dependencies]
 blake3 = { workspace = true }
 tritium-core = { workspace = true }
+tritium-format = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-testkit = { workspace = true }
 # Row-parallel dense matmul forward/vjp — the training hot path. Parallelizing over OUTPUT rows
@@ -21,6 +22,7 @@ tritium-testkit = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+half = { workspace = true }
 # Property-based gates for LoRA (frozen-base zero-grad, merge correctness, rank edges) —
 # ADR 0007. Workspace-pinned; already used by tritium-core/-cpu/-nn/-format/-quantize.
 proptest = { workspace = true }
@@ -30,7 +32,6 @@ serde_json = { workspace = true }
 # the quantize allocator's Sensitivity::Custom. tritium-quantize does NOT depend on tritium-train,
 # so this dev-dep is acyclic. Also pulls the SALT dequant helper via tritium-format.
 tritium-quantize = { workspace = true }
-tritium-format = { workspace = true }
 
 [lints]
 workspace = true

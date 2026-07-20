@@ -1,8 +1,10 @@
 //! CPU reference adapter for the plan-0049 portable-training seam.
 
 use core::f32::consts::PI;
+use std::io::Cursor as IoCursor;
 
 use blake3::Hasher;
+use tritium_format::salt_v2_package::SaltV2PackageReader;
 use tritium_spec::{
     TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
     TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
@@ -12,7 +14,8 @@ use tritium_spec::{
 
 use crate::{
     AdamState, AdamW, CautiousAdamW, INT8_ADAM_BLOCK, Int8AdamState, Int8AdamW, Muon, MuonState,
-    Optimizer, Sgd,
+    Optimizer, Sgd, SgdState,
+    checkpoint::{Checkpoint, CheckpointError, LeafCheckpoint, read_checkpoint, write_checkpoint},
     ops::{attention, conv1d, conv2d},
 };
 
@@ -21,6 +24,7 @@ const MAX_SALT_PLANES: u64 = 64;
 const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONV_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ATTENTION_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LIFECYCLE_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const CPU_LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: u32::MAX,
     max_elements: usize::MAX as u64,
@@ -60,6 +64,10 @@ enum CpuOperation {
     CautiousAdamW,
     Int8AdamW,
     Muon,
+    Checkpoint,
+    Resume,
+    Export,
+    Reload,
 }
 
 #[derive(Clone, Copy)]
@@ -192,6 +200,22 @@ const CPU_OPERATIONS: &[CpuOperationEntry] = &[
     CpuOperationEntry {
         id: "optimizer.muon",
         operation: CpuOperation::Muon,
+    },
+    CpuOperationEntry {
+        id: "lifecycle.checkpoint",
+        operation: CpuOperation::Checkpoint,
+    },
+    CpuOperationEntry {
+        id: "lifecycle.resume",
+        operation: CpuOperation::Resume,
+    },
+    CpuOperationEntry {
+        id: "lifecycle.export",
+        operation: CpuOperation::Export,
+    },
+    CpuOperationEntry {
+        id: "lifecycle.reload",
+        operation: CpuOperation::Reload,
     },
 ];
 
@@ -502,6 +526,16 @@ const MUON_STEP: OperationSchema = OperationSchema {
     ],
     outputs: &["parameter", "momentum"],
 };
+const EXPORT: OperationSchema = OperationSchema {
+    inputs: &["package"],
+    attributes: &["format"],
+    outputs: &["artifact"],
+};
+const RELOAD: OperationSchema = OperationSchema {
+    inputs: &["artifact"],
+    attributes: &["format"],
+    outputs: &["package"],
+};
 
 /// Honest partial CPU reference adapter for `TrainBackendV1`.
 ///
@@ -576,6 +610,18 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             (CpuOperation::Muon, TrainExecutionV1::Step) => {
                 require_contract(&request, output, &MUON_STEP)?;
             }
+            (CpuOperation::Checkpoint, TrainExecutionV1::Checkpoint) => {
+                require_checkpoint_contract(&request, output)?;
+            }
+            (CpuOperation::Resume, TrainExecutionV1::Resume) => {
+                require_resume_contract(&request, output)?;
+            }
+            (CpuOperation::Export, TrainExecutionV1::Export) => {
+                require_contract(&request, output, &EXPORT)?;
+            }
+            (CpuOperation::Reload, TrainExecutionV1::Reload) => {
+                require_contract(&request, output, &RELOAD)?;
+            }
             _ => {}
         }
         let scratch_bytes =
@@ -589,6 +635,16 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
         }
         if matches!(operation.operation, CpuOperation::Attention)
             && scratch_bytes > MAX_ATTENTION_SCRATCH_BYTES
+        {
+            return Err(attribute_value("scratch", "limit_64_mib"));
+        }
+        if matches!(
+            operation.operation,
+            CpuOperation::Checkpoint
+                | CpuOperation::Resume
+                | CpuOperation::Export
+                | CpuOperation::Reload
+        ) && scratch_bytes > MAX_LIFECYCLE_SCRATCH_BYTES
         {
             return Err(attribute_value("scratch", "limit_64_mib"));
         }
@@ -714,6 +770,18 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
                 int8_adamw_step(&request, output)?;
             }
             (CpuOperation::Muon, TrainExecutionV1::Step) => muon_step(&request, output)?,
+            (CpuOperation::Checkpoint, TrainExecutionV1::Checkpoint) => {
+                lifecycle_checkpoint(&request, output)?;
+            }
+            (CpuOperation::Resume, TrainExecutionV1::Resume) => {
+                lifecycle_resume(&request, output)?;
+            }
+            (CpuOperation::Export, TrainExecutionV1::Export) => {
+                lifecycle_export(&request, output)?;
+            }
+            (CpuOperation::Reload, TrainExecutionV1::Reload) => {
+                lifecycle_reload(&request, output)?;
+            }
             _ => {
                 return Err(TrainBackendError::Backend {
                     code: "dispatch_invariant".to_owned(),
@@ -729,7 +797,17 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
             execution: request.execution,
-            dtype: TrainDTypeV1::F32,
+            dtype: if matches!(
+                operation.operation,
+                CpuOperation::Checkpoint
+                    | CpuOperation::Resume
+                    | CpuOperation::Export
+                    | CpuOperation::Reload
+            ) {
+                TrainDTypeV1::Bytes
+            } else {
+                TrainDTypeV1::F32
+            },
             limits: CPU_LIMITS,
             input_digest,
             output_digest: train_output_digest_v1(output),
@@ -2496,6 +2574,475 @@ fn muon_step(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointOptimizer {
+    Sgd,
+    AdamW,
+    CautiousAdamW,
+    Int8AdamW,
+    Muon,
+}
+
+impl CheckpointOptimizer {
+    fn parse(request: &TrainRequestV1<'_>) -> Result<Self, TrainBackendError> {
+        match attribute_text(request, "optimizer")? {
+            "sgd" => Ok(Self::Sgd),
+            "adamw" => Ok(Self::AdamW),
+            "cautious_adamw" => Ok(Self::CautiousAdamW),
+            "int8_adamw" => Ok(Self::Int8AdamW),
+            "muon" => Ok(Self::Muon),
+            _ => Err(attribute_value("optimizer", "known")),
+        }
+    }
+
+    const fn planes(self) -> &'static [&'static str] {
+        match self {
+            Self::Sgd => &["parameter"],
+            Self::AdamW | Self::CautiousAdamW => &["parameter", "moment1", "moment2"],
+            Self::Int8AdamW => &[
+                "parameter",
+                "moment1_q8",
+                "moment2_q8",
+                "moment1_scale",
+                "moment2_scale",
+            ],
+            Self::Muon => &["parameter", "momentum"],
+        }
+    }
+}
+
+fn lifecycle_attributes<'a>(
+    request: &'a TrainRequestV1<'_>,
+    checkpoint: bool,
+) -> Result<(CheckpointOptimizer, u64, &'a [u64]), TrainBackendError> {
+    let expected = if checkpoint {
+        &["optimizer", "step", "leaf_lens"][..]
+    } else {
+        &["optimizer", "leaf_lens"][..]
+    };
+    if !same_names(
+        request.attributes.iter().map(|attribute| attribute.name),
+        expected,
+    ) {
+        return Err(role_error("attribute"));
+    }
+    let optimizer = CheckpointOptimizer::parse(request)?;
+    let step = if checkpoint {
+        attribute_u64(request, "step")?
+    } else {
+        0
+    };
+    let leaf_lens = attribute_u64_list(request, "leaf_lens")?;
+    if leaf_lens.is_empty() {
+        return Err(attribute_value("leaf_lens", "nonempty"));
+    }
+    u32::try_from(leaf_lens.len()).map_err(|_| attribute_value("leaf_lens", "u32_count"))?;
+    for &len in leaf_lens {
+        if len == 0 {
+            return Err(attribute_value("leaf_lens", "positive"));
+        }
+        u32::try_from(len).map_err(|_| attribute_value("leaf_lens", "u32"))?;
+    }
+    Ok((optimizer, step, leaf_lens))
+}
+
+fn indexed_plane_name(plane: &str, index: usize) -> String {
+    format!("{plane}.{index}")
+}
+
+fn checkpoint_roles_match<'a>(
+    actual: impl Iterator<Item = &'a str>,
+    optimizer: CheckpointOptimizer,
+    leaves: usize,
+) -> Result<bool, TrainBackendError> {
+    let expected_count = optimizer
+        .planes()
+        .len()
+        .checked_mul(leaves)
+        .ok_or_else(|| attribute_value("leaf_lens", "role_count"))?;
+    let mut actual = actual;
+    if actual.size_hint().0 > expected_count {
+        return Ok(false);
+    }
+    for index in 0..leaves {
+        for &plane in optimizer.planes() {
+            let expected = indexed_plane_name(plane, index);
+            if actual.next() != Some(expected.as_str()) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(actual.next().is_none())
+}
+
+fn require_checkpoint_contract(
+    request: &TrainRequestV1<'_>,
+    output: &TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    let (optimizer, _, leaf_lens) = lifecycle_attributes(request, true)?;
+    if !checkpoint_roles_match(
+        request.inputs.iter().map(|buffer| buffer.name),
+        optimizer,
+        leaf_lens.len(),
+    )? {
+        return Err(role_error("input"));
+    }
+    if !same_names(
+        output.buffers.iter().map(|buffer| buffer.name),
+        &["checkpoint"],
+    ) {
+        return Err(role_error("output"));
+    }
+    validate_checkpoint_input_shapes(request, optimizer, leaf_lens)?;
+    let encoded_bytes = checkpoint_encoded_bytes(optimizer, leaf_lens)?;
+    require_bytes_output(output, "checkpoint", &[encoded_bytes])
+}
+
+fn require_resume_contract(
+    request: &TrainRequestV1<'_>,
+    output: &TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    let (optimizer, _, leaf_lens) = lifecycle_attributes(request, false)?;
+    if !same_names(
+        request.inputs.iter().map(|buffer| buffer.name),
+        &["checkpoint"],
+    ) {
+        return Err(role_error("input"));
+    }
+    input_bytes(request, "checkpoint")?;
+    if output.buffers.first().map(|buffer| buffer.name) != Some("step")
+        || !checkpoint_roles_match(
+            output.buffers.iter().skip(1).map(|buffer| buffer.name),
+            optimizer,
+            leaf_lens.len(),
+        )?
+    {
+        return Err(role_error("output"));
+    }
+    require_bytes_output(output, "step", &[8])?;
+    validate_checkpoint_output_shapes(output, optimizer, leaf_lens)
+}
+
+fn validate_checkpoint_input_shapes(
+    request: &TrainRequestV1<'_>,
+    optimizer: CheckpointOptimizer,
+    leaf_lens: &[u64],
+) -> Result<(), TrainBackendError> {
+    for (index, &len) in leaf_lens.iter().enumerate() {
+        let blocks = len.div_ceil(INT8_ADAM_BLOCK as u64);
+        for &plane in optimizer.planes() {
+            let name = indexed_plane_name(plane, index);
+            let expected = if plane.ends_with("_scale") {
+                blocks
+            } else {
+                len
+            };
+            if plane.ends_with("_q8") {
+                let (shape, _) = input_bytes(request, &name)?;
+                if shape != [expected] {
+                    return Err(shape_error());
+                }
+            } else {
+                let (shape, values) = input_f32(request, &name)?;
+                if shape != [expected] {
+                    return Err(shape_error());
+                }
+                reject_nonfinite(&name, values)?;
+                if (plane == "moment2" || plane.ends_with("_scale"))
+                    && values.iter().any(|&value| value < 0.0)
+                {
+                    return Err(attribute_value(plane, "nonnegative"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_output_shapes(
+    output: &TrainOutputV1<'_>,
+    optimizer: CheckpointOptimizer,
+    leaf_lens: &[u64],
+) -> Result<(), TrainBackendError> {
+    for (index, &len) in leaf_lens.iter().enumerate() {
+        let blocks = len.div_ceil(INT8_ADAM_BLOCK as u64);
+        for &plane in optimizer.planes() {
+            let name = indexed_plane_name(plane, index);
+            let shape = [if plane.ends_with("_scale") {
+                blocks
+            } else {
+                len
+            }];
+            if plane.ends_with("_q8") {
+                require_bytes_output(output, &name, &shape)?;
+            } else {
+                require_f32_output(output, &name, &shape)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_input_f32(
+    request: &TrainRequestV1<'_>,
+    plane: &str,
+    index: usize,
+) -> Result<Vec<f32>, TrainBackendError> {
+    Ok(input_f32(request, &indexed_plane_name(plane, index))?
+        .1
+        .to_vec())
+}
+
+fn checkpoint_input_bytes(
+    request: &TrainRequestV1<'_>,
+    plane: &str,
+    index: usize,
+) -> Result<Vec<u8>, TrainBackendError> {
+    Ok(input_bytes(request, &indexed_plane_name(plane, index))?
+        .1
+        .to_vec())
+}
+
+fn lifecycle_checkpoint(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_checkpoint_contract(request, output)?;
+    let (optimizer, step, leaf_lens) = lifecycle_attributes(request, true)?;
+    let bytes = match optimizer {
+        CheckpointOptimizer::Sgd => {
+            let leaves = (0..leaf_lens.len())
+                .map(|index| {
+                    Ok(LeafCheckpoint {
+                        param: checkpoint_input_f32(request, "parameter", index)?,
+                        state: SgdState,
+                    })
+                })
+                .collect::<Result<Vec<_>, TrainBackendError>>()?;
+            write_checkpoint(&Sgd::new(0.0), &Checkpoint { step, leaves })
+        }
+        CheckpointOptimizer::AdamW | CheckpointOptimizer::CautiousAdamW => {
+            let leaves = (0..leaf_lens.len())
+                .map(|index| {
+                    Ok(LeafCheckpoint {
+                        param: checkpoint_input_f32(request, "parameter", index)?,
+                        state: AdamState {
+                            m: checkpoint_input_f32(request, "moment1", index)?,
+                            v: checkpoint_input_f32(request, "moment2", index)?,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, TrainBackendError>>()?;
+            write_checkpoint(&AdamW::new(0.0), &Checkpoint { step, leaves })
+        }
+        CheckpointOptimizer::Int8AdamW => {
+            let leaves = (0..leaf_lens.len())
+                .map(|index| {
+                    let len = leaf_lens[index] as usize;
+                    Ok(LeafCheckpoint {
+                        param: checkpoint_input_f32(request, "parameter", index)?,
+                        state: Int8AdamState {
+                            m_q: checkpoint_input_bytes(request, "moment1_q8", index)?
+                                .into_iter()
+                                .map(|value| value as i8)
+                                .collect(),
+                            v_q: checkpoint_input_bytes(request, "moment2_q8", index)?,
+                            m_scale: checkpoint_input_f32(request, "moment1_scale", index)?,
+                            v_scale: checkpoint_input_f32(request, "moment2_scale", index)?,
+                            len,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, TrainBackendError>>()?;
+            write_checkpoint(&Int8AdamW::new(0.0), &Checkpoint { step, leaves })
+        }
+        CheckpointOptimizer::Muon => {
+            let leaves = (0..leaf_lens.len())
+                .map(|index| {
+                    Ok(LeafCheckpoint {
+                        param: checkpoint_input_f32(request, "parameter", index)?,
+                        state: MuonState {
+                            momentum: checkpoint_input_f32(request, "momentum", index)?,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, TrainBackendError>>()?;
+            write_checkpoint(&Muon::new(0.0, 1, 1), &Checkpoint { step, leaves })
+        }
+    };
+    require_bytes_output(output, "checkpoint", &[bytes.len() as u64])?;
+    output_bytes(output, "checkpoint")?.copy_from_slice(&bytes);
+    Ok(())
+}
+
+fn checkpoint_error(error: CheckpointError) -> TrainBackendError {
+    let constraint = match error {
+        CheckpointError::BadMagic => "bad_magic",
+        CheckpointError::UnsupportedVersion(_) => "unsupported_version",
+        CheckpointError::Truncated { .. } => "truncated",
+        CheckpointError::TrailingBytes(_) => "trailing_bytes",
+    };
+    attribute_value("checkpoint", constraint)
+}
+
+fn lifecycle_resume(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_resume_contract(request, output)?;
+    let (optimizer, _, leaf_lens) = lifecycle_attributes(request, false)?;
+    let checkpoint = input_bytes(request, "checkpoint")?.1;
+    match optimizer {
+        CheckpointOptimizer::Sgd => {
+            let parsed = read_checkpoint(&Sgd::new(0.0), checkpoint).map_err(checkpoint_error)?;
+            validate_resumed_parameters(&parsed)?;
+            restore_checkpoint(output, leaf_lens, parsed, |_, _, _| Ok(()))?;
+        }
+        CheckpointOptimizer::AdamW | CheckpointOptimizer::CautiousAdamW => {
+            let parsed = read_checkpoint(&AdamW::new(0.0), checkpoint).map_err(checkpoint_error)?;
+            validate_resumed_parameters(&parsed)?;
+            for leaf in &parsed.leaves {
+                reject_nonfinite("moment1", &leaf.state.m)?;
+                reject_nonfinite("moment2", &leaf.state.v)?;
+                if leaf.state.v.iter().any(|&value| value < 0.0) {
+                    return Err(attribute_value("moment2", "nonnegative"));
+                }
+            }
+            restore_checkpoint(output, leaf_lens, parsed, |output, index, state| {
+                checkpoint_output_f32(output, "moment1", index)?.copy_from_slice(&state.m);
+                checkpoint_output_f32(output, "moment2", index)?.copy_from_slice(&state.v);
+                Ok(())
+            })?;
+        }
+        CheckpointOptimizer::Int8AdamW => {
+            let parsed =
+                read_checkpoint(&Int8AdamW::new(0.0), checkpoint).map_err(checkpoint_error)?;
+            validate_resumed_parameters(&parsed)?;
+            for leaf in &parsed.leaves {
+                reject_nonfinite("moment1_scale", &leaf.state.m_scale)?;
+                reject_nonfinite("moment2_scale", &leaf.state.v_scale)?;
+                if leaf.state.m_scale.iter().any(|&value| value < 0.0) {
+                    return Err(attribute_value("moment1_scale", "nonnegative"));
+                }
+                if leaf.state.v_scale.iter().any(|&value| value < 0.0) {
+                    return Err(attribute_value("moment2_scale", "nonnegative"));
+                }
+            }
+            restore_checkpoint(output, leaf_lens, parsed, |output, index, state| {
+                for (out, &value) in checkpoint_output_bytes(output, "moment1_q8", index)?
+                    .iter_mut()
+                    .zip(&state.m_q)
+                {
+                    *out = value as u8;
+                }
+                checkpoint_output_bytes(output, "moment2_q8", index)?.copy_from_slice(&state.v_q);
+                checkpoint_output_f32(output, "moment1_scale", index)?
+                    .copy_from_slice(&state.m_scale);
+                checkpoint_output_f32(output, "moment2_scale", index)?
+                    .copy_from_slice(&state.v_scale);
+                Ok(())
+            })?;
+        }
+        CheckpointOptimizer::Muon => {
+            let parsed =
+                read_checkpoint(&Muon::new(0.0, 1, 1), checkpoint).map_err(checkpoint_error)?;
+            validate_resumed_parameters(&parsed)?;
+            for leaf in &parsed.leaves {
+                reject_nonfinite("momentum", &leaf.state.momentum)?;
+            }
+            restore_checkpoint(output, leaf_lens, parsed, |output, index, state| {
+                checkpoint_output_f32(output, "momentum", index)?.copy_from_slice(&state.momentum);
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_resumed_parameters<S>(checkpoint: &Checkpoint<S>) -> Result<(), TrainBackendError> {
+    for leaf in &checkpoint.leaves {
+        reject_nonfinite("parameter", &leaf.param)?;
+    }
+    Ok(())
+}
+
+fn restore_checkpoint<S>(
+    output: &mut TrainOutputV1<'_>,
+    leaf_lens: &[u64],
+    checkpoint: Checkpoint<S>,
+    mut restore_state: impl FnMut(&mut TrainOutputV1<'_>, usize, &S) -> Result<(), TrainBackendError>,
+) -> Result<(), TrainBackendError> {
+    if checkpoint.leaves.len() != leaf_lens.len()
+        || checkpoint
+            .leaves
+            .iter()
+            .zip(leaf_lens)
+            .any(|(leaf, &len)| leaf.param.len() as u64 != len)
+    {
+        return Err(attribute_value("leaf_lens", "checkpoint_match"));
+    }
+    output_bytes(output, "step")?.copy_from_slice(&checkpoint.step.to_le_bytes());
+    for (index, leaf) in checkpoint.leaves.iter().enumerate() {
+        checkpoint_output_f32(output, "parameter", index)?.copy_from_slice(&leaf.param);
+        restore_state(output, index, &leaf.state)?;
+    }
+    Ok(())
+}
+
+fn checkpoint_output_f32<'a>(
+    output: &'a mut TrainOutputV1<'_>,
+    plane: &str,
+    index: usize,
+) -> Result<&'a mut [f32], TrainBackendError> {
+    output_f32(output, &indexed_plane_name(plane, index))
+}
+
+fn checkpoint_output_bytes<'a>(
+    output: &'a mut TrainOutputV1<'_>,
+    plane: &str,
+    index: usize,
+) -> Result<&'a mut [u8], TrainBackendError> {
+    output_bytes(output, &indexed_plane_name(plane, index))
+}
+
+fn validate_salt_v2_package<'a>(
+    request: &TrainRequestV1<'a>,
+    input_name: &str,
+) -> Result<&'a [u8], TrainBackendError> {
+    if attribute_text(request, "format")? != "salt_v2_package_v1" {
+        return Err(attribute_value("format", "salt_v2_package_v1"));
+    }
+    let (shape, bytes) = input_bytes(request, input_name)?;
+    if shape != [bytes.len() as u64] || bytes.is_empty() {
+        return Err(shape_error());
+    }
+    SaltV2PackageReader::new_strict(IoCursor::new(bytes))
+        .map_err(|_| attribute_value(input_name, "salt_v2_package"))?;
+    Ok(bytes)
+}
+
+fn lifecycle_export(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &EXPORT)?;
+    let package = validate_salt_v2_package(request, "package")?;
+    require_bytes_output(output, "artifact", &[package.len() as u64])?;
+    output_bytes(output, "artifact")?.copy_from_slice(package);
+    Ok(())
+}
+
+fn lifecycle_reload(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &RELOAD)?;
+    let artifact = validate_salt_v2_package(request, "artifact")?;
+    require_bytes_output(output, "package", &[artifact.len() as u64])?;
+    output_bytes(output, "package")?.copy_from_slice(artifact);
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum FsqBoundKind {
     Clamp,
@@ -3280,11 +3827,76 @@ fn operation_scratch_bytes(
                 checked_scratch_product(&[gram, 3])?,
             ])?
         }
+        (CpuOperation::Checkpoint, TrainExecutionV1::Checkpoint) => {
+            let (optimizer, _, leaf_lens) = lifecycle_attributes(request, true)?;
+            return checked_scratch_sum(&[
+                checkpoint_payload_bytes(optimizer, leaf_lens)?,
+                checkpoint_encoded_bytes(optimizer, leaf_lens)?,
+            ]);
+        }
+        (CpuOperation::Resume, TrainExecutionV1::Resume) => {
+            let (optimizer, _, leaf_lens) = lifecycle_attributes(request, false)?;
+            return checkpoint_payload_bytes(optimizer, leaf_lens);
+        }
+        (CpuOperation::Export, TrainExecutionV1::Export) => {
+            let (_, package) = input_bytes(request, "package")?;
+            return payload_bytes(package.len(), 2);
+        }
+        (CpuOperation::Reload, TrainExecutionV1::Reload) => {
+            let (_, artifact) = input_bytes(request, "artifact")?;
+            return payload_bytes(artifact.len(), 2);
+        }
         _ => 0,
     };
     elements
         .checked_mul(size_of::<f32>() as u64)
         .ok_or_else(|| attribute_value("scratch", "bytes"))
+}
+
+fn checkpoint_encoded_bytes(
+    optimizer: CheckpointOptimizer,
+    leaf_lens: &[u64],
+) -> Result<u64, TrainBackendError> {
+    let mut bytes = 4_u64 + 1 + 8 + 4;
+    for &len in leaf_lens {
+        let blocks = len.div_ceil(INT8_ADAM_BLOCK as u64);
+        let state = match optimizer {
+            CheckpointOptimizer::Sgd => 0,
+            CheckpointOptimizer::AdamW | CheckpointOptimizer::CautiousAdamW => {
+                checked_scratch_product(&[len, 8])?
+            }
+            CheckpointOptimizer::Int8AdamW => checked_scratch_sum(&[
+                checked_scratch_product(&[len, 2])?,
+                checked_scratch_product(&[blocks, 8])?,
+            ])?,
+            CheckpointOptimizer::Muon => checked_scratch_product(&[len, 4])?,
+        };
+        bytes = checked_scratch_sum(&[bytes, 8, checked_scratch_product(&[len, 4])?, state])?;
+    }
+    Ok(bytes)
+}
+
+fn checkpoint_payload_bytes(
+    optimizer: CheckpointOptimizer,
+    leaf_lens: &[u64],
+) -> Result<u64, TrainBackendError> {
+    let mut bytes = 0_u64;
+    for &len in leaf_lens {
+        let blocks = len.div_ceil(INT8_ADAM_BLOCK as u64);
+        let state = match optimizer {
+            CheckpointOptimizer::Sgd => 0,
+            CheckpointOptimizer::AdamW | CheckpointOptimizer::CautiousAdamW => {
+                checked_scratch_product(&[len, 8])?
+            }
+            CheckpointOptimizer::Int8AdamW => checked_scratch_sum(&[
+                checked_scratch_product(&[len, 2])?,
+                checked_scratch_product(&[blocks, 8])?,
+            ])?,
+            CheckpointOptimizer::Muon => checked_scratch_product(&[len, 4])?,
+        };
+        bytes = checked_scratch_sum(&[bytes, checked_scratch_product(&[len, 4])?, state])?;
+    }
+    Ok(bytes)
 }
 
 fn embedding_attributes(

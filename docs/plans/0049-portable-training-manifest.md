@@ -112,7 +112,7 @@ semantics, reject duplicate/unknown/type/order drift, and re-emit byte-identical
 canonical JSON. Python passed the complete 92-test suite; Deno type-check and
 three parser tests passed. Slice 2 is next.
 
-The Slice 2 tracer corpus now carries 105 cases across 31 of 35 operations. In
+The Slice 2 tracer corpus now carries 114 cases across all 35 operations. In
 addition to the primitive and shape clusters, it covers `graph.ste_surrogate`,
 bounded multi-plane `graph.salt_ste`, `graph.lsq_ste`, configurable `graph.fsq`,
 grouped/depthwise asymmetric `graph.conv1d` and `graph.conv2d`, `graph.dense_matmul`,
@@ -125,15 +125,17 @@ positions, and projection-free causal/noncausal grouped-query
 `graph.concat_cols`, each in forward and VJP phases. Stateful vectors exercise
 resumed AdamW, masked Cautious AdamW, block-boundary quiet/spike Int8 AdamW,
 and rectangular Muon state transitions. Int8 optimizer planes use canonical
-two's-complement bytes for q8 state and f32 block scales. Error sentinels cover shape
+two's-complement bytes for q8 state and f32 block scales. Lifecycle vectors bind
+multi-leaf TOPT checkpoint/resume and strict SALT V2 package export/reload.
+Error sentinels cover shape
 mismatch, invalid quantizer geometry/configuration, out-of-range tokens, slice
 bounds, concat geometry, non-finite input, and an intentionally malformed
 duplicate-input request.
 A generic testkit runner poisons success outputs, preserves error sentinels,
 grades structured error identity, independently recomputes request/output
 receipt digests, and binds every successful receipt to the exact corpus bytes.
-This is incremental evidence, not Slice 2 closure: the remaining 4 lifecycle operations
-and their adversarial/error matrices are still required.
+This closes Slice 2 corpus coverage and the CPU semantic matrix; accelerator and
+constrained-target receipts remain required for release closure.
 
 Edits:
 

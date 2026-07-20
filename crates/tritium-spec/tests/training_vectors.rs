@@ -182,6 +182,10 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "optimizer.cautious_adamw.step.masked_state",
             "optimizer.int8_adamw.step.quiet_spike_blocks",
             "optimizer.muon.step.resumed_rectangular",
+            "lifecycle.checkpoint.adamw_multileaf",
+            "lifecycle.resume.adamw_multileaf",
+            "lifecycle.export.salt_v2_package",
+            "lifecycle.reload.salt_v2_package",
             "graph.add.forward.nonfinite",
             "graph.add.forward.duplicate_input",
             "graph.transpose.forward.shape_error",
@@ -219,6 +223,11 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "optimizer.cautious_adamw.step.invalid_beta1",
             "optimizer.int8_adamw.step.scale_shape",
             "optimizer.muon.step.zero_ns_steps",
+            "lifecycle.checkpoint.negative_second_moment",
+            "lifecycle.resume.bad_magic",
+            "lifecycle.resume.negative_second_moment",
+            "lifecycle.export.unknown_format",
+            "lifecycle.reload.bad_magic",
             "graph.attention.forward.ragged_gqa",
             "graph.attention.forward.product_limit",
         ]
@@ -226,6 +235,6 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "a5d90a5fcdb9c545fd12a87f07af36659c7a159bed2dae96337f19329f48d836"
+        "d5e3c4f3a9e33e5e2649e0ab3fd4e0e89899a1d4f68ad418ac2f91844c9c56ab"
     );
 }

@@ -13,7 +13,7 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
     let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json()).unwrap();
     let report = run_training_conformance(&CpuTrainBackendV1::new(), &vectors);
     assert!(report.is_ok(), "{:#?}", report.failed);
-    assert_eq!(report.passed.len(), 105);
+    assert_eq!(report.passed.len(), 114);
     let mut receipt_count = 0;
     let mut checked_conv2d_scratch = false;
     let mut checked_attention_forward_scratch = false;
@@ -21,6 +21,7 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
     let mut checked_int8_adam_scratch = false;
     let mut checked_muon_scratch = false;
     let mut checked_optimizer_scratch = [false; 4];
+    let mut checked_lifecycle_scratch = [false; 4];
     for passed in report.passed {
         if let Some(receipt) = passed.receipt {
             receipt_count += 1;
@@ -58,9 +59,21 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
                     checked_optimizer_scratch[index] = true;
                 }
             }
+            let lifecycle_scratch = [
+                ("lifecycle.checkpoint.adamw_multileaf", 153),
+                ("lifecycle.resume.adamw_multileaf", 60),
+                ("lifecycle.export.salt_v2_package", 240),
+                ("lifecycle.reload.salt_v2_package", 240),
+            ];
+            for (index, &(case_id, scratch_bytes)) in lifecycle_scratch.iter().enumerate() {
+                if passed.case_id == case_id {
+                    assert_eq!(receipt.scratch_bytes, scratch_bytes);
+                    checked_lifecycle_scratch[index] = true;
+                }
+            }
         }
     }
-    assert_eq!(receipt_count, 66);
+    assert_eq!(receipt_count, 70);
     assert!(checked_conv2d_scratch);
     assert!(checked_attention_forward_scratch);
     assert!(checked_attention_vjp_scratch);
@@ -68,6 +81,11 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
     assert!(checked_muon_scratch);
     assert!(
         checked_optimizer_scratch
+            .into_iter()
+            .all(core::convert::identity)
+    );
+    assert!(
+        checked_lifecycle_scratch
             .into_iter()
             .all(core::convert::identity)
     );
@@ -105,6 +123,10 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
             "optimizer.cautious_adamw",
             "optimizer.int8_adamw",
             "optimizer.muon",
+            "lifecycle.checkpoint",
+            "lifecycle.resume",
+            "lifecycle.export",
+            "lifecycle.reload",
         ]
     );
 }

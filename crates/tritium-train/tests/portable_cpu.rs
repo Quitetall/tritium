@@ -50,6 +50,10 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
             "optimizer.cautious_adamw",
             "optimizer.int8_adamw",
             "optimizer.muon",
+            "lifecycle.checkpoint",
+            "lifecycle.resume",
+            "lifecycle.export",
+            "lifecycle.reload",
         ]
     );
     assert_eq!(capabilities.manifest_digest, TrainingOpManifestV1::digest());
@@ -189,7 +193,7 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
         TrainBufferDataRefV1::F32(&input),
     )];
     let request = TrainRequestV1::new(
-        "lifecycle.checkpoint",
+        "lifecycle.unknown",
         TrainExecutionV1::Checkpoint,
         &inputs,
         &[],
@@ -203,7 +207,7 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
     let mut output = TrainOutputV1::new(&mut buffers);
     assert!(matches!(
         backend.execute(request, &mut output),
-        Err(TrainBackendError::UnsupportedOperation(operation)) if operation == "lifecycle.checkpoint"
+        Err(TrainBackendError::InvalidRequest(_))
     ));
     assert_eq!(sentinel, [123.0]);
 

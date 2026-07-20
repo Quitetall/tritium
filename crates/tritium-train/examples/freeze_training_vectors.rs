@@ -8,10 +8,16 @@
 
 use std::path::Path;
 
+use half::f16;
 use serde::Serialize;
+use tritium_format::salt_v2::SaltV2Codec;
+use tritium_format::salt_v2_package::{
+    SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
+};
 use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
 use tritium_train::{
-    AdamW, CautiousAdamW, Int8AdamW, Muon, Optimizer, Sgd,
+    AdamState, AdamW, CautiousAdamW, Int8AdamW, Muon, Optimizer, Sgd,
+    checkpoint::{Checkpoint, LeafCheckpoint, write_checkpoint},
     ops::{
         act, attention, bias, conv1d, conv2d, dense, elementwise, embed,
         fsq::{self, FsqBound, FsqCfg, FsqSte},
@@ -604,6 +610,45 @@ fn main() {
     let muon_input_momentum = muon_state.momentum.clone();
     let mut muon_updated = muon_parameter;
     muon_config.step(2, &mut muon_updated, &muon_gradient, &mut muon_state);
+
+    let checkpoint = Checkpoint {
+        step: 7,
+        leaves: vec![
+            LeafCheckpoint {
+                param: vec![1.0_f32, -2.0, 3.0],
+                state: AdamState {
+                    m: vec![0.1, -0.2, 0.3],
+                    v: vec![0.01, 0.04, 0.09],
+                },
+            },
+            LeafCheckpoint {
+                param: vec![4.0_f32, -5.0],
+                state: AdamState {
+                    m: vec![0.4, -0.5],
+                    v: vec![0.16, 0.25],
+                },
+            },
+        ],
+    };
+    let checkpoint_bytes = write_checkpoint(&adam_config, &checkpoint);
+    let mut corrupt_checkpoint = checkpoint_bytes.clone();
+    corrupt_checkpoint[0] ^= u8::MAX;
+    let mut invalid_state_checkpoint = checkpoint.clone();
+    invalid_state_checkpoint.leaves[0].state.v[1] = -0.04;
+    let invalid_state_checkpoint_bytes = write_checkpoint(&adam_config, &invalid_state_checkpoint);
+
+    let hard_plane = SaltV2Plane::new(vec![-1, 0, 1, 1, 0, -1], vec![f16::from_f32(0.5)])
+        .expect("valid hard plane");
+    let hard_tile = SaltV2Tile::new(vec![hard_plane]).expect("valid hard tile");
+    let hard_tensor =
+        SaltV2Tensor::new("model.weight", vec![2, 3], vec![hard_tile]).expect("valid hard tensor");
+    let hard_package =
+        SaltV2Package::new(SaltV2Codec::D2, vec![hard_tensor]).expect("valid hard package");
+    let hard_artifact = write_salt_v2_package(&hard_package)
+        .expect("encode hard package")
+        .bytes;
+    let mut corrupt_artifact = hard_artifact.clone();
+    corrupt_artifact[0] ^= u8::MAX;
 
     let corpus = Corpus {
         schema_id: TrainingVectorSetV1::SCHEMA_ID,
@@ -2143,6 +2188,93 @@ fn main() {
                 },
             },
             Case {
+                case_id: "lifecycle.checkpoint.adamw_multileaf",
+                operation: "lifecycle.checkpoint",
+                execution: "checkpoint",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter.0", &[3], &checkpoint.leaves[0].param),
+                    f32_buffer("moment1.0", &[3], &checkpoint.leaves[0].state.m),
+                    f32_buffer("moment2.0", &[3], &checkpoint.leaves[0].state.v),
+                    f32_buffer("parameter.1", &[2], &checkpoint.leaves[1].param),
+                    f32_buffer("moment1.1", &[2], &checkpoint.leaves[1].state.m),
+                    f32_buffer("moment2.1", &[2], &checkpoint.leaves[1].state.v),
+                ],
+                attributes: checkpoint_attributes("adamw", checkpoint.step, &[3, 2]),
+                expected: Expected::Success {
+                    outputs: vec![bytes_buffer(
+                        "checkpoint",
+                        &[checkpoint_bytes.len() as u64],
+                        &checkpoint_bytes,
+                    )],
+                    scratch_bytes_max: checkpoint_bytes.len() as u64 + 60,
+                },
+            },
+            Case {
+                case_id: "lifecycle.resume.adamw_multileaf",
+                operation: "lifecycle.resume",
+                execution: "resume",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![bytes_buffer(
+                    "checkpoint",
+                    &[checkpoint_bytes.len() as u64],
+                    &checkpoint_bytes,
+                )],
+                attributes: resume_attributes("adamw", &[3, 2]),
+                expected: Expected::Success {
+                    outputs: vec![
+                        bytes_buffer("step", &[8], &checkpoint.step.to_le_bytes()),
+                        f32_buffer("parameter.0", &[3], &checkpoint.leaves[0].param),
+                        f32_buffer("moment1.0", &[3], &checkpoint.leaves[0].state.m),
+                        f32_buffer("moment2.0", &[3], &checkpoint.leaves[0].state.v),
+                        f32_buffer("parameter.1", &[2], &checkpoint.leaves[1].param),
+                        f32_buffer("moment1.1", &[2], &checkpoint.leaves[1].state.m),
+                        f32_buffer("moment2.1", &[2], &checkpoint.leaves[1].state.v),
+                    ],
+                    scratch_bytes_max: 60,
+                },
+            },
+            Case {
+                case_id: "lifecycle.export.salt_v2_package",
+                operation: "lifecycle.export",
+                execution: "export",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![bytes_buffer(
+                    "package",
+                    &[hard_artifact.len() as u64],
+                    &hard_artifact,
+                )],
+                attributes: artifact_attributes(),
+                expected: Expected::Success {
+                    outputs: vec![bytes_buffer(
+                        "artifact",
+                        &[hard_artifact.len() as u64],
+                        &hard_artifact,
+                    )],
+                    scratch_bytes_max: (hard_artifact.len() * 2) as u64,
+                },
+            },
+            Case {
+                case_id: "lifecycle.reload.salt_v2_package",
+                operation: "lifecycle.reload",
+                execution: "reload",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![bytes_buffer(
+                    "artifact",
+                    &[hard_artifact.len() as u64],
+                    &hard_artifact,
+                )],
+                attributes: artifact_attributes(),
+                expected: Expected::Success {
+                    outputs: vec![bytes_buffer(
+                        "package",
+                        &[hard_artifact.len() as u64],
+                        &hard_artifact,
+                    )],
+                    scratch_bytes_max: (hard_artifact.len() * 2) as u64,
+                },
+            },
+            Case {
                 case_id: "graph.add.forward.nonfinite",
                 operation: "graph.add",
                 execution: "forward",
@@ -3000,6 +3132,125 @@ fn main() {
                 },
             },
             Case {
+                case_id: "lifecycle.checkpoint.negative_second_moment",
+                operation: "lifecycle.checkpoint",
+                execution: "checkpoint",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter.0", &[3], &checkpoint.leaves[0].param),
+                    f32_buffer("moment1.0", &[3], &checkpoint.leaves[0].state.m),
+                    f32_buffer("moment2.0", &[3], &[0.01, -0.04, 0.09]),
+                    f32_buffer("parameter.1", &[2], &checkpoint.leaves[1].param),
+                    f32_buffer("moment1.1", &[2], &checkpoint.leaves[1].state.m),
+                    f32_buffer("moment2.1", &[2], &checkpoint.leaves[1].state.v),
+                ],
+                attributes: checkpoint_attributes("adamw", checkpoint.step, &[3, 2]),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.moment2.nonnegative",
+                    outputs: vec![bytes_buffer(
+                        "checkpoint",
+                        &[checkpoint_bytes.len() as u64],
+                        &vec![123; checkpoint_bytes.len()],
+                    )],
+                },
+            },
+            Case {
+                case_id: "lifecycle.resume.bad_magic",
+                operation: "lifecycle.resume",
+                execution: "resume",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![bytes_buffer(
+                    "checkpoint",
+                    &[corrupt_checkpoint.len() as u64],
+                    &corrupt_checkpoint,
+                )],
+                attributes: resume_attributes("adamw", &[3, 2]),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.checkpoint.bad_magic",
+                    outputs: vec![
+                        bytes_buffer("step", &[8], &[123; 8]),
+                        f32_buffer("parameter.0", &[3], &[123.0; 3]),
+                        f32_buffer("moment1.0", &[3], &[234.0; 3]),
+                        f32_buffer("moment2.0", &[3], &[345.0; 3]),
+                        f32_buffer("parameter.1", &[2], &[123.0; 2]),
+                        f32_buffer("moment1.1", &[2], &[234.0; 2]),
+                        f32_buffer("moment2.1", &[2], &[345.0; 2]),
+                    ],
+                },
+            },
+            Case {
+                case_id: "lifecycle.resume.negative_second_moment",
+                operation: "lifecycle.resume",
+                execution: "resume",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![bytes_buffer(
+                    "checkpoint",
+                    &[invalid_state_checkpoint_bytes.len() as u64],
+                    &invalid_state_checkpoint_bytes,
+                )],
+                attributes: resume_attributes("adamw", &[3, 2]),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.moment2.nonnegative",
+                    outputs: vec![
+                        bytes_buffer("step", &[8], &[123; 8]),
+                        f32_buffer("parameter.0", &[3], &[123.0; 3]),
+                        f32_buffer("moment1.0", &[3], &[234.0; 3]),
+                        f32_buffer("moment2.0", &[3], &[345.0; 3]),
+                        f32_buffer("parameter.1", &[2], &[123.0; 2]),
+                        f32_buffer("moment1.1", &[2], &[234.0; 2]),
+                        f32_buffer("moment2.1", &[2], &[345.0; 2]),
+                    ],
+                },
+            },
+            Case {
+                case_id: "lifecycle.export.unknown_format",
+                operation: "lifecycle.export",
+                execution: "export",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![bytes_buffer(
+                    "package",
+                    &[hard_artifact.len() as u64],
+                    &hard_artifact,
+                )],
+                attributes: vec![Attribute::Text {
+                    name: "format",
+                    value: "legacy_salt_bundle",
+                }],
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.format.salt_v2_package_v1",
+                    outputs: vec![bytes_buffer(
+                        "artifact",
+                        &[hard_artifact.len() as u64],
+                        &vec![123; hard_artifact.len()],
+                    )],
+                },
+            },
+            Case {
+                case_id: "lifecycle.reload.bad_magic",
+                operation: "lifecycle.reload",
+                execution: "reload",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![bytes_buffer(
+                    "artifact",
+                    &[corrupt_artifact.len() as u64],
+                    &corrupt_artifact,
+                )],
+                attributes: artifact_attributes(),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.artifact.salt_v2_package",
+                    outputs: vec![bytes_buffer(
+                        "package",
+                        &[hard_artifact.len() as u64],
+                        &vec![123; hard_artifact.len()],
+                    )],
+                },
+            },
+            Case {
                 case_id: "graph.attention.forward.ragged_gqa",
                 operation: "graph.attention",
                 execution: "forward",
@@ -3189,4 +3440,41 @@ fn muon_attributes(step: u64, config: &Muon) -> Vec<Attribute> {
             value: config.ns_steps as u64,
         },
     ]
+}
+
+fn checkpoint_attributes(optimizer: &'static str, step: u64, leaf_lens: &[u64]) -> Vec<Attribute> {
+    vec![
+        Attribute::Text {
+            name: "optimizer",
+            value: optimizer,
+        },
+        Attribute::U64 {
+            name: "step",
+            value: step,
+        },
+        Attribute::U64List {
+            name: "leaf_lens",
+            values: leaf_lens.to_vec(),
+        },
+    ]
+}
+
+fn resume_attributes(optimizer: &'static str, leaf_lens: &[u64]) -> Vec<Attribute> {
+    vec![
+        Attribute::Text {
+            name: "optimizer",
+            value: optimizer,
+        },
+        Attribute::U64List {
+            name: "leaf_lens",
+            values: leaf_lens.to_vec(),
+        },
+    ]
+}
+
+fn artifact_attributes() -> Vec<Attribute> {
+    vec![Attribute::Text {
+        name: "format",
+        value: "salt_v2_package_v1",
+    }]
 }
