@@ -166,6 +166,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             result[index] = gradient;
         }
+        case 21u: { result[index] = left[index] - params.scalar * right[index]; }
         default: { result[index] = 0.0; }
     }
 }

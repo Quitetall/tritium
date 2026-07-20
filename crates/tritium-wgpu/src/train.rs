@@ -21,6 +21,7 @@ const OPERATIONS: &[&str] = &[
     "graph.rmsnorm",
     "graph.softmax",
     "loss.mse",
+    "optimizer.sgd",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -466,6 +467,52 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_sgd(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        if request.execution != TrainExecutionV1::Step {
+            return Err(invariant("SGD received an illegal phase"));
+        }
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &["parameter", "gradient"],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["step", "lr"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &["parameter"],
+            "outputs",
+        )?;
+        let step = attribute_u64(request, "step")?;
+        let learning_rate = attribute_f32(request, "lr")?;
+        if step == 0 {
+            return Err(attribute_value("step", "one_based"));
+        }
+        if learning_rate < 0.0 {
+            return Err(attribute_value("lr", "nonnegative"));
+        }
+        let (shape, parameter) = input_f32(request, "parameter")?;
+        let (gradient_shape, gradient) = input_f32(request, "gradient")?;
+        if shape != gradient_shape {
+            return Err(shape_error());
+        }
+        require_finite("parameter", parameter)?;
+        require_finite("gradient", gradient)?;
+        let updated = self
+            .backend
+            .pointwise(parameter, gradient, parameter, 21, learning_rate, 0)
+            .map_err(wgpu_error)?;
+        output_f32(output, "parameter", shape, parameter.len())?.copy_from_slice(&updated);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -507,6 +554,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.bias" {
             self.execute_bias(&request, output)?;
+            0
+        } else if request.operation == "optimizer.sgd" {
+            self.execute_sgd(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
