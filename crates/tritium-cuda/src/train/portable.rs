@@ -50,6 +50,10 @@ const OPERATIONS: &[&str] = &[
     "optimizer.cautious_adamw",
     "optimizer.int8_adamw",
     "optimizer.muon",
+    "lifecycle.checkpoint",
+    "lifecycle.resume",
+    "lifecycle.export",
+    "lifecycle.reload",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -2460,7 +2464,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
                 .iter()
                 .map(|operation| (*operation).to_owned())
                 .collect(),
-            dtypes: vec![TrainDTypeV1::F32],
+            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::Bytes],
             limits: LIMITS,
             device_resident: true,
         }
@@ -2505,6 +2509,12 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "optimizer.cautious_adamw" => self.execute_adamw(&request, output, true)?,
             "optimizer.int8_adamw" => self.execute_int8_adamw(&request, output)?,
             "optimizer.muon" => self.execute_muon(&request, output)?,
+            "lifecycle.checkpoint"
+            | "lifecycle.resume"
+            | "lifecycle.export"
+            | "lifecycle.reload" => {
+                tritium_train::portable::execute_lifecycle_control_plane(&request, output)?;
+            }
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
@@ -2565,6 +2575,9 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
                     .and_then(|elements| elements.checked_mul(size_of::<f32>() as u64))
                     .ok_or_else(shape_error)?
             }
+            (operation, _execution) if operation.starts_with("lifecycle.") => {
+                tritium_train::portable::lifecycle_control_plane_scratch_bytes(&request)?
+            }
             _ => 0,
         };
         Ok(TrainReceiptV1 {
@@ -2575,7 +2588,11 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             vector_digest: request.vector_digest,
             operation: request.operation.to_owned(),
             execution: request.execution,
-            dtype: TrainDTypeV1::F32,
+            dtype: if request.operation.starts_with("lifecycle.") {
+                TrainDTypeV1::Bytes
+            } else {
+                TrainDTypeV1::F32
+            },
             limits: LIMITS,
             input_digest,
             output_digest: train_output_digest_v1(output),

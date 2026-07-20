@@ -3038,6 +3038,46 @@ fn lifecycle_reload(
     Ok(())
 }
 
+/// Execute one canonical lifecycle operation shared by accelerator adapters.
+///
+/// Lifecycle payloads are host-visible control-plane bytes by contract. This
+/// helper performs serialization and strict artifact validation only; it never
+/// invokes the CPU tensor backend or executes graph/optimizer work.
+pub fn execute_lifecycle_control_plane(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    match (request.operation, request.execution) {
+        ("lifecycle.checkpoint", TrainExecutionV1::Checkpoint) => {
+            lifecycle_checkpoint(request, output)
+        }
+        ("lifecycle.resume", TrainExecutionV1::Resume) => lifecycle_resume(request, output),
+        ("lifecycle.export", TrainExecutionV1::Export) => lifecycle_export(request, output),
+        ("lifecycle.reload", TrainExecutionV1::Reload) => lifecycle_reload(request, output),
+        _ => Err(TrainBackendError::UnsupportedOperation(
+            request.operation.to_owned(),
+        )),
+    }
+}
+
+/// Return the canonical peak scratch ledger for a lifecycle request.
+pub fn lifecycle_control_plane_scratch_bytes(
+    request: &TrainRequestV1<'_>,
+) -> Result<u64, TrainBackendError> {
+    let operation = match request.operation {
+        "lifecycle.checkpoint" => CpuOperation::Checkpoint,
+        "lifecycle.resume" => CpuOperation::Resume,
+        "lifecycle.export" => CpuOperation::Export,
+        "lifecycle.reload" => CpuOperation::Reload,
+        operation => {
+            return Err(TrainBackendError::UnsupportedOperation(
+                operation.to_owned(),
+            ));
+        }
+    };
+    operation_scratch_bytes(operation, request.execution, request)
+}
+
 #[derive(Clone, Copy)]
 enum FsqBoundKind {
     Clamp,
