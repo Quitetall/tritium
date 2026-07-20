@@ -952,6 +952,7 @@ mod tests {
         k: &[Vec<f32>],
         v: &[Vec<f32>],
         o: &[Vec<f32>],
+        attention_gate: Option<&[Vec<f32>]>,
         gate: &[Vec<f32>],
         up: &[Vec<f32>],
         down: &[Vec<f32>],
@@ -963,9 +964,11 @@ mod tests {
         ffn_sub_norm: Option<&[f32]>,
         activation: crate::CausalActivation,
         final_norm: &[f32],
+        lm_head: Option<&[Vec<f32>]>,
         n_head: usize,
         n_kv_head: usize,
         head_dim: usize,
+        rotary_dim: usize,
         rope_theta: f32,
         epsilon: f32,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -979,6 +982,7 @@ mod tests {
             tokens.len(),
             n_head,
             head_dim,
+            rotary_dim,
             past_k.len() / (n_kv_head * head_dim),
             rope_theta,
         );
@@ -987,6 +991,7 @@ mod tests {
             tokens.len(),
             n_kv_head,
             head_dim,
+            rotary_dim,
             past_k.len() / (n_kv_head * head_dim),
             rope_theta,
         );
@@ -1004,8 +1009,16 @@ mod tests {
             past_k.len() / (n_kv_head * head_dim),
         )
         .unwrap();
-        let output_input = attention_sub_norm.map_or(context.clone(), |weight| {
-            rms_norm(&context, weight, epsilon)
+        let gated_context = attention_gate.map_or(context.clone(), |weight| {
+            let gates = dense_project(&attention_input, weight);
+            context
+                .iter()
+                .zip(gates)
+                .map(|(value, gate)| value * (1.0 / (1.0 + (-gate).exp())))
+                .collect()
+        });
+        let output_input = attention_sub_norm.map_or(gated_context.clone(), |weight| {
+            rms_norm(&gated_context, weight, epsilon)
         });
         let attention_output = dense_project(&output_input, o);
         let post_attention: Vec<f32> = hidden
@@ -1037,7 +1050,7 @@ mod tests {
             .map(|(residual, update)| residual + update)
             .collect();
         let final_hidden = rms_norm(&post_ffn, final_norm, epsilon);
-        let logits = dense_project(&final_hidden, embedding);
+        let logits = dense_project(&final_hidden, lm_head.unwrap_or(embedding));
         (logits, present_k, present_v)
     }
 
@@ -1046,18 +1059,19 @@ mod tests {
         tokens: usize,
         heads: usize,
         head_dim: usize,
+        rotary_dim: usize,
         past_tokens: usize,
         theta: f32,
     ) -> Vec<f32> {
-        let half = head_dim / 2;
-        let mut output = vec![0.0; input.len()];
+        let half = rotary_dim / 2;
+        let mut output = input.to_vec();
         for token in 0..tokens {
             let position = (past_tokens + token) as f64;
             for head in 0..heads {
                 let base = (token * heads + head) * head_dim;
                 for lane in 0..half {
                     let angle =
-                        position * f64::from(theta).powf(-2.0 * lane as f64 / head_dim as f64);
+                        position * f64::from(theta).powf(-2.0 * lane as f64 / rotary_dim as f64);
                     let (sin, cos) = angle.sin_cos();
                     let first = input[base + lane];
                     let second = input[base + half + lane];
@@ -1074,7 +1088,7 @@ mod tests {
         use ort::value::Tensor;
 
         let format = TernaryFormat::Tq2_0;
-        let dense_embedding = vec![
+        let dense_embedding: Vec<Vec<f32>> = vec![
             (0..16).map(|lane| f32::from(lane % 2 == 0)).collect(),
             (0..16).map(|lane| f32::from(lane % 2 == 1)).collect(),
             (0..16)
@@ -1086,6 +1100,11 @@ mod tests {
                 .collect(),
         ];
         let dense_q = identity_matrix(16);
+        let dense_lm_head = vec![
+            dense_embedding[1].clone(),
+            dense_embedding[2].clone(),
+            dense_embedding[0].clone(),
+        ];
         let dense_k = (0..8)
             .map(|row| {
                 let mut values = vec![0.0; 16];
@@ -1116,6 +1135,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let embedding_packed = pack_rows(&trits(&dense_embedding), format);
+        let lm_head_packed = pack_rows(&trits(&dense_lm_head), TernaryFormat::Tq1_0);
         let q_packed = pack_rows(&trits(&dense_q), format);
         let k_packed = pack_rows(&trits(&dense_k), format);
         let v_packed = pack_rows(&trits(&dense_v), format);
@@ -1147,6 +1167,7 @@ mod tests {
             key: packed_matrix(8, 16, &k_packed, &eight_scales, format),
             value: packed_matrix(8, 16, &v_packed, &eight_scales, format),
             attention_output: packed_matrix(16, 16, &o_packed, &sixteen_scales, format),
+            attention_gate: None,
             attention_sub_norm: None,
             ffn_norm: &ffn_norm,
             gate: packed_matrix(16, 16, &gate_packed, &sixteen_scales, format),
@@ -1165,7 +1186,14 @@ mod tests {
             deferred_coverage_id: "tiny-deferred",
         };
         let embedding = packed_matrix(3, 16, &embedding_packed, &embedding_scales, format);
-        let encode_result = |tokens, past_tokens, layer, rotary| {
+        let lm_head = packed_matrix(
+            3,
+            16,
+            &lm_head_packed,
+            &embedding_scales,
+            TernaryFormat::Tq1_0,
+        );
+        let encode_result = |tokens, past_tokens, layer, rotary, lm_head| {
             crate::encode_causal_lm(crate::CausalLmModel {
                 tokens,
                 past_tokens,
@@ -1175,6 +1203,7 @@ mod tests {
                 rotary,
                 rms_epsilon: epsilon,
                 embedding,
+                lm_head,
                 layers: std::slice::from_ref(&layer),
                 final_norm: &final_norm,
                 identity,
@@ -1185,7 +1214,11 @@ mod tests {
                 tokens,
                 past_tokens,
                 layer,
-                Some(crate::RotaryEmbedding { theta: rope_theta }),
+                Some(crate::RotaryEmbedding {
+                    theta: rope_theta,
+                    dimensions: 4,
+                }),
+                None,
             )
             .unwrap()
         };
@@ -1194,7 +1227,11 @@ mod tests {
                 1,
                 0,
                 layer,
-                Some(crate::RotaryEmbedding { theta: f32::NAN })
+                Some(crate::RotaryEmbedding {
+                    theta: f32::NAN,
+                    dimensions: 4,
+                }),
+                None,
             )
             .is_err()
         );
@@ -1207,7 +1244,11 @@ mod tests {
                     query_norm: Some(&short_norm),
                     ..layer
                 },
-                Some(crate::RotaryEmbedding { theta: rope_theta })
+                Some(crate::RotaryEmbedding {
+                    theta: rope_theta,
+                    dimensions: 4,
+                }),
+                None,
             )
             .is_err()
         );
@@ -1216,7 +1257,7 @@ mod tests {
             key_norm: None,
             ..layer
         };
-        let plain = encode_result(1, 0, plain_layer, None).unwrap();
+        let plain = encode_result(1, 0, plain_layer, None, None).unwrap();
         assert!(
             crate::diagnose_unsupported_graph(&plain)
                 .unwrap()
@@ -1233,6 +1274,7 @@ mod tests {
             &dense_k,
             &dense_v,
             &dense_o,
+            None,
             &dense_gate,
             &dense_up,
             &dense_down,
@@ -1244,14 +1286,199 @@ mod tests {
             None,
             crate::CausalActivation::SwiGlu,
             &final_norm,
+            None,
             4,
             2,
+            4,
             4,
             rope_theta,
             epsilon,
         );
         let prompt_model = encode(2, 0);
         assert_eq!(prompt_model, encode(2, 0));
+        let (untied_expected, _, _) = reference_causal_lm(
+            &prompt_tokens,
+            &[],
+            &[],
+            &dense_embedding,
+            &dense_q,
+            &dense_k,
+            &dense_v,
+            &dense_o,
+            None,
+            &dense_gate,
+            &dense_up,
+            &dense_down,
+            &attention_norm,
+            &query_norm,
+            &key_norm,
+            &ffn_norm,
+            None,
+            None,
+            crate::CausalActivation::SwiGlu,
+            &final_norm,
+            Some(&dense_lm_head),
+            4,
+            2,
+            4,
+            4,
+            rope_theta,
+            epsilon,
+        );
+        let untied_model = encode_result(
+            2,
+            0,
+            layer,
+            Some(crate::RotaryEmbedding {
+                theta: rope_theta,
+                dimensions: 4,
+            }),
+            Some(lm_head),
+        )
+        .unwrap();
+        let mut untied_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&untied_model)
+            .unwrap();
+        let untied_tokens =
+            Tensor::from_array(([2], prompt_tokens.clone().into_boxed_slice())).unwrap();
+        let untied_outputs = untied_session.run(ort::inputs![&untied_tokens]).unwrap();
+        let (_, untied_logits) = untied_outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(untied_logits, &untied_expected, 2.0e-5);
+        assert_ne!(untied_logits, expected_logits.as_slice());
+        let partial_query_norm = [1.0, 0.5, 1.25, 0.75, 0.8, 1.1, 0.6, 1.4];
+        let partial_key_norm = [0.75, 1.25, 0.6, 1.4, 1.0, 0.9, 1.2, 0.7];
+        let (partial_rope_expected, _, _) = reference_causal_lm(
+            &prompt_tokens,
+            &[],
+            &[],
+            &dense_embedding,
+            &dense_q,
+            &dense_k,
+            &dense_v,
+            &dense_o,
+            None,
+            &dense_gate,
+            &dense_up,
+            &dense_down,
+            &attention_norm,
+            &partial_query_norm,
+            &partial_key_norm,
+            &ffn_norm,
+            None,
+            None,
+            crate::CausalActivation::SwiGlu,
+            &final_norm,
+            None,
+            2,
+            1,
+            8,
+            4,
+            rope_theta,
+            epsilon,
+        );
+        let partial_rope_layer = crate::CausalLmDecoderLayer {
+            query_norm: Some(&partial_query_norm),
+            key_norm: Some(&partial_key_norm),
+            ..layer
+        };
+        let partial_rope_model = crate::encode_causal_lm(crate::CausalLmModel {
+            tokens: 2,
+            past_tokens: 0,
+            n_head: 2,
+            n_kv_head: 1,
+            head_dim: 8,
+            rotary: Some(crate::RotaryEmbedding {
+                theta: rope_theta,
+                dimensions: 4,
+            }),
+            rms_epsilon: epsilon,
+            embedding,
+            lm_head: None,
+            layers: std::slice::from_ref(&partial_rope_layer),
+            final_norm: &final_norm,
+            identity,
+        })
+        .unwrap();
+        let mut partial_rope_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&partial_rope_model)
+            .unwrap();
+        let partial_rope_tokens =
+            Tensor::from_array(([2], prompt_tokens.clone().into_boxed_slice())).unwrap();
+        let partial_rope_outputs = partial_rope_session
+            .run(ort::inputs![&partial_rope_tokens])
+            .unwrap();
+        let (_, partial_rope_logits) = partial_rope_outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(partial_rope_logits, &partial_rope_expected, 2.0e-5);
+        assert_ne!(partial_rope_logits, expected_logits.as_slice());
+        let gate_sub_norm = (0..16)
+            .map(|lane| 0.9 + 0.025 * lane as f32)
+            .collect::<Vec<_>>();
+        let (attention_gate_expected, _, _) = reference_causal_lm(
+            &prompt_tokens,
+            &[],
+            &[],
+            &dense_embedding,
+            &dense_q,
+            &dense_k,
+            &dense_v,
+            &dense_o,
+            Some(&dense_q),
+            &dense_gate,
+            &dense_up,
+            &dense_down,
+            &attention_norm,
+            &query_norm,
+            &key_norm,
+            &ffn_norm,
+            Some(&gate_sub_norm),
+            None,
+            crate::CausalActivation::SwiGlu,
+            &final_norm,
+            None,
+            4,
+            2,
+            4,
+            4,
+            rope_theta,
+            epsilon,
+        );
+        let attention_gate_model = encode_result(
+            2,
+            0,
+            crate::CausalLmDecoderLayer {
+                attention_gate: Some(packed_matrix(16, 16, &q_packed, &sixteen_scales, format)),
+                attention_sub_norm: Some(&gate_sub_norm),
+                ..layer
+            },
+            Some(crate::RotaryEmbedding {
+                theta: rope_theta,
+                dimensions: 4,
+            }),
+            None,
+        )
+        .unwrap();
+        let mut attention_gate_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&attention_gate_model)
+            .unwrap();
+        let attention_gate_tokens =
+            Tensor::from_array(([2], prompt_tokens.clone().into_boxed_slice())).unwrap();
+        let attention_gate_outputs = attention_gate_session
+            .run(ort::inputs![&attention_gate_tokens])
+            .unwrap();
+        let (_, attention_gate_logits) = attention_gate_outputs[0]
+            .try_extract_tensor::<f32>()
+            .unwrap();
+        assert_f32_close(attention_gate_logits, &attention_gate_expected, 2.0e-5);
+        assert_ne!(attention_gate_logits, expected_logits.as_slice());
         let attention_sub_norm = (0..16)
             .map(|lane| 0.8 + 0.03 * lane as f32)
             .collect::<Vec<_>>();
@@ -1268,7 +1495,11 @@ mod tests {
             2,
             0,
             bitnet_layer,
-            Some(crate::RotaryEmbedding { theta: rope_theta }),
+            Some(crate::RotaryEmbedding {
+                theta: rope_theta,
+                dimensions: 4,
+            }),
+            None,
         )
         .unwrap();
         assert!(
@@ -1285,6 +1516,7 @@ mod tests {
             &dense_k,
             &dense_v,
             &dense_o,
+            None,
             &dense_gate,
             &dense_up,
             &dense_down,
@@ -1296,8 +1528,10 @@ mod tests {
             Some(&ffn_sub_norm),
             crate::CausalActivation::Relu2,
             &final_norm,
+            None,
             4,
             2,
+            4,
             4,
             rope_theta,
             epsilon,
@@ -1321,7 +1555,11 @@ mod tests {
                     ffn_sub_norm: Some(&short_norm),
                     ..bitnet_layer
                 },
-                Some(crate::RotaryEmbedding { theta: rope_theta }),
+                Some(crate::RotaryEmbedding {
+                    theta: rope_theta,
+                    dimensions: 4,
+                }),
+                None,
             )
             .is_err()
         );
@@ -1331,9 +1569,13 @@ mod tests {
             n_head: 4,
             n_kv_head: 2,
             head_dim: 4,
-            rotary: Some(crate::RotaryEmbedding { theta: rope_theta }),
+            rotary: Some(crate::RotaryEmbedding {
+                theta: rope_theta,
+                dimensions: 4,
+            }),
             rms_epsilon: epsilon,
             embedding,
+            lm_head: None,
             layers: std::slice::from_ref(&layer),
             final_norm: &final_norm,
             identity,
@@ -1369,7 +1611,11 @@ mod tests {
                 1,
                 oversized_past,
                 layer,
-                Some(crate::RotaryEmbedding { theta: rope_theta }),
+                Some(crate::RotaryEmbedding {
+                    theta: rope_theta,
+                    dimensions: 4,
+                }),
+                None,
             )
             .is_err()
         );
@@ -1379,9 +1625,13 @@ mod tests {
             n_head: 4,
             n_kv_head: 2,
             head_dim: 4,
-            rotary: Some(crate::RotaryEmbedding { theta: rope_theta }),
+            rotary: Some(crate::RotaryEmbedding {
+                theta: rope_theta,
+                dimensions: 4,
+            }),
             rms_epsilon: epsilon,
             embedding,
+            lm_head: None,
             layers: std::slice::from_ref(&layer),
             final_norm: &final_norm,
             identity,
@@ -1395,9 +1645,13 @@ mod tests {
                 n_head: 4,
                 n_kv_head: 2,
                 head_dim: 4,
-                rotary: Some(crate::RotaryEmbedding { theta: rope_theta }),
+                rotary: Some(crate::RotaryEmbedding {
+                    theta: rope_theta,
+                    dimensions: 4,
+                }),
                 rms_epsilon: epsilon,
                 embedding,
+                lm_head: None,
                 layers: std::slice::from_ref(&layer),
                 final_norm: &final_norm,
                 identity,
@@ -1462,6 +1716,7 @@ mod tests {
             &dense_k,
             &dense_v,
             &dense_o,
+            None,
             &dense_gate,
             &dense_up,
             &dense_down,
@@ -1473,8 +1728,10 @@ mod tests {
             None,
             crate::CausalActivation::SwiGlu,
             &final_norm,
+            None,
             4,
             2,
+            4,
             4,
             rope_theta,
             epsilon,

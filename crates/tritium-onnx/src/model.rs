@@ -119,6 +119,8 @@ pub struct PackedTernaryMatrix<'a> {
 pub struct RotaryEmbedding {
     /// Positive finite frequency base (`rope_theta`).
     pub theta: f32,
+    /// Even prefix width rotated within each attention head.
+    pub dimensions: usize,
 }
 
 /// Packed weights and preserved RMSNorm vectors for one causal decoder layer.
@@ -138,6 +140,8 @@ pub struct CausalLmDecoderLayer<'a> {
     pub value: PackedTernaryMatrix<'a>,
     /// Attention output projection.
     pub attention_output: PackedTernaryMatrix<'a>,
+    /// Optional sigmoid gate projected from normalized attention input.
+    pub attention_gate: Option<PackedTernaryMatrix<'a>>,
     /// Optional RMSNorm over attention context before the output projection.
     pub attention_sub_norm: Option<&'a [f32]>,
     /// Pre-FFN RMSNorm weight.
@@ -177,6 +181,8 @@ pub struct CausalLmModel<'a> {
     pub rms_epsilon: f32,
     /// Tied token embedding and language-model head table.
     pub embedding: PackedTernaryMatrix<'a>,
+    /// Optional untied language-model head; `None` reuses [`Self::embedding`].
+    pub lm_head: Option<PackedTernaryMatrix<'a>>,
     /// Ordered decoder layers; at least one is required.
     pub layers: &'a [CausalLmDecoderLayer<'a>],
     /// Final RMSNorm weight.
@@ -274,9 +280,11 @@ impl<'a> MappedSmolLm2<'a> {
             head_dim: self.config.head_dim,
             rotary: Some(RotaryEmbedding {
                 theta: self.config.rope_theta,
+                dimensions: self.config.head_dim,
             }),
             rms_epsilon: self.config.rms_epsilon,
             embedding: self.embedding,
+            lm_head: None,
             layers: &self.layers,
             final_norm: self.final_norm,
             identity: self.identity,
@@ -314,6 +322,7 @@ pub fn map_smollm2_causal_lm<'a>(
             key: source.matrix(&format!("{prefix}.self_attn.k_proj.weight"))?,
             value: source.matrix(&format!("{prefix}.self_attn.v_proj.weight"))?,
             attention_output: source.matrix(&format!("{prefix}.self_attn.o_proj.weight"))?,
+            attention_gate: None,
             attention_sub_norm: None,
             ffn_norm: source.vector(&format!("{prefix}.post_attention_layernorm.weight"))?,
             gate: source.matrix(&format!("{prefix}.mlp.gate_proj.weight"))?,
@@ -562,9 +571,11 @@ impl<'a> MappedBitNet<'a> {
             head_dim: self.config.head_dim,
             rotary: Some(RotaryEmbedding {
                 theta: self.config.rope_theta,
+                dimensions: self.config.head_dim,
             }),
             rms_epsilon: self.config.rms_epsilon,
             embedding: self.embedding,
+            lm_head: None,
             layers: &self.layers,
             final_norm: self.final_norm,
             identity: self.identity,
@@ -605,6 +616,7 @@ pub fn map_bitnet_gguf_causal_lm<'a>(
             key: source.matrix(&format!("{prefix}.attn_k.weight"))?,
             value: source.matrix(&format!("{prefix}.attn_v.weight"))?,
             attention_output: source.matrix(&format!("{prefix}.attn_output.weight"))?,
+            attention_gate: None,
             attention_sub_norm: Some(source.vector(&format!("{prefix}.attn_sub_norm.weight"))?),
             ffn_norm: source.vector(&format!("{prefix}.ffn_norm.weight"))?,
             gate: source.matrix(&format!("{prefix}.ffn_gate.weight"))?,
@@ -1162,6 +1174,8 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".first_end")
                 || name.ends_with(".second_start")
                 || name.ends_with(".second_end")
+                || name.ends_with(".tail_start")
+                || name.ends_with(".tail_end")
                 || name.ends_with(".steps") =>
             {
                 Some(TENSOR_INT64)
@@ -1295,6 +1309,17 @@ fn concat_axis(node: &NodeProto, graph: &GraphProto) -> Option<i64> {
         && producer(&node.input[0]).is_some_and(|candidate| candidate.op_type == "Neg")
         && producer(&node.input[1]).is_some_and(|candidate| candidate.op_type == "Slice");
     if rotary {
+        return Some(-1);
+    }
+    let rotary_prefix = node.input.len() == 2
+        && node
+            .input
+            .iter()
+            .all(|input| producer(input).is_some_and(|candidate| candidate.op_type == "Slice"));
+    let rotary_tail = node.input.len() == 2
+        && producer(&node.input[0]).is_some_and(|candidate| candidate.op_type == "Add")
+        && producer(&node.input[1]).is_some_and(|candidate| candidate.op_type == "Slice");
+    if rotary_prefix || rotary_tail {
         return Some(-1);
     }
     let cache = node.input.len() == 2
@@ -2277,6 +2302,7 @@ struct CausalGraphGeometry {
 struct RotaryGraphConfig {
     tokens: usize,
     head_dim: usize,
+    rotary_dim: usize,
     past_tokens: usize,
     theta: f32,
 }
@@ -2286,6 +2312,9 @@ struct RotaryGraphState {
     first_end: String,
     second_start: String,
     second_end: String,
+    tail_start: String,
+    tail_end: String,
+    has_tail: bool,
     axes: String,
     steps: String,
     cos: String,
@@ -2293,11 +2322,9 @@ struct RotaryGraphState {
 }
 
 fn rotary_tables(config: RotaryGraphConfig) -> Result<(Vec<f32>, Vec<f32>), OnnxModelError> {
-    let RotaryGraphConfig {
-        tokens, head_dim, ..
-    } = config;
+    let tokens = config.tokens;
     let elements = tokens
-        .checked_mul(head_dim)
+        .checked_mul(config.rotary_dim)
         .ok_or(OnnxModelError::ShapeOverflow("RoPE table element count"))?;
     let table_bytes = elements
         .checked_mul(2)
@@ -2311,7 +2338,7 @@ fn rotary_tables(config: RotaryGraphConfig) -> Result<(Vec<f32>, Vec<f32>), Onnx
     let mut cos = Vec::with_capacity(elements);
     let mut sin = Vec::with_capacity(elements);
     for token in 0..tokens {
-        for lane in 0..head_dim {
+        for lane in 0..config.rotary_dim {
             let (lane_cos, lane_sin) = rotary_pair(config, token, lane)?;
             cos.push(lane_cos as f32);
             sin.push(lane_sin as f32);
@@ -2325,11 +2352,11 @@ fn rotary_pair(
     token: usize,
     lane: usize,
 ) -> Result<(f64, f64), OnnxModelError> {
-    let half = config.head_dim / 2;
+    let half = config.rotary_dim / 2;
     let frequency_lane = lane % half;
     let position = (config.past_tokens + token) as f64;
     let angle = position
-        * f64::from(config.theta).powf(-2.0 * frequency_lane as f64 / config.head_dim as f64);
+        * f64::from(config.theta).powf(-2.0 * frequency_lane as f64 / config.rotary_dim as f64);
     if !angle.is_finite() {
         return Err(OnnxModelError::InvalidModel(format!(
             "RoPE angle is non-finite at position {} frequency lane {frequency_lane}",
@@ -2573,7 +2600,7 @@ impl CausalGraphBuilder {
         if self.failure.is_some() {
             return;
         }
-        let elements = match config.tokens.checked_mul(config.head_dim) {
+        let elements = match config.tokens.checked_mul(config.rotary_dim) {
             Some(elements) => elements,
             None => {
                 self.failure
@@ -2609,7 +2636,7 @@ impl CausalGraphBuilder {
             return;
         };
         for token in 0..config.tokens {
-            for lane in 0..config.head_dim {
+            for lane in 0..config.rotary_dim {
                 let pair = match rotary_pair(config, token, lane) {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -2751,10 +2778,8 @@ impl CausalGraphBuilder {
         &mut self,
         config: RotaryGraphConfig,
     ) -> Result<RotaryGraphState, OnnxModelError> {
-        let RotaryGraphConfig {
-            tokens, head_dim, ..
-        } = config;
-        let half = head_dim / 2;
+        let tokens = config.tokens;
+        let half = config.rotary_dim / 2;
         let first_start = "rope.first_start".to_owned();
         let first_end = "rope.first_end".to_owned();
         let second_start = "rope.second_start".to_owned();
@@ -2771,7 +2796,19 @@ impl CausalGraphBuilder {
         self.add_i64(
             &second_end,
             vec![1],
-            &[as_i64(head_dim, "RoPE head dimension")?],
+            &[as_i64(config.rotary_dim, "RoPE rotary dimension")?],
+        );
+        let tail_start = "rope.tail_start".to_owned();
+        let tail_end = "rope.tail_end".to_owned();
+        self.add_i64(
+            &tail_start,
+            vec![1],
+            &[as_i64(config.rotary_dim, "RoPE rotary dimension")?],
+        );
+        self.add_i64(
+            &tail_end,
+            vec![1],
+            &[as_i64(config.head_dim, "RoPE head dimension")?],
         );
         self.add_i64(&axes, vec![1], &[-1]);
         self.add_i64(&steps, vec![1], &[1]);
@@ -2780,7 +2817,7 @@ impl CausalGraphBuilder {
         let dimensions = vec![
             as_i64(tokens, "RoPE token count")?,
             1,
-            as_i64(head_dim, "RoPE head dimension")?,
+            as_i64(config.rotary_dim, "RoPE rotary dimension")?,
         ];
         if self.is_external() {
             self.add_external_rotary_table(&cos_name, config, true, dimensions.clone());
@@ -2796,6 +2833,9 @@ impl CausalGraphBuilder {
             first_end,
             second_start,
             second_end,
+            tail_start,
+            tail_end,
+            has_tail: config.rotary_dim < config.head_dim,
             axes,
             steps,
             cos: cos_name,
@@ -2848,12 +2888,20 @@ impl CausalGraphBuilder {
             &[&rotated],
             vec![int_attribute("axis", -1)],
         );
+        let unrotated = format!("{prefix}.unrotated");
+        self.standard(
+            format!("{prefix}.unrotated_prefix"),
+            "Concat",
+            &[&first, &second],
+            &[&unrotated],
+            vec![int_attribute("axis", -1)],
+        );
         let direct = format!("{prefix}.direct");
         let crossed = format!("{prefix}.crossed");
         self.standard(
             format!("{prefix}.direct_mul"),
             "Mul",
-            &[input, &state.cos],
+            &[&unrotated, &state.cos],
             &[&direct],
             Vec::new(),
         );
@@ -2864,13 +2912,41 @@ impl CausalGraphBuilder {
             &[&crossed],
             Vec::new(),
         );
+        let rotated_prefix = if state.has_tail {
+            format!("{prefix}.rotated_prefix")
+        } else {
+            output.to_owned()
+        };
         self.standard(
             format!("{prefix}.sum"),
             "Add",
             &[&direct, &crossed],
-            &[output],
+            &[&rotated_prefix],
             Vec::new(),
         );
+        if state.has_tail {
+            let tail = format!("{prefix}.tail");
+            self.standard(
+                format!("{prefix}.slice_tail"),
+                "Slice",
+                &[
+                    input,
+                    &state.tail_start,
+                    &state.tail_end,
+                    &state.axes,
+                    &state.steps,
+                ],
+                &[&tail],
+                Vec::new(),
+            );
+            self.standard(
+                format!("{prefix}.append_tail"),
+                "Concat",
+                &[&rotated_prefix, &tail],
+                &[output],
+                vec![int_attribute("axis", -1)],
+            );
+        }
     }
 
     fn cache_and_expand_gqa(
@@ -3158,6 +3234,7 @@ fn build_causal_lm_graph(
             graph.prepare_rotary(RotaryGraphConfig {
                 tokens: model.tokens,
                 head_dim: model.head_dim,
+                rotary_dim: rotary.dimensions,
                 past_tokens: model.past_tokens,
                 theta: rotary.theta,
             })
@@ -3230,6 +3307,19 @@ fn build_causal_lm_graph(
             &format!("{prefix}.value"),
             layer.value,
         )?;
+        let attention_gate = if let Some(weight) = layer.attention_gate {
+            let gate = format!("{prefix}.attention_gate");
+            graph.projection(
+                &format!("{prefix}.attention_gate_projection"),
+                &attention_input,
+                &gate,
+                &format!("{prefix}.attention_gate"),
+                weight,
+            )?;
+            Some(gate)
+        } else {
+            None
+        };
         let query_shape = format!("{prefix}.query_shape");
         let kv_shape = format!("{prefix}.kv_shape");
         graph.add_i64(&query_shape, vec![3], &[tokens, n_head, head_dim]);
@@ -3394,6 +3484,25 @@ fn build_causal_lm_graph(
             Vec::new(),
         );
         let mut output_input = context;
+        if let Some(gate) = attention_gate {
+            let sigmoid = format!("{prefix}.attention_gate_sigmoid");
+            graph.standard(
+                format!("{prefix}.attention_gate_activation"),
+                "Sigmoid",
+                &[&gate],
+                &[&sigmoid],
+                Vec::new(),
+            );
+            let gated = format!("{prefix}.gated_attention");
+            graph.standard(
+                format!("{prefix}.attention_gate_multiply"),
+                "Mul",
+                &[&output_input, &sigmoid],
+                &[&gated],
+                Vec::new(),
+            );
+            output_input = gated;
+        }
         if let Some(weight) = layer.attention_sub_norm {
             let normalized = format!("{prefix}.attention_sub_norm.output");
             graph.rms_norm(
@@ -3439,16 +3548,22 @@ fn build_causal_lm_graph(
         model.final_norm,
         model.rms_epsilon,
     );
-    graph.nodes.push(NodeProto {
-        input: strings([
-            final_hidden,
+    let (head_packed, head_scales, head_format) = if let Some(head) = model.lm_head {
+        graph.add_matrix("lm_head", head);
+        ("lm_head.packed", "lm_head.scales", head.format)
+    } else {
+        (
             "tok_embeddings.packed",
             "tok_embeddings.scales",
-        ]),
+            model.embedding.format,
+        )
+    };
+    graph.nodes.push(NodeProto {
+        input: strings([final_hidden, head_packed, head_scales]),
         output: strings(["logits"]),
         name: "lm_head".to_owned(),
         op_type: ONNX_OP_NAME.to_owned(),
-        attribute: attributes(hidden, format_code(model.embedding.format)?),
+        attribute: attributes(hidden, format_code(head_format)?),
         domain: ONNX_DOMAIN.to_owned(),
     });
     let mut outputs = vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])];
@@ -3477,7 +3592,14 @@ fn build_causal_lm_graph(
         metadata("tritium.n_head", &model.n_head.to_string()),
         metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
         metadata("tritium.head_dim", &model.head_dim.to_string()),
-        metadata("tritium.tied_embedding_head", "true"),
+        metadata(
+            "tritium.tied_embedding_head",
+            if model.lm_head.is_none() {
+                "true"
+            } else {
+                "false"
+            },
+        ),
     ];
     if let Some(rotary) = model.rotary {
         metadata_props.push(metadata("tritium.rope_theta", &rotary.theta.to_string()));
@@ -3826,14 +3948,20 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
                 "RoPE theta must be finite and positive".to_owned(),
             ));
         }
-        if model.head_dim < 2 || !model.head_dim.is_multiple_of(2) {
+        if rotary.dimensions < 2
+            || !rotary.dimensions.is_multiple_of(2)
+            || rotary.dimensions > model.head_dim
+        {
             return Err(OnnxModelError::InvalidModel(format!(
-                "RoPE requires positive even head_dim, got {}",
-                model.head_dim
+                "RoPE dimensions must be positive, even, and at most head_dim; got {} for {}",
+                rotary.dimensions, model.head_dim
             )));
         }
     }
     validate_matrix("embedding", model.embedding)?;
+    if let Some(head) = model.lm_head {
+        validate_matrix_shape("lm_head", head, model.embedding.rows, hidden)?;
+    }
     validate_vector("final_norm", model.final_norm, hidden)?;
     for (index, layer) in model.layers.iter().copied().enumerate() {
         validate_vector(
@@ -3866,6 +3994,14 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             hidden,
             hidden,
         )?;
+        if let Some(gate) = layer.attention_gate {
+            validate_matrix_shape(
+                &format!("layer.{index}.attention_gate"),
+                gate,
+                hidden,
+                hidden,
+            )?;
+        }
         if let Some(weight) = layer.attention_sub_norm {
             validate_vector(&format!("layer.{index}.attention_sub_norm"), weight, hidden)?;
         }
@@ -3926,6 +4062,9 @@ fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), O
 
     let mut total = 0;
     add_matrix(&mut total, model.embedding)?;
+    if let Some(head) = model.lm_head {
+        add_matrix(&mut total, head)?;
+    }
     add_vector(&mut total, model.final_norm)?;
     for layer in model.layers.iter().copied() {
         add_vector(&mut total, layer.attention_norm)?;
@@ -3937,6 +4076,9 @@ fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), O
         }
         if let Some(weight) = layer.attention_sub_norm {
             add_vector(&mut total, weight)?;
+        }
+        if let Some(gate) = layer.attention_gate {
+            add_matrix(&mut total, gate)?;
         }
         add_vector(&mut total, layer.ffn_norm)?;
         if let Some(weight) = layer.ffn_sub_norm {
@@ -3964,10 +4106,10 @@ fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), O
         .and_then(|elements| elements.checked_mul(core::mem::size_of::<f32>()))
         .ok_or(OnnxModelError::ShapeOverflow("attention mask byte count"))?;
     add(&mut total, mask_bytes)?;
-    if model.rotary.is_some() {
+    if let Some(rotary) = model.rotary {
         let rotary_bytes = model
             .tokens
-            .checked_mul(model.head_dim)
+            .checked_mul(rotary.dimensions)
             .and_then(|elements| elements.checked_mul(2))
             .and_then(|elements| elements.checked_mul(core::mem::size_of::<f32>()))
             .ok_or(OnnxModelError::ShapeOverflow("RoPE table byte count"))?;
@@ -4891,6 +5033,14 @@ mod tests {
             attribute: Vec::new(),
             domain: String::new(),
         };
+        let unnamed_concat = |inputs: &[&str], output: &str| NodeProto {
+            input: inputs.iter().map(|value| (*value).to_owned()).collect(),
+            output: strings([output]),
+            name: String::new(),
+            op_type: "Concat".to_owned(),
+            attribute: vec![int_attribute("axis", -1)],
+            domain: String::new(),
+        };
         let protobuf = ModelProto {
             ir_version: ONNX_IR_VERSION,
             producer_name: "tritium-onnx-test".to_owned(),
@@ -4903,6 +5053,19 @@ mod tests {
                     unary("Slice", "query", "first_half"),
                     unary("Neg", "second_half", "negated_second"),
                     concat(&["negated_second", "first_half"], "rotated", 0),
+                    unary("Slice", "query", "partial_first"),
+                    unary("Slice", "query", "partial_second"),
+                    unnamed_concat(&["partial_first", "partial_second"], "unrotated"),
+                    NodeProto {
+                        input: strings(["direct", "crossed"]),
+                        output: strings(["rotated_prefix"]),
+                        name: String::new(),
+                        op_type: "Add".to_owned(),
+                        attribute: Vec::new(),
+                        domain: String::new(),
+                    },
+                    unary("Slice", "query", "tail"),
+                    unnamed_concat(&["rotated_prefix", "tail"], "partial_output"),
                 ],
                 name: "concat-axis-mutations".to_owned(),
                 initializer: Vec::new(),
@@ -5000,6 +5163,7 @@ mod tests {
         let (cos, sin) = rotary_tables(RotaryGraphConfig {
             tokens: 2,
             head_dim: 128,
+            rotary_dim: 128,
             past_tokens: 10_000_000,
             theta: f32::MIN_POSITIVE,
         })
@@ -5014,6 +5178,7 @@ mod tests {
         let result = rotary_tables(RotaryGraphConfig {
             tokens: MAX_MODEL_BYTES,
             head_dim: 2,
+            rotary_dim: 2,
             past_tokens: 0,
             theta: 10_000.0,
         });
@@ -5042,6 +5207,7 @@ mod tests {
             rotary: None,
             rms_epsilon: 1.0e-5,
             embedding: empty_matrix,
+            lm_head: None,
             final_norm: &[],
             layers: &[],
             identity: OnnxArtifactIdentityV2 {

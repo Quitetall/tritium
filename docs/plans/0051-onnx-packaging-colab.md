@@ -103,9 +103,12 @@ namespace adapter maps ternarized packed embeddings/projections and preserved
 norms, rejecting missing/duplicate/extra tensors including an untied
 `output.weight`. Raw dense-embedding/I2_S conversion remains an upstream
 quantization/import concern. Qwen3.6 still requires its heterogeneous
-DeltaNet/full-attention schedule, untied head, output gate, biases and partial
-RoPE. Multi-layer large-model external-data packaging, those Qwen graph
-extensions, dynamic axes and end-user generation APIs remain open.
+DeltaNet/full-attention schedule, zero-centered norms, fused query/gate tensor
+mapping and MTP composition. Conventional causal graphs now support an untied
+packed LM head, prefix-only RoPE and sigmoid attention-output gating, each with
+independent-reference ORT parity. Multi-layer large-model external-data
+packaging, remaining Qwen graph extensions, dynamic axes and end-user
+generation APIs remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
