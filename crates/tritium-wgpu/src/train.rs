@@ -14,6 +14,9 @@ const OPERATIONS: &[&str] = &[
     "graph.scale_const",
     "graph.add",
     "graph.mul",
+    "graph.relu2",
+    "graph.silu",
+    "graph.causal_mask",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -71,6 +74,12 @@ impl WgpuTrainBackendV1 {
                     &["left", "right", "grad_output"],
                     &["grad_left", "grad_right"],
                 ),
+                ("graph.relu2" | "graph.silu", TrainExecutionV1::Forward) => (&["x"], &["result"]),
+                ("graph.relu2" | "graph.silu", TrainExecutionV1::Vjp) => {
+                    (&["x", "grad_output"], &["grad_x"])
+                }
+                ("graph.causal_mask", TrainExecutionV1::Forward) => (&["x"], &["result"]),
+                ("graph.causal_mask", TrainExecutionV1::Vjp) => (&["grad_output"], &["grad_x"]),
                 _ => return Err(invariant("pointwise operation received an illegal phase")),
             };
         require_names(
@@ -83,10 +92,10 @@ impl WgpuTrainBackendV1 {
             output_names,
             "outputs",
         )?;
-        let expected_attributes: &[&str] = if request.operation == "graph.scale_const" {
-            &["scale"]
-        } else {
-            &[]
+        let expected_attributes: &[&str] = match request.operation {
+            "graph.scale_const" => &["scale"],
+            "graph.causal_mask" => &["rows", "cols"],
+            _ => &[],
         };
         require_names(
             request.attributes.iter().map(|attribute| attribute.name),
@@ -100,37 +109,53 @@ impl WgpuTrainBackendV1 {
         } else {
             0.0
         };
-        let second = if matches!(request.operation, "graph.add" | "graph.mul")
-            && request.execution == TrainExecutionV1::Forward
-        {
-            let (second_shape, second) = input_f32(request, "right")?;
+        let second_name = match (request.operation, request.execution) {
+            ("graph.add" | "graph.mul", TrainExecutionV1::Forward) => Some("right"),
+            ("graph.relu2" | "graph.silu", TrainExecutionV1::Vjp) => Some("grad_output"),
+            _ => None,
+        };
+        let second = if let Some(second_name) = second_name {
+            let (second_shape, second) = input_f32(request, second_name)?;
             if second_shape != shape {
                 return Err(shape_error());
             }
-            require_finite("right", second)?;
+            require_finite(second_name, second)?;
             second
         } else {
             first
         };
+        let auxiliary = if request.operation == "graph.causal_mask" {
+            let rows = attribute_u64(request, "rows")?;
+            let cols = attribute_u64(request, "cols")?;
+            if rows == 0 || cols == 0 || rows > u32::MAX as u64 || cols > u32::MAX as u64 {
+                return Err(shape_error());
+            }
+            if shape != [rows, cols] {
+                return Err(shape_error());
+            }
+            cols as u32
+        } else {
+            0
+        };
         let results = match (request.operation, request.execution) {
             ("graph.detach", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 0, 0.0)]
+                vec![self.backend.pointwise(first, second, 0, 0.0, auxiliary)]
             }
             ("graph.detach", TrainExecutionV1::Vjp) => {
-                vec![self.backend.pointwise(first, second, 1, 0.0)]
+                vec![self.backend.pointwise(first, second, 1, 0.0, auxiliary)]
             }
             ("graph.scale_const", _) => {
-                vec![self.backend.pointwise(first, second, 2, scalar)]
+                vec![self.backend.pointwise(first, second, 2, scalar, auxiliary)]
             }
             ("graph.add", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 3, 0.0)]
+                vec![self.backend.pointwise(first, second, 3, 0.0, auxiliary)]
             }
             ("graph.add", TrainExecutionV1::Vjp) => vec![
-                self.backend.pointwise(first, second, 0, 0.0),
-                self.backend.pointwise(first, second, 0, 0.0),
+                self.backend.pointwise(first, second, 0, 0.0, auxiliary),
+                self.backend.pointwise(first, second, 0, 0.0, auxiliary),
             ],
             ("graph.mul", TrainExecutionV1::Forward) => {
-                vec![self.backend.pointwise(first, second, 4, 0.0)]
+                vec![self.backend.pointwise(first, second, 4, 0.0, auxiliary)]
             }
             ("graph.mul", TrainExecutionV1::Vjp) => {
                 let (left_shape, left) = input_f32(request, "left")?;
@@ -143,9 +168,27 @@ impl WgpuTrainBackendV1 {
                 require_finite("right", right)?;
                 require_finite("grad_output", gradient)?;
                 vec![
-                    self.backend.pointwise(gradient, right, 4, 0.0),
-                    self.backend.pointwise(gradient, left, 4, 0.0),
+                    self.backend.pointwise(gradient, right, 4, 0.0, auxiliary),
+                    self.backend.pointwise(gradient, left, 4, 0.0, auxiliary),
                 ]
+            }
+            ("graph.relu2", TrainExecutionV1::Forward) => {
+                vec![self.backend.pointwise(first, second, 5, 0.0, auxiliary)]
+            }
+            ("graph.relu2", TrainExecutionV1::Vjp) => {
+                vec![self.backend.pointwise(first, second, 6, 0.0, auxiliary)]
+            }
+            ("graph.silu", TrainExecutionV1::Forward) => {
+                vec![self.backend.pointwise(first, second, 7, 0.0, auxiliary)]
+            }
+            ("graph.silu", TrainExecutionV1::Vjp) => {
+                vec![self.backend.pointwise(first, second, 8, 0.0, auxiliary)]
+            }
+            ("graph.causal_mask", TrainExecutionV1::Forward) => {
+                vec![self.backend.pointwise(first, second, 9, 0.0, auxiliary)]
+            }
+            ("graph.causal_mask", TrainExecutionV1::Vjp) => {
+                vec![self.backend.pointwise(first, second, 10, 0.0, auxiliary)]
             }
             _ => unreachable!(),
         };
@@ -329,6 +372,27 @@ fn attribute_f32(request: &TrainRequestV1<'_>, name: &str) -> Result<f32, TrainB
             },
         ));
     }
+    Ok(value)
+}
+
+fn attribute_u64(request: &TrainRequestV1<'_>, name: &str) -> Result<u64, TrainBackendError> {
+    let attribute = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "attributes",
+            })
+        })?;
+    let TrainAttributeValueV1::U64(value) = attribute.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "u64",
+            },
+        ));
+    };
     Ok(value)
 }
 

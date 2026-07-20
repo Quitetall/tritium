@@ -35,7 +35,7 @@ struct PointwiseParams {
     len: u32,
     operation: u32,
     scalar: f32,
-    padding: u32,
+    auxiliary: u32,
 }
 
 // std140 uniform structs round up to a 16-byte multiple; pin both the size AND
@@ -255,6 +255,7 @@ impl WgpuBackend {
         right: &[f32],
         operation: u32,
         scalar: f32,
+        auxiliary: u32,
     ) -> Result<Vec<f32>, BackendError> {
         if left.len() != right.len() || left.len() > u32::MAX as usize {
             return Err(BackendError::ShapeMismatch {
@@ -269,7 +270,7 @@ impl WgpuBackend {
             len: left.len() as u32,
             operation,
             scalar,
-            padding: 0,
+            auxiliary,
         };
         let usage = wgpu::BufferUsages::STORAGE;
         let params_buf = self
