@@ -70,12 +70,10 @@ hardware labels before execution.
 | [0050](./0050-web-training-session.md) | `@tritium-ai/web` compiled TypeScript session, WASM orchestration and whole-manifest WebGPU training | 0049 schema/manifest freeze | strict-TS package plus Chrome/Firefox/Safari WebGPU and cross-backend artifact parity |
 | [0051](./0051-onnx-packaging-colab.md) | Whole-model ONNX inference, wheels/crates/PyPI/npm, compatibility matrix and Colab | 0046 + 0047 + 0049 schemas | local-RC fresh-env gates, then authorized registry smoke |
 | [0052](./0052-hardened-serving-deployment.md) | Hardened serving, OCI/Helm/KEDA/Knative, auth, observability, failure injection | stable artifact/load API | deployment e2e and rollback gates |
-| 0053 | Guides, governance/community, three-tier zoo, independent reproduction and release | 0043 + 0045–0052 | all ADR 0033 boxes green; local signed RC, authorized activation, post-publish smoke |
+| [0053](./0053-zoo-community-release.md) | Guides, governance/community, three-tier zoo, independent reproduction and release | 0043 + 0045–0052 | all ADR 0033 boxes green; local signed RC, authorized activation, post-publish smoke |
 
-Plans 0050 and 0051 are active. Plan 0052 is a frozen, executable work order;
-implementation has not started. Plan 0053 remains a reserved work-order number,
-not a completed or executable document. Its file must be written and accepted
-before implementation starts; this index must not link a nonexistent plan.
+Plans 0050 and 0051 are active. Plans 0052 and 0053 are frozen, executable work
+orders whose implementation has not started.
 
 ## Cross-cutting contracts
 
