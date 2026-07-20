@@ -101,5 +101,8 @@ half = { workspace = true }
 # NOTE: `tritium-train` is a `cuda`-gated normal dependency (above), not a dev-dep — the GPU
 # parity + QAT tests reach it through that, and it is the grad kernels' real consumer (0013).
 
+[build-dependencies]
+tritium-build-info = { workspace = true }
+
 [lints]
 workspace = true

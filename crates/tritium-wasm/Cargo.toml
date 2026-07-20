@@ -20,5 +20,8 @@ half = { workspace = true }
 [dev-dependencies]
 tritium-testkit = { workspace = true }
 
+[build-dependencies]
+tritium-build-info = { workspace = true }
+
 [lints]
 workspace = true

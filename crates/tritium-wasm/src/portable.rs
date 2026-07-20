@@ -86,13 +86,22 @@ impl TrainBackendV1 for WasmTrainBackendV1 {
 
         let mut receipt = self.reference.execute(request, output)?;
         receipt.backend_id = BACKEND_ID.to_owned();
-        receipt.backend_build = format!("tritium-wasm-{}", env!("CARGO_PKG_VERSION"));
+        receipt.backend_build = backend_build_identity();
         receipt.physical_device = Some(self.physical_device.clone());
         receipt.limits = LIMITS;
         receipt.host_transfers = 0;
         receipt.device_resident = true;
         Ok(receipt)
     }
+}
+
+fn backend_build_identity() -> String {
+    format!(
+        "{}@{}+{}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        env!("TRITIUM_SOURCE_ID")
+    )
 }
 
 fn caller_bytes(

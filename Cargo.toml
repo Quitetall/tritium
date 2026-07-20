@@ -5,6 +5,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/tritium-build-info", # source identity for receipt-producing build scripts
     "crates/tritium-core",
     "crates/tritium-spec",     # backend trait contract, no impls
     "crates/tritium-format",   # TQ1_0/TQ2_0 packing, GGUF + safetensors I/O
@@ -55,6 +56,7 @@ categories = ["science", "hardware-support", "mathematics"]
 # internal crates (path + caret version, bumped in lockstep with the workspace version at each
 # minor release). The explicit version is required for `cargo publish` (crates.io forbids bare path
 # deps) and lets cargo-deny keep `wildcards = "deny"` meaningful for *external* deps.
+tritium-build-info = { path = "crates/tritium-build-info", version = "1.0.0" }
 tritium-core = { path = "crates/tritium-core", version = "1.0.0" }
 tritium-spec = { path = "crates/tritium-spec", version = "1.0.0" }
 tritium-format = { path = "crates/tritium-format", version = "1.0.0" }

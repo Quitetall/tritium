@@ -195,6 +195,25 @@ tensor operation is advertised before its WGSL path passes the corpus. ROCm
 implementation/evidence is currently target-blocked on this host: no AMD device
 or ROCm compiler/runtime tools are installed.
 
+Semantic receipt admission is implemented at the generic seam. The sealer runs
+the backend itself and emits canonical `tritium.training_receipts` v1 JSON containing every ordered
+success/error case, exact manifest/vector identities, full-worktree source
+identity, physical target, limits, residency, per-case request/output digests and
+scratch ledger. Admission requires a separately trusted expected bundle digest
+and rejects unknown/noncanonical JSON, partial or reordered coverage,
+anonymous/nonresident targets, request/resident-byte drift, scratch overruns and
+duplicate backend identities. Capability Markdown is generated only from
+content-addressed admitted bundles. The CPU example sealed and reopened 114/114
+cases locally. Its emitted `DIGEST=PATH` binding is a local workflow convenience,
+not a release trust root: candidate manifests must pin the digest independently.
+Binary/toolchain provenance, performance receipts, and checked-in release bundles
+remain pending candidate-revision runs on every required physical target.
+Release admission accepts only a clean immutable Git commit identity. The shared
+build helper also fingerprints dirty development trees and registers git metadata
+plus every tracked and currently-untracked source path as Cargo rebuild inputs,
+but those bundles require explicit `Development`/`--allow-dirty` admission and
+cannot feed the default release table.
+
 Edits:
 
 - Add strict manifest types/parser to `tritium-spec/src/training.rs`.
@@ -292,6 +311,8 @@ actual target receipts. Zero-test or skipped lanes fail.
 cargo fmt --check
 cargo test -p tritium-spec -p tritium-train
 cargo clippy -p tritium-spec -p tritium-train --all-targets -- -D warnings
+receipt_binding=$(cargo run -q -p tritium-train --example seal_cpu_training_receipts -- target/training-receipts)
+cargo run -p tritium-testkit --example training_capability_table -- --allow-dirty "$receipt_binding"
 PYTHONPATH=crates/tritium-py/python pytest -q \
   crates/tritium-py/tests/test_training_manifest.py
 npx tsc -p bindings/typescript/tsconfig.json --noEmit

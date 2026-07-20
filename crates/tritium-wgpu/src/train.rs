@@ -2402,7 +2402,7 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
         };
         Ok(TrainReceiptV1 {
             backend_id: "wgpu.portable.v1:wgpu".to_owned(),
-            backend_build: format!("tritium-wgpu-{}", env!("CARGO_PKG_VERSION")),
+            backend_build: backend_build_identity(),
             physical_device: Some(self.physical_device.clone()),
             manifest_digest: TrainingOpManifestV1::digest(),
             vector_digest: request.vector_digest,
@@ -2422,6 +2422,15 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             device_resident: true,
         })
     }
+}
+
+fn backend_build_identity() -> String {
+    format!(
+        "{}@{}+{}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        env!("TRITIUM_SOURCE_ID")
+    )
 }
 
 fn resident_bytes(

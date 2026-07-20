@@ -81,11 +81,20 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
         .strip_prefix(concat!(
             "tritium-train@",
             env!("CARGO_PKG_VERSION"),
-            "+source-blake3:"
+            "+source-git:"
         ))
         .unwrap();
-    assert_eq!(build_digest.len(), 64);
-    assert!(build_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let (commit, dirty) = build_digest
+        .split_once("+dirty-blake3:")
+        .map_or((build_digest, None), |(commit, digest)| {
+            (commit, Some(digest))
+        });
+    assert!(commit.len() == 40 || commit.len() == 64);
+    assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if let Some(dirty) = dirty {
+        assert_eq!(dirty.len(), 64);
+        assert!(dirty.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
     assert!(
         receipt
             .physical_device

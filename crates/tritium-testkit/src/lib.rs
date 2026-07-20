@@ -41,6 +41,7 @@ mod jsonl;
 mod portable_training;
 mod reference_backend;
 mod runner;
+mod training_receipts;
 mod vector;
 
 pub use codec_vectors::{
@@ -56,6 +57,12 @@ pub use portable_training::{
     TrainingVectorPass, run_supported_training_conformance, run_training_conformance,
 };
 pub use runner::{FailedCase, FailureReason, Report, run_conformance, run_fused_fallback_contract};
+pub use training_receipts::{
+    AdmittedTrainingReceiptBundleV1, SealedTrainingReceiptBundleV1, TrainingReceiptBundleError,
+    TrainingReceiptSourcePolicyV1, admit_training_receipts,
+    render_development_training_capability_table, render_training_capability_table,
+    seal_training_receipts,
+};
 pub use vector::{ConformanceVector, Tolerance};
 
 // Re-export the backend contract + core vocabulary so a downstream backend

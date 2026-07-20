@@ -252,6 +252,16 @@ fn vector_request<'a>(
         .with_vector_digest(vectors.source_digest())
 }
 
+pub(crate) fn canonical_case_input_digest(
+    case: &TrainingVectorCaseV1,
+    vectors: &TrainingVectorSetV1,
+) -> [u8; 32] {
+    let inputs: Vec<_> = case.inputs.iter().map(materialize_buffer).collect();
+    let input_views: Vec<_> = inputs.iter().map(TrainOwnedBufferV1::as_ref).collect();
+    let attributes: Vec<_> = case.attributes.iter().map(attribute_view).collect();
+    train_request_digest_v1(&vector_request(case, vectors, &input_views, &attributes))
+}
+
 fn materialize_buffer(buffer: &TrainingVectorBufferV1) -> TrainOwnedBufferV1 {
     let data = match &buffer.data {
         TrainingVectorBufferDataV1::F32Bits(bits) => {

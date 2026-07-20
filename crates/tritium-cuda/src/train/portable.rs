@@ -2582,7 +2582,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         };
         Ok(TrainReceiptV1 {
             backend_id: self.backend_id.clone(),
-            backend_build: format!("tritium-cuda-{}", env!("CARGO_PKG_VERSION")),
+            backend_build: backend_build_identity(),
             physical_device: Some(self.physical_device.clone()),
             manifest_digest: TrainingOpManifestV1::digest(),
             vector_digest: request.vector_digest,
@@ -2602,6 +2602,15 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             device_resident: true,
         })
     }
+}
+
+fn backend_build_identity() -> String {
+    format!(
+        "{}@{}+{}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        env!("TRITIUM_SOURCE_ID")
+    )
 }
 
 fn require_names<'a>(

@@ -33,6 +33,7 @@ const SUPPORTED_SM_ARCHS: &[&str] = &["75", "80", "89", "90"];
 const IMMA_MIN_ARCH: &str = "80";
 
 fn main() {
+    tritium_build_info::emit_source_identity();
     // Rebuild triggers regardless of feature state: cheap, and correct when the
     // feature is later toggled on.
     println!("cargo:rerun-if-changed=kernels/tq2_0_add.cu");

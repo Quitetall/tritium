@@ -4258,6 +4258,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tritium-build-info"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
 name = "tritium-burn"
 version = "1.0.0"
 dependencies = [
@@ -4338,6 +4345,7 @@ dependencies = [
  "linkme",
  "serde",
  "serde_json",
+ "tritium-build-info",
  "tritium-core",
  "tritium-cpu",
  "tritium-format",
@@ -4525,6 +4533,7 @@ dependencies = [
 name = "tritium-testkit"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "half",
  "proptest",
  "serde",
@@ -4544,6 +4553,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tritium-build-info",
  "tritium-core",
  "tritium-format",
  "tritium-quantize",
@@ -4556,6 +4566,7 @@ name = "tritium-wasm"
 version = "1.0.0"
 dependencies = [
  "half",
+ "tritium-build-info",
  "tritium-core",
  "tritium-format",
  "tritium-spec",
@@ -4571,6 +4582,7 @@ dependencies = [
  "half",
  "linkme",
  "pollster",
+ "tritium-build-info",
  "tritium-core",
  "tritium-format",
  "tritium-runtime",

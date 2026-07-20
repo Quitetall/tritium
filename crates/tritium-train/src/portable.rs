@@ -4,7 +4,6 @@ use core::f32::consts::PI;
 use std::io::Cursor as IoCursor;
 use std::sync::OnceLock;
 
-use blake3::Hasher;
 use tritium_format::salt_v2_package::SaltV2PackageReader;
 use tritium_spec::{
     TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
@@ -4324,17 +4323,10 @@ fn receipt_overflow() -> TrainBackendError {
 }
 
 fn backend_build_identity() -> String {
-    let mut hasher = Hasher::new();
-    hasher.update(env!("CARGO_PKG_NAME").as_bytes());
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
-    hasher.update(include_bytes!("portable.rs"));
-    hasher.update(include_bytes!("optim.rs"));
-    hasher.update(include_bytes!("../../tritium-spec/src/train_backend.rs"));
-    hasher.update(include_bytes!("../../../spec/training/v1/manifest.json"));
     format!(
-        "{}@{}+source-blake3:{}",
+        "{}@{}+{}",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
-        hasher.finalize().to_hex()
+        env!("TRITIUM_SOURCE_ID")
     )
 }
