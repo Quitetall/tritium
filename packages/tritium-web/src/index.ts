@@ -49,6 +49,8 @@ export type {
 } from "./portable.js";
 export type {
   CompiledTrainingBufferV1,
+  CompiledTrainingBindingV1,
+  CompiledBackwardOperationV1,
   CompiledTrainingOperationV1,
   CompiledTrainingPlanV1,
   TrainingBatchV1,

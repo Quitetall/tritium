@@ -184,11 +184,11 @@ test("checked session executes the complete lifecycle in order", async () => {
   assert.equal(model.payload[0], 1, "adapter receives an isolated model payload");
   assert.equal(adapter.prepareSaw, 1, "validation cannot mutate prepare payload");
   assert.equal(session.state, "prepared");
-  assert.equal(session.plan.residentBytes, 84);
+  assert.equal(session.plan.residentBytes, 132);
   assert.equal(session.plan.batchStagingBytes, 8);
-  assert.equal(session.plan.preparePeakBytes, 90);
-  assert.equal(session.plan.forwardPeakBytes, 92);
-  assert.equal(session.plan.peakBytes, 92);
+  assert.equal(session.plan.preparePeakBytes, 138);
+  assert.equal(session.plan.forwardPeakBytes, 140);
+  assert.equal(session.plan.peakBytes, 140);
   const weight = session.plan.buffers.find((buffer) => buffer.id === "weight");
   const tied = session.plan.buffers.find((buffer) => buffer.id === "tied-weight");
   assert.equal(tied.ownerId, "weight");
@@ -199,6 +199,30 @@ test("checked session executes the complete lifecycle in order", async () => {
   assert.deepEqual(
     session.plan.operations.find((operation) => operation.id === "sgd").inputs,
     ["weight", "grad"],
+  );
+  assert.deepEqual(
+    session.plan.backwardOperations.map((operation) => [
+      operation.sourceOperationId,
+      operation.execution,
+    ]),
+    [
+      ["mse", "vjp"],
+      ["add", "vjp"],
+    ],
+  );
+  assert.equal(
+    session.plan.buffers.find((buffer) => buffer.backwardInitialization === "one").shape.length,
+    0,
+  );
+  assert.equal(
+    session.plan.buffers.find((buffer) => buffer.id === "grad").backwardInitialization,
+    "zero",
+  );
+  assert.equal(
+    session.plan.backwardOperations[1].outputs.find(
+      (binding) => binding.role === "grad_right",
+    ).bufferId,
+    "grad",
   );
 
   await rejectsCode(session.step(), "invalid_state");
@@ -276,6 +300,19 @@ test("planner rejects invalid ownership and memory before adapter allocation", a
   const ownerAdapter = new MockAdapter();
   await rejectsCode(prepareTraining(badOwner, config, ownerAdapter), "invalid_schema");
   assert.deepEqual(ownerAdapter.calls, []);
+
+  const nonScalarLoss = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: model.recipe.tensors.map((tensor) =>
+        tensor.id === "loss" ? { ...tensor, role: "activation" } : tensor,
+      ),
+    },
+  };
+  const lossAdapter = new MockAdapter();
+  await rejectsCode(prepareTraining(nonScalarLoss, config, lossAdapter), "invalid_schema");
+  assert.deepEqual(lossAdapter.calls, []);
 
   const illegalWrite = {
     ...model,
@@ -391,6 +428,81 @@ test("planner enforces one optimizer and gradient per tied parameter owner", asy
     "invalid_schema",
   );
   assert.deepEqual(orphanAdapter.calls, []);
+});
+
+test("planner emits deterministic fan-in accumulation for tied parameters", async () => {
+  const tiedModel = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: [
+        ...model.recipe.tensors,
+        { id: "sum2", dtype: "f32", shape: [1], role: "activation", aliasOf: null },
+      ],
+      operations: [
+        model.recipe.operations[0],
+        {
+          id: "add-tied",
+          operation: "graph.add",
+          inputs: ["sum", "tied-weight"],
+          outputs: ["sum2"],
+          attributes: [],
+        },
+        { ...model.recipe.operations[1], inputs: ["sum2", "target"] },
+        model.recipe.operations[2],
+      ],
+    },
+  };
+  const session = await prepareTraining(tiedModel, config, new MockAdapter());
+  const reductions = session.plan.backwardOperations.filter(
+    (operation) => operation.operation === "graph.add" && operation.execution === "forward",
+  );
+  assert.equal(reductions.length, 1);
+  assert.equal(reductions[0].outputs[0].bufferId, "grad");
+  assert.ok(
+    reductions[0].inputs.every((binding) =>
+      binding.bufferId.startsWith("__tritium.contribution."),
+    ),
+  );
+  assert.equal(
+    session.plan.backwardOperations.filter(
+      (operation) =>
+        operation.execution === "vjp" &&
+        operation.outputs.some((binding) => binding.role === "grad_right"),
+    ).length,
+    2,
+  );
+  await session.dispose();
+});
+
+test("planner treats detach as a reverse-reachability barrier", async () => {
+  const detachedModel = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      operations: [
+        {
+          id: "detach",
+          operation: "graph.detach",
+          inputs: ["weight"],
+          outputs: ["sum"],
+          attributes: [],
+        },
+        model.recipe.operations[1],
+        model.recipe.operations[2],
+      ],
+    },
+  };
+  const session = await prepareTraining(detachedModel, config, new MockAdapter());
+  assert.deepEqual(
+    session.plan.backwardOperations.map((operation) => operation.sourceOperationId),
+    ["mse"],
+  );
+  assert.equal(
+    session.plan.buffers.find((buffer) => buffer.id === "grad").backwardInitialization,
+    "zero",
+  );
+  await session.dispose();
 });
 
 test("planner binds stateful optimizer slots exclusively and positionally", async () => {
@@ -603,7 +715,7 @@ test("prepare uses one pre-await caller snapshot", async () => {
   releaseValidation();
   const session = await preparing;
   assert.equal(adapter.prepareSaw, 1);
-  assert.equal(session.plan.preparePeakBytes, 90);
+  assert.equal(session.plan.preparePeakBytes, 138);
   await session.dispose();
 });
 

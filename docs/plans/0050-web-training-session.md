@@ -142,8 +142,13 @@ The adapter boundary now separates allocation-free, non-mutating, non-retaining
 operation-specific geometry/attribute validation from persistent preparation;
 preparation may allocate decoded state but may not mutate or retain its inputs.
 Preparation peak accounting includes the isolated validation and preparation
-payloads. Adapter execution of compiled tied-gradient accumulation, canonical WASM
-checkpoint/artifact execution and device-loss transactions remain open.
+payloads. The compiler now derives the reachable reverse-mode VJP schedule from
+the single declared loss, assigns canonical backend roles to saved inputs and
+cotangents, reserves the loss seed, marks declared gradients for clearing at
+each backward boundary, and emits deterministic `graph.add` fan-in reductions
+into each tied parameter owner's sole gradient buffer. Adapter execution of that
+frozen schedule, canonical WASM checkpoint/artifact execution and device-loss
+transactions remain open.
 
 Compile a `TrainingRecipeV1` into an immutable operation schedule, buffer plan
 and optimizer-state layout. Preparation validates all roles, shapes, dtypes,

@@ -94,9 +94,25 @@ export interface CompiledTrainingBufferV1 extends TrainingTensorSpecV1 {
   readonly ownerId: string;
   readonly byteOffset: number;
   readonly byteLength: number;
+  readonly backwardInitialization: "none" | "zero" | "one";
 }
 
 export interface CompiledTrainingOperationV1 extends TrainingOperationSpecV1 {}
+
+export interface CompiledTrainingBindingV1 {
+  readonly role: string;
+  readonly bufferId: string;
+}
+
+export interface CompiledBackwardOperationV1 {
+  readonly id: string;
+  readonly sourceOperationId: string;
+  readonly operation: string;
+  readonly execution: "forward" | "vjp";
+  readonly inputs: readonly CompiledTrainingBindingV1[];
+  readonly outputs: readonly CompiledTrainingBindingV1[];
+  readonly attributes: readonly TrainingAttributeSpecV1[];
+}
 
 export interface CompiledTrainingPlanV1 {
   readonly schemaId: "tritium.compiled_training_plan";
@@ -104,6 +120,7 @@ export interface CompiledTrainingPlanV1 {
   readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
   readonly buffers: readonly CompiledTrainingBufferV1[];
   readonly operations: readonly CompiledTrainingOperationV1[];
+  readonly backwardOperations: readonly CompiledBackwardOperationV1[];
   readonly residentBytes: number;
   readonly batchStagingBytes: number;
   readonly preparePeakBytes: number;
@@ -436,6 +453,7 @@ function validateModel(model: WebTrainingModelV1): void {
     if (
       typeof tensor.id !== "string" ||
       tensor.id.length === 0 ||
+      tensor.id.startsWith("__tritium.") ||
       !(["f32", "u32", "bytes"] as const).includes(tensor.dtype) ||
       !([
         "batch",
@@ -596,6 +614,139 @@ function operationDTypes(
   }
 }
 
+interface DifferentiationRuleV1 {
+  readonly savedInputRoles: readonly string[];
+  readonly gradientInputIndexes: readonly number[];
+  readonly gradientOutputRoles: readonly string[];
+}
+
+function differentiationRule(operation: string): DifferentiationRuleV1 {
+  switch (operation) {
+    case "graph.ste_surrogate":
+      return {
+        savedInputRoles: ["weight", "scale"],
+        gradientInputIndexes: [0, 1],
+        gradientOutputRoles: ["grad_weight", "grad_scale"],
+      };
+    case "graph.salt_ste":
+      return {
+        savedInputRoles: ["weight"],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_weight"],
+      };
+    case "graph.lsq_ste":
+      return {
+        savedInputRoles: ["weight", "alpha"],
+        gradientInputIndexes: [0, 1],
+        gradientOutputRoles: ["grad_weight", "grad_alpha"],
+      };
+    case "graph.fsq":
+      return {
+        savedInputRoles: ["x"],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_x"],
+      };
+    case "graph.dense_matmul":
+      return {
+        savedInputRoles: ["x", "weight"],
+        gradientInputIndexes: [0, 1],
+        gradientOutputRoles: ["grad_x", "grad_weight"],
+      };
+    case "graph.ternary_matmul":
+      return {
+        savedInputRoles: ["activation", "weight", "scale"],
+        gradientInputIndexes: [0, 1, 2],
+        gradientOutputRoles: ["grad_activation", "grad_weight", "grad_scale"],
+      };
+    case "graph.transpose":
+    case "graph.slice_cols":
+    case "graph.scale_const":
+    case "graph.causal_mask":
+    case "graph.rope":
+      return {
+        savedInputRoles: [],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_x"],
+      };
+    case "graph.embedding_gather":
+      return {
+        savedInputRoles: ["weight", "tokens"],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_weight"],
+      };
+    case "graph.concat_cols":
+      return {
+        savedInputRoles: [],
+        gradientInputIndexes: [0, 1],
+        gradientOutputRoles: ["grad_part.0", "grad_part.1"],
+      };
+    case "graph.add":
+      return {
+        savedInputRoles: [],
+        gradientInputIndexes: [0, 1],
+        gradientOutputRoles: ["grad_left", "grad_right"],
+      };
+    case "graph.mul":
+      return {
+        savedInputRoles: ["left", "right"],
+        gradientInputIndexes: [0, 1],
+        gradientOutputRoles: ["grad_left", "grad_right"],
+      };
+    case "graph.bias":
+      return {
+        savedInputRoles: ["x", "bias"],
+        gradientInputIndexes: [0, 1],
+        gradientOutputRoles: ["grad_x", "grad_bias"],
+      };
+    case "graph.conv1d":
+    case "graph.conv2d":
+      return {
+        savedInputRoles: ["x", "weight", "scale"],
+        gradientInputIndexes: [0, 1, 2],
+        gradientOutputRoles: ["grad_x", "grad_weight", "grad_scale"],
+      };
+    case "graph.relu2":
+    case "graph.silu":
+      return {
+        savedInputRoles: ["x"],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_x"],
+      };
+    case "graph.rmsnorm":
+      return {
+        savedInputRoles: ["x", "weight"],
+        gradientInputIndexes: [0, 1],
+        gradientOutputRoles: ["grad_x", "grad_weight"],
+      };
+    case "graph.softmax":
+      return {
+        savedInputRoles: ["x"],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_x"],
+      };
+    case "graph.attention":
+      return {
+        savedInputRoles: ["q", "k", "v"],
+        gradientInputIndexes: [0, 1, 2],
+        gradientOutputRoles: ["grad_q", "grad_k", "grad_v"],
+      };
+    case "loss.mse":
+      return {
+        savedInputRoles: ["prediction", "target"],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_prediction"],
+      };
+    case "loss.softmax_cross_entropy":
+      return {
+        savedInputRoles: ["logits", "target"],
+        gradientInputIndexes: [0],
+        gradientOutputRoles: ["grad_logits"],
+      };
+    default:
+      fail("invalid_schema", `operation ${operation} has no first-order VJP rule`);
+  }
+}
+
 function sameShape(left: TrainingTensorSpecV1, right: TrainingTensorSpecV1): boolean {
   return (
     left.shape.length === right.shape.length &&
@@ -631,7 +782,7 @@ export function compileTrainingPlan(
     allocations.set(tensor.id, { byteOffset, byteLength });
   }
 
-  const buffers = model.recipe.tensors.map((tensor) => {
+  const buffers: CompiledTrainingBufferV1[] = model.recipe.tensors.map((tensor) => {
     const ownerId = tensor.aliasOf ?? tensor.id;
     const owner = tensors.get(ownerId);
     if (
@@ -659,6 +810,8 @@ export function compileTrainingPlan(
       ownerId,
       byteOffset: allocation.byteOffset,
       byteLength: allocation.byteLength,
+      backwardInitialization:
+        tensor.role === "gradient" ? ("zero" as const) : ("none" as const),
     });
   });
 
@@ -874,6 +1027,189 @@ export function compileTrainingPlan(
       fail("invalid_schema", `optimizer state ${tensor.id} has no parameter owner`);
     }
   }
+
+  const lossOperations = operations.filter((operation) =>
+    operation.operation.startsWith("loss."),
+  );
+  if (lossOperations.length !== 1) {
+    fail("invalid_schema", "a training recipe must contain exactly one loss operation");
+  }
+  const lossOutput = tensors.get(lossOperations[0]!.outputs[0]!);
+  if (
+    lossOutput === undefined ||
+    lossOutput.role !== "result" ||
+    lossOutput.dtype !== "f32" ||
+    lossOutput.shape.length !== 0
+  ) {
+    fail("invalid_schema", "the training loss must be a scalar f32 result");
+  }
+
+  let internalBufferIndex = 0;
+  const allocateInternal = (
+    source: TrainingTensorSpecV1,
+    purpose: string,
+    initialization: "none" | "one" = "none",
+  ): string => {
+    const id = `__tritium.${purpose}.${internalBufferIndex}`;
+    internalBufferIndex += 1;
+    const byteOffset = align16(residentBytes);
+    const byteLength = tensorByteLength(source);
+    residentBytes = checkedAdd(byteOffset, byteLength, "resident buffer plan");
+    buffers.push(
+      Object.freeze({
+        id,
+        dtype: source.dtype,
+        shape: Object.freeze([...source.shape]),
+        role: "gradient",
+        aliasOf: null,
+        ownerId: id,
+        byteOffset,
+        byteLength,
+        backwardInitialization: initialization,
+      }),
+    );
+    return id;
+  };
+
+  const parameterGradientByOwner = new Map<string, string>();
+  for (const operation of operations) {
+    if (!operation.operation.startsWith("optimizer.")) continue;
+    parameterGradientByOwner.set(operation.inputs[0]!, operation.inputs[1]!);
+  }
+  const gradientTargetKey = (tensorId: string): string => {
+    const tensor = tensors.get(tensorId)!;
+    return tensor.role === "parameter" ? tensor.aliasOf ?? tensor.id : tensor.id;
+  };
+
+  interface ActiveBackwardNode {
+    readonly operation: CompiledTrainingOperationV1;
+    readonly rule: DifferentiationRuleV1;
+    readonly outputGradientKey: string;
+    readonly contributionKeys: readonly string[];
+  }
+  const neededGradients = new Set<string>([lossOperations[0]!.outputs[0]!]);
+  const activeBackwardNodes: ActiveBackwardNode[] = [];
+  for (const operation of [...operations].reverse()) {
+    if (operation.operation.startsWith("optimizer.")) continue;
+    const outputId = operation.outputs[0]!;
+    if (!neededGradients.has(outputId)) continue;
+    if (operation.operation === "graph.detach") continue;
+    const rule = differentiationRule(operation.operation);
+    const contributionKeys = rule.gradientInputIndexes.map((inputIndex) => {
+      const inputId = operation.inputs[inputIndex]!;
+      const key = gradientTargetKey(inputId);
+      neededGradients.add(key);
+      return key;
+    });
+    activeBackwardNodes.push({
+      operation,
+      rule,
+      outputGradientKey: gradientTargetKey(outputId),
+      contributionKeys,
+    });
+  }
+
+  const contributionCounts = new Map<string, number>();
+  for (const node of activeBackwardNodes) {
+    for (const key of node.contributionKeys) {
+      contributionCounts.set(key, (contributionCounts.get(key) ?? 0) + 1);
+    }
+  }
+  const gradientBuffers = new Map<string, string>();
+  const ensureGradientBuffer = (key: string): string => {
+    const existing = gradientBuffers.get(key);
+    if (existing !== undefined) return existing;
+    const parameterGradient = parameterGradientByOwner.get(key);
+    if (parameterGradient !== undefined) {
+      gradientBuffers.set(key, parameterGradient);
+      return parameterGradient;
+    }
+    const source = tensors.get(key);
+    if (source === undefined || source.dtype !== "f32") {
+      fail("invalid_schema", `cannot allocate gradient for ${key}`);
+    }
+    const allocated = allocateInternal(source, "gradient");
+    gradientBuffers.set(key, allocated);
+    return allocated;
+  };
+
+  const lossSeed = allocateInternal(lossOutput, "loss_seed", "one");
+  gradientBuffers.set(lossOutput.id, lossSeed);
+  const contributions = new Map<string, string[]>();
+  const backwardOperations: CompiledBackwardOperationV1[] = [];
+  let dispatchIndex = 0;
+  for (const node of activeBackwardNodes) {
+    const { operation, rule } = node;
+    const outputBindings: CompiledTrainingBindingV1[] = [];
+    for (const [index, key] of node.contributionKeys.entries()) {
+      const total = contributionCounts.get(key)!;
+      const source = tensors.get(key)!;
+      const bufferId =
+        total === 1
+          ? ensureGradientBuffer(key)
+          : allocateInternal(source, "contribution");
+      const targetContributions = contributions.get(key) ?? [];
+      targetContributions.push(bufferId);
+      contributions.set(key, targetContributions);
+      outputBindings.push(
+        Object.freeze({
+          role: rule.gradientOutputRoles[index]!,
+          bufferId,
+        }),
+      );
+    }
+    const savedInputs = rule.savedInputRoles.map((role, index) =>
+      Object.freeze({ role, bufferId: operation.inputs[index]! }),
+    );
+    backwardOperations.push(
+      Object.freeze({
+        id: `backward.${dispatchIndex}`,
+        sourceOperationId: operation.id,
+        operation: operation.operation,
+        execution: "vjp",
+        inputs: Object.freeze([
+          ...savedInputs,
+          Object.freeze({
+            role: "grad_output",
+            bufferId: ensureGradientBuffer(node.outputGradientKey),
+          }),
+        ]),
+        outputs: Object.freeze(outputBindings),
+        attributes: operation.attributes,
+      }),
+    );
+    dispatchIndex += 1;
+
+    for (const key of new Set(node.contributionKeys)) {
+      const parts = contributions.get(key)!;
+      if (parts.length !== contributionCounts.get(key) || parts.length < 2) continue;
+      let accumulated = parts[0]!;
+      for (let index = 1; index < parts.length; index += 1) {
+        const last = index === parts.length - 1;
+        const result = last
+          ? ensureGradientBuffer(key)
+          : allocateInternal(tensors.get(key)!, "accumulation");
+        backwardOperations.push(
+          Object.freeze({
+            id: `backward.${dispatchIndex}`,
+            sourceOperationId: operation.id,
+            operation: "graph.add",
+            execution: "forward",
+            inputs: Object.freeze([
+              Object.freeze({ role: "left", bufferId: accumulated }),
+              Object.freeze({ role: "right", bufferId: parts[index]! }),
+            ]),
+            outputs: Object.freeze([
+              Object.freeze({ role: "result", bufferId: result }),
+            ]),
+            attributes: Object.freeze([]),
+          }),
+        );
+        dispatchIndex += 1;
+        accumulated = result;
+      }
+    }
+  }
   const isolatedPayloadBytes = checkedMultiply(
     model.payload.byteLength,
     2,
@@ -908,6 +1244,7 @@ export function compileTrainingPlan(
     manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
     buffers: Object.freeze(buffers),
     operations: Object.freeze(operations),
+    backwardOperations: Object.freeze(backwardOperations),
     residentBytes,
     batchStagingBytes,
     preparePeakBytes,

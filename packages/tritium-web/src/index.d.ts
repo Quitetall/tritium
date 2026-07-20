@@ -183,9 +183,25 @@ export interface CompiledTrainingBufferV1 extends TrainingTensorSpecV1 {
   readonly ownerId: string;
   readonly byteOffset: number;
   readonly byteLength: number;
+  readonly backwardInitialization: "none" | "zero" | "one";
 }
 
 export interface CompiledTrainingOperationV1 extends TrainingOperationSpecV1 {}
+
+export interface CompiledTrainingBindingV1 {
+  readonly role: string;
+  readonly bufferId: string;
+}
+
+export interface CompiledBackwardOperationV1 {
+  readonly id: string;
+  readonly sourceOperationId: string;
+  readonly operation: string;
+  readonly execution: "forward" | "vjp";
+  readonly inputs: readonly CompiledTrainingBindingV1[];
+  readonly outputs: readonly CompiledTrainingBindingV1[];
+  readonly attributes: readonly TrainingAttributeSpecV1[];
+}
 
 export interface CompiledTrainingPlanV1 {
   readonly schemaId: "tritium.compiled_training_plan";
@@ -193,6 +209,7 @@ export interface CompiledTrainingPlanV1 {
   readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
   readonly buffers: readonly CompiledTrainingBufferV1[];
   readonly operations: readonly CompiledTrainingOperationV1[];
+  readonly backwardOperations: readonly CompiledBackwardOperationV1[];
   readonly residentBytes: number;
   readonly batchStagingBytes: number;
   readonly preparePeakBytes: number;
