@@ -595,6 +595,7 @@ pub struct CudaBackend {
     pub(super) func_fsq_fwd: CudaFunction,
     pub(super) func_fsq_bwd: CudaFunction,
     pub(super) func_salt_bounded_fwd: CudaFunction,
+    pub(super) func_sgd_step: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -889,6 +890,9 @@ impl CudaBackend {
         let func_salt_bounded_fwd = grad_module
             .load_function(KERNEL_NAME_SALT_BOUNDED_FWD)
             .map_err(|e| driver_err("resolve salt_quantize_forward_bounded kernel", &e))?;
+        let func_sgd_step = grad_module
+            .load_function(KERNEL_NAME_SGD_STEP)
+            .map_err(|e| driver_err("resolve sgd_step kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -999,6 +1003,7 @@ impl CudaBackend {
             func_fsq_fwd,
             func_fsq_bwd,
             func_salt_bounded_fwd,
+            func_sgd_step,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -3578,6 +3583,42 @@ impl CudaBackend {
             launch
                 .launch(Self::elementwise_cfg(n))
                 .map_err(|e| driver_err("launch fsq_backward_dev", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sgd_step_portable_dev(
+        &self,
+        parameter: &CudaSlice<f32>,
+        gradient: &CudaSlice<f32>,
+        updated: &mut CudaSlice<f32>,
+        lr: f32,
+        n: usize,
+    ) -> Result<(), BackendError> {
+        if parameter.len() < n || gradient.len() < n || updated.len() < n {
+            return Err(BackendError::ShapeMismatch {
+                expected: n,
+                got: updated.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let n = i64::try_from(n)
+            .map_err(|_| BackendError::InvalidInput("SGD length exceeds i64::MAX".into()))?;
+        let mut launch = self.stream.launch_builder(&self.func_sgd_step);
+        launch
+            .arg(parameter)
+            .arg(gradient)
+            .arg(updated)
+            .arg(&lr)
+            .arg(&n);
+        #[allow(unsafe_code)]
+        // SAFETY: validated spans; one thread per parameter element.
+        unsafe {
+            launch
+                .launch(Self::elementwise_cfg(n as usize))
+                .map_err(|e| driver_err("launch sgd_step_portable_dev", &e))?;
         }
         Ok(())
     }

@@ -1430,6 +1430,14 @@ extern "C" __global__ void fsq_backward(
     grad_x[i] = upstream[i] * derivative;
 }
 
+extern "C" __global__ void sgd_step(
+    const float* __restrict__ parameter, const float* __restrict__ gradient,
+    float* __restrict__ updated, float lr, long n)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) updated[i] = parameter[i] - lr * gradient[i];
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(

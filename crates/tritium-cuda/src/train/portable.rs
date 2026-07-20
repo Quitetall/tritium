@@ -40,6 +40,7 @@ const OPERATIONS: &[&str] = &[
     "graph.rope",
     "loss.mse",
     "loss.softmax_cross_entropy",
+    "optimizer.sgd",
 ];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
@@ -1684,6 +1685,63 @@ impl CudaTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_sgd(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        if request.execution != TrainExecutionV1::Step {
+            return Err(invariant("sgd received an illegal phase"));
+        }
+        require_names(
+            request.inputs.iter().map(|b| b.name),
+            &["parameter", "gradient"],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|a| a.name),
+            &["step", "lr"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|b| b.name),
+            &["parameter"],
+            "outputs",
+        )?;
+        let (shape, parameter) = input_f32_any_shape(request, "parameter")?;
+        let (gradient_shape, gradient) = input_f32_any_shape(request, "gradient")?;
+        if shape != gradient_shape {
+            return Err(shape_error());
+        }
+        require_finite("parameter", parameter)?;
+        require_finite("gradient", gradient)?;
+        if attribute_u64(request, "step")? == 0 {
+            return Err(attribute_value("step", "one_based"));
+        }
+        let lr = attribute_f32(request, "lr")?;
+        if lr < 0.0 {
+            return Err(attribute_value("lr", "nonnegative"));
+        }
+        let device_parameter = self.backend.dev_upload(parameter).map_err(cuda_error)?;
+        let device_gradient = self.backend.dev_upload(gradient).map_err(cuda_error)?;
+        let mut device_updated = self
+            .backend
+            .dev_alloc_zeros(parameter.len())
+            .map_err(cuda_error)?;
+        self.backend
+            .sgd_step_portable_dev(
+                &device_parameter,
+                &device_gradient,
+                &mut device_updated,
+                lr,
+                parameter.len(),
+            )
+            .map_err(cuda_error)?;
+        let updated = download_device(&self.backend, &device_updated, parameter.len())?;
+        output_f32(output, "parameter", shape, parameter.len())?.copy_from_slice(&updated);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -1732,6 +1790,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "graph.rope" => self.execute_rope(&request, output)?,
             "loss.mse" => self.execute_mse(&request, output)?,
             "loss.softmax_cross_entropy" => self.execute_softmax_xent(&request, output)?,
+            "optimizer.sgd" => self.execute_sgd(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
