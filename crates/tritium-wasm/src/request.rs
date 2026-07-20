@@ -706,8 +706,9 @@ mod tests {
     use serde_json::{Value, json};
     use tritium_spec::{
         TrainingOpManifestV1, TrainingVectorAttributeV1, TrainingVectorAttributeValueV1,
-        TrainingVectorBufferDataV1, TrainingVectorBufferV1, TrainingVectorErrorCategoryV1,
-        TrainingVectorExpectedV1, TrainingVectorSetV1,
+        TrainingVectorBufferDataV1, TrainingVectorBufferV1, TrainingVectorCaseV1,
+        TrainingVectorErrorCategoryV1, TrainingVectorExpectedV1, TrainingVectorSetV1,
+        train_output_digest_v1, train_request_digest_v1,
     };
 
     use super::*;
@@ -802,6 +803,74 @@ mod tests {
             TrainingVectorBufferDataV1::F32Bits(_) => "f32",
             TrainingVectorBufferDataV1::U32(_) => "u32",
             TrainingVectorBufferDataV1::Bytes(_) => "bytes",
+        }
+    }
+
+    fn owned_vector_buffer(value: &TrainingVectorBufferV1) -> OwnedBuffer {
+        let data = match &value.data {
+            TrainingVectorBufferDataV1::F32Bits(bits) => {
+                OwnedBufferData::F32(bits.iter().copied().map(f32::from_bits).collect())
+            }
+            TrainingVectorBufferDataV1::U32(values) => OwnedBufferData::U32(values.clone()),
+            TrainingVectorBufferDataV1::Bytes(values) => OwnedBufferData::Bytes(values.clone()),
+        };
+        OwnedBuffer {
+            name: value.name.clone(),
+            shape: value.shape.clone(),
+            data,
+        }
+    }
+
+    fn owned_vector_attribute(value: &TrainingVectorAttributeV1) -> OwnedAttribute {
+        match &value.value {
+            TrainingVectorAttributeValueV1::F32Bits(bits) => {
+                OwnedAttribute::F32(value.name.clone(), f32::from_bits(*bits))
+            }
+            TrainingVectorAttributeValueV1::U64(attribute) => {
+                OwnedAttribute::U64(value.name.clone(), *attribute)
+            }
+            TrainingVectorAttributeValueV1::Bool(attribute) => {
+                OwnedAttribute::Bool(value.name.clone(), *attribute)
+            }
+            TrainingVectorAttributeValueV1::Text(attribute) => {
+                OwnedAttribute::Text(value.name.clone(), attribute.clone())
+            }
+            TrainingVectorAttributeValueV1::U64List(values) => {
+                OwnedAttribute::U64List(value.name.clone(), values.clone())
+            }
+            TrainingVectorAttributeValueV1::U32List(values) => {
+                OwnedAttribute::U32List(value.name.clone(), values.clone())
+            }
+        }
+    }
+
+    fn case_input_digest(case: &TrainingVectorCaseV1, vectors: &TrainingVectorSetV1) -> String {
+        let inputs: Vec<_> = case.inputs.iter().map(owned_vector_buffer).collect();
+        let attributes: Vec<_> = case.attributes.iter().map(owned_vector_attribute).collect();
+        let input_views: Vec<_> = inputs.iter().map(OwnedBuffer::as_ref).collect();
+        let attribute_views: Vec<_> = attributes.iter().map(OwnedAttribute::as_ref).collect();
+        let request = TrainRequestV1::new(
+            &case.operation,
+            case.execution,
+            &input_views,
+            &attribute_views,
+        )
+        .with_vector_digest(vectors.source_digest());
+        digest_hex(train_request_digest_v1(&request))
+    }
+
+    fn expected_output_digest(outputs: &[TrainingVectorBufferV1]) -> String {
+        let mut buffers: Vec<_> = outputs.iter().map(owned_vector_buffer).collect();
+        let mut views: Vec<_> = buffers.iter_mut().map(OwnedBuffer::as_mut).collect();
+        let output = TrainOutputV1::new(&mut views);
+        digest_hex(train_output_digest_v1(&output))
+    }
+
+    fn vector_payload_bytes(value: &TrainingVectorBufferV1) -> u64 {
+        match &value.data {
+            TrainingVectorBufferDataV1::F32Bits(values) => values.len() as u64 * 4,
+            TrainingVectorBufferDataV1::U32(values) => values.len() as u64 * 4,
+            TrainingVectorBufferDataV1::Bytes(values) => values.len() as u64,
         }
     }
 
@@ -938,26 +1007,20 @@ mod tests {
                     assert_eq!(receipt["maxBytes"], 8 * 1024 * 1024);
                     assert_eq!(receipt["hostTransfers"], 0);
                     assert_eq!(receipt["deviceResident"], true);
-                    assert!(
-                        receipt["peakResidentBytes"]
-                            .as_u64()
-                            .is_some_and(|value| value <= 64 * 1024 * 1024)
-                    );
+                    let resident_bytes = case
+                        .inputs
+                        .iter()
+                        .chain(outputs)
+                        .map(vector_payload_bytes)
+                        .sum::<u64>();
+                    assert_eq!(receipt["peakResidentBytes"], resident_bytes);
                     assert!(
                         receipt["scratchBytes"]
                             .as_u64()
                             .is_some_and(|value| value <= *scratch_bytes_max)
                     );
-                    assert!(
-                        receipt["inputDigest"]
-                            .as_str()
-                            .is_some_and(|value| value.len() == 64)
-                    );
-                    assert!(
-                        receipt["outputDigest"]
-                            .as_str()
-                            .is_some_and(|value| value.len() == 64)
-                    );
+                    assert_eq!(receipt["inputDigest"], case_input_digest(case, &vectors));
+                    assert_eq!(receipt["outputDigest"], expected_output_digest(outputs));
                 }
                 TrainingVectorExpectedV1::Error {
                     category,
