@@ -749,7 +749,7 @@ test("planner validates int8 AdamW block-state geometry", async () => {
   };
   int8Adapter.prepare = async (_preparedModel, _preparedConfig, plan) =>
     receipt("session.prepare", "webgpu", {
-      peakResidentBytes: plan.residentBytes,
+      peakResidentBytes: plan.preparePeakBytes,
     });
   const session = await prepareTraining(int8Model, int8Config, int8Adapter);
   assert.deepEqual(session.plan.operations.find((item) => item.id === "int8-adamw").inputs.slice(2), [

@@ -6,9 +6,11 @@ contains the frozen language-neutral training identities and the checked
 schema, backend-policy, capability, receipt, memory, ordering and concurrency
 violations. Recipes compile before `adapter.prepare` may allocate into an immutable,
 16-byte-aligned buffer/schedule plan. Tensor owners are explicit, tied
-parameters share one allocation and one compiled gradient/optimizer owner, batch names/dtypes/shapes are checked against
-the plan, and allocation-free validation plus non-retaining preparation close
-operation-specific geometry/attribute rules before persistent preparation.
+parameters share one allocation and one compiled gradient/optimizer owner, and
+batch names/dtypes/shapes are checked against the plan. Structural planning and
+the built-in adapter's optimizer-subset, portable-buffer, worst-case request
+JSON and lifecycle-capacity gates run before guest creation; complete
+operation-specific geometry/attribute admission remains a release gate.
 Model/batch bytes are isolated from adapter mutation. Failed
 adapter calls do not advance session state. The archive also bundles a real
 `wasm32-unknown-unknown` guest; `runPortableWasmConformance()` executes all 114
@@ -33,17 +35,28 @@ canonical owner, preserve exact f32 bits, return explicit destination buffer
 IDs and fail closed on binding, dtype, shape or compiled-plan drift. Generated
 binding freshness is part of `npm run check`.
 
+`encodeWebTrainingPayload(...)` writes canonical `TRWEBP1` bytes containing
+root parameters and optimizer state. `decodeWebTrainingPayload(...)` verifies
+BLAKE3 integrity, canonical ordering, exact dtype/byte lengths and compiled
+ownership before materializing one mutable tensor per owner. `backend: "wasm"`
+now selects a built-in session adapter; permitted `auto` fallback does likewise.
+It prepares the guest once, then executes compiled forward, reverse and atomic
+multi-group optimizer schedules without re-reading or rehashing guest bytes.
+Same-kind optimizer groups checkpoint through canonical portable lifecycle
+bytes and resume atomically with exact optimizer planes and step count.
+Receipts report planner-accounted phase peaks; physical browser memory
+receipts remain a separate acceptance gate.
+
 `PortableWasmLifecycleState.create(...)` owns copied optimizer planes, commits
 and resumes atomically through that guest. Its separate `admitExport(...)`
 boundary strict-reloads caller-supplied SALT packages before returning them.
-Initial model-to-buffer decoding, session-owned compiled dispatch execution and
-state-derived model export remain separate release gates.
+Complete pre-allocation operation geometry admission and state-derived model
+export remain release gates.
 
-The compiled lifecycle WASM controller and WebGPU adapter are still under construction;
-the conformance guest is not mislabeled as either. Until a lifecycle adapter is
-supplied, `prepareTraining(model, config)` returns a typed
-`adapter_unavailable` error; this package never labels a JavaScript fallback as
-WebGPU execution.
+The built-in adapter remains explicitly `wasm-fallback`; it never satisfies a
+WebGPU gate. WebGPU implementation and state-derived SALT export remain under
+construction. `backend: "webgpu"` still returns `adapter_unavailable` unless a
+real WebGPU adapter is supplied.
 
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.

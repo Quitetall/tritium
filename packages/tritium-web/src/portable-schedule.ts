@@ -39,6 +39,7 @@ type BindingRegistry = Readonly<
 const BINDINGS = PORTABLE_OPERATION_BINDINGS_V1 as unknown as BindingRegistry;
 const MAX_PORTABLE_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_PORTABLE_REQUEST_JSON_BYTES = 8 * 1024 * 1024;
+const UTF8 = new TextEncoder();
 
 export class PortableSchedulePlanError extends Error {
   readonly code: PortableSchedulePlanErrorCode;
@@ -177,6 +178,14 @@ function bufferMap(
     }
   }
   return buffers;
+}
+
+/** Internal strict admission shared by schedule and payload boundaries. */
+export function admittedCompiledBufferMap(
+  plan: CompiledTrainingPlanV1,
+): ReadonlyMap<string, CompiledTrainingBufferV1> {
+  checkPlan(plan);
+  return bufferMap(plan);
 }
 
 function tensorFor(
@@ -320,6 +329,126 @@ function portableAttribute(attribute: TrainingAttributeSpecV1): PortableAttribut
       });
     default:
       fail("invalid_schema", "compiled attribute kind is invalid");
+  }
+}
+
+function boundedBufferJsonBytes(
+  role: string,
+  buffer: CompiledTrainingBufferV1,
+  input: boolean,
+): number {
+  const field = buffer.dtype === "f32" ? "bits" : "values";
+  const empty = {
+    name: role,
+    shape: [...buffer.shape],
+    data: { dtype: buffer.dtype, [field]: [] },
+  };
+  const fixed = UTF8.encode(JSON.stringify(empty)).byteLength - 2;
+  const elements = buffer.dtype === "bytes" ? buffer.byteLength : buffer.byteLength / 4;
+  const digits = input ? (buffer.dtype === "bytes" ? 3 : 10) : 1;
+  const arrayBytes = elements === 0 ? 2 : 1 + elements * (digits + 1);
+  const total = fixed + arrayBytes;
+  if (!Number.isSafeInteger(total)) fail("capacity", "portable buffer JSON size overflowed");
+  return total;
+}
+
+function boundedBufferListJsonBytes(
+  roles: readonly string[],
+  ids: readonly string[],
+  buffers: ReadonlyMap<string, CompiledTrainingBufferV1>,
+  input: boolean,
+): number {
+  let bytes = 2;
+  ids.forEach((id, index) => {
+    const buffer = buffers.get(id);
+    if (buffer === undefined) fail("invalid_schema", `unknown compiled buffer ${id}`);
+    bytes += boundedBufferJsonBytes(roles[index]!, buffer, input) + (index === 0 ? 0 : 1);
+    if (!Number.isSafeInteger(bytes)) fail("capacity", "portable request size overflowed");
+  });
+  return bytes;
+}
+
+function preflightRequest(
+  operation: string,
+  execution: "forward" | "vjp" | "step",
+  inputIds: readonly string[],
+  outputIds: readonly string[],
+  attributes: readonly TrainingAttributeSpecV1[],
+  buffers: ReadonlyMap<string, CompiledTrainingBufferV1>,
+): void {
+  checkIds(inputIds, `${operation}.${execution} input`);
+  checkIds(outputIds, `${operation}.${execution} output`);
+  checkAttributes(attributes, `${operation}.${execution}`);
+  const roles = binding(operation, execution);
+  if (roles.inputs.length !== inputIds.length || roles.outputs.length !== outputIds.length) {
+    fail("invalid_schema", `${operation}.${execution} arity differs from canonical ABI`);
+  }
+  if (
+    roles.attributes.length !== attributes.length ||
+    attributes.some(
+      (attribute, index) =>
+        attribute.name !== roles.attributes[index]?.name ||
+        attribute.kind !== roles.attributes[index]?.kind,
+    )
+  ) {
+    fail("invalid_schema", `${operation}.${execution} attributes differ from canonical ABI`);
+  }
+  const shell = {
+    schemaId: "tritium.portable_training_request",
+    schemaVersion: 1,
+    physicalDevice: "wasm32:browser",
+    operation,
+    execution,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    inputs: [],
+    attributes: attributes.map(portableAttribute),
+    outputs: [],
+  };
+  const shellBytes = UTF8.encode(JSON.stringify(shell)).byteLength - 4;
+  const requestBytes =
+    shellBytes +
+    boundedBufferListJsonBytes(roles.inputs, inputIds, buffers, true) +
+    boundedBufferListJsonBytes(roles.outputs, outputIds, buffers, false);
+  if (!Number.isSafeInteger(requestBytes) || requestBytes > MAX_PORTABLE_REQUEST_JSON_BYTES) {
+    fail("capacity", "compiled portable request may exceed 8 MiB");
+  }
+}
+
+/** Allocation-free admission for every dispatch the built-in WASM session can issue. */
+export function preflightPortableSchedulePlan(plan: CompiledTrainingPlanV1): void {
+  checkPlan(plan);
+  const buffers = bufferMap(plan);
+  for (const operation of plan.operations) {
+    const execution = operation.operation.startsWith("optimizer.") ? "step" : "forward";
+    preflightRequest(
+      operation.operation,
+      execution,
+      operation.inputs,
+      operation.outputs,
+      operation.attributes,
+      buffers,
+    );
+  }
+  for (const operation of plan.backwardOperations) {
+    const roles = binding(operation.operation, operation.execution);
+    const actualInputs = operation.inputs.map((item) => item.role);
+    const actualOutputs = operation.outputs.map((item) => item.role);
+    if (
+      actualInputs.length !== roles.inputs.length ||
+      actualInputs.some((role, index) => role !== roles.inputs[index]) ||
+      actualOutputs.length !== roles.outputs.length ||
+      actualOutputs.some((role, index) => role !== roles.outputs[index])
+    ) {
+      fail("invalid_schema", `${operation.id} role bindings drift from canonical ABI`);
+    }
+    preflightRequest(
+      operation.operation,
+      operation.execution,
+      operation.inputs.map((item) => item.bufferId),
+      operation.outputs.map((item) => item.bufferId),
+      operation.attributes,
+      buffers,
+    );
   }
 }
 

@@ -36,6 +36,7 @@ await cp(
   resolve(root, "src/portable-schedule-types.d.ts"),
   resolve(output, "portable-schedule-types.d.ts"),
 );
+await cp(resolve(root, "src/payload-types.d.ts"), resolve(output, "payload-types.d.ts"));
 await cp(resolve(root, "src/portable.d.ts"), resolve(output, "portable.d.ts"));
 await cp(resolve(root, "../../LICENSE"), resolve(output, "LICENSE"));
 await cp(resolve(root, "../../NOTICE"), resolve(output, "NOTICE"));

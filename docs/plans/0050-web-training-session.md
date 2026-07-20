@@ -114,8 +114,19 @@ registry used to compile immutable typed-array stores into exact forward, VJP
 and optimizer-step portable requests. The package gate rejects registry drift,
 unknown buffers, role drift, dtype/shape mismatches and malformed compiled
 plans before guest entry. It remains explicitly `wasm-fallback`; session-owned
-execution, the initial model-to-buffer payload contract, state-derived model
-export and physical Chrome/Firefox runs remain open.
+forward/VJP/optimizer execution now uses one admitted guest without per-dispatch
+guest rehashing. A canonical 64 MiB-bounded `TRWEBP1` container initializes
+root parameter and optimizer-state owners with BLAKE3 integrity and exact
+little-endian lanes; aliases, gradients, activations and loss seeds are derived
+from the compiled plan. Same-kind optimizer groups now checkpoint through
+canonical plan-0049 bytes and resume atomically into fresh sessions with exact
+step/plane recovery. Structural compilation, mixed-optimizer admission and
+static portable buffer/request/lifecycle capacity checks fail before guest
+creation. Lower-level schedule/lifecycle compiler failures normalize to the
+stable session error surface. Receipts now carry planner-accounted phase peaks;
+they are not substitutes for the still-open physical browser memory evidence.
+State-derived model export, complete operation-specific pre-allocation geometry
+admission and physical Chrome/Firefox runs remain open.
 
 Compile `tritium-spec`, the bounded portable executor and SALT V2 strict reader
 to `wasm32-unknown-unknown`. JavaScript owns only lifecycle orchestration and
@@ -146,8 +157,9 @@ buffer plan; tensor ownership, tied-parameter allocation, exact batch staging,
 safe-integer byte accounting, preparation peak ceilings, and one-gradient /
 one-optimizer ownership for each tied-parameter group fail closed.
 The adapter boundary now separates allocation-free, non-mutating, non-retaining
-operation-specific geometry/attribute validation from persistent preparation;
-preparation may allocate decoded state but may not mutate or retain its inputs.
+structural/subset validation from persistent preparation; preparation may
+allocate decoded state but may not mutate or retain its inputs. Completing the
+operation-specific geometry/attribute catalog remains open.
 Preparation peak accounting includes the isolated validation and preparation
 payloads. The compiler now derives the reachable reverse-mode VJP schedule from
 the single declared loss, assigns canonical backend roles to saved inputs and
@@ -156,10 +168,15 @@ each backward boundary, and emits deterministic `graph.add` fan-in reductions
 into each tied parameter owner's sole gradient buffer. Generated canonical
 bindings now lower every frozen forward, VJP, fan-in and optimizer step into a
 typed portable dispatch with copied inputs and explicit output buffer IDs.
-Session execution of that frozen schedule, initial parameter decoding and
-device-loss transactions remain open; canonical WASM
-checkpoint/resume state transactions are owned and failure-stable, while SALT
-package admission is canonical but state-derived export remains open.
+The bundled fallback now owns decoded buffers, stages checked batches, executes
+that schedule through one prepared guest, resets reverse seeds, commits each
+guest dispatch only after validated success and commits multi-group optimizer
+steps atomically. Default `backend: "wasm"` and admitted `auto` fallback select
+it without caller adapter wiring. Checkpoint and resume use canonical WASM
+transactions directly; candidate planes and step commit only after every
+returned plane validates. Complete pre-allocation geometry admission and
+device-loss transactions remain open, while SALT package admission is
+canonical but state-derived export remains open.
 
 Compile a `TrainingRecipeV1` into an immutable operation schedule, buffer plan
 and optimizer-state layout. Preparation validates all roles, shapes, dtypes,
@@ -168,8 +185,8 @@ state.
 
 - Parameters, gradients, optimizer state and activations have explicit owners.
 - Tied parameters occupy one allocation and receive one accumulated update.
-- Forward/backward/step reuse prepared buffers; no allocator is used in the
-  steady-state inner loop except capacity-bound batch staging.
+- Forward/backward/step reuse prepared tensor owners; transient request
+  snapshots and atomic candidate outputs remain capacity-bound.
 - Checkpoint/resume uses the canonical plan-0049 lifecycle encoding.
 - Export writes canonical SALT V2 bytes and immediately reloads them through
   the strict WASM reader before returning.

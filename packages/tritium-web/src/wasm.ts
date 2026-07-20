@@ -47,7 +47,9 @@ let initialized: Promise<void> | null = null;
 
 class GuestTrapError extends Error {}
 
-async function readGuestBytes(source: PortableWasmSourceV1): Promise<Uint8Array> {
+export async function snapshotPortableWasmSource(
+  source: PortableWasmSourceV1,
+): Promise<Uint8Array> {
   if (source instanceof Response) {
     return new Uint8Array(await source.arrayBuffer());
   }
@@ -57,6 +59,11 @@ async function readGuestBytes(source: PortableWasmSourceV1): Promise<Uint8Array>
     );
   }
   if (source instanceof ArrayBuffer) return new Uint8Array(source.slice(0));
+  if (source instanceof URL && source.protocol === "file:") {
+    const moduleName = "node:fs/promises";
+    const fileSystem = await import(moduleName) as { readFile(url: URL): Promise<Uint8Array> };
+    return Uint8Array.from(await fileSystem.readFile(source));
+  }
   const response = await fetch(source);
   if (!response.ok) {
     throw new Error(`portable WASM fetch failed with HTTP ${response.status}`);
@@ -65,7 +72,7 @@ async function readGuestBytes(source: PortableWasmSourceV1): Promise<Uint8Array>
 }
 
 async function initializeGuest(source: PortableWasmSourceV1): Promise<string> {
-  const guestBytes = await readGuestBytes(source);
+  const guestBytes = await snapshotPortableWasmSource(source);
   const guestDigest = bytesToHex(blake3(guestBytes));
   if (guestDigest !== WASM_GUEST_DIGEST_V1) {
     throw new Error(
@@ -481,14 +488,19 @@ function localError(
   });
 }
 
-/** Execute one strict request through Rust-owned WASM semantics. */
-export async function executePortableWasmRequest(
+export type PreparedPortableWasmExecutor = Readonly<{
+  buildId: string;
+  execute(request: PortableTrainingRequestV1): Promise<PortableTrainingResponseV1>;
+}>;
+
+type AdmittedPortableRequest = Readonly<{
+  requestJson: string;
+  requestSnapshot: PortableTrainingRequestV1;
+}>;
+
+function admitPortableRequest(
   request: PortableTrainingRequestV1,
-  source: PortableWasmSourceV1 = new URL(
-    "./tritium_wasm_bg.wasm",
-    import.meta.url,
-  ),
-): Promise<PortableTrainingResponseV1> {
+): AdmittedPortableRequest | PortableTrainingResponseV1 {
   let requestJson: string;
   let requestSnapshot: PortableTrainingRequestV1;
   try {
@@ -508,27 +520,70 @@ export async function executePortableWasmRequest(
       "capacity",
     );
   }
-  let backendBuild: string;
+  return Object.freeze({ requestJson, requestSnapshot });
+}
+
+async function executeAdmittedRequest(
+  admitted: AdmittedPortableRequest,
+  backendBuild: string,
+): Promise<PortableTrainingResponseV1> {
+  let responseJson: string;
   try {
-    backendBuild = await initializeGuest(source);
+    responseJson = tritium_execute_portable_request_json(admitted.requestJson);
+  } catch {
+    return localError("guest_trap", "portable WASM guest trapped", "internal");
+  }
+  return validateResponse(
+    JSON.parse(responseJson) as unknown,
+    admitted.requestSnapshot,
+    backendBuild,
+  );
+}
+
+async function executeInitializedRequest(
+  request: PortableTrainingRequestV1,
+  backendBuild: string,
+): Promise<PortableTrainingResponseV1> {
+  const admitted = admitPortableRequest(request);
+  return "status" in admitted
+    ? admitted
+    : executeAdmittedRequest(admitted, backendBuild);
+}
+
+/** Snapshot, admit, and initialize one guest for repeated request execution. */
+export async function preparePortableWasmExecutor(
+  source: PortableWasmSourceV1 = new URL(
+    "./tritium_wasm_bg.wasm",
+    import.meta.url,
+  ),
+): Promise<PreparedPortableWasmExecutor> {
+  const buildId = await initializeGuest(source);
+  return Object.freeze({
+    buildId,
+    execute: (request: PortableTrainingRequestV1) => executeInitializedRequest(request, buildId),
+  });
+}
+
+/** Execute one strict request through Rust-owned WASM semantics. */
+export async function executePortableWasmRequest(
+  request: PortableTrainingRequestV1,
+  source: PortableWasmSourceV1 = new URL(
+    "./tritium_wasm_bg.wasm",
+    import.meta.url,
+  ),
+): Promise<PortableTrainingResponseV1> {
+  const admitted = admitPortableRequest(request);
+  if ("status" in admitted) return admitted;
+  let executor: PreparedPortableWasmExecutor;
+  try {
+    executor = await preparePortableWasmExecutor(source);
   } catch (error) {
     if (error instanceof GuestTrapError) {
       return localError("guest_trap", "portable WASM guest trapped", "internal");
     }
     throw error;
   }
-
-  let responseJson: string;
-  try {
-    responseJson = tritium_execute_portable_request_json(requestJson);
-  } catch {
-    return localError("guest_trap", "portable WASM guest trapped", "internal");
-  }
-  return validateResponse(
-    JSON.parse(responseJson) as unknown,
-    requestSnapshot,
-    backendBuild,
-  );
+  return executeAdmittedRequest(admitted, executor.buildId);
 }
 
 /** Execute the complete canonical vector corpus twice inside the bundled guest. */

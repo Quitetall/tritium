@@ -303,7 +303,10 @@ function validateAndCopyBatch(
   ) {
     fail("invalid_schema", "batch inputs do not match the compiled plan", state);
   }
-  const copied: Record<string, Float32Array | Uint32Array | Uint8Array> = {};
+  const copied = Object.create(null) as Record<
+    string,
+    Float32Array | Uint32Array | Uint8Array
+  >;
   for (const buffer of expected) {
     const value = batch.inputs[buffer.id];
     const dtypeMatches =
@@ -1539,8 +1542,8 @@ export class WebTrainingSession {
       receipt,
       capabilities,
       "session.prepare",
-      plan.residentBytes,
-      safeConfig.maxResidentBytes - safeModel.payload.byteLength * 2,
+      plan.preparePeakBytes,
+      safeConfig.maxResidentBytes,
       0,
     );
     return new WebTrainingSession(
@@ -1597,8 +1600,8 @@ export class WebTrainingSession {
         safeResult.receipt,
         this.capabilities,
         "session.forward",
-        this.plan.residentBytes,
-        this.#maxResidentBytes - this.plan.batchStagingBytes,
+        this.plan.forwardPeakBytes,
+        this.#maxResidentBytes,
         this.#completedSteps,
       );
       this.#lastResult = safeResult;
@@ -1618,7 +1621,7 @@ export class WebTrainingSession {
         receipt,
         this.capabilities,
         "session.backward",
-        this.plan.residentBytes,
+        this.plan.peakBytes,
         this.#maxResidentBytes,
         this.#completedSteps,
       );
@@ -1635,7 +1638,7 @@ export class WebTrainingSession {
         receipt,
         this.capabilities,
         "session.step",
-        this.plan.residentBytes,
+        this.plan.peakBytes,
         this.#maxResidentBytes,
         this.#completedSteps + 1,
       );
@@ -1657,7 +1660,7 @@ export class WebTrainingSession {
         result.receipt,
         this.capabilities,
         "session.checkpoint",
-        this.plan.residentBytes,
+        this.plan.peakBytes,
         this.#maxResidentBytes,
         this.#completedSteps,
       );
@@ -1678,7 +1681,7 @@ export class WebTrainingSession {
         receipt,
         this.capabilities,
         "session.resume",
-        this.plan.residentBytes,
+        this.plan.peakBytes,
         this.#maxResidentBytes,
         null,
       );
@@ -1698,7 +1701,7 @@ export class WebTrainingSession {
         result.receipt,
         this.capabilities,
         "session.export",
-        this.plan.residentBytes,
+        this.plan.peakBytes,
         this.#maxResidentBytes,
         this.#completedSteps,
       );
@@ -1721,11 +1724,33 @@ export async function prepareTraining(
   config: WebTrainingConfigV1,
   adapter?: WebTrainingAdapterV1,
 ): Promise<WebTrainingSession> {
+  validateModel(model);
+  validateConfig(config);
   if (adapter === undefined) {
-    fail(
-      "adapter_unavailable",
-      "no generated WebGPU or WASM adapter was supplied",
-    );
+    if (config.backend === "wasm" || (config.backend === "auto" && config.allowWasmFallback)) {
+      const plan = compileTrainingPlan(model, config);
+      const {
+        createPortableWasmTrainingAdapter,
+        validatePortableWasmPlan,
+      } = await import("./wasm-adapter.ts");
+      validatePortableWasmPlan(plan);
+      try {
+        adapter = await createPortableWasmTrainingAdapter();
+      } catch (error) {
+        if (error instanceof WebTrainingError) throw error;
+        fail(
+          "adapter_unavailable",
+          `portable WASM guest could not be created: ${
+            error instanceof Error ? error.message : "unknown failure"
+          }`,
+        );
+      }
+    } else {
+      fail(
+        "adapter_unavailable",
+        "no generated WebGPU adapter was supplied",
+      );
+    }
   }
   return WebTrainingSession.prepare(model, config, adapter);
 }

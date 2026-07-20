@@ -20,6 +20,7 @@ export {
   prepareTraining,
 } from "./session.ts";
 export { executePortableWasmRequest, runPortableWasmConformance } from "./wasm.ts";
+export { createPortableWasmTrainingAdapter } from "./wasm-adapter.ts";
 export {
   PortableLifecyclePlanError,
   compilePortableCheckpointRequest,
@@ -36,6 +37,11 @@ export {
   compilePortableBackwardOperationRequest,
   compilePortablePlanOperationRequest,
 } from "./portable-schedule.ts";
+export {
+  WebTrainingPayloadError,
+  decodeWebTrainingPayload,
+  encodeWebTrainingPayload,
+} from "./payload.ts";
 export type {
   PortableAdamLeafV1,
   PortableCheckpointOptimizerV1,
@@ -56,6 +62,10 @@ export type {
   PortableScheduleTensorStoreV1,
   PortableScheduleTensorV1,
 } from "./portable-schedule.ts";
+export type {
+  WebTrainingInitialTensorsV1,
+  WebTrainingPayloadErrorCode,
+} from "./payload.ts";
 export type {
   PortableAttributeV1,
   PortableBufferDataV1,

@@ -19,6 +19,10 @@ import type {
   PortableSchedulePlanErrorCode,
   PortableScheduleTensorStoreV1,
 } from "./portable-schedule-types.js";
+import type {
+  WebTrainingInitialTensorsV1,
+  WebTrainingPayloadErrorCode,
+} from "./payload-types.js";
 
 export type {
   PortableAdamLeafV1,
@@ -55,6 +59,11 @@ export type {
   PortableScheduleTensorStoreV1,
   PortableScheduleTensorV1,
 } from "./portable-schedule-types.js";
+
+export type {
+  WebTrainingInitialTensorsV1,
+  WebTrainingPayloadErrorCode,
+} from "./payload-types.js";
 
 export type TrainingOpCategoryV1 =
   | "graph"
@@ -101,6 +110,10 @@ export declare function executePortableWasmRequest(
   request: PortableTrainingRequestV1,
   source?: PortableWasmSourceV1,
 ): Promise<PortableTrainingResponseV1>;
+
+export declare function createPortableWasmTrainingAdapter(
+  source?: PortableWasmSourceV1,
+): Promise<WebTrainingAdapterV1>;
 
 export declare class PortableLifecyclePlanError extends Error {
   readonly code: "invalid_schema" | "capacity";
@@ -164,6 +177,20 @@ export declare function compilePortableBackwardOperationRequest(
   store: PortableScheduleTensorStoreV1,
   physicalDevice?: string,
 ): PortableCompiledDispatchV1;
+
+export declare class WebTrainingPayloadError extends Error {
+  readonly code: WebTrainingPayloadErrorCode;
+  constructor(code: WebTrainingPayloadErrorCode, message: string);
+}
+
+export declare function encodeWebTrainingPayload(
+  tensors: WebTrainingInitialTensorsV1,
+): Uint8Array;
+
+export declare function decodeWebTrainingPayload(
+  plan: CompiledTrainingPlanV1,
+  payload: Uint8Array,
+): PortableScheduleTensorStoreV1;
 
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";

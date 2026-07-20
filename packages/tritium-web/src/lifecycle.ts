@@ -134,6 +134,93 @@ function checkpointSize(
   return bytes;
 }
 
+function boundedLifecyclePlaneJsonBytes(
+  elements: number,
+  dtype: "f32" | "bytes",
+  input: boolean,
+): number {
+  const digits = input ? (dtype === "bytes" ? 3 : 10) : 1;
+  const bytes = 256 + 1 + elements * (digits + 1);
+  if (!Number.isSafeInteger(bytes)) fail("capacity", "lifecycle JSON size overflowed");
+  return bytes;
+}
+
+/** Allocation-free capacity admission for checkpoint and resume requests. */
+export function preflightPortableLifecycleLayout(
+  optimizer: PortableCheckpointOptimizerV1,
+  leafLengths: readonly number[],
+): void {
+  if (![
+    "sgd",
+    "adamw",
+    "cautious_adamw",
+    "int8_adamw",
+    "muon",
+  ].includes(optimizer)) {
+    fail("invalid_schema", "optimizer is not supported by portable checkpoints");
+  }
+  validateLeafLengths(leafLengths);
+  const planes =
+    optimizer === "sgd"
+      ? 1
+      : optimizer === "adamw" || optimizer === "cautious_adamw"
+        ? 3
+        : optimizer === "int8_adamw"
+          ? 5
+          : 2;
+  if (leafLengths.length * planes > 64) {
+    fail("capacity", "checkpoint inputs exceed 64 buffers");
+  }
+  if (1 + leafLengths.length * planes > 64) {
+    fail("capacity", "resume outputs exceed 64 buffers");
+  }
+  const encodedBytes = checkpointSize(optimizer, leafLengths);
+  let callerBytes = encodedBytes + 8;
+  let checkpointJsonBytes =
+    4096 +
+    leafLengths.length * 12 +
+    boundedLifecyclePlaneJsonBytes(encodedBytes, "bytes", false);
+  let resumeJsonBytes =
+    4096 +
+    leafLengths.length * 12 +
+    boundedLifecyclePlaneJsonBytes(encodedBytes, "bytes", true) +
+    boundedLifecyclePlaneJsonBytes(8, "bytes", false);
+  for (const length of leafLengths) {
+    const blocks = Math.ceil(length / INT8_ADAM_BLOCK);
+    const stateBytes =
+      optimizer === "sgd"
+        ? 0
+        : optimizer === "adamw" || optimizer === "cautious_adamw"
+          ? length * 8
+          : optimizer === "int8_adamw"
+            ? length * 2 + blocks * 8
+            : length * 4;
+    callerBytes = checkedCallerBytes(callerBytes, length * 4 + stateBytes);
+    checkpointJsonBytes += boundedLifecyclePlaneJsonBytes(length, "f32", true);
+    resumeJsonBytes += boundedLifecyclePlaneJsonBytes(length, "f32", false);
+    if (optimizer === "adamw" || optimizer === "cautious_adamw") {
+      checkpointJsonBytes += 2 * boundedLifecyclePlaneJsonBytes(length, "f32", true);
+      resumeJsonBytes += 2 * boundedLifecyclePlaneJsonBytes(length, "f32", false);
+    } else if (optimizer === "int8_adamw") {
+      checkpointJsonBytes += 2 * boundedLifecyclePlaneJsonBytes(length, "bytes", true);
+      checkpointJsonBytes += 2 * boundedLifecyclePlaneJsonBytes(blocks, "f32", true);
+      resumeJsonBytes += 2 * boundedLifecyclePlaneJsonBytes(length, "bytes", false);
+      resumeJsonBytes += 2 * boundedLifecyclePlaneJsonBytes(blocks, "f32", false);
+    } else if (optimizer === "muon") {
+      checkpointJsonBytes += boundedLifecyclePlaneJsonBytes(length, "f32", true);
+      resumeJsonBytes += boundedLifecyclePlaneJsonBytes(length, "f32", false);
+    }
+  }
+  if (
+    !Number.isSafeInteger(checkpointJsonBytes) ||
+    !Number.isSafeInteger(resumeJsonBytes) ||
+    checkpointJsonBytes > MAX_REQUEST_JSON_BYTES ||
+    resumeJsonBytes > MAX_REQUEST_JSON_BYTES
+  ) {
+    fail("capacity", "lifecycle request may exceed 8 MiB");
+  }
+}
+
 function validateLeafLengths(values: readonly number[]): readonly number[] {
   checkedArray(values, 0xffff_ffff, "leafLengths", 1024);
   if (values.length === 0) fail("invalid_schema", "at least one leaf is required");
