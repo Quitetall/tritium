@@ -10,6 +10,7 @@ use tritium_spec::{
 use crate::WgpuBackend;
 
 const OPERATIONS: &[&str] = &[
+    "graph.transpose",
     "graph.detach",
     "graph.scale_const",
     "graph.bias",
@@ -513,6 +514,64 @@ impl WgpuTrainBackendV1 {
         output_f32(output, "parameter", shape, parameter.len())?.copy_from_slice(&updated);
         Ok(())
     }
+
+    fn execute_transpose(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, output_name) = match request.execution {
+            TrainExecutionV1::Forward => ("x", "result"),
+            TrainExecutionV1::Vjp => ("grad_output", "grad_x"),
+            _ => return Err(invariant("transpose received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        if rows == 0 || cols == 0 || rows > u32::MAX as u64 || cols > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let input_shape = if request.execution == TrainExecutionV1::Forward {
+            [rows, cols]
+        } else {
+            [cols, rows]
+        };
+        let output_shape = if request.execution == TrainExecutionV1::Forward {
+            [cols, rows]
+        } else {
+            [rows, cols]
+        };
+        let (actual_shape, input) = input_f32(request, input_name)?;
+        if actual_shape != input_shape {
+            return Err(shape_error());
+        }
+        require_finite(input_name, input)?;
+        let operation = if request.execution == TrainExecutionV1::Forward {
+            22
+        } else {
+            23
+        };
+        let result = self
+            .backend
+            .pointwise(input, input, input, operation, 0.0, cols as u32)
+            .map_err(wgpu_error)?;
+        output_f32(output, output_name, &output_shape, input.len())?.copy_from_slice(&result);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -557,6 +616,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "optimizer.sgd" {
             self.execute_sgd(&request, output)?;
+            0
+        } else if request.operation == "graph.transpose" {
+            self.execute_transpose(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;

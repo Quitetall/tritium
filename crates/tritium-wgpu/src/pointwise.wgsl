@@ -167,6 +167,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             result[index] = gradient;
         }
         case 21u: { result[index] = left[index] - params.scalar * right[index]; }
+        case 22u: {
+            let rows = params.len / params.auxiliary;
+            result[index] = left[(index % rows) * params.auxiliary + index / rows];
+        }
+        case 23u: {
+            let rows = params.len / params.auxiliary;
+            result[index] = left[(index % params.auxiliary) * rows + index / params.auxiliary];
+        }
         default: { result[index] = 0.0; }
     }
 }
