@@ -12,6 +12,7 @@ use crate::WgpuBackend;
 const OPERATIONS: &[&str] = &[
     "graph.dense_matmul",
     "graph.ternary_matmul",
+    "graph.embedding_gather",
     "graph.transpose",
     "graph.slice_cols",
     "graph.concat_cols",
@@ -1001,6 +1002,77 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_embedding(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) = match request.execution {
+            TrainExecutionV1::Forward => (&["weight", "tokens"], &["result"]),
+            TrainExecutionV1::Vjp => (&["weight", "tokens", "grad_output"], &["grad_weight"]),
+            _ => return Err(invariant("embedding gather received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["vocab", "n_embd"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let vocab = attribute_u64(request, "vocab")?;
+        let width = attribute_u64(request, "n_embd")?;
+        if vocab > u32::MAX as u64 || width > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let (weight_shape, weight) = input_f32(request, "weight")?;
+        let (token_shape, tokens) = input_u32(request, "tokens")?;
+        let sequence = tokens.len() as u64;
+        if weight_shape != [vocab, width] || token_shape != [sequence] {
+            return Err(shape_error());
+        }
+        if tokens.iter().any(|&token| token as u64 >= vocab) {
+            return Err(shape_error());
+        }
+        require_finite("weight", weight)?;
+        let result_shape = [sequence, width];
+        let gradient = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != result_shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            &[]
+        };
+        let result = self
+            .backend
+            .embedding(
+                weight,
+                tokens,
+                gradient,
+                vocab as usize,
+                width as usize,
+                request.execution == TrainExecutionV1::Vjp,
+            )
+            .map_err(wgpu_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            output_f32(output, "result", &result_shape, result.len())?.copy_from_slice(&result);
+        } else {
+            output_f32(output, "grad_weight", &[vocab, width], weight.len())?
+                .copy_from_slice(&result);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -1012,7 +1084,7 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
                 .iter()
                 .map(|operation| (*operation).to_owned())
                 .collect(),
-            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::Bytes],
+            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::U32, TrainDTypeV1::Bytes],
             limits: LIMITS,
             device_resident: true,
         }
@@ -1060,6 +1132,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.concat_cols" {
             self.execute_concat_cols(&request, output)?;
+            0
+        } else if request.operation == "graph.embedding_gather" {
+            self.execute_embedding(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
@@ -1148,6 +1223,38 @@ fn input_f32<'a>(
         TrainBufferDataRefV1::F32(data) => Ok((buffer.shape, data)),
         TrainBufferDataRefV1::U32(_) => Err(dtype_error(name, TrainDTypeV1::U32)),
         TrainBufferDataRefV1::Bytes(_) => Err(dtype_error(name, TrainDTypeV1::Bytes)),
+    }
+}
+
+fn input_u32<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<(&'a [u64], &'a [u32]), TrainBackendError> {
+    let buffer = request
+        .inputs
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "inputs",
+            })
+        })?;
+    match buffer.data {
+        TrainBufferDataRefV1::U32(data) => Ok((buffer.shape, data)),
+        TrainBufferDataRefV1::F32(_) => Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::DType {
+                name: name.to_owned(),
+                expected: TrainDTypeV1::U32,
+                got: TrainDTypeV1::F32,
+            },
+        )),
+        TrainBufferDataRefV1::Bytes(_) => Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::DType {
+                name: name.to_owned(),
+                expected: TrainDTypeV1::U32,
+                got: TrainDTypeV1::Bytes,
+            },
+        )),
     }
 }
 

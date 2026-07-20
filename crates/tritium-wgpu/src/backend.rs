@@ -51,6 +51,15 @@ struct ConcatParams {
     padding: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct EmbeddingParams {
+    vocab: u32,
+    width: u32,
+    sequence: u32,
+    operation: u32,
+}
+
 // std140 uniform structs round up to a 16-byte multiple; pin both the size AND
 // the field offsets so a field reorder (which preserves size) can't silently land
 // `n` where the shader reads `k`.
@@ -95,6 +104,8 @@ pub struct WgpuBackend {
     pointwise_bind_group_layout: wgpu::BindGroupLayout,
     concat_pipeline: wgpu::ComputePipeline,
     concat_bind_group_layout: wgpu::BindGroupLayout,
+    embedding_pipeline: wgpu::ComputePipeline,
+    embedding_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -279,6 +290,35 @@ impl WgpuBackend {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+            let embedding_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-embedding"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("embedding.wgsl").into()),
+            });
+            let embedding_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-embedding-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, rw),
+                    ],
+                });
+            let embedding_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-embedding-pl"),
+                bind_group_layouts: &[&embedding_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let embedding_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-embedding-pipe"),
+                    layout: Some(&embedding_layout),
+                    module: &embedding_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
             Ok(WgpuBackend {
                 device,
@@ -289,6 +329,8 @@ impl WgpuBackend {
                 pointwise_bind_group_layout,
                 concat_pipeline,
                 concat_bind_group_layout,
+                embedding_pipeline,
+                embedding_bind_group_layout,
                 device_name,
             })
         }
@@ -620,6 +662,158 @@ impl WgpuBackend {
         if let Some(error) = self.device.pop_error_scope().block_on() {
             return Err(BackendError::Backend(format!(
                 "wgpu concat device error: {error}"
+            )));
+        }
+        rx.recv()
+            .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+            .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        let mut result = vec![0.0_f32; output_len];
+        {
+            let data = slice.get_mapped_range();
+            result.copy_from_slice(bytemuck::cast_slice(&data));
+        }
+        staging.unmap();
+        Ok(result)
+    }
+
+    pub(crate) fn embedding(
+        &self,
+        weight: &[f32],
+        tokens: &[u32],
+        gradient: &[f32],
+        vocab: usize,
+        width: usize,
+        backward: bool,
+    ) -> Result<Vec<f32>, BackendError> {
+        if vocab > u32::MAX as usize
+            || width > u32::MAX as usize
+            || tokens.len() > u32::MAX as usize
+        {
+            return Err(BackendError::InvalidInput(
+                "embedding geometry exceeds u32".into(),
+            ));
+        }
+        let output_len = if backward {
+            vocab.checked_mul(width)
+        } else {
+            tokens.len().checked_mul(width)
+        }
+        .ok_or_else(|| BackendError::InvalidInput("embedding output overflows usize".into()))?;
+        if output_len == 0 {
+            return Ok(Vec::new());
+        }
+        let params = EmbeddingParams {
+            vocab: vocab as u32,
+            width: width as u32,
+            sequence: tokens.len() as u32,
+            operation: u32::from(backward),
+        };
+        let storage = wgpu::BufferUsages::STORAGE;
+        let dummy_f32 = [0.0_f32];
+        let dummy_u32 = [0_u32];
+        let gradient_binding = if gradient.is_empty() {
+            &dummy_f32
+        } else {
+            gradient
+        };
+        let token_binding = if tokens.is_empty() {
+            &dummy_u32
+        } else {
+            tokens
+        };
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-embedding-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let weight_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-embedding-weight"),
+                contents: bytemuck::cast_slice(weight),
+                usage: storage,
+            });
+        let tokens_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-embedding-tokens"),
+                contents: bytemuck::cast_slice(token_binding),
+                usage: storage,
+            });
+        let gradient_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-embedding-gradient"),
+                contents: bytemuck::cast_slice(gradient_binding),
+                usage: storage,
+            });
+        let bytes = (output_len * core::mem::size_of::<f32>()) as u64;
+        let result_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-embedding-result"),
+            size: bytes,
+            usage: storage | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-embedding-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-embedding-bg"),
+            layout: &self.embedding_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: weight_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: tokens_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: gradient_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: result_buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-embedding-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-embedding-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.embedding_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((output_len as u32).div_ceil(WG_SIZE), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result_buf, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu embedding device error: {error}"
             )));
         }
         rx.recv()
