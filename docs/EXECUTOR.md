@@ -13,8 +13,8 @@ file + everything under `docs/` is all you need.
 
 Right now the active plans are **0043** (Qwen3.6-27B SALT V2 empirical
 capstone) and **0044** (v1.1 full public-release work order). Child plan 0045 is
-done; 0046–0050 are in progress and must retain independent entry/exit gates.
-Plans 0051–0053 are reserved and do not become executable until their detailed
+done; 0046–0051 are in progress and must retain independent entry/exit gates.
+Plans 0052–0053 are reserved and do not become executable until their detailed
 files are written and accepted. Plan 0043 may run structural and local gates in
 parallel, but its paid 27B run still requires separate explicit approval.
 
