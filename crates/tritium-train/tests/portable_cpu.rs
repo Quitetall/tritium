@@ -31,6 +31,8 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
             "graph.bias",
             "graph.add",
             "graph.mul",
+            "graph.conv1d",
+            "graph.conv2d",
             "graph.relu2",
             "graph.silu",
             "graph.rmsnorm",

@@ -110,9 +110,10 @@ semantics, reject duplicate/unknown/type/order drift, and re-emit byte-identical
 canonical JSON. Python passed the complete 92-test suite; Deno type-check and
 three parser tests passed. Slice 2 is next.
 
-The Slice 2 tracer corpus now carries 68 cases across 24 of 35 operations. In
+The Slice 2 tracer corpus now carries 87 cases across 26 of 35 operations. In
 addition to the primitive and shape clusters, it covers `graph.ste_surrogate`,
-multi-plane `graph.salt_ste`, `graph.lsq_ste`, configurable `graph.fsq`, `graph.dense_matmul`,
+bounded multi-plane `graph.salt_ste`, `graph.lsq_ste`, configurable `graph.fsq`,
+grouped/depthwise asymmetric `graph.conv1d` and `graph.conv2d`, `graph.dense_matmul`,
 scale-bearing `graph.ternary_matmul`, `graph.rmsnorm`, row-wise `graph.softmax`,
 `graph.causal_mask`, zero-scratch `graph.rope` with target-independent `u32` positions, and `loss.softmax_cross_entropy` forward/VJP semantics, plus `graph.transpose`, repeated
 `graph.embedding_gather`, `graph.slice_cols`, and dynamic-role
@@ -123,7 +124,7 @@ duplicate-input request.
 A generic testkit runner poisons success outputs, preserves error sentinels,
 grades structured error identity, independently recomputes request/output
 receipt digests, and binds every successful receipt to the exact corpus bytes.
-This is incremental evidence, not Slice 2 closure: the remaining 11 operations
+This is incremental evidence, not Slice 2 closure: the remaining 9 operations
 and their adversarial/error matrices are still required.
 
 Edits:

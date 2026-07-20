@@ -909,6 +909,376 @@
       }
     },
     {
+      "case_id": "graph.fsq.forward.hard_half_ties",
+      "operation": "graph.fsq",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              3208642560,
+              3204448256,
+              1056964608,
+              1061158912
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "channels",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "len",
+          "value": 4
+        },
+        {
+          "type": "u32_list",
+          "name": "levels",
+          "values": [
+            3
+          ]
+        },
+        {
+          "type": "text",
+          "name": "bound",
+          "value": "clamp"
+        },
+        {
+          "type": "text",
+          "name": "ste",
+          "value": "hard"
+        },
+        {
+          "type": "f32",
+          "name": "alpha",
+          "bits": 0
+        },
+        {
+          "type": "u64",
+          "name": "seed",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3212836864,
+                0,
+                1065353216,
+                1065353216
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.fsq.vjp.hard_tanh",
+      "operation": "graph.fsq",
+      "execution": "vjp",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 897988541,
+        "relative_bits": 897988541
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              3208642560,
+              3204448256,
+              1056964608,
+              1061158912
+            ]
+          }
+        },
+        {
+          "name": "grad_output",
+          "shape": [
+            1,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1048576000
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "channels",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "len",
+          "value": 4
+        },
+        {
+          "type": "u32_list",
+          "name": "levels",
+          "values": [
+            5
+          ]
+        },
+        {
+          "type": "text",
+          "name": "bound",
+          "value": "tanh"
+        },
+        {
+          "type": "text",
+          "name": "ste",
+          "value": "hard"
+        },
+        {
+          "type": "f32",
+          "name": "alpha",
+          "bits": 0
+        },
+        {
+          "type": "u64",
+          "name": "seed",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "grad_x",
+            "shape": [
+              1,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1058585049,
+                3217642659,
+                1053381795,
+                1041807833
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.fsq.forward.stochastic_seed_7",
+      "operation": "graph.fsq",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 897988541,
+        "relative_bits": 897988541
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              3209481421,
+              3201092813,
+              1045220557,
+              1060320051
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "channels",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "len",
+          "value": 4
+        },
+        {
+          "type": "u32_list",
+          "name": "levels",
+          "values": [
+            5
+          ]
+        },
+        {
+          "type": "text",
+          "name": "bound",
+          "value": "tanh"
+        },
+        {
+          "type": "text",
+          "name": "ste",
+          "value": "stochastic"
+        },
+        {
+          "type": "f32",
+          "name": "alpha",
+          "bits": 0
+        },
+        {
+          "type": "u64",
+          "name": "seed",
+          "value": 7
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3212836864,
+                3204448256,
+                0,
+                1056964608
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.fsq.forward.stochastic_seed_8",
+      "operation": "graph.fsq",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 897988541,
+        "relative_bits": 897988541
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              3209481421,
+              3201092813,
+              1045220557,
+              1060320051
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "channels",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "len",
+          "value": 4
+        },
+        {
+          "type": "u32_list",
+          "name": "levels",
+          "values": [
+            5
+          ]
+        },
+        {
+          "type": "text",
+          "name": "bound",
+          "value": "tanh"
+        },
+        {
+          "type": "text",
+          "name": "ste",
+          "value": "stochastic"
+        },
+        {
+          "type": "f32",
+          "name": "alpha",
+          "bits": 0
+        },
+        {
+          "type": "u64",
+          "name": "seed",
+          "value": 8
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3204448256,
+                3204448256,
+                1056964608,
+                1065353216
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 0
+      }
+    },
+    {
       "case_id": "graph.dense_matmul.forward.basic",
       "operation": "graph.dense_matmul",
       "execution": "forward",
@@ -2125,6 +2495,812 @@
           }
         ],
         "scratch_bytes_max": 0
+      }
+    },
+    {
+      "case_id": "graph.conv1d.forward.depthwise_asymmetric",
+      "operation": "graph.conv1d",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 897988541,
+        "relative_bits": 897988541
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            2,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1077936128,
+              3212836864,
+              1073741824,
+              1082130432,
+              3204448256
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            1,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1048576000,
+              1069547520
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1061158912,
+              1067450368
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "batch",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "c_in",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "c_out",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "l_in",
+          "value": 4
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "stride",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "dilation",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_left",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_right",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "groups",
+          "value": 2
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              2,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3200253952,
+                1069547520,
+                3218604032,
+                3208642560,
+                3220176896,
+                1079771136,
+                1090650112,
+                1050673152
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 80
+      }
+    },
+    {
+      "case_id": "graph.conv1d.vjp.depthwise_asymmetric",
+      "operation": "graph.conv1d",
+      "execution": "vjp",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 897988541,
+        "relative_bits": 897988541
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            2,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1077936128,
+              3212836864,
+              1073741824,
+              1082130432,
+              3204448256
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            1,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1048576000,
+              1069547520
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1061158912,
+              1067450368
+            ]
+          }
+        },
+        {
+          "name": "grad_output",
+          "shape": [
+            1,
+            2,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              3212836864,
+              1048576000,
+              1073741824,
+              3208642560,
+              1069547520,
+              1056964608,
+              3196059648
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "batch",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "c_in",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "c_out",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "l_in",
+          "value": 4
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "stride",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "dilation",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_left",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_right",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "groups",
+          "value": 2
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "grad_x",
+            "shape": [
+              1,
+              2,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3211788288,
+                1058013184,
+                1068761088,
+                3208642560,
+                3211788288,
+                1077805056,
+                1062993920,
+                3203399680
+              ]
+            }
+          },
+          {
+            "name": "grad_weight",
+            "shape": [
+              2,
+              1,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3200253952,
+                1087307776,
+                3220176896,
+                1089142784
+              ]
+            }
+          },
+          {
+            "name": "grad_scale",
+            "shape": [
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3231318016,
+                1090977792
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 148
+      }
+    },
+    {
+      "case_id": "graph.conv2d.forward.depthwise_asymmetric",
+      "operation": "graph.conv2d",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 897988541,
+        "relative_bits": 897988541
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1077936128,
+              3212836864,
+              1073741824,
+              1082130432,
+              3204448256,
+              1048576000,
+              1069547520,
+              3225419776,
+              1075838976,
+              3208642560,
+              1056964608,
+              1073741824,
+              3217031168,
+              1077936128,
+              3223322624,
+              1067450368,
+              1061158912,
+              3212836864,
+              1082130432,
+              3196059648,
+              1074790400
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            1,
+            2,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1048576000,
+              1069547520,
+              3212836864,
+              1061158912,
+              1056964608,
+              3196059648
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1061997773,
+              1067030938
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "batch",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "c_in",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "c_out",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "input_h",
+          "value": 3
+        },
+        {
+          "type": "u64",
+          "name": "input_w",
+          "value": 4
+        },
+        {
+          "type": "u64",
+          "name": "kernel_h",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "kernel_w",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "stride_h",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "stride_w",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "dilation_h",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "dilation_w",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_top",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_bottom",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "pad_left",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "pad_right",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "groups",
+          "value": 2
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              2,
+              3,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                3222064333,
+                1080872141,
+                1081291571,
+                3206125978,
+                1048576000,
+                1085905306,
+                3206125978,
+                1070805812,
+                1081711002,
+                3226363495,
+                3237268685,
+                3218289460
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 168
+      }
+    },
+    {
+      "case_id": "graph.conv2d.vjp.depthwise_asymmetric",
+      "operation": "graph.conv2d",
+      "execution": "vjp",
+      "tolerance": {
+        "kind": "absolute_relative",
+        "absolute_bits": 897988541,
+        "relative_bits": 897988541
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1077936128,
+              3212836864,
+              1073741824,
+              1082130432,
+              3204448256,
+              1048576000,
+              1069547520,
+              3225419776,
+              1075838976,
+              3208642560,
+              1056964608,
+              1073741824,
+              3217031168,
+              1077936128,
+              3223322624,
+              1067450368,
+              1061158912,
+              3212836864,
+              1082130432,
+              3196059648,
+              1074790400
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            1,
+            2,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1048576000,
+              1069547520,
+              3212836864,
+              1061158912,
+              1056964608,
+              3196059648
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1061997773,
+              1067030938
+            ]
+          }
+        },
+        {
+          "name": "grad_output",
+          "shape": [
+            1,
+            2,
+            3,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608,
+              3212836864,
+              1048576000,
+              1073741824,
+              3208642560,
+              1069547520,
+              1056964608,
+              3196059648,
+              1065353216,
+              3204448256,
+              1061158912,
+              3214934016
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "batch",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "c_in",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "c_out",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "input_h",
+          "value": 3
+        },
+        {
+          "type": "u64",
+          "name": "input_w",
+          "value": 4
+        },
+        {
+          "type": "u64",
+          "name": "kernel_h",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "kernel_w",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "stride_h",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "stride_w",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "dilation_h",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "dilation_w",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_top",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_bottom",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "pad_left",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "pad_right",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "groups",
+          "value": 2
+        }
+      ],
+      "expected": {
+        "kind": "success",
+        "outputs": [
+          {
+            "name": "grad_x",
+            "shape": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1050253722,
+                1056964608,
+                1068708659,
+                3221225472,
+                3205287117,
+                1058642330,
+                1070386381,
+                1072064103,
+                3189348762,
+                3211159143,
+                1050253722,
+                1072064103,
+                3211159143,
+                1061158912,
+                1055286887,
+                3200253952,
+                3197737370,
+                1052770304,
+                1067030938,
+                3212417434,
+                1055286887,
+                3194381927,
+                3208642560,
+                1052770304
+              ]
+            }
+          },
+          {
+            "name": "grad_weight",
+            "shape": [
+              2,
+              1,
+              2,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1087163597,
+                1076258406,
+                1075629261,
+                3217031168,
+                3215143732,
+                3220176896,
+                1067660084,
+                3223217766
+              ]
+            }
+          },
+          {
+            "name": "grad_scale",
+            "shape": [
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1082818560,
+                1064304640
+              ]
+            }
+          }
+        ],
+        "scratch_bytes_max": 372
       }
     },
     {
@@ -5195,6 +6371,1183 @@
             "data": {
               "dtype": "f32",
               "bits": [
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.salt_ste.forward.zero_rows_huge_cols",
+      "operation": "graph.salt_ste",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "weight",
+          "shape": [
+            0,
+            4294967295
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": []
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "rows",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "cols",
+          "value": 4294967295
+        },
+        {
+          "type": "u64",
+          "name": "planes",
+          "value": 2
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.rows.positive",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.salt_ste.forward.too_many_planes",
+      "operation": "graph.salt_ste",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "weight",
+          "shape": [
+            1,
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "rows",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "cols",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "planes",
+          "value": 65
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.planes.max_64",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              1
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.salt_ste.forward.reordered_attributes",
+      "operation": "graph.salt_ste",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "weight",
+          "shape": [
+            1,
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1056964608
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "cols",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "rows",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "planes",
+          "value": 2
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "roles.attribute",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              1
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.lsq_ste.vjp.zero_cols",
+      "operation": "graph.lsq_ste",
+      "execution": "vjp",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "weight",
+          "shape": [
+            1,
+            0
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": []
+          }
+        },
+        {
+          "name": "alpha",
+          "shape": [
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216
+            ]
+          }
+        },
+        {
+          "name": "grad_output",
+          "shape": [
+            1,
+            0
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": []
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "rows",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "cols",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.cols.positive",
+        "outputs": [
+          {
+            "name": "grad_weight",
+            "shape": [],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          },
+          {
+            "name": "grad_alpha",
+            "shape": [],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1139015680
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.fsq.forward.zero_len",
+      "operation": "graph.fsq",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            0
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": []
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "channels",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "len",
+          "value": 0
+        },
+        {
+          "type": "u32_list",
+          "name": "levels",
+          "values": [
+            3
+          ]
+        },
+        {
+          "type": "text",
+          "name": "bound",
+          "value": "clamp"
+        },
+        {
+          "type": "text",
+          "name": "ste",
+          "value": "hard"
+        },
+        {
+          "type": "f32",
+          "name": "alpha",
+          "bits": 0
+        },
+        {
+          "type": "u64",
+          "name": "seed",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.len.positive",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.fsq.forward.invalid_alpha",
+      "operation": "graph.fsq",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1048576000
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "channels",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "len",
+          "value": 1
+        },
+        {
+          "type": "u32_list",
+          "name": "levels",
+          "values": [
+            3
+          ]
+        },
+        {
+          "type": "text",
+          "name": "bound",
+          "value": "clamp"
+        },
+        {
+          "type": "text",
+          "name": "ste",
+          "value": "soft_round"
+        },
+        {
+          "type": "f32",
+          "name": "alpha",
+          "bits": 1069547520
+        },
+        {
+          "type": "u64",
+          "name": "seed",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.alpha.unit_interval",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              1
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.fsq.forward.unknown_ste",
+      "operation": "graph.fsq",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            1
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1048576000
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "channels",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "len",
+          "value": 1
+        },
+        {
+          "type": "u32_list",
+          "name": "levels",
+          "values": [
+            3
+          ]
+        },
+        {
+          "type": "text",
+          "name": "bound",
+          "value": "clamp"
+        },
+        {
+          "type": "text",
+          "name": "ste",
+          "value": "unknown"
+        },
+        {
+          "type": "f32",
+          "name": "alpha",
+          "bits": 0
+        },
+        {
+          "type": "u64",
+          "name": "seed",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.ste.known",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              1
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.conv1d.forward.zero_groups",
+      "operation": "graph.conv1d",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            2,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1077936128,
+              3212836864,
+              1073741824,
+              1082130432,
+              3204448256
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            1,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1048576000,
+              1069547520
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1061158912,
+              1067450368
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "batch",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "c_in",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "c_out",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "l_in",
+          "value": 4
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "stride",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "dilation",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_left",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_right",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "groups",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.groups.positive",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              2,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.conv1d.forward.ragged_groups",
+      "operation": "graph.conv1d",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            2,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1077936128,
+              3212836864,
+              1073741824,
+              1082130432,
+              3204448256
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            1,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1048576000,
+              1069547520
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1061158912,
+              1067450368
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "batch",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "c_in",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "c_out",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "l_in",
+          "value": 4
+        },
+        {
+          "type": "u64",
+          "name": "k",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "stride",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "dilation",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_left",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_right",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "groups",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.groups.divides_channels",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              2,
+              4
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.conv2d.forward.zero_groups",
+      "operation": "graph.conv2d",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1077936128,
+              3212836864,
+              1073741824,
+              1082130432,
+              3204448256,
+              1048576000,
+              1069547520,
+              3225419776,
+              1075838976,
+              3208642560,
+              1056964608,
+              1073741824,
+              3217031168,
+              1077936128,
+              3223322624,
+              1067450368,
+              1061158912,
+              3212836864,
+              1082130432,
+              3196059648,
+              1074790400
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            1,
+            2,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1048576000,
+              1069547520,
+              3212836864,
+              1061158912,
+              1056964608,
+              3196059648
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1061997773,
+              1067030938
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "batch",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "c_in",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "c_out",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "input_h",
+          "value": 3
+        },
+        {
+          "type": "u64",
+          "name": "input_w",
+          "value": 4
+        },
+        {
+          "type": "u64",
+          "name": "kernel_h",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "kernel_w",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "stride_h",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "stride_w",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "dilation_h",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "dilation_w",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_top",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_bottom",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "pad_left",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "pad_right",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "groups",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.groups.positive",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              2,
+              3,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "graph.conv2d.forward.oversized_kernel",
+      "operation": "graph.conv2d",
+      "execution": "forward",
+      "tolerance": {
+        "kind": "bit_exact"
+      },
+      "inputs": [
+        {
+          "name": "x",
+          "shape": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3221225472,
+              1056964608,
+              1077936128,
+              3212836864,
+              1073741824,
+              1082130432,
+              3204448256,
+              1048576000,
+              1069547520,
+              3225419776,
+              1075838976,
+              3208642560,
+              1056964608,
+              1073741824,
+              3217031168,
+              1077936128,
+              3223322624,
+              1067450368,
+              1061158912,
+              3212836864,
+              1082130432,
+              3196059648,
+              1074790400
+            ]
+          }
+        },
+        {
+          "name": "weight",
+          "shape": [
+            2,
+            1,
+            2,
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1065353216,
+              3204448256,
+              1048576000,
+              1069547520,
+              3212836864,
+              1061158912,
+              1056964608,
+              3196059648
+            ]
+          }
+        },
+        {
+          "name": "scale",
+          "shape": [
+            2
+          ],
+          "data": {
+            "dtype": "f32",
+            "bits": [
+              1061997773,
+              1067030938
+            ]
+          }
+        }
+      ],
+      "attributes": [
+        {
+          "type": "u64",
+          "name": "batch",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "c_in",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "c_out",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "input_h",
+          "value": 3
+        },
+        {
+          "type": "u64",
+          "name": "input_w",
+          "value": 4
+        },
+        {
+          "type": "u64",
+          "name": "kernel_h",
+          "value": 8
+        },
+        {
+          "type": "u64",
+          "name": "kernel_w",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "stride_h",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "stride_w",
+          "value": 2
+        },
+        {
+          "type": "u64",
+          "name": "dilation_h",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "dilation_w",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_top",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "pad_bottom",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "pad_left",
+          "value": 0
+        },
+        {
+          "type": "u64",
+          "name": "pad_right",
+          "value": 1
+        },
+        {
+          "type": "u64",
+          "name": "groups",
+          "value": 2
+        }
+      ],
+      "expected": {
+        "kind": "error",
+        "category": "invalid_operation",
+        "code": "attribute_value.kernel_h.output_nonzero",
+        "outputs": [
+          {
+            "name": "result",
+            "shape": [
+              1,
+              2,
+              3,
+              2
+            ],
+            "data": {
+              "dtype": "f32",
+              "bits": [
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
+                1123418112,
                 1123418112,
                 1123418112,
                 1123418112,

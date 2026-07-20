@@ -4,15 +4,20 @@ use core::f32::consts::PI;
 
 use blake3::Hasher;
 use tritium_spec::{
-    train_output_digest_v1, train_request_digest_v1, TrainAttributeValueV1, TrainBackendError,
-    TrainBackendV1, TrainBufferDataMutV1, TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1,
-    TrainExecutionV1, TrainLimitsV1, TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1,
-    TrainRequestV1, TrainingOpManifestV1,
+    TrainAttributeValueV1, TrainBackendError, TrainBackendV1, TrainBufferDataMutV1,
+    TrainBufferDataRefV1, TrainCapabilitiesV1, TrainDTypeV1, TrainExecutionV1, TrainLimitsV1,
+    TrainOperationErrorV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1, TrainingOpManifestV1,
+    train_output_digest_v1, train_request_digest_v1,
 };
 
-use crate::{Optimizer, Sgd};
+use crate::{
+    Optimizer, Sgd,
+    ops::{conv1d, conv2d},
+};
 
 const BACKEND_ID: &str = "cpu.reference.v1";
+const MAX_SALT_PLANES: u64 = 64;
+const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const CPU_LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: u32::MAX,
     max_elements: usize::MAX as u64,
@@ -36,6 +41,8 @@ enum CpuOperation {
     Bias,
     Add,
     Mul,
+    Conv1d,
+    Conv2d,
     Relu2,
     Silu,
     Rmsnorm,
@@ -113,6 +120,14 @@ const CPU_OPERATIONS: &[CpuOperationEntry] = &[
     CpuOperationEntry {
         id: "graph.mul",
         operation: CpuOperation::Mul,
+    },
+    CpuOperationEntry {
+        id: "graph.conv1d",
+        operation: CpuOperation::Conv1d,
+    },
+    CpuOperationEntry {
+        id: "graph.conv2d",
+        operation: CpuOperation::Conv2d,
     },
     CpuOperationEntry {
         id: "graph.relu2",
@@ -264,6 +279,54 @@ const MUL_VJP: OperationSchema = OperationSchema {
     inputs: &["left", "right", "grad_output"],
     attributes: &[],
     outputs: &["grad_left", "grad_right"],
+};
+const CONV1D_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x", "weight", "scale"],
+    attributes: &[
+        "batch",
+        "c_in",
+        "c_out",
+        "l_in",
+        "k",
+        "stride",
+        "dilation",
+        "pad_left",
+        "pad_right",
+        "groups",
+    ],
+    outputs: &["result"],
+};
+const CONV1D_VJP: OperationSchema = OperationSchema {
+    inputs: &["x", "weight", "scale", "grad_output"],
+    attributes: CONV1D_FORWARD.attributes,
+    outputs: &["grad_x", "grad_weight", "grad_scale"],
+};
+const CONV2D_FORWARD: OperationSchema = OperationSchema {
+    inputs: &["x", "weight", "scale"],
+    attributes: &[
+        "batch",
+        "c_in",
+        "c_out",
+        "input_h",
+        "input_w",
+        "kernel_h",
+        "kernel_w",
+        "stride_h",
+        "stride_w",
+        "dilation_h",
+        "dilation_w",
+        "pad_top",
+        "pad_bottom",
+        "pad_left",
+        "pad_right",
+        "groups",
+    ],
+    outputs: &["result"],
+};
+const CONV2D_VJP: OperationSchema = OperationSchema {
+    inputs: &["x", "weight", "scale", "grad_output"],
+    attributes: CONV2D_FORWARD.attributes,
+    outputs: &["grad_x", "grad_weight", "grad_scale"],
 };
 const DETACH_FORWARD: OperationSchema = OperationSchema {
     inputs: &["x"],
@@ -479,6 +542,14 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             (CpuOperation::Add, TrainExecutionV1::Vjp) => add_vjp(&request, output)?,
             (CpuOperation::Mul, TrainExecutionV1::Forward) => mul_forward(&request, output)?,
             (CpuOperation::Mul, TrainExecutionV1::Vjp) => mul_vjp(&request, output)?,
+            (CpuOperation::Conv1d, TrainExecutionV1::Forward) => {
+                conv1d_forward(&request, output)?;
+            }
+            (CpuOperation::Conv1d, TrainExecutionV1::Vjp) => conv1d_vjp(&request, output)?,
+            (CpuOperation::Conv2d, TrainExecutionV1::Forward) => {
+                conv2d_forward(&request, output)?;
+            }
+            (CpuOperation::Conv2d, TrainExecutionV1::Vjp) => conv2d_vjp(&request, output)?,
             (CpuOperation::Relu2, TrainExecutionV1::Forward) => relu2_forward(&request, output)?,
             (CpuOperation::Relu2, TrainExecutionV1::Vjp) => relu2_vjp(&request, output)?,
             (CpuOperation::Silu, TrainExecutionV1::Forward) => silu_forward(&request, output)?,
@@ -515,12 +586,8 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
                 });
             }
         }
-        let scratch_bytes = match (operation.operation, request.execution) {
-            (CpuOperation::SaltSte, TrainExecutionV1::Forward) => attribute_u64(&request, "cols")?
-                .checked_mul(size_of::<f32>() as u64)
-                .ok_or_else(|| attribute_value("cols", "scratch_bytes"))?,
-            _ => 0,
-        };
+        let scratch_bytes =
+            operation_scratch_bytes(operation.operation, request.execution, &request)?;
         Ok(TrainReceiptV1 {
             backend_id: BACKEND_ID.to_owned(),
             backend_build: backend_build_identity(),
@@ -610,9 +677,18 @@ fn salt_ste_forward(
     require_contract(request, output, &SALT_FORWARD)?;
     let (weight_shape, weight) = input_f32(request, "weight")?;
     let (rows, cols, rows_usize, cols_usize) = matrix_attributes(request)?;
-    let planes = positive_usize_attribute(request, "planes")?;
+    let planes = salt_planes(request)?;
+    if rows_usize == 0 {
+        return Err(attribute_value("rows", "positive"));
+    }
     if cols_usize == 0 {
         return Err(attribute_value("cols", "positive"));
+    }
+    let scratch_bytes = cols
+        .checked_mul(size_of::<f32>() as u64)
+        .ok_or_else(|| attribute_value("cols", "scratch_bytes"))?;
+    if scratch_bytes > MAX_SALT_SCRATCH_BYTES {
+        return Err(attribute_value("cols", "scratch_limit"));
     }
     if weight_shape != [rows, cols] {
         return Err(shape_error());
@@ -653,7 +729,7 @@ fn salt_ste_vjp(
     let (weight_shape, weight) = input_f32(request, "weight")?;
     let (gradient_shape, grad_output) = input_f32(request, "grad_output")?;
     let (rows, cols, _, cols_usize) = matrix_attributes(request)?;
-    positive_usize_attribute(request, "planes")?;
+    salt_planes(request)?;
     if cols_usize == 0 {
         return Err(attribute_value("cols", "positive"));
     }
@@ -677,6 +753,9 @@ fn lsq_ste_forward(
     let (rows, cols, _, cols_usize) = matrix_attributes(request)?;
     if weight_shape != [rows, cols] || alpha_shape != [rows] {
         return Err(shape_error());
+    }
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
     }
     reject_nonfinite("weight", weight)?;
     reject_nonfinite("alpha", alpha)?;
@@ -706,6 +785,9 @@ fn lsq_ste_vjp(
     let (rows, cols, _, cols_usize) = matrix_attributes(request)?;
     if weight_shape != [rows, cols] || alpha_shape != [rows] || gradient_shape != weight_shape {
         return Err(shape_error());
+    }
+    if cols_usize == 0 {
+        return Err(attribute_value("cols", "positive"));
     }
     reject_nonfinite("weight", weight)?;
     reject_nonfinite("alpha", alpha)?;
@@ -803,6 +885,171 @@ fn fsq_vjp(
             FsqEstimator::Hard | FsqEstimator::Stochastic => gradient * derivative,
         };
     }
+    Ok(())
+}
+
+fn conv1d_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &CONV1D_FORWARD)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (cfg, l_out) = conv1d_attributes(request)?;
+    let input_shape = [cfg.batch as u64, cfg.c_in as u64, cfg.l_in as u64];
+    let weight_shape_expected = [
+        cfg.c_out as u64,
+        (cfg.c_in / cfg.groups) as u64,
+        cfg.k as u64,
+    ];
+    let scale_shape_expected = [cfg.c_out as u64];
+    let result_shape = [cfg.batch as u64, cfg.c_out as u64, l_out as u64];
+    if x_shape != input_shape
+        || weight_shape != weight_shape_expected
+        || scale_shape != scale_shape_expected
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    require_f32_output(output, "result", &result_shape)?;
+    let result = conv1d::forward(x, weight, scale, &cfg);
+    output_f32(output, "result")?.copy_from_slice(&result);
+    Ok(())
+}
+
+fn conv1d_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &CONV1D_VJP)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (gradient_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (cfg, l_out) = conv1d_attributes(request)?;
+    let input_shape = [cfg.batch as u64, cfg.c_in as u64, cfg.l_in as u64];
+    let weight_shape_expected = [
+        cfg.c_out as u64,
+        (cfg.c_in / cfg.groups) as u64,
+        cfg.k as u64,
+    ];
+    let scale_shape_expected = [cfg.c_out as u64];
+    let result_shape = [cfg.batch as u64, cfg.c_out as u64, l_out as u64];
+    if x_shape != input_shape
+        || weight_shape != weight_shape_expected
+        || scale_shape != scale_shape_expected
+        || gradient_shape != result_shape
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", x_shape)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    require_f32_output(output, "grad_scale", scale_shape)?;
+    let gradients = conv1d::vjp(x, weight, scale, &cfg, grad_output);
+    output_f32(output, "grad_x")?.copy_from_slice(&gradients[0]);
+    output_f32(output, "grad_weight")?.copy_from_slice(&gradients[1]);
+    output_f32(output, "grad_scale")?.copy_from_slice(&gradients[2]);
+    Ok(())
+}
+
+fn conv2d_forward(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &CONV2D_FORWARD)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (cfg, height_out, width_out) = conv2d_attributes(request)?;
+    let input_shape = [
+        cfg.batch as u64,
+        cfg.c_in as u64,
+        cfg.input_h as u64,
+        cfg.input_w as u64,
+    ];
+    let weight_shape_expected = [
+        cfg.c_out as u64,
+        (cfg.c_in / cfg.groups) as u64,
+        cfg.kernel_h as u64,
+        cfg.kernel_w as u64,
+    ];
+    let scale_shape_expected = [cfg.c_out as u64];
+    let result_shape = [
+        cfg.batch as u64,
+        cfg.c_out as u64,
+        height_out as u64,
+        width_out as u64,
+    ];
+    if x_shape != input_shape
+        || weight_shape != weight_shape_expected
+        || scale_shape != scale_shape_expected
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    require_f32_output(output, "result", &result_shape)?;
+    let result = conv2d::try_forward(x, weight, scale, &cfg).map_err(conv2d_reference_error)?;
+    output_f32(output, "result")?.copy_from_slice(&result);
+    Ok(())
+}
+
+fn conv2d_vjp(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &CONV2D_VJP)?;
+    let (x_shape, x) = input_f32(request, "x")?;
+    let (weight_shape, weight) = input_f32(request, "weight")?;
+    let (scale_shape, scale) = input_f32(request, "scale")?;
+    let (gradient_shape, grad_output) = input_f32(request, "grad_output")?;
+    let (cfg, height_out, width_out) = conv2d_attributes(request)?;
+    let input_shape = [
+        cfg.batch as u64,
+        cfg.c_in as u64,
+        cfg.input_h as u64,
+        cfg.input_w as u64,
+    ];
+    let weight_shape_expected = [
+        cfg.c_out as u64,
+        (cfg.c_in / cfg.groups) as u64,
+        cfg.kernel_h as u64,
+        cfg.kernel_w as u64,
+    ];
+    let scale_shape_expected = [cfg.c_out as u64];
+    let result_shape = [
+        cfg.batch as u64,
+        cfg.c_out as u64,
+        height_out as u64,
+        width_out as u64,
+    ];
+    if x_shape != input_shape
+        || weight_shape != weight_shape_expected
+        || scale_shape != scale_shape_expected
+        || gradient_shape != result_shape
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("x", x)?;
+    reject_nonfinite("weight", weight)?;
+    reject_nonfinite("scale", scale)?;
+    reject_nonfinite("grad_output", grad_output)?;
+    require_f32_output(output, "grad_x", x_shape)?;
+    require_f32_output(output, "grad_weight", weight_shape)?;
+    require_f32_output(output, "grad_scale", scale_shape)?;
+    let gradients =
+        conv2d::try_vjp(x, weight, scale, &cfg, grad_output).map_err(conv2d_reference_error)?;
+    output_f32(output, "grad_x")?.copy_from_slice(&gradients[0]);
+    output_f32(output, "grad_weight")?.copy_from_slice(&gradients[1]);
+    output_f32(output, "grad_scale")?.copy_from_slice(&gradients[2]);
     Ok(())
 }
 
@@ -1983,15 +2230,15 @@ fn fsq_attributes<'a>(
     })
 }
 
-fn positive_usize_attribute(
-    request: &TrainRequestV1<'_>,
-    name: &str,
-) -> Result<usize, TrainBackendError> {
-    let value = attribute_u64(request, name)?;
+fn salt_planes(request: &TrainRequestV1<'_>) -> Result<usize, TrainBackendError> {
+    let value = attribute_u64(request, "planes")?;
     if value == 0 {
-        return Err(attribute_value(name, "positive"));
+        return Err(attribute_value("planes", "positive"));
     }
-    usize::try_from(value).map_err(|_| attribute_value(name, "usize"))
+    if value > MAX_SALT_PLANES {
+        return Err(attribute_value("planes", "max_64"));
+    }
+    Ok(value as usize)
 }
 
 fn fsq_bound(value: f32, bound: FsqBoundKind) -> f32 {
@@ -2182,6 +2429,290 @@ fn matmul_attributes(
         .checked_mul(n_usize)
         .ok_or_else(|| attribute_value("m", "m_times_n"))?;
     Ok((m, n, k, m_usize, n_usize, k_usize))
+}
+
+fn portable_usize_attribute(
+    request: &TrainRequestV1<'_>,
+    name: &str,
+) -> Result<usize, TrainBackendError> {
+    let value = attribute_u64(request, name)?;
+    u32::try_from(value)
+        .map(|value| value as usize)
+        .map_err(|_| attribute_value(name, "u32"))
+}
+
+fn checked_output_axis(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    pad_before: usize,
+    pad_after: usize,
+    name: &str,
+) -> Result<usize, TrainBackendError> {
+    let effective = dilation
+        .checked_mul(kernel - 1)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| attribute_value(name, "arithmetic"))?;
+    let padded = input
+        .checked_add(pad_before)
+        .and_then(|value| value.checked_add(pad_after))
+        .ok_or_else(|| attribute_value(name, "arithmetic"))?;
+    if padded < effective {
+        return Err(attribute_value(name, "output_nonzero"));
+    }
+    Ok((padded - effective) / stride + 1)
+}
+
+fn bounded_product(values: &[usize], name: &str) -> Result<usize, TrainBackendError> {
+    let product = values.iter().try_fold(1_usize, |total, &value| {
+        total
+            .checked_mul(value)
+            .ok_or_else(|| attribute_value(name, "arithmetic"))
+    })?;
+    if product > u32::MAX as usize {
+        return Err(attribute_value(name, "max_elements"));
+    }
+    Ok(product)
+}
+
+fn conv1d_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<(conv1d::Conv1dCfg, usize), TrainBackendError> {
+    let cfg = conv1d::Conv1dCfg {
+        batch: portable_usize_attribute(request, "batch")?,
+        c_in: portable_usize_attribute(request, "c_in")?,
+        c_out: portable_usize_attribute(request, "c_out")?,
+        l_in: portable_usize_attribute(request, "l_in")?,
+        k: portable_usize_attribute(request, "k")?,
+        stride: portable_usize_attribute(request, "stride")?,
+        dilation: portable_usize_attribute(request, "dilation")?,
+        pad_left: portable_usize_attribute(request, "pad_left")?,
+        pad_right: portable_usize_attribute(request, "pad_right")?,
+        groups: portable_usize_attribute(request, "groups")?,
+    };
+    for (name, value) in [
+        ("batch", cfg.batch),
+        ("c_in", cfg.c_in),
+        ("c_out", cfg.c_out),
+        ("l_in", cfg.l_in),
+        ("k", cfg.k),
+        ("stride", cfg.stride),
+        ("dilation", cfg.dilation),
+        ("groups", cfg.groups),
+    ] {
+        if value == 0 {
+            return Err(attribute_value(name, "positive"));
+        }
+    }
+    if !cfg.c_in.is_multiple_of(cfg.groups) || !cfg.c_out.is_multiple_of(cfg.groups) {
+        return Err(attribute_value("groups", "divides_channels"));
+    }
+    let l_out = checked_output_axis(
+        cfg.l_in,
+        cfg.k,
+        cfg.stride,
+        cfg.dilation,
+        cfg.pad_left,
+        cfg.pad_right,
+        "k",
+    )?;
+    let channels_per_group = cfg.c_in / cfg.groups;
+    bounded_product(&[cfg.batch, cfg.c_in, cfg.l_in], "batch")?;
+    bounded_product(&[cfg.c_out, channels_per_group, cfg.k], "c_out")?;
+    bounded_product(&[cfg.batch, cfg.c_out, l_out], "batch")?;
+    Ok((cfg, l_out))
+}
+
+fn conv2d_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<(conv2d::Conv2dCfg, usize, usize), TrainBackendError> {
+    let cfg = conv2d::Conv2dCfg {
+        batch: portable_usize_attribute(request, "batch")?,
+        c_in: portable_usize_attribute(request, "c_in")?,
+        c_out: portable_usize_attribute(request, "c_out")?,
+        input_h: portable_usize_attribute(request, "input_h")?,
+        input_w: portable_usize_attribute(request, "input_w")?,
+        kernel_h: portable_usize_attribute(request, "kernel_h")?,
+        kernel_w: portable_usize_attribute(request, "kernel_w")?,
+        stride_h: portable_usize_attribute(request, "stride_h")?,
+        stride_w: portable_usize_attribute(request, "stride_w")?,
+        dilation_h: portable_usize_attribute(request, "dilation_h")?,
+        dilation_w: portable_usize_attribute(request, "dilation_w")?,
+        pad_top: portable_usize_attribute(request, "pad_top")?,
+        pad_bottom: portable_usize_attribute(request, "pad_bottom")?,
+        pad_left: portable_usize_attribute(request, "pad_left")?,
+        pad_right: portable_usize_attribute(request, "pad_right")?,
+        groups: portable_usize_attribute(request, "groups")?,
+    };
+    for (name, value) in [
+        ("batch", cfg.batch),
+        ("c_in", cfg.c_in),
+        ("c_out", cfg.c_out),
+        ("input_h", cfg.input_h),
+        ("input_w", cfg.input_w),
+        ("kernel_h", cfg.kernel_h),
+        ("kernel_w", cfg.kernel_w),
+        ("stride_h", cfg.stride_h),
+        ("stride_w", cfg.stride_w),
+        ("dilation_h", cfg.dilation_h),
+        ("dilation_w", cfg.dilation_w),
+        ("groups", cfg.groups),
+    ] {
+        if value == 0 {
+            return Err(attribute_value(name, "positive"));
+        }
+    }
+    if !cfg.c_in.is_multiple_of(cfg.groups) || !cfg.c_out.is_multiple_of(cfg.groups) {
+        return Err(attribute_value("groups", "divides_channels"));
+    }
+    let height_out = checked_output_axis(
+        cfg.input_h,
+        cfg.kernel_h,
+        cfg.stride_h,
+        cfg.dilation_h,
+        cfg.pad_top,
+        cfg.pad_bottom,
+        "kernel_h",
+    )?;
+    let width_out = checked_output_axis(
+        cfg.input_w,
+        cfg.kernel_w,
+        cfg.stride_w,
+        cfg.dilation_w,
+        cfg.pad_left,
+        cfg.pad_right,
+        "kernel_w",
+    )?;
+    let channels_per_group = cfg.c_in / cfg.groups;
+    bounded_product(&[cfg.batch, cfg.c_in, cfg.input_h, cfg.input_w], "batch")?;
+    bounded_product(
+        &[cfg.c_out, channels_per_group, cfg.kernel_h, cfg.kernel_w],
+        "c_out",
+    )?;
+    bounded_product(&[cfg.batch, cfg.c_out, height_out, width_out], "batch")?;
+    Ok((cfg, height_out, width_out))
+}
+
+fn conv2d_reference_error(error: conv2d::Conv2dError) -> TrainBackendError {
+    match error {
+        conv2d::Conv2dError::BufferLength { .. } => shape_error(),
+        conv2d::Conv2dError::InvalidGeometry(_) => attribute_value("geometry", "invalid"),
+        conv2d::Conv2dError::ArithmeticOverflow => attribute_value("geometry", "arithmetic"),
+    }
+}
+
+fn checked_scratch_product(values: &[u64]) -> Result<u64, TrainBackendError> {
+    values.iter().try_fold(1_u64, |total, &value| {
+        total
+            .checked_mul(value)
+            .ok_or_else(|| attribute_value("scratch", "arithmetic"))
+    })
+}
+
+fn checked_scratch_sum(values: &[u64]) -> Result<u64, TrainBackendError> {
+    values.iter().try_fold(0_u64, |total, &value| {
+        total
+            .checked_add(value)
+            .ok_or_else(|| attribute_value("scratch", "arithmetic"))
+    })
+}
+
+fn operation_scratch_bytes(
+    operation: CpuOperation,
+    execution: TrainExecutionV1,
+    request: &TrainRequestV1<'_>,
+) -> Result<u64, TrainBackendError> {
+    let elements = match (operation, execution) {
+        (CpuOperation::SaltSte, TrainExecutionV1::Forward) => attribute_u64(request, "cols")?,
+        (CpuOperation::Conv1d, phase) => {
+            let (cfg, l_out) = conv1d_attributes(request)?;
+            let input =
+                checked_scratch_product(&[cfg.batch as u64, cfg.c_in as u64, cfg.l_in as u64])?;
+            let weight = checked_scratch_product(&[
+                cfg.c_out as u64,
+                (cfg.c_in / cfg.groups) as u64,
+                cfg.k as u64,
+            ])?;
+            let scale = cfg.c_out as u64;
+            let columns = checked_scratch_product(&[
+                l_out as u64,
+                (cfg.c_in / cfg.groups) as u64,
+                cfg.k as u64,
+            ])?;
+            let group_output =
+                checked_scratch_product(&[l_out as u64, (cfg.c_out / cfg.groups) as u64])?;
+            match phase {
+                TrainExecutionV1::Forward => {
+                    let output = checked_scratch_product(&[
+                        cfg.batch as u64,
+                        cfg.c_out as u64,
+                        l_out as u64,
+                    ])?;
+                    checked_scratch_sum(&[output, columns, group_output])?
+                }
+                TrainExecutionV1::Vjp => {
+                    let matmul_gradients = checked_scratch_sum(&[
+                        columns,
+                        weight / cfg.groups as u64,
+                        scale / cfg.groups as u64,
+                    ])?;
+                    checked_scratch_sum(&[
+                        input,
+                        weight,
+                        scale,
+                        columns,
+                        group_output,
+                        matmul_gradients,
+                    ])?
+                }
+                _ => 0,
+            }
+        }
+        (CpuOperation::Conv2d, phase) => {
+            let (cfg, height_out, width_out) = conv2d_attributes(request)?;
+            let tile_rows = (height_out * width_out).min(conv2d::CONV2D_PATCH_TILE_ROWS) as u64;
+            let patch_columns = checked_scratch_product(&[
+                (cfg.c_in / cfg.groups) as u64,
+                cfg.kernel_h as u64,
+                cfg.kernel_w as u64,
+            ])?;
+            let group_channels = (cfg.c_out / cfg.groups) as u64;
+            let columns = checked_scratch_product(&[tile_rows, patch_columns])?;
+            let group_output = checked_scratch_product(&[tile_rows, group_channels])?;
+            match phase {
+                TrainExecutionV1::Forward => checked_scratch_sum(&[columns, group_output])?,
+                TrainExecutionV1::Vjp => {
+                    let input = checked_scratch_product(&[
+                        cfg.batch as u64,
+                        cfg.c_in as u64,
+                        cfg.input_h as u64,
+                        cfg.input_w as u64,
+                    ])?;
+                    let weight = checked_scratch_product(&[cfg.c_out as u64, patch_columns])?;
+                    let scale = cfg.c_out as u64;
+                    let matmul_gradients = checked_scratch_sum(&[
+                        columns,
+                        weight / cfg.groups as u64,
+                        group_channels,
+                    ])?;
+                    checked_scratch_sum(&[
+                        input,
+                        weight,
+                        scale,
+                        columns,
+                        group_output,
+                        matmul_gradients,
+                    ])?
+                }
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+    elements
+        .checked_mul(size_of::<f32>() as u64)
+        .ok_or_else(|| attribute_value("scratch", "bytes"))
 }
 
 fn embedding_attributes(

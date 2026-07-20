@@ -127,6 +127,10 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.lsq_ste.vjp.basic",
             "graph.fsq.forward.soft_round",
             "graph.fsq.vjp.soft_round",
+            "graph.fsq.forward.hard_half_ties",
+            "graph.fsq.vjp.hard_tanh",
+            "graph.fsq.forward.stochastic_seed_7",
+            "graph.fsq.forward.stochastic_seed_8",
             "graph.dense_matmul.forward.basic",
             "graph.dense_matmul.vjp.basic",
             "graph.ternary_matmul.forward.basic",
@@ -141,6 +145,10 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.concat_cols.vjp.basic",
             "graph.mul.forward.basic",
             "graph.mul.vjp.basic",
+            "graph.conv1d.forward.depthwise_asymmetric",
+            "graph.conv1d.vjp.depthwise_asymmetric",
+            "graph.conv2d.forward.depthwise_asymmetric",
+            "graph.conv2d.vjp.depthwise_asymmetric",
             "graph.detach.forward.basic",
             "graph.detach.vjp.zero",
             "graph.scale_const.forward.basic",
@@ -184,11 +192,22 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.salt_ste.forward.zero_planes",
             "graph.lsq_ste.forward.shape_error",
             "graph.fsq.forward.invalid_levels",
+            "graph.salt_ste.forward.zero_rows_huge_cols",
+            "graph.salt_ste.forward.too_many_planes",
+            "graph.salt_ste.forward.reordered_attributes",
+            "graph.lsq_ste.vjp.zero_cols",
+            "graph.fsq.forward.zero_len",
+            "graph.fsq.forward.invalid_alpha",
+            "graph.fsq.forward.unknown_ste",
+            "graph.conv1d.forward.zero_groups",
+            "graph.conv1d.forward.ragged_groups",
+            "graph.conv2d.forward.zero_groups",
+            "graph.conv2d.forward.oversized_kernel",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "420782acaec46d2915629815c9c082030671b413818880afd1bcf246d2219f13"
+        "0d74bc21e902874603cdbaf45098a22218aa1f209ed9be590b2ade04b49cf132"
     );
 }
