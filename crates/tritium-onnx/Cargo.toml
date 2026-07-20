@@ -14,16 +14,20 @@ categories.workspace = true
 # Lean by default: Layer 1 (the plain `ternary_mpgemm_kernel` + its bit-exact
 # conformance gate) needs NO external deps, so the default build + `cargo test
 # --workspace` pull ZERO of `ort`/`onnxruntime`. Layer 2 (the `ort` 2.x custom
-# operator) lives behind the `onnx` feature, which makes `ort` an optional dep.
+# deterministic protobuf writer lives behind `model`; Layer 2 (the `ort` 2.x
+# custom operators) lives behind `onnx`, which includes `model` and makes `ort`
+# an optional dependency.
 # `ort/download-binaries` fetches a prebuilt onnxruntime at build time so a CI
 # lane with network can build + test `--features onnx` without a system lib.
 default = []
-onnx = ["dep:ort"]
+model = ["dep:prost"]
+onnx = ["dep:ort", "model"]
 
 [dependencies]
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
 half = { workspace = true }
+prost = { workspace = true, optional = true }
 # `ort` with default-features off + the minimal set we need:
 #   std            — Session / OperatorDomain need the std runtime
 #   download-binaries + tls-rustls — fetch a prebuilt onnxruntime at build (no
@@ -41,7 +45,6 @@ ort = { workspace = true, optional = true, features = [
 
 [dev-dependencies]
 tritium-testkit = { workspace = true }
-prost = { workspace = true }
 
 [lints]
 workspace = true

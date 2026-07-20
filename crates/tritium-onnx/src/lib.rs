@@ -16,6 +16,7 @@
 //! ```text
 //! cargo build -p tritium-onnx                  # lean: Layer 1 only, zero ort
 //! cargo test  -p tritium-onnx                  # Layer 1 bit-exact conformance gate
+//! cargo test  -p tritium-onnx --features model # deterministic protobuf export
 //! cargo test  -p tritium-onnx --features onnx  # + Layer 2 ort custom-op registration
 //! ```
 #![deny(missing_docs)]
@@ -25,6 +26,21 @@ use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
+
+/// Stable Tritium ONNX custom-operator domain.
+pub const ONNX_DOMAIN: &str = "com.tritium";
+
+/// Stable opset-1 packed ternary matrix multiplication node name.
+pub const ONNX_OP_NAME: &str = "TritiumTernaryMpGemm";
+
+/// Stable opset-1 packed ternary embedding node name.
+pub const ONNX_EMBEDDING_OP_NAME: &str = "TritiumTernaryEmbedding";
+
+/// Node-attribute name for the contraction/embedding dimension `K`.
+pub const ATTR_K: &str = "K";
+
+/// Node-attribute name for the packing format (`0` = TQ2_0, `1` = TQ1_0).
+pub const ATTR_FORMAT: &str = "format";
 
 /// Errors from the always-on ternary mpGEMM kernel.
 ///
@@ -347,13 +363,18 @@ pub fn ternary_embedding_kernel(
 
 #[cfg(feature = "onnx")]
 pub use onnx_op::{
-    ATTR_FORMAT, ATTR_K, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME, ONNX_OP_NAME,
     TritiumTernaryEmbeddingKernel, TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel,
     TritiumTernaryMpGemmOp, tritium_operator_domain,
 };
 
 #[cfg(feature = "onnx")]
 mod onnx_op;
+
+#[cfg(feature = "model")]
+pub use model::{OnnxModelError, TiedEmbeddingHeadModel, encode_tied_embedding_head};
+
+#[cfg(feature = "model")]
+mod model;
 
 #[cfg(test)]
 mod tests {

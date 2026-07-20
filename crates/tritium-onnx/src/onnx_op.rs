@@ -37,22 +37,10 @@ use ort::operator::{
 use ort::value::TensorElementType;
 use tritium_core::TernaryFormat;
 
-use crate::{ternary_embedding_kernel, ternary_mpgemm_kernel};
-
-/// The ONNX node op type this operator registers.
-pub const ONNX_OP_NAME: &str = "TritiumTernaryMpGemm";
-
-/// The ONNX node op type for selected-row packed ternary embedding lookup.
-pub const ONNX_EMBEDDING_OP_NAME: &str = "TritiumTernaryEmbedding";
-
-/// The custom-operator domain Tritium registers [`ONNX_OP_NAME`] under.
-pub const ONNX_DOMAIN: &str = "com.tritium";
-
-/// Node-attribute name for the contraction dimension `K`.
-pub const ATTR_K: &str = "K";
-
-/// Node-attribute name for the packing format (`0` = TQ2_0, `1` = TQ1_0).
-pub const ATTR_FORMAT: &str = "format";
+use crate::{
+    ATTR_FORMAT, ATTR_K, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME, ONNX_OP_NAME,
+    ternary_embedding_kernel, ternary_mpgemm_kernel,
+};
 
 /// Map the integer `format` node attribute to a [`TernaryFormat`].
 ///
@@ -318,7 +306,6 @@ pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
 mod tests {
     use super::*;
     use half::f16;
-    use prost::Message;
     use tritium_core::Trit;
     use tritium_format::{num_blocks, pack_tq1_0_row, pack_tq2_0_row};
     use tritium_testkit::{ConformanceVector, FROZEN_COUNT, FROZEN_SEED, generate_vectors};
@@ -474,265 +461,10 @@ mod tests {
         );
     }
 
-    #[derive(Clone, PartialEq, Message)]
-    struct ModelProto {
-        #[prost(int64, tag = "1")]
-        ir_version: i64,
-        #[prost(string, tag = "2")]
-        producer_name: String,
-        #[prost(message, optional, tag = "7")]
-        graph: Option<GraphProto>,
-        #[prost(message, repeated, tag = "8")]
-        opset_import: Vec<OperatorSetIdProto>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct OperatorSetIdProto {
-        #[prost(string, tag = "1")]
-        domain: String,
-        #[prost(int64, tag = "2")]
-        version: i64,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct GraphProto {
-        #[prost(message, repeated, tag = "1")]
-        node: Vec<NodeProto>,
-        #[prost(string, tag = "2")]
-        name: String,
-        #[prost(message, repeated, tag = "11")]
-        input: Vec<ValueInfoProto>,
-        #[prost(message, repeated, tag = "12")]
-        output: Vec<ValueInfoProto>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct NodeProto {
-        #[prost(string, repeated, tag = "1")]
-        input: Vec<String>,
-        #[prost(string, repeated, tag = "2")]
-        output: Vec<String>,
-        #[prost(string, tag = "3")]
-        name: String,
-        #[prost(string, tag = "4")]
-        op_type: String,
-        #[prost(message, repeated, tag = "5")]
-        attribute: Vec<AttributeProto>,
-        #[prost(string, tag = "7")]
-        domain: String,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct AttributeProto {
-        #[prost(string, tag = "1")]
-        name: String,
-        #[prost(int64, tag = "3")]
-        value: i64,
-        #[prost(int32, tag = "20")]
-        kind: i32,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct ValueInfoProto {
-        #[prost(string, tag = "1")]
-        name: String,
-        #[prost(message, optional, tag = "2")]
-        r#type: Option<TypeProto>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct TypeProto {
-        #[prost(message, optional, tag = "1")]
-        tensor_type: Option<TensorTypeProto>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct TensorTypeProto {
-        #[prost(int32, tag = "1")]
-        elem_type: i32,
-        #[prost(message, optional, tag = "2")]
-        shape: Option<TensorShapeProto>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct TensorShapeProto {
-        #[prost(message, repeated, tag = "1")]
-        dim: Vec<TensorDimensionProto>,
-    }
-
-    #[derive(Clone, PartialEq, Message)]
-    struct TensorDimensionProto {
-        #[prost(int64, tag = "1")]
-        dim_value: i64,
-    }
-
-    fn tensor_value(name: &str, elem_type: i32, dimensions: &[usize]) -> ValueInfoProto {
-        ValueInfoProto {
-            name: name.to_owned(),
-            r#type: Some(TypeProto {
-                tensor_type: Some(TensorTypeProto {
-                    elem_type,
-                    shape: Some(TensorShapeProto {
-                        dim: dimensions
-                            .iter()
-                            .map(|&dimension| TensorDimensionProto {
-                                dim_value: dimension as i64,
-                            })
-                            .collect(),
-                    }),
-                }),
-            }),
-        }
-    }
-
-    fn session_model_bytes(m: usize, n: usize, k: usize, packed: usize) -> Vec<u8> {
-        ModelProto {
-            ir_version: 10,
-            producer_name: "tritium-onnx-test".to_owned(),
-            graph: Some(GraphProto {
-                node: vec![NodeProto {
-                    input: vec!["act".to_owned(), "packed".to_owned(), "scales".to_owned()],
-                    output: vec!["out".to_owned()],
-                    name: "ternary".to_owned(),
-                    op_type: ONNX_OP_NAME.to_owned(),
-                    attribute: vec![
-                        AttributeProto {
-                            name: ATTR_K.to_owned(),
-                            value: k as i64,
-                            kind: 2,
-                        },
-                        AttributeProto {
-                            name: ATTR_FORMAT.to_owned(),
-                            value: 0,
-                            kind: 2,
-                        },
-                    ],
-                    domain: ONNX_DOMAIN.to_owned(),
-                }],
-                name: "tritium-session-test".to_owned(),
-                input: vec![
-                    tensor_value("act", 1, &[m, k]),
-                    tensor_value("packed", 2, &[packed]),
-                    tensor_value("scales", 1, &[n]),
-                ],
-                output: vec![tensor_value("out", 1, &[m, n])],
-            }),
-            opset_import: vec![
-                OperatorSetIdProto {
-                    domain: String::new(),
-                    version: 21,
-                },
-                OperatorSetIdProto {
-                    domain: ONNX_DOMAIN.to_owned(),
-                    version: 1,
-                },
-            ],
-        }
-        .encode_to_vec()
-    }
-
-    fn embedding_session_model_bytes(
-        token_shape: &[usize],
-        vocab: usize,
-        k: usize,
-        packed: usize,
-    ) -> Vec<u8> {
-        let mut output_shape = token_shape.to_vec();
-        output_shape.push(k);
-        ModelProto {
-            ir_version: 10,
-            producer_name: "tritium-onnx-test".to_owned(),
-            graph: Some(GraphProto {
-                node: vec![NodeProto {
-                    input: vec![
-                        "tokens".to_owned(),
-                        "packed".to_owned(),
-                        "scales".to_owned(),
-                    ],
-                    output: vec!["out".to_owned()],
-                    name: "embedding".to_owned(),
-                    op_type: ONNX_EMBEDDING_OP_NAME.to_owned(),
-                    attribute: vec![
-                        AttributeProto {
-                            name: ATTR_K.to_owned(),
-                            value: k as i64,
-                            kind: 2,
-                        },
-                        AttributeProto {
-                            name: ATTR_FORMAT.to_owned(),
-                            value: 0,
-                            kind: 2,
-                        },
-                    ],
-                    domain: ONNX_DOMAIN.to_owned(),
-                }],
-                name: "tritium-embedding-session-test".to_owned(),
-                input: vec![
-                    tensor_value("tokens", 7, token_shape),
-                    tensor_value("packed", 2, &[packed]),
-                    tensor_value("scales", 1, &[vocab]),
-                ],
-                output: vec![tensor_value("out", 1, &output_shape)],
-            }),
-            opset_import: vec![
-                OperatorSetIdProto {
-                    domain: String::new(),
-                    version: 21,
-                },
-                OperatorSetIdProto {
-                    domain: ONNX_DOMAIN.to_owned(),
-                    version: 1,
-                },
-            ],
-        }
-        .encode_to_vec()
-    }
-
-    /// Full end-to-end ONNX session: serialize a real opset-1 custom-domain
-    /// graph, load it through ONNX Runtime, execute it and compare the result
-    /// bit-exactly with Tritium's reference kernel.
+    /// Production serializer plus both custom operators: the only runtime input
+    /// is token IDs; packed weights and scales are tied graph initializers.
     #[test]
-    fn end_to_end_session_matches_reference() {
-        use ort::value::Tensor;
-
-        // A small TQ2_0 case: M=1, N=1, K=256, weights all +1, scale 1.0 -> the
-        // output is the sum of the activation row.
-        let m = 1usize;
-        let n = 1usize;
-        let k = 256usize;
-        let format = TernaryFormat::Tq2_0;
-        let act: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01 - 1.0).collect();
-        let scales = vec![1.0f32];
-        let nb = num_blocks(k);
-        let unit = vec![f16::ONE; nb];
-        let mut packed = vec![0u8; nb * block_bytes(format)];
-        let trits = vec![Trit::POS; k];
-        pack_tq2_0_row(&trits, &unit, &mut packed).unwrap();
-
-        let expected =
-            ternary_mpgemm_kernel(&act, &packed, &scales, m, k, format).expect("layer-1 ref");
-
-        let model = session_model_bytes(m, n, k, packed.len());
-        let mut session = ort::session::Session::builder()
-            .unwrap()
-            .with_operators(tritium_operator_domain().unwrap())
-            .unwrap()
-            .commit_from_memory(&model)
-            .unwrap();
-        assert_eq!(session.opset_for_domain(ONNX_DOMAIN).unwrap(), 1);
-
-        let act_t = Tensor::from_array(([m, k], act.into_boxed_slice())).unwrap();
-        let packed_t = Tensor::from_array(([packed.len()], packed.into_boxed_slice())).unwrap();
-        let scales_t = Tensor::from_array(([n], scales.into_boxed_slice())).unwrap();
-        let outputs = session
-            .run(ort::inputs![&act_t, &packed_t, &scales_t])
-            .unwrap();
-        let (_, got) = outputs[0].try_extract_tensor::<f32>().unwrap();
-        assert_eq!(got, expected.as_slice(), "e2e onnx output bit-exact");
-    }
-
-    #[test]
-    fn end_to_end_embedding_session_matches_reference() {
+    fn end_to_end_tied_embedding_head_matches_reference() {
         use ort::value::Tensor;
 
         let k = 256;
@@ -741,23 +473,34 @@ mod tests {
         let packed = pack_rows(&rows, format);
         let scales = vec![0.5, 2.0, 1.25];
         let tokens = vec![2i64, 0, 1, 2];
+        let hidden =
+            ternary_embedding_kernel(&tokens, &[tokens.len()], &packed, &scales, k, format)
+                .unwrap();
         let expected =
-            ternary_embedding_kernel(&tokens, &[2, 2], &packed, &scales, k, format).unwrap();
-        let model = embedding_session_model_bytes(&[2, 2], rows.len(), k, packed.len());
+            ternary_mpgemm_kernel(&hidden, &packed, &scales, tokens.len(), k, format).unwrap();
+        let model = crate::encode_tied_embedding_head(crate::TiedEmbeddingHeadModel {
+            tokens: tokens.len(),
+            vocab: rows.len(),
+            hidden: k,
+            packed: &packed,
+            scales: &scales,
+            format,
+            source_model_id: "test-source",
+            recipe_id: "test-recipe",
+            package_id: "test-package",
+        })
+        .unwrap();
         let mut session = ort::session::Session::builder()
             .unwrap()
             .with_operators(tritium_operator_domain().unwrap())
             .unwrap()
             .commit_from_memory(&model)
             .unwrap();
-        let tokens_t = Tensor::from_array(([2, 2], tokens.into_boxed_slice())).unwrap();
-        let packed_t = Tensor::from_array(([packed.len()], packed.into_boxed_slice())).unwrap();
-        let scales_t = Tensor::from_array(([scales.len()], scales.into_boxed_slice())).unwrap();
-        let outputs = session
-            .run(ort::inputs![&tokens_t, &packed_t, &scales_t])
-            .unwrap();
+        assert_eq!(session.opset_for_domain(ONNX_DOMAIN).unwrap(), 1);
+        let tokens_t = Tensor::from_array(([tokens.len()], tokens.into_boxed_slice())).unwrap();
+        let outputs = session.run(ort::inputs![&tokens_t]).unwrap();
         let (shape, got) = outputs[0].try_extract_tensor::<f32>().unwrap();
-        assert_eq!(shape.as_ref(), &[2, 2, k as i64]);
-        assert_eq!(got, expected.as_slice(), "e2e embedding bit-exact");
+        assert_eq!(shape.as_ref(), &[4, rows.len() as i64]);
+        assert_eq!(got, expected.as_slice(), "e2e tied graph bit-exact");
     }
 }
