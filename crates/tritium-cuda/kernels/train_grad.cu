@@ -1533,6 +1533,111 @@ extern "C" __global__ void muon_step(
     }
 }
 
+extern "C" __global__ void conv1d_forward_portable(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    const float* __restrict__ scale, float* __restrict__ result,
+    int batch, int c_in, int c_out, int l_in, int kernel, int stride,
+    int dilation, int pad_left, int groups, int l_out)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    int c_in_pg = c_in / groups;
+    int n_g = c_out / groups;
+    int k_g = c_in_pg * kernel;
+    for (int b = 0; b < batch; ++b) {
+        for (int group = 0; group < groups; ++group) {
+            for (int l = 0; l < l_out; ++l) {
+                for (int n = 0; n < n_g; ++n) {
+                    int co = group * n_g + n;
+                    float acc = 0.0f;
+                    for (int j = 0; j < k_g; ++j) {
+                        int ci_local = j / kernel;
+                        int kk = j - ci_local * kernel;
+                        int position = l * stride + kk * dilation - pad_left;
+                        float activation = 0.0f;
+                        if (position >= 0 && position < l_in) {
+                            int ci = group * c_in_pg + ci_local;
+                            activation = x[(b * c_in + ci) * l_in + position];
+                        }
+                        acc += activation * weight[co * k_g + j];
+                    }
+                    result[(b * c_out + co) * l_out + l] = scale[co] * acc;
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void conv1d_backward_portable(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    const float* __restrict__ scale, const float* __restrict__ grad_output,
+    float* __restrict__ grad_x, float* __restrict__ grad_weight,
+    float* __restrict__ grad_scale, float* __restrict__ columns,
+    float* __restrict__ group_gradient, float* __restrict__ grad_columns,
+    float* __restrict__ grad_weight_group, float* __restrict__ grad_scale_group,
+    int batch, int c_in, int c_out, int l_in, int kernel, int stride,
+    int dilation, int pad_left, int groups, int l_out)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    int c_in_pg = c_in / groups;
+    int n_g = c_out / groups;
+    int k_g = c_in_pg * kernel;
+    for (int b = 0; b < batch; ++b) {
+        for (int group = 0; group < groups; ++group) {
+            for (int l = 0; l < l_out; ++l) {
+                for (int ci_local = 0; ci_local < c_in_pg; ++ci_local) {
+                    int ci = group * c_in_pg + ci_local;
+                    for (int kk = 0; kk < kernel; ++kk) {
+                        int position = l * stride + kk * dilation - pad_left;
+                        int j = ci_local * kernel + kk;
+                        columns[l * k_g + j] = position >= 0 && position < l_in
+                            ? x[(b * c_in + ci) * l_in + position] : 0.0f;
+                    }
+                }
+            }
+            for (int n = 0; n < n_g; ++n) {
+                int co = group * n_g + n;
+                for (int l = 0; l < l_out; ++l)
+                    group_gradient[l * n_g + n] = grad_output[(b * c_out + co) * l_out + l];
+            }
+            for (int i = 0; i < l_out * k_g; ++i) grad_columns[i] = 0.0f;
+            for (int i = 0; i < n_g * k_g; ++i) grad_weight_group[i] = 0.0f;
+            for (int i = 0; i < n_g; ++i) grad_scale_group[i] = 0.0f;
+            for (int l = 0; l < l_out; ++l) {
+                for (int n = 0; n < n_g; ++n) {
+                    float gy = group_gradient[l * n_g + n];
+                    float s = scale[group * n_g + n];
+                    float product = 0.0f;
+                    for (int j = 0; j < k_g; ++j) {
+                        float activation = columns[l * k_g + j];
+                        float w = weight[(group * n_g + n) * k_g + j];
+                        product += activation * w;
+                        grad_columns[l * k_g + j] += gy * s * w;
+                        grad_weight_group[n * k_g + j] += gy * s * activation;
+                    }
+                    grad_scale_group[n] += gy * product;
+                }
+            }
+            for (int n = 0; n < n_g; ++n) {
+                int co = group * n_g + n;
+                grad_scale[co] += grad_scale_group[n];
+                for (int j = 0; j < k_g; ++j)
+                    grad_weight[co * k_g + j] += grad_weight_group[n * k_g + j];
+            }
+            for (int l = 0; l < l_out; ++l) {
+                for (int ci_local = 0; ci_local < c_in_pg; ++ci_local) {
+                    int ci = group * c_in_pg + ci_local;
+                    for (int kk = 0; kk < kernel; ++kk) {
+                        int position = l * stride + kk * dilation - pad_left;
+                        if (position >= 0 && position < l_in)
+                            grad_x[(b * c_in + ci) * l_in + position]
+                                += grad_columns[l * k_g + ci_local * kernel + kk];
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(
