@@ -25,7 +25,7 @@ await session.backward(result.loss);
 await session.step();
 const checkpoint = await session.checkpoint();
 await session.resume(checkpoint);
-await session.export("model.tsalt2");
+const artifact = await session.export();
 ```
 
 ## Frozen public contracts
@@ -177,8 +177,18 @@ guest dispatch only after validated success and commits multi-group optimizer
 steps atomically. Default `backend: "wasm"` and admitted `auto` fallback select
 it without caller adapter wiring. Checkpoint and resume use canonical WASM
 transactions directly; candidate planes and step commit only after every
-returned plane validates. Device-loss transactions remain open, while SALT
-package admission is canonical but state-derived export remains open.
+returned plane validates. The built-in adapter now derives canonical B3 SALT V2
+packages from the current owned parameters at every `graph.salt_ste` export
+site, fits one to three additive planes using stored f16 group128 scales, and
+passes the resulting bytes twice through the strict Rust reader/writer over a
+direct binary WASM boundary before release. The compiled plan accounts the
+package, fit scratch, doubled semantic storage, six simultaneous package
+copies, a fixed metadata margin and returned artifacts in
+`exportPackageBytes`, `exportPeakBytes` and the session peak. Required exports
+fail before adapter allocation when no
+target exists, a row boundary cannot share canonical group128 scales, the
+plane count exceeds the SALT V2 container, or the exact package exceeds 8 MiB.
+Device-loss transactions remain open.
 
 Compile a `TrainingRecipeV1` into an immutable operation schedule, buffer plan
 and optimizer-state layout. Preparation validates all roles, shapes, dtypes,
@@ -190,8 +200,9 @@ state.
 - Forward/backward/step reuse prepared tensor owners; transient request
   snapshots and atomic candidate outputs remain capacity-bound.
 - Checkpoint/resume uses the canonical plan-0049 lifecycle encoding.
-- Export writes canonical SALT V2 bytes and immediately reloads them through
-  the strict WASM reader before returning.
+- Export writes canonical SALT V2 bytes, admits them over a binary WASM
+  boundary, proves the guest output equals the live-state artifact, and
+  immediately strict-reloads those bytes again before returning.
 - Cancellation and device loss leave the session either reusable from its last
   complete step or terminal with a typed receipt; partial state is never
   presented as committed.

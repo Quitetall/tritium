@@ -1,4 +1,5 @@
 import init, {
+  tritium_admit_salt_v2_package,
   tritium_execute_portable_request_json,
   tritium_portable_build_id,
   tritium_portable_conformance_case_count,
@@ -491,6 +492,7 @@ function localError(
 export type PreparedPortableWasmExecutor = Readonly<{
   buildId: string;
   execute(request: PortableTrainingRequestV1): Promise<PortableTrainingResponseV1>;
+  admitSaltV2(packageBytes: Uint8Array): Uint8Array;
 }>;
 
 type AdmittedPortableRequest = Readonly<{
@@ -561,6 +563,16 @@ export async function preparePortableWasmExecutor(
   return Object.freeze({
     buildId,
     execute: (request: PortableTrainingRequestV1) => executeInitializedRequest(request, buildId),
+    admitSaltV2: (packageBytes: Uint8Array) => {
+      if (!(packageBytes instanceof Uint8Array) || packageBytes.byteLength === 0) {
+        throw new Error("SALT V2 package must be a nonempty Uint8Array");
+      }
+      try {
+        return Uint8Array.from(tritium_admit_salt_v2_package(packageBytes));
+      } catch (error) {
+        throw new GuestTrapError("portable WASM SALT V2 admission failed", { cause: error });
+      }
+    },
   });
 }
 

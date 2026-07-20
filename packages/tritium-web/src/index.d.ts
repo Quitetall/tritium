@@ -302,6 +302,8 @@ export interface CompiledTrainingPlanV1 {
   readonly batchStagingBytes: number;
   readonly preparePeakBytes: number;
   readonly forwardPeakBytes: number;
+  readonly exportPackageBytes: number;
+  readonly exportPeakBytes: number;
   readonly peakBytes: number;
 }
 

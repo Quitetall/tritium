@@ -51,12 +51,21 @@ receipts remain a separate acceptance gate.
 `PortableWasmLifecycleState.create(...)` owns copied optimizer planes, commits
 and resumes atomically through that guest. Its separate `admitExport(...)`
 boundary strict-reloads caller-supplied SALT packages before returning them.
-State-derived model export remains a release gate.
+The built-in training adapter separately derives a compact B3 SALT V2 package
+from live `graph.salt_ste` parameter owners. Export targets are admitted before
+allocation, use one to three additive planes with f16 group128 scales, and are
+returned only after two direct-binary WASM reader/writer admissions, including
+artifact-to-guest and reload byte equality. The compiled plan exposes exact
+package bytes and a conservative export-phase peak covering fit scratch,
+doubled semantic storage, six simultaneous package copies, a metadata margin
+and returned artifacts. Multi-row
+targets must align row boundaries to 128 coefficients; this prevents a browser
+artifact from silently changing the training quantizer's scale domains.
 
 The built-in adapter remains explicitly `wasm-fallback`; it never satisfies a
-WebGPU gate. WebGPU implementation and state-derived SALT export remain under
-construction. `backend: "webgpu"` still returns `adapter_unavailable` unless a
-real WebGPU adapter is supplied.
+WebGPU gate. WebGPU implementation remains under construction. `backend:
+"webgpu"` still returns `adapter_unavailable` unless a real WebGPU adapter is
+supplied.
 
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.

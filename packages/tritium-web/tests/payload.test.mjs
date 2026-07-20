@@ -185,10 +185,199 @@ test("bundled adapter exposes stable session errors", async () => {
   const session = await prepareTraining({ ...model, payload: validPayload }, config);
   await assert.rejects(session.export(), (error) => {
     assert.ok(error instanceof WebTrainingError);
-    assert.equal(error.code, "adapter_unavailable");
+    assert.equal(error.code, "invalid_state");
     return true;
   });
   await session.dispose();
+});
+
+function saltTrainingModel(width, planes = 3, weights = undefined) {
+  return {
+    schemaId: "tritium.web_training_model",
+    schemaVersion: 1,
+    recipe: {
+      schemaId: "tritium.training_recipe",
+      schemaVersion: 1,
+      tensors: [
+        { id: "target", dtype: "f32", shape: [1, width], role: "batch", aliasOf: null },
+        { id: "weight", dtype: "f32", shape: [1, width], role: "parameter", aliasOf: null },
+        { id: "grad", dtype: "f32", shape: [1, width], role: "gradient", aliasOf: null },
+        { id: "quant", dtype: "f32", shape: [1, width], role: "activation", aliasOf: null },
+        { id: "loss", dtype: "f32", shape: [], role: "result", aliasOf: null },
+      ],
+      operations: [
+        {
+          id: "salt",
+          operation: "graph.salt_ste",
+          inputs: ["weight"],
+          outputs: ["quant"],
+          attributes: [
+            { name: "rows", kind: "u64", value: 1 },
+            { name: "cols", kind: "u64", value: width },
+            { name: "planes", kind: "u64", value: planes },
+          ],
+        },
+        {
+          id: "mse",
+          operation: "loss.mse",
+          inputs: ["quant", "target"],
+          outputs: ["loss"],
+          attributes: [],
+        },
+        {
+          id: "sgd",
+          operation: "optimizer.sgd",
+          inputs: ["weight", "grad"],
+          outputs: ["weight"],
+          attributes: [
+            { name: "step", kind: "u64", value: 0 },
+            { name: "lr", kind: "f32", value: 0.1 },
+          ],
+        },
+      ],
+    },
+    payload: encodeWebTrainingPayload({
+      weight: weights ?? Float32Array.from(
+        { length: width },
+        (_, index) => (index % 7 - 3) / 4,
+      ),
+    }),
+  };
+}
+
+const saltConfig = {
+  backend: "wasm",
+  allowWasmFallback: true,
+  maxResidentBytes: 1024 * 1024,
+  seed: 7,
+  requiredOperations: [
+    "graph.salt_ste",
+    "loss.mse",
+    "optimizer.sgd",
+    "lifecycle.export",
+    "lifecycle.reload",
+  ],
+};
+
+test("bundled adapter exports live additive parameters as strict canonical B3 SALT", async () => {
+  const width = 1152; // four full allocation tiles plus one ragged tile
+  const saltModel = saltTrainingModel(width);
+  const compiled = compileTrainingPlan(saltModel, saltConfig);
+  assert.ok(compiled.exportPackageBytes > 0);
+  assert.ok(compiled.exportPeakBytes > compiled.forwardPeakBytes);
+  assert.equal(
+    compiled.peakBytes,
+    Math.max(
+      compiled.preparePeakBytes,
+      compiled.forwardPeakBytes,
+      compiled.exportPeakBytes,
+    ),
+  );
+  const session = await prepareTraining(saltModel, saltConfig);
+  const first = await session.export();
+  const replay = await session.export();
+  assert.deepEqual(first.bytes, replay.bytes, "unchanged live state exports deterministically");
+  assert.equal(new TextDecoder().decode(first.bytes.subarray(0, 8)), "TSLT2PKG");
+  assert.equal(first.bytes[10], 2, "browser export uses compact B3 coding");
+  assert.equal(first.bytes.length, compiled.exportPackageBytes);
+  assert.equal(first.receipt.operation, "session.export");
+  assert.equal(first.receipt.peakResidentBytes, compiled.exportPeakBytes);
+
+  const result = await session.forward({ inputs: { target: new Float32Array(width) } });
+  await session.backward(result);
+  await session.step();
+  const changed = await session.export();
+  assert.notDeepEqual(changed.bytes, first.bytes, "export is derived from updated parameters");
+  assert.equal(changed.receipt.completedSteps, 1);
+  await session.dispose();
+});
+
+function singleSaltTensorLayout(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const nameBytes = view.getUint32(24, true);
+  const rank = view.getUint32(28, true);
+  const payloadBytes = Number(view.getBigUint64(48, true));
+  const scalesBytes = Number(view.getBigUint64(56, true));
+  const payloadOffset = 24 + 64 + nameBytes + rank * 8;
+  return {
+    packedTensorCount: view.getUint32(12, true),
+    packedTileCount: view.getBigUint64(40, true),
+    payload: bytes.subarray(payloadOffset, payloadOffset + payloadBytes),
+    scales: bytes.subarray(
+      payloadOffset + payloadBytes,
+      payloadOffset + payloadBytes + scalesBytes,
+    ),
+  };
+}
+
+test("B3 export carries terminal 2/4/6-bit and ragged allocation maps canonically", async () => {
+  for (const [width, planes, embedded] of [
+    [256, 2, 0b01],
+    [512, 2, 0b0101],
+    [768, 3, 0b11_1111],
+  ]) {
+    const session = await prepareTraining(saltTrainingModel(width, planes), saltConfig);
+    const layout = singleSaltTensorLayout((await session.export()).bytes);
+    assert.equal(layout.packedTensorCount & 0x03ff_ffff, 1);
+    assert.equal(layout.packedTensorCount >>> 26, embedded, `${width} terminal map`);
+    assert.equal(layout.packedTileCount >> 62n, 0n, `${width} has no ragged tile`);
+    await session.dispose();
+  }
+
+  const ragged = await prepareTraining(saltTrainingModel(128, 3), saltConfig);
+  const layout = singleSaltTensorLayout((await ragged.export()).bytes);
+  assert.equal(layout.packedTensorCount >>> 26, 0);
+  assert.equal(layout.packedTileCount >> 62n, 3n);
+  await ragged.dispose();
+});
+
+test("B3 export matches additive trits and f16 round-to-nearest-even scale oracles", async () => {
+  const cases = [
+    {
+      name: "mixed",
+      weights: new Float32Array([-1, -0.5, 0, 0.5, 1]),
+      payload: 225,
+      scale: [0xcd, 0x38],
+    },
+    {
+      name: "even tie",
+      weights: new Float32Array(5).fill(1.00048828125),
+      payload: 242,
+      scale: [0x00, 0x3c],
+    },
+    {
+      name: "minimum subnormal",
+      weights: new Float32Array(5).fill(2 ** -24),
+      payload: 242,
+      scale: [0x01, 0x00],
+    },
+  ];
+  for (const oracle of cases) {
+    const session = await prepareTraining(
+      saltTrainingModel(5, 1, oracle.weights),
+      saltConfig,
+    );
+    const layout = singleSaltTensorLayout((await session.export()).bytes);
+    assert.deepEqual([...layout.payload], [oracle.payload], `${oracle.name} trits`);
+    assert.deepEqual([...layout.scales], oracle.scale, `${oracle.name} scale`);
+    await session.dispose();
+  }
+
+  for (const [name, value] of [
+    ["underflow", 2 ** -25],
+    ["overflow", 65520],
+  ]) {
+    const session = await prepareTraining(
+      saltTrainingModel(5, 1, new Float32Array(5).fill(value)),
+      saltConfig,
+    );
+    await assert.rejects(session.export(), (error) => {
+      assert.ok(error instanceof WebTrainingError);
+      assert.equal(error.code, "invalid_state", name);
+      return true;
+    });
+    await session.dispose();
+  }
 });
 
 async function rejectsWebCode(promise, code) {

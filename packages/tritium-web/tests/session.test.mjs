@@ -65,7 +65,7 @@ const config = {
   allowWasmFallback: false,
   maxResidentBytes: 2048,
   seed: 7,
-  requiredOperations: ["lifecycle.checkpoint", "lifecycle.export"],
+  requiredOperations: ["lifecycle.checkpoint"],
 };
 
 function batch() {
@@ -210,6 +210,8 @@ test("checked session executes the complete lifecycle in order", async () => {
   assert.equal(session.plan.batchStagingBytes, 8);
   assert.equal(session.plan.preparePeakBytes, 138);
   assert.equal(session.plan.forwardPeakBytes, 140);
+  assert.equal(session.plan.exportPackageBytes, 0);
+  assert.equal(session.plan.exportPeakBytes, 0);
   assert.equal(session.plan.peakBytes, 140);
   const weight = session.plan.buffers.find((buffer) => buffer.id === "weight");
   const tied = session.plan.buffers.find((buffer) => buffer.id === "tied-weight");
@@ -307,6 +309,79 @@ test("backend policy and manifest coverage fail before adapter preparation", asy
   };
   await assert.rejects(prepareTraining(model, config, validator), /invalid geometry/);
   assert.deepEqual(validator.calls, ["validate"]);
+});
+
+test("required SALT export rejects a recipe without a ternary export target before allocation", async () => {
+  const adapter = new MockAdapter();
+  await rejectsCode(
+    prepareTraining(
+      model,
+      { ...config, requiredOperations: ["lifecycle.export"] },
+      adapter,
+    ),
+    "invalid_schema",
+  );
+  assert.deepEqual(adapter.calls, []);
+});
+
+test("SALT export targets must fit the three-plane group128 container", async () => {
+  const saltModel = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: model.recipe.tensors.map((tensor) =>
+        tensor.id === "loss" ? tensor : { ...tensor, shape: [2, 3] },
+      ),
+      operations: model.recipe.operations.map((operation) =>
+        operation.id === "add"
+          ? {
+              ...operation,
+              operation: "graph.salt_ste",
+              inputs: ["weight"],
+              outputs: ["sum"],
+              attributes: [
+                { name: "rows", kind: "u64", value: 2 },
+                { name: "cols", kind: "u64", value: 3 },
+                { name: "planes", kind: "u64", value: 4 },
+              ],
+            }
+          : operation,
+      ),
+    },
+  };
+  for (const [name, mutate] of [
+    ["plane count", (candidate) => candidate],
+    [
+      "group alignment",
+      (candidate) => ({
+        ...candidate,
+        recipe: {
+          ...candidate.recipe,
+          operations: candidate.recipe.operations.map((operation) =>
+            operation.id === "add"
+              ? {
+                  ...operation,
+                  attributes: operation.attributes.map((attribute) =>
+                    attribute.name === "planes" ? { ...attribute, value: 2 } : attribute,
+                  ),
+                }
+              : operation,
+          ),
+        },
+      }),
+    ],
+  ]) {
+    const adapter = new MockAdapter();
+    await rejectsCode(
+      prepareTraining(
+        mutate(saltModel),
+        { ...config, requiredOperations: ["lifecycle.export"] },
+        adapter,
+      ),
+      "invalid_schema",
+    );
+    assert.deepEqual(adapter.calls, [], name);
+  }
 });
 
 test("planner rejects invalid ownership and memory before adapter allocation", async () => {

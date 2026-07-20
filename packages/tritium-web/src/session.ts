@@ -11,6 +11,11 @@ import {
   TrainingGeometryError,
   validateTrainingOperationGeometry,
 } from "./geometry.ts";
+import {
+  compileSaltExportTargets,
+  saltExportLayout,
+  SaltExportError,
+} from "./salt-export.ts";
 
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";
@@ -129,6 +134,8 @@ export interface CompiledTrainingPlanV1 {
   readonly batchStagingBytes: number;
   readonly preparePeakBytes: number;
   readonly forwardPeakBytes: number;
+  readonly exportPackageBytes: number;
+  readonly exportPeakBytes: number;
   readonly peakBytes: number;
 }
 
@@ -1252,14 +1259,8 @@ export function compileTrainingPlan(
     batchStagingBytes,
     "forward memory",
   );
-  const peakBytes = Math.max(preparePeakBytes, forwardPeakBytes);
-  if (peakBytes > config.maxResidentBytes) {
-    fail(
-      "memory_limit",
-      `compiled plan requires ${peakBytes} bytes; ceiling is ${config.maxResidentBytes}`,
-    );
-  }
-  return Object.freeze({
+  const provisionalPeakBytes = Math.max(preparePeakBytes, forwardPeakBytes);
+  const provisionalPlan: CompiledTrainingPlanV1 = Object.freeze({
     schemaId: "tritium.compiled_training_plan",
     schemaVersion: 1,
     manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
@@ -1270,8 +1271,60 @@ export function compileTrainingPlan(
     batchStagingBytes,
     preparePeakBytes,
     forwardPeakBytes,
+    exportPackageBytes: 0,
+    exportPeakBytes: 0,
+    peakBytes: provisionalPeakBytes,
+  });
+  let exportPackageBytes = 0;
+  let exportPeakBytes = 0;
+  try {
+    const targets = compileSaltExportTargets(
+      provisionalPlan,
+      config.requiredOperations.includes("lifecycle.export"),
+    );
+    if (targets.length !== 0) {
+      const layout = saltExportLayout(targets);
+      exportPackageBytes = layout.packageBytes;
+      const fitBytes = checkedAdd(
+        checkedMultiply(layout.packageBytes, 2, "SALT export fit"),
+        layout.maxFitScratchBytes,
+        "SALT export fit",
+      );
+      const admissionBytes = checkedAdd(
+        checkedAdd(
+          checkedMultiply(layout.packageBytes, 6, "SALT export admission"),
+          checkedMultiply(layout.semanticBytes, 2, "SALT export admission"),
+          "SALT export admission",
+        ),
+        64 * 1024,
+        "SALT export admission",
+      );
+      exportPeakBytes = checkedAdd(
+        residentBytes,
+        Math.max(fitBytes, admissionBytes),
+        "SALT export peak",
+      );
+    }
+  } catch (error) {
+    if (error instanceof SaltExportError) {
+      fail(error.code === "capacity" ? "memory_limit" : "invalid_schema", error.message);
+    }
+    throw error;
+  }
+  const peakBytes = Math.max(preparePeakBytes, forwardPeakBytes, exportPeakBytes);
+  if (peakBytes > config.maxResidentBytes) {
+    fail(
+      "memory_limit",
+      `compiled plan requires ${peakBytes} bytes; ceiling is ${config.maxResidentBytes}`,
+    );
+  }
+  const plan: CompiledTrainingPlanV1 = Object.freeze({
+    ...provisionalPlan,
+    exportPackageBytes,
+    exportPeakBytes,
     peakBytes,
   });
+  return plan;
 }
 
 function validateCapabilities(
@@ -1711,7 +1764,7 @@ export class WebTrainingSession {
         result.receipt,
         this.capabilities,
         "session.export",
-        this.plan.peakBytes,
+        this.plan.exportPeakBytes,
         this.#maxResidentBytes,
         this.#completedSteps,
       );

@@ -27,6 +27,8 @@
 use core::any::Any;
 
 use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
+#[cfg(any(test, target_arch = "wasm32"))]
+use tritium_format::salt_v2_package::{read_salt_v2_package, write_salt_v2_package};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
@@ -36,6 +38,24 @@ mod portable;
 mod request;
 pub use portable::WasmTrainBackendV1;
 pub use request::tritium_execute_portable_request_json;
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn admit_canonical_salt_v2_package(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let decoded = read_salt_v2_package(bytes).map_err(|error| error.to_string())?;
+    let encoded = write_salt_v2_package(&decoded.package).map_err(|error| error.to_string())?;
+    if encoded.bytes != bytes {
+        return Err("SALT V2 package is valid but not byte-canonical".to_owned());
+    }
+    Ok(encoded.bytes)
+}
+
+/// Strictly decode and byte-canonically reload one SALT V2 package without a
+/// JSON-expanded byte array.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn tritium_admit_salt_v2_package(bytes: &[u8]) -> Result<Vec<u8>, wasm_bindgen::JsError> {
+    admit_canonical_salt_v2_package(bytes).map_err(|error| wasm_bindgen::JsError::new(&error))
+}
 
 #[cfg(target_arch = "wasm32")]
 fn portable_training_conformance_report()
@@ -403,6 +423,29 @@ mod tests {
     fn device_id_is_wasm() {
         assert_eq!(WasmBackend::new().device_id(), "wasm");
         assert_eq!(init_wasm().unwrap().device_id(), "wasm");
+    }
+
+    #[test]
+    fn direct_salt_admission_is_byte_identical_and_rejects_corruption() {
+        use half::f16;
+        use tritium_format::salt_v2::SaltV2Codec;
+        use tritium_format::salt_v2_package::{
+            SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile,
+        };
+
+        let plane =
+            SaltV2Plane::new(vec![-1, 0, 1], vec![f16::from_f32(0.5)]).expect("valid plane");
+        let tile = SaltV2Tile::new(vec![plane]).expect("valid tile");
+        let tensor = SaltV2Tensor::new("weight", vec![1, 3], vec![tile]).expect("valid tensor");
+        let package = SaltV2Package::new(SaltV2Codec::B3, vec![tensor]).expect("valid package");
+        let bytes = write_salt_v2_package(&package)
+            .expect("encode package")
+            .bytes;
+        assert_eq!(admit_canonical_salt_v2_package(&bytes).unwrap(), bytes);
+
+        let mut corrupt = bytes;
+        corrupt[0] ^= u8::MAX;
+        assert!(admit_canonical_salt_v2_package(&corrupt).is_err());
     }
 
     #[test]

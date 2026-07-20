@@ -31,6 +31,11 @@ import {
   PortableSchedulePlanError,
   preflightPortableSchedulePlan,
 } from "./portable-schedule.ts";
+import {
+  compileSaltExportTargets,
+  encodeStateDerivedSaltV2,
+  SaltExportError,
+} from "./salt-export.ts";
 import type {
   PortableBufferV1,
   PortableTrainingRequestV1,
@@ -249,7 +254,12 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
     ).operations
       .filter((operation) => operation.category !== "lifecycle")
       .map((operation) => operation.id);
-    supportedOperations.push("lifecycle.checkpoint", "lifecycle.resume");
+    supportedOperations.push(
+      "lifecycle.checkpoint",
+      "lifecycle.resume",
+      "lifecycle.export",
+      "lifecycle.reload",
+    );
     this.capabilities = Object.freeze({
       schemaId: "tritium.web_training_capabilities",
       schemaVersion: 1,
@@ -603,10 +613,52 @@ class PortableWasmTrainingAdapter implements WebTrainingAdapterV1 {
   }
 
   async export(): Promise<WebBinaryResultV1> {
-    adapterFail(
-      "adapter_unavailable",
-      "portable WASM state-derived SALT export is not implemented",
-    );
+    const { plan, store } = this.#ready();
+    let artifact: Uint8Array;
+    try {
+      const targets = compileSaltExportTargets(plan, false);
+      artifact = encodeStateDerivedSaltV2(targets, store);
+    } catch (error) {
+      if (error instanceof SaltExportError) {
+        adapterFail(
+          error.code === "capacity" ? "memory_limit" : error.code,
+          error.message,
+        );
+      }
+      throw error;
+    }
+    let admitted: Uint8Array;
+    let reloaded: Uint8Array;
+    try {
+      admitted = this.#executor.admitSaltV2(artifact);
+      reloaded = this.#executor.admitSaltV2(admitted);
+    } catch (error) {
+      adapterFail(
+        "invalid_receipt",
+        `portable WASM rejected state-derived SALT export: ${String(error)}`,
+      );
+    }
+    if (
+      admitted.length !== artifact.length ||
+      admitted.some((value, index) => value !== artifact[index])
+    ) {
+      adapterFail("invalid_receipt", "portable WASM changed the state-derived SALT artifact");
+    }
+    if (
+      reloaded.length !== admitted.length ||
+      reloaded.some((value, index) => value !== admitted[index])
+    ) {
+      adapterFail("invalid_receipt", "strict reload changed the exported SALT package");
+    }
+    return Object.freeze({
+      bytes: admitted,
+      receipt: webReceipt(
+        this.capabilities,
+        "session.export",
+        this.#completedSteps,
+        plan.exportPeakBytes,
+      ),
+    });
   }
 
   async dispose(): Promise<void> {
