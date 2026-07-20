@@ -104,7 +104,8 @@ ceilings and reject-not-clamp semantics are implemented. The existing request
 lifetime now also runs inside lazy SSE bodies from queue admission: expiry
 emits a typed OpenAI `request_timeout` event, records
 `tritium_stream_timeouts_total`, terminates framing and drops the receiver so
-the worker cancels. Per-principal rate limits, auth rotation, explicit KV
+the worker cancels. Non-streaming expiry returns HTTP 408 with the same typed
+OpenAI envelope. Per-principal rate limits, auth rotation, explicit KV
 reclamation receipts and the full adversarial matrix remain open.
 
 ## Slice 3 — metrics, logs and traces

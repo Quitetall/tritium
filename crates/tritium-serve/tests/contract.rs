@@ -856,7 +856,7 @@ async fn nonstream_timeout_408() {
             ..ServeConfig::default()
         },
     );
-    let (status, _) = send(
+    let (status, body) = send(
         &router,
         chat(json!({"model":"tritium","messages":[{"role":"user","content":"1"}]})),
     )
@@ -866,6 +866,9 @@ async fn nonstream_timeout_408() {
         StatusCode::REQUEST_TIMEOUT,
         "slow non-streaming -> 408"
     );
+    let body: Value = serde_json::from_slice(&body).expect("OpenAI timeout envelope");
+    assert_eq!(body["error"]["type"], "request_timeout_error");
+    assert_eq!(body["error"]["code"], "request_timeout");
 }
 
 /// Streaming has an absolute deadline inside the lazy SSE body. Expiry emits

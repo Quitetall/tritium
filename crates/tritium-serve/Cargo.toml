@@ -23,7 +23,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
-tower-http = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 # A backend must be linked for the binary to actually serve a model.
@@ -34,7 +33,7 @@ tritium-format = { workspace = true, optional = true }
 
 [features]
 default = []
-serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:tower-http", "dep:async-stream", "dep:futures-core", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
+serve = ["dep:tokio", "dep:axum", "dep:tower", "dep:async-stream", "dep:futures-core", "dep:tritium-cpu", "dep:tritium-runtime", "dep:tritium-format", "tritium-nn/tokenizer"]
 # Link the CUDA backend so `--backend cuda` can resolve (needs nvcc at build time).
 cuda = ["serve", "dep:tritium-cuda", "tritium-nn/cuda"]
 # Gated real-model end-to-end test (needs TRITIUM_SERVE_E2E=1 + TRITIUM_MODEL_PATH).

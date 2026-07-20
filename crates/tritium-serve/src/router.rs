@@ -309,12 +309,20 @@ fn build_router_inner(
         // implied — threat-model DoS bound).
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024));
     if cfg.request_timeout_secs > 0 {
-        // Times the SERVICE FUTURE only: bounds non-streaming requests
-        // end-to-end; streaming resolves at headers (lazy SSE body), so this
-        // bounds nothing there — see `request_timeout_secs` docs.
-        router = router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(cfg.request_timeout_secs),
+        // Bound body extraction, handler work, queue wait and buffered
+        // generation. Streaming has a second deadline inside its lazy body.
+        // A local middleware is used so timeout failures retain the OpenAI
+        // error envelope instead of tower-http's empty 408 response.
+        let timeout = Duration::from_secs(cfg.request_timeout_secs);
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                match tokio::time::timeout(timeout, next.run(req)).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        (StatusCode::REQUEST_TIMEOUT, Json(request_timeout_error())).into_response()
+                    }
+                }
+            },
         ));
     }
     if cfg.max_concurrent_requests > 0 {
@@ -389,6 +397,16 @@ fn api_error(
     param: Option<&str>,
 ) -> Response {
     (status, Json(ApiError::new(kind, msg, param))).into_response()
+}
+
+fn request_timeout_error() -> ApiError {
+    let mut error = ApiError::new(
+        "request_timeout_error",
+        "request exceeded the configured lifetime",
+        None,
+    );
+    error.error.code = Some("request_timeout".to_owned());
+    error
 }
 
 /// Lower the OpenAI sampling fields to the internal [`Sampling`]. `temperature
@@ -857,12 +875,7 @@ fn stream_response(
         }
 
         if timed_out {
-            let mut error = ApiError::new(
-                "request_timeout_error",
-                "stream exceeded the configured request lifetime",
-                None,
-            );
-            error.error.code = Some("request_timeout".to_owned());
+            let error = request_timeout_error();
             yield Ok(Event::default().data(serde_json::to_string(&error).unwrap_or_default()));
         } else if errored {
             yield Ok(sse_data(&error_chunk(&id, created, &model)));
