@@ -38,7 +38,8 @@ use ort::value::TensorElementType;
 use tritium_core::TernaryFormat;
 
 use crate::{
-    ATTR_FORMAT, ATTR_K, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME, ONNX_OP_NAME,
+    ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_PAST_TOKENS, ONNX_DOMAIN,
+    ONNX_EMBEDDING_OP_NAME, ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME, kv_attention_kernel,
     ternary_embedding_kernel, ternary_mpgemm_kernel,
 };
 
@@ -209,6 +210,171 @@ impl Kernel for TritiumTernaryEmbeddingKernel {
     }
 }
 
+fn usize_attribute(
+    attributes: &KernelAttributes,
+    name: &'static str,
+    allow_zero: bool,
+) -> ort::Result<usize> {
+    let value: i64 = attributes
+        .get(name)
+        .ok_or_else(|| OrtError::new(format!("tritium-onnx: missing i64 attribute `{name}`")))?;
+    let minimum = if allow_zero { 0 } else { 1 };
+    if value < minimum {
+        return Err(OrtError::new(format!(
+            "tritium-onnx: attribute `{name}` must be {}, got {value}",
+            if allow_zero {
+                "nonnegative"
+            } else {
+                "positive"
+            }
+        )));
+    }
+    usize::try_from(value)
+        .map_err(|_| OrtError::new(format!("tritium-onnx: attribute `{name}` exceeds usize")))
+}
+
+/// Custom operator descriptor for cache-aware causal grouped-query attention.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TritiumKvAttentionOp;
+
+impl Operator for TritiumKvAttentionOp {
+    fn name(&self) -> &str {
+        ONNX_KV_ATTENTION_OP_NAME
+    }
+
+    fn inputs(&self) -> Vec<OperatorInput> {
+        vec![
+            OperatorInput::required(TensorElementType::Float32),
+            OperatorInput::required(TensorElementType::Float32),
+            OperatorInput::required(TensorElementType::Float32),
+        ]
+    }
+
+    fn outputs(&self) -> Vec<OperatorOutput> {
+        vec![OperatorOutput::required(TensorElementType::Float32)]
+    }
+
+    fn min_version(&self) -> i32 {
+        2
+    }
+
+    fn max_version(&self) -> i32 {
+        2
+    }
+
+    fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
+        Ok(Box::new(TritiumKvAttentionKernel {
+            n_head: usize_attribute(attributes, ATTR_N_HEAD, false)?,
+            n_kv_head: usize_attribute(attributes, ATTR_N_KV_HEAD, false)?,
+            head_dim: usize_attribute(attributes, ATTR_HEAD_DIM, false)?,
+            past_tokens: usize_attribute(attributes, ATTR_PAST_TOKENS, true)?,
+        }))
+    }
+}
+
+/// Per-node cache-aware attention kernel with frozen head geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct TritiumKvAttentionKernel {
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    past_tokens: usize,
+}
+
+impl TritiumKvAttentionKernel {
+    /// Execute over extracted rank-3 Q/K/V tensors.
+    ///
+    /// # Errors
+    /// An [`ort::Error`] if shapes disagree with attributes/cache offset or the
+    /// semantic oracle rejects flat input lengths.
+    pub fn run(
+        &self,
+        q_shape: &[i64],
+        q: &[f32],
+        k_shape: &[i64],
+        k_cache: &[f32],
+        v_shape: &[i64],
+        v_cache: &[f32],
+    ) -> Result<Vec<f32>, OrtError> {
+        if q_shape.len() != 3 || k_shape.len() != 3 || v_shape.len() != 3 {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: KV attention requires rank-3 Q/K/V, got {q_shape:?}, {k_shape:?}, {v_shape:?}"
+            )));
+        }
+        let expected_q_tail = [self.n_head as i64, self.head_dim as i64];
+        let expected_kv_tail = [self.n_kv_head as i64, self.head_dim as i64];
+        if q_shape[1..] != expected_q_tail {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: Q tail {:?} does not match {:?}",
+                &q_shape[1..],
+                expected_q_tail
+            )));
+        }
+        if k_shape[1..] != expected_kv_tail || v_shape != k_shape {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: K/V shapes {k_shape:?}/{v_shape:?} do not match cache tail {expected_kv_tail:?}"
+            )));
+        }
+        let query_tokens = usize::try_from(q_shape[0])
+            .map_err(|_| OrtError::new("tritium-onnx: negative query token count"))?;
+        let total_tokens = self
+            .past_tokens
+            .checked_add(query_tokens)
+            .ok_or_else(|| OrtError::new("tritium-onnx: KV cache token count overflow"))?;
+        if usize::try_from(k_shape[0]) != Ok(total_tokens) {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: cache token count {} does not equal past {} + query {query_tokens}",
+                k_shape[0], self.past_tokens
+            )));
+        }
+        kv_attention_kernel(
+            q,
+            k_cache,
+            v_cache,
+            query_tokens,
+            self.n_head,
+            self.n_kv_head,
+            self.head_dim,
+            self.past_tokens,
+        )
+        .map_err(|error| OrtError::new(error.to_string()))
+    }
+}
+
+impl Kernel for TritiumKvAttentionKernel {
+    fn compute(&mut self, ctx: &KernelContext) -> ort::Result<()> {
+        let q_value = ctx
+            .input(0)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing input 0 (q)"))?;
+        let k_value = ctx
+            .input(1)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing input 1 (k_cache)"))?;
+        let v_value = ctx
+            .input(2)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing input 2 (v_cache)"))?;
+        let (q_shape, q) = q_value.try_extract_tensor::<f32>()?;
+        let (k_shape, k_cache) = k_value.try_extract_tensor::<f32>()?;
+        let (v_shape, v_cache) = v_value.try_extract_tensor::<f32>()?;
+        let q_dimensions: Vec<i64> = q_shape.iter().copied().collect();
+        let k_dimensions: Vec<i64> = k_shape.iter().copied().collect();
+        let v_dimensions: Vec<i64> = v_shape.iter().copied().collect();
+        let output = self.run(
+            &q_dimensions,
+            q,
+            &k_dimensions,
+            k_cache,
+            &v_dimensions,
+            v_cache,
+        )?;
+        let mut output_value = ctx
+            .output(0, q_dimensions)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing output 0"))?;
+        let (_, output_ref) = output_value.try_extract_tensor_mut::<f32>()?;
+        output_ref.copy_from_slice(&output);
+        Ok(())
+    }
+}
+
 /// The per-node kernel produced by [`TritiumTernaryMpGemmOp::create_kernel`],
 /// carrying the node's resolved `K` and packing `format`. Its
 /// [`compute`](Kernel::compute) extracts the three input tensors and runs the
@@ -289,8 +455,8 @@ impl Kernel for TritiumTernaryMpGemmKernel {
 }
 
 /// Build an [`OperatorDomain`] named [`ONNX_DOMAIN`] with
-/// [`TritiumTernaryMpGemmOp`] and [`TritiumTernaryEmbeddingOp`] registered,
-/// ready to pass to
+/// opset-1 [`TritiumTernaryMpGemmOp`]/[`TritiumTernaryEmbeddingOp`] plus
+/// opset-2 [`TritiumKvAttentionOp`] registered, ready to pass to
 /// [`ort::session::builder::SessionBuilder::with_operators`].
 ///
 /// # Errors
@@ -299,7 +465,8 @@ impl Kernel for TritiumTernaryMpGemmKernel {
 pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
     OperatorDomain::new(ONNX_DOMAIN)?
         .add(TritiumTernaryMpGemmOp)?
-        .add(TritiumTernaryEmbeddingOp)
+        .add(TritiumTernaryEmbeddingOp)?
+        .add(TritiumKvAttentionOp)
 }
 
 #[cfg(test)]
@@ -408,6 +575,95 @@ mod tests {
         assert_eq!(embedding.name(), ONNX_EMBEDDING_OP_NAME);
         assert_eq!(embedding.inputs().len(), 3, "tokens, packed, scales");
         assert_eq!(embedding.outputs().len(), 1, "embedding");
+        let attention = TritiumKvAttentionOp;
+        assert_eq!(attention.name(), ONNX_KV_ATTENTION_OP_NAME);
+        assert_eq!(attention.inputs().len(), 3, "q, k_cache, v_cache");
+        assert_eq!(attention.outputs().len(), 1, "context");
+    }
+
+    #[test]
+    fn kv_attention_kernel_runs_prompt_and_cached_decode() {
+        let prompt = TritiumKvAttentionKernel {
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: 1,
+            past_tokens: 0,
+        };
+        assert_eq!(
+            prompt
+                .run(
+                    &[2, 1, 1],
+                    &[1.0, 2.0],
+                    &[2, 1, 1],
+                    &[1.0, 1.0],
+                    &[2, 1, 1],
+                    &[10.0, 20.0],
+                )
+                .unwrap(),
+            vec![10.0, 15.0]
+        );
+        let decode = TritiumKvAttentionKernel {
+            past_tokens: 2,
+            ..prompt
+        };
+        let output = decode
+            .run(
+                &[1, 1, 1],
+                &[3.0],
+                &[3, 1, 1],
+                &[1.0, 1.0, 1.0],
+                &[3, 1, 1],
+                &[10.0, 20.0, 40.0],
+            )
+            .unwrap();
+        assert!((output[0] - 70.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn end_to_end_kv_attention_runs_prompt_and_cached_decode() {
+        use ort::value::Tensor;
+
+        for (query_tokens, past_tokens, q, k, v, expected) in [
+            (
+                2usize,
+                0usize,
+                vec![1.0_f32, 2.0],
+                vec![1.0_f32, 1.0],
+                vec![10.0_f32, 20.0],
+                vec![10.0_f32, 15.0],
+            ),
+            (
+                1usize,
+                2usize,
+                vec![3.0_f32],
+                vec![1.0_f32, 1.0, 1.0],
+                vec![10.0_f32, 20.0, 40.0],
+                vec![70.0_f32 / 3.0],
+            ),
+        ] {
+            let model =
+                crate::model::encode_kv_attention_test_graph(query_tokens, past_tokens, 1, 1, 1);
+            let mut session = ort::session::Session::builder()
+                .unwrap()
+                .with_operators(tritium_operator_domain().unwrap())
+                .unwrap()
+                .commit_from_memory(&model)
+                .unwrap();
+            let total_tokens = query_tokens + past_tokens;
+            let q_tensor =
+                Tensor::from_array(([query_tokens, 1, 1], q.into_boxed_slice())).unwrap();
+            let k_tensor =
+                Tensor::from_array(([total_tokens, 1, 1], k.into_boxed_slice())).unwrap();
+            let v_tensor =
+                Tensor::from_array(([total_tokens, 1, 1], v.into_boxed_slice())).unwrap();
+            let outputs = session
+                .run(ort::inputs![&q_tensor, &k_tensor, &v_tensor])
+                .unwrap();
+            let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
+            for (&actual, &expected) in actual.iter().zip(&expected) {
+                assert!((actual - expected).abs() < 1e-5);
+            }
+        }
     }
 
     /// The kernel's operand path (`TritiumTernaryMpGemmKernel::run`) reproduces

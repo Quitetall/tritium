@@ -7,9 +7,10 @@
 //!   [`ternary_embedding_kernel`] consume TQ2_0 / TQ1_0 weights directly. Their
 //!   conformance tests pull neither `ort` nor `onnxruntime`.
 //!
-//! - **Layer 2 (feature `onnx`, pulls `ort`).** [`TritiumTernaryMpGemmOp`] and
-//!   [`TritiumTernaryEmbeddingOp`] register the corresponding `com.tritium`
-//!   opset-1 nodes. Enabling the feature fetches a prebuilt ONNX Runtime.
+//! - **Layer 2 (feature `onnx`, pulls `ort`).** Packed projection/embedding
+//!   operators retain `com.tritium` opset 1. Experimental cache attention uses
+//!   [`TritiumKvAttentionOp`] at opset 2. Enabling the feature fetches ONNX
+//!   Runtime.
 //!
 //! ## Feature gate
 //!
@@ -36,11 +37,26 @@ pub const ONNX_OP_NAME: &str = "TritiumTernaryMpGemm";
 /// Stable opset-1 packed ternary embedding node name.
 pub const ONNX_EMBEDDING_OP_NAME: &str = "TritiumTernaryEmbedding";
 
+/// Experimental opset-2 cache-aware grouped-query attention node name.
+pub const ONNX_KV_ATTENTION_OP_NAME: &str = "TritiumKvAttention";
+
 /// Node-attribute name for the contraction/embedding dimension `K`.
 pub const ATTR_K: &str = "K";
 
 /// Node-attribute name for the packing format (`0` = TQ2_0, `1` = TQ1_0).
 pub const ATTR_FORMAT: &str = "format";
+
+/// Cache-aware attention query-head-count attribute.
+pub const ATTR_N_HEAD: &str = "n_head";
+
+/// Cache-aware attention key/value-head-count attribute.
+pub const ATTR_N_KV_HEAD: &str = "n_kv_head";
+
+/// Cache-aware attention head-width attribute.
+pub const ATTR_HEAD_DIM: &str = "head_dim";
+
+/// Cache-aware attention prefix-length attribute.
+pub const ATTR_PAST_TOKENS: &str = "past_tokens";
 
 /// Errors from the always-on ternary mpGEMM kernel.
 ///
@@ -97,6 +113,24 @@ pub enum OnnxTernaryError {
         /// Number of rows in the embedding table.
         vocab: usize,
     },
+    /// Cache-aware attention geometry is zero, inconsistent, or not valid GQA.
+    InvalidAttentionGeometry(String),
+    /// One attention input has the wrong flat element count.
+    AttentionInputLength {
+        /// Stable input name (`q`, `k_cache`, or `v_cache`).
+        input: &'static str,
+        /// Required flat element count.
+        expected: usize,
+        /// Supplied flat element count.
+        got: usize,
+    },
+    /// One attention input contains a NaN or infinity.
+    InvalidAttentionValue {
+        /// Stable input name.
+        input: &'static str,
+        /// Flat rejected element index.
+        index: usize,
+    },
 }
 
 impl core::fmt::Display for OnnxTernaryError {
@@ -137,6 +171,21 @@ impl core::fmt::Display for OnnxTernaryError {
             } => write!(
                 f,
                 "tritium-onnx: token {token} at flat position {position} is outside vocabulary 0..{vocab}"
+            ),
+            OnnxTernaryError::InvalidAttentionGeometry(reason) => {
+                write!(f, "tritium-onnx: invalid KV attention geometry: {reason}")
+            }
+            OnnxTernaryError::AttentionInputLength {
+                input,
+                expected,
+                got,
+            } => write!(
+                f,
+                "tritium-onnx: KV attention {input} has {got} elements, expected {expected}"
+            ),
+            OnnxTernaryError::InvalidAttentionValue { input, index } => write!(
+                f,
+                "tritium-onnx: KV attention {input}[{index}] must be finite"
             ),
         }
     }
@@ -371,10 +420,116 @@ pub fn ternary_embedding_kernel(
     Ok(output)
 }
 
+/// Cache-aware causal grouped-query attention semantic oracle.
+///
+/// `q` has shape `[query_tokens, n_head, head_dim]`; `k_cache` and `v_cache`
+/// have shape `[past_tokens + query_tokens, n_kv_head, head_dim]`. Query row
+/// `i` may attend through cache row `past_tokens + i`. Returned flat buffer has
+/// same shape as `q`.
+///
+/// # Errors
+/// [`OnnxTernaryError`] if geometry is empty/invalid, dimensions overflow, any
+/// flat input length disagrees with declared geometry, or an input is non-finite.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_attention_kernel(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    query_tokens: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    past_tokens: usize,
+) -> Result<Vec<f32>, OnnxTernaryError> {
+    if query_tokens == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
+        return Err(OnnxTernaryError::InvalidAttentionGeometry(
+            "query_tokens, n_head, n_kv_head, and head_dim must be positive".to_owned(),
+        ));
+    }
+    if !n_head.is_multiple_of(n_kv_head) {
+        return Err(OnnxTernaryError::InvalidAttentionGeometry(format!(
+            "n_head {n_head} is not divisible by n_kv_head {n_kv_head}"
+        )));
+    }
+    let total_tokens = past_tokens
+        .checked_add(query_tokens)
+        .ok_or(OnnxTernaryError::ShapeOverflow("KV cache token count"))?;
+    let q_len = query_tokens
+        .checked_mul(n_head)
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or(OnnxTernaryError::ShapeOverflow(
+            "KV attention query elements",
+        ))?;
+    let kv_len = total_tokens
+        .checked_mul(n_kv_head)
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or(OnnxTernaryError::ShapeOverflow(
+            "KV attention cache elements",
+        ))?;
+    for (input, got, expected) in [
+        ("q", q.len(), q_len),
+        ("k_cache", k_cache.len(), kv_len),
+        ("v_cache", v_cache.len(), kv_len),
+    ] {
+        if got != expected {
+            return Err(OnnxTernaryError::AttentionInputLength {
+                input,
+                expected,
+                got,
+            });
+        }
+    }
+    for (input, values) in [("q", q), ("k_cache", k_cache), ("v_cache", v_cache)] {
+        if let Some((index, _)) = values
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(OnnxTernaryError::InvalidAttentionValue { input, index });
+        }
+    }
+
+    let group_size = n_head / n_kv_head;
+    let scale = 1.0 / (head_dim as f64).sqrt();
+    let mut output = vec![0.0; q_len];
+    let mut probabilities = vec![0.0_f64; total_tokens];
+    for query in 0..query_tokens {
+        let visible = past_tokens + query + 1;
+        for head in 0..n_head {
+            let kv_head = head / group_size;
+            let mut maximum = f64::NEG_INFINITY;
+            for key in 0..visible {
+                let mut score = 0.0_f64;
+                for lane in 0..head_dim {
+                    score += f64::from(q[(query * n_head + head) * head_dim + lane])
+                        * f64::from(k_cache[(key * n_kv_head + kv_head) * head_dim + lane]);
+                }
+                probabilities[key] = score * scale;
+                maximum = maximum.max(probabilities[key]);
+            }
+            let mut sum = 0.0;
+            for probability in &mut probabilities[..visible] {
+                *probability = (*probability - maximum).exp();
+                sum += *probability;
+            }
+            for lane in 0..head_dim {
+                let mut value = 0.0_f64;
+                for key in 0..visible {
+                    value += probabilities[key] / sum
+                        * f64::from(v_cache[(key * n_kv_head + kv_head) * head_dim + lane]);
+                }
+                output[(query * n_head + head) * head_dim + lane] = value as f32;
+            }
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(feature = "onnx")]
 pub use onnx_op::{
-    TritiumTernaryEmbeddingKernel, TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel,
-    TritiumTernaryMpGemmOp, tritium_operator_domain,
+    TritiumKvAttentionKernel, TritiumKvAttentionOp, TritiumTernaryEmbeddingKernel,
+    TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel, TritiumTernaryMpGemmOp,
+    tritium_operator_domain,
 };
 
 #[cfg(feature = "onnx")]
@@ -534,6 +689,23 @@ mod tests {
                 .collect();
             assert_eq!(got, expected, "selected-row gather must match for {format}");
         }
+    }
+
+    #[test]
+    fn kv_attention_prompt_and_cached_decode_match_worked_oracle() {
+        let prompt =
+            kv_attention_kernel(&[1.0, 2.0], &[1.0, 1.0], &[10.0, 20.0], 2, 1, 1, 1, 0).unwrap();
+        assert_eq!(prompt, vec![10.0, 15.0]);
+
+        let decode =
+            kv_attention_kernel(&[3.0], &[1.0, 1.0, 1.0], &[10.0, 20.0, 40.0], 1, 1, 1, 1, 2)
+                .unwrap();
+        assert!((decode[0] - 70.0 / 3.0).abs() < 1e-5);
+
+        let overflow_resistant =
+            kv_attention_kernel(&[f32::MAX], &[f32::MAX], &[7.0], 1, 1, 1, 1, 0).unwrap();
+        assert_eq!(overflow_resistant, vec![7.0]);
+        assert!(kv_attention_kernel(&[f32::NAN], &[1.0], &[1.0], 1, 1, 1, 1, 0).is_err());
     }
 
     #[test]

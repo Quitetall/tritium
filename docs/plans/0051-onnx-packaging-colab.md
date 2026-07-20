@@ -52,8 +52,14 @@ format remain source-compatible and readable; version-specific verifiers reject
 cross-version interpretation. Both v1 inline and v2 external-data graphs execute
 through real ORT sessions. Public pre-session inspection now returns deterministic
 typed diagnostics for every unsupported node, attribute, dtype and unresolved
-coverage item in the current tied-graph subset. Decoder blocks, KV cache,
-decoder-wide diagnostics and whole-model generation remain open.
+coverage item in the current tied-graph subset. Decoder blocks, integrated
+cache lifecycle, decoder-wide diagnostics and whole-model generation remain
+open. Cache-aware causal GQA now has a dependency-free semantic oracle plus an
+experimental `com.tritium` opset-2 `TritiumKvAttention` proof; real ORT sessions
+execute both prompt attention and one-token continuation over supplied K/V
+cache. This does not alter frozen opset 1 or replace required standard-ONNX v1.1
+attention glue. Packed Q/K/V/O projection, cache production/update and complete
+decoder-block serialization remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

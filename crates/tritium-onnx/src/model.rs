@@ -9,7 +9,10 @@ use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
 };
 
-use crate::{ATTR_FORMAT, ATTR_K, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME, ONNX_OP_NAME};
+use crate::{
+    ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_PAST_TOKENS, ONNX_DOMAIN,
+    ONNX_EMBEDDING_OP_NAME, ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME,
+};
 
 const ONNX_IR_VERSION: i64 = 10;
 const ONNX_OPSET: i64 = 21;
@@ -299,16 +302,43 @@ pub fn diagnose_unsupported_graph(
         .graph
         .as_ref()
         .ok_or_else(|| OnnxModelError::InvalidModel("graph is missing".to_owned()))?;
+    let mut tritium_opsets = protobuf
+        .opset_import
+        .iter()
+        .filter(|opset| opset.domain == ONNX_DOMAIN);
+    let tritium_opset = tritium_opsets.next().map(|opset| opset.version);
+    if tritium_opsets.next().is_some() {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "duplicate opset import for domain {ONNX_DOMAIN}"
+        )));
+    }
     let mut diagnostics = Vec::new();
 
     for node in &graph.node {
-        let supported = node.domain == ONNX_DOMAIN
-            && matches!(node.op_type.as_str(), ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME);
+        let supported = node_supported(node, tritium_opset);
         if !supported {
+            let reason = if node.domain == ONNX_DOMAIN
+                && node.op_type == ONNX_KV_ATTENTION_OP_NAME
+                && tritium_opset != Some(2)
+            {
+                format!(
+                    "operator requires {ONNX_DOMAIN} opset 2, imported {}",
+                    tritium_opset
+                        .map_or_else(|| "missing".to_owned(), |version| version.to_string())
+                )
+            } else if node.domain == ONNX_DOMAIN && !matches!(tritium_opset, Some(1 | 2)) {
+                format!(
+                    "unsupported {ONNX_DOMAIN} opset {}",
+                    tritium_opset
+                        .map_or_else(|| "missing".to_owned(), |version| version.to_string())
+                )
+            } else {
+                format!("unsupported operator {}::{}", node.domain, node.op_type)
+            };
             diagnostics.push(UnsupportedGraphDiagnostic {
                 kind: UnsupportedGraphItemKind::Node,
                 subject: diagnostic_subject(&node.name, "<unnamed node>"),
-                reason: format!("unsupported operator {}::{}", node.domain, node.op_type),
+                reason,
             });
         }
     }
@@ -319,7 +349,9 @@ pub fn diagnose_unsupported_graph(
                 diagnostic_subject(&node.name, "<unnamed node>"),
                 diagnostic_subject(&attribute.name, "<unnamed attribute>")
             );
-            if !matches!(attribute.name.as_str(), ATTR_K | ATTR_FORMAT) {
+            if node.domain != ONNX_DOMAIN
+                || !supported_attributes(&node.op_type).contains(&attribute.name.as_str())
+            {
                 diagnostics.push(UnsupportedGraphDiagnostic {
                     kind: UnsupportedGraphItemKind::Attribute,
                     subject,
@@ -346,12 +378,30 @@ pub fn diagnose_unsupported_graph(
                     subject,
                     reason: format!("unsupported format code {}", attribute.value),
                 });
+            } else if matches!(
+                attribute.name.as_str(),
+                ATTR_N_HEAD | ATTR_N_KV_HEAD | ATTR_HEAD_DIM
+            ) && attribute.value <= 0
+            {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!(
+                        "{} must be positive, got {}",
+                        attribute.name, attribute.value
+                    ),
+                });
+            } else if attribute.name == ATTR_PAST_TOKENS && attribute.value < 0 {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!("past_tokens must be nonnegative, got {}", attribute.value),
+                });
             }
         }
-        let supported = node.domain == ONNX_DOMAIN
-            && matches!(node.op_type.as_str(), ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME);
+        let supported = node_supported(node, tritium_opset);
         if supported {
-            for required in [ATTR_K, ATTR_FORMAT] {
+            for &required in supported_attributes(&node.op_type) {
                 let count = node
                     .attribute
                     .iter()
@@ -374,6 +424,37 @@ pub fn diagnose_unsupported_graph(
                         subject,
                         reason: format!("duplicate attribute appears {count} times"),
                     }),
+                }
+            }
+            if node.op_type == ONNX_KV_ATTENTION_OP_NAME {
+                let positive_value = |name: &str| {
+                    let mut attributes = node.attribute.iter().filter(|attribute| {
+                        attribute.name == name
+                            && attribute.kind == ATTRIBUTE_INT
+                            && attribute.value > 0
+                    });
+                    let value = attributes.next().map(|attribute| attribute.value);
+                    if attributes.next().is_none() {
+                        value
+                    } else {
+                        None
+                    }
+                };
+                if let (Some(n_head), Some(n_kv_head)) =
+                    (positive_value(ATTR_N_HEAD), positive_value(ATTR_N_KV_HEAD))
+                    && n_head % n_kv_head != 0
+                {
+                    diagnostics.push(UnsupportedGraphDiagnostic {
+                        kind: UnsupportedGraphItemKind::Attribute,
+                        subject: format!(
+                            "{}.{}",
+                            diagnostic_subject(&node.name, "<unnamed node>"),
+                            ATTR_N_KV_HEAD
+                        ),
+                        reason: format!(
+                            "n_head {n_head} is not divisible by n_kv_head {n_kv_head}"
+                        ),
+                    });
                 }
             }
         }
@@ -408,6 +489,12 @@ pub fn diagnose_unsupported_graph(
                 tensor_elem_type(input),
                 TENSOR_INT64,
             ),
+            "q" | "k_cache" | "v_cache" => push_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(input),
+                TENSOR_FLOAT,
+            ),
             _ => push_uncontracted_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
@@ -418,7 +505,7 @@ pub fn diagnose_unsupported_graph(
     for output in &graph.output {
         let subject = format!("output {}", output.name);
         match output.name.as_str() {
-            "logits" => push_dtype_diagnostic(
+            "logits" | "context" => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
                 tensor_elem_type(output),
@@ -457,6 +544,27 @@ pub fn diagnose_unsupported_graph(
         }
     }
     Ok(diagnostics)
+}
+
+fn supported_attributes(op_type: &str) -> &'static [&'static str] {
+    match op_type {
+        ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME => &[ATTR_K, ATTR_FORMAT],
+        ONNX_KV_ATTENTION_OP_NAME => {
+            &[ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_HEAD_DIM, ATTR_PAST_TOKENS]
+        }
+        _ => &[],
+    }
+}
+
+fn node_supported(node: &NodeProto, tritium_opset: Option<i64>) -> bool {
+    if node.domain != ONNX_DOMAIN {
+        return false;
+    }
+    match node.op_type.as_str() {
+        ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME => matches!(tritium_opset, Some(1 | 2)),
+        ONNX_KV_ATTENTION_OP_NAME => tritium_opset == Some(2),
+        _ => false,
+    }
 }
 
 fn diagnostic_subject(value: &str, fallback: &str) -> String {
@@ -1037,6 +1145,88 @@ fn encode_model(
         metadata_props,
     }
     .encode_to_vec())
+}
+
+#[cfg(test)]
+pub(crate) fn encode_kv_attention_test_graph(
+    query_tokens: usize,
+    past_tokens: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+) -> Vec<u8> {
+    let query_tokens = i64::try_from(query_tokens).unwrap();
+    let past_tokens = i64::try_from(past_tokens).unwrap();
+    let total_tokens = query_tokens.checked_add(past_tokens).unwrap();
+    let n_head = i64::try_from(n_head).unwrap();
+    let n_kv_head = i64::try_from(n_kv_head).unwrap();
+    let head_dim = i64::try_from(head_dim).unwrap();
+    let graph = GraphProto {
+        node: vec![NodeProto {
+            input: strings(["q", "k_cache", "v_cache"]),
+            output: strings(["context"]),
+            name: "tritium.kv_attention".to_owned(),
+            op_type: crate::ONNX_KV_ATTENTION_OP_NAME.to_owned(),
+            attribute: vec![
+                AttributeProto {
+                    name: crate::ATTR_N_HEAD.to_owned(),
+                    value: n_head,
+                    kind: ATTRIBUTE_INT,
+                },
+                AttributeProto {
+                    name: crate::ATTR_N_KV_HEAD.to_owned(),
+                    value: n_kv_head,
+                    kind: ATTRIBUTE_INT,
+                },
+                AttributeProto {
+                    name: crate::ATTR_HEAD_DIM.to_owned(),
+                    value: head_dim,
+                    kind: ATTRIBUTE_INT,
+                },
+                AttributeProto {
+                    name: crate::ATTR_PAST_TOKENS.to_owned(),
+                    value: past_tokens,
+                    kind: ATTRIBUTE_INT,
+                },
+            ],
+            domain: ONNX_DOMAIN.to_owned(),
+        }],
+        name: "tritium.kv_attention.test".to_owned(),
+        initializer: Vec::new(),
+        input: vec![
+            tensor_value("q", TENSOR_FLOAT, &[query_tokens, n_head, head_dim]),
+            tensor_value(
+                "k_cache",
+                TENSOR_FLOAT,
+                &[total_tokens, n_kv_head, head_dim],
+            ),
+            tensor_value(
+                "v_cache",
+                TENSOR_FLOAT,
+                &[total_tokens, n_kv_head, head_dim],
+            ),
+        ],
+        output: vec![tensor_value(
+            "context",
+            TENSOR_FLOAT,
+            &[query_tokens, n_head, head_dim],
+        )],
+        value_info: Vec::new(),
+    };
+    ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx-test".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: ONNX_DOMAIN.to_owned(),
+        model_version: 1,
+        graph: Some(graph),
+        opset_import: vec![OperatorSetIdProto {
+            domain: ONNX_DOMAIN.to_owned(),
+            version: 2,
+        }],
+        metadata_props: Vec::new(),
+    }
+    .encode_to_vec()
 }
 
 fn validate(model: &TiedEmbeddingHeadModel<'_>) -> Result<(), OnnxModelError> {
@@ -1676,6 +1866,16 @@ mod tests {
                 },
                 UnsupportedGraphDiagnostic {
                     kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "tritium.embedding.K".to_owned(),
+                    reason: "unsupported attribute".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "tritium.embedding.format".to_owned(),
+                    reason: "unsupported attribute".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
                     subject: "tritium.lm_head.axis".to_owned(),
                     reason: "unsupported attribute".to_owned(),
                 },
@@ -1868,6 +2068,55 @@ mod tests {
         };
         let encoded = encode_tied_embedding_head(model).unwrap();
         assert!(diagnose_unsupported_graph(&encoded).unwrap().is_empty());
+    }
+
+    #[test]
+    fn supported_kv_attention_graph_has_no_unsupported_diagnostics() {
+        let encoded = encode_kv_attention_test_graph(1, 2, 2, 1, 4);
+        assert!(diagnose_unsupported_graph(&encoded).unwrap().is_empty());
+    }
+
+    #[test]
+    fn kv_attention_diagnostics_reject_nondivisible_gqa_heads() {
+        let encoded = encode_kv_attention_test_graph(1, 0, 3, 2, 4);
+        assert_eq!(
+            diagnose_unsupported_graph(&encoded).unwrap(),
+            vec![UnsupportedGraphDiagnostic {
+                kind: UnsupportedGraphItemKind::Attribute,
+                subject: "tritium.kv_attention.n_kv_head".to_owned(),
+                reason: "n_head 3 is not divisible by n_kv_head 2".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn kv_attention_diagnostics_reject_opset_one_import() {
+        let encoded = encode_kv_attention_test_graph(1, 0, 2, 1, 4);
+        let mut protobuf = ModelProto::decode(encoded.as_slice()).unwrap();
+        protobuf.opset_import[0].version = 1;
+        assert_eq!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap(),
+            vec![UnsupportedGraphDiagnostic {
+                kind: UnsupportedGraphItemKind::Node,
+                subject: "tritium.kv_attention".to_owned(),
+                reason: "operator requires com.tritium opset 2, imported 1".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn diagnostics_reject_duplicate_tritium_opset_imports() {
+        let encoded = encode_kv_attention_test_graph(1, 0, 2, 1, 4);
+        let mut protobuf = ModelProto::decode(encoded.as_slice()).unwrap();
+        protobuf.opset_import.push(OperatorSetIdProto {
+            domain: ONNX_DOMAIN.to_owned(),
+            version: 3,
+        });
+        assert!(matches!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("duplicate opset import")
+        ));
     }
 
     #[test]
