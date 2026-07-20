@@ -50,8 +50,10 @@ converted coverage and deferred/preserved coverage identities through
 verification receipts and canonical re-encoding. The schema-v1 API and wire
 format remain source-compatible and readable; version-specific verifiers reject
 cross-version interpretation. Both v1 inline and v2 external-data graphs execute
-through real ORT sessions. Decoder blocks, KV cache, typed unsupported-graph
-diagnostics and whole-model generation remain open.
+through real ORT sessions. Public pre-session inspection now returns deterministic
+typed diagnostics for every unsupported node, attribute, dtype and unresolved
+coverage item in the current tied-graph subset. Decoder blocks, KV cache,
+decoder-wide diagnostics and whole-model generation remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

@@ -172,6 +172,31 @@ pub struct VerifiedExternalOnnxModelV2 {
     pub identity: VerifiedOnnxArtifactIdentityV2,
 }
 
+/// Category of one unsupported ONNX graph item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnsupportedGraphItemKind {
+    /// Unsupported node domain or operator.
+    Node,
+    /// Unsupported node attribute or attribute representation.
+    Attribute,
+    /// Unsupported tensor element type.
+    Dtype,
+    /// Unresolved conversion-coverage item.
+    Coverage,
+}
+
+/// One typed, actionable unsupported-graph diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedGraphDiagnostic {
+    /// Stable diagnostic category.
+    pub kind: UnsupportedGraphItemKind,
+    /// Node, attribute, tensor, or coverage path rejected.
+    pub subject: String,
+    /// Stable human-readable rejection reason.
+    pub reason: String,
+}
+
 /// Validation or serialization errors from Tritium ONNX model encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -249,6 +274,239 @@ impl core::fmt::Display for OnnxModelError {
 }
 
 impl std::error::Error for OnnxModelError {}
+
+/// Diagnose every unsupported node, attribute, dtype, and unresolved coverage
+/// item visible in a serialized Tritium ONNX graph.
+///
+/// Diagnostics use deterministic category order: nodes, attributes, dtypes,
+/// then coverage. An empty result means these support dimensions are admitted;
+/// strict graph identity and external-data admission remain verifier duties.
+///
+/// # Errors
+/// [`OnnxModelError::InvalidModel`] if protobuf is malformed, oversized, or has
+/// no graph.
+pub fn diagnose_unsupported_graph(
+    model_bytes: &[u8],
+) -> Result<Vec<UnsupportedGraphDiagnostic>, OnnxModelError> {
+    if model_bytes.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    let protobuf = ModelProto::decode(model_bytes)
+        .map_err(|error| OnnxModelError::InvalidModel(error.to_string()))?;
+    let graph = protobuf
+        .graph
+        .as_ref()
+        .ok_or_else(|| OnnxModelError::InvalidModel("graph is missing".to_owned()))?;
+    let mut diagnostics = Vec::new();
+
+    for node in &graph.node {
+        let supported = node.domain == ONNX_DOMAIN
+            && matches!(node.op_type.as_str(), ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME);
+        if !supported {
+            diagnostics.push(UnsupportedGraphDiagnostic {
+                kind: UnsupportedGraphItemKind::Node,
+                subject: diagnostic_subject(&node.name, "<unnamed node>"),
+                reason: format!("unsupported operator {}::{}", node.domain, node.op_type),
+            });
+        }
+    }
+    for node in &graph.node {
+        for attribute in &node.attribute {
+            let subject = format!(
+                "{}.{}",
+                diagnostic_subject(&node.name, "<unnamed node>"),
+                diagnostic_subject(&attribute.name, "<unnamed attribute>")
+            );
+            if !matches!(attribute.name.as_str(), ATTR_K | ATTR_FORMAT) {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: "unsupported attribute".to_owned(),
+                });
+            } else if attribute.kind != ATTRIBUTE_INT {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!(
+                        "expected ONNX attribute type {ATTRIBUTE_INT}, got {}",
+                        attribute.kind
+                    ),
+                });
+            } else if attribute.name == ATTR_K && attribute.value <= 0 {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!("K must be positive, got {}", attribute.value),
+                });
+            } else if attribute.name == ATTR_FORMAT && !matches!(attribute.value, 0 | 1) {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!("unsupported format code {}", attribute.value),
+                });
+            }
+        }
+        let supported = node.domain == ONNX_DOMAIN
+            && matches!(node.op_type.as_str(), ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME);
+        if supported {
+            for required in [ATTR_K, ATTR_FORMAT] {
+                let count = node
+                    .attribute
+                    .iter()
+                    .filter(|attribute| attribute.name == required)
+                    .count();
+                let subject = format!(
+                    "{}.{}",
+                    diagnostic_subject(&node.name, "<unnamed node>"),
+                    required
+                );
+                match count {
+                    0 => diagnostics.push(UnsupportedGraphDiagnostic {
+                        kind: UnsupportedGraphItemKind::Attribute,
+                        subject,
+                        reason: "missing required attribute".to_owned(),
+                    }),
+                    1 => {}
+                    count => diagnostics.push(UnsupportedGraphDiagnostic {
+                        kind: UnsupportedGraphItemKind::Attribute,
+                        subject,
+                        reason: format!("duplicate attribute appears {count} times"),
+                    }),
+                }
+            }
+        }
+    }
+    for initializer in &graph.initializer {
+        let expected = match initializer.name.as_str() {
+            "tritium.packed" => Some(TENSOR_UINT8),
+            "tritium.scales" => Some(TENSOR_FLOAT),
+            _ => None,
+        };
+        let subject = format!("initializer {}", initializer.name);
+        match expected {
+            Some(expected) => push_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                Some(initializer.data_type),
+                expected,
+            ),
+            None => push_uncontracted_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                Some(initializer.data_type),
+            ),
+        }
+    }
+    for input in &graph.input {
+        let subject = format!("input {}", input.name);
+        match input.name.as_str() {
+            "tokens" => push_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(input),
+                TENSOR_INT64,
+            ),
+            _ => push_uncontracted_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(input),
+            ),
+        }
+    }
+    for output in &graph.output {
+        let subject = format!("output {}", output.name);
+        match output.name.as_str() {
+            "logits" => push_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(output),
+                TENSOR_FLOAT,
+            ),
+            _ => push_uncontracted_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(output),
+            ),
+        }
+    }
+    for value in &graph.value_info {
+        let subject = format!("value_info {}", value.name);
+        match value.name.as_str() {
+            "hidden" => push_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(value),
+                TENSOR_FLOAT,
+            ),
+            _ => push_uncontracted_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(value),
+            ),
+        }
+    }
+    for entry in &protobuf.metadata_props {
+        if let Some(subject) = entry.key.strip_prefix("tritium.coverage.unresolved.") {
+            diagnostics.push(UnsupportedGraphDiagnostic {
+                kind: UnsupportedGraphItemKind::Coverage,
+                subject: diagnostic_subject(subject, "<unnamed coverage item>"),
+                reason: format!("coverage item is unresolved: {}", entry.value),
+            });
+        }
+    }
+    Ok(diagnostics)
+}
+
+fn diagnostic_subject(value: &str, fallback: &str) -> String {
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn tensor_elem_type(value: &ValueInfoProto) -> Option<i32> {
+    value
+        .r#type
+        .as_ref()
+        .and_then(|kind| kind.tensor_type.as_ref())
+        .map(|tensor| tensor.elem_type)
+}
+
+fn push_dtype_diagnostic(
+    diagnostics: &mut Vec<UnsupportedGraphDiagnostic>,
+    subject: String,
+    actual: Option<i32>,
+    expected: i32,
+) {
+    if actual != Some(expected) {
+        diagnostics.push(UnsupportedGraphDiagnostic {
+            kind: UnsupportedGraphItemKind::Dtype,
+            subject,
+            reason: actual.map_or_else(
+                || format!("expected ONNX dtype {expected}, got missing type"),
+                |actual| format!("expected ONNX dtype {expected}, got {actual}"),
+            ),
+        });
+    }
+}
+
+fn push_uncontracted_dtype_diagnostic(
+    diagnostics: &mut Vec<UnsupportedGraphDiagnostic>,
+    subject: String,
+    actual: Option<i32>,
+) {
+    diagnostics.push(UnsupportedGraphDiagnostic {
+        kind: UnsupportedGraphItemKind::Dtype,
+        subject,
+        reason: actual.map_or_else(
+            || "missing type has no supported contract for this tensor".to_owned(),
+            |actual| format!("dtype {actual} has no supported contract for this tensor"),
+        ),
+    });
+}
 
 /// Encode a tied packed embedding/head graph as a deterministic ONNX model.
 ///
@@ -743,6 +1001,7 @@ fn encode_model(
         initializer,
         input: vec![tensor_value("tokens", TENSOR_INT64, &[tokens])],
         output: vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])],
+        value_info: Vec::new(),
     };
     let mut metadata_props = vec![
         metadata("tritium.schema_version", schema_version),
@@ -1052,6 +1311,8 @@ struct GraphProto {
     input: Vec<ValueInfoProto>,
     #[prost(message, repeated, tag = "12")]
     output: Vec<ValueInfoProto>,
+    #[prost(message, repeated, tag = "13")]
+    value_info: Vec<ValueInfoProto>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1367,6 +1628,246 @@ mod tests {
             }),
             Err(OnnxModelError::EmptyIdentity("tokenizer_id"))
         ));
+    }
+
+    #[test]
+    fn unsupported_graph_diagnostics_are_typed_and_exhaustive() {
+        let packed = unit_packed(TernaryFormat::Tq2_0, 1);
+        let model = TiedEmbeddingHeadModelV2 {
+            tokens: 1,
+            vocab: 1,
+            hidden: 256,
+            packed: &packed,
+            scales: &[1.0],
+            format: TernaryFormat::Tq2_0,
+            identity: OnnxArtifactIdentityV2 {
+                source_model_id: "source",
+                tokenizer_id: "tokenizer",
+                recipe_id: "recipe",
+                tritium_build_id: "build",
+                package_id: "package",
+                converted_coverage_id: "converted",
+                deferred_coverage_id: "deferred",
+            },
+        };
+        let mut protobuf =
+            ModelProto::decode(encode_tied_embedding_head_v2(model).unwrap().as_slice()).unwrap();
+        let graph = protobuf.graph.as_mut().unwrap();
+        graph.node[0].domain = "ai.onnx".to_owned();
+        graph.node[0].op_type = "Gather".to_owned();
+        graph.node[1].attribute.push(AttributeProto {
+            name: "axis".to_owned(),
+            value: 0,
+            kind: ATTRIBUTE_INT,
+        });
+        graph.initializer[0].data_type = TENSOR_INT64;
+        protobuf.metadata_props.push(metadata(
+            "tritium.coverage.unresolved.language.layers.0.mlp",
+            "preserved",
+        ));
+
+        assert_eq!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap(),
+            vec![
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Node,
+                    subject: "tritium.embedding".to_owned(),
+                    reason: "unsupported operator ai.onnx::Gather".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "tritium.lm_head.axis".to_owned(),
+                    reason: "unsupported attribute".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Dtype,
+                    subject: "initializer tritium.packed".to_owned(),
+                    reason: "expected ONNX dtype 2, got 7".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Coverage,
+                    subject: "language.layers.0.mlp".to_owned(),
+                    reason: "coverage item is unresolved: preserved".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_graph_diagnostics_reject_invalid_attribute_values() {
+        let packed = unit_packed(TernaryFormat::Tq2_0, 1);
+        let model = TiedEmbeddingHeadModel {
+            tokens: 1,
+            vocab: 1,
+            hidden: 256,
+            packed: &packed,
+            scales: &[1.0],
+            format: TernaryFormat::Tq2_0,
+            source_model_id: "source",
+            recipe_id: "recipe",
+            package_id: "package",
+        };
+        let mut protobuf =
+            ModelProto::decode(encode_tied_embedding_head(model).unwrap().as_slice()).unwrap();
+        let graph = protobuf.graph.as_mut().unwrap();
+        graph.node[0]
+            .attribute
+            .iter_mut()
+            .find(|attribute| attribute.name == ATTR_K)
+            .unwrap()
+            .value = 0;
+        graph.node[1]
+            .attribute
+            .iter_mut()
+            .find(|attribute| attribute.name == ATTR_FORMAT)
+            .unwrap()
+            .value = 9;
+
+        assert_eq!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap(),
+            vec![
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "tritium.embedding.K".to_owned(),
+                    reason: "K must be positive, got 0".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "tritium.lm_head.format".to_owned(),
+                    reason: "unsupported format code 9".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_graph_diagnostics_name_missing_and_duplicate_attributes() {
+        let packed = unit_packed(TernaryFormat::Tq2_0, 1);
+        let model = TiedEmbeddingHeadModel {
+            tokens: 1,
+            vocab: 1,
+            hidden: 256,
+            packed: &packed,
+            scales: &[1.0],
+            format: TernaryFormat::Tq2_0,
+            source_model_id: "source",
+            recipe_id: "recipe",
+            package_id: "package",
+        };
+        let mut protobuf =
+            ModelProto::decode(encode_tied_embedding_head(model).unwrap().as_slice()).unwrap();
+        let graph = protobuf.graph.as_mut().unwrap();
+        graph.node[0]
+            .attribute
+            .retain(|attribute| attribute.name != ATTR_K);
+        let duplicate_format = graph.node[1]
+            .attribute
+            .iter()
+            .find(|attribute| attribute.name == ATTR_FORMAT)
+            .unwrap()
+            .clone();
+        graph.node[1].attribute.push(duplicate_format);
+
+        assert_eq!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap(),
+            vec![
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "tritium.embedding.K".to_owned(),
+                    reason: "missing required attribute".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "tritium.lm_head.format".to_owned(),
+                    reason: "duplicate attribute appears 2 times".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_graph_diagnostics_cover_every_typed_tensor_declaration() {
+        const ONNX_TENSOR_STRING: i32 = 8;
+        let packed = unit_packed(TernaryFormat::Tq2_0, 1);
+        let model = TiedEmbeddingHeadModel {
+            tokens: 1,
+            vocab: 1,
+            hidden: 256,
+            packed: &packed,
+            scales: &[1.0],
+            format: TernaryFormat::Tq2_0,
+            source_model_id: "source",
+            recipe_id: "recipe",
+            package_id: "package",
+        };
+        let mut protobuf =
+            ModelProto::decode(encode_tied_embedding_head(model).unwrap().as_slice()).unwrap();
+        let graph = protobuf.graph.as_mut().unwrap();
+        let mut extra_initializer = graph.initializer[0].clone();
+        extra_initializer.name = "extra".to_owned();
+        extra_initializer.data_type = ONNX_TENSOR_STRING;
+        graph.initializer.push(extra_initializer);
+        graph
+            .input
+            .push(tensor_value("extra_input", ONNX_TENSOR_STRING, &[1]));
+        graph
+            .output
+            .push(tensor_value("extra_output", ONNX_TENSOR_STRING, &[1]));
+        graph
+            .value_info
+            .push(tensor_value("hidden", ONNX_TENSOR_STRING, &[1, 256]));
+        graph
+            .value_info
+            .push(tensor_value("scratch", ONNX_TENSOR_STRING, &[1]));
+
+        assert_eq!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap(),
+            vec![
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Dtype,
+                    subject: "initializer extra".to_owned(),
+                    reason: "dtype 8 has no supported contract for this tensor".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Dtype,
+                    subject: "input extra_input".to_owned(),
+                    reason: "dtype 8 has no supported contract for this tensor".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Dtype,
+                    subject: "output extra_output".to_owned(),
+                    reason: "dtype 8 has no supported contract for this tensor".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Dtype,
+                    subject: "value_info hidden".to_owned(),
+                    reason: "expected ONNX dtype 1, got 8".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Dtype,
+                    subject: "value_info scratch".to_owned(),
+                    reason: "dtype 8 has no supported contract for this tensor".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn supported_graph_has_no_unsupported_diagnostics() {
+        let packed = unit_packed(TernaryFormat::Tq1_0, 1);
+        let model = TiedEmbeddingHeadModel {
+            tokens: 1,
+            vocab: 1,
+            hidden: 256,
+            packed: &packed,
+            scales: &[1.0],
+            format: TernaryFormat::Tq1_0,
+            source_model_id: "source",
+            recipe_id: "recipe",
+            package_id: "package",
+        };
+        let encoded = encode_tied_embedding_head(model).unwrap();
+        assert!(diagnose_unsupported_graph(&encoded).unwrap().is_empty());
     }
 
     #[test]
