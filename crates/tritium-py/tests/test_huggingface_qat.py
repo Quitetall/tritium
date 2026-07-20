@@ -88,7 +88,7 @@ def test_hf_config_records_exact_recipe_not_nominal_bits(tmp_path: Path):
     encoded = config.quantization_config
 
     assert encoded["quant_method"] == "tritium"
-    assert encoded["schema_version"] == 1
+    assert encoded["schema_version"] == 2
     assert encoded["target_modules"] == ["Linear", "Embedding"]
     assert "bits" not in encoded
 

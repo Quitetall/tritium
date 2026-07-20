@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 from torch import nn
 
@@ -21,6 +22,16 @@ class _Replacement:
     converted: nn.Module
 
 
+@dataclass(frozen=True)
+class PreparedModel:
+    """Validated model plus immutable recipe and graph-coverage receipt."""
+
+    model: nn.Module
+    config: TernaryConfig
+    coverage: CoverageReport
+    schema_version: int = 1
+
+
 def _new_estimator(config: TernaryConfig) -> Estimator:
     if config.planes != 1:
         raise TritiumError(
@@ -32,7 +43,12 @@ def _new_estimator(config: TernaryConfig) -> Estimator:
     return create_estimator(config.estimator)
 
 
-def _parameter_coverage(model: nn.Module, converted_weights: set) -> CoverageReport:
+def _parameter_coverage(
+    model: nn.Module,
+    target_weights: set,
+    *,
+    target_disposition: str = "converted",
+) -> CoverageReport:
     by_identity: "OrderedDict[int, Tuple[object, List[str]]]" = OrderedDict()
     for name, parameter in model.named_parameters(remove_duplicate=False):
         key = id(parameter)
@@ -43,20 +59,25 @@ def _parameter_coverage(model: nn.Module, converted_weights: set) -> CoverageRep
     entries = []
     for parameter, aliases in by_identity.values():
         alias_set = set(aliases)
-        converted_aliases = alias_set & converted_weights
-        preserved_aliases = alias_set - converted_weights
-        if converted_aliases and preserved_aliases:
+        target_aliases = alias_set & target_weights
+        preserved_aliases = alias_set - target_weights
+        if target_aliases and preserved_aliases:
             raise TritiumError(
-                "a shared parameter has both converted and preserved owners",
+                "a shared parameter has both targeted and preserved owners",
                 code="coverage_conflict",
                 stage="inspect",
                 module=aliases[0],
                 details={"aliases": aliases},
             )
-        disposition = "converted" if converted_aliases else "preserved"
-        if converted_aliases:
-            reason = "target_weight"
-        elif any(".estimator." in alias or alias.startswith("estimator.") for alias in aliases):
+        disposition = target_disposition if target_aliases else "preserved"
+        if target_aliases:
+            reason = (
+                "ptq_target" if target_disposition == "selected" else "target_weight"
+            )
+        elif any(
+            ".estimator." in alias or alias.startswith("estimator.")
+            for alias in aliases
+        ):
             reason = "estimator_state"
         elif any(alias.endswith(".bias") or alias == "bias" for alias in aliases):
             reason = "bias_preserved"
@@ -75,6 +96,42 @@ def _parameter_coverage(model: nn.Module, converted_weights: set) -> CoverageRep
     return CoverageReport.new(entries)
 
 
+def _selected_weights(
+    model: nn.Module, config: TernaryConfig, *, strict: bool
+) -> set:
+    supported_targets = {"Conv1d", "Conv2d", "Embedding", "Linear"}
+    unknown_targets = set(config.target_modules) - supported_targets
+    if unknown_targets:
+        raise TritiumError(
+            "configuration selects unsupported module types",
+            code="unsupported_module",
+            stage="inspect",
+            details={"targets": sorted(unknown_targets)},
+        )
+
+    selected = set()
+    module_types = {
+        "Conv1d": nn.Conv1d,
+        "Conv2d": nn.Conv2d,
+        "Embedding": nn.Embedding,
+        "Linear": nn.Linear,
+    }
+    for path, module in model.named_modules(remove_duplicate=False):
+        if any(
+            target in config.target_modules and isinstance(module, module_type)
+            for target, module_type in module_types.items()
+        ):
+            selected.add(f"{path}.weight" if path else "weight")
+    if strict and not selected:
+        raise TritiumError(
+            "no modules matched the requested targets",
+            code="incomplete_coverage",
+            stage="inspect",
+        )
+    _parameter_coverage(model, selected)
+    return selected
+
+
 def _parent_and_child(root: nn.Module, path: str):
     parts = path.split(".")
     parent = root
@@ -83,10 +140,10 @@ def _parent_and_child(root: nn.Module, path: str):
     return parent, parts[-1]
 
 
-def prepare_qat(
+def _prepare_qat_inplace(
     model: nn.Module, config: TernaryConfig, *, strict: bool = True
 ) -> nn.Module:
-    """Validate then convert selected modules without cloning master parameters."""
+    """Internal validated in-place QAT graph conversion."""
 
     from ..nn import TernaryConv1d, TernaryConv2d, TernaryEmbedding, TernaryLinear
 
@@ -98,15 +155,7 @@ def prepare_qat(
             code="invalid_config",
             stage="inspect",
         )
-    supported_targets = {"Conv1d", "Conv2d", "Embedding", "Linear"}
-    unknown_targets = set(config.target_modules) - supported_targets
-    if unknown_targets:
-        raise TritiumError(
-            "configuration selects unsupported module types",
-            code="unsupported_module",
-            stage="inspect",
-            details={"targets": sorted(unknown_targets)},
-        )
+    _selected_weights(model, config, strict=strict)
 
     replacements: List[_Replacement] = []
     converted_weights = set()
@@ -199,8 +248,58 @@ def prepare_qat(
     return result
 
 
-def inspect(model: nn.Module) -> CoverageReport:
-    """Return the immutable conversion receipt attached by :func:`prepare_qat`."""
+def prepare(
+    model: nn.Module,
+    config: TernaryConfig,
+    *,
+    strict: bool = True,
+    inplace: bool,
+) -> PreparedModel:
+    """Validate a complete graph, then prepare it with explicit ownership."""
+
+    if not isinstance(model, nn.Module):
+        raise TypeError("prepare requires a torch.nn.Module")
+    if not isinstance(config, TernaryConfig):
+        raise TypeError("prepare requires a TernaryConfig")
+    if not isinstance(inplace, bool):
+        raise TypeError("prepare inplace must be a bool")
+
+    selected = _selected_weights(model, config, strict=strict)
+    target = model if inplace else copy.deepcopy(model)
+    if config.mode == "qat":
+        target = _prepare_qat_inplace(target, config, strict=strict)
+        coverage = inspect(target)
+    else:
+        if not inplace:
+            selected = _selected_weights(target, config, strict=strict)
+        coverage = _parameter_coverage(
+            target,
+            selected,
+            target_disposition="selected",
+        )
+        target._tritium_coverage = coverage
+    return PreparedModel(model=target, config=config, coverage=coverage)
+
+
+def prepare_qat(
+    model: nn.Module, config: TernaryConfig, *, strict: bool = True
+) -> nn.Module:
+    """Compatibility facade over :func:`prepare` using in-place ownership."""
+
+    if isinstance(config, TernaryConfig) and config.mode != "qat":
+        raise TritiumError(
+            "prepare_qat requires TernaryConfig.qat",
+            code="invalid_config",
+            stage="inspect",
+        )
+    return prepare(model, config, strict=strict, inplace=True).model
+
+
+def inspect(model: Union[nn.Module, PreparedModel]) -> CoverageReport:
+    """Return the immutable coverage receipt for a prepared model."""
+
+    if isinstance(model, PreparedModel):
+        return model.coverage
 
     report = getattr(model, "_tritium_coverage", None)
     if not isinstance(report, CoverageReport):

@@ -17,13 +17,12 @@ class TernaryConfig:
     planes: int
     profile: Optional[str]
     target_bpw: Optional[float]
-    refinement: str
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         if self.mode not in {"qat", "ptq"}:
             raise ValueError("mode must be 'qat' or 'ptq'")
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError("unsupported TernaryConfig schema_version")
         if not 1 <= self.planes <= 3:
             raise ValueError("planes must be between 1 and 3")
@@ -33,7 +32,10 @@ class TernaryConfig:
             raise ValueError("estimator must not be empty")
         if any(not name for name in self.target_modules):
             raise ValueError("target_modules cannot contain an empty name")
-        if self.mode == "ptq" and self.profile not in {"compact-v1", "near-lossless-v1"}:
+        if self.mode == "ptq" and self.profile not in {
+            "compact-v1",
+            "near-lossless-v1",
+        }:
             raise ValueError("PTQ profile must be 'compact-v1' or 'near-lossless-v1'")
         if self.mode == "qat" and self.profile is not None:
             raise ValueError("QAT configuration does not accept a deployment profile")
@@ -45,8 +47,6 @@ class TernaryConfig:
             cap = 2.25 if self.profile == "compact-v1" else 4.0
             if self.target_bpw > cap:
                 raise ValueError(f"target_bpw exceeds {self.profile} physical ceiling")
-        if self.refinement not in {"none", "scale-only", "hard-pv"}:
-            raise ValueError("unknown refinement mode")
 
     @classmethod
     def qat(
@@ -63,7 +63,6 @@ class TernaryConfig:
             planes=planes,
             profile=None,
             target_bpw=None,
-            refinement="none",
         )
 
     @classmethod
@@ -73,7 +72,6 @@ class TernaryConfig:
         profile: str,
         target_modules: Tuple[str, ...] = ("Linear", "Embedding", "Conv1d"),
         target_bpw: Optional[float] = None,
-        refinement: str = "none",
     ) -> "TernaryConfig":
         return cls(
             mode="ptq",
@@ -82,7 +80,6 @@ class TernaryConfig:
             planes=3,
             profile=profile,
             target_bpw=target_bpw,
-            refinement=refinement,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -94,11 +91,11 @@ class TernaryConfig:
             "planes": self.planes,
             "profile": self.profile,
             "target_bpw": self.target_bpw,
-            "refinement": self.refinement,
         }
 
     @classmethod
     def from_dict(cls, value: Dict[str, Any]) -> "TernaryConfig":
+        version = int(value.get("schema_version", -1))
         expected = {
             "schema_version",
             "mode",
@@ -107,10 +104,19 @@ class TernaryConfig:
             "planes",
             "profile",
             "target_bpw",
-            "refinement",
         }
+        if version == 1:
+            legacy_expected = expected | {"refinement"}
+            if set(value) != legacy_expected:
+                raise ValueError("TernaryConfig fields do not match schema version 1")
+            if value["refinement"] != "none":
+                raise ValueError(
+                    "legacy PTQ/QAT refinement must be represented by RefinementConfig"
+                )
+            value = {key: item for key, item in value.items() if key != "refinement"}
+            value["schema_version"] = 2
         if set(value) != expected:
-            raise ValueError("TernaryConfig fields do not match schema version 1")
+            raise ValueError("TernaryConfig fields do not match schema version 2")
         return cls(
             schema_version=int(value["schema_version"]),
             mode=str(value["mode"]),
@@ -121,5 +127,47 @@ class TernaryConfig:
             target_bpw=(
                 None if value["target_bpw"] is None else float(value["target_bpw"])
             ),
-            refinement=str(value["refinement"]),
+        )
+
+
+@dataclass(frozen=True)
+class RefinementConfig:
+    """A separately versioned recipe for refining an existing PTQ result."""
+
+    kind: str
+    structure: str
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("unsupported RefinementConfig schema_version")
+        if self.kind not in {"scale-only", "hard-pv"}:
+            raise ValueError("refinement kind must be 'scale-only' or 'hard-pv'")
+        if self.structure not in {"dense", "s34"}:
+            raise ValueError("refinement structure must be 'dense' or 's34'")
+
+    @classmethod
+    def scale_only(cls) -> "RefinementConfig":
+        return cls(kind="scale-only", structure="dense")
+
+    @classmethod
+    def hard_pv(cls, *, structure: str = "dense") -> "RefinementConfig":
+        return cls(kind="hard-pv", structure=structure)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "structure": self.structure,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "RefinementConfig":
+        expected = {"schema_version", "kind", "structure"}
+        if set(value) != expected:
+            raise ValueError("RefinementConfig fields do not match schema version 1")
+        return cls(
+            schema_version=int(value["schema_version"]),
+            kind=str(value["kind"]),
+            structure=str(value["structure"]),
         )

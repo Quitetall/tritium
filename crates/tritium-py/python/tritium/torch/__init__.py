@@ -1,7 +1,7 @@
 """Differentiable PyTorch frontend for Tritium ternary models."""
 
-from .config import TernaryConfig
-from .conversion import inspect, prepare_qat
+from .config import RefinementConfig, TernaryConfig
+from .conversion import PreparedModel, inspect, prepare, prepare_qat
 from .coverage import CoverageEntry, CoverageReport
 from .errors import TritiumError
 from .estimators import (
@@ -37,6 +37,8 @@ __all__ = [
     "HfTritiumConfig",
     "LSQEstimator",
     "ProjectionContext",
+    "PreparedModel",
+    "RefinementConfig",
     "SaltSTE",
     "SparseTernaryEstimator",
     "TernaryConfig",
@@ -47,6 +49,7 @@ __all__ = [
     "TWNEstimator",
     "create_estimator",
     "inspect",
+    "prepare",
     "prepare_qat",
     "reference_ternary_linear",
     "register_estimator",

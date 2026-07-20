@@ -54,6 +54,12 @@ class CoverageReport:
         return sum(entry.disposition == "converted" for entry in self.entries)
 
     @property
+    def selected_parameters(self) -> int:
+        """Number of parameters selected for a later conversion phase."""
+
+        return sum(entry.disposition == "selected" for entry in self.entries)
+
+    @property
     def preserved_parameters(self) -> int:
         return sum(entry.disposition == "preserved" for entry in self.entries)
 
