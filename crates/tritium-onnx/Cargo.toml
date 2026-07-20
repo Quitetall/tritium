@@ -20,13 +20,14 @@ categories.workspace = true
 # `ort/download-binaries` fetches a prebuilt onnxruntime at build time so a CI
 # lane with network can build + test `--features onnx` without a system lib.
 default = []
-model = ["dep:prost"]
+model = ["dep:blake3", "dep:prost"]
 onnx = ["dep:ort", "model"]
 
 [dependencies]
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
 half = { workspace = true }
+blake3 = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 # `ort` with default-features off + the minimal set we need:
 #   std            — Session / OperatorDomain need the std runtime

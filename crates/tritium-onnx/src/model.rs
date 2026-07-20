@@ -13,6 +13,9 @@ const TENSOR_FLOAT: i32 = 1;
 const TENSOR_UINT8: i32 = 2;
 const TENSOR_INT64: i32 = 7;
 const ATTRIBUTE_INT: i32 = 2;
+const EXTERNAL_DATA: i32 = 1;
+const EXTERNAL_WEIGHTS_FILE: &str = "weights.bin";
+const EXTERNAL_ALIGNMENT: usize = 64;
 
 /// A deterministic tied packed embedding/head graph.
 ///
@@ -41,6 +44,17 @@ pub struct TiedEmbeddingHeadModel<'a> {
     pub recipe_id: &'a str,
     /// Non-empty packed artifact/package identity.
     pub package_id: &'a str,
+}
+
+/// A deterministic ONNX model plus its content-bound external initializer file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalOnnxModel {
+    /// Serialized `model.onnx` bytes.
+    pub model_bytes: Vec<u8>,
+    /// Serialized `weights.bin` bytes referenced by the model.
+    pub weights_bytes: Vec<u8>,
+    /// BLAKE3 digest of `weights_bytes`, also embedded in model metadata.
+    pub weights_blake3: [u8; 32],
 }
 
 /// Validation or serialization errors from Tritium ONNX model encoding.
@@ -112,16 +126,97 @@ pub fn encode_tied_embedding_head(
     model: TiedEmbeddingHeadModel<'_>,
 ) -> Result<Vec<u8>, OnnxModelError> {
     validate(&model)?;
+    let scale_bytes = scale_bytes(model.scales);
+    let packed_bytes = as_i64(model.packed.len(), "packed byte count")?;
+    let vocab = as_i64(model.vocab, "vocabulary")?;
+    encode_model(
+        model,
+        vec![
+            inline_tensor(
+                "tritium.packed",
+                TENSOR_UINT8,
+                vec![packed_bytes],
+                model.packed.to_vec(),
+            ),
+            inline_tensor("tritium.scales", TENSOR_FLOAT, vec![vocab], scale_bytes),
+        ],
+        Vec::new(),
+    )
+}
+
+/// Encode a tied packed embedding/head graph with 64-byte-aligned initializers
+/// in the fixed relative file `weights.bin`.
+///
+/// The model metadata binds the external filename, exact byte length and BLAKE3
+/// digest. A loader must verify those fields before creating an ORT session.
+///
+/// # Errors
+/// [`OnnxModelError`] if the graph contract is invalid or external offsets and
+/// lengths overflow ONNX `int64`/host `usize`.
+pub fn encode_external_tied_embedding_head(
+    model: TiedEmbeddingHeadModel<'_>,
+) -> Result<ExternalOnnxModel, OnnxModelError> {
+    validate(&model)?;
+    let scale_bytes = scale_bytes(model.scales);
+    let scale_offset = align_up(model.packed.len(), EXTERNAL_ALIGNMENT)?;
+    let weights_len = scale_offset
+        .checked_add(scale_bytes.len())
+        .ok_or(OnnxModelError::ShapeOverflow("external weight byte count"))?;
+    let mut weights_bytes = Vec::new();
+    weights_bytes
+        .try_reserve_exact(weights_len)
+        .map_err(|_| OnnxModelError::ShapeOverflow("external weight allocation"))?;
+    weights_bytes.extend_from_slice(model.packed);
+    weights_bytes.resize(scale_offset, 0);
+    weights_bytes.extend_from_slice(&scale_bytes);
+    let weights_blake3 = *blake3::hash(&weights_bytes).as_bytes();
+    let digest_hex = blake3::Hash::from_bytes(weights_blake3)
+        .to_hex()
+        .to_string();
+    let packed_len = as_i64(model.packed.len(), "packed byte count")?;
+    let scale_offset_i64 = as_i64(scale_offset, "external scale offset")?;
+    let scale_len = as_i64(scale_bytes.len(), "external scale byte count")?;
+    let vocab = as_i64(model.vocab, "vocabulary")?;
+    let model_bytes = encode_model(
+        model,
+        vec![
+            external_tensor(
+                "tritium.packed",
+                TENSOR_UINT8,
+                vec![packed_len],
+                0,
+                packed_len,
+            ),
+            external_tensor(
+                "tritium.scales",
+                TENSOR_FLOAT,
+                vec![vocab],
+                scale_offset_i64,
+                scale_len,
+            ),
+        ],
+        vec![
+            metadata("tritium.external_data.file", EXTERNAL_WEIGHTS_FILE),
+            metadata("tritium.external_data.bytes", &weights_len.to_string()),
+            metadata("tritium.external_data.blake3", &digest_hex),
+        ],
+    )?;
+    Ok(ExternalOnnxModel {
+        model_bytes,
+        weights_bytes,
+        weights_blake3,
+    })
+}
+
+fn encode_model(
+    model: TiedEmbeddingHeadModel<'_>,
+    initializer: Vec<TensorProto>,
+    mut extra_metadata: Vec<StringStringEntryProto>,
+) -> Result<Vec<u8>, OnnxModelError> {
     let tokens = as_i64(model.tokens, "token count")?;
     let vocab = as_i64(model.vocab, "vocabulary")?;
     let hidden = as_i64(model.hidden, "hidden size")?;
-    let packed_bytes = as_i64(model.packed.len(), "packed byte count")?;
     let format = format_code(model.format)?;
-    let scale_bytes = model
-        .scales
-        .iter()
-        .flat_map(|scale| scale.to_le_bytes())
-        .collect();
 
     let graph = GraphProto {
         node: vec![
@@ -143,23 +238,19 @@ pub fn encode_tied_embedding_head(
             },
         ],
         name: "tritium.tied_embedding_head".to_owned(),
-        initializer: vec![
-            TensorProto {
-                dims: vec![packed_bytes],
-                data_type: TENSOR_UINT8,
-                name: "tritium.packed".to_owned(),
-                raw_data: model.packed.to_vec(),
-            },
-            TensorProto {
-                dims: vec![vocab],
-                data_type: TENSOR_FLOAT,
-                name: "tritium.scales".to_owned(),
-                raw_data: scale_bytes,
-            },
-        ],
+        initializer,
         input: vec![tensor_value("tokens", TENSOR_INT64, &[tokens])],
         output: vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])],
     };
+    let mut metadata_props = vec![
+        metadata("tritium.schema_version", "1"),
+        metadata("tritium.source_model_id", model.source_model_id),
+        metadata("tritium.recipe_id", model.recipe_id),
+        metadata("tritium.package_id", model.package_id),
+        metadata("tritium.weight_format", &model.format.to_string()),
+        metadata("tritium.tied_embedding_head", "true"),
+    ];
+    metadata_props.append(&mut extra_metadata);
     Ok(ModelProto {
         ir_version: ONNX_IR_VERSION,
         producer_name: "tritium-onnx".to_owned(),
@@ -177,14 +268,7 @@ pub fn encode_tied_embedding_head(
                 version: TRITIUM_OPSET,
             },
         ],
-        metadata_props: vec![
-            metadata("tritium.schema_version", "1"),
-            metadata("tritium.source_model_id", model.source_model_id),
-            metadata("tritium.recipe_id", model.recipe_id),
-            metadata("tritium.package_id", model.package_id),
-            metadata("tritium.weight_format", &model.format.to_string()),
-            metadata("tritium.tied_embedding_head", "true"),
-        ],
+        metadata_props,
     }
     .encode_to_vec())
 }
@@ -252,6 +336,20 @@ fn as_i64(value: usize, name: &'static str) -> Result<i64, OnnxModelError> {
     i64::try_from(value).map_err(|_| OnnxModelError::ShapeOverflow(name))
 }
 
+fn align_up(value: usize, alignment: usize) -> Result<usize, OnnxModelError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|aligned| aligned / alignment * alignment)
+        .ok_or(OnnxModelError::ShapeOverflow("external data alignment"))
+}
+
+fn scale_bytes(scales: &[f32]) -> Vec<u8> {
+    scales
+        .iter()
+        .flat_map(|scale| scale.to_le_bytes())
+        .collect()
+}
+
 fn format_code(format: TernaryFormat) -> Result<i64, OnnxModelError> {
     match format {
         TernaryFormat::Tq2_0 => Ok(0),
@@ -280,6 +378,38 @@ fn metadata(key: &str, value: &str) -> StringStringEntryProto {
     StringStringEntryProto {
         key: key.to_owned(),
         value: value.to_owned(),
+    }
+}
+
+fn inline_tensor(name: &str, data_type: i32, dims: Vec<i64>, raw_data: Vec<u8>) -> TensorProto {
+    TensorProto {
+        dims,
+        data_type,
+        name: name.to_owned(),
+        raw_data,
+        external_data: Vec::new(),
+        data_location: 0,
+    }
+}
+
+fn external_tensor(
+    name: &str,
+    data_type: i32,
+    dims: Vec<i64>,
+    offset: i64,
+    length: i64,
+) -> TensorProto {
+    TensorProto {
+        dims,
+        data_type,
+        name: name.to_owned(),
+        raw_data: Vec::new(),
+        external_data: vec![
+            metadata("location", EXTERNAL_WEIGHTS_FILE),
+            metadata("offset", &offset.to_string()),
+            metadata("length", &length.to_string()),
+        ],
+        data_location: EXTERNAL_DATA,
     }
 }
 
@@ -378,6 +508,10 @@ struct TensorProto {
     name: String,
     #[prost(bytes = "vec", tag = "9")]
     raw_data: Vec<u8>,
+    #[prost(message, repeated, tag = "13")]
+    external_data: Vec<StringStringEntryProto>,
+    #[prost(int32, tag = "14")]
+    data_location: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -482,5 +616,44 @@ mod tests {
             encode_tied_embedding_head(model).unwrap(),
             encode_tied_embedding_head(model).unwrap()
         );
+    }
+
+    #[test]
+    fn external_encoding_binds_layout_and_digest() {
+        let packed = vec![0x55; TQ2_0_BLOCK_BYTES * 2];
+        let model = TiedEmbeddingHeadModel {
+            tokens: 2,
+            vocab: 2,
+            hidden: 256,
+            packed: &packed,
+            scales: &[1.0, 0.5],
+            format: TernaryFormat::Tq2_0,
+            source_model_id: "source",
+            recipe_id: "recipe",
+            package_id: "package",
+        };
+        let encoded = encode_external_tied_embedding_head(model).unwrap();
+        assert_eq!(
+            encoded.weights_blake3,
+            *blake3::hash(&encoded.weights_bytes).as_bytes()
+        );
+        assert_eq!(encoded.weights_bytes.len() % 4, 0);
+        let protobuf = ModelProto::decode(encoded.model_bytes.as_slice()).unwrap();
+        let graph = protobuf.graph.unwrap();
+        assert_eq!(graph.initializer.len(), 2);
+        assert!(graph.initializer.iter().all(|tensor| {
+            tensor.raw_data.is_empty()
+                && tensor.data_location == EXTERNAL_DATA
+                && tensor
+                    .external_data
+                    .iter()
+                    .any(|entry| entry.key == "location" && entry.value == EXTERNAL_WEIGHTS_FILE)
+        }));
+        let expected_digest = blake3::Hash::from_bytes(encoded.weights_blake3)
+            .to_hex()
+            .to_string();
+        assert!(protobuf.metadata_props.iter().any(|entry| {
+            entry.key == "tritium.external_data.blake3" && entry.value == expected_digest
+        }));
     }
 }

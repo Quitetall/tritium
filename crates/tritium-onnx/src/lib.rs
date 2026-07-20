@@ -371,7 +371,10 @@ pub use onnx_op::{
 mod onnx_op;
 
 #[cfg(feature = "model")]
-pub use model::{OnnxModelError, TiedEmbeddingHeadModel, encode_tied_embedding_head};
+pub use model::{
+    ExternalOnnxModel, OnnxModelError, TiedEmbeddingHeadModel, encode_external_tied_embedding_head,
+    encode_tied_embedding_head,
+};
 
 #[cfg(feature = "model")]
 mod model;

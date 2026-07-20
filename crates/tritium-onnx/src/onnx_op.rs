@@ -306,6 +306,8 @@ pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
 mod tests {
     use super::*;
     use half::f16;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tritium_core::Trit;
     use tritium_format::{num_blocks, pack_tq1_0_row, pack_tq2_0_row};
     use tritium_testkit::{ConformanceVector, FROZEN_COUNT, FROZEN_SEED, generate_vectors};
@@ -360,6 +362,32 @@ mod tests {
             }
         }
         packed
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "tritium-onnx-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("create ONNX test directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -502,5 +530,48 @@ mod tests {
         let (shape, got) = outputs[0].try_extract_tensor::<f32>().unwrap();
         assert_eq!(shape.as_ref(), &[4, rows.len() as i64]);
         assert_eq!(got, expected.as_slice(), "e2e tied graph bit-exact");
+    }
+
+    #[test]
+    fn end_to_end_external_data_matches_reference() {
+        use ort::value::Tensor;
+
+        let k = 256;
+        let format = TernaryFormat::Tq1_0;
+        let rows = vec![vec![Trit::NEG; k], vec![Trit::ZERO; k], vec![Trit::POS; k]];
+        let packed = pack_rows(&rows, format);
+        let scales = vec![0.5, 2.0, 1.25];
+        let tokens = vec![2i64, 0, 1, 2];
+        let hidden =
+            ternary_embedding_kernel(&tokens, &[tokens.len()], &packed, &scales, k, format)
+                .unwrap();
+        let expected =
+            ternary_mpgemm_kernel(&hidden, &packed, &scales, tokens.len(), k, format).unwrap();
+        let bundle = crate::encode_external_tied_embedding_head(crate::TiedEmbeddingHeadModel {
+            tokens: tokens.len(),
+            vocab: rows.len(),
+            hidden: k,
+            packed: &packed,
+            scales: &scales,
+            format,
+            source_model_id: "test-source",
+            recipe_id: "test-recipe",
+            package_id: "test-package",
+        })
+        .unwrap();
+        let directory = TestDirectory::new();
+        let model_path = directory.0.join("model.onnx");
+        std::fs::write(&model_path, bundle.model_bytes).unwrap();
+        std::fs::write(directory.0.join("weights.bin"), bundle.weights_bytes).unwrap();
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&model_path)
+            .unwrap();
+        let tokens_t = Tensor::from_array(([tokens.len()], tokens.into_boxed_slice())).unwrap();
+        let outputs = session.run(ort::inputs![&tokens_t]).unwrap();
+        let (_, got) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(got, expected.as_slice(), "external-data graph bit-exact");
     }
 }
