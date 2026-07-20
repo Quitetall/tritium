@@ -18,7 +18,7 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 67);
+    assert_eq!(report.passed.len(), 69);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
@@ -44,6 +44,7 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
             "optimizer.sgd",
             "optimizer.adamw",
             "optimizer.cautious_adamw",
+            "optimizer.int8_adamw",
             "lifecycle.checkpoint",
             "lifecycle.resume",
             "lifecycle.export",

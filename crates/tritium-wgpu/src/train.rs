@@ -35,6 +35,7 @@ const OPERATIONS: &[&str] = &[
     "optimizer.sgd",
     "optimizer.adamw",
     "optimizer.cautious_adamw",
+    "optimizer.int8_adamw",
     "lifecycle.checkpoint",
     "lifecycle.resume",
     "lifecycle.export",
@@ -1334,6 +1335,131 @@ impl WgpuTrainBackendV1 {
         output_f32(output, "moment2", shape, parameter.len())?.copy_from_slice(&updated_moment2);
         Ok(())
     }
+
+    fn execute_int8_adamw(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        if request.execution != TrainExecutionV1::Step {
+            return Err(invariant("int8 AdamW received an illegal phase"));
+        }
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[
+                "parameter",
+                "gradient",
+                "moment1_q8",
+                "moment2_q8",
+                "moment1_scale",
+                "moment2_scale",
+            ],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["step", "lr", "beta1", "beta2", "eps", "weight_decay"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[
+                "parameter",
+                "moment1_q8",
+                "moment2_q8",
+                "moment1_scale",
+                "moment2_scale",
+            ],
+            "outputs",
+        )?;
+        let step = attribute_u64(request, "step")?;
+        let learning_rate = attribute_f32(request, "lr")?;
+        let beta1 = attribute_f32(request, "beta1")?;
+        let beta2 = attribute_f32(request, "beta2")?;
+        let epsilon = attribute_f32(request, "eps")?;
+        let weight_decay = attribute_f32(request, "weight_decay")?;
+        if step == 0 {
+            return Err(attribute_value("step", "one_based"));
+        }
+        if learning_rate < 0.0 {
+            return Err(attribute_value("lr", "nonnegative"));
+        }
+        if !(0.0..1.0).contains(&beta1) {
+            return Err(attribute_value("beta1", "unit_interval_open"));
+        }
+        if !(0.0..1.0).contains(&beta2) {
+            return Err(attribute_value("beta2", "unit_interval_open"));
+        }
+        if epsilon <= 0.0 {
+            return Err(attribute_value("eps", "positive"));
+        }
+        if weight_decay < 0.0 {
+            return Err(attribute_value("weight_decay", "nonnegative"));
+        }
+        let (shape, parameter) = input_f32(request, "parameter")?;
+        let (gradient_shape, gradient) = input_f32(request, "gradient")?;
+        let (moment1_shape, moment1_q8) = input_bytes(request, "moment1_q8")?;
+        let (moment2_shape, moment2_q8) = input_bytes(request, "moment2_q8")?;
+        let (moment1_scale_shape, moment1_scale) = input_f32(request, "moment1_scale")?;
+        let (moment2_scale_shape, moment2_scale) = input_f32(request, "moment2_scale")?;
+        let len = parameter.len();
+        let blocks = len.div_ceil(256);
+        if len == 0
+            || len > u32::MAX as usize
+            || gradient_shape != shape
+            || moment1_shape != [len as u64]
+            || moment2_shape != [len as u64]
+            || moment1_scale_shape != [blocks as u64]
+            || moment2_scale_shape != [blocks as u64]
+        {
+            return Err(shape_error());
+        }
+        require_finite("parameter", parameter)?;
+        require_finite("gradient", gradient)?;
+        require_finite("moment1_scale", moment1_scale)?;
+        require_finite("moment2_scale", moment2_scale)?;
+        if moment1_scale.iter().any(|&value| value < 0.0) {
+            return Err(attribute_value("moment1_scale", "nonnegative"));
+        }
+        if moment2_scale.iter().any(|&value| value < 0.0) {
+            return Err(attribute_value("moment2_scale", "nonnegative"));
+        }
+        let exponent = i32::try_from(step).unwrap_or(i32::MAX);
+        let params = AdamWParams::new(
+            len as u32,
+            AdamWScalars {
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+                correction1: 1.0 - beta1.powi(exponent),
+                correction2: 1.0 - beta2.powi(exponent),
+                shrink: 1.0 - learning_rate * weight_decay,
+            },
+        );
+        let updated = self
+            .backend
+            .int8_adamw(
+                parameter,
+                gradient,
+                moment1_q8,
+                moment2_q8,
+                moment1_scale,
+                moment2_scale,
+                params,
+            )
+            .map_err(wgpu_error)?;
+        output_f32(output, "parameter", shape, len)?.copy_from_slice(&updated.parameter);
+        output_bytes(output, "moment1_q8", &[len as u64], len)?
+            .copy_from_slice(&updated.moment1_q8);
+        output_bytes(output, "moment2_q8", &[len as u64], len)?
+            .copy_from_slice(&updated.moment2_q8);
+        output_f32(output, "moment1_scale", &[blocks as u64], blocks)?
+            .copy_from_slice(&updated.moment1_scale);
+        output_f32(output, "moment2_scale", &[blocks as u64], blocks)?
+            .copy_from_slice(&updated.moment2_scale);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -1408,6 +1534,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "optimizer.cautious_adamw" {
             self.execute_adamw(&request, output, true)?;
+            0
+        } else if request.operation == "optimizer.int8_adamw" {
+            self.execute_int8_adamw(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;
@@ -1531,6 +1660,26 @@ fn input_u32<'a>(
     }
 }
 
+fn input_bytes<'a>(
+    request: &'a TrainRequestV1<'_>,
+    name: &str,
+) -> Result<(&'a [u64], &'a [u8]), TrainBackendError> {
+    let buffer = request
+        .inputs
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "inputs",
+            })
+        })?;
+    match buffer.data {
+        TrainBufferDataRefV1::Bytes(data) => Ok((buffer.shape, data)),
+        TrainBufferDataRefV1::F32(_) => Err(dtype_error(name, TrainDTypeV1::F32)),
+        TrainBufferDataRefV1::U32(_) => Err(dtype_error(name, TrainDTypeV1::U32)),
+    }
+}
+
 fn output_f32<'a>(
     output: &'a mut TrainOutputV1<'_>,
     name: &str,
@@ -1554,6 +1703,32 @@ fn output_f32<'a>(
         TrainBufferDataMutV1::F32(_) => Err(shape_error()),
         TrainBufferDataMutV1::U32(_) => Err(dtype_error(name, TrainDTypeV1::U32)),
         TrainBufferDataMutV1::Bytes(_) => Err(dtype_error(name, TrainDTypeV1::Bytes)),
+    }
+}
+
+fn output_bytes<'a>(
+    output: &'a mut TrainOutputV1<'_>,
+    name: &str,
+    shape: &[u64],
+    len: usize,
+) -> Result<&'a mut [u8], TrainBackendError> {
+    let buffer = output
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "outputs",
+            })
+        })?;
+    if buffer.shape != shape {
+        return Err(shape_error());
+    }
+    match &mut buffer.data {
+        TrainBufferDataMutV1::Bytes(data) if data.len() == len => Ok(data),
+        TrainBufferDataMutV1::Bytes(_) => Err(shape_error()),
+        TrainBufferDataMutV1::F32(_) => Err(dtype_error(name, TrainDTypeV1::F32)),
+        TrainBufferDataMutV1::U32(_) => Err(dtype_error(name, TrainDTypeV1::U32)),
     }
 }
 

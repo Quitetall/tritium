@@ -111,6 +111,15 @@ impl AdamWParams {
 
 type AdamWOutput = (Vec<f32>, Vec<f32>, Vec<f32>);
 
+/// Host-visible state produced after one native int8 AdamW step.
+pub(crate) struct Int8AdamWOutput {
+    pub(crate) parameter: Vec<f32>,
+    pub(crate) moment1_q8: Vec<u8>,
+    pub(crate) moment2_q8: Vec<u8>,
+    pub(crate) moment1_scale: Vec<f32>,
+    pub(crate) moment2_scale: Vec<f32>,
+}
+
 // std140 uniform structs round up to a 16-byte multiple; pin both the size AND
 // the field offsets so a field reorder (which preserves size) can't silently land
 // `n` where the shader reads `k`.
@@ -163,6 +172,8 @@ pub struct WgpuBackend {
     adamw_finish_pipeline: wgpu::ComputePipeline,
     cautious_adamw_pipelines: [wgpu::ComputePipeline; 4],
     adamw_bind_group_layout: wgpu::BindGroupLayout,
+    int8_adamw_pipelines: [wgpu::ComputePipeline; 8],
+    int8_adamw_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -484,6 +495,51 @@ impl WgpuBackend {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+            let int8_adamw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-int8-adamw"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("int8_adamw.wgsl").into()),
+            });
+            let int8_adamw_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-int8-adamw-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, rw),
+                        entry(2, ro),
+                        entry(3, rw),
+                        entry(4, rw),
+                        entry(5, rw),
+                        entry(6, rw),
+                        entry(7, rw),
+                        entry(8, rw),
+                    ],
+                });
+            let int8_adamw_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("portable-int8-adamw-pl"),
+                    bind_group_layouts: &[&int8_adamw_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+            let int8_adamw_pipelines = [
+                "dequantize",
+                "square_variance",
+                "products",
+                "finish_products",
+                "finish_variance",
+                "update_parameter",
+                "reduce_scales",
+                "quantize",
+            ]
+            .map(|entry_point| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry_point),
+                    layout: Some(&int8_adamw_layout),
+                    module: &int8_adamw_shader,
+                    entry_point: Some(entry_point),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                })
+            });
 
             Ok(WgpuBackend {
                 device,
@@ -502,6 +558,8 @@ impl WgpuBackend {
                 adamw_finish_pipeline,
                 cautious_adamw_pipelines,
                 adamw_bind_group_layout,
+                int8_adamw_pipelines,
+                int8_adamw_bind_group_layout,
                 device_name,
             })
         }
@@ -1220,6 +1278,239 @@ impl WgpuBackend {
         moment1_staging.unmap();
         moment2_staging.unmap();
         Ok((parameter, moment1, moment2))
+    }
+
+    /// Execute one block-wise int8 AdamW step without host-side tensor math.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn int8_adamw(
+        &self,
+        parameter: &[f32],
+        gradient: &[f32],
+        moment1_q8: &[u8],
+        moment2_q8: &[u8],
+        moment1_scale: &[f32],
+        moment2_scale: &[f32],
+        params: AdamWParams,
+    ) -> Result<Int8AdamWOutput, BackendError> {
+        let len = parameter.len();
+        let blocks = len.div_ceil(256);
+        if len == 0
+            || gradient.len() != len
+            || moment1_q8.len() != len
+            || moment2_q8.len() != len
+            || moment1_scale.len() != blocks
+            || moment2_scale.len() != blocks
+            || params.len as usize != len
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: len,
+                got: gradient.len(),
+            });
+        }
+        let storage = wgpu::BufferUsages::STORAGE;
+        let input = |label, contents: &[u8], copy_src| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents,
+                    usage: storage
+                        | if copy_src {
+                            wgpu::BufferUsages::COPY_SRC
+                        } else {
+                            wgpu::BufferUsages::empty()
+                        },
+                })
+        };
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-int8-adamw-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let parameter_buf = input(
+            "portable-int8-adamw-parameter",
+            bytemuck::cast_slice(parameter),
+            true,
+        );
+        let gradient_buf = input(
+            "portable-int8-adamw-gradient",
+            bytemuck::cast_slice(gradient),
+            false,
+        );
+        let moment1_codes: Vec<u32> = moment1_q8.iter().map(|&value| u32::from(value)).collect();
+        let moment2_codes: Vec<u32> = moment2_q8.iter().map(|&value| u32::from(value)).collect();
+        let moment1_buf = input(
+            "portable-int8-adamw-moment1",
+            bytemuck::cast_slice(&moment1_codes),
+            true,
+        );
+        let moment2_buf = input(
+            "portable-int8-adamw-moment2",
+            bytemuck::cast_slice(&moment2_codes),
+            true,
+        );
+        let moment1_scale_buf = input(
+            "portable-int8-adamw-moment1-scale",
+            bytemuck::cast_slice(moment1_scale),
+            true,
+        );
+        let moment2_scale_buf = input(
+            "portable-int8-adamw-moment2-scale",
+            bytemuck::cast_slice(moment2_scale),
+            true,
+        );
+        let tensor_bytes = core::mem::size_of_val(parameter) as u64;
+        let scratch = |label| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: tensor_bytes,
+                usage: storage,
+                mapped_at_creation: false,
+            })
+        };
+        let scratch1 = scratch("portable-int8-adamw-scratch1");
+        let scratch2 = scratch("portable-int8-adamw-scratch2");
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-int8-adamw-bg"),
+            layout: &self.int8_adamw_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: parameter_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: gradient_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: moment1_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: moment2_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: moment1_scale_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: moment2_scale_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: scratch1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: scratch2.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-int8-adamw-encoder"),
+            });
+        for (index, pipeline) in self.int8_adamw_pipelines.iter().enumerate() {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-int8-adamw-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = if index == 6 {
+                blocks as u32
+            } else {
+                (len as u32).div_ceil(WG_SIZE)
+            };
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        let staging = |label, size| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let scale_bytes = core::mem::size_of_val(moment1_scale) as u64;
+        let parameter_staging = staging("portable-int8-adamw-parameter-staging", tensor_bytes);
+        let moment1_staging = staging("portable-int8-adamw-moment1-staging", tensor_bytes);
+        let moment2_staging = staging("portable-int8-adamw-moment2-staging", tensor_bytes);
+        let moment1_scale_staging =
+            staging("portable-int8-adamw-moment1-scale-staging", scale_bytes);
+        let moment2_scale_staging =
+            staging("portable-int8-adamw-moment2-scale-staging", scale_bytes);
+        for (source, destination, size) in [
+            (&parameter_buf, &parameter_staging, tensor_bytes),
+            (&moment1_buf, &moment1_staging, tensor_bytes),
+            (&moment2_buf, &moment2_staging, tensor_bytes),
+            (&moment1_scale_buf, &moment1_scale_staging, scale_bytes),
+            (&moment2_scale_buf, &moment2_scale_staging, scale_bytes),
+        ] {
+            encoder.copy_buffer_to_buffer(source, 0, destination, 0, size);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let staging_buffers = [
+            &parameter_staging,
+            &moment1_staging,
+            &moment2_staging,
+            &moment1_scale_staging,
+            &moment2_scale_staging,
+        ];
+        let receivers: Vec<_> = staging_buffers
+            .iter()
+            .map(|buffer| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = tx.send(result);
+                    });
+                rx
+            })
+            .collect();
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu int8 AdamW device error: {error}"
+            )));
+        }
+        for receiver in receivers {
+            receiver
+                .recv()
+                .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+                .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        }
+        let read = |buffer: &wgpu::Buffer| {
+            let data = buffer.slice(..).get_mapped_range();
+            let bytes = data.to_vec();
+            drop(data);
+            bytes
+        };
+        let parameter = bytemuck::cast_slice(&read(&parameter_staging)).to_vec();
+        let moment1_words: Vec<u32> = bytemuck::cast_slice(&read(&moment1_staging)).to_vec();
+        let moment2_words: Vec<u32> = bytemuck::cast_slice(&read(&moment2_staging)).to_vec();
+        let moment1_scale = bytemuck::cast_slice(&read(&moment1_scale_staging)).to_vec();
+        let moment2_scale = bytemuck::cast_slice(&read(&moment2_scale_staging)).to_vec();
+        for buffer in staging_buffers {
+            buffer.unmap();
+        }
+        Ok(Int8AdamWOutput {
+            parameter,
+            moment1_q8: moment1_words.into_iter().map(|value| value as u8).collect(),
+            moment2_q8: moment2_words.into_iter().map(|value| value as u8).collect(),
+            moment1_scale,
+            moment2_scale,
+        })
     }
 }
 
