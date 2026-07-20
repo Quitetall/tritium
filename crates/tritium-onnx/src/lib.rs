@@ -82,7 +82,182 @@ pub const ATTR_KEY_HEAD_DIM: &str = "key_head_dim";
 /// DeltaNet per-head value width attribute.
 pub const ATTR_VALUE_HEAD_DIM: &str = "value_head_dim";
 
-#[cfg(feature = "onnx")]
+/// Backend-neutral validated geometry for Qwen Gated DeltaNet recurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QwenDeltaNetGeometry {
+    conv_kernel_dim: usize,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+}
+
+/// Derived Qwen Gated DeltaNet tensor widths and state sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QwenDeltaNetDimensions {
+    key_width: usize,
+    value_width: usize,
+    conv_width: usize,
+    conv_state_len: usize,
+    recurrent_state_len: usize,
+}
+
+/// Invalid or overflowing Qwen Gated DeltaNet geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QwenDeltaNetGeometryError(&'static str);
+
+impl core::fmt::Display for QwenDeltaNetGeometryError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for QwenDeltaNetGeometryError {}
+
+impl QwenDeltaNetGeometry {
+    /// Validate and bind one DeltaNet geometry.
+    ///
+    /// # Errors
+    /// Returns [`QwenDeltaNetGeometryError`] for zero dimensions, invalid head
+    /// grouping, or derived-width overflow.
+    pub fn new(
+        conv_kernel_dim: usize,
+        num_key_heads: usize,
+        num_value_heads: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+    ) -> Result<Self, QwenDeltaNetGeometryError> {
+        let geometry = Self {
+            conv_kernel_dim,
+            num_key_heads,
+            num_value_heads,
+            key_head_dim,
+            value_head_dim,
+        };
+        geometry.dimensions()?;
+        Ok(geometry)
+    }
+
+    /// Depthwise causal-convolution history width.
+    #[must_use]
+    pub const fn conv_kernel_dim(self) -> usize {
+        self.conv_kernel_dim
+    }
+
+    /// Query/key head count.
+    #[must_use]
+    pub const fn num_key_heads(self) -> usize {
+        self.num_key_heads
+    }
+
+    /// Value/recurrent head count.
+    #[must_use]
+    pub const fn num_value_heads(self) -> usize {
+        self.num_value_heads
+    }
+
+    /// Query/key lanes per head.
+    #[must_use]
+    pub const fn key_head_dim(self) -> usize {
+        self.key_head_dim
+    }
+
+    /// Value lanes per head.
+    #[must_use]
+    pub const fn value_head_dim(self) -> usize {
+        self.value_head_dim
+    }
+
+    /// Derive every projected width and explicit-state element count.
+    ///
+    /// # Errors
+    /// Returns [`QwenDeltaNetGeometryError`] for invalid grouping or overflow.
+    pub fn dimensions(self) -> Result<QwenDeltaNetDimensions, QwenDeltaNetGeometryError> {
+        if self.conv_kernel_dim == 0
+            || self.num_key_heads == 0
+            || self.num_value_heads == 0
+            || self.key_head_dim == 0
+            || self.value_head_dim == 0
+        {
+            return Err(QwenDeltaNetGeometryError(
+                "DeltaNet geometry dimensions must be nonzero",
+            ));
+        }
+        if !self.num_value_heads.is_multiple_of(self.num_key_heads) {
+            return Err(QwenDeltaNetGeometryError(
+                "DeltaNet num_value_heads must be divisible by num_key_heads",
+            ));
+        }
+        let key_width = self
+            .num_key_heads
+            .checked_mul(self.key_head_dim)
+            .ok_or(QwenDeltaNetGeometryError("DeltaNet key width overflow"))?;
+        let value_width = self
+            .num_value_heads
+            .checked_mul(self.value_head_dim)
+            .ok_or(QwenDeltaNetGeometryError("DeltaNet value width overflow"))?;
+        let conv_width = key_width
+            .checked_mul(2)
+            .and_then(|width| width.checked_add(value_width))
+            .ok_or(QwenDeltaNetGeometryError(
+                "DeltaNet convolution width overflow",
+            ))?;
+        let conv_state_len =
+            conv_width
+                .checked_mul(self.conv_kernel_dim)
+                .ok_or(QwenDeltaNetGeometryError(
+                    "DeltaNet convolution state overflow",
+                ))?;
+        let recurrent_state_len = self
+            .num_value_heads
+            .checked_mul(self.key_head_dim)
+            .and_then(|len| len.checked_mul(self.value_head_dim))
+            .ok_or(QwenDeltaNetGeometryError(
+                "DeltaNet recurrent state overflow",
+            ))?;
+        Ok(QwenDeltaNetDimensions {
+            key_width,
+            value_width,
+            conv_width,
+            conv_state_len,
+            recurrent_state_len,
+        })
+    }
+}
+
+impl QwenDeltaNetDimensions {
+    /// Globally split query width.
+    #[must_use]
+    pub const fn key_width(self) -> usize {
+        self.key_width
+    }
+
+    /// Recurrent value/output width.
+    #[must_use]
+    pub const fn value_width(self) -> usize {
+        self.value_width
+    }
+
+    /// Packed Q/K/V convolution width.
+    #[must_use]
+    pub const fn conv_width(self) -> usize {
+        self.conv_width
+    }
+
+    /// Explicit convolution-state element count.
+    #[must_use]
+    pub const fn conv_state_len(self) -> usize {
+        self.conv_state_len
+    }
+
+    /// Explicit recurrent-state element count.
+    #[must_use]
+    pub const fn recurrent_state_len(self) -> usize {
+        self.recurrent_state_len
+    }
+}
+
+#[cfg(any(feature = "model", feature = "onnx"))]
 #[derive(Debug, Clone, Copy)]
 #[repr(usize)]
 pub(crate) enum QwenDeltaNetInput {
@@ -99,7 +274,7 @@ pub(crate) enum QwenDeltaNetInput {
     Epsilon,
 }
 
-#[cfg(feature = "onnx")]
+#[cfg(any(feature = "model", feature = "onnx"))]
 impl QwenDeltaNetInput {
     pub(crate) const ALL: [Self; 11] = [
         Self::RawQkv,
@@ -115,6 +290,7 @@ impl QwenDeltaNetInput {
         Self::Epsilon,
     ];
 
+    #[cfg(feature = "onnx")]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::RawQkv => "raw_qkv",
@@ -623,10 +799,10 @@ pub fn kv_attention_kernel(
 
 #[cfg(feature = "onnx")]
 pub use onnx_op::{
-    QwenDeltaNetGeometry, QwenDeltaNetInputs, QwenDeltaNetOutput, QwenDeltaNetTensor,
-    TritiumKvAttentionKernel, TritiumKvAttentionOp, TritiumQwenDeltaNetKernel,
-    TritiumQwenDeltaNetOp, TritiumTernaryEmbeddingKernel, TritiumTernaryEmbeddingOp,
-    TritiumTernaryMpGemmKernel, TritiumTernaryMpGemmOp, tritium_operator_domain,
+    QwenDeltaNetInputs, QwenDeltaNetOutput, QwenDeltaNetTensor, TritiumKvAttentionKernel,
+    TritiumKvAttentionOp, TritiumQwenDeltaNetKernel, TritiumQwenDeltaNetOp,
+    TritiumTernaryEmbeddingKernel, TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel,
+    TritiumTernaryMpGemmOp, tritium_operator_domain,
 };
 
 #[cfg(feature = "onnx")]
@@ -636,16 +812,16 @@ mod onnx_op;
 pub use model::{
     AdmittedExternalCausalLmDigests, BitNetConfig, BitNetGgufTensorProvider, CausalActivation,
     CausalLmDecoderLayer, CausalLmModel, CausalQueryProjection, ExternalOnnxModel, MappedBitNet,
-    MappedSmolLm2, OnnxArtifactIdentityV2, OnnxModelError, PackedTernaryMatrix, RotaryEmbedding,
-    RotaryMode, SmolLm2Config, SmolLm2TensorProvider, TiedEmbeddingHeadModel,
-    TiedEmbeddingHeadModelV2, UnsupportedGraphDiagnostic, UnsupportedGraphItemKind,
-    VerifiedExternalCausalLmModel, VerifiedExternalOnnxModel, VerifiedExternalOnnxModelV2,
-    VerifiedOnnxArtifactIdentityV2, diagnose_unsupported_graph, encode_causal_lm,
-    encode_external_causal_lm, encode_external_tied_embedding_head,
-    encode_external_tied_embedding_head_v2, encode_tied_embedding_head,
-    encode_tied_embedding_head_v2, map_bitnet_gguf_causal_lm, map_smollm2_causal_lm,
-    verify_external_causal_lm, verify_external_tied_embedding_head,
-    verify_external_tied_embedding_head_v2,
+    MappedSmolLm2, OnnxArtifactIdentityV2, OnnxModelError, PackedTernaryMatrix,
+    QwenDeltaNetDecoderLayer, QwenDeltaNetLayerModel, RotaryEmbedding, RotaryMode, SmolLm2Config,
+    SmolLm2TensorProvider, TiedEmbeddingHeadModel, TiedEmbeddingHeadModelV2,
+    UnsupportedGraphDiagnostic, UnsupportedGraphItemKind, VerifiedExternalCausalLmModel,
+    VerifiedExternalOnnxModel, VerifiedExternalOnnxModelV2, VerifiedOnnxArtifactIdentityV2,
+    diagnose_unsupported_graph, encode_causal_lm, encode_external_causal_lm,
+    encode_external_tied_embedding_head, encode_external_tied_embedding_head_v2,
+    encode_qwen_deltanet_layer, encode_tied_embedding_head, encode_tied_embedding_head_v2,
+    map_bitnet_gguf_causal_lm, map_smollm2_causal_lm, verify_external_causal_lm,
+    verify_external_tied_embedding_head, verify_external_tied_embedding_head_v2,
 };
 
 #[cfg(feature = "model")]

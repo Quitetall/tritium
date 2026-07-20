@@ -11,7 +11,7 @@ use tritium_format::{
 
 use crate::{
     ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_PAST_TOKENS, ONNX_DOMAIN,
-    ONNX_EMBEDDING_OP_NAME, ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME,
+    ONNX_EMBEDDING_OP_NAME, ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME, QwenDeltaNetGeometry,
 };
 
 const ONNX_IR_VERSION: i64 = 10;
@@ -171,6 +171,95 @@ pub struct CausalLmDecoderLayer<'a> {
     pub activation: CausalActivation,
     /// Down projection.
     pub down: PackedTernaryMatrix<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CausalFfnLayer<'a> {
+    ffn_norm: &'a [f32],
+    gate: PackedTernaryMatrix<'a>,
+    up: PackedTernaryMatrix<'a>,
+    ffn_sub_norm: Option<&'a [f32]>,
+    activation: CausalActivation,
+    down: PackedTernaryMatrix<'a>,
+}
+
+impl<'a> CausalLmDecoderLayer<'a> {
+    fn ffn(self) -> CausalFfnLayer<'a> {
+        CausalFfnLayer {
+            ffn_norm: self.ffn_norm,
+            gate: self.gate,
+            up: self.up,
+            ffn_sub_norm: self.ffn_sub_norm,
+            activation: self.activation,
+            down: self.down,
+        }
+    }
+}
+
+/// Packed projections and preserved parameters for one Qwen DeltaNet decoder layer.
+#[derive(Debug, Clone, Copy)]
+pub struct QwenDeltaNetDecoderLayer<'a> {
+    /// Zero-centered pre-mixer RMSNorm parameter.
+    pub attention_norm: &'a [f32],
+    /// Globally split packed Q/K/V projection `[conv_width, hidden]`.
+    pub qkv: PackedTernaryMatrix<'a>,
+    /// Packed output-gate projection `[value_width, hidden]`.
+    pub z: PackedTernaryMatrix<'a>,
+    /// Packed beta-logit projection `[num_value_heads, hidden]`.
+    pub beta: PackedTernaryMatrix<'a>,
+    /// Packed decay-logit projection `[num_value_heads, hidden]`.
+    pub decay: PackedTernaryMatrix<'a>,
+    /// Depthwise convolution weights `[conv_width, conv_kernel_dim]`.
+    pub conv_weight: &'a [f32],
+    /// Per-value-head RMSNorm weights `[value_head_dim]`.
+    pub norm_weight: &'a [f32],
+    /// Per-value-head delta-time bias.
+    pub dt_bias: &'a [f32],
+    /// Per-value-head logarithmic decay coefficient.
+    pub a_log: &'a [f32],
+    /// Packed mixer output projection `[hidden, value_width]`.
+    pub output: PackedTernaryMatrix<'a>,
+    /// Zero-centered pre-FFN RMSNorm parameter.
+    pub ffn_norm: &'a [f32],
+    /// Packed SwiGLU gate projection.
+    pub gate: PackedTernaryMatrix<'a>,
+    /// Packed SwiGLU up projection.
+    pub up: PackedTernaryMatrix<'a>,
+    /// Packed SwiGLU down projection.
+    pub down: PackedTernaryMatrix<'a>,
+}
+
+impl<'a> QwenDeltaNetDecoderLayer<'a> {
+    fn ffn(self) -> CausalFfnLayer<'a> {
+        CausalFfnLayer {
+            ffn_norm: self.ffn_norm,
+            gate: self.gate,
+            up: self.up,
+            ffn_sub_norm: None,
+            activation: CausalActivation::SwiGlu,
+            down: self.down,
+        }
+    }
+}
+
+/// Fixed-shape whole Qwen DeltaNet decoder-layer graph.
+///
+/// Inputs are `hidden`, `conv_state`, and `recurrent_state`. Outputs are
+/// `next_hidden`, `next_conv`, and `next_recurrent`.
+#[derive(Debug, Clone, Copy)]
+pub struct QwenDeltaNetLayerModel<'a> {
+    /// Token rows processed by this transition.
+    pub tokens: usize,
+    /// Residual-stream width.
+    pub hidden: usize,
+    /// Positive finite RMSNorm epsilon.
+    pub rms_epsilon: f32,
+    /// DeltaNet state geometry.
+    pub geometry: QwenDeltaNetGeometry,
+    /// Layer weights and preserved parameters.
+    pub layer: QwenDeltaNetDecoderLayer<'a>,
+    /// Complete artifact identity.
+    pub identity: OnnxArtifactIdentityV2<'a>,
 }
 
 /// Fixed-shape packed decoder-only causal language-model graph.
@@ -1214,7 +1303,9 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".attention_scale")
                 || name.ends_with(".attention_mask")
                 || name.ends_with(".cos")
-                || name.ends_with(".sin") =>
+                || name.ends_with(".sin")
+                || name.ends_with(".dt_bias")
+                || name.ends_with(".a_log") =>
             {
                 Some(TENSOR_FLOAT)
             }
@@ -1278,6 +1369,12 @@ pub fn diagnose_unsupported_graph(
                 tensor_elem_type(input),
                 TENSOR_FLOAT,
             ),
+            "hidden" => push_dtype_diagnostic(
+                &mut diagnostics,
+                subject,
+                tensor_elem_type(input),
+                TENSOR_FLOAT,
+            ),
             name if is_deltanet_input(name) => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
@@ -1302,7 +1399,7 @@ pub fn diagnose_unsupported_graph(
     for output in &graph.output {
         let subject = format!("output {}", output.name);
         match output.name.as_str() {
-            "logits" | "context" => push_dtype_diagnostic(
+            "logits" | "context" | "next_hidden" => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
                 tensor_elem_type(output),
@@ -1573,6 +1670,275 @@ pub fn encode_causal_lm(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelEr
     validate_causal_initializer_budget(&model)?;
     let (protobuf, weights) = build_causal_lm_graph(model, false)?;
     debug_assert!(weights.is_none());
+    let encoded = protobuf.encode_to_vec();
+    if encoded.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
+}
+
+/// Encode one complete Qwen Gated DeltaNet decoder layer.
+///
+/// Packed QKV/Z/beta/decay/output/FFN projections execute through Tritium
+/// mpGEMM nodes. The opset-2 DeltaNet node consumes explicit prior state and
+/// publishes both next states; residual and SwiGLU paths remain standard ONNX.
+/// Qwen zero-centered RMSNorm semantics are fixed into the graph.
+///
+/// # Errors
+/// [`OnnxModelError`] if geometry, packed payloads, preserved parameters,
+/// identities, or bounded inline initializer size violate the contract.
+pub fn encode_qwen_deltanet_layer(
+    model: QwenDeltaNetLayerModel<'_>,
+) -> Result<Vec<u8>, OnnxModelError> {
+    let dimensions = validate_qwen_deltanet_layer(&model)?;
+    validate_qwen_deltanet_initializer_budget(&model)?;
+    let tokens = as_i64(model.tokens, "Qwen DeltaNet token count")?;
+    let hidden = as_i64(model.hidden, "Qwen DeltaNet hidden width")?;
+    let mut graph = CausalGraphBuilder::default();
+    let prefix = "layer.0";
+    let attention_input = "layer.0.attention_input";
+    graph.rms_norm_with_semantics(
+        "layer.0.attention_norm",
+        "hidden",
+        attention_input,
+        model.layer.attention_norm,
+        model.rms_epsilon,
+        true,
+    );
+    for (node, output, initializer, matrix) in [
+        ("qkv_projection", "raw_qkv", "qkv", model.layer.qkv),
+        ("z_projection", "z", "z", model.layer.z),
+        ("beta_projection", "beta_logits", "beta", model.layer.beta),
+        (
+            "decay_projection",
+            "decay_logits",
+            "decay",
+            model.layer.decay,
+        ),
+    ] {
+        graph.projection(
+            &format!("{prefix}.{node}"),
+            attention_input,
+            &format!("{prefix}.{output}"),
+            &format!("{prefix}.deltanet.{initializer}"),
+            matrix,
+        )?;
+    }
+    let conv_weight = "layer.0.deltanet.conv.weight";
+    let norm_weight = "layer.0.deltanet.norm.weight";
+    let dt_bias = "layer.0.deltanet.dt_bias";
+    let a_log = "layer.0.deltanet.a_log";
+    let epsilon = "layer.0.deltanet.epsilon";
+    graph.add_f32(
+        conv_weight,
+        vec![
+            as_i64(dimensions.conv_width(), "DeltaNet convolution width")?,
+            as_i64(
+                model.geometry.conv_kernel_dim(),
+                "DeltaNet convolution kernel width",
+            )?,
+        ],
+        model.layer.conv_weight,
+    );
+    graph.add_f32(
+        norm_weight,
+        vec![as_i64(
+            model.geometry.value_head_dim(),
+            "DeltaNet value head width",
+        )?],
+        model.layer.norm_weight,
+    );
+    graph.add_f32(
+        dt_bias,
+        vec![as_i64(
+            model.geometry.num_value_heads(),
+            "DeltaNet value head count",
+        )?],
+        model.layer.dt_bias,
+    );
+    graph.add_f32(
+        a_log,
+        vec![as_i64(
+            model.geometry.num_value_heads(),
+            "DeltaNet value head count",
+        )?],
+        model.layer.a_log,
+    );
+    graph.add_f32(epsilon, Vec::new(), &[model.rms_epsilon]);
+    let inputs = crate::QwenDeltaNetInput::ALL.map(|slot| match slot {
+        crate::QwenDeltaNetInput::RawQkv => "layer.0.raw_qkv",
+        crate::QwenDeltaNetInput::Z => "layer.0.z",
+        crate::QwenDeltaNetInput::BetaLogits => "layer.0.beta_logits",
+        crate::QwenDeltaNetInput::DecayLogits => "layer.0.decay_logits",
+        crate::QwenDeltaNetInput::ConvWeight => conv_weight,
+        crate::QwenDeltaNetInput::NormWeight => norm_weight,
+        crate::QwenDeltaNetInput::DtBias => dt_bias,
+        crate::QwenDeltaNetInput::ALog => a_log,
+        crate::QwenDeltaNetInput::ConvState => "conv_state",
+        crate::QwenDeltaNetInput::RecurrentState => "recurrent_state",
+        crate::QwenDeltaNetInput::Epsilon => epsilon,
+    });
+    graph.nodes.push(NodeProto {
+        input: strings(inputs),
+        output: strings(["layer.0.normalized_core", "next_conv", "next_recurrent"]),
+        name: "layer.0.deltanet".to_owned(),
+        op_type: crate::ONNX_QWEN_DELTANET_OP_NAME.to_owned(),
+        attribute: vec![
+            int_attribute(
+                crate::ATTR_CONV_KERNEL_DIM,
+                as_i64(
+                    model.geometry.conv_kernel_dim(),
+                    "DeltaNet convolution kernel width",
+                )?,
+            ),
+            int_attribute(
+                crate::ATTR_NUM_KEY_HEADS,
+                as_i64(
+                    model.geometry.num_key_heads(),
+                    "DeltaNet query/key head count",
+                )?,
+            ),
+            int_attribute(
+                crate::ATTR_NUM_VALUE_HEADS,
+                as_i64(
+                    model.geometry.num_value_heads(),
+                    "DeltaNet value head count",
+                )?,
+            ),
+            int_attribute(
+                crate::ATTR_KEY_HEAD_DIM,
+                as_i64(model.geometry.key_head_dim(), "DeltaNet key head width")?,
+            ),
+            int_attribute(
+                crate::ATTR_VALUE_HEAD_DIM,
+                as_i64(model.geometry.value_head_dim(), "DeltaNet value head width")?,
+            ),
+        ],
+        domain: ONNX_DOMAIN.to_owned(),
+    });
+    graph.projection(
+        "layer.0.output_projection",
+        "layer.0.normalized_core",
+        "layer.0.attention_output",
+        "layer.0.deltanet.output",
+        model.layer.output,
+    )?;
+    graph.standard(
+        "layer.0.attention_residual".to_owned(),
+        "Add",
+        &["hidden", "layer.0.attention_output"],
+        &["layer.0.post_attention"],
+        Vec::new(),
+    );
+    graph.ffn_block(
+        prefix,
+        "layer.0.post_attention",
+        "next_hidden",
+        model.layer.ffn(),
+        model.rms_epsilon,
+        true,
+    )?;
+    if let Some(error) = graph.failure {
+        return Err(error);
+    }
+    let protobuf = ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: ONNX_DOMAIN.to_owned(),
+        model_version: 2,
+        graph: Some(GraphProto {
+            node: graph.nodes,
+            name: "tritium.qwen_deltanet_layer".to_owned(),
+            initializer: graph.initializers,
+            input: vec![
+                tensor_value("hidden", TENSOR_FLOAT, &[tokens, hidden]),
+                tensor_value(
+                    "conv_state",
+                    TENSOR_FLOAT,
+                    &[
+                        as_i64(dimensions.conv_width(), "DeltaNet convolution width")?,
+                        as_i64(
+                            model.geometry.conv_kernel_dim(),
+                            "DeltaNet convolution kernel width",
+                        )?,
+                    ],
+                ),
+                tensor_value(
+                    "recurrent_state",
+                    TENSOR_FLOAT,
+                    &[
+                        as_i64(
+                            model.geometry.num_value_heads(),
+                            "DeltaNet value head count",
+                        )?,
+                        as_i64(model.geometry.key_head_dim(), "DeltaNet key head width")?,
+                        as_i64(model.geometry.value_head_dim(), "DeltaNet value head width")?,
+                    ],
+                ),
+            ],
+            output: vec![
+                tensor_value("next_hidden", TENSOR_FLOAT, &[tokens, hidden]),
+                tensor_value(
+                    "next_conv",
+                    TENSOR_FLOAT,
+                    &[
+                        as_i64(dimensions.conv_width(), "DeltaNet convolution width")?,
+                        as_i64(
+                            model.geometry.conv_kernel_dim(),
+                            "DeltaNet convolution kernel width",
+                        )?,
+                    ],
+                ),
+                tensor_value(
+                    "next_recurrent",
+                    TENSOR_FLOAT,
+                    &[
+                        as_i64(
+                            model.geometry.num_value_heads(),
+                            "DeltaNet value head count",
+                        )?,
+                        as_i64(model.geometry.key_head_dim(), "DeltaNet key head width")?,
+                        as_i64(model.geometry.value_head_dim(), "DeltaNet value head width")?,
+                    ],
+                ),
+            ],
+            value_info: Vec::new(),
+        }),
+        opset_import: vec![
+            OperatorSetIdProto {
+                domain: String::new(),
+                version: ONNX_OPSET,
+            },
+            OperatorSetIdProto {
+                domain: ONNX_DOMAIN.to_owned(),
+                version: 2,
+            },
+        ],
+        metadata_props: vec![
+            metadata("tritium.schema_version", "2"),
+            metadata("tritium.graph_kind", "qwen-deltanet-layer"),
+            metadata("tritium.source_model_id", model.identity.source_model_id),
+            metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
+            metadata("tritium.recipe_id", model.identity.recipe_id),
+            metadata("tritium.build_id", model.identity.tritium_build_id),
+            metadata("tritium.package_id", model.identity.package_id),
+            metadata(
+                "tritium.coverage.converted_id",
+                model.identity.converted_coverage_id,
+            ),
+            metadata(
+                "tritium.coverage.deferred_id",
+                model.identity.deferred_coverage_id,
+            ),
+            metadata("tritium.tokens", &model.tokens.to_string()),
+            metadata("tritium.hidden", &model.hidden.to_string()),
+            metadata("tritium.layers", "1"),
+            metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
+        ],
+    };
     let encoded = protobuf.encode_to_vec();
     if encoded.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
@@ -3271,7 +3637,7 @@ impl CausalGraphBuilder {
         prefix: &str,
         input: &str,
         output: &str,
-        layer: CausalLmDecoderLayer<'_>,
+        layer: CausalFfnLayer<'_>,
         epsilon: f32,
         zero_centered_norm: bool,
     ) -> Result<(), OnnxModelError> {
@@ -3750,7 +4116,7 @@ fn build_causal_lm_graph(
             &prefix,
             &post_attention,
             &layer_output,
-            layer,
+            layer.ffn(),
             model.rms_epsilon,
             model.zero_centered_norm,
         )?;
@@ -4379,6 +4745,147 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
         )?;
     }
     validate_identity_v2(model.identity)
+}
+
+fn validate_qwen_deltanet_layer(
+    model: &QwenDeltaNetLayerModel<'_>,
+) -> Result<crate::QwenDeltaNetDimensions, OnnxModelError> {
+    for (name, value) in [
+        ("Qwen DeltaNet token count", model.tokens),
+        ("Qwen DeltaNet hidden width", model.hidden),
+    ] {
+        if value == 0 {
+            return Err(OnnxModelError::EmptyDimension(name));
+        }
+        as_i64(value, name)?;
+    }
+    let dimensions = model
+        .geometry
+        .dimensions()
+        .map_err(|error| OnnxModelError::InvalidModel(error.to_string()))?;
+    if !model.rms_epsilon.is_finite() || model.rms_epsilon <= 0.0 {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen DeltaNet RMSNorm epsilon must be finite and positive".to_owned(),
+        ));
+    }
+    let value_width = dimensions.value_width();
+    let conv_width = dimensions.conv_width();
+    validate_vector(
+        "layer.0.attention_norm",
+        model.layer.attention_norm,
+        model.hidden,
+    )?;
+    validate_matrix_shape("layer.0.qkv", model.layer.qkv, conv_width, model.hidden)?;
+    validate_matrix_shape("layer.0.z", model.layer.z, value_width, model.hidden)?;
+    validate_matrix_shape(
+        "layer.0.beta",
+        model.layer.beta,
+        model.geometry.num_value_heads(),
+        model.hidden,
+    )?;
+    validate_matrix_shape(
+        "layer.0.decay",
+        model.layer.decay,
+        model.geometry.num_value_heads(),
+        model.hidden,
+    )?;
+    let conv_weight_len = conv_width
+        .checked_mul(model.geometry.conv_kernel_dim())
+        .ok_or(OnnxModelError::ShapeOverflow(
+            "DeltaNet convolution weights",
+        ))?;
+    validate_vector(
+        "layer.0.conv_weight",
+        model.layer.conv_weight,
+        conv_weight_len,
+    )?;
+    validate_vector(
+        "layer.0.norm_weight",
+        model.layer.norm_weight,
+        model.geometry.value_head_dim(),
+    )?;
+    validate_vector(
+        "layer.0.dt_bias",
+        model.layer.dt_bias,
+        model.geometry.num_value_heads(),
+    )?;
+    validate_vector(
+        "layer.0.a_log",
+        model.layer.a_log,
+        model.geometry.num_value_heads(),
+    )?;
+    validate_matrix_shape(
+        "layer.0.output",
+        model.layer.output,
+        model.hidden,
+        value_width,
+    )?;
+    validate_vector("layer.0.ffn_norm", model.layer.ffn_norm, model.hidden)?;
+    if model.layer.gate.rows == 0 || model.layer.gate.rows != model.layer.up.rows {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen DeltaNet gate/up intermediate widths disagree".to_owned(),
+        ));
+    }
+    let intermediate = model.layer.gate.rows;
+    validate_matrix_shape("layer.0.gate", model.layer.gate, intermediate, model.hidden)?;
+    validate_matrix_shape("layer.0.up", model.layer.up, intermediate, model.hidden)?;
+    validate_matrix_shape("layer.0.down", model.layer.down, model.hidden, intermediate)?;
+    validate_identity_v2(model.identity)?;
+    Ok(dimensions)
+}
+
+fn validate_qwen_deltanet_initializer_budget(
+    model: &QwenDeltaNetLayerModel<'_>,
+) -> Result<(), OnnxModelError> {
+    let mut total = 0_usize;
+    let mut add = |bytes: usize| -> Result<(), OnnxModelError> {
+        total = total
+            .checked_add(bytes)
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "Qwen DeltaNet initializer byte count",
+            ))?;
+        if total > MAX_MODEL_BYTES {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "Qwen DeltaNet initializers require at least {total} bytes, exceed bounded inline graph"
+            )));
+        }
+        Ok(())
+    };
+    for matrix in [
+        model.layer.qkv,
+        model.layer.z,
+        model.layer.beta,
+        model.layer.decay,
+        model.layer.output,
+        model.layer.gate,
+        model.layer.up,
+        model.layer.down,
+    ] {
+        add(matrix.packed.len())?;
+        add(matrix
+            .scales
+            .len()
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "Qwen DeltaNet scale byte count",
+            ))?)?;
+    }
+    for vector in [
+        model.layer.attention_norm,
+        model.layer.conv_weight,
+        model.layer.norm_weight,
+        model.layer.dt_bias,
+        model.layer.a_log,
+        model.layer.ffn_norm,
+    ] {
+        add(vector
+            .len()
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "Qwen DeltaNet preserved byte count",
+            ))?)?;
+    }
+    Ok(())
 }
 
 fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {

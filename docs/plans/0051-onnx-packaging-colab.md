@@ -124,7 +124,11 @@ Tritium mpGEMMs; the core consumes explicit convolution and recurrent state and
 publishes both next states. Frozen independent numeric vectors cover prompt and
 cached-token transitions through real ORT, including depthwise history order,
 decay-before-delta, normalized state feedback and gated RMSNorm. Whole-layer
-emission and heterogeneous schedule composition remain open.
+emission now composes packed QKV/Z/beta/decay/output and SwiGLU projections,
+zero-centered pre-mixer/pre-FFN norms, both residuals and explicit prior/next
+state through real ORT. Heterogeneous language-model schedule composition,
+external-data emission and the exact architecture tensor-map adapter remain
+open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
