@@ -38,6 +38,10 @@ use tritium_train::{AdamState, AdamW, LrSchedule, Optimizer, TrainGemm};
 
 use crate::cuda::{CudaBackend, EmbedSegments, TrainingSaltLinear};
 
+mod portable;
+
+pub use portable::CudaTrainBackendV1;
+
 /// `(g_a[M,K], g_w[N,K], g_s[N])` — the three matmul gradients returned together by
 /// [`GemmEngine::backward`].
 pub(crate) type GradTriple = (Vec<f32>, Vec<f32>, Vec<f32>);

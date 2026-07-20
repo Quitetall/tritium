@@ -97,8 +97,36 @@ pub fn run_training_conformance(
     backend: &dyn TrainBackendV1,
     vectors: &TrainingVectorSetV1,
 ) -> TrainingConformanceReport {
+    run_training_conformance_matching(backend, vectors, |_| true)
+}
+
+/// Execute the canonical cases for every operation a partial adapter advertises.
+///
+/// This is an incremental-development gate, not release admission: a v1 release
+/// backend must still advertise the complete manifest and pass
+/// [`run_training_conformance`].
+#[must_use]
+pub fn run_supported_training_conformance(
+    backend: &dyn TrainBackendV1,
+    vectors: &TrainingVectorSetV1,
+) -> TrainingConformanceReport {
+    let supported = backend.capabilities().supported_operations;
+    run_training_conformance_matching(backend, vectors, |operation| {
+        supported.iter().any(|supported| supported == operation)
+    })
+}
+
+fn run_training_conformance_matching(
+    backend: &dyn TrainBackendV1,
+    vectors: &TrainingVectorSetV1,
+    include: impl Fn(&str) -> bool,
+) -> TrainingConformanceReport {
     let mut report = TrainingConformanceReport::default();
-    for case in vectors.cases() {
+    for case in vectors
+        .cases()
+        .iter()
+        .filter(|case| include(&case.operation))
+    {
         match run_case(backend, vectors, case) {
             Ok(receipt) => report.passed.push(TrainingVectorPass {
                 case_id: case.case_id.clone(),
