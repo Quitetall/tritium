@@ -139,19 +139,22 @@ This closes Slice 2 corpus coverage and the CPU semantic matrix; accelerator and
 constrained-target receipts remain required for release closure.
 
 CUDA adapter work has started against the same seam. Current actual-RTX-4090
-evidence covers 79 canonical cases across 24/35 operations: STE surrogate, SALT
+evidence covers 85 canonical cases across 27/35 operations: STE surrogate, SALT
 STE, LSQ, FSQ, dense and scale-bearing ternary matmul, transpose, embedding,
 column slice/concat, detach,
 scale, bias, add, multiply, ReLU2, SiLU, RMSNorm, softmax, causal mask, and RoPE.
-MSE and softmax cross-entropy forward/VJP plus SGD step are resident as well.
+MSE and softmax cross-entropy forward/VJP plus SGD, AdamW, cautious AdamW, and
+blockwise int8 AdamW steps are resident as well. Cautious AdamW uses a resident
+two-pass masked update; int8 AdamW keeps blockwise moments and scales resident.
 STE, LSQ, and FSQ use dedicated forward/VJP kernels, including deterministic
 row-order LSQ alpha reduction and seeded stochastic FSQ. SALT supports the full
 1--64-plane contract with row-sequential reductions and one-row scratch. Bias
 and ReLU2 use dedicated resident kernels; training RoPE positions are unsigned
 end-to-end, matching the frozen `u32` contract rather than narrowing to signed
 indices. Each success emits a physical-device-bound receipt; the adapter
-advertises only this proved subset and never delegates to CPU. This is development evidence, not a
-release-admissible CUDA receipt; CUDA remains open until all 35 operations pass.
+advertises only this proved subset and never delegates to CPU. This is
+development evidence, not a release-admissible CUDA receipt; CUDA remains open
+until all 35 operations pass.
 
 The constrained WASI/WASM adapter is complete for the frozen corpus. It compiles
 the deterministic scalar semantic executor into the guest rather than calling a
