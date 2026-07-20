@@ -184,6 +184,7 @@ def test_accelerate_gradient_accumulation_and_state_resume(tmp_path: Path):
 
     state_dir = tmp_path / "accelerate-state"
     accelerator.save_state(state_dir)
+    expected_random = torch.rand(8)
     unwrapped = accelerator.unwrap_model(model)
     saved = {
         name: tensor.detach().clone()
@@ -194,6 +195,8 @@ def test_accelerate_gradient_accumulation_and_state_resume(tmp_path: Path):
         for parameter in unwrapped.parameters():
             parameter.add_(10)
     accelerator.load_state(state_dir)
+    observed_random = torch.rand(8)
 
     restored = unwrapped.state_dict()
     assert all(torch.equal(restored[name], tensor) for name, tensor in saved.items())
+    assert torch.equal(observed_random, expected_random)

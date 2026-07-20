@@ -42,7 +42,9 @@ saves with safe serialization, automatically reloads through
 
 - [x] Verify Trainer and direct Accelerate steps use ordinary optimizers.
 - [x] Verify single-process gradient accumulation and checkpoint/resume.
-- [ ] Verify mixed precision and exact RNG continuation.
+- [x] Verify CPU bf16 mixed precision and exact RNG continuation through
+  Accelerate state resume. CUDA fp16 remains in the dispatcher gate and the
+  distinct-device distributed lane.
 - [x] Run real two-rank DDP and FSDP semantic tests on CPU/Gloo; skipped
   distributed tests are failures in the release lane. FSDP uses native sharded
   distributed-checkpoint resume; PyTorch 2.11 CPU full-state materialization

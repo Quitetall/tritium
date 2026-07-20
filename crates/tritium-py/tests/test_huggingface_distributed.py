@@ -61,3 +61,17 @@ def test_two_rank_cpu_fsdp_step_and_sharded_state_resume(tmp_path: Path):
     output = completed.stdout + completed.stderr
     assert "TRITIUM_FSDP_OK rank=0" in output
     assert "TRITIUM_FSDP_OK rank=1" in output
+
+
+def test_accelerate_cpu_bf16_in_fresh_runtime():
+    worker = Path(__file__).with_name("hf_accelerate_worker.py")
+    completed = subprocess.run(
+        [sys.executable, str(worker)],
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "TRITIUM_ACCELERATE_BF16_OK" in completed.stdout
