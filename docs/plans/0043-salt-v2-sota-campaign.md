@@ -790,8 +790,12 @@ cataloged before fitting, then its canonical rate-free Pmax master is emitted
 one 256-coefficient tile at a time. Two-tensor goldens prove those independent
 streams and receipts are byte-identical to the corresponding outputs of the
 whole-model solver. This removes model-wide master residency from the PTQ
-producer boundary; it does not yet supply the sharded-checkpoint reader and
-collector that feeds all 506 Qwen tensors into the campaign store.
+producer boundary. `reconcile_qwen36_ptq` now joins the admitted seek-backed
+Qwen shards to an exact 506-record evidence namespace, rejects extra/missing or
+misordered records and mixed token streams, plans the immutable campaign while
+retaining only one widened matrix and one factor record, resumes only missing
+masters, and seals through the existing content-addressed store. The producer
+that collects all 506 `S2KF` records from real calibration remains open.
 Guided-Fisher, input-Hessian, and forward-KL curvature can now retain exact
 Kronecker structure instead of expanding one dense G128 matrix per output row.
 The solver materializes only the active G128
@@ -822,9 +826,10 @@ The following work deliberately remains open and keeps this plan in progress:
   set, Tritium host/CUDA parity, full serving lifecycle, or practical recurrent
   and KV-cache allocations. The compiled MTP authorization ledger contains no
   production evidence row, so fixture success cannot admit Stage 8;
-- the production model driver does not yet collect and connect reopened
-  factorized-curvature evidence, block-output reconstruction, scale-only
-  teacher-KL, or hard PV updates to real checkpoint tensors;
+- the production pure-PTQ driver now connects admitted checkpoint tensors to
+  reopened factorized-curvature evidence and the canonical campaign store, but
+  checkpoint-scale evidence collection, block-output reconstruction,
+  scale-only teacher-KL, and hard PV updates remain open;
 - `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense
   BlockLDLQ path, then
   `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult` slices exact
@@ -869,10 +874,10 @@ The following work deliberately remains open and keeps this plan in progress:
   manifest checks around child work, while open, seal, and completion reopen
   repeat full cryptographic package and parent-prefix validation.
   This remains **structural fixture evidence**, not checkpoint-scale or quality
-  evidence. PV/KL execution over real tensors remains unimplemented. The
-  production fitter/refinement driver must still stream real checkpoint output
-  into these stores and produce a measured flagship receipt before Stage 5 can
-  advance. CAS master installation otherwise stages one
+  evidence. The pure-PTQ checkpoint/evidence driver now targets these stores,
+  but has not been run on the pinned checkpoint; PV/KL execution over real
+  tensors remains unimplemented. A measured flagship receipt is still required
+  before Stage 5 can advance. CAS master installation otherwise stages one
   exact record, fuses generic byte validation with canonical SALT semantic decoding
   through the retained file handle, requires decoder completion before
   sync/publication, and returns both generic and semantic receipts without an

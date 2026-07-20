@@ -5,6 +5,7 @@
 //! install the 506 canonical tensor masters without rewriting that base.
 
 mod additive_master;
+mod ptq_driver;
 
 pub use additive_master::{
     Qwen36AdditiveCampaignSpec, Qwen36AdditiveCampaignStore, Qwen36AdditiveInstallError,
@@ -14,6 +15,7 @@ pub use additive_master::{
     Qwen36ScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
     Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
+pub use ptq_driver::{Qwen36PtqDriverError, Qwen36PtqEvidenceDirectory, reconcile_qwen36_ptq};
 
 use core::{convert::Infallible, fmt};
 use std::{

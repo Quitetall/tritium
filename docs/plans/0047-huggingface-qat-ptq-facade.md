@@ -63,6 +63,9 @@ saves with safe serialization, automatically reloads through
   factors, then reproduces the exact tensor-master stream after restart.
 - [x] Resume a pure-PTQ tensor fit from those bound identities without retaining
   or rebuilding the complete activation cache.
+- [x] Reconcile the admitted 506-matrix Qwen source and exact evidence namespace
+  into the resumable content-addressed PTQ campaign, fitting only missing
+  masters and sealing only after strict canonical reopen.
 - Bind the Rust SALT pipeline to `quantize(model_or_id, calibration, config,
   work_dir)` without a Python-list weight bridge.
 - Expose immutable `QuantizationResult` model/coverage/report plus atomic
