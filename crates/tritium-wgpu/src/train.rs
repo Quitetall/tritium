@@ -11,6 +11,7 @@ use crate::WgpuBackend;
 
 const OPERATIONS: &[&str] = &[
     "graph.ste_surrogate",
+    "graph.lsq_ste",
     "graph.dense_matmul",
     "graph.ternary_matmul",
     "graph.embedding_gather",
@@ -1149,6 +1150,94 @@ impl WgpuTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_lsq(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_names, output_names): (&[&str], &[&str]) = match request.execution {
+            TrainExecutionV1::Forward => (&["weight", "alpha"], &["result"]),
+            TrainExecutionV1::Vjp => (
+                &["weight", "alpha", "grad_output"],
+                &["grad_weight", "grad_alpha"],
+            ),
+            _ => return Err(invariant("LSQ received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            input_names,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            output_names,
+            "outputs",
+        )?;
+        let rows = attribute_u64(request, "rows")?;
+        let cols = attribute_u64(request, "cols")?;
+        if cols == 0 {
+            return Err(attribute_value("cols", "positive"));
+        }
+        if rows > u32::MAX as u64 || cols > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let weight_shape = [rows, cols];
+        let alpha_shape = [rows];
+        let (actual_weight_shape, weight) = input_f32(request, "weight")?;
+        let (actual_alpha_shape, alpha) = input_f32(request, "alpha")?;
+        if actual_weight_shape != weight_shape || actual_alpha_shape != alpha_shape {
+            return Err(shape_error());
+        }
+        require_finite("weight", weight)?;
+        require_finite("alpha", alpha)?;
+        let gradient = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != weight_shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            weight
+        };
+        if request.execution == TrainExecutionV1::Forward {
+            let result = self
+                .backend
+                .pointwise(weight, alpha, gradient, 35, 0.0, cols as u32)
+                .map_err(wgpu_error)?;
+            output_f32(output, "result", &weight_shape, weight.len())?.copy_from_slice(&result);
+        } else {
+            let grad_weight = self
+                .backend
+                .pointwise(weight, alpha, gradient, 36, 0.0, cols as u32)
+                .map_err(wgpu_error)?;
+            let grad_alpha = self
+                .backend
+                .pointwise_sized(
+                    weight,
+                    alpha,
+                    gradient,
+                    37,
+                    0.0,
+                    cols as u32,
+                    0,
+                    0,
+                    alpha.len(),
+                )
+                .map_err(wgpu_error)?;
+            output_f32(output, "grad_weight", &weight_shape, weight.len())?
+                .copy_from_slice(&grad_weight);
+            output_f32(output, "grad_alpha", &alpha_shape, alpha.len())?
+                .copy_from_slice(&grad_alpha);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for WgpuTrainBackendV1 {
@@ -1214,6 +1303,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             0
         } else if request.operation == "graph.ste_surrogate" {
             self.execute_ste_surrogate(&request, output)?;
+            0
+        } else if request.operation == "graph.lsq_ste" {
+            self.execute_lsq(&request, output)?;
             0
         } else {
             self.execute_pointwise(&request, output)?;

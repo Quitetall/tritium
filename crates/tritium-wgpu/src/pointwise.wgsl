@@ -297,6 +297,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 result[index] = 0.0;
             }
         }
+        case 35u: {
+            let row = index / params.auxiliary;
+            let row_alpha = right[row];
+            if (row_alpha <= 0.0) {
+                result[index] = 0.0;
+            } else {
+                result[index] = clamp(round(left[index] / row_alpha), -1.0, 1.0)
+                    * row_alpha;
+            }
+        }
+        case 36u: {
+            let row = index / params.auxiliary;
+            let row_alpha = right[row];
+            if (row_alpha > 0.0 && abs(left[index] / row_alpha) < 1.0) {
+                result[index] = extra[index];
+            } else {
+                result[index] = 0.0;
+            }
+        }
+        case 37u: {
+            let row = index;
+            let row_alpha = right[row];
+            if (row_alpha <= 0.0) {
+                result[index] = 0.0;
+                return;
+            }
+            var gradient = 0.0;
+            for (var column = 0u; column < params.auxiliary; column = column + 1u) {
+                let element = row * params.auxiliary + column;
+                let normalized = left[element] / row_alpha;
+                var local: f32;
+                if (abs(normalized) < 1.0) {
+                    local = round(normalized) - normalized;
+                } else {
+                    local = sign(normalized);
+                }
+                gradient = gradient + extra[element] * local;
+            }
+            result[index] = gradient / sqrt(f32(params.auxiliary));
+        }
         default: { result[index] = 0.0; }
     }
 }
