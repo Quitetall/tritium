@@ -11,7 +11,7 @@ use super::DeviceTape;
 use crate::CudaBackend;
 
 const BACKEND_FAMILY: &str = "cuda.portable.v1";
-const OPERATIONS: &[&str] = &["graph.dense_matmul"];
+const OPERATIONS: &[&str] = &["graph.dense_matmul", "graph.transpose"];
 const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
     max_rank: 4,
     max_elements: u32::MAX as u64,
@@ -134,6 +134,53 @@ impl CudaTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_transpose(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, input_shape, output_name, output_shape) = match request.execution {
+            TrainExecutionV1::Forward => ("x", [0, 1], "result", [1, 0]),
+            TrainExecutionV1::Vjp => ("grad_output", [1, 0], "grad_x", [0, 1]),
+            _ => return Err(invariant("transpose received an illegal execution phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["rows", "cols"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let rows = attribute_usize(request, "rows")?;
+        let cols = attribute_usize(request, "cols")?;
+        let elements = rows.checked_mul(cols).ok_or_else(shape_error)?;
+        let dimensions = [rows as u64, cols as u64];
+        let expected_input = [dimensions[input_shape[0]], dimensions[input_shape[1]]];
+        let expected_output = [dimensions[output_shape[0]], dimensions[output_shape[1]]];
+        let input = input_f32(request, input_name, &expected_input)?;
+        require_finite(input_name, input)?;
+        let mut tape = DeviceTape::new(&self.backend, 1).map_err(cuda_error)?;
+        let input_id = tape.leaf(input).map_err(cuda_error)?;
+        let result_id = tape
+            .transpose(
+                input_id,
+                expected_input[0] as usize,
+                expected_input[1] as usize,
+            )
+            .map_err(cuda_error)?;
+        let result = tape.value(result_id).map_err(cuda_error)?;
+        output_f32(output, output_name, &expected_output, elements)?.copy_from_slice(&result);
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -160,6 +207,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
         let input_digest = train_request_digest_v1(&request);
         match request.operation {
             "graph.dense_matmul" => self.execute_dense_matmul(&request, output)?,
+            "graph.transpose" => self.execute_transpose(&request, output)?,
             operation => {
                 return Err(TrainBackendError::UnsupportedOperation(
                     operation.to_owned(),
