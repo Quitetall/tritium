@@ -52,9 +52,8 @@ format remain source-compatible and readable; version-specific verifiers reject
 cross-version interpretation. Both v1 inline and v2 external-data graphs execute
 through real ORT sessions. Public pre-session inspection now returns deterministic
 typed diagnostics for every unsupported node, attribute, dtype and unresolved
-coverage item in the current tied-graph subset. Decoder blocks, integrated
-cache lifecycle, decoder-wide diagnostics and whole-model generation remain
-open. Cache-aware causal GQA now has a dependency-free semantic oracle plus an
+coverage item in the admitted tied-graph and decoder-core subset. Cache-aware
+causal GQA now has a dependency-free semantic oracle plus an
 experimental `com.tritium` opset-2 `TritiumKvAttention` proof; real ORT sessions
 execute both prompt attention and one-token continuation over supplied K/V
 cache. This does not alter frozen opset 1 or replace required standard-ONNX v1.1
@@ -63,8 +62,16 @@ decode path using only standard opset-21 `Transpose`, `MatMul`, `Mul`, `Add` and
 `Softmax` nodes, an explicit additive causal mask and complete supplied K/V
 cache. Its inspector contract rejects noncanonical opsets, attribute kinds,
 rank-three permutations and softmax axes. Packed Q/K/V/O projection, cache
-production/update, GQA expansion in the standard graph and complete
-decoder-block serialization remain open.
+production/update, GQA expansion and complete decoder-block serialization now
+join in a production `encode_causal_lm` graph: packed tied embedding/head and
+Q/K/V/O/SwiGLU projections, preserved RMSNorm vectors, residuals, causal mask,
+per-layer cache concatenation and present-cache outputs. A nondegenerate tiny
+2:1 GQA model executes prompt plus cached continuation through real ORT and
+matches an independent dense reference for logits, greedy tokens and every K/V
+element. Deterministic encoding and the pre-session inspector are part of the
+same gate. Serializer decomposition, multi-layer large-model external-data
+packaging, architecture adapters including RoPE/QK norm, dynamic axes and
+end-user generation APIs remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

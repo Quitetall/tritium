@@ -12,6 +12,10 @@
 //!   [`TritiumKvAttentionOp`] at opset 2. Enabling the feature fetches ONNX
 //!   Runtime.
 //!
+//! With feature `model`, [`encode_causal_lm`] serializes packed decoder layers
+//! using opset-1 Tritium projection/embedding nodes plus standard opset-21
+//! RMSNorm, GQA attention, SwiGLU, residual, and K/V-cache glue.
+//!
 //! ## Feature gate
 //!
 //! ```text
@@ -537,12 +541,12 @@ mod onnx_op;
 
 #[cfg(feature = "model")]
 pub use model::{
-    ExternalOnnxModel, OnnxArtifactIdentityV2, OnnxModelError, TiedEmbeddingHeadModel,
-    TiedEmbeddingHeadModelV2, UnsupportedGraphDiagnostic, UnsupportedGraphItemKind,
-    VerifiedExternalOnnxModel, VerifiedExternalOnnxModelV2, VerifiedOnnxArtifactIdentityV2,
-    diagnose_unsupported_graph, encode_external_tied_embedding_head,
-    encode_external_tied_embedding_head_v2, encode_tied_embedding_head,
-    encode_tied_embedding_head_v2, verify_external_tied_embedding_head,
+    CausalLmDecoderLayer, CausalLmModel, ExternalOnnxModel, OnnxArtifactIdentityV2, OnnxModelError,
+    PackedTernaryMatrix, TiedEmbeddingHeadModel, TiedEmbeddingHeadModelV2,
+    UnsupportedGraphDiagnostic, UnsupportedGraphItemKind, VerifiedExternalOnnxModel,
+    VerifiedExternalOnnxModelV2, VerifiedOnnxArtifactIdentityV2, diagnose_unsupported_graph,
+    encode_causal_lm, encode_external_tied_embedding_head, encode_external_tied_embedding_head_v2,
+    encode_tied_embedding_head, encode_tied_embedding_head_v2, verify_external_tied_embedding_head,
     verify_external_tied_embedding_head_v2,
 };
 

@@ -98,6 +98,74 @@ pub struct TiedEmbeddingHeadModelV2<'a> {
     pub identity: OnnxArtifactIdentityV2<'a>,
 }
 
+/// One packed output-major ternary matrix consumed directly by Tritium ONNX
+/// custom operators.
+#[derive(Debug, Clone, Copy)]
+pub struct PackedTernaryMatrix<'a> {
+    /// Output row count.
+    pub rows: usize,
+    /// Input/contraction column count.
+    pub columns: usize,
+    /// Canonical TQ2_0 or TQ1_0 packed rows.
+    pub packed: &'a [u8],
+    /// One finite nonnegative scale per output row.
+    pub scales: &'a [f32],
+    /// Canonical packed ternary format.
+    pub format: TernaryFormat,
+}
+
+/// Packed weights and preserved RMSNorm vectors for one causal decoder layer.
+#[derive(Debug, Clone, Copy)]
+pub struct CausalLmDecoderLayer<'a> {
+    /// Pre-attention RMSNorm weight.
+    pub attention_norm: &'a [f32],
+    /// Query projection.
+    pub query: PackedTernaryMatrix<'a>,
+    /// Key projection.
+    pub key: PackedTernaryMatrix<'a>,
+    /// Value projection.
+    pub value: PackedTernaryMatrix<'a>,
+    /// Attention output projection.
+    pub attention_output: PackedTernaryMatrix<'a>,
+    /// Pre-FFN RMSNorm weight.
+    pub ffn_norm: &'a [f32],
+    /// SwiGLU gate projection.
+    pub gate: PackedTernaryMatrix<'a>,
+    /// SwiGLU up projection.
+    pub up: PackedTernaryMatrix<'a>,
+    /// SwiGLU down projection.
+    pub down: PackedTernaryMatrix<'a>,
+}
+
+/// Fixed-shape packed decoder-only causal language-model graph.
+///
+/// Prompt graphs set `past_tokens` to zero and consume token IDs only. Cached
+/// decode graphs consume one `past_k.{layer}` and `past_v.{layer}` tensor per
+/// layer and return complete `present_k.{layer}`/`present_v.{layer}` tensors.
+#[derive(Debug, Clone, Copy)]
+pub struct CausalLmModel<'a> {
+    /// Query token count fixed into this graph.
+    pub tokens: usize,
+    /// Prefix-cache token count fixed into this graph.
+    pub past_tokens: usize,
+    /// Query attention head count.
+    pub n_head: usize,
+    /// Key/value attention head count.
+    pub n_kv_head: usize,
+    /// Elements per attention head.
+    pub head_dim: usize,
+    /// Positive finite RMSNorm epsilon.
+    pub rms_epsilon: f32,
+    /// Tied token embedding and language-model head table.
+    pub embedding: PackedTernaryMatrix<'a>,
+    /// Ordered decoder layers; at least one is required.
+    pub layers: &'a [CausalLmDecoderLayer<'a>],
+    /// Final RMSNorm weight.
+    pub final_norm: &'a [f32],
+    /// Complete artifact identity.
+    pub identity: OnnxArtifactIdentityV2<'a>,
+}
+
 impl<'a> TiedEmbeddingHeadModelV2<'a> {
     fn legacy(self) -> TiedEmbeddingHeadModel<'a> {
         TiedEmbeddingHeadModel {
@@ -422,11 +490,30 @@ pub fn diagnose_unsupported_graph(
                         attribute.ints
                     ),
                 });
-            } else if attribute.name == "axis" && attribute.value != -1 {
+            } else if node.op_type == "Softmax" && attribute.name == "axis" && attribute.value != -1
+            {
                 diagnostics.push(UnsupportedGraphDiagnostic {
                     kind: UnsupportedGraphItemKind::Attribute,
                     subject,
                     reason: format!("attention softmax axis must be -1, got {}", attribute.value),
+                });
+            } else if node.op_type == "Concat" && attribute.name == "axis" && attribute.value != 0 {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!("KV cache concat axis must be 0, got {}", attribute.value),
+                });
+            } else if node.op_type == "ReduceMean"
+                && attribute.name == "keepdims"
+                && attribute.value != 1
+            {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!(
+                        "RMSNorm reduction must keep dimensions, got {}",
+                        attribute.value
+                    ),
                 });
             }
         }
@@ -492,9 +579,24 @@ pub fn diagnose_unsupported_graph(
     }
     for initializer in &graph.initializer {
         let expected = match initializer.name.as_str() {
-            "tritium.packed" => Some(TENSOR_UINT8),
-            "tritium.scales" => Some(TENSOR_FLOAT),
-            "attention.scale" => Some(TENSOR_FLOAT),
+            name if name == "tritium.packed" || name.ends_with(".packed") => Some(TENSOR_UINT8),
+            name if name == "tritium.scales"
+                || name == "attention.scale"
+                || name.ends_with(".scales")
+                || name.ends_with(".weight")
+                || name.ends_with(".epsilon")
+                || name.ends_with(".attention_scale")
+                || name.ends_with(".attention_mask") =>
+            {
+                Some(TENSOR_FLOAT)
+            }
+            name if name.ends_with(".axes")
+                || name.ends_with(".shape")
+                || name.ends_with("_shape")
+                || name.ends_with(".gqa_repeats") =>
+            {
+                Some(TENSOR_INT64)
+            }
             _ => None,
         };
         let subject = format!("initializer {}", initializer.name);
@@ -527,6 +629,14 @@ pub fn diagnose_unsupported_graph(
                 tensor_elem_type(input),
                 TENSOR_FLOAT,
             ),
+            name if name.starts_with("past_k.") || name.starts_with("past_v.") => {
+                push_dtype_diagnostic(
+                    &mut diagnostics,
+                    subject,
+                    tensor_elem_type(input),
+                    TENSOR_FLOAT,
+                )
+            }
             _ => push_uncontracted_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
@@ -543,6 +653,14 @@ pub fn diagnose_unsupported_graph(
                 tensor_elem_type(output),
                 TENSOR_FLOAT,
             ),
+            name if name.starts_with("present_k.") || name.starts_with("present_v.") => {
+                push_dtype_diagnostic(
+                    &mut diagnostics,
+                    subject,
+                    tensor_elem_type(output),
+                    TENSOR_FLOAT,
+                )
+            }
             _ => push_uncontracted_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
@@ -586,7 +704,12 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
         }
         ("", "Transpose") => &["perm"],
         ("", "Softmax") => &["axis"],
-        ("", "MatMul" | "Mul" | "Add") => &[],
+        ("", "Concat") => &["axis"],
+        ("", "ReduceMean") => &["keepdims"],
+        (
+            "",
+            "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Reshape" | "Tile" | "Identity",
+        ) => &[],
         _ => &[],
     }
 }
@@ -617,9 +740,11 @@ fn node_supported(
             matches!(tritium_opset, Some(1 | 2))
         }
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => tritium_opset == Some(2),
-        ("", "Transpose" | "MatMul" | "Mul" | "Add" | "Softmax") => {
-            standard_opset == Some(ONNX_OPSET)
-        }
+        (
+            "",
+            "Transpose" | "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Reshape"
+            | "Tile" | "Identity" | "Concat" | "ReduceMean" | "Softmax",
+        ) => standard_opset == Some(ONNX_OPSET),
         _ => false,
     }
 }
@@ -727,6 +852,20 @@ pub fn encode_tied_embedding_head_v2(
         identity_metadata_v2(model.identity),
         "2",
     )
+}
+
+/// Encode a packed decoder-only causal LM as a deterministic ONNX model.
+///
+/// Packed embedding/projection initializers remain compressed and execute via
+/// `com.tritium` opset 1. RMSNorm, GQA expansion, causal attention, residuals,
+/// SwiGLU, cache concatenation, and cache outputs use standard ONNX opset 21.
+///
+/// # Errors
+/// [`OnnxModelError`] if model geometry, packed payloads, preserved vectors,
+/// cache sizes, epsilon, or artifact identity violate the causal-LM contract.
+pub fn encode_causal_lm(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
+    validate_causal_lm(&model)?;
+    encode_causal_lm_graph(model)
 }
 
 /// Encode a tied packed embedding/head graph with 64-byte-aligned initializers
@@ -1204,6 +1343,625 @@ fn encode_model(
     .encode_to_vec())
 }
 
+#[derive(Default)]
+struct CausalGraphBuilder {
+    nodes: Vec<NodeProto>,
+    initializers: Vec<TensorProto>,
+}
+
+impl CausalGraphBuilder {
+    fn standard(
+        &mut self,
+        name: impl Into<String>,
+        op_type: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        attribute: Vec<AttributeProto>,
+    ) {
+        self.nodes.push(NodeProto {
+            input: inputs.iter().map(|value| (*value).to_owned()).collect(),
+            output: outputs.iter().map(|value| (*value).to_owned()).collect(),
+            name: name.into(),
+            op_type: op_type.to_owned(),
+            attribute,
+            domain: String::new(),
+        });
+    }
+
+    fn add_f32(&mut self, name: &str, dimensions: Vec<i64>, values: &[f32]) {
+        self.initializers.push(inline_tensor(
+            name,
+            TENSOR_FLOAT,
+            dimensions,
+            scale_bytes(values),
+        ));
+    }
+
+    fn add_i64(&mut self, name: &str, dimensions: Vec<i64>, values: &[i64]) {
+        self.initializers.push(inline_tensor(
+            name,
+            TENSOR_INT64,
+            dimensions,
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        ));
+    }
+
+    fn add_matrix(&mut self, prefix: &str, matrix: PackedTernaryMatrix<'_>) {
+        self.initializers.push(inline_tensor(
+            &format!("{prefix}.packed"),
+            TENSOR_UINT8,
+            vec![i64::try_from(matrix.packed.len()).expect("validated packed byte count")],
+            matrix.packed.to_vec(),
+        ));
+        self.add_f32(
+            &format!("{prefix}.scales"),
+            vec![i64::try_from(matrix.rows).expect("validated matrix rows")],
+            matrix.scales,
+        );
+    }
+
+    fn projection(
+        &mut self,
+        name: &str,
+        input: &str,
+        output: &str,
+        matrix_prefix: &str,
+        matrix: PackedTernaryMatrix<'_>,
+    ) -> Result<(), OnnxModelError> {
+        self.add_matrix(matrix_prefix, matrix);
+        self.nodes.push(NodeProto {
+            input: vec![
+                input.to_owned(),
+                format!("{matrix_prefix}.packed"),
+                format!("{matrix_prefix}.scales"),
+            ],
+            output: vec![output.to_owned()],
+            name: name.to_owned(),
+            op_type: ONNX_OP_NAME.to_owned(),
+            attribute: attributes(
+                as_i64(matrix.columns, "matrix columns")?,
+                format_code(matrix.format)?,
+            ),
+            domain: ONNX_DOMAIN.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn rms_norm(&mut self, prefix: &str, input: &str, output: &str, weight: &[f32], epsilon: f32) {
+        let squared = format!("{prefix}.squared");
+        let mean = format!("{prefix}.mean");
+        let stabilized = format!("{prefix}.stabilized");
+        let root = format!("{prefix}.root");
+        let normalized = format!("{prefix}.normalized");
+        let axes = format!("{prefix}.axes");
+        let epsilon_name = format!("{prefix}.epsilon");
+        let weight_name = format!("{prefix}.weight");
+        self.add_i64(&axes, vec![1], &[-1]);
+        self.add_f32(&epsilon_name, Vec::new(), &[epsilon]);
+        self.add_f32(
+            &weight_name,
+            vec![i64::try_from(weight.len()).expect("validated norm width")],
+            weight,
+        );
+        self.standard(
+            format!("{prefix}.square"),
+            "Mul",
+            &[input, input],
+            &[&squared],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.reduce"),
+            "ReduceMean",
+            &[&squared, &axes],
+            &[&mean],
+            vec![int_attribute("keepdims", 1)],
+        );
+        self.standard(
+            format!("{prefix}.stabilize"),
+            "Add",
+            &[&mean, &epsilon_name],
+            &[&stabilized],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.sqrt"),
+            "Sqrt",
+            &[&stabilized],
+            &[&root],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.divide"),
+            "Div",
+            &[input, &root],
+            &[&normalized],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.scale"),
+            "Mul",
+            &[&normalized, &weight_name],
+            &[output],
+            Vec::new(),
+        );
+    }
+}
+
+fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
+    let tokens = as_i64(model.tokens, "token count")?;
+    let past_tokens = as_i64(model.past_tokens, "past token count")?;
+    let total_tokens = tokens
+        .checked_add(past_tokens)
+        .ok_or(OnnxModelError::ShapeOverflow("total token count"))?;
+    let total_tokens_usize = model
+        .tokens
+        .checked_add(model.past_tokens)
+        .ok_or(OnnxModelError::ShapeOverflow("total token count"))?;
+    let hidden = as_i64(model.embedding.columns, "hidden size")?;
+    let vocab = as_i64(model.embedding.rows, "vocabulary")?;
+    let n_head = as_i64(model.n_head, "attention head count")?;
+    let n_kv_head = as_i64(model.n_kv_head, "KV head count")?;
+    let head_dim = as_i64(model.head_dim, "head dimension")?;
+    let gqa_repeat = as_i64(model.n_head / model.n_kv_head, "GQA repeat")?;
+    let mut graph = CausalGraphBuilder::default();
+    graph.add_matrix("tok_embeddings", model.embedding);
+    graph.nodes.push(NodeProto {
+        input: strings(["tokens", "tok_embeddings.packed", "tok_embeddings.scales"]),
+        output: strings(["layer.0.input"]),
+        name: "tok_embeddings".to_owned(),
+        op_type: ONNX_EMBEDDING_OP_NAME.to_owned(),
+        attribute: attributes(hidden, format_code(model.embedding.format)?),
+        domain: ONNX_DOMAIN.to_owned(),
+    });
+    let mut hidden_name = "layer.0.input".to_owned();
+    let mut inputs = vec![tensor_value("tokens", TENSOR_INT64, &[tokens])];
+    let mut cache_outputs = Vec::with_capacity(model.layers.len() * 2);
+
+    for (index, layer) in model.layers.iter().copied().enumerate() {
+        let prefix = format!("layer.{index}");
+        let attention_input = format!("{prefix}.attention_input");
+        graph.rms_norm(
+            &format!("{prefix}.attention_norm"),
+            &hidden_name,
+            &attention_input,
+            layer.attention_norm,
+            model.rms_epsilon,
+        );
+        let query_flat = format!("{prefix}.query_flat");
+        let current_k_flat = format!("{prefix}.current_k_flat");
+        let current_v_flat = format!("{prefix}.current_v_flat");
+        graph.projection(
+            &format!("{prefix}.query"),
+            &attention_input,
+            &query_flat,
+            &format!("{prefix}.query"),
+            layer.query,
+        )?;
+        graph.projection(
+            &format!("{prefix}.key"),
+            &attention_input,
+            &current_k_flat,
+            &format!("{prefix}.key"),
+            layer.key,
+        )?;
+        graph.projection(
+            &format!("{prefix}.value"),
+            &attention_input,
+            &current_v_flat,
+            &format!("{prefix}.value"),
+            layer.value,
+        )?;
+        let query_shape = format!("{prefix}.query_shape");
+        let kv_shape = format!("{prefix}.kv_shape");
+        graph.add_i64(&query_shape, vec![3], &[tokens, n_head, head_dim]);
+        graph.add_i64(&kv_shape, vec![3], &[tokens, n_kv_head, head_dim]);
+        let query_tokens = format!("{prefix}.query_tokens");
+        let query = format!("{prefix}.query_heads");
+        let current_k = format!("{prefix}.current_k");
+        let current_v = format!("{prefix}.current_v");
+        graph.standard(
+            format!("{prefix}.query_reshape"),
+            "Reshape",
+            &[&query_flat, &query_shape],
+            &[&query_tokens],
+            Vec::new(),
+        );
+        graph.standard(
+            format!("{prefix}.query_transpose"),
+            "Transpose",
+            &[&query_tokens],
+            &[&query],
+            vec![ints_attribute("perm", &[1, 0, 2])],
+        );
+        graph.standard(
+            format!("{prefix}.key_reshape"),
+            "Reshape",
+            &[&current_k_flat, &kv_shape],
+            &[&current_k],
+            Vec::new(),
+        );
+        graph.standard(
+            format!("{prefix}.value_reshape"),
+            "Reshape",
+            &[&current_v_flat, &kv_shape],
+            &[&current_v],
+            Vec::new(),
+        );
+        let present_k = format!("present_k.{index}");
+        let present_v = format!("present_v.{index}");
+        if model.past_tokens == 0 {
+            graph.standard(
+                format!("{prefix}.key_identity"),
+                "Identity",
+                &[&current_k],
+                &[&present_k],
+                Vec::new(),
+            );
+            graph.standard(
+                format!("{prefix}.value_identity"),
+                "Identity",
+                &[&current_v],
+                &[&present_v],
+                Vec::new(),
+            );
+        } else {
+            let past_k = format!("past_k.{index}");
+            let past_v = format!("past_v.{index}");
+            inputs.push(tensor_value(
+                &past_k,
+                TENSOR_FLOAT,
+                &[past_tokens, n_kv_head, head_dim],
+            ));
+            inputs.push(tensor_value(
+                &past_v,
+                TENSOR_FLOAT,
+                &[past_tokens, n_kv_head, head_dim],
+            ));
+            graph.standard(
+                format!("{prefix}.key_concat"),
+                "Concat",
+                &[&past_k, &current_k],
+                &[&present_k],
+                vec![int_attribute("axis", 0)],
+            );
+            graph.standard(
+                format!("{prefix}.value_concat"),
+                "Concat",
+                &[&past_v, &current_v],
+                &[&present_v],
+                vec![int_attribute("axis", 0)],
+            );
+        }
+        cache_outputs.push(tensor_value(
+            &present_k,
+            TENSOR_FLOAT,
+            &[total_tokens, n_kv_head, head_dim],
+        ));
+        cache_outputs.push(tensor_value(
+            &present_v,
+            TENSOR_FLOAT,
+            &[total_tokens, n_kv_head, head_dim],
+        ));
+        let grouped_k_shape = format!("{prefix}.grouped_k_shape");
+        let grouped_v_shape = format!("{prefix}.grouped_v_shape");
+        let grouped_shape = [total_tokens, n_kv_head, 1, head_dim];
+        graph.add_i64(&grouped_k_shape, vec![4], &grouped_shape);
+        graph.add_i64(&grouped_v_shape, vec![4], &grouped_shape);
+        let grouped_k = format!("{prefix}.grouped_k");
+        let grouped_v = format!("{prefix}.grouped_v");
+        graph.standard(
+            format!("{prefix}.key_group_reshape"),
+            "Reshape",
+            &[&present_k, &grouped_k_shape],
+            &[&grouped_k],
+            Vec::new(),
+        );
+        graph.standard(
+            format!("{prefix}.value_group_reshape"),
+            "Reshape",
+            &[&present_v, &grouped_v_shape],
+            &[&grouped_v],
+            Vec::new(),
+        );
+        let repeats = format!("{prefix}.gqa_repeats");
+        graph.add_i64(&repeats, vec![4], &[1, 1, gqa_repeat, 1]);
+        let tiled_k = format!("{prefix}.tiled_k");
+        let tiled_v = format!("{prefix}.tiled_v");
+        graph.standard(
+            format!("{prefix}.key_gqa_tile"),
+            "Tile",
+            &[&grouped_k, &repeats],
+            &[&tiled_k],
+            Vec::new(),
+        );
+        graph.standard(
+            format!("{prefix}.value_gqa_tile"),
+            "Tile",
+            &[&grouped_v, &repeats],
+            &[&tiled_v],
+            Vec::new(),
+        );
+        let expanded_shape = format!("{prefix}.expanded_kv_shape");
+        graph.add_i64(&expanded_shape, vec![3], &[total_tokens, n_head, head_dim]);
+        let expanded_k = format!("{prefix}.expanded_k");
+        let expanded_v = format!("{prefix}.expanded_v");
+        graph.standard(
+            format!("{prefix}.key_gqa"),
+            "Reshape",
+            &[&tiled_k, &expanded_shape],
+            &[&expanded_k],
+            Vec::new(),
+        );
+        graph.standard(
+            format!("{prefix}.value_gqa"),
+            "Reshape",
+            &[&tiled_v, &expanded_shape],
+            &[&expanded_v],
+            Vec::new(),
+        );
+        let transposed_k = format!("{prefix}.transposed_k");
+        let transposed_v = format!("{prefix}.transposed_v");
+        graph.standard(
+            format!("{prefix}.key_transpose"),
+            "Transpose",
+            &[&expanded_k],
+            &[&transposed_k],
+            vec![ints_attribute("perm", &[1, 2, 0])],
+        );
+        graph.standard(
+            format!("{prefix}.value_transpose"),
+            "Transpose",
+            &[&expanded_v],
+            &[&transposed_v],
+            vec![ints_attribute("perm", &[1, 0, 2])],
+        );
+        let scores = format!("{prefix}.scores");
+        graph.standard(
+            format!("{prefix}.score_matmul"),
+            "MatMul",
+            &[&query, &transposed_k],
+            &[&scores],
+            Vec::new(),
+        );
+        let attention_scale = format!("{prefix}.attention_scale");
+        graph.add_f32(
+            &attention_scale,
+            Vec::new(),
+            &[1.0 / (model.head_dim as f32).sqrt()],
+        );
+        let scaled_scores = format!("{prefix}.scaled_scores");
+        graph.standard(
+            format!("{prefix}.score_scale"),
+            "Mul",
+            &[&scores, &attention_scale],
+            &[&scaled_scores],
+            Vec::new(),
+        );
+        let mask = format!("{prefix}.attention_mask");
+        let mask_elements =
+            model
+                .tokens
+                .checked_mul(total_tokens_usize)
+                .ok_or(OnnxModelError::ShapeOverflow(
+                    "attention mask element count",
+                ))?;
+        let mut mask_values = Vec::with_capacity(mask_elements);
+        for query_index in 0..model.tokens {
+            let last_visible = model.past_tokens + query_index;
+            for key_index in 0..total_tokens_usize {
+                mask_values.push(if key_index <= last_visible {
+                    0.0
+                } else {
+                    -1.0e9
+                });
+            }
+        }
+        graph.add_f32(&mask, vec![1, tokens, total_tokens], &mask_values);
+        let masked_scores = format!("{prefix}.masked_scores");
+        graph.standard(
+            format!("{prefix}.mask"),
+            "Add",
+            &[&scaled_scores, &mask],
+            &[&masked_scores],
+            Vec::new(),
+        );
+        let probabilities = format!("{prefix}.probabilities");
+        graph.standard(
+            format!("{prefix}.softmax"),
+            "Softmax",
+            &[&masked_scores],
+            &[&probabilities],
+            vec![int_attribute("axis", -1)],
+        );
+        let context_heads = format!("{prefix}.context_heads");
+        graph.standard(
+            format!("{prefix}.context_matmul"),
+            "MatMul",
+            &[&probabilities, &transposed_v],
+            &[&context_heads],
+            Vec::new(),
+        );
+        let context_tokens = format!("{prefix}.context_tokens");
+        graph.standard(
+            format!("{prefix}.context_transpose"),
+            "Transpose",
+            &[&context_heads],
+            &[&context_tokens],
+            vec![ints_attribute("perm", &[1, 0, 2])],
+        );
+        let hidden_shape = format!("{prefix}.hidden_shape");
+        graph.add_i64(&hidden_shape, vec![2], &[tokens, hidden]);
+        let context = format!("{prefix}.context");
+        graph.standard(
+            format!("{prefix}.context_reshape"),
+            "Reshape",
+            &[&context_tokens, &hidden_shape],
+            &[&context],
+            Vec::new(),
+        );
+        let attention_output = format!("{prefix}.attention_output");
+        graph.projection(
+            &format!("{prefix}.output"),
+            &context,
+            &attention_output,
+            &format!("{prefix}.attention_output"),
+            layer.attention_output,
+        )?;
+        let post_attention = format!("{prefix}.post_attention");
+        graph.standard(
+            format!("{prefix}.attention_residual"),
+            "Add",
+            &[&hidden_name, &attention_output],
+            &[&post_attention],
+            Vec::new(),
+        );
+        let ffn_input = format!("{prefix}.ffn_input");
+        graph.rms_norm(
+            &format!("{prefix}.ffn_norm"),
+            &post_attention,
+            &ffn_input,
+            layer.ffn_norm,
+            model.rms_epsilon,
+        );
+        let gate = format!("{prefix}.gate");
+        let up = format!("{prefix}.up");
+        graph.projection(
+            &format!("{prefix}.gate_projection"),
+            &ffn_input,
+            &gate,
+            &format!("{prefix}.gate"),
+            layer.gate,
+        )?;
+        graph.projection(
+            &format!("{prefix}.up_projection"),
+            &ffn_input,
+            &up,
+            &format!("{prefix}.up"),
+            layer.up,
+        )?;
+        let sigmoid = format!("{prefix}.gate_sigmoid");
+        graph.standard(
+            format!("{prefix}.sigmoid"),
+            "Sigmoid",
+            &[&gate],
+            &[&sigmoid],
+            Vec::new(),
+        );
+        let silu = format!("{prefix}.silu");
+        graph.standard(
+            format!("{prefix}.silu_mul"),
+            "Mul",
+            &[&gate, &sigmoid],
+            &[&silu],
+            Vec::new(),
+        );
+        let gated = format!("{prefix}.gated");
+        graph.standard(
+            format!("{prefix}.swiglu"),
+            "Mul",
+            &[&silu, &up],
+            &[&gated],
+            Vec::new(),
+        );
+        let ffn_output = format!("{prefix}.ffn_output");
+        graph.projection(
+            &format!("{prefix}.down_projection"),
+            &gated,
+            &ffn_output,
+            &format!("{prefix}.down"),
+            layer.down,
+        )?;
+        let layer_output = format!("layer.{}.input", index + 1);
+        graph.standard(
+            format!("{prefix}.ffn_residual"),
+            "Add",
+            &[&post_attention, &ffn_output],
+            &[&layer_output],
+            Vec::new(),
+        );
+        hidden_name = layer_output;
+    }
+    let final_hidden = "final_norm.output";
+    graph.rms_norm(
+        "final_norm",
+        &hidden_name,
+        final_hidden,
+        model.final_norm,
+        model.rms_epsilon,
+    );
+    graph.nodes.push(NodeProto {
+        input: strings([
+            final_hidden,
+            "tok_embeddings.packed",
+            "tok_embeddings.scales",
+        ]),
+        output: strings(["logits"]),
+        name: "lm_head".to_owned(),
+        op_type: ONNX_OP_NAME.to_owned(),
+        attribute: attributes(hidden, format_code(model.embedding.format)?),
+        domain: ONNX_DOMAIN.to_owned(),
+    });
+    let mut outputs = vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])];
+    outputs.extend(cache_outputs);
+    let metadata_props = vec![
+        metadata("tritium.schema_version", "2"),
+        metadata("tritium.graph_kind", "causal-lm"),
+        metadata("tritium.source_model_id", model.identity.source_model_id),
+        metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
+        metadata("tritium.recipe_id", model.identity.recipe_id),
+        metadata("tritium.build_id", model.identity.tritium_build_id),
+        metadata("tritium.package_id", model.identity.package_id),
+        metadata(
+            "tritium.coverage.converted_id",
+            model.identity.converted_coverage_id,
+        ),
+        metadata(
+            "tritium.coverage.deferred_id",
+            model.identity.deferred_coverage_id,
+        ),
+        metadata("tritium.tokens", &model.tokens.to_string()),
+        metadata("tritium.past_tokens", &model.past_tokens.to_string()),
+        metadata("tritium.layers", &model.layers.len().to_string()),
+        metadata("tritium.hidden", &model.embedding.columns.to_string()),
+        metadata("tritium.vocab", &model.embedding.rows.to_string()),
+        metadata("tritium.n_head", &model.n_head.to_string()),
+        metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
+        metadata("tritium.head_dim", &model.head_dim.to_string()),
+        metadata("tritium.tied_embedding_head", "true"),
+    ];
+    Ok(ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: ONNX_DOMAIN.to_owned(),
+        model_version: 2,
+        graph: Some(GraphProto {
+            node: graph.nodes,
+            name: "tritium.causal_lm".to_owned(),
+            initializer: graph.initializers,
+            input: inputs,
+            output: outputs,
+            value_info: Vec::new(),
+        }),
+        opset_import: vec![
+            OperatorSetIdProto {
+                domain: String::new(),
+                version: ONNX_OPSET,
+            },
+            OperatorSetIdProto {
+                domain: ONNX_DOMAIN.to_owned(),
+                version: TRITIUM_OPSET,
+            },
+        ],
+        metadata_props,
+    }
+    .encode_to_vec())
+}
+
 #[cfg(test)]
 pub(crate) fn encode_kv_attention_test_graph(
     query_tokens: usize,
@@ -1465,6 +2223,151 @@ fn validate(model: &TiedEmbeddingHeadModel<'_>) -> Result<(), OnnxModelError> {
     Ok(())
 }
 
+fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
+    if model.layers.is_empty() {
+        return Err(OnnxModelError::InvalidModel(
+            "causal LM requires at least one decoder layer".to_owned(),
+        ));
+    }
+    for (name, value) in [
+        ("token count", model.tokens),
+        ("attention head count", model.n_head),
+        ("KV head count", model.n_kv_head),
+        ("head dimension", model.head_dim),
+        ("vocabulary", model.embedding.rows),
+        ("hidden size", model.embedding.columns),
+    ] {
+        if value == 0 {
+            return Err(OnnxModelError::EmptyDimension(name));
+        }
+        as_i64(value, name)?;
+    }
+    as_i64(model.past_tokens, "past token count")?;
+    if !model.rms_epsilon.is_finite() || model.rms_epsilon <= 0.0 {
+        return Err(OnnxModelError::InvalidModel(
+            "RMSNorm epsilon must be finite and positive".to_owned(),
+        ));
+    }
+    if !model.n_head.is_multiple_of(model.n_kv_head) {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "n_head {} is not divisible by n_kv_head {}",
+            model.n_head, model.n_kv_head
+        )));
+    }
+    let hidden = model
+        .n_head
+        .checked_mul(model.head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("attention hidden size"))?;
+    if hidden != model.embedding.columns {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "n_head * head_dim is {hidden}, hidden size is {}",
+            model.embedding.columns
+        )));
+    }
+    validate_matrix("embedding", model.embedding)?;
+    validate_vector("final_norm", model.final_norm, hidden)?;
+    for (index, layer) in model.layers.iter().copied().enumerate() {
+        validate_vector(
+            &format!("layer.{index}.attention_norm"),
+            layer.attention_norm,
+            hidden,
+        )?;
+        validate_vector(&format!("layer.{index}.ffn_norm"), layer.ffn_norm, hidden)?;
+        let kv_width = model
+            .n_kv_head
+            .checked_mul(model.head_dim)
+            .ok_or(OnnxModelError::ShapeOverflow("KV projection width"))?;
+        validate_matrix_shape(&format!("layer.{index}.query"), layer.query, hidden, hidden)?;
+        validate_matrix_shape(&format!("layer.{index}.key"), layer.key, kv_width, hidden)?;
+        validate_matrix_shape(
+            &format!("layer.{index}.value"),
+            layer.value,
+            kv_width,
+            hidden,
+        )?;
+        validate_matrix_shape(
+            &format!("layer.{index}.attention_output"),
+            layer.attention_output,
+            hidden,
+            hidden,
+        )?;
+        if layer.gate.rows == 0 || layer.gate.rows != layer.up.rows {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "layer.{index} gate/up intermediate widths disagree"
+            )));
+        }
+        let intermediate = layer.gate.rows;
+        validate_matrix_shape(
+            &format!("layer.{index}.gate"),
+            layer.gate,
+            intermediate,
+            hidden,
+        )?;
+        validate_matrix_shape(&format!("layer.{index}.up"), layer.up, intermediate, hidden)?;
+        validate_matrix_shape(
+            &format!("layer.{index}.down"),
+            layer.down,
+            hidden,
+            intermediate,
+        )?;
+    }
+    validate_identity_v2(model.identity)
+}
+
+fn validate_matrix_shape(
+    name: &str,
+    matrix: PackedTernaryMatrix<'_>,
+    rows: usize,
+    columns: usize,
+) -> Result<(), OnnxModelError> {
+    if matrix.rows != rows || matrix.columns != columns {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{name} shape [{}, {}] must be [{rows}, {columns}]",
+            matrix.rows, matrix.columns
+        )));
+    }
+    validate_matrix(name, matrix)
+}
+
+fn validate_matrix(name: &str, matrix: PackedTernaryMatrix<'_>) -> Result<(), OnnxModelError> {
+    if matrix.rows == 0 || matrix.columns == 0 {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{name} matrix dimensions must be nonzero"
+        )));
+    }
+    validate(&TiedEmbeddingHeadModel {
+        tokens: 1,
+        vocab: matrix.rows,
+        hidden: matrix.columns,
+        packed: matrix.packed,
+        scales: matrix.scales,
+        format: matrix.format,
+        source_model_id: "matrix-validation",
+        recipe_id: "matrix-validation",
+        package_id: "matrix-validation",
+    })
+    .map_err(|error| OnnxModelError::InvalidModel(format!("{name}: {error}")))
+}
+
+fn validate_vector(name: &str, values: &[f32], expected: usize) -> Result<(), OnnxModelError> {
+    if values.len() != expected {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{name} has {} elements, expected {expected}",
+            values.len()
+        )));
+    }
+    if let Some((index, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{name}[{index}] must be finite"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_v2(model: &TiedEmbeddingHeadModelV2<'_>) -> Result<(), OnnxModelError> {
     validate(&model.legacy())?;
     validate_identity_v2(model.identity)
@@ -1579,6 +2482,15 @@ fn int_attribute(name: &str, value: i64) -> AttributeProto {
         value,
         kind: ATTRIBUTE_INT,
         ints: Vec::new(),
+    }
+}
+
+fn ints_attribute(name: &str, values: &[i64]) -> AttributeProto {
+    AttributeProto {
+        name: name.to_owned(),
+        value: 0,
+        kind: ATTRIBUTE_INTS,
+        ints: values.to_vec(),
     }
 }
 

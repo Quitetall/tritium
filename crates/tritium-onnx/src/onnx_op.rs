@@ -531,6 +531,22 @@ mod tests {
         packed
     }
 
+    fn packed_matrix<'a>(
+        rows: usize,
+        columns: usize,
+        packed: &'a [u8],
+        scales: &'a [f32],
+        format: TernaryFormat,
+    ) -> crate::PackedTernaryMatrix<'a> {
+        crate::PackedTernaryMatrix {
+            rows,
+            columns,
+            packed,
+            scales,
+            format,
+        }
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -892,5 +908,305 @@ mod tests {
         let outputs = session.run(ort::inputs![&tokens_t]).unwrap();
         let (_, got) = outputs[0].try_extract_tensor::<f32>().unwrap();
         assert_eq!(got, expected.as_slice(), "external-data graph bit-exact");
+    }
+
+    fn dense_project(input: &[f32], rows: &[Vec<f32>]) -> Vec<f32> {
+        let columns = rows[0].len();
+        input
+            .chunks_exact(columns)
+            .flat_map(|x| {
+                rows.iter()
+                    .map(move |w| x.iter().zip(w).map(|(x, w)| x * w).sum::<f32>())
+            })
+            .collect()
+    }
+
+    fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {
+        let width = weight.len();
+        input
+            .chunks_exact(width)
+            .flat_map(|row| {
+                let denominator =
+                    (row.iter().map(|value| value * value).sum::<f32>() / width as f32 + epsilon)
+                        .sqrt();
+                row.iter()
+                    .zip(weight)
+                    .map(move |(value, weight)| value * weight / denominator)
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reference_causal_lm(
+        tokens: &[i64],
+        past_k: &[f32],
+        past_v: &[f32],
+        embedding: &[Vec<f32>],
+        q: &[Vec<f32>],
+        k: &[Vec<f32>],
+        v: &[Vec<f32>],
+        o: &[Vec<f32>],
+        gate: &[Vec<f32>],
+        up: &[Vec<f32>],
+        down: &[Vec<f32>],
+        attention_norm: &[f32],
+        ffn_norm: &[f32],
+        final_norm: &[f32],
+        epsilon: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let hidden: Vec<f32> = tokens
+            .iter()
+            .flat_map(|&token| embedding[usize::try_from(token).unwrap()].iter().copied())
+            .collect();
+        let attention_input = rms_norm(&hidden, attention_norm, epsilon);
+        let query = dense_project(&attention_input, q);
+        let current_k = dense_project(&attention_input, k);
+        let current_v = dense_project(&attention_input, v);
+        let present_k = [past_k, &current_k].concat();
+        let present_v = [past_v, &current_v].concat();
+        let context = kv_attention_kernel(
+            &query,
+            &present_k,
+            &present_v,
+            tokens.len(),
+            4,
+            2,
+            1,
+            past_k.len() / 2,
+        )
+        .unwrap();
+        let attention_output = dense_project(&context, o);
+        let post_attention: Vec<f32> = hidden
+            .iter()
+            .zip(attention_output)
+            .map(|(residual, update)| residual + update)
+            .collect();
+        let ffn_input = rms_norm(&post_attention, ffn_norm, epsilon);
+        let gate_values = dense_project(&ffn_input, gate);
+        let up_values = dense_project(&ffn_input, up);
+        let activated: Vec<f32> = gate_values
+            .into_iter()
+            .zip(up_values)
+            .map(|(gate, up)| gate * (1.0 / (1.0 + (-gate).exp())) * up)
+            .collect();
+        let ffn_output = dense_project(&activated, down);
+        let post_ffn: Vec<f32> = post_attention
+            .iter()
+            .zip(ffn_output)
+            .map(|(residual, update)| residual + update)
+            .collect();
+        let final_hidden = rms_norm(&post_ffn, final_norm, epsilon);
+        let logits = dense_project(&final_hidden, embedding);
+        (logits, present_k, present_v)
+    }
+
+    #[test]
+    fn end_to_end_packed_causal_lm_runs_prompt_and_cached_decode() {
+        use ort::value::Tensor;
+
+        let format = TernaryFormat::Tq2_0;
+        let dense_embedding = vec![
+            vec![1.0, 0.0, 1.0, 0.0],
+            vec![0.0, 1.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0, -1.0],
+        ];
+        let dense_q = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let dense_k = vec![vec![1.0, 0.0, 1.0, 0.0], vec![0.0, 1.0, 0.0, 1.0]];
+        let dense_v = vec![vec![1.0, -1.0, 0.0, 0.0], vec![0.0, 0.0, 1.0, -1.0]];
+        let dense_o = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let dense_gate = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, -1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, -1.0],
+        ];
+        let dense_up = vec![
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        let dense_down = vec![
+            vec![1.0, 1.0, 0.0, 0.0],
+            vec![-1.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, -1.0, 1.0],
+        ];
+        let trits = |rows: &[Vec<f32>]| {
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|&value| Trit::from_i8(value as i8).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let embedding_packed = pack_rows(&trits(&dense_embedding), format);
+        let q_packed = pack_rows(&trits(&dense_q), format);
+        let k_packed = pack_rows(&trits(&dense_k), format);
+        let v_packed = pack_rows(&trits(&dense_v), format);
+        let o_packed = pack_rows(&trits(&dense_o), format);
+        let gate_packed = pack_rows(&trits(&dense_gate), format);
+        let up_packed = pack_rows(&trits(&dense_up), format);
+        let down_packed = pack_rows(&trits(&dense_down), format);
+        let embedding_scales = [1.0; 3];
+        let four_scales = [1.0; 4];
+        let two_scales = [1.0; 2];
+        let attention_norm = [1.0, 0.75, 1.25, 0.5];
+        let ffn_norm = [0.5, 1.25, 0.8, 1.5];
+        let final_norm = [1.5, 0.8, 0.6, 1.2];
+        let epsilon = 1.0e-5;
+        let layer = crate::CausalLmDecoderLayer {
+            attention_norm: &attention_norm,
+            query: packed_matrix(4, 4, &q_packed, &four_scales, format),
+            key: packed_matrix(2, 4, &k_packed, &two_scales, format),
+            value: packed_matrix(2, 4, &v_packed, &two_scales, format),
+            attention_output: packed_matrix(4, 4, &o_packed, &four_scales, format),
+            ffn_norm: &ffn_norm,
+            gate: packed_matrix(4, 4, &gate_packed, &four_scales, format),
+            up: packed_matrix(4, 4, &up_packed, &four_scales, format),
+            down: packed_matrix(4, 4, &down_packed, &four_scales, format),
+        };
+        let identity = crate::OnnxArtifactIdentityV2 {
+            source_model_id: "tiny-source@revision",
+            tokenizer_id: "tiny-tokenizer@revision",
+            recipe_id: "tiny-recipe",
+            tritium_build_id: "tiny-build",
+            package_id: "tiny-package",
+            converted_coverage_id: "tiny-converted",
+            deferred_coverage_id: "tiny-deferred",
+        };
+        let embedding = packed_matrix(3, 4, &embedding_packed, &embedding_scales, format);
+        let encode = |tokens, past_tokens| {
+            crate::encode_causal_lm(crate::CausalLmModel {
+                tokens,
+                past_tokens,
+                n_head: 4,
+                n_kv_head: 2,
+                head_dim: 1,
+                rms_epsilon: epsilon,
+                embedding,
+                layers: std::slice::from_ref(&layer),
+                final_norm: &final_norm,
+                identity,
+            })
+            .unwrap()
+        };
+
+        let prompt_tokens = vec![0_i64, 1];
+        let (expected_logits, expected_k, expected_v) = reference_causal_lm(
+            &prompt_tokens,
+            &[],
+            &[],
+            &dense_embedding,
+            &dense_q,
+            &dense_k,
+            &dense_v,
+            &dense_o,
+            &dense_gate,
+            &dense_up,
+            &dense_down,
+            &attention_norm,
+            &ffn_norm,
+            &final_norm,
+            epsilon,
+        );
+        let prompt_model = encode(2, 0);
+        assert_eq!(prompt_model, encode(2, 0));
+        let diagnostics = crate::diagnose_unsupported_graph(&prompt_model).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut prompt = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&prompt_model)
+            .unwrap();
+        let prompt_tensor = Tensor::from_array(([2], prompt_tokens.into_boxed_slice())).unwrap();
+        let outputs = prompt.run(ort::inputs![&prompt_tensor]).unwrap();
+        let (_, logits) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        let (_, present_k) = outputs[1].try_extract_tensor::<f32>().unwrap();
+        let (_, present_v) = outputs[2].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(logits, &expected_logits, 2.0e-5);
+        assert_eq!(
+            greedy_last_token(logits, 3),
+            greedy_last_token(&expected_logits, 3)
+        );
+        assert_f32_close(present_k, &expected_k, 2.0e-5);
+        assert_f32_close(present_v, &expected_v, 2.0e-5);
+
+        let decode_tokens = vec![2_i64];
+        let (expected_logits, expected_k, expected_v) = reference_causal_lm(
+            &decode_tokens,
+            &expected_k,
+            &expected_v,
+            &dense_embedding,
+            &dense_q,
+            &dense_k,
+            &dense_v,
+            &dense_o,
+            &dense_gate,
+            &dense_up,
+            &dense_down,
+            &attention_norm,
+            &ffn_norm,
+            &final_norm,
+            epsilon,
+        );
+        let decode_model = encode(1, 2);
+        let diagnostics = crate::diagnose_unsupported_graph(&decode_model).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut decode = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&decode_model)
+            .unwrap();
+        let tokens_tensor = Tensor::from_array(([1], decode_tokens.into_boxed_slice())).unwrap();
+        let k_tensor =
+            Tensor::from_array(([2, 2, 1], present_k.to_vec().into_boxed_slice())).unwrap();
+        let v_tensor =
+            Tensor::from_array(([2, 2, 1], present_v.to_vec().into_boxed_slice())).unwrap();
+        let outputs = decode
+            .run(ort::inputs![&tokens_tensor, &k_tensor, &v_tensor])
+            .unwrap();
+        let (_, logits) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        let (_, present_k) = outputs[1].try_extract_tensor::<f32>().unwrap();
+        let (_, present_v) = outputs[2].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(logits, &expected_logits, 2.0e-5);
+        assert_eq!(
+            greedy_last_token(logits, 3),
+            greedy_last_token(&expected_logits, 3)
+        );
+        assert_f32_close(present_k, &expected_k, 2.0e-5);
+        assert_f32_close(present_v, &expected_v, 2.0e-5);
+    }
+
+    fn assert_f32_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "value {index}: {actual} != {expected} within {tolerance}"
+            );
+        }
+    }
+
+    fn greedy_last_token(logits: &[f32], vocabulary: usize) -> usize {
+        logits[logits.len() - vocabulary..]
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .unwrap()
+            .0
     }
 }
