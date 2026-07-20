@@ -58,7 +58,12 @@ open. Cache-aware causal GQA now has a dependency-free semantic oracle plus an
 experimental `com.tritium` opset-2 `TritiumKvAttention` proof; real ORT sessions
 execute both prompt attention and one-token continuation over supplied K/V
 cache. This does not alter frozen opset 1 or replace required standard-ONNX v1.1
-attention glue. Packed Q/K/V/O projection, cache production/update and complete
+attention glue. A second real-ORT proof now executes the same prompt and cached
+decode path using only standard opset-21 `Transpose`, `MatMul`, `Mul`, `Add` and
+`Softmax` nodes, an explicit additive causal mask and complete supplied K/V
+cache. Its inspector contract rejects noncanonical opsets, attribute kinds,
+rank-three permutations and softmax axes. Packed Q/K/V/O projection, cache
+production/update, GQA expansion in the standard graph and complete
 decoder-block serialization remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator

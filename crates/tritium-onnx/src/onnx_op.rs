@@ -666,6 +666,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn end_to_end_standard_onnx_attention_runs_prompt_and_cached_decode() {
+        use ort::value::Tensor;
+
+        for (query_tokens, past_tokens, head_dim, q, k, v, mask) in [
+            (
+                2usize,
+                0usize,
+                2usize,
+                vec![1.0_f32, 0.0, 0.0, 2.0],
+                vec![1.0_f32, 0.0, 0.0, 1.0],
+                vec![10.0_f32, 1.0, 20.0, 4.0],
+                vec![0.0_f32, -1.0e9, 0.0, 0.0],
+            ),
+            (
+                1usize,
+                2usize,
+                2usize,
+                vec![1.0_f32, 1.0],
+                vec![1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0],
+                vec![10.0_f32, 1.0, 20.0, 4.0, 40.0, 8.0],
+                vec![0.0_f32; 3],
+            ),
+        ] {
+            let expected =
+                kv_attention_kernel(&q, &k, &v, query_tokens, 1, 1, head_dim, past_tokens).unwrap();
+            let model = crate::model::encode_standard_attention_test_graph(
+                query_tokens,
+                past_tokens + query_tokens,
+                head_dim,
+            );
+            let mut session = ort::session::Session::builder()
+                .unwrap()
+                .commit_from_memory(&model)
+                .unwrap();
+            let total_tokens = past_tokens + query_tokens;
+            let q_tensor =
+                Tensor::from_array(([query_tokens, 1, head_dim], q.into_boxed_slice())).unwrap();
+            let k_tensor =
+                Tensor::from_array(([total_tokens, 1, head_dim], k.into_boxed_slice())).unwrap();
+            let v_tensor =
+                Tensor::from_array(([total_tokens, 1, head_dim], v.into_boxed_slice())).unwrap();
+            let mask_tensor =
+                Tensor::from_array(([query_tokens, 1, total_tokens], mask.into_boxed_slice()))
+                    .unwrap();
+            let outputs = session
+                .run(ort::inputs![&q_tensor, &k_tensor, &v_tensor, &mask_tensor])
+                .unwrap();
+            let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (&actual, &expected) in actual.iter().zip(&expected) {
+                assert!((actual - expected).abs() < 1e-5);
+            }
+        }
+    }
+
     /// The kernel's operand path (`TritiumTernaryMpGemmKernel::run`) reproduces
     /// the frozen conformance set bit-exactly — it routes through the same
     /// Layer-1 `ternary_mpgemm_kernel`. This exercises the Layer-2 plumbing

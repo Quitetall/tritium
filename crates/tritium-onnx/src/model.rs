@@ -21,6 +21,7 @@ const TENSOR_FLOAT: i32 = 1;
 const TENSOR_UINT8: i32 = 2;
 const TENSOR_INT64: i32 = 7;
 const ATTRIBUTE_INT: i32 = 2;
+const ATTRIBUTE_INTS: i32 = 7;
 const EXTERNAL_DATA: i32 = 1;
 const EXTERNAL_WEIGHTS_FILE: &str = "weights.bin";
 const EXTERNAL_ALIGNMENT: usize = 64;
@@ -312,10 +313,20 @@ pub fn diagnose_unsupported_graph(
             "duplicate opset import for domain {ONNX_DOMAIN}"
         )));
     }
+    let mut standard_opsets = protobuf
+        .opset_import
+        .iter()
+        .filter(|opset| opset.domain.is_empty());
+    let standard_opset = standard_opsets.next().map(|opset| opset.version);
+    if standard_opsets.next().is_some() {
+        return Err(OnnxModelError::InvalidModel(
+            "duplicate opset import for standard ONNX domain".to_owned(),
+        ));
+    }
     let mut diagnostics = Vec::new();
 
     for node in &graph.node {
-        let supported = node_supported(node, tritium_opset);
+        let supported = node_supported(node, tritium_opset, standard_opset);
         if !supported {
             let reason = if node.domain == ONNX_DOMAIN
                 && node.op_type == ONNX_KV_ATTENTION_OP_NAME
@@ -330,6 +341,12 @@ pub fn diagnose_unsupported_graph(
                 format!(
                     "unsupported {ONNX_DOMAIN} opset {}",
                     tritium_opset
+                        .map_or_else(|| "missing".to_owned(), |version| version.to_string())
+                )
+            } else if node.domain.is_empty() && standard_opset != Some(ONNX_OPSET) {
+                format!(
+                    "unsupported standard ONNX opset {}",
+                    standard_opset
                         .map_or_else(|| "missing".to_owned(), |version| version.to_string())
                 )
             } else {
@@ -349,20 +366,19 @@ pub fn diagnose_unsupported_graph(
                 diagnostic_subject(&node.name, "<unnamed node>"),
                 diagnostic_subject(&attribute.name, "<unnamed attribute>")
             );
-            if node.domain != ONNX_DOMAIN
-                || !supported_attributes(&node.op_type).contains(&attribute.name.as_str())
-            {
+            if !supported_attributes(node).contains(&attribute.name.as_str()) {
                 diagnostics.push(UnsupportedGraphDiagnostic {
                     kind: UnsupportedGraphItemKind::Attribute,
                     subject,
                     reason: "unsupported attribute".to_owned(),
                 });
-            } else if attribute.kind != ATTRIBUTE_INT {
+            } else if attribute.kind != expected_attribute_kind(&attribute.name) {
+                let expected = expected_attribute_kind(&attribute.name);
                 diagnostics.push(UnsupportedGraphDiagnostic {
                     kind: UnsupportedGraphItemKind::Attribute,
                     subject,
                     reason: format!(
-                        "expected ONNX attribute type {ATTRIBUTE_INT}, got {}",
+                        "expected ONNX attribute type {expected}, got {}",
                         attribute.kind
                     ),
                 });
@@ -397,11 +413,26 @@ pub fn diagnose_unsupported_graph(
                     subject,
                     reason: format!("past_tokens must be nonnegative, got {}", attribute.value),
                 });
+            } else if attribute.name == "perm" && !valid_rank_three_permutation(&attribute.ints) {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!(
+                        "expected a rank-3 permutation of [0, 1, 2], got {:?}",
+                        attribute.ints
+                    ),
+                });
+            } else if attribute.name == "axis" && attribute.value != -1 {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!("attention softmax axis must be -1, got {}", attribute.value),
+                });
             }
         }
-        let supported = node_supported(node, tritium_opset);
+        let supported = node_supported(node, tritium_opset, standard_opset);
         if supported {
-            for &required in supported_attributes(&node.op_type) {
+            for &required in supported_attributes(node) {
                 let count = node
                     .attribute
                     .iter()
@@ -463,6 +494,7 @@ pub fn diagnose_unsupported_graph(
         let expected = match initializer.name.as_str() {
             "tritium.packed" => Some(TENSOR_UINT8),
             "tritium.scales" => Some(TENSOR_FLOAT),
+            "attention.scale" => Some(TENSOR_FLOAT),
             _ => None,
         };
         let subject = format!("initializer {}", initializer.name);
@@ -489,7 +521,7 @@ pub fn diagnose_unsupported_graph(
                 tensor_elem_type(input),
                 TENSOR_INT64,
             ),
-            "q" | "k_cache" | "v_cache" => push_dtype_diagnostic(
+            "q" | "k_cache" | "v_cache" | "attention_mask" => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
                 tensor_elem_type(input),
@@ -546,23 +578,48 @@ pub fn diagnose_unsupported_graph(
     Ok(diagnostics)
 }
 
-fn supported_attributes(op_type: &str) -> &'static [&'static str] {
-    match op_type {
-        ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME => &[ATTR_K, ATTR_FORMAT],
-        ONNX_KV_ATTENTION_OP_NAME => {
+fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
+    match (node.domain.as_str(), node.op_type.as_str()) {
+        (ONNX_DOMAIN, ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME) => &[ATTR_K, ATTR_FORMAT],
+        (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => {
             &[ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_HEAD_DIM, ATTR_PAST_TOKENS]
         }
+        ("", "Transpose") => &["perm"],
+        ("", "Softmax") => &["axis"],
+        ("", "MatMul" | "Mul" | "Add") => &[],
         _ => &[],
     }
 }
 
-fn node_supported(node: &NodeProto, tritium_opset: Option<i64>) -> bool {
-    if node.domain != ONNX_DOMAIN {
-        return false;
+fn expected_attribute_kind(name: &str) -> i32 {
+    if name == "perm" {
+        ATTRIBUTE_INTS
+    } else {
+        ATTRIBUTE_INT
     }
-    match node.op_type.as_str() {
-        ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME => matches!(tritium_opset, Some(1 | 2)),
-        ONNX_KV_ATTENTION_OP_NAME => tritium_opset == Some(2),
+}
+
+fn valid_rank_three_permutation(values: &[i64]) -> bool {
+    values.len() == 3 && values.iter().all(|axis| (0..3).contains(axis)) && {
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        sorted == [0, 1, 2]
+    }
+}
+
+fn node_supported(
+    node: &NodeProto,
+    tritium_opset: Option<i64>,
+    standard_opset: Option<i64>,
+) -> bool {
+    match (node.domain.as_str(), node.op_type.as_str()) {
+        (ONNX_DOMAIN, ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME) => {
+            matches!(tritium_opset, Some(1 | 2))
+        }
+        (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => tritium_opset == Some(2),
+        ("", "Transpose" | "MatMul" | "Mul" | "Add" | "Softmax") => {
+            standard_opset == Some(ONNX_OPSET)
+        }
         _ => false,
     }
 }
@@ -1172,21 +1229,25 @@ pub(crate) fn encode_kv_attention_test_graph(
                     name: crate::ATTR_N_HEAD.to_owned(),
                     value: n_head,
                     kind: ATTRIBUTE_INT,
+                    ints: Vec::new(),
                 },
                 AttributeProto {
                     name: crate::ATTR_N_KV_HEAD.to_owned(),
                     value: n_kv_head,
                     kind: ATTRIBUTE_INT,
+                    ints: Vec::new(),
                 },
                 AttributeProto {
                     name: crate::ATTR_HEAD_DIM.to_owned(),
                     value: head_dim,
                     kind: ATTRIBUTE_INT,
+                    ints: Vec::new(),
                 },
                 AttributeProto {
                     name: crate::ATTR_PAST_TOKENS.to_owned(),
                     value: past_tokens,
                     kind: ATTRIBUTE_INT,
+                    ints: Vec::new(),
                 },
             ],
             domain: ONNX_DOMAIN.to_owned(),
@@ -1223,6 +1284,121 @@ pub(crate) fn encode_kv_attention_test_graph(
         opset_import: vec![OperatorSetIdProto {
             domain: ONNX_DOMAIN.to_owned(),
             version: 2,
+        }],
+        metadata_props: Vec::new(),
+    }
+    .encode_to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn encode_standard_attention_test_graph(
+    query_tokens: usize,
+    total_tokens: usize,
+    head_dim: usize,
+) -> Vec<u8> {
+    let query_tokens = i64::try_from(query_tokens).unwrap();
+    let total_tokens = i64::try_from(total_tokens).unwrap();
+    let head_dim_i64 = i64::try_from(head_dim).unwrap();
+    let transpose = |name: &str, input: &str, output: &str, permutation: &[i64]| NodeProto {
+        input: strings([input]),
+        output: strings([output]),
+        name: name.to_owned(),
+        op_type: "Transpose".to_owned(),
+        attribute: vec![AttributeProto {
+            name: "perm".to_owned(),
+            value: 0,
+            kind: ATTRIBUTE_INTS,
+            ints: permutation.to_vec(),
+        }],
+        domain: String::new(),
+    };
+    let binary = |name: &str, op_type: &str, left: &str, right: &str, output: &str| NodeProto {
+        input: strings([left, right]),
+        output: strings([output]),
+        name: name.to_owned(),
+        op_type: op_type.to_owned(),
+        attribute: Vec::new(),
+        domain: String::new(),
+    };
+    let graph = GraphProto {
+        node: vec![
+            transpose(
+                "attention.k_transpose",
+                "k_cache",
+                "k_transposed",
+                &[1, 2, 0],
+            ),
+            transpose(
+                "attention.v_transpose",
+                "v_cache",
+                "v_transposed",
+                &[1, 0, 2],
+            ),
+            binary("attention.scores", "MatMul", "q", "k_transposed", "scores"),
+            binary(
+                "attention.scale",
+                "Mul",
+                "scores",
+                "attention.scale",
+                "scaled",
+            ),
+            binary(
+                "attention.mask",
+                "Add",
+                "scaled",
+                "attention_mask",
+                "masked",
+            ),
+            NodeProto {
+                input: strings(["masked"]),
+                output: strings(["probabilities"]),
+                name: "attention.softmax".to_owned(),
+                op_type: "Softmax".to_owned(),
+                attribute: vec![int_attribute("axis", -1)],
+                domain: String::new(),
+            },
+            binary(
+                "attention.context",
+                "MatMul",
+                "probabilities",
+                "v_transposed",
+                "context",
+            ),
+        ],
+        name: "tritium.standard_attention.test".to_owned(),
+        initializer: vec![inline_tensor(
+            "attention.scale",
+            TENSOR_FLOAT,
+            Vec::new(),
+            (1.0_f32 / (head_dim as f32).sqrt()).to_le_bytes().to_vec(),
+        )],
+        input: vec![
+            tensor_value("q", TENSOR_FLOAT, &[query_tokens, 1, head_dim_i64]),
+            tensor_value("k_cache", TENSOR_FLOAT, &[total_tokens, 1, head_dim_i64]),
+            tensor_value("v_cache", TENSOR_FLOAT, &[total_tokens, 1, head_dim_i64]),
+            tensor_value(
+                "attention_mask",
+                TENSOR_FLOAT,
+                &[query_tokens, 1, total_tokens],
+            ),
+        ],
+        output: vec![tensor_value(
+            "context",
+            TENSOR_FLOAT,
+            &[query_tokens, 1, head_dim_i64],
+        )],
+        value_info: Vec::new(),
+    };
+    ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx-test".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: String::new(),
+        model_version: 1,
+        graph: Some(graph),
+        opset_import: vec![OperatorSetIdProto {
+            domain: String::new(),
+            version: ONNX_OPSET,
         }],
         metadata_props: Vec::new(),
     }
@@ -1402,6 +1578,7 @@ fn int_attribute(name: &str, value: i64) -> AttributeProto {
         name: name.to_owned(),
         value,
         kind: ATTRIBUTE_INT,
+        ints: Vec::new(),
     }
 }
 
@@ -1529,6 +1706,8 @@ struct AttributeProto {
     value: i64,
     #[prost(int32, tag = "20")]
     kind: i32,
+    #[prost(int64, repeated, packed = "true", tag = "8")]
+    ints: Vec<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1849,6 +2028,7 @@ mod tests {
             name: "axis".to_owned(),
             value: 0,
             kind: ATTRIBUTE_INT,
+            ints: Vec::new(),
         });
         graph.initializer[0].data_type = TENSOR_INT64;
         protobuf.metadata_props.push(metadata(
@@ -2074,6 +2254,43 @@ mod tests {
     fn supported_kv_attention_graph_has_no_unsupported_diagnostics() {
         let encoded = encode_kv_attention_test_graph(1, 2, 2, 1, 4);
         assert!(diagnose_unsupported_graph(&encoded).unwrap().is_empty());
+    }
+
+    #[test]
+    fn supported_standard_attention_graph_has_no_unsupported_diagnostics() {
+        let encoded = encode_standard_attention_test_graph(2, 2, 1);
+        assert!(diagnose_unsupported_graph(&encoded).unwrap().is_empty());
+    }
+
+    #[test]
+    fn standard_attention_diagnostics_reject_invalid_permutation_and_softmax_axis() {
+        let encoded = encode_standard_attention_test_graph(2, 2, 1);
+        let mut protobuf = ModelProto::decode(encoded.as_slice()).unwrap();
+        let graph = protobuf.graph.as_mut().unwrap();
+        graph.node[0].attribute[0].ints = vec![0, 0, 2];
+        graph
+            .node
+            .iter_mut()
+            .find(|node| node.op_type == "Softmax")
+            .unwrap()
+            .attribute[0]
+            .value = 0;
+
+        assert_eq!(
+            diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap(),
+            vec![
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "attention.k_transpose.perm".to_owned(),
+                    reason: "expected a rank-3 permutation of [0, 1, 2], got [0, 0, 2]".to_owned(),
+                },
+                UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject: "attention.softmax.axis".to_owned(),
+                    reason: "attention softmax axis must be -1, got 0".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]
