@@ -109,6 +109,39 @@ struct SoftmaxXentParams {
     padding_3: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+/// Validated grouped-convolution geometry for one native dispatch.
+pub(crate) struct ConvParams {
+    pub(crate) batch: u32,
+    pub(crate) c_in: u32,
+    pub(crate) c_out: u32,
+    pub(crate) input_h: u32,
+    pub(crate) input_w: u32,
+    pub(crate) kernel_h: u32,
+    pub(crate) kernel_w: u32,
+    pub(crate) stride_h: u32,
+    pub(crate) stride_w: u32,
+    pub(crate) dilation_h: u32,
+    pub(crate) dilation_w: u32,
+    pub(crate) pad_top: u32,
+    pub(crate) pad_left: u32,
+    pub(crate) groups: u32,
+    pub(crate) output_h: u32,
+    pub(crate) output_w: u32,
+    pub(crate) execution: u32,
+    pub(crate) pad_bottom: u32,
+    pub(crate) pad_right: u32,
+    pub(crate) padding: u32,
+}
+
+/// Host-visible grouped-convolution outputs.
+pub(crate) struct ConvOutput {
+    pub(crate) result: Vec<f32>,
+    pub(crate) grad_weight: Vec<f32>,
+    pub(crate) grad_scale: Vec<f32>,
+}
+
 impl FsqParams {
     /// Build packed FSQ shader parameters after adapter validation.
     pub(crate) fn new(
@@ -1914,6 +1947,237 @@ impl WgpuBackend {
         parameter_staging.unmap();
         momentum_staging.unmap();
         Ok((parameter, momentum))
+    }
+
+    /// Execute grouped Conv1d/Conv2d forward or VJP on device.
+    pub(crate) fn convolution(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        scale: &[f32],
+        grad_output: &[f32],
+        params: ConvParams,
+    ) -> Result<ConvOutput, BackendError> {
+        let backward = params.execution != 0;
+        let result_len = if backward {
+            params.batch as usize
+                * params.c_in as usize
+                * params.input_h as usize
+                * params.input_w as usize
+        } else {
+            params.batch as usize
+                * params.c_out as usize
+                * params.output_h as usize
+                * params.output_w as usize
+        };
+        let weight_len = weight.len();
+        let scale_len = scale.len();
+        let storage = wgpu::BufferUsages::STORAGE;
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-conv-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let input = |label, values: &[f32]| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(values),
+                    usage: storage,
+                })
+        };
+        let x_buf = input("portable-conv-x", x);
+        let weight_buf = input("portable-conv-weight", weight);
+        let scale_buf = input("portable-conv-scale", scale);
+        let grad_output_buf = input("portable-conv-grad-output", grad_output);
+        let output = |label, len: usize| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (len.max(1) * core::mem::size_of::<f32>()) as u64,
+                usage: storage | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let result = output("portable-conv-result", result_len);
+        let grad_weight = output("portable-conv-grad-weight", weight_len);
+        let grad_scale = output("portable-conv-grad-scale", scale_len);
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-conv"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("conv.wgsl").into()),
+            });
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let ro = wgpu::BufferBindingType::Storage { read_only: true };
+        let rw = wgpu::BufferBindingType::Storage { read_only: false };
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("portable-conv-bgl"),
+                entries: &[
+                    entry(0, wgpu::BufferBindingType::Uniform),
+                    entry(1, ro),
+                    entry(2, ro),
+                    entry(3, ro),
+                    entry(4, ro),
+                    entry(5, rw),
+                    entry(6, rw),
+                    entry(7, rw),
+                ],
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-conv-pl"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("portable-conv-pipe"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-conv-bg"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: weight_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: scale_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: grad_output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: result.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: grad_weight.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: grad_scale.as_entire_binding(),
+                },
+            ],
+        });
+
+        let staging = |label, len: usize| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (len.max(1) * core::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let result_staging = staging("portable-conv-result-staging", result_len);
+        let weight_staging = staging("portable-conv-weight-staging", weight_len);
+        let scale_staging = staging("portable-conv-scale-staging", scale_len);
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-conv-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-conv-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &result,
+            0,
+            &result_staging,
+            0,
+            (result_len * core::mem::size_of::<f32>()) as u64,
+        );
+        if backward {
+            encoder.copy_buffer_to_buffer(
+                &grad_weight,
+                0,
+                &weight_staging,
+                0,
+                core::mem::size_of_val(weight) as u64,
+            );
+            encoder.copy_buffer_to_buffer(
+                &grad_scale,
+                0,
+                &scale_staging,
+                0,
+                core::mem::size_of_val(scale) as u64,
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let readback = |buffer: &wgpu::Buffer, len: usize| -> Result<Vec<f32>, BackendError> {
+            let slice = buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |mapped| {
+                let _ = tx.send(mapped);
+            });
+            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+            rx.recv()
+                .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+                .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+            let data = slice.get_mapped_range();
+            let values = bytemuck::cast_slice(&data)[..len].to_vec();
+            drop(data);
+            buffer.unmap();
+            Ok(values)
+        };
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu convolution device error: {error}"
+            )));
+        }
+        let result_values = readback(&result_staging, result_len)?;
+        let (weight_values, scale_values) = if backward {
+            (
+                readback(&weight_staging, weight_len)?,
+                readback(&scale_staging, scale_len)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(ConvOutput {
+            result: result_values,
+            grad_weight: weight_values,
+            grad_scale: scale_values,
+        })
     }
 
     /// Execute greedy multi-plane SALT reconstruction on device.
