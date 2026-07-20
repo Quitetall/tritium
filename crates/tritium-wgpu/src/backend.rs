@@ -83,6 +83,19 @@ pub(crate) struct FsqParams {
     seed_high: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopeParams {
+    n_token: u32,
+    n_head: u32,
+    head_dim: u32,
+    inverse: u32,
+    theta: f32,
+    padding_0: f32,
+    padding_1: f32,
+    padding_2: f32,
+}
+
 impl FsqParams {
     /// Build packed FSQ shader parameters after adapter validation.
     pub(crate) fn new(
@@ -265,6 +278,8 @@ pub struct WgpuBackend {
     salt_bind_group_layout: wgpu::BindGroupLayout,
     fsq_pipeline: wgpu::ComputePipeline,
     fsq_bind_group_layout: wgpu::BindGroupLayout,
+    rope_pipeline: wgpu::ComputePipeline,
+    rope_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -709,6 +724,28 @@ impl WgpuBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+            let rope_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-rope"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("rope.wgsl").into()),
+            });
+            let rope_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-rope-bgl"),
+                    entries: &[entry(0, uni), entry(1, ro), entry(2, ro), entry(3, rw)],
+                });
+            let rope_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-rope-pl"),
+                bind_group_layouts: &[&rope_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let rope_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("portable-rope-pipe"),
+                layout: Some(&rope_layout),
+                module: &rope_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
             Ok(WgpuBackend {
                 device,
@@ -735,6 +772,8 @@ impl WgpuBackend {
                 salt_bind_group_layout,
                 fsq_pipeline,
                 fsq_bind_group_layout,
+                rope_pipeline,
+                rope_bind_group_layout,
                 device_name,
             })
         }
@@ -2051,6 +2090,133 @@ impl WgpuBackend {
         if let Some(error) = self.device.pop_error_scope().block_on() {
             return Err(BackendError::Backend(format!(
                 "wgpu FSQ device error: {error}"
+            )));
+        }
+        rx.recv()
+            .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+            .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+        let data = slice.get_mapped_range();
+        let values = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(values)
+    }
+
+    /// Apply NeoX half-rotated RoPE or its inverse on device.
+    pub(crate) fn rope(
+        &self,
+        x: &[f32],
+        positions: &[u32],
+        n_head: u32,
+        head_dim: u32,
+        theta: f32,
+        inverse: bool,
+    ) -> Result<Vec<f32>, BackendError> {
+        let expected = positions
+            .len()
+            .checked_mul(n_head as usize)
+            .and_then(|value| value.checked_mul(head_dim as usize))
+            .ok_or_else(|| BackendError::InvalidInput("RoPE shape overflow".to_owned()))?;
+        if x.len() != expected || positions.is_empty() || n_head == 0 || head_dim == 0 {
+            return Err(BackendError::ShapeMismatch {
+                expected,
+                got: x.len(),
+            });
+        }
+        let params = RopeParams {
+            n_token: positions.len() as u32,
+            n_head,
+            head_dim,
+            inverse: u32::from(inverse),
+            theta,
+            padding_0: 0.0,
+            padding_1: 0.0,
+            padding_2: 0.0,
+        };
+        let storage = wgpu::BufferUsages::STORAGE;
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-rope-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let x_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-rope-x"),
+                contents: bytemuck::cast_slice(x),
+                usage: storage,
+            });
+        let positions_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-rope-positions"),
+                contents: bytemuck::cast_slice(positions),
+                usage: storage,
+            });
+        let bytes = core::mem::size_of_val(x) as u64;
+        let result = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-rope-result"),
+            size: bytes,
+            usage: storage | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portable-rope-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-rope-bg"),
+            layout: &self.rope_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: result.as_entire_binding(),
+                },
+            ],
+        });
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-rope-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-rope-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.rope_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let pairs = (positions.len() as u32) * n_head * (head_dim / 2);
+            pass.dispatch_workgroups(pairs.div_ceil(WG_SIZE), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&result, 0, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            let _ = tx.send(mapped);
+        });
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu RoPE device error: {error}"
             )));
         }
         rx.recv()

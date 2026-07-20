@@ -31,6 +31,7 @@ const OPERATIONS: &[&str] = &[
     "graph.relu2",
     "graph.silu",
     "graph.causal_mask",
+    "graph.rope",
     "graph.rmsnorm",
     "graph.softmax",
     "loss.mse",
@@ -454,6 +455,85 @@ impl WgpuTrainBackendV1 {
             .fsq(x, upstream, levels, params)
             .map_err(wgpu_error)?;
         output_f32(output, output_name, &shape, elements as usize)?.copy_from_slice(&result);
+        Ok(())
+    }
+
+    fn execute_rope(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let (input_name, output_name, inverse) = match request.execution {
+            TrainExecutionV1::Forward => ("x", "result", false),
+            TrainExecutionV1::Vjp => ("grad_output", "grad_x", true),
+            _ => return Err(invariant("RoPE received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            &[input_name],
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["positions", "n_head", "head_dim", "theta"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            &[output_name],
+            "outputs",
+        )?;
+        let positions: Vec<u32> = attribute_u64_list(request, "positions")?
+            .iter()
+            .map(|&position| {
+                u32::try_from(position).map_err(|_| attribute_value("positions", "u32"))
+            })
+            .collect::<Result<_, _>>()?;
+        let n_head = attribute_u64(request, "n_head")?;
+        let head_dim = attribute_u64(request, "head_dim")?;
+        if n_head == 0 {
+            return Err(attribute_value("n_head", "positive"));
+        }
+        if head_dim == 0 {
+            return Err(attribute_value("head_dim", "positive"));
+        }
+        if !head_dim.is_multiple_of(2) {
+            return Err(attribute_value("head_dim", "even"));
+        }
+        if n_head > u32::MAX as u64 || head_dim > u32::MAX as u64 {
+            return Err(shape_error());
+        }
+        let elements = positions
+            .len()
+            .checked_mul(n_head as usize)
+            .and_then(|value| value.checked_mul(head_dim as usize))
+            .ok_or_else(shape_error)?;
+        let theta = attribute_f32(request, "theta")?;
+        if theta <= 0.0 {
+            return Err(attribute_value("theta", "positive"));
+        }
+        let shape = [positions.len() as u64, n_head, head_dim];
+        let (input_shape, input) = input_f32(request, input_name)?;
+        if input_shape != shape || input.len() != elements {
+            return Err(shape_error());
+        }
+        require_finite(input_name, input)?;
+        let target = output_f32(output, output_name, &shape, elements)?;
+        if elements == 0 {
+            return Ok(());
+        }
+        let result = self
+            .backend
+            .rope(
+                input,
+                &positions,
+                n_head as u32,
+                head_dim as u32,
+                theta,
+                inverse,
+            )
+            .map_err(wgpu_error)?;
+        target.copy_from_slice(&result);
         Ok(())
     }
 
@@ -1818,6 +1898,9 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             self.execute_salt(&request, output)?
         } else if request.operation == "graph.fsq" {
             self.execute_fsq(&request, output)?;
+            0
+        } else if request.operation == "graph.rope" {
+            self.execute_rope(&request, output)?;
             0
         } else if request.operation == "graph.lsq_ste" {
             self.execute_lsq(&request, output)?;

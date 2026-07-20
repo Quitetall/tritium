@@ -175,8 +175,8 @@ This closes WASI/WASM semantic parity; browser WASM packaging remains plan 0050,
 and MCU constrained-target parity remains open.
 
 Native wgpu work has begun on the RTX 4090 Vulkan adapter. Current evidence
-covers 87 vectors across STE surrogate, multi-plane SALT STE, LSQ, FSQ, dense and scale-bearing ternary matmul, embedding gather, transpose, column slice/concat, detach, constant scale, bias, add, multiply, ReLU2,
-SiLU, RMSNorm, causal masking, row softmax, MSE loss, SGD, AdamW, cautious AdamW, int8 AdamW, Muon, and all four lifecycle operations. Pointwise tensor work executes through resident WGSL
+covers 91 vectors across STE surrogate, multi-plane SALT STE, LSQ, FSQ, dense and scale-bearing ternary matmul, embedding gather, transpose, column slice/concat, detach, constant scale, bias, add, multiply, ReLU2,
+SiLU, RMSNorm, causal masking, RoPE, row softmax, MSE loss, SGD, AdamW, cautious AdamW, int8 AdamW, Muon, and all four lifecycle operations. Pointwise tensor work executes through resident WGSL
 storage buffers; lifecycle uses the shared canonical control-plane byte
 implementation. AdamW uses ordered storage passes to preserve the frozen f32
 rounding points without a host tensor roundtrip; cautious AdamW adds a native
@@ -189,6 +189,7 @@ SALT preserves ascending-column AbsMean folds and the bounded one-row scratch
 contract while keeping all residual planes device-resident.
 FSQ covers clamp/tanh bounds and hard, annealed soft-round, and seeded
 stochastic estimators; emulated u64 xorshift preserves the frozen seed stream.
+RoPE covers forward and inverse-rotation VJP with device trigonometry.
 Receipts bind the physical NVIDIA adapter, and no additional
 tensor operation is advertised before its WGSL path passes the corpus. ROCm
 implementation/evidence is currently target-blocked on this host: no AMD device
