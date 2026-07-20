@@ -30,15 +30,15 @@ use crate::model::{
 use crate::qwen35_config::{Qwen35CheckpointConfig, Qwen35LayerType, Qwen35TextConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TensorRole {
+pub(super) enum TensorRole {
     Matrix,
     Preserved,
 }
 
 #[derive(Debug)]
 pub(super) struct TensorSpec {
-    shape: Vec<usize>,
-    role: TensorRole,
+    pub(super) shape: Vec<usize>,
+    pub(super) role: TensorRole,
 }
 
 pub(super) trait Qwen35HfTensorSource {

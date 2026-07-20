@@ -48,10 +48,10 @@ pub use model::{
     Qwen35HfTensorMetadata, Qwen35MtpCache, Qwen35MtpInputPlan, Qwen35MtpLayerWeights,
     Qwen35MtpOracleCoverageProfile, Qwen35MtpOracleEvidenceClass, Qwen35MtpOutput,
     Qwen35MtpParityReceipt, Qwen35MtpPromotionError, Qwen35MtpRunner, Qwen35MtpStatus,
-    Qwen35MtpWeights, Qwen35TensorStreamError, Qwen35TextCache, Qwen35TextLayerWeights,
-    Qwen35TextMixerWeights, Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights,
-    Qwen35VerifiedHfLanguageMtpModel, Tokenizer, UnverifiedQwen35Mtp,
-    qwen36_27b_canonical_source_config,
+    Qwen35MtpWeights, Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt,
+    Qwen35TensorStreamError, Qwen35TextCache, Qwen35TextLayerWeights, Qwen35TextMixerWeights,
+    Qwen35TextOutput, Qwen35TextRunner, Qwen35TextWeights, Qwen35VerifiedHfLanguageMtpModel,
+    Tokenizer, UnverifiedQwen35Mtp, qwen36_27b_canonical_source_config,
 };
 #[cfg(feature = "cuda")]
 pub use model::{
