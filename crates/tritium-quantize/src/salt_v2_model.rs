@@ -439,6 +439,47 @@ pub struct SaltV2ModelFitInput<'a> {
     pub physical: SaltV2ModelPhysicalInput,
 }
 
+/// Bounded-memory input for one independently resumable tensor-master fit.
+///
+/// `tensor_index` is the tensor's global ordinal in the architecture adapter's
+/// canonical additive-tensor order. `source_tensor_digest` is the semantic
+/// source-precision digest from that adapter; the fitter separately derives and
+/// records the exact widened-f32 digest from [`Self::tensor`].
+#[derive(Clone, Copy, Debug)]
+pub struct SaltV2TensorMasterFitInput<'a> {
+    /// One finite row-major source matrix and its bound curvature evidence.
+    pub tensor: SaltV2TensorFitInput<'a>,
+    /// Canonical activation cache whose identity binds the curvature evidence.
+    pub activations: &'a ActivationCache,
+    /// Semantic identity of the complete source model.
+    pub source_model_id: ModelId,
+    /// Global tensor ordinal in the architecture adapter's additive order.
+    pub tensor_index: u64,
+    /// Architecture-framed digest of the original source-precision tensor.
+    pub source_tensor_digest: [u8; 32],
+}
+
+/// Completed bounded-memory fit of one canonical rate-free Pmax tensor master.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaltV2TensorMasterFitResult {
+    spec: SaltV2MasterTensorSpec,
+    receipt: SaltV2MasterTensorReceipt,
+}
+
+impl SaltV2TensorMasterFitResult {
+    /// Canonical metadata that must be admitted before publishing the payload.
+    #[must_use]
+    pub const fn spec(&self) -> &SaltV2MasterTensorSpec {
+        &self.spec
+    }
+
+    /// Content receipt over the canonical metadata and streamed payload bytes.
+    #[must_use]
+    pub const fn receipt(&self) -> SaltV2MasterTensorReceipt {
+        self.receipt
+    }
+}
+
 /// Search-stage input that requires one full feedback artifact per source tensor.
 #[derive(Clone, Copy, Debug)]
 pub struct SaltV2MasterFitInput<'a> {
@@ -770,6 +811,11 @@ pub enum SaltV2Error {
         /// Flat coefficient index.
         index: usize,
     },
+    /// Architecture adapter omitted the semantic source-precision tensor digest.
+    MissingSourceTensorDigest {
+        /// Global tensor ordinal.
+        tensor: usize,
+    },
     /// Tensor curvature recipe differed from the frozen configuration.
     CurvatureKindMismatch {
         /// Tensor ordinal.
@@ -951,6 +997,10 @@ impl fmt::Display for SaltV2Error {
             Self::NonFiniteWeight { tensor, index } => {
                 write!(formatter, "tensor {tensor} weight {index} is not finite")
             }
+            Self::MissingSourceTensorDigest { tensor } => write!(
+                formatter,
+                "tensor {tensor} semantic source digest is missing"
+            ),
             Self::CurvatureKindMismatch {
                 tensor,
                 expected,
@@ -1183,6 +1233,11 @@ impl SaltV2MasterFit {
             .work
             .get(tensor_index)
             .ok_or(SaltV2Error::UnknownMasterTensor { tensor_index })?;
+        if source_tensor_digest == [0; 32] {
+            return Err(SaltV2Error::MissingSourceTensorDigest {
+                tensor: tensor_index,
+            });
+        }
         let feedback_digest = match &self.feedback {
             Some(receipt) => Some(feedback_receipt_digest(std::slice::from_ref(
                 receipt
@@ -1305,6 +1360,131 @@ pub fn fit_salt_v2_model(
     let rate = config.rate;
     let master = fit_salt_v2_master_without_feedback(input, config)?;
     allocate_and_pack_salt_v2_master(&master, rate)
+}
+
+/// Plan one independently stored tensor master without fitting or writing it.
+///
+/// The returned specification is rate-free and deployment-codec-free. It can
+/// therefore be committed to a resumable campaign catalog before expensive
+/// fitting begins. Planning scans only this tensor and never materializes
+/// another model tensor or any ternary plane.
+///
+/// # Errors
+/// Rejects malformed recipes, unavailable external stages, invalid tensor
+/// geometry or values, mismatched source/cache/token provenance, an invalid
+/// global ordinal, or invalid semantic source metadata.
+pub fn plan_salt_v2_tensor_master(
+    input: SaltV2TensorMasterFitInput<'_>,
+    config: &SaltV2Config,
+) -> Result<SaltV2MasterTensorSpec, SaltV2Error> {
+    validate_config(config)?;
+    validate_external_stages(config)?;
+    let tensor_index =
+        usize::try_from(input.tensor_index).map_err(|_| SaltV2Error::AccountingOverflow)?;
+    if input.source_tensor_digest == [0; 32] {
+        return Err(SaltV2Error::MissingSourceTensorDigest {
+            tensor: tensor_index,
+        });
+    }
+    let tensors = [input.tensor];
+    let model = SaltV2ModelFitInput {
+        tensors: &tensors,
+        activations: input.activations,
+        source_model_id: input.source_model_id,
+        physical: SaltV2ModelPhysicalInput {
+            total_model_parameters: u64::try_from(input.tensor.weights.len())
+                .map_err(|_| SaltV2Error::AccountingOverflow)?,
+            preserved_artifact_bytes: 0,
+            preserved_resident_bytes: 0,
+            required_runtime_shadow_bytes: 0,
+        },
+    };
+    validate_model_input(&model, config)?;
+    let tensor = input.tensor;
+    SaltV2MasterTensorSpec::new(
+        tensor.name.to_owned(),
+        vec![
+            u64::try_from(tensor.rows).map_err(|_| SaltV2Error::AccountingOverflow)?,
+            u64::try_from(tensor.cols).map_err(|_| SaltV2Error::AccountingOverflow)?,
+        ],
+        input.source_model_id,
+        input.source_tensor_digest,
+        source_tensor_digest(&tensor),
+        u64::try_from(tensor_index).map_err(|_| SaltV2Error::AccountingOverflow)?,
+        SaltV2MasterEvidence {
+            recipe_id: master_recipe_digest(config),
+            solver_id: reference_solver_id(),
+            activation_digest: input.activations.digest().into_bytes(),
+            curvature_digest: tensor.curvature.digest(),
+            feedback_digest: None,
+            track: SaltV2MasterTrack::Ptq,
+            parent_master_id: None,
+        },
+        SaltV2MasterGeometry {
+            constraint: config.packing.fit_constraint(),
+            max_planes: u8::try_from(config.max_planes)
+                .map_err(|_| SaltV2Error::AccountingOverflow)?,
+        },
+    )
+    .map_err(SaltV2Error::MasterArtifact)
+}
+
+/// Fit and stream one canonical rate-free Pmax tensor master.
+///
+/// Memory is bounded by the caller-owned source matrix plus one 256-coefficient
+/// allocation tile and the solver's small local state. Tiles are written in
+/// canonical order as soon as they are fit; no model-wide weight or master
+/// collection is created. For the same input and recipe, the bytes are exactly
+/// those emitted for this tensor by [`SaltV2MasterFit::write_tensor_master`].
+///
+/// # Errors
+/// Propagates all planning and joint-fit failures, rejects a non-prefix
+/// frontier, and reports bounded sink failures through [`SaltV2Error`]. A sink
+/// may contain an incomplete unpublished stream after an error.
+pub fn fit_salt_v2_tensor_master<W: Write>(
+    input: SaltV2TensorMasterFitInput<'_>,
+    config: &SaltV2Config,
+    sink: W,
+) -> Result<SaltV2TensorMasterFitResult, SaltV2Error> {
+    let spec = plan_salt_v2_tensor_master(input, config)?;
+    let tensor_index =
+        usize::try_from(input.tensor_index).map_err(|_| SaltV2Error::AccountingOverflow)?;
+    let tensor = input.tensor;
+    let tile_count = tensor.weights.len().div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
+    let required_planes = usize::from(spec.geometry().max_planes);
+    let mut encoder = SaltV2MasterTensorEncoder::new(&spec, sink)?;
+    for tile_index in 0..tile_count {
+        let start = tile_index
+            .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+            .ok_or(SaltV2Error::AccountingOverflow)?;
+        let end = (start + SALT_V2_ALLOCATION_TILE_SIZE).min(tensor.weights.len());
+        let tile = fit_tile_frontier(tensor_index, tile_index, start, end, &tensor, config)?;
+        if tile.master.planes().len() != required_planes
+            || tile.losses.len() != required_planes
+            || tile.candidates.is_empty()
+            || tile.candidates.len() > required_planes
+            || tile
+                .candidates
+                .iter()
+                .enumerate()
+                .any(|(prefix, candidate)| {
+                    candidate.planes != (prefix + 1) as u8
+                        || candidate.tile.planes() != &tile.master.planes()[..=prefix]
+                })
+        {
+            return Err(SaltV2Error::MasterPrefixMismatch {
+                tensor_index,
+                tile_index,
+            });
+        }
+        encoder.write_tile(
+            u8::try_from(tile.candidates.len()).map_err(|_| SaltV2Error::AccountingOverflow)?,
+            &tile.losses,
+            tile.master.planes(),
+        )?;
+    }
+    let receipt = encoder.finish()?;
+    Ok(SaltV2TensorMasterFitResult { spec, receipt })
 }
 
 fn fit_salt_v2_master_without_feedback(
@@ -4800,6 +4980,110 @@ mod tests {
             decoded[0].planes(),
             d2_master.work[0].tiles[0].master.planes()
         );
+    }
+
+    #[test]
+    fn independent_tensor_fit_is_whole_model_byte_exact_and_keeps_global_ordinal() {
+        let first_weights = weights(1);
+        let mut second_weights = weights(1);
+        for (index, value) in second_weights.iter_mut().enumerate() {
+            *value += (index % 5) as f32 * 0.0078125;
+        }
+        let first_diagonal = vec![1.0; first_weights.len()];
+        let second_diagonal = vec![2.0; second_weights.len()];
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let tensors = [
+            SaltV2TensorFitInput {
+                name: "model.layers.0.mlp.down_proj.weight",
+                weights: &first_weights,
+                rows: 2,
+                cols: 128,
+                curvature: CurvatureArtifact::diagonal_fisher(source_id, [71; 32], &first_diagonal),
+            },
+            SaltV2TensorFitInput {
+                name: "model.layers.1.mlp.down_proj.weight",
+                weights: &second_weights,
+                rows: 2,
+                cols: 128,
+                curvature: CurvatureArtifact::diagonal_fisher(
+                    source_id,
+                    [72; 32],
+                    &second_diagonal,
+                ),
+            },
+        ];
+        let recipe = config(100_000);
+        let whole = fit_salt_v2_master_without_feedback(
+            SaltV2ModelFitInput {
+                tensors: &tensors,
+                activations: &cache,
+                source_model_id: model_id,
+                physical: SaltV2ModelPhysicalInput {
+                    total_model_parameters: 512,
+                    ..SaltV2ModelPhysicalInput::default()
+                },
+            },
+            &recipe,
+        )
+        .expect("whole-model master");
+
+        for (index, tensor) in tensors.iter().copied().enumerate() {
+            let source_tensor_digest = [81 + index as u8; 32];
+            let input = SaltV2TensorMasterFitInput {
+                tensor,
+                activations: &cache,
+                source_model_id: model_id,
+                tensor_index: index as u64,
+                source_tensor_digest,
+            };
+            let planned = plan_salt_v2_tensor_master(input, &recipe).expect("plan tensor");
+            assert_eq!(planned.tensor_index(), index as u64);
+            assert_eq!(
+                planned,
+                whole
+                    .tensor_master_spec(index, source_tensor_digest)
+                    .expect("whole-model tensor spec")
+            );
+
+            let mut independent_payload = Vec::new();
+            let independent = fit_salt_v2_tensor_master(input, &recipe, &mut independent_payload)
+                .expect("independent tensor fit");
+            let mut whole_payload = Vec::new();
+            let whole_receipt = whole
+                .write_tensor_master(index, source_tensor_digest, &mut whole_payload)
+                .expect("whole-model tensor stream");
+            assert_eq!(independent.spec(), &planned);
+            assert_eq!(independent.receipt(), whole_receipt);
+            assert_eq!(independent_payload, whole_payload);
+        }
+    }
+
+    #[test]
+    fn independent_tensor_plan_rejects_unbound_semantic_source_digest() {
+        let source_weights = weights(1);
+        let diagonal = vec![1.0; source_weights.len()];
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let input = SaltV2TensorMasterFitInput {
+            tensor: SaltV2TensorFitInput {
+                name: "model.layers.0.mlp.down_proj.weight",
+                weights: &source_weights,
+                rows: 2,
+                cols: 128,
+                curvature: CurvatureArtifact::diagonal_fisher(source_id, [73; 32], &diagonal),
+            },
+            activations: &cache,
+            source_model_id: model_id,
+            tensor_index: 0,
+            source_tensor_digest: [0; 32],
+        };
+        assert!(matches!(
+            plan_salt_v2_tensor_master(input, &config(10_000)),
+            Err(SaltV2Error::MissingSourceTensorDigest { tensor: 0 })
+        ));
     }
 
     #[test]

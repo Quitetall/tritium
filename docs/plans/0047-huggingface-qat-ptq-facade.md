@@ -55,6 +55,9 @@ saves with safe serialization, automatically reloads through
 
 ## Step 3 — resumable PTQ facade
 
+- [x] Add a bounded-memory Rust producer seam that plans each global tensor
+  master before fitting and streams its canonical Pmax payload tile by tile.
+  Independent streams are byte-exact with the whole-model reference solver.
 - Bind the Rust SALT pipeline to `quantize(model_or_id, calibration, config,
   work_dir)` without a Python-list weight bridge.
 - Expose immutable `QuantizationResult` model/coverage/report plus atomic

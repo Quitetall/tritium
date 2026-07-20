@@ -107,9 +107,10 @@ pub use salt_v2_model::{
     SaltV2MasterFitInput, SaltV2ModelFeedbackReceipt, SaltV2ModelFitInput, SaltV2ModelFitMetrics,
     SaltV2ModelFitReceipt, SaltV2ModelFitResult, SaltV2ModelPhysicalInput, SaltV2ModelStageDriver,
     SaltV2Packing, SaltV2PhysicalSize, SaltV2Refinement, SaltV2TensorFeedbackReceipt,
-    SaltV2TensorFitInput, SaltV2TensorFitReceipt, SaltV2TileCandidateMetrics,
-    allocate_and_pack_salt_v2_master, allocate_and_pack_salt_v2_master_with_packing,
-    fit_salt_v2_master, fit_salt_v2_model,
+    SaltV2TensorFitInput, SaltV2TensorFitReceipt, SaltV2TensorMasterFitInput,
+    SaltV2TensorMasterFitResult, SaltV2TileCandidateMetrics, allocate_and_pack_salt_v2_master,
+    allocate_and_pack_salt_v2_master_with_packing, fit_salt_v2_master, fit_salt_v2_model,
+    fit_salt_v2_tensor_master, plan_salt_v2_tensor_master,
 };
 pub use training_export::{
     TrainingSaltExportError, TrainingSaltExportStats, export_training_salt_row,

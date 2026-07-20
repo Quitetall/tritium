@@ -784,6 +784,14 @@ compiled oracle ledger. Its only row is a reproducible synthetic fixture that
 binds official vLLM first-pass proposer inputs, target hidden/logit/token parity,
 MTP hidden/logit parity, and full prefill/decode KV caches; its receipt is
 explicitly ineligible for production.
+The reference fitter now also exposes `plan_salt_v2_tensor_master` and
+`fit_salt_v2_tensor_master`: a source-bound global tensor ordinal can be
+cataloged before fitting, then its canonical rate-free Pmax master is emitted
+one 256-coefficient tile at a time. Two-tensor goldens prove those independent
+streams and receipts are byte-identical to the corresponding outputs of the
+whole-model solver. This removes model-wide master residency from the PTQ
+producer boundary; it does not yet supply the checkpoint/evidence reader that
+feeds all 506 Qwen tensors into the campaign store.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than
@@ -803,10 +811,13 @@ The following work deliberately remains open and keeps this plan in progress:
 - `fit_salt_v2_master(...) -> SaltV2MasterFit` now invokes the standalone dense
   BlockLDLQ path, then
   `allocate_and_pack_salt_v2_master(...) -> SaltV2ModelFitResult` slices exact
-  prefixes without refitting. This is still a bounded CPU reference: its full
+  prefixes without refitting. The whole-model compatibility entry point still
+  owns the complete fitted master, but the independent tensor-master path now
+  bounds producer memory to one source matrix, one 256-coefficient fit tile and
+  solver-local state while retaining the global architecture ordinal and exact
+  whole-model bytes. This is still a bounded CPU reference: its full
   inverse Hessian is dense binary64, input columns and natural groups must
-  preserve row-local G128 scale geometry, and fitting still owns the whole model
-  master in memory. Canonical per-tensor radix-3 masters are now streamed into an
+  preserve row-local G128 scale geometry. Canonical per-tensor radix-3 masters are now streamed into an
   immutable CAS, semantically reopened with bounded staging, installed beneath a
   base-preserving Qwen campaign namespace, and sealed only after all 506 ordered
   language/MTP PTQ masters verify. A sealed PTQ campaign can now open a distinct,
