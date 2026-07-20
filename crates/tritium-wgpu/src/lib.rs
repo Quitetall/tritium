@@ -16,6 +16,10 @@
 mod backend;
 #[cfg(feature = "wgpu")]
 pub use backend::{WgpuBackend, WgpuBuffer};
+#[cfg(feature = "wgpu")]
+mod train;
+#[cfg(feature = "wgpu")]
+pub use train::WgpuTrainBackendV1;
 
 /// Registry `init` constructor — returns `Err` (logged + skipped by the registry)
 /// when no Vulkan adapter/device is available.

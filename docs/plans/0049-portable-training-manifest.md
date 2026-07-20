@@ -174,6 +174,13 @@ to the actual engine identity. Native structural tests and an actual
 This closes WASI/WASM semantic parity; browser WASM packaging remains plan 0050,
 and MCU constrained-target parity remains open.
 
+Native wgpu work has begun on the RTX 4090 Vulkan adapter. Its first proved
+slice covers all nine lifecycle checkpoint/resume/export/reload vectors using
+the shared canonical control-plane byte implementation, with receipts bound to
+the physical NVIDIA adapter. No tensor operation is advertised until its WGSL
+path passes the corpus. ROCm implementation/evidence is currently target-blocked
+on this host: no AMD device or ROCm compiler/runtime tools are installed.
+
 Edits:
 
 - Add strict manifest types/parser to `tritium-spec/src/training.rs`.

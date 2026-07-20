@@ -205,6 +205,11 @@ impl WgpuBackend {
         }
         init().block_on()
     }
+
+    /// Physical adapter identity used to bind portable-training receipts.
+    pub(crate) fn physical_device(&self) -> &str {
+        &self.device_name
+    }
 }
 
 impl TernaryBackend for WgpuBackend {

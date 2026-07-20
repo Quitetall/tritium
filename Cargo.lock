@@ -4592,6 +4592,7 @@ dependencies = [
  "tritium-runtime",
  "tritium-spec",
  "tritium-testkit",
+ "tritium-train",
  "wgpu 23.0.1",
 ]
 

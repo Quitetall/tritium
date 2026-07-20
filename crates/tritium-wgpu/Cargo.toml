@@ -15,6 +15,7 @@ tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-runtime = { workspace = true }
 tritium-format = { workspace = true }
+tritium-train = { workspace = true, optional = true }
 half = { workspace = true }
 
 wgpu = { workspace = true, optional = true }
@@ -27,7 +28,7 @@ default = []
 # GPU code (and its heavy deps) live behind `wgpu`, mirroring tritium-cuda's `cuda`
 # gate: the default build is an inert stub the cpu-only CI matrix compiles with no
 # GPU deps.
-wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:tritium-train"]
 # `register` adds linkme self-registration into the runtime BACKENDS slice.
 register = ["wgpu", "dep:linkme"]
 
