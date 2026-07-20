@@ -813,15 +813,17 @@ pub use model::{
     AdmittedExternalCausalLmDigests, BitNetConfig, BitNetGgufTensorProvider, CausalActivation,
     CausalLmDecoderLayer, CausalLmModel, CausalQueryProjection, ExternalOnnxModel, MappedBitNet,
     MappedSmolLm2, OnnxArtifactIdentityV2, OnnxModelError, PackedTernaryMatrix,
-    QwenDeltaNetDecoderLayer, QwenDeltaNetLayerModel, RotaryEmbedding, RotaryMode, SmolLm2Config,
+    QwenCausalLmDecoderLayer, QwenCausalLmModel, QwenDeltaNetDecoderLayer, QwenDeltaNetLayerModel,
+    QwenFullAttentionDecoderLayer, RotaryEmbedding, RotaryMode, SmolLm2Config,
     SmolLm2TensorProvider, TiedEmbeddingHeadModel, TiedEmbeddingHeadModelV2,
     UnsupportedGraphDiagnostic, UnsupportedGraphItemKind, VerifiedExternalCausalLmModel,
     VerifiedExternalOnnxModel, VerifiedExternalOnnxModelV2, VerifiedOnnxArtifactIdentityV2,
     diagnose_unsupported_graph, encode_causal_lm, encode_external_causal_lm,
     encode_external_tied_embedding_head, encode_external_tied_embedding_head_v2,
-    encode_qwen_deltanet_layer, encode_tied_embedding_head, encode_tied_embedding_head_v2,
-    map_bitnet_gguf_causal_lm, map_smollm2_causal_lm, verify_external_causal_lm,
-    verify_external_tied_embedding_head, verify_external_tied_embedding_head_v2,
+    encode_qwen_causal_lm, encode_qwen_deltanet_layer, encode_tied_embedding_head,
+    encode_tied_embedding_head_v2, map_bitnet_gguf_causal_lm, map_smollm2_causal_lm,
+    verify_external_causal_lm, verify_external_tied_embedding_head,
+    verify_external_tied_embedding_head_v2,
 };
 
 #[cfg(feature = "model")]

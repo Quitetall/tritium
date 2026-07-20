@@ -229,6 +229,60 @@ pub struct QwenDeltaNetDecoderLayer<'a> {
     pub down: PackedTernaryMatrix<'a>,
 }
 
+/// Architecture-exact Qwen full-attention decoder layer.
+///
+/// Q/K normalization, fused head-interleaved query/gate projection, and
+/// SwiGLU are structural rather than optional. Qwen does not apply an
+/// additional attention-context or FFN-intermediate subnorm.
+#[derive(Debug, Clone, Copy)]
+pub struct QwenFullAttentionDecoderLayer<'a> {
+    /// Zero-centered pre-attention RMSNorm parameter.
+    pub attention_norm: &'a [f32],
+    /// Mandatory per-query-head RMSNorm parameter.
+    pub query_norm: &'a [f32],
+    /// Mandatory per-key-head RMSNorm parameter.
+    pub key_norm: &'a [f32],
+    /// Fused head-interleaved query/output-gate projection.
+    pub fused_query_gate: PackedTernaryMatrix<'a>,
+    /// Key projection.
+    pub key: PackedTernaryMatrix<'a>,
+    /// Value projection.
+    pub value: PackedTernaryMatrix<'a>,
+    /// Attention output projection.
+    pub attention_output: PackedTernaryMatrix<'a>,
+    /// Zero-centered pre-FFN RMSNorm parameter.
+    pub ffn_norm: &'a [f32],
+    /// SwiGLU gate projection.
+    pub gate: PackedTernaryMatrix<'a>,
+    /// SwiGLU up projection.
+    pub up: PackedTernaryMatrix<'a>,
+    /// SwiGLU down projection.
+    pub down: PackedTernaryMatrix<'a>,
+}
+
+impl<'a> QwenFullAttentionDecoderLayer<'a> {
+    fn causal(self) -> CausalLmDecoderLayer<'a> {
+        CausalLmDecoderLayer {
+            attention_norm: self.attention_norm,
+            query_norm: Some(self.query_norm),
+            key_norm: Some(self.key_norm),
+            query: CausalQueryProjection::HeadInterleavedQueryGate {
+                fused: self.fused_query_gate,
+            },
+            key: self.key,
+            value: self.value,
+            attention_output: self.attention_output,
+            attention_sub_norm: None,
+            ffn_norm: self.ffn_norm,
+            gate: self.gate,
+            up: self.up,
+            ffn_sub_norm: None,
+            activation: CausalActivation::SwiGlu,
+            down: self.down,
+        }
+    }
+}
+
 impl<'a> QwenDeltaNetDecoderLayer<'a> {
     fn ffn(self) -> CausalFfnLayer<'a> {
         CausalFfnLayer {
@@ -258,6 +312,51 @@ pub struct QwenDeltaNetLayerModel<'a> {
     pub geometry: QwenDeltaNetGeometry,
     /// Layer weights and preserved parameters.
     pub layer: QwenDeltaNetDecoderLayer<'a>,
+    /// Complete artifact identity.
+    pub identity: OnnxArtifactIdentityV2<'a>,
+}
+
+/// One layer in an ordered heterogeneous Qwen language-model schedule.
+#[derive(Debug, Clone, Copy)]
+pub enum QwenCausalLmDecoderLayer<'a> {
+    /// Gated DeltaNet recurrence with explicit convolution and recurrent state.
+    DeltaNet(QwenDeltaNetDecoderLayer<'a>),
+    /// Gated grouped-query causal attention with KV cache state.
+    FullAttention(QwenFullAttentionDecoderLayer<'a>),
+}
+
+/// Fixed-shape packed heterogeneous Qwen causal language model.
+///
+/// DeltaNet layers consume `conv_state.{layer}` and
+/// `recurrent_state.{layer}`. Full-attention layers consume `past_k.{layer}`
+/// and `past_v.{layer}` when `past_tokens > 0`. Every layer publishes its
+/// corresponding complete next state under the same sparse layer index.
+#[derive(Debug, Clone, Copy)]
+pub struct QwenCausalLmModel<'a> {
+    /// Query token count fixed into this graph.
+    pub tokens: usize,
+    /// Prefix-cache token count fixed into full-attention layers.
+    pub past_tokens: usize,
+    /// Full-attention query head count.
+    pub n_head: usize,
+    /// Full-attention key/value head count.
+    pub n_kv_head: usize,
+    /// Full-attention elements per head.
+    pub head_dim: usize,
+    /// Qwen rotary embedding applied only to full-attention layers.
+    pub rotary: RotaryEmbedding,
+    /// Positive finite zero-centered RMSNorm epsilon.
+    pub rms_epsilon: f32,
+    /// Shared DeltaNet geometry for every recurrent layer.
+    pub delta_geometry: QwenDeltaNetGeometry,
+    /// Packed token embedding table.
+    pub embedding: PackedTernaryMatrix<'a>,
+    /// Optional untied packed language head.
+    pub lm_head: Option<PackedTernaryMatrix<'a>>,
+    /// Exact ordered heterogeneous schedule.
+    pub layers: &'a [QwenCausalLmDecoderLayer<'a>],
+    /// Zero-centered final RMSNorm parameter.
+    pub final_norm: &'a [f32],
     /// Complete artifact identity.
     pub identity: OnnxArtifactIdentityV2<'a>,
 }
@@ -1692,157 +1791,37 @@ pub fn encode_causal_lm(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelEr
 pub fn encode_qwen_deltanet_layer(
     model: QwenDeltaNetLayerModel<'_>,
 ) -> Result<Vec<u8>, OnnxModelError> {
-    let dimensions = validate_qwen_deltanet_layer(&model)?;
+    validate_qwen_deltanet_layer(&model)?;
     validate_qwen_deltanet_initializer_budget(&model)?;
     let tokens = as_i64(model.tokens, "Qwen DeltaNet token count")?;
     let hidden = as_i64(model.hidden, "Qwen DeltaNet hidden width")?;
     let mut graph = CausalGraphBuilder::default();
-    let prefix = "layer.0";
-    let attention_input = "layer.0.attention_input";
-    graph.rms_norm_with_semantics(
-        "layer.0.attention_norm",
+    let mut inputs = vec![tensor_value("hidden", TENSOR_FLOAT, &[tokens, hidden])];
+    let mut state_outputs = Vec::with_capacity(2);
+    let layer_output = graph.delta_net_block(
+        0,
         "hidden",
-        attention_input,
-        model.layer.attention_norm,
-        model.rms_epsilon,
-        true,
-    );
-    for (node, output, initializer, matrix) in [
-        ("qkv_projection", "raw_qkv", "qkv", model.layer.qkv),
-        ("z_projection", "z", "z", model.layer.z),
-        ("beta_projection", "beta_logits", "beta", model.layer.beta),
-        (
-            "decay_projection",
-            "decay_logits",
-            "decay",
-            model.layer.decay,
-        ),
-    ] {
-        graph.projection(
-            &format!("{prefix}.{node}"),
-            attention_input,
-            &format!("{prefix}.{output}"),
-            &format!("{prefix}.deltanet.{initializer}"),
-            matrix,
-        )?;
-    }
-    let conv_weight = "layer.0.deltanet.conv.weight";
-    let norm_weight = "layer.0.deltanet.norm.weight";
-    let dt_bias = "layer.0.deltanet.dt_bias";
-    let a_log = "layer.0.deltanet.a_log";
-    let epsilon = "layer.0.deltanet.epsilon";
-    graph.add_f32(
-        conv_weight,
-        vec![
-            as_i64(dimensions.conv_width(), "DeltaNet convolution width")?,
-            as_i64(
-                model.geometry.conv_kernel_dim(),
-                "DeltaNet convolution kernel width",
-            )?,
-        ],
-        model.layer.conv_weight,
-    );
-    graph.add_f32(
-        norm_weight,
-        vec![as_i64(
-            model.geometry.value_head_dim(),
-            "DeltaNet value head width",
-        )?],
-        model.layer.norm_weight,
-    );
-    graph.add_f32(
-        dt_bias,
-        vec![as_i64(
-            model.geometry.num_value_heads(),
-            "DeltaNet value head count",
-        )?],
-        model.layer.dt_bias,
-    );
-    graph.add_f32(
-        a_log,
-        vec![as_i64(
-            model.geometry.num_value_heads(),
-            "DeltaNet value head count",
-        )?],
-        model.layer.a_log,
-    );
-    graph.add_f32(epsilon, Vec::new(), &[model.rms_epsilon]);
-    let inputs = crate::QwenDeltaNetInput::ALL.map(|slot| match slot {
-        crate::QwenDeltaNetInput::RawQkv => "layer.0.raw_qkv",
-        crate::QwenDeltaNetInput::Z => "layer.0.z",
-        crate::QwenDeltaNetInput::BetaLogits => "layer.0.beta_logits",
-        crate::QwenDeltaNetInput::DecayLogits => "layer.0.decay_logits",
-        crate::QwenDeltaNetInput::ConvWeight => conv_weight,
-        crate::QwenDeltaNetInput::NormWeight => norm_weight,
-        crate::QwenDeltaNetInput::DtBias => dt_bias,
-        crate::QwenDeltaNetInput::ALog => a_log,
-        crate::QwenDeltaNetInput::ConvState => "conv_state",
-        crate::QwenDeltaNetInput::RecurrentState => "recurrent_state",
-        crate::QwenDeltaNetInput::Epsilon => epsilon,
-    });
-    graph.nodes.push(NodeProto {
-        input: strings(inputs),
-        output: strings(["layer.0.normalized_core", "next_conv", "next_recurrent"]),
-        name: "layer.0.deltanet".to_owned(),
-        op_type: crate::ONNX_QWEN_DELTANET_OP_NAME.to_owned(),
-        attribute: vec![
-            int_attribute(
-                crate::ATTR_CONV_KERNEL_DIM,
-                as_i64(
-                    model.geometry.conv_kernel_dim(),
-                    "DeltaNet convolution kernel width",
-                )?,
-            ),
-            int_attribute(
-                crate::ATTR_NUM_KEY_HEADS,
-                as_i64(
-                    model.geometry.num_key_heads(),
-                    "DeltaNet query/key head count",
-                )?,
-            ),
-            int_attribute(
-                crate::ATTR_NUM_VALUE_HEADS,
-                as_i64(
-                    model.geometry.num_value_heads(),
-                    "DeltaNet value head count",
-                )?,
-            ),
-            int_attribute(
-                crate::ATTR_KEY_HEAD_DIM,
-                as_i64(model.geometry.key_head_dim(), "DeltaNet key head width")?,
-            ),
-            int_attribute(
-                crate::ATTR_VALUE_HEAD_DIM,
-                as_i64(model.geometry.value_head_dim(), "DeltaNet value head width")?,
-            ),
-        ],
-        domain: ONNX_DOMAIN.to_owned(),
-    });
-    graph.projection(
-        "layer.0.output_projection",
-        "layer.0.normalized_core",
-        "layer.0.attention_output",
-        "layer.0.deltanet.output",
-        model.layer.output,
+        model.layer,
+        DeltaNetGraphContext {
+            geometry: model.geometry,
+            state_scope: DeltaStateScope::Standalone,
+            epsilon: model.rms_epsilon,
+        },
+        &mut inputs,
+        &mut state_outputs,
     )?;
     graph.standard(
-        "layer.0.attention_residual".to_owned(),
-        "Add",
-        &["hidden", "layer.0.attention_output"],
-        &["layer.0.post_attention"],
+        "layer.0.output_identity".to_owned(),
+        "Identity",
+        &[&layer_output],
+        &["next_hidden"],
         Vec::new(),
     );
-    graph.ffn_block(
-        prefix,
-        "layer.0.post_attention",
-        "next_hidden",
-        model.layer.ffn(),
-        model.rms_epsilon,
-        true,
-    )?;
     if let Some(error) = graph.failure {
         return Err(error);
     }
+    let mut outputs = vec![tensor_value("next_hidden", TENSOR_FLOAT, &[tokens, hidden])];
+    outputs.extend(state_outputs);
     let protobuf = ModelProto {
         ir_version: ONNX_IR_VERSION,
         producer_name: "tritium-onnx".to_owned(),
@@ -1853,58 +1832,8 @@ pub fn encode_qwen_deltanet_layer(
             node: graph.nodes,
             name: "tritium.qwen_deltanet_layer".to_owned(),
             initializer: graph.initializers,
-            input: vec![
-                tensor_value("hidden", TENSOR_FLOAT, &[tokens, hidden]),
-                tensor_value(
-                    "conv_state",
-                    TENSOR_FLOAT,
-                    &[
-                        as_i64(dimensions.conv_width(), "DeltaNet convolution width")?,
-                        as_i64(
-                            model.geometry.conv_kernel_dim(),
-                            "DeltaNet convolution kernel width",
-                        )?,
-                    ],
-                ),
-                tensor_value(
-                    "recurrent_state",
-                    TENSOR_FLOAT,
-                    &[
-                        as_i64(
-                            model.geometry.num_value_heads(),
-                            "DeltaNet value head count",
-                        )?,
-                        as_i64(model.geometry.key_head_dim(), "DeltaNet key head width")?,
-                        as_i64(model.geometry.value_head_dim(), "DeltaNet value head width")?,
-                    ],
-                ),
-            ],
-            output: vec![
-                tensor_value("next_hidden", TENSOR_FLOAT, &[tokens, hidden]),
-                tensor_value(
-                    "next_conv",
-                    TENSOR_FLOAT,
-                    &[
-                        as_i64(dimensions.conv_width(), "DeltaNet convolution width")?,
-                        as_i64(
-                            model.geometry.conv_kernel_dim(),
-                            "DeltaNet convolution kernel width",
-                        )?,
-                    ],
-                ),
-                tensor_value(
-                    "next_recurrent",
-                    TENSOR_FLOAT,
-                    &[
-                        as_i64(
-                            model.geometry.num_value_heads(),
-                            "DeltaNet value head count",
-                        )?,
-                        as_i64(model.geometry.key_head_dim(), "DeltaNet key head width")?,
-                        as_i64(model.geometry.value_head_dim(), "DeltaNet value head width")?,
-                    ],
-                ),
-            ],
+            input: inputs,
+            output: outputs,
             value_info: Vec::new(),
         }),
         opset_import: vec![
@@ -1939,6 +1868,23 @@ pub fn encode_qwen_deltanet_layer(
             metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
         ],
     };
+    let encoded = protobuf.encode_to_vec();
+    if encoded.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
+}
+
+/// Encode a packed heterogeneous Qwen causal language model.
+///
+/// # Errors
+/// [`OnnxModelError`] if schedule or model contract is invalid.
+pub fn encode_qwen_causal_lm(model: QwenCausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
+    validate_qwen_causal_lm(&model)?;
+    build_qwen_causal_lm_graph(model, CausalGraphBuilder::counting())?;
+    let protobuf = build_qwen_causal_lm_graph(model, CausalGraphBuilder::default())?;
     let encoded = protobuf.encode_to_vec();
     if encoded.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
@@ -2712,6 +2658,7 @@ struct CausalGraphBuilder {
 enum CausalInitializerStorage {
     Inline,
     External(Vec<u8>),
+    Counting { bytes: usize },
 }
 
 fn reserve_external_range(weights: &mut Vec<u8>, length: usize) -> Result<usize, OnnxModelError> {
@@ -2748,6 +2695,53 @@ struct CausalGraphGeometry {
     n_kv_head: i64,
     head_dim: i64,
     gqa_repeat: i64,
+}
+
+#[derive(Clone, Copy)]
+struct FullAttentionGraphContext<'a> {
+    tokens: i64,
+    n_head: i64,
+    n_kv_head: i64,
+    head_dim: i64,
+    head_dim_usize: usize,
+    query_width: i64,
+    geometry: CausalGraphGeometry,
+    rotary_state: Option<&'a RotaryGraphState>,
+    attention_mask: &'a str,
+    epsilon: f32,
+    zero_centered_norm: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeltaStateScope {
+    Standalone,
+    LayerIndex(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeltaNetGraphContext {
+    geometry: QwenDeltaNetGeometry,
+    state_scope: DeltaStateScope,
+    epsilon: f32,
+}
+
+impl DeltaStateScope {
+    fn names(self) -> [String; 4] {
+        match self {
+            Self::Standalone => [
+                "conv_state".to_owned(),
+                "recurrent_state".to_owned(),
+                "next_conv".to_owned(),
+                "next_recurrent".to_owned(),
+            ],
+            Self::LayerIndex(index) => [
+                format!("conv_state.{index}"),
+                format!("recurrent_state.{index}"),
+                format!("next_conv.{index}"),
+                format!("next_recurrent.{index}"),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2826,6 +2820,13 @@ struct CacheGraphOutputs {
 }
 
 impl CausalGraphBuilder {
+    fn counting() -> Self {
+        Self {
+            storage: CausalInitializerStorage::Counting { bytes: 0 },
+            ..Self::default()
+        }
+    }
+
     fn external() -> Self {
         Self {
             storage: CausalInitializerStorage::External(Vec::new()),
@@ -2841,8 +2842,31 @@ impl CausalGraphBuilder {
         self.failure.clone().map_or(Ok(()), Err)
     }
 
+    fn count_inline_bytes(&mut self, bytes: usize) {
+        let CausalInitializerStorage::Counting { bytes: total } = &mut self.storage else {
+            return;
+        };
+        let Some(next) = total.checked_add(bytes) else {
+            self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                "inline initializer byte count",
+            ));
+            return;
+        };
+        *total = next;
+        if next > MAX_MODEL_BYTES {
+            self.failure
+                .get_or_insert(OnnxModelError::InvalidModel(format!(
+                    "inline initializers require at least {next} bytes, exceed bounded graph"
+                )));
+        }
+    }
+
     fn store_bytes(&mut self, name: &str, data_type: i32, dimensions: Vec<i64>, bytes: &[u8]) {
         if self.failure.is_some() {
+            return;
+        }
+        if matches!(self.storage, CausalInitializerStorage::Counting { .. }) {
+            self.count_inline_bytes(bytes.len());
             return;
         }
         let tensor = match &mut self.storage {
@@ -2878,6 +2902,7 @@ impl CausalGraphBuilder {
                 };
                 external_tensor(name, data_type, dimensions, offset, length)
             }
+            CausalInitializerStorage::Counting { .. } => unreachable!(),
         };
         self.initializers.push(tensor);
     }
@@ -2905,6 +2930,16 @@ impl CausalGraphBuilder {
 
     fn add_f32(&mut self, name: &str, dimensions: Vec<i64>, values: &[f32]) {
         if self.failure.is_some() {
+            return;
+        }
+        if matches!(self.storage, CausalInitializerStorage::Counting { .. }) {
+            let Some(bytes) = values.len().checked_mul(core::mem::size_of::<f32>()) else {
+                self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                    "inline f32 initializer byte count",
+                ));
+                return;
+            };
+            self.count_inline_bytes(bytes);
             return;
         }
         if matches!(self.storage, CausalInitializerStorage::Inline) {
@@ -2977,6 +3012,15 @@ impl CausalGraphBuilder {
                 return;
             }
         };
+        if matches!(self.storage, CausalInitializerStorage::Counting { .. }) {
+            let Some(bytes) = elements.checked_mul(core::mem::size_of::<f32>()) else {
+                self.failure
+                    .get_or_insert(OnnxModelError::ShapeOverflow("attention mask byte count"));
+                return;
+            };
+            self.count_inline_bytes(bytes);
+            return;
+        }
         if matches!(self.storage, CausalInitializerStorage::Inline) {
             let mut values = Vec::new();
             if values.try_reserve_exact(elements).is_err() {
@@ -3111,6 +3155,16 @@ impl CausalGraphBuilder {
 
     fn add_i64(&mut self, name: &str, dimensions: Vec<i64>, values: &[i64]) {
         if self.failure.is_some() {
+            return;
+        }
+        if matches!(self.storage, CausalInitializerStorage::Counting { .. }) {
+            let Some(bytes) = values.len().checked_mul(core::mem::size_of::<i64>()) else {
+                self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                    "inline i64 initializer byte count",
+                ));
+                return;
+            };
+            self.count_inline_bytes(bytes);
             return;
         }
         self.initializers.push(inline_tensor(
@@ -3363,7 +3417,15 @@ impl CausalGraphBuilder {
             1,
             as_i64(config.rotary_dim, "RoPE rotary dimension")?,
         ];
-        if self.is_external() {
+        if matches!(self.storage, CausalInitializerStorage::Counting { .. }) {
+            let bytes = config
+                .tokens
+                .checked_mul(config.rotary_dim)
+                .and_then(|elements| elements.checked_mul(core::mem::size_of::<f32>()))
+                .ok_or(OnnxModelError::ShapeOverflow("RoPE table byte count"))?;
+            self.count_inline_bytes(bytes);
+            self.count_inline_bytes(bytes);
+        } else if self.is_external() {
             self.add_external_rotary_table(&cos_name, config, true, dimensions.clone());
             self.add_external_rotary_table(&sin_name, config, false, dimensions);
         } else {
@@ -3632,6 +3694,511 @@ impl CausalGraphBuilder {
         }
     }
 
+    fn full_attention_block(
+        &mut self,
+        index: usize,
+        hidden_name: &str,
+        layer: CausalLmDecoderLayer<'_>,
+        context: FullAttentionGraphContext<'_>,
+        inputs: &mut Vec<ValueInfoProto>,
+        cache_outputs: &mut Vec<ValueInfoProto>,
+    ) -> Result<String, OnnxModelError> {
+        let FullAttentionGraphContext {
+            tokens,
+            n_head,
+            n_kv_head,
+            head_dim,
+            head_dim_usize,
+            query_width,
+            geometry,
+            rotary_state,
+            attention_mask,
+            epsilon,
+            zero_centered_norm,
+        } = context;
+        let prefix = format!("layer.{index}");
+        let attention_input = format!("{prefix}.attention_input");
+        self.rms_norm_with_semantics(
+            &format!("{prefix}.attention_norm"),
+            hidden_name,
+            &attention_input,
+            layer.attention_norm,
+            epsilon,
+            zero_centered_norm,
+        );
+        let current_k_flat = format!("{prefix}.current_k_flat");
+        let current_v_flat = format!("{prefix}.current_v_flat");
+        let (query_flat, attention_gate) = match layer.query {
+            CausalQueryProjection::HeadInterleavedQueryGate { fused: weight } => {
+                let fused = format!("{prefix}.fused_query_gate");
+                self.projection(
+                    &format!("{prefix}.fused_query_gate_projection"),
+                    &attention_input,
+                    &fused,
+                    &format!("{prefix}.fused_query_gate"),
+                    weight,
+                )?;
+                let (query, gate) = self.deinterleave_query_gate(
+                    &format!("{prefix}.query_gate_split"),
+                    &fused,
+                    tokens,
+                    n_head,
+                    head_dim,
+                    query_width,
+                );
+                (query, Some(gate))
+            }
+            CausalQueryProjection::Separate {
+                query: weight,
+                gate,
+            } => {
+                let query = format!("{prefix}.query_flat");
+                self.projection(
+                    &format!("{prefix}.query"),
+                    &attention_input,
+                    &query,
+                    &format!("{prefix}.query"),
+                    weight,
+                )?;
+                let gate = if let Some(weight) = gate {
+                    let gate = format!("{prefix}.attention_gate");
+                    self.projection(
+                        &format!("{prefix}.attention_gate_projection"),
+                        &attention_input,
+                        &gate,
+                        &format!("{prefix}.attention_gate"),
+                        weight,
+                    )?;
+                    Some(gate)
+                } else {
+                    None
+                };
+                (query, gate)
+            }
+        };
+        self.projection(
+            &format!("{prefix}.key"),
+            &attention_input,
+            &current_k_flat,
+            &format!("{prefix}.key"),
+            layer.key,
+        )?;
+        self.projection(
+            &format!("{prefix}.value"),
+            &attention_input,
+            &current_v_flat,
+            &format!("{prefix}.value"),
+            layer.value,
+        )?;
+        let query_shape = format!("{prefix}.query_shape");
+        let kv_shape = format!("{prefix}.kv_shape");
+        self.add_i64(&query_shape, vec![3], &[tokens, n_head, head_dim]);
+        self.add_i64(&kv_shape, vec![3], &[tokens, n_kv_head, head_dim]);
+        let query_tokens = format!("{prefix}.query_tokens");
+        let query = format!("{prefix}.query_heads");
+        let current_k = format!("{prefix}.current_k");
+        let current_v = format!("{prefix}.current_v");
+        self.standard(
+            format!("{prefix}.query_reshape"),
+            "Reshape",
+            &[&query_flat, &query_shape],
+            &[&query_tokens],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.key_reshape"),
+            "Reshape",
+            &[&current_k_flat, &kv_shape],
+            &[&current_k],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.value_reshape"),
+            "Reshape",
+            &[&current_v_flat, &kv_shape],
+            &[&current_v],
+            Vec::new(),
+        );
+        let mut query_ready = query_tokens;
+        if let Some(weight) = layer.query_norm {
+            let normalized = format!("{prefix}.query_norm.output");
+            self.rms_norm_with_semantics(
+                &format!("{prefix}.query_norm"),
+                &query_ready,
+                &normalized,
+                weight,
+                epsilon,
+                zero_centered_norm,
+            );
+            query_ready = normalized;
+        }
+        let mut key_ready = current_k;
+        if let Some(weight) = layer.key_norm {
+            let normalized = format!("{prefix}.key_norm.output");
+            self.rms_norm_with_semantics(
+                &format!("{prefix}.key_norm"),
+                &key_ready,
+                &normalized,
+                weight,
+                epsilon,
+                zero_centered_norm,
+            );
+            key_ready = normalized;
+        }
+        if let Some(rotary) = rotary_state {
+            let rotated_query = format!("{prefix}.query_rope.output");
+            self.rotary(
+                &format!("{prefix}.query_rope"),
+                &query_ready,
+                &rotated_query,
+                rotary,
+            );
+            query_ready = rotated_query;
+            let rotated_key = format!("{prefix}.key_rope.output");
+            self.rotary(
+                &format!("{prefix}.key_rope"),
+                &key_ready,
+                &rotated_key,
+                rotary,
+            );
+            key_ready = rotated_key;
+        }
+        self.standard(
+            format!("{prefix}.query_transpose"),
+            "Transpose",
+            &[&query_ready],
+            &[&query],
+            vec![ints_attribute("perm", &[1, 0, 2])],
+        );
+        let cache = self.cache_and_expand_gqa(index, &key_ready, &current_v, geometry, inputs);
+        cache_outputs.extend(cache.declarations);
+        let expanded_k = cache.expanded_k;
+        let expanded_v = cache.expanded_v;
+        let transposed_k = format!("{prefix}.transposed_k");
+        let transposed_v = format!("{prefix}.transposed_v");
+        self.standard(
+            format!("{prefix}.key_transpose"),
+            "Transpose",
+            &[&expanded_k],
+            &[&transposed_k],
+            vec![ints_attribute("perm", &[1, 2, 0])],
+        );
+        self.standard(
+            format!("{prefix}.value_transpose"),
+            "Transpose",
+            &[&expanded_v],
+            &[&transposed_v],
+            vec![ints_attribute("perm", &[1, 0, 2])],
+        );
+        let scores = format!("{prefix}.scores");
+        self.standard(
+            format!("{prefix}.score_matmul"),
+            "MatMul",
+            &[&query, &transposed_k],
+            &[&scores],
+            Vec::new(),
+        );
+        let attention_scale = format!("{prefix}.attention_scale");
+        self.add_f32(
+            &attention_scale,
+            Vec::new(),
+            &[1.0 / (head_dim_usize as f32).sqrt()],
+        );
+        let scaled_scores = format!("{prefix}.scaled_scores");
+        self.standard(
+            format!("{prefix}.score_scale"),
+            "Mul",
+            &[&scores, &attention_scale],
+            &[&scaled_scores],
+            Vec::new(),
+        );
+        let masked_scores = format!("{prefix}.masked_scores");
+        self.standard(
+            format!("{prefix}.mask"),
+            "Add",
+            &[&scaled_scores, attention_mask],
+            &[&masked_scores],
+            Vec::new(),
+        );
+        let probabilities = format!("{prefix}.probabilities");
+        self.standard(
+            format!("{prefix}.softmax"),
+            "Softmax",
+            &[&masked_scores],
+            &[&probabilities],
+            vec![int_attribute("axis", -1)],
+        );
+        let context_heads = format!("{prefix}.context_heads");
+        self.standard(
+            format!("{prefix}.context_matmul"),
+            "MatMul",
+            &[&probabilities, &transposed_v],
+            &[&context_heads],
+            Vec::new(),
+        );
+        let context_tokens = format!("{prefix}.context_tokens");
+        self.standard(
+            format!("{prefix}.context_transpose"),
+            "Transpose",
+            &[&context_heads],
+            &[&context_tokens],
+            vec![ints_attribute("perm", &[1, 0, 2])],
+        );
+        let context_shape = format!("{prefix}.context_shape");
+        self.add_i64(&context_shape, vec![2], &[tokens, query_width]);
+        let context = format!("{prefix}.context");
+        self.standard(
+            format!("{prefix}.context_reshape"),
+            "Reshape",
+            &[&context_tokens, &context_shape],
+            &[&context],
+            Vec::new(),
+        );
+        let mut output_input = context;
+        if let Some(gate) = attention_gate {
+            let sigmoid = format!("{prefix}.attention_gate_sigmoid");
+            self.standard(
+                format!("{prefix}.attention_gate_activation"),
+                "Sigmoid",
+                &[&gate],
+                &[&sigmoid],
+                Vec::new(),
+            );
+            let gated = format!("{prefix}.gated_attention");
+            self.standard(
+                format!("{prefix}.attention_gate_multiply"),
+                "Mul",
+                &[&output_input, &sigmoid],
+                &[&gated],
+                Vec::new(),
+            );
+            output_input = gated;
+        }
+        if let Some(weight) = layer.attention_sub_norm {
+            let normalized = format!("{prefix}.attention_sub_norm.output");
+            self.rms_norm_with_semantics(
+                &format!("{prefix}.attention_sub_norm"),
+                &output_input,
+                &normalized,
+                weight,
+                epsilon,
+                zero_centered_norm,
+            );
+            output_input = normalized;
+        }
+        let attention_output = format!("{prefix}.attention_output");
+        self.projection(
+            &format!("{prefix}.output"),
+            &output_input,
+            &attention_output,
+            &format!("{prefix}.attention_output"),
+            layer.attention_output,
+        )?;
+        let post_attention = format!("{prefix}.post_attention");
+        self.standard(
+            format!("{prefix}.attention_residual"),
+            "Add",
+            &[hidden_name, &attention_output],
+            &[&post_attention],
+            Vec::new(),
+        );
+        let layer_output = format!("layer.{}.input", index + 1);
+        self.ffn_block(
+            &prefix,
+            &post_attention,
+            &layer_output,
+            layer.ffn(),
+            epsilon,
+            zero_centered_norm,
+        )?;
+        Ok(layer_output)
+    }
+
+    fn delta_net_block(
+        &mut self,
+        index: usize,
+        hidden_name: &str,
+        layer: QwenDeltaNetDecoderLayer<'_>,
+        context: DeltaNetGraphContext,
+        inputs: &mut Vec<ValueInfoProto>,
+        state_outputs: &mut Vec<ValueInfoProto>,
+    ) -> Result<String, OnnxModelError> {
+        let DeltaNetGraphContext {
+            geometry,
+            state_scope,
+            epsilon: epsilon_value,
+        } = context;
+        let dimensions = geometry
+            .dimensions()
+            .map_err(|error| OnnxModelError::InvalidModel(error.to_string()))?;
+        let prefix = format!("layer.{index}");
+        let attention_input = format!("{prefix}.attention_input");
+        self.rms_norm_with_semantics(
+            &format!("{prefix}.attention_norm"),
+            hidden_name,
+            &attention_input,
+            layer.attention_norm,
+            epsilon_value,
+            true,
+        );
+        let raw_qkv = format!("{prefix}.raw_qkv");
+        let z = format!("{prefix}.z");
+        let beta = format!("{prefix}.beta_logits");
+        let decay = format!("{prefix}.decay_logits");
+        for (node, output, initializer, matrix) in [
+            ("qkv_projection", &raw_qkv, "qkv", layer.qkv),
+            ("z_projection", &z, "z", layer.z),
+            ("beta_projection", &beta, "beta", layer.beta),
+            ("decay_projection", &decay, "decay", layer.decay),
+        ] {
+            self.projection(
+                &format!("{prefix}.{node}"),
+                &attention_input,
+                output,
+                &format!("{prefix}.deltanet.{initializer}"),
+                matrix,
+            )?;
+        }
+        let conv_weight = format!("{prefix}.deltanet.conv.weight");
+        let norm_weight = format!("{prefix}.deltanet.norm.weight");
+        let dt_bias = format!("{prefix}.deltanet.dt_bias");
+        let a_log = format!("{prefix}.deltanet.a_log");
+        let epsilon = format!("{prefix}.deltanet.epsilon");
+        self.add_f32(
+            &conv_weight,
+            vec![
+                as_i64(dimensions.conv_width(), "DeltaNet convolution width")?,
+                as_i64(
+                    geometry.conv_kernel_dim(),
+                    "DeltaNet convolution kernel width",
+                )?,
+            ],
+            layer.conv_weight,
+        );
+        self.add_f32(
+            &norm_weight,
+            vec![as_i64(
+                geometry.value_head_dim(),
+                "DeltaNet value head width",
+            )?],
+            layer.norm_weight,
+        );
+        self.add_f32(
+            &dt_bias,
+            vec![as_i64(
+                geometry.num_value_heads(),
+                "DeltaNet value head count",
+            )?],
+            layer.dt_bias,
+        );
+        self.add_f32(
+            &a_log,
+            vec![as_i64(
+                geometry.num_value_heads(),
+                "DeltaNet value head count",
+            )?],
+            layer.a_log,
+        );
+        self.add_f32(&epsilon, Vec::new(), &[epsilon_value]);
+        let [conv_state, recurrent_state, next_conv, next_recurrent] = state_scope.names();
+        let conv_shape = [
+            as_i64(dimensions.conv_width(), "DeltaNet convolution width")?,
+            as_i64(
+                geometry.conv_kernel_dim(),
+                "DeltaNet convolution kernel width",
+            )?,
+        ];
+        let recurrent_shape = [
+            as_i64(geometry.num_value_heads(), "DeltaNet value head count")?,
+            as_i64(geometry.key_head_dim(), "DeltaNet key head width")?,
+            as_i64(geometry.value_head_dim(), "DeltaNet value head width")?,
+        ];
+        inputs.push(tensor_value(&conv_state, TENSOR_FLOAT, &conv_shape));
+        inputs.push(tensor_value(
+            &recurrent_state,
+            TENSOR_FLOAT,
+            &recurrent_shape,
+        ));
+        state_outputs.push(tensor_value(&next_conv, TENSOR_FLOAT, &conv_shape));
+        state_outputs.push(tensor_value(
+            &next_recurrent,
+            TENSOR_FLOAT,
+            &recurrent_shape,
+        ));
+        let normalized_core = format!("{prefix}.normalized_core");
+        let node_inputs = crate::QwenDeltaNetInput::ALL.map(|slot| match slot {
+            crate::QwenDeltaNetInput::RawQkv => raw_qkv.as_str(),
+            crate::QwenDeltaNetInput::Z => z.as_str(),
+            crate::QwenDeltaNetInput::BetaLogits => beta.as_str(),
+            crate::QwenDeltaNetInput::DecayLogits => decay.as_str(),
+            crate::QwenDeltaNetInput::ConvWeight => conv_weight.as_str(),
+            crate::QwenDeltaNetInput::NormWeight => norm_weight.as_str(),
+            crate::QwenDeltaNetInput::DtBias => dt_bias.as_str(),
+            crate::QwenDeltaNetInput::ALog => a_log.as_str(),
+            crate::QwenDeltaNetInput::ConvState => conv_state.as_str(),
+            crate::QwenDeltaNetInput::RecurrentState => recurrent_state.as_str(),
+            crate::QwenDeltaNetInput::Epsilon => epsilon.as_str(),
+        });
+        self.nodes.push(NodeProto {
+            input: strings(node_inputs),
+            output: strings([&normalized_core, &next_conv, &next_recurrent]),
+            name: format!("{prefix}.deltanet"),
+            op_type: crate::ONNX_QWEN_DELTANET_OP_NAME.to_owned(),
+            attribute: vec![
+                int_attribute(
+                    crate::ATTR_CONV_KERNEL_DIM,
+                    as_i64(
+                        geometry.conv_kernel_dim(),
+                        "DeltaNet convolution kernel width",
+                    )?,
+                ),
+                int_attribute(
+                    crate::ATTR_NUM_KEY_HEADS,
+                    as_i64(geometry.num_key_heads(), "DeltaNet query/key head count")?,
+                ),
+                int_attribute(
+                    crate::ATTR_NUM_VALUE_HEADS,
+                    as_i64(geometry.num_value_heads(), "DeltaNet value head count")?,
+                ),
+                int_attribute(
+                    crate::ATTR_KEY_HEAD_DIM,
+                    as_i64(geometry.key_head_dim(), "DeltaNet key head width")?,
+                ),
+                int_attribute(
+                    crate::ATTR_VALUE_HEAD_DIM,
+                    as_i64(geometry.value_head_dim(), "DeltaNet value head width")?,
+                ),
+            ],
+            domain: ONNX_DOMAIN.to_owned(),
+        });
+        let attention_output = format!("{prefix}.attention_output");
+        self.projection(
+            &format!("{prefix}.output_projection"),
+            &normalized_core,
+            &attention_output,
+            &format!("{prefix}.deltanet.output"),
+            layer.output,
+        )?;
+        let post_attention = format!("{prefix}.post_attention");
+        self.standard(
+            format!("{prefix}.attention_residual"),
+            "Add",
+            &[hidden_name, &attention_output],
+            &[&post_attention],
+            Vec::new(),
+        );
+        let layer_output = format!("layer.{}.input", index + 1);
+        self.ffn_block(
+            &prefix,
+            &post_attention,
+            &layer_output,
+            layer.ffn(),
+            epsilon_value,
+            true,
+        )?;
+        Ok(layer_output)
+    }
+
     fn ffn_block(
         &mut self,
         prefix: &str,
@@ -3743,6 +4310,215 @@ impl CausalGraphBuilder {
     }
 }
 
+fn build_qwen_causal_lm_graph(
+    model: QwenCausalLmModel<'_>,
+    mut graph: CausalGraphBuilder,
+) -> Result<ModelProto, OnnxModelError> {
+    let tokens = as_i64(model.tokens, "token count")?;
+    let past_tokens = as_i64(model.past_tokens, "past token count")?;
+    let total_tokens = tokens
+        .checked_add(past_tokens)
+        .ok_or(OnnxModelError::ShapeOverflow("total token count"))?;
+    let total_tokens_usize = model
+        .tokens
+        .checked_add(model.past_tokens)
+        .ok_or(OnnxModelError::ShapeOverflow("total token count"))?;
+    let hidden = as_i64(model.embedding.columns, "hidden size")?;
+    let vocab = as_i64(model.embedding.rows, "vocabulary")?;
+    let n_head = as_i64(model.n_head, "attention head count")?;
+    let n_kv_head = as_i64(model.n_kv_head, "KV head count")?;
+    let head_dim = as_i64(model.head_dim, "head dimension")?;
+    let query_width = n_head
+        .checked_mul(head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("query width"))?;
+    let geometry = CausalGraphGeometry {
+        past_tokens,
+        total_tokens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        gqa_repeat: as_i64(model.n_head / model.n_kv_head, "GQA repeat")?,
+    };
+    let rotary_state = graph.prepare_rotary(RotaryGraphConfig {
+        tokens: model.tokens,
+        head_dim: model.head_dim,
+        rotary_dim: model.rotary.dimensions,
+        past_tokens: model.past_tokens,
+        theta: model.rotary.theta,
+    })?;
+    let mask_elements =
+        model
+            .tokens
+            .checked_mul(total_tokens_usize)
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "attention mask element count",
+            ))?;
+    if mask_elements > MAX_MODEL_BYTES / core::mem::size_of::<f32>() {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "attention mask requires {mask_elements} elements, exceeds bounded inline graph"
+        )));
+    }
+    let attention_mask = "attention.attention_mask";
+    graph.add_causal_mask(
+        attention_mask,
+        model.tokens,
+        total_tokens_usize,
+        model.past_tokens,
+        vec![1, tokens, total_tokens],
+    );
+    graph.add_matrix("tok_embeddings", model.embedding);
+    graph.nodes.push(NodeProto {
+        input: strings(["tokens", "tok_embeddings.packed", "tok_embeddings.scales"]),
+        output: strings(["layer.0.input"]),
+        name: "tok_embeddings".to_owned(),
+        op_type: ONNX_EMBEDDING_OP_NAME.to_owned(),
+        attribute: attributes(hidden, format_code(model.embedding.format)?),
+        domain: ONNX_DOMAIN.to_owned(),
+    });
+    let mut hidden_name = "layer.0.input".to_owned();
+    let mut inputs = vec![tensor_value("tokens", TENSOR_INT64, &[tokens])];
+    let mut state_outputs = Vec::with_capacity(model.layers.len() * 2);
+    let full_context = FullAttentionGraphContext {
+        tokens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        head_dim_usize: model.head_dim,
+        query_width,
+        geometry,
+        rotary_state: Some(&rotary_state),
+        attention_mask,
+        epsilon: model.rms_epsilon,
+        zero_centered_norm: true,
+    };
+    for (index, layer) in model.layers.iter().copied().enumerate() {
+        hidden_name = match layer {
+            QwenCausalLmDecoderLayer::DeltaNet(layer) => graph.delta_net_block(
+                index,
+                &hidden_name,
+                layer,
+                DeltaNetGraphContext {
+                    geometry: model.delta_geometry,
+                    state_scope: DeltaStateScope::LayerIndex(index),
+                    epsilon: model.rms_epsilon,
+                },
+                &mut inputs,
+                &mut state_outputs,
+            )?,
+            QwenCausalLmDecoderLayer::FullAttention(layer) => graph.full_attention_block(
+                index,
+                &hidden_name,
+                layer.causal(),
+                full_context,
+                &mut inputs,
+                &mut state_outputs,
+            )?,
+        };
+    }
+    let final_hidden = "final_norm.output";
+    graph.rms_norm_with_semantics(
+        "final_norm",
+        &hidden_name,
+        final_hidden,
+        model.final_norm,
+        model.rms_epsilon,
+        true,
+    );
+    let (head_packed, head_scales, head_format) = if let Some(head) = model.lm_head {
+        graph.add_matrix("lm_head", head);
+        ("lm_head.packed", "lm_head.scales", head.format)
+    } else {
+        (
+            "tok_embeddings.packed",
+            "tok_embeddings.scales",
+            model.embedding.format,
+        )
+    };
+    graph.nodes.push(NodeProto {
+        input: strings([final_hidden, head_packed, head_scales]),
+        output: strings(["logits"]),
+        name: "lm_head".to_owned(),
+        op_type: ONNX_OP_NAME.to_owned(),
+        attribute: attributes(hidden, format_code(head_format)?),
+        domain: ONNX_DOMAIN.to_owned(),
+    });
+    let mut outputs = vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])];
+    outputs.extend(state_outputs);
+    let schedule = model
+        .layers
+        .iter()
+        .map(|layer| match layer {
+            QwenCausalLmDecoderLayer::DeltaNet(_) => "linear_attention",
+            QwenCausalLmDecoderLayer::FullAttention(_) => "full_attention",
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if let Some(error) = graph.failure {
+        return Err(error);
+    }
+    Ok(ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: ONNX_DOMAIN.to_owned(),
+        model_version: 2,
+        graph: Some(GraphProto {
+            node: graph.nodes,
+            name: "tritium.qwen_causal_lm".to_owned(),
+            initializer: graph.initializers,
+            input: inputs,
+            output: outputs,
+            value_info: Vec::new(),
+        }),
+        opset_import: vec![
+            OperatorSetIdProto {
+                domain: String::new(),
+                version: ONNX_OPSET,
+            },
+            OperatorSetIdProto {
+                domain: ONNX_DOMAIN.to_owned(),
+                version: 2,
+            },
+        ],
+        metadata_props: vec![
+            metadata("tritium.schema_version", "2"),
+            metadata("tritium.graph_kind", "qwen-causal-lm"),
+            metadata("tritium.source_model_id", model.identity.source_model_id),
+            metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
+            metadata("tritium.recipe_id", model.identity.recipe_id),
+            metadata("tritium.build_id", model.identity.tritium_build_id),
+            metadata("tritium.package_id", model.identity.package_id),
+            metadata(
+                "tritium.coverage.converted_id",
+                model.identity.converted_coverage_id,
+            ),
+            metadata(
+                "tritium.coverage.deferred_id",
+                model.identity.deferred_coverage_id,
+            ),
+            metadata("tritium.tokens", &model.tokens.to_string()),
+            metadata("tritium.past_tokens", &model.past_tokens.to_string()),
+            metadata("tritium.layers", &model.layers.len().to_string()),
+            metadata("tritium.hidden", &model.embedding.columns.to_string()),
+            metadata("tritium.vocab", &model.embedding.rows.to_string()),
+            metadata("tritium.n_head", &model.n_head.to_string()),
+            metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
+            metadata("tritium.head_dim", &model.head_dim.to_string()),
+            metadata("tritium.layer_schedule", &schedule),
+            metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
+            metadata(
+                "tritium.tied_embedding_head",
+                if model.lm_head.is_none() {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+            metadata("tritium.rope_theta", &model.rotary.theta.to_string()),
+        ],
+    })
+}
+
 fn build_causal_lm_graph(
     model: CausalLmModel<'_>,
     external: bool,
@@ -3823,304 +4599,28 @@ fn build_causal_lm_graph(
     let mut inputs = vec![tensor_value("tokens", TENSOR_INT64, &[tokens])];
     let mut cache_outputs = Vec::with_capacity(model.layers.len() * 2);
 
+    let full_attention_context = FullAttentionGraphContext {
+        tokens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        head_dim_usize: model.head_dim,
+        query_width,
+        geometry,
+        rotary_state: rotary_state.as_ref(),
+        attention_mask,
+        epsilon: model.rms_epsilon,
+        zero_centered_norm: model.zero_centered_norm,
+    };
     for (index, layer) in model.layers.iter().copied().enumerate() {
-        let prefix = format!("layer.{index}");
-        let attention_input = format!("{prefix}.attention_input");
-        graph.rms_norm_with_semantics(
-            &format!("{prefix}.attention_norm"),
+        hidden_name = graph.full_attention_block(
+            index,
             &hidden_name,
-            &attention_input,
-            layer.attention_norm,
-            model.rms_epsilon,
-            model.zero_centered_norm,
-        );
-        let current_k_flat = format!("{prefix}.current_k_flat");
-        let current_v_flat = format!("{prefix}.current_v_flat");
-        let (query_flat, attention_gate) = match layer.query {
-            CausalQueryProjection::HeadInterleavedQueryGate { fused: weight } => {
-                let fused = format!("{prefix}.fused_query_gate");
-                graph.projection(
-                    &format!("{prefix}.fused_query_gate_projection"),
-                    &attention_input,
-                    &fused,
-                    &format!("{prefix}.fused_query_gate"),
-                    weight,
-                )?;
-                let (query, gate) = graph.deinterleave_query_gate(
-                    &format!("{prefix}.query_gate_split"),
-                    &fused,
-                    tokens,
-                    n_head,
-                    head_dim,
-                    query_width,
-                );
-                (query, Some(gate))
-            }
-            CausalQueryProjection::Separate {
-                query: weight,
-                gate,
-            } => {
-                let query = format!("{prefix}.query_flat");
-                graph.projection(
-                    &format!("{prefix}.query"),
-                    &attention_input,
-                    &query,
-                    &format!("{prefix}.query"),
-                    weight,
-                )?;
-                let gate = if let Some(weight) = gate {
-                    let gate = format!("{prefix}.attention_gate");
-                    graph.projection(
-                        &format!("{prefix}.attention_gate_projection"),
-                        &attention_input,
-                        &gate,
-                        &format!("{prefix}.attention_gate"),
-                        weight,
-                    )?;
-                    Some(gate)
-                } else {
-                    None
-                };
-                (query, gate)
-            }
-        };
-        graph.projection(
-            &format!("{prefix}.key"),
-            &attention_input,
-            &current_k_flat,
-            &format!("{prefix}.key"),
-            layer.key,
+            layer,
+            full_attention_context,
+            &mut inputs,
+            &mut cache_outputs,
         )?;
-        graph.projection(
-            &format!("{prefix}.value"),
-            &attention_input,
-            &current_v_flat,
-            &format!("{prefix}.value"),
-            layer.value,
-        )?;
-        let query_shape = format!("{prefix}.query_shape");
-        let kv_shape = format!("{prefix}.kv_shape");
-        graph.add_i64(&query_shape, vec![3], &[tokens, n_head, head_dim]);
-        graph.add_i64(&kv_shape, vec![3], &[tokens, n_kv_head, head_dim]);
-        let query_tokens = format!("{prefix}.query_tokens");
-        let query = format!("{prefix}.query_heads");
-        let current_k = format!("{prefix}.current_k");
-        let current_v = format!("{prefix}.current_v");
-        graph.standard(
-            format!("{prefix}.query_reshape"),
-            "Reshape",
-            &[&query_flat, &query_shape],
-            &[&query_tokens],
-            Vec::new(),
-        );
-        graph.standard(
-            format!("{prefix}.key_reshape"),
-            "Reshape",
-            &[&current_k_flat, &kv_shape],
-            &[&current_k],
-            Vec::new(),
-        );
-        graph.standard(
-            format!("{prefix}.value_reshape"),
-            "Reshape",
-            &[&current_v_flat, &kv_shape],
-            &[&current_v],
-            Vec::new(),
-        );
-        let mut query_ready = query_tokens;
-        if let Some(weight) = layer.query_norm {
-            let normalized = format!("{prefix}.query_norm.output");
-            graph.rms_norm_with_semantics(
-                &format!("{prefix}.query_norm"),
-                &query_ready,
-                &normalized,
-                weight,
-                model.rms_epsilon,
-                model.zero_centered_norm,
-            );
-            query_ready = normalized;
-        }
-        let mut key_ready = current_k;
-        if let Some(weight) = layer.key_norm {
-            let normalized = format!("{prefix}.key_norm.output");
-            graph.rms_norm_with_semantics(
-                &format!("{prefix}.key_norm"),
-                &key_ready,
-                &normalized,
-                weight,
-                model.rms_epsilon,
-                model.zero_centered_norm,
-            );
-            key_ready = normalized;
-        }
-        if let Some(rotary) = &rotary_state {
-            let rotated_query = format!("{prefix}.query_rope.output");
-            graph.rotary(
-                &format!("{prefix}.query_rope"),
-                &query_ready,
-                &rotated_query,
-                rotary,
-            );
-            query_ready = rotated_query;
-            let rotated_key = format!("{prefix}.key_rope.output");
-            graph.rotary(
-                &format!("{prefix}.key_rope"),
-                &key_ready,
-                &rotated_key,
-                rotary,
-            );
-            key_ready = rotated_key;
-        }
-        graph.standard(
-            format!("{prefix}.query_transpose"),
-            "Transpose",
-            &[&query_ready],
-            &[&query],
-            vec![ints_attribute("perm", &[1, 0, 2])],
-        );
-        let cache =
-            graph.cache_and_expand_gqa(index, &key_ready, &current_v, geometry, &mut inputs);
-        cache_outputs.extend(cache.declarations);
-        let expanded_k = cache.expanded_k;
-        let expanded_v = cache.expanded_v;
-        let transposed_k = format!("{prefix}.transposed_k");
-        let transposed_v = format!("{prefix}.transposed_v");
-        graph.standard(
-            format!("{prefix}.key_transpose"),
-            "Transpose",
-            &[&expanded_k],
-            &[&transposed_k],
-            vec![ints_attribute("perm", &[1, 2, 0])],
-        );
-        graph.standard(
-            format!("{prefix}.value_transpose"),
-            "Transpose",
-            &[&expanded_v],
-            &[&transposed_v],
-            vec![ints_attribute("perm", &[1, 0, 2])],
-        );
-        let scores = format!("{prefix}.scores");
-        graph.standard(
-            format!("{prefix}.score_matmul"),
-            "MatMul",
-            &[&query, &transposed_k],
-            &[&scores],
-            Vec::new(),
-        );
-        let attention_scale = format!("{prefix}.attention_scale");
-        graph.add_f32(
-            &attention_scale,
-            Vec::new(),
-            &[1.0 / (model.head_dim as f32).sqrt()],
-        );
-        let scaled_scores = format!("{prefix}.scaled_scores");
-        graph.standard(
-            format!("{prefix}.score_scale"),
-            "Mul",
-            &[&scores, &attention_scale],
-            &[&scaled_scores],
-            Vec::new(),
-        );
-        let masked_scores = format!("{prefix}.masked_scores");
-        graph.standard(
-            format!("{prefix}.mask"),
-            "Add",
-            &[&scaled_scores, attention_mask],
-            &[&masked_scores],
-            Vec::new(),
-        );
-        let probabilities = format!("{prefix}.probabilities");
-        graph.standard(
-            format!("{prefix}.softmax"),
-            "Softmax",
-            &[&masked_scores],
-            &[&probabilities],
-            vec![int_attribute("axis", -1)],
-        );
-        let context_heads = format!("{prefix}.context_heads");
-        graph.standard(
-            format!("{prefix}.context_matmul"),
-            "MatMul",
-            &[&probabilities, &transposed_v],
-            &[&context_heads],
-            Vec::new(),
-        );
-        let context_tokens = format!("{prefix}.context_tokens");
-        graph.standard(
-            format!("{prefix}.context_transpose"),
-            "Transpose",
-            &[&context_heads],
-            &[&context_tokens],
-            vec![ints_attribute("perm", &[1, 0, 2])],
-        );
-        let context_shape = format!("{prefix}.context_shape");
-        graph.add_i64(&context_shape, vec![2], &[tokens, query_width]);
-        let context = format!("{prefix}.context");
-        graph.standard(
-            format!("{prefix}.context_reshape"),
-            "Reshape",
-            &[&context_tokens, &context_shape],
-            &[&context],
-            Vec::new(),
-        );
-        let mut output_input = context;
-        if let Some(gate) = attention_gate {
-            let sigmoid = format!("{prefix}.attention_gate_sigmoid");
-            graph.standard(
-                format!("{prefix}.attention_gate_activation"),
-                "Sigmoid",
-                &[&gate],
-                &[&sigmoid],
-                Vec::new(),
-            );
-            let gated = format!("{prefix}.gated_attention");
-            graph.standard(
-                format!("{prefix}.attention_gate_multiply"),
-                "Mul",
-                &[&output_input, &sigmoid],
-                &[&gated],
-                Vec::new(),
-            );
-            output_input = gated;
-        }
-        if let Some(weight) = layer.attention_sub_norm {
-            let normalized = format!("{prefix}.attention_sub_norm.output");
-            graph.rms_norm_with_semantics(
-                &format!("{prefix}.attention_sub_norm"),
-                &output_input,
-                &normalized,
-                weight,
-                model.rms_epsilon,
-                model.zero_centered_norm,
-            );
-            output_input = normalized;
-        }
-        let attention_output = format!("{prefix}.attention_output");
-        graph.projection(
-            &format!("{prefix}.output"),
-            &output_input,
-            &attention_output,
-            &format!("{prefix}.attention_output"),
-            layer.attention_output,
-        )?;
-        let post_attention = format!("{prefix}.post_attention");
-        graph.standard(
-            format!("{prefix}.attention_residual"),
-            "Add",
-            &[&hidden_name, &attention_output],
-            &[&post_attention],
-            Vec::new(),
-        );
-        let layer_output = format!("layer.{}.input", index + 1);
-        graph.ffn_block(
-            &prefix,
-            &post_attention,
-            &layer_output,
-            layer.ffn(),
-            model.rms_epsilon,
-            model.zero_centered_norm,
-        )?;
-        hidden_name = layer_output;
     }
     let final_hidden = "final_norm.output";
     graph.rms_norm_with_semantics(
@@ -4209,6 +4709,7 @@ fn build_causal_lm_graph(
     let external_weights = match graph.storage {
         CausalInitializerStorage::Inline => None,
         CausalInitializerStorage::External(weights) => Some(weights),
+        CausalInitializerStorage::Counting { .. } => unreachable!("generic graph is not counted"),
     };
     let protobuf = ModelProto {
         ir_version: ONNX_IR_VERSION,
@@ -4832,6 +5333,56 @@ fn validate_qwen_deltanet_layer(
     validate_matrix_shape("layer.0.down", model.layer.down, model.hidden, intermediate)?;
     validate_identity_v2(model.identity)?;
     Ok(dimensions)
+}
+
+fn validate_qwen_causal_lm(model: &QwenCausalLmModel<'_>) -> Result<(), OnnxModelError> {
+    if model.layers.is_empty() {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen causal LM requires at least one layer".to_owned(),
+        ));
+    }
+    let mut has_delta = false;
+    let mut has_full = false;
+    for layer in model.layers.iter().copied() {
+        match layer {
+            QwenCausalLmDecoderLayer::DeltaNet(layer) => {
+                has_delta = true;
+                validate_qwen_deltanet_layer(&QwenDeltaNetLayerModel {
+                    tokens: model.tokens,
+                    hidden: model.embedding.columns,
+                    rms_epsilon: model.rms_epsilon,
+                    geometry: model.delta_geometry,
+                    layer,
+                    identity: model.identity,
+                })?;
+            }
+            QwenCausalLmDecoderLayer::FullAttention(layer) => {
+                has_full = true;
+                let singleton = [layer.causal()];
+                validate_causal_lm(&CausalLmModel {
+                    tokens: model.tokens,
+                    past_tokens: model.past_tokens,
+                    n_head: model.n_head,
+                    n_kv_head: model.n_kv_head,
+                    head_dim: model.head_dim,
+                    rotary: Some(model.rotary),
+                    rms_epsilon: model.rms_epsilon,
+                    zero_centered_norm: true,
+                    embedding: model.embedding,
+                    lm_head: model.lm_head,
+                    layers: &singleton,
+                    final_norm: model.final_norm,
+                    identity: model.identity,
+                })?;
+            }
+        }
+    }
+    if !has_delta || !has_full {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen heterogeneous schedule requires DeltaNet and full-attention layers".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_qwen_deltanet_initializer_budget(
@@ -6026,6 +6577,47 @@ mod tests {
     }
 
     #[test]
+    fn qwen_heterogeneous_encoder_rejects_empty_schedule() {
+        let empty_matrix = PackedTernaryMatrix {
+            rows: 0,
+            columns: 0,
+            packed: &[],
+            scales: &[],
+            format: TernaryFormat::Tq2_0,
+        };
+        let model = QwenCausalLmModel {
+            tokens: 1,
+            past_tokens: 0,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: 2,
+            rotary: RotaryEmbedding {
+                theta: 10_000.0,
+                dimensions: 2,
+            },
+            rms_epsilon: 1.0e-6,
+            delta_geometry: QwenDeltaNetGeometry::new(2, 1, 1, 1, 1).unwrap(),
+            embedding: empty_matrix,
+            lm_head: None,
+            layers: &[],
+            final_norm: &[],
+            identity: OnnxArtifactIdentityV2 {
+                source_model_id: "source",
+                tokenizer_id: "tokenizer",
+                recipe_id: "recipe",
+                tritium_build_id: "build",
+                package_id: "package",
+                converted_coverage_id: "converted",
+                deferred_coverage_id: "deferred",
+            },
+        };
+        assert!(matches!(
+            encode_qwen_causal_lm(model),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("at least one layer")
+        ));
+    }
+
+    #[test]
     fn kv_attention_diagnostics_reject_opset_one_import() {
         let encoded = encode_kv_attention_test_graph(1, 0, 2, 1, 4);
         let mut protobuf = ModelProto::decode(encoded.as_slice()).unwrap();
@@ -6145,6 +6737,21 @@ mod tests {
             Err(OnnxModelError::InvalidModel(reason))
                 if reason.contains("causal initializers require at least")
         ));
+    }
+
+    #[test]
+    fn counting_builder_rejects_generated_initializer_aggregate_without_materializing() {
+        let mut graph = CausalGraphBuilder::counting();
+        graph.add_causal_mask("mask", 4096, 4096, 0, vec![1, 4096, 4096]);
+        assert!(graph.failure.is_none());
+
+        graph.add_i64("shape", vec![1], &[1]);
+        assert!(matches!(
+            graph.failure,
+            Some(OnnxModelError::InvalidModel(ref reason))
+                if reason.contains("inline initializers require at least")
+        ));
+        assert!(graph.initializers.is_empty());
     }
 
     #[test]

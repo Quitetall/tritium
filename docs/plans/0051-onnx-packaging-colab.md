@@ -127,8 +127,12 @@ decay-before-delta, normalized state feedback and gated RMSNorm. Whole-layer
 emission now composes packed QKV/Z/beta/decay/output and SwiGLU projections,
 zero-centered pre-mixer/pre-FFN norms, both residuals and explicit prior/next
 state through real ORT. Heterogeneous language-model schedule composition,
-external-data emission and the exact architecture tensor-map adapter remain
-open.
+including sparse layer-indexed DeltaNet and KV-cache state, now runs prompt and
+cached decode through one packed causal graph. Its public full-attention type
+structurally requires Q/K norm, fused head-interleaved query/gate and SwiGLU.
+Inline admission dry-runs the shared emission path and aggregates every
+initializer payload before cloning. External-data emission, exact architecture
+tensor-map mapping and MTP composition remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

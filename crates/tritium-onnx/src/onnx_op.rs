@@ -1361,6 +1361,183 @@ mod tests {
     }
 
     #[test]
+    fn qwen_heterogeneous_schedule_runs_prompt_and_cached_decode() {
+        use ort::value::Tensor;
+
+        let format = TernaryFormat::Tq2_0;
+        let hidden = 256;
+        let basis = |sign: i8, columns: usize| {
+            let mut row = vec![Trit::ZERO; columns];
+            row[0] = Trit::from_i8(sign).unwrap();
+            row
+        };
+        let zero = |columns: usize| vec![Trit::ZERO; columns];
+        let matrix = |rows, columns, packed, scales| crate::PackedTernaryMatrix {
+            rows,
+            columns,
+            packed,
+            scales,
+            format,
+        };
+
+        let embedding_packed = pack_rows(&[basis(1, hidden), basis(-1, hidden)], format);
+        let embedding_scales = [1.0, 1.0];
+        let qkv_packed = pack_rows(
+            &[basis(1, hidden), basis(-1, hidden), basis(1, hidden)],
+            format,
+        );
+        let qkv_scales = [0.2, 0.3, 0.4];
+        let z_packed = pack_rows(&[basis(1, hidden)], format);
+        let z_scales = [0.5];
+        let beta_packed = pack_rows(&[basis(1, hidden)], format);
+        let beta_scales = [0.1];
+        let decay_packed = pack_rows(&[basis(-1, hidden)], format);
+        let decay_scales = [0.2];
+        let delta_output_packed = pack_rows(&vec![zero(1); hidden], format);
+        let hidden_zero_scales = vec![0.0; hidden];
+        let ffn_gate_packed = pack_rows(&[zero(hidden)], format);
+        let ffn_up_packed = pack_rows(&[zero(hidden)], format);
+        let ffn_down_packed = pack_rows(&vec![zero(1); hidden], format);
+        let one_scale = [1.0];
+        let input_rms = (1.0_f32 / hidden as f32 + 1.0e-6).sqrt();
+        let input_norm = vec![input_rms - 1.0; hidden];
+        let zero_norm = vec![0.0; hidden];
+        let delta = crate::QwenDeltaNetDecoderLayer {
+            attention_norm: &input_norm,
+            qkv: matrix(3, hidden, &qkv_packed, &qkv_scales),
+            z: matrix(1, hidden, &z_packed, &z_scales),
+            beta: matrix(1, hidden, &beta_packed, &beta_scales),
+            decay: matrix(1, hidden, &decay_packed, &decay_scales),
+            conv_weight: &[0.2, 0.8, -0.1, 0.7, 0.3, 0.9],
+            norm_weight: &[1.1],
+            dt_bias: &[0.2],
+            a_log: &[-0.3],
+            output: matrix(hidden, 1, &delta_output_packed, &hidden_zero_scales),
+            ffn_norm: &zero_norm,
+            gate: matrix(1, hidden, &ffn_gate_packed, &one_scale),
+            up: matrix(1, hidden, &ffn_up_packed, &one_scale),
+            down: matrix(hidden, 1, &ffn_down_packed, &hidden_zero_scales),
+        };
+
+        let mut fused_rows = vec![zero(hidden); hidden * 2];
+        fused_rows[0][0] = Trit::from_i8(1).unwrap();
+        fused_rows[hidden][0] = Trit::from_i8(1).unwrap();
+        let fused_packed = pack_rows(&fused_rows, format);
+        let mut fused_scales = vec![0.0; hidden * 2];
+        fused_scales[0] = 1.0;
+        fused_scales[hidden] = 20.0;
+        let mut attention_rows = vec![zero(hidden); hidden];
+        attention_rows[0][0] = Trit::from_i8(1).unwrap();
+        let attention_packed = pack_rows(&attention_rows, format);
+        let mut attention_scales = vec![0.0; hidden];
+        attention_scales[0] = 1.0;
+        let head_norm = vec![input_rms - 1.0; hidden];
+        let full = crate::QwenFullAttentionDecoderLayer {
+            attention_norm: &input_norm,
+            query_norm: &head_norm,
+            key_norm: &head_norm,
+            fused_query_gate: matrix(hidden * 2, hidden, &fused_packed, &fused_scales),
+            key: matrix(hidden, hidden, &attention_packed, &attention_scales),
+            value: matrix(hidden, hidden, &attention_packed, &attention_scales),
+            attention_output: matrix(hidden, hidden, &attention_packed, &attention_scales),
+            ffn_norm: &zero_norm,
+            gate: matrix(1, hidden, &ffn_gate_packed, &one_scale),
+            up: matrix(1, hidden, &ffn_up_packed, &one_scale),
+            down: matrix(hidden, 1, &ffn_down_packed, &hidden_zero_scales),
+        };
+        let layers = [
+            crate::QwenCausalLmDecoderLayer::DeltaNet(delta),
+            crate::QwenCausalLmDecoderLayer::FullAttention(full),
+        ];
+        let final_rms = (4.0_f32 / hidden as f32 + 1.0e-6).sqrt();
+        let final_norm = vec![final_rms - 1.0; hidden];
+        let identity = crate::OnnxArtifactIdentityV2 {
+            source_model_id: "qwen-source",
+            tokenizer_id: "qwen-tokenizer",
+            recipe_id: "qwen-recipe",
+            tritium_build_id: "qwen-build",
+            package_id: "qwen-package",
+            converted_coverage_id: "qwen-converted",
+            deferred_coverage_id: "qwen-deferred",
+        };
+        let base = crate::QwenCausalLmModel {
+            tokens: 1,
+            past_tokens: 0,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: hidden,
+            rotary: crate::RotaryEmbedding {
+                theta: 10_000.0,
+                dimensions: hidden,
+            },
+            rms_epsilon: 1.0e-6,
+            delta_geometry: crate::QwenDeltaNetGeometry::new(2, 1, 1, 1, 1).unwrap(),
+            embedding: matrix(2, hidden, &embedding_packed, &embedding_scales),
+            lm_head: None,
+            layers: &layers,
+            final_norm: &final_norm,
+            identity,
+        };
+        let prompt_model = crate::encode_qwen_causal_lm(base).unwrap();
+        assert!(
+            crate::diagnose_unsupported_graph(&prompt_model)
+                .unwrap()
+                .is_empty()
+        );
+        let mut prompt_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&prompt_model)
+            .unwrap();
+        let token = Tensor::from_array(([1], vec![0_i64])).unwrap();
+        let conv = Tensor::from_array(([3, 2], vec![0.0_f32; 6])).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], vec![0.0_f32])).unwrap();
+        let prompt = prompt_session
+            .run(ort::inputs![&token, &conv, &recurrent])
+            .unwrap();
+        let (_, logits) = prompt[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(logits, &[2.0, -2.0], 2.0e-5);
+        let (_, next_conv) = prompt[1].try_extract_tensor::<f32>().unwrap();
+        let (_, next_recurrent) = prompt[2].try_extract_tensor::<f32>().unwrap();
+        let (_, present_k) = prompt[3].try_extract_tensor::<f32>().unwrap();
+        let (_, present_v) = prompt[4].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(next_conv, &[0.0, 0.2, 0.0, -0.3, 0.0, 0.4], 1.0e-6);
+        assert_f32_close(next_recurrent, &[-0.111_317_93], 2.0e-6);
+        let next_conv = next_conv.to_vec();
+        let next_recurrent = next_recurrent.to_vec();
+        let present_k = present_k.to_vec();
+        let present_v = present_v.to_vec();
+        drop(prompt);
+
+        let decode_model = crate::encode_qwen_causal_lm(crate::QwenCausalLmModel {
+            past_tokens: 1,
+            ..base
+        })
+        .unwrap();
+        let mut decode_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&decode_model)
+            .unwrap();
+        let token = Tensor::from_array(([1], vec![1_i64])).unwrap();
+        let conv = Tensor::from_array(([3, 2], next_conv)).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], next_recurrent)).unwrap();
+        let past_k = Tensor::from_array(([1, 1, hidden], present_k)).unwrap();
+        let past_v = Tensor::from_array(([1, 1, hidden], present_v)).unwrap();
+        let decode = decode_session
+            .run(ort::inputs![&token, &conv, &recurrent, &past_k, &past_v])
+            .unwrap();
+        let (_, decode_logits) = decode[0].try_extract_tensor::<f32>().unwrap();
+        assert!(decode_logits.iter().all(|value| value.is_finite()));
+        let (conv_shape, _) = decode[1].try_extract_tensor::<f32>().unwrap();
+        let (key_shape, _) = decode[3].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(conv_shape.as_ref(), &[3, 2]);
+        assert_eq!(key_shape.as_ref(), &[2, 1, hidden as i64]);
+    }
+
+    #[test]
     fn end_to_end_kv_attention_runs_prompt_and_cached_decode() {
         use ort::value::Tensor;
 
