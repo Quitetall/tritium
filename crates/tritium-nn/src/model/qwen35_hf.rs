@@ -43,6 +43,32 @@ pub(super) struct TensorSpec {
 
 pub(super) trait Qwen35HfTensorSource {
     fn tensor_f32_exact(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, NnError>;
+
+    fn projection_exact(
+        &self,
+        name: &str,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Projection, NnError> {
+        Ok(Projection::Dense(DenseLinear::new_exact(
+            self.tensor_f32_exact(name, &[rows, columns])?,
+            rows,
+            columns,
+        )?))
+    }
+
+    fn token_embedding_exact(
+        &self,
+        name: &str,
+        rows: usize,
+        columns: usize,
+    ) -> Result<TokenEmbedding, NnError> {
+        TokenEmbedding::from_dense(
+            self.tensor_f32_exact(name, &[rows, columns])?,
+            rows,
+            columns,
+        )
+    }
 }
 
 impl Qwen35HfTensorSource for HfShardSet {
@@ -852,11 +878,8 @@ pub(super) fn load_language_weights<S: Qwen35HfTensorSource + ?Sized>(
     let hidden = axis(config.hidden_size);
     let intermediate = axis(config.intermediate_size);
     let vocab = axis(config.vocab_size);
-    let embedding = TokenEmbedding::from_dense(
-        shards.tensor_f32_exact("model.language_model.embed_tokens.weight", &[vocab, hidden])?,
-        vocab,
-        hidden,
-    )?;
+    let embedding =
+        shards.token_embedding_exact("model.language_model.embed_tokens.weight", vocab, hidden)?;
     let mut layers = Vec::new();
     layers
         .try_reserve_exact(config.layer_types.len())
@@ -904,11 +927,7 @@ pub(super) fn load_language_weights<S: Qwen35HfTensorSource + ?Sized>(
         ));
     }
     let final_norm = shards.tensor_f32_exact("model.language_model.norm.weight", &[hidden])?;
-    let lm_head = Projection::Dense(DenseLinear::new_exact(
-        shards.tensor_f32_exact("lm_head.weight", &[vocab, hidden])?,
-        vocab,
-        hidden,
-    )?);
+    let lm_head = shards.projection_exact("lm_head.weight", vocab, hidden)?;
     Ok(Qwen35TextWeights::new(
         embedding, layers, final_norm, lm_head,
     ))
@@ -1029,11 +1048,7 @@ fn dense<S: Qwen35HfTensorSource + ?Sized>(
     columns: usize,
 ) -> Result<Projection, NnError> {
     let name = tensor_name(prefix, suffix);
-    Ok(Projection::Dense(DenseLinear::new_exact(
-        shards.tensor_f32_exact(&name, &[rows, columns])?,
-        rows,
-        columns,
-    )?))
+    shards.projection_exact(&name, rows, columns)
 }
 
 fn vector<S: Qwen35HfTensorSource + ?Sized>(
