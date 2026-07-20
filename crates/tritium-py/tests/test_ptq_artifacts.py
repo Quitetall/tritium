@@ -92,6 +92,7 @@ def _upgrade_bundle_to_v3(root: Path) -> None:
     manifest.update(
         schema_version=3,
         artifact_kind="qwen3.6-language-mtp-salt-v2-hf-bundle",
+        source_revision=artifacts._QWEN36_REVISION,
         hf_assets=assets,
     )
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

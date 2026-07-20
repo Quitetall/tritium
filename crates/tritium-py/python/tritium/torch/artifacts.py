@@ -37,7 +37,7 @@ _TOP_LEVEL_FIELDS_V1 = {
     "profiles",
 }
 _TOP_LEVEL_FIELDS_V2 = _TOP_LEVEL_FIELDS_V1 | {"preserved"}
-_TOP_LEVEL_FIELDS_V3 = _TOP_LEVEL_FIELDS_V2 | {"hf_assets"}
+_TOP_LEVEL_FIELDS_V3 = _TOP_LEVEL_FIELDS_V2 | {"hf_assets", "source_revision"}
 _PROFILE_FIELDS = {
     "file",
     "package_id",
@@ -62,6 +62,7 @@ _HF_ASSET_FILES = (
     "tokenizer_config.json",
     "vocab.json",
 )
+_QWEN36_REVISION = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,7 @@ class QuantizationResult:
     near_lossless: ArtifactRef
     preserved: Optional[PreservedRef] = None
     hf_assets: Tuple[HfAssetRef, ...] = ()
+    source_revision: Optional[str] = None
     complete_model: bool = False
     schema_version: int = 1
 
@@ -227,6 +229,8 @@ def _read_manifest(directory: Path) -> Dict[str, Any]:
     }[version]
     if value["artifact_kind"] != expected_kind or value["complete_model"] is not False:
         raise ValueError("unsupported Tritium artifact kind")
+    if version == 3 and value["source_revision"] != _QWEN36_REVISION:
+        raise ValueError("schema-v3 source_revision differs from pinned Qwen3.6 revision")
     if value["packing"] not in {"d2", "b3", "s34"}:
         raise ValueError("invalid Tritium package codec")
     if type(value["official_payload_authenticated"]) is not bool:
@@ -388,6 +392,7 @@ def load(
         near_lossless=near,
         preserved=preserved,
         hf_assets=hf_assets,
+        source_revision=value.get("source_revision"),
         schema_version=value["schema_version"],
     )
 
@@ -438,6 +443,9 @@ def _manifest_bytes(result: QuantizationResult) -> bytes:
     if result.schema_version == 3:
         if len(result.hf_assets) != len(_HF_ASSET_FILES):
             raise ValueError("schema version 3 requires exact HF asset catalog")
+        if result.source_revision != _QWEN36_REVISION:
+            raise ValueError("schema version 3 requires pinned Qwen3.6 revision")
+        value["source_revision"] = result.source_revision
         value["hf_assets"] = [
             {
                 "file": asset.file,

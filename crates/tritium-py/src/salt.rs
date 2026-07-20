@@ -243,6 +243,7 @@ impl Qwen36PtqPackageReceipt {
             "admission_id": self.admission_id,
             "selection_id": self.selection_id,
             "source_model_id": self.source_model_id,
+            "source_revision": tritium_nn::QWEN36_27B_REVISION,
             "source_identity_status": self.source_identity_status,
             "official_payload_authenticated": self.official_payload_authenticated,
             "preserved": {
@@ -550,6 +551,8 @@ pub(crate) fn reconcile_qwen36_ptq_packages(
 
     py.detach(move || {
         validate_output_location(&output_dir, [&model_dir, &work_dir, &evidence_dir])?;
+        let model_dir = fs::canonicalize(&model_dir)
+            .map_err(|error| format!("canonicalize model_dir failed: {:?}", error.kind()))?;
         let evidence = Qwen36PtqEvidenceDirectory::open_bounded(&evidence_dir, max_evidence_bytes)
             .map_err(|error| error.to_string())?;
         let curvature = evidence
