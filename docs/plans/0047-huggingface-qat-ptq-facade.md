@@ -61,6 +61,8 @@ saves with safe serialization, automatically reloads through
 - [x] Add a canonical, bounded-reopen factorized-curvature record that binds
   source provenance, global tensor identity, geometry, and all Kronecker
   factors, then reproduces the exact tensor-master stream after restart.
+- [x] Resume a pure-PTQ tensor fit from those bound identities without retaining
+  or rebuilding the complete activation cache.
 - Bind the Rust SALT pipeline to `quantize(model_or_id, calibration, config,
   work_dir)` without a Python-list weight bridge.
 - Expose immutable `QuantizationResult` model/coverage/report plus atomic

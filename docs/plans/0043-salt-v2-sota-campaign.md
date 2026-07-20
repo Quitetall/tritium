@@ -804,7 +804,10 @@ ordinal, tensor geometry, upstream evidence, every input block, every output
 scalar, and damping behind a domain-separated checksum. Its bounded reader
 rejects corruption, truncation, noncanonical encodings, forged allocation
 counts, and provenance drift before the reopened record can drive an exact
-tensor-master fit. Checkpoint-scale evidence collection remains open.
+tensor-master fit. The restart API consumes the source/cache/token identities
+already bound by that record, so it does not reconstruct a model-sized
+activation cache merely to resume pure PTQ. Checkpoint-scale evidence
+collection remains open.
 Pipeline ownership is process-serialized through a reserved lock namespace.
 Compact packages remain exact prefixes of their near-lossless packages. ADR
 0028's 2026-07-15 amendments make the ordered-master prefix curve, rather than

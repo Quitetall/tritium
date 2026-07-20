@@ -577,6 +577,24 @@ pub struct SaltV2TensorMasterFitInput<'a> {
     pub source_tensor_digest: [u8; 32],
 }
 
+/// Restart input for one tensor whose curvature artifact already binds provenance.
+///
+/// Unlike [`SaltV2TensorMasterFitInput`], this input does not retain the complete
+/// activation cache. It is intended for a durable evidence reader that has
+/// already verified the canonical curvature record and needs only the exact
+/// source-model, cache, and token-stream identities carried by that artifact.
+#[derive(Clone, Copy, Debug)]
+pub struct SaltV2RestartableTensorMasterFitInput<'a> {
+    /// One finite row-major source matrix and its reopened curvature evidence.
+    pub tensor: SaltV2TensorFitInput<'a>,
+    /// Semantic identity of the complete source model.
+    pub source_model_id: ModelId,
+    /// Global tensor ordinal in the architecture adapter's additive order.
+    pub tensor_index: u64,
+    /// Architecture-framed digest of the original source-precision tensor.
+    pub source_tensor_digest: [u8; 32],
+}
+
 /// Completed bounded-memory fit of one canonical rate-free Pmax tensor master.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaltV2TensorMasterFitResult {
@@ -1495,38 +1513,85 @@ pub fn plan_salt_v2_tensor_master(
     input: SaltV2TensorMasterFitInput<'_>,
     config: &SaltV2Config,
 ) -> Result<SaltV2MasterTensorSpec, SaltV2Error> {
+    plan_salt_v2_tensor_master_with_provenance(
+        input.tensor,
+        input.source_model_id,
+        input.tensor_index,
+        input.source_tensor_digest,
+        input.activations.digest().into_bytes(),
+        input.activations.spec().source_digest().into_bytes(),
+        config,
+    )
+}
+
+/// Plan one independently stored tensor master from reopened curvature evidence.
+///
+/// This is the durable-restart counterpart to [`plan_salt_v2_tensor_master`].
+/// The artifact's immutable source identity supplies the already-verified
+/// activation-cache and token-stream digests, so the full cache need not be
+/// reconstructed merely to resume fitting.
+///
+/// # Errors
+/// Rejects malformed recipes, unavailable external stages, invalid tensor
+/// geometry or values, a source-model mismatch, an invalid global ordinal, or
+/// invalid semantic source metadata.
+pub fn plan_salt_v2_restartable_tensor_master(
+    input: SaltV2RestartableTensorMasterFitInput<'_>,
+    config: &SaltV2Config,
+) -> Result<SaltV2MasterTensorSpec, SaltV2Error> {
+    let source_id = input.tensor.curvature.source_id();
+    plan_salt_v2_tensor_master_with_provenance(
+        input.tensor,
+        input.source_model_id,
+        input.tensor_index,
+        input.source_tensor_digest,
+        source_id.activation_cache_digest(),
+        source_id.token_stream_digest(),
+        config,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_salt_v2_tensor_master_with_provenance(
+    tensor: SaltV2TensorFitInput<'_>,
+    source_model_id: ModelId,
+    tensor_index: u64,
+    admitted_tensor_digest: [u8; 32],
+    activation_cache_digest: [u8; 32],
+    token_stream_digest: [u8; 32],
+    config: &SaltV2Config,
+) -> Result<SaltV2MasterTensorSpec, SaltV2Error> {
     validate_config(config)?;
     validate_external_stages(config)?;
     let tensor_index =
-        usize::try_from(input.tensor_index).map_err(|_| SaltV2Error::AccountingOverflow)?;
-    if input.source_tensor_digest == [0; 32] {
+        usize::try_from(tensor_index).map_err(|_| SaltV2Error::AccountingOverflow)?;
+    if admitted_tensor_digest == [0; 32] {
         return Err(SaltV2Error::MissingSourceTensorDigest {
             tensor: tensor_index,
         });
     }
     validate_tensor_input(
         tensor_index,
-        &input.tensor,
+        &tensor,
         config,
-        *input.source_model_id.as_bytes(),
-        input.activations.digest().into_bytes(),
-        input.activations.spec().source_digest().into_bytes(),
+        *source_model_id.as_bytes(),
+        activation_cache_digest,
+        token_stream_digest,
     )?;
-    let tensor = input.tensor;
     SaltV2MasterTensorSpec::new(
         tensor.name.to_owned(),
         vec![
             u64::try_from(tensor.rows).map_err(|_| SaltV2Error::AccountingOverflow)?,
             u64::try_from(tensor.cols).map_err(|_| SaltV2Error::AccountingOverflow)?,
         ],
-        input.source_model_id,
-        input.source_tensor_digest,
+        source_model_id,
+        admitted_tensor_digest,
         source_tensor_digest(&tensor),
         u64::try_from(tensor_index).map_err(|_| SaltV2Error::AccountingOverflow)?,
         SaltV2MasterEvidence {
             recipe_id: master_recipe_digest(config),
             solver_id: reference_solver_id(),
-            activation_digest: input.activations.digest().into_bytes(),
+            activation_digest: activation_cache_digest,
             curvature_digest: tensor.curvature.digest(),
             feedback_digest: None,
             track: SaltV2MasterTrack::Ptq,
@@ -1559,9 +1624,35 @@ pub fn fit_salt_v2_tensor_master<W: Write>(
     sink: W,
 ) -> Result<SaltV2TensorMasterFitResult, SaltV2Error> {
     let spec = plan_salt_v2_tensor_master(input, config)?;
+    fit_salt_v2_tensor_master_with_spec(input.tensor, input.tensor_index, spec, config, sink)
+}
+
+/// Fit and stream one tensor master from a verified, reopened curvature artifact.
+///
+/// Output is byte-identical to [`fit_salt_v2_tensor_master`] for the same
+/// source matrix, recipe, ordinal, and evidence. This API avoids retaining or
+/// rebuilding an activation cache after its identities have been durably bound.
+///
+/// # Errors
+/// Propagates all restart planning, joint-fit, prefix, and bounded sink failures.
+pub fn fit_salt_v2_restartable_tensor_master<W: Write>(
+    input: SaltV2RestartableTensorMasterFitInput<'_>,
+    config: &SaltV2Config,
+    sink: W,
+) -> Result<SaltV2TensorMasterFitResult, SaltV2Error> {
+    let spec = plan_salt_v2_restartable_tensor_master(input, config)?;
+    fit_salt_v2_tensor_master_with_spec(input.tensor, input.tensor_index, spec, config, sink)
+}
+
+fn fit_salt_v2_tensor_master_with_spec<W: Write>(
+    tensor: SaltV2TensorFitInput<'_>,
+    tensor_index: u64,
+    spec: SaltV2MasterTensorSpec,
+    config: &SaltV2Config,
+    sink: W,
+) -> Result<SaltV2TensorMasterFitResult, SaltV2Error> {
     let tensor_index =
-        usize::try_from(input.tensor_index).map_err(|_| SaltV2Error::AccountingOverflow)?;
-    let tensor = input.tensor;
+        usize::try_from(tensor_index).map_err(|_| SaltV2Error::AccountingOverflow)?;
     let tile_count = tensor.weights.len().div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
     let required_planes = usize::from(spec.geometry().max_planes);
     let mut encoder = SaltV2MasterTensorEncoder::new(&spec, sink)?;
@@ -5324,6 +5415,60 @@ mod tests {
             assert_eq!(independent.receipt(), whole_receipt);
             assert_eq!(independent_payload, whole_payload);
         }
+    }
+
+    #[test]
+    fn restartable_tensor_fit_uses_bound_evidence_without_reloading_the_cache() {
+        let source_weights = weights(1);
+        let diagonal = vec![1.0; source_weights.len()];
+        let cache = activation_cache();
+        let model_id = source_model_id();
+        let source_id = curvature_source(model_id, &cache);
+        let tensor = SaltV2TensorFitInput {
+            name: "model.layers.0.mlp.down_proj.weight",
+            weights: &source_weights,
+            rows: 2,
+            cols: 128,
+            curvature: CurvatureArtifact::diagonal_fisher(source_id, [79; 32], &diagonal),
+        };
+        let source_tensor_digest = [80; 32];
+        let ordinary = SaltV2TensorMasterFitInput {
+            tensor,
+            activations: &cache,
+            source_model_id: model_id,
+            tensor_index: 23,
+            source_tensor_digest,
+        };
+        let restartable = SaltV2RestartableTensorMasterFitInput {
+            tensor,
+            source_model_id: model_id,
+            tensor_index: 23,
+            source_tensor_digest,
+        };
+        let recipe = config(10_000);
+
+        assert_eq!(
+            plan_salt_v2_restartable_tensor_master(restartable, &recipe).unwrap(),
+            plan_salt_v2_tensor_master(ordinary, &recipe).unwrap()
+        );
+        let mut ordinary_bytes = Vec::new();
+        let ordinary_result =
+            fit_salt_v2_tensor_master(ordinary, &recipe, &mut ordinary_bytes).unwrap();
+        let mut restartable_bytes = Vec::new();
+        let restartable_result =
+            fit_salt_v2_restartable_tensor_master(restartable, &recipe, &mut restartable_bytes)
+                .unwrap();
+        assert_eq!(restartable_result, ordinary_result);
+        assert_eq!(restartable_bytes, ordinary_bytes);
+
+        let wrong_model = SaltV2RestartableTensorMasterFitInput {
+            source_model_id: ModelId::from_digest(different_digest(*model_id.as_bytes())),
+            ..restartable
+        };
+        assert!(matches!(
+            plan_salt_v2_restartable_tensor_master(wrong_model, &recipe),
+            Err(SaltV2Error::CurvatureSourceModelMismatch { tensor: 23 })
+        ));
     }
 
     #[test]
