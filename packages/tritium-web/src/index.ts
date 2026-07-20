@@ -9,11 +9,23 @@ export type {
   TrainingOpManifestV1,
   TrainingVjpV1,
 } from "../../../bindings/typescript/src/training_manifest.ts";
-
-/** BLAKE3 identity of the canonical TrainingOpManifestV1 bytes. */
-export const TRAINING_MANIFEST_DIGEST_V1 =
-  "aefb352d04db145e48394b392a106ab0ad831e09e62d8c76ceddedb36a564083" as const;
-
-/** BLAKE3 identity of the complete canonical semantic-vector corpus. */
-export const TRAINING_VECTOR_DIGEST_V1 =
-  "fcb250733b991aac165871f8c54b0b063337a3ed01bd1da02de220916887fbd6" as const;
+export {
+  TRAINING_MANIFEST_DIGEST_V1,
+  TRAINING_VECTOR_DIGEST_V1,
+} from "./identity.ts";
+export { WebTrainingError, WebTrainingSession, prepareTraining } from "./session.ts";
+export type {
+  TrainingBatchV1,
+  TrainingRecipeV1,
+  TrainingResultV1,
+  WebBinaryResultV1,
+  WebTrainingAdapterV1,
+  WebTrainingBackendPolicyV1,
+  WebTrainingCapabilitiesV1,
+  WebTrainingConfigV1,
+  WebTrainingErrorCode,
+  WebTrainingImplementationV1,
+  WebTrainingModelV1,
+  WebTrainingReceiptV1,
+  WebTrainingState,
+} from "./session.ts";

@@ -109,6 +109,14 @@ WebGPU gate.
 
 ## Slice 3 — compiled session and artifact lifecycle
 
+Status: **IN PROGRESS** — the strict public types, fail-closed adapter boundary,
+backend/fallback policy, manifest coverage validation, immutable capability
+snapshot, receipt/memory validation, serialized state machine, failure-stable
+transitions, checkpoint/resume/export byte isolation and idempotent terminal
+dispose are implemented and tested. Compiled recipe/buffer planning, tied-state
+ownership, canonical WASM checkpoint/artifact execution and device-loss
+transactions remain open.
+
 Compile a `TrainingRecipeV1` into an immutable operation schedule, buffer plan
 and optimizer-state layout. Preparation validates all roles, shapes, dtypes,
 alias groups, memory ceilings and export targets before allocating device
