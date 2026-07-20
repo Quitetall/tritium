@@ -195,15 +195,20 @@ export declare function decodeWebTrainingPayload(
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";
 export type WebTrainingState =
+  | "preparing"
   | "prepared"
   | "forward-complete"
   | "backward-complete"
+  | "terminal"
   | "disposed";
 export type WebTrainingErrorCode =
   | "adapter_unavailable"
   | "backend_policy"
   | "busy"
   | "capability_mismatch"
+  | "adapter_failure"
+  | "cancelled"
+  | "device_lost"
   | "disposed"
   | "invalid_config"
   | "invalid_receipt"
@@ -214,11 +219,33 @@ export type WebTrainingErrorCode =
 export declare class WebTrainingError extends Error {
   readonly code: WebTrainingErrorCode;
   readonly state: WebTrainingState | null;
+  readonly failureReceipt: WebTrainingFailureReceiptV1 | null;
   constructor(
     code: WebTrainingErrorCode,
     message: string,
     state?: WebTrainingState | null,
+    failureReceipt?: WebTrainingFailureReceiptV1 | null,
   );
+}
+
+export interface WebTrainingFailureReceiptV1 {
+  readonly schemaId: "tritium.web_training_failure_receipt";
+  readonly schemaVersion: 1;
+  readonly implementation: WebTrainingImplementationV1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly buildId: string;
+  readonly physicalDevice: string | null;
+  readonly operation: string;
+  readonly completedSteps: number;
+  readonly cause: "adapter_failure" | "cancelled" | "device_lost";
+  readonly stateBefore: WebTrainingState;
+  readonly stateAfter: WebTrainingState;
+  readonly recoverable: boolean;
+}
+
+export interface WebTrainingOperationOptionsV1 {
+  readonly signal?: AbortSignal;
 }
 
 export interface TrainingRecipeV1 {
@@ -364,7 +391,10 @@ export interface WebBinaryResultV1 {
 }
 
 /** Low-level generated adapter. `validate` is allocation-free; neither
- * `validate` nor `prepare` may mutate or retain their arguments.
+ * `validate` nor `prepare` may mutate or retain their arguments. Recoverable
+ * typed rejections happen before mutation. Cancellation
+ * must roll back partial writes before rejecting with `cancelled`; device loss
+ * rejects with `device_lost` and is terminal.
  */
 export interface WebTrainingAdapterV1 {
   readonly capabilities: WebTrainingCapabilitiesV1;
@@ -378,12 +408,12 @@ export interface WebTrainingAdapterV1 {
     config: WebTrainingConfigV1,
     plan: CompiledTrainingPlanV1,
   ): Promise<WebTrainingReceiptV1>;
-  forward(batch: TrainingBatchV1): Promise<TrainingResultV1>;
-  backward(result: TrainingResultV1): Promise<WebTrainingReceiptV1>;
-  step(): Promise<WebTrainingReceiptV1>;
-  checkpoint(): Promise<WebBinaryResultV1>;
-  resume(checkpoint: Uint8Array): Promise<WebTrainingReceiptV1>;
-  export(): Promise<WebBinaryResultV1>;
+  forward(batch: TrainingBatchV1, signal?: AbortSignal | null): Promise<TrainingResultV1>;
+  backward(result: TrainingResultV1, signal?: AbortSignal | null): Promise<WebTrainingReceiptV1>;
+  step(signal?: AbortSignal | null): Promise<WebTrainingReceiptV1>;
+  checkpoint(signal?: AbortSignal | null): Promise<WebBinaryResultV1>;
+  resume(checkpoint: Uint8Array, signal?: AbortSignal | null): Promise<WebTrainingReceiptV1>;
+  export(signal?: AbortSignal | null): Promise<WebBinaryResultV1>;
   dispose(): Promise<void>;
 }
 
@@ -396,12 +426,12 @@ export declare class WebTrainingSession {
     adapter: WebTrainingAdapterV1,
   ): Promise<WebTrainingSession>;
   get state(): WebTrainingState;
-  forward(batch: TrainingBatchV1): Promise<TrainingResultV1>;
-  backward(result: TrainingResultV1): Promise<WebTrainingReceiptV1>;
-  step(): Promise<WebTrainingReceiptV1>;
-  checkpoint(): Promise<WebBinaryResultV1>;
-  resume(checkpoint: Uint8Array): Promise<WebTrainingReceiptV1>;
-  export(): Promise<WebBinaryResultV1>;
+  forward(batch: TrainingBatchV1, options?: WebTrainingOperationOptionsV1): Promise<TrainingResultV1>;
+  backward(result: TrainingResultV1, options?: WebTrainingOperationOptionsV1): Promise<WebTrainingReceiptV1>;
+  step(options?: WebTrainingOperationOptionsV1): Promise<WebTrainingReceiptV1>;
+  checkpoint(options?: WebTrainingOperationOptionsV1): Promise<WebBinaryResultV1>;
+  resume(checkpoint: Uint8Array, options?: WebTrainingOperationOptionsV1): Promise<WebTrainingReceiptV1>;
+  export(options?: WebTrainingOperationOptionsV1): Promise<WebBinaryResultV1>;
   dispose(): Promise<void>;
 }
 

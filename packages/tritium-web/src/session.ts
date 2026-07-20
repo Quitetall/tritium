@@ -20,9 +20,11 @@ import {
 export type WebTrainingBackendPolicyV1 = "auto" | "webgpu" | "wasm";
 export type WebTrainingImplementationV1 = "webgpu" | "wasm-fallback";
 export type WebTrainingState =
+  | "preparing"
   | "prepared"
   | "forward-complete"
   | "backward-complete"
+  | "terminal"
   | "disposed";
 
 export type WebTrainingErrorCode =
@@ -30,6 +32,9 @@ export type WebTrainingErrorCode =
   | "backend_policy"
   | "busy"
   | "capability_mismatch"
+  | "adapter_failure"
+  | "cancelled"
+  | "device_lost"
   | "disposed"
   | "invalid_config"
   | "invalid_receipt"
@@ -40,17 +45,40 @@ export type WebTrainingErrorCode =
 export class WebTrainingError extends Error {
   readonly code: WebTrainingErrorCode;
   readonly state: WebTrainingState | null;
+  readonly failureReceipt: WebTrainingFailureReceiptV1 | null;
 
   constructor(
     code: WebTrainingErrorCode,
     message: string,
     state: WebTrainingState | null = null,
+    failureReceipt: WebTrainingFailureReceiptV1 | null = null,
   ) {
     super(message);
     this.name = "WebTrainingError";
     this.code = code;
     this.state = state;
+    this.failureReceipt = failureReceipt;
   }
+}
+
+export interface WebTrainingFailureReceiptV1 {
+  readonly schemaId: "tritium.web_training_failure_receipt";
+  readonly schemaVersion: 1;
+  readonly implementation: WebTrainingImplementationV1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
+  readonly vectorDigest: typeof TRAINING_VECTOR_DIGEST_V1;
+  readonly buildId: string;
+  readonly physicalDevice: string | null;
+  readonly operation: string;
+  readonly completedSteps: number;
+  readonly cause: "adapter_failure" | "cancelled" | "device_lost";
+  readonly stateBefore: WebTrainingState;
+  readonly stateAfter: WebTrainingState;
+  readonly recoverable: boolean;
+}
+
+export interface WebTrainingOperationOptionsV1 {
+  readonly signal?: AbortSignal;
 }
 
 export interface TrainingRecipeV1 {
@@ -199,6 +227,10 @@ export interface WebBinaryResultV1 {
  * `validate` must be allocation-free, and neither `validate` nor `prepare` may
  * mutate or retain their arguments. Validation completes operation-specific
  * geometry and attribute checks before `prepare` allocates persistent state.
+ * A recoverable typed rejection must happen before mutation. A cancelled
+ * operation must reject with `WebTrainingError("cancelled", ...)`
+ * only after rolling back every partial write. Device loss must reject with
+ * `WebTrainingError("device_lost", ...)`; the session makes that state terminal.
  */
 export interface WebTrainingAdapterV1 {
   readonly capabilities: WebTrainingCapabilitiesV1;
@@ -212,12 +244,12 @@ export interface WebTrainingAdapterV1 {
     config: WebTrainingConfigV1,
     plan: CompiledTrainingPlanV1,
   ): Promise<WebTrainingReceiptV1>;
-  forward(batch: TrainingBatchV1): Promise<TrainingResultV1>;
-  backward(result: TrainingResultV1): Promise<WebTrainingReceiptV1>;
-  step(): Promise<WebTrainingReceiptV1>;
-  checkpoint(): Promise<WebBinaryResultV1>;
-  resume(checkpoint: Uint8Array): Promise<WebTrainingReceiptV1>;
-  export(): Promise<WebBinaryResultV1>;
+  forward(batch: TrainingBatchV1, signal?: AbortSignal | null): Promise<TrainingResultV1>;
+  backward(result: TrainingResultV1, signal?: AbortSignal | null): Promise<WebTrainingReceiptV1>;
+  step(signal?: AbortSignal | null): Promise<WebTrainingReceiptV1>;
+  checkpoint(signal?: AbortSignal | null): Promise<WebBinaryResultV1>;
+  resume(checkpoint: Uint8Array, signal?: AbortSignal | null): Promise<WebTrainingReceiptV1>;
+  export(signal?: AbortSignal | null): Promise<WebBinaryResultV1>;
   dispose(): Promise<void>;
 }
 
@@ -1514,6 +1546,125 @@ function snapshotCapabilities(
   });
 }
 
+function failureReceipt(
+  capabilities: WebTrainingCapabilitiesV1,
+  operation: string,
+  completedSteps: number,
+  cause: "adapter_failure" | "cancelled" | "device_lost",
+  stateBefore: WebTrainingState,
+  stateAfter: WebTrainingState,
+): WebTrainingFailureReceiptV1 {
+  return Object.freeze({
+    schemaId: "tritium.web_training_failure_receipt",
+    schemaVersion: 1,
+    implementation: capabilities.implementation,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
+    vectorDigest: TRAINING_VECTOR_DIGEST_V1,
+    buildId: capabilities.buildId,
+    physicalDevice: capabilities.physicalDevice,
+    operation,
+    completedSteps,
+    cause,
+    stateBefore,
+    stateAfter,
+    recoverable: cause === "cancelled",
+  });
+}
+
+function operationSignal(
+  options: WebTrainingOperationOptionsV1 | undefined,
+): AbortSignal | null {
+  if (options === undefined) return null;
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    fail("invalid_schema", "operation options must be an object");
+  }
+  const keys = Object.keys(options);
+  if (keys.length > 1 || (keys.length === 1 && keys[0] !== "signal")) {
+    fail("invalid_schema", "operation options contain unknown fields");
+  }
+  const signal = options.signal;
+  if (signal === undefined) return null;
+  if (
+    typeof signal !== "object" ||
+    signal === null ||
+    typeof signal.aborted !== "boolean" ||
+    typeof signal.addEventListener !== "function" ||
+    typeof signal.removeEventListener !== "function"
+  ) {
+    fail("invalid_schema", "operation signal must be an AbortSignal");
+  }
+  return signal;
+}
+
+function signalAborted(signal: AbortSignal | null): boolean {
+  return signal !== null && signal.aborted;
+}
+
+function adapterFailureCause(
+  error: unknown,
+): "cancelled" | "device_lost" | null {
+  if (typeof error !== "object" || error === null) return null;
+  try {
+    const code = Reflect.get(error, "code");
+    return code === "cancelled" || code === "device_lost" ? code : null;
+  } catch {
+    return null;
+  }
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  if (typeof error !== "object" || error === null) return fallback;
+  try {
+    const message = Reflect.get(error, "message");
+    return typeof message === "string" ? message : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  try {
+    return Reflect.get(error, "name") === "AbortError";
+  } catch {
+    return false;
+  }
+}
+
+class PostDispatchAdmissionError extends Error {
+  readonly original: unknown;
+
+  constructor(original: unknown) {
+    super(errorMessage(original, "adapter result failed admission"));
+    this.name = "PostDispatchAdmissionError";
+    this.original = original;
+  }
+}
+
+function admitPostDispatch<T>(admit: () => T): T {
+  try {
+    return admit();
+  } catch (error) {
+    throw new PostDispatchAdmissionError(error);
+  }
+}
+
+function recoverableAdapterErrorCode(error: unknown): WebTrainingErrorCode | null {
+  if (typeof error !== "object" || error === null) return null;
+  try {
+    const code = Reflect.get(error, "code");
+    return code === "capability_mismatch" ||
+      code === "invalid_config" ||
+      code === "invalid_schema" ||
+      code === "invalid_state" ||
+      code === "memory_limit"
+      ? code
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export class WebTrainingSession {
   readonly capabilities: WebTrainingCapabilitiesV1;
   readonly plan: CompiledTrainingPlanV1;
@@ -1523,6 +1674,7 @@ export class WebTrainingSession {
   #busy = false;
   #lastResult: TrainingResultV1 | null = null;
   #completedSteps = 0;
+  #adapterDisposed = false;
 
   private constructor(
     adapter: WebTrainingAdapterV1,
@@ -1590,25 +1742,72 @@ export class WebTrainingSession {
       }),
       payload: Uint8Array.from(capturedPayload),
     });
-    const validation = await adapter.validate(safeModel, safeConfig, plan);
-    if (validation !== undefined) {
-      fail("capability_mismatch", "adapter.validate must return undefined");
-    }
     const prepareModel = Object.freeze({
       ...safeModel,
       payload: capturedPayload,
     });
-    const receipt = snapshotReceipt(
-      await adapter.prepare(prepareModel, safeConfig, plan),
-    );
-    validateReceipt(
-      receipt,
-      capabilities,
-      "session.prepare",
-      plan.preparePeakBytes,
-      safeConfig.maxResidentBytes,
-      0,
-    );
+    let validation: void;
+    try {
+      validation = await adapter.validate(safeModel, safeConfig, plan);
+    } catch (error) {
+      if (adapterFailureCause(error) !== "device_lost") throw error;
+      try {
+        await adapter.dispose();
+      } catch {
+        // Device loss is authoritative; cleanup failure cannot replace it.
+      }
+      const failed = failureReceipt(
+        capabilities,
+        "session.validate",
+        0,
+        "device_lost",
+        "preparing",
+        "terminal",
+      );
+      throw new WebTrainingError(
+        "device_lost",
+        errorMessage(error, "device lost during validation"),
+        "terminal",
+        failed,
+      );
+    }
+    if (validation !== undefined) {
+      fail("capability_mismatch", "adapter.validate must return undefined");
+    }
+
+    let receipt: WebTrainingReceiptV1;
+    try {
+      receipt = snapshotReceipt(await adapter.prepare(prepareModel, safeConfig, plan));
+      validateReceipt(
+        receipt,
+        capabilities,
+        "session.prepare",
+        plan.preparePeakBytes,
+        safeConfig.maxResidentBytes,
+        0,
+      );
+    } catch (error) {
+      try {
+        await adapter.dispose();
+      } catch {
+        // Preparation's primary failure remains authoritative.
+      }
+      if (adapterFailureCause(error) !== "device_lost") throw error;
+      const failed = failureReceipt(
+        capabilities,
+        "session.prepare",
+        0,
+        "device_lost",
+        "preparing",
+        "terminal",
+      );
+      throw new WebTrainingError(
+        "device_lost",
+        errorMessage(error, "device lost during preparation"),
+        "terminal",
+        failed,
+      );
+    }
     return new WebTrainingSession(
       adapter,
       safeConfig.maxResidentBytes,
@@ -1636,6 +1835,110 @@ export class WebTrainingSession {
     }
   }
 
+  #failureReceipt(
+    operation: string,
+    cause: "adapter_failure" | "cancelled" | "device_lost",
+    stateBefore: WebTrainingState,
+    stateAfter: WebTrainingState,
+  ): WebTrainingFailureReceiptV1 {
+    return failureReceipt(
+      this.capabilities,
+      operation,
+      this.#completedSteps,
+      cause,
+      stateBefore,
+      stateAfter,
+    );
+  }
+
+  async #disposeAdapter(permanent: boolean): Promise<void> {
+    if (this.#adapterDisposed) return;
+    if (permanent) this.#adapterDisposed = true;
+    try {
+      await this.#adapter.dispose();
+      this.#adapterDisposed = true;
+    } catch (error) {
+      if (!permanent) this.#adapterDisposed = false;
+      throw error;
+    }
+  }
+
+  async #adapterTransaction<T>(
+    operation: string,
+    signal: AbortSignal | null,
+    run: (signal: AbortSignal | null) => Promise<T>,
+  ): Promise<T> {
+    const stateBefore = this.#state;
+    if (signalAborted(signal)) {
+      const receipt = this.#failureReceipt(
+        operation,
+        "cancelled",
+        stateBefore,
+        stateBefore,
+      );
+      throw new WebTrainingError(
+        "cancelled",
+        `${operation} was cancelled before dispatch`,
+        stateBefore,
+        receipt,
+      );
+    }
+    try {
+      return await run(signal);
+    } catch (error) {
+      const recoverableCode =
+        error instanceof PostDispatchAdmissionError
+          ? null
+          : recoverableAdapterErrorCode(error);
+      if (recoverableCode !== null) {
+        throw new WebTrainingError(
+          recoverableCode,
+          errorMessage(error, `${operation} was rejected before mutation`),
+          stateBefore,
+        );
+      }
+      const classified = adapterFailureCause(error);
+      const cause =
+        classified ??
+        (signalAborted(signal) && isAbortError(error) ? "cancelled" : "adapter_failure");
+      const message =
+        error instanceof PostDispatchAdmissionError
+          ? errorMessage(error.original, `${operation} result failed admission`)
+          : errorMessage(error, `${operation} failed`);
+      if (cause !== "cancelled") {
+        this.#lastResult = null;
+        this.#state = "terminal";
+        try {
+          await this.#disposeAdapter(true);
+        } catch {
+          // Terminal failure is authoritative; cleanup failure cannot replace it.
+        }
+      }
+      const stateAfter = this.#state;
+      const receipt = this.#failureReceipt(operation, cause, stateBefore, stateAfter);
+      throw new WebTrainingError(cause, message, stateAfter, receipt);
+    }
+  }
+
+  #rejectPreDispatchCancellation(
+    operation: string,
+    signal: AbortSignal | null,
+  ): void {
+    if (!signalAborted(signal)) return;
+    const receipt = this.#failureReceipt(
+      operation,
+      "cancelled",
+      this.#state,
+      this.#state,
+    );
+    throw new WebTrainingError(
+      "cancelled",
+      `${operation} was cancelled before dispatch`,
+      this.#state,
+      receipt,
+    );
+  }
+
   #require(expected: WebTrainingState, operation: string): void {
     if (this.#state !== expected) {
       fail(
@@ -1646,137 +1949,206 @@ export class WebTrainingSession {
     }
   }
 
-  async forward(batch: TrainingBatchV1): Promise<TrainingResultV1> {
+  async forward(
+    batch: TrainingBatchV1,
+    options?: WebTrainingOperationOptionsV1,
+  ): Promise<TrainingResultV1> {
     return this.#exclusive(async () => {
       this.#require("prepared", "forward");
+      const signal = operationSignal(options);
+      this.#rejectPreDispatchCancellation("session.forward", signal);
       const safeBatch = validateAndCopyBatch(batch, this.plan, this.#state);
-      const result = await this.#adapter.forward(safeBatch);
-      exactKeys(result, ["loss", "receipt"], "forward result", "invalid_receipt");
-      const safeResult = Object.freeze({
-        loss: result.loss,
-        receipt: snapshotReceipt(result.receipt),
-      });
-      if (!Number.isFinite(safeResult.loss)) {
-        fail("invalid_receipt", "forward loss must be finite", this.#state);
-      }
-      validateReceipt(
-        safeResult.receipt,
-        this.capabilities,
+      return this.#adapterTransaction(
         "session.forward",
-        this.plan.forwardPeakBytes,
-        this.#maxResidentBytes,
-        this.#completedSteps,
+        signal,
+        async (admittedSignal) => {
+          const result = await this.#adapter.forward(safeBatch, admittedSignal);
+          return admitPostDispatch(() => {
+            exactKeys(result, ["loss", "receipt"], "forward result", "invalid_receipt");
+            const safeResult = Object.freeze({
+              loss: result.loss,
+              receipt: snapshotReceipt(result.receipt),
+            });
+            if (!Number.isFinite(safeResult.loss)) {
+              fail("invalid_receipt", "forward loss must be finite", this.#state);
+            }
+            validateReceipt(
+              safeResult.receipt,
+              this.capabilities,
+              "session.forward",
+              this.plan.forwardPeakBytes,
+              this.#maxResidentBytes,
+              this.#completedSteps,
+            );
+            this.#lastResult = safeResult;
+            this.#state = "forward-complete";
+            return safeResult;
+          });
+        },
       );
-      this.#lastResult = safeResult;
-      this.#state = "forward-complete";
-      return safeResult;
     });
   }
 
-  async backward(result: TrainingResultV1): Promise<WebTrainingReceiptV1> {
+  async backward(
+    result: TrainingResultV1,
+    options?: WebTrainingOperationOptionsV1,
+  ): Promise<WebTrainingReceiptV1> {
     return this.#exclusive(async () => {
       this.#require("forward-complete", "backward");
+      const signal = operationSignal(options);
+      this.#rejectPreDispatchCancellation("session.backward", signal);
       if (result !== this.#lastResult) {
         fail("invalid_state", "backward result is not the active forward", this.#state);
       }
-      const receipt = snapshotReceipt(await this.#adapter.backward(result));
-      validateReceipt(
-        receipt,
-        this.capabilities,
+      return this.#adapterTransaction(
         "session.backward",
-        this.plan.peakBytes,
-        this.#maxResidentBytes,
-        this.#completedSteps,
+        signal,
+        async (admittedSignal) => {
+          const rawReceipt = await this.#adapter.backward(result, admittedSignal);
+          return admitPostDispatch(() => {
+            const receipt = snapshotReceipt(rawReceipt);
+            validateReceipt(
+              receipt,
+              this.capabilities,
+              "session.backward",
+              this.plan.peakBytes,
+              this.#maxResidentBytes,
+              this.#completedSteps,
+            );
+            this.#state = "backward-complete";
+            return receipt;
+          });
+        },
       );
-      this.#state = "backward-complete";
-      return receipt;
     });
   }
 
-  async step(): Promise<WebTrainingReceiptV1> {
+  async step(options?: WebTrainingOperationOptionsV1): Promise<WebTrainingReceiptV1> {
     return this.#exclusive(async () => {
       this.#require("backward-complete", "step");
-      const receipt = snapshotReceipt(await this.#adapter.step());
-      validateReceipt(
-        receipt,
-        this.capabilities,
+      const signal = operationSignal(options);
+      return this.#adapterTransaction(
         "session.step",
-        this.plan.peakBytes,
-        this.#maxResidentBytes,
-        this.#completedSteps + 1,
+        signal,
+        async (admittedSignal) => {
+          const rawReceipt = await this.#adapter.step(admittedSignal);
+          return admitPostDispatch(() => {
+            const receipt = snapshotReceipt(rawReceipt);
+            validateReceipt(
+              receipt,
+              this.capabilities,
+              "session.step",
+              this.plan.peakBytes,
+              this.#maxResidentBytes,
+              this.#completedSteps + 1,
+            );
+            this.#completedSteps = receipt.completedSteps;
+            this.#lastResult = null;
+            this.#state = "prepared";
+            return receipt;
+          });
+        },
       );
-      this.#completedSteps = receipt.completedSteps;
-      this.#lastResult = null;
-      this.#state = "prepared";
-      return receipt;
     });
   }
 
-  async checkpoint(): Promise<WebBinaryResultV1> {
+  async checkpoint(
+    options?: WebTrainingOperationOptionsV1,
+  ): Promise<WebBinaryResultV1> {
     return this.#exclusive(async () => {
       this.#require("prepared", "checkpoint");
-      const result = snapshotBinaryResult(
-        await this.#adapter.checkpoint(),
-        "checkpoint",
-      );
-      validateReceipt(
-        result.receipt,
-        this.capabilities,
+      const signal = operationSignal(options);
+      return this.#adapterTransaction(
         "session.checkpoint",
-        this.plan.peakBytes,
-        this.#maxResidentBytes,
-        this.#completedSteps,
+        signal,
+        async (admittedSignal) => {
+          const rawResult = await this.#adapter.checkpoint(admittedSignal);
+          return admitPostDispatch(() => {
+            const result = snapshotBinaryResult(rawResult, "checkpoint");
+            validateReceipt(
+              result.receipt,
+              this.capabilities,
+              "session.checkpoint",
+              this.plan.peakBytes,
+              this.#maxResidentBytes,
+              this.#completedSteps,
+            );
+            return result;
+          });
+        },
       );
-      return result;
     });
   }
 
-  async resume(checkpoint: Uint8Array): Promise<WebTrainingReceiptV1> {
+  async resume(
+    checkpoint: Uint8Array,
+    options?: WebTrainingOperationOptionsV1,
+  ): Promise<WebTrainingReceiptV1> {
     return this.#exclusive(async () => {
       this.#require("prepared", "resume");
+      const signal = operationSignal(options);
+      this.#rejectPreDispatchCancellation("session.resume", signal);
       if (!(checkpoint instanceof Uint8Array) || checkpoint.byteLength === 0) {
         fail("invalid_schema", "checkpoint must not be empty", this.#state);
       }
-      const receipt = snapshotReceipt(
-        await this.#adapter.resume(Uint8Array.from(checkpoint)),
-      );
-      validateReceipt(
-        receipt,
-        this.capabilities,
+      return this.#adapterTransaction(
         "session.resume",
-        this.plan.peakBytes,
-        this.#maxResidentBytes,
-        null,
+        signal,
+        async (admittedSignal) => {
+          const rawReceipt = await this.#adapter.resume(
+            Uint8Array.from(checkpoint),
+            admittedSignal,
+          );
+          return admitPostDispatch(() => {
+            const receipt = snapshotReceipt(rawReceipt);
+            validateReceipt(
+              receipt,
+              this.capabilities,
+              "session.resume",
+              this.plan.peakBytes,
+              this.#maxResidentBytes,
+              null,
+            );
+            this.#completedSteps = receipt.completedSteps;
+            return receipt;
+          });
+        },
       );
-      this.#completedSteps = receipt.completedSteps;
-      return receipt;
     });
   }
 
-  async export(): Promise<WebBinaryResultV1> {
+  async export(options?: WebTrainingOperationOptionsV1): Promise<WebBinaryResultV1> {
     return this.#exclusive(async () => {
       this.#require("prepared", "export");
-      const result = snapshotBinaryResult(
-        await this.#adapter.export(),
-        "export",
-      );
-      validateReceipt(
-        result.receipt,
-        this.capabilities,
+      const signal = operationSignal(options);
+      return this.#adapterTransaction(
         "session.export",
-        this.plan.exportPeakBytes,
-        this.#maxResidentBytes,
-        this.#completedSteps,
+        signal,
+        async (admittedSignal) => {
+          const rawResult = await this.#adapter.export(admittedSignal);
+          return admitPostDispatch(() => {
+            const result = snapshotBinaryResult(rawResult, "export");
+            validateReceipt(
+              result.receipt,
+              this.capabilities,
+              "session.export",
+              this.plan.exportPeakBytes,
+              this.#maxResidentBytes,
+              this.#completedSteps,
+            );
+            return result;
+          });
+        },
       );
-      return result;
     });
   }
 
   async dispose(): Promise<void> {
     if (this.#state === "disposed") return;
     await this.#exclusive(async () => {
-      await this.#adapter.dispose();
       this.#lastResult = null;
+      this.#state = "terminal";
+      await this.#disposeAdapter(false);
       this.#state = "disposed";
     });
   }

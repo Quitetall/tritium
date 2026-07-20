@@ -311,6 +311,64 @@ test("backend policy and manifest coverage fail before adapter preparation", asy
   assert.deepEqual(validator.calls, ["validate"]);
 });
 
+test("device loss during preparation returns a terminal failure receipt", async () => {
+  const adapter = new MockAdapter();
+  adapter.prepare = async () => {
+    adapter.calls.push("prepare");
+    throw new WebTrainingError("device_lost", "device lost during allocation");
+  };
+  await assert.rejects(prepareTraining(model, config, adapter), (error) => {
+    assert.ok(error instanceof WebTrainingError);
+    assert.equal(error.code, "device_lost");
+    assert.equal(error.state, "terminal");
+    assert.equal(error.failureReceipt.operation, "session.prepare");
+    assert.equal(error.failureReceipt.stateBefore, "preparing");
+    assert.equal(error.failureReceipt.stateAfter, "terminal");
+    assert.equal(error.failureReceipt.recoverable, false);
+    assert.ok(Object.isFrozen(error.failureReceipt));
+    return true;
+  });
+  assert.deepEqual(adapter.calls, ["validate", "prepare", "dispose"]);
+});
+
+test("all post-prepare allocation failures dispose once and preserve the primary error", async () => {
+  const rejected = new MockAdapter();
+  const primary = new Error("allocation failed");
+  rejected.prepare = async () => {
+    rejected.calls.push("prepare");
+    throw primary;
+  };
+  rejected.dispose = async () => {
+    rejected.calls.push("dispose");
+    throw new Error("cleanup failed");
+  };
+  await assert.rejects(prepareTraining(model, config, rejected), (error) => error === primary);
+  assert.deepEqual(rejected.calls, ["validate", "prepare", "dispose"]);
+
+  const malformed = new MockAdapter();
+  malformed.prepare = async () => {
+    malformed.calls.push("prepare");
+    return receipt("wrong.operation");
+  };
+  await rejectsCode(prepareTraining(model, config, malformed), "invalid_receipt");
+  assert.deepEqual(malformed.calls, ["validate", "prepare", "dispose"]);
+});
+
+test("structural device-loss errors cross constructor realms", async () => {
+  const adapter = new MockAdapter();
+  adapter.validate = async () => {
+    adapter.calls.push("validate");
+    throw { code: "device_lost", message: "foreign realm device loss" };
+  };
+  await assert.rejects(prepareTraining(model, config, adapter), (error) => {
+    assert.ok(error instanceof WebTrainingError);
+    assert.equal(error.code, "device_lost");
+    assert.match(error.message, /foreign realm/);
+    return true;
+  });
+  assert.deepEqual(adapter.calls, ["validate", "dispose"]);
+});
+
 test("required SALT export rejects a recipe without a ternary export target before allocation", async () => {
   const adapter = new MockAdapter();
   await rejectsCode(
@@ -1029,8 +1087,9 @@ test("receipt resident and step counters gate state commits", async () => {
     loss: 1,
     receipt: receipt("session.forward", "webgpu", { peakResidentBytes: 0 }),
   });
-  await rejectsCode(residentSession.forward(batch()), "memory_limit");
-  assert.equal(residentSession.state, "prepared");
+  await rejectsCode(residentSession.forward(batch()), "adapter_failure");
+  assert.equal(residentSession.state, "terminal");
+  assert.equal(residentAdapter.calls.at(-1), "dispose");
 
   const stepAdapter = new MockAdapter();
   const stepSession = await prepareTraining(model, config, stepAdapter);
@@ -1038,8 +1097,9 @@ test("receipt resident and step counters gate state commits", async () => {
   await stepSession.backward(result);
   stepAdapter.step = async () =>
     receipt("session.step", "webgpu", { completedSteps: 7 });
-  await rejectsCode(stepSession.step(), "invalid_receipt");
-  assert.equal(stepSession.state, "backward-complete");
+  await rejectsCode(stepSession.step(), "adapter_failure");
+  assert.equal(stepSession.state, "terminal");
+  assert.equal(stepAdapter.calls.at(-1), "dispose");
 });
 
 test("forward rejects batches that differ from the compiled plan", async () => {
@@ -1062,29 +1122,33 @@ test("forward rejects batches that differ from the compiled plan", async () => {
   assert.equal(session.state, "prepared");
 });
 
-test("invalid receipts and adapter failures leave state uncommitted", async () => {
+test("unknown adapter failures and malformed receipts fail closed", async () => {
   const adapter = new MockAdapter();
   const session = await prepareTraining(model, config, adapter);
   adapter.forward = async () => {
     throw new Error("device lost");
   };
-  await assert.rejects(
-    session.forward(batch()),
-    /device lost/,
-  );
-  assert.equal(session.state, "prepared");
+  await rejectsCode(session.forward(batch()), "adapter_failure");
+  assert.equal(session.state, "terminal");
+  assert.equal(adapter.calls.filter((call) => call === "dispose").length, 1);
 
-  adapter.forward = async () => ({
+  const malformedAdapter = new MockAdapter();
+  let mutations = 0;
+  malformedAdapter.forward = async () => ({
     loss: 1,
-    receipt: receipt("session.forward", "webgpu", {
-      manifestDigest: "0".repeat(64),
-    }),
+    receipt: (() => {
+      mutations += 1;
+      return receipt("session.forward", "webgpu", {
+        manifestDigest: "0".repeat(64),
+      });
+    })(),
   });
-  await rejectsCode(
-    session.forward(batch()),
-    "invalid_receipt",
-  );
-  assert.equal(session.state, "prepared");
+  const malformedSession = await prepareTraining(model, config, malformedAdapter);
+  await rejectsCode(malformedSession.forward(batch()), "adapter_failure");
+  assert.equal(malformedSession.state, "terminal");
+  await rejectsCode(malformedSession.forward(batch()), "invalid_state");
+  assert.equal(mutations, 1);
+  assert.equal(malformedAdapter.calls.filter((call) => call === "dispose").length, 1);
 });
 
 test("concurrent session mutations fail closed", async () => {
@@ -1100,4 +1164,124 @@ test("concurrent session mutations fail closed", async () => {
   release();
   await forward;
   assert.equal(session.state, "forward-complete");
+});
+
+test("cancellation is a typed reusable transaction failure", async () => {
+  const adapter = new MockAdapter();
+  const session = await prepareTraining(model, config, adapter);
+  const controller = new AbortController();
+  controller.abort("caller cancelled");
+  await assert.rejects(
+    session.forward(batch(), { signal: controller.signal }),
+    (error) => {
+      assert.ok(error instanceof WebTrainingError);
+      assert.equal(error.code, "cancelled");
+      assert.equal(error.state, "prepared");
+      assert.equal(error.failureReceipt.cause, "cancelled");
+      assert.equal(error.failureReceipt.stateBefore, "prepared");
+      assert.equal(error.failureReceipt.stateAfter, "prepared");
+      assert.equal(error.failureReceipt.recoverable, true);
+      assert.equal(error.failureReceipt.completedSteps, 0);
+      assert.ok(Object.isFrozen(error.failureReceipt));
+      return true;
+    },
+  );
+  assert.deepEqual(adapter.calls, ["validate", "prepare"]);
+  assert.equal(session.state, "prepared");
+
+  let batchReads = 0;
+  const unreadBatch = {
+    get inputs() {
+      batchReads += 1;
+      throw new Error("pre-aborted batch must not be inspected");
+    },
+  };
+  await rejectsCode(
+    session.forward(unreadBatch, { signal: controller.signal }),
+    "cancelled",
+  );
+  assert.equal(batchReads, 0);
+
+  const inFlightController = new AbortController();
+  adapter.forward = async (_batch, signal) => {
+    adapter.calls.push("forward");
+    assert.equal(signal, inFlightController.signal);
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new DOMException("dispatch cancelled", "AbortError")),
+        { once: true },
+      );
+    });
+  };
+  const inFlight = session.forward(batch(), { signal: inFlightController.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  inFlightController.abort();
+  await assert.rejects(inFlight, (error) => {
+    assert.ok(error instanceof WebTrainingError);
+    assert.equal(error.code, "cancelled");
+    assert.equal(error.failureReceipt.recoverable, true);
+    return true;
+  });
+  assert.equal(session.state, "prepared");
+
+  adapter.forward = MockAdapter.prototype.forward.bind(adapter);
+  const activeResult = await session.forward(batch());
+  await rejectsCode(
+    session.backward({ ...activeResult }, { signal: controller.signal }),
+    "cancelled",
+  );
+  assert.equal(session.state, "forward-complete");
+  await session.backward(activeResult);
+  await session.step();
+  await rejectsCode(
+    session.resume(new Uint8Array(), { signal: controller.signal }),
+    "cancelled",
+  );
+  assert.equal(session.state, "prepared");
+});
+
+test("device loss is terminal, typed, and disposes adapter state once", async () => {
+  const adapter = new MockAdapter();
+  adapter.forward = async () => {
+    adapter.calls.push("forward");
+    throw new WebTrainingError("device_lost", "GPU device was lost");
+  };
+  const session = await prepareTraining(model, config, adapter);
+  await assert.rejects(session.forward(batch()), (error) => {
+    assert.ok(error instanceof WebTrainingError);
+    assert.equal(error.code, "device_lost");
+    assert.equal(error.state, "terminal");
+    assert.equal(error.failureReceipt.cause, "device_lost");
+    assert.equal(error.failureReceipt.stateBefore, "prepared");
+    assert.equal(error.failureReceipt.stateAfter, "terminal");
+    assert.equal(error.failureReceipt.recoverable, false);
+    assert.equal(error.failureReceipt.operation, "session.forward");
+    return true;
+  });
+  assert.equal(session.state, "terminal");
+  await rejectsCode(session.forward(batch()), "invalid_state");
+  assert.equal(adapter.calls.filter((call) => call === "dispose").length, 1);
+  await session.dispose();
+  await session.dispose();
+  assert.equal(session.state, "disposed");
+  assert.equal(adapter.calls.filter((call) => call === "dispose").length, 1);
+});
+
+test("dispose failure terminalizes training but permits cleanup retry", async () => {
+  const adapter = new MockAdapter();
+  let attempts = 0;
+  adapter.dispose = async () => {
+    adapter.calls.push("dispose");
+    attempts += 1;
+    if (attempts === 1) throw new Error("transient cleanup failure");
+  };
+  const session = await prepareTraining(model, config, adapter);
+  await assert.rejects(session.dispose(), /transient cleanup failure/);
+  assert.equal(session.state, "terminal");
+  await rejectsCode(session.forward(batch()), "invalid_state");
+  await session.dispose();
+  await session.dispose();
+  assert.equal(session.state, "disposed");
+  assert.equal(attempts, 2);
 });

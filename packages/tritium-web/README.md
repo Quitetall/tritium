@@ -48,6 +48,20 @@ bytes and resume atomically with exact optimizer planes and step count.
 Receipts report planner-accounted phase peaks; physical browser memory
 receipts remain a separate acceptance gate.
 
+Forward, backward, step, checkpoint, resume, and export accept `{ signal }`.
+Cancellation before dispatch or a cooperative adapter cancellation returns a
+typed, identity-bound recoverable failure receipt and leaves the previous
+complete state reusable.
+Adapters must reject cancellation only after rolling back partial writes and
+must emit other recoverable typed failures before mutation. Typed device loss
+during validation, preparation, or execution returns a nonrecoverable failure
+receipt, clears active results, makes the session terminal and disposes adapter
+state exactly once when allocation has begun. Unknown failures and malformed
+results after dispatch also terminalize and dispose the adapter. Physical
+WebGPU loss injection remains a browser acceptance gate.
+Explicit disposal terminalizes the session before cleanup begins; failed
+cleanup may be retried, but training never resumes on partially released state.
+
 `PortableWasmLifecycleState.create(...)` owns copied optimizer planes, commits
 and resumes atomically through that guest. Its separate `admitExport(...)`
 boundary strict-reloads caller-supplied SALT packages before returning them.

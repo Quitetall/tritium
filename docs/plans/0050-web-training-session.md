@@ -123,12 +123,23 @@ canonical plan-0049 bytes and resume atomically into fresh sessions with exact
 step/plane recovery. Structural compilation, mixed-optimizer admission and
 static portable buffer/request/lifecycle capacity checks fail before guest
 creation. Lower-level schedule/lifecycle compiler failures normalize to the
-stable session error surface. Receipts now carry planner-accounted phase peaks;
-they are not substitutes for the still-open physical browser memory evidence.
+stable session error surface. Receipts now carry planner-accounted phase peaks.
+Forward, backward, step, checkpoint, resume and export accept an optional
+`AbortSignal`; pre-dispatch and
+cooperative in-flight cancellation return an identity-bound recoverable
+failure receipt without advancing state. Adapters must commit cancellation
+atomically and reject other recoverable typed errors before mutation. Typed
+device loss during validation, preparation or a prepared
+operation returns a nonrecoverable failure receipt, clears the active result,
+makes the session terminal and disposes allocated adapter state exactly once.
+Unknown failures or malformed post-dispatch results fail closed the same way.
+Explicit disposal terminalizes before cleanup and permits only cleanup retry
+after failure.
+These structural receipts are not substitutes for the still-open physical
+browser memory and device-loss evidence.
 All 31 non-lifecycle operations now receive allocation-free canonical ABI,
 forward-shape, attribute-domain and worst-case scratch validation before any
-adapter allocation. State-derived model export and physical Chrome/Firefox
-runs remain open.
+adapter allocation. Physical Chrome/Firefox runs remain open.
 
 Compile `tritium-spec`, the bounded portable executor and SALT V2 strict reader
 to `wasm32-unknown-unknown`. JavaScript owns only lifecycle orchestration and
@@ -188,7 +199,8 @@ copies, a fixed metadata margin and returned artifacts in
 fail before adapter allocation when no
 target exists, a row boundary cannot share canonical group128 scales, the
 plane count exceeds the SALT V2 container, or the exact package exceeds 8 MiB.
-Device-loss transactions remain open.
+Physical WebGPU device-loss injection remains open; the public transaction and
+failure-receipt contract is complete.
 
 Compile a `TrainingRecipeV1` into an immutable operation schedule, buffer plan
 and optimizer-state layout. Preparation validates all roles, shapes, dtypes,
@@ -203,9 +215,10 @@ state.
 - Export writes canonical SALT V2 bytes, admits them over a binary WASM
   boundary, proves the guest output equals the live-state artifact, and
   immediately strict-reloads those bytes again before returning.
-- Cancellation and device loss leave the session either reusable from its last
-  complete step or terminal with a typed receipt; partial state is never
-  presented as committed.
+- Certified cancellation leaves the session reusable from its last complete
+  step. Device loss, unknown post-dispatch failure, and malformed results make
+  it terminal with a typed receipt; partial state is never presented as
+  committed.
 
 Reference tests compare every lifecycle transition and final artifact byte for
 byte with the CPU adapter.

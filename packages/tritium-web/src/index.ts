@@ -99,8 +99,10 @@ export type {
   WebTrainingCapabilitiesV1,
   WebTrainingConfigV1,
   WebTrainingErrorCode,
+  WebTrainingFailureReceiptV1,
   WebTrainingImplementationV1,
   WebTrainingModelV1,
+  WebTrainingOperationOptionsV1,
   WebTrainingReceiptV1,
   WebTrainingState,
 } from "./session.ts";
