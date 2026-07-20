@@ -138,6 +138,13 @@ receipt digests, and binds every successful receipt to the exact corpus bytes.
 This closes Slice 2 corpus coverage and the CPU semantic matrix; accelerator and
 constrained-target receipts remain required for release closure.
 
+CUDA adapter work has started against the same seam. Current actual-RTX-4090
+evidence covers 26 canonical cases across 9/35 operations: dense matmul,
+transpose, scale, add, multiply, SiLU, RMSNorm, softmax, and causal mask. Each
+success emits a physical-device-bound receipt; the adapter advertises only this
+proved subset and never delegates to CPU. This is development evidence, not a
+release-admissible CUDA receipt; CUDA remains open until all 35 operations pass.
+
 Edits:
 
 - Add strict manifest types/parser to `tritium-spec/src/training.rs`.
