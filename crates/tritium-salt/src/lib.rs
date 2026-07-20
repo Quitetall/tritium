@@ -38,10 +38,11 @@ pub use qwen36_tensor_work::{
     Qwen36AllocatedCampaignStore, Qwen36CompleteWorkspaceReceipt,
     Qwen36LanguageMtpWorkspaceReceipt, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
-    Qwen36PackageScaleOnlyCampaignStore, Qwen36PreservedVisitError, Qwen36PtqDriverError,
-    Qwen36PtqEvidenceDirectory, Qwen36ScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
-    Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
-    Qwen36TensorWorkError, Qwen36TensorWorkStore, Qwen36TensorWorkSummary, reconcile_qwen36_ptq,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36PhysicalAllocationError, Qwen36PreservedVisitError,
+    Qwen36PtqDriverError, Qwen36PtqEvidenceDirectory, Qwen36ScaleOnlyCampaignStore,
+    Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
+    Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt, Qwen36TensorWorkError,
+    Qwen36TensorWorkStore, Qwen36TensorWorkSummary, reconcile_qwen36_ptq,
 };
 pub use tensor_work_store::{
     TensorPayloadValidator, TensorPayloadWriter, TensorPutError, TensorRecordInfo,

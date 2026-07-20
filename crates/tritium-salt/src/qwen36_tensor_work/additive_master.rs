@@ -5,8 +5,9 @@ mod selected_allocation;
 pub use selected_allocation::{
     Qwen36AllocatedCampaignStore, Qwen36PackageAdmissionError, Qwen36PackageAdmissionReceipt,
     Qwen36PackageAdmittedCampaignStore, Qwen36PackageProfileReceipt, Qwen36PackageRuntimeLedger,
-    Qwen36PackageScaleOnlyCampaignStore, Qwen36SelectedAllocationBindError,
-    Qwen36SelectedAllocationReceipt, Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
+    Qwen36PackageScaleOnlyCampaignStore, Qwen36PhysicalAllocationError,
+    Qwen36SelectedAllocationBindError, Qwen36SelectedAllocationReceipt,
+    Qwen36SelectedAllocationSpec, Qwen36SelectedProfileReceipt,
 };
 
 use core::fmt;
@@ -2480,12 +2481,14 @@ mod tests {
     use half::f16;
     use tritium_format::{
         PackageId, SemanticTensorHasher,
+        salt_v2::SaltV2Codec,
         salt_v2_master::{
             SaltV2FitConstraint, SaltV2MasterError, SaltV2MasterEvidence, SaltV2MasterGeometry,
             SaltV2MasterTensorEncoder, SaltV2MasterTrack, SaltV2PrefixLoss,
         },
         salt_v2_package::{
-            SaltV2Package, SaltV2Plane, SaltV2Tensor, SaltV2Tile, write_salt_v2_package,
+            SaltV2Package, SaltV2Plane, SaltV2StreamTensorSpec, SaltV2Tensor, SaltV2Tile,
+            SaltV2Transform, SaltV2UniformRateModel, write_salt_v2_package,
         },
     };
     use tritium_nn::{NnError, Qwen35TensorStreamError};
@@ -2605,6 +2608,106 @@ mod tests {
             fixture_master("mtp.weight", [22; 32], 1, [52; 32]),
         ])
         .expect("valid fixture campaign")
+    }
+
+    fn full_tile_plan() -> WorkspacePlan {
+        let mut plan = fixture_plan();
+        plan.summary.active_coefficients = 512;
+        for slot in &mut plan.additive {
+            slot.shape = vec![1, 256];
+            slot.coefficients = 256;
+        }
+        plan
+    }
+
+    fn full_tile_master(
+        name: &str,
+        source_digest: [u8; 32],
+        ordinal: u64,
+        widened_digest: [u8; 32],
+    ) -> SaltV2MasterTensorSpec {
+        SaltV2MasterTensorSpec::new(
+            name,
+            vec![1, 256],
+            ModelId::from_digest([11; 32]),
+            source_digest,
+            widened_digest,
+            ordinal,
+            SaltV2MasterEvidence {
+                recipe_id: [31; 32],
+                solver_id: [32; 32],
+                activation_digest: [33; 32],
+                curvature_digest: [if ordinal == 0 { 40 } else { 41 }; 32],
+                feedback_digest: None,
+                track: SaltV2MasterTrack::Ptq,
+                parent_master_id: None,
+            },
+            SaltV2MasterGeometry {
+                constraint: SaltV2FitConstraint::Dense,
+                max_planes: 3,
+            },
+        )
+        .expect("valid full-tile master")
+    }
+
+    fn full_tile_campaign_spec() -> Qwen36AdditiveCampaignSpec {
+        Qwen36AdditiveCampaignSpec::new(vec![
+            full_tile_master("language.weight", [21; 32], 0, [51; 32]),
+            full_tile_master("mtp.weight", [22; 32], 1, [52; 32]),
+        ])
+        .expect("valid full-tile campaign")
+    }
+
+    fn full_tile_selection_spec() -> Qwen36SelectedAllocationSpec {
+        let specs = [
+            SaltV2StreamTensorSpec::new("language.weight", vec![1, 256], SaltV2Transform::None)
+                .unwrap(),
+            SaltV2StreamTensorSpec::new("mtp.weight", vec![1, 256], SaltV2Transform::None).unwrap(),
+        ];
+        let rate = SaltV2UniformRateModel::new(SaltV2Codec::D2, &specs).unwrap();
+        let metadata = ByteDelta::declared(PhysicalBytes {
+            serialized: rate.fixed_serialized_bytes(),
+            resident: rate.fixed_resident_bytes(),
+        });
+        let compact = rate.physical_bytes(2).unwrap();
+        let near = rate.physical_bytes(4).unwrap();
+        Qwen36SelectedAllocationSpec::new(
+            SaltV2Codec::D2,
+            [91; 32],
+            [92; 32],
+            NestedProfileBudgets {
+                compact: ProfileBudget {
+                    maximum: PhysicalBytes {
+                        serialized: compact.serialized,
+                        resident: compact.resident,
+                    },
+                    metadata,
+                },
+                near_lossless: ProfileBudget {
+                    maximum: PhysicalBytes {
+                        serialized: near.serialized,
+                        resident: near.resident,
+                    },
+                    metadata,
+                },
+            },
+        )
+        .expect("valid physical selection spec")
+    }
+
+    fn write_full_tile_master(
+        spec: &SaltV2MasterTensorSpec,
+        writer: &mut TensorPayloadWriter<'_>,
+        losses: [f64; 3],
+    ) -> Result<(), SaltV2MasterError> {
+        let losses =
+            losses.map(|loss| SaltV2PrefixLoss::new(loss, loss).expect("valid fixture loss"));
+        let plane = SaltV2Plane::new(vec![0; 256], vec![f16::ZERO; 256usize.div_ceil(128)])?;
+        let planes = [plane.clone(), plane.clone(), plane];
+        let mut encoder = SaltV2MasterTensorEncoder::new(spec, writer)?;
+        encoder.write_tile(3, &losses, &planes)?;
+        encoder.finish()?;
+        Ok(())
     }
 
     fn fixture_selection_spec() -> Qwen36SelectedAllocationSpec {
@@ -3409,6 +3512,51 @@ mod tests {
         .expect("tamper selected map record");
         assert!(parent.reopen_selected_allocation().is_err());
 
+        drop(parent);
+        drop(base);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_masters_allocate_exact_physical_nested_profiles() {
+        let root = fixture_root("physical-selected-allocation");
+        let _ = fs::remove_dir_all(&root);
+        let source = EmptySource;
+        let base = Qwen36TensorWorkStore::open_from_parts(&source, root.clone(), full_tile_plan())
+            .expect("open full-tile workspace");
+        base.reconcile_preserved().expect("seal empty base");
+        let campaign_spec = full_tile_campaign_spec();
+        let parent = base
+            .open_master_campaign(campaign_spec.clone())
+            .expect("open full-tile campaign");
+        let curves = [[9.0, 5.0, 4.0], [8.0, 7.0, 1.0]];
+        for (expected, losses) in campaign_spec.expected_masters().iter().zip(curves) {
+            parent
+                .install_master(expected, |writer| {
+                    write_full_tile_master(expected, writer, losses)
+                })
+                .expect("install full-tile master");
+        }
+        parent.seal_complete().expect("seal full-tile campaign");
+
+        let allocated = parent
+            .allocate_selected_allocation(full_tile_selection_spec())
+            .expect("derive exact physical allocation");
+        assert_eq!(allocated.receipt().compact().selected_planes(), 2);
+        assert_eq!(allocated.receipt().near_lossless().selected_planes(), 4);
+        assert_eq!(allocated.receipt().tile_count(), 2);
+        allocated
+            .verify_current()
+            .expect("reverify exact selection");
+        drop(allocated);
+
+        let reopened = parent
+            .reopen_selected_allocation()
+            .expect("reopen physically allocated selection");
+        assert_eq!(reopened.receipt().compact().selected_planes(), 2);
+        assert_eq!(reopened.receipt().near_lossless().selected_planes(), 4);
+
+        drop(reopened);
         drop(parent);
         drop(base);
         let _ = fs::remove_dir_all(root);

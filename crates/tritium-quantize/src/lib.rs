@@ -89,9 +89,10 @@ pub use salt_v2_activation::{
     ActivationCacheSpec, ActivationChunk, ActivationDType, ActivationDigest, ActivationShard,
 };
 pub use salt_v2_allocator::{
-    ByteDelta, GroupCandidates, NestedProfileAllocation, NestedProfileBudgets, PhysicalAllocError,
-    PhysicalBytes, PlaneCandidate, ProfileAllocation, ProfileBudget, SaltV2Profile,
-    allocate_nested_profiles,
+    ByteDelta, GroupCandidates, NestedProfileAllocation, NestedProfileBudgets, PackedPlaneCounts,
+    PackedUniformProfileAllocation, PackedUniformProfilePlanner, PhysicalAllocError, PhysicalBytes,
+    PlaneCandidate, ProfileAllocation, ProfileBudget, SaltV2Profile, UniformPrefixCurve,
+    UniformProfileAllocError, allocate_nested_profiles, allocate_uniform_profile_packed,
 };
 pub use salt_v2_curvature::{
     CurvatureError, CurvatureSourceId, InputGram, InputGramAccumulator, KfacMetric, OutputFisher,

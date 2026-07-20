@@ -2,6 +2,13 @@
 
 use core::fmt;
 
+mod compact_uniform;
+
+pub use compact_uniform::{
+    PackedPlaneCounts, PackedUniformProfileAllocation, PackedUniformProfilePlanner,
+    UniformPrefixCurve, UniformProfileAllocError, allocate_uniform_profile_packed,
+};
+
 const SALT_V2_PLANES: usize = 3;
 
 /// Exact byte counts in the serialized package and in the resident runtime image.
@@ -745,6 +752,25 @@ impl ExactReduction {
     fn cmp(self, other: Self) -> core::cmp::Ordering {
         self.exact().cmp(&other.exact())
     }
+
+    fn rounded_bits(self) -> u64 {
+        let from = f64::from_bits(self.from_bits);
+        let to = f64::from_bits(self.to_bits);
+        canonical_nonnegative_bits(from - to)
+    }
+}
+
+fn compare_reduction_descending(
+    left: ExactReduction,
+    right: ExactReduction,
+) -> core::cmp::Ordering {
+    // Correct rounding is monotone, so unequal rounded non-negative
+    // differences have the same order as their exact real differences. Only
+    // the usually tiny equal-key buckets need superaccumulator comparison.
+    right
+        .rounded_bits()
+        .cmp(&left.rounded_bits())
+        .then_with(|| right.cmp(left))
 }
 
 fn canonical_nonnegative_bits(value: f64) -> u64 {
@@ -754,6 +780,14 @@ fn canonical_nonnegative_bits(value: f64) -> u64 {
 trait RankedUpgrade {
     fn group(&self) -> usize;
     fn reduction(&self) -> ExactReduction;
+}
+
+trait RankedUnitUpgrade: RankedUpgrade {
+    fn target_planes(&self) -> u8;
+}
+
+trait RankedBundledUpgrade: RankedUpgrade {
+    fn first_plane_reduction(&self) -> ExactReduction;
 }
 
 const EXACT_PREFIX_BLOCK: usize = 64;
@@ -1063,6 +1097,12 @@ impl RankedUpgrade for UnitUpgrade {
     }
 }
 
+impl RankedUnitUpgrade for UnitUpgrade {
+    fn target_planes(&self) -> u8 {
+        self.target_planes
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BundledUpgrade {
     group: usize,
@@ -1077,6 +1117,12 @@ impl RankedUpgrade for BundledUpgrade {
 
     fn reduction(&self) -> ExactReduction {
         self.distortion_reduction
+    }
+}
+
+impl RankedBundledUpgrade for BundledUpgrade {
+    fn first_plane_reduction(&self) -> ExactReduction {
+        self.first_plane_reduction
     }
 }
 
@@ -1103,13 +1149,13 @@ struct RegularChoice {
     exceptional_bundle_rank: Option<usize>,
 }
 
-struct RegularIndexes<'a> {
+struct RegularIndexes<'a, U, B> {
     unit_prefix: &'a ExactPrefixIndex,
     bundle_prefix: &'a ExactPrefixIndex,
     unit_lex: &'a LexGroupIndex,
     bundle_lex: &'a LexGroupIndex,
-    units: &'a [UnitUpgrade],
-    bundles: &'a [BundledUpgrade],
+    units: &'a [U],
+    bundles: &'a [B],
 }
 
 /// Solve the regular full-tile case without constructing a model-sized Pareto frontier.
@@ -1243,16 +1289,12 @@ fn regular_plane_counts(
     }
 
     unit_upgrades.sort_unstable_by(|left, right| {
-        right
-            .distortion_reduction
-            .cmp(left.distortion_reduction)
+        compare_reduction_descending(left.distortion_reduction, right.distortion_reduction)
             .then_with(|| left.group.cmp(&right.group))
             .then_with(|| left.target_planes.cmp(&right.target_planes))
     });
     bundled_upgrades.sort_unstable_by(|left, right| {
-        right
-            .distortion_reduction
-            .cmp(left.distortion_reduction)
+        compare_reduction_descending(left.distortion_reduction, right.distortion_reduction)
             .then_with(|| left.group.cmp(&right.group))
     });
 
@@ -1284,8 +1326,8 @@ fn regular_plane_counts(
     Ok(Some(plane_counts))
 }
 
-fn best_regular_choice(
-    indexes: &RegularIndexes<'_>,
+fn best_regular_choice<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
+    indexes: &RegularIndexes<'_, U, B>,
     capacity: usize,
     profile: SaltV2Profile,
 ) -> Result<RegularChoice, PhysicalAllocError> {
@@ -1329,7 +1371,7 @@ fn best_regular_choice(
                 replacement_after_exclusion: false,
             };
             retain_better_hull_choice(&mut prefix_best, choice, None, indexes, profile)?;
-            ordinary_prefix_best.push(prefix_best.expect("current prefix choice"));
+            ordinary_prefix_best.push(prefix_best.expect("current prefix choice").bundle_count);
         }
 
         let replacement_maximum = bundle_count.saturating_sub(1).min(residual_capacity / 2);
@@ -1340,14 +1382,7 @@ fn best_regular_choice(
         replacement_suffix_best
             .try_reserve_exact(replacement_len)
             .map_err(|_| PhysicalAllocError::WorkingMemoryUnavailable { profile })?;
-        replacement_suffix_best.resize(
-            replacement_len,
-            HullChoice {
-                bundle_count: 0,
-                unit_count: 0,
-                replacement_after_exclusion: false,
-            },
-        );
+        replacement_suffix_best.resize(replacement_len, 0);
         let mut suffix_best = None;
         for selected_bundles in (0..=replacement_maximum).rev() {
             let selected_units = unit_count.min(residual_capacity - selected_bundles * 2);
@@ -1359,17 +1394,27 @@ fn best_regular_choice(
                 replacement_after_exclusion: true,
             };
             retain_better_hull_choice(&mut suffix_best, choice, None, indexes, profile)?;
-            replacement_suffix_best[selected_bundles] = suffix_best.expect("current suffix choice");
+            replacement_suffix_best[selected_bundles] =
+                suffix_best.expect("current suffix choice").bundle_count;
         }
 
         for (excluded_rank, bundle) in indexes.bundles.iter().enumerate() {
-            if bundle.first_plane_reduction.is_zero() {
+            if bundle.first_plane_reduction().is_zero() {
                 continue;
             }
-            let mut best_without_bundle =
-                Some(ordinary_prefix_best[excluded_rank.min(ordinary_maximum)]);
+            let ordinary_bundles = ordinary_prefix_best[excluded_rank.min(ordinary_maximum)];
+            let mut best_without_bundle = Some(HullChoice {
+                bundle_count: ordinary_bundles,
+                unit_count: unit_count.min(residual_capacity - ordinary_bundles * 2),
+                replacement_after_exclusion: false,
+            });
             if excluded_rank < replacement_maximum {
-                let replacement = replacement_suffix_best[excluded_rank + 1];
+                let replacement_bundles = replacement_suffix_best[excluded_rank + 1];
+                let replacement = HullChoice {
+                    bundle_count: replacement_bundles,
+                    unit_count: unit_count.min(residual_capacity - replacement_bundles * 2),
+                    replacement_after_exclusion: true,
+                };
                 retain_better_hull_choice(
                     &mut best_without_bundle,
                     replacement,
@@ -1403,10 +1448,10 @@ fn checked_reduction_add(
         .ok_or(PhysicalAllocError::AccountingOverflow { profile })
 }
 
-fn hull_reduction(
+fn hull_reduction<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     choice: HullChoice,
     excluded_bundle_rank: Option<usize>,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
     profile: SaltV2Profile,
 ) -> Result<ExactDistortion, PhysicalAllocError> {
     let unit_reduction = indexes
@@ -1420,15 +1465,15 @@ fn hull_reduction(
         && excluded_rank < choice.bundle_prefix_len()
     {
         bundle_reduction = bundle_reduction
-            .checked_sub(indexes.bundles[excluded_rank].distortion_reduction.exact())
+            .checked_sub(indexes.bundles[excluded_rank].reduction().exact())
             .ok_or(PhysicalAllocError::AccountingOverflow { profile })?;
     }
     checked_reduction_add(unit_reduction, bundle_reduction, profile)
 }
 
-fn regular_reduction(
+fn regular_reduction<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     choice: RegularChoice,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
     profile: SaltV2Profile,
 ) -> Result<ExactDistortion, PhysicalAllocError> {
     let mut reduction = hull_reduction(
@@ -1441,7 +1486,7 @@ fn regular_reduction(
         reduction = checked_reduction_add(
             reduction,
             indexes.bundles[exceptional_rank]
-                .first_plane_reduction
+                .first_plane_reduction()
                 .exact(),
             profile,
         )?;
@@ -1457,11 +1502,11 @@ fn exact_reduction(
     ExactReduction::new(from, to).ok_or(PhysicalAllocError::AccountingOverflow { profile })
 }
 
-fn retain_better_hull_choice(
+fn retain_better_hull_choice<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     best: &mut Option<HullChoice>,
     candidate: HullChoice,
     excluded_bundle_rank: Option<usize>,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
     profile: SaltV2Profile,
 ) -> Result<(), PhysicalAllocError> {
     let replace = match *best {
@@ -1476,11 +1521,11 @@ fn retain_better_hull_choice(
     Ok(())
 }
 
-fn hull_choice_is_better(
+fn hull_choice_is_better<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     candidate: HullChoice,
     current: HullChoice,
     excluded_bundle_rank: Option<usize>,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
     profile: SaltV2Profile,
 ) -> Result<bool, PhysicalAllocError> {
     match hull_reduction(candidate, excluded_bundle_rank, indexes, profile)?.cmp(&hull_reduction(
@@ -1504,10 +1549,10 @@ fn hull_choice_is_better(
     ))
 }
 
-fn retain_better_regular_choice(
+fn retain_better_regular_choice<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     best: &mut Option<RegularChoice>,
     candidate: RegularChoice,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
     profile: SaltV2Profile,
 ) -> Result<(), PhysicalAllocError> {
     let replace = match *best {
@@ -1520,10 +1565,10 @@ fn retain_better_regular_choice(
     Ok(())
 }
 
-fn regular_choice_is_better(
+fn regular_choice_is_better<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     candidate: RegularChoice,
     current: RegularChoice,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
     profile: SaltV2Profile,
 ) -> Result<bool, PhysicalAllocError> {
     let candidate_upgrades =
@@ -1543,10 +1588,10 @@ fn regular_choice_is_better(
     Ok(regular_choice_lex_is_greater(candidate, current, indexes))
 }
 
-fn regular_choice_lex_is_greater(
+fn regular_choice_lex_is_greater<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     candidate: RegularChoice,
     current: RegularChoice,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
 ) -> bool {
     let unit_difference = prefix_difference(
         indexes.unit_lex,
@@ -1563,11 +1608,11 @@ fn regular_choice_lex_is_greater(
     )
 }
 
-fn hull_choice_lex_is_greater(
+fn hull_choice_lex_is_greater<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     candidate: HullChoice,
     current: HullChoice,
     excluded_bundle_rank: Option<usize>,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
 ) -> bool {
     let unit_difference = prefix_difference(
         indexes.unit_lex,
@@ -1628,11 +1673,11 @@ fn first_difference_prefers_candidate(
     }
 }
 
-fn first_hull_bundle_difference(
+fn first_hull_bundle_difference<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     candidate: HullChoice,
     current: HullChoice,
     excluded_bundle_rank: Option<usize>,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
 ) -> Option<RankedGroup> {
     let candidate_take = candidate.bundle_prefix_len();
     let current_take = current.bundle_prefix_len();
@@ -1652,10 +1697,10 @@ fn first_hull_bundle_difference(
     best
 }
 
-fn first_regular_bundle_difference(
+fn first_regular_bundle_difference<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     candidate: RegularChoice,
     current: RegularChoice,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
 ) -> Option<RankedGroup> {
     let candidate_take = candidate.hull.bundle_prefix_len();
     let current_take = current.hull.bundle_prefix_len();
@@ -1731,9 +1776,9 @@ fn bundle_planes_for_choice(choice: RegularChoice, rank: usize) -> u8 {
     if rank < take { 3 } else { 1 }
 }
 
-fn materialize_regular_choice(
+fn materialize_regular_choice<U: RankedUnitUpgrade, B: RankedBundledUpgrade>(
     choice: RegularChoice,
-    indexes: &RegularIndexes<'_>,
+    indexes: &RegularIndexes<'_, U, B>,
     floors: &[u8],
     profile: SaltV2Profile,
 ) -> Result<Vec<u8>, PhysicalAllocError> {
@@ -1742,11 +1787,11 @@ fn materialize_regular_choice(
     let take = choice.hull.bundle_count + usize::from(choice.hull.replacement_after_exclusion);
     for (rank, upgrade) in indexes.bundles.iter().take(take).enumerate() {
         if choice.exceptional_bundle_rank != Some(rank) {
-            plane_counts[upgrade.group] = 3;
+            plane_counts[upgrade.group()] = 3;
         }
     }
     if let Some(excluded_rank) = choice.exceptional_bundle_rank {
-        plane_counts[indexes.bundles[excluded_rank].group] = 2;
+        plane_counts[indexes.bundles[excluded_rank].group()] = 2;
     }
     Ok(plane_counts)
 }
@@ -1776,10 +1821,14 @@ fn try_filled_plane_counts(
     Ok(counts)
 }
 
-fn apply_unit_prefix(plane_counts: &mut [u8], units: &[UnitUpgrade], unit_count: usize) {
+fn apply_unit_prefix<U: RankedUnitUpgrade>(
+    plane_counts: &mut [u8],
+    units: &[U],
+    unit_count: usize,
+) {
     for upgrade in units.iter().take(unit_count) {
-        debug_assert_eq!(plane_counts[upgrade.group] + 1, upgrade.target_planes);
-        plane_counts[upgrade.group] = upgrade.target_planes;
+        debug_assert_eq!(plane_counts[upgrade.group()] + 1, upgrade.target_planes());
+        plane_counts[upgrade.group()] = upgrade.target_planes();
     }
 }
 
@@ -2127,6 +2176,21 @@ mod tests {
         assert_eq!(
             largest.checked_add_f64(overflow_midpoint).unwrap().to_f64(),
             None
+        );
+    }
+
+    #[test]
+    fn rounded_reduction_sort_key_refines_exact_collisions() {
+        let larger = ExactReduction::new(1.0, 0.0).expect("larger reduction");
+        let smaller = ExactReduction::new(1.0, 2f64.powi(-54)).expect("smaller reduction");
+        assert_eq!(larger.rounded_bits(), smaller.rounded_bits());
+        assert_eq!(
+            compare_reduction_descending(larger, smaller),
+            core::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_reduction_descending(smaller, larger),
+            core::cmp::Ordering::Greater
         );
     }
 

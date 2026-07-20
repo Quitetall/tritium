@@ -7,7 +7,8 @@ use std::{
 };
 
 use super::{
-    SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_MAX_PLANES, SALT_V2_MAX_TENSORS,
+    SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_INDEXED_RUNTIME_RANK_PREFIX_BYTES,
+    SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES, SALT_V2_MAX_PLANES, SALT_V2_MAX_TENSORS,
     SALT_V2_PACKAGE_ALIGNMENT, SALT_V2_PACKAGE_HEADER_BYTES, SALT_V2_PACKAGE_MAGIC,
     SALT_V2_PACKAGE_VERSION, SALT_V2_SCALE_GROUP_SIZE, SALT_V2_TENSOR_COUNT_BITS,
     SALT_V2_TENSOR_HEADER_BYTES, SALT_V2_TILE_COUNT_BITS, SALT_V2_TRANSFORM_METADATA_BYTES,
@@ -71,6 +72,281 @@ impl SaltV2StreamTensorSpec {
     #[must_use]
     pub const fn transform(&self) -> SaltV2Transform {
         self.transform
+    }
+}
+
+/// Exact serialized and indexed-runtime bytes for one uniform full-tile profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaltV2UniformPhysicalBytes {
+    /// Canonical aligned package-file bytes.
+    pub serialized: u64,
+    /// Exact steady indexed-runtime bytes without a dense shadow.
+    pub resident: u64,
+}
+
+/// Why a uniform full-allocation-tile rate model could not be constructed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SaltV2UniformRateError {
+    /// Package metadata or length validation failed.
+    Package(SaltV2PackageError),
+    /// At least one tensor ends in a shorter allocation tile, so plane costs differ.
+    RaggedTensor {
+        /// Canonical tensor name.
+        name: String,
+        /// Shape-derived coefficient count.
+        logical_coefficients: u64,
+    },
+}
+
+impl fmt::Display for SaltV2UniformRateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Package(error) => write!(formatter, "SALT V2 uniform rate model: {error}"),
+            Self::RaggedTensor {
+                name,
+                logical_coefficients,
+            } => write!(
+                formatter,
+                "SALT V2 tensor `{name}` has {logical_coefficients} coefficients, not full 256-coefficient allocation tiles"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SaltV2UniformRateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Package(error) => Some(error),
+            Self::RaggedTensor { .. } => None,
+        }
+    }
+}
+
+impl From<SaltV2PackageError> for SaltV2UniformRateError {
+    fn from(error: SaltV2PackageError) -> Self {
+        Self::Package(error)
+    }
+}
+
+/// Closed-form physical accounting for packages whose allocation tiles are all full.
+///
+/// For this common matrix case every additional plane has one exact payload/scale
+/// delta. Package headers/maps and indexed-runtime maps/rank prefixes are fixed,
+/// while final serialized alignment is applied only once to the aggregate. This
+/// makes the two physical ceilings an exact plane-cardinality constraint without
+/// charging per-tile padding or relying on logical bpw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaltV2UniformRateModel {
+    codec: SaltV2Codec,
+    tensor_count: u64,
+    tile_count: u64,
+    fixed_serialized_bytes: u64,
+    fixed_resident_bytes: u64,
+    plane_bytes: u64,
+}
+
+impl SaltV2UniformRateModel {
+    /// Derive exact fixed and per-plane costs from canonical tensor metadata.
+    pub fn new(
+        codec: SaltV2Codec,
+        specs: &[SaltV2StreamTensorSpec],
+    ) -> Result<Self, SaltV2UniformRateError> {
+        if specs.is_empty() {
+            return Err(SaltV2PackageError::EmptyPackage.into());
+        }
+        if specs.len() > SALT_V2_MAX_TENSORS {
+            return Err(SaltV2PackageError::TooManyTensors { got: specs.len() }.into());
+        }
+        let plane_payload = codec
+            .ledger(SALT_V2_ALLOCATION_TILE_SIZE)
+            .map_err(SaltV2PackageError::from)?
+            .physical_bytes;
+        let plane_payload =
+            u64::try_from(plane_payload).map_err(|_| SaltV2PackageError::LengthOverflow)?;
+        let scales_per_plane =
+            u64::try_from(SALT_V2_ALLOCATION_TILE_SIZE.div_ceil(SALT_V2_SCALE_GROUP_SIZE))
+                .map_err(|_| SaltV2PackageError::LengthOverflow)?;
+        let plane_bytes = plane_payload
+            .checked_add(
+                scales_per_plane
+                    .checked_mul(2)
+                    .ok_or(SaltV2PackageError::LengthOverflow)?,
+            )
+            .ok_or(SaltV2PackageError::LengthOverflow)?;
+        let mut names = BTreeSet::new();
+        let mut tile_count = 0u64;
+        let mut fixed_serialized_bytes = SALT_V2_PACKAGE_HEADER_BYTES as u64;
+        let mut fixed_resident_bytes = 0u64;
+        for spec in specs {
+            if !names.insert(&spec.name) {
+                return Err(SaltV2PackageError::DuplicateTensorName(spec.name.clone()).into());
+            }
+            let logical_coefficients = checked_dimension_product(&spec.dims)?;
+            if !logical_coefficients.is_multiple_of(SALT_V2_ALLOCATION_TILE_SIZE as u64) {
+                return Err(SaltV2UniformRateError::RaggedTensor {
+                    name: spec.name.clone(),
+                    logical_coefficients,
+                });
+            }
+            let tensor_tiles = logical_coefficients / SALT_V2_ALLOCATION_TILE_SIZE as u64;
+            let tensor_maximum_planes = tensor_tiles
+                .checked_mul(SALT_V2_MAX_PLANES as u64)
+                .ok_or(SaltV2PackageError::LengthOverflow)?;
+            let tensor_payload_bytes = tensor_maximum_planes
+                .checked_mul(plane_payload)
+                .ok_or(SaltV2PackageError::LengthOverflow)?;
+            let tensor_scale_count = tensor_maximum_planes
+                .checked_mul(scales_per_plane)
+                .ok_or(SaltV2PackageError::LengthOverflow)?;
+            for runtime_value in [
+                tensor_tiles,
+                tensor_maximum_planes,
+                tensor_payload_bytes,
+                tensor_scale_count,
+            ] {
+                u32::try_from(runtime_value).map_err(|_| SaltV2PackageError::LengthOverflow)?;
+            }
+            tile_count = tile_count
+                .checked_add(tensor_tiles)
+                .ok_or(SaltV2PackageError::LengthOverflow)?;
+            fixed_serialized_bytes = fixed_serialized_bytes
+                .checked_add(SALT_V2_TENSOR_HEADER_BYTES as u64)
+                .and_then(|bytes| bytes.checked_add(spec.name.len() as u64))
+                .and_then(|bytes| {
+                    bytes.checked_add(u64::try_from(spec.dims.len()).ok()?.checked_mul(8)?)
+                })
+                .ok_or(SaltV2PackageError::LengthOverflow)?;
+            fixed_resident_bytes = fixed_resident_bytes
+                .checked_add(
+                    tensor_tiles
+                        .checked_mul(2)
+                        .ok_or(SaltV2PackageError::LengthOverflow)?
+                        / 8,
+                )
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        tensor_tiles
+                            .saturating_sub(1)
+                            .checked_div(SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES as u64)?
+                            .checked_mul(SALT_V2_INDEXED_RUNTIME_RANK_PREFIX_BYTES as u64)?,
+                    )
+                })
+                .ok_or(SaltV2PackageError::LengthOverflow)?;
+        }
+        fixed_serialized_bytes = fixed_serialized_bytes
+            .checked_add(
+                tile_count
+                    .checked_mul(2)
+                    .ok_or(SaltV2PackageError::LengthOverflow)?
+                    / 8,
+            )
+            .ok_or(SaltV2PackageError::LengthOverflow)?;
+        let maximum_planes = tile_count
+            .checked_mul(SALT_V2_MAX_PLANES as u64)
+            .ok_or(SaltV2PackageError::LengthOverflow)?;
+        let _ = fixed_serialized_bytes
+            .checked_add(
+                plane_bytes
+                    .checked_mul(maximum_planes)
+                    .ok_or(SaltV2PackageError::LengthOverflow)?,
+            )
+            .ok_or(SaltV2PackageError::LengthOverflow)?;
+        let _ = fixed_resident_bytes
+            .checked_add(
+                plane_bytes
+                    .checked_mul(maximum_planes)
+                    .ok_or(SaltV2PackageError::LengthOverflow)?,
+            )
+            .ok_or(SaltV2PackageError::LengthOverflow)?;
+        Ok(Self {
+            codec,
+            tensor_count: specs.len() as u64,
+            tile_count,
+            fixed_serialized_bytes,
+            fixed_resident_bytes,
+            plane_bytes,
+        })
+    }
+
+    /// Package codec whose payload delta is modeled.
+    #[must_use]
+    pub const fn codec(self) -> SaltV2Codec {
+        self.codec
+    }
+
+    /// Number of canonical tensors.
+    #[must_use]
+    pub const fn tensor_count(self) -> u64 {
+        self.tensor_count
+    }
+
+    /// Number of mandatory full allocation tiles.
+    #[must_use]
+    pub const fn tile_count(self) -> u64 {
+        self.tile_count
+    }
+
+    /// Exact unaligned package metadata, including the standalone map bytes.
+    #[must_use]
+    pub const fn fixed_serialized_bytes(self) -> u64 {
+        self.fixed_serialized_bytes
+    }
+
+    /// Exact indexed-runtime map and rank-prefix bytes.
+    #[must_use]
+    pub const fn fixed_resident_bytes(self) -> u64 {
+        self.fixed_resident_bytes
+    }
+
+    /// Exact payload plus G128 f16 scales for one full-tile plane.
+    #[must_use]
+    pub const fn plane_bytes(self) -> u64 {
+        self.plane_bytes
+    }
+
+    /// Exact bytes for a total present-plane cardinality in `tiles..=3*tiles`.
+    #[must_use]
+    pub fn physical_bytes(self, present_planes: u64) -> Option<SaltV2UniformPhysicalBytes> {
+        if present_planes < self.tile_count
+            || present_planes > self.tile_count.checked_mul(SALT_V2_MAX_PLANES as u64)?
+        {
+            return None;
+        }
+        let raw_serialized = self
+            .fixed_serialized_bytes
+            .checked_add(self.plane_bytes.checked_mul(present_planes)?)?;
+        let alignment = SALT_V2_PACKAGE_ALIGNMENT as u64;
+        let serialized = raw_serialized
+            .checked_add(alignment - 1)?
+            .checked_div(alignment)?
+            .checked_mul(alignment)?;
+        let resident = self
+            .fixed_resident_bytes
+            .checked_add(self.plane_bytes.checked_mul(present_planes)?)?;
+        Some(SaltV2UniformPhysicalBytes {
+            serialized,
+            resident,
+        })
+    }
+
+    /// Largest present-plane cardinality admitted by both exact ceilings.
+    ///
+    /// Returns `None` when even the mandatory one-plane-per-tile package cannot fit.
+    #[must_use]
+    pub fn maximum_present_planes(self, maximum: SaltV2UniformPhysicalBytes) -> Option<u64> {
+        let alignment = SALT_V2_PACKAGE_ALIGNMENT as u64;
+        let aligned_serialized_ceiling = maximum.serialized / alignment * alignment;
+        let serialized_planes = aligned_serialized_ceiling
+            .checked_sub(self.fixed_serialized_bytes)?
+            .checked_div(self.plane_bytes)?;
+        let resident_planes = maximum
+            .resident
+            .checked_sub(self.fixed_resident_bytes)?
+            .checked_div(self.plane_bytes)?;
+        let admitted = serialized_planes
+            .min(resident_planes)
+            .min(self.tile_count.checked_mul(SALT_V2_MAX_PLANES as u64)?);
+        (admitted >= self.tile_count).then_some(admitted)
     }
 }
 
@@ -870,7 +1146,8 @@ mod tests {
 
     use super::*;
     use crate::salt_v2_package::{
-        SaltV2Package, SaltV2Plane, SaltV2Tensor, read_salt_v2_package, write_salt_v2_package,
+        SaltV2IndexedRuntimeLedger, SaltV2Package, SaltV2Plane, SaltV2Tensor, read_salt_v2_package,
+        write_salt_v2_package,
     };
     use half::f16;
 
@@ -1055,5 +1332,74 @@ mod tests {
         assert!(plan.ledger().payload_bytes > plan.allocation_map_storage_bytes() as u64 * 500);
         let debug = format!("{plan:?}");
         assert!(!debug.contains("255, 255"));
+    }
+
+    #[test]
+    fn uniform_rate_model_matches_canonical_file_and_indexed_runtime_ledgers() {
+        let tile_count = 257usize;
+        for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+            let tiles = (0..tile_count)
+                .map(|index| tile(SALT_V2_ALLOCATION_TILE_SIZE, index % 3 + 1, index))
+                .collect::<Vec<_>>();
+            let present_planes = tiles.iter().map(|tile| tile.planes().len() as u64).sum();
+            let tensor = SaltV2Tensor::new(
+                "uniform",
+                vec![(tile_count * SALT_V2_ALLOCATION_TILE_SIZE) as u64],
+                tiles,
+            )
+            .expect("uniform tensor");
+            let package = SaltV2Package::new(codec, vec![tensor]).expect("uniform package");
+            let encoded = write_salt_v2_package(&package).expect("encode uniform package");
+            let runtime = SaltV2IndexedRuntimeLedger::for_package(&package).expect("runtime");
+            let spec = SaltV2StreamTensorSpec::new(
+                "uniform",
+                vec![(tile_count * SALT_V2_ALLOCATION_TILE_SIZE) as u64],
+                SaltV2Transform::None,
+            )
+            .expect("spec");
+            let model = SaltV2UniformRateModel::new(codec, &[spec]).expect("rate model");
+            let physical = model
+                .physical_bytes(present_planes)
+                .expect("physical bytes");
+
+            assert_eq!(model.tile_count(), tile_count as u64);
+            assert_eq!(physical.serialized, encoded.ledger.total_bytes);
+            assert_eq!(physical.resident, runtime.steady_resident_bytes());
+            assert_eq!(model.maximum_present_planes(physical), Some(present_planes));
+        }
+    }
+
+    #[test]
+    fn uniform_rate_model_rejects_ragged_geometry() {
+        let spec =
+            SaltV2StreamTensorSpec::new("ragged", vec![257], SaltV2Transform::None).expect("spec");
+        assert!(matches!(
+            SaltV2UniformRateModel::new(SaltV2Codec::D2, &[spec]),
+            Err(SaltV2UniformRateError::RaggedTensor {
+                name,
+                logical_coefficients: 257
+            }) if name == "ragged"
+        ));
+    }
+
+    #[test]
+    fn uniform_rate_model_rejects_unindexable_tensor_payloads() {
+        let d2_payload_per_plane = SaltV2Codec::D2
+            .ledger(SALT_V2_ALLOCATION_TILE_SIZE)
+            .expect("D2 ledger")
+            .physical_bytes as u64;
+        let tiles = u64::from(u32::MAX) / (d2_payload_per_plane * 3) + 1;
+        let spec = SaltV2StreamTensorSpec::new(
+            "unindexable",
+            vec![tiles * SALT_V2_ALLOCATION_TILE_SIZE as u64],
+            SaltV2Transform::None,
+        )
+        .expect("shape-only spec");
+        assert!(matches!(
+            SaltV2UniformRateModel::new(SaltV2Codec::D2, &[spec]),
+            Err(SaltV2UniformRateError::Package(
+                SaltV2PackageError::LengthOverflow
+            ))
+        ));
     }
 }

@@ -71,6 +71,11 @@ saves with safe serialization, automatically reloads through
 - [x] Stream selected Compact/NearLossless parent prefixes into byte-exact
   seek-backed packages and exact package admission without constructing a
   whole-model semantic package or duplicating the caller source artifact.
+- [x] Convert canonical full-tile package and indexed-runtime ceilings into an
+  exact plane-cardinality budget, solve verified Hessian prefix curves with a
+  callback-driven compact allocator, and durably bind nested two-bit maps. The
+  solver retains exact non-concave global optimality and deterministic ties;
+  ragged or runtime-unindexable geometry fails closed.
 - Bind the Rust SALT pipeline to `quantize(model_or_id, calibration, config,
   work_dir)` without a Python-list weight bridge.
 - Expose immutable `QuantizationResult` model/coverage/report plus atomic

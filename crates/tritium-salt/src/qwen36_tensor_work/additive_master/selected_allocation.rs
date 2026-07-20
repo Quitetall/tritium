@@ -8,6 +8,7 @@ pub use package_admission::{
 };
 
 use std::{
+    convert::Infallible,
     error::Error,
     fmt,
     fs::{self, File},
@@ -19,9 +20,15 @@ use tritium_format::{
     ModelId,
     salt_v2::SaltV2Codec,
     salt_v2_master::{SaltV2FitConstraint, SaltV2MasterTensorDecoder, SaltV2MasterVisitError},
+    salt_v2_package::{
+        SaltV2StreamTensorSpec, SaltV2Transform, SaltV2UniformPhysicalBytes,
+        SaltV2UniformRateError, SaltV2UniformRateModel,
+    },
 };
 use tritium_quantize::{
-    ByteDelta, NestedProfileBudgets, PhysicalBytes, ProfileBudget, SaltV2Profile,
+    ByteDelta, NestedProfileBudgets, PackedPlaneCounts, PackedUniformProfilePlanner,
+    PhysicalAllocError, PhysicalBytes, ProfileBudget, SaltV2Profile, UniformPrefixCurve,
+    UniformProfileAllocError,
 };
 
 use crate::{
@@ -240,6 +247,96 @@ impl<E> From<Qwen36TensorWorkError> for Qwen36SelectedAllocationBindError<E> {
     }
 }
 
+/// Failure while deriving and durably binding an exact package-byte allocation.
+#[derive(Debug)]
+pub enum Qwen36PhysicalAllocationError {
+    /// Parent campaign, master, filesystem, or durable publication failed.
+    Campaign(Qwen36TensorWorkError),
+    /// Canonical package geometry cannot use the uniform full-tile rate model.
+    Rate(SaltV2UniformRateError),
+    /// Exact compact allocation failed.
+    Allocation(UniformProfileAllocError<Infallible>),
+    /// The policy's declared metadata differs from canonical package/runtime metadata.
+    MetadataMismatch {
+        /// Metadata derived from the canonical package and indexed runtime.
+        modeled: PhysicalBytes,
+        /// Metadata carried by the allocation policy.
+        specified: PhysicalBytes,
+    },
+    /// Even one mandatory plane per tile exceeds one profile's exact ceilings.
+    BudgetTooSmall {
+        /// Profile whose minimum package cannot fit.
+        profile: SaltV2Profile,
+        /// Exact mandatory physical bytes.
+        required: PhysicalBytes,
+        /// Policy ceilings.
+        maximum: PhysicalBytes,
+    },
+}
+
+impl fmt::Display for Qwen36PhysicalAllocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Campaign(error) => {
+                write!(formatter, "physical allocation campaign failed: {error}")
+            }
+            Self::Rate(error) => {
+                write!(formatter, "physical allocation rate model failed: {error}")
+            }
+            Self::Allocation(error) => {
+                write!(formatter, "physical allocation solver failed: {error}")
+            }
+            Self::MetadataMismatch { modeled, specified } => write!(
+                formatter,
+                "allocation metadata {specified:?} differs from canonical package/runtime metadata {modeled:?}"
+            ),
+            Self::BudgetTooSmall {
+                profile,
+                required,
+                maximum,
+            } => write!(
+                formatter,
+                "{profile:?} requires {required:?}, exceeding exact ceilings {maximum:?}"
+            ),
+        }
+    }
+}
+
+impl Error for Qwen36PhysicalAllocationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Campaign(error) => Some(error),
+            Self::Rate(error) => Some(error),
+            Self::Allocation(error) => Some(error),
+            Self::MetadataMismatch { .. } | Self::BudgetTooSmall { .. } => None,
+        }
+    }
+}
+
+impl From<Qwen36TensorWorkError> for Qwen36PhysicalAllocationError {
+    fn from(error: Qwen36TensorWorkError) -> Self {
+        Self::Campaign(error)
+    }
+}
+
+impl From<SaltV2UniformRateError> for Qwen36PhysicalAllocationError {
+    fn from(error: SaltV2UniformRateError) -> Self {
+        Self::Rate(error)
+    }
+}
+
+impl From<UniformProfileAllocError<Infallible>> for Qwen36PhysicalAllocationError {
+    fn from(error: UniformProfileAllocError<Infallible>) -> Self {
+        Self::Allocation(error)
+    }
+}
+
+impl From<PhysicalAllocError> for Qwen36PhysicalAllocationError {
+    fn from(error: PhysicalAllocError) -> Self {
+        Self::Allocation(UniformProfileAllocError::Allocation(error))
+    }
+}
+
 impl Qwen36SelectedAllocationReceipt {
     /// Content identity of the complete canonical nested selection receipt.
     #[must_use]
@@ -419,6 +516,34 @@ pub struct Qwen36AllocatedCampaignStore<'parent, 'store, 'source> {
     parent_completion: Qwen36CompleteWorkspaceReceipt,
 }
 
+fn physical_bytes(bytes: SaltV2UniformPhysicalBytes) -> PhysicalBytes {
+    PhysicalBytes {
+        serialized: bytes.serialized,
+        resident: bytes.resident,
+    }
+}
+
+fn maximum_present_planes(
+    rate: SaltV2UniformRateModel,
+    maximum: PhysicalBytes,
+    profile: SaltV2Profile,
+) -> Result<u64, Qwen36PhysicalAllocationError> {
+    rate.maximum_present_planes(SaltV2UniformPhysicalBytes {
+        serialized: maximum.serialized,
+        resident: maximum.resident,
+    })
+    .ok_or_else(|| {
+        let required = rate
+            .physical_bytes(rate.tile_count())
+            .expect("uniform rate model always represents its mandatory prefix");
+        Qwen36PhysicalAllocationError::BudgetTooSmall {
+            profile,
+            required: physical_bytes(required),
+            maximum,
+        }
+    })
+}
+
 impl Qwen36AllocatedCampaignStore<'_, '_, '_> {
     /// Durable parent-bound nested-selection receipt carried by this capability.
     #[must_use]
@@ -428,6 +553,202 @@ impl Qwen36AllocatedCampaignStore<'_, '_, '_> {
 }
 
 impl<'store, 'source> Qwen36AdditiveCampaignStore<'store, 'source> {
+    /// Derive and durably bind the exact Compact/Near allocation from verified masters.
+    ///
+    /// The canonical package rate model converts both serialized and indexed-runtime
+    /// ceilings into exact plane cardinalities. Parent masters are verified and decoded
+    /// once per profile directly into the callback-driven compact solver; only ranked
+    /// upgrade records and two-bit maps scale with tile count. Hessian prefix loss is the
+    /// optimization objective. Counts beyond a tile's admitted prefix receive zero gain
+    /// and therefore cannot be selected.
+    ///
+    /// # Errors
+    /// Fails closed for changed parent state, ragged or unindexable package geometry,
+    /// contradictory metadata, undersized budgets, allocation failure, or publication
+    /// failure.
+    #[cfg(unix)]
+    pub fn allocate_selected_allocation<'parent>(
+        &'parent self,
+        spec: Qwen36SelectedAllocationSpec,
+    ) -> Result<Qwen36AllocatedCampaignStore<'parent, 'store, 'source>, Qwen36PhysicalAllocationError>
+    {
+        let (_, parent_manifest, _) = self.require_complete_verified(FixedCampaignMode::Capture)?;
+        let package_specs = self
+            .spec
+            .expected_masters
+            .iter()
+            .map(|master| {
+                SaltV2StreamTensorSpec::new(
+                    master.name(),
+                    master.shape().to_vec(),
+                    SaltV2Transform::None,
+                )
+                .map_err(SaltV2UniformRateError::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rate = SaltV2UniformRateModel::new(spec.codec(), &package_specs)?;
+        let modeled_metadata = PhysicalBytes {
+            serialized: rate.fixed_serialized_bytes(),
+            resident: rate.fixed_resident_bytes(),
+        };
+        let budgets = spec.budgets();
+        let specified_metadata = budgets.compact.metadata.effective();
+        if specified_metadata != modeled_metadata {
+            return Err(Qwen36PhysicalAllocationError::MetadataMismatch {
+                modeled: modeled_metadata,
+                specified: specified_metadata,
+            });
+        }
+
+        let compact_maximum =
+            maximum_present_planes(rate, budgets.compact.maximum, SaltV2Profile::CompactV1)?;
+        let compact_floor =
+            PackedPlaneCounts::filled(rate.tile_count(), 1, SaltV2Profile::CompactV1)?;
+        let mut compact_planner = PackedUniformProfilePlanner::new(
+            rate.tile_count(),
+            &compact_floor,
+            compact_maximum - rate.tile_count(),
+            SaltV2Profile::CompactV1,
+        )?;
+        self.push_verified_hessian_curves(&parent_manifest.masters, &mut compact_planner)?;
+        let compact = compact_planner.finish()?;
+
+        let near_maximum = maximum_present_planes(
+            rate,
+            budgets.near_lossless.maximum,
+            SaltV2Profile::NearLosslessV1,
+        )?;
+        if near_maximum < compact.present_planes {
+            let required = rate
+                .physical_bytes(compact.present_planes)
+                .expect("compact allocation is rate-model representable");
+            return Err(Qwen36PhysicalAllocationError::BudgetTooSmall {
+                profile: SaltV2Profile::NearLosslessV1,
+                required: physical_bytes(required),
+                maximum: budgets.near_lossless.maximum,
+            });
+        }
+        let mut near_planner = PackedUniformProfilePlanner::new(
+            rate.tile_count(),
+            &compact.plane_counts,
+            near_maximum - compact.present_planes,
+            SaltV2Profile::NearLosslessV1,
+        )?;
+        self.push_verified_hessian_curves(&parent_manifest.masters, &mut near_planner)?;
+        let near = near_planner.finish()?;
+        let tile_count = rate.tile_count();
+        let counts = (0..tile_count).map(|tile| {
+            Ok::<_, Infallible>((
+                compact
+                    .plane_counts
+                    .get(tile)
+                    .expect("compact map covers rate-model tiles"),
+                near.plane_counts
+                    .get(tile)
+                    .expect("near map covers rate-model tiles"),
+            ))
+        });
+        self.bind_selected_allocation(spec, counts)
+            .map_err(|error| match error {
+                Qwen36SelectedAllocationBindError::Campaign(error) => {
+                    Qwen36PhysicalAllocationError::Campaign(error)
+                }
+                Qwen36SelectedAllocationBindError::Source(source) => match source {},
+            })
+    }
+
+    /// Reject physical allocation where stable file identity is unavailable.
+    #[cfg(not(unix))]
+    pub fn allocate_selected_allocation<'parent>(
+        &'parent self,
+        _spec: Qwen36SelectedAllocationSpec,
+    ) -> Result<Qwen36AllocatedCampaignStore<'parent, 'store, 'source>, Qwen36PhysicalAllocationError>
+    {
+        Err(Qwen36TensorWorkError::AdditiveCampaignUnsupportedPlatform.into())
+    }
+
+    #[cfg(unix)]
+    fn push_verified_hessian_curves(
+        &self,
+        parent_masters: &[Qwen36AdditiveMasterReceipt],
+        planner: &mut PackedUniformProfilePlanner<'_>,
+    ) -> Result<(), Qwen36PhysicalAllocationError> {
+        if parent_masters.len() != self.spec.expected_masters.len() {
+            return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                "physical allocation parent tensor count",
+            )
+            .into());
+        }
+        for (expected, parent_master) in self.spec.expected_masters.iter().zip(parent_masters) {
+            let mut decoder =
+                SaltV2MasterTensorDecoder::new(expected).map_err(Qwen36TensorWorkError::Master)?;
+            let mut local_tiles = 0usize;
+            self.objects
+                .try_visit_verified(
+                    &parent_master.record,
+                    super::MASTER_STREAM_CHUNK_BYTES,
+                    |chunk| {
+                        decoder
+                            .try_push(chunk, &mut |tile| {
+                                let admitted = usize::from(tile.admissible_planes());
+                                if admitted == 0 || admitted > 3 || admitted > tile.losses().len() {
+                                    return Err(Qwen36PhysicalAllocationError::Campaign(
+                                        Qwen36TensorWorkError::WorkspaceMismatch(
+                                            "physical allocation admitted prefix",
+                                        ),
+                                    ));
+                                }
+                                let admitted_loss = tile.losses()[admitted - 1].hessian();
+                                let mut losses = [admitted_loss; 3];
+                                for (destination, loss) in
+                                    losses.iter_mut().zip(&tile.losses()[..admitted])
+                                {
+                                    *destination = loss.hessian();
+                                }
+                                let curve = UniformPrefixCurve::new(losses).map_err(|error| {
+                                    Qwen36PhysicalAllocationError::Allocation(
+                                        UniformProfileAllocError::Allocation(error),
+                                    )
+                                })?;
+                                planner
+                                    .push(curve)
+                                    .map_err(Qwen36PhysicalAllocationError::Allocation)?;
+                                local_tiles = local_tiles.checked_add(1).ok_or({
+                                    Qwen36PhysicalAllocationError::Campaign(
+                                        Qwen36TensorWorkError::LengthOverflow(
+                                            "physical allocation tensor tiles",
+                                        ),
+                                    )
+                                })?;
+                                Ok(())
+                            })
+                            .map_err(|error| match error {
+                                SaltV2MasterVisitError::Master(error) => {
+                                    Qwen36PhysicalAllocationError::Campaign(
+                                        Qwen36TensorWorkError::Master(error),
+                                    )
+                                }
+                                SaltV2MasterVisitError::Visitor(error) => error,
+                            })
+                    },
+                )
+                .map_err(|error| match error {
+                    TensorVisitError::Store(error) => Qwen36PhysicalAllocationError::Campaign(
+                        Qwen36TensorWorkError::TensorStore(error),
+                    ),
+                    TensorVisitError::Sink(error) => error,
+                })?;
+            decoder.finish().map_err(Qwen36TensorWorkError::Master)?;
+            if local_tiles != expected.tile_count() {
+                return Err(Qwen36TensorWorkError::WorkspaceMismatch(
+                    "physical allocation tensor tile count",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     /// Validate and durably bind one exact nested allocation to this sealed PTQ parent.
     ///
     /// `counts` is pulled exactly once per parent tile plus one terminal read.

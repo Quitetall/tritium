@@ -1,9 +1,9 @@
 # 0043 — SALT V2 implementation and SOTA campaign
 
 Status: **IN PROGRESS** (Qwen family/MTP fixture, resumable tensor-master driver,
-selected-package structural admission, and bounded canonical package writing
-implemented through 2026-07-20; checkpoint-scale and empirical campaign gates
-remain open)
+exact physical nested allocation, selected-package structural admission, and
+bounded canonical package writing implemented through 2026-07-20;
+checkpoint-scale and empirical campaign gates remain open)
 
 - **Decision:** [ADR 0028](../adr/0028-salt-v2-additive-ternarization.md)
 - **Research cutoff:** 2026-07-14, inclusive

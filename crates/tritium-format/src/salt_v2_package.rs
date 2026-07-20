@@ -29,7 +29,8 @@ pub use reader::{
 };
 pub use stream_writer::{
     SaltV2PackageStreamError, SaltV2PackageStreamPlan, SaltV2PackageStreamPlanError,
-    SaltV2PackageStreamWriter, SaltV2StreamTensorSpec,
+    SaltV2PackageStreamWriter, SaltV2StreamTensorSpec, SaltV2UniformPhysicalBytes,
+    SaltV2UniformRateError, SaltV2UniformRateModel,
 };
 
 /// Number of coefficients sharing one SALT V2 scale.
