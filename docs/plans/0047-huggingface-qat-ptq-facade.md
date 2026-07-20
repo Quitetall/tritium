@@ -66,6 +66,8 @@ saves with safe serialization, automatically reloads through
 - [x] Reconcile the admitted 506-matrix Qwen source and exact evidence namespace
   into the resumable content-addressed PTQ campaign, fitting only missing
   masters and sealing only after strict canonical reopen.
+- [x] Expose that expert master-campaign primitive and immutable structural
+  receipt through the abi3 Python wheel without a Python-list weight bridge.
 - Bind the Rust SALT pipeline to `quantize(model_or_id, calibration, config,
   work_dir)` without a Python-list weight bridge.
 - Expose immutable `QuantizationResult` model/coverage/report plus atomic

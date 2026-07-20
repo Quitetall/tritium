@@ -63,6 +63,32 @@ extra residual planes on the most sensitive tiles (up to `~4.75` bpw at `T = 3`)
 You can preview the bpw/error tradeoff on a raw fp32 matrix without committing to
 a full quantize via `tritium report salt`.
 
+## SALT V2 Qwen master campaigns
+
+The legacy `tritium quantize` command above is not the Qwen3.6-27B SALT V2
+campaign path. Advanced users with a fully collected canonical `S2KF` evidence
+directory can resume the rate-free master stage directly from Python:
+
+```python
+from tritium.salt import reconcile_qwen36_ptq_masters
+
+receipt = reconcile_qwen36_ptq_masters(
+    "/models/Qwen3.6-27B",
+    revision="6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+    work_dir="./tritium-work",
+    evidence_dir="./curvature-evidence",
+)
+print(receipt.campaign_id, receipt.additive_tensors)
+```
+
+This boundary admits and seek-reads the source checkpoint in Rust, requires the
+exact 506-record evidence namespace and one campaign-wide token stream, widens
+only one matrix at a time, resumes valid content-addressed masters, and seals a
+canonical structural receipt. It does **not** return a deployable model: profile
+allocation, package assembly, evaluation, and export remain governed later
+stages. The high-level raw-calibration `tritium.torch.quantize(...)` facade is
+still under implementation in plan 0047.
+
 ## Hardware constraints (load-bearing)
 
 - **Regular compute.** Plane counts are quantized to `{1, 2, 3}` and allocated at

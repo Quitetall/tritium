@@ -29,6 +29,7 @@
 #![allow(unreachable_pub)] // pyo3's `#[pymethods]` expansion emits `pub` items.
 
 mod ops;
+mod salt;
 
 use std::sync::Mutex;
 
@@ -258,6 +259,8 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::ste_quantize_vjp, m)?)?;
     m.add_function(wrap_pyfunction!(ops::lsq_forward, m)?)?;
     m.add_function(wrap_pyfunction!(ops::lsq_vjp, m)?)?;
+    m.add_class::<salt::Qwen36PtqMasterReceipt>()?;
+    m.add_function(wrap_pyfunction!(salt::reconcile_qwen36_ptq_masters, m)?)?;
     m.add(
         "__doc__",
         "Tritium: ternary-model inference + autograd ops from Python.",

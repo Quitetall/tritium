@@ -796,6 +796,9 @@ misordered records and mixed token streams, plans the immutable campaign while
 retaining only one widened matrix and one factor record, resumes only missing
 masters, and seals through the existing content-addressed store. The producer
 that collects all 506 `S2KF` records from real calibration remains open.
+The same driver is exposed to Python as
+`tritium.salt.reconcile_qwen36_ptq_masters`; its immutable receipt is explicitly
+rate-free and cannot be mistaken for a packaged model or evaluation result.
 Guided-Fisher, input-Hessian, and forward-KL curvature can now retain exact
 Kronecker structure instead of expanding one dense G128 matrix per output row.
 The solver materializes only the active G128

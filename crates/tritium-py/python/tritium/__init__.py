@@ -18,6 +18,7 @@ from ._tritium import (
     ste_quantize_vjp,
     ternary_matmul,
 )
+from . import salt
 
 __all__ = [
     "Model",
@@ -31,6 +32,7 @@ __all__ = [
     "ste_absmean_scale",
     "ste_quantize_forward",
     "ste_quantize_vjp",
+    "salt",
 ]
 
 # The torch wrappers are optional: importing them requires PyTorch. Inference (Model/ternary_matmul)

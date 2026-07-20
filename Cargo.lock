@@ -4424,7 +4424,9 @@ dependencies = [
  "tritium-core",
  "tritium-cpu",
  "tritium-nn",
+ "tritium-quantize",
  "tritium-runtime",
+ "tritium-salt",
  "tritium-spec",
  "tritium-train",
 ]
