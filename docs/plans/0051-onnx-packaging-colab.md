@@ -98,8 +98,11 @@ The first architecture tensor-map adapter now maps canonical SmolLM2
 Hugging Face names into the tied-head, bias-free, full-RoPE SwiGLU graph and
 rejects missing names or config/tensor geometry drift. The causal graph now
 also represents BitNet's ReLU2 gate activation plus attention-output and
-FFN-intermediate subnorms, with real ORT/reference parity; the BitNet GGUF
-tensor-map adapter remains open. Qwen3.6 still requires its heterogeneous
+FFN-intermediate subnorms, with real ORT/reference parity. An exact BitNet GGUF
+namespace adapter maps ternarized packed embeddings/projections and preserved
+norms, rejecting missing/duplicate/extra tensors including an untied
+`output.weight`. Raw dense-embedding/I2_S conversion remains an upstream
+quantization/import concern. Qwen3.6 still requires its heterogeneous
 DeltaNet/full-attention schedule, untied head, output gate, biases and partial
 RoPE. Multi-layer large-model external-data packaging, those Qwen graph
 extensions, dynamic axes and end-user generation APIs remain open.

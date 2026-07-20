@@ -542,16 +542,17 @@ mod onnx_op;
 
 #[cfg(feature = "model")]
 pub use model::{
-    AdmittedExternalCausalLmDigests, CausalActivation, CausalLmDecoderLayer, CausalLmModel,
-    ExternalOnnxModel, MappedSmolLm2, OnnxArtifactIdentityV2, OnnxModelError, PackedTernaryMatrix,
-    RotaryEmbedding, RotaryMode, SmolLm2Config, SmolLm2TensorProvider, TiedEmbeddingHeadModel,
-    TiedEmbeddingHeadModelV2, UnsupportedGraphDiagnostic, UnsupportedGraphItemKind,
-    VerifiedExternalCausalLmModel, VerifiedExternalOnnxModel, VerifiedExternalOnnxModelV2,
-    VerifiedOnnxArtifactIdentityV2, diagnose_unsupported_graph, encode_causal_lm,
-    encode_external_causal_lm, encode_external_tied_embedding_head,
-    encode_external_tied_embedding_head_v2, encode_tied_embedding_head,
-    encode_tied_embedding_head_v2, map_smollm2_causal_lm, verify_external_causal_lm,
-    verify_external_tied_embedding_head, verify_external_tied_embedding_head_v2,
+    AdmittedExternalCausalLmDigests, BitNetConfig, BitNetGgufTensorProvider, CausalActivation,
+    CausalLmDecoderLayer, CausalLmModel, ExternalOnnxModel, MappedBitNet, MappedSmolLm2,
+    OnnxArtifactIdentityV2, OnnxModelError, PackedTernaryMatrix, RotaryEmbedding, RotaryMode,
+    SmolLm2Config, SmolLm2TensorProvider, TiedEmbeddingHeadModel, TiedEmbeddingHeadModelV2,
+    UnsupportedGraphDiagnostic, UnsupportedGraphItemKind, VerifiedExternalCausalLmModel,
+    VerifiedExternalOnnxModel, VerifiedExternalOnnxModelV2, VerifiedOnnxArtifactIdentityV2,
+    diagnose_unsupported_graph, encode_causal_lm, encode_external_causal_lm,
+    encode_external_tied_embedding_head, encode_external_tied_embedding_head_v2,
+    encode_tied_embedding_head, encode_tied_embedding_head_v2, map_bitnet_gguf_causal_lm,
+    map_smollm2_causal_lm, verify_external_causal_lm, verify_external_tied_embedding_head,
+    verify_external_tied_embedding_head_v2,
 };
 
 #[cfg(feature = "model")]

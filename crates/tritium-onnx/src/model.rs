@@ -297,7 +297,7 @@ pub fn map_smollm2_causal_lm<'a>(
 ) -> Result<MappedSmolLm2<'a>, OnnxModelError> {
     validate_smollm2_config(config)?;
     let expected_names = smollm2_tensor_names(config.layers)?;
-    validate_exact_tensor_set(source.tensor_names()?, &expected_names)?;
+    validate_exact_tensor_set("SmolLM2", source.tensor_names()?, &expected_names)?;
     let embedding = source.matrix("model.embed_tokens.weight")?;
     let final_norm = source.vector("model.norm.weight")?;
     let mut layers = Vec::new();
@@ -345,36 +345,18 @@ pub fn map_smollm2_causal_lm<'a>(
 }
 
 fn validate_smollm2_config(config: SmolLm2Config) -> Result<(), OnnxModelError> {
-    if config.layers == 0
-        || config.hidden == 0
-        || config.intermediate == 0
-        || config.vocab == 0
-        || config.n_head == 0
-        || config.n_kv_head == 0
-        || config.head_dim == 0
-    {
-        return Err(OnnxModelError::InvalidModel(
-            "SmolLM2 config dimensions must be nonzero".to_owned(),
-        ));
-    }
-    let projected_hidden = config
-        .n_head
-        .checked_mul(config.head_dim)
-        .ok_or(OnnxModelError::ShapeOverflow("SmolLM2 attention width"))?;
-    if projected_hidden != config.hidden || !config.n_head.is_multiple_of(config.n_kv_head) {
-        return Err(OnnxModelError::InvalidModel(
-            "SmolLM2 attention geometry differs from hidden width or GQA grouping".to_owned(),
-        ));
-    }
-    if !config.rope_theta.is_finite()
-        || config.rope_theta <= 0.0
-        || !config.rms_epsilon.is_finite()
-        || config.rms_epsilon <= 0.0
-    {
-        return Err(OnnxModelError::InvalidModel(
-            "SmolLM2 RoPE theta and RMS epsilon must be positive and finite".to_owned(),
-        ));
-    }
+    validate_causal_adapter_geometry(CausalAdapterGeometry {
+        family: "SmolLM2",
+        layers: config.layers,
+        hidden: config.hidden,
+        intermediate: config.intermediate,
+        vocab: config.vocab,
+        n_head: config.n_head,
+        n_kv_head: config.n_kv_head,
+        head_dim: config.head_dim,
+        rope_theta: config.rope_theta,
+        rms_epsilon: config.rms_epsilon,
+    })?;
     if !config.tied_embeddings
         || config.projection_bias
         || config.activation != CausalActivation::SwiGlu
@@ -384,6 +366,66 @@ fn validate_smollm2_config(config: SmolLm2Config) -> Result<(), OnnxModelError> 
             "SmolLM2 adapter requires tied embeddings, bias-free SwiGLU and full unscaled RoPE"
                 .to_owned(),
         ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CausalAdapterGeometry {
+    family: &'static str,
+    layers: usize,
+    hidden: usize,
+    intermediate: usize,
+    vocab: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    rms_epsilon: f32,
+}
+
+fn validate_causal_adapter_geometry(geometry: CausalAdapterGeometry) -> Result<(), OnnxModelError> {
+    if geometry.layers == 0
+        || geometry.hidden == 0
+        || geometry.intermediate == 0
+        || geometry.vocab == 0
+        || geometry.n_head == 0
+        || geometry.n_kv_head == 0
+        || geometry.head_dim == 0
+    {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{} config dimensions must be nonzero",
+            geometry.family
+        )));
+    }
+    let projected_hidden =
+        geometry
+            .n_head
+            .checked_mul(geometry.head_dim)
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "causal adapter attention width",
+            ))?;
+    if projected_hidden != geometry.hidden || !geometry.n_head.is_multiple_of(geometry.n_kv_head) {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{} attention geometry differs from hidden width or GQA grouping",
+            geometry.family
+        )));
+    }
+    if geometry.head_dim < 2 || !geometry.head_dim.is_multiple_of(2) {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{} full RoPE requires a positive even head dimension",
+            geometry.family
+        )));
+    }
+    if !geometry.rope_theta.is_finite()
+        || geometry.rope_theta <= 0.0
+        || !geometry.rms_epsilon.is_finite()
+        || geometry.rms_epsilon <= 0.0
+    {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{} RoPE theta and RMS epsilon must be positive and finite",
+            geometry.family
+        )));
     }
     Ok(())
 }
@@ -416,22 +458,26 @@ fn smollm2_tensor_names(layers: usize) -> Result<Vec<String>, OnnxModelError> {
     Ok(names)
 }
 
-fn validate_exact_tensor_set(actual: &[String], expected: &[String]) -> Result<(), OnnxModelError> {
+fn validate_exact_tensor_set(
+    family: &str,
+    actual: &[String],
+    expected: &[String],
+) -> Result<(), OnnxModelError> {
     let mut actual_sorted = Vec::new();
     actual_sorted
         .try_reserve_exact(actual.len())
-        .map_err(|_| OnnxModelError::ShapeOverflow("SmolLM2 source manifest allocation"))?;
+        .map_err(|_| OnnxModelError::ShapeOverflow("adapter source manifest allocation"))?;
     actual_sorted.extend(actual.iter().map(String::as_str));
     actual_sorted.sort_unstable();
     if actual_sorted.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(OnnxModelError::InvalidModel(
-            "SmolLM2 source tensor manifest contains duplicate names".to_owned(),
-        ));
+        return Err(OnnxModelError::InvalidModel(format!(
+            "{family} source tensor manifest contains duplicate names"
+        )));
     }
     let mut expected_sorted = Vec::new();
     expected_sorted
         .try_reserve_exact(expected.len())
-        .map_err(|_| OnnxModelError::ShapeOverflow("SmolLM2 expected manifest allocation"))?;
+        .map_err(|_| OnnxModelError::ShapeOverflow("adapter expected manifest allocation"))?;
     expected_sorted.extend(expected.iter().map(String::as_str));
     expected_sorted.sort_unstable();
     if let Some(name) = expected_sorted
@@ -439,7 +485,7 @@ fn validate_exact_tensor_set(actual: &[String], expected: &[String]) -> Result<(
         .find(|name| actual_sorted.binary_search(name).is_err())
     {
         return Err(OnnxModelError::InvalidModel(format!(
-            "SmolLM2 source is missing tensor {name}"
+            "{family} source is missing tensor {name}"
         )));
     }
     if let Some(name) = actual_sorted
@@ -447,10 +493,197 @@ fn validate_exact_tensor_set(actual: &[String], expected: &[String]) -> Result<(
         .find(|name| expected_sorted.binary_search(name).is_err())
     {
         return Err(OnnxModelError::InvalidModel(format!(
-            "SmolLM2 source contains unsupported tensor {name}"
+            "{family} source contains unsupported tensor {name}"
         )));
     }
     Ok(())
+}
+
+/// BitNet GGUF geometry supported by the homogeneous causal exporter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BitNetConfig {
+    /// Decoder layer count.
+    pub layers: usize,
+    /// Residual-stream width.
+    pub hidden: usize,
+    /// ReLU2 intermediate width.
+    pub intermediate: usize,
+    /// Token vocabulary size.
+    pub vocab: usize,
+    /// Query attention head count.
+    pub n_head: usize,
+    /// Key/value attention head count.
+    pub n_kv_head: usize,
+    /// Elements per attention head.
+    pub head_dim: usize,
+    /// Rotary embedding base.
+    pub rope_theta: f32,
+    /// RMSNorm epsilon shared by decoder norms.
+    pub rms_epsilon: f32,
+    /// Rotary-position semantics declared by GGUF metadata.
+    pub rotary_mode: RotaryMode,
+}
+
+/// Complete packed-tensor view of a ternarized BitNet GGUF namespace.
+pub trait BitNetGgufTensorProvider<'a> {
+    /// Enumerate every tensor name in the GGUF, excluding metadata keys.
+    fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError>;
+    /// Resolve one GGUF rank-two tensor as packed ternary data.
+    fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError>;
+    /// Resolve one preserved GGUF fp32/fp16-widened norm vector.
+    fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError>;
+}
+
+/// Borrowed BitNet graph after exact GGUF tensor-name mapping.
+#[derive(Debug)]
+pub struct MappedBitNet<'a> {
+    config: BitNetConfig,
+    embedding: PackedTernaryMatrix<'a>,
+    layers: Vec<CausalLmDecoderLayer<'a>>,
+    final_norm: &'a [f32],
+    identity: OnnxArtifactIdentityV2<'a>,
+}
+
+impl<'a> MappedBitNet<'a> {
+    /// Canonically ordered BitNet decoder layers.
+    #[must_use]
+    pub fn layers(&self) -> &[CausalLmDecoderLayer<'a>] {
+        &self.layers
+    }
+
+    /// Borrow this mapping as a fixed prompt/decode graph.
+    #[must_use]
+    pub fn model(&self, tokens: usize, past_tokens: usize) -> CausalLmModel<'_> {
+        CausalLmModel {
+            tokens,
+            past_tokens,
+            n_head: self.config.n_head,
+            n_kv_head: self.config.n_kv_head,
+            head_dim: self.config.head_dim,
+            rotary: Some(RotaryEmbedding {
+                theta: self.config.rope_theta,
+            }),
+            rms_epsilon: self.config.rms_epsilon,
+            embedding: self.embedding,
+            layers: &self.layers,
+            final_norm: self.final_norm,
+            identity: self.identity,
+        }
+    }
+}
+
+/// Map exact BitNet GGUF tensor names into the packed causal ONNX contract.
+///
+/// This admits the tied-head, bias-free BitNet decoder: full RoPE, ReLU2,
+/// attention-output subnorm and FFN-intermediate subnorm. Dense or untied GGUF
+/// heads and extra tensors fail closed.
+///
+/// # Errors
+/// Returns [`OnnxModelError`] for invalid config, incomplete/extra tensor sets,
+/// or any preserved/packed tensor mismatch.
+pub fn map_bitnet_gguf_causal_lm<'a>(
+    source: &'a impl BitNetGgufTensorProvider<'a>,
+    config: BitNetConfig,
+    identity: OnnxArtifactIdentityV2<'a>,
+) -> Result<MappedBitNet<'a>, OnnxModelError> {
+    validate_bitnet_config(config)?;
+    let expected_names = bitnet_gguf_tensor_names(config.layers)?;
+    validate_exact_tensor_set("BitNet", source.tensor_names()?, &expected_names)?;
+    let embedding = source.matrix("token_embd.weight")?;
+    let final_norm = source.vector("output_norm.weight")?;
+    let mut layers = Vec::new();
+    layers
+        .try_reserve_exact(config.layers)
+        .map_err(|_| OnnxModelError::ShapeOverflow("BitNet layer allocation"))?;
+    for index in 0..config.layers {
+        let prefix = format!("blk.{index}");
+        layers.push(CausalLmDecoderLayer {
+            attention_norm: source.vector(&format!("{prefix}.attn_norm.weight"))?,
+            query_norm: None,
+            key_norm: None,
+            query: source.matrix(&format!("{prefix}.attn_q.weight"))?,
+            key: source.matrix(&format!("{prefix}.attn_k.weight"))?,
+            value: source.matrix(&format!("{prefix}.attn_v.weight"))?,
+            attention_output: source.matrix(&format!("{prefix}.attn_output.weight"))?,
+            attention_sub_norm: Some(source.vector(&format!("{prefix}.attn_sub_norm.weight"))?),
+            ffn_norm: source.vector(&format!("{prefix}.ffn_norm.weight"))?,
+            gate: source.matrix(&format!("{prefix}.ffn_gate.weight"))?,
+            up: source.matrix(&format!("{prefix}.ffn_up.weight"))?,
+            ffn_sub_norm: Some(source.vector(&format!("{prefix}.ffn_sub_norm.weight"))?),
+            activation: CausalActivation::Relu2,
+            down: source.matrix(&format!("{prefix}.ffn_down.weight"))?,
+        });
+    }
+    let mapped = MappedBitNet {
+        config,
+        embedding,
+        layers,
+        final_norm,
+        identity,
+    };
+    validate_causal_lm(&mapped.model(1, 0))?;
+    if mapped.embedding.rows != config.vocab
+        || mapped.embedding.columns != config.hidden
+        || mapped.layers.iter().any(|layer| {
+            layer.gate.rows != config.intermediate || layer.up.rows != config.intermediate
+        })
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "BitNet tensor geometry differs from architecture config".to_owned(),
+        ));
+    }
+    Ok(mapped)
+}
+
+fn validate_bitnet_config(config: BitNetConfig) -> Result<(), OnnxModelError> {
+    validate_causal_adapter_geometry(CausalAdapterGeometry {
+        family: "BitNet",
+        layers: config.layers,
+        hidden: config.hidden,
+        intermediate: config.intermediate,
+        vocab: config.vocab,
+        n_head: config.n_head,
+        n_kv_head: config.n_kv_head,
+        head_dim: config.head_dim,
+        rope_theta: config.rope_theta,
+        rms_epsilon: config.rms_epsilon,
+    })?;
+    if config.rotary_mode != RotaryMode::Full {
+        return Err(OnnxModelError::InvalidModel(
+            "BitNet GGUF adapter requires full unscaled RoPE".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn bitnet_gguf_tensor_names(layers: usize) -> Result<Vec<String>, OnnxModelError> {
+    let count = layers
+        .checked_mul(11)
+        .and_then(|count| count.checked_add(2))
+        .ok_or(OnnxModelError::ShapeOverflow("BitNet tensor-name count"))?;
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(count)
+        .map_err(|_| OnnxModelError::ShapeOverflow("BitNet tensor-name allocation"))?;
+    names.push("token_embd.weight".to_owned());
+    names.push("output_norm.weight".to_owned());
+    for index in 0..layers {
+        let prefix = format!("blk.{index}");
+        names.extend([
+            format!("{prefix}.attn_norm.weight"),
+            format!("{prefix}.attn_q.weight"),
+            format!("{prefix}.attn_k.weight"),
+            format!("{prefix}.attn_v.weight"),
+            format!("{prefix}.attn_output.weight"),
+            format!("{prefix}.attn_sub_norm.weight"),
+            format!("{prefix}.ffn_norm.weight"),
+            format!("{prefix}.ffn_gate.weight"),
+            format!("{prefix}.ffn_up.weight"),
+            format!("{prefix}.ffn_sub_norm.weight"),
+            format!("{prefix}.ffn_down.weight"),
+        ]);
+    }
+    Ok(names)
 }
 
 impl<'a> TiedEmbeddingHeadModelV2<'a> {
@@ -5030,5 +5263,183 @@ mod tests {
                 "model.layers.0.mlp.down_proj.weight",
             ]
         );
+    }
+
+    #[test]
+    fn bitnet_gguf_adapter_maps_relu2_subnorm_graph_and_rejects_extra_head() {
+        use std::cell::RefCell;
+
+        struct Source {
+            names: Vec<String>,
+            embedding: Vec<u8>,
+            hidden: Vec<u8>,
+            kv: Vec<u8>,
+            intermediate: Vec<u8>,
+            down: Vec<u8>,
+            embedding_scales: Vec<f32>,
+            hidden_scales: Vec<f32>,
+            kv_scales: Vec<f32>,
+            intermediate_scales: Vec<f32>,
+            norm_hidden: Vec<f32>,
+            norm_intermediate: Vec<f32>,
+            requested: RefCell<Vec<String>>,
+        }
+
+        impl<'a> BitNetGgufTensorProvider<'a> for Source {
+            fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError> {
+                self.requested.borrow_mut().push("<manifest>".to_owned());
+                Ok(&self.names)
+            }
+
+            fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError> {
+                self.requested.borrow_mut().push(name.to_owned());
+                let (rows, columns, packed, scales) = match name {
+                    "token_embd.weight" => (
+                        2,
+                        256,
+                        self.embedding.as_slice(),
+                        self.embedding_scales.as_slice(),
+                    ),
+                    "blk.0.attn_q.weight" | "blk.0.attn_output.weight" => (
+                        256,
+                        256,
+                        self.hidden.as_slice(),
+                        self.hidden_scales.as_slice(),
+                    ),
+                    "blk.0.attn_k.weight" | "blk.0.attn_v.weight" => {
+                        (128, 256, self.kv.as_slice(), self.kv_scales.as_slice())
+                    }
+                    "blk.0.ffn_gate.weight" | "blk.0.ffn_up.weight" => (
+                        512,
+                        256,
+                        self.intermediate.as_slice(),
+                        self.intermediate_scales.as_slice(),
+                    ),
+                    "blk.0.ffn_down.weight" => (
+                        256,
+                        512,
+                        self.down.as_slice(),
+                        self.hidden_scales.as_slice(),
+                    ),
+                    _ => {
+                        return Err(OnnxModelError::InvalidModel(format!(
+                            "unexpected BitNet matrix {name}"
+                        )));
+                    }
+                };
+                Ok(PackedTernaryMatrix {
+                    rows,
+                    columns,
+                    packed,
+                    scales,
+                    format: TernaryFormat::Tq2_0,
+                })
+            }
+
+            fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError> {
+                self.requested.borrow_mut().push(name.to_owned());
+                match name {
+                    "output_norm.weight"
+                    | "blk.0.attn_norm.weight"
+                    | "blk.0.attn_sub_norm.weight"
+                    | "blk.0.ffn_norm.weight" => Ok(&self.norm_hidden),
+                    "blk.0.ffn_sub_norm.weight" => Ok(&self.norm_intermediate),
+                    _ => Err(OnnxModelError::InvalidModel(format!(
+                        "unexpected BitNet vector {name}"
+                    ))),
+                }
+            }
+        }
+
+        let mut source = Source {
+            names: [
+                "token_embd.weight",
+                "output_norm.weight",
+                "blk.0.attn_norm.weight",
+                "blk.0.attn_q.weight",
+                "blk.0.attn_k.weight",
+                "blk.0.attn_v.weight",
+                "blk.0.attn_output.weight",
+                "blk.0.attn_sub_norm.weight",
+                "blk.0.ffn_norm.weight",
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_up.weight",
+                "blk.0.ffn_sub_norm.weight",
+                "blk.0.ffn_down.weight",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            embedding: unit_packed(TernaryFormat::Tq2_0, 2),
+            hidden: unit_packed(TernaryFormat::Tq2_0, 256),
+            kv: unit_packed(TernaryFormat::Tq2_0, 128),
+            intermediate: unit_packed(TernaryFormat::Tq2_0, 512),
+            down: unit_packed_shape(TernaryFormat::Tq2_0, 256, 512),
+            embedding_scales: vec![1.0; 2],
+            hidden_scales: vec![1.0; 256],
+            kv_scales: vec![1.0; 128],
+            intermediate_scales: vec![1.0; 512],
+            norm_hidden: vec![1.0; 256],
+            norm_intermediate: vec![1.0; 512],
+            requested: RefCell::new(Vec::new()),
+        };
+        let config = BitNetConfig {
+            layers: 1,
+            hidden: 256,
+            intermediate: 512,
+            vocab: 2,
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 64,
+            rope_theta: 10_000.0,
+            rms_epsilon: 1.0e-5,
+            rotary_mode: RotaryMode::Full,
+        };
+        let identity = OnnxArtifactIdentityV2 {
+            source_model_id: "bitnet-gguf@digest",
+            tokenizer_id: "bitnet-tokenizer@digest",
+            recipe_id: "recipe",
+            tritium_build_id: "build",
+            package_id: "package",
+            converted_coverage_id: "converted",
+            deferred_coverage_id: "deferred",
+        };
+        assert!(matches!(
+            map_bitnet_gguf_causal_lm(
+                &source,
+                BitNetConfig {
+                    rotary_mode: RotaryMode::Partial,
+                    ..config
+                },
+                identity,
+            ),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("full unscaled RoPE")
+        ));
+        assert!(matches!(
+            map_bitnet_gguf_causal_lm(
+                &source,
+                BitNetConfig {
+                    hidden: 252,
+                    head_dim: 63,
+                    ..config
+                },
+                identity,
+            ),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("even head dimension")
+        ));
+        assert!(source.requested.borrow().is_empty());
+        let mapped = map_bitnet_gguf_causal_lm(&source, config, identity).unwrap();
+        assert_eq!(mapped.layers().len(), 1);
+        assert_eq!(mapped.layers()[0].activation, CausalActivation::Relu2);
+        assert!(mapped.layers()[0].attention_sub_norm.is_some());
+        assert!(mapped.layers()[0].ffn_sub_norm.is_some());
+        assert!(encode_external_causal_lm(mapped.model(1, 0)).is_ok());
+
+        source.names.push("output.weight".to_owned());
+        assert!(matches!(
+            map_bitnet_gguf_causal_lm(&source, config, identity),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("unsupported tensor") && reason.contains("output.weight")
+        ));
     }
 }
