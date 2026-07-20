@@ -921,6 +921,12 @@ mod tests {
             .collect()
     }
 
+    fn identity_matrix(size: usize) -> Vec<Vec<f32>> {
+        (0..size)
+            .map(|row| (0..size).map(|column| f32::from(row == column)).collect())
+            .collect()
+    }
+
     fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {
         let width = weight.len();
         input
@@ -950,8 +956,14 @@ mod tests {
         up: &[Vec<f32>],
         down: &[Vec<f32>],
         attention_norm: &[f32],
+        query_norm: &[f32],
+        key_norm: &[f32],
         ffn_norm: &[f32],
         final_norm: &[f32],
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        rope_theta: f32,
         epsilon: f32,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let hidden: Vec<f32> = tokens
@@ -959,8 +971,22 @@ mod tests {
             .flat_map(|&token| embedding[usize::try_from(token).unwrap()].iter().copied())
             .collect();
         let attention_input = rms_norm(&hidden, attention_norm, epsilon);
-        let query = dense_project(&attention_input, q);
-        let current_k = dense_project(&attention_input, k);
+        let query = apply_rope(
+            &rms_norm(&dense_project(&attention_input, q), query_norm, epsilon),
+            tokens.len(),
+            n_head,
+            head_dim,
+            past_k.len() / (n_kv_head * head_dim),
+            rope_theta,
+        );
+        let current_k = apply_rope(
+            &rms_norm(&dense_project(&attention_input, k), key_norm, epsilon),
+            tokens.len(),
+            n_kv_head,
+            head_dim,
+            past_k.len() / (n_kv_head * head_dim),
+            rope_theta,
+        );
         let current_v = dense_project(&attention_input, v);
         let present_k = [past_k, &current_k].concat();
         let present_v = [past_v, &current_v].concat();
@@ -969,10 +995,10 @@ mod tests {
             &present_k,
             &present_v,
             tokens.len(),
-            4,
-            2,
-            1,
-            past_k.len() / 2,
+            n_head,
+            n_kv_head,
+            head_dim,
+            past_k.len() / (n_kv_head * head_dim),
         )
         .unwrap();
         let attention_output = dense_project(&context, o);
@@ -1000,48 +1026,71 @@ mod tests {
         (logits, present_k, present_v)
     }
 
+    fn apply_rope(
+        input: &[f32],
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        past_tokens: usize,
+        theta: f32,
+    ) -> Vec<f32> {
+        let half = head_dim / 2;
+        let mut output = vec![0.0; input.len()];
+        for token in 0..tokens {
+            let position = (past_tokens + token) as f64;
+            for head in 0..heads {
+                let base = (token * heads + head) * head_dim;
+                for lane in 0..half {
+                    let angle =
+                        position * f64::from(theta).powf(-2.0 * lane as f64 / head_dim as f64);
+                    let (sin, cos) = angle.sin_cos();
+                    let first = input[base + lane];
+                    let second = input[base + half + lane];
+                    output[base + lane] = first * cos as f32 - second * sin as f32;
+                    output[base + half + lane] = second * cos as f32 + first * sin as f32;
+                }
+            }
+        }
+        output
+    }
+
     #[test]
     fn end_to_end_packed_causal_lm_runs_prompt_and_cached_decode() {
         use ort::value::Tensor;
 
         let format = TernaryFormat::Tq2_0;
         let dense_embedding = vec![
-            vec![1.0, 0.0, 1.0, 0.0],
-            vec![0.0, 1.0, 0.0, 1.0],
-            vec![1.0, 1.0, 0.0, -1.0],
+            (0..16).map(|lane| f32::from(lane % 2 == 0)).collect(),
+            (0..16).map(|lane| f32::from(lane % 2 == 1)).collect(),
+            (0..16)
+                .map(|lane| match lane % 4 {
+                    0 | 1 => 1.0,
+                    2 => 0.0,
+                    _ => -1.0,
+                })
+                .collect(),
         ];
-        let dense_q = vec![
-            vec![1.0, 0.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0, 0.0],
-            vec![0.0, 0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 0.0, 1.0],
-        ];
-        let dense_k = vec![vec![1.0, 0.0, 1.0, 0.0], vec![0.0, 1.0, 0.0, 1.0]];
-        let dense_v = vec![vec![1.0, -1.0, 0.0, 0.0], vec![0.0, 0.0, 1.0, -1.0]];
-        let dense_o = vec![
-            vec![1.0, 0.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0, 0.0],
-            vec![0.0, 0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 0.0, 1.0],
-        ];
-        let dense_gate = vec![
-            vec![1.0, 0.0, 0.0, 0.0],
-            vec![0.0, -1.0, 0.0, 0.0],
-            vec![0.0, 0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 0.0, -1.0],
-        ];
-        let dense_up = vec![
-            vec![0.0, 1.0, 0.0, 0.0],
-            vec![1.0, 0.0, 0.0, 0.0],
-            vec![0.0, 0.0, 0.0, 1.0],
-            vec![0.0, 0.0, 1.0, 0.0],
-        ];
-        let dense_down = vec![
-            vec![1.0, 1.0, 0.0, 0.0],
-            vec![-1.0, 1.0, 0.0, 0.0],
-            vec![0.0, 0.0, 1.0, 1.0],
-            vec![0.0, 0.0, -1.0, 1.0],
-        ];
+        let dense_q = identity_matrix(16);
+        let dense_k = (0..8)
+            .map(|row| {
+                let mut values = vec![0.0; 16];
+                values[row] = 1.0;
+                values[(row + 5) % 16] = 1.0;
+                values
+            })
+            .collect::<Vec<_>>();
+        let dense_v = (0..8)
+            .map(|row| {
+                let mut values = vec![0.0; 16];
+                values[(row * 2) % 16] = 1.0;
+                values[(row * 2 + 1) % 16] = -1.0;
+                values
+            })
+            .collect::<Vec<_>>();
+        let dense_o = identity_matrix(16);
+        let dense_gate = identity_matrix(16);
+        let dense_up = identity_matrix(16);
+        let dense_down = identity_matrix(16);
         let trits = |rows: &[Vec<f32>]| {
             rows.iter()
                 .map(|row| {
@@ -1060,22 +1109,33 @@ mod tests {
         let up_packed = pack_rows(&trits(&dense_up), format);
         let down_packed = pack_rows(&trits(&dense_down), format);
         let embedding_scales = [1.0; 3];
-        let four_scales = [1.0; 4];
-        let two_scales = [1.0; 2];
-        let attention_norm = [1.0, 0.75, 1.25, 0.5];
-        let ffn_norm = [0.5, 1.25, 0.8, 1.5];
-        let final_norm = [1.5, 0.8, 0.6, 1.2];
+        let sixteen_scales = vec![1.0; 16];
+        let eight_scales = vec![1.0; 8];
+        let attention_norm = (0..16)
+            .map(|lane| 0.5 + 0.1 * (lane % 10) as f32)
+            .collect::<Vec<_>>();
+        let query_norm = [1.0, 0.5, 1.25, 0.75];
+        let key_norm = [0.75, 1.25, 0.6, 1.4];
+        let ffn_norm = (0..16)
+            .map(|lane| 0.6 + 0.08 * (lane % 9) as f32)
+            .collect::<Vec<_>>();
+        let final_norm = (0..16)
+            .map(|lane| 0.7 + 0.07 * (lane % 8) as f32)
+            .collect::<Vec<_>>();
+        let rope_theta = 10_000.0;
         let epsilon = 1.0e-5;
         let layer = crate::CausalLmDecoderLayer {
             attention_norm: &attention_norm,
-            query: packed_matrix(4, 4, &q_packed, &four_scales, format),
-            key: packed_matrix(2, 4, &k_packed, &two_scales, format),
-            value: packed_matrix(2, 4, &v_packed, &two_scales, format),
-            attention_output: packed_matrix(4, 4, &o_packed, &four_scales, format),
+            query_norm: Some(&query_norm),
+            key_norm: Some(&key_norm),
+            query: packed_matrix(16, 16, &q_packed, &sixteen_scales, format),
+            key: packed_matrix(8, 16, &k_packed, &eight_scales, format),
+            value: packed_matrix(8, 16, &v_packed, &eight_scales, format),
+            attention_output: packed_matrix(16, 16, &o_packed, &sixteen_scales, format),
             ffn_norm: &ffn_norm,
-            gate: packed_matrix(4, 4, &gate_packed, &four_scales, format),
-            up: packed_matrix(4, 4, &up_packed, &four_scales, format),
-            down: packed_matrix(4, 4, &down_packed, &four_scales, format),
+            gate: packed_matrix(16, 16, &gate_packed, &sixteen_scales, format),
+            up: packed_matrix(16, 16, &up_packed, &sixteen_scales, format),
+            down: packed_matrix(16, 16, &down_packed, &sixteen_scales, format),
         };
         let identity = crate::OnnxArtifactIdentityV2 {
             source_model_id: "tiny-source@revision",
@@ -1086,22 +1146,64 @@ mod tests {
             converted_coverage_id: "tiny-converted",
             deferred_coverage_id: "tiny-deferred",
         };
-        let embedding = packed_matrix(3, 4, &embedding_packed, &embedding_scales, format);
-        let encode = |tokens, past_tokens| {
+        let embedding = packed_matrix(3, 16, &embedding_packed, &embedding_scales, format);
+        let encode_result = |tokens, past_tokens, layer, rotary| {
             crate::encode_causal_lm(crate::CausalLmModel {
                 tokens,
                 past_tokens,
                 n_head: 4,
                 n_kv_head: 2,
-                head_dim: 1,
+                head_dim: 4,
+                rotary,
                 rms_epsilon: epsilon,
                 embedding,
                 layers: std::slice::from_ref(&layer),
                 final_norm: &final_norm,
                 identity,
             })
+        };
+        let encode = |tokens, past_tokens| {
+            encode_result(
+                tokens,
+                past_tokens,
+                layer,
+                Some(crate::RotaryEmbedding { theta: rope_theta }),
+            )
             .unwrap()
         };
+        assert!(
+            encode_result(
+                1,
+                0,
+                layer,
+                Some(crate::RotaryEmbedding { theta: f32::NAN })
+            )
+            .is_err()
+        );
+        let short_norm = [1.0];
+        assert!(
+            encode_result(
+                1,
+                0,
+                crate::CausalLmDecoderLayer {
+                    query_norm: Some(&short_norm),
+                    ..layer
+                },
+                Some(crate::RotaryEmbedding { theta: rope_theta })
+            )
+            .is_err()
+        );
+        let plain_layer = crate::CausalLmDecoderLayer {
+            query_norm: None,
+            key_norm: None,
+            ..layer
+        };
+        let plain = encode_result(1, 0, plain_layer, None).unwrap();
+        assert!(
+            crate::diagnose_unsupported_graph(&plain)
+                .unwrap()
+                .is_empty()
+        );
 
         let prompt_tokens = vec![0_i64, 1];
         let (expected_logits, expected_k, expected_v) = reference_causal_lm(
@@ -1117,8 +1219,14 @@ mod tests {
             &dense_up,
             &dense_down,
             &attention_norm,
+            &query_norm,
+            &key_norm,
             &ffn_norm,
             &final_norm,
+            4,
+            2,
+            4,
+            rope_theta,
             epsilon,
         );
         let prompt_model = encode(2, 0);
@@ -1158,8 +1266,14 @@ mod tests {
             &dense_up,
             &dense_down,
             &attention_norm,
+            &query_norm,
+            &key_norm,
             &ffn_norm,
             &final_norm,
+            4,
+            2,
+            4,
+            rope_theta,
             epsilon,
         );
         let decode_model = encode(1, 2);
@@ -1173,9 +1287,9 @@ mod tests {
             .unwrap();
         let tokens_tensor = Tensor::from_array(([1], decode_tokens.into_boxed_slice())).unwrap();
         let k_tensor =
-            Tensor::from_array(([2, 2, 1], present_k.to_vec().into_boxed_slice())).unwrap();
+            Tensor::from_array(([2, 2, 4], present_k.to_vec().into_boxed_slice())).unwrap();
         let v_tensor =
-            Tensor::from_array(([2, 2, 1], present_v.to_vec().into_boxed_slice())).unwrap();
+            Tensor::from_array(([2, 2, 4], present_v.to_vec().into_boxed_slice())).unwrap();
         let outputs = decode
             .run(ort::inputs![&tokens_tensor, &k_tensor, &v_tensor])
             .unwrap();

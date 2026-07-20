@@ -114,11 +114,22 @@ pub struct PackedTernaryMatrix<'a> {
     pub format: TernaryFormat,
 }
 
+/// Qwen-style full-head rotary position embedding parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct RotaryEmbedding {
+    /// Positive finite frequency base (`rope_theta`).
+    pub theta: f32,
+}
+
 /// Packed weights and preserved RMSNorm vectors for one causal decoder layer.
 #[derive(Debug, Clone, Copy)]
 pub struct CausalLmDecoderLayer<'a> {
     /// Pre-attention RMSNorm weight.
     pub attention_norm: &'a [f32],
+    /// Optional per-query-head RMSNorm weight applied before RoPE.
+    pub query_norm: Option<&'a [f32]>,
+    /// Optional per-key-head RMSNorm weight applied before RoPE/cache write.
+    pub key_norm: Option<&'a [f32]>,
     /// Query projection.
     pub query: PackedTernaryMatrix<'a>,
     /// Key projection.
@@ -154,6 +165,8 @@ pub struct CausalLmModel<'a> {
     pub n_kv_head: usize,
     /// Elements per attention head.
     pub head_dim: usize,
+    /// Optional rotary position embedding applied to Q and newly produced K.
+    pub rotary: Option<RotaryEmbedding>,
     /// Positive finite RMSNorm epsilon.
     pub rms_epsilon: f32,
     /// Tied token embedding and language-model head table.
@@ -497,12 +510,26 @@ pub fn diagnose_unsupported_graph(
                     subject,
                     reason: format!("attention softmax axis must be -1, got {}", attribute.value),
                 });
-            } else if node.op_type == "Concat" && attribute.name == "axis" && attribute.value != 0 {
-                diagnostics.push(UnsupportedGraphDiagnostic {
-                    kind: UnsupportedGraphItemKind::Attribute,
-                    subject,
-                    reason: format!("KV cache concat axis must be 0, got {}", attribute.value),
-                });
+            } else if node.op_type == "Concat" && attribute.name == "axis" {
+                match concat_axis(node, graph) {
+                    Some(expected) if attribute.value != expected => {
+                        diagnostics.push(UnsupportedGraphDiagnostic {
+                            kind: UnsupportedGraphItemKind::Attribute,
+                            subject,
+                            reason: format!(
+                                "{} concat axis must be {expected}, got {}",
+                                if expected == 0 { "KV cache" } else { "RoPE" },
+                                attribute.value
+                            ),
+                        });
+                    }
+                    None => diagnostics.push(UnsupportedGraphDiagnostic {
+                        kind: UnsupportedGraphItemKind::Attribute,
+                        subject,
+                        reason: "concat node has no supported semantic role".to_owned(),
+                    }),
+                    Some(_) => {}
+                }
             } else if node.op_type == "ReduceMean"
                 && attribute.name == "keepdims"
                 && attribute.value != 1
@@ -586,14 +613,21 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".weight")
                 || name.ends_with(".epsilon")
                 || name.ends_with(".attention_scale")
-                || name.ends_with(".attention_mask") =>
+                || name.ends_with(".attention_mask")
+                || name.ends_with(".cos")
+                || name.ends_with(".sin") =>
             {
                 Some(TENSOR_FLOAT)
             }
             name if name.ends_with(".axes")
                 || name.ends_with(".shape")
                 || name.ends_with("_shape")
-                || name.ends_with(".gqa_repeats") =>
+                || name.ends_with(".gqa_repeats")
+                || name.ends_with(".first_start")
+                || name.ends_with(".first_end")
+                || name.ends_with(".second_start")
+                || name.ends_with(".second_end")
+                || name.ends_with(".steps") =>
             {
                 Some(TENSOR_INT64)
             }
@@ -708,10 +742,34 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
         ("", "ReduceMean") => &["keepdims"],
         (
             "",
-            "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Reshape" | "Tile" | "Identity",
+            "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Reshape" | "Tile" | "Identity"
+            | "Slice" | "Neg",
         ) => &[],
         _ => &[],
     }
+}
+
+fn concat_axis(node: &NodeProto, graph: &GraphProto) -> Option<i64> {
+    let producer = |value: &str| {
+        graph
+            .node
+            .iter()
+            .find(|candidate| candidate.output.iter().any(|output| output == value))
+    };
+    let rotary = node.input.len() == 2
+        && producer(&node.input[0]).is_some_and(|candidate| candidate.op_type == "Neg")
+        && producer(&node.input[1]).is_some_and(|candidate| candidate.op_type == "Slice");
+    if rotary {
+        return Some(-1);
+    }
+    let cache = node.input.len() == 2
+        && node.output.len() == 1
+        && graph.input.iter().any(|input| input.name == node.input[0])
+        && graph
+            .output
+            .iter()
+            .any(|output| output.name == node.output[0]);
+    cache.then_some(0)
 }
 
 fn expected_attribute_kind(name: &str) -> i32 {
@@ -743,7 +801,7 @@ fn node_supported(
         (
             "",
             "Transpose" | "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Reshape"
-            | "Tile" | "Identity" | "Concat" | "ReduceMean" | "Softmax",
+            | "Tile" | "Identity" | "Slice" | "Neg" | "Concat" | "ReduceMean" | "Softmax",
         ) => standard_opset == Some(ONNX_OPSET),
         _ => false,
     }
@@ -1349,6 +1407,83 @@ struct CausalGraphBuilder {
     initializers: Vec<TensorProto>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CausalGraphGeometry {
+    past_tokens: i64,
+    total_tokens: i64,
+    n_head: i64,
+    n_kv_head: i64,
+    head_dim: i64,
+    gqa_repeat: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RotaryGraphConfig {
+    tokens: usize,
+    head_dim: usize,
+    past_tokens: usize,
+    theta: f32,
+}
+
+struct RotaryGraphState {
+    first_start: String,
+    first_end: String,
+    second_start: String,
+    second_end: String,
+    axes: String,
+    steps: String,
+    cos: String,
+    sin: String,
+}
+
+fn rotary_tables(config: RotaryGraphConfig) -> Result<(Vec<f32>, Vec<f32>), OnnxModelError> {
+    let RotaryGraphConfig {
+        tokens,
+        head_dim,
+        past_tokens,
+        theta,
+    } = config;
+    let half = head_dim / 2;
+    let elements = tokens
+        .checked_mul(head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("RoPE table element count"))?;
+    let table_bytes = elements
+        .checked_mul(2)
+        .and_then(|values| values.checked_mul(core::mem::size_of::<f32>()))
+        .ok_or(OnnxModelError::ShapeOverflow("RoPE table byte count"))?;
+    if table_bytes > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "RoPE tables require {table_bytes} bytes, exceed bounded inline graph"
+        )));
+    }
+    let mut cos = Vec::with_capacity(elements);
+    let mut sin = Vec::with_capacity(elements);
+    for token in 0..tokens {
+        let position = (past_tokens + token) as f64;
+        for lane in 0..head_dim {
+            let frequency_lane = lane % half;
+            let angle =
+                position * f64::from(theta).powf(-2.0 * frequency_lane as f64 / head_dim as f64);
+            if !angle.is_finite() {
+                return Err(OnnxModelError::InvalidModel(format!(
+                    "RoPE angle is non-finite at position {} frequency lane {frequency_lane}",
+                    past_tokens + token
+                )));
+            }
+            let (lane_sin, lane_cos) = angle.sin_cos();
+            cos.push(lane_cos as f32);
+            sin.push(lane_sin as f32);
+        }
+    }
+    Ok((cos, sin))
+}
+
+struct CacheGraphOutputs {
+    expanded_k: String,
+    expanded_v: String,
+    declarations: [ValueInfoProto; 2],
+}
+
 impl CausalGraphBuilder {
     fn standard(
         &mut self,
@@ -1489,6 +1624,350 @@ impl CausalGraphBuilder {
             Vec::new(),
         );
     }
+
+    fn prepare_rotary(
+        &mut self,
+        config: RotaryGraphConfig,
+    ) -> Result<RotaryGraphState, OnnxModelError> {
+        let RotaryGraphConfig {
+            tokens, head_dim, ..
+        } = config;
+        let half = head_dim / 2;
+        let first_start = "rope.first_start".to_owned();
+        let first_end = "rope.first_end".to_owned();
+        let second_start = "rope.second_start".to_owned();
+        let second_end = "rope.second_end".to_owned();
+        let axes = "rope.axes".to_owned();
+        let steps = "rope.steps".to_owned();
+        self.add_i64(&first_start, vec![1], &[0]);
+        self.add_i64(&first_end, vec![1], &[as_i64(half, "RoPE half dimension")?]);
+        self.add_i64(
+            &second_start,
+            vec![1],
+            &[as_i64(half, "RoPE half dimension")?],
+        );
+        self.add_i64(
+            &second_end,
+            vec![1],
+            &[as_i64(head_dim, "RoPE head dimension")?],
+        );
+        self.add_i64(&axes, vec![1], &[-1]);
+        self.add_i64(&steps, vec![1], &[1]);
+        let (cos, sin) = rotary_tables(config)?;
+        let cos_name = "rope.cos".to_owned();
+        let sin_name = "rope.sin".to_owned();
+        self.add_f32(
+            &cos_name,
+            vec![
+                as_i64(tokens, "RoPE token count")?,
+                1,
+                as_i64(head_dim, "RoPE head dimension")?,
+            ],
+            &cos,
+        );
+        self.add_f32(
+            &sin_name,
+            vec![
+                as_i64(tokens, "RoPE token count")?,
+                1,
+                as_i64(head_dim, "RoPE head dimension")?,
+            ],
+            &sin,
+        );
+        Ok(RotaryGraphState {
+            first_start,
+            first_end,
+            second_start,
+            second_end,
+            axes,
+            steps,
+            cos: cos_name,
+            sin: sin_name,
+        })
+    }
+
+    fn rotary(&mut self, prefix: &str, input: &str, output: &str, state: &RotaryGraphState) {
+        let first = format!("{prefix}.first");
+        let second = format!("{prefix}.second");
+        self.standard(
+            format!("{prefix}.slice_first"),
+            "Slice",
+            &[
+                input,
+                &state.first_start,
+                &state.first_end,
+                &state.axes,
+                &state.steps,
+            ],
+            &[&first],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.slice_second"),
+            "Slice",
+            &[
+                input,
+                &state.second_start,
+                &state.second_end,
+                &state.axes,
+                &state.steps,
+            ],
+            &[&second],
+            Vec::new(),
+        );
+        let negated_second = format!("{prefix}.negated_second");
+        self.standard(
+            format!("{prefix}.negate_second"),
+            "Neg",
+            &[&second],
+            &[&negated_second],
+            Vec::new(),
+        );
+        let rotated = format!("{prefix}.rotated");
+        self.standard(
+            format!("{prefix}.rotate_half"),
+            "Concat",
+            &[&negated_second, &first],
+            &[&rotated],
+            vec![int_attribute("axis", -1)],
+        );
+        let direct = format!("{prefix}.direct");
+        let crossed = format!("{prefix}.crossed");
+        self.standard(
+            format!("{prefix}.direct_mul"),
+            "Mul",
+            &[input, &state.cos],
+            &[&direct],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.cross_mul"),
+            "Mul",
+            &[&rotated, &state.sin],
+            &[&crossed],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.sum"),
+            "Add",
+            &[&direct, &crossed],
+            &[output],
+            Vec::new(),
+        );
+    }
+
+    fn cache_and_expand_gqa(
+        &mut self,
+        index: usize,
+        current_k: &str,
+        current_v: &str,
+        geometry: CausalGraphGeometry,
+        inputs: &mut Vec<ValueInfoProto>,
+    ) -> CacheGraphOutputs {
+        let prefix = format!("layer.{index}");
+        let present_k = format!("present_k.{index}");
+        let present_v = format!("present_v.{index}");
+        if geometry.past_tokens == 0 {
+            self.standard(
+                format!("{prefix}.key_identity"),
+                "Identity",
+                &[current_k],
+                &[&present_k],
+                Vec::new(),
+            );
+            self.standard(
+                format!("{prefix}.value_identity"),
+                "Identity",
+                &[current_v],
+                &[&present_v],
+                Vec::new(),
+            );
+        } else {
+            let past_k = format!("past_k.{index}");
+            let past_v = format!("past_v.{index}");
+            inputs.push(tensor_value(
+                &past_k,
+                TENSOR_FLOAT,
+                &[geometry.past_tokens, geometry.n_kv_head, geometry.head_dim],
+            ));
+            inputs.push(tensor_value(
+                &past_v,
+                TENSOR_FLOAT,
+                &[geometry.past_tokens, geometry.n_kv_head, geometry.head_dim],
+            ));
+            self.standard(
+                format!("{prefix}.key_concat"),
+                "Concat",
+                &[&past_k, current_k],
+                &[&present_k],
+                vec![int_attribute("axis", 0)],
+            );
+            self.standard(
+                format!("{prefix}.value_concat"),
+                "Concat",
+                &[&past_v, current_v],
+                &[&present_v],
+                vec![int_attribute("axis", 0)],
+            );
+        }
+        let declarations = [
+            tensor_value(
+                &present_k,
+                TENSOR_FLOAT,
+                &[geometry.total_tokens, geometry.n_kv_head, geometry.head_dim],
+            ),
+            tensor_value(
+                &present_v,
+                TENSOR_FLOAT,
+                &[geometry.total_tokens, geometry.n_kv_head, geometry.head_dim],
+            ),
+        ];
+        let grouped_k_shape = format!("{prefix}.grouped_k_shape");
+        let grouped_v_shape = format!("{prefix}.grouped_v_shape");
+        let grouped_shape = [
+            geometry.total_tokens,
+            geometry.n_kv_head,
+            1,
+            geometry.head_dim,
+        ];
+        self.add_i64(&grouped_k_shape, vec![4], &grouped_shape);
+        self.add_i64(&grouped_v_shape, vec![4], &grouped_shape);
+        let grouped_k = format!("{prefix}.grouped_k");
+        let grouped_v = format!("{prefix}.grouped_v");
+        self.standard(
+            format!("{prefix}.key_group_reshape"),
+            "Reshape",
+            &[&present_k, &grouped_k_shape],
+            &[&grouped_k],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.value_group_reshape"),
+            "Reshape",
+            &[&present_v, &grouped_v_shape],
+            &[&grouped_v],
+            Vec::new(),
+        );
+        let repeats = format!("{prefix}.gqa_repeats");
+        self.add_i64(&repeats, vec![4], &[1, 1, geometry.gqa_repeat, 1]);
+        let tiled_k = format!("{prefix}.tiled_k");
+        let tiled_v = format!("{prefix}.tiled_v");
+        self.standard(
+            format!("{prefix}.key_gqa_tile"),
+            "Tile",
+            &[&grouped_k, &repeats],
+            &[&tiled_k],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.value_gqa_tile"),
+            "Tile",
+            &[&grouped_v, &repeats],
+            &[&tiled_v],
+            Vec::new(),
+        );
+        let expanded_shape = format!("{prefix}.expanded_kv_shape");
+        self.add_i64(
+            &expanded_shape,
+            vec![3],
+            &[geometry.total_tokens, geometry.n_head, geometry.head_dim],
+        );
+        let expanded_k = format!("{prefix}.expanded_k");
+        let expanded_v = format!("{prefix}.expanded_v");
+        self.standard(
+            format!("{prefix}.key_gqa"),
+            "Reshape",
+            &[&tiled_k, &expanded_shape],
+            &[&expanded_k],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.value_gqa"),
+            "Reshape",
+            &[&tiled_v, &expanded_shape],
+            &[&expanded_v],
+            Vec::new(),
+        );
+        CacheGraphOutputs {
+            expanded_k,
+            expanded_v,
+            declarations,
+        }
+    }
+
+    fn ffn_block(
+        &mut self,
+        prefix: &str,
+        input: &str,
+        output: &str,
+        layer: CausalLmDecoderLayer<'_>,
+        epsilon: f32,
+    ) -> Result<(), OnnxModelError> {
+        let ffn_input = format!("{prefix}.ffn_input");
+        self.rms_norm(
+            &format!("{prefix}.ffn_norm"),
+            input,
+            &ffn_input,
+            layer.ffn_norm,
+            epsilon,
+        );
+        let gate = format!("{prefix}.gate");
+        let up = format!("{prefix}.up");
+        self.projection(
+            &format!("{prefix}.gate_projection"),
+            &ffn_input,
+            &gate,
+            &format!("{prefix}.gate"),
+            layer.gate,
+        )?;
+        self.projection(
+            &format!("{prefix}.up_projection"),
+            &ffn_input,
+            &up,
+            &format!("{prefix}.up"),
+            layer.up,
+        )?;
+        let sigmoid = format!("{prefix}.gate_sigmoid");
+        self.standard(
+            format!("{prefix}.sigmoid"),
+            "Sigmoid",
+            &[&gate],
+            &[&sigmoid],
+            Vec::new(),
+        );
+        let silu = format!("{prefix}.silu");
+        self.standard(
+            format!("{prefix}.silu_mul"),
+            "Mul",
+            &[&gate, &sigmoid],
+            &[&silu],
+            Vec::new(),
+        );
+        let gated = format!("{prefix}.gated");
+        self.standard(
+            format!("{prefix}.swiglu"),
+            "Mul",
+            &[&silu, &up],
+            &[&gated],
+            Vec::new(),
+        );
+        let ffn_output = format!("{prefix}.ffn_output");
+        self.projection(
+            &format!("{prefix}.down_projection"),
+            &gated,
+            &ffn_output,
+            &format!("{prefix}.down"),
+            layer.down,
+        )?;
+        self.standard(
+            format!("{prefix}.ffn_residual"),
+            "Add",
+            &[input, &ffn_output],
+            &[output],
+            Vec::new(),
+        );
+        Ok(())
+    }
 }
 
 fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
@@ -1507,7 +1986,51 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
     let n_kv_head = as_i64(model.n_kv_head, "KV head count")?;
     let head_dim = as_i64(model.head_dim, "head dimension")?;
     let gqa_repeat = as_i64(model.n_head / model.n_kv_head, "GQA repeat")?;
+    let geometry = CausalGraphGeometry {
+        past_tokens,
+        total_tokens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        gqa_repeat,
+    };
     let mut graph = CausalGraphBuilder::default();
+    let rotary_state = model
+        .rotary
+        .map(|rotary| {
+            graph.prepare_rotary(RotaryGraphConfig {
+                tokens: model.tokens,
+                head_dim: model.head_dim,
+                past_tokens: model.past_tokens,
+                theta: rotary.theta,
+            })
+        })
+        .transpose()?;
+    let mask_elements =
+        model
+            .tokens
+            .checked_mul(total_tokens_usize)
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "attention mask element count",
+            ))?;
+    if mask_elements > MAX_MODEL_BYTES / core::mem::size_of::<f32>() {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "attention mask requires {mask_elements} elements, exceeds bounded inline graph"
+        )));
+    }
+    let attention_mask = "attention.attention_mask";
+    let mut mask_values = Vec::with_capacity(mask_elements);
+    for query_index in 0..model.tokens {
+        let last_visible = model.past_tokens + query_index;
+        for key_index in 0..total_tokens_usize {
+            mask_values.push(if key_index <= last_visible {
+                0.0
+            } else {
+                -1.0e9
+            });
+        }
+    }
+    graph.add_f32(attention_mask, vec![1, tokens, total_tokens], &mask_values);
     graph.add_matrix("tok_embeddings", model.embedding);
     graph.nodes.push(NodeProto {
         input: strings(["tokens", "tok_embeddings.packed", "tok_embeddings.scales"]),
@@ -1571,13 +2094,6 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
             Vec::new(),
         );
         graph.standard(
-            format!("{prefix}.query_transpose"),
-            "Transpose",
-            &[&query_tokens],
-            &[&query],
-            vec![ints_attribute("perm", &[1, 0, 2])],
-        );
-        graph.standard(
             format!("{prefix}.key_reshape"),
             "Reshape",
             &[&current_k_flat, &kv_shape],
@@ -1591,118 +2107,60 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
             &[&current_v],
             Vec::new(),
         );
-        let present_k = format!("present_k.{index}");
-        let present_v = format!("present_v.{index}");
-        if model.past_tokens == 0 {
-            graph.standard(
-                format!("{prefix}.key_identity"),
-                "Identity",
-                &[&current_k],
-                &[&present_k],
-                Vec::new(),
+        let mut query_ready = query_tokens;
+        if let Some(weight) = layer.query_norm {
+            let normalized = format!("{prefix}.query_norm.output");
+            graph.rms_norm(
+                &format!("{prefix}.query_norm"),
+                &query_ready,
+                &normalized,
+                weight,
+                model.rms_epsilon,
             );
-            graph.standard(
-                format!("{prefix}.value_identity"),
-                "Identity",
-                &[&current_v],
-                &[&present_v],
-                Vec::new(),
-            );
-        } else {
-            let past_k = format!("past_k.{index}");
-            let past_v = format!("past_v.{index}");
-            inputs.push(tensor_value(
-                &past_k,
-                TENSOR_FLOAT,
-                &[past_tokens, n_kv_head, head_dim],
-            ));
-            inputs.push(tensor_value(
-                &past_v,
-                TENSOR_FLOAT,
-                &[past_tokens, n_kv_head, head_dim],
-            ));
-            graph.standard(
-                format!("{prefix}.key_concat"),
-                "Concat",
-                &[&past_k, &current_k],
-                &[&present_k],
-                vec![int_attribute("axis", 0)],
-            );
-            graph.standard(
-                format!("{prefix}.value_concat"),
-                "Concat",
-                &[&past_v, &current_v],
-                &[&present_v],
-                vec![int_attribute("axis", 0)],
-            );
+            query_ready = normalized;
         }
-        cache_outputs.push(tensor_value(
-            &present_k,
-            TENSOR_FLOAT,
-            &[total_tokens, n_kv_head, head_dim],
-        ));
-        cache_outputs.push(tensor_value(
-            &present_v,
-            TENSOR_FLOAT,
-            &[total_tokens, n_kv_head, head_dim],
-        ));
-        let grouped_k_shape = format!("{prefix}.grouped_k_shape");
-        let grouped_v_shape = format!("{prefix}.grouped_v_shape");
-        let grouped_shape = [total_tokens, n_kv_head, 1, head_dim];
-        graph.add_i64(&grouped_k_shape, vec![4], &grouped_shape);
-        graph.add_i64(&grouped_v_shape, vec![4], &grouped_shape);
-        let grouped_k = format!("{prefix}.grouped_k");
-        let grouped_v = format!("{prefix}.grouped_v");
+        let mut key_ready = current_k;
+        if let Some(weight) = layer.key_norm {
+            let normalized = format!("{prefix}.key_norm.output");
+            graph.rms_norm(
+                &format!("{prefix}.key_norm"),
+                &key_ready,
+                &normalized,
+                weight,
+                model.rms_epsilon,
+            );
+            key_ready = normalized;
+        }
+        if let Some(rotary) = &rotary_state {
+            let rotated_query = format!("{prefix}.query_rope.output");
+            graph.rotary(
+                &format!("{prefix}.query_rope"),
+                &query_ready,
+                &rotated_query,
+                rotary,
+            );
+            query_ready = rotated_query;
+            let rotated_key = format!("{prefix}.key_rope.output");
+            graph.rotary(
+                &format!("{prefix}.key_rope"),
+                &key_ready,
+                &rotated_key,
+                rotary,
+            );
+            key_ready = rotated_key;
+        }
         graph.standard(
-            format!("{prefix}.key_group_reshape"),
-            "Reshape",
-            &[&present_k, &grouped_k_shape],
-            &[&grouped_k],
-            Vec::new(),
+            format!("{prefix}.query_transpose"),
+            "Transpose",
+            &[&query_ready],
+            &[&query],
+            vec![ints_attribute("perm", &[1, 0, 2])],
         );
-        graph.standard(
-            format!("{prefix}.value_group_reshape"),
-            "Reshape",
-            &[&present_v, &grouped_v_shape],
-            &[&grouped_v],
-            Vec::new(),
-        );
-        let repeats = format!("{prefix}.gqa_repeats");
-        graph.add_i64(&repeats, vec![4], &[1, 1, gqa_repeat, 1]);
-        let tiled_k = format!("{prefix}.tiled_k");
-        let tiled_v = format!("{prefix}.tiled_v");
-        graph.standard(
-            format!("{prefix}.key_gqa_tile"),
-            "Tile",
-            &[&grouped_k, &repeats],
-            &[&tiled_k],
-            Vec::new(),
-        );
-        graph.standard(
-            format!("{prefix}.value_gqa_tile"),
-            "Tile",
-            &[&grouped_v, &repeats],
-            &[&tiled_v],
-            Vec::new(),
-        );
-        let expanded_shape = format!("{prefix}.expanded_kv_shape");
-        graph.add_i64(&expanded_shape, vec![3], &[total_tokens, n_head, head_dim]);
-        let expanded_k = format!("{prefix}.expanded_k");
-        let expanded_v = format!("{prefix}.expanded_v");
-        graph.standard(
-            format!("{prefix}.key_gqa"),
-            "Reshape",
-            &[&tiled_k, &expanded_shape],
-            &[&expanded_k],
-            Vec::new(),
-        );
-        graph.standard(
-            format!("{prefix}.value_gqa"),
-            "Reshape",
-            &[&tiled_v, &expanded_shape],
-            &[&expanded_v],
-            Vec::new(),
-        );
+        let cache =
+            graph.cache_and_expand_gqa(index, &key_ready, &current_v, geometry, &mut inputs);
+        cache_outputs.extend(cache.declarations);
+        let expanded_k = cache.expanded_k;
+        let expanded_v = cache.expanded_v;
         let transposed_k = format!("{prefix}.transposed_k");
         let transposed_v = format!("{prefix}.transposed_v");
         graph.standard(
@@ -1741,31 +2199,11 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
             &[&scaled_scores],
             Vec::new(),
         );
-        let mask = format!("{prefix}.attention_mask");
-        let mask_elements =
-            model
-                .tokens
-                .checked_mul(total_tokens_usize)
-                .ok_or(OnnxModelError::ShapeOverflow(
-                    "attention mask element count",
-                ))?;
-        let mut mask_values = Vec::with_capacity(mask_elements);
-        for query_index in 0..model.tokens {
-            let last_visible = model.past_tokens + query_index;
-            for key_index in 0..total_tokens_usize {
-                mask_values.push(if key_index <= last_visible {
-                    0.0
-                } else {
-                    -1.0e9
-                });
-            }
-        }
-        graph.add_f32(&mask, vec![1, tokens, total_tokens], &mask_values);
         let masked_scores = format!("{prefix}.masked_scores");
         graph.standard(
             format!("{prefix}.mask"),
             "Add",
-            &[&scaled_scores, &mask],
+            &[&scaled_scores, attention_mask],
             &[&masked_scores],
             Vec::new(),
         );
@@ -1819,70 +2257,14 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
             &[&post_attention],
             Vec::new(),
         );
-        let ffn_input = format!("{prefix}.ffn_input");
-        graph.rms_norm(
-            &format!("{prefix}.ffn_norm"),
-            &post_attention,
-            &ffn_input,
-            layer.ffn_norm,
-            model.rms_epsilon,
-        );
-        let gate = format!("{prefix}.gate");
-        let up = format!("{prefix}.up");
-        graph.projection(
-            &format!("{prefix}.gate_projection"),
-            &ffn_input,
-            &gate,
-            &format!("{prefix}.gate"),
-            layer.gate,
-        )?;
-        graph.projection(
-            &format!("{prefix}.up_projection"),
-            &ffn_input,
-            &up,
-            &format!("{prefix}.up"),
-            layer.up,
-        )?;
-        let sigmoid = format!("{prefix}.gate_sigmoid");
-        graph.standard(
-            format!("{prefix}.sigmoid"),
-            "Sigmoid",
-            &[&gate],
-            &[&sigmoid],
-            Vec::new(),
-        );
-        let silu = format!("{prefix}.silu");
-        graph.standard(
-            format!("{prefix}.silu_mul"),
-            "Mul",
-            &[&gate, &sigmoid],
-            &[&silu],
-            Vec::new(),
-        );
-        let gated = format!("{prefix}.gated");
-        graph.standard(
-            format!("{prefix}.swiglu"),
-            "Mul",
-            &[&silu, &up],
-            &[&gated],
-            Vec::new(),
-        );
-        let ffn_output = format!("{prefix}.ffn_output");
-        graph.projection(
-            &format!("{prefix}.down_projection"),
-            &gated,
-            &ffn_output,
-            &format!("{prefix}.down"),
-            layer.down,
-        )?;
         let layer_output = format!("layer.{}.input", index + 1);
-        graph.standard(
-            format!("{prefix}.ffn_residual"),
-            "Add",
-            &[&post_attention, &ffn_output],
-            &[&layer_output],
-            Vec::new(),
-        );
+        graph.ffn_block(
+            &prefix,
+            &post_attention,
+            &layer_output,
+            layer,
+            model.rms_epsilon,
+        )?;
         hidden_name = layer_output;
     }
     let final_hidden = "final_norm.output";
@@ -1907,7 +2289,7 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
     });
     let mut outputs = vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])];
     outputs.extend(cache_outputs);
-    let metadata_props = vec![
+    let mut metadata_props = vec![
         metadata("tritium.schema_version", "2"),
         metadata("tritium.graph_kind", "causal-lm"),
         metadata("tritium.source_model_id", model.identity.source_model_id),
@@ -1933,7 +2315,10 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
         metadata("tritium.head_dim", &model.head_dim.to_string()),
         metadata("tritium.tied_embedding_head", "true"),
     ];
-    Ok(ModelProto {
+    if let Some(rotary) = model.rotary {
+        metadata_props.push(metadata("tritium.rope_theta", &rotary.theta.to_string()));
+    }
+    let encoded = ModelProto {
         ir_version: ONNX_IR_VERSION,
         producer_name: "tritium-onnx".to_owned(),
         producer_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -1959,7 +2344,13 @@ fn encode_causal_lm_graph(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModel
         ],
         metadata_props,
     }
-    .encode_to_vec())
+    .encode_to_vec();
+    if encoded.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -2264,6 +2655,19 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             model.embedding.columns
         )));
     }
+    if let Some(rotary) = model.rotary {
+        if !rotary.theta.is_finite() || rotary.theta <= 0.0 {
+            return Err(OnnxModelError::InvalidModel(
+                "RoPE theta must be finite and positive".to_owned(),
+            ));
+        }
+        if model.head_dim < 2 || !model.head_dim.is_multiple_of(2) {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "RoPE requires positive even head_dim, got {}",
+                model.head_dim
+            )));
+        }
+    }
     validate_matrix("embedding", model.embedding)?;
     validate_vector("final_norm", model.final_norm, hidden)?;
     for (index, layer) in model.layers.iter().copied().enumerate() {
@@ -2272,6 +2676,12 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             layer.attention_norm,
             hidden,
         )?;
+        if let Some(weight) = layer.query_norm {
+            validate_vector(&format!("layer.{index}.query_norm"), weight, model.head_dim)?;
+        }
+        if let Some(weight) = layer.key_norm {
+            validate_vector(&format!("layer.{index}.key_norm"), weight, model.head_dim)?;
+        }
         validate_vector(&format!("layer.{index}.ffn_norm"), layer.ffn_norm, hidden)?;
         let kv_width = model
             .n_kv_head
@@ -2311,7 +2721,83 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
             intermediate,
         )?;
     }
+    validate_causal_initializer_budget(model)?;
     validate_identity_v2(model.identity)
+}
+
+fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
+    fn add(total: &mut usize, bytes: usize) -> Result<(), OnnxModelError> {
+        *total = total
+            .checked_add(bytes)
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "causal initializer byte count",
+            ))?;
+        if *total > MAX_MODEL_BYTES {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "causal initializers require at least {total} bytes, exceed bounded inline graph"
+            )));
+        }
+        Ok(())
+    }
+    fn add_vector(total: &mut usize, values: &[f32]) -> Result<(), OnnxModelError> {
+        let bytes = values
+            .len()
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or(OnnxModelError::ShapeOverflow("preserved vector byte count"))?;
+        add(total, bytes)
+    }
+    fn add_matrix(
+        total: &mut usize,
+        matrix: PackedTernaryMatrix<'_>,
+    ) -> Result<(), OnnxModelError> {
+        add(total, matrix.packed.len())?;
+        add_vector(total, matrix.scales)
+    }
+
+    let mut total = 0;
+    add_matrix(&mut total, model.embedding)?;
+    add_vector(&mut total, model.final_norm)?;
+    for layer in model.layers.iter().copied() {
+        add_vector(&mut total, layer.attention_norm)?;
+        if let Some(weight) = layer.query_norm {
+            add_vector(&mut total, weight)?;
+        }
+        if let Some(weight) = layer.key_norm {
+            add_vector(&mut total, weight)?;
+        }
+        add_vector(&mut total, layer.ffn_norm)?;
+        for matrix in [
+            layer.query,
+            layer.key,
+            layer.value,
+            layer.attention_output,
+            layer.gate,
+            layer.up,
+            layer.down,
+        ] {
+            add_matrix(&mut total, matrix)?;
+        }
+    }
+    let total_tokens = model
+        .tokens
+        .checked_add(model.past_tokens)
+        .ok_or(OnnxModelError::ShapeOverflow("total token count"))?;
+    let mask_bytes = model
+        .tokens
+        .checked_mul(total_tokens)
+        .and_then(|elements| elements.checked_mul(core::mem::size_of::<f32>()))
+        .ok_or(OnnxModelError::ShapeOverflow("attention mask byte count"))?;
+    add(&mut total, mask_bytes)?;
+    if model.rotary.is_some() {
+        let rotary_bytes = model
+            .tokens
+            .checked_mul(model.head_dim)
+            .and_then(|elements| elements.checked_mul(2))
+            .and_then(|elements| elements.checked_mul(core::mem::size_of::<f32>()))
+            .ok_or(OnnxModelError::ShapeOverflow("RoPE table byte count"))?;
+        add(&mut total, rotary_bytes)?;
+    }
+    Ok(())
 }
 
 fn validate_matrix_shape(
@@ -3206,6 +3692,63 @@ mod tests {
     }
 
     #[test]
+    fn concat_diagnostics_enforce_cache_and_rotary_axes_by_role() {
+        let concat = |inputs: &[&str], output: &str, axis: i64| NodeProto {
+            input: inputs.iter().map(|value| (*value).to_owned()).collect(),
+            output: strings([output]),
+            name: "renamed-cosmetic-node".to_owned(),
+            op_type: "Concat".to_owned(),
+            attribute: vec![int_attribute("axis", axis)],
+            domain: String::new(),
+        };
+        let unary = |op_type: &str, input: &str, output: &str| NodeProto {
+            input: strings([input]),
+            output: strings([output]),
+            name: String::new(),
+            op_type: op_type.to_owned(),
+            attribute: Vec::new(),
+            domain: String::new(),
+        };
+        let protobuf = ModelProto {
+            ir_version: ONNX_IR_VERSION,
+            producer_name: "tritium-onnx-test".to_owned(),
+            producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+            domain: String::new(),
+            model_version: 1,
+            graph: Some(GraphProto {
+                node: vec![
+                    concat(&["past_k.0", "current_k"], "present_k.0", -1),
+                    unary("Slice", "query", "first_half"),
+                    unary("Neg", "second_half", "negated_second"),
+                    concat(&["negated_second", "first_half"], "rotated", 0),
+                ],
+                name: "concat-axis-mutations".to_owned(),
+                initializer: Vec::new(),
+                input: vec![tensor_value("past_k.0", TENSOR_FLOAT, &[1, 1, 2])],
+                output: vec![tensor_value("present_k.0", TENSOR_FLOAT, &[2, 1, 2])],
+                value_info: Vec::new(),
+            }),
+            opset_import: vec![OperatorSetIdProto {
+                domain: String::new(),
+                version: ONNX_OPSET,
+            }],
+            metadata_props: Vec::new(),
+        };
+        let diagnostics = diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics[0]
+                .reason
+                .contains("KV cache concat axis must be 0")
+        );
+        assert!(
+            diagnostics[1]
+                .reason
+                .contains("RoPE concat axis must be -1")
+        );
+    }
+
+    #[test]
     fn kv_attention_diagnostics_reject_nondivisible_gqa_heads() {
         let encoded = encode_kv_attention_test_graph(1, 0, 3, 2, 4);
         assert_eq!(
@@ -3267,6 +3810,72 @@ mod tests {
         assert!(matches!(
             result,
             Err(OnnxModelError::InvalidPackedRow { .. })
+        ));
+    }
+
+    #[test]
+    fn rotary_tables_remain_finite_at_extreme_valid_theta_and_position() {
+        let (cos, sin) = rotary_tables(RotaryGraphConfig {
+            tokens: 2,
+            head_dim: 128,
+            past_tokens: 10_000_000,
+            theta: f32::MIN_POSITIVE,
+        })
+        .unwrap();
+        assert_eq!(cos.len(), 256);
+        assert_eq!(sin.len(), 256);
+        assert!(cos.iter().chain(&sin).all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn rotary_tables_reject_oversized_allocation_before_building_values() {
+        let result = rotary_tables(RotaryGraphConfig {
+            tokens: MAX_MODEL_BYTES,
+            head_dim: 2,
+            past_tokens: 0,
+            theta: 10_000.0,
+        });
+        assert!(matches!(
+            result,
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("RoPE tables require")
+        ));
+    }
+
+    #[test]
+    fn causal_initializer_budget_rejects_aggregate_payload_before_cloning() {
+        let empty_matrix = PackedTernaryMatrix {
+            rows: 1,
+            columns: 1,
+            packed: &[],
+            scales: &[],
+            format: TernaryFormat::Tq2_0,
+        };
+        let model = CausalLmModel {
+            tokens: 4097,
+            past_tokens: 0,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: 1,
+            rotary: None,
+            rms_epsilon: 1.0e-5,
+            embedding: empty_matrix,
+            final_norm: &[],
+            layers: &[],
+            identity: OnnxArtifactIdentityV2 {
+                source_model_id: "source",
+                tokenizer_id: "tokenizer",
+                recipe_id: "recipe",
+                tritium_build_id: "build",
+                package_id: "package",
+                converted_coverage_id: "converted",
+                deferred_coverage_id: "deferred",
+            },
+        };
+        assert!(matches!(
+            validate_causal_initializer_budget(&model),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("causal initializers require at least")
         ));
     }
 }

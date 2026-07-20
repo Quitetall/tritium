@@ -14,7 +14,8 @@
 //!
 //! With feature `model`, [`encode_causal_lm`] serializes packed decoder layers
 //! using opset-1 Tritium projection/embedding nodes plus standard opset-21
-//! RMSNorm, GQA attention, SwiGLU, residual, and K/V-cache glue.
+//! RMSNorm (including optional Q/K norm), full-head RoPE, GQA attention,
+//! SwiGLU, residual, and K/V-cache glue.
 //!
 //! ## Feature gate
 //!
@@ -542,7 +543,7 @@ mod onnx_op;
 #[cfg(feature = "model")]
 pub use model::{
     CausalLmDecoderLayer, CausalLmModel, ExternalOnnxModel, OnnxArtifactIdentityV2, OnnxModelError,
-    PackedTernaryMatrix, TiedEmbeddingHeadModel, TiedEmbeddingHeadModelV2,
+    PackedTernaryMatrix, RotaryEmbedding, TiedEmbeddingHeadModel, TiedEmbeddingHeadModelV2,
     UnsupportedGraphDiagnostic, UnsupportedGraphItemKind, VerifiedExternalOnnxModel,
     VerifiedExternalOnnxModelV2, VerifiedOnnxArtifactIdentityV2, diagnose_unsupported_graph,
     encode_causal_lm, encode_external_tied_embedding_head, encode_external_tied_embedding_head_v2,

@@ -69,9 +69,19 @@ per-layer cache concatenation and present-cache outputs. A nondegenerate tiny
 2:1 GQA model executes prompt plus cached continuation through real ORT and
 matches an independent dense reference for logits, greedy tokens and every K/V
 element. Deterministic encoding and the pre-session inspector are part of the
-same gate. Serializer decomposition, multi-layer large-model external-data
-packaging, architecture adapters including RoPE/QK norm, dynamic axes and
-end-user generation APIs remain open.
+same gate. Cache/GQA and FFN emission now live behind focused builder seams.
+Optional per-head Q/K RMSNorm plus full-head Qwen-style RoPE use absolute prompt
+and decode positions; rotated K is what enters and leaves each cache. The same
+4Q/2KV, head-dim-4 ORT gate uses nonuniform Q/K norm weights, nonzero frequency
+lanes and positions 0, 1 and 2, so norm/rotation/cache-order errors change the
+independent logits and cache oracle. One f64-generated cos/sin table and one
+slice-constant set are shared across every layer/Q/K application; extreme valid
+theta/position regression requires every serialized table value to remain finite.
+The causal mask is shared across layers, and aggregate initializer plus exact
+protobuf bounds reject oversized inline graphs before publication.
+Multi-layer large-model external-data packaging, architecture tensor-map
+adapters, sliding/local/partial RoPE variants, dynamic axes and end-user
+generation APIs remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
