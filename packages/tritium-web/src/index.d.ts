@@ -67,7 +67,68 @@ export declare class WebTrainingError extends Error {
 export interface TrainingRecipeV1 {
   readonly schemaId: "tritium.training_recipe";
   readonly schemaVersion: 1;
-  readonly operations: readonly string[];
+  readonly tensors: readonly TrainingTensorSpecV1[];
+  readonly operations: readonly TrainingOperationSpecV1[];
+}
+
+export type TrainingDTypeV1 = "f32" | "u32" | "bytes";
+export type TrainingTensorRoleV1 =
+  | "batch"
+  | "parameter"
+  | "gradient"
+  | "optimizer-state"
+  | "activation"
+  | "result";
+
+export interface TrainingTensorSpecV1 {
+  readonly id: string;
+  readonly dtype: TrainingDTypeV1;
+  readonly shape: readonly number[];
+  readonly role: TrainingTensorRoleV1;
+  readonly aliasOf: string | null;
+}
+
+export interface TrainingOperationSpecV1 {
+  readonly id: string;
+  readonly operation: string;
+  readonly inputs: readonly string[];
+  readonly outputs: readonly string[];
+  readonly attributes: readonly TrainingAttributeSpecV1[];
+}
+
+export type TrainingAttributeKindV1 =
+  | "f32"
+  | "u64"
+  | "bool"
+  | "text"
+  | "u64-list"
+  | "u32-list";
+
+export interface TrainingAttributeSpecV1 {
+  readonly name: string;
+  readonly kind: TrainingAttributeKindV1;
+  readonly value: number | boolean | string | readonly number[];
+}
+
+export interface CompiledTrainingBufferV1 extends TrainingTensorSpecV1 {
+  readonly ownerId: string;
+  readonly byteOffset: number;
+  readonly byteLength: number;
+}
+
+export interface CompiledTrainingOperationV1 extends TrainingOperationSpecV1 {}
+
+export interface CompiledTrainingPlanV1 {
+  readonly schemaId: "tritium.compiled_training_plan";
+  readonly schemaVersion: 1;
+  readonly manifestDigest: typeof TRAINING_MANIFEST_DIGEST_V1;
+  readonly buffers: readonly CompiledTrainingBufferV1[];
+  readonly operations: readonly CompiledTrainingOperationV1[];
+  readonly residentBytes: number;
+  readonly batchStagingBytes: number;
+  readonly preparePeakBytes: number;
+  readonly forwardPeakBytes: number;
+  readonly peakBytes: number;
 }
 
 export interface WebTrainingModelV1 {
@@ -126,11 +187,20 @@ export interface WebBinaryResultV1 {
   readonly receipt: WebTrainingReceiptV1;
 }
 
+/** Low-level generated adapter. `validate` is allocation-free; neither
+ * `validate` nor `prepare` may mutate or retain their arguments.
+ */
 export interface WebTrainingAdapterV1 {
   readonly capabilities: WebTrainingCapabilitiesV1;
+  validate(
+    model: WebTrainingModelV1,
+    config: WebTrainingConfigV1,
+    plan: CompiledTrainingPlanV1,
+  ): Promise<void>;
   prepare(
     model: WebTrainingModelV1,
     config: WebTrainingConfigV1,
+    plan: CompiledTrainingPlanV1,
   ): Promise<WebTrainingReceiptV1>;
   forward(batch: TrainingBatchV1): Promise<TrainingResultV1>;
   backward(result: TrainingResultV1): Promise<WebTrainingReceiptV1>;
@@ -143,6 +213,7 @@ export interface WebTrainingAdapterV1 {
 
 export declare class WebTrainingSession {
   readonly capabilities: WebTrainingCapabilitiesV1;
+  readonly plan: CompiledTrainingPlanV1;
   static prepare(
     model: WebTrainingModelV1,
     config: WebTrainingConfigV1,
@@ -157,6 +228,11 @@ export declare class WebTrainingSession {
   export(): Promise<WebBinaryResultV1>;
   dispose(): Promise<void>;
 }
+
+export declare function compileTrainingPlan(
+  model: WebTrainingModelV1,
+  config: WebTrainingConfigV1,
+): CompiledTrainingPlanV1;
 
 export declare function prepareTraining(
   model: WebTrainingModelV1,

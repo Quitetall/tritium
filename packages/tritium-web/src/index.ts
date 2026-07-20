@@ -13,11 +13,25 @@ export {
   TRAINING_MANIFEST_DIGEST_V1,
   TRAINING_VECTOR_DIGEST_V1,
 } from "./identity.ts";
-export { WebTrainingError, WebTrainingSession, prepareTraining } from "./session.ts";
+export {
+  WebTrainingError,
+  WebTrainingSession,
+  compileTrainingPlan,
+  prepareTraining,
+} from "./session.ts";
 export type {
+  CompiledTrainingBufferV1,
+  CompiledTrainingOperationV1,
+  CompiledTrainingPlanV1,
   TrainingBatchV1,
+  TrainingAttributeKindV1,
+  TrainingAttributeSpecV1,
+  TrainingDTypeV1,
+  TrainingOperationSpecV1,
   TrainingRecipeV1,
   TrainingResultV1,
+  TrainingTensorRoleV1,
+  TrainingTensorSpecV1,
   WebBinaryResultV1,
   WebTrainingAdapterV1,
   WebTrainingBackendPolicyV1,

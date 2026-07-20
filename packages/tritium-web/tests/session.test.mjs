@@ -20,9 +20,22 @@ const model = {
   recipe: {
     schemaId: "tritium.training_recipe",
     schemaVersion: 1,
-    operations: ["graph.add", "loss.mse", "optimizer.sgd"],
+    tensors: [
+      { id: "x", dtype: "f32", shape: [1], role: "batch", aliasOf: null },
+      { id: "target", dtype: "f32", shape: [1], role: "batch", aliasOf: null },
+      { id: "weight", dtype: "f32", shape: [1], role: "parameter", aliasOf: null },
+      { id: "tied-weight", dtype: "f32", shape: [1], role: "parameter", aliasOf: "weight" },
+      { id: "grad", dtype: "f32", shape: [1], role: "gradient", aliasOf: null },
+      { id: "sum", dtype: "f32", shape: [1], role: "activation", aliasOf: null },
+      { id: "loss", dtype: "f32", shape: [], role: "result", aliasOf: null },
+    ],
+    operations: [
+      { id: "add", operation: "graph.add", inputs: ["x", "weight"], outputs: ["sum"], attributes: [] },
+      { id: "mse", operation: "loss.mse", inputs: ["sum", "target"], outputs: ["loss"], attributes: [] },
+      { id: "sgd", operation: "optimizer.sgd", inputs: ["weight", "grad"], outputs: ["weight"], attributes: [] },
+    ],
   },
-  payload: new Uint8Array([1, 2, 3]),
+  payload: Buffer.from([1, 2, 3]),
 };
 
 const config = {
@@ -32,6 +45,15 @@ const config = {
   seed: 7,
   requiredOperations: ["lifecycle.checkpoint", "lifecycle.export"],
 };
+
+function batch() {
+  return {
+    inputs: {
+      x: new Float32Array([1]),
+      target: new Float32Array([0]),
+    },
+  };
+}
 
 function capabilities(implementation = "webgpu") {
   return {
@@ -69,52 +91,77 @@ class MockAdapter {
     this.implementation = implementation;
     this.calls = [];
     this.forwardBarrier = null;
+    this.completedSteps = 0;
   }
 
-  async prepare(preparedModel) {
+  async validate(preparedModel) {
+    this.calls.push("validate");
+    preparedModel.payload[0] = 77;
+  }
+
+  async prepare(preparedModel, _config, plan) {
     this.calls.push("prepare");
+    this.plan = plan;
+    this.prepareSaw = preparedModel.payload[0];
     preparedModel.payload[0] = 99;
-    return receipt("session.prepare", this.implementation);
+    return receipt("session.prepare", this.implementation, {
+      completedSteps: this.completedSteps,
+    });
   }
 
-  async forward() {
+  async forward(preparedBatch) {
     this.calls.push("forward");
+    preparedBatch.inputs.x[0] = 99;
     if (this.forwardBarrier !== null) await this.forwardBarrier;
     return {
       loss: 0.25,
-      receipt: receipt("session.forward", this.implementation),
+      receipt: receipt("session.forward", this.implementation, {
+        completedSteps: this.completedSteps,
+      }),
     };
   }
 
   async backward() {
     this.calls.push("backward");
-    return receipt("session.backward", this.implementation);
+    return receipt("session.backward", this.implementation, {
+      completedSteps: this.completedSteps,
+    });
   }
 
   async step() {
     this.calls.push("step");
-    return receipt("session.step", this.implementation);
+    this.completedSteps += 1;
+    return receipt("session.step", this.implementation, {
+      completedSteps: this.completedSteps,
+    });
   }
 
   async checkpoint() {
     this.calls.push("checkpoint");
+    this.checkpointBytes = Buffer.from([4, 5]);
     return {
-      bytes: new Uint8Array([4, 5]),
-      receipt: receipt("session.checkpoint", this.implementation),
+      bytes: this.checkpointBytes,
+      receipt: receipt("session.checkpoint", this.implementation, {
+        completedSteps: this.completedSteps,
+      }),
     };
   }
 
   async resume(bytes) {
     this.calls.push(`resume:${bytes[0]}`);
     bytes[0] = 88;
-    return receipt("session.resume", this.implementation);
+    return receipt("session.resume", this.implementation, {
+      completedSteps: this.completedSteps,
+    });
   }
 
   async export() {
     this.calls.push("export");
     return {
       bytes: new Uint8Array([6, 7]),
-      receipt: receipt("session.export", this.implementation),
+      receipt: receipt("session.export", this.implementation, {
+        completedSteps: this.completedSteps,
+      }),
     };
   }
 
@@ -135,10 +182,27 @@ test("checked session executes the complete lifecycle in order", async () => {
   const adapter = new MockAdapter();
   const session = await prepareTraining(model, config, adapter);
   assert.equal(model.payload[0], 1, "adapter receives an isolated model payload");
+  assert.equal(adapter.prepareSaw, 1, "validation cannot mutate prepare payload");
   assert.equal(session.state, "prepared");
+  assert.equal(session.plan.residentBytes, 84);
+  assert.equal(session.plan.batchStagingBytes, 8);
+  assert.equal(session.plan.preparePeakBytes, 90);
+  assert.equal(session.plan.forwardPeakBytes, 92);
+  assert.equal(session.plan.peakBytes, 92);
+  const weight = session.plan.buffers.find((buffer) => buffer.id === "weight");
+  const tied = session.plan.buffers.find((buffer) => buffer.id === "tied-weight");
+  assert.equal(tied.ownerId, "weight");
+  assert.equal(tied.byteOffset, weight.byteOffset);
+  assert.equal(tied.byteLength, weight.byteLength);
+  assert.ok(Object.isFrozen(session.plan));
+  assert.ok(Object.isFrozen(session.plan.buffers));
 
   await rejectsCode(session.step(), "invalid_state");
-  const result = await session.forward({ inputs: { x: new Float32Array([1]) } });
+  const callerBatch = batch();
+  const result = await session.forward(callerBatch);
+  assert.equal(callerBatch.inputs.x[0], 1, "adapter receives isolated batch staging");
+  assert.ok(Object.isFrozen(result));
+  assert.ok(Object.isFrozen(result.receipt));
   assert.equal(session.state, "forward-complete");
   await rejectsCode(session.backward({ ...result }), "invalid_state");
   await session.backward(result);
@@ -149,6 +213,7 @@ test("checked session executes the complete lifecycle in order", async () => {
 
   const checkpoint = await session.checkpoint();
   checkpoint.bytes[0] = 42;
+  assert.equal(adapter.checkpointBytes[0], 4, "checkpoint output does not alias Buffer storage");
   await session.resume(checkpoint.bytes);
   assert.equal(checkpoint.bytes[0], 42, "resume receives an isolated byte copy");
   const artifact = await session.export();
@@ -157,7 +222,7 @@ test("checked session executes the complete lifecycle in order", async () => {
   await session.dispose();
   assert.equal(session.state, "disposed");
   await rejectsCode(
-    session.forward({ inputs: { x: new Float32Array([1]) } }),
+    session.forward(batch()),
     "disposed",
   );
   assert.equal(adapter.calls.filter((call) => call === "dispose").length, 1);
@@ -171,7 +236,12 @@ test("backend policy and manifest coverage fail before adapter preparation", asy
   const adapter = new MockAdapter();
   const badModel = {
     ...model,
-    recipe: { ...model.recipe, operations: ["graph.not_real"] },
+    recipe: {
+      ...model.recipe,
+      operations: [
+        { ...model.recipe.operations[0], operation: "graph.not_real" },
+      ],
+    },
   };
   await rejectsCode(
     prepareTraining(badModel, config, adapter),
@@ -179,6 +249,220 @@ test("backend policy and manifest coverage fail before adapter preparation", asy
   );
   assert.deepEqual(adapter.calls, []);
   await rejectsCode(prepareTraining(model, config), "adapter_unavailable");
+
+  const validator = new MockAdapter();
+  validator.validate = async () => {
+    validator.calls.push("validate");
+    throw new Error("invalid geometry");
+  };
+  await assert.rejects(prepareTraining(model, config, validator), /invalid geometry/);
+  assert.deepEqual(validator.calls, ["validate"]);
+});
+
+test("planner rejects invalid ownership and memory before adapter allocation", async () => {
+  const badOwner = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      tensors: model.recipe.tensors.map((tensor) =>
+        tensor.id === "tied-weight" ? { ...tensor, aliasOf: "missing" } : tensor,
+      ),
+    },
+  };
+  const ownerAdapter = new MockAdapter();
+  await rejectsCode(prepareTraining(badOwner, config, ownerAdapter), "invalid_schema");
+  assert.deepEqual(ownerAdapter.calls, []);
+
+  const illegalWrite = {
+    ...model,
+    recipe: {
+      ...model.recipe,
+      operations: [
+        { ...model.recipe.operations[0], outputs: ["weight"] },
+        ...model.recipe.operations.slice(1),
+      ],
+    },
+  };
+  const writeAdapter = new MockAdapter();
+  await rejectsCode(prepareTraining(illegalWrite, config, writeAdapter), "invalid_schema");
+  assert.deepEqual(writeAdapter.calls, []);
+
+  const memoryAdapter = new MockAdapter();
+  await rejectsCode(
+    prepareTraining(model, { ...config, maxResidentBytes: 90 }, memoryAdapter),
+    "memory_limit",
+  );
+  assert.deepEqual(memoryAdapter.calls, []);
+});
+
+test("planner rejects non-representable and sparse typed attributes", async () => {
+  for (const attribute of [
+    { name: "rate", kind: "f32", value: Number.MAX_VALUE },
+    { name: "shape", kind: "u32-list", value: new Array(2) },
+  ]) {
+    const badModel = {
+      ...model,
+      recipe: {
+        ...model.recipe,
+        operations: model.recipe.operations.map((operation, index) =>
+          index === 0 ? { ...operation, attributes: [attribute] } : operation,
+        ),
+      },
+    };
+    const adapter = new MockAdapter();
+    await rejectsCode(prepareTraining(badModel, config, adapter), "invalid_schema");
+    assert.deepEqual(adapter.calls, []);
+  }
+});
+
+test("prepare uses one pre-await caller snapshot", async () => {
+  const mutableModel = {
+    ...model,
+    payload: Uint8Array.from(model.payload),
+  };
+  const mutableConfig = { ...config };
+  const adapter = new MockAdapter();
+  let releaseValidation;
+  adapter.validate = async (preparedModel) => {
+    adapter.calls.push("validate");
+    assert.equal(preparedModel.payload[0], 1);
+    await new Promise((resolve) => {
+      releaseValidation = resolve;
+    });
+  };
+  const preparing = prepareTraining(mutableModel, mutableConfig, adapter);
+  mutableModel.payload = Uint8Array.from([9, 9, 9, 9]);
+  mutableConfig.maxResidentBytes = 1;
+  releaseValidation();
+  const session = await preparing;
+  assert.equal(adapter.prepareSaw, 1);
+  assert.equal(session.plan.preparePeakBytes, 90);
+  await session.dispose();
+});
+
+test("capability getters are snapshotted exactly once", async () => {
+  const adapter = new MockAdapter();
+  const source = capabilities();
+  let buildReads = 0;
+  adapter.capabilities = {
+    ...source,
+    get buildId() {
+      buildReads += 1;
+      return buildReads === 1 ? source.buildId : "unvalidated-build";
+    },
+  };
+  const session = await prepareTraining(model, config, adapter);
+  assert.equal(buildReads, 1);
+  assert.equal(session.capabilities.buildId, source.buildId);
+  await session.dispose();
+});
+
+test("capability snapshot rejects unknown and malformed fields", async () => {
+  const unknownAdapter = new MockAdapter();
+  unknownAdapter.capabilities = { ...capabilities(), futureField: true };
+  await rejectsCode(
+    prepareTraining(model, config, unknownAdapter),
+    "capability_mismatch",
+  );
+  assert.deepEqual(unknownAdapter.calls, []);
+
+  const malformedAdapter = new MockAdapter();
+  malformedAdapter.capabilities = {
+    ...capabilities(),
+    supportedOperations: null,
+  };
+  await rejectsCode(
+    prepareTraining(model, config, malformedAdapter),
+    "capability_mismatch",
+  );
+  assert.deepEqual(malformedAdapter.calls, []);
+});
+
+test("adapter outputs are snapshotted before validation", async () => {
+  const adapter = new MockAdapter();
+  const session = await prepareTraining(model, config, adapter);
+  let lossReads = 0;
+  let receiptReads = 0;
+  let buildReads = 0;
+  const forwardReceipt = receipt("session.forward");
+  Object.defineProperty(forwardReceipt, "buildId", {
+    enumerable: true,
+    get() {
+      buildReads += 1;
+      return buildReads === 1 ? "test-adapter-v1" : "drifted-build";
+    },
+  });
+  adapter.forward = async () => ({
+    get loss() {
+      lossReads += 1;
+      return lossReads === 1 ? 0.5 : Number.NaN;
+    },
+    get receipt() {
+      receiptReads += 1;
+      return receiptReads === 1 ? forwardReceipt : receipt("wrong-operation");
+    },
+  });
+  const result = await session.forward(batch());
+  assert.equal(result.loss, 0.5);
+  assert.equal(result.receipt.buildId, "test-adapter-v1");
+  assert.equal(lossReads, 1);
+  assert.equal(receiptReads, 1);
+  assert.equal(buildReads, 1);
+
+  await session.backward(result);
+  await session.step();
+  let byteReads = 0;
+  adapter.checkpoint = async () => ({
+    get bytes() {
+      byteReads += 1;
+      return byteReads === 1 ? Uint8Array.from([4, 5]) : new Uint8Array();
+    },
+    receipt: receipt("session.checkpoint", "webgpu", { completedSteps: 1 }),
+  });
+  const checkpoint = await session.checkpoint();
+  assert.deepEqual([...checkpoint.bytes], [4, 5]);
+  assert.equal(byteReads, 1);
+  await session.dispose();
+});
+
+test("receipt resident and step counters gate state commits", async () => {
+  const residentAdapter = new MockAdapter();
+  const residentSession = await prepareTraining(model, config, residentAdapter);
+  residentAdapter.forward = async () => ({
+    loss: 1,
+    receipt: receipt("session.forward", "webgpu", { peakResidentBytes: 0 }),
+  });
+  await rejectsCode(residentSession.forward(batch()), "memory_limit");
+  assert.equal(residentSession.state, "prepared");
+
+  const stepAdapter = new MockAdapter();
+  const stepSession = await prepareTraining(model, config, stepAdapter);
+  const result = await stepSession.forward(batch());
+  await stepSession.backward(result);
+  stepAdapter.step = async () =>
+    receipt("session.step", "webgpu", { completedSteps: 7 });
+  await rejectsCode(stepSession.step(), "invalid_receipt");
+  assert.equal(stepSession.state, "backward-complete");
+});
+
+test("forward rejects batches that differ from the compiled plan", async () => {
+  const adapter = new MockAdapter();
+  const session = await prepareTraining(model, config, adapter);
+  await rejectsCode(
+    session.forward({ inputs: { x: new Float32Array([1]) } }),
+    "invalid_schema",
+  );
+  await rejectsCode(
+    session.forward({
+      inputs: {
+        x: new Uint32Array([1]),
+        target: new Float32Array([0]),
+      },
+    }),
+    "invalid_schema",
+  );
+  assert.deepEqual(adapter.calls, ["validate", "prepare"]);
+  assert.equal(session.state, "prepared");
 });
 
 test("invalid receipts and adapter failures leave state uncommitted", async () => {
@@ -188,7 +472,7 @@ test("invalid receipts and adapter failures leave state uncommitted", async () =
     throw new Error("device lost");
   };
   await assert.rejects(
-    session.forward({ inputs: { x: new Float32Array([1]) } }),
+    session.forward(batch()),
     /device lost/,
   );
   assert.equal(session.state, "prepared");
@@ -200,7 +484,7 @@ test("invalid receipts and adapter failures leave state uncommitted", async () =
     }),
   });
   await rejectsCode(
-    session.forward({ inputs: { x: new Float32Array([1]) } }),
+    session.forward(batch()),
     "invalid_receipt",
   );
   assert.equal(session.state, "prepared");
@@ -213,7 +497,7 @@ test("concurrent session mutations fail closed", async () => {
     release = resolve;
   });
   const session = await prepareTraining(model, config, adapter);
-  const forward = session.forward({ inputs: { x: new Float32Array([1]) } });
+  const forward = session.forward(batch());
   await new Promise((resolve) => setImmediate(resolve));
   await rejectsCode(session.checkpoint(), "busy");
   release();

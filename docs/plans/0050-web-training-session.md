@@ -113,9 +113,17 @@ Status: **IN PROGRESS** — the strict public types, fail-closed adapter boundar
 backend/fallback policy, manifest coverage validation, immutable capability
 snapshot, receipt/memory validation, serialized state machine, failure-stable
 transitions, checkpoint/resume/export byte isolation and idempotent terminal
-dispose are implemented and tested. Compiled recipe/buffer planning, tied-state
-ownership, canonical WASM checkpoint/artifact execution and device-loss
-transactions remain open.
+dispose are implemented and tested. Recipes now compile before `adapter.prepare`
+may allocate into an immutable operation schedule and 16-byte-aligned static
+buffer plan; tensor ownership, tied-parameter allocation, exact batch staging,
+safe-integer byte accounting and preparation peak ceilings fail closed.
+The adapter boundary now separates allocation-free, non-mutating, non-retaining
+operation-specific geometry/attribute validation from persistent preparation;
+preparation may allocate decoded state but may not mutate or retain its inputs.
+Preparation peak accounting includes the isolated validation and preparation
+payloads. Gradient
+accumulation ownership for tied parameters, canonical WASM
+checkpoint/artifact execution and device-loss transactions remain open.
 
 Compile a `TrainingRecipeV1` into an immutable operation schedule, buffer plan
 and optimizer-state layout. Preparation validates all roles, shapes, dtypes,
