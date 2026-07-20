@@ -14,6 +14,7 @@ categories.workspace = true
 tritium-core = { workspace = true }
 tritium-spec = { workspace = true }
 tritium-format = { workspace = true }
+tritium-train = { workspace = true }
 half = { workspace = true }
 
 [dev-dependencies]

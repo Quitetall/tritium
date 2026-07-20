@@ -32,6 +32,9 @@ use tritium_format::{
 };
 use tritium_spec::{BackendError, DeviceBuffer, DeviceCaps, MpGemm, TernaryBackend};
 
+mod portable;
+pub use portable::WasmTrainBackendV1;
+
 /// Owned host-memory buffer of packed weight bytes (the wasm linear-memory copy).
 #[derive(Debug, Clone)]
 pub struct WasmBuffer {
@@ -171,9 +174,10 @@ pub fn init_wasm() -> Result<Box<dyn TernaryBackend>, BackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tritium_spec::{TrainBackendV1, TrainingVectorSetV1};
     use tritium_testkit::{
         FROZEN_COUNT, FROZEN_SEED, Tolerance, generate_vectors, run_conformance,
-        run_fused_fallback_contract,
+        run_fused_fallback_contract, run_training_conformance,
     };
 
     // The frozen conformance set is exactly `generate_vectors(FROZEN_SEED,
@@ -222,5 +226,35 @@ mod tests {
     fn device_id_is_wasm() {
         assert_eq!(WasmBackend::new().device_id(), "wasm");
         assert_eq!(init_wasm().unwrap().device_id(), "wasm");
+    }
+
+    #[test]
+    fn portable_training_manifest_is_complete() {
+        let vectors = TrainingVectorSetV1::parse_json(include_bytes!(
+            "../../../spec/training/v1/vectors/v1.json"
+        ))
+        .expect("parse canonical training vectors");
+        let physical_device = if cfg!(target_arch = "wasm32") {
+            option_env!("TRITIUM_WASM_PHYSICAL_DEVICE").unwrap_or("wasmtime:unversioned")
+        } else {
+            "wasm32:structural-host"
+        };
+        let backend = WasmTrainBackendV1::new(physical_device).expect("valid device identity");
+        let report = run_training_conformance(&backend, &vectors);
+        assert!(
+            report.is_ok(),
+            "{} WASM portable-training failures: {:?}",
+            report.failed.len(),
+            report.failed
+        );
+        assert_eq!(report.passed.len(), vectors.cases().len());
+        assert_eq!(backend.capabilities().supported_operations.len(), 35);
+        assert!(
+            report
+                .passed
+                .iter()
+                .filter_map(|case| case.receipt.as_ref())
+                .all(|receipt| receipt.physical_device.as_deref() == Some(physical_device))
+        );
     }
 }
