@@ -264,7 +264,7 @@ async fn stop_string_truncates_stream() {
 }
 
 #[tokio::test]
-async fn models_and_health_drain() {
+async fn models_liveness_and_readiness_split_during_drain() {
     let (router, draining) = mock_router(vec![1], FinishReason::Stop);
     let (s, body) = send(
         &router,
@@ -279,7 +279,7 @@ async fn models_and_health_drain() {
     assert_eq!(v["object"], "list");
     assert_eq!(v["data"][0]["id"], "tritium");
 
-    let (ok, _) = send(
+    let (ok, body) = send(
         &router,
         Request::builder()
             .uri("/healthz")
@@ -288,8 +288,23 @@ async fn models_and_health_drain() {
     )
     .await;
     assert_eq!(ok, StatusCode::OK);
+    let health: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(health["worker_alive"], true);
+    assert_eq!(health["draining"], false);
+    let (ready, body) = send(
+        &router,
+        Request::builder()
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(ready, StatusCode::OK);
+    let readiness: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(readiness["status"], "ready");
+
     draining.store(true, Ordering::Relaxed);
-    let (drained, _) = send(
+    let (alive, body) = send(
         &router,
         Request::builder()
             .uri("/healthz")
@@ -297,7 +312,22 @@ async fn models_and_health_drain() {
             .unwrap(),
     )
     .await;
+    assert_eq!(alive, StatusCode::OK);
+    let health: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(health["worker_alive"], true);
+    assert_eq!(health["draining"], true);
+    let (drained, body) = send(
+        &router,
+        Request::builder()
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(drained, StatusCode::SERVICE_UNAVAILABLE);
+    let readiness: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(readiness["status"], "not_ready");
+    assert_eq!(readiness["draining"], true);
 }
 
 #[tokio::test]
@@ -788,6 +818,9 @@ async fn bearer_auth_enforced_when_configured() {
     assert_eq!(status, StatusCode::OK);
     // Health is also behind auth when configured (uniform surface).
     let req = Request::get("/healthz").body(Body::empty()).unwrap();
+    let (status, _) = send(&router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let req = Request::get("/readyz").body(Body::empty()).unwrap();
     let (status, _) = send(&router, req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

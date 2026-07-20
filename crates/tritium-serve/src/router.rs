@@ -1,5 +1,6 @@
 //! The axum router: OpenAI `/v1/chat/completions` (non-stream + SSE), `/v1/models`,
-//! `/healthz`, with backpressure and a drain flag for graceful shutdown.
+//! `/healthz` liveness and `/readyz` traffic readiness, with backpressure and a
+//! drain flag for graceful shutdown.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -295,6 +296,7 @@ fn build_router_inner(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
         .route("/metrics", get(metrics))
         .route("/v1/tree/session", post(tree_session))
         .route("/v1/tree/verify", post(tree_verify))
@@ -897,20 +899,37 @@ async fn health(State(st): State<AppState>) -> Response {
         )
             .into_response();
     }
-    if st.draining.load(Ordering::Relaxed) {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "status": "draining", "model": &*st.model_id })),
-        )
-            .into_response()
+    Json(serde_json::json!({
+        "status": "ok",
+        "model": &*st.model_id,
+        "worker_alive": true,
+        "draining": st.draining.load(Ordering::Relaxed),
+        "queue_depth": queue_depth,
+    }))
+    .into_response()
+}
+
+async fn readiness(State(st): State<AppState>) -> Response {
+    let worker_alive = st.worker_alive.load(Ordering::Relaxed);
+    let draining = st.draining.load(Ordering::Relaxed);
+    let queue_depth = st.jobs.max_capacity() - st.jobs.capacity();
+    let ready = worker_alive && !draining;
+    let status = if ready {
+        StatusCode::OK
     } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
         Json(serde_json::json!({
-            "status": "ok",
+            "status": if ready { "ready" } else { "not_ready" },
             "model": &*st.model_id,
+            "worker_alive": worker_alive,
+            "draining": draining,
             "queue_depth": queue_depth,
-        }))
+        })),
+    )
         .into_response()
-    }
 }
 
 /// Prometheus text exposition (behind the same auth as everything else).

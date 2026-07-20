@@ -1,7 +1,7 @@
 //! # tritium-serve — OpenAI-compatible HTTP/SSE inference server.
 //!
 //! Serves Tritium ternary models over the OpenAI `/v1/chat/completions` wire
-//! protocol (non-streaming + SSE), `/v1/models`, and `/healthz`. Because it is
+//! protocol (non-streaming + SSE), `/v1/models`, `/healthz`, and `/readyz`. Because it is
 //! OpenAI-wire-faithful, it is **LAMU-compatible for free**: point a LAMU
 //! `local-llm` OpenAI backend at `http://<host>:<port>/v1` with `model` set to
 //! whatever `GET /v1/models` reports.
