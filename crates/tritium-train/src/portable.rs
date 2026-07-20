@@ -11,6 +11,7 @@ use tritium_spec::{
 };
 
 use crate::{
+    AdamState, AdamW, CautiousAdamW, INT8_ADAM_BLOCK, Int8AdamState, Int8AdamW, Muon, MuonState,
     Optimizer, Sgd,
     ops::{attention, conv1d, conv2d},
 };
@@ -55,6 +56,10 @@ enum CpuOperation {
     Mse,
     SoftmaxCrossEntropy,
     Sgd,
+    AdamW,
+    CautiousAdamW,
+    Int8AdamW,
+    Muon,
 }
 
 #[derive(Clone, Copy)]
@@ -171,6 +176,22 @@ const CPU_OPERATIONS: &[CpuOperationEntry] = &[
     CpuOperationEntry {
         id: "optimizer.sgd",
         operation: CpuOperation::Sgd,
+    },
+    CpuOperationEntry {
+        id: "optimizer.adamw",
+        operation: CpuOperation::AdamW,
+    },
+    CpuOperationEntry {
+        id: "optimizer.cautious_adamw",
+        operation: CpuOperation::CautiousAdamW,
+    },
+    CpuOperationEntry {
+        id: "optimizer.int8_adamw",
+        operation: CpuOperation::Int8AdamW,
+    },
+    CpuOperationEntry {
+        id: "optimizer.muon",
+        operation: CpuOperation::Muon,
     },
 ];
 
@@ -445,6 +466,42 @@ const SGD_STEP: OperationSchema = OperationSchema {
     attributes: &["step", "lr"],
     outputs: &["parameter"],
 };
+const ADAM_STEP: OperationSchema = OperationSchema {
+    inputs: &["parameter", "gradient", "moment1", "moment2"],
+    attributes: &["step", "lr", "beta1", "beta2", "eps", "weight_decay"],
+    outputs: &["parameter", "moment1", "moment2"],
+};
+const INT8_ADAM_STEP: OperationSchema = OperationSchema {
+    inputs: &[
+        "parameter",
+        "gradient",
+        "moment1_q8",
+        "moment2_q8",
+        "moment1_scale",
+        "moment2_scale",
+    ],
+    attributes: ADAM_STEP.attributes,
+    outputs: &[
+        "parameter",
+        "moment1_q8",
+        "moment2_q8",
+        "moment1_scale",
+        "moment2_scale",
+    ],
+};
+const MUON_STEP: OperationSchema = OperationSchema {
+    inputs: &["parameter", "gradient", "momentum"],
+    attributes: &[
+        "step",
+        "lr",
+        "momentum",
+        "weight_decay",
+        "rows",
+        "cols",
+        "ns_steps",
+    ],
+    outputs: &["parameter", "momentum"],
+};
 
 /// Honest partial CPU reference adapter for `TrainBackendV1`.
 ///
@@ -471,7 +528,7 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
                 .iter()
                 .map(|operation| operation.id.to_owned())
                 .collect(),
-            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::U32],
+            dtypes: vec![TrainDTypeV1::F32, TrainDTypeV1::U32, TrainDTypeV1::Bytes],
             limits: CPU_LIMITS,
             device_resident: true,
         }
@@ -509,6 +566,15 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
             }
             (CpuOperation::Attention, TrainExecutionV1::Vjp) => {
                 require_contract(&request, output, &ATTENTION_VJP)?;
+            }
+            (CpuOperation::AdamW | CpuOperation::CautiousAdamW, TrainExecutionV1::Step) => {
+                require_contract(&request, output, &ADAM_STEP)?;
+            }
+            (CpuOperation::Int8AdamW, TrainExecutionV1::Step) => {
+                require_contract(&request, output, &INT8_ADAM_STEP)?;
+            }
+            (CpuOperation::Muon, TrainExecutionV1::Step) => {
+                require_contract(&request, output, &MUON_STEP)?;
             }
             _ => {}
         }
@@ -640,6 +706,14 @@ impl TrainBackendV1 for CpuTrainBackendV1 {
                 softmax_xent_vjp(&request, output)?;
             }
             (CpuOperation::Sgd, TrainExecutionV1::Step) => sgd_step(&request, output)?,
+            (CpuOperation::AdamW, TrainExecutionV1::Step) => adamw_step(&request, output)?,
+            (CpuOperation::CautiousAdamW, TrainExecutionV1::Step) => {
+                cautious_adamw_step(&request, output)?;
+            }
+            (CpuOperation::Int8AdamW, TrainExecutionV1::Step) => {
+                int8_adamw_step(&request, output)?;
+            }
+            (CpuOperation::Muon, TrainExecutionV1::Step) => muon_step(&request, output)?,
             _ => {
                 return Err(TrainBackendError::Backend {
                     code: "dispatch_invariant".to_owned(),
@@ -2269,6 +2343,159 @@ fn sgd_step(
     Ok(())
 }
 
+fn adamw_step(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    let (step, optimizer) = adam_optimizer_attributes(request)?;
+    adam_family_step(request, output, step, optimizer, false)
+}
+
+fn cautious_adamw_step(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    let (step, optimizer) = adam_optimizer_attributes(request)?;
+    adam_family_step(request, output, step, optimizer, true)
+}
+
+fn adam_family_step(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+    step: u64,
+    optimizer: AdamW,
+    cautious: bool,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &ADAM_STEP)?;
+    let (parameter_shape, parameter) = input_f32(request, "parameter")?;
+    let (gradient_shape, gradient) = input_f32(request, "gradient")?;
+    let (moment1_shape, moment1) = input_f32(request, "moment1")?;
+    let (moment2_shape, moment2) = input_f32(request, "moment2")?;
+    if parameter.is_empty()
+        || gradient_shape != parameter_shape
+        || moment1_shape != parameter_shape
+        || moment2_shape != parameter_shape
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("parameter", parameter)?;
+    reject_nonfinite("gradient", gradient)?;
+    reject_nonfinite("moment1", moment1)?;
+    reject_nonfinite("moment2", moment2)?;
+    require_f32_output(output, "parameter", parameter_shape)?;
+    require_f32_output(output, "moment1", parameter_shape)?;
+    require_f32_output(output, "moment2", parameter_shape)?;
+
+    let mut state = AdamState {
+        m: moment1.to_vec(),
+        v: moment2.to_vec(),
+    };
+    let updated = output_f32(output, "parameter")?;
+    updated.copy_from_slice(parameter);
+    if cautious {
+        CautiousAdamW(optimizer).step(step, updated, gradient, &mut state);
+    } else {
+        optimizer.step(step, updated, gradient, &mut state);
+    }
+    output_f32(output, "moment1")?.copy_from_slice(&state.m);
+    output_f32(output, "moment2")?.copy_from_slice(&state.v);
+    Ok(())
+}
+
+fn int8_adamw_step(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &INT8_ADAM_STEP)?;
+    let (step, optimizer) = adam_optimizer_attributes(request)?;
+    let (parameter_shape, parameter) = input_f32(request, "parameter")?;
+    let (gradient_shape, gradient) = input_f32(request, "gradient")?;
+    let (moment1_shape, moment1_q8) = input_bytes(request, "moment1_q8")?;
+    let (moment2_shape, moment2_q8) = input_bytes(request, "moment2_q8")?;
+    let (moment1_scale_shape, moment1_scale) = input_f32(request, "moment1_scale")?;
+    let (moment2_scale_shape, moment2_scale) = input_f32(request, "moment2_scale")?;
+    let len = parameter.len();
+    let len_u64 = u64::try_from(len).map_err(|_| attribute_value("parameter", "u64"))?;
+    let blocks = len.div_ceil(INT8_ADAM_BLOCK);
+    let blocks_u64 = u64::try_from(blocks).map_err(|_| attribute_value("parameter", "blocks"))?;
+    if len == 0
+        || gradient_shape != parameter_shape
+        || moment1_shape != [len_u64]
+        || moment2_shape != [len_u64]
+        || moment1_scale_shape != [blocks_u64]
+        || moment2_scale_shape != [blocks_u64]
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("parameter", parameter)?;
+    reject_nonfinite("gradient", gradient)?;
+    reject_nonfinite("moment1_scale", moment1_scale)?;
+    reject_nonfinite("moment2_scale", moment2_scale)?;
+    if moment1_scale.iter().any(|&value| value < 0.0) {
+        return Err(attribute_value("moment1_scale", "nonnegative"));
+    }
+    if moment2_scale.iter().any(|&value| value < 0.0) {
+        return Err(attribute_value("moment2_scale", "nonnegative"));
+    }
+    require_f32_output(output, "parameter", parameter_shape)?;
+    require_bytes_output(output, "moment1_q8", &[len_u64])?;
+    require_bytes_output(output, "moment2_q8", &[len_u64])?;
+    require_f32_output(output, "moment1_scale", &[blocks_u64])?;
+    require_f32_output(output, "moment2_scale", &[blocks_u64])?;
+
+    let mut state = Int8AdamState {
+        m_q: moment1_q8.iter().map(|&value| value as i8).collect(),
+        v_q: moment2_q8.to_vec(),
+        m_scale: moment1_scale.to_vec(),
+        v_scale: moment2_scale.to_vec(),
+        len,
+    };
+    let updated = output_f32(output, "parameter")?;
+    updated.copy_from_slice(parameter);
+    Int8AdamW(optimizer).step(step, updated, gradient, &mut state);
+    for (output, &value) in output_bytes(output, "moment1_q8")?
+        .iter_mut()
+        .zip(&state.m_q)
+    {
+        *output = value as u8;
+    }
+    output_bytes(output, "moment2_q8")?.copy_from_slice(&state.v_q);
+    output_f32(output, "moment1_scale")?.copy_from_slice(&state.m_scale);
+    output_f32(output, "moment2_scale")?.copy_from_slice(&state.v_scale);
+    Ok(())
+}
+
+fn muon_step(
+    request: &TrainRequestV1<'_>,
+    output: &mut TrainOutputV1<'_>,
+) -> Result<(), TrainBackendError> {
+    require_contract(request, output, &MUON_STEP)?;
+    let (step, optimizer) = muon_optimizer_attributes(request)?;
+    let (parameter_shape, parameter) = input_f32(request, "parameter")?;
+    let (gradient_shape, gradient) = input_f32(request, "gradient")?;
+    let (momentum_shape, momentum) = input_f32(request, "momentum")?;
+    let expected_shape = [optimizer.rows as u64, optimizer.cols as u64];
+    if parameter_shape != expected_shape
+        || gradient_shape != expected_shape
+        || momentum_shape != expected_shape
+    {
+        return Err(shape_error());
+    }
+    reject_nonfinite("parameter", parameter)?;
+    reject_nonfinite("gradient", gradient)?;
+    reject_nonfinite("momentum", momentum)?;
+    require_f32_output(output, "parameter", &expected_shape)?;
+    require_f32_output(output, "momentum", &expected_shape)?;
+    let mut state = MuonState {
+        momentum: momentum.to_vec(),
+    };
+    let updated = output_f32(output, "parameter")?;
+    updated.copy_from_slice(parameter);
+    optimizer.step(step, updated, gradient, &mut state);
+    output_f32(output, "momentum")?.copy_from_slice(&state.momentum);
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum FsqBoundKind {
     Clamp,
@@ -2474,6 +2701,21 @@ fn input_u32<'a>(
     }
 }
 
+fn input_bytes<'a>(
+    request: &TrainRequestV1<'a>,
+    name: &str,
+) -> Result<(&'a [u64], &'a [u8]), TrainBackendError> {
+    let buffer = request
+        .inputs
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or_else(|| role_error("input"))?;
+    match buffer.data {
+        TrainBufferDataRefV1::Bytes(data) => Ok((buffer.shape, data)),
+        data => Err(dtype_error(name, TrainDTypeV1::Bytes, ref_dtype(data))),
+    }
+}
+
 fn output_f32<'a>(
     output: &'a mut TrainOutputV1<'_>,
     name: &str,
@@ -2486,6 +2728,21 @@ fn output_f32<'a>(
     match &mut buffer.data {
         TrainBufferDataMutV1::F32(data) => Ok(data),
         data => Err(dtype_error(name, TrainDTypeV1::F32, mut_dtype(data))),
+    }
+}
+
+fn output_bytes<'a>(
+    output: &'a mut TrainOutputV1<'_>,
+    name: &str,
+) -> Result<&'a mut [u8], TrainBackendError> {
+    let buffer = output
+        .buffers
+        .iter_mut()
+        .find(|buffer| buffer.name == name)
+        .ok_or_else(|| role_error("output"))?;
+    match &mut buffer.data {
+        TrainBufferDataMutV1::Bytes(data) => Ok(data),
+        data => Err(dtype_error(name, TrainDTypeV1::Bytes, mut_dtype(data))),
     }
 }
 
@@ -2512,6 +2769,29 @@ fn require_f32_output(
     Ok(())
 }
 
+fn require_bytes_output(
+    output: &TrainOutputV1<'_>,
+    name: &str,
+    shape: &[u64],
+) -> Result<(), TrainBackendError> {
+    let buffer = output
+        .buffers
+        .iter()
+        .find(|buffer| buffer.name == name)
+        .ok_or_else(|| role_error("output"))?;
+    if buffer.shape != shape {
+        return Err(shape_error());
+    }
+    if !matches!(&buffer.data, TrainBufferDataMutV1::Bytes(_)) {
+        return Err(dtype_error(
+            buffer.name,
+            TrainDTypeV1::Bytes,
+            mut_dtype(&buffer.data),
+        ));
+    }
+    Ok(())
+}
+
 fn matrix_attributes(
     request: &TrainRequestV1<'_>,
 ) -> Result<(u64, u64, usize, usize), TrainBackendError> {
@@ -2523,6 +2803,78 @@ fn matrix_attributes(
         .checked_mul(cols_usize)
         .ok_or_else(|| attribute_value("rows", "rows_times_cols"))?;
     Ok((rows, cols, rows_usize, cols_usize))
+}
+
+fn adam_optimizer_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<(u64, AdamW), TrainBackendError> {
+    let step = attribute_u64(request, "step")?;
+    let optimizer = AdamW {
+        lr: attribute_f32(request, "lr")?,
+        beta1: attribute_f32(request, "beta1")?,
+        beta2: attribute_f32(request, "beta2")?,
+        eps: attribute_f32(request, "eps")?,
+        weight_decay: attribute_f32(request, "weight_decay")?,
+    };
+    if step == 0 {
+        return Err(attribute_value("step", "one_based"));
+    }
+    if optimizer.lr < 0.0 {
+        return Err(attribute_value("lr", "nonnegative"));
+    }
+    if !(0.0..1.0).contains(&optimizer.beta1) {
+        return Err(attribute_value("beta1", "unit_interval_open"));
+    }
+    if !(0.0..1.0).contains(&optimizer.beta2) {
+        return Err(attribute_value("beta2", "unit_interval_open"));
+    }
+    if optimizer.eps <= 0.0 {
+        return Err(attribute_value("eps", "positive"));
+    }
+    if optimizer.weight_decay < 0.0 {
+        return Err(attribute_value("weight_decay", "nonnegative"));
+    }
+    Ok((step, optimizer))
+}
+
+fn muon_optimizer_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<(u64, Muon), TrainBackendError> {
+    let step = attribute_u64(request, "step")?;
+    let optimizer = Muon {
+        lr: attribute_f32(request, "lr")?,
+        momentum: attribute_f32(request, "momentum")?,
+        weight_decay: attribute_f32(request, "weight_decay")?,
+        rows: portable_usize_attribute(request, "rows")?,
+        cols: portable_usize_attribute(request, "cols")?,
+        ns_steps: portable_usize_attribute(request, "ns_steps")?,
+    };
+    if step == 0 {
+        return Err(attribute_value("step", "one_based"));
+    }
+    if optimizer.lr < 0.0 {
+        return Err(attribute_value("lr", "nonnegative"));
+    }
+    if !(0.0..1.0).contains(&optimizer.momentum) {
+        return Err(attribute_value("momentum", "unit_interval_open"));
+    }
+    if optimizer.weight_decay < 0.0 {
+        return Err(attribute_value("weight_decay", "nonnegative"));
+    }
+    if optimizer.rows == 0 {
+        return Err(attribute_value("rows", "positive"));
+    }
+    if optimizer.cols == 0 {
+        return Err(attribute_value("cols", "positive"));
+    }
+    if optimizer.ns_steps == 0 {
+        return Err(attribute_value("ns_steps", "positive"));
+    }
+    if optimizer.ns_steps > 32 {
+        return Err(attribute_value("ns_steps", "max_32"));
+    }
+    bounded_product(&[optimizer.rows, optimizer.cols], "rows")?;
+    Ok((step, optimizer))
 }
 
 fn matmul_attributes(
@@ -2586,15 +2938,15 @@ fn checked_output_axis(
 }
 
 fn bounded_product(values: &[usize], name: &str) -> Result<usize, TrainBackendError> {
-    let product = values.iter().try_fold(1_usize, |total, &value| {
+    let product = values.iter().try_fold(1_u64, |total, &value| {
         total
-            .checked_mul(value)
+            .checked_mul(value as u64)
             .ok_or_else(|| attribute_value(name, "arithmetic"))
     })?;
-    if product > u32::MAX as usize {
+    if product > u32::MAX as u64 {
         return Err(attribute_value(name, "max_elements"));
     }
-    Ok(product)
+    Ok(product as usize)
 }
 
 fn conv1d_attributes(
@@ -2894,6 +3246,39 @@ fn operation_scratch_bytes(
                 TrainExecutionV1::Vjp => checked_scratch_sum(&[query, kv, kv, scores, scores])?,
                 _ => 0,
             }
+        }
+        (CpuOperation::AdamW, TrainExecutionV1::Step) => {
+            adam_optimizer_attributes(request)?;
+            let (_, parameter) = input_f32(request, "parameter")?;
+            checked_scratch_product(&[parameter.len() as u64, 2])?
+        }
+        (CpuOperation::CautiousAdamW, TrainExecutionV1::Step) => {
+            adam_optimizer_attributes(request)?;
+            let (_, parameter) = input_f32(request, "parameter")?;
+            checked_scratch_product(&[parameter.len() as u64, 3])?
+        }
+        (CpuOperation::Int8AdamW, TrainExecutionV1::Step) => {
+            adam_optimizer_attributes(request)?;
+            let (_, parameter) = input_f32(request, "parameter")?;
+            let len = parameter.len() as u64;
+            let blocks = parameter.len().div_ceil(INT8_ADAM_BLOCK) as u64;
+            let state_bytes = checked_scratch_sum(&[
+                checked_scratch_product(&[len, 2])?,
+                checked_scratch_product(&[blocks, 8])?,
+            ])?;
+            let block_elements = parameter.len().min(INT8_ADAM_BLOCK) as u64;
+            let block_bytes = checked_scratch_product(&[block_elements, 2, 4])?;
+            return checked_scratch_sum(&[state_bytes, block_bytes]);
+        }
+        (CpuOperation::Muon, TrainExecutionV1::Step) => {
+            let (_, optimizer) = muon_optimizer_attributes(request)?;
+            let matrix = checked_scratch_product(&[optimizer.rows as u64, optimizer.cols as u64])?;
+            let gram_axis = optimizer.rows.min(optimizer.cols) as u64;
+            let gram = checked_scratch_product(&[gram_axis, gram_axis])?;
+            checked_scratch_sum(&[
+                checked_scratch_product(&[matrix, 4])?,
+                checked_scratch_product(&[gram, 3])?,
+            ])?
         }
         _ => 0,
     };

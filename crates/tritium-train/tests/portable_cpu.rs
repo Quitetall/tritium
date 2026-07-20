@@ -12,7 +12,10 @@ use tritium_train::CpuTrainBackendV1;
 fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
     let backend = CpuTrainBackendV1::new();
     let capabilities = backend.capabilities();
-    assert_eq!(capabilities.dtypes, [TrainDTypeV1::F32, TrainDTypeV1::U32]);
+    assert_eq!(
+        capabilities.dtypes,
+        [TrainDTypeV1::F32, TrainDTypeV1::U32, TrainDTypeV1::Bytes]
+    );
     assert_eq!(
         capabilities.supported_operations,
         [
@@ -43,6 +46,10 @@ fn cpu_add_forward_and_vjp_match_literal_vectors_and_emit_receipts() {
             "loss.mse",
             "loss.softmax_cross_entropy",
             "optimizer.sgd",
+            "optimizer.adamw",
+            "optimizer.cautious_adamw",
+            "optimizer.int8_adamw",
+            "optimizer.muon",
         ]
     );
     assert_eq!(capabilities.manifest_digest, TrainingOpManifestV1::digest());
@@ -181,7 +188,12 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
         &[1],
         TrainBufferDataRefV1::F32(&input),
     )];
-    let request = TrainRequestV1::new("optimizer.adamw", TrainExecutionV1::Step, &inputs, &[]);
+    let request = TrainRequestV1::new(
+        "lifecycle.checkpoint",
+        TrainExecutionV1::Checkpoint,
+        &inputs,
+        &[],
+    );
     let mut sentinel = [123.0_f32];
     let mut buffers = [TrainNamedBufferMutV1::new(
         "result",
@@ -191,7 +203,7 @@ fn cpu_adapter_rejects_unsupported_or_malformed_requests_before_mutation() {
     let mut output = TrainOutputV1::new(&mut buffers);
     assert!(matches!(
         backend.execute(request, &mut output),
-        Err(TrainBackendError::UnsupportedOperation(operation)) if operation == "optimizer.adamw"
+        Err(TrainBackendError::UnsupportedOperation(operation)) if operation == "lifecycle.checkpoint"
     ));
     assert_eq!(sentinel, [123.0]);
 

@@ -11,7 +11,7 @@ use std::path::Path;
 use serde::Serialize;
 use tritium_spec::{TrainingOpManifestV1, TrainingVectorSetV1};
 use tritium_train::{
-    Optimizer, Sgd,
+    AdamW, CautiousAdamW, Int8AdamW, Muon, Optimizer, Sgd,
     ops::{
         act, attention, bias, conv1d, conv2d, dense, elementwise, embed,
         fsq::{self, FsqBound, FsqCfg, FsqSte},
@@ -60,6 +60,7 @@ struct Buffer {
 enum Data {
     F32 { bits: Vec<u32> },
     U32 { values: Vec<u32> },
+    Bytes { values: Vec<u8> },
 }
 
 #[derive(Serialize)]
@@ -120,6 +121,16 @@ fn u32_buffer(name: &'static str, shape: &[u64], values: &[u32]) -> Buffer {
         name,
         shape: shape.to_vec(),
         data: Data::U32 {
+            values: values.to_vec(),
+        },
+    }
+}
+
+fn bytes_buffer(name: &'static str, shape: &[u64], values: &[u8]) -> Buffer {
+    Buffer {
+        name,
+        shape: shape.to_vec(),
+        data: Data::Bytes {
             values: values.to_vec(),
         },
     }
@@ -360,6 +371,44 @@ fn main() {
         attention_cfg,
         &attention_grad_output,
     );
+    let attention_noncausal_grads = attention::vjp(
+        &attention_q,
+        &attention_k,
+        &attention_v,
+        attention_noncausal_cfg,
+        &attention_grad_output,
+    );
+    let attention_gqa_cfg = attention::AttentionCfg {
+        seq: 2,
+        n_head: 4,
+        n_kv_head: 2,
+        head_dim: 1,
+        causal: true,
+    };
+    let attention_gqa_q = [0.2_f32, -0.4, 0.7, 0.1, -0.3, 0.8, -0.6, 0.5];
+    let attention_gqa_k = [0.5_f32, -0.25, -0.75, 0.9];
+    let attention_gqa_v = [1.0_f32, 10.0, -2.0, 20.0];
+    let attention_gqa_grad_output = [0.25_f32, -0.5, 0.75, -1.0, 1.25, -1.5, 1.75, -2.0];
+    let attention_gqa_result = attention::forward(
+        &attention_gqa_q,
+        &attention_gqa_k,
+        &attention_gqa_v,
+        attention_gqa_cfg,
+    );
+    let attention_gqa_grads = attention::vjp(
+        &attention_gqa_q,
+        &attention_gqa_k,
+        &attention_gqa_v,
+        attention_gqa_cfg,
+        &attention_gqa_grad_output,
+    );
+    let attention_product_limit_cfg = attention::AttentionCfg {
+        seq: 65_536,
+        n_head: 1,
+        n_kv_head: 1,
+        head_dim: 1,
+        causal: true,
+    };
 
     let mul_left = [2.0_f32, -3.0, 0.0];
     let mul_right = [-4.0_f32, 0.5, 7.0];
@@ -472,6 +521,89 @@ fn main() {
     let mut updated = parameter;
     let mut state = optimizer.init_state(updated.len());
     optimizer.step(1, &mut updated, &gradient, &mut state);
+
+    let adam_config = AdamW {
+        lr: 0.01,
+        beta1: 0.8,
+        beta2: 0.95,
+        eps: 1.0e-6,
+        weight_decay: 0.02,
+    };
+    let adam_invalid_beta1 = AdamW {
+        beta1: 1.0,
+        ..adam_config
+    };
+    let adam_seed_parameter = [1.0_f32, -2.0, 0.5, -0.25];
+    let adam_seed_gradient = [0.4_f32, -0.2, 0.0, 0.75];
+    let adam_gradient = [-0.1_f32, -0.2, 0.3, 0.0];
+    let mut adam_parameter = adam_seed_parameter;
+    let mut adam_state = adam_config.init_state(adam_parameter.len());
+    adam_config.step(1, &mut adam_parameter, &adam_seed_gradient, &mut adam_state);
+    let adam_input_state = adam_state.clone();
+    let mut adam_updated = adam_parameter;
+    adam_config.step(2, &mut adam_updated, &adam_gradient, &mut adam_state);
+
+    let cautious_config = CautiousAdamW(adam_config);
+    let mut cautious_parameter = adam_seed_parameter;
+    let mut cautious_state = cautious_config.init_state(cautious_parameter.len());
+    cautious_config.step(
+        1,
+        &mut cautious_parameter,
+        &adam_seed_gradient,
+        &mut cautious_state,
+    );
+    let cautious_input_state = cautious_state.clone();
+    let cautious_gradient = [-0.8_f32, -0.1, -0.4, 0.25];
+    let mut cautious_updated = cautious_parameter;
+    cautious_config.step(
+        2,
+        &mut cautious_updated,
+        &cautious_gradient,
+        &mut cautious_state,
+    );
+
+    let int8_config = Int8AdamW(adam_config);
+    let mut int8_parameter = vec![0.0_f32; 260];
+    let mut int8_seed_gradient = vec![0.0_f32; 260];
+    int8_seed_gradient[0] = 8.0;
+    int8_seed_gradient[1] = -0.25;
+    int8_seed_gradient[255] = 0.5;
+    int8_seed_gradient[256] = 0.001;
+    int8_seed_gradient[259] = -0.002;
+    let mut int8_state = int8_config.init_state(int8_parameter.len());
+    int8_config.step(1, &mut int8_parameter, &int8_seed_gradient, &mut int8_state);
+    let int8_input_state = int8_state.clone();
+    let int8_gradient = vec![0.0_f32; 260];
+    let mut int8_updated = int8_parameter.clone();
+    int8_config.step(2, &mut int8_updated, &int8_gradient, &mut int8_state);
+    let int8_input_m_q: Vec<u8> = int8_input_state
+        .m_q
+        .iter()
+        .map(|&value| value as u8)
+        .collect();
+    let int8_output_m_q: Vec<u8> = int8_state.m_q.iter().map(|&value| value as u8).collect();
+
+    let muon_config = Muon {
+        lr: 0.02,
+        momentum: 0.9,
+        weight_decay: 0.01,
+        rows: 2,
+        cols: 3,
+        ns_steps: 3,
+    };
+    let muon_zero_steps = Muon {
+        ns_steps: 0,
+        ..muon_config
+    };
+    let muon_seed_parameter = [0.5_f32, -0.25, 1.0, -1.0, 0.75, 0.125];
+    let muon_seed_gradient = [0.2_f32, -0.4, 0.1, 0.3, -0.2, 0.5];
+    let muon_gradient = [-0.1_f32, 0.25, 0.0, -0.2, 0.4, -0.3];
+    let mut muon_parameter = muon_seed_parameter;
+    let mut muon_state = muon_config.init_state(muon_parameter.len());
+    muon_config.step(1, &mut muon_parameter, &muon_seed_gradient, &mut muon_state);
+    let muon_input_momentum = muon_state.momentum.clone();
+    let mut muon_updated = muon_parameter;
+    muon_config.step(2, &mut muon_updated, &muon_gradient, &mut muon_state);
 
     let corpus = Corpus {
         schema_id: TrainingVectorSetV1::SCHEMA_ID,
@@ -1742,6 +1874,73 @@ fn main() {
                 },
             },
             Case {
+                case_id: "graph.attention.vjp.noncausal_mqa",
+                operation: "graph.attention",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("q", &[3, 2, 2], &attention_q),
+                    f32_buffer("k", &[3, 1, 2], &attention_k),
+                    f32_buffer("v", &[3, 1, 2], &attention_v),
+                    f32_buffer("grad_output", &[3, 2, 2], &attention_grad_output),
+                ],
+                attributes: attention_attributes(&attention_noncausal_cfg),
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_q", &[3, 2, 2], &attention_noncausal_grads[0]),
+                        f32_buffer("grad_k", &[3, 1, 2], &attention_noncausal_grads[1]),
+                        f32_buffer("grad_v", &[3, 1, 2], &attention_noncausal_grads[2]),
+                    ],
+                    scratch_bytes_max: 168,
+                },
+            },
+            Case {
+                case_id: "graph.attention.forward.multigroup_gqa",
+                operation: "graph.attention",
+                execution: "forward",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-6_f32.to_bits(),
+                    relative_bits: 1.0e-6_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("q", &[2, 4, 1], &attention_gqa_q),
+                    f32_buffer("k", &[2, 2, 1], &attention_gqa_k),
+                    f32_buffer("v", &[2, 2, 1], &attention_gqa_v),
+                ],
+                attributes: attention_attributes(&attention_gqa_cfg),
+                expected: Expected::Success {
+                    outputs: vec![f32_buffer("result", &[2, 4, 1], &attention_gqa_result)],
+                    scratch_bytes_max: 48,
+                },
+            },
+            Case {
+                case_id: "graph.attention.vjp.multigroup_gqa",
+                operation: "graph.attention",
+                execution: "vjp",
+                tolerance: Tolerance::AbsoluteRelative {
+                    absolute_bits: 1.0e-5_f32.to_bits(),
+                    relative_bits: 1.0e-5_f32.to_bits(),
+                },
+                inputs: vec![
+                    f32_buffer("q", &[2, 4, 1], &attention_gqa_q),
+                    f32_buffer("k", &[2, 2, 1], &attention_gqa_k),
+                    f32_buffer("v", &[2, 2, 1], &attention_gqa_v),
+                    f32_buffer("grad_output", &[2, 4, 1], &attention_gqa_grad_output),
+                ],
+                attributes: attention_attributes(&attention_gqa_cfg),
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("grad_q", &[2, 4, 1], &attention_gqa_grads[0]),
+                        f32_buffer("grad_k", &[2, 2, 1], &attention_gqa_grads[1]),
+                        f32_buffer("grad_v", &[2, 2, 1], &attention_gqa_grads[2]),
+                    ],
+                    scratch_bytes_max: 96,
+                },
+            },
+            Case {
                 case_id: "loss.mse.forward.basic",
                 operation: "loss.mse",
                 execution: "forward",
@@ -1855,6 +2054,92 @@ fn main() {
                 expected: Expected::Success {
                     outputs: vec![f32_buffer("parameter", &[2], &updated)],
                     scratch_bytes_max: 0,
+                },
+            },
+            Case {
+                case_id: "optimizer.adamw.step.resumed_state",
+                operation: "optimizer.adamw",
+                execution: "step",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter", &[4], &adam_parameter),
+                    f32_buffer("gradient", &[4], &adam_gradient),
+                    f32_buffer("moment1", &[4], &adam_input_state.m),
+                    f32_buffer("moment2", &[4], &adam_input_state.v),
+                ],
+                attributes: adam_attributes(2, &adam_config),
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("parameter", &[4], &adam_updated),
+                        f32_buffer("moment1", &[4], &adam_state.m),
+                        f32_buffer("moment2", &[4], &adam_state.v),
+                    ],
+                    scratch_bytes_max: 32,
+                },
+            },
+            Case {
+                case_id: "optimizer.cautious_adamw.step.masked_state",
+                operation: "optimizer.cautious_adamw",
+                execution: "step",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter", &[4], &cautious_parameter),
+                    f32_buffer("gradient", &[4], &cautious_gradient),
+                    f32_buffer("moment1", &[4], &cautious_input_state.m),
+                    f32_buffer("moment2", &[4], &cautious_input_state.v),
+                ],
+                attributes: adam_attributes(2, &adam_config),
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("parameter", &[4], &cautious_updated),
+                        f32_buffer("moment1", &[4], &cautious_state.m),
+                        f32_buffer("moment2", &[4], &cautious_state.v),
+                    ],
+                    scratch_bytes_max: 48,
+                },
+            },
+            Case {
+                case_id: "optimizer.int8_adamw.step.quiet_spike_blocks",
+                operation: "optimizer.int8_adamw",
+                execution: "step",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter", &[260], &int8_parameter),
+                    f32_buffer("gradient", &[260], &int8_gradient),
+                    bytes_buffer("moment1_q8", &[260], &int8_input_m_q),
+                    bytes_buffer("moment2_q8", &[260], &int8_input_state.v_q),
+                    f32_buffer("moment1_scale", &[2], &int8_input_state.m_scale),
+                    f32_buffer("moment2_scale", &[2], &int8_input_state.v_scale),
+                ],
+                attributes: adam_attributes(2, &adam_config),
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("parameter", &[260], &int8_updated),
+                        bytes_buffer("moment1_q8", &[260], &int8_output_m_q),
+                        bytes_buffer("moment2_q8", &[260], &int8_state.v_q),
+                        f32_buffer("moment1_scale", &[2], &int8_state.m_scale),
+                        f32_buffer("moment2_scale", &[2], &int8_state.v_scale),
+                    ],
+                    scratch_bytes_max: 2584,
+                },
+            },
+            Case {
+                case_id: "optimizer.muon.step.resumed_rectangular",
+                operation: "optimizer.muon",
+                execution: "step",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter", &[2, 3], &muon_parameter),
+                    f32_buffer("gradient", &[2, 3], &muon_gradient),
+                    f32_buffer("momentum", &[2, 3], &muon_input_momentum),
+                ],
+                attributes: muon_attributes(2, &muon_config),
+                expected: Expected::Success {
+                    outputs: vec![
+                        f32_buffer("parameter", &[2, 3], &muon_updated),
+                        f32_buffer("momentum", &[2, 3], &muon_state.momentum),
+                    ],
+                    scratch_bytes_max: 144,
                 },
             },
             Case {
@@ -2625,6 +2910,96 @@ fn main() {
                 },
             },
             Case {
+                case_id: "optimizer.adamw.step.zero_step",
+                operation: "optimizer.adamw",
+                execution: "step",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter", &[2], &parameter),
+                    f32_buffer("gradient", &[2], &gradient),
+                    f32_buffer("moment1", &[2], &[0.0; 2]),
+                    f32_buffer("moment2", &[2], &[0.0; 2]),
+                ],
+                attributes: adam_attributes(0, &adam_config),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.step.one_based",
+                    outputs: vec![
+                        f32_buffer("parameter", &[2], &[123.0; 2]),
+                        f32_buffer("moment1", &[2], &[234.0; 2]),
+                        f32_buffer("moment2", &[2], &[345.0; 2]),
+                    ],
+                },
+            },
+            Case {
+                case_id: "optimizer.cautious_adamw.step.invalid_beta1",
+                operation: "optimizer.cautious_adamw",
+                execution: "step",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter", &[2], &parameter),
+                    f32_buffer("gradient", &[2], &gradient),
+                    f32_buffer("moment1", &[2], &[0.0; 2]),
+                    f32_buffer("moment2", &[2], &[0.0; 2]),
+                ],
+                attributes: adam_attributes(1, &adam_invalid_beta1),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.beta1.unit_interval_open",
+                    outputs: vec![
+                        f32_buffer("parameter", &[2], &[123.0; 2]),
+                        f32_buffer("moment1", &[2], &[234.0; 2]),
+                        f32_buffer("moment2", &[2], &[345.0; 2]),
+                    ],
+                },
+            },
+            Case {
+                case_id: "optimizer.int8_adamw.step.scale_shape",
+                operation: "optimizer.int8_adamw",
+                execution: "step",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter", &[2], &parameter),
+                    f32_buffer("gradient", &[2], &gradient),
+                    bytes_buffer("moment1_q8", &[2], &[0; 2]),
+                    bytes_buffer("moment2_q8", &[2], &[0; 2]),
+                    f32_buffer("moment1_scale", &[], &[0.0]),
+                    f32_buffer("moment2_scale", &[1], &[0.0]),
+                ],
+                attributes: adam_attributes(1, &adam_config),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "shape",
+                    outputs: vec![
+                        f32_buffer("parameter", &[2], &[123.0; 2]),
+                        bytes_buffer("moment1_q8", &[2], &[123; 2]),
+                        bytes_buffer("moment2_q8", &[2], &[234; 2]),
+                        f32_buffer("moment1_scale", &[1], &[345.0]),
+                        f32_buffer("moment2_scale", &[1], &[456.0]),
+                    ],
+                },
+            },
+            Case {
+                case_id: "optimizer.muon.step.zero_ns_steps",
+                operation: "optimizer.muon",
+                execution: "step",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("parameter", &[2, 3], &muon_parameter),
+                    f32_buffer("gradient", &[2, 3], &muon_gradient),
+                    f32_buffer("momentum", &[2, 3], &muon_input_momentum),
+                ],
+                attributes: muon_attributes(1, &muon_zero_steps),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.ns_steps.positive",
+                    outputs: vec![
+                        f32_buffer("parameter", &[2, 3], &[123.0; 6]),
+                        f32_buffer("momentum", &[2, 3], &[234.0; 6]),
+                    ],
+                },
+            },
+            Case {
                 case_id: "graph.attention.forward.ragged_gqa",
                 operation: "graph.attention",
                 execution: "forward",
@@ -2639,6 +3014,23 @@ fn main() {
                     category: "invalid_operation",
                     code: "attribute_value.n_kv_head.divides_n_head",
                     outputs: vec![f32_buffer("result", &[3, 2, 2], &[123.0; 12])],
+                },
+            },
+            Case {
+                case_id: "graph.attention.forward.product_limit",
+                operation: "graph.attention",
+                execution: "forward",
+                tolerance: Tolerance::BitExact,
+                inputs: vec![
+                    f32_buffer("q", &[1], &[0.5]),
+                    f32_buffer("k", &[1], &[0.25]),
+                    f32_buffer("v", &[1], &[1.0]),
+                ],
+                attributes: attention_attributes(&attention_product_limit_cfg),
+                expected: Expected::Error {
+                    category: "invalid_operation",
+                    code: "attribute_value.seq.max_elements",
+                    outputs: vec![f32_buffer("result", &[], &[123.0])],
                 },
             },
         ],
@@ -2733,6 +3125,68 @@ fn attention_attributes(cfg: &attention::AttentionCfg) -> Vec<Attribute> {
         Attribute::Bool {
             name: "causal",
             value: cfg.causal,
+        },
+    ]
+}
+
+fn adam_attributes(step: u64, config: &AdamW) -> Vec<Attribute> {
+    vec![
+        Attribute::U64 {
+            name: "step",
+            value: step,
+        },
+        Attribute::F32 {
+            name: "lr",
+            bits: config.lr.to_bits(),
+        },
+        Attribute::F32 {
+            name: "beta1",
+            bits: config.beta1.to_bits(),
+        },
+        Attribute::F32 {
+            name: "beta2",
+            bits: config.beta2.to_bits(),
+        },
+        Attribute::F32 {
+            name: "eps",
+            bits: config.eps.to_bits(),
+        },
+        Attribute::F32 {
+            name: "weight_decay",
+            bits: config.weight_decay.to_bits(),
+        },
+    ]
+}
+
+fn muon_attributes(step: u64, config: &Muon) -> Vec<Attribute> {
+    vec![
+        Attribute::U64 {
+            name: "step",
+            value: step,
+        },
+        Attribute::F32 {
+            name: "lr",
+            bits: config.lr.to_bits(),
+        },
+        Attribute::F32 {
+            name: "momentum",
+            bits: config.momentum.to_bits(),
+        },
+        Attribute::F32 {
+            name: "weight_decay",
+            bits: config.weight_decay.to_bits(),
+        },
+        Attribute::U64 {
+            name: "rows",
+            value: config.rows as u64,
+        },
+        Attribute::U64 {
+            name: "cols",
+            value: config.cols as u64,
+        },
+        Attribute::U64 {
+            name: "ns_steps",
+            value: config.ns_steps as u64,
         },
     ]
 }

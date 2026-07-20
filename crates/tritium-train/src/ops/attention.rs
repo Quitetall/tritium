@@ -5,8 +5,6 @@
 //! `K/V:[seq,n_kv_head,head_dim]`, matching the boundary a fused backend kernel
 //! can implement without duplicating model projections.
 
-use super::softmax::MASK_NEG;
-
 /// Geometry for one self-attention operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttentionCfg {
@@ -162,7 +160,7 @@ fn attention_probabilities(
                     * k[vector_index(cfg, key, kv_head, cfg.n_kv_head, lane)];
             }
             probabilities[row + key] = if cfg.causal && key > query {
-                MASK_NEG
+                f32::NEG_INFINITY
             } else {
                 score * scale
             };
@@ -173,7 +171,11 @@ fn attention_probabilities(
             .fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0_f32;
         for key in 0..cfg.seq {
-            let exponential = (probabilities[row + key] - maximum).exp();
+            let exponential = if cfg.causal && key > query {
+                0.0
+            } else {
+                (probabilities[row + key] - maximum).exp()
+            };
             probabilities[row + key] = exponential;
             sum += exponential;
         }
@@ -220,6 +222,19 @@ mod tests {
             [12, 6, 6]
         );
         assert!(gradients.iter().flatten().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn causal_mask_is_exact_when_allowed_score_is_below_mask_sentinel_range() {
+        let cfg = AttentionCfg {
+            seq: 2,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: 1,
+            causal: true,
+        };
+        let output = forward(&[1.0e16, 0.0], &[-1.0e16, 0.0], &[2.0, 100.0], cfg);
+        assert_eq!(output[0], 2.0);
     }
 
     #[test]

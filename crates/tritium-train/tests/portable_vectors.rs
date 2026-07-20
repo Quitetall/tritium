@@ -1,11 +1,11 @@
 //! Canonical plan-0049 vectors replayed through the public CPU backend seam.
 
 use tritium_spec::{
-    train_output_digest_v1, train_request_digest_v1, TrainBackendError, TrainBackendV1,
-    TrainCapabilitiesV1, TrainDTypeV1, TrainOutputV1, TrainReceiptV1, TrainRequestV1,
-    TrainingVectorSetV1,
+    TrainBackendError, TrainBackendV1, TrainCapabilitiesV1, TrainDTypeV1, TrainOutputV1,
+    TrainReceiptV1, TrainRequestV1, TrainingVectorSetV1, train_output_digest_v1,
+    train_request_digest_v1,
 };
-use tritium_testkit::{run_training_conformance, TrainingVectorFailureReason};
+use tritium_testkit::{TrainingVectorFailureReason, run_training_conformance};
 use tritium_train::CpuTrainBackendV1;
 
 #[test]
@@ -13,11 +13,14 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
     let vectors = TrainingVectorSetV1::parse_json(TrainingVectorSetV1::canonical_json()).unwrap();
     let report = run_training_conformance(&CpuTrainBackendV1::new(), &vectors);
     assert!(report.is_ok(), "{:#?}", report.failed);
-    assert_eq!(report.passed.len(), 93);
+    assert_eq!(report.passed.len(), 105);
     let mut receipt_count = 0;
     let mut checked_conv2d_scratch = false;
     let mut checked_attention_forward_scratch = false;
     let mut checked_attention_vjp_scratch = false;
+    let mut checked_int8_adam_scratch = false;
+    let mut checked_muon_scratch = false;
+    let mut checked_optimizer_scratch = [false; 4];
     for passed in report.passed {
         if let Some(receipt) = passed.receipt {
             receipt_count += 1;
@@ -35,12 +38,39 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
                 assert_eq!(receipt.scratch_bytes, 168);
                 checked_attention_vjp_scratch = true;
             }
+            if passed.case_id == "optimizer.int8_adamw.step.quiet_spike_blocks" {
+                assert_eq!(receipt.scratch_bytes, 2584);
+                checked_int8_adam_scratch = true;
+            }
+            if passed.case_id == "optimizer.muon.step.resumed_rectangular" {
+                assert_eq!(receipt.scratch_bytes, 144);
+                checked_muon_scratch = true;
+            }
+            let optimizer_scratch = [
+                ("optimizer.adamw.step.resumed_state", 32),
+                ("optimizer.cautious_adamw.step.masked_state", 48),
+                ("optimizer.int8_adamw.step.quiet_spike_blocks", 2584),
+                ("optimizer.muon.step.resumed_rectangular", 144),
+            ];
+            for (index, &(case_id, scratch_bytes)) in optimizer_scratch.iter().enumerate() {
+                if passed.case_id == case_id {
+                    assert_eq!(receipt.scratch_bytes, scratch_bytes);
+                    checked_optimizer_scratch[index] = true;
+                }
+            }
         }
     }
-    assert_eq!(receipt_count, 59);
+    assert_eq!(receipt_count, 66);
     assert!(checked_conv2d_scratch);
     assert!(checked_attention_forward_scratch);
     assert!(checked_attention_vjp_scratch);
+    assert!(checked_int8_adam_scratch);
+    assert!(checked_muon_scratch);
+    assert!(
+        checked_optimizer_scratch
+            .into_iter()
+            .all(core::convert::identity)
+    );
     assert_eq!(
         CpuTrainBackendV1::new().capabilities().supported_operations,
         [
@@ -71,6 +101,10 @@ fn canonical_tracer_vectors_pass_with_corpus_bound_receipts() {
             "loss.mse",
             "loss.softmax_cross_entropy",
             "optimizer.sgd",
+            "optimizer.adamw",
+            "optimizer.cautious_adamw",
+            "optimizer.int8_adamw",
+            "optimizer.muon",
         ]
     );
 }

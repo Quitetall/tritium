@@ -170,11 +170,18 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.attention.forward.causal_gqa",
             "graph.attention.forward.noncausal_gqa",
             "graph.attention.vjp.causal_gqa",
+            "graph.attention.vjp.noncausal_mqa",
+            "graph.attention.forward.multigroup_gqa",
+            "graph.attention.vjp.multigroup_gqa",
             "loss.mse.forward.basic",
             "loss.mse.vjp.basic",
             "loss.softmax_cross_entropy.forward.basic",
             "loss.softmax_cross_entropy.vjp.basic",
             "optimizer.sgd.step.basic",
+            "optimizer.adamw.step.resumed_state",
+            "optimizer.cautious_adamw.step.masked_state",
+            "optimizer.int8_adamw.step.quiet_spike_blocks",
+            "optimizer.muon.step.resumed_rectangular",
             "graph.add.forward.nonfinite",
             "graph.add.forward.duplicate_input",
             "graph.transpose.forward.shape_error",
@@ -208,12 +215,17 @@ fn canonical_partial_tracer_corpus_has_frozen_seed_order() {
             "graph.conv1d.forward.scratch_limit",
             "graph.conv2d.forward.zero_groups",
             "graph.conv2d.forward.oversized_kernel",
+            "optimizer.adamw.step.zero_step",
+            "optimizer.cautious_adamw.step.invalid_beta1",
+            "optimizer.int8_adamw.step.scale_shape",
+            "optimizer.muon.step.zero_ns_steps",
             "graph.attention.forward.ragged_gqa",
+            "graph.attention.forward.product_limit",
         ]
     );
     assert_eq!(vectors.source_digest(), TrainingVectorSetV1::digest());
     assert_eq!(
         hex(&TrainingVectorSetV1::digest()),
-        "ae3e3fa0b5a08a6db8da1b4f2e7b0148437392ce6379be17dc18e1acc164061c"
+        "a5d90a5fcdb9c545fd12a87f07af36659c7a159bed2dae96337f19329f48d836"
     );
 }
