@@ -142,6 +142,27 @@ pub(crate) struct ConvOutput {
     pub(crate) grad_scale: Vec<f32>,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+/// Validated grouped-query attention geometry for one native dispatch.
+pub(crate) struct AttentionParams {
+    pub(crate) seq: u32,
+    pub(crate) n_head: u32,
+    pub(crate) n_kv_head: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) causal: u32,
+    pub(crate) execution: u32,
+    pub(crate) padding_0: u32,
+    pub(crate) padding_1: u32,
+}
+
+/// Host-visible grouped-query attention outputs.
+pub(crate) struct AttentionOutput {
+    pub(crate) result_or_grad_q: Vec<f32>,
+    pub(crate) grad_k: Vec<f32>,
+    pub(crate) grad_v: Vec<f32>,
+}
+
 impl FsqParams {
     /// Build packed FSQ shader parameters after adapter validation.
     pub(crate) fn new(
@@ -328,6 +349,10 @@ pub struct WgpuBackend {
     rope_bind_group_layout: wgpu::BindGroupLayout,
     softmax_xent_pipeline: wgpu::ComputePipeline,
     softmax_xent_bind_group_layout: wgpu::BindGroupLayout,
+    conv_pipeline: wgpu::ComputePipeline,
+    conv_bind_group_layout: wgpu::BindGroupLayout,
+    attention_pipeline: wgpu::ComputePipeline,
+    attention_bind_group_layout: wgpu::BindGroupLayout,
     device_name: String,
 }
 
@@ -818,6 +843,71 @@ impl WgpuBackend {
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 });
+            let conv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-conv"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("conv.wgsl").into()),
+            });
+            let conv_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-conv-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, ro),
+                        entry(5, rw),
+                        entry(6, rw),
+                        entry(7, rw),
+                    ],
+                });
+            let conv_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-conv-pl"),
+                bind_group_layouts: &[&conv_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let conv_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("portable-conv-pipe"),
+                layout: Some(&conv_layout),
+                module: &conv_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+            let attention_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("portable-attention"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("attention.wgsl").into()),
+            });
+            let attention_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("portable-attention-bgl"),
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, ro),
+                        entry(5, rw),
+                        entry(6, rw),
+                        entry(7, rw),
+                        entry(8, rw),
+                        entry(9, rw),
+                    ],
+                });
+            let attention_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portable-attention-pl"),
+                bind_group_layouts: &[&attention_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+            let attention_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("portable-attention-pipe"),
+                    layout: Some(&attention_layout),
+                    module: &attention_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
 
             Ok(WgpuBackend {
                 device,
@@ -848,6 +938,10 @@ impl WgpuBackend {
                 rope_bind_group_layout,
                 softmax_xent_pipeline,
                 softmax_xent_bind_group_layout,
+                conv_pipeline,
+                conv_bind_group_layout,
+                attention_pipeline,
+                attention_bind_group_layout,
                 device_name,
             })
         }
@@ -1949,6 +2043,192 @@ impl WgpuBackend {
         Ok((parameter, momentum))
     }
 
+    /// Execute grouped-query attention forward or VJP on device.
+    pub(crate) fn attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        grad_output: &[f32],
+        params: AttentionParams,
+    ) -> Result<AttentionOutput, BackendError> {
+        let backward = params.execution != 0;
+        let query_len = q.len();
+        let kv_len = k.len();
+        let probability_len = params.seq as usize * params.seq as usize;
+        let storage = wgpu::BufferUsages::STORAGE;
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("portable-attention-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let input = |label, values: &[f32]| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(values),
+                    usage: storage,
+                })
+        };
+        let q_buf = input("portable-attention-q", q);
+        let k_buf = input("portable-attention-k", k);
+        let v_buf = input("portable-attention-v", v);
+        let grad_output_buf = input("portable-attention-grad-output", grad_output);
+        let output = |label, len: usize| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (len.max(1) * core::mem::size_of::<f32>()) as u64,
+                usage: storage | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let output_0 = output("portable-attention-output-0", query_len);
+        let output_1 = output(
+            "portable-attention-output-1",
+            if backward { kv_len } else { 1 },
+        );
+        let output_2 = output(
+            "portable-attention-output-2",
+            if backward { kv_len } else { 1 },
+        );
+        let probabilities = output("portable-attention-probabilities", probability_len);
+        let grad_probabilities = output(
+            "portable-attention-grad-probabilities",
+            if backward { probability_len } else { 1 },
+        );
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portable-attention-bg"),
+            layout: &self.attention_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: k_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: v_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: grad_output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: output_0.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: output_1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: output_2.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: probabilities.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: grad_probabilities.as_entire_binding(),
+                },
+            ],
+        });
+        let staging = |label, len: usize| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (len.max(1) * core::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let staging_0 = staging("portable-attention-staging-0", query_len);
+        let staging_1 = staging("portable-attention-staging-1", kv_len);
+        let staging_2 = staging("portable-attention-staging-2", kv_len);
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("portable-attention-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("portable-attention-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.attention_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &output_0,
+            0,
+            &staging_0,
+            0,
+            core::mem::size_of_val(q) as u64,
+        );
+        if backward {
+            encoder.copy_buffer_to_buffer(
+                &output_1,
+                0,
+                &staging_1,
+                0,
+                core::mem::size_of_val(k) as u64,
+            );
+            encoder.copy_buffer_to_buffer(
+                &output_2,
+                0,
+                &staging_2,
+                0,
+                core::mem::size_of_val(v) as u64,
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let readback = |buffer: &wgpu::Buffer, len: usize| -> Result<Vec<f32>, BackendError> {
+            let slice = buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |mapped| {
+                let _ = tx.send(mapped);
+            });
+            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+            rx.recv()
+                .map_err(|error| BackendError::Backend(format!("map channel: {error}")))?
+                .map_err(|error| BackendError::Backend(format!("buffer map: {error}")))?;
+            let data = slice.get_mapped_range();
+            let values = bytemuck::cast_slice(&data)[..len].to_vec();
+            drop(data);
+            buffer.unmap();
+            Ok(values)
+        };
+        if let Some(error) = self.device.pop_error_scope().block_on() {
+            return Err(BackendError::Backend(format!(
+                "wgpu attention device error: {error}"
+            )));
+        }
+        let first = readback(&staging_0, query_len)?;
+        let (second, third) = if backward {
+            (readback(&staging_1, kv_len)?, readback(&staging_2, kv_len)?)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(AttentionOutput {
+            result_or_grad_q: first,
+            grad_k: second,
+            grad_v: third,
+        })
+    }
+
     /// Execute grouped Conv1d/Conv2d forward or VJP on device.
     pub(crate) fn convolution(
         &self,
@@ -2004,59 +2284,9 @@ impl WgpuBackend {
         let grad_weight = output("portable-conv-grad-weight", weight_len);
         let grad_scale = output("portable-conv-grad-scale", scale_len);
 
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("portable-conv"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("conv.wgsl").into()),
-            });
-        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let ro = wgpu::BufferBindingType::Storage { read_only: true };
-        let rw = wgpu::BufferBindingType::Storage { read_only: false };
-        let layout = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("portable-conv-bgl"),
-                entries: &[
-                    entry(0, wgpu::BufferBindingType::Uniform),
-                    entry(1, ro),
-                    entry(2, ro),
-                    entry(3, ro),
-                    entry(4, ro),
-                    entry(5, rw),
-                    entry(6, rw),
-                    entry(7, rw),
-                ],
-            });
-        let pipeline_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("portable-conv-pl"),
-                bind_group_layouts: &[&layout],
-                push_constant_ranges: &[],
-            });
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("portable-conv-pipe"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("portable-conv-bg"),
-            layout: &layout,
+            layout: &self.conv_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -2115,7 +2345,7 @@ impl WgpuBackend {
                 label: Some("portable-conv-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&self.conv_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }

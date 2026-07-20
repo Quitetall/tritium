@@ -18,7 +18,7 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
         report.failed.len(),
         report.failed
     );
-    assert_eq!(report.passed.len(), 106);
+    assert_eq!(report.passed.len(), 114);
     assert_eq!(
         backend.capabilities().supported_operations,
         [
@@ -39,6 +39,7 @@ fn wgpu_executes_every_vector_for_its_advertised_operations() {
             "graph.mul",
             "graph.conv1d",
             "graph.conv2d",
+            "graph.attention",
             "graph.relu2",
             "graph.silu",
             "graph.causal_mask",

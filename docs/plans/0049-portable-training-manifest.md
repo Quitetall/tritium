@@ -175,7 +175,7 @@ This closes WASI/WASM semantic parity; browser WASM packaging remains plan 0050,
 and MCU constrained-target parity remains open.
 
 Native wgpu work has begun on the RTX 4090 Vulkan adapter. Current evidence
-covers 106 vectors across STE surrogate, multi-plane SALT STE, LSQ, FSQ, dense and scale-bearing ternary matmul, embedding gather, transpose, column slice/concat, detach, constant scale, bias, add, multiply, grouped Conv1d/Conv2d forward and VJP, ReLU2,
+covers all 114 vectors and 35 operations across STE surrogate, multi-plane SALT STE, LSQ, FSQ, dense and scale-bearing ternary matmul, embedding gather, transpose, column slice/concat, detach, constant scale, bias, add, multiply, grouped Conv1d/Conv2d and grouped-query attention forward and VJP, ReLU2,
 SiLU, RMSNorm, causal masking, RoPE, row softmax, MSE and softmax cross-entropy losses, SGD, AdamW, cautious AdamW, int8 AdamW, Muon, and all four lifecycle operations. Pointwise tensor work executes through resident WGSL
 storage buffers; lifecycle uses the shared canonical control-plane byte
 implementation. AdamW uses ordered storage passes to preserve the frozen f32

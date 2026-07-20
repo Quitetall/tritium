@@ -9,7 +9,7 @@ use tritium_spec::{
 
 use crate::{
     WgpuBackend,
-    backend::{AdamWParams, AdamWScalars, ConvParams, FsqParams, MuonParams},
+    backend::{AdamWParams, AdamWScalars, AttentionParams, ConvParams, FsqParams, MuonParams},
 };
 
 const OPERATIONS: &[&str] = &[
@@ -30,6 +30,7 @@ const OPERATIONS: &[&str] = &[
     "graph.mul",
     "graph.conv1d",
     "graph.conv2d",
+    "graph.attention",
     "graph.relu2",
     "graph.silu",
     "graph.causal_mask",
@@ -56,6 +57,7 @@ const LIMITS: TrainLimitsV1 = TrainLimitsV1 {
 const MAX_SALT_PLANES: u64 = 64;
 const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONV_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ATTENTION_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Native-wgpu implementation of the frozen portable-training seam.
 ///
@@ -1817,6 +1819,128 @@ impl WgpuTrainBackendV1 {
         Ok(())
     }
 
+    fn execute_attention(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<u64, TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["q", "k", "v"],
+            TrainExecutionV1::Vjp => &["q", "k", "v", "grad_output"],
+            _ => return Err(invariant("attention received an illegal phase")),
+        };
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_q", "grad_k", "grad_v"],
+            _ => unreachable!(),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["seq", "n_head", "n_kv_head", "head_dim", "causal"],
+            "attributes",
+        )?;
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let config = attention_attributes(request)?;
+        let query_len = bounded_u32_product(&[config.seq, config.n_head, config.head_dim], "seq")?;
+        let kv_len = bounded_u32_product(&[config.seq, config.n_kv_head, config.head_dim], "seq")?;
+        let probability_len = bounded_u32_product(&[config.seq, config.seq], "seq")?;
+        let contract_elements = match request.execution {
+            TrainExecutionV1::Forward => query_len.checked_add(probability_len),
+            TrainExecutionV1::Vjp => query_len
+                .checked_add(kv_len)
+                .and_then(|value| value.checked_add(kv_len))
+                .and_then(|value| value.checked_add(probability_len))
+                .and_then(|value| value.checked_add(probability_len)),
+            _ => unreachable!(),
+        }
+        .ok_or_else(shape_error)?;
+        let contract_scratch = (contract_elements as u64)
+            .checked_mul(4)
+            .ok_or_else(shape_error)?;
+        if contract_scratch > MAX_ATTENTION_SCRATCH_BYTES {
+            return Err(attribute_value("scratch", "limit_64_mib"));
+        }
+        let query_shape = [
+            config.seq as u64,
+            config.n_head as u64,
+            config.head_dim as u64,
+        ];
+        let kv_shape = [
+            config.seq as u64,
+            config.n_kv_head as u64,
+            config.head_dim as u64,
+        ];
+        let (actual_query_shape, q) = input_f32(request, "q")?;
+        let (actual_key_shape, k) = input_f32(request, "k")?;
+        let (actual_value_shape, v) = input_f32(request, "v")?;
+        if actual_query_shape != query_shape
+            || actual_key_shape != kv_shape
+            || actual_value_shape != kv_shape
+            || q.len() != query_len
+            || k.len() != kv_len
+            || v.len() != kv_len
+        {
+            return Err(shape_error());
+        }
+        require_finite("q", q)?;
+        require_finite("k", k)?;
+        require_finite("v", v)?;
+        let grad_output = if request.execution == TrainExecutionV1::Vjp {
+            let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
+            if gradient_shape != query_shape {
+                return Err(shape_error());
+            }
+            require_finite("grad_output", gradient)?;
+            gradient
+        } else {
+            q
+        };
+        let result = self
+            .backend
+            .attention(
+                q,
+                k,
+                v,
+                grad_output,
+                AttentionParams {
+                    seq: config.seq as u32,
+                    n_head: config.n_head as u32,
+                    n_kv_head: config.n_kv_head as u32,
+                    head_dim: config.head_dim as u32,
+                    causal: u32::from(config.causal),
+                    execution: u32::from(request.execution == TrainExecutionV1::Vjp),
+                    padding_0: 0,
+                    padding_1: 0,
+                },
+            )
+            .map_err(wgpu_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            output_f32(output, "result", &query_shape, query_len)?
+                .copy_from_slice(&result.result_or_grad_q);
+        } else {
+            output_f32(output, "grad_q", &query_shape, query_len)?
+                .copy_from_slice(&result.result_or_grad_q);
+            output_f32(output, "grad_k", &kv_shape, kv_len)?.copy_from_slice(&result.grad_k);
+            output_f32(output, "grad_v", &kv_shape, kv_len)?.copy_from_slice(&result.grad_v);
+        }
+        let actual_scratch = probability_len as u64
+            * if request.execution == TrainExecutionV1::Forward {
+                4
+            } else {
+                8
+            };
+        Ok(actual_scratch)
+    }
+
     fn execute_conv1d(
         &self,
         request: &TrainRequestV1<'_>,
@@ -2255,6 +2379,8 @@ impl TrainBackendV1 for WgpuTrainBackendV1 {
             self.execute_conv1d(&request, output)?
         } else if request.operation == "graph.conv2d" {
             self.execute_conv2d(&request, output)?
+        } else if request.operation == "graph.attention" {
+            self.execute_attention(&request, output)?
         } else if request.operation == "graph.lsq_ste" {
             self.execute_lsq(&request, output)?;
             0
@@ -2515,6 +2641,55 @@ fn attribute_u64(request: &TrainRequestV1<'_>, name: &str) -> Result<u64, TrainB
 
 fn attribute_usize(request: &TrainRequestV1<'_>, name: &str) -> Result<usize, TrainBackendError> {
     usize::try_from(attribute_u64(request, name)?).map_err(|_| shape_error())
+}
+
+fn attribute_bool(request: &TrainRequestV1<'_>, name: &str) -> Result<bool, TrainBackendError> {
+    let attribute = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or({
+            TrainBackendError::InvalidOperation(TrainOperationErrorV1::Roles {
+                namespace: "attributes",
+            })
+        })?;
+    let TrainAttributeValueV1::Bool(value) = attribute.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "bool",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn attention_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<tritium_train::ops::attention::AttentionCfg, TrainBackendError> {
+    let config = tritium_train::ops::attention::AttentionCfg {
+        seq: attribute_usize(request, "seq")?,
+        n_head: attribute_usize(request, "n_head")?,
+        n_kv_head: attribute_usize(request, "n_kv_head")?,
+        head_dim: attribute_usize(request, "head_dim")?,
+        causal: attribute_bool(request, "causal")?,
+    };
+    for (name, value) in [
+        ("seq", config.seq),
+        ("n_head", config.n_head),
+        ("n_kv_head", config.n_kv_head),
+        ("head_dim", config.head_dim),
+    ] {
+        if value == 0 {
+            return Err(attribute_value(name, "positive"));
+        }
+    }
+    if !config.n_head.is_multiple_of(config.n_kv_head) {
+        return Err(attribute_value("n_kv_head", "divides_n_head"));
+    }
+    bounded_u32_product(&[config.seq, config.n_head, config.head_dim], "seq")?;
+    bounded_u32_product(&[config.seq, config.n_kv_head, config.head_dim], "seq")?;
+    Ok(config)
 }
 
 fn conv1d_attributes(
