@@ -13,6 +13,7 @@ try:
         AUTO_QUANTIZER_MAPPING,
     )
     from transformers.quantizers.base import HfQuantizer
+    from transformers import Trainer
     from transformers.utils.quantization_config import QuantizationConfigMixin
 except ImportError as error:  # pragma: no cover - exercised in torch-only wheels
     raise ImportError("Hugging Face integration requires transformers") from error
@@ -71,6 +72,28 @@ class TritiumHfQuantizer(HfQuantizer):
     def _process_model_after_weight_loading(self, model, **kwargs):
         del kwargs
         return model
+
+
+class TritiumTrainer(Trainer):
+    """Thin HF Trainer facade that converts before optimizer construction."""
+
+    def __init__(self, *args, tritium_config: TernaryConfig | None = None, **kwargs):
+        model = kwargs.get("model", args[0] if args else None)
+        if model is None:
+            raise ValueError("TritiumTrainer requires a model")
+        if tritium_config is not None:
+            from .conversion import prepare_qat
+
+            model = prepare_qat(model, tritium_config)
+            if args:
+                args = (model, *args[1:])
+            else:
+                kwargs["model"] = model
+        else:
+            from .conversion import inspect
+
+            inspect(model)
+        super().__init__(*args, **kwargs)
 
 
 def register_huggingface() -> None:

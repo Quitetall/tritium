@@ -40,9 +40,9 @@ saves with safe serialization, automatically reloads through
 
 ## Step 2 — Trainer/Accelerate and distributed state
 
-- Verify Trainer and direct Accelerate steps use ordinary optimizers.
-- Verify gradient accumulation, mixed precision, checkpoint/resume and RNG
-  continuation.
+- [x] Verify Trainer and direct Accelerate steps use ordinary optimizers.
+- [x] Verify single-process gradient accumulation and checkpoint/resume.
+- [ ] Verify mixed precision and exact RNG continuation.
 - Run real two-rank DDP and FSDP tests; skipped distributed tests are failures
   in the release lane.
 

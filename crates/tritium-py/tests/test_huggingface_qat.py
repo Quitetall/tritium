@@ -8,7 +8,12 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
 from tritium.nn import TernaryEmbedding, TernaryLinear  # noqa: E402
-from tritium.torch import TernaryConfig, inspect, prepare_qat  # noqa: E402
+from tritium.torch import (  # noqa: E402
+    TernaryConfig,
+    TritiumTrainer,
+    inspect,
+    prepare_qat,
+)
 
 
 def _tiny_llama():
@@ -86,3 +91,109 @@ def test_hf_config_records_exact_recipe_not_nominal_bits(tmp_path: Path):
     assert encoded["schema_version"] == 1
     assert encoded["target_modules"] == ["Linear", "Embedding"]
     assert "bits" not in encoded
+
+
+class _TokenDataset(torch.utils.data.Dataset):
+    def __init__(self):
+        self.rows = [
+            torch.tensor([1, 2, 3, 4]),
+            torch.tensor([2, 3, 4, 5]),
+            torch.tensor([3, 4, 5, 6]),
+            torch.tensor([4, 5, 6, 7]),
+        ]
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        tokens = self.rows[index]
+        return {"input_ids": tokens, "labels": tokens.clone()}
+
+
+def test_tritium_trainer_saves_and_resumes_native_hf_checkpoint(tmp_path: Path):
+    args = transformers.TrainingArguments(
+        output_dir=tmp_path,
+        per_device_train_batch_size=1,
+        max_steps=1,
+        learning_rate=1e-4,
+        save_strategy="steps",
+        save_steps=1,
+        logging_strategy="no",
+        report_to="none",
+        disable_tqdm=True,
+        use_cpu=True,
+        seed=41,
+        data_seed=41,
+        optim="adamw_torch",
+    )
+    trainer = TritiumTrainer(
+        model=_tiny_llama(),
+        tritium_config=_qat_config(),
+        args=args,
+        train_dataset=_TokenDataset(),
+    )
+    assert trainer.train().global_step == 1
+    checkpoint = tmp_path / "checkpoint-1"
+    assert checkpoint.is_dir()
+
+    reloaded = transformers.AutoModelForCausalLM.from_pretrained(checkpoint)
+    resume_args = transformers.TrainingArguments(
+        output_dir=tmp_path,
+        per_device_train_batch_size=1,
+        max_steps=2,
+        learning_rate=1e-4,
+        save_strategy="no",
+        logging_strategy="no",
+        report_to="none",
+        disable_tqdm=True,
+        use_cpu=True,
+        seed=41,
+        data_seed=41,
+        optim="adamw_torch",
+    )
+    resumed = TritiumTrainer(
+        model=reloaded,
+        args=resume_args,
+        train_dataset=_TokenDataset(),
+    )
+    assert resumed.train(resume_from_checkpoint=checkpoint).global_step == 2
+    assert isinstance(resumed.model.model.embed_tokens, TernaryEmbedding)
+    assert inspect(resumed.model).converted_parameters > 0
+
+
+def test_accelerate_gradient_accumulation_and_state_resume(tmp_path: Path):
+    accelerate = pytest.importorskip("accelerate")
+    accelerator = accelerate.Accelerator(
+        cpu=True,
+        gradient_accumulation_steps=2,
+        project_dir=tmp_path,
+    )
+    model = prepare_qat(_tiny_llama(), _qat_config())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    dataloader = torch.utils.data.DataLoader(_TokenDataset(), batch_size=1)
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+
+    for index, batch in enumerate(dataloader):
+        with accelerator.accumulate(model):
+            loss = model(**batch).loss
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        if index == 1:
+            break
+
+    state_dir = tmp_path / "accelerate-state"
+    accelerator.save_state(state_dir)
+    unwrapped = accelerator.unwrap_model(model)
+    saved = {
+        name: tensor.detach().clone()
+        for name, tensor in unwrapped.state_dict().items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    with torch.no_grad():
+        for parameter in unwrapped.parameters():
+            parameter.add_(10)
+    accelerator.load_state(state_dir)
+
+    restored = unwrapped.state_dict()
+    assert all(torch.equal(restored[name], tensor) for name, tensor in saved.items())

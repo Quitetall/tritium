@@ -6,9 +6,10 @@ from .coverage import CoverageEntry, CoverageReport
 from .errors import TritiumError
 from .estimators import AbsMeanSTE, Estimator, SaltSTE
 try:
-    from .hf import HfTritiumConfig, register_huggingface
+    from .hf import HfTritiumConfig, TritiumTrainer, register_huggingface
 except ImportError:  # transformers is an optional integration dependency
     HfTritiumConfig = None
+    TritiumTrainer = None
     register_huggingface = None
 else:
     register_huggingface()
@@ -26,6 +27,7 @@ __all__ = [
     "TernaryConfig",
     "TernaryProjection",
     "TritiumError",
+    "TritiumTrainer",
     "inspect",
     "prepare_qat",
     "reference_ternary_linear",
