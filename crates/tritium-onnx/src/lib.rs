@@ -382,9 +382,12 @@ mod onnx_op;
 
 #[cfg(feature = "model")]
 pub use model::{
-    ExternalOnnxModel, OnnxModelError, TiedEmbeddingHeadModel, VerifiedExternalOnnxModel,
-    encode_external_tied_embedding_head, encode_tied_embedding_head,
-    verify_external_tied_embedding_head,
+    ExternalOnnxModel, OnnxArtifactIdentityV2, OnnxModelError, TiedEmbeddingHeadModel,
+    TiedEmbeddingHeadModelV2, VerifiedExternalOnnxModel, VerifiedExternalOnnxModelV2,
+    VerifiedOnnxArtifactIdentityV2, encode_external_tied_embedding_head,
+    encode_external_tied_embedding_head_v2, encode_tied_embedding_head,
+    encode_tied_embedding_head_v2, verify_external_tied_embedding_head,
+    verify_external_tied_embedding_head_v2,
 };
 
 #[cfg(feature = "model")]

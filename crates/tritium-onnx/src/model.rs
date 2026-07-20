@@ -52,6 +52,64 @@ pub struct TiedEmbeddingHeadModel<'a> {
     pub package_id: &'a str,
 }
 
+/// Complete schema-v2 identity binding for a Tritium ONNX artifact.
+#[derive(Debug, Clone, Copy)]
+pub struct OnnxArtifactIdentityV2<'a> {
+    /// Immutable source-model identity, including resolved revision.
+    pub source_model_id: &'a str,
+    /// Tokenizer identity, including resolved revision.
+    pub tokenizer_id: &'a str,
+    /// Conversion recipe identity.
+    pub recipe_id: &'a str,
+    /// Tritium build/source identity that produced the graph.
+    pub tritium_build_id: &'a str,
+    /// Packed artifact/package identity.
+    pub package_id: &'a str,
+    /// Identity of the exact in-scope converted coverage ledger.
+    pub converted_coverage_id: &'a str,
+    /// Identity of the explicit deferred/preserved coverage ledger.
+    pub deferred_coverage_id: &'a str,
+}
+
+/// A schema-v2 tied embedding/head graph with complete artifact identity.
+///
+/// This additive type leaves [`TiedEmbeddingHeadModel`] and its schema-v1 wire
+/// format source-compatible and readable while allowing release artifacts to
+/// bind the full conversion provenance contract.
+#[derive(Debug, Clone, Copy)]
+pub struct TiedEmbeddingHeadModelV2<'a> {
+    /// Number of input tokens in the fixed graph.
+    pub tokens: usize,
+    /// Vocabulary/table row count.
+    pub vocab: usize,
+    /// Hidden/table column count.
+    pub hidden: usize,
+    /// Packed TQ2_0 or TQ1_0 table bytes, output-major.
+    pub packed: &'a [u8],
+    /// One finite nonnegative scale per vocabulary row.
+    pub scales: &'a [f32],
+    /// Canonical packed ternary format.
+    pub format: TernaryFormat,
+    /// Complete schema-v2 artifact identity.
+    pub identity: OnnxArtifactIdentityV2<'a>,
+}
+
+impl<'a> TiedEmbeddingHeadModelV2<'a> {
+    fn legacy(self) -> TiedEmbeddingHeadModel<'a> {
+        TiedEmbeddingHeadModel {
+            tokens: self.tokens,
+            vocab: self.vocab,
+            hidden: self.hidden,
+            packed: self.packed,
+            scales: self.scales,
+            format: self.format,
+            source_model_id: self.identity.source_model_id,
+            recipe_id: self.identity.recipe_id,
+            package_id: self.identity.package_id,
+        }
+    }
+}
+
 /// A deterministic ONNX model plus its content-bound external initializer file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalOnnxModel {
@@ -84,6 +142,34 @@ pub struct VerifiedExternalOnnxModel {
     pub recipe_id: String,
     /// Bound artifact package identity.
     pub package_id: String,
+}
+
+/// Owned identity receipt from schema-v2 external ONNX verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOnnxArtifactIdentityV2 {
+    /// Bound source model identity.
+    pub source_model_id: String,
+    /// Bound tokenizer identity.
+    pub tokenizer_id: String,
+    /// Bound conversion recipe identity.
+    pub recipe_id: String,
+    /// Bound Tritium build/source identity.
+    pub tritium_build_id: String,
+    /// Bound artifact package identity.
+    pub package_id: String,
+    /// Bound converted coverage-ledger identity.
+    pub converted_coverage_id: String,
+    /// Bound deferred/preserved coverage-ledger identity.
+    pub deferred_coverage_id: String,
+}
+
+/// Receipt from strict schema-v2 external ONNX model/data verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedExternalOnnxModelV2 {
+    /// Verified graph, external data and geometry receipt.
+    pub model: VerifiedExternalOnnxModel,
+    /// Complete bound artifact identity.
+    pub identity: VerifiedOnnxArtifactIdentityV2,
 }
 
 /// Validation or serialization errors from Tritium ONNX model encoding.
@@ -188,6 +274,35 @@ pub fn encode_tied_embedding_head(
             inline_tensor("tritium.scales", TENSOR_FLOAT, vec![vocab], scale_bytes),
         ],
         Vec::new(),
+        "1",
+    )
+}
+
+/// Encode a schema-v2 tied embedding/head graph with complete artifact identity.
+///
+/// # Errors
+/// [`OnnxModelError`] if graph geometry, payload, or any identity is invalid.
+pub fn encode_tied_embedding_head_v2(
+    model: TiedEmbeddingHeadModelV2<'_>,
+) -> Result<Vec<u8>, OnnxModelError> {
+    validate_v2(&model)?;
+    let legacy = model.legacy();
+    let scale_bytes = scale_bytes(legacy.scales);
+    let packed_bytes = as_i64(legacy.packed.len(), "packed byte count")?;
+    let vocab = as_i64(legacy.vocab, "vocabulary")?;
+    encode_model(
+        legacy,
+        vec![
+            inline_tensor(
+                "tritium.packed",
+                TENSOR_UINT8,
+                vec![packed_bytes],
+                legacy.packed.to_vec(),
+            ),
+            inline_tensor("tritium.scales", TENSOR_FLOAT, vec![vocab], scale_bytes),
+        ],
+        identity_metadata_v2(model.identity),
+        "2",
     )
 }
 
@@ -204,6 +319,26 @@ pub fn encode_external_tied_embedding_head(
     model: TiedEmbeddingHeadModel<'_>,
 ) -> Result<ExternalOnnxModel, OnnxModelError> {
     validate(&model)?;
+    encode_external_model(model, Vec::new(), "1")
+}
+
+/// Encode a schema-v2 tied embedding/head graph with content-bound external data.
+///
+/// # Errors
+/// [`OnnxModelError`] if graph geometry, payload, external layout, or any
+/// identity is invalid.
+pub fn encode_external_tied_embedding_head_v2(
+    model: TiedEmbeddingHeadModelV2<'_>,
+) -> Result<ExternalOnnxModel, OnnxModelError> {
+    validate_v2(&model)?;
+    encode_external_model(model.legacy(), identity_metadata_v2(model.identity), "2")
+}
+
+fn encode_external_model(
+    model: TiedEmbeddingHeadModel<'_>,
+    mut identity_metadata: Vec<StringStringEntryProto>,
+    schema_version: &'static str,
+) -> Result<ExternalOnnxModel, OnnxModelError> {
     let scale_bytes = scale_bytes(model.scales);
     let scale_offset = align_up(model.packed.len(), EXTERNAL_ALIGNMENT)?;
     let weights_len = scale_offset
@@ -242,11 +377,15 @@ pub fn encode_external_tied_embedding_head(
                 scale_len,
             ),
         ],
-        vec![
-            metadata("tritium.external_data.file", EXTERNAL_WEIGHTS_FILE),
-            metadata("tritium.external_data.bytes", &weights_len.to_string()),
-            metadata("tritium.external_data.blake3", &digest_hex),
-        ],
+        {
+            identity_metadata.extend([
+                metadata("tritium.external_data.file", EXTERNAL_WEIGHTS_FILE),
+                metadata("tritium.external_data.bytes", &weights_len.to_string()),
+                metadata("tritium.external_data.blake3", &digest_hex),
+            ]);
+            identity_metadata
+        },
+        schema_version,
     )?;
     Ok(ExternalOnnxModel {
         model_bytes,
@@ -269,6 +408,157 @@ pub fn verify_external_tied_embedding_head(
     model_bytes: &[u8],
     weights_bytes: &[u8],
 ) -> Result<VerifiedExternalOnnxModel, OnnxModelError> {
+    let verified = verify_external_parts(model_bytes, weights_bytes, "1")?;
+    let source_model_id = metadata_value(&verified.metadata, "tritium.source_model_id")?.to_owned();
+    let recipe_id = metadata_value(&verified.metadata, "tritium.recipe_id")?.to_owned();
+    let package_id = metadata_value(&verified.metadata, "tritium.package_id")?.to_owned();
+    let specification = TiedEmbeddingHeadModel {
+        tokens: verified.tokens,
+        vocab: verified.vocab,
+        hidden: verified.hidden,
+        packed: &weights_bytes[..verified.packed_len],
+        scales: &verified.scales,
+        format: verified.format,
+        source_model_id: &source_model_id,
+        recipe_id: &recipe_id,
+        package_id: &package_id,
+    };
+    let expected = encode_external_tied_embedding_head(specification)?;
+    verify_canonical_external(&expected, model_bytes, weights_bytes)?;
+    Ok(VerifiedExternalOnnxModel {
+        model_blake3: *blake3::hash(model_bytes).as_bytes(),
+        weights_blake3: verified.weights_blake3,
+        weights_bytes: weights_bytes.len(),
+        tokens: verified.tokens,
+        vocab: verified.vocab,
+        hidden: verified.hidden,
+        source_model_id,
+        recipe_id,
+        package_id,
+    })
+}
+
+/// Verify a schema-v2 external-data graph and its complete artifact identity.
+///
+/// Schema-v1 remains available through [`verify_external_tied_embedding_head`];
+/// callers choose the expected contract explicitly, so neither version can be
+/// silently interpreted as the other.
+///
+/// # Errors
+/// [`OnnxModelError`] for malformed protobuf/metadata, an identity, digest or
+/// length mismatch, invalid packed/scales data, or non-canonical mutation.
+pub fn verify_external_tied_embedding_head_v2(
+    model_bytes: &[u8],
+    weights_bytes: &[u8],
+    expected_identity: OnnxArtifactIdentityV2<'_>,
+) -> Result<VerifiedExternalOnnxModelV2, OnnxModelError> {
+    validate_identity_v2(expected_identity)?;
+    let verified = verify_external_parts(model_bytes, weights_bytes, "2")?;
+    let identity = VerifiedOnnxArtifactIdentityV2 {
+        source_model_id: metadata_value(&verified.metadata, "tritium.source_model_id")?.to_owned(),
+        tokenizer_id: metadata_value(&verified.metadata, "tritium.tokenizer_id")?.to_owned(),
+        recipe_id: metadata_value(&verified.metadata, "tritium.recipe_id")?.to_owned(),
+        tritium_build_id: metadata_value(&verified.metadata, "tritium.build_id")?.to_owned(),
+        package_id: metadata_value(&verified.metadata, "tritium.package_id")?.to_owned(),
+        converted_coverage_id: metadata_value(&verified.metadata, "tritium.coverage.converted_id")?
+            .to_owned(),
+        deferred_coverage_id: metadata_value(&verified.metadata, "tritium.coverage.deferred_id")?
+            .to_owned(),
+    };
+    for (name, actual, expected) in [
+        (
+            "source_model_id",
+            identity.source_model_id.as_str(),
+            expected_identity.source_model_id,
+        ),
+        (
+            "tokenizer_id",
+            identity.tokenizer_id.as_str(),
+            expected_identity.tokenizer_id,
+        ),
+        (
+            "recipe_id",
+            identity.recipe_id.as_str(),
+            expected_identity.recipe_id,
+        ),
+        (
+            "tritium_build_id",
+            identity.tritium_build_id.as_str(),
+            expected_identity.tritium_build_id,
+        ),
+        (
+            "package_id",
+            identity.package_id.as_str(),
+            expected_identity.package_id,
+        ),
+        (
+            "converted_coverage_id",
+            identity.converted_coverage_id.as_str(),
+            expected_identity.converted_coverage_id,
+        ),
+        (
+            "deferred_coverage_id",
+            identity.deferred_coverage_id.as_str(),
+            expected_identity.deferred_coverage_id,
+        ),
+    ] {
+        if actual != expected {
+            return Err(OnnxModelError::InvalidModel(format!(
+                "artifact identity {name} does not match admission contract"
+            )));
+        }
+    }
+    let specification = TiedEmbeddingHeadModelV2 {
+        tokens: verified.tokens,
+        vocab: verified.vocab,
+        hidden: verified.hidden,
+        packed: &weights_bytes[..verified.packed_len],
+        scales: &verified.scales,
+        format: verified.format,
+        identity: OnnxArtifactIdentityV2 {
+            source_model_id: &identity.source_model_id,
+            tokenizer_id: &identity.tokenizer_id,
+            recipe_id: &identity.recipe_id,
+            tritium_build_id: &identity.tritium_build_id,
+            package_id: &identity.package_id,
+            converted_coverage_id: &identity.converted_coverage_id,
+            deferred_coverage_id: &identity.deferred_coverage_id,
+        },
+    };
+    let expected = encode_external_tied_embedding_head_v2(specification)?;
+    verify_canonical_external(&expected, model_bytes, weights_bytes)?;
+    Ok(VerifiedExternalOnnxModelV2 {
+        model: VerifiedExternalOnnxModel {
+            model_blake3: *blake3::hash(model_bytes).as_bytes(),
+            weights_blake3: verified.weights_blake3,
+            weights_bytes: weights_bytes.len(),
+            tokens: verified.tokens,
+            vocab: verified.vocab,
+            hidden: verified.hidden,
+            source_model_id: identity.source_model_id.clone(),
+            recipe_id: identity.recipe_id.clone(),
+            package_id: identity.package_id.clone(),
+        },
+        identity,
+    })
+}
+
+struct VerifiedExternalParts {
+    metadata: BTreeMap<String, String>,
+    weights_blake3: [u8; 32],
+    tokens: usize,
+    vocab: usize,
+    hidden: usize,
+    format: TernaryFormat,
+    packed_len: usize,
+    scales: Vec<f32>,
+}
+
+fn verify_external_parts(
+    model_bytes: &[u8],
+    weights_bytes: &[u8],
+    schema_version: &'static str,
+) -> Result<VerifiedExternalParts, OnnxModelError> {
     if model_bytes.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
             "protobuf exceeds {MAX_MODEL_BYTES} bytes"
@@ -285,7 +575,7 @@ pub fn verify_external_tied_embedding_head(
             )));
         }
     }
-    require_metadata(&metadata, "tritium.schema_version", "1")?;
+    require_metadata(&metadata, "tritium.schema_version", schema_version)?;
     require_metadata(&metadata, "tritium.tied_embedding_head", "true")?;
     require_metadata(
         &metadata,
@@ -305,9 +595,6 @@ pub fn verify_external_tied_embedding_head(
             )));
         }
     };
-    let source_model_id = metadata_value(&metadata, "tritium.source_model_id")?.to_owned();
-    let recipe_id = metadata_value(&metadata, "tritium.recipe_id")?.to_owned();
-    let package_id = metadata_value(&metadata, "tritium.package_id")?.to_owned();
     let actual_weights_hash = blake3::hash(weights_bytes);
     let actual_weights_hex = actual_weights_hash.to_hex().to_string();
     if metadata_value(&metadata, "tritium.external_data.blake3")? != actual_weights_hex {
@@ -355,18 +642,23 @@ pub fn verify_external_tied_embedding_head(
         .chunks_exact(core::mem::size_of::<f32>())
         .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         .collect();
-    let specification = TiedEmbeddingHeadModel {
+    Ok(VerifiedExternalParts {
+        metadata,
+        weights_blake3: *actual_weights_hash.as_bytes(),
         tokens,
         vocab,
         hidden,
-        packed: &weights_bytes[..packed_len],
-        scales: &scales,
         format,
-        source_model_id: &source_model_id,
-        recipe_id: &recipe_id,
-        package_id: &package_id,
-    };
-    let expected = encode_external_tied_embedding_head(specification)?;
+        packed_len,
+        scales,
+    })
+}
+
+fn verify_canonical_external(
+    expected: &ExternalOnnxModel,
+    model_bytes: &[u8],
+    weights_bytes: &[u8],
+) -> Result<(), OnnxModelError> {
     if expected.model_bytes != model_bytes {
         return Err(OnnxModelError::InvalidModel(
             "graph does not match the canonical bound Tritium graph".to_owned(),
@@ -377,17 +669,7 @@ pub fn verify_external_tied_embedding_head(
             "initializer layout is not canonical".to_owned(),
         ));
     }
-    Ok(VerifiedExternalOnnxModel {
-        model_blake3: *blake3::hash(model_bytes).as_bytes(),
-        weights_blake3: *actual_weights_hash.as_bytes(),
-        weights_bytes: weights_bytes.len(),
-        tokens,
-        vocab,
-        hidden,
-        source_model_id,
-        recipe_id,
-        package_id,
-    })
+    Ok(())
 }
 
 fn metadata_value<'a>(
@@ -431,6 +713,7 @@ fn encode_model(
     model: TiedEmbeddingHeadModel<'_>,
     initializer: Vec<TensorProto>,
     mut extra_metadata: Vec<StringStringEntryProto>,
+    schema_version: &'static str,
 ) -> Result<Vec<u8>, OnnxModelError> {
     let tokens = as_i64(model.tokens, "token count")?;
     let vocab = as_i64(model.vocab, "vocabulary")?;
@@ -462,7 +745,7 @@ fn encode_model(
         output: vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])],
     };
     let mut metadata_props = vec![
-        metadata("tritium.schema_version", "1"),
+        metadata("tritium.schema_version", schema_version),
         metadata("tritium.source_model_id", model.source_model_id),
         metadata("tritium.recipe_id", model.recipe_id),
         metadata("tritium.package_id", model.package_id),
@@ -478,7 +761,9 @@ fn encode_model(
         producer_name: "tritium-onnx".to_owned(),
         producer_version: env!("CARGO_PKG_VERSION").to_owned(),
         domain: ONNX_DOMAIN.to_owned(),
-        model_version: 1,
+        model_version: schema_version
+            .parse()
+            .expect("static schema version is numeric"),
         graph: Some(graph),
         opset_import: vec![
             OperatorSetIdProto {
@@ -553,6 +838,43 @@ fn validate(model: &TiedEmbeddingHeadModel<'_>) -> Result<(), OnnxModelError> {
         as_i64(dimension, name)?;
     }
     Ok(())
+}
+
+fn validate_v2(model: &TiedEmbeddingHeadModelV2<'_>) -> Result<(), OnnxModelError> {
+    validate(&model.legacy())?;
+    validate_identity_v2(model.identity)
+}
+
+fn validate_identity_v2(identity: OnnxArtifactIdentityV2<'_>) -> Result<(), OnnxModelError> {
+    for (name, identity) in [
+        ("source_model_id", identity.source_model_id),
+        ("tokenizer_id", identity.tokenizer_id),
+        ("recipe_id", identity.recipe_id),
+        ("tritium_build_id", identity.tritium_build_id),
+        ("package_id", identity.package_id),
+        ("converted_coverage_id", identity.converted_coverage_id),
+        ("deferred_coverage_id", identity.deferred_coverage_id),
+    ] {
+        if identity.is_empty() {
+            return Err(OnnxModelError::EmptyIdentity(name));
+        }
+    }
+    Ok(())
+}
+
+fn identity_metadata_v2(identity: OnnxArtifactIdentityV2<'_>) -> Vec<StringStringEntryProto> {
+    vec![
+        metadata("tritium.tokenizer_id", identity.tokenizer_id),
+        metadata("tritium.build_id", identity.tritium_build_id),
+        metadata(
+            "tritium.coverage.converted_id",
+            identity.converted_coverage_id,
+        ),
+        metadata(
+            "tritium.coverage.deferred_id",
+            identity.deferred_coverage_id,
+        ),
+    ]
 }
 
 fn validate_packed_payload(model: &TiedEmbeddingHeadModel<'_>) -> Result<(), OnnxModelError> {
@@ -949,6 +1271,101 @@ mod tests {
         assert!(matches!(
             verify_external_tied_embedding_head(&encoded.model_bytes, &corrupted),
             Err(OnnxModelError::ExternalDataMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn schema_v2_binds_complete_identity_without_breaking_v1() {
+        let packed = unit_packed(TernaryFormat::Tq2_0, 2);
+        let identity = OnnxArtifactIdentityV2 {
+            source_model_id: "source@revision",
+            tokenizer_id: "tokenizer@revision",
+            recipe_id: "recipe@digest",
+            tritium_build_id: "tritium@git-sha",
+            package_id: "package@digest",
+            converted_coverage_id: "converted@digest",
+            deferred_coverage_id: "deferred@digest",
+        };
+        let model = TiedEmbeddingHeadModelV2 {
+            tokens: 2,
+            vocab: 2,
+            hidden: 256,
+            packed: &packed,
+            scales: &[1.0, 0.5],
+            format: TernaryFormat::Tq2_0,
+            identity,
+        };
+        let encoded = encode_external_tied_embedding_head_v2(model).unwrap();
+        let receipt = verify_external_tied_embedding_head_v2(
+            &encoded.model_bytes,
+            &encoded.weights_bytes,
+            identity,
+        )
+        .unwrap();
+        assert_eq!(receipt.model.source_model_id, identity.source_model_id);
+        assert_eq!(receipt.model.recipe_id, identity.recipe_id);
+        assert_eq!(receipt.model.package_id, identity.package_id);
+        assert_eq!(receipt.identity.tokenizer_id, identity.tokenizer_id);
+        assert_eq!(receipt.identity.tritium_build_id, identity.tritium_build_id);
+        assert_eq!(
+            receipt.identity.converted_coverage_id,
+            identity.converted_coverage_id
+        );
+        assert_eq!(
+            receipt.identity.deferred_coverage_id,
+            identity.deferred_coverage_id
+        );
+        assert!(
+            verify_external_tied_embedding_head(&encoded.model_bytes, &encoded.weights_bytes)
+                .is_err()
+        );
+
+        let mut protobuf = ModelProto::decode(encoded.model_bytes.as_slice()).unwrap();
+        protobuf
+            .metadata_props
+            .retain(|entry| entry.key != "tritium.tokenizer_id");
+        assert!(matches!(
+            verify_external_tied_embedding_head_v2(
+                &protobuf.encode_to_vec(),
+                &encoded.weights_bytes,
+                identity,
+            ),
+            Err(OnnxModelError::InvalidModel(_))
+        ));
+
+        let legacy = encode_external_tied_embedding_head(model.legacy()).unwrap();
+        assert!(
+            verify_external_tied_embedding_head(&legacy.model_bytes, &legacy.weights_bytes).is_ok()
+        );
+        assert!(
+            verify_external_tied_embedding_head_v2(
+                &legacy.model_bytes,
+                &legacy.weights_bytes,
+                identity,
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            verify_external_tied_embedding_head_v2(
+                &encoded.model_bytes,
+                &encoded.weights_bytes,
+                OnnxArtifactIdentityV2 {
+                    package_id: "different-package",
+                    ..identity
+                },
+            ),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("package_id")
+        ));
+        assert!(matches!(
+            encode_tied_embedding_head_v2(TiedEmbeddingHeadModelV2 {
+                identity: OnnxArtifactIdentityV2 {
+                    tokenizer_id: "",
+                    ..identity
+                },
+                ..model
+            }),
+            Err(OnnxModelError::EmptyIdentity("tokenizer_id"))
         ));
     }
 

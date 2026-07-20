@@ -547,18 +547,25 @@ mod tests {
                 .unwrap();
         let expected =
             ternary_mpgemm_kernel(&hidden, &packed, &scales, tokens.len(), k, format).unwrap();
-        let bundle = crate::encode_external_tied_embedding_head(crate::TiedEmbeddingHeadModel {
-            tokens: tokens.len(),
-            vocab: rows.len(),
-            hidden: k,
-            packed: &packed,
-            scales: &scales,
-            format,
-            source_model_id: "test-source",
-            recipe_id: "test-recipe",
-            package_id: "test-package",
-        })
-        .unwrap();
+        let bundle =
+            crate::encode_external_tied_embedding_head_v2(crate::TiedEmbeddingHeadModelV2 {
+                tokens: tokens.len(),
+                vocab: rows.len(),
+                hidden: k,
+                packed: &packed,
+                scales: &scales,
+                format,
+                identity: crate::OnnxArtifactIdentityV2 {
+                    source_model_id: "test-source",
+                    tokenizer_id: "test-tokenizer",
+                    recipe_id: "test-recipe",
+                    tritium_build_id: "test-build",
+                    package_id: "test-package",
+                    converted_coverage_id: "test-converted",
+                    deferred_coverage_id: "test-deferred",
+                },
+            })
+            .unwrap();
         let directory = TestDirectory::new();
         let model_path = directory.0.join("model.onnx");
         std::fs::write(&model_path, bundle.model_bytes).unwrap();

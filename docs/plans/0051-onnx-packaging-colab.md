@@ -42,6 +42,17 @@ rejected before session creation.
 
 ## Slice 1 — whole-model graph and real ORT execution
 
+Status: **IN PROGRESS** — packed mpGEMM and selected-row embedding custom ops,
+deterministic tied embedding/head graphs, strict external-data verification and
+real ORT execution exist. The additive schema-v2 API now fail-closed binds
+source model, resolved tokenizer, conversion recipe, Tritium build, package,
+converted coverage and deferred/preserved coverage identities through
+verification receipts and canonical re-encoding. The schema-v1 API and wire
+format remain source-compatible and readable; version-specific verifiers reject
+cross-version interpretation. Both v1 inline and v2 external-data graphs execute
+through real ORT sessions. Decoder blocks, KV cache, typed unsupported-graph
+diagnostics and whole-model generation remain open.
+
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
 
