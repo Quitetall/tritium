@@ -1787,6 +1787,125 @@ extern "C" __global__ void conv2d_backward_portable(
     }
 }
 
+__device__ __forceinline__ long attention_vector_index(
+    int token, int head, int head_count, int head_dim, int lane)
+{
+    return ((long)token * head_count + head) * head_dim + lane;
+}
+
+__device__ void attention_probabilities_portable(
+    const float* q, const float* k, float* probabilities,
+    int seq, int n_head, int n_kv_head, int head_dim, int causal,
+    int head, int kv_head, float scale)
+{
+    for (int query = 0; query < seq; ++query) {
+        long row = (long)query * seq;
+        for (int key = 0; key < seq; ++key) {
+            float score = 0.0f;
+            for (int lane = 0; lane < head_dim; ++lane) {
+                score += q[attention_vector_index(query, head, n_head, head_dim, lane)]
+                       * k[attention_vector_index(key, kv_head, n_kv_head, head_dim, lane)];
+            }
+            probabilities[row + key] = causal && key > query ? -INFINITY : score * scale;
+        }
+        float maximum = -INFINITY;
+        for (int key = 0; key < seq; ++key)
+            maximum = fmaxf(maximum, probabilities[row + key]);
+        float sum = 0.0f;
+        for (int key = 0; key < seq; ++key) {
+            float exponential = causal && key > query
+                ? 0.0f : expf(probabilities[row + key] - maximum);
+            probabilities[row + key] = exponential;
+            sum += exponential;
+        }
+        for (int key = 0; key < seq; ++key) probabilities[row + key] /= sum;
+    }
+}
+
+// Canonical portable GQA attention. A serial kernel intentionally preserves the frozen reference
+// accumulation order; optimized twins may replace it only with receipt-distinguished tolerances.
+extern "C" __global__ void attention_forward_portable(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ result,
+    float* __restrict__ probabilities, int seq, int n_head,
+    int n_kv_head, int head_dim, int causal)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    int group_size = n_head / n_kv_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    for (int head = 0; head < n_head; ++head) {
+        int kv_head = head / group_size;
+        attention_probabilities_portable(q, k, probabilities, seq, n_head, n_kv_head,
+                                         head_dim, causal, head, kv_head, scale);
+        for (int query = 0; query < seq; ++query) {
+            for (int lane = 0; lane < head_dim; ++lane) {
+                float accumulator = 0.0f;
+                for (int key = 0; key < seq; ++key) {
+                    accumulator += probabilities[(long)query * seq + key]
+                        * v[attention_vector_index(key, kv_head, n_kv_head, head_dim, lane)];
+                }
+                result[attention_vector_index(query, head, n_head, head_dim, lane)] = accumulator;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void attention_backward_portable(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ grad_output,
+    float* __restrict__ grad_q, float* __restrict__ grad_k,
+    float* __restrict__ grad_v, float* __restrict__ probabilities,
+    float* __restrict__ grad_probabilities, int seq, int n_head,
+    int n_kv_head, int head_dim, int causal)
+{
+    if (blockIdx.x || threadIdx.x) return;
+    int group_size = n_head / n_kv_head;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    for (int head = n_head - 1; head >= 0; --head) {
+        int kv_head = head / group_size;
+        attention_probabilities_portable(q, k, probabilities, seq, n_head, n_kv_head,
+                                         head_dim, causal, head, kv_head, scale);
+        for (long i = 0; i < (long)seq * seq; ++i) grad_probabilities[i] = 0.0f;
+        for (int query = 0; query < seq; ++query) {
+            for (int lane = 0; lane < head_dim; ++lane) {
+                float gradient = grad_output[
+                    attention_vector_index(query, head, n_head, head_dim, lane)];
+                for (int key = 0; key < seq; ++key) {
+                    long probability_index = (long)query * seq + key;
+                    long value_index = attention_vector_index(
+                        key, kv_head, n_kv_head, head_dim, lane);
+                    grad_probabilities[probability_index] += gradient * v[value_index];
+                    grad_v[value_index] += gradient * probabilities[probability_index];
+                }
+            }
+        }
+        for (int query = 0; query < seq; ++query) {
+            long row = (long)query * seq;
+            float contraction = 0.0f;
+            for (int key = 0; key < seq; ++key)
+                contraction += probabilities[row + key] * grad_probabilities[row + key];
+            for (int key = 0; key < seq; ++key) {
+                long index = row + key;
+                grad_probabilities[index] = causal && key > query ? 0.0f
+                    : probabilities[index] * (grad_probabilities[index] - contraction) * scale;
+            }
+        }
+        for (int query = 0; query < seq; ++query) {
+            for (int key = 0; key < seq; ++key) {
+                float gradient = grad_probabilities[(long)query * seq + key];
+                for (int lane = 0; lane < head_dim; ++lane) {
+                    long query_index = attention_vector_index(
+                        query, head, n_head, head_dim, lane);
+                    long key_index = attention_vector_index(
+                        key, kv_head, n_kv_head, head_dim, lane);
+                    grad_q[query_index] += gradient * k[key_index];
+                    grad_k[key_index] += gradient * q[query_index];
+                }
+            }
+        }
+    }
+}
+
 // Softmax cross-entropy backward: g_logits[r,c] = (gscale)·(p[r,c]·Σ_c target − target[r,c]),
 // gscale = grad_out/rows. One thread per row (recompute stable softmax). ops::loss::softmax_xent_vjp.
 extern "C" __global__ void softmax_xent_backward(

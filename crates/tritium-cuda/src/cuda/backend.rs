@@ -128,6 +128,25 @@ fn conv2d_kernel_geometry(
     Ok(result)
 }
 
+fn attention_kernel_geometry(
+    config: &tritium_train::ops::attention::AttentionCfg,
+) -> Result<[i32; 5], BackendError> {
+    let values = [
+        config.seq,
+        config.n_head,
+        config.n_kv_head,
+        config.head_dim,
+        usize::from(config.causal),
+    ];
+    let mut result = [0_i32; 5];
+    for (target, value) in result.iter_mut().zip(values) {
+        *target = i32::try_from(value).map_err(|_| {
+            BackendError::InvalidInput("attention geometry exceeds i32::MAX".into())
+        })?;
+    }
+    Ok(result)
+}
+
 #[derive(Clone, Copy)]
 enum TrainingSaltDispatch {
     Exact,
@@ -658,6 +677,8 @@ pub struct CudaBackend {
     pub(super) func_conv1d_bwd: CudaFunction,
     pub(super) func_conv2d_fwd: CudaFunction,
     pub(super) func_conv2d_bwd: CudaFunction,
+    pub(super) func_attention_fwd: CudaFunction,
+    pub(super) func_attention_bwd: CudaFunction,
     /// Backend identifier, e.g. `"cuda:0"`.
     pub(super) device_id: String,
     /// Human-readable device name reported by the driver, e.g. `"NVIDIA H100"`.
@@ -976,6 +997,12 @@ impl CudaBackend {
         let func_conv2d_bwd = grad_module
             .load_function(KERNEL_NAME_CONV2D_BWD)
             .map_err(|e| driver_err("resolve conv2d_backward_portable kernel", &e))?;
+        let func_attention_fwd = grad_module
+            .load_function(KERNEL_NAME_ATTENTION_FWD)
+            .map_err(|e| driver_err("resolve attention_forward_portable kernel", &e))?;
+        let func_attention_bwd = grad_module
+            .load_function(KERNEL_NAME_ATTENTION_BWD)
+            .map_err(|e| driver_err("resolve attention_backward_portable kernel", &e))?;
 
         let salt_v2_module = ctx
             .load_module(Ptx::from_src(SALT_V2_PTX))
@@ -1094,6 +1121,8 @@ impl CudaBackend {
             func_conv1d_bwd,
             func_conv2d_fwd,
             func_conv2d_bwd,
+            func_attention_fwd,
+            func_attention_bwd,
             device_id: format!("cuda:{ordinal}"),
             device_name,
             sm_arch,
@@ -2781,6 +2810,113 @@ impl CudaBackend {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| driver_err("launch conv2d_backward_portable", &e))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_forward_portable_dev(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        result: &mut CudaSlice<f32>,
+        config: &tritium_train::ops::attention::AttentionCfg,
+    ) -> Result<(), BackendError> {
+        let query_len = config.query_elements().unwrap_or(usize::MAX);
+        let kv_len = config.kv_elements().unwrap_or(usize::MAX);
+        if !config.buffers_fit(q.len(), k.len(), v.len(), result.len()) {
+            return Err(BackendError::ShapeMismatch {
+                expected: query_len,
+                got: result.len(),
+            });
+        }
+        let mut probabilities = self
+            .stream
+            .alloc_zeros::<f32>(config.seq * config.seq)
+            .map_err(|e| driver_err("allocate attention probabilities", &e))?;
+        let geometry = attention_kernel_geometry(config)?;
+        let mut launch = self.stream.launch_builder(&self.func_attention_fwd);
+        launch
+            .arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(result)
+            .arg(&mut probabilities);
+        for value in &geometry {
+            launch.arg(value);
+        }
+        debug_assert_eq!(k.len(), kv_len);
+        #[allow(unsafe_code)]
+        // SAFETY: exact spans and positive, bounded geometry; serial deterministic kernel.
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| driver_err("launch attention_forward_portable", &e))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_backward_portable_dev(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        grad_output: &CudaSlice<f32>,
+        grad_q: &mut CudaSlice<f32>,
+        grad_k: &mut CudaSlice<f32>,
+        grad_v: &mut CudaSlice<f32>,
+        config: &tritium_train::ops::attention::AttentionCfg,
+    ) -> Result<(), BackendError> {
+        if !config.buffers_fit(q.len(), k.len(), v.len(), grad_output.len())
+            || grad_q.len() != q.len()
+            || grad_k.len() != k.len()
+            || grad_v.len() != v.len()
+        {
+            return Err(BackendError::ShapeMismatch {
+                expected: q.len(),
+                got: grad_output.len(),
+            });
+        }
+        let scratch_len = config.seq * config.seq;
+        let mut probabilities = self
+            .stream
+            .alloc_zeros::<f32>(scratch_len)
+            .map_err(|e| driver_err("allocate attention probabilities", &e))?;
+        let mut grad_probabilities = self
+            .stream
+            .alloc_zeros::<f32>(scratch_len)
+            .map_err(|e| driver_err("allocate attention probability gradients", &e))?;
+        let geometry = attention_kernel_geometry(config)?;
+        let mut launch = self.stream.launch_builder(&self.func_attention_bwd);
+        launch
+            .arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(grad_output)
+            .arg(grad_q)
+            .arg(grad_k)
+            .arg(grad_v)
+            .arg(&mut probabilities)
+            .arg(&mut grad_probabilities);
+        for value in &geometry {
+            launch.arg(value);
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: exact spans and positive, bounded geometry; serial deterministic kernel.
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| driver_err("launch attention_backward_portable", &e))?;
         }
         Ok(())
     }

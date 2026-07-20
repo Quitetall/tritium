@@ -17,6 +17,7 @@ const BACKEND_FAMILY: &str = "cuda.portable.v1";
 const MAX_SALT_PLANES: usize = 64;
 const MAX_SALT_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONV_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ATTENTION_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
 const OPERATIONS: &[&str] = &[
     "graph.ste_surrogate",
     "graph.salt_ste",
@@ -35,6 +36,7 @@ const OPERATIONS: &[&str] = &[
     "graph.mul",
     "graph.conv1d",
     "graph.conv2d",
+    "graph.attention",
     "graph.relu2",
     "graph.silu",
     "graph.rmsnorm",
@@ -2324,6 +2326,129 @@ impl CudaTrainBackendV1 {
         }
         Ok(())
     }
+
+    fn execute_attention(
+        &self,
+        request: &TrainRequestV1<'_>,
+        output: &mut TrainOutputV1<'_>,
+    ) -> Result<(), TrainBackendError> {
+        let expected_inputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["q", "k", "v"],
+            TrainExecutionV1::Vjp => &["q", "k", "v", "grad_output"],
+            _ => return Err(invariant("attention received an illegal phase")),
+        };
+        require_names(
+            request.inputs.iter().map(|buffer| buffer.name),
+            expected_inputs,
+            "inputs",
+        )?;
+        require_names(
+            request.attributes.iter().map(|attribute| attribute.name),
+            &["seq", "n_head", "n_kv_head", "head_dim", "causal"],
+            "attributes",
+        )?;
+        let expected_outputs: &[&str] = match request.execution {
+            TrainExecutionV1::Forward => &["result"],
+            TrainExecutionV1::Vjp => &["grad_q", "grad_k", "grad_v"],
+            _ => unreachable!(),
+        };
+        require_names(
+            output.buffers.iter().map(|buffer| buffer.name),
+            expected_outputs,
+            "outputs",
+        )?;
+        let config = attention_attributes(request)?;
+        let query_len = config.query_elements().ok_or_else(shape_error)?;
+        let kv_len = config.kv_elements().ok_or_else(shape_error)?;
+        let probability_len = bounded_u32_product(&[config.seq, config.seq], "seq")?;
+        let contract_elements = match request.execution {
+            TrainExecutionV1::Forward => query_len.checked_add(probability_len),
+            TrainExecutionV1::Vjp => query_len
+                .checked_add(kv_len)
+                .and_then(|value| value.checked_add(kv_len))
+                .and_then(|value| value.checked_add(probability_len))
+                .and_then(|value| value.checked_add(probability_len)),
+            _ => unreachable!(),
+        }
+        .ok_or_else(shape_error)?;
+        let contract_scratch = (contract_elements as u64)
+            .checked_mul(size_of::<f32>() as u64)
+            .ok_or_else(shape_error)?;
+        if contract_scratch > MAX_ATTENTION_SCRATCH_BYTES {
+            return Err(attribute_value("scratch", "limit_64_mib"));
+        }
+        let query_shape = [
+            config.seq as u64,
+            config.n_head as u64,
+            config.head_dim as u64,
+        ];
+        let kv_shape = [
+            config.seq as u64,
+            config.n_kv_head as u64,
+            config.head_dim as u64,
+        ];
+        let q = input_f32(request, "q", &query_shape)?;
+        let k = input_f32(request, "k", &kv_shape)?;
+        let v = input_f32(request, "v", &kv_shape)?;
+        require_finite("q", q)?;
+        require_finite("k", k)?;
+        require_finite("v", v)?;
+        debug_assert_eq!(q.len(), query_len);
+        debug_assert_eq!(k.len(), kv_len);
+        let device_q = self.backend.dev_upload(q).map_err(cuda_error)?;
+        let device_k = self.backend.dev_upload(k).map_err(cuda_error)?;
+        let device_v = self.backend.dev_upload(v).map_err(cuda_error)?;
+        if request.execution == TrainExecutionV1::Forward {
+            output_f32(output, "result", &query_shape, query_len)?;
+            let mut device_result = self
+                .backend
+                .dev_alloc_zeros(query_len)
+                .map_err(cuda_error)?;
+            self.backend
+                .attention_forward_portable_dev(
+                    &device_q,
+                    &device_k,
+                    &device_v,
+                    &mut device_result,
+                    &config,
+                )
+                .map_err(cuda_error)?;
+            let result = download_device(&self.backend, &device_result, query_len)?;
+            output_f32(output, "result", &query_shape, query_len)?.copy_from_slice(&result);
+        } else {
+            let grad_output = input_f32(request, "grad_output", &query_shape)?;
+            require_finite("grad_output", grad_output)?;
+            output_f32(output, "grad_q", &query_shape, query_len)?;
+            output_f32(output, "grad_k", &kv_shape, kv_len)?;
+            output_f32(output, "grad_v", &kv_shape, kv_len)?;
+            let device_grad_output = self.backend.dev_upload(grad_output).map_err(cuda_error)?;
+            let mut device_grad_q = self
+                .backend
+                .dev_alloc_zeros(query_len)
+                .map_err(cuda_error)?;
+            let mut device_grad_k = self.backend.dev_alloc_zeros(kv_len).map_err(cuda_error)?;
+            let mut device_grad_v = self.backend.dev_alloc_zeros(kv_len).map_err(cuda_error)?;
+            self.backend
+                .attention_backward_portable_dev(
+                    &device_q,
+                    &device_k,
+                    &device_v,
+                    &device_grad_output,
+                    &mut device_grad_q,
+                    &mut device_grad_k,
+                    &mut device_grad_v,
+                    &config,
+                )
+                .map_err(cuda_error)?;
+            let grad_q = download_device(&self.backend, &device_grad_q, query_len)?;
+            let grad_k = download_device(&self.backend, &device_grad_k, kv_len)?;
+            let grad_v = download_device(&self.backend, &device_grad_v, kv_len)?;
+            output_f32(output, "grad_q", &query_shape, query_len)?.copy_from_slice(&grad_q);
+            output_f32(output, "grad_k", &kv_shape, kv_len)?.copy_from_slice(&grad_k);
+            output_f32(output, "grad_v", &kv_shape, kv_len)?.copy_from_slice(&grad_v);
+        }
+        Ok(())
+    }
 }
 
 impl TrainBackendV1 for CudaTrainBackendV1 {
@@ -2366,6 +2491,7 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             "graph.mul" => self.execute_mul(&request, output)?,
             "graph.conv1d" => self.execute_conv1d(&request, output)?,
             "graph.conv2d" => self.execute_conv2d(&request, output)?,
+            "graph.attention" => self.execute_attention(&request, output)?,
             "graph.relu2" => self.execute_relu2(&request, output)?,
             "graph.silu" => self.execute_silu(&request, output)?,
             "graph.rmsnorm" => self.execute_rmsnorm(&request, output)?,
@@ -2425,6 +2551,19 @@ impl TrainBackendV1 for CudaTrainBackendV1 {
             ("graph.conv2d", TrainExecutionV1::Vjp) => {
                 let (config, height_out, width_out) = conv2d_attributes(&request)?;
                 conv2d_actual_scratch(&config, height_out, width_out)?
+            }
+            ("graph.attention", execution) => {
+                let config = attention_attributes(&request)?;
+                let probability_elements = bounded_u32_product(&[config.seq, config.seq], "seq")?;
+                let multiplier = match execution {
+                    TrainExecutionV1::Forward => 1_u64,
+                    TrainExecutionV1::Vjp => 2_u64,
+                    _ => 0_u64,
+                };
+                (probability_elements as u64)
+                    .checked_mul(multiplier)
+                    .and_then(|elements| elements.checked_mul(size_of::<f32>() as u64))
+                    .ok_or_else(shape_error)?
             }
             _ => 0,
         };
@@ -2561,6 +2700,34 @@ fn bounded_u32_product(values: &[usize], name: &str) -> Result<usize, TrainBacke
         return Err(attribute_value(name, "max_elements"));
     }
     Ok(product as usize)
+}
+
+fn attention_attributes(
+    request: &TrainRequestV1<'_>,
+) -> Result<tritium_train::ops::attention::AttentionCfg, TrainBackendError> {
+    let config = tritium_train::ops::attention::AttentionCfg {
+        seq: attribute_usize(request, "seq")?,
+        n_head: attribute_usize(request, "n_head")?,
+        n_kv_head: attribute_usize(request, "n_kv_head")?,
+        head_dim: attribute_usize(request, "head_dim")?,
+        causal: attribute_bool(request, "causal")?,
+    };
+    for (name, value) in [
+        ("seq", config.seq),
+        ("n_head", config.n_head),
+        ("n_kv_head", config.n_kv_head),
+        ("head_dim", config.head_dim),
+    ] {
+        if value == 0 {
+            return Err(attribute_value(name, "positive"));
+        }
+    }
+    if !config.n_head.is_multiple_of(config.n_kv_head) {
+        return Err(attribute_value("n_kv_head", "divides_n_head"));
+    }
+    bounded_u32_product(&[config.seq, config.n_head, config.head_dim], "seq")?;
+    bounded_u32_product(&[config.seq, config.n_kv_head, config.head_dim], "seq")?;
+    Ok(config)
 }
 
 fn conv1d_contract_scratch(
@@ -2802,6 +2969,23 @@ fn attribute_f32(request: &TrainRequestV1<'_>, name: &str) -> Result<f32, TrainB
             TrainOperationErrorV1::AttributeType {
                 name: name.to_owned(),
                 expected: "f32",
+            },
+        ));
+    };
+    Ok(value)
+}
+
+fn attribute_bool(request: &TrainRequestV1<'_>, name: &str) -> Result<bool, TrainBackendError> {
+    let value = request
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .ok_or_else(|| roles("attributes"))?;
+    let TrainAttributeValueV1::Bool(value) = value.value else {
+        return Err(TrainBackendError::InvalidOperation(
+            TrainOperationErrorV1::AttributeType {
+                name: name.to_owned(),
+                expected: "bool",
             },
         ));
     };
