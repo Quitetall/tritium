@@ -134,6 +134,7 @@ def _selected_linear_modules(
     }
     records = []
     seen = set()
+    weight_owners = {}
     for path, module in prepared.model.named_modules(remove_duplicate=False):
         weight_name = f"{path}.weight" if path else "weight"
         if not isinstance(module, nn.Linear) or weight_name not in selected:
@@ -142,6 +143,15 @@ def _selected_linear_modules(
         if key in seen:
             continue
         seen.add(key)
+        prior_owner = weight_owners.get(id(module.weight))
+        if prior_owner is not None:
+            raise TritiumError(
+                "raw diagonal calibration does not yet merge distinct Linear modules sharing one weight",
+                code="unsupported_shared_parameter",
+                stage="calibrate",
+                details={"modules": [prior_owner, path]},
+            )
+        weight_owners[id(module.weight)] = path
         aliases = next(
             entry.aliases
             for entry in prepared.coverage.entries

@@ -442,6 +442,29 @@ def test_live_module_calibration_fails_closed_on_incomplete_or_oversize_data(tmp
     assert caught.value.code == "unsupported_module"
     assert caught.value.details["parameters"] == ["0.weight"]
 
+    class SharedLinears(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.left = torch.nn.Linear(2, 2, bias=False)
+            self.right = torch.nn.Linear(2, 2, bias=False)
+            self.right.weight = self.left.weight
+
+        def forward(self, value):
+            return self.left(value) + self.right(value)
+
+    shared = prepare(
+        SharedLinears(),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    with pytest.raises(TritiumError) as caught:
+        calibrate(
+            shared,
+            [torch.ones(1, 2)],
+            evidence_dir=tmp_path / "shared",
+        )
+    assert caught.value.code == "unsupported_shared_parameter"
+
 
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
     sentinel_prepared = object()
