@@ -2927,6 +2927,43 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_sequence_geometry_builds_prompt_and_decode_masks_on_one_session() {
+        use ort::value::Tensor;
+
+        let model = crate::model::encode_dynamic_sequence_geometry_test_graph();
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .commit_from_memory(&model)
+            .unwrap();
+
+        let prompt_tokens = Tensor::from_array(([2], vec![7_i64, 8])).unwrap();
+        let no_past = Tensor::from_array(((), vec![0_i64])).unwrap();
+        let prompt = session.run(ort::inputs![&prompt_tokens, &no_past]).unwrap();
+        let (positions_shape, positions) = prompt[0].try_extract_tensor::<i64>().unwrap();
+        assert_eq!(positions_shape.as_ref(), &[2]);
+        assert_eq!(positions, &[0, 1]);
+        let (mask_shape, mask) = prompt[1].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(mask_shape.as_ref(), &[1, 2, 2]);
+        assert_f32_close(mask, &[0.0, -1.0e9, 0.0, 0.0], 0.0);
+        assert_eq!(prompt[2].try_extract_scalar::<i64>().unwrap(), 2);
+        assert_eq!(prompt[3].try_extract_scalar::<i64>().unwrap(), 0);
+        assert_eq!(prompt[4].try_extract_scalar::<i64>().unwrap(), 2);
+        drop(prompt);
+
+        let decode_token = Tensor::from_array(([1], vec![9_i64])).unwrap();
+        let two_past = Tensor::from_array(((), vec![2_i64])).unwrap();
+        let decode = session.run(ort::inputs![&decode_token, &two_past]).unwrap();
+        let (_, positions) = decode[0].try_extract_tensor::<i64>().unwrap();
+        assert_eq!(positions, &[2]);
+        let (mask_shape, mask) = decode[1].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(mask_shape.as_ref(), &[1, 1, 3]);
+        assert_f32_close(mask, &[0.0, 0.0, 0.0], 0.0);
+        assert_eq!(decode[2].try_extract_scalar::<i64>().unwrap(), 1);
+        assert_eq!(decode[3].try_extract_scalar::<i64>().unwrap(), 2);
+        assert_eq!(decode[4].try_extract_scalar::<i64>().unwrap(), 3);
+    }
+
+    #[test]
     fn end_to_end_standard_onnx_attention_runs_prompt_and_cached_decode() {
         use ort::value::Tensor;
 

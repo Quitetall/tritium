@@ -2479,7 +2479,9 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".cos")
                 || name.ends_with(".sin")
                 || name.ends_with(".dt_bias")
-                || name.ends_with(".a_log") =>
+                || name.ends_with(".a_log")
+                || name.ends_with(".allowed")
+                || name.ends_with(".blocked") =>
             {
                 Some(TENSOR_FLOAT)
             }
@@ -2493,7 +2495,9 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".second_end")
                 || name.ends_with(".tail_start")
                 || name.ends_with(".tail_end")
-                || name.ends_with(".steps") =>
+                || name.ends_with(".steps")
+                || name == "sequence.zero"
+                || name == "sequence.one" =>
             {
                 Some(TENSOR_INT64)
             }
@@ -2531,7 +2535,7 @@ pub fn diagnose_unsupported_graph(
     for input in &graph.input {
         let subject = format!("input {}", input.name);
         match input.name.as_str() {
-            "tokens" | "shifted_tokens" => push_dtype_diagnostic(
+            "tokens" | "shifted_tokens" | "past_tokens" => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
                 tensor_elem_type(input),
@@ -2659,10 +2663,12 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
         ("", "Softmax") => &["axis"],
         ("", "Concat") => &["axis"],
         ("", "ReduceMean") => &["keepdims"],
+        ("", "Gather") => &["axis"],
         (
             "",
             "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Relu" | "Reshape" | "Tile"
-            | "Identity" | "Slice" | "Neg",
+            | "Identity" | "Slice" | "Neg" | "Shape" | "Range" | "Unsqueeze" | "LessOrEqual"
+            | "Where",
         ) => &[],
         _ => &[],
     }
@@ -2770,7 +2776,7 @@ fn node_supported(
             "",
             "Transpose" | "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Relu"
             | "Reshape" | "Tile" | "Identity" | "Slice" | "Neg" | "Concat" | "ReduceMean"
-            | "Softmax",
+            | "Softmax" | "Shape" | "Gather" | "Range" | "Unsqueeze" | "LessOrEqual" | "Where",
         ) => standard_opset == Some(ONNX_OPSET),
         _ => false,
     }
@@ -4849,6 +4855,15 @@ struct CausalGraphGeometry {
     gqa_repeat: i64,
 }
 
+#[cfg(test)]
+struct DynamicSequenceGeometry {
+    positions: String,
+    key_positions: String,
+    token_count: String,
+    past_count: String,
+    total_count: String,
+}
+
 #[derive(Clone, Copy)]
 struct FullAttentionGraphContext<'a> {
     tokens: i64,
@@ -5346,6 +5361,125 @@ impl CausalGraphBuilder {
             offset,
             length,
         ));
+    }
+
+    #[cfg(test)]
+    fn add_dynamic_sequence_geometry(
+        &mut self,
+        tokens_input: &str,
+        past_count_input: &str,
+        prefix: &str,
+    ) -> DynamicSequenceGeometry {
+        let token_shape = format!("{prefix}.token_shape");
+        let zero = format!("{prefix}.zero");
+        let one = format!("{prefix}.one");
+        let token_count = format!("{prefix}.token_count");
+        let total_count = format!("{prefix}.total_count");
+        self.add_i64(&zero, Vec::new(), &[0]);
+        self.add_i64(&one, Vec::new(), &[1]);
+        self.standard(
+            format!("{prefix}.token_shape_node"),
+            "Shape",
+            &[tokens_input],
+            &[&token_shape],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.token_count_node"),
+            "Gather",
+            &[&token_shape, &zero],
+            &[&token_count],
+            vec![int_attribute("axis", 0)],
+        );
+        self.standard(
+            format!("{prefix}.total_count_node"),
+            "Add",
+            &[past_count_input, &token_count],
+            &[&total_count],
+            Vec::new(),
+        );
+        let positions = format!("{prefix}.positions");
+        let key_positions = format!("{prefix}.key_positions");
+        self.standard(
+            format!("{prefix}.positions_node"),
+            "Range",
+            &[past_count_input, &total_count, &one],
+            &[&positions],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.key_positions_node"),
+            "Range",
+            &[&zero, &total_count, &one],
+            &[&key_positions],
+            Vec::new(),
+        );
+        DynamicSequenceGeometry {
+            positions,
+            key_positions,
+            token_count,
+            past_count: past_count_input.to_owned(),
+            total_count,
+        }
+    }
+
+    #[cfg(test)]
+    fn add_dynamic_causal_mask(
+        &mut self,
+        prefix: &str,
+        geometry: &DynamicSequenceGeometry,
+    ) -> String {
+        let query_axes = format!("{prefix}.query_axes");
+        let key_axes = format!("{prefix}.key_axes");
+        self.add_i64(&query_axes, vec![1], &[1]);
+        self.add_i64(&key_axes, vec![1], &[0]);
+        let query_grid = format!("{prefix}.query_grid");
+        let key_grid = format!("{prefix}.key_grid");
+        self.standard(
+            format!("{prefix}.query_grid_node"),
+            "Unsqueeze",
+            &[&geometry.positions, &query_axes],
+            &[&query_grid],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.key_grid_node"),
+            "Unsqueeze",
+            &[&geometry.key_positions, &key_axes],
+            &[&key_grid],
+            Vec::new(),
+        );
+        let visible = format!("{prefix}.visible");
+        self.standard(
+            format!("{prefix}.visible_node"),
+            "LessOrEqual",
+            &[&key_grid, &query_grid],
+            &[&visible],
+            Vec::new(),
+        );
+        let allowed = format!("{prefix}.allowed");
+        let blocked = format!("{prefix}.blocked");
+        self.add_f32(&allowed, Vec::new(), &[0.0]);
+        self.add_f32(&blocked, Vec::new(), &[-1.0e9]);
+        let matrix = format!("{prefix}.matrix");
+        self.standard(
+            format!("{prefix}.matrix_node"),
+            "Where",
+            &[&visible, &allowed, &blocked],
+            &[&matrix],
+            Vec::new(),
+        );
+        let batch_axes = format!("{prefix}.batch_axes");
+        self.add_i64(&batch_axes, vec![1], &[0]);
+        let mask = format!("{prefix}.output");
+        self.standard(
+            format!("{prefix}.batch_node"),
+            "Unsqueeze",
+            &[&matrix, &batch_axes],
+            &[&mask],
+            Vec::new(),
+        );
+        mask
     }
 
     fn add_causal_mask(
@@ -7571,6 +7705,62 @@ pub(crate) fn encode_dynamic_kv_attention_test_graph(
         opset_import: vec![OperatorSetIdProto {
             domain: ONNX_DOMAIN.to_owned(),
             version: 3,
+        }],
+        metadata_props: Vec::new(),
+    }
+    .encode_to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn encode_dynamic_sequence_geometry_test_graph() -> Vec<u8> {
+    use tensor_dimension_proto::Value::{DimParam, DimValue};
+
+    let mut graph = CausalGraphBuilder::default();
+    let geometry = graph.add_dynamic_sequence_geometry("tokens", "past_tokens", "sequence");
+    let mask = graph.add_dynamic_causal_mask("causal_mask", &geometry);
+    assert!(graph.failure.is_none());
+    ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx-test".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: String::new(),
+        model_version: 1,
+        graph: Some(GraphProto {
+            node: graph.nodes,
+            name: "tritium.dynamic_sequence_geometry.test".to_owned(),
+            initializer: graph.initializers,
+            input: vec![
+                tensor_value_dimensions(
+                    "tokens",
+                    TENSOR_INT64,
+                    vec![DimParam("query_tokens".to_owned())],
+                ),
+                tensor_value("past_tokens", TENSOR_INT64, &[]),
+            ],
+            output: vec![
+                tensor_value_dimensions(
+                    &geometry.positions,
+                    TENSOR_INT64,
+                    vec![DimParam("query_tokens".to_owned())],
+                ),
+                tensor_value_dimensions(
+                    &mask,
+                    TENSOR_FLOAT,
+                    vec![
+                        DimValue(1),
+                        DimParam("query_tokens".to_owned()),
+                        DimParam("total_tokens".to_owned()),
+                    ],
+                ),
+                tensor_value(&geometry.token_count, TENSOR_INT64, &[]),
+                tensor_value(&geometry.past_count, TENSOR_INT64, &[]),
+                tensor_value(&geometry.total_count, TENSOR_INT64, &[]),
+            ],
+            value_info: Vec::new(),
+        }),
+        opset_import: vec![OperatorSetIdProto {
+            domain: String::new(),
+            version: ONNX_OPSET,
         }],
         metadata_props: Vec::new(),
     }
