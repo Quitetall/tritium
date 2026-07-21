@@ -515,14 +515,21 @@ def load_module_conversion(
         raise ValueError("module conversion recipe identity mismatch")
     if any(len(weight.planes) != config.planes for weight in weights):
         raise ValueError("module conversion plane count differs from recipe")
-    selected = tuple(
-        entry for entry in coverage.entries if entry.disposition == "selected"
-    )
-    if len(selected) != len(weights) or any(
-        entry.path != weight.path
-        or entry.aliases != weight.aliases
-        or entry.numel != weight.shape[0] * weight.shape[1]
-        for entry, weight in zip(selected, weights)
+    selected = {
+        entry.path: entry
+        for entry in coverage.entries
+        if entry.disposition == "selected"
+    }
+    fitted = {weight.path: weight for weight in weights}
+    if (
+        len(selected) != coverage.selected_parameters
+        or len(fitted) != len(weights)
+        or selected.keys() != fitted.keys()
+        or any(
+            entry.aliases != fitted[path].aliases
+            or entry.numel != fitted[path].shape[0] * fitted[path].shape[1]
+            for path, entry in selected.items()
+        )
     ):
         raise ValueError("module conversion weights differ from selected coverage")
     return ModuleQuantizationResult(

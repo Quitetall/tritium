@@ -111,3 +111,33 @@ def test_module_conversion_rejects_missing_selected_coverage_weight(tmp_path):
 
     with pytest.raises(ValueError, match="selected coverage"):
         load_module_conversion(work)
+
+
+def test_module_conversion_coverage_bijection_is_order_independent(tmp_path):
+    class TiedEmbeddingHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(4, 4)
+            self.head = torch.nn.Linear(4, 4, bias=False)
+            self.head.weight = self.embed.weight
+
+        def forward(self, tokens):
+            return self.head(self.embed(tokens))
+
+    prepared = prepare(
+        TiedEmbeddingHead(),
+        TernaryConfig.ptq(
+            profile="compact-v1", target_modules=("Linear", "Embedding")
+        ),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.tensor([[0, 1, 2]])],
+        evidence_dir=tmp_path / "evidence",
+    )
+    converted = convert(prepared, calibration, work_dir=tmp_path / "work")
+
+    assert converted.weights[0].path == "embed.weight"
+    assert converted.weights[0].aliases == ("embed.weight", "head.weight")
+    assert load_module_conversion(converted.artifact_dir) == converted

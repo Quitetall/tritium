@@ -1,7 +1,7 @@
 //! Strict, bounded conversion-artifact to SALT V2 package bridge.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
@@ -453,12 +453,25 @@ fn validate_coverage(coverage: &CoverageReceipt, weights: &[AdmittedWeight]) -> 
         .entries
         .iter()
         .filter(|entry| entry.disposition == "selected")
-        .collect::<Vec<_>>();
-    if selected.len() != weights.len()
-        || selected.iter().zip(weights).any(|(entry, weight)| {
-            entry.path != weight.name
-                || entry.aliases != weight.aliases
-                || entry.numel != (weight.rows as u64).saturating_mul(weight.columns as u64)
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let fitted = weights
+        .iter()
+        .map(|weight| (weight.name.as_str(), weight))
+        .collect::<BTreeMap<_, _>>();
+    if selected.len()
+        != coverage
+            .entries
+            .iter()
+            .filter(|entry| entry.disposition == "selected")
+            .count()
+        || fitted.len() != weights.len()
+        || selected.keys().ne(fitted.keys())
+        || selected.iter().any(|(path, entry)| {
+            fitted.get(path).is_none_or(|weight| {
+                entry.aliases != weight.aliases
+                    || entry.numel != (weight.rows as u64).saturating_mul(weight.columns as u64)
+            })
         })
     {
         return Err("conversion weights differ from selected coverage".to_owned());
