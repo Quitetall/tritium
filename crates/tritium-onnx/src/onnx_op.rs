@@ -2167,6 +2167,51 @@ mod tests {
             let (_, bundled) = bundled_outputs[index].try_extract_tensor::<f32>().unwrap();
             assert_f32_close(bundled, inline, 0.0);
         }
+
+        let dynamic_mtp = crate::encode_dynamic_qwen35_mtp(mtp_model).unwrap();
+        let diagnostics = crate::diagnose_unsupported_graph(&dynamic_mtp).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut dynamic_mtp_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&dynamic_mtp)
+            .unwrap();
+        let shifted = Tensor::from_array(([2], vec![0_i64, 1])).unwrap();
+        let target = Tensor::from_array(([2, hidden], vec![0.0_f32; hidden * 2])).unwrap();
+        let no_past = Tensor::from_array(((), vec![0_i64])).unwrap();
+        let dummy_k = Tensor::from_array(([1, 1, hidden], vec![0.0_f32; hidden])).unwrap();
+        let dummy_v = Tensor::from_array(([1, 1, hidden], vec![0.0_f32; hidden])).unwrap();
+        let dynamic_prompt = dynamic_mtp_session
+            .run(ort::inputs![
+                &shifted, &target, &no_past, &dummy_k, &dummy_v
+            ])
+            .unwrap();
+        let (logits_shape, logits) = dynamic_prompt[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(logits_shape.as_ref(), &[2, 2]);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        let (hidden_shape, _) = dynamic_prompt[1].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(hidden_shape.as_ref(), &[2, hidden as i64]);
+        let (key_shape, present_k) = dynamic_prompt[2].try_extract_tensor::<f32>().unwrap();
+        let (_, present_v) = dynamic_prompt[3].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(key_shape.as_ref(), &[2, 1, hidden as i64]);
+        let present_k = present_k.to_vec();
+        let present_v = present_v.to_vec();
+        drop(dynamic_prompt);
+
+        let shifted = Tensor::from_array(([1], vec![0_i64])).unwrap();
+        let target = Tensor::from_array(([1, hidden], vec![0.0_f32; hidden])).unwrap();
+        let two_past = Tensor::from_array(((), vec![2_i64])).unwrap();
+        let past_k = Tensor::from_array(([2, 1, hidden], present_k)).unwrap();
+        let past_v = Tensor::from_array(([2, 1, hidden], present_v)).unwrap();
+        let dynamic_decode = dynamic_mtp_session
+            .run(ort::inputs![&shifted, &target, &two_past, &past_k, &past_v])
+            .unwrap();
+        let (logits_shape, logits) = dynamic_decode[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(logits_shape.as_ref(), &[1, 2]);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        let (key_shape, _) = dynamic_decode[2].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(key_shape.as_ref(), &[3, 1, hidden as i64]);
     }
 
     #[test]

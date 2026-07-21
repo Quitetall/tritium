@@ -2500,8 +2500,8 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".steps")
                 || name.ends_with("_starts")
                 || name.ends_with("_steps")
-                || name == "sequence.zero"
-                || name == "sequence.one" =>
+                || name.ends_with("sequence.zero")
+                || name.ends_with("sequence.one") =>
             {
                 Some(TENSOR_INT64)
             }
@@ -3102,6 +3102,39 @@ pub fn encode_qwen35_mtp<'a, M: OnnxPackedMatrix<'a>>(
     validate_qwen35_mtp_model(&model)?;
     build_qwen35_mtp_graph(model, CausalGraphBuilder::counting())?;
     let (protobuf, _) = build_qwen35_mtp_graph(model, CausalGraphBuilder::default())?;
+    let encoded = protobuf.encode_to_vec();
+    if encoded.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
+}
+
+/// Encode one schema-v3 Qwen MTP graph with dynamic prompt/decode length.
+///
+/// The graph accepts symbolic `shifted_tokens` and `target_hidden`, scalar
+/// `past_tokens`, and capacity-backed K/V tensors. For a prompt, callers pass
+/// `past_tokens = 0` plus non-empty dummy cache tensors; decode feeds the prior
+/// present cache into the same ONNX Runtime session.
+///
+/// `model.tokens` and `model.past_tokens` must be the canonical construction
+/// marker `1` and `0`; those values are not frozen into the emitted graph.
+///
+/// # Errors
+/// [`OnnxModelError`] if the canonical marker, MTP model, packed payloads,
+/// preserved vectors, or initializer budget is invalid.
+pub fn encode_dynamic_qwen35_mtp<'a, M: OnnxPackedMatrix<'a>>(
+    model: Qwen35MtpModel<'a, M>,
+) -> Result<Vec<u8>, OnnxModelError> {
+    if model.tokens != 1 || model.past_tokens != 0 {
+        return Err(OnnxModelError::InvalidModel(
+            "dynamic Qwen MTP construction requires tokens=1 and past_tokens=0".to_owned(),
+        ));
+    }
+    validate_qwen35_mtp_model(&model)?;
+    build_dynamic_qwen35_mtp_graph(model, CausalGraphBuilder::counting())?;
+    let (protobuf, _) = build_dynamic_qwen35_mtp_graph(model, CausalGraphBuilder::default())?;
     let encoded = protobuf.encode_to_vec();
     if encoded.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
@@ -7502,6 +7535,204 @@ fn build_qwen35_mtp_graph<'a, M: OnnxPackedMatrix<'a>>(
                 ),
                 metadata("tritium.tokens", &model.tokens.to_string()),
                 metadata("tritium.past_tokens", &model.past_tokens.to_string()),
+                metadata("tritium.layers", "1"),
+                metadata("tritium.hidden", &model.embedding.columns().to_string()),
+                metadata("tritium.vocab", &model.embedding.rows().to_string()),
+                metadata("tritium.n_head", &model.n_head.to_string()),
+                metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
+                metadata("tritium.head_dim", &model.head_dim.to_string()),
+                metadata("tritium.rotary_dim", &model.rotary.dimensions.to_string()),
+                metadata("tritium.rms_epsilon", &model.rms_epsilon.to_string()),
+                metadata("tritium.input_alignment", "caller-shifted-target-aligned"),
+                metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
+                metadata("tritium.tied_embedding_head", "false"),
+                metadata("tritium.rope_theta", &model.rotary.theta.to_string()),
+            ],
+        },
+        external_weights,
+    ))
+}
+
+fn build_dynamic_qwen35_mtp_graph<'a, M: OnnxPackedMatrix<'a>>(
+    model: Qwen35MtpModel<'a, M>,
+    mut graph: CausalGraphBuilder,
+) -> Result<(ModelProto, Option<ExternalWeightArena>), OnnxModelError> {
+    use tensor_dimension_proto::Value::{DimParam, DimValue};
+
+    let hidden = as_i64(model.embedding.columns(), "MTP hidden size")?;
+    let vocab = as_i64(model.embedding.rows(), "MTP vocabulary")?;
+    let n_head = as_i64(model.n_head, "MTP attention head count")?;
+    let n_kv_head = as_i64(model.n_kv_head, "MTP KV head count")?;
+    let head_dim = as_i64(model.head_dim, "MTP head dimension")?;
+    let query_width = n_head
+        .checked_mul(head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("MTP query width"))?;
+    let geometry = CausalGraphGeometry {
+        past_tokens: 0,
+        total_tokens: 0,
+        n_head,
+        n_kv_head,
+        head_dim,
+        gqa_repeat: as_i64(model.n_head / model.n_kv_head, "MTP GQA repeat")?,
+    };
+    let sequence =
+        graph.add_dynamic_sequence_geometry("shifted_tokens", "past_tokens", "mtp.sequence");
+    let attention_mask = graph.add_dynamic_causal_mask("mtp.attention_mask", &sequence);
+    let rotary_state = graph.add_dynamic_rotary_tables(
+        "mtp.rope",
+        &sequence,
+        model.head_dim,
+        model.rotary.dimensions,
+        model.rotary.theta,
+    )?;
+
+    graph.embedding(
+        "mtp.embedding",
+        "shifted_tokens",
+        "mtp.embedding",
+        "tok_embeddings",
+        model.embedding,
+    )?;
+    graph.rms_norm_with_semantics(
+        "mtp.embedding_norm",
+        "mtp.embedding",
+        "mtp.embedding_norm.output",
+        model.mtp.pre_fc_norm_embedding,
+        model.rms_epsilon,
+        true,
+    );
+    graph.rms_norm_with_semantics(
+        "mtp.target_norm",
+        "target_hidden",
+        "mtp.target_norm.output",
+        model.mtp.pre_fc_norm_hidden,
+        model.rms_epsilon,
+        true,
+    );
+    graph.standard(
+        "mtp.fusion_concat",
+        "Concat",
+        &["mtp.embedding_norm.output", "mtp.target_norm.output"],
+        &["mtp.fusion_input"],
+        vec![int_attribute("axis", 1)],
+    );
+    graph.projection(
+        "mtp.fusion",
+        "mtp.fusion_input",
+        "mtp.layer_input",
+        "mtp.fusion",
+        model.mtp.fusion,
+    )?;
+
+    let mut inputs = vec![
+        tensor_value_dimensions(
+            "shifted_tokens",
+            TENSOR_INT64,
+            vec![DimParam("query_tokens".to_owned())],
+        ),
+        tensor_value_dimensions(
+            "target_hidden",
+            TENSOR_FLOAT,
+            vec![DimParam("query_tokens".to_owned()), DimValue(hidden)],
+        ),
+        tensor_value("past_tokens", TENSOR_INT64, &[]),
+    ];
+    let mut state_outputs = Vec::with_capacity(2);
+    let layer_output = graph.full_attention_block(
+        0,
+        "mtp.layer_input",
+        model.mtp.layer.causal(),
+        FullAttentionGraphContext {
+            tokens: 0,
+            n_head,
+            n_kv_head,
+            head_dim,
+            head_dim_usize: model.head_dim,
+            query_width,
+            geometry,
+            rotary_state: Some(&rotary_state),
+            dynamic_sequence: Some(&sequence),
+            attention_mask: &attention_mask,
+            epsilon: model.rms_epsilon,
+            zero_centered_norm: true,
+        },
+        &mut inputs,
+        &mut state_outputs,
+    )?;
+    graph.rms_norm_with_semantics(
+        "mtp.final_norm",
+        &layer_output,
+        "mtp.final_hidden",
+        model.mtp.final_norm,
+        model.rms_epsilon,
+        true,
+    );
+    graph.projection(
+        "mtp.lm_head",
+        "mtp.final_hidden",
+        "mtp.logits",
+        "lm_head",
+        model.lm_head,
+    )?;
+    if let Some(error) = graph.failure {
+        return Err(error);
+    }
+    let mut outputs = vec![
+        tensor_value_dimensions(
+            "mtp.logits",
+            TENSOR_FLOAT,
+            vec![DimParam("query_tokens".to_owned()), DimValue(vocab)],
+        ),
+        tensor_value_dimensions(
+            "mtp.final_hidden",
+            TENSOR_FLOAT,
+            vec![DimParam("query_tokens".to_owned()), DimValue(hidden)],
+        ),
+    ];
+    outputs.extend(state_outputs);
+    let external_weights = external_storage_result(graph.storage)?;
+    Ok((
+        ModelProto {
+            ir_version: ONNX_IR_VERSION,
+            producer_name: "tritium-onnx".to_owned(),
+            producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+            domain: ONNX_DOMAIN.to_owned(),
+            model_version: 3,
+            graph: Some(GraphProto {
+                node: graph.nodes,
+                name: "tritium.qwen35_mtp.dynamic".to_owned(),
+                initializer: graph.initializers,
+                input: inputs,
+                output: outputs,
+                value_info: Vec::new(),
+            }),
+            opset_import: vec![
+                OperatorSetIdProto {
+                    domain: String::new(),
+                    version: ONNX_OPSET,
+                },
+                OperatorSetIdProto {
+                    domain: ONNX_DOMAIN.to_owned(),
+                    version: 2,
+                },
+            ],
+            metadata_props: vec![
+                metadata("tritium.schema_version", "3"),
+                metadata("tritium.graph_kind", "qwen35-mtp"),
+                metadata("tritium.sequence_mode", "dynamic-cache-v1"),
+                metadata("tritium.source_model_id", model.identity.source_model_id),
+                metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
+                metadata("tritium.recipe_id", model.identity.recipe_id),
+                metadata("tritium.build_id", model.identity.tritium_build_id),
+                metadata("tritium.package_id", model.identity.package_id),
+                metadata(
+                    "tritium.coverage.converted_id",
+                    model.identity.converted_coverage_id,
+                ),
+                metadata(
+                    "tritium.coverage.deferred_id",
+                    model.identity.deferred_coverage_id,
+                ),
                 metadata("tritium.layers", "1"),
                 metadata("tritium.hidden", &model.embedding.columns().to_string()),
                 metadata("tritium.vocab", &model.embedding.rows().to_string()),
