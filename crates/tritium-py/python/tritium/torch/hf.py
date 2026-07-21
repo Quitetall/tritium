@@ -71,10 +71,12 @@ class TritiumHfQuantizer(HfQuantizer):
     def _process_model_after_weight_loading(self, model, **kwargs):
         del kwargs
         if self.quantization_config.recipe.mode == "ptq":
-            from ..nn import AdditiveTernaryLinear
+            from ..nn import AdditiveTernaryEmbedding, AdditiveTernaryLinear
 
             for module in model.modules():
-                if isinstance(module, AdditiveTernaryLinear):
+                if isinstance(
+                    module, (AdditiveTernaryLinear, AdditiveTernaryEmbedding)
+                ):
                     module.validate_buffers()
             expected = getattr(model.config, "tritium_ptq_checkpoint_digest", None)
             if not isinstance(expected, str) or not expected.startswith("sha256:"):
@@ -134,22 +136,34 @@ def register_huggingface() -> None:
 
 
 def _prepare_ptq_inference_shell(model, recipe: TernaryConfig):
-    """Replace exact Linear modules with meta-safe compact state shells."""
+    """Replace exact selected modules with meta-safe compact state shells."""
 
-    unsupported = set(recipe.target_modules) - {"Linear"}
-    if unsupported or "Linear" not in recipe.target_modules:
+    supported = {"Linear", "Embedding"}
+    unsupported = set(recipe.target_modules) - supported
+    if unsupported or not recipe.target_modules:
         raise TritiumError(
-            "generic Hugging Face PTQ reload currently supports Linear targets only",
+            "generic Hugging Face PTQ reload target set is unsupported",
             code="unsupported_recipe",
             stage="load",
             details={"targets": sorted(recipe.target_modules)},
         )
-    from ..nn import AdditiveTernaryLinear
+    from ..nn import (
+        AdditiveTernaryEmbedding,
+        AdditiveTernaryLinear,
+        AdditiveTernaryWeight,
+    )
 
     replacements = {}
+    packed_weights = {}
+    tied_weights = dict(getattr(model, "all_tied_weights_keys", {}) or {})
+    weight_keys_by_identity = {}
     pending = []
     for path, module in model.named_modules(remove_duplicate=False):
-        if type(module) is not nn.Linear:
+        kind = type(module).__name__
+        if kind not in recipe.target_modules or type(module) not in {
+            nn.Linear,
+            nn.Embedding,
+        }:
             continue
         if not path:
             raise TritiumError(
@@ -159,19 +173,58 @@ def _prepare_ptq_inference_shell(model, recipe: TernaryConfig):
             )
         replacement = replacements.get(id(module))
         if replacement is None:
-            replacement = AdditiveTernaryLinear.empty(
-                module.in_features,
-                module.out_features,
-                recipe.planes,
-                bias=module.bias is not None,
-                device=module.weight.device,
-                dtype=module.weight.dtype,
-            )
+            weight_path = f"{path}.weight"
+            weight_key = tied_weights.get(weight_path, weight_path)
+            weight_key = weight_keys_by_identity.setdefault(id(module.weight), weight_key)
+            packed_weight = packed_weights.get(weight_key)
+            owns_weight = packed_weight is None
+            if packed_weight is None:
+                rows, columns = map(int, module.weight.shape)
+                packed_weight = AdditiveTernaryWeight.empty(
+                    columns,
+                    rows,
+                    recipe.planes,
+                    device=module.weight.device,
+                )
+                packed_weights[weight_key] = packed_weight
+            if type(module) is nn.Linear:
+                replacement = AdditiveTernaryLinear.empty(
+                    module.in_features,
+                    module.out_features,
+                    recipe.planes,
+                    bias=module.bias is not None,
+                    device=module.weight.device,
+                    dtype=module.weight.dtype,
+                    packed_weight=packed_weight,
+                    owner=owns_weight,
+                )
+            else:
+                if module.max_norm is not None:
+                    raise TritiumError(
+                        "Hugging Face PTQ reload cannot preserve mutating Embedding max_norm",
+                        code="unsupported_module_option",
+                        stage="load",
+                        module=path,
+                    )
+                replacement = AdditiveTernaryEmbedding.empty(
+                    module.num_embeddings,
+                    module.embedding_dim,
+                    recipe.planes,
+                    padding_idx=module.padding_idx,
+                    max_norm=module.max_norm,
+                    norm_type=module.norm_type,
+                    scale_grad_by_freq=module.scale_grad_by_freq,
+                    sparse=module.sparse,
+                    device=module.weight.device,
+                    dtype=module.weight.dtype,
+                    packed_weight=packed_weight,
+                    owner=owns_weight,
+                )
             replacements[id(module)] = replacement
         pending.append((path, replacement))
     if not pending:
         raise TritiumError(
-            "Hugging Face PTQ recipe selected no exact Linear modules",
+            "Hugging Face PTQ recipe selected no exact supported modules",
             code="incomplete_coverage",
             stage="load",
         )
@@ -181,6 +234,10 @@ def _prepare_ptq_inference_shell(model, recipe: TernaryConfig):
         for part in parts[:-1]:
             parent = parent._modules[part]
         parent._modules[parts[-1]] = replacement
+    if hasattr(model, "all_tied_weights_keys"):
+        model.all_tied_weights_keys = {}
+    if hasattr(model, "_tied_weights_keys"):
+        model._tied_weights_keys = {}
     return model
 
 

@@ -788,13 +788,19 @@ def load_quantized_module(
             stage="load",
         ) from error
 
-    from ..nn import AdditiveTernaryLinear
+    from ..nn import (
+        AdditiveTernaryEmbedding,
+        AdditiveTernaryLinear,
+        AdditiveTernaryWeight,
+    )
 
     modules = dict(target.named_modules(remove_duplicate=False))
-    replacements = {}
     owners = {}
+    replacement_paths = {}
     for reference in admitted.weights:
         fitted = admitted.weight(reference.path)
+        packed_weight = None
+        replacement_by_module = {}
         for alias in reference.aliases:
             if alias == "weight":
                 module_path = ""
@@ -808,9 +814,9 @@ def load_quantized_module(
                     module=alias,
                 )
             module = modules.get(module_path)
-            if type(module) is not nn.Linear:
+            if type(module) not in {nn.Linear, nn.Embedding}:
                 raise TritiumError(
-                    "module conversion target is not an exact Linear module",
+                    "module conversion target is not an exact Linear or Embedding module",
                     code="coverage_mismatch",
                     stage="load",
                     module=module_path,
@@ -831,19 +837,44 @@ def load_quantized_module(
                     module=module_path,
                 )
             owners[id(module)] = reference.path
-            replacement = replacements.get(id(module))
+            replacement = replacement_by_module.get(id(module))
             if replacement is None:
-                replacement = AdditiveTernaryLinear(
-                    fitted.planes,
-                    module.bias,
-                ).to(device=module.weight.device)
-                replacements[id(module)] = replacement
-            modules[module_path] = replacement
+                if packed_weight is None:
+                    packed_weight = AdditiveTernaryWeight(fitted.planes).to(
+                        device=module.weight.device
+                    )
+                    owns_weight = True
+                else:
+                    owns_weight = False
+                if type(module) is nn.Linear:
+                    replacement = AdditiveTernaryLinear.from_packed_weight(
+                        packed_weight,
+                        module.bias,
+                        owner=owns_weight,
+                    )
+                else:
+                    if module.max_norm is not None:
+                        raise TritiumError(
+                            "module conversion cannot preserve mutating Embedding max_norm",
+                            code="unsupported_module_option",
+                            stage="load",
+                            module=module_path,
+                        )
+                    replacement = AdditiveTernaryEmbedding(
+                        packed_weight,
+                        padding_idx=module.padding_idx,
+                        max_norm=module.max_norm,
+                        norm_type=module.norm_type,
+                        scale_grad_by_freq=module.scale_grad_by_freq,
+                        sparse=module.sparse,
+                        dtype=module.weight.dtype,
+                        owner=owns_weight,
+                    )
+                replacement_by_module[id(module)] = replacement
+            replacement_paths[module_path] = replacement
 
     root = target
-    for module_path, replacement in modules.items():
-        if not isinstance(replacement, AdditiveTernaryLinear):
-            continue
+    for module_path, replacement in replacement_paths.items():
         if module_path == "":
             root = replacement
             continue
@@ -854,6 +885,10 @@ def load_quantized_module(
         parent._modules[parts[-1]] = replacement
     root.requires_grad_(False)
     root.eval()
+    if hasattr(root, "all_tied_weights_keys"):
+        root.all_tied_weights_keys = {}
+    if hasattr(root, "_tied_weights_keys"):
+        root._tied_weights_keys = {}
     root._tritium_ptq_artifact_id = admitted.artifact_id
     root._tritium_coverage = admitted.coverage
     if hasattr(root, "config"):

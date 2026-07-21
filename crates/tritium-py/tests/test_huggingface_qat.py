@@ -7,7 +7,12 @@ import pytest
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
-from tritium.nn import AdditiveTernaryLinear, TernaryEmbedding, TernaryLinear  # noqa: E402
+from tritium.nn import (  # noqa: E402
+    AdditiveTernaryEmbedding,
+    AdditiveTernaryLinear,
+    TernaryEmbedding,
+    TernaryLinear,
+)
 from tritium.torch import (  # noqa: E402
     TernaryConfig,
     TritiumError,
@@ -97,6 +102,47 @@ def test_hf_ptq_save_reload_is_compact_automatic_and_exact(tmp_path: Path):
     with pytest.raises(TritiumError) as captured:
         transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "hf")
     assert captured.value.code == "state_domain"
+
+
+def test_hf_ptq_save_reload_preserves_tied_embedding_head(tmp_path: Path):
+    source = _tiny_llama()
+    prepared = prepare(
+        source,
+        TernaryConfig.ptq(
+            profile="compact-v1", target_modules=("Linear", "Embedding")
+        ),
+        inplace=False,
+    )
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    calibration = calibrate(
+        prepared,
+        [{"input_ids": tokens, "use_cache": False}],
+        evidence_dir=tmp_path / "evidence",
+    )
+    artifact = convert(prepared, calibration, work_dir=tmp_path / "work")
+    model = load_quantized_module(prepared.model, artifact)
+
+    assert isinstance(model.model.embed_tokens, AdditiveTernaryEmbedding)
+    assert isinstance(model.lm_head, AdditiveTernaryLinear)
+    assert model.model.embed_tokens.packed_weight is model.lm_head.packed_weight
+    model.tie_weights()
+    assert model.model.embed_tokens.packed_weight is model.lm_head.packed_weight
+    expected = model(input_ids=tokens, use_cache=False).logits.detach()
+    model.save_pretrained(tmp_path / "hf", safe_serialization=True)
+
+    from safetensors.torch import load_file
+
+    state = load_file(tmp_path / "hf" / "model.safetensors")
+    assert not any(name.endswith("embed_tokens.weight") for name in state)
+    assert not any(name.endswith("lm_head.weight") for name in state)
+    reloaded = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "hf")
+    assert isinstance(reloaded.model.embed_tokens, AdditiveTernaryEmbedding)
+    assert isinstance(reloaded.lm_head, AdditiveTernaryLinear)
+    assert reloaded.model.embed_tokens.packed_weight is reloaded.lm_head.packed_weight
+    reloaded.tie_weights()
+    assert reloaded.model.embed_tokens.packed_weight is reloaded.lm_head.packed_weight
+    observed = reloaded(input_ids=tokens, use_cache=False).logits
+    torch.testing.assert_close(observed, expected)
 
 
 def test_embedding_conversion_preserves_options_and_masked_ste():

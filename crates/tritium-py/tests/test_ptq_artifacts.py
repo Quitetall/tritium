@@ -12,7 +12,7 @@ import torch  # noqa: E402
 
 import tritium.torch.artifacts as artifacts  # noqa: E402
 import tritium.torch.ptq as ptq  # noqa: E402
-from tritium.nn import AdditiveTernaryLinear  # noqa: E402
+from tritium.nn import AdditiveTernaryEmbedding, AdditiveTernaryLinear  # noqa: E402
 from tritium.torch import (  # noqa: E402
     TernaryConfig,
     TritiumError,
@@ -790,7 +790,13 @@ def test_load_quantized_module_binds_compact_planes_without_dense_master(tmp_pat
     assert dict(loaded.named_parameters()) == {}
     assert loaded[0].physical_bytes < prepared.model[0].weight.numel() * 2
     assert all(
-        name.startswith(("0.packed_trits_", "0.scales_", "0.bias"))
+        name.startswith(
+            (
+                "0._packed_weight.packed_trits_",
+                "0._packed_weight.scales_",
+                "0.bias",
+            )
+        )
         for name in loaded.state_dict()
     )
     inputs = torch.randn(3, 128)
@@ -805,6 +811,42 @@ def test_load_quantized_module_binds_compact_planes_without_dense_master(tmp_pat
     inplace = load_quantized_module(prepared.model, artifact, inplace=True)
     assert inplace is prepared.model
     assert isinstance(inplace[0], AdditiveTernaryLinear)
+
+
+def test_load_quantized_module_shares_tied_embedding_storage(tmp_path):
+    class TiedEmbeddingHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4, padding_idx=0)
+            self.head = torch.nn.Linear(4, 8, bias=False)
+            self.head.weight = self.embed.weight
+
+        def forward(self, tokens):
+            return self.head(self.embed(tokens))
+
+    prepared = prepare(
+        TiedEmbeddingHead(),
+        TernaryConfig.ptq(
+            profile="compact-v1", target_modules=("Linear", "Embedding")
+        ),
+        inplace=False,
+    )
+    tokens = torch.tensor([[0, 1, 2]])
+    calibration = calibrate(
+        prepared,
+        [tokens],
+        evidence_dir=tmp_path / "evidence",
+    )
+    artifact = convert(prepared, calibration, work_dir=tmp_path / "work")
+    loaded = load_quantized_module(prepared.model, artifact)
+
+    assert isinstance(loaded.embed, AdditiveTernaryEmbedding)
+    assert isinstance(loaded.head, AdditiveTernaryLinear)
+    assert loaded.embed.packed_weight is loaded.head.packed_weight
+    assert loaded.embed.padding_idx == 0
+    assert dict(loaded.named_parameters()) == {}
+    assert loaded.embed(tokens).shape == (1, 3, 4)
+    assert loaded(tokens).shape == (1, 3, 8)
 
 
 def test_load_quantized_module_rejects_source_drift(tmp_path):

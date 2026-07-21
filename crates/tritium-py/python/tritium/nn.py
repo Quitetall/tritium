@@ -77,17 +77,16 @@ def _project(
     return projection.dense
 
 
-class AdditiveTernaryLinear(nn.Module):
-    """Inference-only linear layer backed by additive trits and row scales."""
+class AdditiveTernaryWeight(nn.Module):
+    """Shared inference-only additive ternary matrix storage."""
 
     def __init__(
         self,
         planes: Sequence[Any],
-        bias: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         if not isinstance(planes, Sequence) or not 1 <= len(planes) <= 3:
-            raise ValueError("AdditiveTernaryLinear requires one to three planes")
+            raise ValueError("AdditiveTernaryWeight requires one to three planes")
         first = planes[0]
         if first.trits.ndim != 2:
             raise ValueError("additive ternary linear trits must be rank 2")
@@ -115,12 +114,6 @@ class AdditiveTernaryLinear(nn.Module):
             packed = (digits.reshape(-1, 5) * powers).sum(dim=1).to(torch.uint8)
             self.register_buffer(f"packed_trits_{index}", packed)
             self.register_buffer(f"scales_{index}", scales)
-        if bias is not None:
-            if bias.ndim != 1 or bias.shape[0] != self.out_features:
-                raise ValueError("additive ternary linear bias geometry differs")
-            self.register_buffer("bias", bias.detach().clone())
-        else:
-            self.register_buffer("bias", None)
         self.training = False
 
     @classmethod
@@ -130,11 +123,9 @@ class AdditiveTernaryLinear(nn.Module):
         out_features: int,
         planes: int,
         *,
-        bias: bool,
         device=None,
-        dtype=None,
-    ) -> "AdditiveTernaryLinear":
-        """Build a metadata-only shell; ``dtype`` controls preserved bias."""
+    ) -> "AdditiveTernaryWeight":
+        """Build a metadata-only compact state shell."""
 
         if in_features <= 0 or out_features <= 0 or not 1 <= planes <= 3:
             raise ValueError("additive ternary linear shell geometry is invalid")
@@ -156,12 +147,6 @@ class AdditiveTernaryLinear(nn.Module):
                     (module.out_features, 1), dtype=torch.float16, device=device
                 ),
             )
-        module.register_buffer(
-            "bias",
-            torch.empty(module.out_features, dtype=dtype, device=device)
-            if bias
-            else None,
-        )
         module.training = False
         return module
 
@@ -213,30 +198,220 @@ class AdditiveTernaryLinear(nn.Module):
             if tensor is not None
         )
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if not input.dtype.is_floating_point:
-            raise TypeError("additive ternary linear input must be floating point")
+    def dense(self, *, dtype: torch.dtype) -> torch.Tensor:
+        """Decode the additive matrix for the portable reference path."""
+
         output = None
         for index in range(self.plane_count):
             packed = getattr(self, f"packed_trits_{index}")
             powers = packed.new_tensor((1, 3, 9, 27, 81), dtype=torch.int16)
-            digits = (
-                packed.to(torch.int16).unsqueeze(1) // powers.unsqueeze(0)
-            ) % 3
+            digits = (packed.to(torch.int16).unsqueeze(1) // powers.unsqueeze(0)) % 3
             trits = (digits.flatten()[: self.weight_elements] - 1).reshape(
                 self.out_features, self.in_features
-            ).to(dtype=input.dtype)
-            scales = getattr(self, f"scales_{index}").to(dtype=input.dtype)
-            partial = F.linear(input, trits, None) * scales.squeeze(-1)
-            output = partial if output is None else output + partial
-        if self.bias is not None:
-            output = output + self.bias.to(dtype=input.dtype)
+            ).to(dtype=dtype)
+            scales = getattr(self, f"scales_{index}").to(dtype=dtype)
+            plane = trits * scales
+            output = plane if output is None else output + plane
         return output
+
+
+class _AdditiveTernaryConsumer(nn.Module):
+    def _bind_packed_weight(
+        self, packed_weight: AdditiveTernaryWeight, *, owner: bool
+    ) -> None:
+        if not isinstance(packed_weight, AdditiveTernaryWeight):
+            raise TypeError("packed_weight must be AdditiveTernaryWeight")
+        if owner:
+            self.add_module("_packed_weight", packed_weight)
+        else:
+            object.__setattr__(self, "_packed_weight", packed_weight)
+
+    @property
+    def packed_weight(self) -> AdditiveTernaryWeight:
+        return self._packed_weight
+
+    def validate_buffers(self) -> None:
+        self.packed_weight.validate_buffers()
+
+    @property
+    def physical_bytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.buffers()
+            if tensor is not None
+        )
+
+
+class AdditiveTernaryLinear(_AdditiveTernaryConsumer):
+    """Inference-only linear layer backed by additive trits and row scales."""
+
+    def __init__(
+        self,
+        planes: Sequence[Any],
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self._initialize(AdditiveTernaryWeight(planes), bias=bias, owner=True)
+
+    def _initialize(
+        self,
+        packed_weight: AdditiveTernaryWeight,
+        *,
+        bias: Optional[torch.Tensor],
+        owner: bool,
+    ) -> None:
+        self.in_features = packed_weight.in_features
+        self.out_features = packed_weight.out_features
+        self.weight_elements = packed_weight.weight_elements
+        self.plane_count = packed_weight.plane_count
+        self._bind_packed_weight(packed_weight, owner=owner)
+        if bias is not None:
+            if bias.ndim != 1 or bias.shape[0] != self.out_features:
+                raise ValueError("additive ternary linear bias geometry differs")
+            self.register_buffer("bias", bias.detach().clone())
+        else:
+            self.register_buffer("bias", None)
+        self.training = False
+
+    @classmethod
+    def from_packed_weight(
+        cls,
+        packed_weight: AdditiveTernaryWeight,
+        bias: Optional[torch.Tensor] = None,
+        *,
+        owner: bool = False,
+    ) -> "AdditiveTernaryLinear":
+        module = cls.__new__(cls)
+        nn.Module.__init__(module)
+        module._initialize(packed_weight, bias=bias, owner=owner)
+        return module
+
+    @classmethod
+    def empty(
+        cls,
+        in_features: int,
+        out_features: int,
+        planes: int,
+        *,
+        bias: bool,
+        device=None,
+        dtype=None,
+        packed_weight: AdditiveTernaryWeight | None = None,
+        owner: bool = True,
+    ) -> "AdditiveTernaryLinear":
+        if packed_weight is None:
+            packed_weight = AdditiveTernaryWeight.empty(
+                in_features, out_features, planes, device=device
+            )
+        elif (packed_weight.in_features, packed_weight.out_features) != (
+            in_features,
+            out_features,
+        ):
+            raise ValueError("additive ternary linear shell geometry differs")
+        preserved_bias = (
+            torch.empty(out_features, dtype=dtype, device=device) if bias else None
+        )
+        return cls.from_packed_weight(
+            packed_weight, preserved_bias, owner=owner
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if not input.dtype.is_floating_point:
+            raise TypeError("additive ternary linear input must be floating point")
+        return F.linear(
+            input,
+            self.packed_weight.dense(dtype=input.dtype),
+            self.bias.to(dtype=input.dtype) if self.bias is not None else None,
+        )
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"planes={self.plane_count}, bias={self.bias is not None}"
+        )
+
+
+class AdditiveTernaryEmbedding(_AdditiveTernaryConsumer):
+    """Inference-only embedding backed by shared additive ternary storage."""
+
+    def __init__(
+        self,
+        packed_weight: AdditiveTernaryWeight,
+        *,
+        padding_idx: int | None = None,
+        max_norm: float | None = None,
+        norm_type: float = 2.0,
+        scale_grad_by_freq: bool = False,
+        sparse: bool = False,
+        dtype: torch.dtype = torch.float32,
+        owner: bool = True,
+    ) -> None:
+        super().__init__()
+        if max_norm is not None:
+            raise ValueError("additive ternary embedding does not support max_norm")
+        self.num_embeddings = packed_weight.out_features
+        self.embedding_dim = packed_weight.in_features
+        self.padding_idx = padding_idx
+        self.max_norm = max_norm
+        self.norm_type = norm_type
+        self.scale_grad_by_freq = scale_grad_by_freq
+        self.sparse = sparse
+        self.output_dtype = dtype
+        self._bind_packed_weight(packed_weight, owner=owner)
+        self.training = False
+
+    @classmethod
+    def empty(
+        cls,
+        num_embeddings: int,
+        embedding_dim: int,
+        planes: int,
+        *,
+        padding_idx: int | None,
+        max_norm: float | None,
+        norm_type: float,
+        scale_grad_by_freq: bool,
+        sparse: bool,
+        device=None,
+        dtype: torch.dtype = torch.float32,
+        packed_weight: AdditiveTernaryWeight | None = None,
+        owner: bool = True,
+    ) -> "AdditiveTernaryEmbedding":
+        if packed_weight is None:
+            packed_weight = AdditiveTernaryWeight.empty(
+                embedding_dim, num_embeddings, planes, device=device
+            )
+        elif (packed_weight.out_features, packed_weight.in_features) != (
+            num_embeddings,
+            embedding_dim,
+        ):
+            raise ValueError("additive ternary embedding shell geometry differs")
+        return cls(
+            packed_weight,
+            padding_idx=padding_idx,
+            max_norm=max_norm,
+            norm_type=norm_type,
+            scale_grad_by_freq=scale_grad_by_freq,
+            sparse=sparse,
+            dtype=dtype,
+            owner=owner,
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.embedding(
+            input,
+            self.packed_weight.dense(dtype=self.output_dtype),
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.sparse,
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}, "
+            f"planes={self.packed_weight.plane_count}, padding_idx={self.padding_idx}"
         )
 
 
