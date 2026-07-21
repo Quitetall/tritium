@@ -21,6 +21,8 @@ await build({
   outfile: resolve(output, "index.js"),
   platform: "browser",
   sourcemap: true,
+  // Keep production stack mapping without embedding the TypeScript source tree.
+  sourcesContent: false,
   target: ["es2022"],
 });
 await cp(resolve(root, "src/index.d.ts"), resolve(output, "index.d.ts"));

@@ -25,7 +25,8 @@
     "check:generated": "node scripts/generate-operation-bindings.mjs --check && node scripts/generate-webgpu-kernels.mjs --check",
     "typecheck": "npm run check:generated && npm run build:wasm && tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test && npm run verify:pack",
+    "verify:pack": "node scripts/verify-pack.mjs"
   },
   "devDependencies": {
     "@noble/hashes": "2.2.0",

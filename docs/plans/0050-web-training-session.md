@@ -326,6 +326,14 @@ case count fail the release lane.
 
 ## Slice 6 — local archive and five-minute tutorial
 
+Status: **IN PROGRESS** — `npm run check` now creates an exact 13-file archive,
+rejects file-set, mode, path, npm-integrity and embedded-source drift, installs
+that tarball offline with lifecycle scripts disabled into a fresh project,
+proves ESM resolution stays under the consumer's `node_modules`, executes the
+bundled 114-case WASM corpus twice and compiles the installed declarations with
+strict TypeScript. A clean-revision CI receipt, physical-browser tutorial and
+five-minute hardware timing remain open.
+
 - Install the exact `npm pack` archive into an empty strict-TypeScript project.
 - Pass `tsc --noEmit`, production bundling and a browser smoke without network
   access after fixtures are staged.

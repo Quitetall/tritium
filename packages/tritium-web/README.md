@@ -100,3 +100,10 @@ Building the archive from source requires the pinned
 `wasm32-unknown-unknown` Rust target and `wasm-bindgen-cli 0.2.126`; the build
 fails on tool drift and verifies the guest's 192 MiB maximum-memory declaration.
 Archive consumers need neither Rust nor wasm-bindgen.
+
+`npm run check` finishes by packing the exact 13-file archive, verifying its
+npm integrity metadata and source-free map, installing it offline with
+lifecycle scripts disabled into a new project, running the bundled 114-case
+WASM corpus from `node_modules`, and compiling the installed declarations under
+strict TypeScript. This is a local-RC qualification gate; publication remains
+disabled.
