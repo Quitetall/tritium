@@ -140,6 +140,7 @@ def run_smoke(wheel: Path, forbidden_root: Path, revision: str) -> dict[str, obj
 
     import torch
     import transformers
+    import safetensors
     import tritium
     from tritium.nn import TernaryEmbedding, TernaryLinear
     from tritium.torch import TernaryConfig, inspect, prepare_qat
@@ -236,6 +237,7 @@ def run_smoke(wheel: Path, forbidden_root: Path, revision: str) -> dict[str, obj
         "python_version": ".".join(map(str, os.sys.version_info[:3])),
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
+        "safetensors_version": safetensors.__version__,
         "tritium_module": str(Path(tritium.__file__).resolve()),
         "converted_parameters": coverage.converted_parameters,
         "operations": [
