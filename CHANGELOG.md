@@ -11,6 +11,15 @@ see `docs/v1.0-api-freeze-audit.md` for the tier policy.
 
 ## [Unreleased] — 1.x dev
 
+### Changed
+
+- **Python distribution rename:** install release candidates with
+  `pip install tritium-torch`; the import namespace remains `import tritium`.
+  This aligns packaging with ADR 0033 and avoids claiming the generic `tritium`
+  distribution name. The Rust workspace and wheel now share the
+  `1.1.0-rc.0` candidate version (rendered as PEP 440 `1.1.0rc0` in wheel
+  metadata).
+
 ### Added
 
 - **SALT reconstruction-fidelity report** (`tritium report salt-model`): loads an fp

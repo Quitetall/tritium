@@ -47,6 +47,7 @@ def check(root: Path) -> str:
             ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
             cwd=root,
             text=True,
+            timeout=120,
         )
     )
     for package in metadata["packages"]:
@@ -96,7 +97,14 @@ def main() -> int:
     root = Path(__file__).resolve().parent.parent
     try:
         version = check(root)
-    except (KeyError, OSError, ValueError, json.JSONDecodeError, tomllib.TOMLDecodeError) as error:
+    except (
+        KeyError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+        tomllib.TOMLDecodeError,
+    ) as error:
         print(f"release-version: FAIL: {error}", file=sys.stderr)
         return 1
     print(f"release-version: OK: {version}")
