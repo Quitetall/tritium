@@ -10,7 +10,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -20,6 +20,7 @@ from ..salt import reconcile_qwen36_ptq_packages
 from .artifacts import QuantizationResult, load
 from .config import TernaryConfig
 from .conversion import PreparedModel, prepare
+from .coverage import CoverageReport
 from .errors import TritiumError
 from .projection import TernaryPlane, TernaryProjection, validate_projection
 
@@ -87,6 +88,9 @@ class ModuleQuantizationResult:
     source_model_digest: str
     evidence_id: str
     algorithm_id: str
+    recipe_id: str
+    config: TernaryConfig
+    coverage: CoverageReport
     weights: Tuple[FittedWeight, ...]
     schema_version: int = 1
 
@@ -559,7 +563,7 @@ def _diagonal_additive_projection(
             code="evidence_geometry_mismatch",
             stage="convert",
         )
-    work = master.detach().to(dtype=torch.float64, device="cpu")
+    master_f64 = master.detach().to(dtype=torch.float64, device="cpu")
     diagonal = curvature.to(dtype=torch.float64, device="cpu")
     mean = diagonal.mean()
     if not bool(torch.isfinite(diagonal).all()) or bool((diagonal < 0).any()):
@@ -573,17 +577,19 @@ def _diagonal_additive_projection(
         if float(mean) == 0.0
         else diagonal + mean * 1e-4
     )
-    residual = work
-    decoded = torch.zeros_like(work)
+    residual = master_f64
+    decoded = torch.zeros_like(master_f64)
     fitted_planes = []
     for _ in range(planes):
-        initial = (residual.abs() * diagonal).sum(dim=1, keepdim=True)
-        initial = initial / diagonal.sum().clamp_min(torch.finfo(torch.float64).tiny)
-        safe = initial.clamp_min(torch.finfo(torch.float64).tiny)
-        trits = (residual / safe).round().clamp(-1, 1).to(torch.int8)
-        code = trits.to(torch.float64)
-        denominator = (code.square() * diagonal).sum(dim=1, keepdim=True)
-        numerator = (residual * code * diagonal).sum(dim=1, keepdim=True)
+        initial_scale = (residual.abs() * diagonal).sum(dim=1, keepdim=True)
+        initial_scale = initial_scale / diagonal.sum().clamp_min(
+            torch.finfo(torch.float64).tiny
+        )
+        nonzero_scale = initial_scale.clamp_min(torch.finfo(torch.float64).tiny)
+        trits = (residual / nonzero_scale).round().clamp(-1, 1).to(torch.int8)
+        trits_f64 = trits.to(torch.float64)
+        denominator = (trits_f64.square() * diagonal).sum(dim=1, keepdim=True)
+        numerator = (residual * trits_f64 * diagonal).sum(dim=1, keepdim=True)
         scale = torch.where(
             denominator > 0,
             numerator / denominator.clamp_min(torch.finfo(torch.float64).tiny),
@@ -595,15 +601,16 @@ def _diagonal_additive_projection(
             group_size=master.shape[1],
         )
         fitted_planes.append(plane)
-        decoded = decoded + code * scale
-        residual = work - decoded
+        stored_scale_f64 = plane.scales.to(torch.float64)
+        decoded = decoded + trits_f64 * stored_scale_f64
+        residual = master_f64 - decoded
     dense = torch.zeros_like(master, device="cpu")
     for plane in fitted_planes:
         dense = dense + plane.trits.to(master.dtype) * plane.scales
     projection = TernaryProjection(
         dense=dense,
         planes=tuple(fitted_planes),
-        algorithm_id=f"tritium.diagonal-additive-{planes}@1",
+        algorithm_id=_diagonal_algorithm_id(planes),
         schema_version=1,
     )
     validate_projection(
@@ -615,7 +622,11 @@ def _diagonal_additive_projection(
     return projection
 
 
-def fit(
+def _diagonal_algorithm_id(planes: int) -> str:
+    return f"tritium.diagonal-additive-{planes}@1"
+
+
+def _fit_module(
     prepared: PreparedModel,
     calibration: ActivationCalibrationReceipt,
 ) -> ModuleQuantizationResult:
@@ -624,15 +635,22 @@ def fit(
     if not isinstance(prepared, PreparedModel) or not isinstance(
         prepared.model, nn.Module
     ):
-        raise TypeError("fit requires a live-module PreparedModel")
+        raise TypeError("module conversion requires a live-module PreparedModel")
     if prepared.config.mode != "ptq":
         raise TritiumError(
-            "fit requires PTQ preparation",
+            "module conversion requires PTQ preparation",
             code="invalid_phase",
             stage="convert",
         )
     if not isinstance(calibration, ActivationCalibrationReceipt):
-        raise TypeError("fit requires an ActivationCalibrationReceipt")
+        raise TypeError("module conversion requires an ActivationCalibrationReceipt")
+    if prepared.config.target_bpw is not None:
+        raise TritiumError(
+            "generic diagonal PTQ does not yet implement target_bpw allocation",
+            code="unsupported_recipe",
+            stage="convert",
+            details={"target_bpw": prepared.config.target_bpw},
+        )
     reopened = load_activation_calibration(
         calibration.evidence_dir,
         max_evidence_bytes=calibration.max_evidence_bytes,
@@ -672,9 +690,8 @@ def fit(
             master.detach().cpu().to(torch.float64)
             - projection.dense.to(torch.float64)
         ).square()
-        weighted_mse = float(
-            (error * curvature).sum() / curvature.sum().clamp_min(1e-30)
-        )
+        denominator = curvature.sum().clamp_min(1e-30) * master.shape[0]
+        weighted_mse = float((error * curvature).sum() / denominator)
         fitted.append(
             FittedWeight(
                 path=record.weight_aliases[0],
@@ -683,10 +700,24 @@ def fit(
                 weighted_mse=weighted_mse,
             )
         )
+    identity = {
+        "schema_version": 1,
+        "source_model_digest": source_digest,
+        "evidence_id": calibration.evidence_id,
+        "algorithm_id": _diagonal_algorithm_id(prepared.config.planes),
+        "config": prepared.config.to_dict(),
+        "coverage": prepared.coverage.to_dict(),
+    }
+    recipe_id = "sha256:" + hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return ModuleQuantizationResult(
         source_model_digest=source_digest,
         evidence_id=calibration.evidence_id,
-        algorithm_id=f"tritium.diagonal-additive-{prepared.config.planes}@1",
+        algorithm_id=_diagonal_algorithm_id(prepared.config.planes),
+        recipe_id=recipe_id,
+        config=prepared.config,
+        coverage=prepared.coverage,
         weights=tuple(fitted),
     )
 
@@ -754,23 +785,42 @@ def calibrate(
 
 def convert(
     prepared: PreparedModel,
-    calibration: CalibrationReceipt,
+    calibration: Union[CalibrationReceipt, ActivationCalibrationReceipt],
     *,
-    revision: str,
-    work_dir: Pathish,
-    output_dir: Pathish,
-    compact_max_bytes: int,
-    compact_max_resident_bytes: int,
-    near_lossless_max_bytes: int,
-    near_lossless_max_resident_bytes: int,
+    revision: Optional[str] = None,
+    work_dir: Optional[Pathish] = None,
+    output_dir: Optional[Pathish] = None,
+    compact_max_bytes: Optional[int] = None,
+    compact_max_resident_bytes: Optional[int] = None,
+    near_lossless_max_bytes: Optional[int] = None,
+    near_lossless_max_resident_bytes: Optional[int] = None,
     packing: str = "b3",
-) -> QuantizationResult:
+) -> Union[QuantizationResult, ModuleQuantizationResult]:
     """Run resumable PTQ, exact allocation, admission, and atomic export."""
 
     if not isinstance(prepared, PreparedModel):
         raise TypeError("convert requires a PreparedModel")
+    if isinstance(prepared.model, nn.Module):
+        qwen_arguments = {
+            "revision": revision,
+            "work_dir": work_dir,
+            "output_dir": output_dir,
+            "compact_max_bytes": compact_max_bytes,
+            "compact_max_resident_bytes": compact_max_resident_bytes,
+            "near_lossless_max_bytes": near_lossless_max_bytes,
+            "near_lossless_max_resident_bytes": near_lossless_max_resident_bytes,
+        }
+        supplied = sorted(
+            name for name, value in qwen_arguments.items() if value is not None
+        )
+        if supplied:
+            raise TypeError(
+                "live-module convert does not accept Qwen package arguments: "
+                + ", ".join(supplied)
+            )
+        return _fit_module(prepared, calibration)
     if not isinstance(calibration, CalibrationReceipt):
-        raise TypeError("convert requires a CalibrationReceipt")
+        raise TypeError("Qwen convert requires a CalibrationReceipt")
     if prepared.config.mode != "ptq" or not isinstance(prepared.model, Path):
         raise TritiumError(
             "Qwen3.6 PTQ conversion requires a prepared local source directory",
@@ -783,6 +833,20 @@ def convert(
             code="unsupported_recipe",
             stage="convert",
             details={"target_bpw": prepared.config.target_bpw},
+        )
+    required = {
+        "revision": revision,
+        "work_dir": work_dir,
+        "output_dir": output_dir,
+        "compact_max_bytes": compact_max_bytes,
+        "compact_max_resident_bytes": compact_max_resident_bytes,
+        "near_lossless_max_bytes": near_lossless_max_bytes,
+        "near_lossless_max_resident_bytes": near_lossless_max_resident_bytes,
+    }
+    missing = sorted(name for name, value in required.items() if value is None)
+    if missing:
+        raise TypeError(
+            "Qwen convert missing required arguments: " + ", ".join(missing)
         )
     current = calibrate(
         prepared,
@@ -856,7 +920,6 @@ __all__ = [
     "ModuleQuantizationResult",
     "calibrate",
     "convert",
-    "fit",
     "load_activation_calibration",
     "quantize",
 ]

@@ -480,22 +480,109 @@ def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_p
         [torch.tensor([[1.0, 2.0, 3.0], [2.0, 1.0, 0.5]])],
         evidence_dir=tmp_path / "fit-evidence",
     )
-    result = ptq.fit(prepared, receipt)
+    result = convert(prepared, receipt)
     assert result.evidence_id == receipt.evidence_id
     assert result.algorithm_id == "tritium.diagonal-additive-3@1"
+    assert result.recipe_id.startswith("sha256:")
+    assert result.config == prepared.config
+    assert result.coverage == prepared.coverage
     assert len(result.weights) == 1
     assert len(result.weights[0].planes) == 3
-    assert result.weights[0].weighted_mse >= 0
+    assert result.weights[0].weighted_mse == pytest.approx(9.7222734e-5)
+    assert result.weights[0].planes[0].trits[0].tolist() == [1, -1, 0]
+    assert result.weights[0].planes[0].scales[0].item() == pytest.approx(0.7)
+    assert result.weights[0].planes[1].trits[0].tolist() == [1, 1, 0]
+    assert result.weights[0].planes[1].scales[0].item() == pytest.approx(0.3)
+    assert result.weights[0].planes[2].trits[0].tolist() == [0, 0, 1]
+    assert result.weights[0].planes[2].scales[0].item() == pytest.approx(0.1)
     for plane in result.weights[0].planes:
         assert set(plane.trits.unique().tolist()) <= {-1, 0, 1}
         assert torch.isfinite(plane.scales).all()
         assert (plane.scales >= 0).all()
 
+    alternate = prepare(
+        model,
+        TernaryConfig.ptq(profile="near-lossless-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    alternate_result = convert(alternate, receipt)
+    assert alternate_result.recipe_id != result.recipe_id
+
+    rate_limited = prepare(
+        model,
+        TernaryConfig.ptq(
+            profile="compact-v1",
+            target_modules=("Linear",),
+            target_bpw=2.0,
+        ),
+        inplace=False,
+    )
+    with pytest.raises(TritiumError) as caught:
+        convert(rate_limited, receipt)
+    assert caught.value.code == "unsupported_recipe"
+
     with torch.no_grad():
         prepared.model.weight[0, 0] += 1
     with pytest.raises(TritiumError) as caught:
-        ptq.fit(prepared, receipt)
+        convert(prepared, receipt)
     assert caught.value.code == "source_changed"
+
+
+def test_live_module_convert_fits_later_planes_against_stored_low_precision_scale(
+    tmp_path,
+):
+    weight = torch.tensor(
+        [
+            [
+                0.599121,
+                1.831055,
+                -2.544922,
+                -0.483154,
+                0.517578,
+                -2.634766,
+                1.576172,
+                2.402344,
+            ]
+        ],
+        dtype=torch.float16,
+    )
+    curvature = torch.tensor(
+        [
+            2.540206,
+            3.080229,
+            3.783262,
+            1.873168,
+            2.096422,
+            3.563944,
+            2.739383,
+            1.179104,
+        ],
+        dtype=torch.float32,
+    )
+    model = torch.nn.Linear(8, 1, bias=False, dtype=torch.float16)
+    with torch.no_grad():
+        model.weight.copy_(weight)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    receipt = calibrate(
+        prepared,
+        [curvature.sqrt().to(torch.float16).unsqueeze(0)],
+        evidence_dir=tmp_path / "low-precision-evidence",
+    )
+    result = convert(prepared, receipt)
+    assert result.weights[0].planes[2].trits[0].tolist() == [
+        1,
+        1,
+        1,
+        0,
+        1,
+        0,
+        -1,
+        1,
+    ]
 
 
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):

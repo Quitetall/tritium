@@ -84,8 +84,10 @@ saves with safe serialization, automatically reloads through
   composes those exact primitives. The Qwen seam admits canonical precomputed
   evidence. Ordinary PyTorch modules now stream bounded, source/data-bound
   diagonal second moments into an atomically published, strict-reload evidence
-  namespace; generic additive fitting and stronger factorized curvature remain
-  open.
+  namespace. Public `convert` now fits source/recipe/coverage-bound hard
+  additive planes from that evidence, including stored-scale-correct residual
+  fitting. Bounded resumable generic fitting, physical allocation/packing and
+  stronger factorized curvature remain open.
 - [x] Expose immutable, exact-ledger `ArtifactRef`, `QuantizationResult`, and
   `ExportReceipt` records plus atomic matrix-bundle export. `complete_model`
   remains false because vision is intentionally outside the language-plus-MTP

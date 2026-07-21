@@ -51,7 +51,6 @@ from .ptq import (
     ModuleQuantizationResult,
     calibrate,
     convert,
-    fit,
     load_activation_calibration,
     quantize,
 )
@@ -101,7 +100,6 @@ __all__ = [
     "convert",
     "export",
     "export_onnx",
-    "fit",
     "inspect",
     "load",
     "load_activation_calibration",
