@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use half::f16;
-use prost::Message;
+use prost::{Message, Oneof};
 use tritium_core::{TernaryFormat, Trit};
 use tritium_format::{
     TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
@@ -2378,6 +2378,12 @@ pub fn diagnose_unsupported_graph(
                 }
             }
             for &required in supported_attributes(node) {
+                if node.op_type == ONNX_KV_ATTENTION_OP_NAME
+                    && required == ATTR_PAST_TOKENS
+                    && tritium_opset == Some(3)
+                {
+                    continue;
+                }
                 let count = node
                     .attribute
                     .iter()
@@ -2758,7 +2764,7 @@ fn node_supported(
         (ONNX_DOMAIN, crate::ONNX_SALT_V2_OP_NAME | crate::ONNX_SALT_V2_EMBEDDING_OP_NAME) => {
             tritium_opset == Some(2)
         }
-        (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => tritium_opset == Some(2),
+        (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => matches!(tritium_opset, Some(2 | 3)),
         (ONNX_DOMAIN, crate::ONNX_QWEN_DELTANET_OP_NAME) => tritium_opset == Some(2),
         (
             "",
@@ -7489,6 +7495,88 @@ pub(crate) fn encode_kv_attention_test_graph(
     .encode_to_vec()
 }
 
+#[cfg(test)]
+pub(crate) fn encode_dynamic_kv_attention_test_graph(
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+) -> Vec<u8> {
+    use tensor_dimension_proto::Value::{DimParam, DimValue};
+
+    let n_head = i64::try_from(n_head).unwrap();
+    let n_kv_head = i64::try_from(n_kv_head).unwrap();
+    let head_dim = i64::try_from(head_dim).unwrap();
+    let graph = GraphProto {
+        node: vec![NodeProto {
+            input: strings(["q", "k_cache", "v_cache"]),
+            output: strings(["context"]),
+            name: "tritium.dynamic_kv_attention".to_owned(),
+            op_type: crate::ONNX_KV_ATTENTION_OP_NAME.to_owned(),
+            attribute: vec![
+                int_attribute(crate::ATTR_N_HEAD, n_head),
+                int_attribute(crate::ATTR_N_KV_HEAD, n_kv_head),
+                int_attribute(crate::ATTR_HEAD_DIM, head_dim),
+            ],
+            domain: ONNX_DOMAIN.to_owned(),
+        }],
+        name: "tritium.dynamic_kv_attention.test".to_owned(),
+        initializer: Vec::new(),
+        input: vec![
+            tensor_value_dimensions(
+                "q",
+                TENSOR_FLOAT,
+                vec![
+                    DimParam("query_tokens".to_owned()),
+                    DimValue(n_head),
+                    DimValue(head_dim),
+                ],
+            ),
+            tensor_value_dimensions(
+                "k_cache",
+                TENSOR_FLOAT,
+                vec![
+                    DimParam("total_tokens".to_owned()),
+                    DimValue(n_kv_head),
+                    DimValue(head_dim),
+                ],
+            ),
+            tensor_value_dimensions(
+                "v_cache",
+                TENSOR_FLOAT,
+                vec![
+                    DimParam("total_tokens".to_owned()),
+                    DimValue(n_kv_head),
+                    DimValue(head_dim),
+                ],
+            ),
+        ],
+        output: vec![tensor_value_dimensions(
+            "context",
+            TENSOR_FLOAT,
+            vec![
+                DimParam("query_tokens".to_owned()),
+                DimValue(n_head),
+                DimValue(head_dim),
+            ],
+        )],
+        value_info: Vec::new(),
+    };
+    ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx-test".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: ONNX_DOMAIN.to_owned(),
+        model_version: 1,
+        graph: Some(graph),
+        opset_import: vec![OperatorSetIdProto {
+            domain: ONNX_DOMAIN.to_owned(),
+            version: 3,
+        }],
+        metadata_props: Vec::new(),
+    }
+    .encode_to_vec()
+}
+
 #[cfg(all(test, feature = "onnx"))]
 pub(crate) fn encode_qwen_deltanet_test_graph() -> Vec<u8> {
     let input_names = crate::QwenDeltaNetInput::ALL.map(|slot| slot.name().to_owned());
@@ -8745,6 +8833,22 @@ fn external_tensor(
 }
 
 fn tensor_value(name: &str, elem_type: i32, dimensions: &[i64]) -> ValueInfoProto {
+    tensor_value_dimensions(
+        name,
+        elem_type,
+        dimensions
+            .iter()
+            .copied()
+            .map(tensor_dimension_proto::Value::DimValue)
+            .collect(),
+    )
+}
+
+fn tensor_value_dimensions(
+    name: &str,
+    elem_type: i32,
+    dimensions: Vec<tensor_dimension_proto::Value>,
+) -> ValueInfoProto {
     ValueInfoProto {
         name: name.to_owned(),
         r#type: Some(TypeProto {
@@ -8752,8 +8856,8 @@ fn tensor_value(name: &str, elem_type: i32, dimensions: &[i64]) -> ValueInfoProt
                 elem_type,
                 shape: Some(TensorShapeProto {
                     dim: dimensions
-                        .iter()
-                        .map(|&dim_value| TensorDimensionProto { dim_value })
+                        .into_iter()
+                        .map(|value| TensorDimensionProto { value: Some(value) })
                         .collect(),
                 }),
             }),
@@ -8879,8 +8983,20 @@ struct TensorShapeProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct TensorDimensionProto {
-    #[prost(int64, tag = "1")]
-    dim_value: i64,
+    #[prost(oneof = "tensor_dimension_proto::Value", tags = "1, 2")]
+    value: Option<tensor_dimension_proto::Value>,
+}
+
+mod tensor_dimension_proto {
+    use super::Oneof;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(super) enum Value {
+        #[prost(int64, tag = "1")]
+        DimValue(i64),
+        #[prost(string, tag = "2")]
+        DimParam(String),
+    }
 }
 
 #[derive(Clone, PartialEq, Message)]

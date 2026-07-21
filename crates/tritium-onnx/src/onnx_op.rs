@@ -560,6 +560,10 @@ fn usize_attribute(
     let value: i64 = attributes
         .get(name)
         .ok_or_else(|| OrtError::new(format!("tritium-onnx: missing i64 attribute `{name}`")))?;
+    checked_usize_attribute(value, name, allow_zero)
+}
+
+fn checked_usize_attribute(value: i64, name: &'static str, allow_zero: bool) -> ort::Result<usize> {
     let minimum = if allow_zero { 0 } else { 1 };
     if value < minimum {
         return Err(OrtError::new(format!(
@@ -601,7 +605,7 @@ impl Operator for TritiumKvAttentionOp {
     }
 
     fn max_version(&self) -> i32 {
-        2
+        3
     }
 
     fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
@@ -609,7 +613,10 @@ impl Operator for TritiumKvAttentionOp {
             n_head: usize_attribute(attributes, ATTR_N_HEAD, false)?,
             n_kv_head: usize_attribute(attributes, ATTR_N_KV_HEAD, false)?,
             head_dim: usize_attribute(attributes, ATTR_HEAD_DIM, false)?,
-            past_tokens: usize_attribute(attributes, ATTR_PAST_TOKENS, true)?,
+            past_tokens: attributes
+                .get::<i64>(ATTR_PAST_TOKENS)
+                .map(|value| checked_usize_attribute(value, ATTR_PAST_TOKENS, true))
+                .transpose()?,
         }))
     }
 }
@@ -620,7 +627,7 @@ pub struct TritiumKvAttentionKernel {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    past_tokens: usize,
+    past_tokens: Option<usize>,
 }
 
 impl TritiumKvAttentionKernel {
@@ -659,14 +666,20 @@ impl TritiumKvAttentionKernel {
         }
         let query_tokens = usize::try_from(q_shape[0])
             .map_err(|_| OrtError::new("tritium-onnx: negative query token count"))?;
-        let total_tokens = self
+        let total_tokens = usize::try_from(k_shape[0])
+            .map_err(|_| OrtError::new("tritium-onnx: negative KV cache token count"))?;
+        let inferred_past = total_tokens.checked_sub(query_tokens).ok_or_else(|| {
+            OrtError::new(format!(
+                "tritium-onnx: cache token count {total_tokens} is smaller than query count {query_tokens}"
+            ))
+        })?;
+        if self
             .past_tokens
-            .checked_add(query_tokens)
-            .ok_or_else(|| OrtError::new("tritium-onnx: KV cache token count overflow"))?;
-        if usize::try_from(k_shape[0]) != Ok(total_tokens) {
+            .is_some_and(|declared| declared != inferred_past)
+        {
             return Err(OrtError::new(format!(
-                "tritium-onnx: cache token count {} does not equal past {} + query {query_tokens}",
-                k_shape[0], self.past_tokens
+                "tritium-onnx: inferred past {inferred_past} differs from declared past {}",
+                self.past_tokens.expect("checked present")
             )));
         }
         kv_attention_kernel(
@@ -677,7 +690,7 @@ impl TritiumKvAttentionKernel {
             self.n_head,
             self.n_kv_head,
             self.head_dim,
-            self.past_tokens,
+            inferred_past,
         )
         .map_err(|error| OrtError::new(error.to_string()))
     }
@@ -1557,7 +1570,7 @@ mod tests {
             n_head: 1,
             n_kv_head: 1,
             head_dim: 1,
-            past_tokens: 0,
+            past_tokens: Some(0),
         };
         assert_eq!(
             prompt
@@ -1573,7 +1586,7 @@ mod tests {
             vec![10.0, 15.0]
         );
         let decode = TritiumKvAttentionKernel {
-            past_tokens: 2,
+            past_tokens: Some(2),
             ..prompt
         };
         let output = decode
@@ -2875,6 +2888,42 @@ mod tests {
                 assert!((actual - expected).abs() < 1e-5);
             }
         }
+    }
+
+    #[test]
+    fn dynamic_kv_attention_runs_prompt_and_decode_on_one_session() {
+        use ort::value::Tensor;
+
+        let model = crate::model::encode_dynamic_kv_attention_test_graph(1, 1, 1);
+        let diagnostics = crate::diagnose_unsupported_graph(&model).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&model)
+            .unwrap();
+
+        let prompt_q = Tensor::from_array(([2, 1, 1], vec![1.0_f32, 2.0])).unwrap();
+        let prompt_k = Tensor::from_array(([2, 1, 1], vec![1.0_f32, 1.0])).unwrap();
+        let prompt_v = Tensor::from_array(([2, 1, 1], vec![10.0_f32, 20.0])).unwrap();
+        let prompt = session
+            .run(ort::inputs![&prompt_q, &prompt_k, &prompt_v])
+            .unwrap();
+        let (prompt_shape, prompt_values) = prompt[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(prompt_shape.as_ref(), &[2, 1, 1]);
+        assert_f32_close(prompt_values, &[10.0, 15.0], 1.0e-5);
+        drop(prompt);
+
+        let decode_q = Tensor::from_array(([1, 1, 1], vec![3.0_f32])).unwrap();
+        let decode_k = Tensor::from_array(([3, 1, 1], vec![1.0_f32, 1.0, 1.0])).unwrap();
+        let decode_v = Tensor::from_array(([3, 1, 1], vec![10.0_f32, 20.0, 40.0])).unwrap();
+        let decode = session
+            .run(ort::inputs![&decode_q, &decode_k, &decode_v])
+            .unwrap();
+        let (decode_shape, decode_values) = decode[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(decode_shape.as_ref(), &[1, 1, 1]);
+        assert_f32_close(decode_values, &[70.0 / 3.0], 1.0e-5);
     }
 
     #[test]
