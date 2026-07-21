@@ -154,6 +154,20 @@ def _selected_linear_modules(
             code="unsupported_module",
             stage="calibrate",
         )
+    covered = {alias for _, _, aliases in records for alias in aliases}
+    unsupported = sorted(
+        entry.path
+        for entry in prepared.coverage.entries
+        if entry.disposition == "selected"
+        and not covered.intersection(entry.aliases)
+    )
+    if unsupported:
+        raise TritiumError(
+            "raw diagonal calibration cannot cover selected non-Linear weights",
+            code="unsupported_module",
+            stage="calibrate",
+            details={"parameters": unsupported},
+        )
     return tuple(records)
 
 

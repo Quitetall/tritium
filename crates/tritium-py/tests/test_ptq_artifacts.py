@@ -423,6 +423,25 @@ def test_live_module_calibration_fails_closed_on_incomplete_or_oversize_data(tmp
     assert caught.value.code == "evidence_too_large"
     assert not (tmp_path / "oversize").exists()
 
+    unsupported = prepare(
+        torch.nn.Sequential(
+            torch.nn.Embedding(8, 3),
+            torch.nn.Linear(3, 2, bias=False),
+        ),
+        TernaryConfig.ptq(
+            profile="compact-v1", target_modules=("Embedding", "Linear")
+        ),
+        inplace=False,
+    )
+    with pytest.raises(TritiumError) as caught:
+        calibrate(
+            unsupported,
+            [torch.tensor([[1, 2]])],
+            evidence_dir=tmp_path / "unsupported",
+        )
+    assert caught.value.code == "unsupported_module"
+    assert caught.value.details["parameters"] == ["0.weight"]
+
 
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
     sentinel_prepared = object()
