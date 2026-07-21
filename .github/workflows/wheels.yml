@@ -27,6 +27,8 @@ on:
       - "crates/tritium-py/**"
       - "scripts/verify-wheel.py"
       - "scripts/tests/test_verify_wheel.py"
+      - "scripts/aggregate-wheel-smoke.py"
+      - "scripts/tests/test_aggregate_wheel_smoke.py"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
 
@@ -154,4 +156,26 @@ jobs:
         with:
           name: abi3-macos-cp${{ matrix.python }}
           path: evidence/*.json
+          if-no-files-found: error
+
+  abi3-admit:
+    name: admit complete abi3 matrix
+    needs: [abi3-smoke, abi3-smoke-macos-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: abi3-*
+          path: evidence
+          merge-multiple: true
+      - name: aggregate exact interpreter matrix
+        run: >-
+          python scripts/aggregate-wheel-smoke.py evidence
+          --source-revision ${{ github.sha }}
+          --output receipts/python-abi3-39-plus.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abi3-compatibility-receipt
+          path: receipts/python-abi3-39-plus.json
           if-no-files-found: error
