@@ -15,6 +15,8 @@
 # installation of the resulting archives remains the stricter local-RC gate.
 set -euo pipefail
 
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
 ./scripts/check-release-version.py
 echo "publish-readiness: cargo package --workspace --frozen --no-verify"
 cargo package --workspace --frozen --no-verify
