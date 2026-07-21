@@ -645,3 +645,26 @@ export declare function lowerPointwiseWebGpuOperationV1(
   operationId: string,
   firstUniformSlot: number,
 ): readonly WebGpuResidentDispatchV1[];
+
+export interface WebGpuResidentTransactionV1 {
+  readonly commands: readonly WebGpuResidentDispatchV1[];
+  readonly copies: readonly WebGpuResidentCopyV1[];
+}
+
+export interface WebGpuResidentScheduleBudgetV1 {
+  readonly maxPeakBytes: number;
+}
+
+export interface WebGpuResidentScheduleV1 {
+  auxiliaryResources(): WebGpuResidentAuxiliarySetV1;
+  transaction(
+    phase: "forward" | "backward",
+    operationId: string,
+    firstUniformSlot: number,
+  ): WebGpuResidentTransactionV1;
+}
+
+export declare function compileWebGpuResidentScheduleV1(
+  plan: CompiledTrainingPlanV1,
+  budget: WebGpuResidentScheduleBudgetV1,
+): WebGpuResidentScheduleV1;

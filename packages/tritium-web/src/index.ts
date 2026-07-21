@@ -29,6 +29,7 @@ export {
 } from "./webgpu-kernels.ts";
 export { WebGpuResidentRuntimeV1 } from "./webgpu-runtime.ts";
 export { lowerPointwiseWebGpuOperationV1 } from "./webgpu-lowering.ts";
+export { compileWebGpuResidentScheduleV1 } from "./webgpu-schedule.ts";
 export {
   PortableLifecyclePlanError,
   compilePortableCheckpointRequest,

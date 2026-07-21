@@ -866,24 +866,24 @@ impl WgpuTrainBackendV1 {
         }
         require_finite("logits", logits)?;
         require_finite("target", target)?;
-        let gradient_scale = if request.execution == TrainExecutionV1::Vjp {
+        let grad_output = if request.execution == TrainExecutionV1::Vjp {
             let (gradient_shape, gradient) = input_f32(request, "grad_output")?;
             if !gradient_shape.is_empty() || gradient.len() != 1 {
                 return Err(shape_error());
             }
             require_finite("grad_output", gradient)?;
-            gradient[0] / rows as f32
+            gradient
         } else {
-            0.0
+            logits
         };
         let result = self
             .backend
             .softmax_xent(
                 logits,
                 target,
+                grad_output,
                 rows as u32,
                 cols as u32,
-                gradient_scale,
                 request.execution == TrainExecutionV1::Vjp,
             )
             .map_err(wgpu_error)?;

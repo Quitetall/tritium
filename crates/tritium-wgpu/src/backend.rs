@@ -105,7 +105,7 @@ struct SoftmaxXentParams {
     cols: u32,
     execution: u32,
     padding: u32,
-    gradient_scale: f32,
+    padding_4: f32,
     padding_1: f32,
     padding_2: f32,
     padding_3: f32,
@@ -828,7 +828,13 @@ impl WgpuBackend {
             let softmax_xent_bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("portable-softmax-xent-bgl"),
-                    entries: &[entry(0, uni), entry(1, ro), entry(2, ro), entry(3, rw)],
+                    entries: &[
+                        entry(0, uni),
+                        entry(1, ro),
+                        entry(2, ro),
+                        entry(3, ro),
+                        entry(4, rw),
+                    ],
                 });
             let softmax_xent_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2818,15 +2824,20 @@ impl WgpuBackend {
         &self,
         logits: &[f32],
         target: &[f32],
+        grad_output: &[f32],
         rows: u32,
         cols: u32,
-        gradient_scale: f32,
         backward: bool,
     ) -> Result<Vec<f32>, BackendError> {
         let elements = (rows as usize)
             .checked_mul(cols as usize)
             .ok_or_else(|| BackendError::InvalidInput("softmax xent shape overflow".to_owned()))?;
-        if logits.len() != elements || target.len() != elements || elements == 0 {
+        if logits.len() != elements
+            || target.len() != elements
+            || elements == 0
+            || (backward && grad_output.len() != 1)
+            || grad_output.is_empty()
+        {
             return Err(BackendError::ShapeMismatch {
                 expected: elements,
                 got: logits.len(),
@@ -2837,7 +2848,7 @@ impl WgpuBackend {
             cols,
             execution: u32::from(backward),
             padding: 0,
-            gradient_scale,
+            padding_4: 0.0,
             padding_1: 0.0,
             padding_2: 0.0,
             padding_3: 0.0,
@@ -2860,6 +2871,7 @@ impl WgpuBackend {
         };
         let logits_buf = input("portable-softmax-xent-logits", logits);
         let target_buf = input("portable-softmax-xent-target", target);
+        let grad_output_buf = input("portable-softmax-xent-grad-output", grad_output);
         let output_len = if backward { elements } else { 1 };
         let bytes = (output_len * core::mem::size_of::<f32>()) as u64;
         let result = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2892,6 +2904,10 @@ impl WgpuBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: grad_output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: result.as_entire_binding(),
                 },
             ],

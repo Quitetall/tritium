@@ -3,7 +3,7 @@ struct Params {
     cols: u32,
     execution: u32,
     padding: u32,
-    gradient_scale: f32,
+    padding_4: f32,
     padding_1: f32,
     padding_2: f32,
     padding_3: f32,
@@ -12,7 +12,8 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> logits: array<f32>;
 @group(0) @binding(2) var<storage, read> targets: array<f32>;
-@group(0) @binding(3) var<storage, read_write> result: array<f32>;
+@group(0) @binding(3) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> result: array<f32>;
 
 @compute @workgroup_size(1, 1, 1)
 fn main() {
@@ -49,7 +50,7 @@ fn main() {
             }
             for (var column = 0u; column < params.cols; column += 1u) {
                 let probability = exp(logits[base + column] - maximum) / sum;
-                result[base + column] = params.gradient_scale
+                result[base + column] = (grad_output[0] / f32(params.rows))
                     * (probability * target_sum - targets[base + column]);
             }
         }

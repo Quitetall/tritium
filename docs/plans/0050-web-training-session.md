@@ -246,16 +246,24 @@ constant/scratch resources and checked resident-to-resident copies in the same
 submission as dependent compute, enabling specialized kernel packing without
 CPU tensor staging. Only its explicit `read` boundary
 creates and maps a staging buffer; device loss invalidates dispatch. Generated
-operation-to-uniform/binding lowering, session-adapter integration and physical
-browser execution remain open.
+The plan-level resident schedule now owns operation-to-uniform/binding lowering
+for all 34 pointwise forms plus SALT, FSQ, embedding, RoPE and softmax cross
+entropy forward/VJP forms. It packs immutable auxiliary constants and bounded
+scratch resources once, then emits fresh uniform snapshots and resident binding
+transactions without exposing packing details to session callers. Compilation
+captures the caller plan once and admits the plan peak, auxiliary resources,
+uniform arena and zero binding against an explicit `maxPeakBytes` ceiling before
+materializing constants. Softmax cross
+entropy VJP now consumes its scalar cotangent through resident storage in both
+native and browser WGSL. This covers 44 of 57 catalog forms. Concat,
+convolutions, attention, optimizer candidate/commit storage, session-adapter
+integration and physical browser execution remain open.
 
-The first generated-registry lowering tranche now covers all 34 forward/VJP forms backed
-by the shared pointwise module: exact registry roles, f32/u32 uniform packing,
-stage-specific lengths, workgroups, resident bindings and operation geometry
-are derived from the compiled plan without tensor values. This includes dense
-and ternary matmul, estimator VJPs, normalization and losses. MSE VJP now reads
-its scalar cotangent from a resident storage binding in both native and browser
-WGSL paths instead of requiring a host scalar readback. Specialized WGSL forms,
+The generated-registry lowering derives exact registry roles, f32/u32 uniform
+packing, stage-specific lengths, workgroups, resident bindings and operation
+geometry from the compiled plan without tensor values. MSE and softmax cross
+entropy VJPs read scalar cotangents from resident storage bindings instead of
+requiring host scalar readback. The remaining 13 specialized catalog forms,
 optimizer candidate/commit storage and session-adapter integration remain open.
 
 Implement all 35 manifest operations with WGSL compute pipelines and explicit

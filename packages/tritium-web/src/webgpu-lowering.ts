@@ -28,7 +28,7 @@ type Binding = Readonly<{
 type Registry = Readonly<
   Record<string, Readonly<Partial<Record<WebGpuDispatchExecutionV1, Binding>>>>
 >;
-type Invocation = Readonly<{
+export type WebGpuLoweringInvocationV1 = Readonly<{
   operation: string;
   execution: WebGpuDispatchExecutionV1;
   inputs: Readonly<Record<string, string>>;
@@ -56,6 +56,10 @@ const POINTWISE_OPERATIONS = new Set([
   "graph.ste_surrogate",
   "graph.lsq_ste",
 ]);
+
+export function isPointwiseWebGpuOperationV1(operation: string): boolean {
+  return POINTWISE_OPERATIONS.has(operation);
+}
 
 function fail(
   code: "capability_mismatch" | "invalid_schema" | "memory_limit",
@@ -98,11 +102,11 @@ function attributeMap(
   return Object.freeze(result);
 }
 
-function invocationFor(
+export function compiledWebGpuInvocationV1(
   plan: CompiledTrainingPlanV1,
   phase: "forward" | "backward",
   operationId: string,
-): Invocation {
+): WebGpuLoweringInvocationV1 {
   const validForward = plan.operations.every((operation) =>
     record(operation) && typeof operation.id === "string" &&
     typeof operation.operation === "string" && Array.isArray(operation.inputs) &&
@@ -170,24 +174,49 @@ function invocationFor(
   });
 }
 
-function required(map: Readonly<Record<string, string>>, role: string): string {
+export function requiredWebGpuRoleV1(
+  map: Readonly<Record<string, string>>,
+  role: string,
+): string {
   const value = map[role];
   if (value === undefined) fail("invalid_schema", `WebGPU lowering omits role ${role}`);
   return value;
 }
 
-function u32(value: unknown, name: string): number {
+export function webGpuU32V1(value: unknown, name: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > 0xffff_ffff) {
     fail("invalid_schema", `${name} must fit u32`);
   }
   return value as number;
 }
 
-function f32(value: unknown, name: string): number {
+export function webGpuF32V1(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isFinite(Math.fround(value))) {
     fail("invalid_schema", `${name} must be finite f32`);
   }
   return Math.fround(value);
+}
+
+type Invocation = WebGpuLoweringInvocationV1;
+const invocationFor = compiledWebGpuInvocationV1;
+const required = requiredWebGpuRoleV1;
+const u32 = webGpuU32V1;
+const f32 = webGpuF32V1;
+
+export function admittedWebGpuBuffersV1(
+  plan: CompiledTrainingPlanV1,
+): ReturnType<typeof admittedCompiledBufferMap> {
+  try {
+    return admittedCompiledBufferMap(plan);
+  } catch (error) {
+    if (error instanceof PortableSchedulePlanError) {
+      fail(
+        error.code === "capacity" ? "memory_limit" : "invalid_schema",
+        error.message,
+      );
+    }
+    throw error;
+  }
 }
 
 function validatePointwiseGeometry(
@@ -415,18 +444,7 @@ export function lowerPointwiseWebGpuOperationV1(
   operationId: string,
   firstUniformSlot: number,
 ): readonly WebGpuResidentDispatchV1[] {
-  let buffers: ReturnType<typeof admittedCompiledBufferMap>;
-  try {
-    buffers = admittedCompiledBufferMap(plan);
-  } catch (error) {
-    if (error instanceof PortableSchedulePlanError) {
-      fail(
-        error.code === "capacity" ? "memory_limit" : "invalid_schema",
-        error.message,
-      );
-    }
-    throw error;
-  }
+  const buffers = admittedWebGpuBuffersV1(plan);
   if (phase !== "forward" && phase !== "backward") {
     fail("invalid_schema", "WebGPU lowering phase must be forward or backward");
   }
