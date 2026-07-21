@@ -65,6 +65,9 @@ class WheelFunctionalSmokeTests(unittest.TestCase):
             ):
                 MODULE.validate_native_result(value)
 
+    def test_smoke_device_choices_are_closed(self):
+        self.assertEqual(MODULE.run_smoke.__defaults__, ("cpu",))
+
 
 if __name__ == "__main__":
     unittest.main()

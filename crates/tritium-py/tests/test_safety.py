@@ -38,6 +38,7 @@ def test_module_surface():
     assert hasattr(tritium, "QwenModel")
     assert hasattr(tritium, "ternary_matmul")
     assert callable(tritium.ternary_matmul)
+    assert tritium.compiled_backends() in (["cpu"], ["cpu", "cuda"])
     assert callable(tritium.Model.load)
     assert callable(tritium.QwenModel.load)
 
@@ -59,6 +60,18 @@ def test_ternary_matmul_correct():
     # rel=0.05 comfortably covers the int8 per-token absmax quant error.
     assert out[0][0] == pytest.approx(-2.0, rel=0.05)
     assert out[0][1] == pytest.approx(10.0, rel=0.05)
+
+
+def test_ternary_matmul_device_is_explicit():
+    assert tritium.ternary_matmul([[1.0]], [[1]], 1.0, device="cpu") == [[1.0]]
+    if "cuda" in tritium.compiled_backends():
+        output = tritium.ternary_matmul([[1.0]], [[1]], 1.0, device="cuda:0")
+        assert output[0][0] == pytest.approx(1.0)
+    else:
+        with pytest.raises(ValueError, match="not compiled with CUDA"):
+            tritium.ternary_matmul([[1.0]], [[1]], 1.0, device="cuda:0")
+    with pytest.raises(ValueError, match="device must be"):
+        tritium.ternary_matmul([[1.0]], [[1]], 1.0, device="magic")
 
 
 def test_ternary_matmul_wrong_shape_raises():

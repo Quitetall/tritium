@@ -33,6 +33,12 @@ on:
       - "scripts/tests/test_wheel_functional_smoke.py"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
+    inputs:
+      build_cuda:
+        description: Build and execute the CUDA 13 wheel on a qualified GPU runner
+        required: false
+        type: boolean
+        default: false
 
 # A new push to a PR cancels the previous wheel build for that PR.
 concurrency:
@@ -221,4 +227,60 @@ jobs:
         with:
           name: wheel-functional-torch-2.11-python-3.13
           path: evidence/torch-2.11-python-3.13.json
+          if-no-files-found: error
+
+  cuda-wheel-smoke:
+    name: Linux CUDA 13 wheel · Torch 2.11 · Python 3.13 · sm_89
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_cuda)
+    runs-on: [self-hosted, linux, x64, cuda, sm89]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: require qualified CUDA 13 runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          NVCC="$(command -v nvcc)"
+          test -x "$NVCC"
+          "$NVCC" --version | grep -E 'release 13\.'
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv
+      - name: build CUDA abi3 wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'maturin>=1.7,<2'
+          maturin build --release --features cuda --manylinux off \
+            --manifest-path crates/tritium-py/Cargo.toml --out dist-cuda
+      - name: verify CUDA wheel structure
+        run: python scripts/verify-wheel.py dist-cuda
+      - name: install pinned CUDA PyTorch and Hugging Face stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --only-binary=:all: \
+            torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+          python -m pip install --disable-pip-version-check --only-binary=:all: \
+            transformers==5.5.3 safetensors==0.8.0
+          python -m pip install --isolated --disable-pip-version-check \
+            --no-index --no-deps --only-binary=:all: --force-reinstall dist-cuda/*.whl
+      - name: execute installed-wheel CUDA kernel and lifecycle
+        shell: bash
+        run: >-
+          python -I ${{ github.workspace }}/scripts/wheel-functional-smoke.py
+          --wheel dist-cuda
+          --forbidden-root ${{ github.workspace }}
+          --source-revision ${{ github.sha }}
+          --device cuda:0
+          --output evidence/cuda13-torch2.11-py3.13-sm89.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cuda13-torch2.11-python3.13-sm89
+          path: |
+            dist-cuda/*.whl
+            evidence/*.json
           if-no-files-found: error

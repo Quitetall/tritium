@@ -125,7 +125,9 @@ def _tiny_llama(transformers):
     return transformers.LlamaForCausalLM(config)
 
 
-def run_smoke(wheel: Path, forbidden_root: Path, revision: str) -> dict[str, object]:
+def run_smoke(
+    wheel: Path, forbidden_root: Path, revision: str, device: str = "cpu"
+) -> dict[str, object]:
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise SmokeError("source revision must be a full lowercase Git object ID")
     wheel = resolve_wheel(wheel)
@@ -150,7 +152,14 @@ def run_smoke(wheel: Path, forbidden_root: Path, revision: str) -> dict[str, obj
     require_installed(Path(tritium._tritium.__file__), forbidden_root, environment_root)
     require_distribution_file(Path(tritium.__file__), distribution_files)
     require_distribution_file(Path(tritium._tritium.__file__), distribution_files)
-    native = tritium.ternary_matmul([[1.0, 2.0]], [[1, -1]], 1.0)
+    if device not in {"cpu", "cuda:0"}:
+        raise SmokeError("device must be cpu or cuda:0")
+    backend = device.split(":", 1)[0]
+    if backend not in tritium.compiled_backends():
+        raise SmokeError(f"candidate wheel does not contain requested {backend} backend")
+    native = tritium.ternary_matmul(
+        [[1.0, 2.0]], [[1, -1]], 1.0, device=device
+    )
     validate_native_result(native)
 
     torch.manual_seed(73)
@@ -238,6 +247,8 @@ def run_smoke(wheel: Path, forbidden_root: Path, revision: str) -> dict[str, obj
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
         "safetensors_version": safetensors.__version__,
+        "native_device": device,
+        "compiled_backends": tritium.compiled_backends(),
         "tritium_module": str(Path(tritium.__file__).resolve()),
         "converted_parameters": coverage.converted_parameters,
         "operations": [
@@ -273,9 +284,12 @@ def main() -> int:
     parser.add_argument("--forbidden-root", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu")
     args = parser.parse_args()
     try:
-        evidence = run_smoke(args.wheel, args.forbidden_root, args.source_revision)
+        evidence = run_smoke(
+            args.wheel, args.forbidden_root, args.source_revision, args.device
+        )
         _atomic_write(args.output, evidence)
     except (OSError, SmokeError) as error:
         parser.error(str(error))

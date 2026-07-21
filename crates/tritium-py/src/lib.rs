@@ -150,21 +150,25 @@ impl Model {
 /// - `weights` is a list of `n` rows, each a list of `k` ints in `{-1, 0, 1}`
 ///   (`[N, K]`); any other integer raises `ValueError`.
 /// - `scale` is the single per-tensor weight scale.
+/// - `device` selects an explicitly compiled backend; CPU is the default.
 ///
 /// Returns the `[M, N]` result as a list of `m` rows of `n` floats. This is the
-/// low-level primitive used by tests to exercise the FFI error paths; it runs on
-/// the CPU backend via the same `TernaryLinear` path the model uses.
+/// low-level primitive used by tests and wheel qualification to exercise the
+/// same backend-generic `TernaryLinear` path the model uses.
 ///
 /// Raises `ValueError` on ragged/empty input, a non-ternary weight, or a
 /// dtype/shape mismatch, and `RuntimeError` if the backend GEMM fails — never a
 /// panic.
 #[pyfunction]
+#[pyo3(signature = (activations, weights, scale, device = "cpu"))]
 fn ternary_matmul(
     py: Python<'_>,
     activations: Vec<Vec<f32>>,
     weights: Vec<Vec<i64>>,
     scale: f32,
+    device: &str,
 ) -> PyResult<Vec<Vec<f32>>> {
+    validate_device(device)?;
     // Shape validation up front so every error is a Python exception, not a panic.
     if activations.is_empty() {
         return Err(PyValueError::new_err(
@@ -212,8 +216,9 @@ fn ternary_matmul(
 
     // Compute with the GIL released. The CPU backend comes from the registry; the
     // `TernaryLinear` path packs, uploads, and runs the same mpGEMM the model uses.
+    let device = device.to_owned();
     let flat = py.detach(move || -> Result<Vec<f32>, String> {
-        let backend = cpu_backend()?;
+        let backend = backend_for_device(&device)?;
         let linear =
             TernaryLinear::new(backend.as_ref(), &trits, n, k, scale).map_err(|e| e.to_string())?;
         let mut out = vec![0.0f32; m * n];
@@ -230,6 +235,14 @@ fn ternary_matmul(
     Ok(flat.chunks_exact(n).map(<[f32]>::to_vec).collect())
 }
 
+#[pyfunction]
+fn compiled_backends() -> Vec<&'static str> {
+    #[cfg(feature = "cuda")]
+    return vec!["cpu", "cuda"];
+    #[cfg(not(feature = "cuda"))]
+    vec!["cpu"]
+}
+
 /// Construct a fresh CPU backend trait object from the runtime registry.
 ///
 /// Returns a stringified error if no `cpu` backend registered (so the caller can
@@ -241,6 +254,45 @@ fn cpu_backend() -> Result<Box<dyn TernaryBackend>, String> {
         }
     }
     Err("no `cpu` backend registered in the runtime".to_owned())
+}
+
+fn validate_device(device: &str) -> PyResult<()> {
+    if device == "cpu" {
+        return Ok(());
+    }
+    if device == "cuda" || device.starts_with("cuda:") {
+        if let Some(ordinal) = device.strip_prefix("cuda:") {
+            ordinal.parse::<usize>().map_err(|_| {
+                PyValueError::new_err("CUDA device must be `cuda` or `cuda:<ordinal>`")
+            })?;
+        }
+        #[cfg(feature = "cuda")]
+        return Ok(());
+        #[cfg(not(feature = "cuda"))]
+        return Err(PyValueError::new_err(
+            "this Tritium wheel was not compiled with CUDA support",
+        ));
+    }
+    Err(PyValueError::new_err(
+        "device must be `cpu`, `cuda`, or `cuda:<ordinal>`",
+    ))
+}
+
+fn backend_for_device(device: &str) -> Result<Box<dyn TernaryBackend>, String> {
+    if device == "cpu" {
+        return cpu_backend();
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let ordinal = device
+            .strip_prefix("cuda:")
+            .map_or(0, |value| value.parse::<usize>().unwrap_or(0));
+        tritium_cuda::CudaBackend::new(ordinal)
+            .map(|backend| Box::new(backend) as Box<dyn TernaryBackend>)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(feature = "cuda"))]
+    Err("CUDA backend is unavailable in this build".to_owned())
 }
 
 /// The compiled `tritium._tritium` extension module.
@@ -260,6 +312,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<onnx::QwenOnnxMtpOutput>()?;
     m.add_class::<module_package::ModuleSaltV2Receipt>()?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
+    m.add_function(wrap_pyfunction!(compiled_backends, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::stage_qwen35_onnx_bundle, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::export_qwen35_onnx_bundle, m)?)?;
