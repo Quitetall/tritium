@@ -247,23 +247,24 @@ submission as dependent compute, enabling specialized kernel packing without
 CPU tensor staging. Only its explicit `read` boundary
 creates and maps a staging buffer; device loss invalidates dispatch. Generated
 The plan-level resident schedule now owns operation-to-uniform/binding lowering
-for all 34 pointwise forms plus SALT, FSQ, embedding, RoPE and softmax cross
-entropy forward/VJP forms. It packs immutable auxiliary constants and bounded
+for all 34 pointwise forms plus SALT, FSQ, embedding, RoPE, column concat and
+softmax cross entropy forward/VJP forms. It packs immutable auxiliary constants and bounded
 scratch resources once, then emits fresh uniform snapshots and resident binding
 transactions without exposing packing details to session callers. Compilation
 captures the caller plan once and admits the plan peak, auxiliary resources,
 uniform arena and zero binding against an explicit `maxPeakBytes` ceiling before
 materializing constants. Softmax cross
 entropy VJP now consumes its scalar cotangent through resident storage in both
-native and browser WGSL. This covers 44 of 57 catalog forms. Concat,
-convolutions, attention, optimizer candidate/commit storage, session-adapter
+native and browser WGSL. This covers 46 of 57 catalog forms. Convolutions,
+attention, optimizer candidate/commit storage, session-adapter
 integration and physical browser execution remain open.
 
 The generated-registry lowering derives exact registry roles, f32/u32 uniform
 packing, stage-specific lengths, workgroups, resident bindings and operation
 geometry from the compiled plan without tensor values. MSE and softmax cross
 entropy VJPs read scalar cotangents from resident storage bindings instead of
-requiring host scalar readback. The remaining 13 specialized catalog forms,
+requiring host scalar readback. Column concat forward packs resident parts with
+same-submission GPU copies and its VJP emits ordered resident slices. The remaining 11 catalog forms,
 optimizer candidate/commit storage and session-adapter integration remain open.
 
 Implement all 35 manifest operations with WGSL compute pipelines and explicit

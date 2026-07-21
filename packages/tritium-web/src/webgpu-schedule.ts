@@ -53,6 +53,7 @@ const SPECIALIZED = new Set([
   "graph.fsq",
   "graph.embedding_gather",
   "graph.rope",
+  "graph.concat_cols",
   "loss.softmax_cross_entropy",
 ]);
 
@@ -268,9 +269,10 @@ function stage(
   uniformBytes: Uint8Array,
   storageBindings: Readonly<Record<number, string>>,
   workgroups: readonly [number, number, number],
+  expectedRepeat: "once" | "per_output" = "once",
 ): WebGpuResidentDispatchV1 {
   const form = webGpuDispatchFormV1(invocation.operation, invocation.execution);
-  if (form.stages.length !== 1 || form.stages[0]?.repeat !== "once" ||
+  if (form.stages.length !== 1 || form.stages[0]?.repeat !== expectedRepeat ||
       form.stages[0]?.moduleId !== expectedModuleId) {
     fail("invalid_schema", `${invocation.operation} specialized catalog stage drifted`);
   }
@@ -552,6 +554,100 @@ export function compileWebGpuResidentScheduleV1(
             [Math.ceil(pairs / 64), 1, 1],
           )]),
           copies: Object.freeze([]),
+        });
+      }
+      case "graph.concat_cols|forward":
+      case "graph.concat_cols|vjp": {
+        const rows = positiveU32(attributes.rows, "rows");
+        const lens = u32List(attributes.lens, "lens");
+        const expectedParts = invocation.execution === "forward"
+          ? Object.keys(input).length
+          : Object.keys(output).length;
+        if (lens.length === 0 || lens.length !== expectedParts ||
+            lens.some((width) => width === 0)) {
+          fail("invalid_schema", "concat lens must match nonempty positive parts");
+        }
+        const total = lens.reduce((sum, width) => product("concat columns", 1, sum + width), 0);
+        const gradient = invocation.execution === "vjp"
+          ? requiredWebGpuRoleV1(input, "grad_output")
+          : "";
+        if (invocation.execution === "vjp") {
+          expect(buffers, gradient, "f32", [rows, total], "concat grad_output");
+          let start = 0;
+          const writtenOwners = new Set<string>();
+          const commands = lens.map((width, index) => {
+            const result = requiredWebGpuRoleV1(output, `grad_part.${index}`);
+            expect(buffers, result, "f32", [rows, width], `concat grad_part.${index}`);
+            const ownerId = buffers.get(result)!.ownerId;
+            if (writtenOwners.has(ownerId)) {
+              fail("invalid_schema", "concat VJP outputs must have distinct physical owners");
+            }
+            writtenOwners.add(ownerId);
+            const len = product("concat gradient", rows, width);
+            const params = uniform(32, (view) => {
+              view.setUint32(0, len, true);
+              view.setUint32(4, 24, true);
+              view.setUint32(12, total, true);
+              view.setUint32(16, start, true);
+              view.setUint32(20, width, true);
+            });
+            start += width;
+            return stage(
+              invocation,
+              "pointwise",
+              params,
+              { 1: gradient, 2: gradient, 3: gradient, 4: result },
+              [Math.ceil(len / 64), 1, 1],
+              "per_output",
+            );
+          });
+          return Object.freeze({
+            commands: Object.freeze(commands),
+            copies: Object.freeze([]),
+          });
+        }
+        const values = auxiliary(
+          "concat-values", product("concat values", rows, total, 4), null,
+        );
+        const lengths = auxiliary("concat-lengths", lens.length * 4, lens);
+        let elementOffset = 0;
+        const offsets = lens.map((width) => {
+          const offset = elementOffset;
+          elementOffset += product("concat part", rows, width);
+          return offset;
+        });
+        const offsetsId = auxiliary("concat-offsets", offsets.length * 4, offsets);
+        const copies: WebGpuResidentCopyV1[] = [];
+        let destinationOffset = 0;
+        lens.forEach((width, index) => {
+          const part = requiredWebGpuRoleV1(input, `part.${index}`);
+          expect(buffers, part, "f32", [rows, width], `concat part.${index}`);
+          const byteLength = product("concat part bytes", rows, width, 4);
+          copies.push(Object.freeze({
+            source: part,
+            sourceOffset: 0,
+            destination: values,
+            destinationOffset,
+            byteLength,
+          }));
+          destinationOffset += byteLength;
+        });
+        const result = requiredWebGpuRoleV1(output, "result");
+        expect(buffers, result, "f32", [rows, total], "concat result");
+        const params = uniform(16, (view) => {
+          view.setUint32(0, rows, true);
+          view.setUint32(4, lens.length, true);
+          view.setUint32(8, total, true);
+        });
+        return Object.freeze({
+          commands: Object.freeze([stage(
+            invocation,
+            "concat",
+            params,
+            { 1: values, 2: lengths, 3: offsetsId, 4: result },
+            [Math.ceil(product("concat output", rows, total) / 64), 1, 1],
+          )]),
+          copies: Object.freeze(copies),
         });
       }
       case "loss.softmax_cross_entropy|forward":

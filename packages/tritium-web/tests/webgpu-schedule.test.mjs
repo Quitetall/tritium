@@ -109,13 +109,14 @@ function view(command) {
   );
 }
 
-test("resident schedule covers all 44 first-tranche canonical execution forms", () => {
+test("resident schedule covers all 46 first-tranche canonical execution forms", () => {
   const supported = new Set([
     "graph.detach", "graph.scale_const", "graph.add", "graph.mul", "graph.relu2",
     "graph.silu", "graph.causal_mask", "graph.softmax", "graph.rmsnorm", "loss.mse",
     "graph.bias", "graph.transpose", "graph.slice_cols", "graph.dense_matmul",
     "graph.ternary_matmul", "graph.ste_surrogate", "graph.lsq_ste",
     "graph.salt_ste", "graph.fsq", "graph.embedding_gather", "graph.rope",
+    "graph.concat_cols",
     "loss.softmax_cross_entropy",
   ]);
   const representatives = new Map();
@@ -124,18 +125,17 @@ test("resident schedule covers all 44 first-tranche canonical execution forms", 
     if (supported.has(item.operation) && item.expected.kind === "success" &&
         !representatives.has(key)) representatives.set(key, item);
   }
-  assert.equal(representatives.size, 44);
+  assert.equal(representatives.size, 46);
   for (const [key, item] of representatives) {
     const representative = representativePlan(item);
     const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
     const transaction = schedule.transaction(
       representative.phase, representative.operationId, 3,
     );
-    assert.equal(
-      transaction.commands.length,
-      webGpuDispatchFormV1(item.operation, item.execution).stages.length,
-      key,
-    );
+    const form = webGpuDispatchFormV1(item.operation, item.execution);
+    const expectedCommands = form.stages.reduce((count, stage) =>
+      count + (stage.repeat === "per_output" ? item.expected.outputs.length : 1), 0);
+    assert.equal(transaction.commands.length, expectedCommands, key);
     assert.deepEqual(
       transaction.commands.map((command, index) => command.uniformSlot - index),
       transaction.commands.map(() => 3),
@@ -191,9 +191,40 @@ test("SALT allocates bounded scratch and softmax VJP keeps cotangent resident", 
   assert.equal(view(command).getFloat32(12, true), 0);
 });
 
+test("concat packs forward parts with GPU copies and emits ordered VJP slices", () => {
+  const forwardItem = corpus.cases.find((candidate) =>
+    candidate.operation === "graph.concat_cols" && candidate.execution === "forward" &&
+    candidate.expected.kind === "success");
+  const forward = representativePlan(forwardItem);
+  const forwardSchedule = compileWebGpuResidentScheduleV1(forward.plan, BUDGET);
+  const transaction = forwardSchedule.transaction(forward.phase, forward.operationId, 0);
+  assert.equal(transaction.copies.length, 2);
+  assert.deepEqual(transaction.copies.map((copy) => [
+    copy.source, copy.destinationOffset, copy.byteLength,
+  ]), [["part.0", 0, 16], ["part.1", 16, 8]]);
+  assert.equal(transaction.commands[0].storageBindings[1], transaction.copies[0].destination);
+  assert.equal(forwardSchedule.auxiliaryResources().maxBytes, 40);
+
+  const vjpItem = corpus.cases.find((candidate) =>
+    candidate.operation === "graph.concat_cols" && candidate.execution === "vjp" &&
+    candidate.expected.kind === "success");
+  const vjp = representativePlan(vjpItem);
+  const commands = compileWebGpuResidentScheduleV1(vjp.plan, BUDGET)
+    .transaction(vjp.phase, vjp.operationId, 4).commands;
+  assert.deepEqual(commands.map((command) => command.uniformSlot), [4, 5]);
+  assert.deepEqual(commands.map((command) => [
+    view(command).getUint32(4, true),
+    view(command).getUint32(16, true),
+    view(command).getUint32(20, true),
+  ]), [[24, 0, 2], [24, 2, 1]]);
+  assert.deepEqual(commands.map((command) => command.storageBindings[4]), [
+    "grad_part.0", "grad_part.1",
+  ]);
+});
+
 test("unsupported forms and malformed specialized geometry fail closed", () => {
   const unsupported = corpus.cases.find((candidate) =>
-    candidate.operation === "graph.concat_cols" && candidate.execution === "forward" &&
+    candidate.operation === "graph.conv1d" && candidate.execution === "forward" &&
     candidate.expected.kind === "success");
   const concat = representativePlan(unsupported);
   const schedule = compileWebGpuResidentScheduleV1(concat.plan, BUDGET);
@@ -250,5 +281,34 @@ test("compiler snapshots hostile plans once and admits aggregate peak before res
       { maxPeakBytes: representative.plan.peakBytes },
     ),
     (error) => error instanceof WebTrainingError && error.code === "memory_limit",
+  );
+});
+
+test("concat VJP rejects duplicate and aliased output owners", () => {
+  const item = structuredClone(corpus.cases.find((candidate) =>
+    candidate.operation === "graph.concat_cols" && candidate.execution === "vjp" &&
+    candidate.expected.kind === "success"));
+  item.attributes.find((attribute) => attribute.name === "lens").values = [2, 2];
+  item.inputs[0].shape = [2, 4];
+  item.expected.outputs[1].shape = [2, 2];
+
+  const duplicate = representativePlan(item);
+  duplicate.plan.backwardOperations[0].outputs[1].bufferId = "grad_part.0";
+  assert.throws(
+    () => compileWebGpuResidentScheduleV1(duplicate.plan, BUDGET),
+    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+  );
+
+  const aliased = representativePlan(item);
+  const owner = aliased.plan.buffers.find((buffer) => buffer.id === "grad_part.0");
+  const alias = aliased.plan.buffers.find((buffer) => buffer.id === "grad_part.1");
+  owner.role = "parameter";
+  alias.role = "parameter";
+  alias.aliasOf = owner.id;
+  alias.ownerId = owner.id;
+  alias.byteOffset = owner.byteOffset;
+  assert.throws(
+    () => compileWebGpuResidentScheduleV1(aliased.plan, BUDGET),
+    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
 });
