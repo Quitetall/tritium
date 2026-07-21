@@ -4431,6 +4431,7 @@ dependencies = [
  "prost",
  "tritium-core",
  "tritium-format",
+ "tritium-nn",
  "tritium-testkit",
 ]
 

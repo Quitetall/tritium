@@ -21,11 +21,13 @@ categories.workspace = true
 # lane with network can build + test `--features onnx` without a system lib.
 default = []
 model = ["dep:blake3", "dep:prost"]
+qwen-package = ["model", "dep:tritium-nn"]
 onnx = ["dep:ort", "model"]
 
 [dependencies]
 tritium-core = { workspace = true }
 tritium-format = { workspace = true }
+tritium-nn = { workspace = true, optional = true }
 half = { workspace = true }
 blake3 = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }

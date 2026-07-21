@@ -1293,6 +1293,15 @@ pub use model::{
 #[cfg(feature = "model")]
 mod model;
 
+#[cfg(feature = "qwen-package")]
+mod qwen_package;
+
+#[cfg(feature = "qwen-package")]
+pub use qwen_package::{
+    Qwen35PackageMatrixSpec, Qwen35PackagePreservedSpec, Qwen35PackageSourceSpec,
+    Qwen35SaltV2PackageSource,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

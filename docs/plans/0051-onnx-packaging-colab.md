@@ -164,9 +164,13 @@ PTQ/refined operands without reconstruction. The Python/Hugging Face facade
 and package-to-Qwen view construction are now the binding Slice 2 work. The
 Qwen mapper now accepts a physical-layout-parameterized
 `Qwen35PackedTensorProvider`, preserving either legacy TQ or additive SALT V2
-operands through mapping; the remaining native source adapter must open the
-authenticated schema-v3 package and exact preserved tensors into that
-contract.
+operands through mapping. `Qwen35SaltV2PackageSource` now consumes
+independently authorized regular file handles, rechecks both admitted transport
+identities, materializes descriptor-free packed arenas plus exact BF16
+preserved vectors from one bounded authenticated snapshot, and rejects exact
+name/rank/shape or aggregate physical-ledger drift before weight
+materialization. Schema-v3 manifest/path admission and the Python facade remain
+the active Slice 2 boundary.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
