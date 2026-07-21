@@ -1290,7 +1290,8 @@ pub use model::{
     encode_qwen_causal_lm, encode_qwen_deltanet_layer, encode_qwen35_mtp,
     encode_tied_embedding_head, encode_tied_embedding_head_v2, map_bitnet_gguf_causal_lm,
     map_qwen35_causal_lm, map_qwen35_packed_causal_lm, map_qwen36_27b_causal_lm,
-    map_qwen36_27b_packed_causal_lm, map_smollm2_causal_lm, verify_external_causal_lm,
+    map_qwen36_27b_packed_causal_lm, map_smollm2_causal_lm, verify_dynamic_external_qwen35_bundle,
+    verify_dynamic_external_qwen35_bundle_from_file, verify_external_causal_lm,
     verify_external_qwen35_bundle, verify_external_qwen35_bundle_from_file,
     verify_external_tied_embedding_head, verify_external_tied_embedding_head_v2,
 };

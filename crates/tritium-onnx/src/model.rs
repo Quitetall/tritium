@@ -1968,10 +1968,12 @@ pub struct VerifiedExternalCausalLmModel {
     pub weights_blake3: [u8; 32],
     /// Exact external-data byte count.
     pub weights_bytes: usize,
-    /// Fixed query-token count.
+    /// Fixed query-token count, or zero for dynamic-cache graphs.
     pub tokens: usize,
-    /// Fixed prefix-cache token count.
+    /// Fixed prefix-cache token count, or zero for dynamic-cache graphs.
     pub past_tokens: usize,
+    /// Dynamic sequence contract; absent for schema-v2 fixed graphs.
+    pub sequence_mode: Option<String>,
     /// Decoder-layer count.
     pub layers: usize,
     /// Complete bound artifact identity.
@@ -3524,6 +3526,7 @@ pub fn verify_external_causal_lm(
         admitted,
         "causal-lm",
         ExternalRangePolicy::Exclusive,
+        ExternalDecoderSchema::FixedV2,
     )?
     .receipt)
 }
@@ -3532,6 +3535,21 @@ pub fn verify_external_causal_lm(
 enum ExternalRangePolicy {
     Exclusive,
     Shared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalDecoderSchema {
+    FixedV2,
+    DynamicV3,
+}
+
+impl ExternalDecoderSchema {
+    const fn version(self) -> &'static str {
+        match self {
+            Self::FixedV2 => "2",
+            Self::DynamicV3 => "3",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3687,6 +3705,7 @@ fn verify_external_decoder_graph(
     admitted: AdmittedExternalCausalLmDigests,
     expected_graph_kind: &str,
     range_policy: ExternalRangePolicy,
+    schema: ExternalDecoderSchema,
 ) -> Result<VerifiedExternalDecoderGraph, OnnxModelError> {
     if model_bytes.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
@@ -3719,8 +3738,39 @@ fn verify_external_decoder_graph(
             )));
         }
     }
-    require_metadata(&metadata, "tritium.schema_version", "2")?;
+    require_metadata(&metadata, "tritium.schema_version", schema.version())?;
     require_metadata(&metadata, "tritium.graph_kind", expected_graph_kind)?;
+    let sequence_mode = match schema {
+        ExternalDecoderSchema::FixedV2 => {
+            if metadata.contains_key("tritium.sequence_mode") {
+                return Err(OnnxModelError::InvalidModel(
+                    "schema-v2 graph must not declare dynamic sequence mode".to_owned(),
+                ));
+            }
+            None
+        }
+        ExternalDecoderSchema::DynamicV3 => {
+            require_metadata(&metadata, "tritium.sequence_mode", "dynamic-cache-v1")?;
+            if metadata.contains_key("tritium.tokens")
+                || metadata.contains_key("tritium.past_tokens")
+            {
+                return Err(OnnxModelError::InvalidModel(
+                    "schema-v3 dynamic graph must not freeze token counts".to_owned(),
+                ));
+            }
+            Some("dynamic-cache-v1".to_owned())
+        }
+    };
+    let expected_model_version = match schema {
+        ExternalDecoderSchema::FixedV2 => 2,
+        ExternalDecoderSchema::DynamicV3 => 3,
+    };
+    if protobuf.model_version != expected_model_version {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "model version {} differs from schema-required {expected_model_version}",
+            protobuf.model_version
+        )));
+    }
     require_metadata(
         &metadata,
         "tritium.external_data.file",
@@ -3754,6 +3804,9 @@ fn verify_external_decoder_graph(
         .graph
         .as_ref()
         .ok_or_else(|| OnnxModelError::InvalidModel("model has no graph".to_owned()))?;
+    if schema == ExternalDecoderSchema::DynamicV3 {
+        verify_dynamic_decoder_io(graph, expected_graph_kind)?;
+    }
     let mut cursor = 0_usize;
     let mut names = BTreeMap::new();
     let mut external_initializers = Vec::new();
@@ -3871,14 +3924,135 @@ fn verify_external_decoder_graph(
             model_blake3: *actual_model_hash.as_bytes(),
             weights_blake3: actual_hash,
             weights_bytes: weights.len(),
-            tokens: parse_usize(&metadata, "tritium.tokens")?,
-            past_tokens: parse_usize(&metadata, "tritium.past_tokens")?,
+            tokens: if schema == ExternalDecoderSchema::FixedV2 {
+                parse_usize(&metadata, "tritium.tokens")?
+            } else {
+                0
+            },
+            past_tokens: if schema == ExternalDecoderSchema::FixedV2 {
+                parse_usize(&metadata, "tritium.past_tokens")?
+            } else {
+                0
+            },
+            sequence_mode,
             layers: parse_usize(&metadata, "tritium.layers")?,
             identity,
         },
         metadata,
         external_initializers,
     })
+}
+
+fn verify_dynamic_decoder_io(graph: &GraphProto, graph_kind: &str) -> Result<(), OnnxModelError> {
+    use tensor_dimension_proto::Value::{DimParam, DimValue};
+
+    let query_input = if graph_kind == "qwen35-mtp" {
+        "shifted_tokens"
+    } else {
+        "tokens"
+    };
+    let query = find_declared_value(&graph.input, query_input)?;
+    if tensor_elem_type(query) != Some(TENSOR_INT64)
+        || declared_dimensions(query)?.as_slice() != [DimParam("query_tokens".to_owned())]
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "dynamic token input must be int64 [query_tokens]".to_owned(),
+        ));
+    }
+    let past = find_declared_value(&graph.input, "past_tokens")?;
+    if tensor_elem_type(past) != Some(TENSOR_INT64) || !declared_dimensions(past)?.is_empty() {
+        return Err(OnnxModelError::InvalidModel(
+            "dynamic past_tokens input must be scalar int64".to_owned(),
+        ));
+    }
+    if graph_kind == "qwen35-mtp" {
+        let target = find_declared_value(&graph.input, "target_hidden")?;
+        let target_dimensions = declared_dimensions(target)?;
+        if tensor_elem_type(target) != Some(TENSOR_FLOAT)
+            || !matches!(
+                target_dimensions.as_slice(),
+                [DimParam(query), DimValue(hidden)] if query == "query_tokens" && *hidden > 0
+            )
+        {
+            return Err(OnnxModelError::InvalidModel(
+                "dynamic MTP target_hidden must be float [query_tokens, hidden]".to_owned(),
+            ));
+        }
+    }
+    let cache_inputs = graph
+        .input
+        .iter()
+        .filter(|value| value.name.starts_with("past_k.") || value.name.starts_with("past_v."))
+        .collect::<Vec<_>>();
+    if cache_inputs.is_empty()
+        || cache_inputs.iter().any(|value| {
+            !matches!(
+                declared_dimensions(value).as_deref(),
+                Ok([DimParam(capacity), DimValue(heads), DimValue(width)])
+                    if capacity == "cache_capacity" && *heads > 0 && *width > 0
+            )
+        })
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "dynamic K/V inputs must be [cache_capacity, n_kv_head, head_dim]".to_owned(),
+        ));
+    }
+    let cache_outputs = graph
+        .output
+        .iter()
+        .filter(|value| {
+            value.name.starts_with("present_k.") || value.name.starts_with("present_v.")
+        })
+        .collect::<Vec<_>>();
+    if cache_outputs.len() != cache_inputs.len()
+        || cache_outputs.iter().any(|value| {
+            !matches!(
+                declared_dimensions(value).as_deref(),
+                Ok([DimParam(total), DimValue(heads), DimValue(width)])
+                    if total == "total_tokens" && *heads > 0 && *width > 0
+            )
+        })
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "dynamic K/V outputs must be [total_tokens, n_kv_head, head_dim]".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn find_declared_value<'a>(
+    values: &'a [ValueInfoProto],
+    name: &str,
+) -> Result<&'a ValueInfoProto, OnnxModelError> {
+    values
+        .iter()
+        .find(|value| value.name == name)
+        .ok_or_else(|| {
+            OnnxModelError::InvalidModel(format!("dynamic graph lacks {name} declaration"))
+        })
+}
+
+fn declared_dimensions(
+    value: &ValueInfoProto,
+) -> Result<Vec<tensor_dimension_proto::Value>, OnnxModelError> {
+    value
+        .r#type
+        .as_ref()
+        .and_then(|kind| kind.tensor_type.as_ref())
+        .and_then(|tensor| tensor.shape.as_ref())
+        .map(|shape| {
+            shape
+                .dim
+                .iter()
+                .filter_map(|dimension| dimension.value.clone())
+                .collect()
+        })
+        .ok_or_else(|| {
+            OnnxModelError::InvalidModel(format!(
+                "dynamic tensor {} lacks complete shape",
+                value.name
+            ))
+        })
 }
 
 /// Verify one externally admitted Qwen language-plus-MTP three-file bundle.
@@ -3895,7 +4069,33 @@ pub fn verify_external_qwen35_bundle(
     admitted: AdmittedExternalQwen35BundleDigests,
 ) -> Result<VerifiedExternalQwen35Bundle, OnnxModelError> {
     let mut weights = ExternalDataReader::from_slice(files.weights_bytes);
-    verify_external_qwen35_bundle_with_reader(files, &mut weights, admitted)
+    verify_external_qwen35_bundle_with_reader(
+        files,
+        &mut weights,
+        admitted,
+        ExternalDecoderSchema::FixedV2,
+    )
+}
+
+/// Verify one admitted schema-v3 dynamic Qwen language-plus-MTP bundle.
+///
+/// Selection is explicit: schema-v2 graphs cannot pass this entrypoint, and
+/// schema-v3 graphs cannot pass [`verify_external_qwen35_bundle`].
+///
+/// # Errors
+/// [`OnnxModelError`] for digest, schema, dynamic sequence, external range,
+/// identity, ancestry, or shared execution-geometry mismatch.
+pub fn verify_dynamic_external_qwen35_bundle(
+    files: ExternalQwen35BundleFiles<'_>,
+    admitted: AdmittedExternalQwen35BundleDigests,
+) -> Result<VerifiedExternalQwen35Bundle, OnnxModelError> {
+    let mut weights = ExternalDataReader::from_slice(files.weights_bytes);
+    verify_external_qwen35_bundle_with_reader(
+        files,
+        &mut weights,
+        admitted,
+        ExternalDecoderSchema::DynamicV3,
+    )
 }
 
 /// Verify one Qwen bundle against seek-backed external weights without loading
@@ -3922,6 +4122,31 @@ pub fn verify_external_qwen35_bundle_from_file(
         },
         &mut weights,
         admitted,
+        ExternalDecoderSchema::FixedV2,
+    )
+}
+
+/// Verify one admitted schema-v3 dynamic Qwen bundle against seek-backed data.
+///
+/// # Errors
+/// [`OnnxModelError`] for file mutation, digest/length mismatch, malformed
+/// dynamic graph, noncanonical ranges, identity drift, or ancestry mismatch.
+pub fn verify_dynamic_external_qwen35_bundle_from_file(
+    language_model_bytes: &[u8],
+    mtp_model_bytes: &[u8],
+    weights_file: File,
+    admitted: AdmittedExternalQwen35BundleDigests,
+) -> Result<VerifiedExternalQwen35Bundle, OnnxModelError> {
+    let mut weights = ExternalDataReader::from_file(weights_file)?;
+    verify_external_qwen35_bundle_with_reader(
+        ExternalQwen35BundleFiles {
+            language_model_bytes,
+            mtp_model_bytes,
+            weights_bytes: &[],
+        },
+        &mut weights,
+        admitted,
+        ExternalDecoderSchema::DynamicV3,
     )
 }
 
@@ -3929,6 +4154,7 @@ fn verify_external_qwen35_bundle_with_reader(
     files: ExternalQwen35BundleFiles<'_>,
     weights: &mut ExternalDataReader<'_>,
     admitted: AdmittedExternalQwen35BundleDigests,
+    schema: ExternalDecoderSchema,
 ) -> Result<VerifiedExternalQwen35Bundle, OnnxModelError> {
     let require_digest = |bytes: &[u8], expected: [u8; 32], label: &str| {
         if blake3::hash(bytes).as_bytes() != &expected {
@@ -3962,6 +4188,7 @@ fn verify_external_qwen35_bundle_with_reader(
         },
         "qwen-causal-lm",
         ExternalRangePolicy::Shared,
+        schema,
     )?;
     let mtp = verify_external_decoder_graph(
         files.mtp_model_bytes,
@@ -3972,6 +4199,7 @@ fn verify_external_qwen35_bundle_with_reader(
         },
         "qwen35-mtp",
         ExternalRangePolicy::Shared,
+        schema,
     )?;
     verify_shared_qwen_ranges(&language, &mtp, weights)?;
     require_metadata(
@@ -11470,6 +11698,82 @@ mod tests {
         assert_eq!(dynamic_seek.mtp_model_bytes, dynamic_bundle.mtp_model_bytes);
         assert_eq!(dynamic_seek_weights, dynamic_bundle.weights_bytes);
         assert_eq!(dynamic_seek.weights_blake3, dynamic_bundle.weights_blake3);
+        let dynamic_admitted = AdmittedExternalQwen35BundleDigests {
+            language_model_blake3: *blake3::hash(&dynamic_bundle.language_model_bytes).as_bytes(),
+            mtp_model_blake3: *blake3::hash(&dynamic_bundle.mtp_model_bytes).as_bytes(),
+            weights_blake3: dynamic_bundle.weights_blake3,
+        };
+        let dynamic_receipt = verify_dynamic_external_qwen35_bundle(
+            ExternalQwen35BundleFiles {
+                language_model_bytes: &dynamic_bundle.language_model_bytes,
+                mtp_model_bytes: &dynamic_bundle.mtp_model_bytes,
+                weights_bytes: &dynamic_bundle.weights_bytes,
+            },
+            dynamic_admitted,
+        )
+        .unwrap();
+        assert_eq!(
+            dynamic_receipt.language.sequence_mode.as_deref(),
+            Some("dynamic-cache-v1")
+        );
+        assert_eq!(dynamic_receipt.language.tokens, 0);
+        assert_eq!(dynamic_receipt.mtp.past_tokens, 0);
+        assert!(matches!(
+            verify_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    language_model_bytes: &dynamic_bundle.language_model_bytes,
+                    mtp_model_bytes: &dynamic_bundle.mtp_model_bytes,
+                    weights_bytes: &dynamic_bundle.weights_bytes,
+                },
+                dynamic_admitted,
+            ),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("tritium.schema_version")
+        ));
+        let dynamic_seek_receipt = verify_dynamic_external_qwen35_bundle_from_file(
+            &dynamic_seek.language_model_bytes,
+            &dynamic_seek.mtp_model_bytes,
+            File::open(&dynamic_seek_path).unwrap(),
+            dynamic_admitted,
+        )
+        .unwrap();
+        assert_eq!(dynamic_seek_receipt, dynamic_receipt);
+        let mut frozen_dynamic_language = dynamic_language.clone();
+        frozen_dynamic_language
+            .graph
+            .as_mut()
+            .unwrap()
+            .input
+            .iter_mut()
+            .find(|input| input.name == "tokens")
+            .unwrap()
+            .r#type
+            .as_mut()
+            .unwrap()
+            .tensor_type
+            .as_mut()
+            .unwrap()
+            .shape
+            .as_mut()
+            .unwrap()
+            .dim[0]
+            .value = Some(tensor_dimension_proto::Value::DimValue(1));
+        let frozen_dynamic_language = frozen_dynamic_language.encode_to_vec();
+        assert!(matches!(
+            verify_dynamic_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    language_model_bytes: &frozen_dynamic_language,
+                    mtp_model_bytes: &dynamic_bundle.mtp_model_bytes,
+                    weights_bytes: &dynamic_bundle.weights_bytes,
+                },
+                AdmittedExternalQwen35BundleDigests {
+                    language_model_blake3: *blake3::hash(&frozen_dynamic_language).as_bytes(),
+                    ..dynamic_admitted
+                },
+            ),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("dynamic token input")
+        ));
         std::fs::remove_file(&dynamic_seek_path).unwrap();
         assert!(matches!(
             encode_dynamic_external_qwen35_bundle_with_ancestry(
