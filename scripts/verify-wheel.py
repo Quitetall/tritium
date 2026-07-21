@@ -246,6 +246,14 @@ def qualify_target(target_id: str, platform_tag: str) -> dict[str, str]:
     return {"host_os": host_os, "host_arch": host_arch}
 
 
+def _qualified_identity(args: argparse.Namespace, result: dict[str, object]) -> dict[str, str]:
+    if not args.target_id or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.target_id):
+        raise WheelError("evidence requires a canonical --target-id")
+    if not args.source_revision or not re.fullmatch(r"[0-9a-f]{40}", args.source_revision):
+        raise WheelError("evidence requires a full lowercase --source-revision")
+    return qualify_target(args.target_id, str(result["platform_tag"]))
+
+
 def clean_install_smoke(path: Path, forbidden_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="tritium-wheel-smoke-") as raw:
         root = Path(raw)
@@ -257,6 +265,7 @@ def clean_install_smoke(path: Path, forbidden_root: Path) -> None:
                 str(python),
                 "-m",
                 "pip",
+                "--isolated",
                 "install",
                 "--disable-pip-version-check",
                 "--no-index",
@@ -305,6 +314,8 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--install-smoke", action="store_true")
     parser.add_argument("--receipt", type=Path)
+    parser.add_argument("--smoke-evidence", type=Path)
+    parser.add_argument("--cell-id")
     parser.add_argument("--target-id")
     parser.add_argument("--source-revision")
     args = parser.parse_args()
@@ -313,16 +324,12 @@ def main() -> int:
         result = inspect_wheel(wheel, _workspace_version(args.workspace))
         if args.install_smoke:
             clean_install_smoke(wheel, args.workspace)
+        if args.receipt and args.smoke_evidence:
+            raise WheelError("choose either --receipt or --smoke-evidence")
         if args.receipt:
             if not args.install_smoke:
                 raise WheelError("compatibility receipts require --install-smoke")
-            if not args.target_id or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.target_id):
-                raise WheelError("--receipt requires a canonical --target-id")
-            if not args.source_revision or not re.fullmatch(
-                r"[0-9a-f]{40}", args.source_revision
-            ):
-                raise WheelError("--receipt requires a full lowercase --source-revision")
-            host = qualify_target(args.target_id, str(result["platform_tag"]))
+            host = _qualified_identity(args, result)
             receipt = {
                 "schema": "tritium.compatibility-receipt.v1",
                 "target_id": args.target_id,
@@ -334,6 +341,27 @@ def main() -> int:
             }
             args.receipt.parent.mkdir(parents=True, exist_ok=True)
             args.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        if args.smoke_evidence:
+            if not args.install_smoke:
+                raise WheelError("smoke evidence requires --install-smoke")
+            if not args.cell_id or not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.cell_id):
+                raise WheelError("smoke evidence requires a canonical --cell-id")
+            host = _qualified_identity(args, result)
+            evidence = {
+                "schema": "tritium.wheel-smoke.v1",
+                "cell_id": args.cell_id,
+                "target_id": args.target_id,
+                "source_revision": args.source_revision,
+                "passed": True,
+                "python_implementation": platform.python_implementation(),
+                "python_version": platform.python_version(),
+                **host,
+                **result,
+            }
+            args.smoke_evidence.parent.mkdir(parents=True, exist_ok=True)
+            args.smoke_evidence.write_text(
+                json.dumps(evidence, indent=2) + "\n", encoding="utf-8"
+            )
         print(json.dumps({"passed": True, "install_smoke": args.install_smoke, **result}))
     except (KeyError, OSError, subprocess.SubprocessError, WheelError) as error:
         parser.error(str(error))
