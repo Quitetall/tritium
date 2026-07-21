@@ -22,6 +22,7 @@ import {
 export interface WebGpuResidentTransactionV1 {
   readonly commands: readonly WebGpuResidentDispatchV1[];
   readonly copies: readonly WebGpuResidentCopyV1[];
+  readonly commitCopies: readonly WebGpuResidentCopyV1[];
 }
 
 export interface WebGpuResidentScheduleBudgetV1 {
@@ -41,6 +42,7 @@ type BufferMap = ReturnType<typeof admittedWebGpuBuffersV1>;
 type Template = Readonly<{
   commands: readonly WebGpuResidentDispatchV1[];
   copies: readonly WebGpuResidentCopyV1[];
+  commitCopies?: readonly WebGpuResidentCopyV1[];
 }>;
 type PendingResource = Readonly<{
   id: string;
@@ -1060,6 +1062,9 @@ export function compileWebGpuResidentScheduleV1(
           workgroups: Object.freeze([...command.workgroups]) as readonly [number, number, number],
         }))),
         copies: Object.freeze(template.copies.map((copy) => Object.freeze({ ...copy }))),
+        commitCopies: Object.freeze(
+          (template.commitCopies ?? []).map((copy) => Object.freeze({ ...copy })),
+        ),
       });
     },
   });

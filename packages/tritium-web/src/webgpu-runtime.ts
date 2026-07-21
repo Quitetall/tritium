@@ -551,12 +551,13 @@ export class WebGpuResidentRuntimeV1 {
   dispatch(
     commands: readonly WebGpuResidentDispatchV1[],
     copies: readonly WebGpuResidentCopyV1[] = [],
+    commitCopies: readonly WebGpuResidentCopyV1[] = [],
   ): void {
     this.#ready();
-    if (!denseArray(commands) || !denseArray(copies)) {
+    if (!denseArray(commands) || !denseArray(copies) || !denseArray(commitCopies)) {
       fail("invalid_schema", "WebGPU transaction inputs must be dense arrays");
     }
-    const capturedCopies = copies.map((copy) => {
+    const captureCopies = (values: readonly WebGpuResidentCopyV1[]) => values.map((copy) => {
       const sourceId = record(copy) ? property(copy, "source", "WebGPU resident copy") : undefined;
       const destinationId = record(copy)
         ? property(copy, "destination", "WebGPU resident copy")
@@ -603,6 +604,21 @@ export class WebGpuResidentRuntimeV1 {
         byteLength: safeByteLength,
       });
     });
+    const capturedCopies = captureCopies(copies);
+    const capturedCommitCopies = captureCopies(commitCopies);
+    const commitSourceOwners = new Set(capturedCommitCopies.map((copy) =>
+      this.#buffers.get(copy.source)!.ownerId));
+    const commitDestinationOwners = new Set<string>();
+    for (const copy of capturedCommitCopies) {
+      const owner = this.#buffers.get(copy.destination)!.ownerId;
+      if (commitDestinationOwners.has(owner)) {
+        fail("invalid_schema", "WebGPU commit copies require unique destination owners");
+      }
+      commitDestinationOwners.add(owner);
+    }
+    if ([...commitDestinationOwners].some((owner) => commitSourceOwners.has(owner))) {
+      fail("invalid_schema", "WebGPU commit destinations cannot feed another commit copy");
+    }
     const capturedCommands = commands.map((command) => {
       if (!record(command)) fail("invalid_schema", "WebGPU dispatch command is malformed");
       const fields = Object.keys(command).sort();
@@ -709,6 +725,15 @@ export class WebGpuResidentRuntimeV1 {
       pass.dispatchWorkgroups(...command.workgroups);
     }
     pass.end();
+    for (const copy of capturedCommitCopies) {
+      encoder.copyBufferToBuffer(
+        this.#physicalBuffer(copy.source),
+        copy.sourceOffset,
+        this.#physicalBuffer(copy.destination),
+        copy.destinationOffset,
+        copy.byteLength,
+      );
+    }
     this.#device.queue.submit([encoder.finish()]);
   }
 

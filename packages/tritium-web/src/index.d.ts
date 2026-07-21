@@ -634,6 +634,7 @@ export declare class WebGpuResidentRuntimeV1 {
   dispatch(
     commands: readonly WebGpuResidentDispatchV1[],
     copies?: readonly WebGpuResidentCopyV1[],
+    commitCopies?: readonly WebGpuResidentCopyV1[],
   ): void;
   read(bufferId: string): Promise<Uint8Array>;
   dispose(): void;
@@ -649,6 +650,7 @@ export declare function lowerPointwiseWebGpuOperationV1(
 export interface WebGpuResidentTransactionV1 {
   readonly commands: readonly WebGpuResidentDispatchV1[];
   readonly copies: readonly WebGpuResidentCopyV1[];
+  readonly commitCopies: readonly WebGpuResidentCopyV1[];
 }
 
 export interface WebGpuResidentScheduleBudgetV1 {

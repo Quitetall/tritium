@@ -4,8 +4,9 @@ import test from "node:test";
 import { WebGpuResidentRuntimeV1, WebTrainingError } from "../dist/index.js";
 
 class FakeBuffer {
-  constructor(size, device) {
+  constructor(size, device, label) {
     this.size = size;
+    this.label = label;
     this.bytes = new Uint8Array(size);
     this.device = device;
   }
@@ -35,6 +36,7 @@ class FakeDevice {
     this.bindGroups = 0;
     this.pipelines = 0;
     this.destroyed = false;
+    this.events = [];
     this.buffers = new Map();
     this.lost = new Promise((resolve) => { this.lose = resolve; });
     this.queue = {
@@ -51,7 +53,7 @@ class FakeDevice {
     return { getBindGroupLayout: () => ({}) };
   }
   createBuffer({ label, size }) {
-    const buffer = new FakeBuffer(size, this);
+    const buffer = new FakeBuffer(size, this, label);
     this.buffers.set(label, buffer);
     return buffer;
   }
@@ -65,10 +67,11 @@ class FakeDevice {
       beginComputePass: () => ({
         setPipeline() {},
         setBindGroup() {},
-        dispatchWorkgroups() {},
+        dispatchWorkgroups: () => this.events.push("dispatch"),
         end() {},
       }),
       copyBufferToBuffer: (source, sourceOffset, destination, destinationOffset, size) => {
+        this.events.push(`copy:${source.label}>${destination.label}`);
         copies.push(() => destination.bytes.set(
           source.bytes.slice(sourceOffset, sourceOffset + size),
           destinationOffset,
@@ -176,6 +179,76 @@ test("auxiliary resources stay resident and receive same-submission GPU copies",
     Uint8Array.of(9, 10, 11, 12, 1, 2, 3, 4),
   );
   assert.equal(device.submits, 2, "copy and dispatch share one submission; read is explicit");
+  runtime.dispose();
+});
+
+test("candidate commits encode after compute in one submission", async () => {
+  const device = new FakeDevice();
+  const runtime = await WebGpuResidentRuntimeV1.prepare(
+    device,
+    plan(),
+    [{ bufferId: "left", bytes: Uint8Array.of(1, 2, 3, 4) }],
+    {
+      maxBytes: 4,
+      resources: [{ id: "candidate", byteLength: 4, initialBytes: null }],
+    },
+  );
+  device.events.length = 0;
+  runtime.dispatch(
+    [command],
+    [{
+      source: "left", sourceOffset: 0,
+      destination: "candidate", destinationOffset: 0, byteLength: 4,
+    }],
+    [{
+      source: "candidate", sourceOffset: 0,
+      destination: "right", destinationOffset: 0, byteLength: 4,
+    }],
+  );
+  assert.deepEqual(device.events, [
+    "copy:tritium:resident:left>tritium:auxiliary:candidate",
+    "dispatch",
+    "copy:tritium:auxiliary:candidate>tritium:resident:right",
+  ]);
+  assert.equal(device.submits, 1);
+  assert.deepEqual(await runtime.read("right"), Uint8Array.of(1, 2, 3, 4));
+  runtime.dispose();
+});
+
+test("candidate commits reject duplicate and chained physical destinations", async () => {
+  const alias = {
+    ...buffer("right_alias", 16),
+    role: "parameter",
+    aliasOf: "right",
+    ownerId: "right",
+  };
+  const aliasedPlan = { ...plan(), buffers: [...plan().buffers, alias] };
+  const device = new FakeDevice();
+  const runtime = await WebGpuResidentRuntimeV1.prepare(
+    device,
+    aliasedPlan,
+    [],
+    {
+      maxBytes: 8,
+      resources: [
+        { id: "candidate-a", byteLength: 4, initialBytes: null },
+        { id: "candidate-b", byteLength: 4, initialBytes: null },
+      ],
+    },
+  );
+  const copy = (source, destination) => ({
+    source, sourceOffset: 0, destination, destinationOffset: 0, byteLength: 4,
+  });
+  for (const commits of [
+    [copy("candidate-a", "right"), copy("candidate-b", "right_alias")],
+    [copy("candidate-a", "right"), copy("right_alias", "result")],
+  ]) {
+    assert.throws(
+      () => runtime.dispatch([command], [], commits),
+      (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+    );
+  }
+  assert.equal(device.submits, 0);
   runtime.dispose();
 });
 
