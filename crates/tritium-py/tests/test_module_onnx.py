@@ -44,6 +44,15 @@ def _model():
     return AdditiveTernaryLinear(planes, torch.tensor([0.1, -0.2])).eval()
 
 
+def _external_data_model():
+    plane = SimpleNamespace(
+        trits=torch.randint(-1, 2, (128, 128), dtype=torch.int8),
+        scales=torch.full((128, 1), 0.25, dtype=torch.float16),
+        group_size=128,
+    )
+    return AdditiveTernaryLinear((plane,)).eval()
+
+
 def test_module_onnx_keeps_packed_state_runs_ort_and_supports_dynamic_batch(tmp_path):
     model = _model()
     example = torch.randn(2, 8)
@@ -92,6 +101,17 @@ def test_module_onnx_rejects_optimizer_dense_shadow_and_rolls_back(monkeypatch, 
         export_module_onnx(_model(), torch.randn(2, 8), output)
     assert captured.value.code == "dense_shadow_detected"
     assert not output.exists()
+
+
+def test_module_onnx_checks_external_data_from_graph_directory(tmp_path):
+    artifact = export_module_onnx(
+        _external_data_model(), torch.randn(1, 128), tmp_path / "bundle"
+    )
+    external = artifact.artifact_dir / "model.onnx.data"
+    assert external.is_file()
+    assert external.stat().st_size > 0
+    runtime = load_module_onnx(artifact.artifact_dir)
+    assert runtime(torch.randn(2, 128)).shape == (2, 128)
 
 
 def test_huggingface_ptq_exports_tied_embedding_and_dynamic_sequence(tmp_path):

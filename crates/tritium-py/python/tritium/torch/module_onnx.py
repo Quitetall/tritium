@@ -427,8 +427,10 @@ def export_module_onnx(
             external_data=True,
             dynamic_shapes=dynamic_shapes,
         )
+        # Path-based checking supplies ONNX with the external-data base directory.
+        # Checking an in-memory ModelProto makes valid large graphs look missing.
+        onnx.checker.check_model(str(graph_path))
         graph = onnx.load(graph_path, load_external_data=False)
-        onnx.checker.check_model(graph)
         _audit_graph(graph.graph, specs, onnx)
         external_locations = {
             entry.value
@@ -568,8 +570,8 @@ def load_module_onnx(
     _validate_specs(specs)
     onnx, ort = _runtime_dependencies()
     graph_path = directory / _GRAPH
+    onnx.checker.check_model(str(graph_path))
     graph = onnx.load(graph_path, load_external_data=False)
-    onnx.checker.check_model(graph)
     external_locations = {
         entry.value
         for initializer in graph.graph.initializer
