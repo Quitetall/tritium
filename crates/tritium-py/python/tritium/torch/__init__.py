@@ -49,6 +49,7 @@ from .onnx import (
     export_onnx,
     load_onnx,
 )
+from .qat import QatHardResult, QatHardWeight, convert_qat_hard
 from .ptq import (
     ActivationCalibrationReceipt,
     ActivationRecord,
@@ -93,6 +94,8 @@ __all__ = [
     "OnnxModule",
     "ProjectionContext",
     "PreparedModel",
+    "QatHardResult",
+    "QatHardWeight",
     "QuantizationResult",
     "QwenOnnxCausalLM",
     "RefinementConfig",
@@ -108,6 +111,7 @@ __all__ = [
     "create_estimator",
     "calibrate",
     "convert",
+    "convert_qat_hard",
     "export",
     "export_onnx",
     "export_module_onnx",

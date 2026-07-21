@@ -60,6 +60,16 @@ coverage and duplicate-plugin tests.
 
 ## Step 3 — separate refinement tracks
 
+Status: **IN PROGRESS** — `convert(prepared_qat)` now emits a separately typed
+inference-only `QatHardResult`, preflights every unique projection before graph
+mutation, packs tied Linear/Embedding masters once and binds source-checkpoint,
+recipe and compact-state identities. Built-in hard forwards now decode exact
+stored f16 scales. TTQ's asymmetric positive/negative values are represented as
+two honest row-scale planes and therefore require `planes=2`; the prior
+per-element-scale pseudo-plane could not enter SALT. Generic QAT-hard durable
+export/reload, convolution lowering and public HF checkpoint registration remain
+open and are not relabeled as PTQ.
+
 - Remove refinement from `TernaryConfig.ptq`; reject ambiguous legacy non-none
   refinement values instead of silently migrating them.
 - Implement `refine(parent, teacher, training, validation, config, work_dir)`.

@@ -181,7 +181,9 @@ def validate_projection(
                 details={"plane": index},
             )
         try:
-            decoded = decoded + plane.trits.to(master.dtype) * plane.scales
+            decoded = decoded + plane.trits.to(master.dtype) * plane.scales.to(
+                master.dtype
+            )
         except RuntimeError as error:
             raise TritiumError(
                 "projection scales are not broadcastable over trits",

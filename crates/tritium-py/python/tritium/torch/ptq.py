@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -31,6 +31,9 @@ from .module_artifacts import (
     seal_module_conversion,
 )
 from .projection import TernaryPlane, TernaryProjection, validate_projection
+
+if TYPE_CHECKING:
+    from .qat import QatHardResult
 
 Pathish = Union[str, os.PathLike[str]]
 # Conservative auxiliary-tensor ledger for the row-tiled float64 fitter.
@@ -103,7 +106,14 @@ def _hash_tensor(digest: "hashlib._Hash", tag: str, value: torch.Tensor) -> None
     flat = tensor.contiguous().view(-1)
     chunk_elements = max(1, (1024 * 1024) // max(1, flat.element_size()))
     for offset in range(0, flat.numel(), chunk_elements):
-        chunk = flat[offset : offset + chunk_elements].cpu().numpy().tobytes()
+        chunk = (
+            flat[offset : offset + chunk_elements]
+            .contiguous()
+            .view(torch.uint8)
+            .cpu()
+            .numpy()
+            .tobytes()
+        )
         _hash_field(digest, f"{tag}:chunk", chunk)
 
 
@@ -964,7 +974,9 @@ def calibrate(
 
 def convert(
     prepared: PreparedModel,
-    calibration: Union[CalibrationReceipt, ActivationCalibrationReceipt],
+    calibration: Optional[
+        Union[CalibrationReceipt, ActivationCalibrationReceipt]
+    ] = None,
     *,
     revision: Optional[str] = None,
     work_dir: Optional[Pathish] = None,
@@ -975,12 +987,39 @@ def convert(
     near_lossless_max_resident_bytes: Optional[int] = None,
     max_working_bytes: int = 64 * 1024 * 1024,
     packing: str = "b3",
-) -> Union[QuantizationResult, ModuleQuantizationResult]:
-    """Run resumable PTQ, exact allocation, admission, and atomic export."""
+) -> Union[QuantizationResult, ModuleQuantizationResult, "QatHardResult"]:
+    """Freeze QAT or run resumable PTQ with explicit result discriminants."""
 
     if not isinstance(prepared, PreparedModel):
         raise TypeError("convert requires a PreparedModel")
+    if prepared.config.mode == "qat":
+        if calibration is not None:
+            raise TypeError("QAT hard conversion does not accept calibration")
+        supplied = {
+            "revision": revision,
+            "work_dir": work_dir,
+            "output_dir": output_dir,
+            "compact_max_bytes": compact_max_bytes,
+            "compact_max_resident_bytes": compact_max_resident_bytes,
+            "near_lossless_max_bytes": near_lossless_max_bytes,
+            "near_lossless_max_resident_bytes": near_lossless_max_resident_bytes,
+            "max_working_bytes": (
+                max_working_bytes if max_working_bytes != 64 * 1024 * 1024 else None
+            ),
+            "packing": packing if packing != "b3" else None,
+        }
+        names = sorted(name for name, value in supplied.items() if value is not None)
+        if names:
+            raise TypeError(
+                "QAT hard conversion does not accept PTQ arguments: "
+                + ", ".join(names)
+            )
+        from .qat import convert_qat_hard
+
+        return convert_qat_hard(prepared)
     if isinstance(prepared.model, nn.Module):
+        if calibration is None:
+            raise TypeError("live-module PTQ convert requires calibration")
         if work_dir is None:
             raise TypeError("live-module convert requires work_dir")
         qwen_arguments = {

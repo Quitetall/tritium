@@ -35,7 +35,18 @@ class PreparedModel:
 
 
 def _new_estimator(config: TernaryConfig) -> Estimator:
-    estimators = tuple(create_estimator(config.estimator) for _ in range(config.planes))
+    first = create_estimator(config.estimator)
+    if first.physical_planes != 1:
+        if config.planes != first.physical_planes:
+            raise TritiumError(
+                f"{config.estimator} requires planes={first.physical_planes}",
+                code="unsupported_recipe",
+                stage="inspect",
+            )
+        return first
+    estimators = (first,) + tuple(
+        create_estimator(config.estimator) for _ in range(config.planes - 1)
+    )
     if len(estimators) == 1:
         return estimators[0]
     return AdditiveEstimator(estimators)

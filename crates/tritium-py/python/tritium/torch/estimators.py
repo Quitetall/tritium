@@ -23,6 +23,7 @@ class Estimator(nn.Module, ABC):
 
     algorithm_id: str
     schema_version: int = 1
+    physical_planes: int = 1
 
     @abstractmethod
     def project(
@@ -57,7 +58,8 @@ class AbsMeanSTE(Estimator):
         safe_scales = scales.clamp_min(torch.finfo(master.dtype).tiny)
         normalized = master / safe_scales
         hard = normalized.round().clamp(-1.0, 1.0)
-        decoded = hard.detach() * scales
+        stored_scales = scales.to(torch.float16)
+        decoded = hard.detach() * stored_scales.to(master.dtype)
         # Rust's STE contract uses a strict |w/s| < 1 mask and returns zero for
         # a degenerate all-zero row. Keep that exact backward while the forward
         # remains the hard canonical decode.
@@ -68,7 +70,7 @@ class AbsMeanSTE(Estimator):
             planes=(
                 TernaryPlane(
                     trits=hard.detach().to(torch.int8),
-                    scales=scales,
+                    scales=stored_scales,
                     group_size=master.shape[1],
                 ),
             ),
@@ -104,20 +106,34 @@ def _projection(
     surrogate: torch.Tensor,
     estimator: Estimator,
 ) -> TernaryProjection:
-    decoded = trits.to(master.dtype) * scales
+    return _multi_projection(master, ((trits, scales),), surrogate, estimator)
+
+
+def _multi_projection(
+    master: torch.Tensor,
+    values: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
+    surrogate: torch.Tensor,
+    estimator: Estimator,
+) -> TernaryProjection:
+    decoded = torch.zeros_like(master)
+    planes = []
+    for trits, scales in values:
+        stored_scales = scales.to(torch.float16)
+        decoded = decoded + trits.to(master.dtype) * stored_scales.to(master.dtype)
+        planes.append(
+            TernaryPlane(
+                trits=trits.detach().to(torch.int8),
+                scales=stored_scales,
+                group_size=master.shape[1],
+            )
+        )
     # Form the zero-valued STE term before adding it. Reassociating this as
     # `(decoded + surrogate) - surrogate.detach()` leaves rounding residue and
     # violates the bit-exact hard-forward contract.
     dense = decoded.detach() + (surrogate - surrogate.detach())
     return TernaryProjection(
         dense=dense,
-        planes=(
-            TernaryPlane(
-                trits=trits.detach().to(torch.int8),
-                scales=scales,
-                group_size=master.shape[1],
-            ),
-        ),
+        planes=tuple(planes),
         algorithm_id=estimator.algorithm_id,
         schema_version=estimator.schema_version,
     )
@@ -279,6 +295,7 @@ class TTQEstimator(Estimator):
 
     algorithm_id = "tritium.ttq"
     schema_version = 1
+    physical_planes = 2
 
     def __init__(self, initial_scale: float = 1.0, initial_threshold: float = 0.05) -> None:
         super().__init__()
@@ -306,21 +323,23 @@ class TTQEstimator(Estimator):
         threshold_ratio = torch.sigmoid(self.threshold_logit).to(master.dtype)
         threshold = row_magnitude * threshold_ratio
         detached = master.detach()
-        trits = torch.where(
-            detached > threshold,
-            torch.ones_like(detached),
-            torch.where(detached < -threshold, -torch.ones_like(detached), torch.zeros_like(detached)),
-        ).to(torch.int8)
-        scales = torch.where(
-            trits > 0,
-            positive_scale,
-            torch.where(trits < 0, negative_scale, torch.zeros_like(master)),
-        )
+        positive_trits = (detached > threshold).to(torch.int8)
+        negative_trits = -(detached < -threshold).to(torch.int8)
+        positive_scales = positive_scale.expand(master.shape[0], 1)
+        negative_scales = negative_scale.expand(master.shape[0], 1)
         sharpness = 10.0
         positive_gate = torch.sigmoid(sharpness * (master - threshold))
         negative_gate = torch.sigmoid(sharpness * (-master - threshold))
         surrogate = positive_scale * positive_gate - negative_scale * negative_gate
-        return _projection(master, trits, scales, surrogate, self)
+        return _multi_projection(
+            master,
+            (
+                (positive_trits, positive_scales),
+                (negative_trits, negative_scales),
+            ),
+            surrogate,
+            self,
+        )
 
 
 class SparseTernaryEstimator(Estimator):

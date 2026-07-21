@@ -99,10 +99,18 @@ def test_builtin_estimator_hard_decode_and_finite_backward(name):
         schema_version=estimator.schema_version,
     )
 
-    assert set(projection.trits.unique().tolist()) <= {-1, 0, 1}
-    assert torch.equal(
-        projection.dense.detach(), projection.trits.to(master.dtype) * projection.scales
+    assert all(
+        set(plane.trits.unique().tolist()) <= {-1, 0, 1}
+        for plane in projection.planes
     )
+    decoded = sum(
+        (
+            plane.trits.to(master.dtype) * plane.scales.to(master.dtype)
+            for plane in projection.planes
+        ),
+        torch.zeros_like(master),
+    )
+    assert torch.equal(projection.dense.detach(), decoded)
     projection.dense.square().mean().backward()
     assert master.grad is not None and torch.isfinite(master.grad).all()
     for parameter in estimator.parameters():
@@ -112,7 +120,7 @@ def test_builtin_estimator_hard_decode_and_finite_backward(name):
 def test_config_catalog_conversion_accounts_for_learned_state():
     model = prepare_qat(
         torch.nn.Sequential(torch.nn.Linear(8, 4)),
-        TernaryConfig.qat(estimator="ttq"),
+        TernaryConfig.qat(estimator="ttq", planes=2),
     )
     layer = model[0]
     assert isinstance(layer, TernaryLinear)
@@ -143,7 +151,7 @@ def test_tied_latent_weight_shares_learned_estimator_state():
 def test_learned_estimator_safetensors_state_round_trip(tmp_path):
     safetensors = pytest.importorskip("safetensors.torch")
     torch.manual_seed(131)
-    config = TernaryConfig.qat(estimator="ttq")
+    config = TernaryConfig.qat(estimator="ttq", planes=2)
     model = prepare_qat(torch.nn.Sequential(torch.nn.Linear(8, 4)), config)
     sample = torch.randn(3, 8)
     model(sample).square().mean().backward()
@@ -165,7 +173,7 @@ def test_learned_estimator_safetensors_state_round_trip(tmp_path):
 def test_learned_estimator_conversion_is_device_resident_on_cuda(name):
     model = prepare_qat(
         torch.nn.Linear(8, 4, device="cuda"),
-        TernaryConfig.qat(estimator=name),
+        TernaryConfig.qat(estimator=name, planes=2 if name == "ttq" else 1),
     )
     sample = torch.randn(3, 8, device="cuda")
     model(sample).square().mean().backward()
