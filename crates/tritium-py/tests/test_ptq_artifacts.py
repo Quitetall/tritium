@@ -466,6 +466,38 @@ def test_live_module_calibration_fails_closed_on_incomplete_or_oversize_data(tmp
     assert caught.value.code == "unsupported_shared_parameter"
 
 
+def test_live_module_fit_consumes_bound_curvature_and_rejects_source_drift(tmp_path):
+    model = torch.nn.Linear(3, 2, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(torch.tensor([[1.0, -0.4, 0.1], [-0.7, 0.2, 0.9]]))
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    receipt = calibrate(
+        prepared,
+        [torch.tensor([[1.0, 2.0, 3.0], [2.0, 1.0, 0.5]])],
+        evidence_dir=tmp_path / "fit-evidence",
+    )
+    result = ptq.fit(prepared, receipt)
+    assert result.evidence_id == receipt.evidence_id
+    assert result.algorithm_id == "tritium.diagonal-additive-3@1"
+    assert len(result.weights) == 1
+    assert len(result.weights[0].planes) == 3
+    assert result.weights[0].weighted_mse >= 0
+    for plane in result.weights[0].planes:
+        assert set(plane.trits.unique().tolist()) <= {-1, 0, 1}
+        assert torch.isfinite(plane.scales).all()
+        assert (plane.scales >= 0).all()
+
+    with torch.no_grad():
+        prepared.model.weight[0, 0] += 1
+    with pytest.raises(TritiumError) as caught:
+        ptq.fit(prepared, receipt)
+    assert caught.value.code == "source_changed"
+
+
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
     sentinel_prepared = object()
     sentinel_calibration = object()

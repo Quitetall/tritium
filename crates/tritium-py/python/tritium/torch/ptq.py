@@ -21,6 +21,7 @@ from .artifacts import QuantizationResult, load
 from .config import TernaryConfig
 from .conversion import PreparedModel, prepare
 from .errors import TritiumError
+from .projection import TernaryPlane, TernaryProjection, validate_projection
 
 Pathish = Union[str, os.PathLike[str]]
 
@@ -66,6 +67,27 @@ class ActivationCalibrationReceipt:
     token_stream_digest: str
     max_evidence_bytes: int
     records: Tuple[ActivationRecord, ...]
+    schema_version: int = 1
+
+
+@dataclass(frozen=True, eq=False)
+class FittedWeight:
+    """One source parameter projected into hard additive ternary planes."""
+
+    path: str
+    aliases: Tuple[str, ...]
+    planes: Tuple[TernaryPlane, ...]
+    weighted_mse: float
+
+
+@dataclass(frozen=True, eq=False)
+class ModuleQuantizationResult:
+    """Non-deployable generic PTQ intermediate awaiting artifact packing."""
+
+    source_model_digest: str
+    evidence_id: str
+    algorithm_id: str
+    weights: Tuple[FittedWeight, ...]
     schema_version: int = 1
 
 
@@ -528,6 +550,147 @@ def _collect_activations(
     )
 
 
+def _diagonal_additive_projection(
+    master: torch.Tensor, curvature: torch.Tensor, planes: int
+) -> TernaryProjection:
+    if master.ndim != 2 or curvature.ndim != 1 or curvature.numel() != master.shape[1]:
+        raise TritiumError(
+            "calibration curvature does not match the selected weight",
+            code="evidence_geometry_mismatch",
+            stage="convert",
+        )
+    work = master.detach().to(dtype=torch.float64, device="cpu")
+    diagonal = curvature.to(dtype=torch.float64, device="cpu")
+    mean = diagonal.mean()
+    if not bool(torch.isfinite(diagonal).all()) or bool((diagonal < 0).any()):
+        raise TritiumError(
+            "calibration curvature must be finite and nonnegative",
+            code="invalid_evidence",
+            stage="convert",
+        )
+    diagonal = (
+        torch.ones_like(diagonal)
+        if float(mean) == 0.0
+        else diagonal + mean * 1e-4
+    )
+    residual = work
+    decoded = torch.zeros_like(work)
+    fitted_planes = []
+    for _ in range(planes):
+        initial = (residual.abs() * diagonal).sum(dim=1, keepdim=True)
+        initial = initial / diagonal.sum().clamp_min(torch.finfo(torch.float64).tiny)
+        safe = initial.clamp_min(torch.finfo(torch.float64).tiny)
+        trits = (residual / safe).round().clamp(-1, 1).to(torch.int8)
+        code = trits.to(torch.float64)
+        denominator = (code.square() * diagonal).sum(dim=1, keepdim=True)
+        numerator = (residual * code * diagonal).sum(dim=1, keepdim=True)
+        scale = torch.where(
+            denominator > 0,
+            numerator / denominator.clamp_min(torch.finfo(torch.float64).tiny),
+            torch.zeros_like(numerator),
+        ).clamp_min(0)
+        plane = TernaryPlane(
+            trits=trits,
+            scales=scale.to(master.dtype),
+            group_size=master.shape[1],
+        )
+        fitted_planes.append(plane)
+        decoded = decoded + code * scale
+        residual = work - decoded
+    dense = torch.zeros_like(master, device="cpu")
+    for plane in fitted_planes:
+        dense = dense + plane.trits.to(master.dtype) * plane.scales
+    projection = TernaryProjection(
+        dense=dense,
+        planes=tuple(fitted_planes),
+        algorithm_id=f"tritium.diagonal-additive-{planes}@1",
+        schema_version=1,
+    )
+    validate_projection(
+        projection,
+        master.detach().to(device="cpu"),
+        algorithm_id=projection.algorithm_id,
+        schema_version=1,
+    )
+    return projection
+
+
+def fit(
+    prepared: PreparedModel,
+    calibration: ActivationCalibrationReceipt,
+) -> ModuleQuantizationResult:
+    """Fit hard additive planes from strict live-module calibration evidence."""
+
+    if not isinstance(prepared, PreparedModel) or not isinstance(
+        prepared.model, nn.Module
+    ):
+        raise TypeError("fit requires a live-module PreparedModel")
+    if prepared.config.mode != "ptq":
+        raise TritiumError(
+            "fit requires PTQ preparation",
+            code="invalid_phase",
+            stage="convert",
+        )
+    if not isinstance(calibration, ActivationCalibrationReceipt):
+        raise TypeError("fit requires an ActivationCalibrationReceipt")
+    reopened = load_activation_calibration(
+        calibration.evidence_dir,
+        max_evidence_bytes=calibration.max_evidence_bytes,
+    )
+    if reopened != calibration:
+        raise TritiumError(
+            "activation calibration changed after admission",
+            code="evidence_changed",
+            stage="convert",
+        )
+    source_digest = _source_model_digest(prepared.model)
+    if source_digest != calibration.source_model_digest:
+        raise TritiumError(
+            "prepared model changed after calibration",
+            code="source_changed",
+            stage="convert",
+        )
+    parameters = dict(prepared.model.named_parameters(remove_duplicate=False))
+    fitted = []
+    for record in calibration.records:
+        try:
+            master = parameters[record.weight_aliases[0]]
+        except KeyError as error:
+            raise TritiumError(
+                "calibration refers to a missing source parameter",
+                code="evidence_geometry_mismatch",
+                stage="convert",
+                module=record.module,
+            ) from error
+        payload = (calibration.evidence_dir / record.file).read_bytes()
+        curvature = torch.frombuffer(bytearray(payload), dtype=torch.float64)
+        curvature = curvature / record.samples
+        projection = _diagonal_additive_projection(
+            master, curvature, prepared.config.planes
+        )
+        error = (
+            master.detach().cpu().to(torch.float64)
+            - projection.dense.to(torch.float64)
+        ).square()
+        weighted_mse = float(
+            (error * curvature).sum() / curvature.sum().clamp_min(1e-30)
+        )
+        fitted.append(
+            FittedWeight(
+                path=record.weight_aliases[0],
+                aliases=record.weight_aliases,
+                planes=projection.planes,
+                weighted_mse=weighted_mse,
+            )
+        )
+    return ModuleQuantizationResult(
+        source_model_digest=source_digest,
+        evidence_id=calibration.evidence_id,
+        algorithm_id=f"tritium.diagonal-additive-{prepared.config.planes}@1",
+        weights=tuple(fitted),
+    )
+
+
 def calibrate(
     prepared: PreparedModel,
     data: Any = None,
@@ -689,8 +852,11 @@ __all__ = [
     "ActivationCalibrationReceipt",
     "ActivationRecord",
     "CalibrationReceipt",
+    "FittedWeight",
+    "ModuleQuantizationResult",
     "calibrate",
     "convert",
+    "fit",
     "load_activation_calibration",
     "quantize",
 ]
