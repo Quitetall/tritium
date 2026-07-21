@@ -4440,8 +4440,10 @@ name = "tritium-py"
 version = "1.0.0"
 dependencies = [
  "blake3",
+ "ort",
  "pyo3",
  "rustix",
+ "serde",
  "serde_json",
  "tritium-build-info",
  "tritium-core",

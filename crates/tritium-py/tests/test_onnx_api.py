@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import tritium.onnx as onnx
 
 
@@ -70,3 +72,13 @@ def test_native_export_rejects_invalid_bundle_without_publication(tmp_path: Path
     else:
         raise AssertionError("invalid bundle was exported")
     assert not output.exists()
+
+
+def test_native_runtime_rejects_unqualified_device_before_io(tmp_path: Path):
+    with pytest.raises(ValueError, match="admits only 'cpu'"):
+        onnx._tritium.QwenOnnxModel.load(str(tmp_path / "missing"), device="cuda:0")
+
+
+def test_native_runtime_rejects_invalid_bundle(tmp_path: Path):
+    with pytest.raises(RuntimeError, match="artifact directory"):
+        onnx._tritium.QwenOnnxModel.load(str(tmp_path / "missing"), device="cpu")

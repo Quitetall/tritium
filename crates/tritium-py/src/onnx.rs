@@ -4,11 +4,16 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
+use ort::session::Session;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use serde::Deserialize;
 use serde_json::json;
 use tritium_nn::{
     Qwen35LayerType as NnQwen35LayerType, Qwen35SaltV2BundleAdmission, Qwen35TensorSchemaRole,
@@ -19,7 +24,8 @@ use tritium_onnx::{
     Qwen35OnnxAncestryV1, Qwen35PackageMatrixSpec, Qwen35PackagePreservedSpec,
     Qwen35PackageSourceSpec, Qwen35SaltV2PackageSource, QwenDeltaNetGeometry,
     VerifiedExternalQwen35Bundle, encode_external_qwen35_bundle_to_file_with_ancestry,
-    map_qwen36_27b_packed_causal_lm, verify_external_qwen35_bundle_from_file,
+    map_qwen36_27b_packed_causal_lm, tritium_operator_domain,
+    verify_external_qwen35_bundle_from_file,
 };
 
 const LANGUAGE_FILE: &str = "language.onnx";
@@ -27,6 +33,10 @@ const MTP_FILE: &str = "mtp.onnx";
 const WEIGHTS_FILE: &str = "weights.bin";
 const MANIFEST_FILE: &str = "tritium-onnx-manifest.json";
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const MAX_MANIFEST_BYTES: u64 = 1_048_576;
+const MAX_GRAPH_BYTES: u64 = 268_435_456;
+const MAX_WEIGHTS_BYTES: u64 = 68_719_476_736;
 
 /// Native receipt proving both Qwen graphs and their shared external data were admitted.
 #[pyclass(module = "tritium", frozen, skip_from_py_object)]
@@ -141,6 +151,461 @@ impl QwenOnnxBundleReceipt {
     fn selection_id(&self) -> Option<&str> {
         self.selection_id.as_deref()
     }
+}
+
+/// Authenticated, file-backed ONNX Runtime sessions for one Qwen language-plus-MTP bundle.
+///
+/// Loading verifies the manifest and all external-data ranges, creates both real
+/// ORT sessions with Tritium's custom operator domain, then verifies the bundle a
+/// second time. Only CPU execution is admitted until wheel-specific provider
+/// qualification lands.
+#[pyclass(module = "tritium", frozen, skip_from_py_object)]
+pub(crate) struct QwenOnnxModel {
+    artifact_dir: String,
+    device: String,
+    receipt: QwenOnnxBundleReceipt,
+    language_inputs: Vec<String>,
+    language_outputs: Vec<String>,
+    mtp_inputs: Vec<String>,
+    mtp_outputs: Vec<String>,
+    _language_session: Mutex<Session>,
+    _mtp_session: Mutex<Session>,
+}
+
+#[pymethods]
+impl QwenOnnxModel {
+    /// Strictly admit a published bundle and create both real ORT sessions.
+    #[staticmethod]
+    #[pyo3(signature = (artifact_dir, *, device = "cpu"))]
+    fn load(py: Python<'_>, artifact_dir: &str, device: &str) -> PyResult<Self> {
+        if artifact_dir.is_empty() {
+            return Err(PyValueError::new_err("artifact_dir must not be empty"));
+        }
+        if device != "cpu" {
+            return Err(PyValueError::new_err(format!(
+                "unsupported ONNX device {device:?}; this wheel admits only 'cpu'"
+            )));
+        }
+        let path = PathBuf::from(artifact_dir);
+        py.detach(move || load_onnx_runtime(&path))
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    #[getter]
+    fn artifact_dir(&self) -> &str {
+        &self.artifact_dir
+    }
+
+    #[getter]
+    fn device(&self) -> &str {
+        &self.device
+    }
+
+    #[getter]
+    fn receipt(&self) -> QwenOnnxBundleReceipt {
+        self.receipt.clone()
+    }
+
+    #[getter]
+    fn language_inputs(&self) -> Vec<String> {
+        self.language_inputs.clone()
+    }
+
+    #[getter]
+    fn language_outputs(&self) -> Vec<String> {
+        self.language_outputs.clone()
+    }
+
+    #[getter]
+    fn mtp_inputs(&self) -> Vec<String> {
+        self.mtp_inputs.clone()
+    }
+
+    #[getter]
+    fn mtp_outputs(&self) -> Vec<String> {
+        self.mtp_outputs.clone()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedManifest {
+    schema: String,
+    language: ManifestGraph,
+    mtp: ManifestGraph,
+    weights: ManifestWeights,
+    identity: ManifestIdentity,
+    conversion: ManifestConversion,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestGraph {
+    file: String,
+    blake3: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestWeights {
+    file: String,
+    blake3: String,
+    bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestIdentity {
+    source_model_id: String,
+    tokenizer_id: String,
+    recipe_id: String,
+    package_id: String,
+    converted_coverage_id: String,
+    deferred_coverage_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestConversion {
+    mode: String,
+    completion_id: String,
+    campaign_id: String,
+    admission_id: String,
+    selection_id: String,
+}
+
+fn load_onnx_runtime(requested: &Path) -> Result<QwenOnnxModel, String> {
+    let before = fs::symlink_metadata(requested)
+        .map_err(|error| format!("inspect ONNX artifact directory failed: {:?}", error.kind()))?;
+    if before.file_type().is_symlink() || !before.is_dir() {
+        return Err("ONNX artifact must be an ordinary non-symlink directory".to_owned());
+    }
+    let directory = fs::canonicalize(requested).map_err(|error| {
+        format!(
+            "canonicalize ONNX artifact directory failed: {:?}",
+            error.kind()
+        )
+    })?;
+    let opened = fs::metadata(&directory).map_err(|error| {
+        format!(
+            "inspect canonical ONNX artifact directory failed: {:?}",
+            error.kind()
+        )
+    })?;
+    if !opened.is_dir() || !same_file(&before, &opened) {
+        return Err("ONNX artifact directory changed during canonicalization".to_owned());
+    }
+
+    let manifest = read_published_manifest(&directory)?;
+    let inputs = manifest_inputs(&directory, &manifest)?;
+    let receipt = verify_paths(&inputs)?;
+    validate_manifest_receipt(&manifest, &receipt)?;
+
+    let language_session =
+        Session::builder()
+            .map_err(|error| format!("create language ORT session builder failed: {error}"))?
+            .with_operators(tritium_operator_domain().map_err(|error| {
+                format!("create language Tritium operator domain failed: {error}")
+            })?)
+            .map_err(|error| format!("register language Tritium operators failed: {error}"))?
+            .commit_from_file(&inputs.language)
+            .map_err(|error| format!("open authenticated language ORT graph failed: {error}"))?;
+    let mtp_session = Session::builder()
+        .map_err(|error| format!("create MTP ORT session builder failed: {error}"))?
+        .with_operators(
+            tritium_operator_domain()
+                .map_err(|error| format!("create MTP Tritium operator domain failed: {error}"))?,
+        )
+        .map_err(|error| format!("register MTP Tritium operators failed: {error}"))?
+        .commit_from_file(&inputs.mtp)
+        .map_err(|error| format!("open authenticated MTP ORT graph failed: {error}"))?;
+
+    let language_inputs = outlet_names(language_session.inputs());
+    let language_outputs = outlet_names(language_session.outputs());
+    let mtp_inputs = outlet_names(mtp_session.inputs());
+    let mtp_outputs = outlet_names(mtp_session.outputs());
+    validate_session_interface(
+        &receipt,
+        &language_inputs,
+        &language_outputs,
+        &mtp_inputs,
+        &mtp_outputs,
+    )?;
+
+    // ORT resolves external data while committing each session. Re-admission
+    // after both commits catches replacement or mutation during that window.
+    let after = verify_paths(&inputs)?;
+    if !same_receipt(&receipt, &after) {
+        return Err("ONNX bundle changed while ORT sessions were being created".to_owned());
+    }
+    validate_manifest_receipt(&manifest, &after)?;
+    let final_directory = fs::metadata(&directory).map_err(|error| {
+        format!(
+            "reinspect ONNX artifact directory failed: {:?}",
+            error.kind()
+        )
+    })?;
+    if !same_file(&opened, &final_directory) {
+        return Err("ONNX artifact directory changed while loading".to_owned());
+    }
+    let artifact_dir = directory
+        .to_str()
+        .ok_or_else(|| "ONNX artifact path must be valid UTF-8".to_owned())?
+        .to_owned();
+
+    Ok(QwenOnnxModel {
+        artifact_dir,
+        device: "cpu".to_owned(),
+        receipt,
+        language_inputs,
+        language_outputs,
+        mtp_inputs,
+        mtp_outputs,
+        _language_session: Mutex::new(language_session),
+        _mtp_session: Mutex::new(mtp_session),
+    })
+}
+
+fn read_published_manifest(directory: &Path) -> Result<PublishedManifest, String> {
+    let bytes = read_regular_bounded(
+        &directory.join(MANIFEST_FILE),
+        MAX_MANIFEST_BYTES,
+        "ONNX manifest",
+    )?;
+    let manifest: PublishedManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse strict ONNX manifest failed: {error}"))?;
+    if manifest.schema != "tritium-qwen35-onnx-bundle-v1" {
+        return Err("unsupported ONNX bundle schema".to_owned());
+    }
+    if manifest.language.file != LANGUAGE_FILE
+        || manifest.mtp.file != MTP_FILE
+        || manifest.weights.file != WEIGHTS_FILE
+    {
+        return Err("ONNX manifest filenames are not canonical".to_owned());
+    }
+    if manifest.weights.bytes == 0 || manifest.weights.bytes > MAX_WEIGHTS_BYTES {
+        return Err("ONNX manifest weights byte count is outside runtime bounds".to_owned());
+    }
+    if !matches!(
+        manifest.conversion.mode.as_str(),
+        "qat-hard" | "ptq" | "refined"
+    ) {
+        return Err("unsupported ONNX conversion mode".to_owned());
+    }
+    Ok(manifest)
+}
+
+fn manifest_inputs(directory: &Path, manifest: &PublishedManifest) -> Result<Inputs, String> {
+    Ok(Inputs {
+        language: directory.join(LANGUAGE_FILE),
+        mtp: directory.join(MTP_FILE),
+        weights: directory.join(WEIGHTS_FILE),
+        admitted: AdmittedExternalQwen35BundleDigests {
+            language_model_blake3: parse_manifest_digest(
+                &manifest.language.blake3,
+                "language.blake3",
+            )?,
+            mtp_model_blake3: parse_manifest_digest(&manifest.mtp.blake3, "mtp.blake3")?,
+            weights_blake3: parse_manifest_digest(&manifest.weights.blake3, "weights.blake3")?,
+        },
+        max_graph_bytes: MAX_GRAPH_BYTES,
+        max_weights_bytes: manifest.weights.bytes,
+    })
+}
+
+fn parse_manifest_digest(value: &str, label: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "{label} must be 64 lowercase hexadecimal characters"
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        digest[index] = u8::from_str_radix(
+            std::str::from_utf8(pair).expect("validated hexadecimal is ASCII"),
+            16,
+        )
+        .map_err(|_| format!("{label} is not hexadecimal"))?;
+    }
+    Ok(digest)
+}
+
+fn validate_manifest_receipt(
+    manifest: &PublishedManifest,
+    receipt: &QwenOnnxBundleReceipt,
+) -> Result<(), String> {
+    let identity_matches = manifest.identity.source_model_id == receipt.source_model_id
+        && manifest.identity.tokenizer_id == receipt.tokenizer_id
+        && manifest.identity.recipe_id == receipt.recipe_id
+        && manifest.identity.package_id == receipt.package_id
+        && manifest.identity.converted_coverage_id == receipt.converted_coverage_id
+        && manifest.identity.deferred_coverage_id == receipt.deferred_coverage_id;
+    let conversion_matches = receipt.conversion_mode.as_deref() == Some(&manifest.conversion.mode)
+        && receipt.completion_id.as_deref() == Some(&manifest.conversion.completion_id)
+        && receipt.campaign_id.as_deref() == Some(&manifest.conversion.campaign_id)
+        && receipt.admission_id.as_deref() == Some(&manifest.conversion.admission_id)
+        && receipt.selection_id.as_deref() == Some(&manifest.conversion.selection_id);
+    if manifest.language.blake3 != receipt.language_blake3
+        || manifest.mtp.blake3 != receipt.mtp_blake3
+        || manifest.weights.blake3 != receipt.weights_blake3
+        || manifest.weights.bytes != receipt.weights_bytes
+        || !identity_matches
+        || !conversion_matches
+    {
+        return Err("ONNX manifest does not match authenticated graph metadata".to_owned());
+    }
+    Ok(())
+}
+
+fn outlet_names(outlets: &[ort::value::Outlet]) -> Vec<String> {
+    outlets
+        .iter()
+        .map(|outlet| outlet.name().to_owned())
+        .collect()
+}
+
+fn validate_session_interface(
+    receipt: &QwenOnnxBundleReceipt,
+    language_inputs: &[String],
+    language_outputs: &[String],
+    mtp_inputs: &[String],
+    mtp_outputs: &[String],
+) -> Result<(), String> {
+    let language_layers = usize::try_from(receipt.language_layers)
+        .map_err(|_| "language layer count exceeds platform bounds".to_owned())?;
+    let delta_layers = paired_state_indices(language_outputs, "next_conv.", "next_recurrent.")?;
+    let attention_layers = paired_state_indices(language_outputs, "present_k.", "present_v.")?;
+    if delta_layers.len().checked_add(attention_layers.len()) != Some(language_layers)
+        || !delta_layers.is_disjoint(&attention_layers)
+    {
+        return Err("ORT language state outputs do not cover each layer exactly once".to_owned());
+    }
+    let mut expected_language_inputs = 1_usize
+        .checked_add(
+            delta_layers
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| "language DeltaNet input count overflow".to_owned())?,
+        )
+        .ok_or_else(|| "language input count overflow".to_owned())?;
+    if receipt.language_past_tokens != 0 {
+        expected_language_inputs = expected_language_inputs
+            .checked_add(
+                attention_layers
+                    .len()
+                    .checked_mul(2)
+                    .ok_or_else(|| "language attention input count overflow".to_owned())?,
+            )
+            .ok_or_else(|| "language input count overflow".to_owned())?;
+    }
+    let expected_language_outputs = 1_usize
+        .checked_add(
+            language_layers
+                .checked_mul(2)
+                .ok_or_else(|| "language output count overflow".to_owned())?,
+        )
+        .ok_or_else(|| "language output count overflow".to_owned())?;
+    let expected_mtp_inputs = if receipt.mtp_past_tokens == 0 { 2 } else { 4 };
+    let expected_mtp_outputs = 4;
+    if language_inputs.first().map(String::as_str) != Some("tokens")
+        || language_outputs.first().map(String::as_str) != Some("logits")
+        || mtp_inputs.first().map(String::as_str) != Some("shifted_tokens")
+        || mtp_inputs.get(1).map(String::as_str) != Some("target_hidden")
+        || mtp_outputs.first().map(String::as_str) != Some("mtp.logits")
+        || mtp_outputs.get(1).map(String::as_str) != Some("mtp.final_hidden")
+        || language_inputs.len() != expected_language_inputs
+        || language_outputs.len() != expected_language_outputs
+        || mtp_inputs.len() != expected_mtp_inputs
+        || mtp_outputs.len() != expected_mtp_outputs
+        || !required_state_inputs(
+            language_inputs,
+            &delta_layers,
+            &attention_layers,
+            receipt.language_past_tokens != 0,
+        )
+        || (receipt.mtp_past_tokens != 0
+            && (mtp_inputs.get(2).map(String::as_str) != Some("past_k.0")
+                || mtp_inputs.get(3).map(String::as_str) != Some("past_v.0")))
+        || mtp_outputs.get(2).map(String::as_str) != Some("present_k.0")
+        || mtp_outputs.get(3).map(String::as_str) != Some("present_v.0")
+    {
+        return Err("ORT session interface differs from authenticated Qwen schema".to_owned());
+    }
+    Ok(())
+}
+
+fn paired_state_indices(
+    names: &[String],
+    left_prefix: &str,
+    right_prefix: &str,
+) -> Result<std::collections::BTreeSet<usize>, String> {
+    let parse = |prefix: &str| -> Result<std::collections::BTreeSet<usize>, String> {
+        names
+            .iter()
+            .filter_map(|name| name.strip_prefix(prefix))
+            .map(|suffix| {
+                suffix.parse::<usize>().map_err(|_| {
+                    format!("ORT state output {prefix}{suffix} has invalid layer index")
+                })
+            })
+            .collect()
+    };
+    let left = parse(left_prefix)?;
+    let right = parse(right_prefix)?;
+    if left != right {
+        return Err(format!(
+            "ORT state outputs {left_prefix}* and {right_prefix}* are not paired"
+        ));
+    }
+    Ok(left)
+}
+
+fn required_state_inputs(
+    names: &[String],
+    delta_layers: &std::collections::BTreeSet<usize>,
+    attention_layers: &std::collections::BTreeSet<usize>,
+    cached: bool,
+) -> bool {
+    let names = names
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    delta_layers.iter().all(|index| {
+        names.contains(format!("conv_state.{index}").as_str())
+            && names.contains(format!("recurrent_state.{index}").as_str())
+    }) && (!cached
+        || attention_layers.iter().all(|index| {
+            names.contains(format!("past_k.{index}").as_str())
+                && names.contains(format!("past_v.{index}").as_str())
+        }))
+}
+
+fn same_receipt(left: &QwenOnnxBundleReceipt, right: &QwenOnnxBundleReceipt) -> bool {
+    left.language_blake3 == right.language_blake3
+        && left.mtp_blake3 == right.mtp_blake3
+        && left.weights_blake3 == right.weights_blake3
+        && left.weights_bytes == right.weights_bytes
+        && left.language_tokens == right.language_tokens
+        && left.language_past_tokens == right.language_past_tokens
+        && left.language_layers == right.language_layers
+        && left.mtp_tokens == right.mtp_tokens
+        && left.mtp_past_tokens == right.mtp_past_tokens
+        && left.mtp_layers == right.mtp_layers
+        && left.source_model_id == right.source_model_id
+        && left.tokenizer_id == right.tokenizer_id
+        && left.recipe_id == right.recipe_id
+        && left.package_id == right.package_id
+        && left.converted_coverage_id == right.converted_coverage_id
+        && left.deferred_coverage_id == right.deferred_coverage_id
+        && left.conversion_mode == right.conversion_mode
+        && left.completion_id == right.completion_id
+        && left.campaign_id == right.campaign_id
+        && left.admission_id == right.admission_id
+        && left.selection_id == right.selection_id
 }
 
 /// Verify an existing three-file Qwen ONNX bundle against independently admitted digests.
@@ -988,6 +1453,51 @@ mod tests {
         let error = export_paths(&request).err().expect("export must fail");
         assert!(error.contains("output directory already exists"));
         assert!(output.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_manifest_parser_rejects_duplicates_and_unknown_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "tritium-py-onnx-manifest-{}-{}",
+            std::process::id(),
+            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let valid = format!(
+            r#"{{
+                "schema":"tritium-qwen35-onnx-bundle-v1",
+                "language":{{"file":"language.onnx","blake3":"{}"}},
+                "mtp":{{"file":"mtp.onnx","blake3":"{}"}},
+                "weights":{{"file":"weights.bin","blake3":"{}","bytes":7}},
+                "identity":{{
+                    "source_model_id":"source","tokenizer_id":"tokenizer",
+                    "recipe_id":"recipe","package_id":"package",
+                    "converted_coverage_id":"converted","deferred_coverage_id":"deferred"
+                }},
+                "conversion":{{
+                    "mode":"ptq","completion_id":"completion","campaign_id":"campaign",
+                    "admission_id":"admission","selection_id":"selection"
+                }}
+            }}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+        );
+        fs::write(root.join(MANIFEST_FILE), &valid).unwrap();
+        assert!(read_published_manifest(&root).is_ok());
+
+        let duplicate = valid.replacen(
+            "\"schema\":",
+            "\"schema\":\"tritium-qwen35-onnx-bundle-v1\",\"schema\":",
+            1,
+        );
+        fs::write(root.join(MANIFEST_FILE), duplicate).unwrap();
+        assert!(read_published_manifest(&root).is_err());
+
+        let unknown = valid.replacen("\"schema\":", "\"unknown\":true,\"schema\":", 1);
+        fs::write(root.join(MANIFEST_FILE), unknown).unwrap();
+        assert!(read_published_manifest(&root).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
