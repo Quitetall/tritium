@@ -3196,6 +3196,49 @@ pub fn encode_external_qwen35_bundle_with_ancestry<'a, M: OnnxPackedMatrix<'a>>(
     encode_external_qwen35_bundle_inner(language, mtp, Some(ancestry))
 }
 
+/// Encode a schema-v3 dynamic Qwen language-plus-MTP bundle with ancestry.
+///
+/// Both model templates must use the canonical `tokens=1, past_tokens=0`
+/// marker. The emitted graphs accept dynamic prompt/decode lengths and share
+/// one authenticated external weight arena.
+///
+/// # Errors
+/// [`OnnxModelError`] if model pairing, the dynamic construction marker,
+/// ancestry, shared aliases, or external-data encoding is invalid.
+pub fn encode_dynamic_external_qwen35_bundle_with_ancestry<'a, M: OnnxPackedMatrix<'a>>(
+    language: QwenCausalLmModel<'a, M>,
+    mtp: Qwen35MtpModel<'a, M>,
+    ancestry: Qwen35OnnxAncestryV1<'_>,
+) -> Result<ExternalQwen35Bundle, OnnxModelError> {
+    validate_dynamic_qwen35_bundle_pair(&language, &mtp)?;
+    validate_qwen35_onnx_ancestry(ancestry)?;
+    let (mut language_protobuf, language_weights) =
+        build_dynamic_qwen_causal_lm_graph(language, CausalGraphBuilder::external())?;
+    let language_weights = language_weights.ok_or_else(|| {
+        OnnxModelError::InvalidModel("Qwen language bundle used inline storage".to_owned())
+    })?;
+    let aliases = qwen_shared_external_aliases(&language_protobuf)?;
+    let (mut mtp_protobuf, weights) = build_dynamic_qwen35_mtp_graph(
+        mtp,
+        CausalGraphBuilder::external_reusing(language_weights, aliases),
+    )?;
+    let metadata = qwen35_onnx_ancestry_metadata(ancestry);
+    language_protobuf.metadata_props.extend(metadata.clone());
+    mtp_protobuf.metadata_props.extend(metadata);
+    let weights_bytes = weights
+        .ok_or_else(|| {
+            OnnxModelError::InvalidModel("Qwen MTP bundle used inline storage".to_owned())
+        })?
+        .into_memory()?;
+    let weights_blake3 = *blake3::hash(&weights_bytes).as_bytes();
+    Ok(ExternalQwen35Bundle {
+        language_model_bytes: bind_external_metadata(language_protobuf, &weights_bytes)?,
+        mtp_model_bytes: bind_external_metadata(mtp_protobuf, &weights_bytes)?,
+        weights_bytes,
+        weights_blake3,
+    })
+}
+
 /// Stream one Qwen language-plus-MTP weight arena into pre-opened empty file.
 ///
 /// Caller owns path admission and must open handle without following symlinks.
@@ -3221,6 +3264,55 @@ pub fn encode_external_qwen35_bundle_to_file_with_ancestry<'a, M: OnnxPackedMatr
     })?;
     let aliases = qwen_shared_external_aliases(&language_protobuf)?;
     let (mut mtp_protobuf, weights) = build_qwen35_mtp_graph(
+        mtp,
+        CausalGraphBuilder::external_reusing(language_weights, aliases),
+    )?;
+    let metadata = qwen35_onnx_ancestry_metadata(ancestry);
+    language_protobuf.metadata_props.extend(metadata.clone());
+    mtp_protobuf.metadata_props.extend(metadata);
+    let weights = weights.ok_or_else(|| {
+        OnnxModelError::InvalidModel("Qwen MTP bundle used inline storage".to_owned())
+    })?;
+    let (weights_bytes, weights_blake3) = weights.finish_file()?;
+    let weights_len = usize::try_from(weights_bytes)
+        .map_err(|_| OnnxModelError::ShapeOverflow("external data length"))?;
+    Ok(SeekExternalQwen35Bundle {
+        language_model_bytes: bind_external_metadata_parts(
+            language_protobuf,
+            weights_len,
+            weights_blake3,
+        )?,
+        mtp_model_bytes: bind_external_metadata_parts(mtp_protobuf, weights_len, weights_blake3)?,
+        weights_bytes,
+        weights_blake3,
+    })
+}
+
+/// Stream a schema-v3 dynamic Qwen language-plus-MTP weight arena to a file.
+///
+/// This is the seek-backed counterpart of
+/// [`encode_dynamic_external_qwen35_bundle_with_ancestry`].
+///
+/// # Errors
+/// [`OnnxModelError`] on invalid dynamic templates/ancestry, non-empty or
+/// non-file output, I/O failure, alias mismatch, or protobuf overflow.
+pub fn encode_dynamic_external_qwen35_bundle_to_file_with_ancestry<'a, M: OnnxPackedMatrix<'a>>(
+    language: QwenCausalLmModel<'a, M>,
+    mtp: Qwen35MtpModel<'a, M>,
+    ancestry: Qwen35OnnxAncestryV1<'_>,
+    weights_file: File,
+) -> Result<SeekExternalQwen35Bundle, OnnxModelError> {
+    validate_dynamic_qwen35_bundle_pair(&language, &mtp)?;
+    validate_qwen35_onnx_ancestry(ancestry)?;
+    let (mut language_protobuf, language_weights) = build_dynamic_qwen_causal_lm_graph(
+        language,
+        CausalGraphBuilder::external_file(weights_file)?,
+    )?;
+    let language_weights = language_weights.ok_or_else(|| {
+        OnnxModelError::InvalidModel("Qwen language bundle used inline storage".to_owned())
+    })?;
+    let aliases = qwen_shared_external_aliases(&language_protobuf)?;
+    let (mut mtp_protobuf, weights) = build_dynamic_qwen35_mtp_graph(
         mtp,
         CausalGraphBuilder::external_reusing(language_weights, aliases),
     )?;
@@ -9380,6 +9472,19 @@ fn validate_qwen35_bundle_pair<'a, M: OnnxPackedMatrix<'a>>(
     Ok(())
 }
 
+fn validate_dynamic_qwen35_bundle_pair<'a, M: OnnxPackedMatrix<'a>>(
+    language: &QwenCausalLmModel<'a, M>,
+    mtp: &Qwen35MtpModel<'a, M>,
+) -> Result<(), OnnxModelError> {
+    validate_qwen35_bundle_pair(language, mtp)?;
+    if language.tokens != 1 || language.past_tokens != 0 {
+        return Err(OnnxModelError::InvalidModel(
+            "dynamic Qwen bundle construction requires tokens=1 and past_tokens=0".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_qwen_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
     model: &QwenCausalLmModel<'a, M>,
 ) -> Result<(), OnnxModelError> {
@@ -11328,6 +11433,53 @@ mod tests {
             Err(OnnxModelError::InvalidModel(reason)) if reason.contains("empty ordinary file")
         ));
         std::fs::remove_file(&seek_path).unwrap();
+
+        let dynamic_bundle = encode_dynamic_external_qwen35_bundle_with_ancestry(
+            mapped.model(1, 0),
+            mapped.mtp_model(1, 0),
+            ancestry,
+        )
+        .unwrap();
+        let dynamic_language =
+            ModelProto::decode(dynamic_bundle.language_model_bytes.as_slice()).unwrap();
+        let dynamic_mtp = ModelProto::decode(dynamic_bundle.mtp_model_bytes.as_slice()).unwrap();
+        for graph in [&dynamic_language, &dynamic_mtp] {
+            let metadata = graph
+                .metadata_props
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(metadata["tritium.schema_version"], "3");
+            assert_eq!(metadata["tritium.sequence_mode"], "dynamic-cache-v1");
+            assert!(!metadata.contains_key("tritium.tokens"));
+            assert!(!metadata.contains_key("tritium.past_tokens"));
+        }
+        let dynamic_seek_path = seek_path.with_extension("dynamic");
+        let dynamic_seek = encode_dynamic_external_qwen35_bundle_to_file_with_ancestry(
+            mapped.model(1, 0),
+            mapped.mtp_model(1, 0),
+            ancestry,
+            File::create_new(&dynamic_seek_path).unwrap(),
+        )
+        .unwrap();
+        let dynamic_seek_weights = std::fs::read(&dynamic_seek_path).unwrap();
+        assert_eq!(
+            dynamic_seek.language_model_bytes,
+            dynamic_bundle.language_model_bytes
+        );
+        assert_eq!(dynamic_seek.mtp_model_bytes, dynamic_bundle.mtp_model_bytes);
+        assert_eq!(dynamic_seek_weights, dynamic_bundle.weights_bytes);
+        assert_eq!(dynamic_seek.weights_blake3, dynamic_bundle.weights_blake3);
+        std::fs::remove_file(&dynamic_seek_path).unwrap();
+        assert!(matches!(
+            encode_dynamic_external_qwen35_bundle_with_ancestry(
+                mapped.model(2, 0),
+                mapped.mtp_model(2, 0),
+                ancestry,
+            ),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("tokens=1 and past_tokens=0")
+        ));
         assert!(matches!(
             encode_external_qwen35_bundle_with_ancestry(
                 mapped.model(1, 0),
