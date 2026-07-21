@@ -47,6 +47,7 @@ _WEIGHT_FIELDS_V2 = {
     "max_working_bytes",
 }
 _RECEIPT_REF_FIELDS = {"file", "digest", "bytes"}
+_TRIT_BYTES = frozenset((0, 1, 255))
 _PLANE_FIELDS = {
     "trits_file",
     "trits_digest",
@@ -127,12 +128,12 @@ class ModuleQuantizationResult:
                 plane.scales_digest,
                 plane.scales_bytes,
             )
-            trits = torch.frombuffer(
-                bytearray(trits_payload), dtype=torch.int8
-            ).reshape(rows, columns)
-            scales = torch.frombuffer(
-                bytearray(scales_payload), dtype=torch.float16
-            ).reshape(plane.scales_shape)
+            trits = torch.frombuffer(trits_payload, dtype=torch.int8).reshape(
+                rows, columns
+            )
+            scales = torch.frombuffer(scales_payload, dtype=torch.float16).reshape(
+                plane.scales_shape
+            )
             if not bool(torch.all((trits >= -1) & (trits <= 1))):
                 raise ValueError("conversion plane contains non-ternary values")
             if not bool(torch.isfinite(scales).all()) or bool((scales < 0).any()):
@@ -187,7 +188,11 @@ def module_recipe_id(
     return _digest_bytes(_canonical(identity))
 
 
-def _digest_file(path: Path, maximum: int) -> Tuple[str, int]:
+def _digest_file(
+    path: Path,
+    maximum: int,
+    allowed_bytes: frozenset[int] | None = None,
+) -> Tuple[str, int]:
     metadata = path.lstat()
     if path.is_symlink() or not path.is_file():
         raise ValueError("conversion payload must be an ordinary file")
@@ -199,18 +204,10 @@ def _digest_file(path: Path, maximum: int) -> Tuple[str, int]:
             chunk = stream.read(1024 * 1024)
             if not chunk:
                 break
+            if allowed_bytes is not None and not set(chunk).issubset(allowed_bytes):
+                raise ValueError("conversion plane contains non-ternary values")
             digest.update(chunk)
     return "sha256:" + digest.hexdigest(), metadata.st_size
-
-
-def _validate_trit_file(path: Path) -> None:
-    with path.open("rb") as stream:
-        while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-                return
-            if any(value not in {0, 1, 255} for value in chunk):
-                raise ValueError("conversion plane contains non-ternary values")
 
 
 def _read_exact(path: Path, digest: str, byte_count: int) -> bytearray:
@@ -343,9 +340,8 @@ def _load_weight_receipt(
         ):
             raise ValueError("conversion plane byte ledger or geometry is invalid")
         trits_digest, trits_bytes = _digest_file(
-            directory / trits_name, maximum_bytes
+            directory / trits_name, maximum_bytes, _TRIT_BYTES
         )
-        _validate_trit_file(directory / trits_name)
         scales_digest, scales_bytes = _digest_file(
             directory / scales_name, maximum_bytes
         )
