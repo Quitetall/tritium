@@ -131,8 +131,12 @@ including sparse layer-indexed DeltaNet and KV-cache state, now runs prompt and
 cached decode through one packed causal graph. Its public full-attention type
 structurally requires Q/K norm, fused head-interleaved query/gate and SwiGLU.
 Inline admission dry-runs the shared emission path and aggregates every
-initializer payload before cloning. External-data emission, exact architecture
-tensor-map mapping and MTP composition remain open.
+initializer payload before cloning. An exact Qwen3.5/Qwen3.6 adapter now admits
+only the canonical mixed-schedule language namespace plus all 15 bundled MTP
+tensors, validates packed geometry and produces the encodable language graph.
+Its flagship entry point additionally requires the pinned 64-layer
+Qwen3.6-27B geometry and exact three-DeltaNet/one-attention cadence. External-
+data emission and executable MTP graph composition remain open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

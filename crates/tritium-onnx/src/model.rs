@@ -361,6 +361,124 @@ pub struct QwenCausalLmModel<'a> {
     pub identity: OnnxArtifactIdentityV2<'a>,
 }
 
+/// One checkpoint layer in Qwen3.5/Qwen3.6 mixed language schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen35LayerType {
+    /// Gated DeltaNet (`linear_attention`).
+    DeltaNet,
+    /// Gated grouped-query causal attention (`full_attention`).
+    FullAttention,
+}
+
+/// Exact packed Qwen3.5/Qwen3.6 language-plus-MTP architecture contract.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35Config<'a> {
+    /// Residual-stream width.
+    pub hidden: usize,
+    /// SwiGLU intermediate width.
+    pub intermediate: usize,
+    /// Padded vocabulary width.
+    pub vocab: usize,
+    /// Full-attention query heads.
+    pub n_head: usize,
+    /// Full-attention key/value heads.
+    pub n_kv_head: usize,
+    /// Full-attention width per head.
+    pub head_dim: usize,
+    /// Prefix of each full-attention head rotated by RoPE.
+    pub rotary_dim: usize,
+    /// Unscaled RoPE base.
+    pub rope_theta: f32,
+    /// Zero-centered decoder RMSNorm epsilon.
+    pub rms_epsilon: f32,
+    /// Shared Gated DeltaNet geometry.
+    pub delta_geometry: QwenDeltaNetGeometry,
+    /// Exact layer-by-layer schedule.
+    pub layer_types: &'a [Qwen35LayerType],
+    /// Canonical interval whose final layer is full attention.
+    pub full_attention_interval: usize,
+    /// Whether language embedding and head alias.
+    pub tied_embeddings: bool,
+    /// Bundled MTP decoder-layer count.
+    pub mtp_layers: usize,
+    /// Whether MTP owns a separate token table.
+    pub mtp_dedicated_embeddings: bool,
+}
+
+/// Exact 15-tensor one-layer Qwen MTP drafter bundle.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35MtpDecoder<'a> {
+    /// Zero-centered norm over shifted shared token embeddings.
+    pub pre_fc_norm_embedding: &'a [f32],
+    /// Zero-centered norm over target final hidden rows.
+    pub pre_fc_norm_hidden: &'a [f32],
+    /// Fusion projection `[hidden, 2 * hidden]`.
+    pub fusion: PackedTernaryMatrix<'a>,
+    /// Forced full-attention decoder layer.
+    pub layer: QwenFullAttentionDecoderLayer<'a>,
+    /// Zero-centered final MTP RMSNorm parameter.
+    pub final_norm: &'a [f32],
+}
+
+/// Borrowed canonical tensor source for packed Qwen language-plus-MTP export.
+pub trait Qwen35TensorProvider<'a> {
+    /// Enumerate complete in-scope canonical tensor names.
+    fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError>;
+    /// Resolve one canonical rank-two tensor as packed ternary data.
+    fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError>;
+    /// Resolve one preserved tensor flattened in canonical row-major order.
+    fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError>;
+}
+
+/// Exact Qwen3.5/Qwen3.6 mapping after fail-closed tensor admission.
+#[derive(Debug)]
+pub struct MappedQwen35<'a> {
+    config: Qwen35Config<'a>,
+    embedding: PackedTernaryMatrix<'a>,
+    lm_head: PackedTernaryMatrix<'a>,
+    layers: Vec<QwenCausalLmDecoderLayer<'a>>,
+    final_norm: &'a [f32],
+    mtp: Qwen35MtpDecoder<'a>,
+    identity: OnnxArtifactIdentityV2<'a>,
+}
+
+impl<'a> MappedQwen35<'a> {
+    /// Canonically ordered heterogeneous language schedule.
+    #[must_use]
+    pub fn layers(&self) -> &[QwenCausalLmDecoderLayer<'a>] {
+        &self.layers
+    }
+
+    /// Exact bundled one-layer MTP weights.
+    #[must_use]
+    pub const fn mtp(&self) -> &Qwen35MtpDecoder<'a> {
+        &self.mtp
+    }
+
+    /// Borrow language weights as fixed prompt/decode graph.
+    #[must_use]
+    pub fn model(&self, tokens: usize, past_tokens: usize) -> QwenCausalLmModel<'_> {
+        QwenCausalLmModel {
+            tokens,
+            past_tokens,
+            n_head: self.config.n_head,
+            n_kv_head: self.config.n_kv_head,
+            head_dim: self.config.head_dim,
+            rotary: RotaryEmbedding {
+                theta: self.config.rope_theta,
+                dimensions: self.config.rotary_dim,
+            },
+            rms_epsilon: self.config.rms_epsilon,
+            delta_geometry: self.config.delta_geometry,
+            embedding: self.embedding,
+            lm_head: Some(self.lm_head),
+            layers: &self.layers,
+            final_norm: self.final_norm,
+            identity: self.identity,
+        }
+    }
+}
+
 /// Fixed-shape packed decoder-only causal language-model graph.
 ///
 /// Prompt graphs set `past_tokens` to zero and consume token IDs only. Cached
@@ -716,6 +834,552 @@ fn validate_exact_tensor_set(
         )));
     }
     Ok(())
+}
+
+const QWEN35_EMBEDDING_TENSOR: &str = "model.language_model.embed_tokens.weight";
+const QWEN35_FINAL_NORM_TENSOR: &str = "model.language_model.norm.weight";
+const QWEN35_LM_HEAD_TENSOR: &str = "lm_head.weight";
+
+struct Qwen35LayerTensorNames {
+    attention_norm: String,
+    ffn_norm: String,
+    gate: String,
+    up: String,
+    down: String,
+    mixer: Qwen35MixerTensorNames,
+}
+
+enum Qwen35MixerTensorNames {
+    DeltaNet {
+        qkv: String,
+        z: String,
+        beta: String,
+        decay: String,
+        output: String,
+        conv_weight: String,
+        norm_weight: String,
+        dt_bias: String,
+        a_log: String,
+    },
+    FullAttention {
+        fused_query_gate: String,
+        key: String,
+        value: String,
+        output: String,
+        query_norm: String,
+        key_norm: String,
+    },
+}
+
+impl Qwen35LayerTensorNames {
+    fn new(prefix: &str, layer_type: Qwen35LayerType) -> Self {
+        let name = |suffix: &str| format!("{prefix}.{suffix}");
+        Self {
+            attention_norm: name("input_layernorm.weight"),
+            ffn_norm: name("post_attention_layernorm.weight"),
+            gate: name("mlp.gate_proj.weight"),
+            up: name("mlp.up_proj.weight"),
+            down: name("mlp.down_proj.weight"),
+            mixer: match layer_type {
+                Qwen35LayerType::DeltaNet => Qwen35MixerTensorNames::DeltaNet {
+                    qkv: name("linear_attn.in_proj_qkv.weight"),
+                    z: name("linear_attn.in_proj_z.weight"),
+                    beta: name("linear_attn.in_proj_b.weight"),
+                    decay: name("linear_attn.in_proj_a.weight"),
+                    output: name("linear_attn.out_proj.weight"),
+                    conv_weight: name("linear_attn.conv1d.weight"),
+                    norm_weight: name("linear_attn.norm.weight"),
+                    dt_bias: name("linear_attn.dt_bias"),
+                    a_log: name("linear_attn.A_log"),
+                },
+                Qwen35LayerType::FullAttention => Qwen35MixerTensorNames::FullAttention {
+                    fused_query_gate: name("self_attn.q_proj.weight"),
+                    key: name("self_attn.k_proj.weight"),
+                    value: name("self_attn.v_proj.weight"),
+                    output: name("self_attn.o_proj.weight"),
+                    query_norm: name("self_attn.q_norm.weight"),
+                    key_norm: name("self_attn.k_norm.weight"),
+                },
+            },
+        }
+    }
+
+    fn extend_manifest(self, names: &mut Vec<String>) {
+        names.extend([
+            self.attention_norm,
+            self.ffn_norm,
+            self.gate,
+            self.up,
+            self.down,
+        ]);
+        match self.mixer {
+            Qwen35MixerTensorNames::DeltaNet {
+                qkv,
+                z,
+                beta,
+                decay,
+                output,
+                conv_weight,
+                norm_weight,
+                dt_bias,
+                a_log,
+            } => names.extend([
+                qkv,
+                z,
+                beta,
+                decay,
+                output,
+                conv_weight,
+                norm_weight,
+                dt_bias,
+                a_log,
+            ]),
+            Qwen35MixerTensorNames::FullAttention {
+                fused_query_gate,
+                key,
+                value,
+                output,
+                query_norm,
+                key_norm,
+            } => names.extend([fused_query_gate, key, value, output, query_norm, key_norm]),
+        }
+    }
+}
+
+struct Qwen35MtpTensorNames {
+    pre_fc_norm_embedding: &'static str,
+    pre_fc_norm_hidden: &'static str,
+    fusion: &'static str,
+    layer: Qwen35LayerTensorNames,
+    final_norm: &'static str,
+}
+
+impl Qwen35MtpTensorNames {
+    fn canonical() -> Self {
+        Self {
+            pre_fc_norm_embedding: "mtp.pre_fc_norm_embedding.weight",
+            pre_fc_norm_hidden: "mtp.pre_fc_norm_hidden.weight",
+            fusion: "mtp.fc.weight",
+            layer: Qwen35LayerTensorNames::new("mtp.layers.0", Qwen35LayerType::FullAttention),
+            final_norm: "mtp.norm.weight",
+        }
+    }
+
+    fn extend_manifest(self, names: &mut Vec<String>) {
+        names.extend([
+            self.pre_fc_norm_embedding.to_owned(),
+            self.pre_fc_norm_hidden.to_owned(),
+            self.fusion.to_owned(),
+        ]);
+        self.layer.extend_manifest(names);
+        names.push(self.final_norm.to_owned());
+    }
+}
+
+/// Map exact Qwen3.5/Qwen3.6 language-plus-MTP names into packed ONNX contracts.
+///
+/// Vision tensors are outside this provider boundary and remain explicitly
+/// represented by the artifact's deferred-coverage identity.
+///
+/// # Errors
+/// Returns [`OnnxModelError`] for unsupported config semantics, incomplete or
+/// extra tensor names, or any packed/preserved geometry mismatch.
+pub fn map_qwen35_causal_lm<'a>(
+    source: &'a impl Qwen35TensorProvider<'a>,
+    config: Qwen35Config<'a>,
+    identity: OnnxArtifactIdentityV2<'a>,
+) -> Result<MappedQwen35<'a>, OnnxModelError> {
+    validate_qwen35_config(config)?;
+    let expected_names = qwen35_tensor_names(config.layer_types)?;
+    validate_exact_tensor_set("Qwen3.5", source.tensor_names()?, &expected_names)?;
+
+    let embedding = source.matrix(QWEN35_EMBEDDING_TENSOR)?;
+    let lm_head = source.matrix(QWEN35_LM_HEAD_TENSOR)?;
+    let final_norm = source.vector(QWEN35_FINAL_NORM_TENSOR)?;
+    let mut layers = Vec::new();
+    layers
+        .try_reserve_exact(config.layer_types.len())
+        .map_err(|_| OnnxModelError::ShapeOverflow("Qwen layer allocation"))?;
+    for (index, layer_type) in config.layer_types.iter().copied().enumerate() {
+        let prefix = format!("model.language_model.layers.{index}");
+        let names = Qwen35LayerTensorNames::new(&prefix, layer_type);
+        let attention_norm = source.vector(&names.attention_norm)?;
+        let ffn_norm = source.vector(&names.ffn_norm)?;
+        let gate = source.matrix(&names.gate)?;
+        let up = source.matrix(&names.up)?;
+        let down = source.matrix(&names.down)?;
+        layers.push(match &names.mixer {
+            Qwen35MixerTensorNames::DeltaNet {
+                qkv,
+                z,
+                beta,
+                decay,
+                output,
+                conv_weight,
+                norm_weight,
+                dt_bias,
+                a_log,
+            } => QwenCausalLmDecoderLayer::DeltaNet(QwenDeltaNetDecoderLayer {
+                attention_norm,
+                qkv: source.matrix(qkv)?,
+                z: source.matrix(z)?,
+                beta: source.matrix(beta)?,
+                decay: source.matrix(decay)?,
+                conv_weight: source.vector(conv_weight)?,
+                norm_weight: source.vector(norm_weight)?,
+                dt_bias: source.vector(dt_bias)?,
+                a_log: source.vector(a_log)?,
+                output: source.matrix(output)?,
+                ffn_norm,
+                gate,
+                up,
+                down,
+            }),
+            Qwen35MixerTensorNames::FullAttention { .. } => {
+                QwenCausalLmDecoderLayer::FullAttention(map_qwen35_full_attention(
+                    source,
+                    &names,
+                    attention_norm,
+                    ffn_norm,
+                    gate,
+                    up,
+                    down,
+                )?)
+            }
+        });
+    }
+
+    let mtp_names = Qwen35MtpTensorNames::canonical();
+    let mtp = Qwen35MtpDecoder {
+        pre_fc_norm_embedding: source.vector(mtp_names.pre_fc_norm_embedding)?,
+        pre_fc_norm_hidden: source.vector(mtp_names.pre_fc_norm_hidden)?,
+        fusion: source.matrix(mtp_names.fusion)?,
+        layer: map_qwen35_full_attention(
+            source,
+            &mtp_names.layer,
+            source.vector(&mtp_names.layer.attention_norm)?,
+            source.vector(&mtp_names.layer.ffn_norm)?,
+            source.matrix(&mtp_names.layer.gate)?,
+            source.matrix(&mtp_names.layer.up)?,
+            source.matrix(&mtp_names.layer.down)?,
+        )?,
+        final_norm: source.vector(mtp_names.final_norm)?,
+    };
+    let mapped = MappedQwen35 {
+        config,
+        embedding,
+        lm_head,
+        layers,
+        final_norm,
+        mtp,
+        identity,
+    };
+    validate_qwen_causal_lm(&mapped.model(1, 0))?;
+    validate_qwen35_mapped_geometry(&mapped)?;
+    Ok(mapped)
+}
+
+/// Map only pinned `Qwen/Qwen3.6-27B` language-plus-MTP geometry.
+///
+/// Family-sized fixtures use [`map_qwen35_causal_lm`], but cannot pass this
+/// flagship admission contract.
+///
+/// # Errors
+/// Returns [`OnnxModelError`] before tensor resolution when any pinned axis,
+/// schedule position, RoPE value, DeltaNet geometry, or MTP semantic differs.
+pub fn map_qwen36_27b_causal_lm<'a>(
+    source: &'a impl Qwen35TensorProvider<'a>,
+    config: Qwen35Config<'a>,
+    identity: OnnxArtifactIdentityV2<'a>,
+) -> Result<MappedQwen35<'a>, OnnxModelError> {
+    validate_pinned_qwen36_27b_config(config)?;
+    map_qwen35_causal_lm(source, config, identity)
+}
+
+fn map_qwen35_full_attention<'a>(
+    source: &'a impl Qwen35TensorProvider<'a>,
+    names: &Qwen35LayerTensorNames,
+    attention_norm: &'a [f32],
+    ffn_norm: &'a [f32],
+    gate: PackedTernaryMatrix<'a>,
+    up: PackedTernaryMatrix<'a>,
+    down: PackedTernaryMatrix<'a>,
+) -> Result<QwenFullAttentionDecoderLayer<'a>, OnnxModelError> {
+    let Qwen35MixerTensorNames::FullAttention {
+        fused_query_gate,
+        key,
+        value,
+        output,
+        query_norm,
+        key_norm,
+    } = &names.mixer
+    else {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen full-attention resolver received DeltaNet tensor names".to_owned(),
+        ));
+    };
+    Ok(QwenFullAttentionDecoderLayer {
+        attention_norm,
+        query_norm: source.vector(query_norm)?,
+        key_norm: source.vector(key_norm)?,
+        fused_query_gate: source.matrix(fused_query_gate)?,
+        key: source.matrix(key)?,
+        value: source.matrix(value)?,
+        attention_output: source.matrix(output)?,
+        ffn_norm,
+        gate,
+        up,
+        down,
+    })
+}
+
+fn validate_qwen35_config(config: Qwen35Config<'_>) -> Result<(), OnnxModelError> {
+    if config.hidden == 0
+        || config.intermediate == 0
+        || config.vocab == 0
+        || config.n_head == 0
+        || config.n_kv_head == 0
+        || config.head_dim == 0
+        || config.rotary_dim == 0
+        || config.full_attention_interval == 0
+        || config.layer_types.is_empty()
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen3.5 config dimensions and schedule must be nonzero".to_owned(),
+        ));
+    }
+    if !config.n_head.is_multiple_of(config.n_kv_head)
+        || !config.head_dim.is_multiple_of(2)
+        || !config.rotary_dim.is_multiple_of(2)
+        || config.rotary_dim > config.head_dim
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen3.5 attention grouping and partial RoPE geometry are invalid".to_owned(),
+        ));
+    }
+    if !config.rope_theta.is_finite()
+        || config.rope_theta <= 0.0
+        || !config.rms_epsilon.is_finite()
+        || config.rms_epsilon <= 0.0
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen3.5 RoPE theta and RMS epsilon must be positive and finite".to_owned(),
+        ));
+    }
+    if config.tied_embeddings || config.mtp_layers != 1 || config.mtp_dedicated_embeddings {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen3.5 adapter requires untied language head and one shared-embedding MTP layer"
+                .to_owned(),
+        ));
+    }
+    config
+        .delta_geometry
+        .dimensions()
+        .map_err(|error| OnnxModelError::InvalidModel(error.to_string()))?;
+    if config
+        .layer_types
+        .iter()
+        .copied()
+        .enumerate()
+        .any(|(index, layer)| {
+            let expected = if (index + 1).is_multiple_of(config.full_attention_interval) {
+                Qwen35LayerType::FullAttention
+            } else {
+                Qwen35LayerType::DeltaNet
+            };
+            layer != expected
+        })
+        || !config
+            .layer_types
+            .len()
+            .is_multiple_of(config.full_attention_interval)
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen3.5 layer schedule differs from its declared full-attention interval".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pinned_qwen36_27b_config(config: Qwen35Config<'_>) -> Result<(), OnnxModelError> {
+    validate_qwen35_config(config)?;
+    let delta = config.delta_geometry;
+    if config.layer_types.len() != 64
+        || config.full_attention_interval != 4
+        || config.hidden != 5_120
+        || config.intermediate != 17_408
+        || config.vocab != 248_320
+        || config.n_head != 24
+        || config.n_kv_head != 4
+        || config.head_dim != 256
+        || config.rotary_dim != 64
+        || config.rope_theta != 10_000_000.0
+        || config.rms_epsilon != 1.0e-6
+        || delta.conv_kernel_dim() != 4
+        || delta.num_key_heads() != 16
+        || delta.num_value_heads() != 48
+        || delta.key_head_dim() != 128
+        || delta.value_head_dim() != 128
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "configuration does not match pinned Qwen/Qwen3.6-27B geometry".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_qwen35_mapped_geometry(mapped: &MappedQwen35<'_>) -> Result<(), OnnxModelError> {
+    let config = mapped.config;
+    validate_matrix_shape(
+        "Qwen embedding",
+        mapped.embedding,
+        config.vocab,
+        config.hidden,
+    )?;
+    validate_matrix_shape("Qwen lm_head", mapped.lm_head, config.vocab, config.hidden)?;
+    validate_vector("Qwen final_norm", mapped.final_norm, config.hidden)?;
+    validate_vector(
+        "Qwen MTP pre_fc_norm_embedding",
+        mapped.mtp.pre_fc_norm_embedding,
+        config.hidden,
+    )?;
+    validate_vector(
+        "Qwen MTP pre_fc_norm_hidden",
+        mapped.mtp.pre_fc_norm_hidden,
+        config.hidden,
+    )?;
+    validate_matrix_shape(
+        "Qwen MTP fusion",
+        mapped.mtp.fusion,
+        config.hidden,
+        config
+            .hidden
+            .checked_mul(2)
+            .ok_or(OnnxModelError::ShapeOverflow("Qwen MTP fusion width"))?,
+    )?;
+    validate_vector("Qwen MTP final_norm", mapped.mtp.final_norm, config.hidden)?;
+    for (index, layer) in mapped.layers.iter().copied().enumerate() {
+        match layer {
+            QwenCausalLmDecoderLayer::DeltaNet(layer) => {
+                for (suffix, matrix, rows, columns) in [
+                    ("gate", layer.gate, config.intermediate, config.hidden),
+                    ("up", layer.up, config.intermediate, config.hidden),
+                    ("down", layer.down, config.hidden, config.intermediate),
+                ] {
+                    validate_matrix_shape(
+                        &format!("Qwen layer {index} {suffix}"),
+                        matrix,
+                        rows,
+                        columns,
+                    )?;
+                }
+            }
+            QwenCausalLmDecoderLayer::FullAttention(layer) => {
+                validate_qwen35_full_attention_geometry(
+                    &format!("Qwen layer {index}"),
+                    layer,
+                    config,
+                )?;
+            }
+        }
+    }
+    validate_qwen35_full_attention_geometry("Qwen MTP layer", mapped.mtp.layer, config)
+}
+
+fn validate_qwen35_full_attention_geometry(
+    name: &str,
+    layer: QwenFullAttentionDecoderLayer<'_>,
+    config: Qwen35Config<'_>,
+) -> Result<(), OnnxModelError> {
+    let query_width = config
+        .n_head
+        .checked_mul(config.head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("Qwen query width"))?;
+    let kv_width = config
+        .n_kv_head
+        .checked_mul(config.head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("Qwen KV width"))?;
+    validate_vector(
+        &format!("{name} attention_norm"),
+        layer.attention_norm,
+        config.hidden,
+    )?;
+    validate_vector(
+        &format!("{name} query_norm"),
+        layer.query_norm,
+        config.head_dim,
+    )?;
+    validate_vector(&format!("{name} key_norm"), layer.key_norm, config.head_dim)?;
+    validate_matrix_shape(
+        &format!("{name} fused_query_gate"),
+        layer.fused_query_gate,
+        query_width
+            .checked_mul(2)
+            .ok_or(OnnxModelError::ShapeOverflow("Qwen fused query width"))?,
+        config.hidden,
+    )?;
+    validate_matrix_shape(&format!("{name} key"), layer.key, kv_width, config.hidden)?;
+    validate_matrix_shape(
+        &format!("{name} value"),
+        layer.value,
+        kv_width,
+        config.hidden,
+    )?;
+    validate_matrix_shape(
+        &format!("{name} attention_output"),
+        layer.attention_output,
+        config.hidden,
+        query_width,
+    )?;
+    validate_vector(&format!("{name} ffn_norm"), layer.ffn_norm, config.hidden)?;
+    validate_matrix_shape(
+        &format!("{name} gate"),
+        layer.gate,
+        config.intermediate,
+        config.hidden,
+    )?;
+    validate_matrix_shape(
+        &format!("{name} up"),
+        layer.up,
+        config.intermediate,
+        config.hidden,
+    )?;
+    validate_matrix_shape(
+        &format!("{name} down"),
+        layer.down,
+        config.hidden,
+        config.intermediate,
+    )
+}
+
+fn qwen35_tensor_names(layer_types: &[Qwen35LayerType]) -> Result<Vec<String>, OnnxModelError> {
+    let layer_count = layer_types.iter().try_fold(0_usize, |count, layer| {
+        count
+            .checked_add(match layer {
+                Qwen35LayerType::DeltaNet => 14,
+                Qwen35LayerType::FullAttention => 11,
+            })
+            .ok_or(OnnxModelError::ShapeOverflow("Qwen tensor-name count"))
+    })?;
+    let capacity = layer_count
+        .checked_add(18)
+        .ok_or(OnnxModelError::ShapeOverflow("Qwen tensor-name count"))?;
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(capacity)
+        .map_err(|_| OnnxModelError::ShapeOverflow("Qwen tensor-name allocation"))?;
+    names.extend([
+        QWEN35_EMBEDDING_TENSOR.to_owned(),
+        QWEN35_FINAL_NORM_TENSOR.to_owned(),
+        QWEN35_LM_HEAD_TENSOR.to_owned(),
+    ]);
+    for (index, layer_type) in layer_types.iter().copied().enumerate() {
+        let prefix = format!("model.language_model.layers.{index}");
+        Qwen35LayerTensorNames::new(&prefix, layer_type).extend_manifest(&mut names);
+    }
+    Qwen35MtpTensorNames::canonical().extend_manifest(&mut names);
+    debug_assert_eq!(names.len(), capacity);
+    Ok(names)
 }
 
 /// BitNet GGUF geometry supported by the homogeneous causal exporter.
@@ -6614,6 +7278,307 @@ mod tests {
         assert!(matches!(
             encode_qwen_causal_lm(model),
             Err(OnnxModelError::InvalidModel(reason)) if reason.contains("at least one layer")
+        ));
+    }
+
+    #[test]
+    fn qwen35_tensor_adapter_rejects_incomplete_language_mtp_manifest() {
+        struct EmptySource;
+
+        impl<'a> Qwen35TensorProvider<'a> for EmptySource {
+            fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError> {
+                Ok(&[])
+            }
+
+            fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError> {
+                Err(OnnxModelError::InvalidModel(format!(
+                    "unexpected matrix request {name}"
+                )))
+            }
+
+            fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError> {
+                Err(OnnxModelError::InvalidModel(format!(
+                    "unexpected vector request {name}"
+                )))
+            }
+        }
+
+        let schedule = [Qwen35LayerType::DeltaNet, Qwen35LayerType::FullAttention];
+        let config = Qwen35Config {
+            hidden: 256,
+            intermediate: 512,
+            vocab: 2,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: 256,
+            rotary_dim: 64,
+            rope_theta: 10_000.0,
+            rms_epsilon: 1.0e-6,
+            delta_geometry: QwenDeltaNetGeometry::new(4, 1, 1, 128, 128).unwrap(),
+            layer_types: &schedule,
+            full_attention_interval: 2,
+            tied_embeddings: false,
+            mtp_layers: 1,
+            mtp_dedicated_embeddings: false,
+        };
+        let identity = OnnxArtifactIdentityV2 {
+            source_model_id: "qwen-source",
+            tokenizer_id: "qwen-tokenizer",
+            recipe_id: "recipe",
+            tritium_build_id: "build",
+            package_id: "package",
+            converted_coverage_id: "language-mtp",
+            deferred_coverage_id: "vision",
+        };
+        assert!(matches!(
+            map_qwen35_causal_lm(&EmptySource, config, identity),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("missing tensor")
+                    && reason.contains("lm_head.weight")
+        ));
+    }
+
+    #[test]
+    fn qwen36_27b_adapter_rejects_short_reordered_and_wrong_cadence_schedules() {
+        struct EmptySource;
+
+        impl<'a> Qwen35TensorProvider<'a> for EmptySource {
+            fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError> {
+                Ok(&[])
+            }
+
+            fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError> {
+                Err(OnnxModelError::InvalidModel(format!(
+                    "unexpected matrix request {name}"
+                )))
+            }
+
+            fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError> {
+                Err(OnnxModelError::InvalidModel(format!(
+                    "unexpected vector request {name}"
+                )))
+            }
+        }
+
+        fn config(schedule: &[Qwen35LayerType]) -> Qwen35Config<'_> {
+            Qwen35Config {
+                hidden: 5_120,
+                intermediate: 17_408,
+                vocab: 248_320,
+                n_head: 24,
+                n_kv_head: 4,
+                head_dim: 256,
+                rotary_dim: 64,
+                rope_theta: 10_000_000.0,
+                rms_epsilon: 1.0e-6,
+                delta_geometry: QwenDeltaNetGeometry::new(4, 16, 48, 128, 128).unwrap(),
+                layer_types: schedule,
+                full_attention_interval: 4,
+                tied_embeddings: false,
+                mtp_layers: 1,
+                mtp_dedicated_embeddings: false,
+            }
+        }
+
+        let identity = OnnxArtifactIdentityV2 {
+            source_model_id: "Qwen/Qwen3.6-27B@6a9e13b",
+            tokenizer_id: "Qwen/Qwen3.6-27B@6a9e13b",
+            recipe_id: "recipe",
+            tritium_build_id: "build",
+            package_id: "package",
+            converted_coverage_id: "language-mtp",
+            deferred_coverage_id: "vision",
+        };
+        let canonical = (0..64)
+            .map(|index| {
+                if (index + 1) % 4 == 0 {
+                    Qwen35LayerType::FullAttention
+                } else {
+                    Qwen35LayerType::DeltaNet
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            map_qwen36_27b_causal_lm(&EmptySource, config(&canonical), identity),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("missing tensor")
+        ));
+        assert!(matches!(
+            map_qwen36_27b_causal_lm(&EmptySource, config(&canonical[..4]), identity),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("pinned")
+        ));
+
+        let mut reordered = canonical.clone();
+        reordered.swap(0, 3);
+        assert!(matches!(
+            map_qwen36_27b_causal_lm(&EmptySource, config(&reordered), identity),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("interval")
+        ));
+        let mut wrong_cadence = canonical.clone();
+        wrong_cadence[7] = Qwen35LayerType::DeltaNet;
+        assert!(matches!(
+            map_qwen36_27b_causal_lm(&EmptySource, config(&wrong_cadence), identity),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("interval")
+        ));
+    }
+
+    #[test]
+    fn qwen35_tensor_adapter_maps_exact_language_mtp_bundle_into_encodable_schedule() {
+        struct Source {
+            names: Vec<String>,
+            matrix_2x256: Vec<u8>,
+            matrix_384x256: Vec<u8>,
+            matrix_128x256: Vec<u8>,
+            matrix_1x256: Vec<u8>,
+            matrix_256x128: Vec<u8>,
+            matrix_512x256: Vec<u8>,
+            matrix_256x256: Vec<u8>,
+            matrix_256x512: Vec<u8>,
+            scales_2: Vec<f32>,
+            scales_384: Vec<f32>,
+            scales_128: Vec<f32>,
+            scales_1: Vec<f32>,
+            scales_256: Vec<f32>,
+            scales_512: Vec<f32>,
+            hidden: Vec<f32>,
+            conv: Vec<f32>,
+            delta_norm: Vec<f32>,
+            scalar: Vec<f32>,
+        }
+
+        impl<'a> Qwen35TensorProvider<'a> for Source {
+            fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError> {
+                Ok(&self.names)
+            }
+
+            fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError> {
+                let (rows, columns, packed, scales) = if matches!(
+                    name,
+                    "model.language_model.embed_tokens.weight" | "lm_head.weight"
+                ) {
+                    (2, 256, &self.matrix_2x256, &self.scales_2)
+                } else if name.ends_with("linear_attn.in_proj_qkv.weight") {
+                    (384, 256, &self.matrix_384x256, &self.scales_384)
+                } else if name.ends_with("linear_attn.in_proj_z.weight") {
+                    (128, 256, &self.matrix_128x256, &self.scales_128)
+                } else if name.ends_with("linear_attn.in_proj_b.weight")
+                    || name.ends_with("linear_attn.in_proj_a.weight")
+                {
+                    (1, 256, &self.matrix_1x256, &self.scales_1)
+                } else if name.ends_with("linear_attn.out_proj.weight") {
+                    (256, 128, &self.matrix_256x128, &self.scales_256)
+                } else if name == "mtp.fc.weight" {
+                    (256, 512, &self.matrix_256x512, &self.scales_256)
+                } else if name.ends_with("self_attn.q_proj.weight") {
+                    (512, 256, &self.matrix_512x256, &self.scales_512)
+                } else if name.ends_with("self_attn.k_proj.weight")
+                    || name.ends_with("self_attn.v_proj.weight")
+                    || name.ends_with("self_attn.o_proj.weight")
+                    || name.ends_with("mlp.gate_proj.weight")
+                    || name.ends_with("mlp.up_proj.weight")
+                    || name.ends_with("mlp.down_proj.weight")
+                {
+                    (256, 256, &self.matrix_256x256, &self.scales_256)
+                } else {
+                    return Err(OnnxModelError::InvalidModel(format!(
+                        "unexpected Qwen matrix {name}"
+                    )));
+                };
+                Ok(PackedTernaryMatrix {
+                    rows,
+                    columns,
+                    packed,
+                    scales,
+                    format: TernaryFormat::Tq2_0,
+                })
+            }
+
+            fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError> {
+                if name.ends_with("linear_attn.conv1d.weight") {
+                    Ok(&self.conv)
+                } else if name.ends_with("linear_attn.norm.weight") {
+                    Ok(&self.delta_norm)
+                } else if name.ends_with("linear_attn.dt_bias")
+                    || name.ends_with("linear_attn.A_log")
+                {
+                    Ok(&self.scalar)
+                } else if name.ends_with(".weight") {
+                    Ok(&self.hidden)
+                } else {
+                    Err(OnnxModelError::InvalidModel(format!(
+                        "unexpected Qwen vector {name}"
+                    )))
+                }
+            }
+        }
+
+        let schedule = [Qwen35LayerType::DeltaNet, Qwen35LayerType::FullAttention];
+        let mut source = Source {
+            names: qwen35_tensor_names(&schedule).unwrap(),
+            matrix_2x256: unit_packed_shape(TernaryFormat::Tq2_0, 2, 256),
+            matrix_384x256: unit_packed_shape(TernaryFormat::Tq2_0, 384, 256),
+            matrix_128x256: unit_packed_shape(TernaryFormat::Tq2_0, 128, 256),
+            matrix_1x256: unit_packed_shape(TernaryFormat::Tq2_0, 1, 256),
+            matrix_256x128: unit_packed_shape(TernaryFormat::Tq2_0, 256, 128),
+            matrix_512x256: unit_packed_shape(TernaryFormat::Tq2_0, 512, 256),
+            matrix_256x256: unit_packed_shape(TernaryFormat::Tq2_0, 256, 256),
+            matrix_256x512: unit_packed_shape(TernaryFormat::Tq2_0, 256, 512),
+            scales_2: vec![1.0; 2],
+            scales_384: vec![1.0; 384],
+            scales_128: vec![1.0; 128],
+            scales_1: vec![1.0],
+            scales_256: vec![1.0; 256],
+            scales_512: vec![1.0; 512],
+            hidden: vec![0.0; 256],
+            conv: vec![0.0; 384 * 2],
+            delta_norm: vec![1.0; 128],
+            scalar: vec![0.0],
+        };
+        let config = Qwen35Config {
+            hidden: 256,
+            intermediate: 256,
+            vocab: 2,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: 256,
+            rotary_dim: 64,
+            rope_theta: 10_000.0,
+            rms_epsilon: 1.0e-6,
+            delta_geometry: QwenDeltaNetGeometry::new(2, 1, 1, 128, 128).unwrap(),
+            layer_types: &schedule,
+            full_attention_interval: 2,
+            tied_embeddings: false,
+            mtp_layers: 1,
+            mtp_dedicated_embeddings: false,
+        };
+        let identity = OnnxArtifactIdentityV2 {
+            source_model_id: "qwen-source",
+            tokenizer_id: "qwen-tokenizer",
+            recipe_id: "recipe",
+            tritium_build_id: "build",
+            package_id: "package",
+            converted_coverage_id: "language-mtp",
+            deferred_coverage_id: "vision",
+        };
+
+        let mapped = map_qwen35_causal_lm(&source, config, identity).unwrap();
+        assert!(matches!(
+            mapped.layers(),
+            [
+                QwenCausalLmDecoderLayer::DeltaNet(_),
+                QwenCausalLmDecoderLayer::FullAttention(_)
+            ]
+        ));
+        assert_eq!(mapped.mtp().fusion.rows, 256);
+        assert_eq!(mapped.mtp().fusion.columns, 512);
+        assert!(encode_qwen_causal_lm(mapped.model(1, 0)).is_ok());
+
+        source
+            .names
+            .push("model.language_model.layers.2.input_layernorm.weight".to_owned());
+        assert!(matches!(
+            map_qwen35_causal_lm(&source, config, identity),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("unsupported tensor") && reason.contains("layers.2")
         ));
     }
 
