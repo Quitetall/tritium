@@ -647,6 +647,7 @@ def test_live_module_convert_rejects_self_consistent_wrong_resume_geometry(tmp_p
     receipt_path = work / "weight-00000.json"
     receipt = json.loads(receipt_path.read_text())
     receipt["shape"] = [1, 6]
+    receipt["fit_chunk_rows"] = 1
     for plane in receipt["planes"]:
         scale_path = work / plane["scales_file"]
         payload = scale_path.read_bytes()[:2]
@@ -659,6 +660,42 @@ def test_live_module_convert_rejects_self_consistent_wrong_resume_geometry(tmp_p
 
     with pytest.raises(ValueError, match="identity differs from calibration"):
         convert(prepared, calibration, work_dir=work)
+
+
+def test_live_module_convert_streams_deterministic_rows_under_working_ceiling(tmp_path):
+    model = torch.nn.Linear(4, 5, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(torch.arange(20, dtype=torch.float32).reshape(5, 4) / 10)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.tensor([[1.0, 2.0, 3.0, 4.0]])],
+        evidence_dir=tmp_path / "tiled-evidence",
+    )
+    tiled = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "tiled-work",
+        max_working_bytes=1024,
+    )
+    roomy = convert(
+        prepared,
+        calibration,
+        work_dir=tmp_path / "roomy-work",
+        max_working_bytes=1024 * 1024,
+    )
+    assert tiled.weights[0].fit_chunk_rows < model.out_features
+    assert tiled.weights[0].max_working_bytes == 1024
+    assert [plane.trits_digest for plane in tiled.weights[0].planes] == [
+        plane.trits_digest for plane in roomy.weights[0].planes
+    ]
+    assert [plane.scales_digest for plane in tiled.weights[0].planes] == [
+        plane.scales_digest for plane in roomy.weights[0].planes
+    ]
 
 
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):

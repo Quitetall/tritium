@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,8 @@ _WEIGHT_FIELDS = {
     "aliases",
     "shape",
     "weighted_mse",
+    "fit_chunk_rows",
+    "max_working_bytes",
     "planes",
 }
 _RECEIPT_REF_FIELDS = {"file", "digest", "bytes"}
@@ -72,6 +75,8 @@ class FittedWeightRef:
     shape: Tuple[int, int]
     planes: Tuple[FittedPlaneRef, ...]
     weighted_mse: float
+    fit_chunk_rows: int
+    max_working_bytes: int
 
 
 @dataclass(frozen=True, eq=False)
@@ -205,11 +210,35 @@ def _validate_trit_file(path: Path) -> None:
                 raise ValueError("conversion plane contains non-ternary values")
 
 
-def _read_exact(path: Path, digest: str, byte_count: int) -> bytes:
-    actual_digest, actual_bytes = _digest_file(path, byte_count)
-    if actual_digest != digest or actual_bytes != byte_count:
+def _read_exact(path: Path, digest: str, byte_count: int) -> bytearray:
+    """Read and hash one payload into one exact-size allocation."""
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("conversion payload must be an ordinary file") from error
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != byte_count:
+            raise ValueError("conversion payload identity mismatch")
+        payload = bytearray(byte_count)
+        view = memoryview(payload)
+        hasher = hashlib.sha256()
+        offset = 0
+        while offset < byte_count:
+            end = min(offset + 1024 * 1024, byte_count)
+            count = stream.readinto(view[offset:end])
+            if count is None or count <= 0:
+                raise ValueError("conversion payload identity mismatch")
+            hasher.update(view[offset : offset + count])
+            offset += count
+        if stream.read(1):
+            raise ValueError("conversion payload identity mismatch")
+        del view
+    if "sha256:" + hasher.hexdigest() != digest:
         raise ValueError("conversion payload identity mismatch")
-    return path.read_bytes()
+    return payload
 
 
 def _read_json(path: Path, maximum: int = 1024 * 1024) -> Dict[str, Any]:
@@ -247,7 +276,7 @@ def _load_weight_receipt(
     if receipt_name != f"weight-{index:05d}.json":
         raise ValueError("conversion weight receipts are out of canonical order")
     value = _read_json(directory / receipt_name)
-    if set(value) != _WEIGHT_FIELDS or value["schema_version"] != 1:
+    if set(value) != _WEIGHT_FIELDS or value["schema_version"] != 2:
         raise ValueError("conversion weight receipt fields differ from schema")
     if value["recipe_id"] != expected_recipe_id:
         raise ValueError("conversion weight receipt belongs to another recipe")
@@ -271,6 +300,15 @@ def _load_weight_receipt(
         or weighted_mse < 0
     ):
         raise ValueError("conversion weighted_mse must be finite and nonnegative")
+    fit_chunk_rows = value["fit_chunk_rows"]
+    max_working_bytes = value["max_working_bytes"]
+    if (
+        type(fit_chunk_rows) is not int
+        or not 1 <= fit_chunk_rows <= shape[0]
+        or type(max_working_bytes) is not int
+        or max_working_bytes <= 0
+    ):
+        raise ValueError("conversion working-set receipt is invalid")
     plane_values = value["planes"]
     if not isinstance(plane_values, list) or not 1 <= len(plane_values) <= 3:
         raise ValueError("conversion weight requires one to three planes")
@@ -331,6 +369,8 @@ def _load_weight_receipt(
         shape=(shape[0], shape[1]),
         planes=tuple(planes),
         weighted_mse=float(weighted_mse),
+        fit_chunk_rows=fit_chunk_rows,
+        max_working_bytes=max_working_bytes,
     )
 
 
@@ -346,9 +386,9 @@ def load_module_conversion(
     if not directory.is_dir():
         raise ValueError("module conversion must be an ordinary directory")
     value = _read_json(directory / _MANIFEST)
-    if set(value) != _TOP_FIELDS or value["schema_version"] != 1:
+    if set(value) != _TOP_FIELDS or value["schema_version"] != 2:
         raise ValueError("module conversion manifest fields differ from schema")
-    if value["artifact_kind"] != "tritium.module-additive-ptq-v1":
+    if value["artifact_kind"] != "tritium.module-additive-ptq-v2":
         raise ValueError("unsupported module conversion artifact kind")
     for field in (
         "source_model_digest",
@@ -437,6 +477,119 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         raise
 
 
+class WeightCheckpointWriter:
+    """Append row chunks directly into one weight's final plane files."""
+
+    def __init__(
+        self,
+        directory: Path,
+        index: int,
+        path: str,
+        aliases: Tuple[str, ...],
+        shape: Tuple[int, int],
+        plane_count: int,
+        fit_chunk_rows: int,
+        max_working_bytes: int,
+    ) -> None:
+        self.directory = directory
+        self.index = index
+        self.path = path
+        self.aliases = aliases
+        self.shape = shape
+        self.plane_count = plane_count
+        self.fit_chunk_rows = fit_chunk_rows
+        self.max_working_bytes = max_working_bytes
+        self.rows_written = 0
+        self._files = []
+        self._digests = []
+        self._bytes = []
+        self._temporary_paths = []
+        self._final_paths = []
+        for plane_index in range(plane_count):
+            for suffix in ("trits.i8", "scales.f16le"):
+                final = directory / f"weight-{index:05d}-plane-{plane_index}.{suffix}"
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".tmp-plane-", dir=str(directory)
+                )
+                self._files.append(os.fdopen(descriptor, "wb"))
+                self._digests.append(hashlib.sha256())
+                self._bytes.append(0)
+                self._temporary_paths.append(Path(temporary_name))
+                self._final_paths.append(final)
+
+    def append(self, planes: Tuple[TernaryPlane, ...]) -> None:
+        if len(planes) != self.plane_count:
+            raise ValueError("fit chunk plane count differs from conversion recipe")
+        chunk_rows = planes[0].trits.shape[0]
+        if chunk_rows <= 0 or self.rows_written + chunk_rows > self.shape[0]:
+            raise ValueError("fit chunk rows exceed weight geometry")
+        for plane_index, plane in enumerate(planes):
+            if (
+                tuple(plane.trits.shape) != (chunk_rows, self.shape[1])
+                or tuple(plane.scales.shape) != (chunk_rows, 1)
+                or plane.group_size != self.shape[1]
+            ):
+                raise ValueError("fit chunk plane geometry differs from weight")
+            trits = plane.trits.detach().to(torch.int8).cpu().contiguous()
+            scales = plane.scales.detach().to(torch.float16).cpu().contiguous()
+            if not bool(torch.all((trits >= -1) & (trits <= 1))):
+                raise ValueError("fit chunk contains non-ternary values")
+            if not bool(torch.isfinite(scales).all()) or bool((scales < 0).any()):
+                raise ValueError("fit chunk contains invalid scales")
+            for slot, payload in (
+                (plane_index * 2, trits.numpy().tobytes()),
+                (plane_index * 2 + 1, scales.numpy().tobytes()),
+            ):
+                self._files[slot].write(payload)
+                self._digests[slot].update(payload)
+                self._bytes[slot] += len(payload)
+        self.rows_written += chunk_rows
+
+    def finish(self, weighted_mse: float) -> FittedWeightRef:
+        if self.rows_written != self.shape[0]:
+            raise ValueError("fit did not emit every output row")
+        if not math.isfinite(weighted_mse) or weighted_mse < 0:
+            raise ValueError("fit weighted_mse must be finite and nonnegative")
+        for stream in self._files:
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+        for temporary, final in zip(self._temporary_paths, self._final_paths):
+            os.replace(temporary, final)
+        planes = []
+        for plane_index in range(self.plane_count):
+            trits_slot = plane_index * 2
+            scales_slot = trits_slot + 1
+            planes.append(
+                FittedPlaneRef(
+                    trits_path=self._final_paths[trits_slot],
+                    trits_digest="sha256:" + self._digests[trits_slot].hexdigest(),
+                    trits_bytes=self._bytes[trits_slot],
+                    scales_path=self._final_paths[scales_slot],
+                    scales_digest="sha256:" + self._digests[scales_slot].hexdigest(),
+                    scales_bytes=self._bytes[scales_slot],
+                    scales_shape=(self.shape[0], 1),
+                    group_size=self.shape[1],
+                )
+            )
+        return FittedWeightRef(
+            path=self.path,
+            aliases=self.aliases,
+            shape=self.shape,
+            planes=tuple(planes),
+            weighted_mse=weighted_mse,
+            fit_chunk_rows=self.fit_chunk_rows,
+            max_working_bytes=self.max_working_bytes,
+        )
+
+    def abort(self) -> None:
+        for stream in self._files:
+            if not stream.closed:
+                stream.close()
+        for path in self._temporary_paths:
+            path.unlink(missing_ok=True)
+
+
 def seal_module_conversion(
     artifact_dir: Pathish,
     *,
@@ -447,7 +600,9 @@ def seal_module_conversion(
     config: TernaryConfig,
     coverage: CoverageReport,
     records: Iterable[Any],
-    fit_weight: Callable[[Any], FittedWeight],
+    fit_weight: Callable[[Any, WeightCheckpointWriter], float],
+    fit_chunk_rows: Callable[[Any], int],
+    max_working_bytes: int,
 ) -> ModuleQuantizationResult:
     """Resume per-weight fitting, then atomically seal one conversion manifest."""
 
@@ -510,36 +665,44 @@ def seal_module_conversion(
                 {"file": receipt_name, "digest": receipt_digest, "bytes": receipt_bytes}
             )
             continue
-        fitted = fit_weight(record)
-        rows, columns = fitted.planes[0].trits.shape
-        plane_values = []
-        for plane_index, plane in enumerate(fitted.planes):
-            trits_name = f"weight-{index:05d}-plane-{plane_index}.trits.i8"
-            scales_name = f"weight-{index:05d}-plane-{plane_index}.scales.f16le"
-            trits_payload = plane.trits.detach().cpu().contiguous().numpy().tobytes()
-            scales = plane.scales.detach().to(torch.float16).cpu().contiguous()
-            scales_payload = scales.numpy().tobytes()
-            _atomic_write(directory / trits_name, trits_payload)
-            _atomic_write(directory / scales_name, scales_payload)
-            plane_values.append(
-                {
-                    "trits_file": trits_name,
-                    "trits_digest": _digest_bytes(trits_payload),
-                    "trits_bytes": len(trits_payload),
-                    "scales_file": scales_name,
-                    "scales_digest": _digest_bytes(scales_payload),
-                    "scales_bytes": len(scales_payload),
-                    "scales_shape": list(scales.shape),
-                    "group_size": plane.group_size,
-                }
-            )
+        writer = WeightCheckpointWriter(
+            directory,
+            index,
+            record.weight_aliases[0],
+            record.weight_aliases,
+            (record.outputs, record.features),
+            config.planes,
+            fit_chunk_rows(record),
+            max_working_bytes,
+        )
+        try:
+            weighted_mse = fit_weight(record, writer)
+            fitted = writer.finish(weighted_mse)
+        except BaseException:
+            writer.abort()
+            raise
+        plane_values = [
+            {
+                "trits_file": plane.trits_path.name,
+                "trits_digest": plane.trits_digest,
+                "trits_bytes": plane.trits_bytes,
+                "scales_file": plane.scales_path.name,
+                "scales_digest": plane.scales_digest,
+                "scales_bytes": plane.scales_bytes,
+                "scales_shape": list(plane.scales_shape),
+                "group_size": plane.group_size,
+            }
+            for plane in fitted.planes
+        ]
         receipt = {
-            "schema_version": 1,
+            "schema_version": 2,
             "recipe_id": recipe_id,
             "path": fitted.path,
             "aliases": list(fitted.aliases),
-            "shape": [rows, columns],
+            "shape": list(fitted.shape),
             "weighted_mse": fitted.weighted_mse,
+            "fit_chunk_rows": fitted.fit_chunk_rows,
+            "max_working_bytes": fitted.max_working_bytes,
             "planes": plane_values,
         }
         _atomic_write(receipt_path, _canonical(receipt))
@@ -555,8 +718,8 @@ def seal_module_conversion(
             {"file": receipt_name, "digest": receipt_digest, "bytes": receipt_bytes}
         )
     manifest = {
-        "schema_version": 1,
-        "artifact_kind": "tritium.module-additive-ptq-v1",
+        "schema_version": 2,
+        "artifact_kind": "tritium.module-additive-ptq-v2",
         "source_model_digest": source_model_digest,
         "evidence_id": evidence_id,
         "algorithm_id": algorithm_id,
@@ -588,6 +751,7 @@ __all__ = [
     "FittedWeight",
     "FittedWeightRef",
     "ModuleQuantizationResult",
+    "WeightCheckpointWriter",
     "load_module_conversion",
     "module_recipe_id",
     "seal_module_conversion",

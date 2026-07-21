@@ -24,6 +24,7 @@ from .errors import TritiumError
 from .module_artifacts import (
     FittedWeight,
     ModuleQuantizationResult,
+    WeightCheckpointWriter,
     load_module_conversion,
     module_recipe_id,
     seal_module_conversion,
@@ -31,6 +32,7 @@ from .module_artifacts import (
 from .projection import TernaryPlane, TernaryProjection, validate_projection
 
 Pathish = Union[str, os.PathLike[str]]
+_FIT_BYTES_PER_COEFFICIENT = 96
 
 
 @dataclass(frozen=True)
@@ -619,6 +621,7 @@ def _fit_module(
     prepared: PreparedModel,
     calibration: ActivationCalibrationReceipt,
     work_dir: Pathish,
+    max_working_bytes: int,
 ) -> ModuleQuantizationResult:
     """Fit hard additive planes from strict live-module calibration evidence."""
 
@@ -641,6 +644,8 @@ def _fit_module(
             stage="convert",
             details={"target_bpw": prepared.config.target_bpw},
         )
+    if type(max_working_bytes) is not int or max_working_bytes <= 0:
+        raise ValueError("max_working_bytes must be a positive integer")
     if prepared.coverage is None:
         raise TritiumError(
             "module conversion requires exact prepared coverage",
@@ -674,7 +679,25 @@ def _fit_module(
         prepared.coverage,
     )
 
-    def fit_weight(record: ActivationRecord) -> FittedWeight:
+    def chunk_rows(record: ActivationRecord) -> int:
+        fixed_bytes = record.features * 8
+        per_row_bytes = record.features * _FIT_BYTES_PER_COEFFICIENT
+        if max_working_bytes < fixed_bytes + per_row_bytes:
+            raise TritiumError(
+                "max_working_bytes cannot hold one fitted output row",
+                code="working_set_too_small",
+                stage="convert",
+                module=record.module,
+                details={
+                    "required_bytes": fixed_bytes + per_row_bytes,
+                    "max_working_bytes": max_working_bytes,
+                },
+            )
+        return min(record.outputs, (max_working_bytes - fixed_bytes) // per_row_bytes)
+
+    def fit_weight(
+        record: ActivationRecord, writer: WeightCheckpointWriter
+    ) -> float:
         try:
             master = parameters[record.weight_aliases[0]]
         except KeyError as error:
@@ -687,21 +710,22 @@ def _fit_module(
         payload = (calibration.evidence_dir / record.file).read_bytes()
         curvature = torch.frombuffer(bytearray(payload), dtype=torch.float64)
         curvature = curvature / record.samples
-        projection = _diagonal_additive_projection(
-            master, curvature, prepared.config.planes
-        )
-        error = (
-            master.detach().cpu().to(torch.float64)
-            - projection.dense.to(torch.float64)
-        ).square()
+        weighted_error = 0.0
+        rows_per_chunk = chunk_rows(record)
+        for start in range(0, master.shape[0], rows_per_chunk):
+            stop = min(master.shape[0], start + rows_per_chunk)
+            master_chunk = master[start:stop]
+            projection = _diagonal_additive_projection(
+                master_chunk, curvature, prepared.config.planes
+            )
+            error = (
+                master_chunk.detach().cpu().to(torch.float64)
+                - projection.dense.to(torch.float64)
+            ).square()
+            weighted_error += float((error * curvature).sum())
+            writer.append(projection.planes)
         denominator = curvature.sum().clamp_min(1e-30) * master.shape[0]
-        weighted_mse = float((error * curvature).sum() / denominator)
-        return FittedWeight(
-            path=record.weight_aliases[0],
-            aliases=record.weight_aliases,
-            planes=projection.planes,
-            weighted_mse=weighted_mse,
-        )
+        return weighted_error / float(denominator)
 
     return seal_module_conversion(
         work_dir,
@@ -713,6 +737,8 @@ def _fit_module(
         coverage=prepared.coverage,
         records=calibration.records,
         fit_weight=fit_weight,
+        fit_chunk_rows=chunk_rows,
+        max_working_bytes=max_working_bytes,
     )
 
 
@@ -788,6 +814,7 @@ def convert(
     compact_max_resident_bytes: Optional[int] = None,
     near_lossless_max_bytes: Optional[int] = None,
     near_lossless_max_resident_bytes: Optional[int] = None,
+    max_working_bytes: int = 64 * 1024 * 1024,
     packing: str = "b3",
 ) -> Union[QuantizationResult, ModuleQuantizationResult]:
     """Run resumable PTQ, exact allocation, admission, and atomic export."""
@@ -813,7 +840,12 @@ def convert(
                 "live-module convert does not accept Qwen package arguments: "
                 + ", ".join(supplied)
             )
-        return _fit_module(prepared, calibration, work_dir)
+        return _fit_module(
+            prepared,
+            calibration,
+            work_dir,
+            max_working_bytes,
+        )
     if not isinstance(calibration, CalibrationReceipt):
         raise TypeError("Qwen convert requires a CalibrationReceipt")
     if prepared.config.mode != "ptq" or not isinstance(prepared.model, Path):
