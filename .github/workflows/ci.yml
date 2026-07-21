@@ -51,6 +51,39 @@ jobs:
       - run: python scripts/check-release-version.py
       - run: python scripts/generate-compatibility.py --check
 
+  # Exact browser-package lane. The local RC stays private, but the candidate
+  # tarball and its digest-bound clean-install receipt are retained as CI
+  # evidence. Consumers need no Rust toolchain or lifecycle scripts.
+  web-package:
+    name: web package (Node 22, source-free archive)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/tritium-web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: install pinned wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: install exact web build dependencies
+        working-directory: packages/tritium-web
+        run: npm ci
+      - name: qualify exact npm archive
+        working-directory: packages/tritium-web
+        env:
+          TRITIUM_NPM_EVIDENCE_DIR: ${{ runner.temp }}/tritium-npm-evidence
+        run: npm run check
+      - name: retain local-RC archive and receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: tritium-web-${{ github.sha }}
+          path: ${{ runner.temp }}/tritium-npm-evidence
+          if-no-files-found: error
+
   # Supply-chain gate (ADR 0011 hardening): licenses (allow-list + NOTICE
   # attribution), RustSec advisories, bans (no external wildcard versions /
   # disallowed crates), and source registries. Fast + CPU-only, on every push +

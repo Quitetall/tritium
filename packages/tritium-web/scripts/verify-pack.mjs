@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import {
+  copyFile,
   mkdir,
   mkdtemp,
   readFile,
@@ -9,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
@@ -80,6 +82,10 @@ async function verifyArchive(temporary) {
       typeof metadata.filename !== "string" || !Array.isArray(metadata.files)) {
     fail("npm metadata differs from package identity");
   }
+  if (metadata.filename !== basename(metadata.filename) ||
+      metadata.filename.includes("\\") || metadata.filename.includes("\0")) {
+    fail("npm returned an unsafe archive filename");
+  }
   const files = metadata.files.map((entry) => {
     if (entry === null || typeof entry !== "object" ||
         !Number.isSafeInteger(entry.size) || entry.size < 0 || entry.mode !== 0o644) {
@@ -148,7 +154,13 @@ process.stdout.write(JSON.stringify(receipt));
     maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
   });
   const wasmReceipt = JSON.parse(smoke.stdout);
-  if (typeof wasmReceipt.buildId !== "string" || wasmReceipt.buildId.length === 0 ||
+  const sourceIdentity = typeof wasmReceipt.buildId === "string"
+    ? /\+source-git:([0-9a-f]{40})(?:\+dirty-blake3:([0-9a-f]{64}))?$/.exec(
+      wasmReceipt.buildId,
+    )
+    : null;
+  if (sourceIdentity === null ||
+      !wasmReceipt.buildId.startsWith(`tritium-wasm@${packageJson.version}+`) ||
       typeof wasmReceipt.guestDigest !== "string" ||
       !/^[0-9a-f]{64}$/.test(wasmReceipt.guestDigest)) {
     fail("installed WASM returned an invalid identity receipt");
@@ -186,6 +198,8 @@ void adapter;
     schemaId: "tritium.npm_archive_receipt",
     schemaVersion: 1,
     package: `${packageJson.name}@${packageJson.version}`,
+    sourceRevision: sourceIdentity[1],
+    sourceDirty: sourceIdentity[2] !== undefined,
     archiveSha256: digest("sha256", archiveBytes),
     archiveBytes: archiveBytes.byteLength,
     entryCount: files.length,
@@ -195,7 +209,24 @@ void adapter;
     wasmBuildId: wasmReceipt.buildId,
     wasmGuestDigest: wasmReceipt.guestDigest,
   });
-  process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
+  const receiptJson = `${JSON.stringify(receipt, null, 2)}\n`;
+  const evidenceDirectory = process.env.TRITIUM_NPM_EVIDENCE_DIR;
+  if (evidenceDirectory !== undefined) {
+    if (evidenceDirectory.length === 0 || evidenceDirectory.includes("\0")) {
+      fail("TRITIUM_NPM_EVIDENCE_DIR is invalid");
+    }
+    const output = resolve(evidenceDirectory);
+    await mkdir(output, { recursive: true });
+    await copyFile(
+      archiveRealPath,
+      resolve(output, metadata.filename),
+      constants.COPYFILE_EXCL,
+    );
+    await writeFile(resolve(output, "npm-archive-receipt.json"), receiptJson, {
+      flag: "wx",
+    });
+  }
+  process.stdout.write(receiptJson);
 }
 
 async function main() {
