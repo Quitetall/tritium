@@ -724,6 +724,22 @@ def test_live_module_convert_rejects_working_ceiling_below_one_row(tmp_path):
 
 
 def test_module_conversion_loader_keeps_v1_artifacts_readable(tmp_path):
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "module_ptq_v1.json").read_text()
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    for name, payload_hex in fixture.items():
+        (work / name).write_bytes(bytes.fromhex(payload_hex))
+
+    reopened = ptq.load_module_conversion(work)
+    assert reopened.schema_version == 1
+    assert reopened.weights[0].fit_chunk_rows == 1
+    assert reopened.weights[0].max_working_bytes is None
+    assert reopened.weight("weight").planes[0].trits.tolist() == [[0, -1]]
+
+
+def test_module_conversion_loader_rejects_cross_version_receipts(tmp_path):
     prepared = prepare(
         torch.nn.Linear(2, 1, bias=False),
         TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
@@ -737,24 +753,10 @@ def test_module_conversion_loader_keeps_v1_artifacts_readable(tmp_path):
     work = tmp_path / "work"
     convert(prepared, calibration, work_dir=work)
 
-    receipt_path = work / "weight-00000.json"
-    receipt = json.loads(receipt_path.read_text())
-    receipt["schema_version"] = 1
-    del receipt["fit_chunk_rows"]
-    del receipt["max_working_bytes"]
-    receipt_payload = json.dumps(
-        receipt, sort_keys=True, separators=(",", ":")
-    ).encode()
-    receipt_path.write_bytes(receipt_payload)
-
     manifest_path = work / "conversion.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["schema_version"] = 1
     manifest["artifact_kind"] = "tritium.module-additive-ptq-v1"
-    manifest["weight_receipts"][0].update(
-        digest="sha256:" + hashlib.sha256(receipt_payload).hexdigest(),
-        bytes=len(receipt_payload),
-    )
     identity = dict(manifest)
     del identity["artifact_id"]
     manifest["artifact_id"] = "sha256:" + hashlib.sha256(
@@ -762,10 +764,8 @@ def test_module_conversion_loader_keeps_v1_artifacts_readable(tmp_path):
     ).hexdigest()
     manifest_path.write_text(json.dumps(manifest))
 
-    reopened = ptq.load_module_conversion(work)
-    assert reopened.schema_version == 1
-    assert reopened.weights[0].fit_chunk_rows == 1
-    assert reopened.weights[0].max_working_bytes is None
+    with pytest.raises(ValueError, match="receipt fields differ from schema"):
+        ptq.load_module_conversion(work)
 
 
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):

@@ -272,15 +272,17 @@ def _load_weight_receipt(
     index: int,
     maximum_bytes: int,
     expected_recipe_id: str,
+    expected_schema_version: int,
 ) -> FittedWeightRef:
     if receipt_name != f"weight-{index:05d}.json":
         raise ValueError("conversion weight receipts are out of canonical order")
     value = _read_json(directory / receipt_name)
     schema_version = value.get("schema_version")
-    expected_fields = (
-        _WEIGHT_FIELDS_V1 if schema_version == 1 else _WEIGHT_FIELDS_V2
-    )
-    if schema_version not in {1, 2} or set(value) != expected_fields:
+    expected_fields = {
+        1: _WEIGHT_FIELDS_V1,
+        2: _WEIGHT_FIELDS_V2,
+    }.get(expected_schema_version)
+    if schema_version != expected_schema_version or set(value) != expected_fields:
         raise ValueError("conversion weight receipt fields differ from schema")
     if value["recipe_id"] != expected_recipe_id:
         raise ValueError("conversion weight receipt belongs to another recipe")
@@ -427,6 +429,7 @@ def load_module_conversion(
                 index,
                 max_payload_bytes,
                 value["recipe_id"],
+                schema_version,
             )
         )
     weights = tuple(weights)
@@ -673,6 +676,7 @@ def seal_module_conversion(
                 index,
                 8 * 1024**3,
                 recipe_id,
+                2,
             )
             if (
                 reference.path != record.weight_aliases[0]
@@ -735,6 +739,7 @@ def seal_module_conversion(
             index,
             8 * 1024**3,
             recipe_id,
+            2,
         )
         receipt_digest, receipt_bytes = _digest_file(receipt_path, 1024 * 1024)
         receipt_references.append(
