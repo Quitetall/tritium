@@ -5,7 +5,7 @@ use core::mem::size_of;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 #[cfg(not(feature = "cuda"))]
 use std::marker::PhantomData;
 use std::path::Path;
@@ -273,6 +273,229 @@ impl Qwen35SaltV2LoadReceipt {
     #[must_use]
     pub const fn resident_bytes(&self) -> u64 {
         self.resident_bytes
+    }
+}
+
+/// Non-materializing admission of one schema-v3 Qwen SALT profile.
+///
+/// This authenticates manifest, Hugging Face configuration/assets, packed
+/// package, preserved safetensors, exact tensor schema, and physical ledgers.
+/// It does not allocate model weights or construct compute backend.
+#[derive(Clone, Debug)]
+pub struct Qwen35SaltV2BundleAdmission {
+    config: Qwen35CheckpointConfig,
+    manifest_package_id: String,
+    profile: String,
+    profile_file: String,
+    preserved_file: String,
+    source_revision: String,
+    completion_id: String,
+    campaign_id: String,
+    admission_id: String,
+    selection_id: String,
+    source_model_id: String,
+    config_package_id: String,
+    package_id: String,
+    preserved_package_id: String,
+    codec: SaltV2Codec,
+    matrix_tensors: usize,
+    preserved_tensors: usize,
+    serialized_bytes: u64,
+    preserved_serialized_bytes: u64,
+    salt_resident_bytes: u64,
+    preserved_fp32_bytes: u64,
+}
+
+impl Qwen35SaltV2BundleAdmission {
+    /// Authenticate one pinned Qwen3.6-27B profile without materializing weights.
+    pub fn admit(bundle_dir: &Path, profile: &str) -> Result<Self, NnError> {
+        Self::admit_with_policy(bundle_dir, profile, true)
+    }
+
+    fn admit_with_policy(
+        bundle_dir: &Path,
+        profile: &str,
+        require_pinned_config: bool,
+    ) -> Result<Self, NnError> {
+        if !matches!(profile, "compact-v1" | "near-lossless-v1") {
+            return Err(NnError::InvalidArtifact(
+                "profile must be `compact-v1` or `near-lossless-v1`".into(),
+            ));
+        }
+        let manifest_bytes = read_regular(&bundle_dir.join(MANIFEST_FILE), MAX_MANIFEST_BYTES)?;
+        let manifest_package_id = hash_bytes(&manifest_bytes);
+        let manifest: BundleManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|error| {
+                NnError::InvalidArtifact(format!("parse strict schema-v3 manifest: {error}"))
+            })?;
+        validate_manifest(&manifest)?;
+        let profile_manifest = match profile {
+            "compact-v1" => &manifest.profiles.compact,
+            "near-lossless-v1" => &manifest.profiles.near_lossless,
+            _ => unreachable!(),
+        };
+        let (config_bytes, config_package_id, _) =
+            verify_hf_assets(bundle_dir, &manifest.hf_assets)?;
+        let config_text = std::str::from_utf8(&config_bytes)
+            .map_err(|_| NnError::MissingConfig("config.json is not UTF-8".into()))?;
+        let config = Qwen35CheckpointConfig::from_hf_config(config_text)?;
+        if require_pinned_config {
+            config.validate_pinned_qwen36_27b(&manifest.source_revision)?;
+        }
+        let package_file =
+            open_regular(&bundle_dir.join(&profile_manifest.file), "SALT V2 profile")?;
+        let preserved_bytes = read_regular(
+            &bundle_dir.join(&manifest.preserved.file),
+            MAX_PRESERVED_BYTES,
+        )?;
+        let preserved_serialized_bytes = u64::try_from(preserved_bytes.len())
+            .map_err(|_| NnError::ResourceExhausted("preserved size exceeds u64".into()))?;
+        if preserved_serialized_bytes != manifest.preserved.serialized_bytes
+            || hash_bytes(&preserved_bytes) != manifest.preserved.package_id
+            || safetensors_payload_bytes(&preserved_bytes)? != manifest.preserved.payload_bytes
+        {
+            return Err(NnError::Provenance(
+                "preserved tensor identity or physical ledger differs from manifest".into(),
+            ));
+        }
+        let mut package = SaltV2PackageReader::new_strict(package_file)
+            .map_err(|error| NnError::InvalidArtifact(format!("open SALT V2 profile: {error}")))?;
+        let package_ledger = package.ledger();
+        let runtime_ledger = package
+            .indexed_runtime_ledger()
+            .map_err(|error| NnError::InvalidArtifact(error.to_string()))?;
+        if package.package_id().to_string() != profile_manifest.package_id
+            || package_ledger.total_bytes != profile_manifest.serialized_bytes
+            || runtime_ledger.steady_resident_bytes() != profile_manifest.resident_bytes
+            || codec_name(package.codec()) != manifest.packing
+        {
+            return Err(NnError::Provenance(
+                "SALT V2 profile identity, codec, or physical ledger differs from manifest".into(),
+            ));
+        }
+        let preserved = SafeTensorsReader::new(Cursor::new(preserved_bytes.into_boxed_slice()))
+            .map_err(|error| {
+                NnError::InvalidArtifact(format!("open preserved safetensors: {error}"))
+            })?;
+        if u64::try_from(preserved.len()).ok() != Some(manifest.preserved.tensors) {
+            return Err(NnError::Provenance(
+                "preserved tensor count differs from bundle manifest".into(),
+            ));
+        }
+        let schema = combined_schema(&config)?;
+        let (matrix_tensors, preserved_tensors, preserved_fp32_bytes) =
+            validate_coverage_readers(&package, &preserved, &schema)?;
+        package
+            .verify_unchanged()
+            .map_err(|error| NnError::Provenance(format!("SALT V2 profile changed: {error}")))?;
+        Ok(Self {
+            config,
+            manifest_package_id,
+            profile: profile.to_owned(),
+            profile_file: profile_manifest.file.clone(),
+            preserved_file: manifest.preserved.file,
+            source_revision: manifest.source_revision,
+            completion_id: manifest.completion_id,
+            campaign_id: manifest.campaign_id,
+            admission_id: manifest.admission_id,
+            selection_id: manifest.selection_id,
+            source_model_id: manifest.source_model_id,
+            config_package_id,
+            package_id: profile_manifest.package_id.clone(),
+            preserved_package_id: manifest.preserved.package_id,
+            codec: package.codec(),
+            matrix_tensors,
+            preserved_tensors,
+            serialized_bytes: package_ledger.total_bytes,
+            preserved_serialized_bytes,
+            salt_resident_bytes: runtime_ledger.steady_resident_bytes(),
+            preserved_fp32_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &Qwen35CheckpointConfig {
+        &self.config
+    }
+    #[must_use]
+    pub fn manifest_package_id(&self) -> &str {
+        &self.manifest_package_id
+    }
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+    #[must_use]
+    pub fn profile_file(&self) -> &str {
+        &self.profile_file
+    }
+    #[must_use]
+    pub fn preserved_file(&self) -> &str {
+        &self.preserved_file
+    }
+    #[must_use]
+    pub fn source_revision(&self) -> &str {
+        &self.source_revision
+    }
+    #[must_use]
+    pub fn completion_id(&self) -> &str {
+        &self.completion_id
+    }
+    #[must_use]
+    pub fn campaign_id(&self) -> &str {
+        &self.campaign_id
+    }
+    #[must_use]
+    pub fn admission_id(&self) -> &str {
+        &self.admission_id
+    }
+    #[must_use]
+    pub fn selection_id(&self) -> &str {
+        &self.selection_id
+    }
+    #[must_use]
+    pub fn source_model_id(&self) -> &str {
+        &self.source_model_id
+    }
+    #[must_use]
+    pub fn config_package_id(&self) -> &str {
+        &self.config_package_id
+    }
+    #[must_use]
+    pub fn package_id(&self) -> &str {
+        &self.package_id
+    }
+    #[must_use]
+    pub fn preserved_package_id(&self) -> &str {
+        &self.preserved_package_id
+    }
+    #[must_use]
+    pub const fn codec(&self) -> SaltV2Codec {
+        self.codec
+    }
+    #[must_use]
+    pub const fn matrix_tensors(&self) -> usize {
+        self.matrix_tensors
+    }
+    #[must_use]
+    pub const fn preserved_tensors(&self) -> usize {
+        self.preserved_tensors
+    }
+    #[must_use]
+    pub const fn serialized_bytes(&self) -> u64 {
+        self.serialized_bytes
+    }
+    #[must_use]
+    pub const fn preserved_serialized_bytes(&self) -> u64 {
+        self.preserved_serialized_bytes
+    }
+    #[must_use]
+    pub const fn salt_resident_bytes(&self) -> u64 {
+        self.salt_resident_bytes
+    }
+    #[must_use]
+    pub const fn preserved_fp32_bytes(&self) -> u64 {
+        self.preserved_fp32_bytes
     }
 }
 
@@ -667,6 +890,14 @@ fn validate_coverage(
 ) -> Result<(usize, usize, u64), NnError> {
     let package = source.package.borrow();
     let preserved = source.preserved.borrow();
+    validate_coverage_readers(&package, &preserved, schema)
+}
+
+fn validate_coverage_readers<R: Read + Seek, S: Read + Seek>(
+    package: &SaltV2PackageReader<R>,
+    preserved: &SafeTensorsReader<S>,
+    schema: &BTreeMap<String, TensorSpec>,
+) -> Result<(usize, usize, u64), NnError> {
     let matrix_names = package.tensor_names().collect::<BTreeSet<_>>();
     let preserved_names = preserved.names().collect::<BTreeSet<_>>();
     let mut preserved_fp32_bytes = 0u64;
@@ -1176,6 +1407,24 @@ mod tests {
         });
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         fs::write(files.directory.join(MANIFEST_FILE), &manifest_bytes).unwrap();
+
+        let admission =
+            Qwen35SaltV2BundleAdmission::admit_with_policy(&files.directory, "compact-v1", false)
+                .unwrap();
+        assert_eq!(admission.profile(), "compact-v1");
+        assert_eq!(admission.profile_file(), "compact.tsalt2");
+        assert_eq!(admission.preserved_file(), PRESERVED_FILE);
+        assert_eq!(admission.completion_id(), "test-completion");
+        assert_eq!(admission.campaign_id(), "test-campaign");
+        assert_eq!(admission.admission_id(), "test-admission");
+        assert_eq!(admission.selection_id(), "test-selection");
+        assert_eq!(admission.package_id(), profile_id);
+        assert_eq!(admission.preserved_package_id(), preserved_id);
+        assert_eq!(admission.matrix_tensors(), matrix_count);
+        assert_eq!(admission.preserved_tensors(), preserved.len());
+        assert_eq!(admission.serialized_bytes(), package_serialized_bytes);
+        assert_eq!(admission.salt_resident_bytes(), package_resident_bytes);
+        assert!(admission.preserved_fp32_bytes() > 0);
 
         let model = Qwen35SaltV2LanguageMtpModel::load_bundle_profile_with_policy(
             &files.directory,

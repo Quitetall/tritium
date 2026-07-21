@@ -43,7 +43,9 @@ pub use qwen35_mtp::{
     Qwen35MtpOracleEvidenceClass, Qwen35MtpOutput, Qwen35MtpParityReceipt, Qwen35MtpRunner,
     Qwen35MtpStatus, Qwen35MtpWeights, UnverifiedQwen35Mtp,
 };
-pub use qwen35_salt_v2::{Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt};
+pub use qwen35_salt_v2::{
+    Qwen35SaltV2BundleAdmission, Qwen35SaltV2LanguageMtpModel, Qwen35SaltV2LoadReceipt,
+};
 pub use runner::{ForwardDump, ModelRunner};
 #[cfg(feature = "cuda")]
 pub use salt_v2::{
