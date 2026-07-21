@@ -709,7 +709,11 @@ fn open_regular_handle(path: &Path, expected_bytes: u64, label: &str) -> Result<
 fn open_regular_bounded(path: &Path, max_bytes: u64, label: &str) -> Result<File, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect {label} failed: {:?}", error.kind()))?;
-    if metadata.len() == 0 || metadata.len() > max_bytes {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > max_bytes
+    {
         return Err(format!(
             "{label} must be non-empty and no larger than {max_bytes} bytes"
         ));
@@ -746,7 +750,7 @@ fn read_regular_bounded(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<
         ));
     }
     let mut file =
-        File::open(path).map_err(|error| format!("open {label} failed: {:?}", error.kind()))?;
+        open_nofollow(path).map_err(|error| format!("open {label} failed: {:?}", error.kind()))?;
     let opened = file
         .metadata()
         .map_err(|error| format!("inspect opened {label} failed: {:?}", error.kind()))?;
@@ -801,20 +805,31 @@ fn copy_sync_streaming(
     max_bytes: u64,
     label: &str,
 ) -> Result<(), String> {
+    let before = fs::symlink_metadata(source)
+        .map_err(|error| format!("inspect {label} failed: {:?}", error.kind()))?;
     let mut input = open_regular_bounded(source, max_bytes, label)?;
-    let expected = input
+    let opened = input
         .metadata()
-        .map_err(|error| format!("inspect opened {label} failed: {:?}", error.kind()))?
-        .len();
+        .map_err(|error| format!("inspect opened {label} failed: {:?}", error.kind()))?;
+    if !same_file(&before, &opened) || before.len() != opened.len() {
+        return Err(format!("{label} changed before streaming"));
+    }
+    let expected = opened.len();
     let mut output = File::create_new(destination)
         .map_err(|error| format!("create staged {label} failed: {:?}", error.kind()))?;
     let copied = io::copy(&mut input, &mut output)
         .map_err(|error| format!("copy staged {label} failed: {:?}", error.kind()))?;
-    let final_length = input
+    let final_opened = input
         .metadata()
-        .map_err(|error| format!("reinspect opened {label} failed: {:?}", error.kind()))?
-        .len();
-    if copied != expected || final_length != expected {
+        .map_err(|error| format!("reinspect opened {label} failed: {:?}", error.kind()))?;
+    let after = fs::symlink_metadata(source)
+        .map_err(|error| format!("reinspect {label} failed: {:?}", error.kind()))?;
+    if copied != expected
+        || final_opened.len() != expected
+        || after.len() != expected
+        || !same_file(&before, &after)
+        || !same_file(&opened, &final_opened)
+    {
         return Err(format!("{label} changed while streaming"));
     }
     output
