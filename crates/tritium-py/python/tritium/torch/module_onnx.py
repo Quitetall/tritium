@@ -117,6 +117,7 @@ def _dependencies():
     try:
         import onnx
         import onnxruntime
+        import onnxscript  # noqa: F401 - required by the Dynamo ONNX exporter
     except ImportError as error:
         raise TritiumError(
             "generic ONNX export requires onnx, onnxscript, and onnxruntime",
