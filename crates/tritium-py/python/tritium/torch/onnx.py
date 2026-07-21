@@ -11,7 +11,10 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Tuple, Union
+
+import torch
+from torch import Tensor, nn
 
 from .. import _tritium
 from .artifacts import QuantizationResult
@@ -59,6 +62,129 @@ class OnnxBundleManifest:
     campaign_id: str
     admission_id: str
     selection_id: str
+
+
+@dataclass(frozen=True)
+class OnnxCausalLMOutput:
+    """PyTorch-shaped output from one authenticated fixed-shape ONNX call."""
+
+    logits: Tensor
+    past_key_values: Tuple[Tensor, ...]
+    state_names: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _OnnxConfig:
+    model_type: str = "tritium_qwen35_onnx"
+    is_encoder_decoder: bool = False
+    is_decoder: bool = True
+    use_cache: bool = True
+
+
+class QwenOnnxCausalLM(nn.Module):
+    """Inference-only PyTorch facade over Tritium's authenticated ORT runtime.
+
+    The current graph contract has a fixed token and cache shape. It supports
+    ordinary batch-one causal-LM forward calls; dynamic cache growth used by
+    ``GenerationMixin.generate`` remains an explicit release gate.
+    """
+
+    def __init__(self, runtime: Any, manifest: OnnxBundleManifest) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self.manifest = manifest
+        self.config = _OnnxConfig()
+        self.eval()
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(self._runtime.device)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        past_key_values: Optional[Tuple[Tensor, ...]] = None,
+        attention_mask: Optional[Tensor] = None,
+        *,
+        use_cache: bool = True,
+        return_dict: bool = True,
+    ) -> Union[OnnxCausalLMOutput, Tuple[Tensor, Tuple[Tensor, ...]]]:
+        if not isinstance(input_ids, Tensor):
+            raise TypeError("input_ids must be a torch.Tensor")
+        if input_ids.device.type != "cpu":
+            raise TritiumError(
+                "this ONNX wheel admits CPU tensors only",
+                code="onnx_device_unavailable",
+                stage="forward_onnx",
+                details={"device": str(input_ids.device)},
+            )
+        if input_ids.ndim == 1:
+            tokens = input_ids
+        elif input_ids.ndim == 2 and input_ids.shape[0] == 1:
+            tokens = input_ids[0]
+        else:
+            raise ValueError("Qwen ONNX input_ids must have shape [tokens] or [1, tokens]")
+        if tokens.dtype not in {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }:
+            raise TypeError("input_ids must have an integer dtype")
+        if attention_mask is not None:
+            if attention_mask.device.type != "cpu" or tuple(attention_mask.shape) not in {
+                tuple(input_ids.shape),
+                (1, tokens.numel()),
+                (tokens.numel(),),
+            }:
+                raise ValueError("attention_mask must match the batch-one input_ids shape")
+            if not bool(torch.all(attention_mask != 0).item()):
+                raise TritiumError(
+                    "padded attention masks are not represented by this fixed ONNX graph",
+                    code="onnx_padding_unavailable",
+                    stage="forward_onnx",
+                )
+        states = None
+        if past_key_values is not None:
+            if not isinstance(past_key_values, tuple):
+                raise TypeError("past_key_values must be a tuple of torch.Tensor values")
+            states = []
+            for index, state in enumerate(past_key_values):
+                if not isinstance(state, Tensor):
+                    raise TypeError(f"past_key_values[{index}] must be a torch.Tensor")
+                if state.device.type != "cpu" or state.dtype != torch.float32:
+                    raise TypeError(
+                        f"past_key_values[{index}] must be a CPU float32 tensor"
+                    )
+                states.append(state.contiguous().view(-1).tolist())
+        native = self._runtime.forward_language(
+            tokens.to(dtype=torch.int64).contiguous().tolist(), states
+        )
+        shape = tuple(native.logits_shape)
+        logits = torch.tensor(native.logits, dtype=torch.float32).reshape(shape).unsqueeze(0)
+        if len(native.states) != len(native.state_shapes):
+            raise RuntimeError("native ONNX state values and shapes differ in count")
+        output_states = tuple(
+            torch.tensor(values, dtype=torch.float32).reshape(tuple(state_shape))
+            for values, state_shape in zip(native.states, native.state_shapes)
+        )
+        if not use_cache:
+            output_states = ()
+        output = OnnxCausalLMOutput(
+            logits=logits,
+            past_key_values=output_states,
+            state_names=tuple(native.state_names),
+        )
+        return output if return_dict else (output.logits, output.past_key_values)
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise TritiumError(
+            "dynamic-cache ONNX generation has not passed the v1.1 release gate",
+            code="dynamic_onnx_generation_unavailable",
+            stage="generate_onnx",
+        )
 
 
 def export_onnx(
@@ -135,7 +261,8 @@ def load_onnx(
             stage="load_onnx",
             details={"artifact_dir": str(manifest.directory)},
         )
-    return native.load(str(manifest.directory), device=device)
+    runtime = native.load(str(manifest.directory), device=device)
+    return QwenOnnxCausalLM(runtime, manifest)
 
 
 def _pairs_without_duplicates(pairs):
@@ -314,4 +441,10 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
-__all__ = ["OnnxBundleManifest", "export_onnx", "load_onnx"]
+__all__ = [
+    "OnnxBundleManifest",
+    "OnnxCausalLMOutput",
+    "QwenOnnxCausalLM",
+    "export_onnx",
+    "load_onnx",
+]

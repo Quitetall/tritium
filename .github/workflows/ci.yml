@@ -37,6 +37,19 @@ jobs:
       # on the hosted macOS/Windows runners.
       - run: cargo test --workspace --exclude tritium-py # unit, integration, and doc tests
 
+  # Release compatibility claims are generated from a strict manifest. A cell
+  # cannot become supported without a digest-bound, revision-bound pass receipt.
+  compatibility-matrix:
+    name: compatibility matrix (receipt-backed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m unittest discover -s scripts/tests -p 'test_*.py' -v
+      - run: python scripts/generate-compatibility.py --check
+
   # Supply-chain gate (ADR 0011 hardening): licenses (allow-list + NOTICE
   # attribution), RustSec advisories, bans (no external wildcard versions /
   # disallowed crates), and source registries. Fast + CPU-only, on every push +
