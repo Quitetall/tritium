@@ -113,7 +113,7 @@ function view(command) {
   );
 }
 
-test("resident schedule covers 52 graph/loss forms plus four transactional optimizers", () => {
+test("resident schedule covers all 52 graph/loss forms and five transactional optimizers", () => {
   const supported = new Set([
     "graph.detach", "graph.scale_const", "graph.add", "graph.mul", "graph.relu2",
     "graph.silu", "graph.causal_mask", "graph.softmax", "graph.rmsnorm", "loss.mse",
@@ -123,7 +123,8 @@ test("resident schedule covers 52 graph/loss forms plus four transactional optim
     "graph.concat_cols",
     "graph.conv1d", "graph.conv2d", "graph.attention",
     "loss.softmax_cross_entropy",
-    "optimizer.sgd", "optimizer.adamw", "optimizer.cautious_adamw", "optimizer.muon",
+    "optimizer.sgd", "optimizer.adamw", "optimizer.cautious_adamw",
+    "optimizer.int8_adamw", "optimizer.muon",
   ]);
   const representatives = new Map();
   for (const item of corpus.cases) {
@@ -131,7 +132,7 @@ test("resident schedule covers 52 graph/loss forms plus four transactional optim
     if (supported.has(item.operation) && item.expected.kind === "success" &&
         !representatives.has(key)) representatives.set(key, item);
   }
-  assert.equal(representatives.size, 56);
+  assert.equal(representatives.size, 57);
   for (const [key, item] of representatives) {
     const representative = representativePlan(item);
     const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
@@ -229,17 +230,7 @@ test("concat packs forward parts with GPU copies and emits ordered VJP slices", 
   ]);
 });
 
-test("unsupported forms and malformed specialized geometry fail closed", () => {
-  const unsupported = corpus.cases.find((candidate) =>
-    candidate.operation === "optimizer.int8_adamw" && candidate.execution === "step" &&
-    candidate.expected.kind === "success");
-  const optimizer = representativePlan(unsupported);
-  const schedule = compileWebGpuResidentScheduleV1(optimizer.plan, BUDGET);
-  assert.throws(
-    () => schedule.transaction(optimizer.phase, optimizer.operationId, 0),
-    (error) => error instanceof WebTrainingError && error.code === "capability_mismatch",
-  );
-
+test("malformed specialized geometry fails closed", () => {
   const saltItem = structuredClone(corpus.cases.find((candidate) =>
     candidate.operation === "graph.salt_ste" && candidate.execution === "forward" &&
     candidate.expected.kind === "success"));
@@ -463,6 +454,51 @@ test("cautious AdamW resets its atomic mask before every staged transaction", ()
   assert.equal(transaction.commands[5].storageBindings[10], resources[5].id);
   assert.equal(view(transaction.commands[0]).getUint32(32, true), 0x3ef9db22);
   assert.equal(view(transaction.commands[0]).getUint32(36, true), 0x3e120c4c);
+});
+
+test("int8 AdamW unpacks compact state, stages widened math, and repacks commits", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "optimizer.int8_adamw" && candidate.execution === "step" &&
+    candidate.expected.kind === "success");
+  const representative = representativePlan(item);
+  const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
+  const resources = schedule.auxiliaryResources().resources;
+  const transaction = schedule.transaction(
+    representative.phase, representative.operationId, 1, 7,
+  );
+  assert.equal(transaction.commands.length, 12);
+  assert.deepEqual(transaction.commands.map((command) => command.stageIndex),
+    Array.from({ length: 12 }, (_, index) => index));
+  assert.deepEqual(transaction.commands.map((command) => command.uniformSlot),
+    Array.from({ length: 12 }, (_, index) => index + 1));
+  assert.deepEqual(transaction.commands[0].storageBindings, {
+    1: "moment1_q8", 2: resources[1].id,
+  });
+  assert.deepEqual(transaction.commands[1].storageBindings, {
+    1: "moment2_q8", 2: resources[2].id,
+  });
+  assert.deepEqual(transaction.commands[2].storageBindings, {
+    3: resources[1].id, 4: resources[2].id, 5: resources[3].id, 6: resources[4].id,
+  });
+  assert.deepEqual(transaction.commands[4].storageBindings, {
+    1: resources[0].id, 2: "gradient", 3: resources[1].id, 4: resources[2].id,
+    7: resources[5].id, 8: resources[6].id,
+  });
+  assert.deepEqual(transaction.commands[10].storageBindings, {
+    1: resources[1].id, 2: resources[7].id,
+  });
+  assert.deepEqual(transaction.commands[11].storageBindings, {
+    1: resources[2].id, 2: resources[8].id,
+  });
+  assert.deepEqual(transaction.commitCopies.map((copy) => [copy.source, copy.destination]), [
+    [resources[0].id, "parameter"],
+    [resources[7].id, "moment1_q8"],
+    [resources[8].id, "moment2_q8"],
+    [resources[3].id, "moment1_scale"],
+    [resources[4].id, "moment2_scale"],
+  ]);
+  assert.equal(view(transaction.commands[2]).getUint32(32, true), 0x3f4a501a);
+  assert.equal(view(transaction.commands[2]).getUint32(36, true), 0x3e9a738c);
 });
 
 test("Muon snapshots mutable inputs, owns exact workspace, then commits state", () => {

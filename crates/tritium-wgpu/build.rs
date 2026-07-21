@@ -9,6 +9,7 @@ const DISPATCHES: &[&str] = &[
     "linear_primary_input_64",
     "linear_rows_64",
     "optimizer_blocks_256",
+    "packed_words_64",
     "rope_pairs_64",
     "single",
 ];

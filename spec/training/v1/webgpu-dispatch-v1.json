@@ -848,6 +848,20 @@
       "execution": "step",
       "stages": [
         {
+          "moduleId": "byte_codec",
+          "entryPoint": "unpack",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "byte_codec",
+          "entryPoint": "unpack",
+          "selector": null,
+          "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
           "moduleId": "int8_adamw",
           "entryPoint": "dequantize",
           "selector": null,
@@ -901,6 +915,20 @@
           "entryPoint": "quantize",
           "selector": null,
           "dispatch": "linear_parameter_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "byte_codec",
+          "entryPoint": "pack",
+          "selector": null,
+          "dispatch": "packed_words_64",
+          "repeat": "once"
+        },
+        {
+          "moduleId": "byte_codec",
+          "entryPoint": "pack",
+          "selector": null,
+          "dispatch": "packed_words_64",
           "repeat": "once"
         }
       ]

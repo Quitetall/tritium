@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { WebGpuResidentRuntimeV1, WebTrainingError } from "../dist/index.js";
+import {
+  compileWebGpuResidentScheduleV1,
+  TRAINING_MANIFEST_DIGEST_V1,
+  WebGpuResidentRuntimeV1,
+  WebTrainingError,
+} from "../dist/index.js";
 
 class FakeBuffer {
   constructor(size, device, label) {
@@ -405,13 +410,95 @@ test("GPU transfers pad byte tensors and clear reused uniform tails", async () =
   const tinyPlan = { ...plan(), buffers: [...plan().buffers, tiny], residentBytes: 64 };
   const runtime = await WebGpuResidentRuntimeV1.prepare(device, tinyPlan, [
     { bufferId: "tiny", bytes: Uint8Array.of(4, 5, 6) },
-  ]);
+  ], {
+    maxBytes: 4,
+    resources: [{
+      id: "packed-candidate", byteLength: 4, initialBytes: Uint8Array.of(7, 8, 9, 0),
+    }],
+  });
   assert.deepEqual(await runtime.read("tiny"), Uint8Array.of(4, 5, 6));
+
+  runtime.dispatch([], [], [{
+    source: "packed-candidate", sourceOffset: 0,
+    destination: "tiny", destinationOffset: 0, byteLength: 4,
+  }]);
+  assert.deepEqual(await runtime.read("tiny"), Uint8Array.of(7, 8, 9));
+  assert.throws(
+    () => runtime.dispatch([], [], [{
+      source: "packed-candidate", sourceOffset: 0,
+      destination: "tiny", destinationOffset: 0, byteLength: 8,
+    }]),
+    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+  );
 
   runtime.dispatch([{ ...command, uniformBytes: new Uint8Array(256).fill(7) }]);
   runtime.dispatch([{ ...command, uniformBytes: Uint8Array.of(1, 2, 3, 4) }]);
   const uniform = device.buffers.get("tritium:uniform-arena").bytes;
   assert.deepEqual(uniform.slice(0, 6), Uint8Array.of(1, 2, 3, 4, 0, 0));
+  runtime.dispose();
+});
+
+test("resident int8 AdamW binds each auto-layout entry point exactly", async () => {
+  const specs = [
+    ["parameter", "f32", [4], 16],
+    ["gradient", "f32", [4], 16],
+    ["moment1_q8", "bytes", [4], 4],
+    ["moment2_q8", "bytes", [4], 4],
+    ["moment1_scale", "f32", [1], 4],
+    ["moment2_scale", "f32", [1], 4],
+  ];
+  let byteOffset = 0;
+  const buffers = specs.map(([id, dtype, shape, byteLength]) => {
+    const result = {
+      id, role: "activation", dtype, shape, aliasOf: null, ownerId: id,
+      byteOffset, byteLength, backwardInitialization: "none",
+    };
+    byteOffset += 16;
+    return result;
+  });
+  const int8Plan = {
+    schemaId: "tritium.compiled_training_plan",
+    schemaVersion: 1,
+    manifestDigest: TRAINING_MANIFEST_DIGEST_V1,
+    buffers,
+    operations: [{
+      id: "int8-step",
+      operation: "optimizer.int8_adamw",
+      inputs: specs.map(([id]) => id),
+      outputs: ["parameter", "moment1_q8", "moment2_q8", "moment1_scale", "moment2_scale"],
+      attributes: [
+        { name: "step", kind: "u64", value: 0 },
+        { name: "lr", kind: "f32", value: Math.fround(0.01) },
+        { name: "beta1", kind: "f32", value: Math.fround(0.9) },
+        { name: "beta2", kind: "f32", value: Math.fround(0.95) },
+        { name: "eps", kind: "f32", value: Math.fround(1e-8) },
+        { name: "weight_decay", kind: "f32", value: Math.fround(0.01) },
+      ],
+    }],
+    backwardOperations: [],
+    residentBytes: byteOffset,
+    batchStagingBytes: 0,
+    preparePeakBytes: byteOffset,
+    forwardPeakBytes: byteOffset,
+    exportPackageBytes: 0,
+    exportPeakBytes: byteOffset,
+    peakBytes: byteOffset,
+  };
+  const schedule = compileWebGpuResidentScheduleV1(
+    int8Plan, { maxPeakBytes: 1 << 20 },
+  );
+  const device = new FakeDevice();
+  const runtime = await WebGpuResidentRuntimeV1.prepare(
+    device,
+    int8Plan,
+    buffers.map((entry) => ({ bufferId: entry.id, bytes: new Uint8Array(entry.byteLength) })),
+    schedule.auxiliaryResources(),
+  );
+  const transaction = schedule.transaction("forward", "int8-step", 0, 1);
+  runtime.dispatch(transaction.commands, transaction.copies, transaction.commitCopies);
+  assert.equal(device.pipelines, 12);
+  assert.equal(device.bindGroups, 12);
+  assert.equal(device.events.filter((event) => event === "dispatch").length, 12);
   runtime.dispose();
 });
 

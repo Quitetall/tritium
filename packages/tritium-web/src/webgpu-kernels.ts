@@ -12,6 +12,7 @@ export interface WebGpuKernelModuleV1 {
   readonly sha256: string;
   readonly source: string;
   readonly bindings: readonly WebGpuKernelBindingV1[];
+  readonly entryPointBindings: Readonly<Record<string, readonly WebGpuKernelBindingV1[]>>;
   readonly entryPoints: Readonly<Record<string, readonly [number, number, number]>>;
 }
 
@@ -41,6 +42,7 @@ export type WebGpuDispatchGeometryV1 =
   | "linear_primary_input_64"
   | "linear_rows_64"
   | "optimizer_blocks_256"
+  | "packed_words_64"
   | "rope_pairs_64"
   | "single";
 

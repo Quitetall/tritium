@@ -48,8 +48,24 @@ const OPERATION_MODULES = Object.freeze({
     "cautious_adamw_rescale",
     "cautious_adamw_finish",
   ],
-  "optimizer.int8_adamw": ["int8_adamw"],
+  "optimizer.int8_adamw": ["byte_codec", "int8_adamw"],
   "optimizer.muon": ["muon"],
+});
+
+// WebGPU auto layouts contain only resources statically used by one entry point.
+// Multi-entry modules therefore need an explicit per-entry subset; single-entry
+// modules safely default to every source-declared binding.
+const ENTRY_POINT_BINDINGS = Object.freeze({
+  int8_adamw: Object.freeze({
+    dequantize: [0, 3, 4, 5, 6],
+    square_variance: [0, 4],
+    products: [0, 1, 2, 3, 4, 7, 8],
+    finish_products: [0, 2, 3, 7, 8],
+    finish_variance: [0, 4, 8],
+    update_parameter: [0, 1, 3, 4],
+    reduce_scales: [0, 3, 4, 5, 6],
+    quantize: [0, 3, 4, 5, 6],
+  }),
 });
 
 const stage = (
@@ -133,6 +149,8 @@ const DISPATCH_FORMS = Object.freeze({
     one("cautious_adamw_finish", "linear_parameter_64"),
   ],
   "optimizer.int8_adamw|step": [
+    stage("byte_codec", "linear_parameter_64", null, "unpack"),
+    stage("byte_codec", "linear_parameter_64", null, "unpack"),
     stage("int8_adamw", "linear_parameter_64", null, "dequantize"),
     stage("int8_adamw", "linear_parameter_64", null, "square_variance"),
     stage("int8_adamw", "linear_parameter_64", null, "products"),
@@ -141,6 +159,8 @@ const DISPATCH_FORMS = Object.freeze({
     stage("int8_adamw", "linear_parameter_64", null, "update_parameter"),
     stage("int8_adamw", "optimizer_blocks_256", null, "reduce_scales"),
     stage("int8_adamw", "linear_parameter_64", null, "quantize"),
+    stage("byte_codec", "packed_words_64", null, "pack"),
+    stage("byte_codec", "packed_words_64", null, "pack"),
   ],
   "optimizer.muon|step": [one("muon", "single")],
 });
@@ -209,7 +229,9 @@ function shaderMetadata(source, id) {
 }
 
 function generatedSource(modules, operations, forms, bundleDigest, catalogDigest) {
-  const moduleEntries = modules.map(({ id, source, digest, bindings, entryPoints }) =>
+  const moduleEntries = modules.map(({
+    id, source, digest, bindings, entryPoints, entryPointBindings,
+  }) =>
     `  ${JSON.stringify(id)}: Object.freeze({\n` +
       `    id: ${JSON.stringify(id)},\n` +
       `    sha256: ${JSON.stringify(digest)},\n` +
@@ -217,6 +239,11 @@ function generatedSource(modules, operations, forms, bundleDigest, catalogDigest
       `    bindings: Object.freeze([${bindings.map((binding) =>
         `Object.freeze(${JSON.stringify(binding)})`,
       ).join(",")}]),\n` +
+      `    entryPointBindings: Object.freeze({${Object.entries(entryPointBindings).map(
+        ([entryPoint, values]) => `${JSON.stringify(entryPoint)}: Object.freeze([${values.map(
+          (binding) => `Object.freeze(${JSON.stringify(binding)})`,
+        ).join(",")}])`,
+      ).join(",")}}),\n` +
       `    entryPoints: Object.freeze({${Object.entries(entryPoints).map(
         ([entryPoint, workgroupSize]) =>
           `${JSON.stringify(entryPoint)}: Object.freeze(${JSON.stringify(workgroupSize)}) as ` +
@@ -270,7 +297,26 @@ async function generate() {
   for (const id of moduleIds) {
     const path = resolve(shaderRoot, `${id}.wgsl`);
     const source = await readFile(path, "utf8");
-    modules.push({ id, source, digest: sha256(source), ...shaderMetadata(source, id) });
+    const metadata = shaderMetadata(source, id);
+    const configured = ENTRY_POINT_BINDINGS[id];
+    if (configured !== undefined &&
+        (Object.keys(configured).length !== Object.keys(metadata.entryPoints).length ||
+          Object.keys(metadata.entryPoints).some((entryPoint) => configured[entryPoint] === undefined))) {
+      throw new Error(`${id} entry-point binding map drifted from source`);
+    }
+    const byId = new Map(metadata.bindings.map((binding) => [binding.binding, binding]));
+    const entryPointBindings = Object.fromEntries(
+      Object.keys(metadata.entryPoints).map((entryPoint) => {
+        const ids = configured?.[entryPoint] ?? metadata.bindings.map((binding) => binding.binding);
+        if (new Set(ids).size !== ids.length || ids.some((binding) => !byId.has(binding))) {
+          throw new Error(`${id}.${entryPoint} references an unknown or duplicate binding`);
+        }
+        return [entryPoint, ids.map((binding) => byId.get(binding))];
+      }),
+    );
+    modules.push({
+      id, source, digest: sha256(source), ...metadata, entryPointBindings,
+    });
   }
   const operations = tensorOperations.map((operation) => ({
     operation,

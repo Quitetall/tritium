@@ -39,6 +39,7 @@ test("WGSL candidate dependency index keys every frozen tensor operation", () =>
       assert.ok(Object.isFrozen(module));
       assert.ok(Object.isFrozen(module.bindings));
       assert.ok(Object.isFrozen(module.entryPoints));
+      assert.ok(Object.isFrozen(module.entryPointBindings));
       assert.ok(module.bindings.length > 0);
       assert.ok(module.bindings.every((binding) => binding.group === 0));
       assert.equal(
@@ -53,7 +54,17 @@ test("WGSL candidate dependency index keys every frozen tensor operation", () =>
   );
   assert.deepEqual(
     bundle.candidateOperationModuleDependencies["optimizer.int8_adamw"],
-    ["int8_adamw"],
+    ["byte_codec", "int8_adamw"],
+  );
+  assert.deepEqual(
+    bundle.modules.int8_adamw.entryPointBindings.dequantize.map((binding) => binding.binding),
+    [0, 3, 4, 5, 6],
+  );
+  assert.deepEqual(
+    bundle.modules.int8_adamw.entryPointBindings.square_variance.map(
+      (binding) => binding.binding,
+    ),
+    [0, 4],
   );
   assert.deepEqual(
     bundle.candidateOperationModuleDependencies["graph.salt_ste"],
@@ -113,6 +124,8 @@ test("WebGPU dispatch catalog covers all 57 frozen execution forms", () => {
       (stage) => stage.entryPoint,
     ),
     [
+      "unpack",
+      "unpack",
       "dequantize",
       "square_variance",
       "products",
@@ -121,6 +134,8 @@ test("WebGPU dispatch catalog covers all 57 frozen execution forms", () => {
       "update_parameter",
       "reduce_scales",
       "quantize",
+      "pack",
+      "pack",
     ],
   );
   assert.throws(

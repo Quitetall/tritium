@@ -438,13 +438,15 @@ export class WebGpuResidentRuntimeV1 {
         for (const [stageIndex, stage] of form.stages.entries()) {
           const stageKey = key(form.operation, form.execution, stageIndex);
           const module = bundle.modules[stage.moduleId];
-          const storageBindings = module?.bindings.filter(
+          const stageBindings = module?.entryPointBindings[stage.entryPoint];
+          const storageBindings = stageBindings?.filter(
             (binding) => binding.addressSpace === "storage",
           ).length ?? 0;
-          const uniformBindings = module?.bindings.filter(
+          const uniformBindings = stageBindings?.filter(
             (binding) => binding.addressSpace === "uniform",
           ).length ?? 0;
-          if (module === undefined || module.bindings.length > maxBindings ||
+          if (module === undefined || stageBindings === undefined ||
+              stageBindings.length > maxBindings ||
               storageBindings > maxStorageBindings ||
               uniformBindings > maxUniformBindings) {
             fail("capability_mismatch", `${stage.moduleId} exceeds WebGPU binding limits`);
@@ -461,12 +463,12 @@ export class WebGpuResidentRuntimeV1 {
             }),
             lossDuringPrepare,
           ]);
-          const hasUniform = module.bindings.some(
+          const hasUniform = stageBindings.some(
             (binding) => binding.addressSpace === "uniform",
           );
           stages.set(stageKey, Object.freeze({
             pipeline,
-            bindings: module.bindings,
+            bindings: stageBindings,
             hasUniform,
           }));
         }
@@ -588,9 +590,15 @@ export class WebGpuResidentRuntimeV1 {
       const destination = this.#buffers.get(destinationId);
       const sourceEnd = safeSourceOffset + safeByteLength;
       const destinationEnd = safeDestinationOffset + safeByteLength;
+      const sourceFits = source !== undefined && (sourceEnd <= source.byteLength ||
+        (safeSourceOffset === 0 && safeByteLength === paddedBytes(source.byteLength)));
+      const destinationFits = destination !== undefined &&
+        (destinationEnd <= destination.byteLength ||
+          (safeDestinationOffset === 0 &&
+            safeByteLength === paddedBytes(destination.byteLength)));
       if (source === undefined || destination === undefined ||
-          !Number.isSafeInteger(sourceEnd) || sourceEnd > source.byteLength ||
-          !Number.isSafeInteger(destinationEnd) || destinationEnd > destination.byteLength) {
+          !Number.isSafeInteger(sourceEnd) || !sourceFits ||
+          !Number.isSafeInteger(destinationEnd) || !destinationFits) {
         fail("invalid_schema", "WebGPU resident copy exceeds a resource view");
       }
       if (source.ownerId === destination.ownerId) {

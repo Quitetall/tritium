@@ -63,8 +63,10 @@ mod tests {
             "per_output"
         );
         let int8 = portable_dispatch_form_v1("optimizer.int8_adamw", "step").unwrap();
-        assert_eq!(int8.stages.len(), 8);
-        assert_eq!(int8.stages[6].entry_point, "reduce_scales");
-        assert_eq!(int8.stages[6].dispatch, "optimizer_blocks_256");
+        assert_eq!(int8.stages.len(), 12);
+        assert_eq!(int8.stages[8].entry_point, "reduce_scales");
+        assert_eq!(int8.stages[8].dispatch, "optimizer_blocks_256");
+        assert_eq!(int8.stages[10].entry_point, "pack");
+        assert_eq!(int8.stages[10].dispatch, "packed_words_64");
     }
 }

@@ -65,6 +65,7 @@ const SPECIALIZED = new Set([
   "optimizer.sgd",
   "optimizer.adamw",
   "optimizer.cautious_adamw",
+  "optimizer.int8_adamw",
   "optimizer.muon",
 ]);
 
@@ -302,7 +303,7 @@ function powiF32(base: number, exponent: number): number {
 function expect(
   buffers: BufferMap,
   bufferId: string,
-  dtype: "f32" | "u32",
+  dtype: "f32" | "u32" | "bytes",
   shape: readonly number[],
   role: string,
 ): void {
@@ -339,10 +340,12 @@ function indexedStage(
   storageBindings: Readonly<Record<number, string>>,
   workgroups: readonly [number, number, number],
   expectedRepeat: "once" | "per_output" = "once",
+  expectedEntryPoint = "main",
 ): WebGpuResidentDispatchV1 {
   const form = webGpuDispatchFormV1(invocation.operation, invocation.execution);
   if (form.stages[stageIndex]?.repeat !== expectedRepeat ||
-      form.stages[stageIndex]?.moduleId !== expectedModuleId) {
+      form.stages[stageIndex]?.moduleId !== expectedModuleId ||
+      form.stages[stageIndex]?.entryPoint !== expectedEntryPoint) {
     fail("invalid_schema", `${invocation.operation} specialized catalog stage drifted`);
   }
   return Object.freeze({
@@ -370,6 +373,7 @@ function stage(
   }
   return indexedStage(
     invocation, 0, expectedModuleId, uniformBytes, storageBindings, workgroups, expectedRepeat,
+    "main",
   );
 }
 
@@ -1199,6 +1203,195 @@ export function compileWebGpuResidentScheduleV1(
             Object.freeze({
               source: candidateMoment2, sourceOffset: 0, destination: resultMoment2,
               destinationOffset: 0, byteLength: bytes,
+            }),
+          ]),
+        });
+      }
+      case "optimizer.int8_adamw|step": {
+        if (webGpuDispatchFormV1(invocation.operation, invocation.execution).stages.length !== 12) {
+          fail("invalid_schema", "optimizer.int8_adamw specialized catalog stage drifted");
+        }
+        if (safeU64(attributes.step, "step") !== 0) {
+          fail("invalid_schema", "int8 AdamW compiled recipe step must start at zero");
+        }
+        const learningRate = webGpuF32V1(attributes.lr, "lr");
+        const beta1 = webGpuF32V1(attributes.beta1, "beta1");
+        const beta2 = webGpuF32V1(attributes.beta2, "beta2");
+        const epsilon = webGpuF32V1(attributes.eps, "eps");
+        const weightDecay = webGpuF32V1(attributes.weight_decay, "weight_decay");
+        if (learningRate < 0 || beta1 < 0 || beta1 >= 1 || beta2 < 0 || beta2 >= 1 ||
+            epsilon <= 0 || weightDecay < 0) {
+          fail("invalid_schema", "int8 AdamW scalar attributes are invalid");
+        }
+        const parameter = requiredWebGpuRoleV1(input, "parameter");
+        const gradient = requiredWebGpuRoleV1(input, "gradient");
+        const moment1 = requiredWebGpuRoleV1(input, "moment1_q8");
+        const moment2 = requiredWebGpuRoleV1(input, "moment2_q8");
+        const scale1 = requiredWebGpuRoleV1(input, "moment1_scale");
+        const scale2 = requiredWebGpuRoleV1(input, "moment2_scale");
+        const resultParameter = requiredWebGpuRoleV1(output, "parameter");
+        const resultMoment1 = requiredWebGpuRoleV1(output, "moment1_q8");
+        const resultMoment2 = requiredWebGpuRoleV1(output, "moment2_q8");
+        const resultScale1 = requiredWebGpuRoleV1(output, "moment1_scale");
+        const resultScale2 = requiredWebGpuRoleV1(output, "moment2_scale");
+        const parameterBuffer = buffers.get(parameter);
+        if (parameterBuffer === undefined || parameterBuffer.dtype !== "f32") {
+          fail("invalid_schema", "int8 AdamW parameter must be f32");
+        }
+        const len = product("int8 AdamW parameter", ...parameterBuffer.shape);
+        const blocks = Math.ceil(len / 256);
+        expect(buffers, gradient, "f32", parameterBuffer.shape, "int8 AdamW gradient");
+        expect(buffers, resultParameter, "f32", parameterBuffer.shape, "int8 AdamW result");
+        for (const [id, role] of [
+          [moment1, "moment1_q8"], [moment2, "moment2_q8"],
+          [resultMoment1, "result moment1_q8"], [resultMoment2, "result moment2_q8"],
+        ] as const) {
+          expect(buffers, id, "bytes", [len], `int8 AdamW ${role}`);
+        }
+        for (const [id, role] of [
+          [scale1, "moment1_scale"], [scale2, "moment2_scale"],
+          [resultScale1, "result moment1_scale"], [resultScale2, "result moment2_scale"],
+        ] as const) {
+          expect(buffers, id, "f32", [blocks], `int8 AdamW ${role}`);
+        }
+        for (const [source, destination, role] of [
+          [parameter, resultParameter, "parameter"],
+          [moment1, resultMoment1, "moment1_q8"],
+          [moment2, resultMoment2, "moment2_q8"],
+          [scale1, resultScale1, "moment1_scale"],
+          [scale2, resultScale2, "moment2_scale"],
+        ] as const) {
+          if (buffers.get(source)!.ownerId !== buffers.get(destination)!.ownerId) {
+            fail("invalid_schema", `int8 AdamW output must commit to ${role} owner`);
+          }
+        }
+        const tensorBytes = product("int8 AdamW tensor bytes", len, 4);
+        const scaleBytes = product("int8 AdamW scale bytes", blocks, 4);
+        const packedWords = Math.ceil(len / 4);
+        const packedBytes = product("int8 AdamW packed bytes", packedWords, 4);
+        const candidateParameter = auxiliary("int8-adamw-parameter-candidate", tensorBytes, null);
+        const expandedMoment1 = auxiliary("int8-adamw-expanded-moment1", tensorBytes, null);
+        const expandedMoment2 = auxiliary("int8-adamw-expanded-moment2", tensorBytes, null);
+        const candidateScale1 = auxiliary("int8-adamw-moment1-scale-candidate", scaleBytes, null);
+        const candidateScale2 = auxiliary("int8-adamw-moment2-scale-candidate", scaleBytes, null);
+        const scratch1 = auxiliary("int8-adamw-scratch-1", tensorBytes, null);
+        const scratch2 = auxiliary("int8-adamw-scratch-2", tensorBytes, null);
+        const packedMoment1 = auxiliary("int8-adamw-packed-moment1-candidate", packedBytes, null);
+        const packedMoment2 = auxiliary("int8-adamw-packed-moment2-candidate", packedBytes, null);
+        const linearWorkgroups = [Math.ceil(len / 64), 1, 1] as const;
+        const packedWorkgroups = [Math.ceil(packedWords / 64), 1, 1] as const;
+        const codecParams = uniform(16, (view) => view.setUint32(0, len, true));
+        const commandFactory = (optimizerStep: number) => {
+          if (!Number.isSafeInteger(optimizerStep) || optimizerStep <= 0) {
+            fail("invalid_schema", "optimizerStep must be a positive safe integer");
+          }
+          const exponent = Math.min(optimizerStep, 0x7fff_ffff);
+          const params = uniform(48, (view) => {
+            view.setUint32(0, len, true);
+            view.setFloat32(16, learningRate, true);
+            view.setFloat32(20, beta1, true);
+            view.setFloat32(24, beta2, true);
+            view.setFloat32(28, epsilon, true);
+            view.setFloat32(32, Math.fround(1 - powiF32(beta1, exponent)), true);
+            view.setFloat32(36, Math.fround(1 - powiF32(beta2, exponent)), true);
+            view.setFloat32(
+              40, Math.fround(1 - Math.fround(learningRate * weightDecay)), true,
+            );
+          });
+          const commands = [
+            indexedStage(invocation, 0, "byte_codec", codecParams, {
+              1: moment1, 2: expandedMoment1,
+            }, linearWorkgroups, "once", "unpack"),
+            indexedStage(invocation, 1, "byte_codec", codecParams, {
+              1: moment2, 2: expandedMoment2,
+            }, linearWorkgroups, "once", "unpack"),
+          ];
+          const coreStages: readonly (readonly [
+            string, Readonly<Record<number, string>>,
+          ])[] = [
+            ["dequantize", {
+              3: expandedMoment1, 4: expandedMoment2, 5: candidateScale1, 6: candidateScale2,
+            }],
+            ["square_variance", { 4: expandedMoment2 }],
+            ["products", {
+              1: candidateParameter, 2: gradient, 3: expandedMoment1, 4: expandedMoment2,
+              7: scratch1, 8: scratch2,
+            }],
+            ["finish_products", {
+              2: gradient, 3: expandedMoment1, 7: scratch1, 8: scratch2,
+            }],
+            ["finish_variance", { 4: expandedMoment2, 8: scratch2 }],
+            ["update_parameter", {
+              1: candidateParameter, 3: expandedMoment1, 4: expandedMoment2,
+            }],
+            ["reduce_scales", {
+              3: expandedMoment1, 4: expandedMoment2, 5: candidateScale1, 6: candidateScale2,
+            }],
+            ["quantize", {
+              3: expandedMoment1, 4: expandedMoment2, 5: candidateScale1, 6: candidateScale2,
+            }],
+          ];
+          for (const [offset, [entryPoint, stageBindings]] of coreStages.entries()) {
+            commands.push(indexedStage(
+              invocation,
+              offset + 2,
+              "int8_adamw",
+              params,
+              stageBindings,
+              entryPoint === "reduce_scales"
+                ? [blocks, 1, 1]
+                : linearWorkgroups,
+              "once",
+              entryPoint,
+            ));
+          }
+          commands.push(
+            indexedStage(invocation, 10, "byte_codec", codecParams, {
+              1: expandedMoment1, 2: packedMoment1,
+            }, packedWorkgroups, "once", "pack"),
+            indexedStage(invocation, 11, "byte_codec", codecParams, {
+              1: expandedMoment2, 2: packedMoment2,
+            }, packedWorkgroups, "once", "pack"),
+          );
+          return Object.freeze(commands);
+        };
+        return Object.freeze({
+          commands: Object.freeze([]),
+          commandFactory,
+          copies: Object.freeze([
+            Object.freeze({
+              source: parameter, sourceOffset: 0, destination: candidateParameter,
+              destinationOffset: 0, byteLength: tensorBytes,
+            }),
+            Object.freeze({
+              source: scale1, sourceOffset: 0, destination: candidateScale1,
+              destinationOffset: 0, byteLength: scaleBytes,
+            }),
+            Object.freeze({
+              source: scale2, sourceOffset: 0, destination: candidateScale2,
+              destinationOffset: 0, byteLength: scaleBytes,
+            }),
+          ]),
+          commitCopies: Object.freeze([
+            Object.freeze({
+              source: candidateParameter, sourceOffset: 0, destination: resultParameter,
+              destinationOffset: 0, byteLength: tensorBytes,
+            }),
+            Object.freeze({
+              source: packedMoment1, sourceOffset: 0, destination: resultMoment1,
+              destinationOffset: 0, byteLength: packedBytes,
+            }),
+            Object.freeze({
+              source: packedMoment2, sourceOffset: 0, destination: resultMoment2,
+              destinationOffset: 0, byteLength: packedBytes,
+            }),
+            Object.freeze({
+              source: candidateScale1, sourceOffset: 0, destination: resultScale1,
+              destinationOffset: 0, byteLength: scaleBytes,
+            }),
+            Object.freeze({
+              source: candidateScale2, sourceOffset: 0, destination: resultScale2,
+              destinationOffset: 0, byteLength: scaleBytes,
             }),
           ]),
         });
