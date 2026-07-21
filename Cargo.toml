@@ -68,6 +68,7 @@ tritium-quantize = { path = "crates/tritium-quantize", version = "1.0.0" }
 tritium-salt = { path = "crates/tritium-salt", version = "1.0.0" }
 tritium-nn = { path = "crates/tritium-nn", version = "1.0.0" }
 tritium-train = { path = "crates/tritium-train", version = "1.0.0" }
+tritium-onnx = { path = "crates/tritium-onnx", version = "1.0.0", default-features = false }
 # foundation
 bytemuck = "1"
 blake3 = "1"

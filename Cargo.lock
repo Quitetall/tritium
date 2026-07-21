@@ -4447,6 +4447,7 @@ dependencies = [
  "tritium-cuda",
  "tritium-format",
  "tritium-nn",
+ "tritium-onnx",
  "tritium-quantize",
  "tritium-runtime",
  "tritium-salt",

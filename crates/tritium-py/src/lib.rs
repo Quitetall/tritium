@@ -29,6 +29,7 @@
 #![allow(unreachable_pub)] // pyo3's `#[pymethods]` expansion emits `pub` items.
 
 mod hf_assets;
+mod onnx;
 mod ops;
 mod qwen;
 mod salt;
@@ -252,7 +253,10 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Model>()?;
     m.add_class::<qwen::QwenModel>()?;
     m.add_class::<qwen::QwenLoadReceipt>()?;
+    m.add_class::<onnx::QwenOnnxBundleReceipt>()?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
+    m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;
+    m.add_function(wrap_pyfunction!(onnx::stage_qwen35_onnx_bundle, m)?)?;
     // Autograd-op primitives (ADR 0030): forward/vjp for ternary Conv1d, FSQ, and STE.
     m.add_function(wrap_pyfunction!(ops::conv1d_forward, m)?)?;
     m.add_function(wrap_pyfunction!(ops::conv1d_vjp, m)?)?;

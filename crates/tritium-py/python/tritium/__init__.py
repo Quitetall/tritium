@@ -20,7 +20,7 @@ from ._tritium import (
     ste_quantize_vjp,
     ternary_matmul,
 )
-from . import portable, salt
+from . import onnx, portable, salt
 
 __all__ = [
     "Model",
@@ -37,6 +37,7 @@ __all__ = [
     "ste_quantize_forward",
     "ste_quantize_vjp",
     "salt",
+    "onnx",
     "portable",
 ]
 
