@@ -38,6 +38,7 @@ from .ops import reference_ternary_linear, ternary_linear
 from .onnx import (
     OnnxBundleManifest,
     OnnxCausalLMOutput,
+    OnnxMtpOutput,
     QwenOnnxCausalLM,
     export_onnx,
     load_onnx,
@@ -65,6 +66,7 @@ __all__ = [
     "LSQEstimator",
     "OnnxBundleManifest",
     "OnnxCausalLMOutput",
+    "OnnxMtpOutput",
     "ProjectionContext",
     "PreparedModel",
     "QuantizationResult",

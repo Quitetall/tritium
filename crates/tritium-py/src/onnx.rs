@@ -172,7 +172,7 @@ pub(crate) struct QwenOnnxModel {
     mtp_inputs: Vec<String>,
     mtp_outputs: Vec<String>,
     language_session: Mutex<Session>,
-    _mtp_session: Mutex<Session>,
+    mtp_session: Mutex<Session>,
 }
 
 /// Owned output of one fixed-shape Qwen language graph execution.
@@ -180,6 +180,18 @@ pub(crate) struct QwenOnnxModel {
 pub(crate) struct QwenOnnxLanguageOutput {
     logits_shape: Vec<usize>,
     logits: Vec<f32>,
+    state_names: Vec<String>,
+    state_shapes: Vec<Vec<usize>>,
+    states: Vec<Vec<f32>>,
+}
+
+/// Owned output of one fixed-shape Qwen MTP graph execution.
+#[pyclass(module = "tritium", frozen, skip_from_py_object)]
+pub(crate) struct QwenOnnxMtpOutput {
+    logits_shape: Vec<usize>,
+    logits: Vec<f32>,
+    final_hidden_shape: Vec<usize>,
+    final_hidden: Vec<f32>,
     state_names: Vec<String>,
     state_shapes: Vec<Vec<usize>>,
     states: Vec<Vec<f32>>,
@@ -195,6 +207,44 @@ impl QwenOnnxLanguageOutput {
     #[getter]
     fn logits(&self) -> Vec<f32> {
         self.logits.clone()
+    }
+
+    #[getter]
+    fn state_names(&self) -> Vec<String> {
+        self.state_names.clone()
+    }
+
+    #[getter]
+    fn state_shapes(&self) -> Vec<Vec<usize>> {
+        self.state_shapes.clone()
+    }
+
+    #[getter]
+    fn states(&self) -> Vec<Vec<f32>> {
+        self.states.clone()
+    }
+}
+
+#[pymethods]
+impl QwenOnnxMtpOutput {
+    #[getter]
+    fn logits_shape(&self) -> Vec<usize> {
+        self.logits_shape.clone()
+    }
+
+    #[getter]
+    fn logits(&self) -> Vec<f32> {
+        self.logits.clone()
+    }
+
+    #[getter]
+    fn final_hidden_shape(&self) -> Vec<usize> {
+        self.final_hidden_shape.clone()
+    }
+
+    #[getter]
+    fn final_hidden(&self) -> Vec<f32> {
+        self.final_hidden.clone()
     }
 
     #[getter]
@@ -296,6 +346,38 @@ impl QwenOnnxModel {
             ));
         }
         py.detach(|| run_language(self, token_ids, states))
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Execute the authenticated fixed-shape bundled MTP drafter graph.
+    ///
+    /// `target_hidden` is flattened row-major from `[tokens, hidden]`. `states`
+    /// follows `mtp_inputs[2:]` and may be omitted only for a prompt graph.
+    #[pyo3(signature = (token_ids, target_hidden, states = None))]
+    fn forward_mtp(
+        &self,
+        py: Python<'_>,
+        token_ids: Vec<i64>,
+        target_hidden: Vec<f32>,
+        states: Option<Vec<Vec<f32>>>,
+    ) -> PyResult<QwenOnnxMtpOutput> {
+        if token_ids.len()
+            != usize::try_from(self.receipt.mtp_tokens).map_err(|_| {
+                PyValueError::new_err("authenticated MTP token count exceeds platform bounds")
+            })?
+        {
+            return Err(PyValueError::new_err(format!(
+                "token_ids has length {}, expected {} for this fixed-shape MTP graph",
+                token_ids.len(),
+                self.receipt.mtp_tokens
+            )));
+        }
+        if states.is_none() && self.receipt.mtp_past_tokens != 0 {
+            return Err(PyValueError::new_err(
+                "states are required when the authenticated MTP graph has past_tokens > 0",
+            ));
+        }
+        py.detach(|| run_mtp(self, token_ids, target_hidden, states))
             .map_err(PyRuntimeError::new_err)
     }
 }
@@ -435,7 +517,7 @@ fn load_onnx_runtime(requested: &Path) -> Result<QwenOnnxModel, String> {
         mtp_inputs,
         mtp_outputs,
         language_session: Mutex::new(language_session),
-        _mtp_session: Mutex::new(mtp_session),
+        mtp_session: Mutex::new(mtp_session),
     })
 }
 
@@ -494,37 +576,150 @@ fn run_language(
     let outputs = session
         .run(inputs.as_slice())
         .map_err(|error| format!("execute authenticated language ORT graph failed: {error}"))?;
-    let (logits_shape, logits) = outputs[0]
-        .try_extract_tensor::<f32>()
-        .map_err(|error| format!("extract language logits failed: {error}"))?;
-    let logits_shape = runtime_shape(logits_shape, "language logits")?;
-    let logits = logits.to_vec();
-    let mut output_shapes = Vec::with_capacity(outputs.len().saturating_sub(1));
-    let mut output_states = Vec::with_capacity(outputs.len().saturating_sub(1));
-    for index in 1..outputs.len() {
-        let (shape, values) = outputs[index]
-            .try_extract_tensor::<f32>()
-            .map_err(|error| {
-                format!(
-                    "extract language state output {} failed: {error}",
-                    index - 1
-                )
-            })?;
-        output_shapes.push(runtime_shape(shape, "language state output")?);
-        output_states.push(values.to_vec());
+    let (logits_shape, logits) = extract_f32_output(&outputs, "logits", "language logits")?;
+    let state_names = model
+        .language_outputs
+        .iter()
+        .skip(1)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut output_shapes = Vec::with_capacity(state_names.len());
+    let mut output_states = Vec::with_capacity(state_names.len());
+    for name in &state_names {
+        let (shape, values) = extract_f32_output(&outputs, name, "language state output")?;
+        output_shapes.push(shape);
+        output_states.push(values);
     }
     Ok(QwenOnnxLanguageOutput {
         logits_shape,
         logits,
-        state_names: model.language_outputs.iter().skip(1).cloned().collect(),
+        state_names,
         state_shapes: output_shapes,
         states: output_states,
     })
 }
 
+fn run_mtp(
+    model: &QwenOnnxModel,
+    token_ids: Vec<i64>,
+    target_hidden: Vec<f32>,
+    states: Option<Vec<Vec<f32>>>,
+) -> Result<QwenOnnxMtpOutput, String> {
+    let mut session = model
+        .mtp_session
+        .lock()
+        .map_err(|_| "MTP ORT session lock was poisoned".to_owned())?;
+    let target_input = session
+        .inputs()
+        .get(1)
+        .ok_or_else(|| "authenticated MTP session has no target_hidden input".to_owned())?;
+    let target_shape = fixed_f32_shape(target_input.dtype(), "target_hidden")?;
+    let expected_hidden = shape_elements(&target_shape, "MTP target hidden")?;
+    if target_hidden.len() != expected_hidden {
+        return Err(format!(
+            "MTP target hidden has {} values, expected {expected_hidden}",
+            target_hidden.len()
+        ));
+    }
+    let state_shapes = session
+        .inputs()
+        .iter()
+        .skip(2)
+        .map(|outlet| fixed_f32_shape(outlet.dtype(), outlet.name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let states = prepare_states(states, &state_shapes, "MTP")?;
+
+    let tokens = Tensor::from_array((vec![token_ids.len()], token_ids.into_boxed_slice()))
+        .map_err(|error| format!("create MTP token tensor failed: {error}"))?;
+    let hidden = Tensor::from_array((target_shape, target_hidden.into_boxed_slice()))
+        .map_err(|error| format!("create MTP target hidden tensor failed: {error}"))?;
+    let mut inputs: Vec<SessionInputValue<'_>> = Vec::with_capacity(2 + states.len());
+    inputs.push(tokens.into_dyn().into());
+    inputs.push(hidden.into_dyn().into());
+    for (shape, values) in state_shapes.iter().cloned().zip(states) {
+        let tensor = Tensor::from_array((shape, values.into_boxed_slice()))
+            .map_err(|error| format!("create MTP state tensor failed: {error}"))?;
+        inputs.push(tensor.into_dyn().into());
+    }
+    let outputs = session
+        .run(inputs.as_slice())
+        .map_err(|error| format!("execute authenticated MTP ORT graph failed: {error}"))?;
+    let (logits_shape, logits) = extract_f32_output(&outputs, "mtp.logits", "MTP logits")?;
+    let (final_hidden_shape, final_hidden) =
+        extract_f32_output(&outputs, "mtp.final_hidden", "MTP final hidden")?;
+    let state_names = model
+        .mtp_outputs
+        .iter()
+        .skip(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut output_shapes = Vec::with_capacity(state_names.len());
+    let mut output_states = Vec::with_capacity(state_names.len());
+    for name in &state_names {
+        let (shape, values) = extract_f32_output(&outputs, name, "MTP state output")?;
+        output_shapes.push(shape);
+        output_states.push(values);
+    }
+    Ok(QwenOnnxMtpOutput {
+        logits_shape,
+        logits,
+        final_hidden_shape,
+        final_hidden,
+        state_names,
+        state_shapes: output_shapes,
+        states: output_states,
+    })
+}
+
+fn extract_f32_output(
+    outputs: &ort::session::SessionOutputs<'_>,
+    name: &str,
+    label: &str,
+) -> Result<(Vec<usize>, Vec<f32>), String> {
+    let output = outputs
+        .get(name)
+        .ok_or_else(|| format!("authenticated ORT session did not return {name:?}"))?;
+    let (shape, values) = output
+        .try_extract_tensor::<f32>()
+        .map_err(|error| format!("extract {label} failed: {error}"))?;
+    Ok((runtime_shape(shape, label)?, values.to_vec()))
+}
+
+fn prepare_states(
+    states: Option<Vec<Vec<f32>>>,
+    state_shapes: &[Vec<usize>],
+    label: &str,
+) -> Result<Vec<Vec<f32>>, String> {
+    match states {
+        Some(states) => {
+            if states.len() != state_shapes.len() {
+                return Err(format!(
+                    "{label} state count is {}, expected {}",
+                    states.len(),
+                    state_shapes.len()
+                ));
+            }
+            for (index, (values, shape)) in states.iter().zip(state_shapes).enumerate() {
+                let expected = shape_elements(shape, "state")?;
+                if values.len() != expected {
+                    return Err(format!(
+                        "{label} state {index} has {} values, expected {expected}",
+                        values.len()
+                    ));
+                }
+            }
+            Ok(states)
+        }
+        None => state_shapes
+            .iter()
+            .map(|shape| shape_elements(shape, "state").map(|elements| vec![0.0; elements]))
+            .collect(),
+    }
+}
+
 fn fixed_f32_shape(dtype: &ort::value::ValueType, name: &str) -> Result<Vec<usize>, String> {
     if dtype.tensor_type() != Some(ort::value::TensorElementType::Float32) {
-        return Err(format!("language state input {name:?} is not float32"));
+        return Err(format!("ONNX input {name:?} is not float32"));
     }
     let shape = dtype
         .tensor_shape()

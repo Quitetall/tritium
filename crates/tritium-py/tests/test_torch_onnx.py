@@ -9,6 +9,7 @@ torch = pytest.importorskip("torch")
 import tritium.torch.onnx as onnx  # noqa: E402
 from tritium.torch import (  # noqa: E402
     QwenOnnxCausalLM,
+    OnnxMtpOutput,
     TritiumError,
     export_onnx,
     load_onnx,
@@ -217,3 +218,74 @@ def test_loaded_model_validates_past_and_refuses_unqualified_generation(
     with pytest.raises(TritiumError) as caught:
         model.generate(torch.tensor([[1]]))
     assert caught.value.code == "dynamic_onnx_generation_unavailable"
+
+
+def test_loaded_model_executes_authenticated_mtp_drafter(monkeypatch, tmp_path):
+    root = tmp_path / "onnx"
+    _write_onnx_bundle(root)
+    observed = {}
+
+    class Runtime:
+        device = "cpu"
+
+        @staticmethod
+        def load(*args, **kwargs):
+            return Runtime()
+
+        def forward_mtp(self, token_ids, target_hidden, states):
+            observed.update(
+                token_ids=token_ids,
+                target_hidden=target_hidden,
+                states=states,
+            )
+            return SimpleNamespace(
+                logits_shape=[2, 3],
+                logits=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                final_hidden_shape=[2, 2],
+                final_hidden=[7.0, 8.0, 9.0, 10.0],
+                state_names=["present_k.0", "present_v.0"],
+                state_shapes=[[3, 1, 2], [3, 1, 2]],
+                states=[list(range(6)), list(range(6, 12))],
+            )
+
+    monkeypatch.setattr(onnx._tritium, "QwenOnnxModel", Runtime, raising=False)
+    model = load_onnx(root)
+    result = model.draft(
+        torch.tensor([[4, 5]], dtype=torch.int64),
+        torch.tensor([[[0.5, 1.5], [2.5, 3.5]]], dtype=torch.float32),
+        past_key_values=(
+            torch.tensor([1.0, 2.0], dtype=torch.float32),
+            torch.tensor([3.0, 4.0], dtype=torch.float32),
+        ),
+    )
+
+    assert isinstance(result, OnnxMtpOutput)
+    assert result.logits.shape == (1, 2, 3)
+    assert result.final_hidden.shape == (1, 2, 2)
+    assert tuple(state.shape for state in result.past_key_values) == (
+        torch.Size([3, 1, 2]),
+        torch.Size([3, 1, 2]),
+    )
+    assert result.state_names == ("present_k.0", "present_v.0")
+    assert observed == {
+        "token_ids": [4, 5],
+        "target_hidden": [0.5, 1.5, 2.5, 3.5],
+        "states": [[1.0, 2.0], [3.0, 4.0]],
+    }
+
+
+def test_loaded_model_rejects_mtp_target_hidden_token_drift(monkeypatch, tmp_path):
+    root = tmp_path / "onnx"
+    _write_onnx_bundle(root)
+    monkeypatch.setattr(
+        onnx._tritium,
+        "QwenOnnxModel",
+        SimpleNamespace(load=lambda *args, **kwargs: SimpleNamespace(device="cpu")),
+        raising=False,
+    )
+    model = load_onnx(root)
+    with pytest.raises(ValueError, match="target_hidden"):
+        model.draft(
+            torch.tensor([1, 2], dtype=torch.int64),
+            torch.zeros((1, 1, 4), dtype=torch.float32),
+        )

@@ -64,11 +64,21 @@ class OnnxBundleManifest:
     selection_id: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class OnnxCausalLMOutput:
     """PyTorch-shaped output from one authenticated fixed-shape ONNX call."""
 
     logits: Tensor
+    past_key_values: Tuple[Tensor, ...]
+    state_names: Tuple[str, ...]
+
+
+@dataclass(frozen=True, eq=False)
+class OnnxMtpOutput:
+    """Batch-one output from the authenticated Qwen MTP drafter graph."""
+
+    logits: Tensor
+    final_hidden: Tensor
     past_key_values: Tuple[Tensor, ...]
     state_names: Tuple[str, ...]
 
@@ -109,35 +119,12 @@ class QwenOnnxCausalLM(nn.Module):
         use_cache: bool = True,
         return_dict: bool = True,
     ) -> Union[OnnxCausalLMOutput, Tuple[Tensor, Tuple[Tensor, ...]]]:
-        if not isinstance(input_ids, Tensor):
-            raise TypeError("input_ids must be a torch.Tensor")
-        if input_ids.device.type != "cpu":
-            raise TritiumError(
-                "this ONNX wheel admits CPU tensors only",
-                code="onnx_device_unavailable",
-                stage="forward_onnx",
-                details={"device": str(input_ids.device)},
-            )
-        if input_ids.ndim == 1:
-            tokens = input_ids
-        elif input_ids.ndim == 2 and input_ids.shape[0] == 1:
-            tokens = input_ids[0]
-        else:
-            raise ValueError("Qwen ONNX input_ids must have shape [tokens] or [1, tokens]")
-        if tokens.dtype not in {
-            torch.int8,
-            torch.int16,
-            torch.int32,
-            torch.int64,
-            torch.uint8,
-        }:
-            raise TypeError("input_ids must have an integer dtype")
+        tokens = _batch_one_tokens(input_ids, "input_ids")
         if attention_mask is not None:
-            if attention_mask.device.type != "cpu" or tuple(attention_mask.shape) not in {
-                tuple(input_ids.shape),
+            if attention_mask.device.type != "cpu" or tuple(attention_mask.shape) not in (
                 (1, tokens.numel()),
                 (tokens.numel(),),
-            }:
+            ):
                 raise ValueError("attention_mask must match the batch-one input_ids shape")
             if not bool(torch.all(attention_mask != 0).item()):
                 raise TritiumError(
@@ -145,29 +132,18 @@ class QwenOnnxCausalLM(nn.Module):
                     code="onnx_padding_unavailable",
                     stage="forward_onnx",
                 )
-        states = None
-        if past_key_values is not None:
-            if not isinstance(past_key_values, tuple):
-                raise TypeError("past_key_values must be a tuple of torch.Tensor values")
-            states = []
-            for index, state in enumerate(past_key_values):
-                if not isinstance(state, Tensor):
-                    raise TypeError(f"past_key_values[{index}] must be a torch.Tensor")
-                if state.device.type != "cpu" or state.dtype != torch.float32:
-                    raise TypeError(
-                        f"past_key_values[{index}] must be a CPU float32 tensor"
-                    )
-                states.append(state.contiguous().view(-1).tolist())
+        states = _flatten_states(past_key_values)
         native = self._runtime.forward_language(
             tokens.to(dtype=torch.int64).contiguous().tolist(), states
         )
-        shape = tuple(native.logits_shape)
-        logits = torch.tensor(native.logits, dtype=torch.float32).reshape(shape).unsqueeze(0)
+        logits = _batch_one_output(native.logits, native.logits_shape, "language logits")
         if len(native.states) != len(native.state_shapes):
             raise RuntimeError("native ONNX state values and shapes differ in count")
         output_states = tuple(
-            torch.tensor(values, dtype=torch.float32).reshape(tuple(state_shape))
-            for values, state_shape in zip(native.states, native.state_shapes)
+            _tensor_from_flat(values, state_shape, f"language state {index}")
+            for index, (values, state_shape) in enumerate(
+                zip(native.states, native.state_shapes)
+            )
         )
         if not use_cache:
             output_states = ()
@@ -177,6 +153,48 @@ class QwenOnnxCausalLM(nn.Module):
             state_names=tuple(native.state_names),
         )
         return output if return_dict else (output.logits, output.past_key_values)
+
+    def draft(
+        self,
+        shifted_input_ids: Tensor,
+        target_hidden: Tensor,
+        past_key_values: Optional[Tuple[Tensor, ...]] = None,
+    ) -> OnnxMtpOutput:
+        """Execute the bundled ternary MTP drafter for one fixed-shape step."""
+        tokens = _batch_one_tokens(shifted_input_ids, "shifted_input_ids")
+        if not isinstance(target_hidden, Tensor):
+            raise TypeError("target_hidden must be a torch.Tensor")
+        if target_hidden.device.type != "cpu" or target_hidden.dtype != torch.float32:
+            raise TypeError("target_hidden must be a CPU float32 tensor")
+        if target_hidden.ndim == 2:
+            hidden = target_hidden
+        elif target_hidden.ndim == 3 and target_hidden.shape[0] == 1:
+            hidden = target_hidden[0]
+        else:
+            raise ValueError("target_hidden must have shape [tokens, hidden] or [1, tokens, hidden]")
+        if hidden.shape[0] != tokens.numel():
+            raise ValueError("target_hidden token dimension must match shifted_input_ids")
+        states = _flatten_states(past_key_values)
+        native = self._runtime.forward_mtp(
+            tokens.to(dtype=torch.int64).contiguous().tolist(),
+            hidden.contiguous().view(-1).tolist(),
+            states,
+        )
+        if len(native.states) != len(native.state_shapes):
+            raise RuntimeError("native ONNX MTP state values and shapes differ in count")
+        return OnnxMtpOutput(
+            logits=_batch_one_output(native.logits, native.logits_shape, "MTP logits"),
+            final_hidden=_batch_one_output(
+                native.final_hidden, native.final_hidden_shape, "MTP final hidden"
+            ),
+            past_key_values=tuple(
+                _tensor_from_flat(values, shape, f"MTP state {index}")
+                for index, (values, shape) in enumerate(
+                    zip(native.states, native.state_shapes)
+                )
+            ),
+            state_names=tuple(native.state_names),
+        )
 
     def generate(self, *args: Any, **kwargs: Any) -> Any:
         del args, kwargs
@@ -272,6 +290,65 @@ def _pairs_without_duplicates(pairs):
             raise ValueError(f"duplicate ONNX manifest field {key!r}")
         value[key] = item
     return value
+
+
+def _batch_one_tokens(value: Tensor, label: str) -> Tensor:
+    if not isinstance(value, Tensor):
+        raise TypeError(f"{label} must be a torch.Tensor")
+    if value.device.type != "cpu":
+        raise TritiumError(
+            "this ONNX wheel admits CPU tensors only",
+            code="onnx_device_unavailable",
+            stage="forward_onnx",
+            details={"device": str(value.device)},
+        )
+    if value.ndim == 1:
+        tokens = value
+    elif value.ndim == 2 and value.shape[0] == 1:
+        tokens = value[0]
+    else:
+        raise ValueError(f"{label} must have shape [tokens] or [1, tokens]")
+    if tokens.dtype not in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }:
+        raise TypeError(f"{label} must have an integer dtype")
+    return tokens
+
+
+def _flatten_states(
+    states: Optional[Tuple[Tensor, ...]],
+) -> Optional[list[list[float]]]:
+    if states is None:
+        return None
+    if not isinstance(states, tuple):
+        raise TypeError("past_key_values must be a tuple of torch.Tensor values")
+    flattened = []
+    for index, state in enumerate(states):
+        if not isinstance(state, Tensor):
+            raise TypeError(f"past_key_values[{index}] must be a torch.Tensor")
+        if state.device.type != "cpu" or state.dtype != torch.float32:
+            raise TypeError(f"past_key_values[{index}] must be a CPU float32 tensor")
+        flattened.append(state.contiguous().view(-1).tolist())
+    return flattened
+
+
+def _tensor_from_flat(values: Any, shape: Any, label: str) -> Tensor:
+    elements = 1
+    for dimension in shape:
+        if type(dimension) is not int or dimension < 0:
+            raise RuntimeError(f"native ONNX {label} has an invalid shape")
+        elements *= dimension
+    if len(values) != elements:
+        raise RuntimeError(f"native ONNX {label} values and shape differ")
+    return torch.tensor(values, dtype=torch.float32).reshape(tuple(shape))
+
+
+def _batch_one_output(values: Any, shape: Any, label: str) -> Tensor:
+    return _tensor_from_flat(values, shape, label).unsqueeze(0)
 
 
 def _read_manifest(requested: Path) -> OnnxBundleManifest:
