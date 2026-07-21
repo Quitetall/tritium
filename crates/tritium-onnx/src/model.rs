@@ -1987,6 +1987,23 @@ pub struct VerifiedExternalQwen35Bundle {
     pub language: VerifiedExternalCausalLmModel,
     /// Verified one-layer MTP graph and external data.
     pub mtp: VerifiedExternalCausalLmModel,
+    /// Distinct conversion ancestry when emitted by the public facade.
+    pub conversion_ancestry: Option<VerifiedQwen35OnnxAncestryV1>,
+}
+
+/// Owned conversion ancestry recovered by strict Qwen bundle verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedQwen35OnnxAncestryV1 {
+    /// Artifact-producing mode: `qat-hard`, `ptq`, or `refined`.
+    pub conversion_mode: String,
+    /// Completed conversion identity.
+    pub completion_id: String,
+    /// Calibration/refinement campaign identity.
+    pub campaign_id: String,
+    /// External admission decision identity.
+    pub admission_id: String,
+    /// Selected additive allocation identity.
+    pub selection_id: String,
 }
 
 /// Category of one unsupported ONNX graph item.
@@ -3575,10 +3592,55 @@ pub fn verify_external_qwen35_bundle(
             )));
         }
     }
+    let language_ancestry = verified_qwen35_onnx_ancestry(&language.metadata)?;
+    let mtp_ancestry = verified_qwen35_onnx_ancestry(&mtp.metadata)?;
+    if language_ancestry != mtp_ancestry {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen language and MTP conversion ancestry differs".to_owned(),
+        ));
+    }
     Ok(VerifiedExternalQwen35Bundle {
         language: language.receipt,
         mtp: mtp.receipt,
+        conversion_ancestry: language_ancestry,
     })
+}
+
+fn verified_qwen35_onnx_ancestry(
+    metadata: &BTreeMap<String, String>,
+) -> Result<Option<VerifiedQwen35OnnxAncestryV1>, OnnxModelError> {
+    const KEYS: [&str; 5] = [
+        "tritium.conversion.mode",
+        "tritium.conversion.completion_id",
+        "tritium.conversion.campaign_id",
+        "tritium.conversion.admission_id",
+        "tritium.conversion.selection_id",
+    ];
+    let present = KEYS
+        .iter()
+        .filter(|key| metadata.contains_key(**key))
+        .count();
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != KEYS.len() {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen conversion ancestry metadata is incomplete".to_owned(),
+        ));
+    }
+    let conversion_mode = metadata_value(metadata, KEYS[0])?;
+    if !matches!(conversion_mode, "qat-hard" | "ptq" | "refined") {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen ONNX conversion_mode must be `qat-hard`, `ptq`, or `refined`".to_owned(),
+        ));
+    }
+    Ok(Some(VerifiedQwen35OnnxAncestryV1 {
+        conversion_mode: conversion_mode.to_owned(),
+        completion_id: metadata_value(metadata, KEYS[1])?.to_owned(),
+        campaign_id: metadata_value(metadata, KEYS[2])?.to_owned(),
+        admission_id: metadata_value(metadata, KEYS[3])?.to_owned(),
+        selection_id: metadata_value(metadata, KEYS[4])?.to_owned(),
+    }))
 }
 
 fn verify_shared_qwen_ranges(
@@ -9555,6 +9617,16 @@ mod tests {
         assert_eq!(receipt.language.tokens, receipt.mtp.tokens);
         assert_eq!(receipt.language.past_tokens, receipt.mtp.past_tokens);
         assert_eq!(receipt.language.identity, receipt.mtp.identity);
+        assert_eq!(
+            receipt.conversion_ancestry,
+            Some(VerifiedQwen35OnnxAncestryV1 {
+                conversion_mode: "ptq".to_owned(),
+                completion_id: "completion".to_owned(),
+                campaign_id: "campaign".to_owned(),
+                admission_id: "admission".to_owned(),
+                selection_id: "selection".to_owned(),
+            })
+        );
 
         let mut corrupted_weights = bundle.weights_bytes.clone();
         corrupted_weights[0] ^= 1;
