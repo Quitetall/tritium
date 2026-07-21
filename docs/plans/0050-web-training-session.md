@@ -265,7 +265,18 @@ then repacked four codes per word for padded, tail-safe state commits. Cautious 
 atomic alignment count in that submission; Muon snapshots mutable inputs into
 candidates before its in-place kernel. Convolution
 and attention VJPs clear resident accumulation outputs through budgeted zero-buffer
-copies before dispatch. Session-adapter integration and physical browser execution remain open.
+copies before dispatch. An explicit `createWebGpuTrainingAdapter(device, options)`
+boundary now connects an already-authorized device to the checked session. It
+uploads admitted batch roots, issues one command buffer for the complete
+graph/loss phase, one for the complete reverse phase (including same-submission
+gradient clears), and one transactional optimizer command buffer. Only the
+scalar loss crosses back to the host during the training loop. GPU-native
+checkpoint/resume/export, rollback for cancellation after GPU submission,
+automatic browser adapter acquisition and physical browser execution remain
+open. Submitted phases await queue completion and race device loss before
+issuing a success receipt; receipts include scheduled auxiliary, uniform, zero
+binding and scalar-readback residency. The explicit factory transfers exclusive
+device ownership to the adapter.
 
 The generated-registry lowering derives exact registry roles, f32/u32 uniform
 packing, stage-specific lengths, workgroups, resident bindings and operation
@@ -273,7 +284,7 @@ geometry from the compiled plan without tensor values. MSE and softmax cross
 entropy VJPs read scalar cotangents from resident storage bindings instead of
 requiring host scalar readback. Column concat forward packs resident parts with
 same-submission GPU copies and its VJP emits ordered resident slices. All 57 catalog
-forms now lower; session-adapter integration remains open.
+forms now lower; the core forward/backward/step session adapter is integrated.
 
 Implement all 35 manifest operations with WGSL compute pipelines and explicit
 VJPs. Kernels may be fused after semantic parity, but the frozen public

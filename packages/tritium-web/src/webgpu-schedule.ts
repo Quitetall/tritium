@@ -27,10 +27,12 @@ export interface WebGpuResidentTransactionV1 {
 
 export interface WebGpuResidentScheduleBudgetV1 {
   readonly maxPeakBytes: number;
+  readonly uniformStride?: number;
 }
 
 export interface WebGpuResidentScheduleV1 {
   auxiliaryResources(): WebGpuResidentAuxiliarySetV1;
+  peakBytes(): number;
   transaction(
     phase: "forward" | "backward",
     operationId: string,
@@ -385,8 +387,13 @@ export function compileWebGpuResidentScheduleV1(
   const plan = snapshotPlan(sourcePlan);
   const budgetRecord = recordSnapshot(budget, "WebGPU schedule budget");
   const maxPeakBytes = property(budgetRecord, "maxPeakBytes", "WebGPU schedule budget");
+  const uniformStride = property(budgetRecord, "uniformStride", "WebGPU schedule budget") ?? 256;
   if (!Number.isSafeInteger(maxPeakBytes) || (maxPeakBytes as number) < 0) {
     fail("invalid_schema", "WebGPU schedule maxPeakBytes must be a nonnegative safe integer");
+  }
+  if (!Number.isSafeInteger(uniformStride) || (uniformStride as number) < 256 ||
+      (uniformStride as number) % 256 !== 0) {
+    fail("invalid_schema", "WebGPU schedule uniformStride must be a positive 256-byte multiple");
   }
   const buffers = admittedWebGpuBuffersV1(plan);
   const metrics = [
@@ -408,16 +415,21 @@ export function compileWebGpuResidentScheduleV1(
     fail("invalid_schema", "compiled plan memory metrics are inconsistent");
   }
   let rootBytes = 0;
+  let physicalRootBytes = 0;
   for (const buffer of buffers.values()) {
     if (buffer.ownerId !== buffer.id) continue;
-    if (rootBytes > Number.MAX_SAFE_INTEGER - buffer.byteLength) {
+    const physicalBytes = Math.max(4, Math.ceil(buffer.byteLength / 4) * 4);
+    if (rootBytes > Number.MAX_SAFE_INTEGER - buffer.byteLength ||
+        physicalRootBytes > Number.MAX_SAFE_INTEGER - physicalBytes) {
       fail("memory_limit", "compiled root buffers exceed safe integer range");
     }
     rootBytes += buffer.byteLength;
+    physicalRootBytes += physicalBytes;
   }
   if (rootBytes > plan.residentBytes) {
     fail("invalid_schema", "compiled residentBytes omits root buffers");
   }
+  const rootPaddingBytes = Math.max(0, physicalRootBytes - plan.residentBytes);
   const uniformSlots = webGpuUniformSlotCapacityV1(plan);
   const occupied = new Set(buffers.keys());
   const pendingResources: PendingResource[] = [];
@@ -1514,13 +1526,16 @@ export function compileWebGpuResidentScheduleV1(
     templates.set(key(entry.phase, entry.id), template);
   }
 
-  const uniformBytes = product("WebGPU uniform arena", uniformSlots, 256);
-  const additionalBytes = auxiliaryBytes + uniformBytes + 4;
+  const uniformBytes = product(
+    "WebGPU uniform arena", uniformSlots, uniformStride as number,
+  );
+  const additionalBytes = auxiliaryBytes + uniformBytes + rootPaddingBytes + 8;
   if (!Number.isSafeInteger(additionalBytes) ||
       !Number.isSafeInteger(plan.peakBytes) || plan.peakBytes < 0 ||
       plan.peakBytes > (maxPeakBytes as number) - additionalBytes) {
     fail("memory_limit", "WebGPU resident schedule exceeds maxPeakBytes");
   }
+  const residentPeakBytes = plan.peakBytes + additionalBytes;
   const resources: WebGpuResidentAuxiliaryV1[] = pendingResources.map((resource) =>
     Object.freeze({
       id: resource.id,
@@ -1537,6 +1552,9 @@ export function compileWebGpuResidentScheduleV1(
   })));
 
   return Object.freeze({
+    peakBytes(): number {
+      return residentPeakBytes;
+    },
     auxiliaryResources(): WebGpuResidentAuxiliarySetV1 {
       return Object.freeze({
         maxBytes: auxiliaryBytes,

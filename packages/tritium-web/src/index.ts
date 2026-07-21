@@ -28,6 +28,7 @@ export {
   webGpuKernelCandidateBundleV1,
 } from "./webgpu-kernels.ts";
 export { WebGpuResidentRuntimeV1 } from "./webgpu-runtime.ts";
+export { createWebGpuTrainingAdapter } from "./webgpu-adapter.ts";
 export { lowerPointwiseWebGpuOperationV1 } from "./webgpu-lowering.ts";
 export { compileWebGpuResidentScheduleV1 } from "./webgpu-schedule.ts";
 export {
@@ -133,5 +134,7 @@ export type {
   WebGpuDevicePortV1,
   WebGpuPipelinePortV1,
   WebGpuResidentDispatchV1,
+  WebGpuResidentSubmissionV1,
   WebGpuResidentTensorV1,
 } from "./webgpu-runtime.ts";
+export type { WebGpuTrainingAdapterOptionsV1 } from "./webgpu-adapter.ts";

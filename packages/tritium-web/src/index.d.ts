@@ -545,6 +545,7 @@ export interface WebGpuCommandEncoderPortV1 {
     destinationOffset: number,
     size: number,
   ): void;
+  clearBuffer(buffer: WebGpuBufferPortV1, offset?: number, size?: number): void;
   finish(): unknown;
 }
 
@@ -562,6 +563,7 @@ export interface WebGpuDevicePortV1 {
   readonly queue: Readonly<{
     writeBuffer(buffer: WebGpuBufferPortV1, bufferOffset: number, data: Uint8Array): void;
     submit(commands: readonly unknown[]): void;
+    onSubmittedWorkDone(): Promise<void>;
   }>;
   readonly lost: Promise<unknown>;
   createShaderModule(descriptor: Readonly<{ label: string; code: string }>): unknown;
@@ -625,6 +627,12 @@ export interface WebGpuResidentDispatchV1 {
   readonly workgroups: readonly [number, number, number];
 }
 
+export interface WebGpuResidentSubmissionV1 {
+  readonly commands: readonly WebGpuResidentDispatchV1[];
+  readonly copies: readonly WebGpuResidentCopyV1[];
+  readonly commitCopies: readonly WebGpuResidentCopyV1[];
+}
+
 export declare class WebGpuResidentRuntimeV1 {
   private constructor();
   static prepare(
@@ -632,15 +640,34 @@ export declare class WebGpuResidentRuntimeV1 {
     plan: CompiledTrainingPlanV1,
     initial: readonly WebGpuResidentTensorV1[],
     auxiliary?: WebGpuResidentAuxiliarySetV1,
+    expectedUniformStride?: number,
   ): Promise<WebGpuResidentRuntimeV1>;
   dispatch(
     commands: readonly WebGpuResidentDispatchV1[],
     copies?: readonly WebGpuResidentCopyV1[],
     commitCopies?: readonly WebGpuResidentCopyV1[],
+    clearBufferIds?: readonly string[],
   ): void;
+  dispatchTransactions(
+    transactions: readonly WebGpuResidentSubmissionV1[],
+    clearBufferIds?: readonly string[],
+  ): Promise<void>;
+  write(bufferId: string, bytes: Uint8Array): void;
   read(bufferId: string): Promise<Uint8Array>;
   dispose(): void;
 }
+
+export interface WebGpuTrainingAdapterOptionsV1 {
+  readonly buildId?: string;
+  readonly physicalDevice?: string | null;
+  readonly maxResidentBytes?: number;
+}
+
+/** Transfers exclusive ownership of `device`; adapter disposal destroys it. */
+export declare function createWebGpuTrainingAdapter(
+  device: WebGpuDevicePortV1,
+  options?: WebGpuTrainingAdapterOptionsV1,
+): WebTrainingAdapterV1;
 
 export declare function lowerPointwiseWebGpuOperationV1(
   plan: CompiledTrainingPlanV1,
@@ -657,9 +684,11 @@ export interface WebGpuResidentTransactionV1 {
 
 export interface WebGpuResidentScheduleBudgetV1 {
   readonly maxPeakBytes: number;
+  readonly uniformStride?: number;
 }
 
 export interface WebGpuResidentScheduleV1 {
+  peakBytes(): number;
   auxiliaryResources(): WebGpuResidentAuxiliarySetV1;
   transaction(
     phase: "forward" | "backward",

@@ -113,6 +113,25 @@ function view(command) {
   );
 }
 
+test("resident schedule admits the captured physical uniform stride", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "graph.add" && candidate.execution === "forward" &&
+    candidate.expected.kind === "success");
+  const admittedPlan = representativePlan(item).plan;
+  const defaultSchedule = compileWebGpuResidentScheduleV1(admittedPlan, BUDGET);
+  const alignedSchedule = compileWebGpuResidentScheduleV1(
+    admittedPlan, { maxPeakBytes: BUDGET.maxPeakBytes, uniformStride: 512 },
+  );
+  assert.equal(alignedSchedule.peakBytes() - defaultSchedule.peakBytes(), 8 * 256);
+  assert.throws(
+    () => compileWebGpuResidentScheduleV1(admittedPlan, {
+      maxPeakBytes: defaultSchedule.peakBytes(),
+      uniformStride: 512,
+    }),
+    (error) => error instanceof WebTrainingError && error.code === "memory_limit",
+  );
+});
+
 test("resident schedule covers all 52 graph/loss forms and five transactional optimizers", () => {
   const supported = new Set([
     "graph.detach", "graph.scale_const", "graph.add", "graph.mul", "graph.relu2",

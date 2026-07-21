@@ -45,6 +45,7 @@ export interface WebGpuCommandEncoderPortV1 {
     destinationOffset: number,
     size: number,
   ): void;
+  clearBuffer(buffer: WebGpuBufferPortV1, offset?: number, size?: number): void;
   finish(): unknown;
 }
 
@@ -66,6 +67,7 @@ export interface WebGpuDevicePortV1 {
       data: Uint8Array,
     ): void;
     submit(commands: readonly unknown[]): void;
+    onSubmittedWorkDone(): Promise<void>;
   }>;
   readonly lost: Promise<unknown>;
   createShaderModule(descriptor: Readonly<{ label: string; code: string }>): unknown;
@@ -129,6 +131,12 @@ export interface WebGpuResidentDispatchV1 {
   readonly workgroups: readonly [number, number, number];
 }
 
+export interface WebGpuResidentSubmissionV1 {
+  readonly commands: readonly WebGpuResidentDispatchV1[];
+  readonly copies: readonly WebGpuResidentCopyV1[];
+  readonly commitCopies: readonly WebGpuResidentCopyV1[];
+}
+
 type ResidentBuffer = Readonly<{
   id: string;
   ownerId: string;
@@ -180,6 +188,14 @@ function property(
     return Reflect.get(value, key);
   } catch {
     fail("invalid_schema", `${name}.${key} could not be read`);
+  }
+}
+
+function ownKeys(value: object, name: string): readonly PropertyKey[] {
+  try {
+    return Reflect.ownKeys(value);
+  } catch {
+    fail("invalid_schema", `${name} keys could not be read`);
   }
 }
 
@@ -258,6 +274,7 @@ export class WebGpuResidentRuntimeV1 {
       maxBytes: 0,
       resources: Object.freeze([]),
     }),
+    expectedUniformStride?: number,
   ): Promise<WebGpuResidentRuntimeV1> {
     const auxiliaryMaxBytes = record(auxiliary)
       ? property(auxiliary, "maxBytes", "WebGPU auxiliary set")
@@ -372,6 +389,9 @@ export class WebGpuResidentRuntimeV1 {
         "minUniformBufferOffsetAlignment",
       ),
     );
+    if (expectedUniformStride !== undefined && uniformStride !== expectedUniformStride) {
+      fail("capability_mismatch", "WebGPU uniform alignment changed after admission");
+    }
     if (maxUniform < UNIFORM_BYTES) {
       fail("capability_mismatch", "WebGPU uniform binding limit is below 256 bytes");
     }
@@ -554,11 +574,42 @@ export class WebGpuResidentRuntimeV1 {
     commands: readonly WebGpuResidentDispatchV1[],
     copies: readonly WebGpuResidentCopyV1[] = [],
     commitCopies: readonly WebGpuResidentCopyV1[] = [],
+    clearBufferIds: readonly string[] = [],
   ): void {
+    void this.#submitTransactions([
+      Object.freeze({ commands, copies, commitCopies }),
+    ], clearBufferIds).catch(() => {
+      // The synchronous low-level API observes loss through the next operation.
+    });
+  }
+
+  dispatchTransactions(
+    transactions: readonly WebGpuResidentSubmissionV1[],
+    clearBufferIds: readonly string[] = [],
+  ): Promise<void> {
+    return this.#submitTransactions(transactions, clearBufferIds);
+  }
+
+  #submitTransactions(
+    transactions: readonly WebGpuResidentSubmissionV1[],
+    clearBufferIds: readonly string[],
+  ): Promise<void> {
     this.#ready();
-    if (!denseArray(commands) || !denseArray(copies) || !denseArray(commitCopies)) {
+    if (!denseArray(transactions) || !denseArray(clearBufferIds)) {
       fail("invalid_schema", "WebGPU transaction inputs must be dense arrays");
     }
+    const clearOwners = new Set<string>();
+    const capturedClears = clearBufferIds.map((bufferId) => {
+      if (typeof bufferId !== "string") {
+        fail("invalid_schema", "WebGPU clear target must be a buffer ID");
+      }
+      const buffer = this.#buffers.get(bufferId);
+      if (buffer === undefined || clearOwners.has(buffer.ownerId)) {
+        fail("invalid_schema", "WebGPU clear targets must have unique physical owners");
+      }
+      clearOwners.add(buffer.ownerId);
+      return Object.freeze({ id: bufferId, byteLength: paddedBytes(buffer.byteLength) });
+    });
     const captureCopies = (values: readonly WebGpuResidentCopyV1[]) => values.map((copy) => {
       const sourceId = record(copy) ? property(copy, "source", "WebGPU resident copy") : undefined;
       const destinationId = record(copy)
@@ -612,24 +663,9 @@ export class WebGpuResidentRuntimeV1 {
         byteLength: safeByteLength,
       });
     });
-    const capturedCopies = captureCopies(copies);
-    const capturedCommitCopies = captureCopies(commitCopies);
-    const commitSourceOwners = new Set(capturedCommitCopies.map((copy) =>
-      this.#buffers.get(copy.source)!.ownerId));
-    const commitDestinationOwners = new Set<string>();
-    for (const copy of capturedCommitCopies) {
-      const owner = this.#buffers.get(copy.destination)!.ownerId;
-      if (commitDestinationOwners.has(owner)) {
-        fail("invalid_schema", "WebGPU commit copies require unique destination owners");
-      }
-      commitDestinationOwners.add(owner);
-    }
-    if ([...commitDestinationOwners].some((owner) => commitSourceOwners.has(owner))) {
-      fail("invalid_schema", "WebGPU commit destinations cannot feed another commit copy");
-    }
-    const capturedCommands = commands.map((command) => {
+    const captureCommands = (commands: readonly WebGpuResidentDispatchV1[]) => commands.map((command) => {
       if (!record(command)) fail("invalid_schema", "WebGPU dispatch command is malformed");
-      const fields = Object.keys(command).sort();
+      const fields = ownKeys(command, "WebGPU dispatch command");
       const expected = [
         "execution",
         "operation",
@@ -639,110 +675,196 @@ export class WebGpuResidentRuntimeV1 {
         "uniformSlot",
         "workgroups",
       ];
-      if (fields.length !== expected.length ||
-          fields.some((field, index) => field !== expected[index]) ||
-          typeof command.operation !== "string" ||
-          !(["forward", "vjp", "step"] as const).includes(command.execution) ||
-          !Number.isSafeInteger(command.stageIndex) || command.stageIndex < 0 ||
-          !record(command.storageBindings) ||
-          !(command.uniformBytes === null || command.uniformBytes instanceof Uint8Array) ||
-          !denseArray(command.workgroups) || command.workgroups.length !== 3) {
+      if (fields.some((field) => typeof field !== "string")) {
+        fail("invalid_schema", "WebGPU dispatch command field must be a string");
+      }
+      const stringFields = [...(fields as readonly string[])].sort();
+      if (stringFields.length !== expected.length ||
+          stringFields.some((field, index) => field !== expected[index])) {
         fail("invalid_schema", "WebGPU dispatch command is malformed");
       }
+      const operation = property(command, "operation", "WebGPU dispatch command");
+      const execution = property(command, "execution", "WebGPU dispatch command");
+      const stageIndex = property(command, "stageIndex", "WebGPU dispatch command");
+      const uniformSlot = property(command, "uniformSlot", "WebGPU dispatch command");
+      const uniformBytes = property(command, "uniformBytes", "WebGPU dispatch command");
+      const storageBindings = property(command, "storageBindings", "WebGPU dispatch command");
+      const workgroups = property(command, "workgroups", "WebGPU dispatch command");
+      if (typeof operation !== "string" ||
+          !(execution === "forward" || execution === "vjp" || execution === "step") ||
+          !Number.isSafeInteger(stageIndex) || (stageIndex as number) < 0 ||
+          !record(storageBindings) ||
+          !(uniformBytes === null || uniformBytes instanceof Uint8Array) ||
+          !denseArray(workgroups) || workgroups.length !== 3) {
+        fail("invalid_schema", "WebGPU dispatch command is malformed");
+      }
+      const capturedBindings: Record<string, string> = {};
+      for (const binding of ownKeys(storageBindings, "WebGPU storage bindings")) {
+        if (typeof binding !== "string") {
+          fail("invalid_schema", "WebGPU storage binding key must be a string");
+        }
+        const bufferId = property(storageBindings, binding, "WebGPU storage bindings");
+        if (typeof bufferId !== "string") {
+          fail("invalid_schema", "WebGPU storage binding value must be a string");
+        }
+        capturedBindings[binding] = bufferId;
+      }
       return Object.freeze({
-        operation: command.operation,
-        execution: command.execution,
-        stageIndex: command.stageIndex,
-        uniformSlot: command.uniformSlot,
-        uniformBytes: command.uniformBytes === null
+        operation,
+        execution: execution as WebGpuDispatchExecutionV1,
+        stageIndex: stageIndex as number,
+        uniformSlot: uniformSlot as number,
+        uniformBytes: uniformBytes === null
           ? null
-          : Uint8Array.from(command.uniformBytes),
-        storageBindings: Object.freeze({ ...command.storageBindings }),
-        workgroups: Object.freeze([...command.workgroups]) as readonly [number, number, number],
+          : Uint8Array.from(uniformBytes),
+        storageBindings: Object.freeze(capturedBindings),
+        workgroups: Object.freeze([...workgroups]) as readonly [number, number, number],
+      });
+    });
+    const capturedTransactions = transactions.map((transaction) => {
+      if (!record(transaction)) {
+        fail("invalid_schema", "WebGPU transaction is malformed");
+      }
+      const commands = property(transaction, "commands", "WebGPU transaction");
+      const copies = property(transaction, "copies", "WebGPU transaction");
+      const commitCopies = property(transaction, "commitCopies", "WebGPU transaction");
+      if (!denseArray(commands) || !denseArray(copies) || !denseArray(commitCopies)) {
+        fail("invalid_schema", "WebGPU transaction is malformed");
+      }
+      const capturedCopies = captureCopies(copies as readonly WebGpuResidentCopyV1[]);
+      const capturedCommitCopies = captureCopies(
+        commitCopies as readonly WebGpuResidentCopyV1[],
+      );
+      const commitSourceOwners = new Set(capturedCommitCopies.map((copy) =>
+        this.#buffers.get(copy.source)!.ownerId));
+      const commitDestinationOwners = new Set<string>();
+      for (const copy of capturedCommitCopies) {
+        const owner = this.#buffers.get(copy.destination)!.ownerId;
+        if (commitDestinationOwners.has(owner)) {
+          fail("invalid_schema", "WebGPU commit copies require unique destination owners");
+        }
+        commitDestinationOwners.add(owner);
+      }
+      if ([...commitDestinationOwners].some((owner) => commitSourceOwners.has(owner))) {
+        fail("invalid_schema", "WebGPU commit destinations cannot feed another commit copy");
+      }
+      return Object.freeze({
+        commands: Object.freeze(captureCommands(
+          commands as readonly WebGpuResidentDispatchV1[],
+        )),
+        copies: Object.freeze(capturedCopies),
+        commitCopies: Object.freeze(capturedCommitCopies),
       });
     });
     const encoder = this.#device.createCommandEncoder({ label: "tritium:transaction" });
-    for (const copy of capturedCopies) {
-      encoder.copyBufferToBuffer(
-        this.#physicalBuffer(copy.source),
-        copy.sourceOffset,
-        this.#physicalBuffer(copy.destination),
-        copy.destinationOffset,
-        copy.byteLength,
-      );
+    for (const clear of capturedClears) {
+      encoder.clearBuffer(this.#physicalBuffer(clear.id), 0, clear.byteLength);
     }
-    const pass = encoder.beginComputePass({ label: "tritium:resident-dispatch" });
     const usedUniformSlots = new Set<number>();
-    for (const command of capturedCommands) {
-      const form = webGpuDispatchFormV1(command.operation, command.execution);
-      const descriptor = form.stages[command.stageIndex];
-      const prepared = this.#stages.get(
-        key(command.operation, command.execution, command.stageIndex),
-      );
-      if (descriptor === undefined || prepared === undefined) {
-        fail("invalid_schema", "WebGPU dispatch stage index is invalid");
+    for (const transaction of capturedTransactions) {
+      for (const copy of transaction.copies) {
+        encoder.copyBufferToBuffer(
+          this.#physicalBuffer(copy.source),
+          copy.sourceOffset,
+          this.#physicalBuffer(copy.destination),
+          copy.destinationOffset,
+          copy.byteLength,
+        );
       }
-      if (prepared.hasUniform &&
-          (!Number.isSafeInteger(command.uniformSlot) || command.uniformSlot < 0 ||
-            command.uniformSlot >= this.#uniformSlots ||
-            usedUniformSlots.has(command.uniformSlot))) {
-        fail("invalid_schema", "WebGPU transaction uniform slots must be unique and in range");
+      if (transaction.commands.length > 0) {
+        const pass = encoder.beginComputePass({ label: "tritium:resident-dispatch" });
+        for (const command of transaction.commands) {
+          const form = webGpuDispatchFormV1(command.operation, command.execution);
+          const descriptor = form.stages[command.stageIndex];
+          const prepared = this.#stages.get(
+            key(command.operation, command.execution, command.stageIndex),
+          );
+          if (descriptor === undefined || prepared === undefined) {
+            fail("invalid_schema", "WebGPU dispatch stage index is invalid");
+          }
+          if (prepared.hasUniform &&
+              (!Number.isSafeInteger(command.uniformSlot) || command.uniformSlot < 0 ||
+                command.uniformSlot >= this.#uniformSlots ||
+                usedUniformSlots.has(command.uniformSlot))) {
+            fail("invalid_schema", "WebGPU transaction uniform slots must be unique and in range");
+          }
+          if (prepared.hasUniform) usedUniformSlots.add(command.uniformSlot);
+          if (prepared.hasUniform !== (command.uniformBytes !== null)) {
+            fail("invalid_schema", "WebGPU uniform presence differs from shader layout");
+          }
+          const expectedStorage = prepared.bindings
+            .filter((binding) => binding.addressSpace === "storage")
+            .map((binding) => String(binding.binding))
+            .sort();
+          const suppliedStorage = Object.keys(command.storageBindings).sort();
+          if (expectedStorage.length !== suppliedStorage.length ||
+              expectedStorage.some((binding, index) => binding !== suppliedStorage[index])) {
+            fail("invalid_schema", "WebGPU storage bindings differ from shader layout");
+          }
+          const limit = this.#device.limits.maxComputeWorkgroupsPerDimension;
+          if (command.workgroups.some((value) =>
+            !Number.isSafeInteger(value) || value < 1 || value > limit
+          )) {
+            fail("memory_limit", "WebGPU dispatch exceeds workgroup limits");
+          }
+          const entries = prepared.bindings.map((binding) =>
+            this.#bindingEntry(command, prepared, binding),
+          );
+          const signature = JSON.stringify([
+            command.operation,
+            command.execution,
+            command.stageIndex,
+            prepared.bindings.map((binding) => binding.addressSpace === "uniform"
+              ? [binding.binding, "uniform", command.uniformSlot]
+              : [binding.binding, "storage", command.storageBindings[binding.binding]]
+            ),
+          ]);
+          let bindGroup = this.#bindGroups.get(signature);
+          if (bindGroup === undefined) {
+            bindGroup = this.#device.createBindGroup({
+              label: `tritium:bindings:${signature}`,
+              layout: prepared.pipeline.getBindGroupLayout(0),
+              entries,
+            });
+            this.#bindGroups.set(signature, bindGroup);
+          }
+          pass.setPipeline(prepared.pipeline);
+          pass.setBindGroup(0, bindGroup);
+          pass.dispatchWorkgroups(...command.workgroups);
+        }
+        pass.end();
       }
-      if (prepared.hasUniform) usedUniformSlots.add(command.uniformSlot);
-      if (prepared.hasUniform !== (command.uniformBytes !== null)) {
-        fail("invalid_schema", "WebGPU uniform presence differs from shader layout");
+      for (const copy of transaction.commitCopies) {
+        encoder.copyBufferToBuffer(
+          this.#physicalBuffer(copy.source),
+          copy.sourceOffset,
+          this.#physicalBuffer(copy.destination),
+          copy.destinationOffset,
+          copy.byteLength,
+        );
       }
-      const expectedStorage = prepared.bindings
-        .filter((binding) => binding.addressSpace === "storage")
-        .map((binding) => String(binding.binding))
-        .sort();
-      const suppliedStorage = Object.keys(command.storageBindings).sort();
-      if (expectedStorage.length !== suppliedStorage.length ||
-          expectedStorage.some((binding, index) => binding !== suppliedStorage[index])) {
-        fail("invalid_schema", "WebGPU storage bindings differ from shader layout");
-      }
-      const limit = this.#device.limits.maxComputeWorkgroupsPerDimension;
-      if (command.workgroups.some((value) =>
-        !Number.isSafeInteger(value) || value < 1 || value > limit
-      )) {
-        fail("memory_limit", "WebGPU dispatch exceeds workgroup limits");
-      }
-      const entries = prepared.bindings.map((binding) =>
-        this.#bindingEntry(command, prepared, binding),
-      );
-      const signature = JSON.stringify([
-        command.operation,
-        command.execution,
-        command.stageIndex,
-        prepared.bindings.map((binding) => binding.addressSpace === "uniform"
-          ? [binding.binding, "uniform", command.uniformSlot]
-          : [binding.binding, "storage", command.storageBindings[binding.binding]]
-        ),
-      ]);
-      let bindGroup = this.#bindGroups.get(signature);
-      if (bindGroup === undefined) {
-        bindGroup = this.#device.createBindGroup({
-          label: `tritium:bindings:${signature}`,
-          layout: prepared.pipeline.getBindGroupLayout(0),
-          entries,
-        });
-        this.#bindGroups.set(signature, bindGroup);
-      }
-      pass.setPipeline(prepared.pipeline);
-      pass.setBindGroup(0, bindGroup);
-      pass.dispatchWorkgroups(...command.workgroups);
-    }
-    pass.end();
-    for (const copy of capturedCommitCopies) {
-      encoder.copyBufferToBuffer(
-        this.#physicalBuffer(copy.source),
-        copy.sourceOffset,
-        this.#physicalBuffer(copy.destination),
-        copy.destinationOffset,
-        copy.byteLength,
-      );
     }
     this.#device.queue.submit([encoder.finish()]);
+    return Promise.race([
+      this.#device.queue.onSubmittedWorkDone().catch(() =>
+        fail("device_lost", "WebGPU queue rejected submitted work")
+      ),
+      this.#device.lost.then(() =>
+        fail("device_lost", "WebGPU device was lost during submitted work")
+      ),
+    ]).then(() => undefined);
+  }
+
+  write(bufferId: string, bytes: Uint8Array): void {
+    this.#ready();
+    const buffer = this.#buffers.get(bufferId);
+    if (buffer === undefined || buffer.ownerId !== buffer.id ||
+        !(bytes instanceof Uint8Array) || bytes.byteLength !== buffer.byteLength) {
+      fail("invalid_schema", "WebGPU resident write differs from a root buffer");
+    }
+    const upload = new Uint8Array(paddedBytes(bytes.byteLength));
+    upload.set(bytes);
+    this.#device.queue.writeBuffer(this.#physicalBuffer(bufferId), 0, upload);
   }
 
   async read(bufferId: string): Promise<Uint8Array> {
@@ -771,7 +893,9 @@ export class WebGpuResidentRuntimeV1 {
       );
       this.#device.queue.submit([encoder.finish()]);
       await Promise.race([
-        staging.mapAsync(MAP_READ),
+        staging.mapAsync(MAP_READ).catch(() =>
+          fail("device_lost", "WebGPU readback mapping failed after submission")
+        ),
         this.#device.lost.then(() =>
           fail("device_lost", "WebGPU device was lost during explicit readback")
         ),

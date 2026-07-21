@@ -85,9 +85,14 @@ targets must align row boundaries to 128 coefficients; this prevents a browser
 artifact from silently changing the training quantizer's scale domains.
 
 The built-in adapter remains explicitly `wasm-fallback`; it never satisfies a
-WebGPU gate. WebGPU implementation remains under construction. `backend:
-"webgpu"` still returns `adapter_unavailable` unless a real WebGPU adapter is
-supplied.
+WebGPU gate. `createWebGpuTrainingAdapter(device, options)` accepts an
+already-authorized WebGPU device and supplies resident forward/backward/step
+execution to `prepareTraining`. The factory transfers exclusive device
+ownership; disposing the adapter destroys that device. Submitted phases await
+queue completion and fail terminally on device loss. It does not yet advertise GPU-native
+checkpoint/resume/export. Automatic browser adapter acquisition is also still
+open, so `backend: "webgpu"` returns `adapter_unavailable` unless this explicit
+adapter is supplied.
 
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.
