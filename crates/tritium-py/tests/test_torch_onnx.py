@@ -18,13 +18,17 @@ from tritium.torch.artifacts import QuantizationResult  # noqa: E402
 from tritium.torch.conversion import PreparedModel  # noqa: E402
 
 
-def _write_onnx_bundle(root: Path):
+def _write_onnx_bundle(root: Path, *, dynamic=False):
     root.mkdir()
     (root / "language.onnx").write_bytes(b"language")
     (root / "mtp.onnx").write_bytes(b"mtp")
     (root / "weights.bin").write_bytes(b"weights")
     value = {
-        "schema": "tritium-qwen35-onnx-bundle-v1",
+        "schema": (
+            "tritium-qwen35-onnx-bundle-v2"
+            if dynamic
+            else "tritium-qwen35-onnx-bundle-v1"
+        ),
         "language": {"file": "language.onnx", "blake3": "11" * 32},
         "mtp": {"file": "mtp.onnx", "blake3": "22" * 32},
         "weights": {"file": "weights.bin", "blake3": "33" * 32, "bytes": 7},
@@ -44,6 +48,8 @@ def _write_onnx_bundle(root: Path):
             "selection_id": "selection",
         },
     }
+    if dynamic:
+        value["sequence_mode"] = "dynamic-cache-v1"
     (root / "tritium-onnx-manifest.json").write_text(json.dumps(value), encoding="utf-8")
     return value
 
@@ -112,7 +118,7 @@ def test_export_onnx_rejects_latent_training_graph():
     assert caught.value.code == "trainable_onnx_requires_v1_3"
 
 
-def test_export_onnx_forwards_complete_ptq_ancestry(monkeypatch, tmp_path):
+def test_export_onnx_forwards_dynamic_ptq_bundle(monkeypatch, tmp_path):
     source = QuantizationResult(
         artifact_dir=tmp_path / "source",
         packing="b3",
@@ -137,11 +143,14 @@ def test_export_onnx_forwards_complete_ptq_ancestry(monkeypatch, tmp_path):
         return "receipt"
 
     monkeypatch.setattr(onnx._tritium, "export_qwen35_onnx_bundle", export, raising=False)
-    assert export_onnx(source, tmp_path / "out", tokens=2, past_tokens=3) == "receipt"
+    assert export_onnx(source, tmp_path / "out") == "receipt"
     assert observed["args"] == (str(source.artifact_dir), str(tmp_path / "out"))
     assert observed["kwargs"]["profile"] == "compact-v1"
-    assert observed["kwargs"]["tokens"] == 2
-    assert observed["kwargs"]["past_tokens"] == 3
+    assert observed["kwargs"]["tokens"] == 1
+    assert observed["kwargs"]["past_tokens"] == 0
+
+    with pytest.raises(ValueError, match="dynamic ONNX export"):
+        export_onnx(source, tmp_path / "out", tokens=2)
 
 
 def test_loaded_model_returns_batch_one_logits_and_flat_authenticated_state(
@@ -218,6 +227,90 @@ def test_loaded_model_validates_past_and_refuses_unqualified_generation(
     with pytest.raises(TritiumError) as caught:
         model.generate(torch.tensor([[1]]))
     assert caught.value.code == "dynamic_onnx_generation_unavailable"
+
+
+def test_dynamic_model_greedy_generation_reuses_cache_and_stops_on_eos(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "onnx"
+    _write_onnx_bundle(root, dynamic=True)
+    calls = []
+
+    class Runtime:
+        device = "cpu"
+
+        @staticmethod
+        def load(*args, **kwargs):
+            return Runtime()
+
+        def forward_language(self, token_ids, states):
+            calls.append((token_ids, states))
+            call = len(calls)
+            next_token = {1: 2, 2: 1, 3: 3}[call]
+            cache_rows = len(token_ids) if call == 1 else len(states[0]) + 1
+            return SimpleNamespace(
+                logits_shape=[len(token_ids), 4],
+                logits=(
+                    [0.0, 0.0, 0.0, 0.0] * (len(token_ids) - 1)
+                    + [5.0 if index == next_token else 0.0 for index in range(4)]
+                ),
+                state_names=["present_k.0"],
+                state_shapes=[[cache_rows, 1, 1]],
+                states=[[float(index) for index in range(1, cache_rows + 1)]],
+            )
+
+    monkeypatch.setattr(onnx._tritium, "QwenOnnxModel", Runtime, raising=False)
+    model = load_onnx(root)
+    generated = model.generate(torch.tensor([[4, 5]]), max_new_tokens=8, eos_token_id=3)
+    assert generated.tolist() == [[4, 5, 2, 1, 3]]
+    assert calls == [
+        ([4, 5], None),
+        ([2], [[1.0, 2.0]]),
+        ([1], [[1.0, 2.0, 3.0]]),
+    ]
+
+
+def test_dynamic_generation_zero_budget_and_rejects_sampling(monkeypatch, tmp_path):
+    root = tmp_path / "onnx"
+    _write_onnx_bundle(root, dynamic=True)
+
+    class Runtime:
+        device = "cpu"
+
+        @staticmethod
+        def load(*args, **kwargs):
+            return Runtime()
+
+        def forward_language(self, *args, **kwargs):
+            pytest.fail("zero generation budget must not execute")
+
+    monkeypatch.setattr(onnx._tritium, "QwenOnnxModel", Runtime, raising=False)
+    model = load_onnx(root)
+    assert model.generate(torch.tensor([[7]]), max_new_tokens=0).tolist() == [[7]]
+    with pytest.raises(TritiumError) as caught:
+        model.generate(torch.tensor([[7]]), do_sample=True)
+    assert caught.value.code == "onnx_sampling_unavailable"
+
+
+def test_manifest_schema_and_sequence_mode_are_cross_bound(monkeypatch, tmp_path):
+    root = tmp_path / "onnx"
+    value = _write_onnx_bundle(root)
+    value["sequence_mode"] = "dynamic-cache-v1"
+    (root / "tritium-onnx-manifest.json").write_text(json.dumps(value), encoding="utf-8")
+    monkeypatch.setattr(
+        onnx._tritium,
+        "QwenOnnxModel",
+        SimpleNamespace(load=lambda *args, **kwargs: pytest.fail("must not load")),
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="schema v1"):
+        load_onnx(root)
+
+    value["schema"] = "tritium-qwen35-onnx-bundle-v2"
+    value.pop("sequence_mode")
+    (root / "tritium-onnx-manifest.json").write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="schema v2"):
+        load_onnx(root)
 
 
 def test_loaded_model_executes_authenticated_mtp_drafter(monkeypatch, tmp_path):

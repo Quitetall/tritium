@@ -26,9 +26,9 @@ use tritium_onnx::{
     AdmittedExternalQwen35BundleDigests, OnnxArtifactIdentityV2, Qwen35Config, Qwen35LayerType,
     Qwen35OnnxAncestryV1, Qwen35PackageMatrixSpec, Qwen35PackagePreservedSpec,
     Qwen35PackageSourceSpec, Qwen35SaltV2PackageSource, QwenDeltaNetGeometry,
-    VerifiedExternalQwen35Bundle, encode_external_qwen35_bundle_to_file_with_ancestry,
+    VerifiedExternalQwen35Bundle, encode_dynamic_external_qwen35_bundle_to_file_with_ancestry,
     map_qwen36_27b_packed_causal_lm, tritium_operator_domain,
-    verify_external_qwen35_bundle_from_file,
+    verify_dynamic_external_qwen35_bundle_from_file, verify_external_qwen35_bundle_from_file,
 };
 
 const LANGUAGE_FILE: &str = "language.onnx";
@@ -54,6 +54,7 @@ pub(crate) struct QwenOnnxBundleReceipt {
     language_layers: u64,
     mtp_tokens: u64,
     mtp_past_tokens: u64,
+    sequence_mode: Option<String>,
     mtp_layers: u64,
     source_model_id: String,
     tokenizer_id: String,
@@ -105,6 +106,10 @@ impl QwenOnnxBundleReceipt {
     #[getter]
     const fn mtp_past_tokens(&self) -> u64 {
         self.mtp_past_tokens
+    }
+    #[getter]
+    fn sequence_mode(&self) -> Option<&str> {
+        self.sequence_mode.as_deref()
     }
     #[getter]
     const fn mtp_layers(&self) -> u64 {
@@ -317,11 +322,10 @@ impl QwenOnnxModel {
         self.mtp_outputs.clone()
     }
 
-    /// Execute the authenticated fixed-shape language graph.
+    /// Execute authenticated dynamic-cache language graph.
     ///
-    /// `states` is ordered exactly like `language_inputs[1:]`. It may be
-    /// omitted only for a graph whose authenticated `past_tokens` is zero, in
-    /// which case recurrent and empty KV inputs are initialized to zero.
+    /// `states` follows language state outputs. Omit for prompt initialization;
+    /// pass prior output states for cached decode.
     #[pyo3(signature = (token_ids, states = None))]
     fn forward_language(
         &self,
@@ -329,27 +333,30 @@ impl QwenOnnxModel {
         token_ids: Vec<i64>,
         states: Option<Vec<Vec<f32>>>,
     ) -> PyResult<QwenOnnxLanguageOutput> {
-        if token_ids.len()
-            != usize::try_from(self.receipt.language_tokens).map_err(|_| {
-                PyValueError::new_err("authenticated language token count exceeds platform bounds")
-            })?
-        {
-            return Err(PyValueError::new_err(format!(
-                "token_ids has length {}, expected {} for this fixed-shape graph",
-                token_ids.len(),
-                self.receipt.language_tokens
-            )));
+        if token_ids.is_empty() {
+            return Err(PyValueError::new_err("token_ids must not be empty"));
         }
-        if states.is_none() && self.receipt.language_past_tokens != 0 {
-            return Err(PyValueError::new_err(
-                "states are required when the authenticated graph has past_tokens > 0",
-            ));
+        if self.receipt.sequence_mode.is_none() {
+            let expected = usize::try_from(self.receipt.language_tokens).map_err(|_| {
+                PyValueError::new_err("authenticated language token count exceeds platform bounds")
+            })?;
+            if token_ids.len() != expected {
+                return Err(PyValueError::new_err(format!(
+                    "token_ids has length {}, expected {expected} for fixed-shape graph",
+                    token_ids.len()
+                )));
+            }
+            if states.is_none() && self.receipt.language_past_tokens != 0 {
+                return Err(PyValueError::new_err(
+                    "states are required when fixed graph has past_tokens > 0",
+                ));
+            }
         }
         py.detach(|| run_language(self, token_ids, states))
             .map_err(PyRuntimeError::new_err)
     }
 
-    /// Execute the authenticated fixed-shape bundled MTP drafter graph.
+    /// Execute authenticated dynamic-cache bundled MTP drafter graph.
     ///
     /// `target_hidden` is flattened row-major from `[tokens, hidden]`. `states`
     /// follows `mtp_inputs[2:]` and may be omitted only for a prompt graph.
@@ -361,21 +368,24 @@ impl QwenOnnxModel {
         target_hidden: Vec<f32>,
         states: Option<Vec<Vec<f32>>>,
     ) -> PyResult<QwenOnnxMtpOutput> {
-        if token_ids.len()
-            != usize::try_from(self.receipt.mtp_tokens).map_err(|_| {
-                PyValueError::new_err("authenticated MTP token count exceeds platform bounds")
-            })?
-        {
-            return Err(PyValueError::new_err(format!(
-                "token_ids has length {}, expected {} for this fixed-shape MTP graph",
-                token_ids.len(),
-                self.receipt.mtp_tokens
-            )));
+        if token_ids.is_empty() {
+            return Err(PyValueError::new_err("token_ids must not be empty"));
         }
-        if states.is_none() && self.receipt.mtp_past_tokens != 0 {
-            return Err(PyValueError::new_err(
-                "states are required when the authenticated MTP graph has past_tokens > 0",
-            ));
+        if self.receipt.sequence_mode.is_none() {
+            let expected = usize::try_from(self.receipt.mtp_tokens).map_err(|_| {
+                PyValueError::new_err("authenticated MTP token count exceeds platform bounds")
+            })?;
+            if token_ids.len() != expected {
+                return Err(PyValueError::new_err(format!(
+                    "token_ids has length {}, expected {expected} for fixed-shape MTP graph",
+                    token_ids.len()
+                )));
+            }
+            if states.is_none() && self.receipt.mtp_past_tokens != 0 {
+                return Err(PyValueError::new_err(
+                    "states are required when fixed MTP graph has past_tokens > 0",
+                ));
+            }
         }
         py.detach(|| run_mtp(self, token_ids, target_hidden, states))
             .map_err(PyRuntimeError::new_err)
@@ -386,11 +396,36 @@ impl QwenOnnxModel {
 #[serde(deny_unknown_fields)]
 struct PublishedManifest {
     schema: String,
+    sequence_mode: Option<String>,
     language: ManifestGraph,
     mtp: ManifestGraph,
     weights: ManifestWeights,
     identity: ManifestIdentity,
     conversion: ManifestConversion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BundleSequenceMode {
+    FixedV1,
+    DynamicCacheV1,
+}
+
+impl PublishedManifest {
+    fn sequence_mode(&self) -> Result<BundleSequenceMode, String> {
+        match (self.schema.as_str(), self.sequence_mode.as_deref()) {
+            ("tritium-qwen35-onnx-bundle-v1", None) => Ok(BundleSequenceMode::FixedV1),
+            ("tritium-qwen35-onnx-bundle-v2", Some("dynamic-cache-v1")) => {
+                Ok(BundleSequenceMode::DynamicCacheV1)
+            }
+            ("tritium-qwen35-onnx-bundle-v1", Some(_)) => {
+                Err("schema-v1 ONNX manifest must not declare sequence_mode".to_owned())
+            }
+            ("tritium-qwen35-onnx-bundle-v2", _) => {
+                Err("schema-v2 ONNX manifest requires sequence_mode dynamic-cache-v1".to_owned())
+            }
+            _ => Err("unsupported ONNX bundle schema".to_owned()),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -453,7 +488,8 @@ fn load_onnx_runtime(requested: &Path) -> Result<QwenOnnxModel, String> {
 
     let manifest = read_published_manifest(&directory)?;
     let inputs = manifest_inputs(&directory, &manifest)?;
-    let receipt = verify_paths(&inputs)?;
+    let sequence_mode = manifest.sequence_mode()?;
+    let receipt = verify_paths_with_mode(&inputs, sequence_mode)?;
     validate_manifest_receipt(&manifest, &receipt)?;
 
     let language_session =
@@ -489,7 +525,7 @@ fn load_onnx_runtime(requested: &Path) -> Result<QwenOnnxModel, String> {
 
     // ORT resolves external data while committing each session. Re-admission
     // after both commits catches replacement or mutation during that window.
-    let after = verify_paths(&inputs)?;
+    let after = verify_paths_with_mode(&inputs, sequence_mode)?;
     if !same_receipt(&receipt, &after) {
         return Err("ONNX bundle changed while ORT sessions were being created".to_owned());
     }
@@ -526,49 +562,62 @@ fn run_language(
     token_ids: Vec<i64>,
     states: Option<Vec<Vec<f32>>>,
 ) -> Result<QwenOnnxLanguageOutput, String> {
+    if model.receipt.sequence_mode.is_none() {
+        return run_fixed_language(model, token_ids, states);
+    }
+    run_dynamic_language(model, token_ids, states)
+}
+
+fn run_fixed_language(
+    model: &QwenOnnxModel,
+    token_ids: Vec<i64>,
+    states: Option<Vec<Vec<f32>>>,
+) -> Result<QwenOnnxLanguageOutput, String> {
     let mut session = model
         .language_session
         .lock()
         .map_err(|_| "language ORT session lock was poisoned".to_owned())?;
-    let state_shapes = session
+    let shapes = session
         .inputs()
         .iter()
         .skip(1)
         .map(|outlet| fixed_f32_shape(outlet.dtype(), outlet.name()))
         .collect::<Result<Vec<_>, _>>()?;
-    let states = match states {
-        Some(states) => {
-            if states.len() != state_shapes.len() {
-                return Err(format!(
-                    "language state count is {}, expected {}",
-                    states.len(),
-                    state_shapes.len()
-                ));
-            }
-            for (index, (values, shape)) in states.iter().zip(&state_shapes).enumerate() {
-                let expected = shape_elements(shape, "language state")?;
-                if values.len() != expected {
-                    return Err(format!(
-                        "language state {index} has {} values, expected {expected}",
-                        values.len()
-                    ));
-                }
-            }
-            states
-        }
-        None => state_shapes
-            .iter()
-            .map(|shape| {
-                shape_elements(shape, "language state").map(|elements| vec![0.0_f32; elements])
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-
+    let states = prepare_fixed_states(states, &shapes, "language")?;
     let tokens = Tensor::from_array((vec![token_ids.len()], token_ids.into_boxed_slice()))
         .map_err(|error| format!("create language token tensor failed: {error}"))?;
     let mut inputs: Vec<SessionInputValue<'_>> = Vec::with_capacity(1 + states.len());
     inputs.push(tokens.into_dyn().into());
-    for (shape, values) in state_shapes.iter().cloned().zip(states) {
+    for (shape, values) in shapes.into_iter().zip(states) {
+        let tensor = Tensor::from_array((shape, values.into_boxed_slice()))
+            .map_err(|error| format!("create language state tensor failed: {error}"))?;
+        inputs.push(tensor.into_dyn().into());
+    }
+    let outputs = session
+        .run(inputs.as_slice())
+        .map_err(|error| format!("execute authenticated language ORT graph failed: {error}"))?;
+    collect_language_output(model, &outputs)
+}
+
+fn run_dynamic_language(
+    model: &QwenOnnxModel,
+    token_ids: Vec<i64>,
+    states: Option<Vec<Vec<f32>>>,
+) -> Result<QwenOnnxLanguageOutput, String> {
+    let mut session = model
+        .language_session
+        .lock()
+        .map_err(|_| "language ORT session lock was poisoned".to_owned())?;
+    let prepared = prepare_dynamic_states(&session.inputs()[2..], states, "language")?;
+
+    let tokens = Tensor::from_array((vec![token_ids.len()], token_ids.into_boxed_slice()))
+        .map_err(|error| format!("create language token tensor failed: {error}"))?;
+    let past_tokens = Tensor::from_array(((), vec![prepared.past_tokens]))
+        .map_err(|error| format!("create language past-token tensor failed: {error}"))?;
+    let mut inputs: Vec<SessionInputValue<'_>> = Vec::with_capacity(2 + prepared.values.len());
+    inputs.push(tokens.into_dyn().into());
+    inputs.push(past_tokens.into_dyn().into());
+    for (shape, values) in prepared.shapes.into_iter().zip(prepared.values) {
         let tensor = Tensor::from_array((shape, values.into_boxed_slice()))
             .map_err(|error| format!("create language state tensor failed: {error}"))?;
         inputs.push(tensor.into_dyn().into());
@@ -605,6 +654,57 @@ fn run_mtp(
     target_hidden: Vec<f32>,
     states: Option<Vec<Vec<f32>>>,
 ) -> Result<QwenOnnxMtpOutput, String> {
+    if model.receipt.sequence_mode.is_none() {
+        return run_fixed_mtp(model, token_ids, target_hidden, states);
+    }
+    run_dynamic_mtp(model, token_ids, target_hidden, states)
+}
+
+fn run_fixed_mtp(
+    model: &QwenOnnxModel,
+    token_ids: Vec<i64>,
+    target_hidden: Vec<f32>,
+    states: Option<Vec<Vec<f32>>>,
+) -> Result<QwenOnnxMtpOutput, String> {
+    let mut session = model
+        .mtp_session
+        .lock()
+        .map_err(|_| "MTP ORT session lock was poisoned".to_owned())?;
+    let target_shape = fixed_f32_shape(session.inputs()[1].dtype(), "target_hidden")?;
+    if target_hidden.len() != shape_elements(&target_shape, "MTP target hidden")? {
+        return Err("MTP target hidden has invalid element count".to_owned());
+    }
+    let shapes = session
+        .inputs()
+        .iter()
+        .skip(2)
+        .map(|outlet| fixed_f32_shape(outlet.dtype(), outlet.name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let states = prepare_fixed_states(states, &shapes, "MTP")?;
+    let tokens = Tensor::from_array((vec![token_ids.len()], token_ids.into_boxed_slice()))
+        .map_err(|error| format!("create MTP token tensor failed: {error}"))?;
+    let hidden = Tensor::from_array((target_shape, target_hidden.into_boxed_slice()))
+        .map_err(|error| format!("create MTP target hidden tensor failed: {error}"))?;
+    let mut inputs: Vec<SessionInputValue<'_>> = Vec::with_capacity(2 + states.len());
+    inputs.push(tokens.into_dyn().into());
+    inputs.push(hidden.into_dyn().into());
+    for (shape, values) in shapes.into_iter().zip(states) {
+        let tensor = Tensor::from_array((shape, values.into_boxed_slice()))
+            .map_err(|error| format!("create MTP state tensor failed: {error}"))?;
+        inputs.push(tensor.into_dyn().into());
+    }
+    let outputs = session
+        .run(inputs.as_slice())
+        .map_err(|error| format!("execute authenticated MTP ORT graph failed: {error}"))?;
+    collect_mtp_output(model, &outputs)
+}
+
+fn run_dynamic_mtp(
+    model: &QwenOnnxModel,
+    token_ids: Vec<i64>,
+    target_hidden: Vec<f32>,
+    states: Option<Vec<Vec<f32>>>,
+) -> Result<QwenOnnxMtpOutput, String> {
     let mut session = model
         .mtp_session
         .lock()
@@ -613,7 +713,8 @@ fn run_mtp(
         .inputs()
         .get(1)
         .ok_or_else(|| "authenticated MTP session has no target_hidden input".to_owned())?;
-    let target_shape = fixed_f32_shape(target_input.dtype(), "target_hidden")?;
+    let hidden_width = dynamic_trailing_width(target_input.dtype(), "target_hidden")?;
+    let target_shape = vec![token_ids.len(), hidden_width];
     let expected_hidden = shape_elements(&target_shape, "MTP target hidden")?;
     if target_hidden.len() != expected_hidden {
         return Err(format!(
@@ -621,22 +722,19 @@ fn run_mtp(
             target_hidden.len()
         ));
     }
-    let state_shapes = session
-        .inputs()
-        .iter()
-        .skip(2)
-        .map(|outlet| fixed_f32_shape(outlet.dtype(), outlet.name()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let states = prepare_states(states, &state_shapes, "MTP")?;
+    let prepared = prepare_dynamic_states(&session.inputs()[3..], states, "MTP")?;
 
     let tokens = Tensor::from_array((vec![token_ids.len()], token_ids.into_boxed_slice()))
         .map_err(|error| format!("create MTP token tensor failed: {error}"))?;
     let hidden = Tensor::from_array((target_shape, target_hidden.into_boxed_slice()))
         .map_err(|error| format!("create MTP target hidden tensor failed: {error}"))?;
-    let mut inputs: Vec<SessionInputValue<'_>> = Vec::with_capacity(2 + states.len());
+    let past_tokens = Tensor::from_array(((), vec![prepared.past_tokens]))
+        .map_err(|error| format!("create MTP past-token tensor failed: {error}"))?;
+    let mut inputs: Vec<SessionInputValue<'_>> = Vec::with_capacity(3 + prepared.values.len());
     inputs.push(tokens.into_dyn().into());
     inputs.push(hidden.into_dyn().into());
-    for (shape, values) in state_shapes.iter().cloned().zip(states) {
+    inputs.push(past_tokens.into_dyn().into());
+    for (shape, values) in prepared.shapes.into_iter().zip(prepared.values) {
         let tensor = Tensor::from_array((shape, values.into_boxed_slice()))
             .map_err(|error| format!("create MTP state tensor failed: {error}"))?;
         inputs.push(tensor.into_dyn().into());
@@ -685,36 +783,89 @@ fn extract_f32_output(
     Ok((runtime_shape(shape, label)?, values.to_vec()))
 }
 
-fn prepare_states(
+fn collect_language_output(
+    model: &QwenOnnxModel,
+    outputs: &ort::session::SessionOutputs<'_>,
+) -> Result<QwenOnnxLanguageOutput, String> {
+    let (logits_shape, logits) = extract_f32_output(outputs, "logits", "language logits")?;
+    let state_names = model
+        .language_outputs
+        .iter()
+        .skip(1)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut state_shapes = Vec::with_capacity(state_names.len());
+    let mut states = Vec::with_capacity(state_names.len());
+    for name in &state_names {
+        let (shape, state) = extract_f32_output(outputs, name, "language state output")?;
+        state_shapes.push(shape);
+        states.push(state);
+    }
+    Ok(QwenOnnxLanguageOutput {
+        logits_shape,
+        logits,
+        state_names,
+        state_shapes,
+        states,
+    })
+}
+
+fn collect_mtp_output(
+    model: &QwenOnnxModel,
+    outputs: &ort::session::SessionOutputs<'_>,
+) -> Result<QwenOnnxMtpOutput, String> {
+    let (logits_shape, logits) = extract_f32_output(outputs, "mtp.logits", "MTP logits")?;
+    let (final_hidden_shape, final_hidden) =
+        extract_f32_output(outputs, "mtp.final_hidden", "MTP final hidden")?;
+    let state_names = model
+        .mtp_outputs
+        .iter()
+        .skip(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut state_shapes = Vec::with_capacity(state_names.len());
+    let mut states = Vec::with_capacity(state_names.len());
+    for name in &state_names {
+        let (shape, state) = extract_f32_output(outputs, name, "MTP state output")?;
+        state_shapes.push(shape);
+        states.push(state);
+    }
+    Ok(QwenOnnxMtpOutput {
+        logits_shape,
+        logits,
+        final_hidden_shape,
+        final_hidden,
+        state_names,
+        state_shapes,
+        states,
+    })
+}
+
+fn prepare_fixed_states(
     states: Option<Vec<Vec<f32>>>,
-    state_shapes: &[Vec<usize>],
+    shapes: &[Vec<usize>],
     label: &str,
 ) -> Result<Vec<Vec<f32>>, String> {
-    match states {
-        Some(states) => {
-            if states.len() != state_shapes.len() {
-                return Err(format!(
-                    "{label} state count is {}, expected {}",
-                    states.len(),
-                    state_shapes.len()
-                ));
-            }
-            for (index, (values, shape)) in states.iter().zip(state_shapes).enumerate() {
-                let expected = shape_elements(shape, "state")?;
-                if values.len() != expected {
-                    return Err(format!(
-                        "{label} state {index} has {} values, expected {expected}",
-                        values.len()
-                    ));
-                }
-            }
-            Ok(states)
-        }
-        None => state_shapes
+    let states = match states {
+        Some(states) => states,
+        None => shapes
             .iter()
-            .map(|shape| shape_elements(shape, "state").map(|elements| vec![0.0; elements]))
-            .collect(),
+            .map(|shape| shape_elements(shape, label).map(|count| vec![0.0; count]))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    if states.len() != shapes.len() {
+        return Err(format!(
+            "{label} state count is {}, expected {}",
+            states.len(),
+            shapes.len()
+        ));
     }
+    for (state, shape) in states.iter().zip(shapes) {
+        if state.len() != shape_elements(shape, label)? {
+            return Err(format!("{label} state has invalid element count"));
+        }
+    }
+    Ok(states)
 }
 
 fn fixed_f32_shape(dtype: &ort::value::ValueType, name: &str) -> Result<Vec<usize>, String> {
@@ -723,8 +874,132 @@ fn fixed_f32_shape(dtype: &ort::value::ValueType, name: &str) -> Result<Vec<usiz
     }
     let shape = dtype
         .tensor_shape()
-        .ok_or_else(|| format!("language state input {name:?} is not a tensor"))?;
-    runtime_shape(shape, name)
+        .ok_or_else(|| format!("ONNX input {name:?} is not a tensor"))?;
+    runtime_shape(shape.as_ref(), name)
+}
+
+struct PreparedDynamicStates {
+    past_tokens: i64,
+    shapes: Vec<Vec<usize>>,
+    values: Vec<Vec<f32>>,
+}
+
+fn prepare_dynamic_states(
+    outlets: &[ort::value::Outlet],
+    states: Option<Vec<Vec<f32>>>,
+    label: &str,
+) -> Result<PreparedDynamicStates, String> {
+    if states
+        .as_ref()
+        .is_some_and(|states| states.len() != outlets.len())
+    {
+        return Err(format!(
+            "{label} state count is {}, expected {}",
+            states.as_ref().map_or(0, Vec::len),
+            outlets.len()
+        ));
+    }
+    let prompt = states.is_none();
+    let supplied = states.unwrap_or_else(|| vec![Vec::new(); outlets.len()]);
+    let mut shapes = Vec::with_capacity(outlets.len());
+    let mut values = Vec::with_capacity(outlets.len());
+    let mut cache_rows = None;
+    for (outlet, mut state) in outlets.iter().zip(supplied) {
+        let name = outlet.name();
+        let is_cache = name.starts_with("past_k.") || name.starts_with("past_v.");
+        let shape = materialize_state_shape(outlet.dtype(), name, state.len(), prompt)?;
+        let elements = shape_elements(&shape, label)?;
+        if prompt {
+            state = vec![0.0; elements];
+        } else if state.len() != elements {
+            return Err(format!(
+                "{label} state {name:?} has {} values, expected {elements}",
+                state.len()
+            ));
+        }
+        if is_cache {
+            let rows = shape[0];
+            if let Some(expected) = cache_rows {
+                if rows != expected {
+                    return Err(format!(
+                        "{label} K/V states disagree on valid prefix length"
+                    ));
+                }
+            } else {
+                cache_rows = Some(rows);
+            }
+        }
+        shapes.push(shape);
+        values.push(state);
+    }
+    let past_tokens = if prompt {
+        0
+    } else {
+        i64::try_from(cache_rows.ok_or_else(|| format!("{label} has no K/V state"))?)
+            .map_err(|_| format!("{label} cache length exceeds int64"))?
+    };
+    Ok(PreparedDynamicStates {
+        past_tokens,
+        shapes,
+        values,
+    })
+}
+
+fn materialize_state_shape(
+    dtype: &ort::value::ValueType,
+    name: &str,
+    values: usize,
+    prompt: bool,
+) -> Result<Vec<usize>, String> {
+    if dtype.tensor_type() != Some(ort::value::TensorElementType::Float32) {
+        return Err(format!("ONNX input {name:?} is not float32"));
+    }
+    let declared = dtype
+        .tensor_shape()
+        .ok_or_else(|| format!("state input {name:?} is not a tensor"))?;
+    if declared.iter().all(|&axis| axis >= 0) {
+        let shape = runtime_shape(declared, name)?;
+        if !prompt && shape_elements(&shape, name)? != values {
+            return Err(format!("state input {name:?} has invalid element count"));
+        }
+        return Ok(shape);
+    }
+    let is_cache = name.starts_with("past_k.") || name.starts_with("past_v.");
+    if !is_cache
+        || declared.len() != 3
+        || declared[0] >= 0
+        || declared[1..].iter().any(|&axis| axis <= 0)
+    {
+        return Err(format!(
+            "state input {name:?} has unsupported dynamic shape"
+        ));
+    }
+    let trailing = runtime_shape(&declared[1..], name)?;
+    let row_elements = shape_elements(&trailing, name)?;
+    let rows = if prompt {
+        1
+    } else if values == 0 || !values.is_multiple_of(row_elements) {
+        return Err(format!("state input {name:?} cannot infer cache rows"));
+    } else {
+        values / row_elements
+    };
+    Ok([vec![rows], trailing].concat())
+}
+
+fn dynamic_trailing_width(dtype: &ort::value::ValueType, name: &str) -> Result<usize, String> {
+    if dtype.tensor_type() != Some(ort::value::TensorElementType::Float32) {
+        return Err(format!("ONNX input {name:?} is not float32"));
+    }
+    let shape = dtype
+        .tensor_shape()
+        .ok_or_else(|| format!("ONNX input {name:?} is not a tensor"))?;
+    match shape.as_ref() {
+        [first, hidden] if *first < 0 && *hidden > 0 => usize::try_from(*hidden)
+            .map_err(|_| format!("ONNX input {name:?} hidden width exceeds usize")),
+        _ => Err(format!(
+            "ONNX input {name:?} is not dynamic [tokens, hidden]"
+        )),
+    }
 }
 
 fn runtime_shape(shape: &[i64], label: &str) -> Result<Vec<usize>, String> {
@@ -753,9 +1028,7 @@ fn read_published_manifest(directory: &Path) -> Result<PublishedManifest, String
     )?;
     let manifest: PublishedManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse strict ONNX manifest failed: {error}"))?;
-    if manifest.schema != "tritium-qwen35-onnx-bundle-v1" {
-        return Err("unsupported ONNX bundle schema".to_owned());
-    }
+    manifest.sequence_mode()?;
     if manifest.language.file != LANGUAGE_FILE
         || manifest.mtp.file != MTP_FILE
         || manifest.weights.file != WEIGHTS_FILE
@@ -832,6 +1105,7 @@ fn validate_manifest_receipt(
         || manifest.mtp.blake3 != receipt.mtp_blake3
         || manifest.weights.blake3 != receipt.weights_blake3
         || manifest.weights.bytes != receipt.weights_bytes
+        || manifest.sequence_mode.as_deref() != receipt.sequence_mode.as_deref()
         || !identity_matches
         || !conversion_matches
     {
@@ -863,7 +1137,8 @@ fn validate_session_interface(
     {
         return Err("ORT language state outputs do not cover each layer exactly once".to_owned());
     }
-    let mut expected_language_inputs = 1_usize
+    let dynamic = receipt.sequence_mode.as_deref() == Some("dynamic-cache-v1");
+    let mut expected_language_inputs = if dynamic { 2_usize } else { 1_usize }
         .checked_add(
             delta_layers
                 .len()
@@ -871,7 +1146,7 @@ fn validate_session_interface(
                 .ok_or_else(|| "language DeltaNet input count overflow".to_owned())?,
         )
         .ok_or_else(|| "language input count overflow".to_owned())?;
-    if receipt.language_past_tokens != 0 {
+    if dynamic || receipt.language_past_tokens != 0 {
         expected_language_inputs = expected_language_inputs
             .checked_add(
                 attention_layers
@@ -888,10 +1163,17 @@ fn validate_session_interface(
                 .ok_or_else(|| "language output count overflow".to_owned())?,
         )
         .ok_or_else(|| "language output count overflow".to_owned())?;
-    let expected_mtp_inputs = if receipt.mtp_past_tokens == 0 { 2 } else { 4 };
+    let expected_mtp_inputs = if dynamic {
+        5
+    } else if receipt.mtp_past_tokens == 0 {
+        2
+    } else {
+        4
+    };
     let expected_mtp_outputs = 4;
     if language_inputs.first().map(String::as_str) != Some("tokens")
         || language_outputs.first().map(String::as_str) != Some("logits")
+        || (dynamic && language_inputs.get(1).map(String::as_str) != Some("past_tokens"))
         || mtp_inputs.first().map(String::as_str) != Some("shifted_tokens")
         || mtp_inputs.get(1).map(String::as_str) != Some("target_hidden")
         || mtp_outputs.first().map(String::as_str) != Some("mtp.logits")
@@ -904,11 +1186,18 @@ fn validate_session_interface(
             language_inputs,
             &delta_layers,
             &attention_layers,
-            receipt.language_past_tokens != 0,
+            dynamic || receipt.language_past_tokens != 0,
         )
-        || (receipt.mtp_past_tokens != 0
-            && (mtp_inputs.get(2).map(String::as_str) != Some("past_k.0")
-                || mtp_inputs.get(3).map(String::as_str) != Some("past_v.0")))
+        || (dynamic && mtp_inputs.get(2).map(String::as_str) != Some("past_tokens"))
+        || ((dynamic || receipt.mtp_past_tokens != 0)
+            && (mtp_inputs
+                .get(if dynamic { 3 } else { 2 })
+                .map(String::as_str)
+                != Some("past_k.0")
+                || mtp_inputs
+                    .get(if dynamic { 4 } else { 3 })
+                    .map(String::as_str)
+                    != Some("past_v.0")))
         || mtp_outputs.get(2).map(String::as_str) != Some("present_k.0")
         || mtp_outputs.get(3).map(String::as_str) != Some("present_v.0")
     {
@@ -973,6 +1262,7 @@ fn same_receipt(left: &QwenOnnxBundleReceipt, right: &QwenOnnxBundleReceipt) -> 
         && left.language_layers == right.language_layers
         && left.mtp_tokens == right.mtp_tokens
         && left.mtp_past_tokens == right.mtp_past_tokens
+        && left.sequence_mode == right.sequence_mode
         && left.mtp_layers == right.mtp_layers
         && left.source_model_id == right.source_model_id
         && left.tokenizer_id == right.tokenizer_id
@@ -1071,8 +1361,10 @@ pub(crate) fn export_qwen35_onnx_bundle(
             "bundle_dir and output_dir must not be empty",
         ));
     }
-    if tokens == 0 {
-        return Err(PyValueError::new_err("tokens must be positive"));
+    if tokens != 1 || past_tokens != 0 {
+        return Err(PyValueError::new_err(
+            "dynamic ONNX export requires tokens=1 and past_tokens=0",
+        ));
     }
     if [
         max_package_bytes,
@@ -1090,8 +1382,6 @@ pub(crate) fn export_qwen35_onnx_bundle(
         bundle: PathBuf::from(bundle_dir),
         output: PathBuf::from(output_dir),
         profile: profile.to_owned(),
-        tokens,
-        past_tokens,
         max_package_bytes,
         max_preserved_bytes,
         max_salt_resident_bytes,
@@ -1105,8 +1395,6 @@ struct ExportRequest {
     bundle: PathBuf,
     output: PathBuf,
     profile: String,
-    tokens: usize,
-    past_tokens: usize,
     max_package_bytes: u64,
     max_preserved_bytes: u64,
     max_salt_resident_bytes: u64,
@@ -1266,9 +1554,9 @@ fn export_paths(request: &ExportRequest) -> Result<QwenOnnxBundleReceipt, String
 
     let staging = create_staging_directory(&parent)?;
     let result = (|| {
-        let emitted = encode_external_qwen35_bundle_to_file_with_ancestry(
-            mapped.model(request.tokens, request.past_tokens),
-            mapped.mtp_model(request.tokens, request.past_tokens),
+        let emitted = encode_dynamic_external_qwen35_bundle_to_file_with_ancestry(
+            mapped.model(1, 0),
+            mapped.mtp_model(1, 0),
             Qwen35OnnxAncestryV1 {
                 conversion_mode: "ptq",
                 completion_id: admission.completion_id(),
@@ -1296,7 +1584,7 @@ fn export_paths(request: &ExportRequest) -> Result<QwenOnnxBundleReceipt, String
             mtp_model_blake3: *blake3::hash(&emitted.mtp_model_bytes).as_bytes(),
             weights_blake3: emitted.weights_blake3,
         };
-        let verified = verify_external_qwen35_bundle_from_file(
+        let verified = verify_dynamic_external_qwen35_bundle_from_file(
             &emitted.language_model_bytes,
             &emitted.mtp_model_bytes,
             open_regular_handle(
@@ -1365,6 +1653,13 @@ impl Inputs {
 }
 
 fn verify_paths(inputs: &Inputs) -> Result<QwenOnnxBundleReceipt, String> {
+    verify_paths_with_mode(inputs, BundleSequenceMode::FixedV1)
+}
+
+fn verify_paths_with_mode(
+    inputs: &Inputs,
+    sequence_mode: BundleSequenceMode,
+) -> Result<QwenOnnxBundleReceipt, String> {
     let language =
         read_regular_bounded(&inputs.language, inputs.max_graph_bytes, "language graph")?;
     let mtp = read_regular_bounded(&inputs.mtp, inputs.max_graph_bytes, "MTP graph")?;
@@ -1373,9 +1668,18 @@ fn verify_paths(inputs: &Inputs) -> Result<QwenOnnxBundleReceipt, String> {
         inputs.max_weights_bytes,
         "external weights",
     )?;
-    let verified =
-        verify_external_qwen35_bundle_from_file(&language, &mtp, weights, inputs.admitted)
-            .map_err(|error| error.to_string())?;
+    let verified = match sequence_mode {
+        BundleSequenceMode::FixedV1 => {
+            verify_external_qwen35_bundle_from_file(&language, &mtp, weights, inputs.admitted)
+        }
+        BundleSequenceMode::DynamicCacheV1 => verify_dynamic_external_qwen35_bundle_from_file(
+            &language,
+            &mtp,
+            weights,
+            inputs.admitted,
+        ),
+    }
+    .map_err(|error| error.to_string())?;
     receipt(&verified, inputs.admitted)
 }
 
@@ -1439,14 +1743,22 @@ fn canonical_output(output: &Path) -> Result<(PathBuf, PathBuf), String> {
 }
 
 fn write_manifest(staging: &Path, receipt: &QwenOnnxBundleReceipt) -> Result<(), String> {
-    let manifest = serde_json::to_vec_pretty(&json!({
-        "schema": "tritium-qwen35-onnx-bundle-v1",
+    let mut manifest = json!({
+        "schema": if receipt.sequence_mode.is_some() { "tritium-qwen35-onnx-bundle-v2" } else { "tritium-qwen35-onnx-bundle-v1" },
         "language": {"file": LANGUAGE_FILE, "blake3": receipt.language_blake3},
         "mtp": {"file": MTP_FILE, "blake3": receipt.mtp_blake3},
         "weights": {"file": WEIGHTS_FILE, "blake3": receipt.weights_blake3, "bytes": receipt.weights_bytes},
         "identity": {"source_model_id": receipt.source_model_id, "tokenizer_id": receipt.tokenizer_id, "recipe_id": receipt.recipe_id, "package_id": receipt.package_id, "converted_coverage_id": receipt.converted_coverage_id, "deferred_coverage_id": receipt.deferred_coverage_id},
         "conversion": {"mode": receipt.conversion_mode, "completion_id": receipt.completion_id, "campaign_id": receipt.campaign_id, "admission_id": receipt.admission_id, "selection_id": receipt.selection_id}
-    })).map_err(|error| format!("encode ONNX manifest failed: {error}"))?;
+    });
+    if let Some(sequence_mode) = &receipt.sequence_mode {
+        manifest
+            .as_object_mut()
+            .expect("manifest JSON is an object")
+            .insert("sequence_mode".to_owned(), json!(sequence_mode));
+    }
+    let manifest = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("encode ONNX manifest failed: {error}"))?;
     write_sync(&staging.join(MANIFEST_FILE), &manifest, "ONNX manifest")
 }
 
@@ -1492,6 +1804,7 @@ fn receipt(
             .map_err(|_| "MTP token count exceeds u64")?,
         mtp_past_tokens: u64::try_from(verified.mtp.past_tokens)
             .map_err(|_| "MTP past-token count exceeds u64")?,
+        sequence_mode: verified.language.sequence_mode.clone(),
         mtp_layers: u64::try_from(verified.mtp.layers)
             .map_err(|_| "MTP layer count exceeds u64")?,
         source_model_id: identity.source_model_id.clone(),
@@ -1822,8 +2135,6 @@ mod tests {
             bundle: root.join("missing-bundle"),
             output: output.clone(),
             profile: "compact-v1".to_owned(),
-            tokens: 1,
-            past_tokens: 0,
             max_package_bytes: 1,
             max_preserved_bytes: 1,
             max_salt_resident_bytes: 1,
@@ -1878,6 +2189,60 @@ mod tests {
         fs::write(root.join(MANIFEST_FILE), unknown).unwrap();
         assert!(read_published_manifest(&root).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_schema_is_cross_bound_to_sequence_mode() {
+        let manifest = |schema: &str, sequence_mode: Option<&str>| PublishedManifest {
+            schema: schema.to_owned(),
+            sequence_mode: sequence_mode.map(str::to_owned),
+            language: ManifestGraph {
+                file: LANGUAGE_FILE.to_owned(),
+                blake3: "11".repeat(32),
+            },
+            mtp: ManifestGraph {
+                file: MTP_FILE.to_owned(),
+                blake3: "22".repeat(32),
+            },
+            weights: ManifestWeights {
+                file: WEIGHTS_FILE.to_owned(),
+                blake3: "33".repeat(32),
+                bytes: 7,
+            },
+            identity: ManifestIdentity {
+                source_model_id: "source".to_owned(),
+                tokenizer_id: "tokenizer".to_owned(),
+                recipe_id: "recipe".to_owned(),
+                package_id: "package".to_owned(),
+                converted_coverage_id: "converted".to_owned(),
+                deferred_coverage_id: "deferred".to_owned(),
+            },
+            conversion: ManifestConversion {
+                mode: "ptq".to_owned(),
+                completion_id: "completion".to_owned(),
+                campaign_id: "campaign".to_owned(),
+                admission_id: "admission".to_owned(),
+                selection_id: "selection".to_owned(),
+            },
+        };
+        assert_eq!(
+            manifest("tritium-qwen35-onnx-bundle-v1", None).sequence_mode(),
+            Ok(BundleSequenceMode::FixedV1)
+        );
+        assert_eq!(
+            manifest("tritium-qwen35-onnx-bundle-v2", Some("dynamic-cache-v1")).sequence_mode(),
+            Ok(BundleSequenceMode::DynamicCacheV1)
+        );
+        assert!(
+            manifest("tritium-qwen35-onnx-bundle-v1", Some("dynamic-cache-v1"))
+                .sequence_mode()
+                .is_err()
+        );
+        assert!(
+            manifest("tritium-qwen35-onnx-bundle-v2", None)
+                .sequence_mode()
+                .is_err()
+        );
     }
 
     #[test]

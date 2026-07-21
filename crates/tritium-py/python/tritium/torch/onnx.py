@@ -22,7 +22,8 @@ from .conversion import PreparedModel
 from .errors import TritiumError
 
 _MANIFEST_FILE = "tritium-onnx-manifest.json"
-_TOP_FIELDS = {"schema", "language", "mtp", "weights", "identity", "conversion"}
+_TOP_FIELDS_V1 = {"schema", "language", "mtp", "weights", "identity", "conversion"}
+_TOP_FIELDS_V2 = _TOP_FIELDS_V1 | {"sequence_mode"}
 _GRAPH_FIELDS = {"file", "blake3"}
 _WEIGHT_FIELDS = {"file", "blake3", "bytes"}
 _IDENTITY_FIELDS = {
@@ -51,6 +52,7 @@ class OnnxBundleManifest:
     mtp_blake3: str
     weights_blake3: str
     weights_bytes: int
+    sequence_mode: Optional[str]
     source_model_id: str
     tokenizer_id: str
     recipe_id: str
@@ -92,12 +94,7 @@ class _OnnxConfig:
 
 
 class QwenOnnxCausalLM(nn.Module):
-    """Inference-only PyTorch facade over Tritium's authenticated ORT runtime.
-
-    The current graph contract has a fixed token and cache shape. It supports
-    ordinary batch-one causal-LM forward calls; dynamic cache growth used by
-    ``GenerationMixin.generate`` remains an explicit release gate.
-    """
+    """Inference-only PyTorch facade over Tritium's authenticated ORT runtime."""
 
     def __init__(self, runtime: Any, manifest: OnnxBundleManifest) -> None:
         super().__init__()
@@ -121,17 +118,7 @@ class QwenOnnxCausalLM(nn.Module):
     ) -> Union[OnnxCausalLMOutput, Tuple[Tensor, Tuple[Tensor, ...]]]:
         tokens = _batch_one_tokens(input_ids, "input_ids")
         if attention_mask is not None:
-            if attention_mask.device.type != "cpu" or tuple(attention_mask.shape) not in (
-                (1, tokens.numel()),
-                (tokens.numel(),),
-            ):
-                raise ValueError("attention_mask must match the batch-one input_ids shape")
-            if not bool(torch.all(attention_mask != 0).item()):
-                raise TritiumError(
-                    "padded attention masks are not represented by this fixed ONNX graph",
-                    code="onnx_padding_unavailable",
-                    stage="forward_onnx",
-                )
+            _validate_attention_mask(attention_mask, tokens.numel())
         states = _flatten_states(past_key_values)
         native = self._runtime.forward_language(
             tokens.to(dtype=torch.int64).contiguous().tolist(), states
@@ -196,13 +183,55 @@ class QwenOnnxCausalLM(nn.Module):
             state_names=tuple(native.state_names),
         )
 
-    def generate(self, *args: Any, **kwargs: Any) -> Any:
-        del args, kwargs
-        raise TritiumError(
-            "dynamic-cache ONNX generation has not passed the v1.1 release gate",
-            code="dynamic_onnx_generation_unavailable",
-            stage="generate_onnx",
-        )
+    def generate(
+        self,
+        input_ids: Tensor,
+        *,
+        max_new_tokens: int = 20,
+        eos_token_id: Optional[Union[int, Tuple[int, ...], list[int]]] = None,
+        attention_mask: Optional[Tensor] = None,
+        do_sample: bool = False,
+        use_cache: bool = True,
+        **kwargs: Any,
+    ) -> Tensor:
+        """Batch-one greedy generation over the authenticated dynamic KV cache."""
+        if self.manifest.sequence_mode != "dynamic-cache-v1":
+            raise TritiumError(
+                "this fixed-shape ONNX bundle cannot grow its KV cache",
+                code="dynamic_onnx_generation_unavailable",
+                stage="generate_onnx",
+            )
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise TypeError(f"unsupported ONNX generation arguments: {names}")
+        if do_sample:
+            raise TritiumError(
+                "ONNX generation currently supports greedy decoding only",
+                code="onnx_sampling_unavailable",
+                stage="generate_onnx",
+            )
+        if use_cache is not True:
+            raise ValueError("dynamic ONNX generation requires use_cache=True")
+        if type(max_new_tokens) is not int or max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a nonnegative integer")
+        tokens = _batch_one_tokens(input_ids, "input_ids").to(dtype=torch.int64)
+        if tokens.numel() == 0:
+            raise ValueError("input_ids must contain at least one token")
+        if attention_mask is not None:
+            _validate_attention_mask(attention_mask, tokens.numel())
+        eos = _eos_ids(eos_token_id)
+        generated = tokens.contiguous().tolist()
+        states: Optional[Tuple[Tensor, ...]] = None
+        step = tokens
+        for _ in range(max_new_tokens):
+            output = self.forward(step, past_key_values=states)
+            next_token = int(torch.argmax(output.logits[0, -1]).item())
+            generated.append(next_token)
+            states = output.past_key_values
+            if next_token in eos:
+                break
+            step = torch.tensor([next_token], dtype=torch.int64)
+        return torch.tensor([generated], dtype=torch.int64)
 
 
 def export_onnx(
@@ -239,8 +268,8 @@ def export_onnx(
             details={"schema_version": source.schema_version},
         )
     source.artifact(profile)
-    if type(tokens) is not int or tokens <= 0 or type(past_tokens) is not int or past_tokens < 0:
-        raise ValueError("tokens must be positive and past_tokens must be nonnegative")
+    if tokens != 1 or past_tokens != 0:
+        raise ValueError("dynamic ONNX export requires tokens=1 and past_tokens=0")
     limits = {
         "max_package_bytes": max_package_bytes,
         "max_preserved_bytes": max_preserved_bytes,
@@ -319,6 +348,33 @@ def _batch_one_tokens(value: Tensor, label: str) -> Tensor:
     return tokens
 
 
+def _validate_attention_mask(attention_mask: Tensor, tokens: int) -> None:
+    if not isinstance(attention_mask, Tensor):
+        raise TypeError("attention_mask must be a torch.Tensor")
+    if attention_mask.device.type != "cpu" or tuple(attention_mask.shape) not in (
+        (1, tokens),
+        (tokens,),
+    ):
+        raise ValueError("attention_mask must match the batch-one input_ids shape")
+    if not bool(torch.all(attention_mask != 0).item()):
+        raise TritiumError(
+            "padded attention masks are not represented by this ONNX graph",
+            code="onnx_padding_unavailable",
+            stage="forward_onnx",
+        )
+
+
+def _eos_ids(value: Optional[Union[int, Tuple[int, ...], list[int]]]) -> frozenset[int]:
+    if value is None:
+        return frozenset()
+    values = (value,) if type(value) is int else value
+    if not isinstance(values, (tuple, list)) or not values:
+        raise TypeError("eos_token_id must be an integer or a non-empty list of integers")
+    if any(type(item) is not int or item < 0 for item in values):
+        raise ValueError("eos_token_id values must be nonnegative integers")
+    return frozenset(values)
+
+
 def _flatten_states(
     states: Optional[Tuple[Tensor, ...]],
 ) -> Optional[list[list[float]]]:
@@ -359,9 +415,20 @@ def _read_manifest(requested: Path) -> OnnxBundleManifest:
         raise ValueError("ONNX artifact must be an ordinary directory")
     path = directory / _MANIFEST_FILE
     value = _read_json_regular(path, max_bytes=1024 * 1024, label="ONNX manifest")
-    if not isinstance(value, dict) or set(value) != _TOP_FIELDS:
-        raise ValueError("ONNX manifest top-level fields differ from schema v1")
-    if value["schema"] != "tritium-qwen35-onnx-bundle-v1":
+    if not isinstance(value, dict):
+        raise ValueError("ONNX manifest must be a JSON object")
+    schema = value.get("schema")
+    if schema == "tritium-qwen35-onnx-bundle-v1":
+        if set(value) != _TOP_FIELDS_V1:
+            raise ValueError("ONNX manifest top-level fields differ from schema v1")
+        sequence_mode = None
+    elif schema == "tritium-qwen35-onnx-bundle-v2":
+        if set(value) != _TOP_FIELDS_V2:
+            raise ValueError("ONNX manifest top-level fields differ from schema v2")
+        if value["sequence_mode"] != "dynamic-cache-v1":
+            raise ValueError("schema-v2 ONNX manifest requires dynamic-cache-v1")
+        sequence_mode = value["sequence_mode"]
+    else:
         raise ValueError("unsupported ONNX bundle schema")
     language = _graph(value["language"], "language.onnx", "language")
     mtp = _graph(value["mtp"], "mtp.onnx", "MTP")
@@ -398,6 +465,7 @@ def _read_manifest(requested: Path) -> OnnxBundleManifest:
         mtp_blake3=mtp,
         weights_blake3=weights_digest,
         weights_bytes=weights["bytes"],
+        sequence_mode=sequence_mode,
         source_model_id=identity["source_model_id"],
         tokenizer_id=identity["tokenizer_id"],
         recipe_id=identity["recipe_id"],

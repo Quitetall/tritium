@@ -54,4 +54,4 @@ with the listed stable diagnostic instead of silently falling back.
 | Target | Status | Evidence / failure |
 |---|---|---|
 | SALT schema v3 current writes | **pending** | Backward-read and current-write matrix receipt is not yet archived. |
-| Tritium ONNX manifest v1 | **pending** | Export, reload, corruption and rollback receipt is not yet archived. |
+| Tritium ONNX manifest v2 writes with v1 backward reads | **pending** | Export, reload, corruption and rollback receipt is not yet archived. |

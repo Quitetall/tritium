@@ -28,7 +28,7 @@
     ],
     "artifact-schema": [
       {"id": "salt-schema-v3-write", "target": "SALT schema v3 current writes", "status": "pending", "blocker": "Backward-read and current-write matrix receipt is not yet archived."},
-      {"id": "onnx-manifest-v1", "target": "Tritium ONNX manifest v1", "status": "pending", "blocker": "Export, reload, corruption and rollback receipt is not yet archived."}
+      {"id": "onnx-manifest-v2", "target": "Tritium ONNX manifest v2 writes with v1 backward reads", "status": "pending", "blocker": "Export, reload, corruption and rollback receipt is not yet archived."}
     ]
   }
 }
