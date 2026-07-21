@@ -254,6 +254,19 @@ def _qualified_identity(args: argparse.Namespace, result: dict[str, object]) -> 
     return qualify_target(args.target_id, str(result["platform_tag"]))
 
 
+def runtime_cell_id(
+    target_id: str,
+    implementation: str,
+    version_info: tuple[int, int],
+) -> str:
+    if implementation != "CPython":
+        raise WheelError(f"abi3 evidence requires CPython, got {implementation!r}")
+    major, minor = version_info
+    if major != 3 or minor < 9:
+        raise WheelError(f"abi3 evidence requires CPython 3.9+, got {major}.{minor}")
+    return f"{target_id}-cp{major}.{minor}"
+
+
 def clean_install_smoke(path: Path, forbidden_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="tritium-wheel-smoke-") as raw:
         root = Path(raw)
@@ -315,7 +328,6 @@ def main() -> int:
     parser.add_argument("--install-smoke", action="store_true")
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--smoke-evidence", type=Path)
-    parser.add_argument("--cell-id")
     parser.add_argument("--target-id")
     parser.add_argument("--source-revision")
     args = parser.parse_args()
@@ -344,16 +356,18 @@ def main() -> int:
         if args.smoke_evidence:
             if not args.install_smoke:
                 raise WheelError("smoke evidence requires --install-smoke")
-            if not args.cell_id or not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.cell_id):
-                raise WheelError("smoke evidence requires a canonical --cell-id")
             host = _qualified_identity(args, result)
+            implementation = platform.python_implementation()
+            cell_id = runtime_cell_id(
+                args.target_id, implementation, (sys.version_info.major, sys.version_info.minor)
+            )
             evidence = {
                 "schema": "tritium.wheel-smoke.v1",
-                "cell_id": args.cell_id,
+                "cell_id": cell_id,
                 "target_id": args.target_id,
                 "source_revision": args.source_revision,
                 "passed": True,
-                "python_implementation": platform.python_implementation(),
+                "python_implementation": implementation,
                 "python_version": platform.python_version(),
                 **host,
                 **result,

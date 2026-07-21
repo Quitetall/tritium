@@ -103,7 +103,6 @@ jobs:
         python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
         platform:
           - { os: linux, runner: ubuntu-latest, target: x86_64, target_id: linux-x86_64-cpu }
-          - { os: macos, runner: macos-latest, target: universal2, target_id: macos-arm64-cpu }
           - { os: windows, runner: windows-latest, target: x64, target_id: windows-x86_64-cpu }
     steps:
       - uses: actions/checkout@v4
@@ -120,10 +119,40 @@ jobs:
           python scripts/verify-wheel.py dist --install-smoke
           --target-id ${{ matrix.platform.target_id }}
           --source-revision ${{ github.sha }}
-          --cell-id ${{ matrix.platform.target_id }}-cp${{ matrix.python }}
           --smoke-evidence evidence/${{ matrix.platform.target_id }}-cp${{ matrix.python }}.json
       - uses: actions/upload-artifact@v4
         with:
           name: abi3-${{ matrix.platform.os }}-cp${{ matrix.python }}
+          path: evidence/*.json
+          if-no-files-found: error
+
+  abi3-smoke-macos-arm64:
+    name: abi3 · macOS arm64 · Python ${{ matrix.python }}
+    needs: wheels
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # GitHub's arm64 image does not provide CPython 3.9/3.10.
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-macos-universal2
+          path: dist
+      - name: install exact abi3 wheel and run native smoke
+        shell: bash
+        run: >-
+          python scripts/verify-wheel.py dist --install-smoke
+          --target-id macos-arm64-cpu
+          --source-revision ${{ github.sha }}
+          --smoke-evidence evidence/macos-arm64-cpu-cp${{ matrix.python }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abi3-macos-cp${{ matrix.python }}
           path: evidence/*.json
           if-no-files-found: error

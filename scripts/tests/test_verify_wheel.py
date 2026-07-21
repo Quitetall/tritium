@@ -129,6 +129,16 @@ class VerifyWheelTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WheelError, "unsupported compatibility target"):
             MODULE.qualify_target("linux-aarch64-cpu", "manylinux_2_28_aarch64")
 
+    def test_runtime_cell_id_is_derived_from_interpreter(self):
+        self.assertEqual(
+            MODULE.runtime_cell_id("linux-x86_64-cpu", "CPython", (3, 14)),
+            "linux-x86_64-cpu-cp3.14",
+        )
+        with self.assertRaisesRegex(MODULE.WheelError, "requires CPython"):
+            MODULE.runtime_cell_id("linux-x86_64-cpu", "PyPy", (3, 11))
+        with self.assertRaisesRegex(MODULE.WheelError, r"3.9\+"):
+            MODULE.runtime_cell_id("linux-x86_64-cpu", "CPython", (3, 8))
+
 
 if __name__ == "__main__":
     unittest.main()
