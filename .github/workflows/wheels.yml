@@ -1,5 +1,5 @@
-# Python wheels (ADR 0011 / v0.90 hardening): build distributable wheels + an
-# sdist for the PyO3 extension crate `tritium-py` (crates/tritium-py), whose lib
+# Python wheels (ADR 0033 / v1.1 hardening): build distributable binary wheels
+# for the PyO3 extension crate `tritium-py` (crates/tritium-py), whose lib
 # is a `cdylib` named `tritium` (excluded from `cargo test --workspace` — it is
 # exercised via maturin + pytest, not cargo test).
 #
@@ -11,9 +11,10 @@
 # Triggers: git tags (release builds), manual dispatch, and a build-only smoke on
 # pull_request so the packaging path stays green without gating every push.
 #
-# IMPORTANT: this workflow does NOT publish to PyPI. There is no token, no
-# `twine upload`, no `maturin publish`, no trusted-publishing step. Every wheel
-# and the sdist are uploaded as build artifacts only (actions/upload-artifact).
+# Plan 0051 forbids source-build fallback for unsupported combinations, so this
+# workflow intentionally produces no sdist. It does NOT publish to PyPI: no token,
+# `twine upload`, no `maturin publish`, no trusted-publishing step. Wheels and
+# qualification receipts are uploaded as build artifacts only.
 name: wheels
 
 on:
@@ -24,6 +25,8 @@ on:
     # packaging path honest without running it on every commit to main.
     paths:
       - "crates/tritium-py/**"
+      - "scripts/verify-wheel.py"
+      - "scripts/tests/test_verify_wheel.py"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
 
@@ -46,15 +49,17 @@ jobs:
       matrix:
         platform:
           # Linux (manylinux, built in the maturin container).
-          - { os: linux, runner: ubuntu-latest, target: x86_64 }
-          - { os: linux, runner: ubuntu-latest, target: aarch64 }
+          - { os: linux, runner: ubuntu-latest, target: x86_64, target_id: linux-x86_64-cpu, smoke: true }
+          - { os: linux, runner: ubuntu-latest, target: aarch64, target_id: linux-aarch64-cpu, smoke: false }
           # macOS (universal2 covers both Apple Silicon + Intel in one wheel).
-          - { os: macos, runner: macos-latest, target: universal2 }
+          - { os: macos, runner: macos-latest, target: universal2, target_id: macos-arm64-cpu, smoke: true }
           # Windows.
-          - { os: windows, runner: windows-latest, target: x64 }
+          - { os: windows, runner: windows-latest, target: x64, target_id: windows-x86_64-cpu, smoke: true }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: test wheel verifier
+        run: python -m unittest scripts.tests.test_verify_wheel -v
       - name: build abi3 wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -67,28 +72,23 @@ jobs:
           # Container manylinux build for linux; `auto` is a no-op off-linux.
           manylinux: ${{ matrix.platform.os == 'linux' && 'auto' || 'off' }}
           sccache: "true"
+      - name: verify wheel structure and integrity
+        if: ${{ !matrix.platform.smoke }}
+        shell: bash
+        run: python scripts/verify-wheel.py dist
+      - name: verify clean no-source wheel install
+        if: ${{ matrix.platform.smoke }}
+        shell: bash
+        run: >-
+          python scripts/verify-wheel.py dist --install-smoke
+          --target-id ${{ matrix.platform.target_id }}
+          --source-revision ${{ github.sha }}
+          --receipt dist/${{ matrix.platform.target_id }}.json
       - name: upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.platform.os }}-${{ matrix.platform.target }}
-          path: dist/*.whl
-          if-no-files-found: error
-
-  # Platform-independent source distribution (built once on linux). Lets `pip
-  # install` fall back to a from-source build where no wheel matches.
-  sdist:
-    name: sdist
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --manifest-path crates/tritium-py/Cargo.toml --out dist
-      - name: upload sdist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sdist
-          path: dist/*.tar.gz
+          path: |
+            dist/*.whl
+            dist/*.json
           if-no-files-found: error
