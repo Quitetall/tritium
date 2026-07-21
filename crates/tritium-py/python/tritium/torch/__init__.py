@@ -35,6 +35,7 @@ except ImportError:  # transformers is an optional integration dependency
 else:
     register_huggingface()
 from .ops import reference_ternary_linear, ternary_linear
+from .onnx import OnnxBundleManifest, export_onnx, load_onnx
 from .ptq import CalibrationReceipt, calibrate, convert, quantize
 from .projection import (
     ProjectionContext,
@@ -56,6 +57,7 @@ __all__ = [
     "HfTritiumConfig",
     "HfAssetRef",
     "LSQEstimator",
+    "OnnxBundleManifest",
     "ProjectionContext",
     "PreparedModel",
     "QuantizationResult",
@@ -73,8 +75,10 @@ __all__ = [
     "calibrate",
     "convert",
     "export",
+    "export_onnx",
     "inspect",
     "load",
+    "load_onnx",
     "prepare",
     "prepare_qat",
     "quantize",
