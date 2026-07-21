@@ -3323,9 +3323,10 @@ pub fn verify_external_causal_lm(
     weights_bytes: &[u8],
     admitted: AdmittedExternalCausalLmDigests,
 ) -> Result<VerifiedExternalCausalLmModel, OnnxModelError> {
+    let mut weights = ExternalDataReader::from_slice(weights_bytes);
     Ok(verify_external_decoder_graph(
         model_bytes,
-        weights_bytes,
+        &mut weights,
         admitted,
         "causal-lm",
         ExternalRangePolicy::Exclusive,
@@ -3354,9 +3355,141 @@ struct VerifiedExternalDecoderGraph {
     external_initializers: Vec<VerifiedExternalInitializer>,
 }
 
+enum ExternalDataReader<'a> {
+    Slice {
+        bytes: &'a [u8],
+        digest: [u8; 32],
+    },
+    File {
+        file: File,
+        bytes: usize,
+        digest: [u8; 32],
+    },
+}
+
+impl<'a> ExternalDataReader<'a> {
+    fn from_slice(bytes: &'a [u8]) -> Self {
+        Self::Slice {
+            bytes,
+            digest: *blake3::hash(bytes).as_bytes(),
+        }
+    }
+
+    fn from_file(mut file: File) -> Result<Self, OnnxModelError> {
+        let before = file.metadata().map_err(external_io)?;
+        if !before.is_file() {
+            return Err(OnnxModelError::ExternalDataMismatch(
+                "weights handle is not an ordinary file".to_owned(),
+            ));
+        }
+        let bytes = usize::try_from(before.len())
+            .map_err(|_| OnnxModelError::ShapeOverflow("external data length"))?;
+        file.seek(SeekFrom::Start(0)).map_err(external_io)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = bytes;
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining != 0 {
+            let count = remaining.min(buffer.len());
+            file.read_exact(&mut buffer[..count]).map_err(external_io)?;
+            hasher.update(&buffer[..count]);
+            remaining -= count;
+        }
+        if file.metadata().map_err(external_io)?.len() != before.len() {
+            return Err(OnnxModelError::ExternalDataMismatch(
+                "weights file changed while hashing".to_owned(),
+            ));
+        }
+        Ok(Self::File {
+            file,
+            bytes,
+            digest: *hasher.finalize().as_bytes(),
+        })
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Slice { bytes, .. } => bytes.len(),
+            Self::File { bytes, .. } => *bytes,
+        }
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        match self {
+            Self::Slice { digest, .. } | Self::File { digest, .. } => *digest,
+        }
+    }
+
+    fn range_is_zero(&mut self, start: usize, end: usize) -> Result<bool, OnnxModelError> {
+        if start > end || end > self.len() {
+            return Err(OnnxModelError::ExternalDataMismatch(
+                "external padding range exceeds weights.bin".to_owned(),
+            ));
+        }
+        match self {
+            Self::Slice { bytes, .. } => Ok(bytes[start..end].iter().all(|&byte| byte == 0)),
+            Self::File { file, .. } => {
+                file.seek(SeekFrom::Start(u64::try_from(start).map_err(|_| {
+                    OnnxModelError::ShapeOverflow("external padding offset")
+                })?))
+                .map_err(external_io)?;
+                let mut remaining = end - start;
+                let mut buffer = [0_u8; EXTERNAL_ALIGNMENT];
+                while remaining != 0 {
+                    let count = remaining.min(buffer.len());
+                    file.read_exact(&mut buffer[..count]).map_err(external_io)?;
+                    if buffer[..count].iter().any(|&byte| byte != 0) {
+                        return Ok(false);
+                    }
+                    remaining -= count;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn verify_unchanged(&mut self) -> Result<(), OnnxModelError> {
+        let Self::File {
+            file,
+            bytes,
+            digest,
+        } = self
+        else {
+            return Ok(());
+        };
+        if file.metadata().map_err(external_io)?.len()
+            != u64::try_from(*bytes)
+                .map_err(|_| OnnxModelError::ShapeOverflow("external data length"))?
+        {
+            return Err(OnnxModelError::ExternalDataMismatch(
+                "weights file length changed during verification".to_owned(),
+            ));
+        }
+        file.seek(SeekFrom::Start(0)).map_err(external_io)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = *bytes;
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining != 0 {
+            let count = remaining.min(buffer.len());
+            file.read_exact(&mut buffer[..count]).map_err(external_io)?;
+            hasher.update(&buffer[..count]);
+            remaining -= count;
+        }
+        if hasher.finalize().as_bytes() != digest
+            || file.metadata().map_err(external_io)?.len()
+                != u64::try_from(*bytes)
+                    .map_err(|_| OnnxModelError::ShapeOverflow("external data length"))?
+        {
+            return Err(OnnxModelError::ExternalDataMismatch(
+                "weights file changed during verification".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn verify_external_decoder_graph(
     model_bytes: &[u8],
-    weights_bytes: &[u8],
+    weights: &mut ExternalDataReader<'_>,
     admitted: AdmittedExternalCausalLmDigests,
     expected_graph_kind: &str,
     range_policy: ExternalRangePolicy,
@@ -3372,8 +3505,8 @@ fn verify_external_decoder_graph(
             "model BLAKE3 differs from admitted package manifest".to_owned(),
         ));
     }
-    let actual_hash = blake3::hash(weights_bytes);
-    if actual_hash.as_bytes() != &admitted.weights_blake3 {
+    let actual_hash = weights.digest();
+    if actual_hash != admitted.weights_blake3 {
         return Err(OnnxModelError::ExternalDataMismatch(
             "weights BLAKE3 differs from admitted package manifest".to_owned(),
         ));
@@ -3400,14 +3533,17 @@ fn verify_external_decoder_graph(
         EXTERNAL_WEIGHTS_FILE,
     )?;
     let declared_weights = parse_usize(&metadata, "tritium.external_data.bytes")?;
-    if declared_weights != weights_bytes.len() {
+    if declared_weights != weights.len() {
         return Err(OnnxModelError::ExternalDataMismatch(format!(
             "byte length {} differs from declared {declared_weights}",
-            weights_bytes.len()
+            weights.len()
         )));
     }
     if metadata_value(&metadata, "tritium.external_data.blake3")?
-        != actual_hash.to_hex().to_string()
+        != actual_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     {
         return Err(OnnxModelError::ExternalDataMismatch(
             "BLAKE3 digest differs from model metadata".to_owned(),
@@ -3492,7 +3628,7 @@ fn verify_external_decoder_graph(
         let end = offset
             .checked_add(length)
             .ok_or(OnnxModelError::ShapeOverflow("external initializer range"))?;
-        if end > weights_bytes.len() {
+        if end > weights.len() {
             return Err(OnnxModelError::ExternalDataMismatch(format!(
                 "initializer {} range exceeds weights.bin",
                 initializer.name
@@ -3506,7 +3642,7 @@ fn verify_external_decoder_graph(
                     initializer.name
                 )));
             }
-            if weights_bytes[cursor..offset].iter().any(|&byte| byte != 0) {
+            if !weights.range_is_zero(cursor, offset)? {
                 return Err(OnnxModelError::ExternalDataMismatch(
                     "alignment padding is not zero".to_owned(),
                 ));
@@ -3521,7 +3657,7 @@ fn verify_external_decoder_graph(
             length,
         });
     }
-    if range_policy == ExternalRangePolicy::Exclusive && cursor != weights_bytes.len() {
+    if range_policy == ExternalRangePolicy::Exclusive && cursor != weights.len() {
         return Err(OnnxModelError::ExternalDataMismatch(
             "weights.bin has unreferenced trailing bytes".to_owned(),
         ));
@@ -3539,8 +3675,8 @@ fn verify_external_decoder_graph(
     Ok(VerifiedExternalDecoderGraph {
         receipt: VerifiedExternalCausalLmModel {
             model_blake3: *actual_model_hash.as_bytes(),
-            weights_blake3: *actual_hash.as_bytes(),
-            weights_bytes: weights_bytes.len(),
+            weights_blake3: actual_hash,
+            weights_bytes: weights.len(),
             tokens: parse_usize(&metadata, "tritium.tokens")?,
             past_tokens: parse_usize(&metadata, "tritium.past_tokens")?,
             layers: parse_usize(&metadata, "tritium.layers")?,
@@ -3564,6 +3700,42 @@ pub fn verify_external_qwen35_bundle(
     files: ExternalQwen35BundleFiles<'_>,
     admitted: AdmittedExternalQwen35BundleDigests,
 ) -> Result<VerifiedExternalQwen35Bundle, OnnxModelError> {
+    let mut weights = ExternalDataReader::from_slice(files.weights_bytes);
+    verify_external_qwen35_bundle_with_reader(files, &mut weights, admitted)
+}
+
+/// Verify one Qwen bundle against seek-backed external weights without loading
+/// `weights.bin` into memory.
+///
+/// Caller must open `weights_file` from independently admitted canonical path
+/// without following symlinks. Graph bytes remain bounded by 64 MiB each.
+///
+/// # Errors
+/// [`OnnxModelError`] for file mutation, digest/length mismatch, malformed graph,
+/// noncanonical ranges/padding, identity drift, or incomplete ancestry.
+pub fn verify_external_qwen35_bundle_from_file(
+    language_model_bytes: &[u8],
+    mtp_model_bytes: &[u8],
+    weights_file: File,
+    admitted: AdmittedExternalQwen35BundleDigests,
+) -> Result<VerifiedExternalQwen35Bundle, OnnxModelError> {
+    let mut weights = ExternalDataReader::from_file(weights_file)?;
+    verify_external_qwen35_bundle_with_reader(
+        ExternalQwen35BundleFiles {
+            language_model_bytes,
+            mtp_model_bytes,
+            weights_bytes: &[],
+        },
+        &mut weights,
+        admitted,
+    )
+}
+
+fn verify_external_qwen35_bundle_with_reader(
+    files: ExternalQwen35BundleFiles<'_>,
+    weights: &mut ExternalDataReader<'_>,
+    admitted: AdmittedExternalQwen35BundleDigests,
+) -> Result<VerifiedExternalQwen35Bundle, OnnxModelError> {
     let require_digest = |bytes: &[u8], expected: [u8; 32], label: &str| {
         if blake3::hash(bytes).as_bytes() != &expected {
             return Err(OnnxModelError::ExternalDataMismatch(format!(
@@ -3582,14 +3754,14 @@ pub fn verify_external_qwen35_bundle(
         admitted.mtp_model_blake3,
         "MTP model",
     )?;
-    require_digest(
-        files.weights_bytes,
-        admitted.weights_blake3,
-        "bundle weights",
-    )?;
+    if weights.digest() != admitted.weights_blake3 {
+        return Err(OnnxModelError::ExternalDataMismatch(
+            "bundle weights BLAKE3 differs from admitted package manifest".to_owned(),
+        ));
+    }
     let language = verify_external_decoder_graph(
         files.language_model_bytes,
-        files.weights_bytes,
+        weights,
         AdmittedExternalCausalLmDigests {
             model_blake3: admitted.language_model_blake3,
             weights_blake3: admitted.weights_blake3,
@@ -3599,7 +3771,7 @@ pub fn verify_external_qwen35_bundle(
     )?;
     let mtp = verify_external_decoder_graph(
         files.mtp_model_bytes,
-        files.weights_bytes,
+        weights,
         AdmittedExternalCausalLmDigests {
             model_blake3: admitted.mtp_model_blake3,
             weights_blake3: admitted.weights_blake3,
@@ -3607,7 +3779,7 @@ pub fn verify_external_qwen35_bundle(
         "qwen35-mtp",
         ExternalRangePolicy::Shared,
     )?;
-    verify_shared_qwen_ranges(&language, &mtp, files.weights_bytes)?;
+    verify_shared_qwen_ranges(&language, &mtp, weights)?;
     require_metadata(
         &language.metadata,
         "tritium.rms_norm_weight_semantics",
@@ -3684,6 +3856,7 @@ pub fn verify_external_qwen35_bundle(
             "Qwen language and MTP conversion ancestry differs".to_owned(),
         ));
     }
+    weights.verify_unchanged()?;
     Ok(VerifiedExternalQwen35Bundle {
         language: language.receipt,
         mtp: mtp.receipt,
@@ -3736,7 +3909,7 @@ fn verified_qwen35_onnx_ancestry(
 fn verify_shared_qwen_ranges(
     language: &VerifiedExternalDecoderGraph,
     mtp: &VerifiedExternalDecoderGraph,
-    weights: &[u8],
+    weights: &mut ExternalDataReader<'_>,
 ) -> Result<(), OnnxModelError> {
     let shared_names = select_qwen_shared_initializer_names(|name| {
         language
@@ -3789,7 +3962,7 @@ fn verify_shared_qwen_ranges(
                 range.name, range.offset
             )));
         }
-        if weights[cursor..range.offset].iter().any(|&byte| byte != 0) {
+        if !weights.range_is_zero(cursor, range.offset)? {
             return Err(OnnxModelError::ExternalDataMismatch(
                 "shared weights alignment padding is not zero".to_owned(),
             ));
@@ -9972,6 +10145,28 @@ mod tests {
         assert_eq!(seek_weights, bundle.weights_bytes);
         assert_eq!(seek_bundle.weights_bytes, seek_weights.len() as u64);
         assert_eq!(seek_bundle.weights_blake3, bundle.weights_blake3);
+        let seek_receipt = verify_external_qwen35_bundle_from_file(
+            &seek_bundle.language_model_bytes,
+            &seek_bundle.mtp_model_bytes,
+            File::open(&seek_path).unwrap(),
+            AdmittedExternalQwen35BundleDigests {
+                language_model_blake3: *blake3::hash(&seek_bundle.language_model_bytes).as_bytes(),
+                mtp_model_blake3: *blake3::hash(&seek_bundle.mtp_model_bytes).as_bytes(),
+                weights_blake3: seek_bundle.weights_blake3,
+            },
+        )
+        .unwrap();
+        assert_eq!(seek_receipt.language.weights_bytes, seek_weights.len());
+        assert_eq!(
+            seek_receipt.conversion_ancestry,
+            Some(VerifiedQwen35OnnxAncestryV1 {
+                conversion_mode: "ptq".to_owned(),
+                completion_id: "completion".to_owned(),
+                campaign_id: "campaign".to_owned(),
+                admission_id: "admission".to_owned(),
+                selection_id: "selection".to_owned(),
+            })
+        );
         assert!(matches!(
             encode_external_qwen35_bundle_to_file_with_ancestry(
                 mapped.model(1, 0),
