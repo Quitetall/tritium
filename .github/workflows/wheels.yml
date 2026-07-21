@@ -50,7 +50,6 @@ jobs:
         platform:
           # Linux (manylinux, built in the maturin container).
           - { os: linux, runner: ubuntu-latest, target: x86_64, target_id: linux-x86_64-cpu, smoke: true }
-          - { os: linux, runner: ubuntu-latest, target: aarch64, target_id: linux-aarch64-cpu, smoke: false }
           # macOS (universal2 covers both Apple Silicon + Intel in one wheel).
           - { os: macos, runner: macos-latest, target: universal2, target_id: macos-arm64-cpu, smoke: true }
           # Windows.

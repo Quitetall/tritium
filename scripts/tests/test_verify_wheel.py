@@ -83,6 +83,32 @@ class VerifyWheelTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WheelError, "source/build residue"):
                 MODULE.inspect_wheel(wheel, "1.1.0rc0")
 
+    def test_parent_traversal_member_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            wheel = Path(raw) / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+            build_wheel(wheel, extra={"../escape": b"payload"})
+            with self.assertRaisesRegex(MODULE.WheelError, "unsafe wheel member"):
+                MODULE.inspect_wheel(wheel, "1.1.0rc0")
+
+    def test_absolute_member_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            wheel = Path(raw) / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+            build_wheel(wheel, extra={"/escape": b"payload"})
+            with self.assertRaisesRegex(MODULE.WheelError, "unsafe wheel member"):
+                MODULE.inspect_wheel(wheel, "1.1.0rc0")
+
+    def test_symlink_member_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            wheel = Path(raw) / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
+            build_wheel(wheel)
+            link = zipfile.ZipInfo("tritium/link")
+            link.create_system = 3
+            link.external_attr = 0o120777 << 16
+            with zipfile.ZipFile(wheel, "a") as archive:
+                archive.writestr(link, "target")
+            with self.assertRaisesRegex(MODULE.WheelError, "must not be a symlink"):
+                MODULE.inspect_wheel(wheel, "1.1.0rc0")
+
     def test_weak_record_hash_fails(self):
         with tempfile.TemporaryDirectory() as raw:
             wheel = Path(raw) / "tritium_torch-1.1.0rc0-cp39-abi3-linux_x86_64.whl"
