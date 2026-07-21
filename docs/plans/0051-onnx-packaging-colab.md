@@ -192,6 +192,18 @@ domain. An in-memory kernel call or ignored session test is not sufficient.
 
 ## Slice 2 — PyTorch/Hugging Face ONNX facade
 
+Status: **IN PROGRESS** — generic hard-PTQ `AdditiveTernaryLinear` graphs now
+export through the public Torch ONNX exporter with B3 payloads and f16 scales
+retained as output-reachable initializers. Export disables optimizer folding,
+audits the graph for a persistent dense target-weight shadow, executes numerical
+parity in a real CPU ONNX Runtime session and only then atomically publishes a
+canonical SHA-256-ledgered bundle. Reload verifies the complete file allowlist,
+external-data paths, graph interface and packed initializer geometry before
+session creation; dynamic batch replay and corrupt-graph rollback are gated.
+This is a semantic generic-module fallback, not evidence of native fused custom
+operator execution, causal generation closure or Hugging Face whole-model ONNX
+support. Those remain binding below.
+
 Add `tritium.torch.export_onnx` and `tritium.torch.load_onnx` over the stable
 plan-0047 results:
 

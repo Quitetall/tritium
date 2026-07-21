@@ -35,6 +35,12 @@ except ImportError:  # transformers is an optional integration dependency
 else:
     register_huggingface()
 from .ops import reference_ternary_linear, ternary_linear
+from .module_onnx import (
+    ModuleOnnxArtifact,
+    OnnxModule,
+    export_module_onnx,
+    load_module_onnx,
+)
 from .onnx import (
     OnnxBundleManifest,
     OnnxCausalLMOutput,
@@ -80,9 +86,11 @@ __all__ = [
     "HfAssetRef",
     "LSQEstimator",
     "ModuleQuantizationResult",
+    "ModuleOnnxArtifact",
     "OnnxBundleManifest",
     "OnnxCausalLMOutput",
     "OnnxMtpOutput",
+    "OnnxModule",
     "ProjectionContext",
     "PreparedModel",
     "QuantizationResult",
@@ -102,10 +110,12 @@ __all__ = [
     "convert",
     "export",
     "export_onnx",
+    "export_module_onnx",
     "inspect",
     "load",
     "load_activation_calibration",
     "load_module_conversion",
+    "load_module_onnx",
     "load_quantized_module",
     "load_onnx",
     "prepare",

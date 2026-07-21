@@ -1,0 +1,87 @@
+"""Real ORT gates for packed generic module ONNX bundles."""
+
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+onnx = pytest.importorskip("onnx")
+pytest.importorskip("onnxruntime")
+pytest.importorskip("onnxscript")
+
+from tritium.nn import AdditiveTernaryLinear  # noqa: E402
+from tritium.torch import (  # noqa: E402
+    TritiumError,
+    export_module_onnx,
+    load_module_onnx,
+)
+
+
+def _model():
+    planes = []
+    trits = torch.tensor(
+        [[1, -1, 0, 1, -1, 0, 1, -1], [0, 1, 1, -1, 0, -1, 1, 0]],
+        dtype=torch.int8,
+    )
+    for index in range(3):
+        planes.append(
+            SimpleNamespace(
+                trits=trits,
+                scales=torch.tensor(
+                    [[0.5 / (index + 1)], [0.25 / (index + 1)]],
+                    dtype=torch.float16,
+                ),
+                group_size=8,
+            )
+        )
+    return AdditiveTernaryLinear(planes, torch.tensor([0.1, -0.2])).eval()
+
+
+def test_module_onnx_keeps_packed_state_runs_ort_and_supports_dynamic_batch(tmp_path):
+    model = _model()
+    example = torch.randn(2, 8)
+    artifact = export_module_onnx(model, example, tmp_path / "bundle")
+    assert artifact.checkpoint_digest.startswith("sha256:")
+    assert load_module_onnx(artifact.artifact_dir, create_session=False) == artifact
+
+    graph = onnx.load(artifact.artifact_dir / "model.onnx", load_external_data=False)
+    initializers = {value.name: value for value in graph.graph.initializer}
+    assert {
+        f"_packed_weight.packed_trits_{index}" for index in range(3)
+    } <= set(initializers)
+    assert not any(
+        value.data_type
+        in {
+            onnx.TensorProto.FLOAT,
+            onnx.TensorProto.FLOAT16,
+            onnx.TensorProto.DOUBLE,
+            onnx.TensorProto.BFLOAT16,
+        }
+        and tuple(value.dims) == (2, 8)
+        for value in initializers.values()
+    )
+    runtime = load_module_onnx(artifact.artifact_dir)
+    replay = torch.randn(5, 8)
+    torch.testing.assert_close(runtime(replay), model(replay), rtol=1e-4, atol=1e-5)
+
+    graph_path = artifact.artifact_dir / "model.onnx"
+    payload = bytearray(graph_path.read_bytes())
+    payload[-1] ^= 1
+    graph_path.write_bytes(payload)
+    with pytest.raises(ValueError, match="file identity mismatch"):
+        load_module_onnx(artifact.artifact_dir)
+
+
+def test_module_onnx_rejects_optimizer_dense_shadow_and_rolls_back(monkeypatch, tmp_path):
+    original = torch.onnx.export
+
+    def optimized(*args, **kwargs):
+        kwargs["optimize"] = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch.onnx, "export", optimized)
+    output = tmp_path / "bundle"
+    with pytest.raises(TritiumError) as captured:
+        export_module_onnx(_model(), torch.randn(2, 8), output)
+    assert captured.value.code == "dense_shadow_detected"
+    assert not output.exists()
