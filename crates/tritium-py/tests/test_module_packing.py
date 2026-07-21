@@ -41,6 +41,20 @@ def test_module_conversion_streams_strict_native_salt_package(tmp_path):
     assert packed.complete_model is False
     assert load_packed_module(packed.artifact_dir) == packed
 
+    manifest_path = packed.artifact_dir / "tritium.json"
+    original_manifest = manifest_path.read_bytes()
+    manifest = json.loads(original_manifest)
+    manifest["weights"]["tensors"] = 2
+    identity = dict(manifest)
+    del identity["artifact_id"]
+    manifest["artifact_id"] = "sha256:" + hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="tensor count"):
+        load_packed_module(packed.artifact_dir)
+    manifest_path.write_bytes(original_manifest)
+
     weights = packed.artifact_dir / "weights.tsalt2"
     payload = bytearray(weights.read_bytes())
     payload[-1] ^= 1

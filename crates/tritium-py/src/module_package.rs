@@ -22,6 +22,8 @@ use tritium_format::salt_v2_package::{
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 const MANIFEST_FILE: &str = "conversion.json";
 const MAX_JSON_BYTES: u64 = 1024 * 1024;
@@ -698,9 +700,18 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino() && left.len() == right.len()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len()
+    left.volume_serial_number().is_some()
+        && left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index().is_some()
+        && left.file_index() == right.file_index()
+        && left.file_size() == right.file_size()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    false
 }
 
 fn is_sha256(value: &str) -> bool {

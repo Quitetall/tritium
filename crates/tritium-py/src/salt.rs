@@ -884,12 +884,14 @@ pub(crate) fn publish_directory_noreplace(source: &str, target: &str) -> PyResul
 
 /// Strictly reopen one exact package and return its measured identity and bytes.
 #[pyfunction]
+#[pyo3(signature = (path, expected_package_id, expected_serialized_bytes, expected_resident_bytes, *, expected_tensors = None))]
 pub(crate) fn verify_salt_v2_package(
     py: Python<'_>,
     path: &str,
     expected_package_id: &str,
     expected_serialized_bytes: u64,
     expected_resident_bytes: u64,
+    expected_tensors: Option<u64>,
 ) -> PyResult<(String, String, u64, u64)> {
     if path.is_empty() || expected_package_id.is_empty() {
         return Err(PyValueError::new_err(
@@ -926,6 +928,14 @@ pub(crate) fn verify_salt_v2_package(
             .indexed_runtime_ledger()
             .map_err(|error| error.to_string())?
             .steady_resident_bytes();
+        if let Some(expected) = expected_tensors
+            && reader.len() as u64 != expected
+        {
+            return Err(format!(
+                "package tensor count {} differs from manifest {expected}",
+                reader.len()
+            ));
+        }
         if serialized != expected_serialized_bytes || resident != expected_resident_bytes {
             return Err(format!(
                 "package physical ledger ({serialized}, {resident}) differs from manifest ({expected_serialized_bytes}, {expected_resident_bytes})"

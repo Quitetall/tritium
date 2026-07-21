@@ -894,6 +894,7 @@ def load_packed_module(artifact_dir: Pathish) -> PackedModuleArtifact:
         weights["package_id"],
         weights["serialized_bytes"],
         weights["resident_bytes"],
+        expected_tensors=weights["tensors"],
     )
     if tuple(observed) != (
         weights["package_id"],
