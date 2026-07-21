@@ -128,6 +128,24 @@ pub struct OnnxArtifactIdentityV2<'a> {
     pub deferred_coverage_id: &'a str,
 }
 
+/// Exact conversion ancestry carried by public Qwen language-plus-MTP exports.
+///
+/// These values remain distinct metadata fields. In particular, callers must
+/// not collapse campaign, admission, and allocation selection into `recipe_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35OnnxAncestryV1<'a> {
+    /// Artifact-producing mode: `qat-hard`, `ptq`, or `refined`.
+    pub conversion_mode: &'a str,
+    /// Completed conversion identity.
+    pub completion_id: &'a str,
+    /// Calibration/refinement campaign identity.
+    pub campaign_id: &'a str,
+    /// External admission decision identity.
+    pub admission_id: &'a str,
+    /// Selected additive allocation identity.
+    pub selection_id: &'a str,
+}
+
 /// A schema-v2 tied embedding/head graph with complete artifact identity.
 ///
 /// This additive type leaves [`TiedEmbeddingHeadModel`] and its schema-v1 wire
@@ -3024,17 +3042,44 @@ pub fn encode_external_qwen35_bundle<'a, M: OnnxPackedMatrix<'a>>(
     language: QwenCausalLmModel<'a, M>,
     mtp: Qwen35MtpModel<'a, M>,
 ) -> Result<ExternalQwen35Bundle, OnnxModelError> {
+    encode_external_qwen35_bundle_inner(language, mtp, None)
+}
+
+/// Encode a Qwen bundle with explicit, non-collapsed conversion ancestry.
+///
+/// # Errors
+/// [`OnnxModelError`] if ancestry is empty/unsupported or the underlying graph
+/// and external-data contract is invalid.
+pub fn encode_external_qwen35_bundle_with_ancestry<'a, M: OnnxPackedMatrix<'a>>(
+    language: QwenCausalLmModel<'a, M>,
+    mtp: Qwen35MtpModel<'a, M>,
+    ancestry: Qwen35OnnxAncestryV1<'_>,
+) -> Result<ExternalQwen35Bundle, OnnxModelError> {
+    validate_qwen35_onnx_ancestry(ancestry)?;
+    encode_external_qwen35_bundle_inner(language, mtp, Some(ancestry))
+}
+
+fn encode_external_qwen35_bundle_inner<'a, M: OnnxPackedMatrix<'a>>(
+    language: QwenCausalLmModel<'a, M>,
+    mtp: Qwen35MtpModel<'a, M>,
+    ancestry: Option<Qwen35OnnxAncestryV1<'_>>,
+) -> Result<ExternalQwen35Bundle, OnnxModelError> {
     validate_qwen35_bundle_pair(&language, &mtp)?;
-    let (language_protobuf, language_weights) =
+    let (mut language_protobuf, language_weights) =
         build_qwen_causal_lm_graph(language, CausalGraphBuilder::external())?;
     let language_weights = language_weights.ok_or_else(|| {
         OnnxModelError::InvalidModel("Qwen language bundle used inline storage".to_owned())
     })?;
     let aliases = qwen_shared_external_aliases(&language_protobuf)?;
-    let (mtp_protobuf, weights) = build_qwen35_mtp_graph(
+    let (mut mtp_protobuf, weights) = build_qwen35_mtp_graph(
         mtp,
         CausalGraphBuilder::external_reusing(language_weights, aliases),
     )?;
+    if let Some(ancestry) = ancestry {
+        let metadata = qwen35_onnx_ancestry_metadata(ancestry);
+        language_protobuf.metadata_props.extend(metadata.clone());
+        mtp_protobuf.metadata_props.extend(metadata);
+    }
     let weights_bytes = weights.ok_or_else(|| {
         OnnxModelError::InvalidModel("Qwen MTP bundle used inline storage".to_owned())
     })?;
@@ -3045,6 +3090,37 @@ pub fn encode_external_qwen35_bundle<'a, M: OnnxPackedMatrix<'a>>(
         weights_bytes,
         weights_blake3,
     })
+}
+
+fn validate_qwen35_onnx_ancestry(ancestry: Qwen35OnnxAncestryV1<'_>) -> Result<(), OnnxModelError> {
+    if !matches!(ancestry.conversion_mode, "qat-hard" | "ptq" | "refined") {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen ONNX conversion_mode must be `qat-hard`, `ptq`, or `refined`".to_owned(),
+        ));
+    }
+    for (name, value) in [
+        ("completion_id", ancestry.completion_id),
+        ("campaign_id", ancestry.campaign_id),
+        ("admission_id", ancestry.admission_id),
+        ("selection_id", ancestry.selection_id),
+    ] {
+        if value.is_empty() {
+            return Err(OnnxModelError::EmptyIdentity(name));
+        }
+    }
+    Ok(())
+}
+
+fn qwen35_onnx_ancestry_metadata(
+    ancestry: Qwen35OnnxAncestryV1<'_>,
+) -> Vec<StringStringEntryProto> {
+    vec![
+        metadata("tritium.conversion.mode", ancestry.conversion_mode),
+        metadata("tritium.conversion.completion_id", ancestry.completion_id),
+        metadata("tritium.conversion.campaign_id", ancestry.campaign_id),
+        metadata("tritium.conversion.admission_id", ancestry.admission_id),
+        metadata("tritium.conversion.selection_id", ancestry.selection_id),
+    ]
 }
 
 fn qwen_shared_external_aliases(
@@ -9428,8 +9504,30 @@ mod tests {
         ));
         assert!(encode_qwen_causal_lm(mapped.model(1, 0)).is_ok());
         assert!(encode_qwen35_mtp(mapped.mtp_model(1, 0)).is_ok());
-        let bundle =
-            encode_external_qwen35_bundle(mapped.model(1, 0), mapped.mtp_model(1, 0)).unwrap();
+        let ancestry = Qwen35OnnxAncestryV1 {
+            conversion_mode: "ptq",
+            completion_id: "completion",
+            campaign_id: "campaign",
+            admission_id: "admission",
+            selection_id: "selection",
+        };
+        let bundle = encode_external_qwen35_bundle_with_ancestry(
+            mapped.model(1, 0),
+            mapped.mtp_model(1, 0),
+            ancestry,
+        )
+        .unwrap();
+        assert!(matches!(
+            encode_external_qwen35_bundle_with_ancestry(
+                mapped.model(1, 0),
+                mapped.mtp_model(1, 0),
+                Qwen35OnnxAncestryV1 {
+                    conversion_mode: "training",
+                    ..ancestry
+                },
+            ),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("conversion_mode")
+        ));
         let standalone_language = encode_external_qwen_causal_lm(mapped.model(1, 0)).unwrap();
         let standalone_mtp = encode_external_qwen35_mtp(mapped.mtp_model(1, 0)).unwrap();
         assert!(
@@ -9474,6 +9572,18 @@ mod tests {
         ));
         let language_proto = ModelProto::decode(bundle.language_model_bytes.as_slice()).unwrap();
         let mut mtp_proto = ModelProto::decode(bundle.mtp_model_bytes.as_slice()).unwrap();
+        for protobuf in [&language_proto, &mtp_proto] {
+            let metadata = protobuf
+                .metadata_props
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(metadata["tritium.conversion.mode"], "ptq");
+            assert_eq!(metadata["tritium.conversion.completion_id"], "completion");
+            assert_eq!(metadata["tritium.conversion.campaign_id"], "campaign");
+            assert_eq!(metadata["tritium.conversion.admission_id"], "admission");
+            assert_eq!(metadata["tritium.conversion.selection_id"], "selection");
+        }
         for name in QWEN_SHARED_TERNARY_INITIALIZERS {
             let descriptor = |protobuf: &ModelProto| {
                 protobuf

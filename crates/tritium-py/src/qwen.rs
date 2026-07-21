@@ -15,7 +15,10 @@ pub(crate) struct QwenLoadReceipt {
     manifest_package_id: String,
     profile: String,
     source_revision: String,
+    declared_completion_id: String,
+    declared_campaign_id: String,
     declared_admission_id: String,
+    declared_selection_id: String,
     declared_source_model_id: String,
     declared_source_identity_status: String,
     declared_official_payload_authenticated: bool,
@@ -42,7 +45,10 @@ impl From<&Qwen35SaltV2LoadReceipt> for QwenLoadReceipt {
             manifest_package_id: receipt.manifest_package_id().to_owned(),
             profile: receipt.profile().to_owned(),
             source_revision: receipt.source_revision().to_owned(),
+            declared_completion_id: receipt.declared_completion_id().to_owned(),
+            declared_campaign_id: receipt.declared_campaign_id().to_owned(),
             declared_admission_id: receipt.declared_admission_id().to_owned(),
+            declared_selection_id: receipt.declared_selection_id().to_owned(),
             declared_source_model_id: receipt.declared_source_model_id().to_owned(),
             declared_source_identity_status: receipt.declared_source_identity_status().to_owned(),
             declared_official_payload_authenticated: receipt
@@ -85,8 +91,26 @@ impl QwenLoadReceipt {
 
     /// Untrusted declaration until external admission authorizes the manifest ID.
     #[getter]
+    fn declared_completion_id(&self) -> &str {
+        &self.declared_completion_id
+    }
+
+    /// Untrusted declaration until external admission authorizes the manifest ID.
+    #[getter]
+    fn declared_campaign_id(&self) -> &str {
+        &self.declared_campaign_id
+    }
+
+    /// Untrusted declaration until external admission authorizes the manifest ID.
+    #[getter]
     fn declared_admission_id(&self) -> &str {
         &self.declared_admission_id
+    }
+
+    /// Untrusted declaration until external admission authorizes the manifest ID.
+    #[getter]
+    fn declared_selection_id(&self) -> &str {
+        &self.declared_selection_id
     }
 
     /// Untrusted source-model declaration copied from the content-bound manifest.
