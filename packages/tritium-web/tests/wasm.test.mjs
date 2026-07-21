@@ -52,6 +52,9 @@ test("bundled wasm32-unknown guest passes the complete corpus twice", async () =
     /guest digest mismatch/,
   );
   const receipt = await runPortableWasmConformance(guest);
+  const packageMetadata = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
   assert.deepEqual(receipt, {
     schemaId: "tritium.portable_wasm_conformance_receipt",
     schemaVersion: 1,
@@ -68,7 +71,11 @@ test("bundled wasm32-unknown guest passes the complete corpus twice", async () =
     maxLinearMemoryBytes: 192 * 1024 * 1024,
     repeatedExecutions: 2,
   });
-  assert.match(receipt.buildId, /^tritium-wasm@1\.0\.0\+source-git:/);
+  assert.equal(
+    receipt.buildId.split("+")[0],
+    `tritium-wasm@${packageMetadata.version}`,
+  );
+  assert.match(receipt.buildId, /\+source-git:[0-9a-f]{40}(?:\+dirty-blake3:[0-9a-f]{64})?$/);
   assert.match(receipt.guestDigest, /^[0-9a-f]{64}$/);
   assert.match(receipt.executionDigest, /^[0-9a-f]{64}$/);
   assert.ok(Object.isFrozen(receipt));
