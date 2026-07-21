@@ -47,7 +47,9 @@ function f32FromBits(bits) {
 }
 
 function representativePlan(item) {
-  const entries = [...item.inputs, ...item.expected.outputs];
+  const entries = [...new Map(
+    [...item.inputs, ...item.expected.outputs].map((entry) => [entry.name, entry]),
+  ).values()];
   const buffers = entries.map((entry) => {
     const elements = entry.shape.reduce((product, value) => product * value, 1);
     const bytesPerElement = entry.data.dtype === "bytes" ? 1 : 4;
@@ -78,7 +80,7 @@ function representativePlan(item) {
   }));
   const binding = (entry) => ({ role: entry.name, bufferId: entry.name });
   const operationId = `canonical.${item.operation}.${item.execution}`;
-  const operations = item.execution === "forward" ? [{
+  const operations = item.execution !== "vjp" ? [{
     id: operationId,
     operation: item.operation,
     inputs: item.inputs.map((entry) => entry.name),
@@ -95,7 +97,7 @@ function representativePlan(item) {
     attributes,
   }] : [];
   return {
-    phase: item.execution === "forward" ? "forward" : "backward",
+    phase: item.execution === "vjp" ? "backward" : "forward",
     operationId,
     plan: plan(buffers, operations, backwards),
   };
@@ -109,7 +111,7 @@ function view(command) {
   );
 }
 
-test("resident schedule covers all 46 first-tranche canonical execution forms", () => {
+test("resident schedule covers all 52 graph and loss execution forms", () => {
   const supported = new Set([
     "graph.detach", "graph.scale_const", "graph.add", "graph.mul", "graph.relu2",
     "graph.silu", "graph.causal_mask", "graph.softmax", "graph.rmsnorm", "loss.mse",
@@ -117,6 +119,7 @@ test("resident schedule covers all 46 first-tranche canonical execution forms", 
     "graph.ternary_matmul", "graph.ste_surrogate", "graph.lsq_ste",
     "graph.salt_ste", "graph.fsq", "graph.embedding_gather", "graph.rope",
     "graph.concat_cols",
+    "graph.conv1d", "graph.conv2d", "graph.attention",
     "loss.softmax_cross_entropy",
   ]);
   const representatives = new Map();
@@ -125,7 +128,7 @@ test("resident schedule covers all 46 first-tranche canonical execution forms", 
     if (supported.has(item.operation) && item.expected.kind === "success" &&
         !representatives.has(key)) representatives.set(key, item);
   }
-  assert.equal(representatives.size, 46);
+  assert.equal(representatives.size, 52);
   for (const [key, item] of representatives) {
     const representative = representativePlan(item);
     const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
@@ -224,12 +227,12 @@ test("concat packs forward parts with GPU copies and emits ordered VJP slices", 
 
 test("unsupported forms and malformed specialized geometry fail closed", () => {
   const unsupported = corpus.cases.find((candidate) =>
-    candidate.operation === "graph.conv1d" && candidate.execution === "forward" &&
+    candidate.operation === "optimizer.sgd" && candidate.execution === "step" &&
     candidate.expected.kind === "success");
-  const concat = representativePlan(unsupported);
-  const schedule = compileWebGpuResidentScheduleV1(concat.plan, BUDGET);
+  const optimizer = representativePlan(unsupported);
+  const schedule = compileWebGpuResidentScheduleV1(optimizer.plan, BUDGET);
   assert.throws(
-    () => schedule.transaction(concat.phase, concat.operationId, 0),
+    () => schedule.transaction(optimizer.phase, optimizer.operationId, 0),
     (error) => error instanceof WebTrainingError && error.code === "capability_mismatch",
   );
 
@@ -311,4 +314,56 @@ test("concat VJP rejects duplicate and aliased output owners", () => {
     () => compileWebGpuResidentScheduleV1(aliased.plan, BUDGET),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
+});
+
+test("convolution VJP clears resident accumulators and packs exact 80-byte ABI", () => {
+  for (const operation of ["graph.conv1d", "graph.conv2d"]) {
+    const item = corpus.cases.find((candidate) =>
+      candidate.operation === operation && candidate.execution === "vjp" &&
+      candidate.expected.kind === "success");
+    const representative = representativePlan(item);
+    const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
+    const transaction = schedule.transaction(
+      representative.phase, representative.operationId, 0,
+    );
+    assert.equal(transaction.commands.length, 1);
+    assert.equal(transaction.commands[0].uniformBytes.byteLength, 80);
+    assert.equal(view(transaction.commands[0]).getUint32(64, true), 1);
+    assert.deepEqual(transaction.copies.map((copy) => copy.destination), [
+      "grad_x", "grad_weight", "grad_scale",
+    ]);
+    assert.equal(new Set(transaction.copies.map((copy) => copy.source)).size, 1);
+    assert.deepEqual(transaction.commands[0].storageBindings, {
+      1: "x", 2: "weight", 3: "scale", 4: "grad_output",
+      5: "grad_x", 6: "grad_weight", 7: "grad_scale",
+    });
+  }
+});
+
+test("attention owns probability scratch and zeroes three VJP outputs", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "graph.attention" && candidate.execution === "vjp" &&
+    candidate.expected.kind === "success");
+  const representative = representativePlan(item);
+  const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
+  const resources = schedule.auxiliaryResources();
+  assert.deepEqual(resources.resources.map((resource) => resource.byteLength), [36, 48, 36]);
+  const transaction = schedule.transaction(representative.phase, representative.operationId, 0);
+  assert.deepEqual(transaction.copies.map((copy) => copy.destination), [
+    "grad_q", "grad_k", "grad_v",
+  ]);
+  assert.deepEqual(transaction.commands[0].storageBindings, {
+    1: "q", 2: "k", 3: "v", 4: "grad_output", 5: "grad_q",
+    6: "grad_k", 7: "grad_v",
+    8: resources.resources[0].id,
+    9: resources.resources[2].id,
+  });
+  assert.deepEqual([
+    view(transaction.commands[0]).getUint32(0, true),
+    view(transaction.commands[0]).getUint32(4, true),
+    view(transaction.commands[0]).getUint32(8, true),
+    view(transaction.commands[0]).getUint32(12, true),
+    view(transaction.commands[0]).getUint32(16, true),
+    view(transaction.commands[0]).getUint32(20, true),
+  ], [3, 2, 1, 2, 1, 1]);
 });

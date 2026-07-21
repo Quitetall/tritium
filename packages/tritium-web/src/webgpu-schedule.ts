@@ -54,6 +54,9 @@ const SPECIALIZED = new Set([
   "graph.embedding_gather",
   "graph.rope",
   "graph.concat_cols",
+  "graph.conv1d",
+  "graph.conv2d",
+  "graph.attention",
   "loss.softmax_cross_entropy",
 ]);
 
@@ -236,6 +239,32 @@ function product(name: string, ...values: number[]): number {
   return result;
 }
 
+function sumU32(name: string, ...values: number[]): number {
+  let result = 0;
+  for (const value of values) {
+    result += value;
+    if (!Number.isSafeInteger(result) || result > 0xffff_ffff) {
+      fail("invalid_schema", `${name} exceeds u32 geometry`);
+    }
+  }
+  return result;
+}
+
+function convAxis(
+  input: number,
+  kernel: number,
+  stride: number,
+  dilation: number,
+  before: number,
+  after: number,
+  name: string,
+): number {
+  const effective = sumU32(name, product(name, kernel - 1, dilation), 1);
+  const padded = sumU32(name, input, before, after);
+  if (padded < effective) fail("invalid_schema", `${name} kernel exceeds padded input`);
+  return Math.floor((padded - effective) / stride) + 1;
+}
+
 function uniform(bytes: number, write: (view: DataView) => void): Uint8Array {
   const result = new Uint8Array(bytes);
   write(new DataView(result.buffer));
@@ -260,6 +289,23 @@ function expect(
       buffer.shape.length !== shape.length ||
       buffer.shape.some((dimension, index) => dimension !== shape[index])) {
     fail("invalid_schema", `${role} differs from specialized WebGPU geometry`);
+  }
+}
+
+function requireDisjointWrites(
+  buffers: BufferMap,
+  reads: readonly string[],
+  writes: readonly string[],
+  operation: string,
+): void {
+  const readOwners = new Set(reads.map((id) => buffers.get(id)!.ownerId));
+  const writeOwners = new Set<string>();
+  for (const id of writes) {
+    const owner = buffers.get(id)!.ownerId;
+    if (readOwners.has(owner) || writeOwners.has(owner)) {
+      fail("invalid_schema", `${operation} writes must have distinct non-input owners`);
+    }
+    writeOwners.add(owner);
   }
 }
 
@@ -646,6 +692,249 @@ export function compileWebGpuResidentScheduleV1(
             params,
             { 1: values, 2: lengths, 3: offsetsId, 4: result },
             [Math.ceil(product("concat output", rows, total) / 64), 1, 1],
+          )]),
+          copies: Object.freeze(copies),
+        });
+      }
+      case "graph.conv1d|forward":
+      case "graph.conv1d|vjp":
+      case "graph.conv2d|forward":
+      case "graph.conv2d|vjp": {
+        const batch = positiveU32(attributes.batch, "batch");
+        const cIn = positiveU32(attributes.c_in, "c_in");
+        const cOut = positiveU32(attributes.c_out, "c_out");
+        const groups = positiveU32(attributes.groups, "groups");
+        if (cIn % groups !== 0 || cOut % groups !== 0) {
+          fail("invalid_schema", "convolution groups must divide channels");
+        }
+        const is1d = invocation.operation === "graph.conv1d";
+        const inputH = is1d ? 1 : positiveU32(attributes.input_h, "input_h");
+        const inputW = is1d
+          ? positiveU32(attributes.l_in, "l_in")
+          : positiveU32(attributes.input_w, "input_w");
+        const kernelH = is1d ? 1 : positiveU32(attributes.kernel_h, "kernel_h");
+        const kernelW = is1d
+          ? positiveU32(attributes.k, "k")
+          : positiveU32(attributes.kernel_w, "kernel_w");
+        const strideH = is1d ? 1 : positiveU32(attributes.stride_h, "stride_h");
+        const strideW = is1d
+          ? positiveU32(attributes.stride, "stride")
+          : positiveU32(attributes.stride_w, "stride_w");
+        const dilationH = is1d ? 1 : positiveU32(attributes.dilation_h, "dilation_h");
+        const dilationW = is1d
+          ? positiveU32(attributes.dilation, "dilation")
+          : positiveU32(attributes.dilation_w, "dilation_w");
+        const padTop = is1d ? 0 : webGpuU32V1(attributes.pad_top, "pad_top");
+        const padBottom = is1d ? 0 : webGpuU32V1(attributes.pad_bottom, "pad_bottom");
+        const padLeft = webGpuU32V1(attributes.pad_left, "pad_left");
+        const padRight = webGpuU32V1(attributes.pad_right, "pad_right");
+        const outputH = convAxis(
+          inputH, kernelH, strideH, dilationH, padTop, padBottom, "conv output_h",
+        );
+        const outputW = convAxis(
+          inputW, kernelW, strideW, dilationW, padLeft, padRight, "conv output_w",
+        );
+        const maximumH = sumU32(
+          "conv h indexing",
+          product("conv h indexing", outputH - 1, strideH),
+          product("conv h indexing", kernelH - 1, dilationH),
+        );
+        const maximumW = sumU32(
+          "conv w indexing",
+          product("conv w indexing", outputW - 1, strideW),
+          product("conv w indexing", kernelW - 1, dilationW),
+        );
+        if (maximumH > 0x7fff_ffff || maximumW > 0x7fff_ffff ||
+            padTop > 0x7fff_ffff || padLeft > 0x7fff_ffff) {
+          fail("invalid_schema", "convolution indexing exceeds i32");
+        }
+        const inputShape = is1d
+          ? [batch, cIn, inputW]
+          : [batch, cIn, inputH, inputW];
+        const weightShape = is1d
+          ? [cOut, cIn / groups, kernelW]
+          : [cOut, cIn / groups, kernelH, kernelW];
+        const outputShape = is1d
+          ? [batch, cOut, outputW]
+          : [batch, cOut, outputH, outputW];
+        const x = requiredWebGpuRoleV1(input, "x");
+        const weight = requiredWebGpuRoleV1(input, "weight");
+        const scale = requiredWebGpuRoleV1(input, "scale");
+        expect(buffers, x, "f32", inputShape, "conv x");
+        expect(buffers, weight, "f32", weightShape, "conv weight");
+        expect(buffers, scale, "f32", [cOut], "conv scale");
+        const inputElements = product("conv input", ...inputShape);
+        const weightElements = product("conv weight", ...weightShape);
+        const outputElements = product("conv output", ...outputShape);
+        const patch = product("conv patch", cIn / groups, kernelH, kernelW);
+        const tileRows = is1d ? outputW : Math.min(product("conv rows", outputH, outputW), 32);
+        const columns = product("conv columns", tileRows, patch);
+        const groupOutput = product("conv group output", tileRows, cOut / groups);
+        const contractElements = invocation.execution === "forward"
+          ? sumU32("conv scratch", outputElements, columns, groupOutput)
+          : sumU32(
+            "conv scratch", inputElements, weightElements, cOut, columns, groupOutput,
+            columns, weightElements / groups, cOut / groups,
+          );
+        if (contractElements * 4 > 64 * 1024 * 1024) {
+          fail("memory_limit", "convolution scratch exceeds 64 MiB");
+        }
+        const resultRole = invocation.execution === "forward" ? "result" : "grad_x";
+        const result = requiredWebGpuRoleV1(output, resultRole);
+        expect(buffers, result, "f32",
+          invocation.execution === "forward" ? outputShape : inputShape, `conv ${resultRole}`);
+        let gradOutput: string;
+        let gradWeight: string;
+        let gradScale: string;
+        const copies: WebGpuResidentCopyV1[] = [];
+        if (invocation.execution === "vjp") {
+          gradOutput = requiredWebGpuRoleV1(input, "grad_output");
+          gradWeight = requiredWebGpuRoleV1(output, "grad_weight");
+          gradScale = requiredWebGpuRoleV1(output, "grad_scale");
+          expect(buffers, gradOutput, "f32", outputShape, "conv grad_output");
+          expect(buffers, gradWeight, "f32", weightShape, "conv grad_weight");
+          expect(buffers, gradScale, "f32", [cOut], "conv grad_scale");
+          requireDisjointWrites(
+            buffers, [x, weight, scale, gradOutput], [result, gradWeight, gradScale],
+            invocation.operation,
+          );
+          const zeroBytes = Math.max(inputElements, weightElements, cOut) * 4;
+          const zero = auxiliary("conv-zero", zeroBytes, null);
+          for (const [destination, byteLength] of [
+            [result, inputElements * 4],
+            [gradWeight, weightElements * 4],
+            [gradScale, cOut * 4],
+          ] as const) {
+            copies.push(Object.freeze({
+              source: zero,
+              sourceOffset: 0,
+              destination,
+              destinationOffset: 0,
+              byteLength,
+            }));
+          }
+        } else {
+          requireDisjointWrites(buffers, [x, weight, scale], [result], invocation.operation);
+          gradOutput = x;
+          gradWeight = auxiliary("conv-unused-grad-weight", 4, null);
+          gradScale = auxiliary("conv-unused-grad-scale", 4, null);
+        }
+        const params = uniform(80, (view) => {
+          [
+            batch, cIn, cOut, inputH, inputW, kernelH, kernelW, strideH, strideW,
+            dilationH, dilationW, padTop, padLeft, groups, outputH, outputW,
+            Number(invocation.execution === "vjp"), padBottom, padRight, 0,
+          ].forEach((value, index) => view.setUint32(index * 4, value, true));
+        });
+        return Object.freeze({
+          commands: Object.freeze([stage(
+            invocation,
+            "conv",
+            params,
+            {
+              1: x, 2: weight, 3: scale, 4: gradOutput,
+              5: result, 6: gradWeight, 7: gradScale,
+            },
+            [1, 1, 1],
+          )]),
+          copies: Object.freeze(copies),
+        });
+      }
+      case "graph.attention|forward":
+      case "graph.attention|vjp": {
+        const seq = positiveU32(attributes.seq, "seq");
+        const nHead = positiveU32(attributes.n_head, "n_head");
+        const nKvHead = positiveU32(attributes.n_kv_head, "n_kv_head");
+        const headDim = positiveU32(attributes.head_dim, "head_dim");
+        if (nHead % nKvHead !== 0 || typeof attributes.causal !== "boolean") {
+          fail("invalid_schema", "attention head or causal attributes are invalid");
+        }
+        const queryShape = [seq, nHead, headDim];
+        const kvShape = [seq, nKvHead, headDim];
+        const queryElements = product("attention query", ...queryShape);
+        const kvElements = product("attention kv", ...kvShape);
+        const probabilityElements = product("attention probabilities", seq, seq);
+        const contractElements = sumU32(
+          "attention scratch", queryElements, kvElements, kvElements,
+          probabilityElements, probabilityElements,
+        );
+        if (contractElements * 4 > 64 * 1024 * 1024) {
+          fail("memory_limit", "attention scratch exceeds 64 MiB");
+        }
+        const q = requiredWebGpuRoleV1(input, "q");
+        const k = requiredWebGpuRoleV1(input, "k");
+        const v = requiredWebGpuRoleV1(input, "v");
+        expect(buffers, q, "f32", queryShape, "attention q");
+        expect(buffers, k, "f32", kvShape, "attention k");
+        expect(buffers, v, "f32", kvShape, "attention v");
+        const probabilities = auxiliary(
+          "attention-probabilities", probabilityElements * 4, null,
+        );
+        let gradOutput: string;
+        let output0: string;
+        let output1: string;
+        let output2: string;
+        let gradProbabilities: string;
+        const copies: WebGpuResidentCopyV1[] = [];
+        if (invocation.execution === "vjp") {
+          gradOutput = requiredWebGpuRoleV1(input, "grad_output");
+          output0 = requiredWebGpuRoleV1(output, "grad_q");
+          output1 = requiredWebGpuRoleV1(output, "grad_k");
+          output2 = requiredWebGpuRoleV1(output, "grad_v");
+          expect(buffers, gradOutput, "f32", queryShape, "attention grad_output");
+          expect(buffers, output0, "f32", queryShape, "attention grad_q");
+          expect(buffers, output1, "f32", kvShape, "attention grad_k");
+          expect(buffers, output2, "f32", kvShape, "attention grad_v");
+          requireDisjointWrites(
+            buffers, [q, k, v, gradOutput], [output0, output1, output2],
+            invocation.operation,
+          );
+          const zero = auxiliary(
+            "attention-zero", Math.max(queryElements, kvElements) * 4, null,
+          );
+          for (const [destination, byteLength] of [
+            [output0, queryElements * 4],
+            [output1, kvElements * 4],
+            [output2, kvElements * 4],
+          ] as const) {
+            copies.push(Object.freeze({
+              source: zero,
+              sourceOffset: 0,
+              destination,
+              destinationOffset: 0,
+              byteLength,
+            }));
+          }
+          gradProbabilities = auxiliary(
+            "attention-grad-probabilities", probabilityElements * 4, null,
+          );
+        } else {
+          gradOutput = q;
+          output0 = requiredWebGpuRoleV1(output, "result");
+          expect(buffers, output0, "f32", queryShape, "attention result");
+          requireDisjointWrites(buffers, [q, k, v], [output0], invocation.operation);
+          output1 = auxiliary("attention-unused-output-1", 4, null);
+          output2 = auxiliary("attention-unused-output-2", 4, null);
+          gradProbabilities = auxiliary("attention-unused-grad-probabilities", 4, null);
+        }
+        const params = uniform(32, (view) => {
+          view.setUint32(0, seq, true);
+          view.setUint32(4, nHead, true);
+          view.setUint32(8, nKvHead, true);
+          view.setUint32(12, headDim, true);
+          view.setUint32(16, Number(attributes.causal), true);
+          view.setUint32(20, Number(invocation.execution === "vjp"), true);
+        });
+        return Object.freeze({
+          commands: Object.freeze([stage(
+            invocation,
+            "attention",
+            params,
+            {
+              1: q, 2: k, 3: v, 4: gradOutput, 5: output0,
+              6: output1, 7: output2, 8: probabilities, 9: gradProbabilities,
+            },
+            [1, 1, 1],
           )]),
           copies: Object.freeze(copies),
         });
