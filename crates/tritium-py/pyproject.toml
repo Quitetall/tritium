@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "tritium"
+name = "tritium-torch"
 description = "Ternary-model (BitNet) inference from Python, backed by the Rust Tritium engine."
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
