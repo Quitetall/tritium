@@ -801,6 +801,10 @@ def test_load_quantized_module_binds_compact_planes_without_dense_master(tmp_pat
     )
     inputs = torch.randn(3, 128)
     fitted = artifact.weight("0.weight")
+    assert loaded[0].packed_weight.trit_counts() == tuple(
+        tuple(int(torch.count_nonzero(plane.trits == value)) for value in (-1, 0, 1))
+        for plane in fitted.planes
+    )
     expected = sum(
         torch.nn.functional.linear(inputs, plane.trits.float())
         * plane.scales.float().squeeze(-1)

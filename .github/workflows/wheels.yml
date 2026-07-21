@@ -31,6 +31,9 @@ on:
       - "scripts/tests/test_aggregate_wheel_smoke.py"
       - "scripts/wheel-functional-smoke.py"
       - "scripts/tests/test_wheel_functional_smoke.py"
+      - "scripts/generate-colab-notebook.py"
+      - "scripts/tests/test_generate_colab_notebook.py"
+      - "examples/colab/tritium-smollm2-v11.ipynb"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
     inputs:
@@ -277,10 +280,24 @@ jobs:
           --source-revision ${{ github.sha }}
           --device cuda:0
           --output evidence/cuda13-torch2.11-py3.13-sm89.json
+      - name: execute generated five-minute SmolLM2 notebook
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            nbformat==5.10.4 nbconvert==7.17.1 ipykernel==7.3.0
+          python scripts/generate-colab-notebook.py --check
+          python -m unittest scripts.tests.test_generate_colab_notebook -v
+          mkdir -p evidence/colab
+          cp examples/colab/tritium-smollm2-v11.ipynb evidence/colab/executed.ipynb
+          TRITIUM_WHEEL=dist-cuda \
+          TRITIUM_OUTPUT_DIR="$PWD/evidence/colab/artifacts" \
+            python -m jupyter nbconvert --execute --to notebook --inplace \
+              --ExecutePreprocessor.timeout=600 evidence/colab/executed.ipynb
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-cuda13-torch2.11-python3.13-sm89
           path: |
             dist-cuda/*.whl
-            evidence/*.json
+            evidence/**
           if-no-files-found: error

@@ -214,6 +214,36 @@ class AdditiveTernaryWeight(nn.Module):
             output = plane if output is None else output + plane
         return output
 
+    def trit_counts(self) -> tuple[tuple[int, int, int], ...]:
+        """Return per-plane ``(-1, 0, +1)`` counts without a dense float shadow."""
+
+        counts = []
+        for index in range(self.plane_count):
+            packed = getattr(self, f"packed_trits_{index}").flatten()
+            symbols = torch.arange(243, device=packed.device, dtype=torch.int64)
+            powers = packed.new_tensor((1, 3, 9, 27, 81), dtype=torch.int64)
+            digits = (symbols.unsqueeze(1) // powers.unsqueeze(0)).remainder(3)
+            lookup = torch.stack(
+                tuple(torch.count_nonzero(digits == value, dim=1) for value in range(3)),
+                dim=1,
+            )
+            full_bytes, tail = divmod(self.weight_elements, 5)
+            totals = torch.zeros(3, device=packed.device, dtype=torch.int64)
+            for chunk in packed[:full_bytes].split(1024 * 1024):
+                frequencies = torch.bincount(chunk.to(torch.int64), minlength=243)
+                totals += frequencies @ lookup
+            if tail:
+                last = packed[full_bytes].to(torch.int64)
+                tail_digits = (last // powers[:tail]).remainder(3)
+                totals += torch.stack(
+                    tuple(
+                        torch.count_nonzero(tail_digits == value)
+                        for value in range(3)
+                    )
+                )
+            counts.append(tuple(int(value) for value in totals.cpu()))
+        return tuple(counts)
+
 
 class _AdditiveTernaryConsumer(nn.Module):
     def _bind_packed_weight(

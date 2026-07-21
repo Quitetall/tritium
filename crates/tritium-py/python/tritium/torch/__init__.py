@@ -63,6 +63,11 @@ from .ptq import (
     load_quantized_module,
     quantize,
 )
+from .tutorial import (
+    SMOLLM2_MODEL_ID,
+    SMOLLM2_REVISION,
+    run_smollm2_release_demo,
+)
 from .projection import (
     ProjectionContext,
     TernaryPlane,
@@ -101,6 +106,8 @@ __all__ = [
     "RefinementConfig",
     "SaltSTE",
     "SparseTernaryEstimator",
+    "SMOLLM2_MODEL_ID",
+    "SMOLLM2_REVISION",
     "TernaryConfig",
     "TernaryPlane",
     "TernaryProjection",
@@ -129,6 +136,7 @@ __all__ = [
     "register_estimator",
     "register_huggingface",
     "registered_estimators",
+    "run_smollm2_release_demo",
     "ternary_linear",
     "validate_projection",
 ]

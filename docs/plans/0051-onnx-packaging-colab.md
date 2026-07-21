@@ -278,6 +278,15 @@ Old readable artifacts remain tested; new writes always use the current schema.
 
 ## Slice 5 — five-minute Colab proof
 
+Status: **IN PROGRESS** — generated notebook, deterministic source checker and
+CUDA-wheel headless execution lane exist. A local exact-wheel run on RTX 4090
+completed pinned SmolLM2-135M PTQ, compact HF save/reload, dynamic-sequence real
+ORT export/replay, token generation, full-model CUDA QAT step and optimizer
+checkpoint/resume in **104.66 seconds excluding first download**. It measured
+537,919,488 selected dense bytes versus 82,056,969 compact checkpoint bytes
+(6.56x) and 31.16% zero trits. This is development evidence; candidate-revision
+CI/Colab receipts remain required before public support is claimed.
+
 Publish a notebook source plus a non-interactive execution harness using the
 pinned SmolLM2-135M tutorial artifact. From a fresh supported Colab runtime it
 must, after one wheel install and excluding first model download:
