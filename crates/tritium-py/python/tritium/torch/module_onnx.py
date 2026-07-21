@@ -113,18 +113,30 @@ def _is_sha256(value: Any) -> bool:
     return True
 
 
-def _dependencies():
+def _runtime_dependencies():
     try:
         import onnx
         import onnxruntime
-        import onnxscript  # noqa: F401 - required by the Dynamo ONNX exporter
     except ImportError as error:
         raise TritiumError(
-            "generic ONNX export requires onnx, onnxscript, and onnxruntime",
+            "generic ONNX bundles require onnx and onnxruntime",
             code="onnx_dependency_missing",
             stage="module_onnx",
         ) from error
     return onnx, onnxruntime
+
+
+def _export_dependencies():
+    dependencies = _runtime_dependencies()
+    try:
+        import onnxscript  # noqa: F401 - required by the Dynamo ONNX exporter
+    except ImportError as error:
+        raise TritiumError(
+            "generic Dynamo ONNX export additionally requires onnxscript",
+            code="onnx_dependency_missing",
+            stage="module_onnx",
+        ) from error
+    return dependencies
 
 
 def _packed_specs(model: nn.Module):
@@ -343,7 +355,7 @@ def export_module_onnx(
         from .ptq import _source_model_digest
 
         checkpoint_digest = _source_model_digest(model)
-    onnx, ort = _dependencies()
+    onnx, ort = _export_dependencies()
     target = Path(output_dir).absolute()
     parent = target.parent.resolve(strict=True)
     if target.exists() or target.is_symlink():
@@ -509,7 +521,7 @@ def load_module_onnx(
     ):
         raise ValueError("module ONNX interface or coverage is invalid")
     _validate_specs(specs)
-    onnx, ort = _dependencies()
+    onnx, ort = _runtime_dependencies()
     graph_path = directory / _GRAPH
     graph = onnx.load(graph_path, load_external_data=False)
     onnx.checker.check_model(graph)
