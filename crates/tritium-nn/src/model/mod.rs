@@ -29,7 +29,8 @@ pub use qwen35::{
 };
 pub use qwen35_hf::{
     Qwen35HfLanguageModel, Qwen35HfLanguageMtpModel, Qwen35HfLanguageMtpReceipt,
-    Qwen35HfLanguageReceipt, Qwen35MtpPromotionError, Qwen35VerifiedHfLanguageMtpModel,
+    Qwen35HfLanguageReceipt, Qwen35MtpPromotionError, Qwen35TensorSchemaEntry,
+    Qwen35TensorSchemaRole, Qwen35VerifiedHfLanguageMtpModel, qwen35_language_mtp_tensor_schema,
 };
 pub use qwen35_hf_source::{
     QWEN35_HF_SOURCE_ARCHITECTURE, Qwen35ContentVerifiedHfSource, Qwen35HfSource,

@@ -41,6 +41,172 @@ pub(super) struct TensorSpec {
     pub(super) role: TensorRole,
 }
 
+/// Physical admission role of one canonical Qwen language/MTP tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen35TensorSchemaRole {
+    /// Rank-two weight converted into the selected packed matrix profile.
+    Matrix,
+    /// Exact floating-point tensor retained in the preserved companion.
+    Preserved,
+}
+
+/// One canonical Qwen language/MTP tensor name, exact shape, and physical role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35TensorSchemaEntry {
+    /// Canonical Hugging Face checkpoint tensor name.
+    pub name: String,
+    /// Exact rank and dimensions before any flattening or widening.
+    pub shape: Vec<usize>,
+    /// Packed-matrix or preserved-tensor placement.
+    pub role: Qwen35TensorSchemaRole,
+}
+
+/// Build the complete exact Qwen language-plus-MTP tensor schema.
+///
+/// Entries are sorted by canonical name. Vision remains outside this boundary.
+///
+/// # Errors
+/// Returns [`NnError`] for invalid or overflowing architecture geometry or a
+/// duplicate language/MTP tensor name.
+pub fn qwen35_language_mtp_tensor_schema(
+    config: &Qwen35TextConfig,
+) -> Result<Vec<Qwen35TensorSchemaEntry>, NnError> {
+    validate_public_schema_config(config)?;
+    let mut schema = language_schema(config)?;
+    for (name, tensor) in mtp_schema(config)? {
+        if schema.insert(name.clone(), tensor).is_some() {
+            return Err(NnError::InvalidArtifact(format!(
+                "duplicate language/MTP schema tensor `{name}`"
+            )));
+        }
+    }
+    Ok(schema
+        .into_iter()
+        .map(|(name, tensor)| Qwen35TensorSchemaEntry {
+            name,
+            shape: tensor.shape,
+            role: match tensor.role {
+                TensorRole::Matrix => Qwen35TensorSchemaRole::Matrix,
+                TensorRole::Preserved => Qwen35TensorSchemaRole::Preserved,
+            },
+        })
+        .collect())
+}
+
+fn validate_public_schema_config(config: &Qwen35TextConfig) -> Result<(), NnError> {
+    let nonzero = [
+        config.num_hidden_layers,
+        config.hidden_size,
+        config.intermediate_size,
+        config.vocab_size,
+        config.full_attention_interval,
+        config.full_attention.num_heads,
+        config.full_attention.num_key_value_heads,
+        config.full_attention.head_dim,
+        config.delta_net.conv_kernel_dim,
+        config.delta_net.num_key_heads,
+        config.delta_net.num_value_heads,
+        config.delta_net.key_head_dim,
+        config.delta_net.value_head_dim,
+    ];
+    if config.model_type != "qwen3_5_text"
+        || nonzero.contains(&0)
+        || usize::try_from(config.num_hidden_layers).ok() != Some(config.layer_types.len())
+        || config.tied_embeddings
+        || config.mtp.num_hidden_layers != 1
+        || config.mtp.dedicated_embeddings
+        || config.full_attention.bias
+    {
+        return Err(invalid_geometry(
+            "public Qwen schema requires validated untied, bias-free language geometry and one shared-embedding MTP layer",
+        ));
+    }
+    if !config
+        .full_attention
+        .num_heads
+        .is_multiple_of(config.full_attention.num_key_value_heads)
+        || !config
+            .delta_net
+            .num_value_heads
+            .is_multiple_of(config.delta_net.num_key_heads)
+        || !config
+            .layer_types
+            .len()
+            .is_multiple_of(config.full_attention_interval as usize)
+        || !config.layer_types.contains(&Qwen35LayerType::DeltaNet)
+        || !config.layer_types.contains(&Qwen35LayerType::FullAttention)
+        || config
+            .layer_types
+            .iter()
+            .copied()
+            .enumerate()
+            .any(|(index, layer)| {
+                let expected =
+                    if (index + 1).is_multiple_of(config.full_attention_interval as usize) {
+                        Qwen35LayerType::FullAttention
+                    } else {
+                        Qwen35LayerType::DeltaNet
+                    };
+                layer != expected
+            })
+    {
+        return Err(invalid_geometry(
+            "public Qwen schema requires canonical head grouping and heterogeneous layer cadence",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod public_schema_tests {
+    use super::*;
+
+    #[test]
+    fn public_language_mtp_schema_retains_roles_ranks_and_order() {
+        let config = Qwen35CheckpointConfig::pinned_qwen36_27b();
+        let schema = qwen35_language_mtp_tensor_schema(&config.text).unwrap();
+        assert!(schema.windows(2).all(|pair| pair[0].name < pair[1].name));
+        assert_eq!(schema.len(), 866);
+        assert_eq!(
+            schema
+                .iter()
+                .filter(|tensor| tensor.role == Qwen35TensorSchemaRole::Matrix)
+                .count(),
+            506
+        );
+
+        let embedding = schema
+            .iter()
+            .find(|tensor| tensor.name == "model.language_model.embed_tokens.weight")
+            .unwrap();
+        assert_eq!(embedding.shape, [248_320, 5_120]);
+        assert_eq!(embedding.role, Qwen35TensorSchemaRole::Matrix);
+
+        let convolution = schema
+            .iter()
+            .find(|tensor| tensor.name == "model.language_model.layers.0.linear_attn.conv1d.weight")
+            .unwrap();
+        assert_eq!(convolution.shape, [10_240, 1, 4]);
+        assert_eq!(convolution.role, Qwen35TensorSchemaRole::Preserved);
+        assert!(schema.iter().any(|tensor| tensor.name == "mtp.fc.weight"));
+        assert!(!schema.iter().any(|tensor| tensor.name.contains("vision")));
+
+        let mutations: [fn(&mut Qwen35TextConfig); 4] = [
+            |config: &mut Qwen35TextConfig| config.hidden_size = 0,
+            |config: &mut Qwen35TextConfig| config.tied_embeddings = true,
+            |config: &mut Qwen35TextConfig| config.mtp.num_hidden_layers = 2,
+            |config: &mut Qwen35TextConfig| {
+                config.layer_types.pop();
+            },
+        ];
+        for mutate in mutations {
+            let mut invalid = config.text.clone();
+            mutate(&mut invalid);
+            assert!(qwen35_language_mtp_tensor_schema(&invalid).is_err());
+        }
+    }
+}
+
 pub(super) trait Qwen35HfTensorSource {
     fn tensor_f32_exact(&self, name: &str, expected: &[usize]) -> Result<Vec<f32>, NnError>;
 
