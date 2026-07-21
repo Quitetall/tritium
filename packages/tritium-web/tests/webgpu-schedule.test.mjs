@@ -72,7 +72,9 @@ function representativePlan(item) {
       : attribute.type === "u64_list"
         ? "u64-list"
         : attribute.type,
-    value: attribute.type === "f32"
+    value: item.execution === "step" && attribute.name === "step"
+      ? 0
+      : attribute.type === "f32"
       ? f32FromBits(attribute.bits)
       : "values" in attribute
         ? [...attribute.values]
@@ -111,7 +113,7 @@ function view(command) {
   );
 }
 
-test("resident schedule covers all 52 graph and loss execution forms", () => {
+test("resident schedule covers 52 graph/loss forms plus transactional SGD", () => {
   const supported = new Set([
     "graph.detach", "graph.scale_const", "graph.add", "graph.mul", "graph.relu2",
     "graph.silu", "graph.causal_mask", "graph.softmax", "graph.rmsnorm", "loss.mse",
@@ -121,6 +123,7 @@ test("resident schedule covers all 52 graph and loss execution forms", () => {
     "graph.concat_cols",
     "graph.conv1d", "graph.conv2d", "graph.attention",
     "loss.softmax_cross_entropy",
+    "optimizer.sgd",
   ]);
   const representatives = new Map();
   for (const item of corpus.cases) {
@@ -128,12 +131,13 @@ test("resident schedule covers all 52 graph and loss execution forms", () => {
     if (supported.has(item.operation) && item.expected.kind === "success" &&
         !representatives.has(key)) representatives.set(key, item);
   }
-  assert.equal(representatives.size, 52);
+  assert.equal(representatives.size, 53);
   for (const [key, item] of representatives) {
     const representative = representativePlan(item);
     const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
     const transaction = schedule.transaction(
       representative.phase, representative.operationId, 3,
+      item.execution === "step" ? 1 : undefined,
     );
     const form = webGpuDispatchFormV1(item.operation, item.execution);
     const expectedCommands = form.stages.reduce((count, stage) =>
@@ -227,7 +231,7 @@ test("concat packs forward parts with GPU copies and emits ordered VJP slices", 
 
 test("unsupported forms and malformed specialized geometry fail closed", () => {
   const unsupported = corpus.cases.find((candidate) =>
-    candidate.operation === "optimizer.sgd" && candidate.execution === "step" &&
+    candidate.operation === "optimizer.adamw" && candidate.execution === "step" &&
     candidate.expected.kind === "success");
   const optimizer = representativePlan(unsupported);
   const schedule = compileWebGpuResidentScheduleV1(optimizer.plan, BUDGET);
@@ -366,4 +370,42 @@ test("attention owns probability scratch and zeroes three VJP outputs", () => {
     view(transaction.commands[0]).getUint32(16, true),
     view(transaction.commands[0]).getUint32(20, true),
   ], [3, 2, 1, 2, 1, 1]);
+});
+
+test("SGD computes into a candidate and commits only after dispatch", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "optimizer.sgd" && candidate.execution === "step" &&
+    candidate.expected.kind === "success");
+  const representative = representativePlan(item);
+  const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
+  const resources = schedule.auxiliaryResources();
+  assert.deepEqual(resources.resources.map((resource) => resource.byteLength), [8]);
+  assert.throws(
+    () => schedule.transaction(representative.phase, representative.operationId, 0),
+    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+  );
+  const transaction = schedule.transaction(
+    representative.phase, representative.operationId, 0, 7,
+  );
+  assert.deepEqual(transaction.commands[0].storageBindings, {
+    1: "parameter", 2: "gradient", 3: "gradient", 4: resources.resources[0].id,
+  });
+  assert.equal(view(transaction.commands[0]).getUint32(4, true), 21);
+  assert.deepEqual(transaction.commitCopies, [{
+    source: resources.resources[0].id,
+    sourceOffset: 0,
+    destination: "parameter",
+    destinationOffset: 0,
+    byteLength: 8,
+  }]);
+  assert.throws(
+    () => schedule.transaction(representative.phase, representative.operationId, 0, 0),
+    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+  );
+  const forged = structuredClone(representative.plan);
+  forged.operations[0].attributes.find((attribute) => attribute.name === "step").value = 1;
+  assert.throws(
+    () => compileWebGpuResidentScheduleV1(forged, BUDGET),
+    (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+  );
 });

@@ -663,6 +663,7 @@ export interface WebGpuResidentScheduleV1 {
     phase: "forward" | "backward",
     operationId: string,
     firstUniformSlot: number,
+    optimizerStep?: number,
   ): WebGpuResidentTransactionV1;
 }
 

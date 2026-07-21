@@ -35,6 +35,7 @@ export interface WebGpuResidentScheduleV1 {
     phase: "forward" | "backward",
     operationId: string,
     firstUniformSlot: number,
+    optimizerStep?: number,
   ): WebGpuResidentTransactionV1;
 }
 
@@ -43,6 +44,7 @@ type Template = Readonly<{
   commands: readonly WebGpuResidentDispatchV1[];
   copies: readonly WebGpuResidentCopyV1[];
   commitCopies?: readonly WebGpuResidentCopyV1[];
+  commandFactory?: (optimizerStep: number) => readonly WebGpuResidentDispatchV1[];
 }>;
 type PendingResource = Readonly<{
   id: string;
@@ -60,6 +62,7 @@ const SPECIALIZED = new Set([
   "graph.conv2d",
   "graph.attention",
   "loss.softmax_cross_entropy",
+  "optimizer.sgd",
 ]);
 
 function fail(
@@ -977,6 +980,56 @@ export function compileWebGpuResidentScheduleV1(
           copies: Object.freeze([]),
         });
       }
+      case "optimizer.sgd|step": {
+        if (safeU64(attributes.step, "step") !== 0) {
+          fail("invalid_schema", "SGD compiled recipe step must start at zero");
+        }
+        const learningRate = webGpuF32V1(attributes.lr, "lr");
+        if (learningRate < 0) fail("invalid_schema", "SGD lr must be nonnegative");
+        const parameter = requiredWebGpuRoleV1(input, "parameter");
+        const gradient = requiredWebGpuRoleV1(input, "gradient");
+        const result = requiredWebGpuRoleV1(output, "parameter");
+        const parameterBuffer = buffers.get(parameter);
+        if (parameterBuffer === undefined || parameterBuffer.dtype !== "f32") {
+          fail("invalid_schema", "SGD parameter must be f32");
+        }
+        expect(buffers, gradient, "f32", parameterBuffer.shape, "SGD gradient");
+        expect(buffers, result, "f32", parameterBuffer.shape, "SGD result");
+        if (buffers.get(result)!.ownerId !== parameterBuffer.ownerId) {
+          fail("invalid_schema", "SGD output must commit to parameter owner");
+        }
+        const len = product("SGD parameter", ...parameterBuffer.shape);
+        const candidate = auxiliary("sgd-parameter-candidate", len * 4, null);
+        const commandFactory = (optimizerStep: number) => {
+          if (!Number.isSafeInteger(optimizerStep) || optimizerStep <= 0) {
+            fail("invalid_schema", "optimizerStep must be a positive safe integer");
+          }
+          const params = uniform(32, (view) => {
+            view.setUint32(0, len, true);
+            view.setUint32(4, 21, true);
+            view.setFloat32(8, learningRate, true);
+          });
+          return Object.freeze([stage(
+            invocation,
+            "pointwise",
+            params,
+            { 1: parameter, 2: gradient, 3: gradient, 4: candidate },
+            [Math.ceil(len / 64), 1, 1],
+          )]);
+        };
+        return Object.freeze({
+          commands: Object.freeze([]),
+          commandFactory,
+          copies: Object.freeze([]),
+          commitCopies: Object.freeze([Object.freeze({
+            source: candidate,
+            sourceOffset: 0,
+            destination: result,
+            destinationOffset: 0,
+            byteLength: len * 4,
+          })]),
+        });
+      }
       default:
         fail("capability_mismatch", `${invocation.operation} has no specialized WebGPU lowering`);
     }
@@ -1037,6 +1090,7 @@ export function compileWebGpuResidentScheduleV1(
       phase: "forward" | "backward",
       operationId: string,
       firstUniformSlot: number,
+      optimizerStep?: number,
     ): WebGpuResidentTransactionV1 {
       if ((phase !== "forward" && phase !== "backward") ||
           typeof operationId !== "string" || operationId.length === 0 ||
@@ -1047,12 +1101,18 @@ export function compileWebGpuResidentScheduleV1(
       if (template === undefined) {
         fail("capability_mismatch", `compiled operation ${operationId} is not lowered`);
       }
-      const finalSlot = firstUniformSlot + template.commands.length - 1;
+      if ((template.commandFactory === undefined) !== (optimizerStep === undefined)) {
+        fail("invalid_schema", "optimizerStep presence differs from compiled operation phase");
+      }
+      const commands = template.commandFactory === undefined
+        ? template.commands
+        : template.commandFactory(optimizerStep!);
+      const finalSlot = firstUniformSlot + commands.length - 1;
       if (!Number.isSafeInteger(finalSlot) || finalSlot >= uniformSlots) {
         fail("invalid_schema", "WebGPU transaction exceeds uniform arena");
       }
       return Object.freeze({
-        commands: Object.freeze(template.commands.map((command, index) => Object.freeze({
+        commands: Object.freeze(commands.map((command, index) => Object.freeze({
           ...command,
           uniformSlot: firstUniformSlot + index,
           uniformBytes: command.uniformBytes === null

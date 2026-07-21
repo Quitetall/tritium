@@ -255,9 +255,12 @@ captures the caller plan once and admits the plan peak, auxiliary resources,
 uniform arena and zero binding against an explicit `maxPeakBytes` ceiling before
 materializing constants. Softmax cross
 entropy VJP now consumes its scalar cotangent through resident storage in both
-native and browser WGSL. This covers all 52 graph/loss catalog forms. Convolution
+native and browser WGSL. This covers all 52 graph/loss catalog forms plus
+transactional SGD. Optimizer transactions require a positive runtime step,
+compute into auxiliary candidates, then commit into live owners only after all
+compute dispatches complete in the same submission. Convolution
 and attention VJPs clear resident accumulation outputs through budgeted zero-buffer
-copies before dispatch. Optimizer candidate/commit storage, session-adapter
+copies before dispatch. Adaptive optimizer candidate/commit storage, session-adapter
 integration and physical browser execution remain open.
 
 The generated-registry lowering derives exact registry roles, f32/u32 uniform
@@ -266,7 +269,7 @@ geometry from the compiled plan without tensor values. MSE and softmax cross
 entropy VJPs read scalar cotangents from resident storage bindings instead of
 requiring host scalar readback. Column concat forward packs resident parts with
 same-submission GPU copies and its VJP emits ordered resident slices. Only the
-five optimizer catalog forms and session-adapter integration remain open.
+four adaptive optimizer catalog forms and session-adapter integration remain open.
 
 Implement all 35 manifest operations with WGSL compute pipelines and explicit
 VJPs. Kernels may be fused after semantic parity, but the frozen public
