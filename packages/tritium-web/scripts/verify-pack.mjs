@@ -5,10 +5,11 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
@@ -68,9 +69,7 @@ function assertRelativeFile(path) {
   }
 }
 
-async function main() {
-  if (packageJson.private !== true) fail("publication guard is not enabled");
-  const temporary = await mkdtemp(join(tmpdir(), "tritium-npm-pack-"));
+async function verifyArchive(temporary) {
   const archiveDirectory = resolve(temporary, "archive");
   await mkdir(archiveDirectory);
   const { stdout } = await run("npm", [
@@ -96,23 +95,18 @@ async function main() {
   }
 
   const archive = resolve(archiveDirectory, metadata.filename);
-  const archiveRoot = `${await realpath(archiveDirectory)}${sep}`;
+  const archiveRoot = await realpath(archiveDirectory);
   const archiveRealPath = await realpath(archive);
-  if (!archiveRealPath.startsWith(archiveRoot)) fail("archive escaped its output directory");
+  const archiveRelativePath = relative(archiveRoot, archiveRealPath);
+  if (archiveRelativePath.length === 0 || archiveRelativePath === ".." ||
+      archiveRelativePath.startsWith(`..${sep}`) || isAbsolute(archiveRelativePath)) {
+    fail("archive escaped its output directory");
+  }
   const archiveBytes = await readFile(archiveRealPath);
   const sha512 = digest("sha512", archiveBytes, "base64");
   if (metadata.integrity !== `sha512-${sha512}` ||
       metadata.shasum !== digest("sha1", archiveBytes)) {
     fail("npm archive digest metadata is invalid");
-  }
-
-  const sourceMap = JSON.parse(await readFile(resolve(root, "dist/index.js.map"), "utf8"));
-  if (!Array.isArray(sourceMap.sources) ||
-      sourceMap.sources.some((source) => typeof source !== "string" ||
-        source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source)) ||
-      (Array.isArray(sourceMap.sourcesContent) &&
-        sourceMap.sourcesContent.some((content) => content !== null))) {
-    fail("source map leaks source contents or absolute paths");
   }
 
   const consumer = resolve(temporary, "consumer");
@@ -128,6 +122,17 @@ async function main() {
   ], { cwd: consumer, maxBuffer: MAX_COMMAND_OUTPUT_BYTES });
   const installedRoot = await realpath(resolve(consumer, "node_modules"));
   const installedRootUrl = pathToFileURL(`${installedRoot}${sep}`).href;
+  const installedPackage = resolve(installedRoot, "@tritium-ai/web");
+  const sourceMap = JSON.parse(
+    await readFile(resolve(installedPackage, "dist/index.js.map"), "utf8"),
+  );
+  if (!Array.isArray(sourceMap.sources) ||
+      sourceMap.sources.some((source) => typeof source !== "string" ||
+        source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source)) ||
+      (Array.isArray(sourceMap.sourcesContent) &&
+        sourceMap.sourcesContent.some((content) => content !== null))) {
+    fail("installed source map leaks source contents or absolute paths");
+  }
   await writeFile(resolve(consumer, "smoke.mjs"), `
 import assert from "node:assert/strict";
 import { runPortableWasmConformance } from "@tritium-ai/web";
@@ -143,6 +148,11 @@ process.stdout.write(JSON.stringify(receipt));
     maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
   });
   const wasmReceipt = JSON.parse(smoke.stdout);
+  if (typeof wasmReceipt.buildId !== "string" || wasmReceipt.buildId.length === 0 ||
+      typeof wasmReceipt.guestDigest !== "string" ||
+      !/^[0-9a-f]{64}$/.test(wasmReceipt.guestDigest)) {
+    fail("installed WASM returned an invalid identity receipt");
+  }
 
   await writeFile(resolve(consumer, "index.ts"), `
 import {
@@ -186,6 +196,16 @@ void adapter;
     wasmGuestDigest: wasmReceipt.guestDigest,
   });
   process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
+}
+
+async function main() {
+  if (packageJson.private !== true) fail("publication guard is not enabled");
+  const temporary = await mkdtemp(join(tmpdir(), "tritium-npm-pack-"));
+  try {
+    await verifyArchive(temporary);
+  } finally {
+    await rm(temporary, { force: true, recursive: true });
+  }
 }
 
 await main();
