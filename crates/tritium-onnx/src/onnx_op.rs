@@ -41,9 +41,11 @@ use crate::{
     ATTR_CODEC, ATTR_CONV_KERNEL_DIM, ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_KEY_HEAD_DIM,
     ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_NUM_KEY_HEADS, ATTR_NUM_VALUE_HEADS, ATTR_PAST_TOKENS,
     ATTR_ROWS, ATTR_TERMINAL_MAP_VALUE, ATTR_VALUE_HEAD_DIM, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME,
-    ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME, ONNX_QWEN_DELTANET_OP_NAME, ONNX_SALT_V2_OP_NAME,
-    QwenDeltaNetGeometry, QwenDeltaNetInput, QwenDeltaNetOutputSlot, SaltV2PackedMatrix,
-    kv_attention_kernel, salt_v2_mpgemm_kernel, ternary_embedding_kernel, ternary_mpgemm_kernel,
+    ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME, ONNX_QWEN_DELTANET_OP_NAME,
+    ONNX_SALT_V2_EMBEDDING_OP_NAME, ONNX_SALT_V2_OP_NAME, QwenDeltaNetGeometry, QwenDeltaNetInput,
+    QwenDeltaNetOutputSlot, SaltV2PackedMatrix, kv_attention_kernel, salt_v2_embedding_kernel,
+    salt_v2_embedding_kernel_admitted, salt_v2_mpgemm_kernel, ternary_embedding_kernel,
+    ternary_mpgemm_kernel,
 };
 
 /// Map the integer `format` node attribute to a [`TernaryFormat`].
@@ -124,6 +126,32 @@ impl Operator for TritiumTernaryMpGemmOp {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TritiumSaltV2MpGemmOp;
 
+fn salt_v2_kernel_config(
+    attributes: &KernelAttributes,
+) -> ort::Result<(usize, usize, tritium_format::salt_v2::SaltV2Codec, u32)> {
+    let columns = usize_attribute(attributes, ATTR_K, false)?;
+    let rows = usize_attribute(attributes, ATTR_ROWS, false)?;
+    let codec: i64 = attributes
+        .get(ATTR_CODEC)
+        .ok_or_else(|| OrtError::new("tritium-onnx: missing i64 attribute `codec`"))?;
+    let codec = match codec {
+        0 => tritium_format::salt_v2::SaltV2Codec::D2,
+        1 => tritium_format::salt_v2::SaltV2Codec::B3,
+        2 => tritium_format::salt_v2::SaltV2Codec::S34,
+        value => {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: unknown SALT V2 codec {value}"
+            )));
+        }
+    };
+    let terminal: i64 = attributes
+        .get(ATTR_TERMINAL_MAP_VALUE)
+        .ok_or_else(|| OrtError::new("tritium-onnx: missing i64 attribute `terminal_map_value`"))?;
+    let terminal_map_value = u32::try_from(terminal)
+        .map_err(|_| OrtError::new("tritium-onnx: terminal_map_value must fit unsigned 32 bits"))?;
+    Ok((rows, columns, codec, terminal_map_value))
+}
+
 impl Operator for TritiumSaltV2MpGemmOp {
     fn name(&self) -> &str {
         ONNX_SALT_V2_OP_NAME
@@ -152,27 +180,7 @@ impl Operator for TritiumSaltV2MpGemmOp {
     }
 
     fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
-        let columns = usize_attribute(attributes, ATTR_K, false)?;
-        let rows = usize_attribute(attributes, ATTR_ROWS, false)?;
-        let codec: i64 = attributes
-            .get(ATTR_CODEC)
-            .ok_or_else(|| OrtError::new("tritium-onnx: missing i64 attribute `codec`"))?;
-        let codec = match codec {
-            0 => tritium_format::salt_v2::SaltV2Codec::D2,
-            1 => tritium_format::salt_v2::SaltV2Codec::B3,
-            2 => tritium_format::salt_v2::SaltV2Codec::S34,
-            value => {
-                return Err(OrtError::new(format!(
-                    "tritium-onnx: unknown SALT V2 codec {value}"
-                )));
-            }
-        };
-        let terminal: i64 = attributes.get(ATTR_TERMINAL_MAP_VALUE).ok_or_else(|| {
-            OrtError::new("tritium-onnx: missing i64 attribute `terminal_map_value`")
-        })?;
-        let terminal_map_value = u32::try_from(terminal).map_err(|_| {
-            OrtError::new("tritium-onnx: terminal_map_value must fit unsigned 32 bits")
-        })?;
+        let (rows, columns, codec, terminal_map_value) = salt_v2_kernel_config(attributes)?;
         Ok(Box::new(TritiumSaltV2MpGemmKernel {
             rows,
             columns,
@@ -266,6 +274,185 @@ impl Kernel for TritiumSaltV2MpGemmKernel {
         let mut value = ctx
             .output(0, vec![shape[0], self.rows as i64])?
             .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 output"))?;
+        let (_, destination) = value.try_extract_tensor_mut::<f32>()?;
+        destination.copy_from_slice(&output);
+        Ok(())
+    }
+}
+
+/// Custom operator for descriptor-free additive SALT V2 embedding lookup.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TritiumSaltV2EmbeddingOp;
+
+impl Operator for TritiumSaltV2EmbeddingOp {
+    fn name(&self) -> &str {
+        ONNX_SALT_V2_EMBEDDING_OP_NAME
+    }
+
+    fn inputs(&self) -> Vec<OperatorInput> {
+        vec![
+            OperatorInput::required(TensorElementType::Int64),
+            OperatorInput::required(TensorElementType::Uint8),
+            OperatorInput::required(TensorElementType::Float16),
+            OperatorInput::required(TensorElementType::Uint8),
+            OperatorInput::required(TensorElementType::Uint32),
+        ]
+    }
+
+    fn outputs(&self) -> Vec<OperatorOutput> {
+        vec![OperatorOutput::required(TensorElementType::Float32)]
+    }
+
+    fn min_version(&self) -> i32 {
+        2
+    }
+
+    fn max_version(&self) -> i32 {
+        2
+    }
+
+    fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
+        let (rows, columns, codec, terminal_map_value) = salt_v2_kernel_config(attributes)?;
+        Ok(Box::new(TritiumSaltV2EmbeddingKernel {
+            rows,
+            columns,
+            codec,
+            terminal_map_value,
+            validated: false,
+        }))
+    }
+}
+
+/// Per-node additive SALT V2 selected-row ORT kernel.
+#[derive(Debug, Clone)]
+pub struct TritiumSaltV2EmbeddingKernel {
+    rows: usize,
+    columns: usize,
+    codec: tritium_format::salt_v2::SaltV2Codec,
+    terminal_map_value: u32,
+    validated: bool,
+}
+
+impl TritiumSaltV2EmbeddingKernel {
+    /// Execute one extracted ORT operand set and return output shape plus values.
+    ///
+    /// # Errors
+    /// Returns an [`ort::Error`] when token shape/IDs, arenas, metadata, or
+    /// codec data violate the SALT V2 contract.
+    pub fn run(
+        &self,
+        token_shape: &[i64],
+        tokens: &[i64],
+        payload: &[u8],
+        scales: &[half::f16],
+        allocation_map: &[u8],
+        rank_prefixes: &[u32],
+    ) -> Result<(Vec<i64>, Vec<f32>), OrtError> {
+        self.run_impl(
+            token_shape,
+            tokens,
+            payload,
+            scales,
+            allocation_map,
+            rank_prefixes,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_impl(
+        &self,
+        token_shape: &[i64],
+        tokens: &[i64],
+        payload: &[u8],
+        scales: &[half::f16],
+        allocation_map: &[u8],
+        rank_prefixes: &[u32],
+        validate_payload: bool,
+    ) -> Result<(Vec<i64>, Vec<f32>), OrtError> {
+        let dimensions: Vec<usize> = token_shape
+            .iter()
+            .enumerate()
+            .map(|(axis, &dimension)| {
+                usize::try_from(dimension).map_err(|_| {
+                    OrtError::new(format!(
+                        "tritium-onnx: SALT V2 token dimension {axis} must be nonnegative"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let matrix = SaltV2PackedMatrix {
+            rows: self.rows,
+            columns: self.columns,
+            codec: self.codec,
+            payload,
+            scales,
+            allocation_map,
+            rank_prefixes,
+            terminal_map_value: self.terminal_map_value,
+        };
+        let output = if validate_payload {
+            salt_v2_embedding_kernel(tokens, &dimensions, matrix)
+        } else {
+            salt_v2_embedding_kernel_admitted(tokens, &dimensions, matrix)
+        }
+        .map_err(|error| OrtError::new(error.to_string()))?;
+        let mut output_shape = token_shape.to_vec();
+        output_shape.push(self.columns as i64);
+        Ok((output_shape, output))
+    }
+}
+
+impl Kernel for TritiumSaltV2EmbeddingKernel {
+    fn compute(&mut self, ctx: &KernelContext) -> ort::Result<()> {
+        let tokens = ctx
+            .input(0)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 tokens"))?;
+        let payload = ctx
+            .input(1)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 payload"))?;
+        let scales = ctx
+            .input(2)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 scales"))?;
+        let allocation_map = ctx
+            .input(3)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 allocation map"))?;
+        let rank_prefixes = ctx
+            .input(4)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 rank prefixes"))?;
+        let (shape, tokens) = tokens.try_extract_tensor::<i64>()?;
+        let (_, payload) = payload.try_extract_tensor::<u8>()?;
+        let (_, scales) = scales.try_extract_tensor::<half::f16>()?;
+        let (_, allocation_map) = allocation_map.try_extract_tensor::<u8>()?;
+        let (_, rank_prefixes) = rank_prefixes.try_extract_tensor::<u32>()?;
+        let shape: Vec<i64> = shape.iter().copied().collect();
+        if !self.validated {
+            SaltV2PackedMatrix {
+                rows: self.rows,
+                columns: self.columns,
+                codec: self.codec,
+                payload,
+                scales,
+                allocation_map,
+                rank_prefixes,
+                terminal_map_value: self.terminal_map_value,
+            }
+            .validate()
+            .map_err(|error| OrtError::new(error.to_string()))?;
+            self.validated = true;
+        }
+        let (output_shape, output) = self.run_impl(
+            &shape,
+            tokens,
+            payload,
+            scales,
+            allocation_map,
+            rank_prefixes,
+            false,
+        )?;
+        let mut value = ctx
+            .output(0, output_shape)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 embedding output"))?;
         let (_, destination) = value.try_extract_tensor_mut::<f32>()?;
         destination.copy_from_slice(&output);
         Ok(())
@@ -1112,6 +1299,7 @@ pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
         .add(TritiumTernaryMpGemmOp)?
         .add(TritiumTernaryEmbeddingOp)?
         .add(TritiumSaltV2MpGemmOp)?
+        .add(TritiumSaltV2EmbeddingOp)?
         .add(TritiumKvAttentionOp)?
         .add(TritiumQwenDeltaNetOp)
 }
@@ -1245,6 +1433,10 @@ mod tests {
         assert_eq!(salt_v2.name(), ONNX_SALT_V2_OP_NAME);
         assert_eq!(salt_v2.inputs().len(), 5);
         assert_eq!(salt_v2.outputs().len(), 1);
+        let salt_embedding = TritiumSaltV2EmbeddingOp;
+        assert_eq!(salt_embedding.name(), ONNX_SALT_V2_EMBEDDING_OP_NAME);
+        assert_eq!(salt_embedding.inputs().len(), 5);
+        assert_eq!(salt_embedding.outputs().len(), 1);
         let attention = TritiumKvAttentionOp;
         assert_eq!(attention.name(), ONNX_KV_ATTENTION_OP_NAME);
         assert_eq!(attention.inputs().len(), 3, "q, k_cache, v_cache");
@@ -1314,6 +1506,49 @@ mod tests {
         let outputs = session.run(ort::inputs![&act]).unwrap();
         let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
         assert_eq!(actual, expected_two);
+    }
+
+    #[test]
+    fn salt_v2_embedding_custom_op_gathers_selected_rows_in_real_ort() {
+        use ort::value::Tensor;
+
+        let rows = 2;
+        let columns = 8;
+        let trits: Vec<Trit> = (0..rows * columns)
+            .map(|index| match index % 3 {
+                0 => Trit::NEG,
+                1 => Trit::ZERO,
+                _ => Trit::POS,
+            })
+            .collect();
+        let payload = pack_salt_v2_plane(SaltV2Codec::B3, &trits).unwrap();
+        let scales = [f16::from_f32(0.5)];
+        let matrix = crate::SaltV2PackedMatrix {
+            rows,
+            columns,
+            codec: SaltV2Codec::B3,
+            payload: &payload,
+            scales: &scales,
+            allocation_map: &[],
+            rank_prefixes: &[],
+            terminal_map_value: 0,
+        };
+        let tokens = [1_i64, 0, 1];
+        let expected = crate::salt_v2_embedding_kernel(&tokens, &[1, 3], matrix).unwrap();
+        let encoded = crate::model::encode_salt_v2_embedding_test_graph(matrix, &[1, 3]);
+        let diagnostics = crate::diagnose_unsupported_graph(&encoded).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&encoded)
+            .unwrap();
+        let tokens = Tensor::from_array(([1, 3], tokens.to_vec())).unwrap();
+        let outputs = session.run(ort::inputs![&tokens]).unwrap();
+        let (shape, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(shape.as_ref(), &[1, 3, columns as i64]);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1867,6 +2102,359 @@ mod tests {
             let (_, inline) = inline_outputs[index].try_extract_tensor::<f32>().unwrap();
             let (_, bundled) = bundled_outputs[index].try_extract_tensor::<f32>().unwrap();
             assert_f32_close(bundled, inline, 0.0);
+        }
+    }
+
+    #[test]
+    fn additive_qwen_language_and_mtp_bundle_run_in_real_ort() {
+        use ort::value::Tensor;
+
+        struct OwnedSaltMatrix {
+            rows: usize,
+            columns: usize,
+            payload: Vec<u8>,
+            scales: Vec<f16>,
+            allocation_map: Vec<u8>,
+            rank_prefixes: Vec<u32>,
+            terminal_map_value: u32,
+        }
+
+        impl OwnedSaltMatrix {
+            fn new(rows: usize, columns: usize, planes: &[Vec<Trit>]) -> Self {
+                let logical = rows * columns;
+                assert!((1..=3).contains(&planes.len()));
+                assert!(planes.iter().all(|plane| plane.len() == logical));
+                let tiles = logical.div_ceil(256);
+                let map_bytes = tiles * 2 / 8;
+                let mut allocation_map = vec![0_u8; map_bytes];
+                let mut terminal_map_value = 0_u32;
+                let code = u8::try_from(planes.len() - 1).unwrap();
+                for tile in 0..tiles {
+                    let bit = tile * 2;
+                    if bit < map_bytes * 8 {
+                        allocation_map[bit / 8] |= code << (bit % 8);
+                    } else {
+                        terminal_map_value |= u32::from(code) << (bit - map_bytes * 8);
+                    }
+                }
+                let mut payload = Vec::new();
+                let mut scales = Vec::new();
+                let mut rank_prefixes = Vec::new();
+                for tile in 0..tiles {
+                    if tile > 0 && tile.is_multiple_of(256) {
+                        rank_prefixes.push(u32::try_from(tile * planes.len()).unwrap());
+                    }
+                    let start = tile * 256;
+                    let end = (start + 256).min(logical);
+                    for (plane, trits) in planes.iter().enumerate() {
+                        payload.extend(
+                            pack_salt_v2_plane(SaltV2Codec::B3, &trits[start..end]).unwrap(),
+                        );
+                        scales.extend(vec![
+                            f16::from_f32(1.0 / (plane + 1) as f32);
+                            (end - start).div_ceil(128)
+                        ]);
+                    }
+                }
+                Self {
+                    rows,
+                    columns,
+                    payload,
+                    scales,
+                    allocation_map,
+                    rank_prefixes,
+                    terminal_map_value,
+                }
+            }
+
+            fn view(&self) -> crate::SaltV2PackedMatrix<'_> {
+                crate::SaltV2PackedMatrix {
+                    rows: self.rows,
+                    columns: self.columns,
+                    codec: SaltV2Codec::B3,
+                    payload: &self.payload,
+                    scales: &self.scales,
+                    allocation_map: &self.allocation_map,
+                    rank_prefixes: &self.rank_prefixes,
+                    terminal_map_value: self.terminal_map_value,
+                }
+            }
+        }
+
+        let hidden = 4;
+        let vocab = 16_385;
+        let zeros = |len| vec![Trit::ZERO; len];
+        let additive = |rows, columns| {
+            let mut first = zeros(rows * columns);
+            let mut second = zeros(rows * columns);
+            first[0] = Trit::POS;
+            second[0] = Trit::POS;
+            OwnedSaltMatrix::new(rows, columns, &[first, second])
+        };
+        let mut embedding_first = zeros(vocab * hidden);
+        let mut embedding_second = zeros(vocab * hidden);
+        embedding_first[0] = Trit::POS;
+        embedding_first[hidden] = Trit::NEG;
+        embedding_second[0] = Trit::POS;
+        let embedding = OwnedSaltMatrix::new(vocab, hidden, &[embedding_first, embedding_second]);
+        assert!(!embedding.allocation_map.is_empty());
+        assert!(!embedding.rank_prefixes.is_empty());
+        let qkv = additive(3, hidden);
+        let one_by_hidden = additive(1, hidden);
+        let hidden_by_one = additive(hidden, 1);
+        let fused_query_gate = additive(2 * hidden, hidden);
+        let hidden_by_hidden = additive(hidden, hidden);
+        let fusion = additive(hidden, 2 * hidden);
+        let norm = vec![0.0_f32; hidden];
+        let delta = crate::QwenDeltaNetDecoderLayer {
+            attention_norm: &norm,
+            qkv: qkv.view(),
+            z: one_by_hidden.view(),
+            beta: one_by_hidden.view(),
+            decay: one_by_hidden.view(),
+            conv_weight: &[0.0; 6],
+            norm_weight: &[1.0],
+            dt_bias: &[0.0],
+            a_log: &[0.0],
+            output: hidden_by_one.view(),
+            ffn_norm: &norm,
+            gate: one_by_hidden.view(),
+            up: one_by_hidden.view(),
+            down: hidden_by_one.view(),
+        };
+        let full = crate::QwenFullAttentionDecoderLayer {
+            attention_norm: &norm,
+            query_norm: &norm,
+            key_norm: &norm,
+            fused_query_gate: fused_query_gate.view(),
+            key: hidden_by_hidden.view(),
+            value: hidden_by_hidden.view(),
+            attention_output: hidden_by_hidden.view(),
+            ffn_norm: &norm,
+            gate: one_by_hidden.view(),
+            up: one_by_hidden.view(),
+            down: hidden_by_one.view(),
+        };
+        let layers = [
+            crate::QwenCausalLmDecoderLayer::DeltaNet(delta),
+            crate::QwenCausalLmDecoderLayer::FullAttention(full),
+        ];
+        let identity = crate::OnnxArtifactIdentityV2 {
+            source_model_id: "salt-qwen-source",
+            tokenizer_id: "salt-qwen-tokenizer",
+            recipe_id: "salt-qwen-recipe",
+            tritium_build_id: "salt-qwen-build",
+            package_id: "salt-qwen-package",
+            converted_coverage_id: "language-mtp",
+            deferred_coverage_id: "vision",
+        };
+        let language = crate::QwenCausalLmModel {
+            tokens: 1,
+            past_tokens: 0,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: hidden,
+            rotary: crate::RotaryEmbedding {
+                theta: 10_000.0,
+                dimensions: hidden,
+            },
+            rms_epsilon: 1.0e-6,
+            delta_geometry: crate::QwenDeltaNetGeometry::new(2, 1, 1, 1, 1).unwrap(),
+            embedding: embedding.view(),
+            lm_head: Some(embedding.view()),
+            layers: &layers,
+            final_norm: &norm,
+            identity,
+        };
+        let mtp = crate::Qwen35MtpModel {
+            tokens: 1,
+            past_tokens: 0,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: hidden,
+            rotary: language.rotary,
+            rms_epsilon: language.rms_epsilon,
+            embedding: embedding.view(),
+            lm_head: embedding.view(),
+            mtp: crate::Qwen35MtpDecoder {
+                pre_fc_norm_embedding: &norm,
+                pre_fc_norm_hidden: &norm,
+                fusion: fusion.view(),
+                layer: full,
+                final_norm: &norm,
+            },
+            identity,
+        };
+
+        let inline_language = crate::encode_qwen_causal_lm(language).unwrap();
+        let inline_mtp = crate::encode_qwen35_mtp(mtp).unwrap();
+        for encoded in [&inline_language, &inline_mtp] {
+            let diagnostics = crate::diagnose_unsupported_graph(encoded).unwrap();
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+            assert!(
+                encoded
+                    .windows(ONNX_SALT_V2_OP_NAME.len())
+                    .any(|bytes| bytes == ONNX_SALT_V2_OP_NAME.as_bytes())
+            );
+            assert!(
+                encoded
+                    .windows(ONNX_SALT_V2_EMBEDDING_OP_NAME.len())
+                    .any(|bytes| bytes == ONNX_SALT_V2_EMBEDDING_OP_NAME.as_bytes())
+            );
+            assert!(
+                !encoded
+                    .windows(ONNX_OP_NAME.len())
+                    .any(|bytes| bytes == ONNX_OP_NAME.as_bytes())
+            );
+        }
+
+        let bundle = crate::encode_external_qwen35_bundle(language, mtp).unwrap();
+        let admitted = crate::AdmittedExternalQwen35BundleDigests {
+            language_model_blake3: *blake3::hash(&bundle.language_model_bytes).as_bytes(),
+            mtp_model_blake3: *blake3::hash(&bundle.mtp_model_bytes).as_bytes(),
+            weights_blake3: bundle.weights_blake3,
+        };
+        crate::verify_external_qwen35_bundle(
+            crate::ExternalQwen35BundleFiles {
+                language_model_bytes: &bundle.language_model_bytes,
+                mtp_model_bytes: &bundle.mtp_model_bytes,
+                weights_bytes: &bundle.weights_bytes,
+            },
+            admitted,
+        )
+        .unwrap();
+
+        let directory = TestDirectory::new();
+        let language_path = directory.0.join("language.onnx");
+        let mtp_path = directory.0.join("mtp.onnx");
+        std::fs::write(&language_path, &bundle.language_model_bytes).unwrap();
+        std::fs::write(&mtp_path, &bundle.mtp_model_bytes).unwrap();
+        std::fs::write(directory.0.join("weights.bin"), &bundle.weights_bytes).unwrap();
+
+        let mut inline_language_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&inline_language)
+            .unwrap();
+        let mut external_language_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&language_path)
+            .unwrap();
+        let token = Tensor::from_array(([1], vec![0_i64])).unwrap();
+        let conv = Tensor::from_array(([3, 2], vec![0.0_f32; 6])).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], vec![0.0_f32])).unwrap();
+        let inline_outputs = inline_language_session
+            .run(ort::inputs![&token, &conv, &recurrent])
+            .unwrap();
+        let external_outputs = external_language_session
+            .run(ort::inputs![&token, &conv, &recurrent])
+            .unwrap();
+        for index in 0..5 {
+            let (_, inline) = inline_outputs[index].try_extract_tensor::<f32>().unwrap();
+            let (_, external) = external_outputs[index].try_extract_tensor::<f32>().unwrap();
+            assert!(external.iter().all(|value| value.is_finite()));
+            assert_f32_close(external, inline, 0.0);
+        }
+        drop(inline_outputs);
+        drop(external_outputs);
+
+        let mut inline_mtp_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&inline_mtp)
+            .unwrap();
+        let mut external_mtp_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&mtp_path)
+            .unwrap();
+        let shifted = Tensor::from_array(([1], vec![0_i64])).unwrap();
+        let target = Tensor::from_array(([1, hidden], vec![0.0_f32; hidden])).unwrap();
+        let inline_outputs = inline_mtp_session
+            .run(ort::inputs![&shifted, &target])
+            .unwrap();
+        let external_outputs = external_mtp_session
+            .run(ort::inputs![&shifted, &target])
+            .unwrap();
+        for index in 0..4 {
+            let (_, inline) = inline_outputs[index].try_extract_tensor::<f32>().unwrap();
+            let (_, external) = external_outputs[index].try_extract_tensor::<f32>().unwrap();
+            assert!(external.iter().all(|value| value.is_finite()));
+            assert_f32_close(external, inline, 0.0);
+        }
+
+        let causal_layer = crate::CausalLmDecoderLayer {
+            attention_norm: &norm,
+            query_norm: Some(&norm),
+            key_norm: Some(&norm),
+            query: crate::CausalQueryProjection::HeadInterleavedQueryGate {
+                fused: fused_query_gate.view(),
+            },
+            key: hidden_by_hidden.view(),
+            value: hidden_by_hidden.view(),
+            attention_output: hidden_by_hidden.view(),
+            attention_sub_norm: None,
+            ffn_norm: &norm,
+            gate: one_by_hidden.view(),
+            up: one_by_hidden.view(),
+            ffn_sub_norm: None,
+            activation: crate::CausalActivation::SwiGlu,
+            down: hidden_by_one.view(),
+        };
+        let causal_layers = [causal_layer];
+        let causal = crate::CausalLmModel {
+            tokens: 1,
+            past_tokens: 0,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: hidden,
+            rotary: Some(language.rotary),
+            rms_epsilon: 1.0e-6,
+            zero_centered_norm: true,
+            embedding: embedding.view(),
+            lm_head: Some(embedding.view()),
+            layers: &causal_layers,
+            final_norm: &norm,
+            identity,
+        };
+        let inline_causal = crate::encode_causal_lm(causal).unwrap();
+        assert!(
+            crate::diagnose_unsupported_graph(&inline_causal)
+                .unwrap()
+                .is_empty()
+        );
+        let external_causal = crate::encode_external_causal_lm(causal).unwrap();
+        let causal_directory = TestDirectory::new();
+        let causal_path = causal_directory.0.join("model.onnx");
+        std::fs::write(&causal_path, &external_causal.model_bytes).unwrap();
+        std::fs::write(
+            causal_directory.0.join("weights.bin"),
+            &external_causal.weights_bytes,
+        )
+        .unwrap();
+        let mut inline_causal_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&inline_causal)
+            .unwrap();
+        let mut external_causal_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_file(&causal_path)
+            .unwrap();
+        let inline_outputs = inline_causal_session.run(ort::inputs![&token]).unwrap();
+        let external_outputs = external_causal_session.run(ort::inputs![&token]).unwrap();
+        for index in 0..3 {
+            let (_, inline) = inline_outputs[index].try_extract_tensor::<f32>().unwrap();
+            let (_, external) = external_outputs[index].try_extract_tensor::<f32>().unwrap();
+            assert_f32_close(external, inline, 0.0);
         }
     }
 

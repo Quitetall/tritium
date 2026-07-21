@@ -28,12 +28,57 @@ const EXTERNAL_DATA: i32 = 1;
 const EXTERNAL_WEIGHTS_FILE: &str = "weights.bin";
 const EXTERNAL_ALIGNMENT: usize = 64;
 const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
-const QWEN_SHARED_EXTERNAL_INITIALIZERS: [&str; 4] = [
+const QWEN_SHARED_TERNARY_INITIALIZERS: [&str; 4] = [
     "tok_embeddings.packed",
     "tok_embeddings.scales",
     "lm_head.packed",
     "lm_head.scales",
 ];
+const QWEN_SHARED_SALT_V2_INITIALIZERS: [&str; 8] = [
+    "tok_embeddings.salt_payload",
+    "tok_embeddings.salt_scales",
+    "tok_embeddings.salt_allocation_map",
+    "tok_embeddings.salt_rank_prefixes",
+    "lm_head.salt_payload",
+    "lm_head.salt_scales",
+    "lm_head.salt_allocation_map",
+    "lm_head.salt_rank_prefixes",
+];
+
+fn select_qwen_shared_initializer_names(
+    mut contains: impl FnMut(&str) -> bool,
+) -> Result<&'static [&'static str], OnnxModelError> {
+    let ternary_all = QWEN_SHARED_TERNARY_INITIALIZERS
+        .iter()
+        .copied()
+        .all(&mut contains);
+    let salt_all = QWEN_SHARED_SALT_V2_INITIALIZERS
+        .iter()
+        .copied()
+        .all(&mut contains);
+    let ternary_any = QWEN_SHARED_TERNARY_INITIALIZERS
+        .iter()
+        .copied()
+        .any(&mut contains);
+    let salt_any = QWEN_SHARED_SALT_V2_INITIALIZERS
+        .iter()
+        .copied()
+        .any(contains);
+    match (ternary_all, salt_all, ternary_any, salt_any) {
+        (true, false, true, false) => Ok(&QWEN_SHARED_TERNARY_INITIALIZERS),
+        (false, true, false, true) => Ok(&QWEN_SHARED_SALT_V2_INITIALIZERS),
+        _ => Err(OnnxModelError::InvalidModel(
+            "Qwen shared embedding/head initializers are incomplete or mix physical formats"
+                .to_owned(),
+        )),
+    }
+}
+
+#[cfg(test)]
+fn is_qwen_shared_initializer_name(name: &str) -> bool {
+    QWEN_SHARED_TERNARY_INITIALIZERS.contains(&name)
+        || QWEN_SHARED_SALT_V2_INITIALIZERS.contains(&name)
+}
 
 /// A deterministic tied packed embedding/head graph.
 ///
@@ -122,6 +167,63 @@ pub struct PackedTernaryMatrix<'a> {
     pub format: TernaryFormat,
 }
 
+/// Borrowed physical storage behind one ONNX packed matrix operand.
+#[derive(Debug, Clone, Copy)]
+pub enum PackedMatrixStorage<'a> {
+    /// Canonical single-plane TQ1/TQ2 rows and fp32 row scales.
+    Ternary(PackedTernaryMatrix<'a>),
+    /// Descriptor-free additive indexed SALT V2 arenas.
+    SaltV2(crate::SaltV2PackedMatrix<'a>),
+}
+
+/// Matrix contract shared by single-plane and additive Qwen graph emission.
+///
+/// This trait is sealed: supported physical layouts require matching graph,
+/// validator, and runtime semantics.
+pub trait OnnxPackedMatrix<'a>: matrix_sealed::Sealed + Copy {
+    /// Output row count.
+    fn rows(self) -> usize;
+    /// Input/contraction column count.
+    fn columns(self) -> usize;
+    /// Borrow physical storage with its exact format discriminant.
+    fn storage(self) -> PackedMatrixStorage<'a>;
+}
+
+mod matrix_sealed {
+    pub trait Sealed {}
+}
+
+impl matrix_sealed::Sealed for PackedTernaryMatrix<'_> {}
+impl matrix_sealed::Sealed for crate::SaltV2PackedMatrix<'_> {}
+
+impl<'a> OnnxPackedMatrix<'a> for PackedTernaryMatrix<'a> {
+    fn rows(self) -> usize {
+        self.rows
+    }
+
+    fn columns(self) -> usize {
+        self.columns
+    }
+
+    fn storage(self) -> PackedMatrixStorage<'a> {
+        PackedMatrixStorage::Ternary(self)
+    }
+}
+
+impl<'a> OnnxPackedMatrix<'a> for crate::SaltV2PackedMatrix<'a> {
+    fn rows(self) -> usize {
+        self.rows
+    }
+
+    fn columns(self) -> usize {
+        self.columns
+    }
+
+    fn storage(self) -> PackedMatrixStorage<'a> {
+        PackedMatrixStorage::SaltV2(self)
+    }
+}
+
 /// Qwen-style full-head rotary position embedding parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct RotaryEmbedding {
@@ -133,24 +235,24 @@ pub struct RotaryEmbedding {
 
 /// Query and optional output-gate projection layout for one attention layer.
 #[derive(Debug, Clone, Copy)]
-pub enum CausalQueryProjection<'a> {
+pub enum CausalQueryProjection<M> {
     /// Independent query and optional sigmoid output-gate projections.
     Separate {
         /// Query projection `[query_width, hidden]`.
-        query: PackedTernaryMatrix<'a>,
+        query: M,
         /// Optional gate projection `[query_width, hidden]`.
-        gate: Option<PackedTernaryMatrix<'a>>,
+        gate: Option<M>,
     },
     /// Qwen head-interleaved `[query lanes..., gate lanes...]` projection.
     HeadInterleavedQueryGate {
         /// Fused projection `[2 * query_width, hidden]`.
-        fused: PackedTernaryMatrix<'a>,
+        fused: M,
     },
 }
 
 /// Packed weights and preserved RMSNorm vectors for one causal decoder layer.
 #[derive(Debug, Clone, Copy)]
-pub struct CausalLmDecoderLayer<'a> {
+pub struct CausalLmDecoderLayer<'a, M = PackedTernaryMatrix<'a>> {
     /// Pre-attention RMSNorm weight.
     pub attention_norm: &'a [f32],
     /// Optional per-query-head RMSNorm weight applied before RoPE.
@@ -158,41 +260,41 @@ pub struct CausalLmDecoderLayer<'a> {
     /// Optional per-key-head RMSNorm weight applied before RoPE/cache write.
     pub key_norm: Option<&'a [f32]>,
     /// Query and optional sigmoid output-gate projection layout.
-    pub query: CausalQueryProjection<'a>,
+    pub query: CausalQueryProjection<M>,
     /// Key projection.
-    pub key: PackedTernaryMatrix<'a>,
+    pub key: M,
     /// Value projection.
-    pub value: PackedTernaryMatrix<'a>,
+    pub value: M,
     /// Attention output projection.
-    pub attention_output: PackedTernaryMatrix<'a>,
+    pub attention_output: M,
     /// Optional RMSNorm over attention context before the output projection.
     pub attention_sub_norm: Option<&'a [f32]>,
     /// Pre-FFN RMSNorm weight.
     pub ffn_norm: &'a [f32],
     /// Gate projection.
-    pub gate: PackedTernaryMatrix<'a>,
+    pub gate: M,
     /// Up projection multiplied by the activated gate.
-    pub up: PackedTernaryMatrix<'a>,
+    pub up: M,
     /// Optional RMSNorm over the gated intermediate before the down projection.
     pub ffn_sub_norm: Option<&'a [f32]>,
     /// Gate activation semantics.
     pub activation: CausalActivation,
     /// Down projection.
-    pub down: PackedTernaryMatrix<'a>,
+    pub down: M,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct CausalFfnLayer<'a> {
+struct CausalFfnLayer<'a, M> {
     ffn_norm: &'a [f32],
-    gate: PackedTernaryMatrix<'a>,
-    up: PackedTernaryMatrix<'a>,
+    gate: M,
+    up: M,
     ffn_sub_norm: Option<&'a [f32]>,
     activation: CausalActivation,
-    down: PackedTernaryMatrix<'a>,
+    down: M,
 }
 
-impl<'a> CausalLmDecoderLayer<'a> {
-    fn ffn(self) -> CausalFfnLayer<'a> {
+impl<'a, M: Copy> CausalLmDecoderLayer<'a, M> {
+    fn ffn(self) -> CausalFfnLayer<'a, M> {
         CausalFfnLayer {
             ffn_norm: self.ffn_norm,
             gate: self.gate,
@@ -206,17 +308,17 @@ impl<'a> CausalLmDecoderLayer<'a> {
 
 /// Packed projections and preserved parameters for one Qwen DeltaNet decoder layer.
 #[derive(Debug, Clone, Copy)]
-pub struct QwenDeltaNetDecoderLayer<'a> {
+pub struct QwenDeltaNetDecoderLayer<'a, M = PackedTernaryMatrix<'a>> {
     /// Zero-centered pre-mixer RMSNorm parameter.
     pub attention_norm: &'a [f32],
     /// Globally split packed Q/K/V projection `[conv_width, hidden]`.
-    pub qkv: PackedTernaryMatrix<'a>,
+    pub qkv: M,
     /// Packed output-gate projection `[value_width, hidden]`.
-    pub z: PackedTernaryMatrix<'a>,
+    pub z: M,
     /// Packed beta-logit projection `[num_value_heads, hidden]`.
-    pub beta: PackedTernaryMatrix<'a>,
+    pub beta: M,
     /// Packed decay-logit projection `[num_value_heads, hidden]`.
-    pub decay: PackedTernaryMatrix<'a>,
+    pub decay: M,
     /// Depthwise convolution weights `[conv_width, conv_kernel_dim]`.
     pub conv_weight: &'a [f32],
     /// Per-value-head RMSNorm weights `[value_head_dim]`.
@@ -226,15 +328,15 @@ pub struct QwenDeltaNetDecoderLayer<'a> {
     /// Per-value-head logarithmic decay coefficient.
     pub a_log: &'a [f32],
     /// Packed mixer output projection `[hidden, value_width]`.
-    pub output: PackedTernaryMatrix<'a>,
+    pub output: M,
     /// Zero-centered pre-FFN RMSNorm parameter.
     pub ffn_norm: &'a [f32],
     /// Packed SwiGLU gate projection.
-    pub gate: PackedTernaryMatrix<'a>,
+    pub gate: M,
     /// Packed SwiGLU up projection.
-    pub up: PackedTernaryMatrix<'a>,
+    pub up: M,
     /// Packed SwiGLU down projection.
-    pub down: PackedTernaryMatrix<'a>,
+    pub down: M,
 }
 
 /// Architecture-exact Qwen full-attention decoder layer.
@@ -243,7 +345,7 @@ pub struct QwenDeltaNetDecoderLayer<'a> {
 /// SwiGLU are structural rather than optional. Qwen does not apply an
 /// additional attention-context or FFN-intermediate subnorm.
 #[derive(Debug, Clone, Copy)]
-pub struct QwenFullAttentionDecoderLayer<'a> {
+pub struct QwenFullAttentionDecoderLayer<'a, M = PackedTernaryMatrix<'a>> {
     /// Zero-centered pre-attention RMSNorm parameter.
     pub attention_norm: &'a [f32],
     /// Mandatory per-query-head RMSNorm parameter.
@@ -251,25 +353,25 @@ pub struct QwenFullAttentionDecoderLayer<'a> {
     /// Mandatory per-key-head RMSNorm parameter.
     pub key_norm: &'a [f32],
     /// Fused head-interleaved query/output-gate projection.
-    pub fused_query_gate: PackedTernaryMatrix<'a>,
+    pub fused_query_gate: M,
     /// Key projection.
-    pub key: PackedTernaryMatrix<'a>,
+    pub key: M,
     /// Value projection.
-    pub value: PackedTernaryMatrix<'a>,
+    pub value: M,
     /// Attention output projection.
-    pub attention_output: PackedTernaryMatrix<'a>,
+    pub attention_output: M,
     /// Zero-centered pre-FFN RMSNorm parameter.
     pub ffn_norm: &'a [f32],
     /// SwiGLU gate projection.
-    pub gate: PackedTernaryMatrix<'a>,
+    pub gate: M,
     /// SwiGLU up projection.
-    pub up: PackedTernaryMatrix<'a>,
+    pub up: M,
     /// SwiGLU down projection.
-    pub down: PackedTernaryMatrix<'a>,
+    pub down: M,
 }
 
-impl<'a> QwenFullAttentionDecoderLayer<'a> {
-    fn causal(self) -> CausalLmDecoderLayer<'a> {
+impl<'a, M: Copy> QwenFullAttentionDecoderLayer<'a, M> {
+    fn causal(self) -> CausalLmDecoderLayer<'a, M> {
         CausalLmDecoderLayer {
             attention_norm: self.attention_norm,
             query_norm: Some(self.query_norm),
@@ -291,8 +393,8 @@ impl<'a> QwenFullAttentionDecoderLayer<'a> {
     }
 }
 
-impl<'a> QwenDeltaNetDecoderLayer<'a> {
-    fn ffn(self) -> CausalFfnLayer<'a> {
+impl<'a, M: Copy> QwenDeltaNetDecoderLayer<'a, M> {
+    fn ffn(self) -> CausalFfnLayer<'a, M> {
         CausalFfnLayer {
             ffn_norm: self.ffn_norm,
             gate: self.gate,
@@ -309,7 +411,7 @@ impl<'a> QwenDeltaNetDecoderLayer<'a> {
 /// Inputs are `hidden`, `conv_state`, and `recurrent_state`. Outputs are
 /// `next_hidden`, `next_conv`, and `next_recurrent`.
 #[derive(Debug, Clone, Copy)]
-pub struct QwenDeltaNetLayerModel<'a> {
+pub struct QwenDeltaNetLayerModel<'a, M = PackedTernaryMatrix<'a>> {
     /// Token rows processed by this transition.
     pub tokens: usize,
     /// Residual-stream width.
@@ -319,18 +421,18 @@ pub struct QwenDeltaNetLayerModel<'a> {
     /// DeltaNet state geometry.
     pub geometry: QwenDeltaNetGeometry,
     /// Layer weights and preserved parameters.
-    pub layer: QwenDeltaNetDecoderLayer<'a>,
+    pub layer: QwenDeltaNetDecoderLayer<'a, M>,
     /// Complete artifact identity.
     pub identity: OnnxArtifactIdentityV2<'a>,
 }
 
 /// One layer in an ordered heterogeneous Qwen language-model schedule.
 #[derive(Debug, Clone, Copy)]
-pub enum QwenCausalLmDecoderLayer<'a> {
+pub enum QwenCausalLmDecoderLayer<'a, M = PackedTernaryMatrix<'a>> {
     /// Gated DeltaNet recurrence with explicit convolution and recurrent state.
-    DeltaNet(QwenDeltaNetDecoderLayer<'a>),
+    DeltaNet(QwenDeltaNetDecoderLayer<'a, M>),
     /// Gated grouped-query causal attention with KV cache state.
-    FullAttention(QwenFullAttentionDecoderLayer<'a>),
+    FullAttention(QwenFullAttentionDecoderLayer<'a, M>),
 }
 
 /// Fixed-shape packed heterogeneous Qwen causal language model.
@@ -340,7 +442,7 @@ pub enum QwenCausalLmDecoderLayer<'a> {
 /// and `past_v.{layer}` when `past_tokens > 0`. Every layer publishes its
 /// corresponding complete next state under the same sparse layer index.
 #[derive(Debug, Clone, Copy)]
-pub struct QwenCausalLmModel<'a> {
+pub struct QwenCausalLmModel<'a, M = PackedTernaryMatrix<'a>> {
     /// Query token count fixed into this graph.
     pub tokens: usize,
     /// Prefix-cache token count fixed into full-attention layers.
@@ -358,11 +460,11 @@ pub struct QwenCausalLmModel<'a> {
     /// Shared DeltaNet geometry for every recurrent layer.
     pub delta_geometry: QwenDeltaNetGeometry,
     /// Packed token embedding table.
-    pub embedding: PackedTernaryMatrix<'a>,
+    pub embedding: M,
     /// Optional untied packed language head.
-    pub lm_head: Option<PackedTernaryMatrix<'a>>,
+    pub lm_head: Option<M>,
     /// Exact ordered heterogeneous schedule.
-    pub layers: &'a [QwenCausalLmDecoderLayer<'a>],
+    pub layers: &'a [QwenCausalLmDecoderLayer<'a, M>],
     /// Zero-centered final RMSNorm parameter.
     pub final_norm: &'a [f32],
     /// Complete artifact identity.
@@ -415,15 +517,15 @@ pub struct Qwen35Config<'a> {
 
 /// Exact 15-tensor one-layer Qwen MTP drafter bundle.
 #[derive(Debug, Clone, Copy)]
-pub struct Qwen35MtpDecoder<'a> {
+pub struct Qwen35MtpDecoder<'a, M = PackedTernaryMatrix<'a>> {
     /// Zero-centered norm over shifted shared token embeddings.
     pub pre_fc_norm_embedding: &'a [f32],
     /// Zero-centered norm over target final hidden rows.
     pub pre_fc_norm_hidden: &'a [f32],
     /// Fusion projection `[hidden, 2 * hidden]`.
-    pub fusion: PackedTernaryMatrix<'a>,
+    pub fusion: M,
     /// Forced full-attention decoder layer.
-    pub layer: QwenFullAttentionDecoderLayer<'a>,
+    pub layer: QwenFullAttentionDecoderLayer<'a, M>,
     /// Zero-centered final MTP RMSNorm parameter.
     pub final_norm: &'a [f32],
 }
@@ -434,7 +536,7 @@ pub struct Qwen35MtpDecoder<'a> {
 /// target hidden rows. Cached graphs consume `past_k.0`/`past_v.0` and publish
 /// complete `present_k.0`/`present_v.0` state.
 #[derive(Debug, Clone, Copy)]
-pub struct Qwen35MtpModel<'a> {
+pub struct Qwen35MtpModel<'a, M = PackedTernaryMatrix<'a>> {
     /// Shifted token rows processed by this graph.
     pub tokens: usize,
     /// Existing MTP KV-cache rows.
@@ -450,11 +552,11 @@ pub struct Qwen35MtpModel<'a> {
     /// Positive finite zero-centered RMSNorm epsilon.
     pub rms_epsilon: f32,
     /// Shared language token embedding.
-    pub embedding: PackedTernaryMatrix<'a>,
+    pub embedding: M,
     /// Shared untied language head.
-    pub lm_head: PackedTernaryMatrix<'a>,
+    pub lm_head: M,
     /// Exact one-layer MTP weights.
-    pub mtp: Qwen35MtpDecoder<'a>,
+    pub mtp: Qwen35MtpDecoder<'a, M>,
     /// Complete artifact identity.
     pub identity: OnnxArtifactIdentityV2<'a>,
 }
@@ -545,7 +647,7 @@ impl<'a> MappedQwen35<'a> {
 /// decode graphs consume one `past_k.{layer}` and `past_v.{layer}` tensor per
 /// layer and return complete `present_k.{layer}`/`present_v.{layer}` tensors.
 #[derive(Debug, Clone, Copy)]
-pub struct CausalLmModel<'a> {
+pub struct CausalLmModel<'a, M = PackedTernaryMatrix<'a>> {
     /// Query token count fixed into this graph.
     pub tokens: usize,
     /// Prefix-cache token count fixed into this graph.
@@ -565,11 +667,11 @@ pub struct CausalLmModel<'a> {
     /// When true, the effective scale is `1 + weight`, matching Qwen3.5.
     pub zero_centered_norm: bool,
     /// Tied token embedding and language-model head table.
-    pub embedding: PackedTernaryMatrix<'a>,
+    pub embedding: M,
     /// Optional untied language-model head; `None` reuses [`Self::embedding`].
-    pub lm_head: Option<PackedTernaryMatrix<'a>>,
+    pub lm_head: Option<M>,
     /// Ordered decoder layers; at least one is required.
-    pub layers: &'a [CausalLmDecoderLayer<'a>],
+    pub layers: &'a [CausalLmDecoderLayer<'a, M>],
     /// Final RMSNorm weight.
     pub final_norm: &'a [f32],
     /// Complete artifact identity.
@@ -1943,6 +2045,7 @@ pub fn diagnose_unsupported_graph(
                     ONNX_KV_ATTENTION_OP_NAME
                         | crate::ONNX_QWEN_DELTANET_OP_NAME
                         | crate::ONNX_SALT_V2_OP_NAME
+                        | crate::ONNX_SALT_V2_EMBEDDING_OP_NAME
                 )
                 && tritium_opset != Some(2)
             {
@@ -2101,7 +2204,10 @@ pub fn diagnose_unsupported_graph(
         }
         let supported = node_supported(node, tritium_opset, standard_opset);
         if supported {
-            if node.op_type == crate::ONNX_SALT_V2_OP_NAME {
+            if matches!(
+                node.op_type.as_str(),
+                crate::ONNX_SALT_V2_OP_NAME | crate::ONNX_SALT_V2_EMBEDDING_OP_NAME
+            ) {
                 let packed_slots = [
                     ".salt_payload",
                     ".salt_scales",
@@ -2390,6 +2496,12 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
             crate::ATTR_CODEC,
             crate::ATTR_TERMINAL_MAP_VALUE,
         ],
+        (ONNX_DOMAIN, crate::ONNX_SALT_V2_EMBEDDING_OP_NAME) => &[
+            ATTR_K,
+            crate::ATTR_ROWS,
+            crate::ATTR_CODEC,
+            crate::ATTR_TERMINAL_MAP_VALUE,
+        ],
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => {
             &[ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_HEAD_DIM, ATTR_PAST_TOKENS]
         }
@@ -2456,7 +2568,10 @@ fn concat_role(node: &NodeProto, graph: &GraphProto) -> Option<ConcatRole> {
             .all(|input| producer(input).is_some_and(|candidate| candidate.op_type == "Mul"))
         && graph.node.iter().any(|candidate| {
             candidate.domain == ONNX_DOMAIN
-                && candidate.op_type == ONNX_OP_NAME
+                && matches!(
+                    candidate.op_type.as_str(),
+                    ONNX_OP_NAME | crate::ONNX_SALT_V2_OP_NAME
+                )
                 && candidate.input.first() == node.output.first()
         });
     if mtp_fusion {
@@ -2503,7 +2618,9 @@ fn node_supported(
         (ONNX_DOMAIN, ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME) => {
             matches!(tritium_opset, Some(1 | 2))
         }
-        (ONNX_DOMAIN, crate::ONNX_SALT_V2_OP_NAME) => tritium_opset == Some(2),
+        (ONNX_DOMAIN, crate::ONNX_SALT_V2_OP_NAME | crate::ONNX_SALT_V2_EMBEDDING_OP_NAME) => {
+            tritium_opset == Some(2)
+        }
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => tritium_opset == Some(2),
         (ONNX_DOMAIN, crate::ONNX_QWEN_DELTANET_OP_NAME) => tritium_opset == Some(2),
         (
@@ -2624,13 +2741,16 @@ pub fn encode_tied_embedding_head_v2(
 /// Encode a packed decoder-only causal LM as a deterministic ONNX model.
 ///
 /// Packed embedding/projection initializers remain compressed and execute via
-/// `com.tritium` opset 1. RMSNorm, GQA expansion, causal attention, residuals,
-/// SwiGLU, cache concatenation, and cache outputs use standard ONNX opset 21.
+/// `com.tritium` opset 1 for canonical TQ matrices or opset 2 for additive SALT
+/// V2 matrices. RMSNorm, GQA expansion, causal attention, residuals, SwiGLU,
+/// cache concatenation, and cache outputs use standard ONNX opset 21.
 ///
 /// # Errors
 /// [`OnnxModelError`] if model geometry, packed payloads, preserved vectors,
 /// cache sizes, epsilon, or artifact identity violate the causal-LM contract.
-pub fn encode_causal_lm(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
+pub fn encode_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
+    model: CausalLmModel<'a, M>,
+) -> Result<Vec<u8>, OnnxModelError> {
     validate_causal_lm(&model)?;
     validate_causal_initializer_budget(&model)?;
     let (protobuf, weights) = build_causal_lm_graph(model, false)?;
@@ -2654,8 +2774,8 @@ pub fn encode_causal_lm(model: CausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelEr
 /// # Errors
 /// [`OnnxModelError`] if geometry, packed payloads, preserved parameters,
 /// identities, or bounded inline initializer size violate the contract.
-pub fn encode_qwen_deltanet_layer(
-    model: QwenDeltaNetLayerModel<'_>,
+pub fn encode_qwen_deltanet_layer<'a, M: OnnxPackedMatrix<'a>>(
+    model: QwenDeltaNetLayerModel<'a, M>,
 ) -> Result<Vec<u8>, OnnxModelError> {
     validate_qwen_deltanet_layer(&model)?;
     validate_qwen_deltanet_initializer_budget(&model)?;
@@ -2747,7 +2867,9 @@ pub fn encode_qwen_deltanet_layer(
 ///
 /// # Errors
 /// [`OnnxModelError`] if schedule or model contract is invalid.
-pub fn encode_qwen_causal_lm(model: QwenCausalLmModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
+pub fn encode_qwen_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
+    model: QwenCausalLmModel<'a, M>,
+) -> Result<Vec<u8>, OnnxModelError> {
     validate_qwen_causal_lm(&model)?;
     build_qwen_causal_lm_graph(model, CausalGraphBuilder::counting())?;
     let (protobuf, _) = build_qwen_causal_lm_graph(model, CausalGraphBuilder::default())?;
@@ -2768,7 +2890,9 @@ pub fn encode_qwen_causal_lm(model: QwenCausalLmModel<'_>) -> Result<Vec<u8>, On
 ///
 /// # Errors
 /// [`OnnxModelError`] if model geometry, initializer admission, or encoding fails.
-pub fn encode_qwen35_mtp(model: Qwen35MtpModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
+pub fn encode_qwen35_mtp<'a, M: OnnxPackedMatrix<'a>>(
+    model: Qwen35MtpModel<'a, M>,
+) -> Result<Vec<u8>, OnnxModelError> {
     validate_qwen35_mtp_model(&model)?;
     build_qwen35_mtp_graph(model, CausalGraphBuilder::counting())?;
     let (protobuf, _) = build_qwen35_mtp_graph(model, CausalGraphBuilder::default())?;
@@ -2786,8 +2910,8 @@ pub fn encode_qwen35_mtp(model: Qwen35MtpModel<'_>) -> Result<Vec<u8>, OnnxModel
 /// # Errors
 /// [`OnnxModelError`] if model validation, external allocation, or protobuf
 /// encoding fails.
-pub fn encode_external_qwen_causal_lm(
-    model: QwenCausalLmModel<'_>,
+pub fn encode_external_qwen_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
+    model: QwenCausalLmModel<'a, M>,
 ) -> Result<ExternalOnnxModel, OnnxModelError> {
     validate_qwen_causal_lm(&model)?;
     let (protobuf, weights) = build_qwen_causal_lm_graph(model, CausalGraphBuilder::external())?;
@@ -2799,8 +2923,8 @@ pub fn encode_external_qwen_causal_lm(
 /// # Errors
 /// [`OnnxModelError`] if model validation, external allocation, or protobuf
 /// encoding fails.
-pub fn encode_external_qwen35_mtp(
-    model: Qwen35MtpModel<'_>,
+pub fn encode_external_qwen35_mtp<'a, M: OnnxPackedMatrix<'a>>(
+    model: Qwen35MtpModel<'a, M>,
 ) -> Result<ExternalOnnxModel, OnnxModelError> {
     validate_qwen35_mtp_model(&model)?;
     let (protobuf, weights) = build_qwen35_mtp_graph(model, CausalGraphBuilder::external())?;
@@ -2812,9 +2936,9 @@ pub fn encode_external_qwen35_mtp(
 /// # Errors
 /// [`OnnxModelError`] if graph identities, geometry, shared embedding/head, or
 /// external-data encoding differ from bundle contract.
-pub fn encode_external_qwen35_bundle(
-    language: QwenCausalLmModel<'_>,
-    mtp: Qwen35MtpModel<'_>,
+pub fn encode_external_qwen35_bundle<'a, M: OnnxPackedMatrix<'a>>(
+    language: QwenCausalLmModel<'a, M>,
+    mtp: Qwen35MtpModel<'a, M>,
 ) -> Result<ExternalQwen35Bundle, OnnxModelError> {
     validate_qwen35_bundle_pair(&language, &mtp)?;
     let (language_protobuf, language_weights) =
@@ -2846,8 +2970,11 @@ fn qwen_shared_external_aliases(
         .graph
         .as_ref()
         .ok_or_else(|| OnnxModelError::InvalidModel("Qwen language graph is absent".to_owned()))?;
+    let shared_names = select_qwen_shared_initializer_names(|name| {
+        graph.initializer.iter().any(|tensor| tensor.name == name)
+    })?;
     let mut aliases = BTreeMap::new();
-    for name in QWEN_SHARED_EXTERNAL_INITIALIZERS {
+    for &name in shared_names {
         let tensor = graph
             .initializer
             .iter()
@@ -2872,8 +2999,8 @@ fn qwen_shared_external_aliases(
 /// # Errors
 /// [`OnnxModelError`] if model validation, range arithmetic, allocation, or
 /// protobuf bounds fail.
-pub fn encode_external_causal_lm(
-    model: CausalLmModel<'_>,
+pub fn encode_external_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
+    model: CausalLmModel<'a, M>,
 ) -> Result<ExternalOnnxModel, OnnxModelError> {
     validate_causal_lm(&model)?;
     let (protobuf, weights) = build_causal_lm_graph(model, true)?;
@@ -3047,6 +3174,8 @@ fn verify_external_decoder_graph(
         }
         let element_bytes = match initializer.data_type {
             TENSOR_UINT8 => 1,
+            TENSOR_FLOAT16 => core::mem::size_of::<f16>(),
+            TENSOR_UINT32 => core::mem::size_of::<u32>(),
             TENSOR_FLOAT => core::mem::size_of::<f32>(),
             TENSOR_INT64 => core::mem::size_of::<i64>(),
             other => {
@@ -3297,7 +3426,12 @@ fn verify_shared_qwen_ranges(
     mtp: &VerifiedExternalDecoderGraph,
     weights: &[u8],
 ) -> Result<(), OnnxModelError> {
-    let shared_names = QWEN_SHARED_EXTERNAL_INITIALIZERS;
+    let shared_names = select_qwen_shared_initializer_names(|name| {
+        language
+            .external_initializers
+            .iter()
+            .any(|initializer| initializer.name == name)
+    })?;
     fn find<'a>(
         graph: &'a VerifiedExternalDecoderGraph,
         name: &str,
@@ -3312,7 +3446,7 @@ fn verify_shared_qwen_ranges(
                 ))
             })
     }
-    for name in shared_names {
+    for &name in shared_names {
         if find(language, name)? != find(mtp, name)? {
             return Err(OnnxModelError::ExternalDataMismatch(format!(
                 "Qwen shared initializer {name} has different descriptors"
@@ -3347,6 +3481,12 @@ fn verify_shared_qwen_ranges(
             return Err(OnnxModelError::ExternalDataMismatch(
                 "shared weights alignment padding is not zero".to_owned(),
             ));
+        }
+        // Canonical empty arenas consume no interval. Several distinct empty
+        // SALT metadata tensors may therefore share the next aligned offset.
+        if range.length == 0 {
+            index += 1;
+            continue;
         }
         let mut next = index + 1;
         while next < ranges.len() && ranges[next].offset == range.offset {
@@ -3879,6 +4019,14 @@ struct CausalGraphBuilder {
     initializers: Vec<TensorProto>,
     storage: CausalInitializerStorage,
     failure: Option<OnnxModelError>,
+    tritium_opset: i64,
+}
+
+struct PackedNodeSpec {
+    operands: Vec<String>,
+    projection_op: &'static str,
+    embedding_op: &'static str,
+    attributes: Vec<AttributeProto>,
 }
 
 enum CausalInitializerStorage {
@@ -4011,6 +4159,7 @@ impl Default for CausalGraphBuilder {
             initializers: Vec::new(),
             storage: CausalInitializerStorage::Inline,
             failure: None,
+            tritium_opset: TRITIUM_OPSET,
         }
     }
 }
@@ -4290,6 +4439,89 @@ impl CausalGraphBuilder {
         });
     }
 
+    fn add_le_values<T: Copy, const WIDTH: usize>(
+        &mut self,
+        name: &str,
+        data_type: i32,
+        dimensions: Vec<i64>,
+        values: &[T],
+        encode: impl Fn(T) -> [u8; WIDTH],
+    ) {
+        if self.failure.is_some() {
+            return;
+        }
+        let Some(length) = values.len().checked_mul(WIDTH) else {
+            self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                "typed initializer byte count",
+            ));
+            return;
+        };
+        if matches!(self.storage, CausalInitializerStorage::Counting { .. }) {
+            self.count_inline_bytes(length);
+            return;
+        }
+        if matches!(self.storage, CausalInitializerStorage::Inline) {
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(length).is_err() {
+                self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                    "typed inline initializer allocation",
+                ));
+                return;
+            }
+            for value in values {
+                bytes.extend_from_slice(&encode(*value));
+            }
+            self.initializers
+                .push(inline_tensor(name, data_type, dimensions, bytes));
+            return;
+        }
+        let CausalInitializerStorage::External(storage) = &mut self.storage else {
+            unreachable!();
+        };
+        match take_external_alias(storage, name, data_type, &dimensions) {
+            Ok(Some((tensor, offset, alias_length))) => {
+                let bytes = &storage.weights[offset..offset + alias_length];
+                if alias_length != length
+                    || !bytes
+                        .chunks_exact(WIDTH)
+                        .zip(values)
+                        .all(|(bytes, value)| bytes == encode(*value))
+                {
+                    self.failure
+                        .get_or_insert(OnnxModelError::InvalidModel(format!(
+                            "shared external initializer {name} values differ"
+                        )));
+                    return;
+                }
+                self.initializers.push(tensor);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.failure.get_or_insert(error);
+                return;
+            }
+        }
+        let offset = match reserve_external_range(&mut storage.weights, length) {
+            Ok(offset) => offset,
+            Err(error) => {
+                self.failure.get_or_insert(error);
+                return;
+            }
+        };
+        for value in values {
+            storage.weights.extend_from_slice(&encode(*value));
+        }
+        let (Ok(offset), Ok(length)) = (i64::try_from(offset), i64::try_from(length)) else {
+            self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                "typed external initializer range",
+            ));
+            return;
+        };
+        self.initializers
+            .push(external_tensor(name, data_type, dimensions, offset, length));
+    }
+
     fn add_f32(&mut self, name: &str, dimensions: Vec<i64>, values: &[f32]) {
         if self.failure.is_some() {
             return;
@@ -4564,43 +4796,176 @@ impl CausalGraphBuilder {
         ));
     }
 
-    fn add_matrix(&mut self, prefix: &str, matrix: PackedTernaryMatrix<'_>) {
-        self.store_bytes(
-            &format!("{prefix}.packed"),
-            TENSOR_UINT8,
-            vec![i64::try_from(matrix.packed.len()).expect("validated packed byte count")],
-            matrix.packed,
-        );
-        self.add_f32(
-            &format!("{prefix}.scales"),
-            vec![i64::try_from(matrix.rows).expect("validated matrix rows")],
-            matrix.scales,
-        );
+    fn add_matrix<'a, M: OnnxPackedMatrix<'a>>(
+        &mut self,
+        prefix: &str,
+        matrix: M,
+        store: bool,
+    ) -> Result<PackedNodeSpec, OnnxModelError> {
+        match matrix.storage() {
+            PackedMatrixStorage::Ternary(matrix) => {
+                let packed = format!("{prefix}.packed");
+                let scales = format!("{prefix}.scales");
+                if store {
+                    self.store_bytes(
+                        &packed,
+                        TENSOR_UINT8,
+                        vec![as_i64(matrix.packed.len(), "packed byte count")?],
+                        matrix.packed,
+                    );
+                    self.add_f32(
+                        &scales,
+                        vec![as_i64(matrix.rows, "matrix rows")?],
+                        matrix.scales,
+                    );
+                }
+                Ok(PackedNodeSpec {
+                    operands: vec![packed, scales],
+                    projection_op: ONNX_OP_NAME,
+                    embedding_op: ONNX_EMBEDDING_OP_NAME,
+                    attributes: attributes(
+                        as_i64(matrix.columns, "matrix columns")?,
+                        format_code(matrix.format)?,
+                    ),
+                })
+            }
+            PackedMatrixStorage::SaltV2(matrix) => {
+                self.tritium_opset = 2;
+                let payload = format!("{prefix}.salt_payload");
+                let scales = format!("{prefix}.salt_scales");
+                let allocation_map = format!("{prefix}.salt_allocation_map");
+                let rank_prefixes = format!("{prefix}.salt_rank_prefixes");
+                if store {
+                    self.store_bytes(
+                        &payload,
+                        TENSOR_UINT8,
+                        vec![as_i64(matrix.payload.len(), "SALT V2 payload bytes")?],
+                        matrix.payload,
+                    );
+                    self.add_le_values(
+                        &scales,
+                        TENSOR_FLOAT16,
+                        vec![as_i64(matrix.scales.len(), "SALT V2 scale count")?],
+                        matrix.scales,
+                        f16::to_le_bytes,
+                    );
+                    self.store_bytes(
+                        &allocation_map,
+                        TENSOR_UINT8,
+                        vec![as_i64(
+                            matrix.allocation_map.len(),
+                            "SALT V2 allocation-map bytes",
+                        )?],
+                        matrix.allocation_map,
+                    );
+                    self.add_le_values(
+                        &rank_prefixes,
+                        TENSOR_UINT32,
+                        vec![as_i64(
+                            matrix.rank_prefixes.len(),
+                            "SALT V2 rank-prefix count",
+                        )?],
+                        matrix.rank_prefixes,
+                        u32::to_le_bytes,
+                    );
+                }
+                let codec = match matrix.codec {
+                    tritium_format::salt_v2::SaltV2Codec::D2 => 0,
+                    tritium_format::salt_v2::SaltV2Codec::B3 => 1,
+                    tritium_format::salt_v2::SaltV2Codec::S34 => 2,
+                    _ => {
+                        return Err(OnnxModelError::InvalidModel(
+                            "unknown SALT V2 codec cannot be serialized".to_owned(),
+                        ));
+                    }
+                };
+                Ok(PackedNodeSpec {
+                    operands: vec![payload, scales, allocation_map, rank_prefixes],
+                    projection_op: crate::ONNX_SALT_V2_OP_NAME,
+                    embedding_op: crate::ONNX_SALT_V2_EMBEDDING_OP_NAME,
+                    attributes: vec![
+                        int_attribute(ATTR_K, as_i64(matrix.columns, "SALT V2 matrix columns")?),
+                        int_attribute(
+                            crate::ATTR_ROWS,
+                            as_i64(matrix.rows, "SALT V2 matrix rows")?,
+                        ),
+                        int_attribute(crate::ATTR_CODEC, codec),
+                        int_attribute(
+                            crate::ATTR_TERMINAL_MAP_VALUE,
+                            i64::from(matrix.terminal_map_value),
+                        ),
+                    ],
+                })
+            }
+        }
     }
 
-    fn projection(
+    fn projection<'a, M: OnnxPackedMatrix<'a>>(
         &mut self,
         name: &str,
         input: &str,
         output: &str,
         matrix_prefix: &str,
-        matrix: PackedTernaryMatrix<'_>,
+        matrix: M,
     ) -> Result<(), OnnxModelError> {
-        self.add_matrix(matrix_prefix, matrix);
+        let spec = self.add_matrix(matrix_prefix, matrix, true)?;
         self.storage_result()?;
+        let mut inputs = Vec::with_capacity(1 + spec.operands.len());
+        inputs.push(input.to_owned());
+        inputs.extend(spec.operands);
         self.nodes.push(NodeProto {
-            input: vec![
-                input.to_owned(),
-                format!("{matrix_prefix}.packed"),
-                format!("{matrix_prefix}.scales"),
-            ],
+            input: inputs,
             output: vec![output.to_owned()],
             name: name.to_owned(),
-            op_type: ONNX_OP_NAME.to_owned(),
-            attribute: attributes(
-                as_i64(matrix.columns, "matrix columns")?,
-                format_code(matrix.format)?,
-            ),
+            op_type: spec.projection_op.to_owned(),
+            attribute: spec.attributes,
+            domain: ONNX_DOMAIN.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn embedding<'a, M: OnnxPackedMatrix<'a>>(
+        &mut self,
+        name: &str,
+        input: &str,
+        output: &str,
+        matrix_prefix: &str,
+        matrix: M,
+    ) -> Result<(), OnnxModelError> {
+        let spec = self.add_matrix(matrix_prefix, matrix, true)?;
+        self.storage_result()?;
+        let mut inputs = Vec::with_capacity(1 + spec.operands.len());
+        inputs.push(input.to_owned());
+        inputs.extend(spec.operands);
+        self.nodes.push(NodeProto {
+            input: inputs,
+            output: vec![output.to_owned()],
+            name: name.to_owned(),
+            op_type: spec.embedding_op.to_owned(),
+            attribute: spec.attributes,
+            domain: ONNX_DOMAIN.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn projection_reusing<'a, M: OnnxPackedMatrix<'a>>(
+        &mut self,
+        name: &str,
+        input: &str,
+        output: &str,
+        matrix_prefix: &str,
+        matrix: M,
+    ) -> Result<(), OnnxModelError> {
+        let spec = self.add_matrix(matrix_prefix, matrix, false)?;
+        let mut inputs = Vec::with_capacity(1 + spec.operands.len());
+        inputs.push(input.to_owned());
+        inputs.extend(spec.operands);
+        self.nodes.push(NodeProto {
+            input: inputs,
+            output: vec![output.to_owned()],
+            name: name.to_owned(),
+            op_type: spec.projection_op.to_owned(),
+            attribute: spec.attributes,
             domain: ONNX_DOMAIN.to_owned(),
         });
         Ok(())
@@ -5080,11 +5445,11 @@ impl CausalGraphBuilder {
         }
     }
 
-    fn full_attention_block(
+    fn full_attention_block<'a, M: OnnxPackedMatrix<'a>>(
         &mut self,
         index: usize,
         hidden_name: &str,
-        layer: CausalLmDecoderLayer<'_>,
+        layer: CausalLmDecoderLayer<'a, M>,
         context: FullAttentionGraphContext<'_>,
         inputs: &mut Vec<ValueInfoProto>,
         cache_outputs: &mut Vec<ValueInfoProto>,
@@ -5400,11 +5765,11 @@ impl CausalGraphBuilder {
         Ok(layer_output)
     }
 
-    fn delta_net_block(
+    fn delta_net_block<'a, M: OnnxPackedMatrix<'a>>(
         &mut self,
         index: usize,
         hidden_name: &str,
-        layer: QwenDeltaNetDecoderLayer<'_>,
+        layer: QwenDeltaNetDecoderLayer<'a, M>,
         context: DeltaNetGraphContext,
         inputs: &mut Vec<ValueInfoProto>,
         state_outputs: &mut Vec<ValueInfoProto>,
@@ -5585,12 +5950,12 @@ impl CausalGraphBuilder {
         Ok(layer_output)
     }
 
-    fn ffn_block(
+    fn ffn_block<'a, M: OnnxPackedMatrix<'a>>(
         &mut self,
         prefix: &str,
         input: &str,
         output: &str,
-        layer: CausalFfnLayer<'_>,
+        layer: CausalFfnLayer<'a, M>,
         epsilon: f32,
         zero_centered_norm: bool,
     ) -> Result<(), OnnxModelError> {
@@ -5696,8 +6061,8 @@ impl CausalGraphBuilder {
     }
 }
 
-fn build_qwen35_mtp_graph(
-    model: Qwen35MtpModel<'_>,
+fn build_qwen35_mtp_graph<'a, M: OnnxPackedMatrix<'a>>(
+    model: Qwen35MtpModel<'a, M>,
     mut graph: CausalGraphBuilder,
 ) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "MTP token count")?;
@@ -5709,8 +6074,8 @@ fn build_qwen35_mtp_graph(
         .tokens
         .checked_add(model.past_tokens)
         .ok_or(OnnxModelError::ShapeOverflow("MTP total token count"))?;
-    let hidden = as_i64(model.embedding.columns, "MTP hidden size")?;
-    let vocab = as_i64(model.embedding.rows, "MTP vocabulary")?;
+    let hidden = as_i64(model.embedding.columns(), "MTP hidden size")?;
+    let vocab = as_i64(model.embedding.rows(), "MTP vocabulary")?;
     let n_head = as_i64(model.n_head, "MTP attention head count")?;
     let n_kv_head = as_i64(model.n_kv_head, "MTP KV head count")?;
     let head_dim = as_i64(model.head_dim, "MTP head dimension")?;
@@ -5741,19 +6106,13 @@ fn build_qwen35_mtp_graph(
         vec![1, tokens, total_tokens],
     );
 
-    graph.add_matrix("tok_embeddings", model.embedding);
-    graph.nodes.push(NodeProto {
-        input: strings([
-            "shifted_tokens",
-            "tok_embeddings.packed",
-            "tok_embeddings.scales",
-        ]),
-        output: strings(["mtp.embedding"]),
-        name: "mtp.embedding".to_owned(),
-        op_type: ONNX_EMBEDDING_OP_NAME.to_owned(),
-        attribute: attributes(hidden, format_code(model.embedding.format)?),
-        domain: ONNX_DOMAIN.to_owned(),
-    });
+    graph.embedding(
+        "mtp.embedding",
+        "shifted_tokens",
+        "mtp.embedding",
+        "tok_embeddings",
+        model.embedding,
+    )?;
     graph.rms_norm_with_semantics(
         "mtp.embedding_norm",
         "mtp.embedding",
@@ -5818,15 +6177,13 @@ fn build_qwen35_mtp_graph(
         model.rms_epsilon,
         true,
     );
-    graph.add_matrix("lm_head", model.lm_head);
-    graph.nodes.push(NodeProto {
-        input: strings(["mtp.final_hidden", "lm_head.packed", "lm_head.scales"]),
-        output: strings(["mtp.logits"]),
-        name: "mtp.lm_head".to_owned(),
-        op_type: ONNX_OP_NAME.to_owned(),
-        attribute: attributes(hidden, format_code(model.lm_head.format)?),
-        domain: ONNX_DOMAIN.to_owned(),
-    });
+    graph.projection(
+        "mtp.lm_head",
+        "mtp.final_hidden",
+        "mtp.logits",
+        "lm_head",
+        model.lm_head,
+    )?;
     if let Some(error) = graph.failure {
         return Err(error);
     }
@@ -5880,8 +6237,8 @@ fn build_qwen35_mtp_graph(
                 metadata("tritium.tokens", &model.tokens.to_string()),
                 metadata("tritium.past_tokens", &model.past_tokens.to_string()),
                 metadata("tritium.layers", "1"),
-                metadata("tritium.hidden", &model.embedding.columns.to_string()),
-                metadata("tritium.vocab", &model.embedding.rows.to_string()),
+                metadata("tritium.hidden", &model.embedding.columns().to_string()),
+                metadata("tritium.vocab", &model.embedding.rows().to_string()),
                 metadata("tritium.n_head", &model.n_head.to_string()),
                 metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
                 metadata("tritium.head_dim", &model.head_dim.to_string()),
@@ -5897,8 +6254,8 @@ fn build_qwen35_mtp_graph(
     ))
 }
 
-fn build_qwen_causal_lm_graph(
-    model: QwenCausalLmModel<'_>,
+fn build_qwen_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
+    model: QwenCausalLmModel<'a, M>,
     mut graph: CausalGraphBuilder,
 ) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "token count")?;
@@ -5910,8 +6267,7 @@ fn build_qwen_causal_lm_graph(
         .tokens
         .checked_add(model.past_tokens)
         .ok_or(OnnxModelError::ShapeOverflow("total token count"))?;
-    let hidden = as_i64(model.embedding.columns, "hidden size")?;
-    let vocab = as_i64(model.embedding.rows, "vocabulary")?;
+    let vocab = as_i64(model.embedding.rows(), "vocabulary")?;
     let n_head = as_i64(model.n_head, "attention head count")?;
     let n_kv_head = as_i64(model.n_kv_head, "KV head count")?;
     let head_dim = as_i64(model.head_dim, "head dimension")?;
@@ -5953,15 +6309,13 @@ fn build_qwen_causal_lm_graph(
         model.past_tokens,
         vec![1, tokens, total_tokens],
     );
-    graph.add_matrix("tok_embeddings", model.embedding);
-    graph.nodes.push(NodeProto {
-        input: strings(["tokens", "tok_embeddings.packed", "tok_embeddings.scales"]),
-        output: strings(["layer.0.input"]),
-        name: "tok_embeddings".to_owned(),
-        op_type: ONNX_EMBEDDING_OP_NAME.to_owned(),
-        attribute: attributes(hidden, format_code(model.embedding.format)?),
-        domain: ONNX_DOMAIN.to_owned(),
-    });
+    graph.embedding(
+        "tok_embeddings",
+        "tokens",
+        "layer.0.input",
+        "tok_embeddings",
+        model.embedding,
+    )?;
     let mut hidden_name = "layer.0.input".to_owned();
     let mut inputs = vec![tensor_value("tokens", TENSOR_INT64, &[tokens])];
     let mut state_outputs = Vec::with_capacity(model.layers.len() * 2);
@@ -6011,24 +6365,17 @@ fn build_qwen_causal_lm_graph(
         model.rms_epsilon,
         true,
     );
-    let (head_packed, head_scales, head_format) = if let Some(head) = model.lm_head {
-        graph.add_matrix("lm_head", head);
-        ("lm_head.packed", "lm_head.scales", head.format)
+    if let Some(head) = model.lm_head {
+        graph.projection("lm_head", final_hidden, "logits", "lm_head", head)?;
     } else {
-        (
-            "tok_embeddings.packed",
-            "tok_embeddings.scales",
-            model.embedding.format,
-        )
-    };
-    graph.nodes.push(NodeProto {
-        input: strings([final_hidden, head_packed, head_scales]),
-        output: strings(["logits"]),
-        name: "lm_head".to_owned(),
-        op_type: ONNX_OP_NAME.to_owned(),
-        attribute: attributes(hidden, format_code(head_format)?),
-        domain: ONNX_DOMAIN.to_owned(),
-    });
+        graph.projection_reusing(
+            "lm_head",
+            final_hidden,
+            "logits",
+            "tok_embeddings",
+            model.embedding,
+        )?;
+    }
     let mut outputs = vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])];
     outputs.extend(state_outputs);
     let schedule = model
@@ -6089,8 +6436,8 @@ fn build_qwen_causal_lm_graph(
                 metadata("tritium.tokens", &model.tokens.to_string()),
                 metadata("tritium.past_tokens", &model.past_tokens.to_string()),
                 metadata("tritium.layers", &model.layers.len().to_string()),
-                metadata("tritium.hidden", &model.embedding.columns.to_string()),
-                metadata("tritium.vocab", &model.embedding.rows.to_string()),
+                metadata("tritium.hidden", &model.embedding.columns().to_string()),
+                metadata("tritium.vocab", &model.embedding.rows().to_string()),
                 metadata("tritium.n_head", &model.n_head.to_string()),
                 metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
                 metadata("tritium.head_dim", &model.head_dim.to_string()),
@@ -6117,8 +6464,8 @@ fn build_qwen_causal_lm_graph(
     ))
 }
 
-fn build_causal_lm_graph(
-    model: CausalLmModel<'_>,
+fn build_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
+    model: CausalLmModel<'a, M>,
     external: bool,
 ) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "token count")?;
@@ -6130,8 +6477,7 @@ fn build_causal_lm_graph(
         .tokens
         .checked_add(model.past_tokens)
         .ok_or(OnnxModelError::ShapeOverflow("total token count"))?;
-    let hidden = as_i64(model.embedding.columns, "hidden size")?;
-    let vocab = as_i64(model.embedding.rows, "vocabulary")?;
+    let vocab = as_i64(model.embedding.rows(), "vocabulary")?;
     let n_head = as_i64(model.n_head, "attention head count")?;
     let n_kv_head = as_i64(model.n_kv_head, "KV head count")?;
     let head_dim = as_i64(model.head_dim, "head dimension")?;
@@ -6184,15 +6530,13 @@ fn build_causal_lm_graph(
         model.past_tokens,
         vec![1, tokens, total_tokens],
     );
-    graph.add_matrix("tok_embeddings", model.embedding);
-    graph.nodes.push(NodeProto {
-        input: strings(["tokens", "tok_embeddings.packed", "tok_embeddings.scales"]),
-        output: strings(["layer.0.input"]),
-        name: "tok_embeddings".to_owned(),
-        op_type: ONNX_EMBEDDING_OP_NAME.to_owned(),
-        attribute: attributes(hidden, format_code(model.embedding.format)?),
-        domain: ONNX_DOMAIN.to_owned(),
-    });
+    graph.embedding(
+        "tok_embeddings",
+        "tokens",
+        "layer.0.input",
+        "tok_embeddings",
+        model.embedding,
+    )?;
     let mut hidden_name = "layer.0.input".to_owned();
     let mut inputs = vec![tensor_value("tokens", TENSOR_INT64, &[tokens])];
     let mut cache_outputs = Vec::with_capacity(model.layers.len() * 2);
@@ -6229,24 +6573,17 @@ fn build_causal_lm_graph(
         model.rms_epsilon,
         model.zero_centered_norm,
     );
-    let (head_packed, head_scales, head_format) = if let Some(head) = model.lm_head {
-        graph.add_matrix("lm_head", head);
-        ("lm_head.packed", "lm_head.scales", head.format)
+    if let Some(head) = model.lm_head {
+        graph.projection("lm_head", final_hidden, "logits", "lm_head", head)?;
     } else {
-        (
-            "tok_embeddings.packed",
-            "tok_embeddings.scales",
-            model.embedding.format,
-        )
-    };
-    graph.nodes.push(NodeProto {
-        input: strings([final_hidden, head_packed, head_scales]),
-        output: strings(["logits"]),
-        name: "lm_head".to_owned(),
-        op_type: ONNX_OP_NAME.to_owned(),
-        attribute: attributes(hidden, format_code(head_format)?),
-        domain: ONNX_DOMAIN.to_owned(),
-    });
+        graph.projection_reusing(
+            "lm_head",
+            final_hidden,
+            "logits",
+            "tok_embeddings",
+            model.embedding,
+        )?;
+    }
     let mut outputs = vec![tensor_value("logits", TENSOR_FLOAT, &[tokens, vocab])];
     outputs.extend(cache_outputs);
     let mut metadata_props = vec![
@@ -6268,8 +6605,8 @@ fn build_causal_lm_graph(
         metadata("tritium.tokens", &model.tokens.to_string()),
         metadata("tritium.past_tokens", &model.past_tokens.to_string()),
         metadata("tritium.layers", &model.layers.len().to_string()),
-        metadata("tritium.hidden", &model.embedding.columns.to_string()),
-        metadata("tritium.vocab", &model.embedding.rows.to_string()),
+        metadata("tritium.hidden", &model.embedding.columns().to_string()),
+        metadata("tritium.vocab", &model.embedding.rows().to_string()),
         metadata("tritium.n_head", &model.n_head.to_string()),
         metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
         metadata("tritium.head_dim", &model.head_dim.to_string()),
@@ -6301,6 +6638,7 @@ fn build_causal_lm_graph(
     if let Some(rotary) = model.rotary {
         metadata_props.push(metadata("tritium.rope_theta", &rotary.theta.to_string()));
     }
+    let tritium_opset = graph.tritium_opset;
     if let Some(error) = graph.failure {
         return Err(error);
     }
@@ -6326,7 +6664,7 @@ fn build_causal_lm_graph(
             },
             OperatorSetIdProto {
                 domain: ONNX_DOMAIN.to_owned(),
-                version: TRITIUM_OPSET,
+                version: tritium_opset,
             },
         ],
         metadata_props,
@@ -6524,7 +6862,9 @@ pub(crate) fn encode_qwen_deltanet_test_graph() -> Vec<u8> {
 }
 
 #[cfg(all(test, feature = "onnx"))]
-pub(crate) fn encode_salt_v2_mpgemm_test_graph(matrix: crate::SaltV2PackedMatrix<'_>) -> Vec<u8> {
+fn salt_v2_test_parts(
+    matrix: crate::SaltV2PackedMatrix<'_>,
+) -> (Vec<AttributeProto>, Vec<TensorProto>) {
     let rows = i64::try_from(matrix.rows).unwrap();
     let columns = i64::try_from(matrix.columns).unwrap();
     let codec = match matrix.codec {
@@ -6543,31 +6883,17 @@ pub(crate) fn encode_salt_v2_mpgemm_test_graph(matrix: crate::SaltV2PackedMatrix
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    let graph = GraphProto {
-        node: vec![NodeProto {
-            input: strings([
-                "hidden",
-                "weight.salt_payload",
-                "weight.salt_scales",
-                "weight.salt_allocation_map",
-                "weight.salt_rank_prefixes",
-            ]),
-            output: strings(["next_hidden"]),
-            name: "tritium.salt_v2_mpgemm".to_owned(),
-            op_type: crate::ONNX_SALT_V2_OP_NAME.to_owned(),
-            attribute: vec![
-                int_attribute(crate::ATTR_K, columns),
-                int_attribute(crate::ATTR_ROWS, rows),
-                int_attribute(crate::ATTR_CODEC, codec),
-                int_attribute(
-                    crate::ATTR_TERMINAL_MAP_VALUE,
-                    i64::from(matrix.terminal_map_value),
-                ),
-            ],
-            domain: ONNX_DOMAIN.to_owned(),
-        }],
-        name: "tritium.salt_v2_mpgemm.test".to_owned(),
-        initializer: vec![
+    (
+        vec![
+            int_attribute(crate::ATTR_K, columns),
+            int_attribute(crate::ATTR_ROWS, rows),
+            int_attribute(crate::ATTR_CODEC, codec),
+            int_attribute(
+                crate::ATTR_TERMINAL_MAP_VALUE,
+                i64::from(matrix.terminal_map_value),
+            ),
+        ],
+        vec![
             inline_tensor(
                 "weight.salt_payload",
                 TENSOR_UINT8,
@@ -6593,8 +6919,78 @@ pub(crate) fn encode_salt_v2_mpgemm_test_graph(matrix: crate::SaltV2PackedMatrix
                 rank_bytes,
             ),
         ],
+    )
+}
+
+#[cfg(all(test, feature = "onnx"))]
+pub(crate) fn encode_salt_v2_mpgemm_test_graph(matrix: crate::SaltV2PackedMatrix<'_>) -> Vec<u8> {
+    let rows = i64::try_from(matrix.rows).unwrap();
+    let columns = i64::try_from(matrix.columns).unwrap();
+    let (attribute, initializer) = salt_v2_test_parts(matrix);
+    let graph = GraphProto {
+        node: vec![NodeProto {
+            input: strings([
+                "hidden",
+                "weight.salt_payload",
+                "weight.salt_scales",
+                "weight.salt_allocation_map",
+                "weight.salt_rank_prefixes",
+            ]),
+            output: strings(["next_hidden"]),
+            name: "tritium.salt_v2_mpgemm".to_owned(),
+            op_type: crate::ONNX_SALT_V2_OP_NAME.to_owned(),
+            attribute,
+            domain: ONNX_DOMAIN.to_owned(),
+        }],
+        name: "tritium.salt_v2_mpgemm.test".to_owned(),
+        initializer,
         input: vec![tensor_value("hidden", TENSOR_FLOAT, &[-1, columns])],
         output: vec![tensor_value("next_hidden", TENSOR_FLOAT, &[-1, rows])],
+        value_info: Vec::new(),
+    };
+    ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx-test".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: String::new(),
+        model_version: 1,
+        graph: Some(graph),
+        opset_import: vec![OperatorSetIdProto {
+            domain: ONNX_DOMAIN.to_owned(),
+            version: 2,
+        }],
+        metadata_props: Vec::new(),
+    }
+    .encode_to_vec()
+}
+
+#[cfg(all(test, feature = "onnx"))]
+pub(crate) fn encode_salt_v2_embedding_test_graph(
+    matrix: crate::SaltV2PackedMatrix<'_>,
+    token_shape: &[i64],
+) -> Vec<u8> {
+    let mut output_shape = token_shape.to_vec();
+    output_shape.push(i64::try_from(matrix.columns).unwrap());
+    let (attribute, initializer) = salt_v2_test_parts(matrix);
+    let graph = GraphProto {
+        node: vec![NodeProto {
+            input: strings([
+                "tokens",
+                "weight.salt_payload",
+                "weight.salt_scales",
+                "weight.salt_allocation_map",
+                "weight.salt_rank_prefixes",
+            ]),
+            output: strings(["next_hidden"]),
+            name: "tritium.salt_v2_embedding".to_owned(),
+            op_type: crate::ONNX_SALT_V2_EMBEDDING_OP_NAME.to_owned(),
+            attribute,
+            domain: ONNX_DOMAIN.to_owned(),
+        }],
+        name: "tritium.salt_v2_embedding.test".to_owned(),
+        initializer,
+        input: vec![tensor_value("tokens", TENSOR_INT64, token_shape)],
+        output: vec![tensor_value("next_hidden", TENSOR_FLOAT, &output_shape)],
         value_info: Vec::new(),
     };
     ModelProto {
@@ -6788,7 +7184,9 @@ fn validate(model: &TiedEmbeddingHeadModel<'_>) -> Result<(), OnnxModelError> {
     Ok(())
 }
 
-fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
+fn validate_causal_lm<'model, 'matrix, M: OnnxPackedMatrix<'matrix>>(
+    model: &CausalLmModel<'model, M>,
+) -> Result<(), OnnxModelError> {
     if model.layers.is_empty() {
         return Err(OnnxModelError::InvalidModel(
             "causal LM requires at least one decoder layer".to_owned(),
@@ -6799,8 +7197,8 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
         ("attention head count", model.n_head),
         ("KV head count", model.n_kv_head),
         ("head dimension", model.head_dim),
-        ("vocabulary", model.embedding.rows),
-        ("hidden size", model.embedding.columns),
+        ("vocabulary", model.embedding.rows()),
+        ("hidden size", model.embedding.columns()),
     ] {
         if value == 0 {
             return Err(OnnxModelError::EmptyDimension(name));
@@ -6823,7 +7221,7 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
         .n_head
         .checked_mul(model.head_dim)
         .ok_or(OnnxModelError::ShapeOverflow("query width"))?;
-    let hidden = model.embedding.columns;
+    let hidden = model.embedding.columns();
     if let Some(rotary) = model.rotary {
         if !rotary.theta.is_finite() || rotary.theta <= 0.0 {
             return Err(OnnxModelError::InvalidModel(
@@ -6842,7 +7240,7 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
     }
     validate_matrix("embedding", model.embedding)?;
     if let Some(head) = model.lm_head {
-        validate_matrix_shape("lm_head", head, model.embedding.rows, hidden)?;
+        validate_matrix_shape("lm_head", head, model.embedding.rows(), hidden)?;
     }
     validate_vector("final_norm", model.final_norm, hidden)?;
     for (index, layer) in model.layers.iter().copied().enumerate() {
@@ -6906,12 +7304,12 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
                 query_width,
             )?;
         }
-        if layer.gate.rows == 0 || layer.gate.rows != layer.up.rows {
+        if layer.gate.rows() == 0 || layer.gate.rows() != layer.up.rows() {
             return Err(OnnxModelError::InvalidModel(format!(
                 "layer.{index} gate/up intermediate widths disagree"
             )));
         }
-        let intermediate = layer.gate.rows;
+        let intermediate = layer.gate.rows();
         if let Some(weight) = layer.ffn_sub_norm {
             validate_vector(&format!("layer.{index}.ffn_sub_norm"), weight, intermediate)?;
         }
@@ -6932,8 +7330,8 @@ fn validate_causal_lm(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
     validate_identity_v2(model.identity)
 }
 
-fn validate_qwen_deltanet_layer(
-    model: &QwenDeltaNetLayerModel<'_>,
+fn validate_qwen_deltanet_layer<'a, M: OnnxPackedMatrix<'a>>(
+    model: &QwenDeltaNetLayerModel<'a, M>,
 ) -> Result<crate::QwenDeltaNetDimensions, OnnxModelError> {
     for (name, value) in [
         ("Qwen DeltaNet token count", model.tokens),
@@ -7006,12 +7404,12 @@ fn validate_qwen_deltanet_layer(
         value_width,
     )?;
     validate_vector("layer.0.ffn_norm", model.layer.ffn_norm, model.hidden)?;
-    if model.layer.gate.rows == 0 || model.layer.gate.rows != model.layer.up.rows {
+    if model.layer.gate.rows() == 0 || model.layer.gate.rows() != model.layer.up.rows() {
         return Err(OnnxModelError::InvalidModel(
             "Qwen DeltaNet gate/up intermediate widths disagree".to_owned(),
         ));
     }
-    let intermediate = model.layer.gate.rows;
+    let intermediate = model.layer.gate.rows();
     validate_matrix_shape("layer.0.gate", model.layer.gate, intermediate, model.hidden)?;
     validate_matrix_shape("layer.0.up", model.layer.up, intermediate, model.hidden)?;
     validate_matrix_shape("layer.0.down", model.layer.down, model.hidden, intermediate)?;
@@ -7019,7 +7417,9 @@ fn validate_qwen_deltanet_layer(
     Ok(dimensions)
 }
 
-fn validate_qwen35_mtp_model(model: &Qwen35MtpModel<'_>) -> Result<(), OnnxModelError> {
+fn validate_qwen35_mtp_model<'a, M: OnnxPackedMatrix<'a>>(
+    model: &Qwen35MtpModel<'a, M>,
+) -> Result<(), OnnxModelError> {
     let layer = [model.mtp.layer.causal()];
     validate_causal_lm(&CausalLmModel {
         tokens: model.tokens,
@@ -7036,7 +7436,7 @@ fn validate_qwen35_mtp_model(model: &Qwen35MtpModel<'_>) -> Result<(), OnnxModel
         final_norm: model.mtp.final_norm,
         identity: model.identity,
     })?;
-    let hidden = model.embedding.columns;
+    let hidden = model.embedding.columns();
     validate_vector(
         "Qwen MTP pre_fc_norm_embedding",
         model.mtp.pre_fc_norm_embedding,
@@ -7057,9 +7457,9 @@ fn validate_qwen35_mtp_model(model: &Qwen35MtpModel<'_>) -> Result<(), OnnxModel
     )
 }
 
-fn validate_qwen35_bundle_pair(
-    language: &QwenCausalLmModel<'_>,
-    mtp: &Qwen35MtpModel<'_>,
+fn validate_qwen35_bundle_pair<'a, M: OnnxPackedMatrix<'a>>(
+    language: &QwenCausalLmModel<'a, M>,
+    mtp: &Qwen35MtpModel<'a, M>,
 ) -> Result<(), OnnxModelError> {
     validate_qwen_causal_lm(language)?;
     validate_qwen35_mtp_model(mtp)?;
@@ -7088,12 +7488,25 @@ fn validate_qwen35_bundle_pair(
             "Qwen language and MTP execution geometry differs".to_owned(),
         ));
     }
-    let same_matrix = |left: PackedTernaryMatrix<'_>, right: PackedTernaryMatrix<'_>| {
-        left.rows == right.rows
-            && left.columns == right.columns
-            && left.format == right.format
-            && left.packed == right.packed
-            && left.scales == right.scales
+    let same_matrix = |left: M, right: M| match (left.storage(), right.storage()) {
+        (PackedMatrixStorage::Ternary(left), PackedMatrixStorage::Ternary(right)) => {
+            left.rows == right.rows
+                && left.columns == right.columns
+                && left.format == right.format
+                && left.packed == right.packed
+                && left.scales == right.scales
+        }
+        (PackedMatrixStorage::SaltV2(left), PackedMatrixStorage::SaltV2(right)) => {
+            left.rows == right.rows
+                && left.columns == right.columns
+                && left.codec == right.codec
+                && left.payload == right.payload
+                && left.scales == right.scales
+                && left.allocation_map == right.allocation_map
+                && left.rank_prefixes == right.rank_prefixes
+                && left.terminal_map_value == right.terminal_map_value
+        }
+        _ => false,
     };
     if !same_matrix(language.embedding, mtp.embedding) {
         return Err(OnnxModelError::InvalidModel(
@@ -7113,7 +7526,9 @@ fn validate_qwen35_bundle_pair(
     Ok(())
 }
 
-fn validate_qwen_causal_lm(model: &QwenCausalLmModel<'_>) -> Result<(), OnnxModelError> {
+fn validate_qwen_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
+    model: &QwenCausalLmModel<'a, M>,
+) -> Result<(), OnnxModelError> {
     if model.layers.is_empty() {
         return Err(OnnxModelError::InvalidModel(
             "Qwen causal LM requires at least one layer".to_owned(),
@@ -7127,7 +7542,7 @@ fn validate_qwen_causal_lm(model: &QwenCausalLmModel<'_>) -> Result<(), OnnxMode
                 has_delta = true;
                 validate_qwen_deltanet_layer(&QwenDeltaNetLayerModel {
                     tokens: model.tokens,
-                    hidden: model.embedding.columns,
+                    hidden: model.embedding.columns(),
                     rms_epsilon: model.rms_epsilon,
                     geometry: model.delta_geometry,
                     layer,
@@ -7164,8 +7579,8 @@ fn validate_qwen_causal_lm(model: &QwenCausalLmModel<'_>) -> Result<(), OnnxMode
     Ok(())
 }
 
-fn qwen_full_attention_interval(
-    layers: &[QwenCausalLmDecoderLayer<'_>],
+fn qwen_full_attention_interval<M>(
+    layers: &[QwenCausalLmDecoderLayer<'_, M>],
 ) -> Result<usize, OnnxModelError> {
     let interval = layers
         .iter()
@@ -7187,8 +7602,49 @@ fn qwen_full_attention_interval(
     Ok(interval)
 }
 
-fn validate_qwen_deltanet_initializer_budget(
-    model: &QwenDeltaNetLayerModel<'_>,
+fn matrix_initializer_bytes<'a, M: OnnxPackedMatrix<'a>>(
+    matrix: M,
+) -> Result<usize, OnnxModelError> {
+    let add = |left: usize, right: usize| {
+        left.checked_add(right).ok_or(OnnxModelError::ShapeOverflow(
+            "matrix initializer byte count",
+        ))
+    };
+    match matrix.storage() {
+        PackedMatrixStorage::Ternary(matrix) => add(
+            matrix.packed.len(),
+            matrix
+                .scales
+                .len()
+                .checked_mul(core::mem::size_of::<f32>())
+                .ok_or(OnnxModelError::ShapeOverflow("matrix scale byte count"))?,
+        ),
+        PackedMatrixStorage::SaltV2(matrix) => {
+            let bytes = add(
+                matrix.payload.len(),
+                matrix
+                    .scales
+                    .len()
+                    .checked_mul(core::mem::size_of::<f16>())
+                    .ok_or(OnnxModelError::ShapeOverflow("SALT V2 scale byte count"))?,
+            )?;
+            let bytes = add(bytes, matrix.allocation_map.len())?;
+            add(
+                bytes,
+                matrix
+                    .rank_prefixes
+                    .len()
+                    .checked_mul(core::mem::size_of::<u32>())
+                    .ok_or(OnnxModelError::ShapeOverflow(
+                        "SALT V2 rank-prefix byte count",
+                    ))?,
+            )
+        }
+    }
+}
+
+fn validate_qwen_deltanet_initializer_budget<'a, M: OnnxPackedMatrix<'a>>(
+    model: &QwenDeltaNetLayerModel<'a, M>,
 ) -> Result<(), OnnxModelError> {
     let mut total = 0_usize;
     let mut add = |bytes: usize| -> Result<(), OnnxModelError> {
@@ -7214,14 +7670,7 @@ fn validate_qwen_deltanet_initializer_budget(
         model.layer.up,
         model.layer.down,
     ] {
-        add(matrix.packed.len())?;
-        add(matrix
-            .scales
-            .len()
-            .checked_mul(core::mem::size_of::<f32>())
-            .ok_or(OnnxModelError::ShapeOverflow(
-                "Qwen DeltaNet scale byte count",
-            ))?)?;
+        add(matrix_initializer_bytes(matrix)?)?;
     }
     for vector in [
         model.layer.attention_norm,
@@ -7241,7 +7690,9 @@ fn validate_qwen_deltanet_initializer_budget(
     Ok(())
 }
 
-fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), OnnxModelError> {
+fn validate_causal_initializer_budget<'a, M: OnnxPackedMatrix<'a>>(
+    model: &CausalLmModel<'a, M>,
+) -> Result<(), OnnxModelError> {
     fn add(total: &mut usize, bytes: usize) -> Result<(), OnnxModelError> {
         *total = total
             .checked_add(bytes)
@@ -7262,12 +7713,11 @@ fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), O
             .ok_or(OnnxModelError::ShapeOverflow("preserved vector byte count"))?;
         add(total, bytes)
     }
-    fn add_matrix(
+    fn add_matrix<'a, M: OnnxPackedMatrix<'a>>(
         total: &mut usize,
-        matrix: PackedTernaryMatrix<'_>,
+        matrix: M,
     ) -> Result<(), OnnxModelError> {
-        add(total, matrix.packed.len())?;
-        add_vector(total, matrix.scales)
+        add(total, matrix_initializer_bytes(matrix)?)
     }
 
     let mut total = 0;
@@ -7335,39 +7785,48 @@ fn validate_causal_initializer_budget(model: &CausalLmModel<'_>) -> Result<(), O
     Ok(())
 }
 
-fn validate_matrix_shape(
+fn validate_matrix_shape<'a, M: OnnxPackedMatrix<'a>>(
     name: &str,
-    matrix: PackedTernaryMatrix<'_>,
+    matrix: M,
     rows: usize,
     columns: usize,
 ) -> Result<(), OnnxModelError> {
-    if matrix.rows != rows || matrix.columns != columns {
+    if matrix.rows() != rows || matrix.columns() != columns {
         return Err(OnnxModelError::InvalidModel(format!(
             "{name} shape [{}, {}] must be [{rows}, {columns}]",
-            matrix.rows, matrix.columns
+            matrix.rows(),
+            matrix.columns()
         )));
     }
     validate_matrix(name, matrix)
 }
 
-fn validate_matrix(name: &str, matrix: PackedTernaryMatrix<'_>) -> Result<(), OnnxModelError> {
-    if matrix.rows == 0 || matrix.columns == 0 {
+fn validate_matrix<'a, M: OnnxPackedMatrix<'a>>(
+    name: &str,
+    matrix: M,
+) -> Result<(), OnnxModelError> {
+    if matrix.rows() == 0 || matrix.columns() == 0 {
         return Err(OnnxModelError::InvalidModel(format!(
             "{name} matrix dimensions must be nonzero"
         )));
     }
-    validate(&TiedEmbeddingHeadModel {
-        tokens: 1,
-        vocab: matrix.rows,
-        hidden: matrix.columns,
-        packed: matrix.packed,
-        scales: matrix.scales,
-        format: matrix.format,
-        source_model_id: "matrix-validation",
-        recipe_id: "matrix-validation",
-        package_id: "matrix-validation",
-    })
-    .map_err(|error| OnnxModelError::InvalidModel(format!("{name}: {error}")))
+    match matrix.storage() {
+        PackedMatrixStorage::Ternary(matrix) => validate(&TiedEmbeddingHeadModel {
+            tokens: 1,
+            vocab: matrix.rows,
+            hidden: matrix.columns,
+            packed: matrix.packed,
+            scales: matrix.scales,
+            format: matrix.format,
+            source_model_id: "matrix-validation",
+            recipe_id: "matrix-validation",
+            package_id: "matrix-validation",
+        })
+        .map_err(|error| OnnxModelError::InvalidModel(format!("{name}: {error}"))),
+        PackedMatrixStorage::SaltV2(matrix) => matrix
+            .validate()
+            .map_err(|error| OnnxModelError::InvalidModel(format!("{name}: {error}"))),
+    }
 }
 
 fn validate_vector(name: &str, values: &[f32], expected: usize) -> Result<(), OnnxModelError> {
@@ -7729,6 +8188,24 @@ mod tests {
             }
         }
         packed
+    }
+
+    #[test]
+    fn qwen_shared_initializer_layout_is_complete_and_unambiguous() {
+        let select =
+            |names: &[&str]| select_qwen_shared_initializer_names(|name| names.contains(&name));
+        assert_eq!(
+            select(&QWEN_SHARED_TERNARY_INITIALIZERS).unwrap(),
+            QWEN_SHARED_TERNARY_INITIALIZERS
+        );
+        assert_eq!(
+            select(&QWEN_SHARED_SALT_V2_INITIALIZERS).unwrap(),
+            QWEN_SHARED_SALT_V2_INITIALIZERS
+        );
+        assert!(select(&QWEN_SHARED_SALT_V2_INITIALIZERS[..7]).is_err());
+        let mut mixed = QWEN_SHARED_TERNARY_INITIALIZERS.to_vec();
+        mixed.push(QWEN_SHARED_SALT_V2_INITIALIZERS[0]);
+        assert!(select(&mixed).is_err());
     }
 
     #[test]
@@ -8842,7 +9319,7 @@ mod tests {
         ));
         let language_proto = ModelProto::decode(bundle.language_model_bytes.as_slice()).unwrap();
         let mut mtp_proto = ModelProto::decode(bundle.mtp_model_bytes.as_slice()).unwrap();
-        for name in QWEN_SHARED_EXTERNAL_INITIALIZERS {
+        for name in QWEN_SHARED_TERNARY_INITIALIZERS {
             let descriptor = |protobuf: &ModelProto| {
                 protobuf
                     .graph
@@ -8931,7 +9408,7 @@ mod tests {
             .iter_mut()
             .find(|initializer| {
                 initializer.data_location == EXTERNAL_DATA
-                    && !QWEN_SHARED_EXTERNAL_INITIALIZERS.contains(&initializer.name.as_str())
+                    && !is_qwen_shared_initializer_name(&initializer.name)
             })
             .unwrap();
         initializer

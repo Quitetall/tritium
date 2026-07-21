@@ -147,17 +147,21 @@ strict union-range admission rejects gaps, partial/unauthorized overlaps,
 identity/geometry/RMS-epsilon drift, noncanonical attention cadence and any of
 three manifest-digest mismatches. Real ORT loads both file-backed graphs from
 the shared arena and matches inline execution. The ONNX domain now also has a
-real experimental opset-2 `TritiumSaltV2MpGemm` substrate over the production
-indexed SALT V2 arenas: D2, B3 and S34 payloads, f16 group-128 scales, adaptive one-to-three
-plane allocation maps and rank prefixes execute without a dense shadow. Its
-dependency-free kernel matches an independent additive oracle; malformed arena
-lengths, noncanonical map padding/ranks, codec data, scales and activations fail
-closed; a registered custom-op graph passes pre-session inspection and executes
-in an actual ORT session. `HostSaltV2Linear` exposes borrowed arena views so the
-next mapper can serialize the real PTQ/refined operands without reconstruction.
-Whole-Qwen emission still uses the single-plane matrix type and is not yet a
-truthful SALT V2 artifact exporter; migrating every language/MTP matrix and the
-shared embedding path remains the binding prerequisite for Slice 2.
+real opset-2 `TritiumSaltV2MpGemm` and `TritiumSaltV2Embedding` substrate over
+the production indexed SALT V2 arenas: D2, B3 and S34 payloads, f16 group-128
+scales, adaptive one-to-three plane allocation maps and rank prefixes execute
+without a dense shadow. Their dependency-free kernels match independent
+additive oracles; malformed arena lengths, noncanonical map padding/ranks,
+codec data, scales, activations and token indices fail closed; registered
+custom-op graphs pass pre-session inspection and execute in actual ORT
+sessions. Whole-Qwen emission is generic over the physical matrix storage and
+now serializes SALT V2 embedding, every language projection and every MTP
+projection directly. The authenticated three-file bundle aliases all eight
+shared embedding/head arenas, rejects partial or mixed storage layouts, and
+matches inline language and MTP execution in real ORT. `HostSaltV2Linear`
+exposes borrowed arena views so a package mapper can serialize real
+PTQ/refined operands without reconstruction. The Python/Hugging Face facade
+and package-to-Qwen view construction are now the binding Slice 2 work.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
