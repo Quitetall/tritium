@@ -271,9 +271,11 @@ uploads admitted batch roots, issues one command buffer for the complete
 graph/loss phase, one for the complete reverse phase (including same-submission
 gradient clears), and one transactional optimizer command buffer. Only the
 scalar loss crosses back to the host during the training loop. GPU-native
-checkpoint/resume/export, rollback for cancellation after GPU submission,
-automatic browser adapter acquisition and physical browser execution remain
-open. Submitted phases await queue completion and race device loss before
+checkpoint/resume/export, rollback for cancellation after GPU submission and
+physical browser execution remain open. With no explicit adapter, the checked
+entry point now requests a high-performance device from `navigator.gpu`;
+strict WebGPU mode fails closed, while auto mode may fall back only under its
+explicit policy. Submitted phases await queue completion and race device loss before
 issuing a success receipt; receipts include scheduled auxiliary, uniform, zero
 binding and scalar-readback residency. The explicit factory transfers exclusive
 device ownership to the adapter.

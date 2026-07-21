@@ -572,13 +572,7 @@ test("ordered phase submission copies a produced value only after its producer d
   runtime.dispose();
 });
 
-test("resident WebGPU adapter executes one command buffer per training phase", async () => {
-  const device = new FakeDevice();
-  const adapter = createWebGpuTrainingAdapter(device, {
-    buildId: "test-webgpu-adapter",
-    physicalDevice: "fake-gpu",
-    maxResidentBytes: 1 << 20,
-  });
+function adapterTrainingFixture() {
   const model = {
     schemaId: "tritium.web_training_model",
     schemaVersion: 1,
@@ -614,6 +608,17 @@ test("resident WebGPU adapter executes one command buffer per training phase", a
     seed: 7,
     requiredOperations: ["graph.add", "loss.mse", "optimizer.sgd"],
   };
+  return { model, config };
+}
+
+test("resident WebGPU adapter executes one command buffer per training phase", async () => {
+  const device = new FakeDevice();
+  const adapter = createWebGpuTrainingAdapter(device, {
+    buildId: "test-webgpu-adapter",
+    physicalDevice: "fake-gpu",
+    maxResidentBytes: 1 << 20,
+  });
+  const { model, config } = adapterTrainingFixture();
   const session = await prepareTraining(model, config, adapter);
   device.events.length = 0;
   const result = await session.forward({
@@ -649,6 +654,66 @@ test("resident WebGPU adapter executes one command buffer per training phase", a
   );
   assert.equal(session.state, "terminal");
   assert.equal(device.destroyed, true);
+});
+
+test("prepareTraining acquires WebGPU and preserves strict fallback policy", async () => {
+  const { model, config } = adapterTrainingFixture();
+  const automaticDevice = new FakeDevice();
+  let requested = 0;
+  const priorNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      gpu: {
+        async requestAdapter(options) {
+          assert.deepEqual(options, { powerPreference: "high-performance" });
+          return {
+            async requestDevice() {
+              requested += 1;
+              return automaticDevice;
+            },
+          };
+        },
+      },
+    },
+  });
+  try {
+    const automatic = await prepareTraining(model, config);
+    assert.equal(automatic.capabilities.implementation, "webgpu");
+    assert.equal(requested, 1);
+    await automatic.dispose();
+    assert.equal(automaticDevice.destroyed, true);
+
+    globalThis.navigator.gpu.requestAdapter = async () => null;
+    await assert.rejects(
+      prepareTraining(model, config),
+      (error) => error instanceof WebTrainingError && error.code === "adapter_unavailable",
+    );
+    const fallback = await prepareTraining(model, {
+      ...config,
+      backend: "auto",
+      allowWasmFallback: true,
+    });
+    assert.equal(fallback.capabilities.implementation, "wasm-fallback");
+    await fallback.dispose();
+
+    let destroyedInvalidDevice = false;
+    globalThis.navigator.gpu.requestAdapter = async () => ({
+      async requestDevice() {
+        return {
+          destroy() { destroyedInvalidDevice = true; },
+        };
+      },
+    });
+    await assert.rejects(
+      prepareTraining(model, config),
+      (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
+    );
+    assert.equal(destroyedInvalidDevice, true);
+  } finally {
+    if (priorNavigator === undefined) delete globalThis.navigator;
+    else Object.defineProperty(globalThis, "navigator", priorNavigator);
+  }
 });
 
 test("resident WebGPU adapter rejects malformed factory inputs with stable errors", async () => {

@@ -90,9 +90,11 @@ already-authorized WebGPU device and supplies resident forward/backward/step
 execution to `prepareTraining`. The factory transfers exclusive device
 ownership; disposing the adapter destroys that device. Submitted phases await
 queue completion and fail terminally on device loss. It does not yet advertise GPU-native
-checkpoint/resume/export. Automatic browser adapter acquisition is also still
-open, so `backend: "webgpu"` returns `adapter_unavailable` unless this explicit
-adapter is supplied.
+checkpoint/resume/export. When no adapter is supplied, `prepareTraining`
+requests a high-performance device from `navigator.gpu`. `backend: "webgpu"`
+fails closed when acquisition fails; `backend: "auto"` may use deterministic
+WASM only when `allowWasmFallback` is true. The explicit factory remains the
+seam for applications that own device selection or permission UX.
 
 This package is private while the local v1.1 release candidate is under
 construction. Registry publication requires explicit release authorization.

@@ -2154,6 +2154,50 @@ export class WebTrainingSession {
   }
 }
 
+/** Read one host property without trusting browser/proxy getters. */
+function capturedMember(value: object, name: PropertyKey): unknown {
+  try {
+    return Reflect.get(value, name);
+  } catch {
+    return undefined;
+  }
+}
+
+async function requestDefaultWebGpuAdapter(): Promise<WebTrainingAdapterV1 | null> {
+  const navigatorValue = capturedMember(globalThis, "navigator");
+  if (typeof navigatorValue !== "object" || navigatorValue === null) return null;
+  const gpu = capturedMember(navigatorValue, "gpu");
+  if (typeof gpu !== "object" || gpu === null) return null;
+  const requestAdapter = capturedMember(gpu, "requestAdapter");
+  if (typeof requestAdapter !== "function") return null;
+  const physicalAdapter = await Reflect.apply(requestAdapter, gpu, [{
+    powerPreference: "high-performance",
+  }]);
+  if (typeof physicalAdapter !== "object" || physicalAdapter === null) return null;
+  const requestDevice = capturedMember(physicalAdapter, "requestDevice");
+  if (typeof requestDevice !== "function") return null;
+  const device = await Reflect.apply(requestDevice, physicalAdapter, []);
+  if (typeof device !== "object" || device === null) {
+    fail("adapter_unavailable", "WebGPU requestDevice returned no device");
+  }
+  try {
+    const { createWebGpuTrainingAdapter } = await import("./webgpu-adapter.ts");
+    return createWebGpuTrainingAdapter(
+      device as Parameters<typeof createWebGpuTrainingAdapter>[0],
+    );
+  } catch (error) {
+    const destroy = capturedMember(device, "destroy");
+    if (typeof destroy === "function") {
+      try {
+        Reflect.apply(destroy, device, []);
+      } catch {
+        // Factory admission failed; preserve that primary error.
+      }
+    }
+    throw error;
+  }
+}
+
 export async function prepareTraining(
   model: WebTrainingModelV1,
   config: WebTrainingConfigV1,
@@ -2162,7 +2206,24 @@ export async function prepareTraining(
   validateModel(model);
   validateConfig(config);
   if (adapter === undefined) {
-    if (config.backend === "wasm" || (config.backend === "auto" && config.allowWasmFallback)) {
+    if (config.backend !== "wasm") {
+      try {
+        adapter = await requestDefaultWebGpuAdapter() ?? undefined;
+      } catch (error) {
+        if (config.backend === "webgpu" || !config.allowWasmFallback) {
+          if (error instanceof WebTrainingError) throw error;
+          fail(
+            "adapter_unavailable",
+            `WebGPU device could not be created: ${
+              error instanceof Error ? error.message : "unknown failure"
+            }`,
+          );
+        }
+      }
+    }
+    if (adapter === undefined &&
+        (config.backend === "wasm" ||
+          (config.backend === "auto" && config.allowWasmFallback))) {
       const plan = compileTrainingPlan(model, config);
       const {
         createPortableWasmTrainingAdapter,
@@ -2180,10 +2241,10 @@ export async function prepareTraining(
           }`,
         );
       }
-    } else {
+    } else if (adapter === undefined) {
       fail(
         "adapter_unavailable",
-        "no generated WebGPU adapter was supplied",
+        "no WebGPU adapter or device is available",
       );
     }
   }
