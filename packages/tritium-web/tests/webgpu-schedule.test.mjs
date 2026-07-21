@@ -113,7 +113,7 @@ function view(command) {
   );
 }
 
-test("resident schedule covers 52 graph/loss forms plus transactional SGD", () => {
+test("resident schedule covers 52 graph/loss forms plus four transactional optimizers", () => {
   const supported = new Set([
     "graph.detach", "graph.scale_const", "graph.add", "graph.mul", "graph.relu2",
     "graph.silu", "graph.causal_mask", "graph.softmax", "graph.rmsnorm", "loss.mse",
@@ -123,7 +123,7 @@ test("resident schedule covers 52 graph/loss forms plus transactional SGD", () =
     "graph.concat_cols",
     "graph.conv1d", "graph.conv2d", "graph.attention",
     "loss.softmax_cross_entropy",
-    "optimizer.sgd",
+    "optimizer.sgd", "optimizer.adamw", "optimizer.cautious_adamw", "optimizer.muon",
   ]);
   const representatives = new Map();
   for (const item of corpus.cases) {
@@ -131,7 +131,7 @@ test("resident schedule covers 52 graph/loss forms plus transactional SGD", () =
     if (supported.has(item.operation) && item.expected.kind === "success" &&
         !representatives.has(key)) representatives.set(key, item);
   }
-  assert.equal(representatives.size, 53);
+  assert.equal(representatives.size, 56);
   for (const [key, item] of representatives) {
     const representative = representativePlan(item);
     const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
@@ -231,7 +231,7 @@ test("concat packs forward parts with GPU copies and emits ordered VJP slices", 
 
 test("unsupported forms and malformed specialized geometry fail closed", () => {
   const unsupported = corpus.cases.find((candidate) =>
-    candidate.operation === "optimizer.adamw" && candidate.execution === "step" &&
+    candidate.operation === "optimizer.int8_adamw" && candidate.execution === "step" &&
     candidate.expected.kind === "success");
   const optimizer = representativePlan(unsupported);
   const schedule = compileWebGpuResidentScheduleV1(optimizer.plan, BUDGET);
@@ -408,4 +408,88 @@ test("SGD computes into a candidate and commits only after dispatch", () => {
     () => compileWebGpuResidentScheduleV1(forged, BUDGET),
     (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
   );
+});
+
+test("AdamW stages candidates and commits all three state planes transactionally", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "optimizer.adamw" && candidate.execution === "step" &&
+    candidate.expected.kind === "success");
+  const representative = representativePlan(item);
+  const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
+  const resources = schedule.auxiliaryResources().resources;
+  const bytes = item.inputs[0].shape.reduce((size, dimension) => size * dimension, 4);
+  assert.deepEqual(resources.map((resource) => resource.byteLength), Array(5).fill(bytes));
+  const transaction = schedule.transaction(
+    representative.phase, representative.operationId, 4, 7,
+  );
+  assert.deepEqual(transaction.commands.map((command) => command.stageIndex), [0, 1, 2, 3]);
+  assert.deepEqual(transaction.commands.map((command) => command.uniformSlot), [4, 5, 6, 7]);
+  assert.deepEqual(transaction.commands[0].storageBindings, {
+    1: "parameter", 2: "gradient", 3: "moment1", 4: "moment2",
+    5: resources[0].id, 6: resources[1].id, 7: resources[2].id,
+    8: resources[3].id, 9: resources[4].id,
+  });
+  assert.deepEqual(transaction.commitCopies.map((copy) => [copy.source, copy.destination]), [
+    [resources[0].id, "parameter"],
+    [resources[1].id, "moment1"],
+    [resources[2].id, "moment2"],
+  ]);
+  assert.equal(view(transaction.commands[0]).getUint32(0, true), bytes / 4);
+  assert.equal(view(transaction.commands[0]).getUint32(32, true), 0x3f4a501a);
+  assert.equal(view(transaction.commands[0]).getUint32(36, true), 0x3e9a738c);
+});
+
+test("cautious AdamW resets its atomic mask before every staged transaction", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "optimizer.cautious_adamw" && candidate.execution === "step" &&
+    candidate.expected.kind === "success");
+  const representative = representativePlan(item);
+  const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
+  const resources = schedule.auxiliaryResources().resources;
+  const transaction = schedule.transaction(
+    representative.phase, representative.operationId, 0, 3,
+  );
+  assert.deepEqual(transaction.commands.map((command) => command.stageIndex),
+    [0, 1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(transaction.copies, [{
+    source: resources[6].id,
+    sourceOffset: 0,
+    destination: resources[5].id,
+    destinationOffset: 0,
+    byteLength: 4,
+  }]);
+  assert.deepEqual([...resources[6].initialBytes], [0, 0, 0, 0]);
+  assert.equal(transaction.commands[3].storageBindings[10], resources[5].id);
+  assert.equal(transaction.commands[5].storageBindings[10], resources[5].id);
+  assert.equal(view(transaction.commands[0]).getUint32(32, true), 0x3ef9db22);
+  assert.equal(view(transaction.commands[0]).getUint32(36, true), 0x3e120c4c);
+});
+
+test("Muon snapshots mutable inputs, owns exact workspace, then commits state", () => {
+  const item = corpus.cases.find((candidate) =>
+    candidate.operation === "optimizer.muon" && candidate.execution === "step" &&
+    candidate.expected.kind === "success");
+  const representative = representativePlan(item);
+  const schedule = compileWebGpuResidentScheduleV1(representative.plan, BUDGET);
+  const resources = schedule.auxiliaryResources().resources;
+  const attribute = (name) => item.attributes.find((candidate) => candidate.name === name).value;
+  const rows = attribute("rows");
+  const cols = attribute("cols");
+  const len = rows * cols;
+  const square = Math.min(rows, cols) ** 2;
+  assert.deepEqual(resources.map((resource) => resource.byteLength), [
+    (3 * len + 3 * square + 2) * 4, len * 4, len * 4,
+  ]);
+  const transaction = schedule.transaction(
+    representative.phase, representative.operationId, 2, 1,
+  );
+  assert.deepEqual(transaction.copies.map((copy) => [copy.source, copy.destination]), [
+    ["parameter", resources[1].id], ["momentum", resources[2].id],
+  ]);
+  assert.deepEqual(transaction.commands[0].storageBindings, {
+    1: resources[1].id, 2: "gradient", 3: resources[2].id, 4: resources[0].id,
+  });
+  assert.deepEqual(transaction.commitCopies.map((copy) => [copy.source, copy.destination]), [
+    [resources[1].id, "parameter"], [resources[2].id, "momentum"],
+  ]);
 });

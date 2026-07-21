@@ -63,6 +63,9 @@ const SPECIALIZED = new Set([
   "graph.attention",
   "loss.softmax_cross_entropy",
   "optimizer.sgd",
+  "optimizer.adamw",
+  "optimizer.cautious_adamw",
+  "optimizer.muon",
 ]);
 
 function fail(
@@ -282,6 +285,20 @@ function u32Bytes(values: readonly number[]): Uint8Array {
   });
 }
 
+// Match Rust f32::powi/LLVM powi: binary32 rounding occurs after every
+// multiply, not once after a double-precision Math.pow.
+function powiF32(base: number, exponent: number): number {
+  let factor = base;
+  let power = exponent;
+  let result = Math.fround(1);
+  while (power !== 0) {
+    if (power % 2 === 1) result = Math.fround(result * factor);
+    power = Math.floor(power / 2);
+    if (power !== 0) factor = Math.fround(factor * factor);
+  }
+  return result;
+}
+
 function expect(
   buffers: BufferMap,
   bufferId: string,
@@ -314,6 +331,31 @@ function requireDisjointWrites(
   }
 }
 
+function indexedStage(
+  invocation: WebGpuLoweringInvocationV1,
+  stageIndex: number,
+  expectedModuleId: string,
+  uniformBytes: Uint8Array,
+  storageBindings: Readonly<Record<number, string>>,
+  workgroups: readonly [number, number, number],
+  expectedRepeat: "once" | "per_output" = "once",
+): WebGpuResidentDispatchV1 {
+  const form = webGpuDispatchFormV1(invocation.operation, invocation.execution);
+  if (form.stages[stageIndex]?.repeat !== expectedRepeat ||
+      form.stages[stageIndex]?.moduleId !== expectedModuleId) {
+    fail("invalid_schema", `${invocation.operation} specialized catalog stage drifted`);
+  }
+  return Object.freeze({
+    operation: invocation.operation,
+    execution: invocation.execution,
+    stageIndex,
+    uniformSlot: 0,
+    uniformBytes,
+    storageBindings: Object.freeze({ ...storageBindings }),
+    workgroups: Object.freeze([...workgroups]) as readonly [number, number, number],
+  });
+}
+
 function stage(
   invocation: WebGpuLoweringInvocationV1,
   expectedModuleId: string,
@@ -323,19 +365,12 @@ function stage(
   expectedRepeat: "once" | "per_output" = "once",
 ): WebGpuResidentDispatchV1 {
   const form = webGpuDispatchFormV1(invocation.operation, invocation.execution);
-  if (form.stages.length !== 1 || form.stages[0]?.repeat !== expectedRepeat ||
-      form.stages[0]?.moduleId !== expectedModuleId) {
+  if (form.stages.length !== 1) {
     fail("invalid_schema", `${invocation.operation} specialized catalog stage drifted`);
   }
-  return Object.freeze({
-    operation: invocation.operation,
-    execution: invocation.execution,
-    stageIndex: 0,
-    uniformSlot: 0,
-    uniformBytes,
-    storageBindings: Object.freeze({ ...storageBindings }),
-    workgroups: Object.freeze([...workgroups]) as readonly [number, number, number],
-  });
+  return indexedStage(
+    invocation, 0, expectedModuleId, uniformBytes, storageBindings, workgroups, expectedRepeat,
+  );
 }
 
 /** Compile pointwise and first-tranche specialized forms into resident transactions. */
@@ -1028,6 +1063,235 @@ export function compileWebGpuResidentScheduleV1(
             destinationOffset: 0,
             byteLength: len * 4,
           })]),
+        });
+      }
+      case "optimizer.adamw|step":
+      case "optimizer.cautious_adamw|step": {
+        const cautious = invocation.operation === "optimizer.cautious_adamw";
+        const expectedStages = cautious ? 7 : 4;
+        if (webGpuDispatchFormV1(invocation.operation, invocation.execution).stages.length !==
+            expectedStages) {
+          fail("invalid_schema", `${invocation.operation} specialized catalog stage drifted`);
+        }
+        if (safeU64(attributes.step, "step") !== 0) {
+          fail("invalid_schema", `${invocation.operation} compiled recipe step must start at zero`);
+        }
+        const learningRate = webGpuF32V1(attributes.lr, "lr");
+        const beta1 = webGpuF32V1(attributes.beta1, "beta1");
+        const beta2 = webGpuF32V1(attributes.beta2, "beta2");
+        const epsilon = webGpuF32V1(attributes.eps, "eps");
+        const weightDecay = webGpuF32V1(attributes.weight_decay, "weight_decay");
+        if (learningRate < 0 || beta1 < 0 || beta1 >= 1 || beta2 < 0 || beta2 >= 1 ||
+            epsilon <= 0 || weightDecay < 0) {
+          fail("invalid_schema", `${invocation.operation} scalar attributes are invalid`);
+        }
+        const parameter = requiredWebGpuRoleV1(input, "parameter");
+        const gradient = requiredWebGpuRoleV1(input, "gradient");
+        const moment1 = requiredWebGpuRoleV1(input, "moment1");
+        const moment2 = requiredWebGpuRoleV1(input, "moment2");
+        const resultParameter = requiredWebGpuRoleV1(output, "parameter");
+        const resultMoment1 = requiredWebGpuRoleV1(output, "moment1");
+        const resultMoment2 = requiredWebGpuRoleV1(output, "moment2");
+        const parameterBuffer = buffers.get(parameter);
+        if (parameterBuffer === undefined || parameterBuffer.dtype !== "f32") {
+          fail("invalid_schema", `${invocation.operation} parameter must be f32`);
+        }
+        for (const [id, role] of [
+          [gradient, "gradient"], [moment1, "moment1"], [moment2, "moment2"],
+          [resultParameter, "result parameter"], [resultMoment1, "result moment1"],
+          [resultMoment2, "result moment2"],
+        ] as const) {
+          expect(buffers, id, "f32", parameterBuffer.shape, `${invocation.operation} ${role}`);
+        }
+        for (const [source, destination, role] of [
+          [parameter, resultParameter, "parameter"],
+          [moment1, resultMoment1, "moment1"],
+          [moment2, resultMoment2, "moment2"],
+        ] as const) {
+          if (buffers.get(source)!.ownerId !== buffers.get(destination)!.ownerId) {
+            fail("invalid_schema", `${invocation.operation} output must commit to ${role} owner`);
+          }
+        }
+        const len = product(`${invocation.operation} parameter`, ...parameterBuffer.shape);
+        const bytes = product(`${invocation.operation} bytes`, len, 4);
+        const candidateParameter = auxiliary("adamw-parameter-candidate", bytes, null);
+        const candidateMoment1 = auxiliary("adamw-moment1-candidate", bytes, null);
+        const candidateMoment2 = auxiliary("adamw-moment2-candidate", bytes, null);
+        const scratch1 = auxiliary("adamw-scratch-1", bytes, null);
+        const scratch2 = auxiliary("adamw-scratch-2", bytes, null);
+        let aligned: string | undefined;
+        let zero: string | undefined;
+        if (cautious) {
+          aligned = auxiliary("cautious-adamw-aligned", 4, null);
+          zero = auxiliary("cautious-adamw-zero", 4, [0]);
+        }
+        const workgroups = [Math.ceil(len / 64), 1, 1] as const;
+        const commandFactory = (optimizerStep: number) => {
+          if (!Number.isSafeInteger(optimizerStep) || optimizerStep <= 0) {
+            fail("invalid_schema", "optimizerStep must be a positive safe integer");
+          }
+          const exponent = Math.min(optimizerStep, 0x7fff_ffff);
+          const correction1 = Math.fround(1 - powiF32(beta1, exponent));
+          const correction2 = Math.fround(1 - powiF32(beta2, exponent));
+          const shrink = Math.fround(1 - Math.fround(learningRate * weightDecay));
+          const params = uniform(48, (view) => {
+            view.setUint32(0, len, true);
+            view.setFloat32(16, learningRate, true);
+            view.setFloat32(20, beta1, true);
+            view.setFloat32(24, beta2, true);
+            view.setFloat32(28, epsilon, true);
+            view.setFloat32(32, correction1, true);
+            view.setFloat32(36, correction2, true);
+            view.setFloat32(40, shrink, true);
+          });
+          const commands = [
+            indexedStage(invocation, 0, "adamw", params, {
+              1: parameter, 2: gradient, 3: moment1, 4: moment2,
+              5: candidateParameter, 6: candidateMoment1, 7: candidateMoment2,
+              8: scratch1, 9: scratch2,
+            }, workgroups),
+            indexedStage(invocation, 1, "adamw_terms", params, {
+              2: gradient, 6: candidateMoment1, 8: scratch1, 9: scratch2,
+            }, workgroups),
+            indexedStage(invocation, 2, "adamw_variance", params, {
+              7: candidateMoment2, 9: scratch2,
+            }, workgroups),
+          ];
+          if (cautious) {
+            commands.push(
+              indexedStage(invocation, 3, "cautious_adamw_mask", params, {
+                2: gradient, 6: candidateMoment1, 7: candidateMoment2,
+                8: scratch1, 10: aligned!,
+              }, workgroups),
+              indexedStage(invocation, 4, "cautious_adamw_lr", params, {
+                8: scratch1,
+              }, workgroups),
+              indexedStage(invocation, 5, "cautious_adamw_rescale", params, {
+                8: scratch1, 10: aligned!,
+              }, workgroups),
+              indexedStage(invocation, 6, "cautious_adamw_finish", params, {
+                5: candidateParameter, 8: scratch1,
+              }, workgroups),
+            );
+          } else {
+            commands.push(indexedStage(invocation, 3, "adamw_finish", params, {
+              5: candidateParameter, 6: candidateMoment1, 7: candidateMoment2,
+            }, workgroups));
+          }
+          return Object.freeze(commands);
+        };
+        return Object.freeze({
+          commands: Object.freeze([]),
+          commandFactory,
+          copies: cautious ? Object.freeze([Object.freeze({
+            source: zero!, sourceOffset: 0, destination: aligned!, destinationOffset: 0,
+            byteLength: 4,
+          })]) : Object.freeze([]),
+          commitCopies: Object.freeze([
+            Object.freeze({
+              source: candidateParameter, sourceOffset: 0, destination: resultParameter,
+              destinationOffset: 0, byteLength: bytes,
+            }),
+            Object.freeze({
+              source: candidateMoment1, sourceOffset: 0, destination: resultMoment1,
+              destinationOffset: 0, byteLength: bytes,
+            }),
+            Object.freeze({
+              source: candidateMoment2, sourceOffset: 0, destination: resultMoment2,
+              destinationOffset: 0, byteLength: bytes,
+            }),
+          ]),
+        });
+      }
+      case "optimizer.muon|step": {
+        if (webGpuDispatchFormV1(invocation.operation, invocation.execution).stages.length !== 1) {
+          fail("invalid_schema", "optimizer.muon specialized catalog stage drifted");
+        }
+        if (safeU64(attributes.step, "step") !== 0) {
+          fail("invalid_schema", "Muon compiled recipe step must start at zero");
+        }
+        const learningRate = webGpuF32V1(attributes.lr, "lr");
+        const momentumDecay = webGpuF32V1(attributes.momentum, "momentum");
+        const weightDecay = webGpuF32V1(attributes.weight_decay, "weight_decay");
+        const rows = positiveU32(attributes.rows, "rows");
+        const cols = positiveU32(attributes.cols, "cols");
+        const steps = positiveU32(attributes.ns_steps, "ns_steps");
+        if (learningRate < 0 || momentumDecay < 0 || momentumDecay >= 1 || weightDecay < 0 ||
+            steps > 32) {
+          fail("invalid_schema", "Muon scalar attributes are invalid");
+        }
+        const len = product("Muon parameter", rows, cols);
+        const parameter = requiredWebGpuRoleV1(input, "parameter");
+        const gradient = requiredWebGpuRoleV1(input, "gradient");
+        const momentum = requiredWebGpuRoleV1(input, "momentum");
+        const resultParameter = requiredWebGpuRoleV1(output, "parameter");
+        const resultMomentum = requiredWebGpuRoleV1(output, "momentum");
+        for (const [id, role] of [
+          [parameter, "parameter"], [gradient, "gradient"], [momentum, "momentum"],
+          [resultParameter, "result parameter"], [resultMomentum, "result momentum"],
+        ] as const) {
+          expect(buffers, id, "f32", [rows, cols], `Muon ${role}`);
+        }
+        if (buffers.get(parameter)!.ownerId !== buffers.get(resultParameter)!.ownerId ||
+            buffers.get(momentum)!.ownerId !== buffers.get(resultMomentum)!.ownerId) {
+          fail("invalid_schema", "Muon outputs must commit to their input owners");
+        }
+        const bytes = product("Muon parameter bytes", len, 4);
+        const r = Math.min(rows, cols);
+        const square = product("Muon square workspace", r, r);
+        const workspaceElements = sumU32(
+          "Muon workspace", product("Muon vector workspace", len, 3),
+          product("Muon matrix workspace", square, 3), 2,
+        );
+        const workspace = auxiliary(
+          "muon-workspace", product("Muon workspace bytes", workspaceElements, 4), null,
+        );
+        const candidateParameter = auxiliary("muon-parameter-candidate", bytes, null);
+        const candidateMomentum = auxiliary("muon-momentum-candidate", bytes, null);
+        const commandFactory = (optimizerStep: number) => {
+          if (!Number.isSafeInteger(optimizerStep) || optimizerStep <= 0) {
+            fail("invalid_schema", "optimizerStep must be a positive safe integer");
+          }
+          const scale = Math.fround(
+            learningRate * Math.fround(Math.sqrt(Math.fround(Math.max(rows, cols)))),
+          );
+          const shrink = Math.fround(1 - Math.fround(learningRate * weightDecay));
+          const params = uniform(32, (view) => {
+            view.setUint32(0, len, true);
+            view.setUint32(4, rows, true);
+            view.setUint32(8, cols, true);
+            view.setUint32(12, steps, true);
+            view.setFloat32(16, momentumDecay, true);
+            view.setFloat32(20, scale, true);
+            view.setFloat32(24, shrink, true);
+          });
+          return Object.freeze([stage(invocation, "muon", params, {
+            1: candidateParameter, 2: gradient, 3: candidateMomentum, 4: workspace,
+          }, [1, 1, 1])]);
+        };
+        return Object.freeze({
+          commands: Object.freeze([]),
+          commandFactory,
+          copies: Object.freeze([
+            Object.freeze({
+              source: parameter, sourceOffset: 0, destination: candidateParameter,
+              destinationOffset: 0, byteLength: bytes,
+            }),
+            Object.freeze({
+              source: momentum, sourceOffset: 0, destination: candidateMomentum,
+              destinationOffset: 0, byteLength: bytes,
+            }),
+          ]),
+          commitCopies: Object.freeze([
+            Object.freeze({
+              source: candidateParameter, sourceOffset: 0, destination: resultParameter,
+              destinationOffset: 0, byteLength: bytes,
+            }),
+            Object.freeze({
+              source: candidateMomentum, sourceOffset: 0, destination: resultMomentum,
+              destinationOffset: 0, byteLength: bytes,
+            }),
+          ]),
         });
       }
       default:
