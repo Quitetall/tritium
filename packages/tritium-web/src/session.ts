@@ -2205,10 +2205,12 @@ export async function prepareTraining(
 ): Promise<WebTrainingSession> {
   validateModel(model);
   validateConfig(config);
+  let ownsAutomaticAdapter = false;
   if (adapter === undefined) {
     if (config.backend !== "wasm") {
       try {
         adapter = await requestDefaultWebGpuAdapter() ?? undefined;
+        ownsAutomaticAdapter = adapter !== undefined;
       } catch (error) {
         if (config.backend === "webgpu" || !config.allowWasmFallback) {
           if (error instanceof WebTrainingError) throw error;
@@ -2248,5 +2250,16 @@ export async function prepareTraining(
       );
     }
   }
-  return WebTrainingSession.prepare(model, config, adapter);
+  try {
+    return await WebTrainingSession.prepare(model, config, adapter);
+  } catch (error) {
+    if (ownsAutomaticAdapter) {
+      try {
+        await adapter.dispose();
+      } catch {
+        // Admission failure is authoritative; cleanup cannot replace it.
+      }
+    }
+    throw error;
+  }
 }

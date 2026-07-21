@@ -710,6 +710,16 @@ test("prepareTraining acquires WebGPU and preserves strict fallback policy", asy
       (error) => error instanceof WebTrainingError && error.code === "invalid_schema",
     );
     assert.equal(destroyedInvalidDevice, true);
+
+    const undersizedDevice = new FakeDevice({ maxBufferSize: 1024 });
+    globalThis.navigator.gpu.requestAdapter = async () => ({
+      async requestDevice() { return undersizedDevice; },
+    });
+    await assert.rejects(
+      prepareTraining(model, config),
+      (error) => error instanceof WebTrainingError && error.code === "memory_limit",
+    );
+    assert.equal(undersizedDevice.destroyed, true);
   } finally {
     if (priorNavigator === undefined) delete globalThis.navigator;
     else Object.defineProperty(globalThis, "navigator", priorNavigator);
