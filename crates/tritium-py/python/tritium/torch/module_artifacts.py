@@ -1,0 +1,581 @@
+"""Strict, bounded, resumable artifacts for generic module PTQ conversion."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Tuple, Union
+
+import torch
+
+from .config import TernaryConfig
+from .coverage import CoverageReport
+from .projection import TernaryPlane
+
+Pathish = Union[str, os.PathLike[str]]
+_MANIFEST = "conversion.json"
+_TOP_FIELDS = {
+    "schema_version",
+    "artifact_kind",
+    "source_model_digest",
+    "evidence_id",
+    "algorithm_id",
+    "recipe_id",
+    "artifact_id",
+    "config",
+    "coverage",
+    "weight_receipts",
+}
+_WEIGHT_FIELDS = {
+    "schema_version",
+    "recipe_id",
+    "path",
+    "aliases",
+    "shape",
+    "weighted_mse",
+    "planes",
+}
+_RECEIPT_REF_FIELDS = {"file", "digest", "bytes"}
+_PLANE_FIELDS = {
+    "trits_file",
+    "trits_digest",
+    "trits_bytes",
+    "scales_file",
+    "scales_digest",
+    "scales_bytes",
+    "scales_shape",
+    "group_size",
+}
+
+
+@dataclass(frozen=True)
+class FittedPlaneRef:
+    trits_path: Path
+    trits_digest: str
+    trits_bytes: int
+    scales_path: Path
+    scales_digest: str
+    scales_bytes: int
+    scales_shape: Tuple[int, ...]
+    group_size: int
+
+
+@dataclass(frozen=True)
+class FittedWeightRef:
+    path: str
+    aliases: Tuple[str, ...]
+    shape: Tuple[int, int]
+    planes: Tuple[FittedPlaneRef, ...]
+    weighted_mse: float
+
+
+@dataclass(frozen=True, eq=False)
+class FittedWeight:
+    path: str
+    aliases: Tuple[str, ...]
+    planes: Tuple[TernaryPlane, ...]
+    weighted_mse: float
+
+
+@dataclass(frozen=True)
+class ModuleQuantizationResult:
+    artifact_dir: Path
+    artifact_id: str
+    source_model_digest: str
+    evidence_id: str
+    algorithm_id: str
+    recipe_id: str
+    config: TernaryConfig
+    coverage: CoverageReport
+    weights: Tuple[FittedWeightRef, ...]
+    schema_version: int = 1
+
+    @property
+    def weight_names(self) -> Tuple[str, ...]:
+        return tuple(weight.path for weight in self.weights)
+
+    def weight(self, path: str) -> FittedWeight:
+        """Load and rehash one fitted weight without retaining other weights."""
+
+        try:
+            reference = next(weight for weight in self.weights if weight.path == path)
+        except StopIteration as error:
+            raise KeyError(path) from error
+        planes = []
+        rows, columns = reference.shape
+        for plane in reference.planes:
+            trits_payload = _read_exact(
+                plane.trits_path,
+                plane.trits_digest,
+                plane.trits_bytes,
+            )
+            scales_payload = _read_exact(
+                plane.scales_path,
+                plane.scales_digest,
+                plane.scales_bytes,
+            )
+            trits = torch.frombuffer(
+                bytearray(trits_payload), dtype=torch.int8
+            ).reshape(rows, columns)
+            scales = torch.frombuffer(
+                bytearray(scales_payload), dtype=torch.float16
+            ).reshape(plane.scales_shape)
+            if not bool(torch.all((trits >= -1) & (trits <= 1))):
+                raise ValueError("conversion plane contains non-ternary values")
+            if not bool(torch.isfinite(scales).all()) or bool((scales < 0).any()):
+                raise ValueError("conversion plane scales are invalid")
+            planes.append(
+                TernaryPlane(
+                    trits=trits,
+                    scales=scales,
+                    group_size=plane.group_size,
+                )
+            )
+        return FittedWeight(
+            path=reference.path,
+            aliases=reference.aliases,
+            planes=tuple(planes),
+            weighted_mse=reference.weighted_mse,
+        )
+
+
+def _pairs_without_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate conversion manifest field {key!r}")
+        value[key] = item
+    return value
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _digest_bytes(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def module_recipe_id(
+    source_model_digest: str,
+    evidence_id: str,
+    algorithm_id: str,
+    config: TernaryConfig,
+    coverage: CoverageReport,
+) -> str:
+    identity = {
+        "schema_version": 1,
+        "source_model_digest": source_model_digest,
+        "evidence_id": evidence_id,
+        "algorithm_id": algorithm_id,
+        "config": config.to_dict(),
+        "coverage": coverage.to_dict(),
+    }
+    return _digest_bytes(_canonical(identity))
+
+
+def _digest_file(path: Path, maximum: int) -> Tuple[str, int]:
+    metadata = path.lstat()
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("conversion payload must be an ordinary file")
+    if metadata.st_size <= 0 or metadata.st_size > maximum:
+        raise ValueError("conversion payload exceeds byte ceiling")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest(), metadata.st_size
+
+
+def _read_exact(path: Path, digest: str, byte_count: int) -> bytes:
+    actual_digest, actual_bytes = _digest_file(path, byte_count)
+    if actual_digest != digest or actual_bytes != byte_count:
+        raise ValueError("conversion payload identity mismatch")
+    return path.read_bytes()
+
+
+def _read_json(path: Path, maximum: int = 1024 * 1024) -> Dict[str, Any]:
+    metadata = path.lstat()
+    if path.is_symlink() or not path.is_file() or metadata.st_size > maximum:
+        raise ValueError("conversion receipt must be a bounded ordinary file")
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream, object_pairs_hook=_pairs_without_duplicates)
+    if not isinstance(value, dict):
+        raise ValueError("conversion receipt must contain one JSON object")
+    return value
+
+
+def _validate_digest(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 71
+        or not value.startswith("sha256:")
+    ):
+        raise ValueError(f"invalid {field}")
+    try:
+        bytes.fromhex(value[7:])
+    except ValueError as error:
+        raise ValueError(f"invalid {field}") from error
+    return value
+
+
+def _load_weight_receipt(
+    directory: Path,
+    receipt_name: str,
+    index: int,
+    maximum_bytes: int,
+    expected_recipe_id: str,
+) -> FittedWeightRef:
+    if receipt_name != f"weight-{index:05d}.json":
+        raise ValueError("conversion weight receipts are out of canonical order")
+    value = _read_json(directory / receipt_name)
+    if set(value) != _WEIGHT_FIELDS or value["schema_version"] != 1:
+        raise ValueError("conversion weight receipt fields differ from schema")
+    if value["recipe_id"] != expected_recipe_id:
+        raise ValueError("conversion weight receipt belongs to another recipe")
+    aliases = value["aliases"]
+    shape = value["shape"]
+    if (
+        not isinstance(value["path"], str)
+        or not value["path"]
+        or not isinstance(aliases, list)
+        or not aliases
+        or any(not isinstance(alias, str) or not alias for alias in aliases)
+        or not isinstance(shape, list)
+        or len(shape) != 2
+        or any(type(dimension) is not int or dimension <= 0 for dimension in shape)
+    ):
+        raise ValueError("conversion weight identity or geometry is invalid")
+    weighted_mse = value["weighted_mse"]
+    if (
+        type(weighted_mse) not in {int, float}
+        or not math.isfinite(weighted_mse)
+        or weighted_mse < 0
+    ):
+        raise ValueError("conversion weighted_mse must be finite and nonnegative")
+    plane_values = value["planes"]
+    if not isinstance(plane_values, list) or not 1 <= len(plane_values) <= 3:
+        raise ValueError("conversion weight requires one to three planes")
+    planes = []
+    elements = shape[0] * shape[1]
+    for plane_index, plane in enumerate(plane_values):
+        if not isinstance(plane, dict) or set(plane) != _PLANE_FIELDS:
+            raise ValueError("conversion plane fields differ from schema")
+        trits_name = f"weight-{index:05d}-plane-{plane_index}.trits.i8"
+        scales_name = f"weight-{index:05d}-plane-{plane_index}.scales.f16le"
+        if plane["trits_file"] != trits_name or plane["scales_file"] != scales_name:
+            raise ValueError("conversion plane filenames are noncanonical")
+        scales_shape = plane["scales_shape"]
+        if (
+            plane["trits_bytes"] != elements
+            or not isinstance(scales_shape, list)
+            or not scales_shape
+            or any(
+                type(dimension) is not int or dimension <= 0
+                for dimension in scales_shape
+            )
+            or scales_shape != [shape[0], 1]
+            or plane["scales_bytes"] != math.prod(scales_shape) * 2
+            or type(plane["group_size"]) is not int
+            or plane["group_size"] != shape[1]
+        ):
+            raise ValueError("conversion plane byte ledger or geometry is invalid")
+        trits_digest, trits_bytes = _digest_file(
+            directory / trits_name, maximum_bytes
+        )
+        scales_digest, scales_bytes = _digest_file(
+            directory / scales_name, maximum_bytes
+        )
+        if (
+            trits_digest != _validate_digest(plane["trits_digest"], "trits_digest")
+            or scales_digest
+            != _validate_digest(plane["scales_digest"], "scales_digest")
+            or trits_bytes != plane["trits_bytes"]
+            or scales_bytes != plane["scales_bytes"]
+        ):
+            raise ValueError("conversion plane payload identity mismatch")
+        planes.append(
+            FittedPlaneRef(
+                trits_path=directory / trits_name,
+                trits_digest=trits_digest,
+                trits_bytes=trits_bytes,
+                scales_path=directory / scales_name,
+                scales_digest=scales_digest,
+                scales_bytes=scales_bytes,
+                scales_shape=tuple(scales_shape),
+                group_size=plane["group_size"],
+            )
+        )
+    return FittedWeightRef(
+        path=value["path"],
+        aliases=tuple(aliases),
+        shape=(shape[0], shape[1]),
+        planes=tuple(planes),
+        weighted_mse=float(weighted_mse),
+    )
+
+
+def load_module_conversion(
+    artifact_dir: Pathish,
+    *,
+    max_payload_bytes: int = 8 * 1024 * 1024 * 1024,
+) -> ModuleQuantizationResult:
+    requested = Path(artifact_dir)
+    if requested.is_symlink():
+        raise ValueError("module conversion directory must not be a symlink")
+    directory = requested.resolve(strict=True)
+    if not directory.is_dir():
+        raise ValueError("module conversion must be an ordinary directory")
+    value = _read_json(directory / _MANIFEST)
+    if set(value) != _TOP_FIELDS or value["schema_version"] != 1:
+        raise ValueError("module conversion manifest fields differ from schema")
+    if value["artifact_kind"] != "tritium.module-additive-ptq-v1":
+        raise ValueError("unsupported module conversion artifact kind")
+    for field in (
+        "source_model_digest",
+        "evidence_id",
+        "recipe_id",
+        "artifact_id",
+    ):
+        _validate_digest(value[field], field)
+    if not isinstance(value["algorithm_id"], str) or not value["algorithm_id"]:
+        raise ValueError("invalid conversion algorithm_id")
+    receipt_values = value["weight_receipts"]
+    if not isinstance(receipt_values, list) or not receipt_values:
+        raise ValueError("module conversion has no weight receipts")
+    receipt_names = []
+    weights = []
+    for index, reference in enumerate(receipt_values):
+        if not isinstance(reference, dict) or set(reference) != _RECEIPT_REF_FIELDS:
+            raise ValueError("conversion receipt reference fields differ from schema")
+        name = f"weight-{index:05d}.json"
+        if reference["file"] != name or type(reference["bytes"]) is not int:
+            raise ValueError("conversion receipt reference is noncanonical")
+        digest, byte_count = _digest_file(directory / name, 1024 * 1024)
+        if (
+            digest != _validate_digest(reference["digest"], "receipt digest")
+            or byte_count != reference["bytes"]
+        ):
+            raise ValueError("conversion weight receipt identity mismatch")
+        receipt_names.append(name)
+        weights.append(
+            _load_weight_receipt(
+                directory,
+                name,
+                index,
+                max_payload_bytes,
+                value["recipe_id"],
+            )
+        )
+    weights = tuple(weights)
+    expected_files = {_MANIFEST, *receipt_names}
+    for weight in weights:
+        for plane in weight.planes:
+            expected_files.add(plane.trits_path.name)
+            expected_files.add(plane.scales_path.name)
+    if {child.name for child in directory.iterdir()} != expected_files:
+        raise ValueError("module conversion directory contains unknown files")
+    identity = dict(value)
+    artifact_id = identity.pop("artifact_id")
+    if artifact_id != _digest_bytes(_canonical(identity)):
+        raise ValueError("module conversion artifact identity mismatch")
+    config = TernaryConfig.from_dict(value["config"])
+    coverage = CoverageReport.from_dict(value["coverage"])
+    if value["recipe_id"] != module_recipe_id(
+        value["source_model_digest"],
+        value["evidence_id"],
+        value["algorithm_id"],
+        config,
+        coverage,
+    ):
+        raise ValueError("module conversion recipe identity mismatch")
+    if any(len(weight.planes) != config.planes for weight in weights):
+        raise ValueError("module conversion plane count differs from recipe")
+    return ModuleQuantizationResult(
+        artifact_dir=directory,
+        artifact_id=artifact_id,
+        source_model_digest=value["source_model_digest"],
+        evidence_id=value["evidence_id"],
+        algorithm_id=value["algorithm_id"],
+        recipe_id=value["recipe_id"],
+        config=config,
+        coverage=coverage,
+        weights=weights,
+    )
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def seal_module_conversion(
+    artifact_dir: Pathish,
+    *,
+    source_model_digest: str,
+    evidence_id: str,
+    algorithm_id: str,
+    recipe_id: str,
+    config: TernaryConfig,
+    coverage: CoverageReport,
+    records: Iterable[Any],
+    fit_weight: Callable[[Any], FittedWeight],
+) -> ModuleQuantizationResult:
+    """Resume per-weight fitting, then atomically seal one conversion manifest."""
+
+    requested = Path(artifact_dir)
+    if requested.is_symlink():
+        raise ValueError("module conversion directory must not be a symlink")
+    directory = requested.resolve()
+    if (directory / _MANIFEST).exists():
+        result = load_module_conversion(directory)
+        expected = (
+            source_model_digest,
+            evidence_id,
+            algorithm_id,
+            recipe_id,
+            config,
+            coverage,
+        )
+        observed = (
+            result.source_model_digest,
+            result.evidence_id,
+            result.algorithm_id,
+            result.recipe_id,
+            result.config,
+            result.coverage,
+        )
+        if observed != expected:
+            raise ValueError("sealed module conversion belongs to another recipe")
+        return result
+    directory.mkdir(parents=True, exist_ok=True)
+    for child in directory.iterdir():
+        if (
+            child.name.startswith(".tmp-")
+            and child.is_file()
+            and not child.is_symlink()
+        ):
+            child.unlink()
+    receipt_references = []
+    for index, record in enumerate(records):
+        receipt_name = f"weight-{index:05d}.json"
+        receipt_path = directory / receipt_name
+        if receipt_path.exists():
+            reference = _load_weight_receipt(
+                directory,
+                receipt_name,
+                index,
+                8 * 1024**3,
+                recipe_id,
+            )
+            if (
+                reference.path != record.weight_aliases[0]
+                or reference.aliases != record.weight_aliases
+            ):
+                raise ValueError(
+                    "resumed conversion weight identity differs from calibration"
+                )
+            receipt_digest, receipt_bytes = _digest_file(receipt_path, 1024 * 1024)
+            receipt_references.append(
+                {"file": receipt_name, "digest": receipt_digest, "bytes": receipt_bytes}
+            )
+            continue
+        fitted = fit_weight(record)
+        rows, columns = fitted.planes[0].trits.shape
+        plane_values = []
+        for plane_index, plane in enumerate(fitted.planes):
+            trits_name = f"weight-{index:05d}-plane-{plane_index}.trits.i8"
+            scales_name = f"weight-{index:05d}-plane-{plane_index}.scales.f16le"
+            trits_payload = plane.trits.detach().cpu().contiguous().numpy().tobytes()
+            scales = plane.scales.detach().to(torch.float16).cpu().contiguous()
+            scales_payload = scales.numpy().tobytes()
+            _atomic_write(directory / trits_name, trits_payload)
+            _atomic_write(directory / scales_name, scales_payload)
+            plane_values.append(
+                {
+                    "trits_file": trits_name,
+                    "trits_digest": _digest_bytes(trits_payload),
+                    "trits_bytes": len(trits_payload),
+                    "scales_file": scales_name,
+                    "scales_digest": _digest_bytes(scales_payload),
+                    "scales_bytes": len(scales_payload),
+                    "scales_shape": list(scales.shape),
+                    "group_size": plane.group_size,
+                }
+            )
+        receipt = {
+            "schema_version": 1,
+            "recipe_id": recipe_id,
+            "path": fitted.path,
+            "aliases": list(fitted.aliases),
+            "shape": [rows, columns],
+            "weighted_mse": fitted.weighted_mse,
+            "planes": plane_values,
+        }
+        _atomic_write(receipt_path, _canonical(receipt))
+        _load_weight_receipt(
+            directory,
+            receipt_name,
+            index,
+            8 * 1024**3,
+            recipe_id,
+        )
+        receipt_digest, receipt_bytes = _digest_file(receipt_path, 1024 * 1024)
+        receipt_references.append(
+            {"file": receipt_name, "digest": receipt_digest, "bytes": receipt_bytes}
+        )
+    manifest = {
+        "schema_version": 1,
+        "artifact_kind": "tritium.module-additive-ptq-v1",
+        "source_model_digest": source_model_digest,
+        "evidence_id": evidence_id,
+        "algorithm_id": algorithm_id,
+        "recipe_id": recipe_id,
+        "config": config.to_dict(),
+        "coverage": coverage.to_dict(),
+        "weight_receipts": receipt_references,
+    }
+    expected_files = {reference["file"] for reference in receipt_references}
+    for index, reference in enumerate(receipt_references):
+        receipt = _read_json(directory / reference["file"])
+        for plane in receipt["planes"]:
+            expected_files.add(plane["trits_file"])
+            expected_files.add(plane["scales_file"])
+    unknown = {
+        child.name
+        for child in directory.iterdir()
+        if child.name not in expected_files and not child.name.startswith(".tmp-")
+    }
+    if unknown:
+        raise ValueError("module conversion work directory contains unknown files")
+    manifest["artifact_id"] = _digest_bytes(_canonical(manifest))
+    _atomic_write(directory / _MANIFEST, _canonical(manifest))
+    return load_module_conversion(directory)
+
+
+__all__ = [
+    "FittedPlaneRef",
+    "FittedWeight",
+    "FittedWeightRef",
+    "ModuleQuantizationResult",
+    "load_module_conversion",
+    "module_recipe_id",
+    "seal_module_conversion",
+]

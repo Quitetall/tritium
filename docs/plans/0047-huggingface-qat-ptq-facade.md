@@ -86,8 +86,10 @@ saves with safe serialization, automatically reloads through
   diagonal second moments into an atomically published, strict-reload evidence
   namespace. Public `convert` now fits source/recipe/coverage-bound hard
   additive planes from that evidence, including stored-scale-correct residual
-  fitting. Bounded resumable generic fitting, physical allocation/packing and
-  stronger factorized curvature remain open.
+  fitting. Generic conversion now checkpoints each fitted weight independently,
+  strict-reloads every digest/ledger, lazily loads one weight at a time, resumes
+  missing weights after restart and atomically seals recipe-bound state.
+  Physical allocation/packing and stronger factorized curvature remain open.
 - [x] Expose immutable, exact-ledger `ArtifactRef`, `QuantizationResult`, and
   `ExportReceipt` records plus atomic matrix-bundle export. `complete_model`
   remains false because vision is intentionally outside the language-plus-MTP

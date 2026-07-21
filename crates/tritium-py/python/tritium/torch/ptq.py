@@ -20,8 +20,14 @@ from ..salt import reconcile_qwen36_ptq_packages
 from .artifacts import QuantizationResult, load
 from .config import TernaryConfig
 from .conversion import PreparedModel, prepare
-from .coverage import CoverageReport
 from .errors import TritiumError
+from .module_artifacts import (
+    FittedWeight,
+    ModuleQuantizationResult,
+    load_module_conversion,
+    module_recipe_id,
+    seal_module_conversion,
+)
 from .projection import TernaryPlane, TernaryProjection, validate_projection
 
 Pathish = Union[str, os.PathLike[str]]
@@ -68,30 +74,6 @@ class ActivationCalibrationReceipt:
     token_stream_digest: str
     max_evidence_bytes: int
     records: Tuple[ActivationRecord, ...]
-    schema_version: int = 1
-
-
-@dataclass(frozen=True, eq=False)
-class FittedWeight:
-    """One source parameter projected into hard additive ternary planes."""
-
-    path: str
-    aliases: Tuple[str, ...]
-    planes: Tuple[TernaryPlane, ...]
-    weighted_mse: float
-
-
-@dataclass(frozen=True, eq=False)
-class ModuleQuantizationResult:
-    """Non-deployable generic PTQ intermediate awaiting artifact packing."""
-
-    source_model_digest: str
-    evidence_id: str
-    algorithm_id: str
-    recipe_id: str
-    config: TernaryConfig
-    coverage: CoverageReport
-    weights: Tuple[FittedWeight, ...]
     schema_version: int = 1
 
 
@@ -597,7 +579,7 @@ def _diagonal_additive_projection(
         ).clamp_min(0)
         plane = TernaryPlane(
             trits=trits,
-            scales=scale.to(master.dtype),
+            scales=scale.to(torch.float16),
             group_size=master.shape[1],
         )
         fitted_planes.append(plane)
@@ -629,6 +611,7 @@ def _diagonal_algorithm_id(planes: int) -> str:
 def _fit_module(
     prepared: PreparedModel,
     calibration: ActivationCalibrationReceipt,
+    work_dir: Pathish,
 ) -> ModuleQuantizationResult:
     """Fit hard additive planes from strict live-module calibration evidence."""
 
@@ -651,6 +634,12 @@ def _fit_module(
             stage="convert",
             details={"target_bpw": prepared.config.target_bpw},
         )
+    if prepared.coverage is None:
+        raise TritiumError(
+            "module conversion requires exact prepared coverage",
+            code="coverage_missing",
+            stage="convert",
+        )
     reopened = load_activation_calibration(
         calibration.evidence_dir,
         max_evidence_bytes=calibration.max_evidence_bytes,
@@ -669,8 +658,16 @@ def _fit_module(
             stage="convert",
         )
     parameters = dict(prepared.model.named_parameters(remove_duplicate=False))
-    fitted = []
-    for record in calibration.records:
+    algorithm_id = _diagonal_algorithm_id(prepared.config.planes)
+    recipe_id = module_recipe_id(
+        source_digest,
+        calibration.evidence_id,
+        algorithm_id,
+        prepared.config,
+        prepared.coverage,
+    )
+
+    def fit_weight(record: ActivationRecord) -> FittedWeight:
         try:
             master = parameters[record.weight_aliases[0]]
         except KeyError as error:
@@ -692,33 +689,23 @@ def _fit_module(
         ).square()
         denominator = curvature.sum().clamp_min(1e-30) * master.shape[0]
         weighted_mse = float((error * curvature).sum() / denominator)
-        fitted.append(
-            FittedWeight(
-                path=record.weight_aliases[0],
-                aliases=record.weight_aliases,
-                planes=projection.planes,
-                weighted_mse=weighted_mse,
-            )
+        return FittedWeight(
+            path=record.weight_aliases[0],
+            aliases=record.weight_aliases,
+            planes=projection.planes,
+            weighted_mse=weighted_mse,
         )
-    identity = {
-        "schema_version": 1,
-        "source_model_digest": source_digest,
-        "evidence_id": calibration.evidence_id,
-        "algorithm_id": _diagonal_algorithm_id(prepared.config.planes),
-        "config": prepared.config.to_dict(),
-        "coverage": prepared.coverage.to_dict(),
-    }
-    recipe_id = "sha256:" + hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return ModuleQuantizationResult(
+
+    return seal_module_conversion(
+        work_dir,
         source_model_digest=source_digest,
         evidence_id=calibration.evidence_id,
-        algorithm_id=_diagonal_algorithm_id(prepared.config.planes),
+        algorithm_id=algorithm_id,
         recipe_id=recipe_id,
         config=prepared.config,
         coverage=prepared.coverage,
-        weights=tuple(fitted),
+        records=calibration.records,
+        fit_weight=fit_weight,
     )
 
 
@@ -801,9 +788,10 @@ def convert(
     if not isinstance(prepared, PreparedModel):
         raise TypeError("convert requires a PreparedModel")
     if isinstance(prepared.model, nn.Module):
+        if work_dir is None:
+            raise TypeError("live-module convert requires work_dir")
         qwen_arguments = {
             "revision": revision,
-            "work_dir": work_dir,
             "output_dir": output_dir,
             "compact_max_bytes": compact_max_bytes,
             "compact_max_resident_bytes": compact_max_resident_bytes,
@@ -818,7 +806,7 @@ def convert(
                 "live-module convert does not accept Qwen package arguments: "
                 + ", ".join(supplied)
             )
-        return _fit_module(prepared, calibration)
+        return _fit_module(prepared, calibration, work_dir)
     if not isinstance(calibration, CalibrationReceipt):
         raise TypeError("Qwen convert requires a CalibrationReceipt")
     if prepared.config.mode != "ptq" or not isinstance(prepared.model, Path):
@@ -921,5 +909,6 @@ __all__ = [
     "calibrate",
     "convert",
     "load_activation_calibration",
+    "load_module_conversion",
     "quantize",
 ]
