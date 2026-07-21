@@ -332,12 +332,12 @@ def main() -> int:
     parser.add_argument("--source-revision")
     args = parser.parse_args()
     try:
+        if args.receipt and args.smoke_evidence:
+            raise WheelError("choose either --receipt or --smoke-evidence")
         wheel = resolve_wheel(args.wheel)
         result = inspect_wheel(wheel, _workspace_version(args.workspace))
         if args.install_smoke:
             clean_install_smoke(wheel, args.workspace)
-        if args.receipt and args.smoke_evidence:
-            raise WheelError("choose either --receipt or --smoke-evidence")
         if args.receipt:
             if not args.install_smoke:
                 raise WheelError("compatibility receipts require --install-smoke")

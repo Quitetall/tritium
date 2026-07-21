@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "verify-wheel.py"
@@ -128,6 +129,23 @@ class VerifyWheelTests(unittest.TestCase):
     def test_target_binding_rejects_unknown_receipt_cell(self):
         with self.assertRaisesRegex(MODULE.WheelError, "unsupported compatibility target"):
             MODULE.qualify_target("linux-aarch64-cpu", "manylinux_2_28_aarch64")
+
+    def test_evidence_modes_fail_before_wheel_io(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "verify-wheel.py",
+                "missing.whl",
+                "--receipt",
+                "receipt.json",
+                "--smoke-evidence",
+                "smoke.json",
+            ],
+        ), mock.patch("sys.stderr", stderr), self.assertRaises(SystemExit):
+            MODULE.main()
+        self.assertIn("choose either --receipt or --smoke-evidence", stderr.getvalue())
 
     def test_runtime_cell_id_is_derived_from_interpreter(self):
         self.assertEqual(
