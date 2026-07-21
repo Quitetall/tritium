@@ -2481,7 +2481,8 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".dt_bias")
                 || name.ends_with(".a_log")
                 || name.ends_with(".allowed")
-                || name.ends_with(".blocked") =>
+                || name.ends_with(".blocked")
+                || name.ends_with(".inv_frequency") =>
             {
                 Some(TENSOR_FLOAT)
             }
@@ -2664,11 +2665,12 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
         ("", "Concat") => &["axis"],
         ("", "ReduceMean") => &["keepdims"],
         ("", "Gather") => &["axis"],
+        ("", "Cast") => &["to"],
         (
             "",
             "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Relu" | "Reshape" | "Tile"
             | "Identity" | "Slice" | "Neg" | "Shape" | "Range" | "Unsqueeze" | "LessOrEqual"
-            | "Where",
+            | "Where" | "Cos" | "Sin",
         ) => &[],
         _ => &[],
     }
@@ -2776,7 +2778,8 @@ fn node_supported(
             "",
             "Transpose" | "MatMul" | "Mul" | "Add" | "Div" | "Sqrt" | "Sigmoid" | "Relu"
             | "Reshape" | "Tile" | "Identity" | "Slice" | "Neg" | "Concat" | "ReduceMean"
-            | "Softmax" | "Shape" | "Gather" | "Range" | "Unsqueeze" | "LessOrEqual" | "Where",
+            | "Softmax" | "Shape" | "Gather" | "Range" | "Unsqueeze" | "LessOrEqual" | "Where"
+            | "Cast" | "Cos" | "Sin",
         ) => standard_opset == Some(ONNX_OPSET),
         _ => false,
     }
@@ -5482,6 +5485,107 @@ impl CausalGraphBuilder {
         mask
     }
 
+    #[cfg(test)]
+    fn add_dynamic_rotary_tables(
+        &mut self,
+        prefix: &str,
+        geometry: &DynamicSequenceGeometry,
+        rotary_dim: usize,
+        theta: f32,
+    ) -> Result<(String, String), OnnxModelError> {
+        if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) {
+            return Err(OnnxModelError::InvalidModel(
+                "dynamic RoPE dimension must be positive and even".to_owned(),
+            ));
+        }
+        if !theta.is_finite() || theta <= 0.0 {
+            return Err(OnnxModelError::InvalidModel(
+                "dynamic RoPE theta must be finite and positive".to_owned(),
+            ));
+        }
+        let half = rotary_dim / 2;
+        let mut inverse = Vec::new();
+        inverse
+            .try_reserve_exact(half)
+            .map_err(|_| OnnxModelError::ShapeOverflow("dynamic RoPE frequencies"))?;
+        for lane in 0..half {
+            let value = f64::from(theta).powf(-2.0 * lane as f64 / rotary_dim as f64) as f32;
+            if !value.is_finite() {
+                return Err(OnnxModelError::InvalidModel(
+                    "dynamic RoPE frequency is non-finite".to_owned(),
+                ));
+            }
+            inverse.push(value);
+        }
+        let inverse_name = format!("{prefix}.inv_frequency");
+        self.add_f32(
+            &inverse_name,
+            vec![1, as_i64(half, "dynamic RoPE half dimension")?],
+            &inverse,
+        );
+        let positions_float = format!("{prefix}.positions_float");
+        self.standard(
+            format!("{prefix}.cast_positions"),
+            "Cast",
+            &[&geometry.positions],
+            &[&positions_float],
+            vec![int_attribute("to", i64::from(TENSOR_FLOAT))],
+        );
+        let position_axes = format!("{prefix}.position_axes");
+        self.add_i64(&position_axes, vec![1], &[1]);
+        let position_column = format!("{prefix}.position_column");
+        self.standard(
+            format!("{prefix}.position_column_node"),
+            "Unsqueeze",
+            &[&positions_float, &position_axes],
+            &[&position_column],
+            Vec::new(),
+        );
+        let half_angles = format!("{prefix}.half_angles");
+        self.standard(
+            format!("{prefix}.angle_matmul"),
+            "MatMul",
+            &[&position_column, &inverse_name],
+            &[&half_angles],
+            Vec::new(),
+        );
+        let angles = format!("{prefix}.angles");
+        self.standard(
+            format!("{prefix}.duplicate_angles"),
+            "Concat",
+            &[&half_angles, &half_angles],
+            &[&angles],
+            vec![int_attribute("axis", 1)],
+        );
+        let table_axes = format!("{prefix}.table_axes");
+        self.add_i64(&table_axes, vec![1], &[1]);
+        let table = format!("{prefix}.table");
+        self.standard(
+            format!("{prefix}.table_node"),
+            "Unsqueeze",
+            &[&angles, &table_axes],
+            &[&table],
+            Vec::new(),
+        );
+        let cos = format!("{prefix}.cos");
+        let sin = format!("{prefix}.sin");
+        self.standard(
+            format!("{prefix}.cos_node"),
+            "Cos",
+            &[&table],
+            &[&cos],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.sin_node"),
+            "Sin",
+            &[&table],
+            &[&sin],
+            Vec::new(),
+        );
+        Ok((cos, sin))
+    }
+
     fn add_causal_mask(
         &mut self,
         name: &str,
@@ -7718,6 +7822,9 @@ pub(crate) fn encode_dynamic_sequence_geometry_test_graph() -> Vec<u8> {
     let mut graph = CausalGraphBuilder::default();
     let geometry = graph.add_dynamic_sequence_geometry("tokens", "past_tokens", "sequence");
     let mask = graph.add_dynamic_causal_mask("causal_mask", &geometry);
+    let (cos, sin) = graph
+        .add_dynamic_rotary_tables("rope", &geometry, 4, 10_000.0)
+        .unwrap();
     assert!(graph.failure.is_none());
     ModelProto {
         ir_version: ONNX_IR_VERSION,
@@ -7750,6 +7857,24 @@ pub(crate) fn encode_dynamic_sequence_geometry_test_graph() -> Vec<u8> {
                         DimValue(1),
                         DimParam("query_tokens".to_owned()),
                         DimParam("total_tokens".to_owned()),
+                    ],
+                ),
+                tensor_value_dimensions(
+                    &cos,
+                    TENSOR_FLOAT,
+                    vec![
+                        DimParam("query_tokens".to_owned()),
+                        DimValue(1),
+                        DimValue(4),
+                    ],
+                ),
+                tensor_value_dimensions(
+                    &sin,
+                    TENSOR_FLOAT,
+                    vec![
+                        DimParam("query_tokens".to_owned()),
+                        DimValue(1),
+                        DimValue(4),
                     ],
                 ),
                 tensor_value(&geometry.token_count, TENSOR_INT64, &[]),

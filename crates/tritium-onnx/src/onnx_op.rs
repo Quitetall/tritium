@@ -2945,9 +2945,40 @@ mod tests {
         let (mask_shape, mask) = prompt[1].try_extract_tensor::<f32>().unwrap();
         assert_eq!(mask_shape.as_ref(), &[1, 2, 2]);
         assert_f32_close(mask, &[0.0, -1.0e9, 0.0, 0.0], 0.0);
-        assert_eq!(prompt[2].try_extract_scalar::<i64>().unwrap(), 2);
-        assert_eq!(prompt[3].try_extract_scalar::<i64>().unwrap(), 0);
+        let (cos_shape, cos) = prompt[2].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(cos_shape.as_ref(), &[2, 1, 4]);
+        assert_f32_close(
+            cos,
+            &[
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0_f32.cos(),
+                0.01_f32.cos(),
+                1.0_f32.cos(),
+                0.01_f32.cos(),
+            ],
+            1.0e-6,
+        );
+        let (_, sin) = prompt[3].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(
+            sin,
+            &[
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0_f32.sin(),
+                0.01_f32.sin(),
+                1.0_f32.sin(),
+                0.01_f32.sin(),
+            ],
+            1.0e-6,
+        );
         assert_eq!(prompt[4].try_extract_scalar::<i64>().unwrap(), 2);
+        assert_eq!(prompt[5].try_extract_scalar::<i64>().unwrap(), 0);
+        assert_eq!(prompt[6].try_extract_scalar::<i64>().unwrap(), 2);
         drop(prompt);
 
         let decode_token = Tensor::from_array(([1], vec![9_i64])).unwrap();
@@ -2958,9 +2989,21 @@ mod tests {
         let (mask_shape, mask) = decode[1].try_extract_tensor::<f32>().unwrap();
         assert_eq!(mask_shape.as_ref(), &[1, 1, 3]);
         assert_f32_close(mask, &[0.0, 0.0, 0.0], 0.0);
-        assert_eq!(decode[2].try_extract_scalar::<i64>().unwrap(), 1);
-        assert_eq!(decode[3].try_extract_scalar::<i64>().unwrap(), 2);
-        assert_eq!(decode[4].try_extract_scalar::<i64>().unwrap(), 3);
+        let (_, cos) = decode[2].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(
+            cos,
+            &[2.0_f32.cos(), 0.02_f32.cos(), 2.0_f32.cos(), 0.02_f32.cos()],
+            1.0e-6,
+        );
+        let (_, sin) = decode[3].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(
+            sin,
+            &[2.0_f32.sin(), 0.02_f32.sin(), 2.0_f32.sin(), 0.02_f32.sin()],
+            1.0e-6,
+        );
+        assert_eq!(decode[4].try_extract_scalar::<i64>().unwrap(), 1);
+        assert_eq!(decode[5].try_extract_scalar::<i64>().unwrap(), 2);
+        assert_eq!(decode[6].try_extract_scalar::<i64>().unwrap(), 3);
     }
 
     #[test]
