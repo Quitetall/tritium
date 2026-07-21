@@ -1,6 +1,8 @@
 //! Deterministic ONNX protobuf serialization for Tritium inference graphs.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use half::f16;
 use prost::Message;
@@ -1879,6 +1881,22 @@ pub struct ExternalQwen35Bundle {
     pub weights_blake3: [u8; 32],
 }
 
+/// Qwen graph bytes plus receipt for seek-backed `weights.bin` emission.
+///
+/// Weight bytes are written directly into caller-provided file and never
+/// retained in returned value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeekExternalQwen35Bundle {
+    /// Canonical `language.onnx` bytes.
+    pub language_model_bytes: Vec<u8>,
+    /// Canonical `mtp.onnx` bytes.
+    pub mtp_model_bytes: Vec<u8>,
+    /// Exact synchronized `weights.bin` byte count.
+    pub weights_bytes: u64,
+    /// BLAKE3 digest of streamed `weights.bin`, bound by both graphs.
+    pub weights_blake3: [u8; 32],
+}
+
 /// Borrowed three-file Qwen language-plus-MTP package presented for admission.
 #[derive(Debug, Clone, Copy)]
 pub struct ExternalQwen35BundleFiles<'a> {
@@ -3076,6 +3094,55 @@ pub fn encode_external_qwen35_bundle_with_ancestry<'a, M: OnnxPackedMatrix<'a>>(
     encode_external_qwen35_bundle_inner(language, mtp, Some(ancestry))
 }
 
+/// Stream one Qwen language-plus-MTP weight arena into pre-opened empty file.
+///
+/// Caller owns path admission and must open handle without following symlinks.
+/// Function validates ordinary empty handle, writes canonical aligned ranges,
+/// verifies shared embedding/head aliases, flushes, and `sync_all`s before
+/// returning graph bytes and content receipt.
+///
+/// # Errors
+/// [`OnnxModelError`] on invalid ancestry/model, non-empty or non-file handle,
+/// I/O failure, shared-range mismatch, or protobuf overflow.
+pub fn encode_external_qwen35_bundle_to_file_with_ancestry<'a, M: OnnxPackedMatrix<'a>>(
+    language: QwenCausalLmModel<'a, M>,
+    mtp: Qwen35MtpModel<'a, M>,
+    ancestry: Qwen35OnnxAncestryV1<'_>,
+    weights_file: File,
+) -> Result<SeekExternalQwen35Bundle, OnnxModelError> {
+    validate_qwen35_bundle_pair(&language, &mtp)?;
+    validate_qwen35_onnx_ancestry(ancestry)?;
+    let (mut language_protobuf, language_weights) =
+        build_qwen_causal_lm_graph(language, CausalGraphBuilder::external_file(weights_file)?)?;
+    let language_weights = language_weights.ok_or_else(|| {
+        OnnxModelError::InvalidModel("Qwen language bundle used inline storage".to_owned())
+    })?;
+    let aliases = qwen_shared_external_aliases(&language_protobuf)?;
+    let (mut mtp_protobuf, weights) = build_qwen35_mtp_graph(
+        mtp,
+        CausalGraphBuilder::external_reusing(language_weights, aliases),
+    )?;
+    let metadata = qwen35_onnx_ancestry_metadata(ancestry);
+    language_protobuf.metadata_props.extend(metadata.clone());
+    mtp_protobuf.metadata_props.extend(metadata);
+    let weights = weights.ok_or_else(|| {
+        OnnxModelError::InvalidModel("Qwen MTP bundle used inline storage".to_owned())
+    })?;
+    let (weights_bytes, weights_blake3) = weights.finish_file()?;
+    let weights_len = usize::try_from(weights_bytes)
+        .map_err(|_| OnnxModelError::ShapeOverflow("external data length"))?;
+    Ok(SeekExternalQwen35Bundle {
+        language_model_bytes: bind_external_metadata_parts(
+            language_protobuf,
+            weights_len,
+            weights_blake3,
+        )?,
+        mtp_model_bytes: bind_external_metadata_parts(mtp_protobuf, weights_len, weights_blake3)?,
+        weights_bytes,
+        weights_blake3,
+    })
+}
+
 fn encode_external_qwen35_bundle_inner<'a, M: OnnxPackedMatrix<'a>>(
     language: QwenCausalLmModel<'a, M>,
     mtp: Qwen35MtpModel<'a, M>,
@@ -3097,9 +3164,11 @@ fn encode_external_qwen35_bundle_inner<'a, M: OnnxPackedMatrix<'a>>(
         language_protobuf.metadata_props.extend(metadata.clone());
         mtp_protobuf.metadata_props.extend(metadata);
     }
-    let weights_bytes = weights.ok_or_else(|| {
-        OnnxModelError::InvalidModel("Qwen MTP bundle used inline storage".to_owned())
-    })?;
+    let weights_bytes = weights
+        .ok_or_else(|| {
+            OnnxModelError::InvalidModel("Qwen MTP bundle used inline storage".to_owned())
+        })?
+        .into_memory()?;
     let weights_blake3 = *blake3::hash(&weights_bytes).as_bytes();
     Ok(ExternalQwen35Bundle {
         language_model_bytes: bind_external_metadata(language_protobuf, &weights_bytes)?,
@@ -3186,11 +3255,15 @@ pub fn encode_external_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
 
 fn finish_external_model(
     protobuf: ModelProto,
-    weights: Option<Vec<u8>>,
+    weights: Option<ExternalWeightArena>,
 ) -> Result<ExternalOnnxModel, OnnxModelError> {
-    let weights_bytes = weights.ok_or_else(|| {
-        OnnxModelError::InvalidModel("external graph builder returned inline storage".to_owned())
-    })?;
+    let weights_bytes = weights
+        .ok_or_else(|| {
+            OnnxModelError::InvalidModel(
+                "external graph builder returned inline storage".to_owned(),
+            )
+        })?
+        .into_memory()?;
     let weights_blake3 = *blake3::hash(&weights_bytes).as_bytes();
     let model_bytes = bind_external_metadata(protobuf, &weights_bytes)?;
     Ok(ExternalOnnxModel {
@@ -3201,16 +3274,28 @@ fn finish_external_model(
 }
 
 fn bind_external_metadata(
-    mut protobuf: ModelProto,
+    protobuf: ModelProto,
     weights_bytes: &[u8],
 ) -> Result<Vec<u8>, OnnxModelError> {
-    let digest = blake3::hash(weights_bytes).to_hex().to_string();
+    bind_external_metadata_parts(
+        protobuf,
+        weights_bytes.len(),
+        *blake3::hash(weights_bytes).as_bytes(),
+    )
+}
+
+fn bind_external_metadata_parts(
+    mut protobuf: ModelProto,
+    weights_bytes: usize,
+    weights_blake3: [u8; 32],
+) -> Result<Vec<u8>, OnnxModelError> {
+    let digest = weights_blake3
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     protobuf.metadata_props.extend([
         metadata("tritium.external_data.file", EXTERNAL_WEIGHTS_FILE),
-        metadata(
-            "tritium.external_data.bytes",
-            &weights_bytes.len().to_string(),
-        ),
+        metadata("tritium.external_data.bytes", &weights_bytes.to_string()),
         metadata("tritium.external_data.blake3", &digest),
     ]);
     let model_bytes = protobuf.encode_to_vec();
@@ -4263,8 +4348,207 @@ enum CausalInitializerStorage {
 }
 
 struct ExternalInitializerStorage {
-    weights: Vec<u8>,
+    weights: ExternalWeightArena,
     aliases: BTreeMap<String, TensorProto>,
+}
+
+enum ExternalWeightArena {
+    Memory(Vec<u8>),
+    File {
+        file: File,
+        bytes: usize,
+        hasher: Box<blake3::Hasher>,
+    },
+}
+
+impl ExternalWeightArena {
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(bytes) => bytes.len(),
+            Self::File { bytes, .. } => *bytes,
+        }
+    }
+
+    fn reserve_range(&mut self, length: usize) -> Result<usize, OnnxModelError> {
+        let current = self.len();
+        let offset = align_up(current, EXTERNAL_ALIGNMENT)?;
+        let padding = offset
+            .checked_sub(current)
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "external initializer padding",
+            ))?;
+        let required = padding
+            .checked_add(length)
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "external initializer allocation",
+            ))?;
+        match self {
+            Self::Memory(bytes) => {
+                bytes.try_reserve_exact(required).map_err(|_| {
+                    OnnxModelError::ShapeOverflow("external initializer allocation")
+                })?;
+                bytes.resize(offset, 0);
+            }
+            Self::File {
+                file,
+                bytes,
+                hasher,
+            } => {
+                file.seek(SeekFrom::Start(u64::try_from(current).map_err(|_| {
+                    OnnxModelError::ShapeOverflow("external initializer offset")
+                })?))
+                .map_err(external_io)?;
+                if padding != 0 {
+                    let zeros = [0_u8; EXTERNAL_ALIGNMENT];
+                    file.write_all(&zeros[..padding]).map_err(external_io)?;
+                    hasher.update(&zeros[..padding]);
+                }
+                *bytes = offset;
+            }
+        }
+        Ok(offset)
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<(), OnnxModelError> {
+        match self {
+            Self::Memory(arena) => arena.extend_from_slice(bytes),
+            Self::File {
+                file,
+                bytes: length,
+                hasher,
+            } => {
+                file.write_all(bytes).map_err(external_io)?;
+                hasher.update(bytes);
+                *length = length
+                    .checked_add(bytes.len())
+                    .ok_or(OnnxModelError::ShapeOverflow("external initializer length"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn append_generated<const WIDTH: usize>(
+        &mut self,
+        count: usize,
+        mut encode: impl FnMut(usize) -> Result<[u8; WIDTH], OnnxModelError>,
+    ) -> Result<(), OnnxModelError> {
+        if WIDTH == 0 {
+            return Err(OnnxModelError::InvalidModel(
+                "external initializer element width must be positive".to_owned(),
+            ));
+        }
+        let chunk_items = (64 * 1024 / WIDTH).max(1);
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(chunk_items.saturating_mul(WIDTH))
+            .map_err(|_| OnnxModelError::ShapeOverflow("external write buffer"))?;
+        let mut base = 0;
+        while base < count {
+            buffer.clear();
+            let end = base.saturating_add(chunk_items).min(count);
+            for index in base..end {
+                buffer.extend_from_slice(&encode(index)?);
+            }
+            self.append(&buffer)?;
+            base = end;
+        }
+        Ok(())
+    }
+
+    fn range_equals(&mut self, offset: usize, expected: &[u8]) -> Result<bool, OnnxModelError> {
+        let end = offset
+            .checked_add(expected.len())
+            .ok_or(OnnxModelError::ShapeOverflow(
+                "shared external initializer range",
+            ))?;
+        if end > self.len() {
+            return Ok(false);
+        }
+        match self {
+            Self::Memory(bytes) => Ok(bytes[offset..end] == *expected),
+            Self::File { file, bytes, .. } => {
+                file.seek(SeekFrom::Start(u64::try_from(offset).map_err(|_| {
+                    OnnxModelError::ShapeOverflow("shared external initializer offset")
+                })?))
+                .map_err(external_io)?;
+                let mut cursor = 0;
+                let mut buffer = [0_u8; 8192];
+                while cursor < expected.len() {
+                    let count = (expected.len() - cursor).min(buffer.len());
+                    file.read_exact(&mut buffer[..count]).map_err(external_io)?;
+                    if buffer[..count] != expected[cursor..cursor + count] {
+                        file.seek(SeekFrom::Start(u64::try_from(*bytes).map_err(|_| {
+                            OnnxModelError::ShapeOverflow("external initializer length")
+                        })?))
+                        .map_err(external_io)?;
+                        return Ok(false);
+                    }
+                    cursor += count;
+                }
+                file.seek(SeekFrom::Start(u64::try_from(*bytes).map_err(|_| {
+                    OnnxModelError::ShapeOverflow("external initializer length")
+                })?))
+                .map_err(external_io)?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn into_memory(self) -> Result<Vec<u8>, OnnxModelError> {
+        match self {
+            Self::Memory(bytes) => Ok(bytes),
+            Self::File { .. } => Err(OnnxModelError::InvalidModel(
+                "memory encoder received seek-backed external storage".to_owned(),
+            )),
+        }
+    }
+
+    fn finish_file(self) -> Result<(u64, [u8; 32]), OnnxModelError> {
+        match self {
+            Self::File {
+                mut file,
+                bytes,
+                hasher,
+            } => {
+                file.flush().map_err(external_io)?;
+                file.sync_all().map_err(external_io)?;
+                let bytes = u64::try_from(bytes)
+                    .map_err(|_| OnnxModelError::ShapeOverflow("external data length"))?;
+                if file.metadata().map_err(external_io)?.len() != bytes {
+                    return Err(OnnxModelError::ExternalDataMismatch(
+                        "seek-backed external data length changed after write".to_owned(),
+                    ));
+                }
+                file.seek(SeekFrom::Start(0)).map_err(external_io)?;
+                let mut verified = blake3::Hasher::new();
+                let mut remaining = bytes;
+                let mut buffer = [0_u8; 64 * 1024];
+                while remaining != 0 {
+                    let count = usize::try_from(remaining.min(buffer.len() as u64))
+                        .map_err(|_| OnnxModelError::ShapeOverflow("external data read"))?;
+                    file.read_exact(&mut buffer[..count]).map_err(external_io)?;
+                    verified.update(&buffer[..count]);
+                    remaining -= count as u64;
+                }
+                let written_digest = *hasher.finalize().as_bytes();
+                if verified.finalize().as_bytes() != &written_digest
+                    || file.metadata().map_err(external_io)?.len() != bytes
+                {
+                    return Err(OnnxModelError::ExternalDataMismatch(
+                        "seek-backed external data changed during final verification".to_owned(),
+                    ));
+                }
+                Ok((bytes, written_digest))
+            }
+            Self::Memory(_) => Err(OnnxModelError::InvalidModel(
+                "seek encoder received memory external storage".to_owned(),
+            )),
+        }
+    }
+}
+
+fn external_io(error: std::io::Error) -> OnnxModelError {
+    OnnxModelError::InvalidModel(format!("seek-backed external data I/O failed: {error}"))
 }
 
 fn encoded_external_range(tensor: &TensorProto) -> Result<(usize, usize), OnnxModelError> {
@@ -4344,7 +4628,7 @@ fn take_external_alias(
 
 fn external_storage_result(
     storage: CausalInitializerStorage,
-) -> Result<Option<Vec<u8>>, OnnxModelError> {
+) -> Result<Option<ExternalWeightArena>, OnnxModelError> {
     match storage {
         CausalInitializerStorage::External(storage) => {
             if !storage.aliases.is_empty() {
@@ -4362,21 +4646,6 @@ fn external_storage_result(
         }
         CausalInitializerStorage::Inline | CausalInitializerStorage::Counting { .. } => Ok(None),
     }
-}
-
-fn reserve_external_range(weights: &mut Vec<u8>, length: usize) -> Result<usize, OnnxModelError> {
-    let offset = align_up(weights.len(), EXTERNAL_ALIGNMENT)?;
-    let required = offset
-        .checked_sub(weights.len())
-        .and_then(|padding| padding.checked_add(length))
-        .ok_or(OnnxModelError::ShapeOverflow(
-            "external initializer allocation",
-        ))?;
-    weights
-        .try_reserve_exact(required)
-        .map_err(|_| OnnxModelError::ShapeOverflow("external initializer allocation"))?;
-    weights.resize(offset, 0);
-    Ok(offset)
 }
 
 impl Default for CausalGraphBuilder {
@@ -4534,14 +4803,37 @@ impl CausalGraphBuilder {
     fn external() -> Self {
         Self {
             storage: CausalInitializerStorage::External(ExternalInitializerStorage {
-                weights: Vec::new(),
+                weights: ExternalWeightArena::Memory(Vec::new()),
                 aliases: BTreeMap::new(),
             }),
             ..Self::default()
         }
     }
 
-    fn external_reusing(weights: Vec<u8>, aliases: BTreeMap<String, TensorProto>) -> Self {
+    fn external_file(file: File) -> Result<Self, OnnxModelError> {
+        let metadata = file.metadata().map_err(external_io)?;
+        if !metadata.is_file() || metadata.len() != 0 {
+            return Err(OnnxModelError::InvalidModel(
+                "seek-backed weights handle must be an empty ordinary file".to_owned(),
+            ));
+        }
+        Ok(Self {
+            storage: CausalInitializerStorage::External(ExternalInitializerStorage {
+                weights: ExternalWeightArena::File {
+                    file,
+                    bytes: 0,
+                    hasher: Box::new(blake3::Hasher::new()),
+                },
+                aliases: BTreeMap::new(),
+            }),
+            ..Self::default()
+        })
+    }
+
+    fn external_reusing(
+        weights: ExternalWeightArena,
+        aliases: BTreeMap<String, TensorProto>,
+    ) -> Self {
         Self {
             storage: CausalInitializerStorage::External(ExternalInitializerStorage {
                 weights,
@@ -4593,9 +4885,15 @@ impl CausalGraphBuilder {
             CausalInitializerStorage::External(storage) => {
                 match take_external_alias(storage, name, data_type, &dimensions) {
                     Ok(Some((tensor, offset, length))) => {
-                        if length != bytes.len()
-                            || storage.weights[offset..offset + length] != *bytes
-                        {
+                        let matches = length == bytes.len()
+                            && match storage.weights.range_equals(offset, bytes) {
+                                Ok(matches) => matches,
+                                Err(error) => {
+                                    self.failure.get_or_insert(error);
+                                    return;
+                                }
+                            };
+                        if !matches {
                             self.failure
                                 .get_or_insert(OnnxModelError::InvalidModel(format!(
                                     "shared external initializer {name} bytes differ"
@@ -4605,15 +4903,17 @@ impl CausalGraphBuilder {
                         tensor
                     }
                     Ok(None) => {
-                        let offset = match reserve_external_range(&mut storage.weights, bytes.len())
-                        {
+                        let offset = match storage.weights.reserve_range(bytes.len()) {
                             Ok(offset) => offset,
                             Err(error) => {
                                 self.failure.get_or_insert(error);
                                 return;
                             }
                         };
-                        storage.weights.extend_from_slice(bytes);
+                        if let Err(error) = storage.weights.append(bytes) {
+                            self.failure.get_or_insert(error);
+                            return;
+                        }
                         let offset = match i64::try_from(offset) {
                             Ok(offset) => offset,
                             Err(_) => {
@@ -4707,13 +5007,25 @@ impl CausalGraphBuilder {
         };
         match take_external_alias(storage, name, data_type, &dimensions) {
             Ok(Some((tensor, offset, alias_length))) => {
-                let bytes = &storage.weights[offset..offset + alias_length];
-                if alias_length != length
-                    || !bytes
-                        .chunks_exact(WIDTH)
-                        .zip(values)
-                        .all(|(bytes, value)| bytes == encode(*value))
-                {
+                let mut expected = Vec::new();
+                if expected.try_reserve_exact(length).is_err() {
+                    self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                        "typed alias comparison allocation",
+                    ));
+                    return;
+                }
+                for value in values {
+                    expected.extend_from_slice(&encode(*value));
+                }
+                let matches = alias_length == length
+                    && match storage.weights.range_equals(offset, &expected) {
+                        Ok(matches) => matches,
+                        Err(error) => {
+                            self.failure.get_or_insert(error);
+                            return;
+                        }
+                    };
+                if !matches {
                     self.failure
                         .get_or_insert(OnnxModelError::InvalidModel(format!(
                             "shared external initializer {name} values differ"
@@ -4729,15 +5041,19 @@ impl CausalGraphBuilder {
                 return;
             }
         }
-        let offset = match reserve_external_range(&mut storage.weights, length) {
+        let offset = match storage.weights.reserve_range(length) {
             Ok(offset) => offset,
             Err(error) => {
                 self.failure.get_or_insert(error);
                 return;
             }
         };
-        for value in values {
-            storage.weights.extend_from_slice(&encode(*value));
+        if let Err(error) = storage
+            .weights
+            .append_generated(values.len(), |index| Ok(encode(values[index])))
+        {
+            self.failure.get_or_insert(error);
+            return;
         }
         let (Ok(offset), Ok(length)) = (i64::try_from(offset), i64::try_from(length)) else {
             self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
@@ -4786,13 +5102,25 @@ impl CausalGraphBuilder {
         };
         match take_external_alias(storage, name, TENSOR_FLOAT, &dimensions) {
             Ok(Some((tensor, offset, alias_length))) => {
-                let bytes = &storage.weights[offset..offset + alias_length];
-                if alias_length != length
-                    || !bytes
-                        .chunks_exact(core::mem::size_of::<f32>())
-                        .zip(values)
-                        .all(|(bytes, value)| bytes == value.to_le_bytes())
-                {
+                let mut expected = Vec::new();
+                if expected.try_reserve_exact(length).is_err() {
+                    self.failure.get_or_insert(OnnxModelError::ShapeOverflow(
+                        "f32 alias comparison allocation",
+                    ));
+                    return;
+                }
+                for value in values {
+                    expected.extend_from_slice(&value.to_le_bytes());
+                }
+                let matches = alias_length == length
+                    && match storage.weights.range_equals(offset, &expected) {
+                        Ok(matches) => matches,
+                        Err(error) => {
+                            self.failure.get_or_insert(error);
+                            return;
+                        }
+                    };
+                if !matches {
                     self.failure
                         .get_or_insert(OnnxModelError::InvalidModel(format!(
                             "shared external initializer {name} values differ"
@@ -4808,15 +5136,19 @@ impl CausalGraphBuilder {
                 return;
             }
         }
-        let offset = match reserve_external_range(&mut storage.weights, length) {
+        let offset = match storage.weights.reserve_range(length) {
             Ok(offset) => offset,
             Err(error) => {
                 self.failure.get_or_insert(error);
                 return;
             }
         };
-        for value in values {
-            storage.weights.extend_from_slice(&value.to_le_bytes());
+        if let Err(error) = storage
+            .weights
+            .append_generated(values.len(), |index| Ok(values[index].to_le_bytes()))
+        {
+            self.failure.get_or_insert(error);
+            return;
         }
         let Ok(offset) = i64::try_from(offset) else {
             self.failure
@@ -4897,7 +5229,7 @@ impl CausalGraphBuilder {
         let CausalInitializerStorage::External(storage) = &mut self.storage else {
             unreachable!();
         };
-        let offset = match reserve_external_range(&mut storage.weights, length) {
+        let offset = match storage.weights.reserve_range(length) {
             Ok(offset) => offset,
             Err(error) => {
                 self.failure.get_or_insert(error);
@@ -4911,16 +5243,19 @@ impl CausalGraphBuilder {
             ));
             return;
         };
-        for query_index in 0..tokens {
+        if let Err(error) = storage.weights.append_generated(elements, |index| {
+            let query_index = index / total_tokens;
+            let key_index = index % total_tokens;
             let last_visible = past_tokens + query_index;
-            for key_index in 0..total_tokens {
-                let value = if key_index <= last_visible {
-                    0.0_f32
-                } else {
-                    -1.0e9
-                };
-                storage.weights.extend_from_slice(&value.to_le_bytes());
+            Ok(if key_index <= last_visible {
+                0.0_f32
+            } else {
+                -1.0e9
             }
+            .to_le_bytes())
+        }) {
+            self.failure.get_or_insert(error);
+            return;
         }
         self.initializers.push(external_tensor(
             name,
@@ -4963,7 +5298,7 @@ impl CausalGraphBuilder {
             ));
             return;
         };
-        let offset = match reserve_external_range(&mut storage.weights, length) {
+        let offset = match storage.weights.reserve_range(length) {
             Ok(offset) => offset,
             Err(error) => {
                 self.failure.get_or_insert(error);
@@ -4976,18 +5311,14 @@ impl CausalGraphBuilder {
                 .get_or_insert(OnnxModelError::ShapeOverflow("external RoPE table range"));
             return;
         };
-        for token in 0..config.tokens {
-            for lane in 0..config.rotary_dim {
-                let pair = match rotary_pair(config, token, lane) {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        self.failure.get_or_insert(error);
-                        return;
-                    }
-                };
-                let value = if cosine { pair.0 } else { pair.1 } as f32;
-                storage.weights.extend_from_slice(&value.to_le_bytes());
-            }
+        if let Err(error) = storage.weights.append_generated(elements, |index| {
+            let token = index / config.rotary_dim;
+            let lane = index % config.rotary_dim;
+            let pair = rotary_pair(config, token, lane)?;
+            Ok((if cosine { pair.0 } else { pair.1 } as f32).to_le_bytes())
+        }) {
+            self.failure.get_or_insert(error);
+            return;
         }
         self.initializers.push(external_tensor(
             name,
@@ -6291,7 +6622,7 @@ impl CausalGraphBuilder {
 fn build_qwen35_mtp_graph<'a, M: OnnxPackedMatrix<'a>>(
     model: Qwen35MtpModel<'a, M>,
     mut graph: CausalGraphBuilder,
-) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
+) -> Result<(ModelProto, Option<ExternalWeightArena>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "MTP token count")?;
     let past_tokens = as_i64(model.past_tokens, "MTP past token count")?;
     let total_tokens = tokens
@@ -6484,7 +6815,7 @@ fn build_qwen35_mtp_graph<'a, M: OnnxPackedMatrix<'a>>(
 fn build_qwen_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
     model: QwenCausalLmModel<'a, M>,
     mut graph: CausalGraphBuilder,
-) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
+) -> Result<(ModelProto, Option<ExternalWeightArena>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "token count")?;
     let past_tokens = as_i64(model.past_tokens, "past token count")?;
     let total_tokens = tokens
@@ -6694,7 +7025,7 @@ fn build_qwen_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
 fn build_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
     model: CausalLmModel<'a, M>,
     external: bool,
-) -> Result<(ModelProto, Option<Vec<u8>>), OnnxModelError> {
+) -> Result<(ModelProto, Option<ExternalWeightArena>), OnnxModelError> {
     let tokens = as_i64(model.tokens, "token count")?;
     let past_tokens = as_i64(model.past_tokens, "past token count")?;
     let total_tokens = tokens
@@ -9617,6 +9948,40 @@ mod tests {
             ancestry,
         )
         .unwrap();
+        let seek_path = std::env::temp_dir().join(format!(
+            "tritium-qwen-onnx-seek-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let seek_bundle = encode_external_qwen35_bundle_to_file_with_ancestry(
+            mapped.model(1, 0),
+            mapped.mtp_model(1, 0),
+            ancestry,
+            File::create_new(&seek_path).unwrap(),
+        )
+        .unwrap();
+        let seek_weights = std::fs::read(&seek_path).unwrap();
+        assert_eq!(
+            seek_bundle.language_model_bytes,
+            bundle.language_model_bytes
+        );
+        assert_eq!(seek_bundle.mtp_model_bytes, bundle.mtp_model_bytes);
+        assert_eq!(seek_weights, bundle.weights_bytes);
+        assert_eq!(seek_bundle.weights_bytes, seek_weights.len() as u64);
+        assert_eq!(seek_bundle.weights_blake3, bundle.weights_blake3);
+        assert!(matches!(
+            encode_external_qwen35_bundle_to_file_with_ancestry(
+                mapped.model(1, 0),
+                mapped.mtp_model(1, 0),
+                ancestry,
+                File::open(&seek_path).unwrap(),
+            ),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("empty ordinary file")
+        ));
+        std::fs::remove_file(&seek_path).unwrap();
         assert!(matches!(
             encode_external_qwen35_bundle_with_ancestry(
                 mapped.model(1, 0),
