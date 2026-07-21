@@ -135,8 +135,15 @@ initializer payload before cloning. An exact Qwen3.5/Qwen3.6 adapter now admits
 only the canonical mixed-schedule language namespace plus all 15 bundled MTP
 tensors, validates packed geometry and produces the encodable language graph.
 Its flagship entry point additionally requires the pinned 64-layer
-Qwen3.6-27B geometry and exact three-DeltaNet/one-attention cadence. External-
-data emission and executable MTP graph composition remain open.
+Qwen3.6-27B geometry and exact three-DeltaNet/one-attention cadence. Bundled MTP
+weights now emit a separate caller-aligned graph: shifted shared-token embedding,
+target-hidden fusion, forced full-attention/SwiGLU decoder, private KV cache,
+final hidden rows and untied drafter logits execute for prompt and cached decode
+through real ORT. A nondegenerate dense oracle uses both fusion halves, nonzero
+Q/K/V/O and SwiGLU projections, and cache-sensitive continuation; logits, final
+hidden rows and every prompt/decode K/V value must match. External-data emission
+and packaging both language and MTP graphs into one admitted artifact remain
+open.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:

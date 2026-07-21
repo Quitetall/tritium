@@ -420,6 +420,37 @@ pub struct Qwen35MtpDecoder<'a> {
     pub final_norm: &'a [f32],
 }
 
+/// Fixed-shape executable Qwen MTP prompt or cached-decode graph.
+///
+/// Callers supply already aligned shifted token IDs and exact final-normalized
+/// target hidden rows. Cached graphs consume `past_k.0`/`past_v.0` and publish
+/// complete `present_k.0`/`present_v.0` state.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35MtpModel<'a> {
+    /// Shifted token rows processed by this graph.
+    pub tokens: usize,
+    /// Existing MTP KV-cache rows.
+    pub past_tokens: usize,
+    /// MTP query heads.
+    pub n_head: usize,
+    /// MTP key/value heads.
+    pub n_kv_head: usize,
+    /// Elements per attention head.
+    pub head_dim: usize,
+    /// Partial Qwen RoPE contract.
+    pub rotary: RotaryEmbedding,
+    /// Positive finite zero-centered RMSNorm epsilon.
+    pub rms_epsilon: f32,
+    /// Shared language token embedding.
+    pub embedding: PackedTernaryMatrix<'a>,
+    /// Shared untied language head.
+    pub lm_head: PackedTernaryMatrix<'a>,
+    /// Exact one-layer MTP weights.
+    pub mtp: Qwen35MtpDecoder<'a>,
+    /// Complete artifact identity.
+    pub identity: OnnxArtifactIdentityV2<'a>,
+}
+
 /// Borrowed canonical tensor source for packed Qwen language-plus-MTP export.
 pub trait Qwen35TensorProvider<'a> {
     /// Enumerate complete in-scope canonical tensor names.
@@ -474,6 +505,27 @@ impl<'a> MappedQwen35<'a> {
             lm_head: Some(self.lm_head),
             layers: &self.layers,
             final_norm: self.final_norm,
+            identity: self.identity,
+        }
+    }
+
+    /// Borrow bundled MTP weights as a fixed prompt/decode graph.
+    #[must_use]
+    pub fn mtp_model(&self, tokens: usize, past_tokens: usize) -> Qwen35MtpModel<'_> {
+        Qwen35MtpModel {
+            tokens,
+            past_tokens,
+            n_head: self.config.n_head,
+            n_kv_head: self.config.n_kv_head,
+            head_dim: self.config.head_dim,
+            rotary: RotaryEmbedding {
+                theta: self.config.rope_theta,
+                dimensions: self.config.rotary_dim,
+            },
+            rms_epsilon: self.config.rms_epsilon,
+            embedding: self.embedding,
+            lm_head: self.lm_head,
+            mtp: self.mtp,
             identity: self.identity,
         }
     }
@@ -1945,14 +1997,15 @@ pub fn diagnose_unsupported_graph(
                     reason: format!("attention softmax axis must be -1, got {}", attribute.value),
                 });
             } else if node.op_type == "Concat" && attribute.name == "axis" {
-                match concat_axis(node, graph) {
-                    Some(expected) if attribute.value != expected => {
+                match concat_role(node, graph) {
+                    Some(role) if attribute.value != role.axis => {
                         diagnostics.push(UnsupportedGraphDiagnostic {
                             kind: UnsupportedGraphItemKind::Attribute,
                             subject,
                             reason: format!(
-                                "{} concat axis must be {expected}, got {}",
-                                if expected == 0 { "KV cache" } else { "RoPE" },
+                                "{} concat axis must be {}, got {}",
+                                role.label,
+                                role.axis,
                                 attribute.value
                             ),
                         });
@@ -2120,7 +2173,7 @@ pub fn diagnose_unsupported_graph(
     for input in &graph.input {
         let subject = format!("input {}", input.name);
         match input.name.as_str() {
-            "tokens" => push_dtype_diagnostic(
+            "tokens" | "shifted_tokens" => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
                 tensor_elem_type(input),
@@ -2132,7 +2185,7 @@ pub fn diagnose_unsupported_graph(
                 tensor_elem_type(input),
                 TENSOR_FLOAT,
             ),
-            "hidden" => push_dtype_diagnostic(
+            "hidden" | "target_hidden" => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
                 tensor_elem_type(input),
@@ -2162,12 +2215,14 @@ pub fn diagnose_unsupported_graph(
     for output in &graph.output {
         let subject = format!("output {}", output.name);
         match output.name.as_str() {
-            "logits" | "context" | "next_hidden" => push_dtype_diagnostic(
-                &mut diagnostics,
-                subject,
-                tensor_elem_type(output),
-                TENSOR_FLOAT,
-            ),
+            "logits" | "context" | "next_hidden" | "mtp.logits" | "mtp.final_hidden" => {
+                push_dtype_diagnostic(
+                    &mut diagnostics,
+                    subject,
+                    tensor_elem_type(output),
+                    TENSOR_FLOAT,
+                )
+            }
             name if is_deltanet_output(name) => push_dtype_diagnostic(
                 &mut diagnostics,
                 subject,
@@ -2243,7 +2298,12 @@ fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
     }
 }
 
-fn concat_axis(node: &NodeProto, graph: &GraphProto) -> Option<i64> {
+struct ConcatRole {
+    axis: i64,
+    label: &'static str,
+}
+
+fn concat_role(node: &NodeProto, graph: &GraphProto) -> Option<ConcatRole> {
     let producer = |value: &str| {
         graph
             .node
@@ -2254,7 +2314,10 @@ fn concat_axis(node: &NodeProto, graph: &GraphProto) -> Option<i64> {
         && producer(&node.input[0]).is_some_and(|candidate| candidate.op_type == "Neg")
         && producer(&node.input[1]).is_some_and(|candidate| candidate.op_type == "Slice");
     if rotary {
-        return Some(-1);
+        return Some(ConcatRole {
+            axis: -1,
+            label: "RoPE",
+        });
     }
     let rotary_prefix = node.input.len() == 2
         && node
@@ -2265,7 +2328,27 @@ fn concat_axis(node: &NodeProto, graph: &GraphProto) -> Option<i64> {
         && producer(&node.input[0]).is_some_and(|candidate| candidate.op_type == "Add")
         && producer(&node.input[1]).is_some_and(|candidate| candidate.op_type == "Slice");
     if rotary_prefix || rotary_tail {
-        return Some(-1);
+        return Some(ConcatRole {
+            axis: -1,
+            label: "RoPE",
+        });
+    }
+    let mtp_fusion = node.input.len() == 2
+        && node.output.len() == 1
+        && node
+            .input
+            .iter()
+            .all(|input| producer(input).is_some_and(|candidate| candidate.op_type == "Mul"))
+        && graph.node.iter().any(|candidate| {
+            candidate.domain == ONNX_DOMAIN
+                && candidate.op_type == ONNX_OP_NAME
+                && candidate.input.first() == node.output.first()
+        });
+    if mtp_fusion {
+        return Some(ConcatRole {
+            axis: 1,
+            label: "MTP fusion",
+        });
     }
     let cache = node.input.len() == 2
         && node.output.len() == 1
@@ -2274,7 +2357,10 @@ fn concat_axis(node: &NodeProto, graph: &GraphProto) -> Option<i64> {
             .output
             .iter()
             .any(|output| output.name == node.output[0]);
-    cache.then_some(0)
+    cache.then_some(ConcatRole {
+        axis: 0,
+        label: "KV cache",
+    })
 }
 
 fn expected_attribute_kind(name: &str) -> i32 {
@@ -2549,6 +2635,27 @@ pub fn encode_qwen_causal_lm(model: QwenCausalLmModel<'_>) -> Result<Vec<u8>, On
     validate_qwen_causal_lm(&model)?;
     build_qwen_causal_lm_graph(model, CausalGraphBuilder::counting())?;
     let protobuf = build_qwen_causal_lm_graph(model, CausalGraphBuilder::default())?;
+    let encoded = protobuf.encode_to_vec();
+    if encoded.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
+}
+
+/// Encode packed Qwen MTP fusion, decoder, cache, final hidden rows, and logits.
+///
+/// Inputs are `shifted_tokens` and `target_hidden`, followed by `past_k.0` and
+/// `past_v.0` for cached decode. Token shifting/alignment remains an explicit
+/// caller contract instead of hidden graph mutation.
+///
+/// # Errors
+/// [`OnnxModelError`] if model geometry, initializer admission, or encoding fails.
+pub fn encode_qwen35_mtp(model: Qwen35MtpModel<'_>) -> Result<Vec<u8>, OnnxModelError> {
+    validate_qwen35_mtp_model(&model)?;
+    build_qwen35_mtp_graph(model, CausalGraphBuilder::counting())?;
+    let protobuf = build_qwen35_mtp_graph(model, CausalGraphBuilder::default())?;
     let encoded = protobuf.encode_to_vec();
     if encoded.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
@@ -4974,6 +5081,201 @@ impl CausalGraphBuilder {
     }
 }
 
+fn build_qwen35_mtp_graph(
+    model: Qwen35MtpModel<'_>,
+    mut graph: CausalGraphBuilder,
+) -> Result<ModelProto, OnnxModelError> {
+    let tokens = as_i64(model.tokens, "MTP token count")?;
+    let past_tokens = as_i64(model.past_tokens, "MTP past token count")?;
+    let total_tokens = tokens
+        .checked_add(past_tokens)
+        .ok_or(OnnxModelError::ShapeOverflow("MTP total token count"))?;
+    let total_tokens_usize = model
+        .tokens
+        .checked_add(model.past_tokens)
+        .ok_or(OnnxModelError::ShapeOverflow("MTP total token count"))?;
+    let hidden = as_i64(model.embedding.columns, "MTP hidden size")?;
+    let vocab = as_i64(model.embedding.rows, "MTP vocabulary")?;
+    let n_head = as_i64(model.n_head, "MTP attention head count")?;
+    let n_kv_head = as_i64(model.n_kv_head, "MTP KV head count")?;
+    let head_dim = as_i64(model.head_dim, "MTP head dimension")?;
+    let query_width = n_head
+        .checked_mul(head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("MTP query width"))?;
+    let geometry = CausalGraphGeometry {
+        past_tokens,
+        total_tokens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        gqa_repeat: as_i64(model.n_head / model.n_kv_head, "MTP GQA repeat")?,
+    };
+    let rotary_state = graph.prepare_rotary(RotaryGraphConfig {
+        tokens: model.tokens,
+        head_dim: model.head_dim,
+        rotary_dim: model.rotary.dimensions,
+        past_tokens: model.past_tokens,
+        theta: model.rotary.theta,
+    })?;
+    let attention_mask = "mtp.attention_mask";
+    graph.add_causal_mask(
+        attention_mask,
+        model.tokens,
+        total_tokens_usize,
+        model.past_tokens,
+        vec![1, tokens, total_tokens],
+    );
+
+    graph.add_matrix("tok_embeddings", model.embedding);
+    graph.nodes.push(NodeProto {
+        input: strings([
+            "shifted_tokens",
+            "tok_embeddings.packed",
+            "tok_embeddings.scales",
+        ]),
+        output: strings(["mtp.embedding"]),
+        name: "mtp.embedding".to_owned(),
+        op_type: ONNX_EMBEDDING_OP_NAME.to_owned(),
+        attribute: attributes(hidden, format_code(model.embedding.format)?),
+        domain: ONNX_DOMAIN.to_owned(),
+    });
+    graph.rms_norm_with_semantics(
+        "mtp.embedding_norm",
+        "mtp.embedding",
+        "mtp.embedding_norm.output",
+        model.mtp.pre_fc_norm_embedding,
+        model.rms_epsilon,
+        true,
+    );
+    graph.rms_norm_with_semantics(
+        "mtp.target_norm",
+        "target_hidden",
+        "mtp.target_norm.output",
+        model.mtp.pre_fc_norm_hidden,
+        model.rms_epsilon,
+        true,
+    );
+    graph.standard(
+        "mtp.fusion_concat",
+        "Concat",
+        &["mtp.embedding_norm.output", "mtp.target_norm.output"],
+        &["mtp.fusion_input"],
+        vec![int_attribute("axis", 1)],
+    );
+    graph.projection(
+        "mtp.fusion",
+        "mtp.fusion_input",
+        "mtp.layer_input",
+        "mtp.fusion",
+        model.mtp.fusion,
+    )?;
+
+    let mut inputs = vec![
+        tensor_value("shifted_tokens", TENSOR_INT64, &[tokens]),
+        tensor_value("target_hidden", TENSOR_FLOAT, &[tokens, hidden]),
+    ];
+    let mut state_outputs = Vec::with_capacity(2);
+    let layer_output = graph.full_attention_block(
+        0,
+        "mtp.layer_input",
+        model.mtp.layer.causal(),
+        FullAttentionGraphContext {
+            tokens,
+            n_head,
+            n_kv_head,
+            head_dim,
+            head_dim_usize: model.head_dim,
+            query_width,
+            geometry,
+            rotary_state: Some(&rotary_state),
+            attention_mask,
+            epsilon: model.rms_epsilon,
+            zero_centered_norm: true,
+        },
+        &mut inputs,
+        &mut state_outputs,
+    )?;
+    graph.rms_norm_with_semantics(
+        "mtp.final_norm",
+        &layer_output,
+        "mtp.final_hidden",
+        model.mtp.final_norm,
+        model.rms_epsilon,
+        true,
+    );
+    graph.add_matrix("lm_head", model.lm_head);
+    graph.nodes.push(NodeProto {
+        input: strings(["mtp.final_hidden", "lm_head.packed", "lm_head.scales"]),
+        output: strings(["mtp.logits"]),
+        name: "mtp.lm_head".to_owned(),
+        op_type: ONNX_OP_NAME.to_owned(),
+        attribute: attributes(hidden, format_code(model.lm_head.format)?),
+        domain: ONNX_DOMAIN.to_owned(),
+    });
+    if let Some(error) = graph.failure {
+        return Err(error);
+    }
+    let mut outputs = vec![
+        tensor_value("mtp.logits", TENSOR_FLOAT, &[tokens, vocab]),
+        tensor_value("mtp.final_hidden", TENSOR_FLOAT, &[tokens, hidden]),
+    ];
+    outputs.extend(state_outputs);
+    Ok(ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: ONNX_DOMAIN.to_owned(),
+        model_version: 2,
+        graph: Some(GraphProto {
+            node: graph.nodes,
+            name: "tritium.qwen35_mtp".to_owned(),
+            initializer: graph.initializers,
+            input: inputs,
+            output: outputs,
+            value_info: Vec::new(),
+        }),
+        opset_import: vec![
+            OperatorSetIdProto {
+                domain: String::new(),
+                version: ONNX_OPSET,
+            },
+            OperatorSetIdProto {
+                domain: ONNX_DOMAIN.to_owned(),
+                version: 2,
+            },
+        ],
+        metadata_props: vec![
+            metadata("tritium.schema_version", "2"),
+            metadata("tritium.graph_kind", "qwen35-mtp"),
+            metadata("tritium.source_model_id", model.identity.source_model_id),
+            metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
+            metadata("tritium.recipe_id", model.identity.recipe_id),
+            metadata("tritium.build_id", model.identity.tritium_build_id),
+            metadata("tritium.package_id", model.identity.package_id),
+            metadata(
+                "tritium.coverage.converted_id",
+                model.identity.converted_coverage_id,
+            ),
+            metadata(
+                "tritium.coverage.deferred_id",
+                model.identity.deferred_coverage_id,
+            ),
+            metadata("tritium.tokens", &model.tokens.to_string()),
+            metadata("tritium.past_tokens", &model.past_tokens.to_string()),
+            metadata("tritium.layers", "1"),
+            metadata("tritium.hidden", &model.embedding.columns.to_string()),
+            metadata("tritium.vocab", &model.embedding.rows.to_string()),
+            metadata("tritium.n_head", &model.n_head.to_string()),
+            metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
+            metadata("tritium.head_dim", &model.head_dim.to_string()),
+            metadata("tritium.input_alignment", "caller-shifted-target-aligned"),
+            metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
+            metadata("tritium.tied_embedding_head", "false"),
+            metadata("tritium.rope_theta", &model.rotary.theta.to_string()),
+        ],
+    })
+}
+
 fn build_qwen_causal_lm_graph(
     model: QwenCausalLmModel<'_>,
     mut graph: CausalGraphBuilder,
@@ -5997,6 +6299,44 @@ fn validate_qwen_deltanet_layer(
     validate_matrix_shape("layer.0.down", model.layer.down, model.hidden, intermediate)?;
     validate_identity_v2(model.identity)?;
     Ok(dimensions)
+}
+
+fn validate_qwen35_mtp_model(model: &Qwen35MtpModel<'_>) -> Result<(), OnnxModelError> {
+    let layer = [model.mtp.layer.causal()];
+    validate_causal_lm(&CausalLmModel {
+        tokens: model.tokens,
+        past_tokens: model.past_tokens,
+        n_head: model.n_head,
+        n_kv_head: model.n_kv_head,
+        head_dim: model.head_dim,
+        rotary: Some(model.rotary),
+        rms_epsilon: model.rms_epsilon,
+        zero_centered_norm: true,
+        embedding: model.embedding,
+        lm_head: Some(model.lm_head),
+        layers: &layer,
+        final_norm: model.mtp.final_norm,
+        identity: model.identity,
+    })?;
+    let hidden = model.embedding.columns;
+    validate_vector(
+        "Qwen MTP pre_fc_norm_embedding",
+        model.mtp.pre_fc_norm_embedding,
+        hidden,
+    )?;
+    validate_vector(
+        "Qwen MTP pre_fc_norm_hidden",
+        model.mtp.pre_fc_norm_hidden,
+        hidden,
+    )?;
+    validate_matrix_shape(
+        "Qwen MTP fusion",
+        model.mtp.fusion,
+        hidden,
+        hidden
+            .checked_mul(2)
+            .ok_or(OnnxModelError::ShapeOverflow("Qwen MTP fusion width"))?,
+    )
 }
 
 fn validate_qwen_causal_lm(model: &QwenCausalLmModel<'_>) -> Result<(), OnnxModelError> {
@@ -7145,6 +7485,21 @@ mod tests {
                     },
                     unary("Slice", "query", "tail"),
                     unnamed_concat(&["rotated_prefix", "tail"], "partial_output"),
+                    unary("Mul", "embedding", "normalized_embedding"),
+                    unary("Mul", "target_hidden", "normalized_target"),
+                    concat(
+                        &["normalized_embedding", "normalized_target"],
+                        "fusion_input",
+                        0,
+                    ),
+                    NodeProto {
+                        input: strings(["fusion_input", "fusion.packed", "fusion.scales"]),
+                        output: strings(["fused_hidden"]),
+                        name: "fusion".to_owned(),
+                        op_type: ONNX_OP_NAME.to_owned(),
+                        attribute: attributes(4, format_code(TernaryFormat::Tq2_0).unwrap()),
+                        domain: ONNX_DOMAIN.to_owned(),
+                    },
                 ],
                 name: "concat-axis-mutations".to_owned(),
                 initializer: Vec::new(),
@@ -7152,14 +7507,20 @@ mod tests {
                 output: vec![tensor_value("present_k.0", TENSOR_FLOAT, &[2, 1, 2])],
                 value_info: Vec::new(),
             }),
-            opset_import: vec![OperatorSetIdProto {
-                domain: String::new(),
-                version: ONNX_OPSET,
-            }],
+            opset_import: vec![
+                OperatorSetIdProto {
+                    domain: String::new(),
+                    version: ONNX_OPSET,
+                },
+                OperatorSetIdProto {
+                    domain: ONNX_DOMAIN.to_owned(),
+                    version: TRITIUM_OPSET,
+                },
+            ],
             metadata_props: Vec::new(),
         };
         let diagnostics = diagnose_unsupported_graph(&protobuf.encode_to_vec()).unwrap();
-        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
         assert!(
             diagnostics[0]
                 .reason
@@ -7169,6 +7530,11 @@ mod tests {
             diagnostics[1]
                 .reason
                 .contains("RoPE concat axis must be -1")
+        );
+        assert!(
+            diagnostics[2]
+                .reason
+                .contains("MTP fusion concat axis must be 1")
         );
     }
 
@@ -7571,6 +7937,7 @@ mod tests {
         assert_eq!(mapped.mtp().fusion.rows, 256);
         assert_eq!(mapped.mtp().fusion.columns, 512);
         assert!(encode_qwen_causal_lm(mapped.model(1, 0)).is_ok());
+        assert!(encode_qwen35_mtp(mapped.mtp_model(1, 0)).is_ok());
 
         source
             .names

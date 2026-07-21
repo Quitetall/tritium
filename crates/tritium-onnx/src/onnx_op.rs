@@ -1538,6 +1538,322 @@ mod tests {
     }
 
     #[test]
+    fn qwen_mtp_graph_runs_prompt_and_cached_decode() {
+        use ort::value::Tensor;
+
+        let format = TernaryFormat::Tq2_0;
+        let hidden = 16;
+        let zero = |columns: usize| vec![Trit::ZERO; columns];
+        let basis = |lane: usize, sign: i8, columns: usize| {
+            let mut row = zero(columns);
+            row[lane] = Trit::from_i8(sign).unwrap();
+            row
+        };
+        let matrix = |rows, columns, packed, scales| crate::PackedTernaryMatrix {
+            rows,
+            columns,
+            packed,
+            scales,
+            format,
+        };
+        let dense = |rows: &[Vec<Trit>], scales: &[f32]| {
+            rows.iter()
+                .zip(scales)
+                .map(|(row, scale)| {
+                    row.iter()
+                        .map(|value| f32::from(*value) * scale)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut embedding_rows = vec![zero(hidden); hidden];
+        embedding_rows[0] = basis(0, 1, hidden);
+        embedding_rows[0][3] = Trit::from_i8(-1).unwrap();
+        embedding_rows[1] = basis(1, 1, hidden);
+        embedding_rows[1][4] = Trit::from_i8(1).unwrap();
+        embedding_rows[2] = basis(2, -1, hidden);
+        embedding_rows[2][5] = Trit::from_i8(1).unwrap();
+        let embedding_scales = vec![1.0; hidden];
+        let embedding_packed = pack_rows(&embedding_rows, format);
+
+        let pre_embedding_norm = (0..hidden)
+            .map(|lane| -0.12 + lane as f32 * 0.011)
+            .collect::<Vec<_>>();
+        let pre_hidden_norm = (0..hidden)
+            .map(|lane| 0.09 - lane as f32 * 0.007)
+            .collect::<Vec<_>>();
+        let mut fusion_rows = vec![zero(hidden * 2); hidden];
+        for (row, values) in fusion_rows.iter_mut().enumerate() {
+            values[row] = Trit::from_i8(1).unwrap();
+            values[hidden + (row + 3) % hidden] =
+                Trit::from_i8(if row % 2 == 0 { 1 } else { -1 }).unwrap();
+        }
+        let fusion_scales = (0..hidden)
+            .map(|row| 0.13 + 0.006 * row as f32)
+            .collect::<Vec<_>>();
+        let fusion_packed = pack_rows(&fusion_rows, format);
+
+        let mut fused_query_gate_rows = vec![zero(hidden); hidden * 2];
+        for row in 0..hidden {
+            fused_query_gate_rows[row][row] = Trit::from_i8(1).unwrap();
+            fused_query_gate_rows[hidden + row][(row + 5) % hidden] =
+                Trit::from_i8(if row % 3 == 0 { -1 } else { 1 }).unwrap();
+        }
+        let fused_query_gate_scales = (0..hidden * 2)
+            .map(|row| 0.18 + 0.003 * row as f32)
+            .collect::<Vec<_>>();
+        let fused_query_gate_packed = pack_rows(&fused_query_gate_rows, format);
+
+        let key_rows = (0..hidden)
+            .map(|row| basis((row + 1) % hidden, if row % 2 == 0 { 1 } else { -1 }, hidden))
+            .collect::<Vec<_>>();
+        let value_rows = (0..hidden)
+            .map(|row| basis((row + 4) % hidden, if row % 3 == 0 { -1 } else { 1 }, hidden))
+            .collect::<Vec<_>>();
+        let output_rows = (0..hidden)
+            .map(|row| basis((row + 2) % hidden, if row % 4 == 0 { -1 } else { 1 }, hidden))
+            .collect::<Vec<_>>();
+        let projection_scales = (0..hidden)
+            .map(|row| 0.16 + 0.004 * row as f32)
+            .collect::<Vec<_>>();
+        let key_packed = pack_rows(&key_rows, format);
+        let value_packed = pack_rows(&value_rows, format);
+        let output_packed = pack_rows(&output_rows, format);
+
+        let gate_rows = (0..hidden)
+            .map(|row| basis(row, if row % 2 == 0 { 1 } else { -1 }, hidden))
+            .collect::<Vec<_>>();
+        let up_rows = (0..hidden)
+            .map(|row| basis((row + 1) % hidden, 1, hidden))
+            .collect::<Vec<_>>();
+        let down_rows = (0..hidden)
+            .map(|row| basis((row + 3) % hidden, if row % 3 == 0 { -1 } else { 1 }, hidden))
+            .collect::<Vec<_>>();
+        let ffn_scales = (0..hidden)
+            .map(|row| 0.11 + 0.005 * row as f32)
+            .collect::<Vec<_>>();
+        let gate_packed = pack_rows(&gate_rows, format);
+        let up_packed = pack_rows(&up_rows, format);
+        let down_packed = pack_rows(&down_rows, format);
+
+        let attention_norm = (0..hidden)
+            .map(|lane| 0.08 - 0.006 * lane as f32)
+            .collect::<Vec<_>>();
+        let query_norm = (0..hidden)
+            .map(|lane| -0.05 + 0.004 * lane as f32)
+            .collect::<Vec<_>>();
+        let key_norm = (0..hidden)
+            .map(|lane| 0.06 - 0.003 * lane as f32)
+            .collect::<Vec<_>>();
+        let ffn_norm = (0..hidden)
+            .map(|lane| -0.07 + 0.005 * lane as f32)
+            .collect::<Vec<_>>();
+        let final_norm = (0..hidden)
+            .map(|lane| 0.04 - 0.002 * lane as f32)
+            .collect::<Vec<_>>();
+        let layer = crate::QwenFullAttentionDecoderLayer {
+            attention_norm: &attention_norm,
+            query_norm: &query_norm,
+            key_norm: &key_norm,
+            fused_query_gate: matrix(
+                hidden * 2,
+                hidden,
+                &fused_query_gate_packed,
+                &fused_query_gate_scales,
+            ),
+            key: matrix(hidden, hidden, &key_packed, &projection_scales),
+            value: matrix(hidden, hidden, &value_packed, &projection_scales),
+            attention_output: matrix(hidden, hidden, &output_packed, &projection_scales),
+            ffn_norm: &ffn_norm,
+            gate: matrix(hidden, hidden, &gate_packed, &ffn_scales),
+            up: matrix(hidden, hidden, &up_packed, &ffn_scales),
+            down: matrix(hidden, hidden, &down_packed, &ffn_scales),
+        };
+        let identity = crate::OnnxArtifactIdentityV2 {
+            source_model_id: "qwen-source",
+            tokenizer_id: "qwen-tokenizer",
+            recipe_id: "qwen-recipe",
+            tritium_build_id: "qwen-build",
+            package_id: "qwen-package",
+            converted_coverage_id: "qwen-language-mtp",
+            deferred_coverage_id: "qwen-vision",
+        };
+        let head_rows = (0..hidden)
+            .map(|row| basis(row, 1, hidden))
+            .collect::<Vec<_>>();
+        let head_scales = vec![1.0; hidden];
+        let head_packed = pack_rows(&head_rows, format);
+        let base = crate::Qwen35MtpModel {
+            tokens: 2,
+            past_tokens: 0,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: hidden,
+            rotary: crate::RotaryEmbedding {
+                theta: 10_000.0,
+                dimensions: 8,
+            },
+            rms_epsilon: 1.0e-6,
+            embedding: matrix(hidden, hidden, &embedding_packed, &embedding_scales),
+            lm_head: matrix(hidden, hidden, &head_packed, &head_scales),
+            mtp: crate::Qwen35MtpDecoder {
+                pre_fc_norm_embedding: &pre_embedding_norm,
+                pre_fc_norm_hidden: &pre_hidden_norm,
+                fusion: matrix(hidden, hidden * 2, &fusion_packed, &fusion_scales),
+                layer,
+                final_norm: &final_norm,
+            },
+            identity,
+        };
+
+        let dense_embedding = dense(&embedding_rows, &embedding_scales);
+        let dense_fusion = dense(&fusion_rows, &fusion_scales);
+        let dense_fused_query_gate = dense(&fused_query_gate_rows, &fused_query_gate_scales);
+        let dense_query = &dense_fused_query_gate[..hidden];
+        let dense_attention_gate = &dense_fused_query_gate[hidden..];
+        let dense_key = dense(&key_rows, &projection_scales);
+        let dense_value = dense(&value_rows, &projection_scales);
+        let dense_output = dense(&output_rows, &projection_scales);
+        let dense_gate = dense(&gate_rows, &ffn_scales);
+        let dense_up = dense(&up_rows, &ffn_scales);
+        let dense_down = dense(&down_rows, &ffn_scales);
+        let dense_head = identity_matrix(hidden);
+        let fuse = |tokens: &[i64], target: &[f32]| {
+            let embedded = tokens
+                .iter()
+                .flat_map(|token| dense_embedding[*token as usize].iter().copied())
+                .collect::<Vec<_>>();
+            let normalized_embedding =
+                rms_norm(&embedded, &pre_embedding_norm, 1.0e-6, true);
+            let normalized_target = rms_norm(target, &pre_hidden_norm, 1.0e-6, true);
+            let concatenated = normalized_embedding
+                .chunks_exact(hidden)
+                .zip(normalized_target.chunks_exact(hidden))
+                .flat_map(|(embedding, target)| embedding.iter().chain(target).copied())
+                .collect::<Vec<_>>();
+            dense_project(&concatenated, &dense_fusion)
+        };
+        let reference = |fused: &[f32], past_k: &[f32], past_v: &[f32]| {
+            let rows = fused
+                .chunks_exact(hidden)
+                .map(<[f32]>::to_vec)
+                .collect::<Vec<_>>();
+            let row_ids = (0..rows.len()).map(|row| row as i64).collect::<Vec<_>>();
+            reference_causal_lm(
+                &row_ids,
+                past_k,
+                past_v,
+                &rows,
+                dense_query,
+                &dense_key,
+                &dense_value,
+                &dense_output,
+                Some(dense_attention_gate),
+                &dense_gate,
+                &dense_up,
+                &dense_down,
+                &attention_norm,
+                &query_norm,
+                &key_norm,
+                &ffn_norm,
+                None,
+                None,
+                crate::CausalActivation::SwiGlu,
+                &final_norm,
+                Some(&dense_head),
+                1,
+                1,
+                hidden,
+                8,
+                10_000.0,
+                1.0e-6,
+                true,
+            )
+        };
+
+        let prompt_model = crate::encode_qwen35_mtp(base).unwrap();
+        let diagnostics = crate::diagnose_unsupported_graph(&prompt_model).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let mut prompt_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&prompt_model)
+            .unwrap();
+        let prompt_tokens = vec![0_i64, 1];
+        let prompt_target = (0..2 * hidden)
+            .map(|lane| ((lane % 7) as f32 - 3.0) * 0.17)
+            .collect::<Vec<_>>();
+        let prompt_fused = fuse(&prompt_tokens, &prompt_target);
+        let (expected_logits, expected_k, expected_v) = reference(&prompt_fused, &[], &[]);
+        let shifted_tokens = Tensor::from_array(([2], prompt_tokens.into_boxed_slice())).unwrap();
+        let target_hidden =
+            Tensor::from_array(([2, hidden], prompt_target.into_boxed_slice())).unwrap();
+        let prompt = prompt_session
+            .run(ort::inputs![&shifted_tokens, &target_hidden])
+            .unwrap();
+        let (_, logits) = prompt[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(logits, &expected_logits, 2.0e-4);
+        let (_, final_hidden) = prompt[1].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(final_hidden, &expected_logits, 2.0e-4);
+        let (_, present_k) = prompt[2].try_extract_tensor::<f32>().unwrap();
+        let (_, present_v) = prompt[3].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(present_k, &expected_k, 2.0e-4);
+        assert_f32_close(present_v, &expected_v, 2.0e-4);
+        let present_k = present_k.to_vec();
+        let present_v = present_v.to_vec();
+        drop(prompt);
+
+        let decode_model = crate::encode_qwen35_mtp(crate::Qwen35MtpModel {
+            tokens: 1,
+            past_tokens: 2,
+            ..base
+        })
+        .unwrap();
+        let mut decode_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&decode_model)
+            .unwrap();
+        let decode_tokens = vec![2_i64];
+        let decode_target = (0..hidden)
+            .map(|lane| ((lane % 5) as f32 - 2.0) * -0.21)
+            .collect::<Vec<_>>();
+        let decode_fused = fuse(&decode_tokens, &decode_target);
+        let (expected_logits, expected_k, expected_v) =
+            reference(&decode_fused, &present_k, &present_v);
+        let (zero_cache_logits, _, _) = reference(
+            &decode_fused,
+            &vec![0.0; present_k.len()],
+            &vec![0.0; present_v.len()],
+        );
+        assert_ne!(expected_logits, zero_cache_logits, "decode must consume KV cache");
+        let shifted_tokens = Tensor::from_array(([1], decode_tokens.into_boxed_slice())).unwrap();
+        let target_hidden =
+            Tensor::from_array(([1, hidden], decode_target.into_boxed_slice())).unwrap();
+        let past_k = Tensor::from_array(([2, 1, hidden], present_k)).unwrap();
+        let past_v = Tensor::from_array(([2, 1, hidden], present_v)).unwrap();
+        let decode = decode_session
+            .run(ort::inputs![
+                &shifted_tokens,
+                &target_hidden,
+                &past_k,
+                &past_v
+            ])
+            .unwrap();
+        let (_, logits) = decode[0].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(logits, &expected_logits, 2.0e-4);
+        let (_, final_hidden) = decode[1].try_extract_tensor::<f32>().unwrap();
+        assert_f32_close(final_hidden, &expected_logits, 2.0e-4);
+        let (key_shape, present_k) = decode[2].try_extract_tensor::<f32>().unwrap();
+        let (_, present_v) = decode[3].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(key_shape.as_ref(), &[3, 1, hidden as i64]);
+        assert_f32_close(present_k, &expected_k, 2.0e-4);
+        assert_f32_close(present_v, &expected_v, 2.0e-4);
+    }
+
+    #[test]
     fn end_to_end_kv_attention_runs_prompt_and_cached_decode() {
         use ort::value::Tensor;
 
