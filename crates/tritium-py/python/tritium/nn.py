@@ -13,6 +13,8 @@ from .torch.estimators import AbsMeanSTE, Estimator, SaltSTE
 from .torch.ops import ternary_linear
 from .torch.projection import ProjectionContext, validate_projection
 
+_B3_MAX_VALID_BYTE = 3**5 - 1
+
 
 def _estimator_extra_state(estimator: Estimator) -> torch.Tensor:
     """Encode estimator identity as a safetensors-compatible tensor."""
@@ -120,6 +122,88 @@ class AdditiveTernaryLinear(nn.Module):
         else:
             self.register_buffer("bias", None)
         self.training = False
+
+    @classmethod
+    def empty(
+        cls,
+        in_features: int,
+        out_features: int,
+        planes: int,
+        *,
+        bias: bool,
+        device=None,
+        dtype=None,
+    ) -> "AdditiveTernaryLinear":
+        """Build a metadata-only shell; ``dtype`` controls preserved bias."""
+
+        if in_features <= 0 or out_features <= 0 or not 1 <= planes <= 3:
+            raise ValueError("additive ternary linear shell geometry is invalid")
+        module = cls.__new__(cls)
+        nn.Module.__init__(module)
+        module.in_features = int(in_features)
+        module.out_features = int(out_features)
+        module.weight_elements = module.in_features * module.out_features
+        module.plane_count = int(planes)
+        packed_elements = (module.weight_elements + 4) // 5
+        for index in range(module.plane_count):
+            module.register_buffer(
+                f"packed_trits_{index}",
+                torch.empty(packed_elements, dtype=torch.uint8, device=device),
+            )
+            module.register_buffer(
+                f"scales_{index}",
+                torch.empty(
+                    (module.out_features, 1), dtype=torch.float16, device=device
+                ),
+            )
+        module.register_buffer(
+            "bias",
+            torch.empty(module.out_features, dtype=dtype, device=device)
+            if bias
+            else None,
+        )
+        module.training = False
+        return module
+
+    def validate_buffers(self) -> None:
+        """Fail closed after external state loading."""
+
+        for index in range(self.plane_count):
+            packed = getattr(self, f"packed_trits_{index}")
+            scales = getattr(self, f"scales_{index}")
+            if packed.dtype != torch.uint8 or packed.numel() != (
+                self.weight_elements + 4
+            ) // 5:
+                raise TritiumError(
+                    "packed ternary state geometry is invalid",
+                    code="state_geometry",
+                    stage="load",
+                )
+            if packed.device.type != "meta" and bool(
+                (packed > _B3_MAX_VALID_BYTE).any()
+            ):
+                raise TritiumError(
+                    "packed ternary state contains invalid B3 bytes",
+                    code="state_domain",
+                    stage="load",
+                )
+            if (
+                scales.dtype != torch.float16
+                or tuple(scales.shape) != (self.out_features, 1)
+            ):
+                raise TritiumError(
+                    "packed ternary scales have invalid geometry",
+                    code="state_geometry",
+                    stage="load",
+                )
+            if scales.device.type != "meta" and (
+                not bool(torch.isfinite(scales).all()) or bool((scales < 0).any())
+            ):
+                raise TritiumError(
+                    "packed ternary scales have invalid values",
+                    code="state_domain",
+                    stage="load",
+                )
 
     @property
     def physical_bytes(self) -> int:

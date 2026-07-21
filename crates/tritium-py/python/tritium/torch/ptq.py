@@ -856,6 +856,13 @@ def load_quantized_module(
     root.eval()
     root._tritium_ptq_artifact_id = admitted.artifact_id
     root._tritium_coverage = admitted.coverage
+    if hasattr(root, "config"):
+        from .hf import attach_huggingface_recipe
+
+        attach_huggingface_recipe(root, admitted.config)
+        root.config.tritium_ptq_artifact_id = admitted.artifact_id
+        root.config.tritium_ptq_source_digest = admitted.source_model_digest
+        root.config.tritium_ptq_checkpoint_digest = _source_model_digest(root)
     return root
 
 

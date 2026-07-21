@@ -7,11 +7,16 @@ import pytest
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
-from tritium.nn import TernaryEmbedding, TernaryLinear  # noqa: E402
+from tritium.nn import AdditiveTernaryLinear, TernaryEmbedding, TernaryLinear  # noqa: E402
 from tritium.torch import (  # noqa: E402
     TernaryConfig,
+    TritiumError,
     TritiumTrainer,
+    calibrate,
+    convert,
     inspect,
+    load_quantized_module,
+    prepare,
     prepare_qat,
 )
 
@@ -34,6 +39,64 @@ def _qat_config():
     return TernaryConfig.qat(
         estimator="salt-ste", target_modules=("Linear", "Embedding"), planes=1
     )
+
+
+def test_hf_ptq_save_reload_is_compact_automatic_and_exact(tmp_path: Path):
+    config = transformers.LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=False,
+    )
+    source = transformers.LlamaForCausalLM(config)
+    prepared = prepare(
+        source,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    calibration = calibrate(
+        prepared,
+        [{"input_ids": tokens, "use_cache": False}],
+        evidence_dir=tmp_path / "evidence",
+    )
+    artifact = convert(prepared, calibration, work_dir=tmp_path / "work")
+    model = load_quantized_module(prepared.model, artifact)
+    expected = model(input_ids=tokens, use_cache=False).logits.detach()
+    model.save_pretrained(tmp_path / "hf", safe_serialization=True)
+
+    from safetensors.torch import load_file, save_file
+
+    state = load_file(tmp_path / "hf" / "model.safetensors")
+    assert any(name.endswith("packed_trits_0") for name in state)
+    assert not any(
+        name.endswith(".weight") and "norm" not in name and "embed_tokens" not in name
+        for name in state
+    )
+    reloaded = transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "hf")
+    assert any(isinstance(module, AdditiveTernaryLinear) for module in reloaded.modules())
+    assert not reloaded.hf_quantizer.is_trainable
+    assert reloaded.config.tritium_ptq_artifact_id == artifact.artifact_id
+    observed = reloaded(input_ids=tokens, use_cache=False).logits
+    torch.testing.assert_close(observed, expected)
+
+    packed_name = next(name for name in state if name.endswith("packed_trits_0"))
+    original = int(state[packed_name][0])
+    state[packed_name][0] = 0 if original != 0 else 1
+    save_file(state, tmp_path / "hf" / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(TritiumError) as captured:
+        transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "hf")
+    assert captured.value.code == "state_identity"
+
+    state[packed_name][0] = 255
+    save_file(state, tmp_path / "hf" / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(TritiumError) as captured:
+        transformers.AutoModelForCausalLM.from_pretrained(tmp_path / "hf")
+    assert captured.value.code == "state_domain"
 
 
 def test_embedding_conversion_preserves_options_and_masked_ste():

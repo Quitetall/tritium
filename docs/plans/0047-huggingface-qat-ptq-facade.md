@@ -96,6 +96,9 @@ saves with safe serialization, automatically reloads through
   holding B3-packed additive trits plus f16 row scales, with no latent master or
   persistent dense decoded weight. This Python path is a semantic reference
   fallback and its transient decode is not native fused/no-shadow evidence.
+  Hugging Face PTQ checkpoints now save those compact buffers through
+  safetensors, reconstruct meta-safe shells through `AutoModel.from_pretrained`
+  and validate B3/scale domains before inference.
   G128-aligned fitted weights now stream one tensor at a time into a strict,
   seek-backed SALT V2 package; conversion sources and packed semantics are
   reverified before atomic publication. Complete-model preservation, native

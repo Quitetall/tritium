@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from torch import nn
+
 from .config import TernaryConfig
 from .errors import TritiumError
 
@@ -43,11 +45,11 @@ class TritiumHfQuantizer(HfQuantizer):
 
     @property
     def is_trainable(self):
-        return True
+        return self.quantization_config.recipe.mode == "qat"
 
     @property
     def is_qat_trainable(self):
-        return True
+        return self.quantization_config.recipe.mode == "qat"
 
     @property
     def is_compileable(self):
@@ -59,18 +61,40 @@ class TritiumHfQuantizer(HfQuantizer):
 
     def _process_model_before_weight_loading(self, model, **kwargs):
         del kwargs
-        if self.quantization_config.recipe.mode != "qat":
-            raise TritiumError(
-                "Hugging Face dense checkpoints currently support QAT recipes only",
-                code="unsupported_recipe",
-                stage="load",
-            )
-        from .conversion import prepare_qat
+        recipe = self.quantization_config.recipe
+        if recipe.mode == "qat":
+            from .conversion import prepare_qat
 
-        return prepare_qat(model, self.quantization_config.recipe)
+            return prepare_qat(model, recipe)
+        return _prepare_ptq_inference_shell(model, recipe)
 
     def _process_model_after_weight_loading(self, model, **kwargs):
         del kwargs
+        if self.quantization_config.recipe.mode == "ptq":
+            from ..nn import AdditiveTernaryLinear
+
+            for module in model.modules():
+                if isinstance(module, AdditiveTernaryLinear):
+                    module.validate_buffers()
+            expected = getattr(model.config, "tritium_ptq_checkpoint_digest", None)
+            if not isinstance(expected, str) or not expected.startswith("sha256:"):
+                raise TritiumError(
+                    "Hugging Face PTQ checkpoint identity is missing",
+                    code="state_identity",
+                    stage="load",
+                )
+            from .ptq import _source_model_digest
+
+            observed = _source_model_digest(model)
+            if observed != expected:
+                raise TritiumError(
+                    "Hugging Face PTQ checkpoint identity changed",
+                    code="state_identity",
+                    stage="load",
+                    details={"expected": expected, "observed": observed},
+                )
+            model.requires_grad_(False)
+            model.eval()
         return model
 
 
@@ -107,6 +131,57 @@ def register_huggingface() -> None:
         raise RuntimeError("another package registered the Tritium HF quantizer")
     AUTO_QUANTIZATION_CONFIG_MAPPING["tritium"] = HfTritiumConfig
     AUTO_QUANTIZER_MAPPING["tritium"] = TritiumHfQuantizer
+
+
+def _prepare_ptq_inference_shell(model, recipe: TernaryConfig):
+    """Replace exact Linear modules with meta-safe compact state shells."""
+
+    unsupported = set(recipe.target_modules) - {"Linear"}
+    if unsupported or "Linear" not in recipe.target_modules:
+        raise TritiumError(
+            "generic Hugging Face PTQ reload currently supports Linear targets only",
+            code="unsupported_recipe",
+            stage="load",
+            details={"targets": sorted(recipe.target_modules)},
+        )
+    from ..nn import AdditiveTernaryLinear
+
+    replacements = {}
+    pending = []
+    for path, module in model.named_modules(remove_duplicate=False):
+        if type(module) is not nn.Linear:
+            continue
+        if not path:
+            raise TritiumError(
+                "Hugging Face PTQ root must be a PreTrainedModel, not Linear",
+                code="unsupported_model",
+                stage="load",
+            )
+        replacement = replacements.get(id(module))
+        if replacement is None:
+            replacement = AdditiveTernaryLinear.empty(
+                module.in_features,
+                module.out_features,
+                recipe.planes,
+                bias=module.bias is not None,
+                device=module.weight.device,
+                dtype=module.weight.dtype,
+            )
+            replacements[id(module)] = replacement
+        pending.append((path, replacement))
+    if not pending:
+        raise TritiumError(
+            "Hugging Face PTQ recipe selected no exact Linear modules",
+            code="incomplete_coverage",
+            stage="load",
+        )
+    for path, replacement in pending:
+        parts = path.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = parent._modules[part]
+        parent._modules[parts[-1]] = replacement
+    return model
 
 
 def attach_huggingface_recipe(model, config: TernaryConfig) -> None:
