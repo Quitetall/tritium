@@ -17,7 +17,7 @@ use tritium_format::salt_v2::SaltV2Codec;
 use tritium_format::salt_v2_package::{
     SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, SaltV2PackageReader,
     SaltV2PackageStreamPlan, SaltV2PackageStreamWriter, SaltV2Plane, SaltV2StreamTensorSpec,
-    SaltV2Transform,
+    SaltV2Transform, unpack_salt_v2_plane,
 };
 
 #[cfg(unix)]
@@ -45,8 +45,28 @@ struct ConversionManifest {
     recipe_id: String,
     artifact_id: String,
     config: Value,
-    coverage: Value,
+    coverage: CoverageReceipt,
     weight_receipts: Vec<ReceiptReference>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoverageReceipt {
+    schema_version: u64,
+    entries: Vec<CoverageEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoverageEntry {
+    path: String,
+    aliases: Vec<String>,
+    disposition: String,
+    #[serde(rename = "reason")]
+    _reason: String,
+    numel: u64,
+    #[serde(rename = "logical_bytes")]
+    _logical_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,20 +98,27 @@ struct WeightReceipt {
 
 #[derive(Debug)]
 struct AdmittedPlane {
-    trits: File,
-    scales: File,
     trits_path: PathBuf,
     scales_path: PathBuf,
     trits_digest: String,
     scales_digest: String,
+    trits_bytes: u64,
+    scales_bytes: u64,
 }
 
 #[derive(Debug)]
 struct AdmittedWeight {
     name: String,
+    aliases: Vec<String>,
     rows: usize,
     columns: usize,
     planes: Vec<AdmittedPlane>,
+}
+
+#[derive(Debug)]
+struct OpenedPlane {
+    trits: File,
+    scales: File,
 }
 
 /// Exact identity and physical ledger of one generic streamed SALT V2 package.
@@ -228,6 +255,7 @@ fn pack(
     if weights.is_empty() {
         return Err("conversion artifact has no fitted weights".to_owned());
     }
+    validate_coverage(&manifest.coverage, &weights)?;
     let actual_files = fs::read_dir(directory)
         .map_err(|error| format!("read conversion directory failed: {:?}", error.kind()))?
         .map(|entry| {
@@ -270,13 +298,13 @@ fn pack(
             .map_err(|error| format!("create SALT V2 output failed: {:?}", error.kind()))?;
         let mut writer =
             SaltV2PackageStreamWriter::new(file, plan).map_err(|error| error.to_string())?;
-        for weight in &mut weights {
+        for weight in &weights {
             stream_weight(weight, &mut writer)?;
         }
         let (file, ledger) = writer.finish().map_err(|error| error.to_string())?;
         file.sync_all()
             .map_err(|error| format!("sync SALT V2 output failed: {:?}", error.kind()))?;
-        let reader = SaltV2PackageReader::new_strict(
+        let mut reader = SaltV2PackageReader::new_strict(
             File::open(output)
                 .map_err(|error| format!("reopen SALT V2 output failed: {:?}", error.kind()))?,
         )
@@ -288,9 +316,7 @@ fn pack(
         if reader.ledger() != ledger {
             return Err("reopened SALT V2 physical ledger changed".to_owned());
         }
-        for weight in &mut weights {
-            verify_admitted_weight(weight)?;
-        }
+        verify_package_semantics(&mut reader, codec, &weights)?;
         Ok(ModuleSaltV2Receipt {
             package_id: reader.package_id().to_string(),
             packing: packing.to_owned(),
@@ -325,7 +351,7 @@ fn validate_manifest(manifest: &ConversionManifest, bytes: &[u8]) -> Result<(), 
     let canonical = serde_json::to_vec(&identity)
         .map_err(|error| format!("encode conversion identity failed: {error}"))?;
     verify_bytes(&canonical, &manifest.artifact_id, canonical.len() as u64)?;
-    let _ = (&manifest.config, &manifest.coverage);
+    let _ = &manifest.config;
     Ok(())
 }
 
@@ -384,22 +410,31 @@ fn admit_weight(
         }
         let trits_path = directory.join(&trits_name);
         let scales_path = directory.join(&scales_name);
-        let trits = open_verified(&trits_path, &plane.trits_digest, plane.trits_bytes)?;
-        let scales = open_verified(&scales_path, &plane.scales_digest, plane.scales_bytes)?;
+        drop(open_verified(
+            &trits_path,
+            &plane.trits_digest,
+            plane.trits_bytes,
+        )?);
+        drop(open_verified(
+            &scales_path,
+            &plane.scales_digest,
+            plane.scales_bytes,
+        )?);
         files.insert(trits_name);
         files.insert(scales_name);
         planes.push(AdmittedPlane {
-            trits,
-            scales,
             trits_path,
             scales_path,
             trits_digest: plane.trits_digest,
             scales_digest: plane.scales_digest,
+            trits_bytes: plane.trits_bytes,
+            scales_bytes: plane.scales_bytes,
         });
     }
     Ok((
         AdmittedWeight {
             name: receipt.path,
+            aliases: receipt.aliases,
             rows,
             columns,
             planes,
@@ -408,10 +443,84 @@ fn admit_weight(
     ))
 }
 
+fn validate_coverage(coverage: &CoverageReceipt, weights: &[AdmittedWeight]) -> Result<(), String> {
+    if coverage.schema_version != 1 {
+        return Err("unsupported conversion coverage schema".to_owned());
+    }
+    let selected = coverage
+        .entries
+        .iter()
+        .filter(|entry| entry.disposition == "selected")
+        .collect::<Vec<_>>();
+    if selected.len() != weights.len()
+        || selected.iter().zip(weights).any(|(entry, weight)| {
+            entry.path != weight.name
+                || entry.aliases != weight.aliases
+                || entry.numel != (weight.rows as u64).saturating_mul(weight.columns as u64)
+        })
+    {
+        return Err("conversion weights differ from selected coverage".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_package_semantics(
+    reader: &mut SaltV2PackageReader<File>,
+    codec: SaltV2Codec,
+    weights: &[AdmittedWeight],
+) -> Result<(), String> {
+    for weight in weights {
+        let mut opened = open_weight(weight)?;
+        let mut comparison = Ok(());
+        reader
+            .visit_packed_tensor(&weight.name, |packed| {
+                if comparison.is_err() {
+                    return;
+                }
+                comparison = (|| {
+                    if packed.plane_count() != weight.planes.len() {
+                        return Err("packed plane count differs from conversion".to_owned());
+                    }
+                    let start = packed
+                        .tile_index()
+                        .checked_mul(SALT_V2_ALLOCATION_TILE_SIZE)
+                        .ok_or_else(|| "packed tile offset overflowed".to_owned())?;
+                    let opened_plane = opened
+                        .get_mut(packed.plane_index())
+                        .ok_or_else(|| "packed plane index exceeds conversion".to_owned())?;
+                    let source =
+                        read_source_plane(weight, opened_plane, start, packed.logical_len())?;
+                    let decoded =
+                        unpack_salt_v2_plane(codec, packed.packed_bytes(), packed.logical_len())
+                            .map_err(|error| error.to_string())?;
+                    let scale_bits = source
+                        .scales()
+                        .iter()
+                        .map(|scale| scale.to_bits())
+                        .collect::<Vec<_>>();
+                    let packed_scale_bits = packed
+                        .scales()
+                        .iter()
+                        .map(|scale| scale.to_bits())
+                        .collect::<Vec<_>>();
+                    if decoded != source.trits() || scale_bits != packed_scale_bits {
+                        return Err("packed SALT V2 semantics differ from conversion".to_owned());
+                    }
+                    Ok(())
+                })();
+            })
+            .map_err(|error| error.to_string())?;
+        comparison?;
+        verify_opened_weight(weight, &mut opened)?;
+    }
+    Ok(())
+}
+
 fn stream_weight(
-    weight: &mut AdmittedWeight,
+    weight: &AdmittedWeight,
     writer: &mut SaltV2PackageStreamWriter<File>,
 ) -> Result<(), String> {
+    let mut opened = open_weight(weight)?;
     let elements = weight
         .rows
         .checked_mul(weight.columns)
@@ -419,50 +528,45 @@ fn stream_weight(
     for start in (0..elements).step_by(SALT_V2_ALLOCATION_TILE_SIZE) {
         let logical_len = (elements - start).min(SALT_V2_ALLOCATION_TILE_SIZE);
         let mut tile_planes = Vec::new();
-        for plane in &mut weight.planes {
-            plane
-                .trits
-                .seek(SeekFrom::Start(start as u64))
-                .map_err(|error| format!("seek conversion trits failed: {:?}", error.kind()))?;
-            let mut trits = vec![0u8; logical_len];
-            plane
-                .trits
-                .read_exact(&mut trits)
-                .map_err(|error| format!("read conversion trits failed: {:?}", error.kind()))?;
-            let trits = trits.into_iter().map(|value| value as i8).collect();
-            let groups = logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
-            let mut scales = Vec::with_capacity(groups);
-            for group in 0..groups {
-                let coefficient = start + group * SALT_V2_SCALE_GROUP_SIZE;
-                let row = coefficient / weight.columns;
-                plane
-                    .scales
-                    .seek(SeekFrom::Start((row * 2) as u64))
-                    .map_err(|error| {
-                        format!("seek conversion scales failed: {:?}", error.kind())
-                    })?;
-                let mut bits = [0u8; 2];
-                plane.scales.read_exact(&mut bits).map_err(|error| {
-                    format!("read conversion scales failed: {:?}", error.kind())
-                })?;
-                scales.push(f16::from_bits(u16::from_le_bytes(bits)));
-            }
-            tile_planes.push(SaltV2Plane::new(trits, scales).map_err(|error| error.to_string())?);
+        for plane in &mut opened {
+            tile_planes.push(read_source_plane(weight, plane, start, logical_len)?);
         }
         writer
             .push_planes(&tile_planes)
             .map_err(|error| error.to_string())?;
     }
+    verify_opened_weight(weight, &mut opened)?;
     Ok(())
 }
 
 fn read_regular(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
-    let metadata = fs::symlink_metadata(path)
+    let before = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect conversion file failed: {:?}", error.kind()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum {
+    if before.file_type().is_symlink() || !before.is_file() || before.len() > maximum {
         return Err("conversion file must be a bounded ordinary file".to_owned());
     }
-    fs::read(path).map_err(|error| format!("read conversion file failed: {:?}", error.kind()))
+    let mut file = File::open(path)
+        .map_err(|error| format!("open conversion file failed: {:?}", error.kind()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("inspect opened conversion file failed: {:?}", error.kind()))?;
+    let current = fs::symlink_metadata(path)
+        .map_err(|error| format!("reinspect conversion file failed: {:?}", error.kind()))?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || !same_file_identity(&opened, &current)
+    {
+        return Err("conversion file changed while opening".to_owned());
+    }
+    let capacity = usize::try_from(opened.len())
+        .map_err(|_| "conversion file length exceeds platform".to_owned())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read conversion file failed: {:?}", error.kind()))?;
+    if bytes.len() as u64 != opened.len() {
+        return Err("conversion file changed while reading".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn open_verified(path: &Path, digest: &str, bytes: u64) -> Result<File, String> {
@@ -496,11 +600,67 @@ fn open_verified(path: &Path, digest: &str, bytes: u64) -> Result<File, String> 
     Ok(file)
 }
 
-fn verify_admitted_weight(weight: &mut AdmittedWeight) -> Result<(), String> {
-    for plane in &mut weight.planes {
+fn open_weight(weight: &AdmittedWeight) -> Result<Vec<OpenedPlane>, String> {
+    weight
+        .planes
+        .iter()
+        .map(|plane| {
+            Ok(OpenedPlane {
+                trits: open_verified(&plane.trits_path, &plane.trits_digest, plane.trits_bytes)?,
+                scales: open_verified(
+                    &plane.scales_path,
+                    &plane.scales_digest,
+                    plane.scales_bytes,
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn read_source_plane(
+    weight: &AdmittedWeight,
+    plane: &mut OpenedPlane,
+    start: usize,
+    logical_len: usize,
+) -> Result<SaltV2Plane, String> {
+    plane
+        .trits
+        .seek(SeekFrom::Start(start as u64))
+        .map_err(|error| format!("seek conversion trits failed: {:?}", error.kind()))?;
+    let mut trits = vec![0u8; logical_len];
+    plane
+        .trits
+        .read_exact(&mut trits)
+        .map_err(|error| format!("read conversion trits failed: {:?}", error.kind()))?;
+    let trits = trits.into_iter().map(|value| value as i8).collect();
+    let groups = logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+    let mut scales = Vec::with_capacity(groups);
+    for group in 0..groups {
+        let coefficient = start + group * SALT_V2_SCALE_GROUP_SIZE;
+        let row = coefficient / weight.columns;
+        plane
+            .scales
+            .seek(SeekFrom::Start((row * 2) as u64))
+            .map_err(|error| format!("seek conversion scales failed: {:?}", error.kind()))?;
+        let mut bits = [0u8; 2];
+        plane
+            .scales
+            .read_exact(&mut bits)
+            .map_err(|error| format!("read conversion scales failed: {:?}", error.kind()))?;
+        scales.push(f16::from_bits(u16::from_le_bytes(bits)));
+    }
+    SaltV2Plane::new(trits, scales).map_err(|error| error.to_string())
+}
+
+fn verify_opened_weight(weight: &AdmittedWeight, opened: &mut [OpenedPlane]) -> Result<(), String> {
+    for (source, plane) in weight.planes.iter().zip(opened) {
         for (file, path, expected) in [
-            (&mut plane.trits, &plane.trits_path, &plane.trits_digest),
-            (&mut plane.scales, &plane.scales_path, &plane.scales_digest),
+            (&mut plane.trits, &source.trits_path, &source.trits_digest),
+            (
+                &mut plane.scales,
+                &source.scales_path,
+                &source.scales_digest,
+            ),
         ] {
             let metadata = fs::symlink_metadata(path).map_err(|error| {
                 format!("reinspect conversion payload failed: {:?}", error.kind())

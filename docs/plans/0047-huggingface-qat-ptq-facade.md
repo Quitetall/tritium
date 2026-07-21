@@ -94,8 +94,12 @@ saves with safe serialization, automatically reloads through
   tested strict reader for schema-v1 artifacts. Generic reload now binds the
   source digest and exact module aliases into inference-only Linear modules
   holding B3-packed additive trits plus f16 row scales, with no latent master or
-  persistent dense decoded weight. SALT package export, native fused dispatch
-  and stronger factorized curvature remain open.
+  persistent dense decoded weight. This Python path is a semantic reference
+  fallback and its transient decode is not native fused/no-shadow evidence.
+  G128-aligned fitted weights now stream one tensor at a time into a strict,
+  seek-backed SALT V2 package; conversion sources and packed semantics are
+  reverified before atomic publication. Complete-model preservation, native
+  fused dispatch and stronger factorized curvature remain open.
 - [x] Expose immutable, exact-ledger `ArtifactRef`, `QuantizationResult`, and
   `ExportReceipt` records plus atomic matrix-bundle export. `complete_model`
   remains false because vision is intentionally outside the language-plus-MTP

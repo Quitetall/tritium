@@ -1,19 +1,25 @@
 """Strict generic conversion to seek-backed SALT V2 package gates."""
 
+import hashlib
+import json
+
 import pytest
 
 pytest.importorskip("torch")
 import torch  # noqa: E402
 
 from tritium.torch import TernaryConfig, calibrate, convert, prepare  # noqa: E402
-from tritium.torch.module_artifacts import load_packed_module  # noqa: E402
+from tritium.torch.module_artifacts import (  # noqa: E402
+    load_module_conversion,
+    load_packed_module,
+)
 
 
 def test_module_conversion_streams_strict_native_salt_package(tmp_path):
-    model = torch.nn.Linear(128, 2, bias=False)
+    model = torch.nn.Linear(384, 3, bias=False)
     with torch.no_grad():
         model.weight.copy_(
-            torch.arange(256, dtype=torch.float32).reshape(2, 128) / 256 - 0.5
+            torch.arange(1152, dtype=torch.float32).reshape(3, 384) / 1152 - 0.5
         )
     prepared = prepare(
         model,
@@ -22,7 +28,7 @@ def test_module_conversion_streams_strict_native_salt_package(tmp_path):
     )
     calibration = calibrate(
         prepared,
-        [torch.ones(1, 128)],
+        [torch.ones(1, 384)],
         evidence_dir=tmp_path / "evidence",
     )
     converted = convert(prepared, calibration, work_dir=tmp_path / "work")
@@ -57,3 +63,37 @@ def test_module_conversion_native_pack_rejects_unaligned_g128_weights(tmp_path):
     converted = convert(prepared, calibration, work_dir=tmp_path / "work")
     with pytest.raises(ValueError, match="G128 alignment"):
         converted.pack_native(tmp_path / "packed")
+
+
+def test_module_conversion_rejects_missing_selected_coverage_weight(tmp_path):
+    model = torch.nn.Sequential(
+        torch.nn.Linear(128, 2, bias=False),
+        torch.nn.Linear(2, 1, bias=False),
+    )
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 128)],
+        evidence_dir=tmp_path / "evidence",
+    )
+    work = tmp_path / "work"
+    convert(prepared, calibration, work_dir=work)
+
+    manifest_path = work / "conversion.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["weight_receipts"].pop()
+    identity = dict(manifest)
+    del identity["artifact_id"]
+    manifest["artifact_id"] = "sha256:" + hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    for path in work.glob("weight-00001*"):
+        path.unlink()
+
+    with pytest.raises(ValueError, match="selected coverage"):
+        load_module_conversion(work)
