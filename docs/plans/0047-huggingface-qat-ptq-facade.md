@@ -81,8 +81,11 @@ saves with safe serialization, automatically reloads through
   ragged or runtime-unindexable geometry fails closed.
 - [x] Bind the Rust SALT pipeline to explicit `prepare` → `calibrate` → `convert`
   phases without a Python-list weight bridge. `quantize(model_or_id, ...)`
-  composes those exact primitives. The v1 seam admits canonical precomputed
-  evidence; raw activation collection remains an explicit open item.
+  composes those exact primitives. The Qwen seam admits canonical precomputed
+  evidence. Ordinary PyTorch modules now stream bounded, source/data-bound
+  diagonal second moments into an atomically published, strict-reload evidence
+  namespace; generic additive fitting and stronger factorized curvature remain
+  open.
 - [x] Expose immutable, exact-ledger `ArtifactRef`, `QuantizationResult`, and
   `ExportReceipt` records plus atomic matrix-bundle export. `complete_model`
   remains false because vision is intentionally outside the language-plus-MTP

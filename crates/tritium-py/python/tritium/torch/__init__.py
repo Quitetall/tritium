@@ -43,7 +43,15 @@ from .onnx import (
     export_onnx,
     load_onnx,
 )
-from .ptq import CalibrationReceipt, calibrate, convert, quantize
+from .ptq import (
+    ActivationCalibrationReceipt,
+    ActivationRecord,
+    CalibrationReceipt,
+    calibrate,
+    convert,
+    load_activation_calibration,
+    quantize,
+)
 from .projection import (
     ProjectionContext,
     TernaryPlane,
@@ -53,6 +61,8 @@ from .projection import (
 
 __all__ = [
     "AbsMeanSTE",
+    "ActivationCalibrationReceipt",
+    "ActivationRecord",
     "AdditiveEstimator",
     "AnnealedSTE",
     "ArtifactRef",
@@ -88,6 +98,7 @@ __all__ = [
     "export_onnx",
     "inspect",
     "load",
+    "load_activation_calibration",
     "load_onnx",
     "prepare",
     "prepare_qat",

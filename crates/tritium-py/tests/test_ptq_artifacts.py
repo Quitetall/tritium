@@ -1,11 +1,13 @@
 """Strict PTQ artifact and phased facade gates from plan 0047."""
 
 import json
+import struct
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("torch")
+import torch  # noqa: E402
 
 import tritium.torch.artifacts as artifacts  # noqa: E402
 import tritium.torch.ptq as ptq  # noqa: E402
@@ -335,6 +337,91 @@ def test_local_ptq_prepare_and_calibration_are_explicit(monkeypatch, tmp_path):
             near_lossless_max_resident_bytes=1,
         )
     assert caught.value.code == "unsupported_recipe"
+
+
+def test_live_module_calibration_streams_bounded_source_bound_curvature(tmp_path):
+    model = torch.nn.Sequential(
+        torch.nn.Linear(3, 2, bias=False),
+        torch.nn.ReLU(),
+        torch.nn.Linear(2, 1, bias=False),
+    )
+    model.train()
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    batches = (
+        torch.tensor([[1.0, 2.0, 3.0], [2.0, 0.0, -1.0]]),
+        torch.tensor([[0.0, 1.0, 2.0]]),
+    )
+    evidence = tmp_path / "activation-evidence"
+    receipt = calibrate(
+        prepared,
+        batches,
+        evidence_dir=evidence,
+        max_evidence_bytes=1024,
+    )
+
+    assert isinstance(receipt, ptq.ActivationCalibrationReceipt)
+    assert receipt.curvature == "diagonal-second-moment-f64le"
+    assert receipt.record_count == 2
+    assert receipt.records[0].module == "0"
+    assert receipt.records[0].samples == 3
+    assert receipt.records[0].features == 3
+    assert prepared.model.training is True
+    values = struct.unpack("<3d", (evidence / receipt.records[0].file).read_bytes())
+    assert values == pytest.approx((5.0, 5.0, 14.0))
+    manifest = json.loads((evidence / "calibration.json").read_text())
+    assert manifest["evidence_id"] == receipt.evidence_id
+    assert manifest["source_model_digest"] == receipt.source_model_digest
+    assert manifest["token_stream_digest"] == receipt.token_stream_digest
+    assert receipt.evidence_id.startswith("sha256:")
+    assert ptq.load_activation_calibration(evidence, max_evidence_bytes=1024) == receipt
+
+    (evidence / receipt.records[0].file).write_bytes(b"\x00" * receipt.records[0].bytes)
+    with pytest.raises(ValueError, match="digest mismatch"):
+        ptq.load_activation_calibration(evidence)
+
+
+def test_live_module_calibration_fails_closed_on_incomplete_or_oversize_data(tmp_path):
+    class Conditional(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.used = torch.nn.Linear(2, 2, bias=False)
+            self.skipped = torch.nn.Linear(2, 2, bias=False)
+
+        def forward(self, value):
+            return self.used(value)
+
+    prepared = prepare(
+        Conditional(),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    with pytest.raises(TritiumError) as caught:
+        calibrate(
+            prepared,
+            [torch.ones(1, 2)],
+            evidence_dir=tmp_path / "incomplete",
+        )
+    assert caught.value.code == "incomplete_coverage"
+    assert not (tmp_path / "incomplete").exists()
+
+    linear = prepare(
+        torch.nn.Linear(3, 2, bias=False),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    with pytest.raises(TritiumError) as caught:
+        calibrate(
+            linear,
+            [torch.ones(1, 3)],
+            evidence_dir=tmp_path / "oversize",
+            max_evidence_bytes=8,
+        )
+    assert caught.value.code == "evidence_too_large"
+    assert not (tmp_path / "oversize").exists()
 
 
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):

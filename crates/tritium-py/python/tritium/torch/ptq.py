@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import struct
+import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Dict, Iterable, Tuple, Union
+
+import torch
+from torch import nn
 
 from .. import _tritium
 from ..salt import reconcile_qwen36_ptq_packages
@@ -32,18 +40,482 @@ class CalibrationReceipt:
     schema_version: int = 1
 
 
+@dataclass(frozen=True)
+class ActivationRecord:
+    """One bounded diagonal-curvature record for a selected module input."""
+
+    module: str
+    weight_aliases: Tuple[str, ...]
+    features: int
+    samples: int
+    file: str
+    digest: str
+    bytes: int
+
+
+@dataclass(frozen=True)
+class ActivationCalibrationReceipt:
+    """Strict receipt for streamed activation evidence from a live module."""
+
+    evidence_dir: Path
+    evidence_id: str
+    curvature: str
+    record_count: int
+    source_model_digest: str
+    activation_cache_digest: str
+    token_stream_digest: str
+    max_evidence_bytes: int
+    records: Tuple[ActivationRecord, ...]
+    schema_version: int = 1
+
+
+def _hash_field(digest: "hashlib._Hash", tag: str, payload: bytes) -> None:
+    encoded = tag.encode("utf-8")
+    digest.update(struct.pack("<Q", len(encoded)))
+    digest.update(encoded)
+    digest.update(struct.pack("<Q", len(payload)))
+    digest.update(payload)
+
+
+def _hash_tensor(digest: "hashlib._Hash", tag: str, value: torch.Tensor) -> None:
+    tensor = value.detach()
+    _hash_field(digest, f"{tag}:dtype", str(tensor.dtype).encode("ascii"))
+    _hash_field(
+        digest,
+        f"{tag}:shape",
+        json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"),
+    )
+    flat = tensor.contiguous().view(-1)
+    chunk_elements = max(1, (1024 * 1024) // max(1, flat.element_size()))
+    for offset in range(0, flat.numel(), chunk_elements):
+        chunk = flat[offset : offset + chunk_elements].cpu().numpy().tobytes()
+        _hash_field(digest, f"{tag}:chunk", chunk)
+
+
+def _hash_value(digest: "hashlib._Hash", tag: str, value: Any) -> None:
+    if isinstance(value, torch.Tensor):
+        _hash_tensor(digest, tag, value)
+    elif isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("calibration batch mappings require string keys")
+        for key in sorted(value):
+            _hash_value(digest, f"{tag}.{key}", value[key])
+    elif isinstance(value, (tuple, list)):
+        for index, item in enumerate(value):
+            _hash_value(digest, f"{tag}[{index}]", item)
+    elif value is None or type(value) in {bool, int, float, str}:
+        _hash_field(
+            digest,
+            tag,
+            json.dumps(value, allow_nan=False, separators=(",", ":")).encode("utf-8"),
+        )
+    else:
+        raise TypeError(
+            f"unsupported calibration batch value at {tag}: {type(value).__name__}"
+        )
+
+
+def _source_model_digest(model: nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        _hash_tensor(digest, f"state.{name}", value)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _selected_linear_modules(
+    prepared: PreparedModel,
+) -> Tuple[Tuple[str, nn.Linear, Tuple[str, ...]], ...]:
+    assert isinstance(prepared.model, nn.Module)
+    selected = {
+        alias
+        for entry in prepared.coverage.entries
+        if entry.disposition == "selected"
+        for alias in entry.aliases
+    }
+    records = []
+    seen = set()
+    for path, module in prepared.model.named_modules(remove_duplicate=False):
+        weight_name = f"{path}.weight" if path else "weight"
+        if not isinstance(module, nn.Linear) or weight_name not in selected:
+            continue
+        key = id(module)
+        if key in seen:
+            continue
+        seen.add(key)
+        aliases = next(
+            entry.aliases
+            for entry in prepared.coverage.entries
+            if weight_name in entry.aliases
+        )
+        records.append((path, module, aliases))
+    if not records:
+        raise TritiumError(
+            "raw calibration currently requires at least one selected Linear module",
+            code="unsupported_module",
+            stage="calibrate",
+        )
+    return tuple(records)
+
+
+def _invoke_model(model: nn.Module, batch: Any) -> Any:
+    if isinstance(batch, Mapping):
+        return model(**batch)
+    if isinstance(batch, (tuple, list)):
+        return model(*batch)
+    return model(batch)
+
+
+def _json_without_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate calibration manifest field {key!r}")
+        value[key] = item
+    return value
+
+
+def load_activation_calibration(
+    evidence_dir: Pathish, *, max_evidence_bytes: int = 64 * 1024 * 1024
+) -> ActivationCalibrationReceipt:
+    """Strictly reopen and rehash streamed diagonal-curvature evidence."""
+
+    if max_evidence_bytes <= 0:
+        raise ValueError("max_evidence_bytes must be positive")
+    requested = Path(evidence_dir)
+    if requested.is_symlink():
+        raise ValueError("activation evidence directory must not be a symlink")
+    directory = requested.resolve(strict=True)
+    if not directory.is_dir():
+        raise ValueError("activation evidence must be an ordinary directory")
+    manifest_path = directory / "calibration.json"
+    metadata = manifest_path.lstat()
+    if (
+        manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or metadata.st_size > 1024 * 1024
+    ):
+        raise ValueError(
+            "calibration.json must be an ordinary manifest no larger than 1 MiB"
+        )
+    with manifest_path.open("r", encoding="utf-8") as stream:
+        manifest = json.load(stream, object_pairs_hook=_json_without_duplicates)
+    fields = {
+        "schema_version",
+        "curvature",
+        "source_model_digest",
+        "activation_cache_digest",
+        "token_stream_digest",
+        "record_count",
+        "records",
+        "evidence_id",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != fields:
+        raise ValueError("calibration manifest fields do not match schema version 1")
+    if manifest["schema_version"] != 1:
+        raise ValueError("unsupported activation calibration schema_version")
+    if manifest["curvature"] != "diagonal-second-moment-f64le":
+        raise ValueError("unsupported activation curvature representation")
+    for field in (
+        "source_model_digest",
+        "activation_cache_digest",
+        "token_stream_digest",
+        "evidence_id",
+    ):
+        value = manifest[field]
+        if (
+            not isinstance(value, str)
+            or len(value) != 71
+            or not value.startswith("sha256:")
+        ):
+            raise ValueError(f"invalid {field}")
+        try:
+            bytes.fromhex(value[7:])
+        except ValueError as error:
+            raise ValueError(f"invalid {field}") from error
+    values = manifest["records"]
+    if (
+        type(manifest["record_count"]) is not int
+        or manifest["record_count"] <= 0
+        or not isinstance(values, list)
+        or len(values) != manifest["record_count"]
+    ):
+        raise ValueError("activation record_count does not match records")
+    record_fields = {
+        "module",
+        "weight_aliases",
+        "features",
+        "samples",
+        "file",
+        "digest",
+        "bytes",
+    }
+    records = []
+    cache_digest = hashlib.sha256()
+    total_bytes = 0
+    expected_files = {"calibration.json"}
+    for index, item in enumerate(values):
+        if not isinstance(item, dict) or set(item) != record_fields:
+            raise ValueError("activation record fields do not match schema version 1")
+        filename = f"curvature-{index:05d}.f64le"
+        if item["file"] != filename:
+            raise ValueError(
+                "activation records are missing, duplicated, or out of order"
+            )
+        aliases = item["weight_aliases"]
+        if (
+            not isinstance(item["module"], str)
+            or not isinstance(aliases, list)
+            or not aliases
+            or any(not isinstance(alias, str) or not alias for alias in aliases)
+        ):
+            raise ValueError("activation record module aliases are invalid")
+        if (
+            type(item["features"]) is not int
+            or item["features"] <= 0
+            or type(item["samples"]) is not int
+            or item["samples"] <= 0
+            or type(item["bytes"]) is not int
+            or item["bytes"] != item["features"] * 8
+        ):
+            raise ValueError("activation record geometry or byte ledger is invalid")
+        path = directory / filename
+        file_metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or file_metadata.st_size != item["bytes"]
+        ):
+            raise ValueError("activation record is not an exact ordinary file")
+        payload = path.read_bytes()
+        digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+        if item["digest"] != digest:
+            raise ValueError("activation record digest mismatch")
+        _hash_field(cache_digest, filename, payload)
+        total_bytes += len(payload)
+        if total_bytes > max_evidence_bytes:
+            raise ValueError("activation evidence exceeds max_evidence_bytes")
+        expected_files.add(filename)
+        records.append(
+            ActivationRecord(
+                module=item["module"],
+                weight_aliases=tuple(aliases),
+                features=item["features"],
+                samples=item["samples"],
+                file=filename,
+                digest=digest,
+                bytes=item["bytes"],
+            )
+        )
+    if {child.name for child in directory.iterdir()} != expected_files:
+        raise ValueError("activation evidence directory contains unknown files")
+    actual_cache_digest = f"sha256:{cache_digest.hexdigest()}"
+    if manifest["activation_cache_digest"] != actual_cache_digest:
+        raise ValueError("activation cache digest mismatch")
+    identity = dict(manifest)
+    evidence_id = identity.pop("evidence_id")
+    canonical = json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if evidence_id != f"sha256:{hashlib.sha256(canonical).hexdigest()}":
+        raise ValueError("activation evidence identity mismatch")
+    return ActivationCalibrationReceipt(
+        evidence_dir=directory,
+        evidence_id=evidence_id,
+        curvature=manifest["curvature"],
+        record_count=len(records),
+        source_model_digest=manifest["source_model_digest"],
+        activation_cache_digest=actual_cache_digest,
+        token_stream_digest=manifest["token_stream_digest"],
+        max_evidence_bytes=max_evidence_bytes,
+        records=tuple(records),
+    )
+
+
+def _collect_activations(
+    prepared: PreparedModel,
+    data: Iterable[Any],
+    evidence_dir: Path,
+    max_evidence_bytes: int,
+) -> ActivationCalibrationReceipt:
+    if max_evidence_bytes <= 0:
+        raise ValueError("max_evidence_bytes must be positive")
+    if evidence_dir.exists() or evidence_dir.is_symlink():
+        raise FileExistsError(f"calibration evidence already exists: {evidence_dir}")
+    modules = _selected_linear_modules(prepared)
+    required_bytes = sum(module.in_features * 8 for _, module, _ in modules)
+    if required_bytes > max_evidence_bytes:
+        raise TritiumError(
+            "activation evidence exceeds max_evidence_bytes",
+            code="evidence_too_large",
+            stage="calibrate",
+            details={
+                "required_bytes": required_bytes,
+                "max_evidence_bytes": max_evidence_bytes,
+            },
+        )
+    accumulators: Dict[str, torch.Tensor] = {
+        path: torch.zeros(module.in_features, dtype=torch.float64)
+        for path, module, _ in modules
+    }
+    samples = {path: 0 for path, _, _ in modules}
+    handles = []
+
+    def hook_for(path: str):
+        def capture(_module, args):
+            if not args or not isinstance(args[0], torch.Tensor):
+                raise TritiumError(
+                    "selected Linear module did not receive a tensor input",
+                    code="invalid_calibration_batch",
+                    stage="calibrate",
+                    module=path,
+                )
+            value = args[0].detach()
+            if value.shape[-1] != accumulators[path].numel():
+                raise TritiumError(
+                    "Linear calibration input width changed",
+                    code="invalid_calibration_batch",
+                    stage="calibrate",
+                    module=path,
+                )
+            rows = value.reshape(-1, value.shape[-1])
+            chunk_rows = max(1, (1024 * 1024) // rows.shape[-1])
+            for offset in range(0, rows.shape[0], chunk_rows):
+                chunk = rows[offset : offset + chunk_rows].to(torch.float64)
+                accumulators[path].add_(chunk.square().sum(dim=0).cpu())
+            samples[path] += rows.shape[0]
+
+        return capture
+
+    for path, module, _ in modules:
+        handles.append(module.register_forward_pre_hook(hook_for(path)))
+
+    model = prepared.model
+    was_training = model.training
+    token_digest = hashlib.sha256()
+    batches = 0
+    try:
+        model.eval()
+        with torch.no_grad():
+            for batches, batch in enumerate(data, 1):
+                _hash_value(token_digest, f"batch[{batches - 1}]", batch)
+                _invoke_model(model, batch)
+    finally:
+        for handle in handles:
+            handle.remove()
+        model.train(was_training)
+    if batches == 0:
+        raise TritiumError(
+            "calibration data must yield at least one batch",
+            code="invalid_calibration_batch",
+            stage="calibrate",
+        )
+    empty = [path for path, count in samples.items() if count == 0]
+    if empty:
+        raise TritiumError(
+            "selected modules were not all exercised by calibration data",
+            code="incomplete_coverage",
+            stage="calibrate",
+            details={"modules": empty},
+        )
+
+    parent = evidence_dir.parent.resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / evidence_dir.name
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{evidence_dir.name}.", dir=str(parent))
+    )
+    activation_digest = hashlib.sha256()
+    record_values = []
+    records = []
+    try:
+        for index, (path, _, aliases) in enumerate(modules):
+            payload = accumulators[path].numpy().astype("<f8", copy=False).tobytes()
+            if len(payload) > max_evidence_bytes:
+                raise TritiumError(
+                    "activation evidence exceeds max_evidence_bytes",
+                    code="evidence_too_large",
+                    stage="calibrate",
+                )
+            filename = f"curvature-{index:05d}.f64le"
+            (staging / filename).write_bytes(payload)
+            digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+            _hash_field(activation_digest, filename, payload)
+            record = ActivationRecord(
+                module=path,
+                weight_aliases=tuple(aliases),
+                features=accumulators[path].numel(),
+                samples=samples[path],
+                file=filename,
+                digest=digest,
+                bytes=len(payload),
+            )
+            records.append(record)
+            record_values.append(
+                {
+                    "module": record.module,
+                    "weight_aliases": list(record.weight_aliases),
+                    "features": record.features,
+                    "samples": record.samples,
+                    "file": record.file,
+                    "digest": record.digest,
+                    "bytes": record.bytes,
+                }
+            )
+        total_bytes = sum(record.bytes for record in records)
+        if total_bytes > max_evidence_bytes:
+            raise TritiumError(
+                "activation evidence exceeds max_evidence_bytes",
+                code="evidence_too_large",
+                stage="calibrate",
+                details={
+                    "required_bytes": total_bytes,
+                    "max_evidence_bytes": max_evidence_bytes,
+                },
+            )
+        source_digest = _source_model_digest(model)
+        cache_digest = f"sha256:{activation_digest.hexdigest()}"
+        stream_digest = f"sha256:{token_digest.hexdigest()}"
+        manifest = {
+            "schema_version": 1,
+            "curvature": "diagonal-second-moment-f64le",
+            "source_model_digest": source_digest,
+            "activation_cache_digest": cache_digest,
+            "token_stream_digest": stream_digest,
+            "record_count": len(records),
+            "records": record_values,
+        }
+        canonical = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        evidence_id = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+        manifest["evidence_id"] = evidence_id
+        (staging / "calibration.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        _tritium.publish_directory_noreplace(str(staging), str(target))
+    except BaseException:
+        if staging.exists():
+            for child in staging.iterdir():
+                child.unlink()
+            staging.rmdir()
+        raise
+    return load_activation_calibration(
+        target, max_evidence_bytes=max_evidence_bytes
+    )
+
+
 def calibrate(
     prepared: PreparedModel,
     data: Any = None,
     *,
     evidence_dir: Pathish,
     max_evidence_bytes: int = 64 * 1024 * 1024,
-) -> CalibrationReceipt:
+) -> Union[CalibrationReceipt, ActivationCalibrationReceipt]:
     """Admit precomputed Qwen3.6 S2KF evidence for PTQ conversion.
 
-    Raw activation collection is intentionally not simulated. Until the
-    streaming collector lands, callers supply the exact canonical 506-record
-    evidence directory and leave ``data`` as ``None``.
+    Local Qwen sources admit the canonical 506-record S2KF namespace. Live
+    PyTorch modules instead stream bounded diagonal second moments from
+    ``data`` into a separately typed evidence namespace.
     """
 
     if not isinstance(prepared, PreparedModel):
@@ -53,6 +525,16 @@ def calibrate(
             "QAT preparation does not use the PTQ calibration phase",
             code="invalid_phase",
             stage="calibrate",
+        )
+    if isinstance(prepared.model, nn.Module):
+        if data is None:
+            raise TritiumError(
+                "live-module calibration requires an iterable of batches",
+                code="calibration_data_required",
+                stage="calibrate",
+            )
+        return _collect_activations(
+            prepared, data, Path(evidence_dir), max_evidence_bytes
         )
     if data is not None:
         raise TritiumError(
@@ -179,4 +661,12 @@ def quantize(
     )
 
 
-__all__ = ["CalibrationReceipt", "calibrate", "convert", "quantize"]
+__all__ = [
+    "ActivationCalibrationReceipt",
+    "ActivationRecord",
+    "CalibrationReceipt",
+    "calibrate",
+    "convert",
+    "load_activation_calibration",
+    "quantize",
+]
