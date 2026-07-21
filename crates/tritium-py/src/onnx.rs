@@ -10,7 +10,10 @@ use std::{
     },
 };
 
-use ort::session::Session;
+use ort::{
+    session::{Session, SessionInputValue},
+    value::Tensor,
+};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use serde::Deserialize;
@@ -168,8 +171,46 @@ pub(crate) struct QwenOnnxModel {
     language_outputs: Vec<String>,
     mtp_inputs: Vec<String>,
     mtp_outputs: Vec<String>,
-    _language_session: Mutex<Session>,
+    language_session: Mutex<Session>,
     _mtp_session: Mutex<Session>,
+}
+
+/// Owned output of one fixed-shape Qwen language graph execution.
+#[pyclass(module = "tritium", frozen, skip_from_py_object)]
+pub(crate) struct QwenOnnxLanguageOutput {
+    logits_shape: Vec<usize>,
+    logits: Vec<f32>,
+    state_names: Vec<String>,
+    state_shapes: Vec<Vec<usize>>,
+    states: Vec<Vec<f32>>,
+}
+
+#[pymethods]
+impl QwenOnnxLanguageOutput {
+    #[getter]
+    fn logits_shape(&self) -> Vec<usize> {
+        self.logits_shape.clone()
+    }
+
+    #[getter]
+    fn logits(&self) -> Vec<f32> {
+        self.logits.clone()
+    }
+
+    #[getter]
+    fn state_names(&self) -> Vec<String> {
+        self.state_names.clone()
+    }
+
+    #[getter]
+    fn state_shapes(&self) -> Vec<Vec<usize>> {
+        self.state_shapes.clone()
+    }
+
+    #[getter]
+    fn states(&self) -> Vec<Vec<f32>> {
+        self.states.clone()
+    }
 }
 
 #[pymethods]
@@ -224,6 +265,38 @@ impl QwenOnnxModel {
     #[getter]
     fn mtp_outputs(&self) -> Vec<String> {
         self.mtp_outputs.clone()
+    }
+
+    /// Execute the authenticated fixed-shape language graph.
+    ///
+    /// `states` is ordered exactly like `language_inputs[1:]`. It may be
+    /// omitted only for a graph whose authenticated `past_tokens` is zero, in
+    /// which case recurrent and empty KV inputs are initialized to zero.
+    #[pyo3(signature = (token_ids, states = None))]
+    fn forward_language(
+        &self,
+        py: Python<'_>,
+        token_ids: Vec<i64>,
+        states: Option<Vec<Vec<f32>>>,
+    ) -> PyResult<QwenOnnxLanguageOutput> {
+        if token_ids.len()
+            != usize::try_from(self.receipt.language_tokens).map_err(|_| {
+                PyValueError::new_err("authenticated language token count exceeds platform bounds")
+            })?
+        {
+            return Err(PyValueError::new_err(format!(
+                "token_ids has length {}, expected {} for this fixed-shape graph",
+                token_ids.len(),
+                self.receipt.language_tokens
+            )));
+        }
+        if states.is_none() && self.receipt.language_past_tokens != 0 {
+            return Err(PyValueError::new_err(
+                "states are required when the authenticated graph has past_tokens > 0",
+            ));
+        }
+        py.detach(|| run_language(self, token_ids, states))
+            .map_err(PyRuntimeError::new_err)
     }
 }
 
@@ -361,8 +434,119 @@ fn load_onnx_runtime(requested: &Path) -> Result<QwenOnnxModel, String> {
         language_outputs,
         mtp_inputs,
         mtp_outputs,
-        _language_session: Mutex::new(language_session),
+        language_session: Mutex::new(language_session),
         _mtp_session: Mutex::new(mtp_session),
+    })
+}
+
+fn run_language(
+    model: &QwenOnnxModel,
+    token_ids: Vec<i64>,
+    states: Option<Vec<Vec<f32>>>,
+) -> Result<QwenOnnxLanguageOutput, String> {
+    let mut session = model
+        .language_session
+        .lock()
+        .map_err(|_| "language ORT session lock was poisoned".to_owned())?;
+    let state_shapes = session
+        .inputs()
+        .iter()
+        .skip(1)
+        .map(|outlet| fixed_f32_shape(outlet.dtype(), outlet.name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let states = match states {
+        Some(states) => {
+            if states.len() != state_shapes.len() {
+                return Err(format!(
+                    "language state count is {}, expected {}",
+                    states.len(),
+                    state_shapes.len()
+                ));
+            }
+            for (index, (values, shape)) in states.iter().zip(&state_shapes).enumerate() {
+                let expected = shape_elements(shape, "language state")?;
+                if values.len() != expected {
+                    return Err(format!(
+                        "language state {index} has {} values, expected {expected}",
+                        values.len()
+                    ));
+                }
+            }
+            states
+        }
+        None => state_shapes
+            .iter()
+            .map(|shape| {
+                shape_elements(shape, "language state").map(|elements| vec![0.0_f32; elements])
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+
+    let tokens = Tensor::from_array((vec![token_ids.len()], token_ids.into_boxed_slice()))
+        .map_err(|error| format!("create language token tensor failed: {error}"))?;
+    let mut inputs: Vec<SessionInputValue<'_>> = Vec::with_capacity(1 + states.len());
+    inputs.push(tokens.into_dyn().into());
+    for (shape, values) in state_shapes.iter().cloned().zip(states) {
+        let tensor = Tensor::from_array((shape, values.into_boxed_slice()))
+            .map_err(|error| format!("create language state tensor failed: {error}"))?;
+        inputs.push(tensor.into_dyn().into());
+    }
+    let outputs = session
+        .run(inputs.as_slice())
+        .map_err(|error| format!("execute authenticated language ORT graph failed: {error}"))?;
+    let (logits_shape, logits) = outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|error| format!("extract language logits failed: {error}"))?;
+    let logits_shape = runtime_shape(logits_shape, "language logits")?;
+    let logits = logits.to_vec();
+    let mut output_shapes = Vec::with_capacity(outputs.len().saturating_sub(1));
+    let mut output_states = Vec::with_capacity(outputs.len().saturating_sub(1));
+    for index in 1..outputs.len() {
+        let (shape, values) = outputs[index]
+            .try_extract_tensor::<f32>()
+            .map_err(|error| {
+                format!(
+                    "extract language state output {} failed: {error}",
+                    index - 1
+                )
+            })?;
+        output_shapes.push(runtime_shape(shape, "language state output")?);
+        output_states.push(values.to_vec());
+    }
+    Ok(QwenOnnxLanguageOutput {
+        logits_shape,
+        logits,
+        state_names: model.language_outputs.iter().skip(1).cloned().collect(),
+        state_shapes: output_shapes,
+        states: output_states,
+    })
+}
+
+fn fixed_f32_shape(dtype: &ort::value::ValueType, name: &str) -> Result<Vec<usize>, String> {
+    if dtype.tensor_type() != Some(ort::value::TensorElementType::Float32) {
+        return Err(format!("language state input {name:?} is not float32"));
+    }
+    let shape = dtype
+        .tensor_shape()
+        .ok_or_else(|| format!("language state input {name:?} is not a tensor"))?;
+    runtime_shape(shape, name)
+}
+
+fn runtime_shape(shape: &[i64], label: &str) -> Result<Vec<usize>, String> {
+    shape
+        .iter()
+        .map(|&axis| {
+            usize::try_from(axis)
+                .map_err(|_| format!("{label} contains a dynamic or negative dimension"))
+        })
+        .collect()
+}
+
+fn shape_elements(shape: &[usize], label: &str) -> Result<usize, String> {
+    shape.iter().try_fold(1_usize, |elements, &axis| {
+        elements
+            .checked_mul(axis)
+            .ok_or_else(|| format!("{label} element count overflow"))
     })
 }
 
@@ -1499,5 +1683,13 @@ mod tests {
         fs::write(root.join(MANIFEST_FILE), unknown).unwrap();
         assert!(read_published_manifest(&root).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixed_runtime_shapes_are_checked_without_wrapping() {
+        assert_eq!(runtime_shape(&[0, 2, 4], "state").unwrap(), [0, 2, 4]);
+        assert!(runtime_shape(&[-1, 2], "state").is_err());
+        assert_eq!(shape_elements(&[0, usize::MAX], "state").unwrap(), 0);
+        assert!(shape_elements(&[usize::MAX, 2], "state").is_err());
     }
 }

@@ -255,6 +255,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<qwen::QwenLoadReceipt>()?;
     m.add_class::<onnx::QwenOnnxBundleReceipt>()?;
     m.add_class::<onnx::QwenOnnxModel>()?;
+    m.add_class::<onnx::QwenOnnxLanguageOutput>()?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::stage_qwen35_onnx_bundle, m)?)?;
