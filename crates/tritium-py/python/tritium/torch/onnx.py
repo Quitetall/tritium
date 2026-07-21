@@ -521,6 +521,7 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
 __all__ = [
     "OnnxBundleManifest",
     "OnnxCausalLMOutput",
+    "OnnxMtpOutput",
     "QwenOnnxCausalLM",
     "export_onnx",
     "load_onnx",
