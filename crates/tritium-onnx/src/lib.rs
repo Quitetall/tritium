@@ -1273,8 +1273,8 @@ pub use model::{
     CausalQueryProjection, ExternalOnnxModel, ExternalQwen35Bundle, ExternalQwen35BundleFiles,
     MappedBitNet, MappedQwen35, MappedSmolLm2, OnnxArtifactIdentityV2, OnnxModelError,
     OnnxPackedMatrix, PackedMatrixStorage, PackedTernaryMatrix, Qwen35Config, Qwen35LayerType,
-    Qwen35MtpDecoder, Qwen35MtpModel, Qwen35TensorProvider, QwenCausalLmDecoderLayer,
-    QwenCausalLmModel, QwenDeltaNetDecoderLayer, QwenDeltaNetLayerModel,
+    Qwen35MtpDecoder, Qwen35MtpModel, Qwen35PackedTensorProvider, Qwen35TensorProvider,
+    QwenCausalLmDecoderLayer, QwenCausalLmModel, QwenDeltaNetDecoderLayer, QwenDeltaNetLayerModel,
     QwenFullAttentionDecoderLayer, RotaryEmbedding, RotaryMode, SmolLm2Config,
     SmolLm2TensorProvider, TiedEmbeddingHeadModel, TiedEmbeddingHeadModelV2,
     UnsupportedGraphDiagnostic, UnsupportedGraphItemKind, VerifiedExternalCausalLmModel,
@@ -1284,9 +1284,10 @@ pub use model::{
     encode_external_qwen35_mtp, encode_external_tied_embedding_head,
     encode_external_tied_embedding_head_v2, encode_qwen_causal_lm, encode_qwen_deltanet_layer,
     encode_qwen35_mtp, encode_tied_embedding_head, encode_tied_embedding_head_v2,
-    map_bitnet_gguf_causal_lm, map_qwen35_causal_lm, map_qwen36_27b_causal_lm,
-    map_smollm2_causal_lm, verify_external_causal_lm, verify_external_qwen35_bundle,
-    verify_external_tied_embedding_head, verify_external_tied_embedding_head_v2,
+    map_bitnet_gguf_causal_lm, map_qwen35_causal_lm, map_qwen35_packed_causal_lm,
+    map_qwen36_27b_causal_lm, map_qwen36_27b_packed_causal_lm, map_smollm2_causal_lm,
+    verify_external_causal_lm, verify_external_qwen35_bundle, verify_external_tied_embedding_head,
+    verify_external_tied_embedding_head_v2,
 };
 
 #[cfg(feature = "model")]

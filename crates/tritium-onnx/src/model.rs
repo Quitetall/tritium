@@ -571,34 +571,65 @@ pub trait Qwen35TensorProvider<'a> {
     fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError>;
 }
 
+/// Canonical Qwen tensor source parameterized by one supported physical matrix layout.
+///
+/// This is the package-facing adapter contract. The legacy
+/// [`Qwen35TensorProvider`] receives a blanket implementation for single-plane
+/// TQ matrices, while additive SALT V2 readers implement this trait directly.
+pub trait Qwen35PackedTensorProvider<'a, M: OnnxPackedMatrix<'a>> {
+    /// Enumerate complete in-scope canonical tensor names.
+    fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError>;
+    /// Resolve one canonical rank-two tensor without changing its physical layout.
+    fn matrix(&'a self, name: &str) -> Result<M, OnnxModelError>;
+    /// Resolve one preserved tensor flattened in canonical row-major order.
+    fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError>;
+}
+
+impl<'a, T> Qwen35PackedTensorProvider<'a, PackedTernaryMatrix<'a>> for T
+where
+    T: Qwen35TensorProvider<'a>,
+{
+    fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError> {
+        Qwen35TensorProvider::tensor_names(self)
+    }
+
+    fn matrix(&'a self, name: &str) -> Result<PackedTernaryMatrix<'a>, OnnxModelError> {
+        Qwen35TensorProvider::matrix(self, name)
+    }
+
+    fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError> {
+        Qwen35TensorProvider::vector(self, name)
+    }
+}
+
 /// Exact Qwen3.5/Qwen3.6 mapping after fail-closed tensor admission.
 #[derive(Debug)]
-pub struct MappedQwen35<'a> {
+pub struct MappedQwen35<'a, M = PackedTernaryMatrix<'a>> {
     config: Qwen35Config<'a>,
-    embedding: PackedTernaryMatrix<'a>,
-    lm_head: PackedTernaryMatrix<'a>,
-    layers: Vec<QwenCausalLmDecoderLayer<'a>>,
+    embedding: M,
+    lm_head: M,
+    layers: Vec<QwenCausalLmDecoderLayer<'a, M>>,
     final_norm: &'a [f32],
-    mtp: Qwen35MtpDecoder<'a>,
+    mtp: Qwen35MtpDecoder<'a, M>,
     identity: OnnxArtifactIdentityV2<'a>,
 }
 
-impl<'a> MappedQwen35<'a> {
+impl<'a, M: OnnxPackedMatrix<'a>> MappedQwen35<'a, M> {
     /// Canonically ordered heterogeneous language schedule.
     #[must_use]
-    pub fn layers(&self) -> &[QwenCausalLmDecoderLayer<'a>] {
+    pub fn layers(&self) -> &[QwenCausalLmDecoderLayer<'a, M>] {
         &self.layers
     }
 
     /// Exact bundled one-layer MTP weights.
     #[must_use]
-    pub const fn mtp(&self) -> &Qwen35MtpDecoder<'a> {
+    pub const fn mtp(&self) -> &Qwen35MtpDecoder<'a, M> {
         &self.mtp
     }
 
     /// Borrow language weights as fixed prompt/decode graph.
     #[must_use]
-    pub fn model(&self, tokens: usize, past_tokens: usize) -> QwenCausalLmModel<'_> {
+    pub fn model(&self, tokens: usize, past_tokens: usize) -> QwenCausalLmModel<'_, M> {
         QwenCausalLmModel {
             tokens,
             past_tokens,
@@ -621,7 +652,7 @@ impl<'a> MappedQwen35<'a> {
 
     /// Borrow bundled MTP weights as a fixed prompt/decode graph.
     #[must_use]
-    pub fn mtp_model(&self, tokens: usize, past_tokens: usize) -> Qwen35MtpModel<'_> {
+    pub fn mtp_model(&self, tokens: usize, past_tokens: usize) -> Qwen35MtpModel<'_, M> {
         Qwen35MtpModel {
             tokens,
             past_tokens,
@@ -1151,6 +1182,24 @@ pub fn map_qwen35_causal_lm<'a>(
     config: Qwen35Config<'a>,
     identity: OnnxArtifactIdentityV2<'a>,
 ) -> Result<MappedQwen35<'a>, OnnxModelError> {
+    map_qwen35_packed_causal_lm(source, config, identity)
+}
+
+/// Map exact Qwen3.5/Qwen3.6 language-plus-MTP names while retaining the
+/// provider's supported packed physical matrix layout.
+///
+/// # Errors
+/// Returns [`OnnxModelError`] for unsupported config semantics, incomplete or
+/// extra tensor names, malformed physical operands, or geometry mismatch.
+pub fn map_qwen35_packed_causal_lm<'a, M, S>(
+    source: &'a S,
+    config: Qwen35Config<'a>,
+    identity: OnnxArtifactIdentityV2<'a>,
+) -> Result<MappedQwen35<'a, M>, OnnxModelError>
+where
+    M: OnnxPackedMatrix<'a>,
+    S: Qwen35PackedTensorProvider<'a, M> + ?Sized,
+{
     validate_qwen35_config(config)?;
     let expected_names = qwen35_tensor_names(config.layer_types)?;
     validate_exact_tensor_set("Qwen3.5", source.tensor_names()?, &expected_names)?;
@@ -1236,7 +1285,6 @@ pub fn map_qwen35_causal_lm<'a>(
         mtp,
         identity,
     };
-    validate_qwen_causal_lm(&mapped.model(1, 0))?;
     validate_qwen35_mapped_geometry(&mapped)?;
     Ok(mapped)
 }
@@ -1258,15 +1306,37 @@ pub fn map_qwen36_27b_causal_lm<'a>(
     map_qwen35_causal_lm(source, config, identity)
 }
 
-fn map_qwen35_full_attention<'a>(
-    source: &'a impl Qwen35TensorProvider<'a>,
+/// Map only pinned `Qwen/Qwen3.6-27B` geometry while retaining the provider's
+/// packed physical layout.
+///
+/// # Errors
+/// Returns [`OnnxModelError`] for a non-pinned configuration or invalid source.
+pub fn map_qwen36_27b_packed_causal_lm<'a, M, S>(
+    source: &'a S,
+    config: Qwen35Config<'a>,
+    identity: OnnxArtifactIdentityV2<'a>,
+) -> Result<MappedQwen35<'a, M>, OnnxModelError>
+where
+    M: OnnxPackedMatrix<'a>,
+    S: Qwen35PackedTensorProvider<'a, M> + ?Sized,
+{
+    validate_pinned_qwen36_27b_config(config)?;
+    map_qwen35_packed_causal_lm(source, config, identity)
+}
+
+fn map_qwen35_full_attention<'a, M, S>(
+    source: &'a S,
     names: &Qwen35LayerTensorNames,
     attention_norm: &'a [f32],
     ffn_norm: &'a [f32],
-    gate: PackedTernaryMatrix<'a>,
-    up: PackedTernaryMatrix<'a>,
-    down: PackedTernaryMatrix<'a>,
-) -> Result<QwenFullAttentionDecoderLayer<'a>, OnnxModelError> {
+    gate: M,
+    up: M,
+    down: M,
+) -> Result<QwenFullAttentionDecoderLayer<'a, M>, OnnxModelError>
+where
+    M: OnnxPackedMatrix<'a>,
+    S: Qwen35PackedTensorProvider<'a, M> + ?Sized,
+{
     let Qwen35MixerTensorNames::FullAttention {
         fused_query_gate,
         key,
@@ -1334,6 +1404,13 @@ fn validate_qwen35_config(config: Qwen35Config<'_>) -> Result<(), OnnxModelError
                 .to_owned(),
         ));
     }
+    if !config.layer_types.contains(&Qwen35LayerType::DeltaNet)
+        || !config.layer_types.contains(&Qwen35LayerType::FullAttention)
+    {
+        return Err(OnnxModelError::InvalidModel(
+            "Qwen3.5 adapter requires a heterogeneous DeltaNet/full-attention schedule".to_owned(),
+        ));
+    }
     config
         .delta_geometry
         .dimensions()
@@ -1390,8 +1467,11 @@ fn validate_pinned_qwen36_27b_config(config: Qwen35Config<'_>) -> Result<(), Onn
     Ok(())
 }
 
-fn validate_qwen35_mapped_geometry(mapped: &MappedQwen35<'_>) -> Result<(), OnnxModelError> {
+fn validate_qwen35_mapped_geometry<'a, M: OnnxPackedMatrix<'a>>(
+    mapped: &MappedQwen35<'a, M>,
+) -> Result<(), OnnxModelError> {
     let config = mapped.config;
+    validate_identity_v2(mapped.identity)?;
     validate_matrix_shape(
         "Qwen embedding",
         mapped.embedding,
@@ -1423,17 +1503,20 @@ fn validate_qwen35_mapped_geometry(mapped: &MappedQwen35<'_>) -> Result<(), Onnx
     for (index, layer) in mapped.layers.iter().copied().enumerate() {
         match layer {
             QwenCausalLmDecoderLayer::DeltaNet(layer) => {
-                for (suffix, matrix, rows, columns) in [
-                    ("gate", layer.gate, config.intermediate, config.hidden),
-                    ("up", layer.up, config.intermediate, config.hidden),
-                    ("down", layer.down, config.hidden, config.intermediate),
-                ] {
-                    validate_matrix_shape(
-                        &format!("Qwen layer {index} {suffix}"),
-                        matrix,
-                        rows,
-                        columns,
-                    )?;
+                validate_qwen_deltanet_layer(&QwenDeltaNetLayerModel {
+                    tokens: 1,
+                    hidden: config.hidden,
+                    rms_epsilon: config.rms_epsilon,
+                    geometry: config.delta_geometry,
+                    layer,
+                    identity: mapped.identity,
+                })?;
+                if layer.gate.rows() != config.intermediate {
+                    return Err(OnnxModelError::InvalidModel(format!(
+                        "Qwen layer {index} intermediate width {} must be {}",
+                        layer.gate.rows(),
+                        config.intermediate
+                    )));
                 }
             }
             QwenCausalLmDecoderLayer::FullAttention(layer) => {
@@ -1445,13 +1528,14 @@ fn validate_qwen35_mapped_geometry(mapped: &MappedQwen35<'_>) -> Result<(), Onnx
             }
         }
     }
+    qwen_full_attention_interval(&mapped.layers)?;
     validate_qwen35_full_attention_geometry("Qwen MTP layer", mapped.mtp.layer, config)
 }
 
-fn validate_qwen35_full_attention_geometry(
+fn validate_qwen35_full_attention_geometry<'a, M: OnnxPackedMatrix<'a>>(
     name: &str,
-    layer: QwenFullAttentionDecoderLayer<'_>,
-    config: Qwen35Config<'_>,
+    layer: QwenFullAttentionDecoderLayer<'a, M>,
+    config: Qwen35Config<'a>,
 ) -> Result<(), OnnxModelError> {
     let query_width = config
         .n_head
@@ -9027,6 +9111,77 @@ mod tests {
             Err(OnnxModelError::InvalidModel(reason))
                 if reason.contains("missing tensor")
                     && reason.contains("lm_head.weight")
+        ));
+    }
+
+    #[test]
+    fn qwen35_packed_adapter_accepts_additive_salt_provider_type() {
+        struct EmptySaltSource;
+
+        impl<'a> Qwen35PackedTensorProvider<'a, crate::SaltV2PackedMatrix<'a>> for EmptySaltSource {
+            fn tensor_names(&'a self) -> Result<&'a [String], OnnxModelError> {
+                Ok(&[])
+            }
+
+            fn matrix(
+                &'a self,
+                name: &str,
+            ) -> Result<crate::SaltV2PackedMatrix<'a>, OnnxModelError> {
+                Err(OnnxModelError::InvalidModel(format!(
+                    "unexpected matrix request {name}"
+                )))
+            }
+
+            fn vector(&'a self, name: &str) -> Result<&'a [f32], OnnxModelError> {
+                Err(OnnxModelError::InvalidModel(format!(
+                    "unexpected vector request {name}"
+                )))
+            }
+        }
+
+        let schedule = [Qwen35LayerType::DeltaNet, Qwen35LayerType::FullAttention];
+        let config = Qwen35Config {
+            hidden: 256,
+            intermediate: 512,
+            vocab: 2,
+            n_head: 1,
+            n_kv_head: 1,
+            head_dim: 256,
+            rotary_dim: 64,
+            rope_theta: 10_000.0,
+            rms_epsilon: 1.0e-6,
+            delta_geometry: QwenDeltaNetGeometry::new(4, 1, 1, 128, 128).unwrap(),
+            layer_types: &schedule,
+            full_attention_interval: 2,
+            tied_embeddings: false,
+            mtp_layers: 1,
+            mtp_dedicated_embeddings: false,
+        };
+        let identity = OnnxArtifactIdentityV2 {
+            source_model_id: "qwen-source",
+            tokenizer_id: "qwen-tokenizer",
+            recipe_id: "recipe",
+            tritium_build_id: "build",
+            package_id: "package",
+            converted_coverage_id: "language-mtp",
+            deferred_coverage_id: "vision",
+        };
+        assert!(matches!(
+            map_qwen35_packed_causal_lm(&EmptySaltSource, config, identity),
+            Err(OnnxModelError::InvalidModel(reason))
+                if reason.contains("missing tensor")
+                    && reason.contains("lm_head.weight")
+        ));
+
+        let all_full = [Qwen35LayerType::FullAttention];
+        let all_full_config = Qwen35Config {
+            layer_types: &all_full,
+            full_attention_interval: 1,
+            ..config
+        };
+        assert!(matches!(
+            map_qwen35_packed_causal_lm(&EmptySaltSource, all_full_config, identity),
+            Err(OnnxModelError::InvalidModel(reason)) if reason.contains("heterogeneous")
         ));
     }
 

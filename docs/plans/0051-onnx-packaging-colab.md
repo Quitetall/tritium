@@ -161,7 +161,12 @@ shared embedding/head arenas, rejects partial or mixed storage layouts, and
 matches inline language and MTP execution in real ORT. `HostSaltV2Linear`
 exposes borrowed arena views so a package mapper can serialize real
 PTQ/refined operands without reconstruction. The Python/Hugging Face facade
-and package-to-Qwen view construction are now the binding Slice 2 work.
+and package-to-Qwen view construction are now the binding Slice 2 work. The
+Qwen mapper now accepts a physical-layout-parameterized
+`Qwen35PackedTensorProvider`, preserving either legacy TQ or additive SALT V2
+operands through mapping; the remaining native source adapter must open the
+authenticated schema-v3 package and exact preserved tensors into that
+contract.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
