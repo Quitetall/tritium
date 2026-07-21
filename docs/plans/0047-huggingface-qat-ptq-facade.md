@@ -91,8 +91,11 @@ saves with safe serialization, automatically reloads through
   streams plane chunks directly to durable files, strict-reloads every
   digest/ledger, lazily loads one weight at a time, resumes missing weights after
   restart and atomically seals recipe-bound state. Schema-v2 writes retain a
-  tested strict reader for schema-v1 artifacts. Physical allocation/packing and
-  stronger factorized curvature remain open.
+  tested strict reader for schema-v1 artifacts. Generic reload now binds the
+  source digest and exact module aliases into inference-only Linear modules
+  holding B3-packed additive trits plus f16 row scales, with no latent master or
+  persistent dense decoded weight. SALT package export, native fused dispatch
+  and stronger factorized curvature remain open.
 - [x] Expose immutable, exact-ledger `ArtifactRef`, `QuantizationResult`, and
   `ExportReceipt` records plus atomic matrix-bundle export. `complete_model`
   remains false because vision is intentionally outside the language-plus-MTP

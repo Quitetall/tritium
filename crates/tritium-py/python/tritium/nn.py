@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -73,6 +73,87 @@ def _project(
         schema_version=estimator.schema_version,
     )
     return projection.dense
+
+
+class AdditiveTernaryLinear(nn.Module):
+    """Inference-only linear layer backed by additive trits and row scales."""
+
+    def __init__(
+        self,
+        planes: Sequence[Any],
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        if not isinstance(planes, Sequence) or not 1 <= len(planes) <= 3:
+            raise ValueError("AdditiveTernaryLinear requires one to three planes")
+        first = planes[0]
+        if first.trits.ndim != 2:
+            raise ValueError("additive ternary linear trits must be rank 2")
+        self.out_features, self.in_features = map(int, first.trits.shape)
+        self.weight_elements = self.out_features * self.in_features
+        self.plane_count = len(planes)
+        for index, plane in enumerate(planes):
+            if (
+                tuple(plane.trits.shape) != (self.out_features, self.in_features)
+                or tuple(plane.scales.shape) != (self.out_features, 1)
+                or plane.group_size != self.in_features
+            ):
+                raise ValueError("additive ternary linear plane geometry differs")
+            trits = plane.trits.detach().to(dtype=torch.int8).contiguous()
+            scales = plane.scales.detach().to(dtype=torch.float16).contiguous()
+            if not bool(torch.all((trits >= -1) & (trits <= 1))):
+                raise ValueError("additive ternary linear contains non-ternary values")
+            if not bool(torch.isfinite(scales).all()) or bool((scales < 0).any()):
+                raise ValueError("additive ternary linear contains invalid scales")
+            digits = (trits.flatten().to(torch.int16) + 1)
+            padding = (-digits.numel()) % 5
+            if padding:
+                digits = F.pad(digits, (0, padding))
+            powers = digits.new_tensor((1, 3, 9, 27, 81))
+            packed = (digits.reshape(-1, 5) * powers).sum(dim=1).to(torch.uint8)
+            self.register_buffer(f"packed_trits_{index}", packed)
+            self.register_buffer(f"scales_{index}", scales)
+        if bias is not None:
+            if bias.ndim != 1 or bias.shape[0] != self.out_features:
+                raise ValueError("additive ternary linear bias geometry differs")
+            self.register_buffer("bias", bias.detach().clone())
+        else:
+            self.register_buffer("bias", None)
+        self.training = False
+
+    @property
+    def physical_bytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.buffers()
+            if tensor is not None
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if not input.dtype.is_floating_point:
+            raise TypeError("additive ternary linear input must be floating point")
+        output = None
+        for index in range(self.plane_count):
+            packed = getattr(self, f"packed_trits_{index}")
+            powers = packed.new_tensor((1, 3, 9, 27, 81), dtype=torch.int16)
+            digits = (
+                packed.to(torch.int16).unsqueeze(1) // powers.unsqueeze(0)
+            ) % 3
+            trits = (digits.flatten()[: self.weight_elements] - 1).reshape(
+                self.out_features, self.in_features
+            ).to(dtype=input.dtype)
+            scales = getattr(self, f"scales_{index}").to(dtype=input.dtype)
+            partial = F.linear(input, trits, None) * scales.squeeze(-1)
+            output = partial if output is None else output + partial
+        if self.bias is not None:
+            output = output + self.bias.to(dtype=input.dtype)
+        return output
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"planes={self.plane_count}, bias={self.bias is not None}"
+        )
 
 
 class TernaryLinear(nn.Module):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -745,6 +746,119 @@ def _fit_module(
     )
 
 
+def load_quantized_module(
+    model: nn.Module,
+    artifact: Union[ModuleQuantizationResult, Pathish],
+    *,
+    inplace: bool = False,
+) -> nn.Module:
+    """Bind one strict generic PTQ artifact to its source module graph."""
+
+    if not isinstance(model, nn.Module):
+        raise TypeError("load_quantized_module requires a torch.nn.Module")
+    if not isinstance(inplace, bool):
+        raise TypeError("load_quantized_module inplace must be a bool")
+    if isinstance(artifact, ModuleQuantizationResult):
+        admitted = load_module_conversion(artifact.artifact_dir)
+        if admitted != artifact:
+            raise TritiumError(
+                "module conversion fields differ from strict artifact reload",
+                code="artifact_changed",
+                stage="load",
+            )
+    else:
+        admitted = load_module_conversion(artifact)
+    source_digest = _source_model_digest(model)
+    if source_digest != admitted.source_model_digest:
+        raise TritiumError(
+            "source model differs from module conversion artifact",
+            code="source_changed",
+            stage="load",
+            details={
+                "expected": admitted.source_model_digest,
+                "observed": source_digest,
+            },
+        )
+    try:
+        target = model if inplace else copy.deepcopy(model)
+    except Exception as error:
+        raise TritiumError(
+            "source model could not be copied for module conversion",
+            code="copy_failed",
+            stage="load",
+        ) from error
+
+    from ..nn import AdditiveTernaryLinear
+
+    modules = dict(target.named_modules(remove_duplicate=False))
+    replacements = {}
+    owners = {}
+    for reference in admitted.weights:
+        fitted = admitted.weight(reference.path)
+        for alias in reference.aliases:
+            if alias == "weight":
+                module_path = ""
+            elif alias.endswith(".weight"):
+                module_path = alias[: -len(".weight")]
+            else:
+                raise TritiumError(
+                    "module conversion weight alias is not canonical",
+                    code="coverage_mismatch",
+                    stage="load",
+                    module=alias,
+                )
+            module = modules.get(module_path)
+            if type(module) is not nn.Linear:
+                raise TritiumError(
+                    "module conversion target is not an exact Linear module",
+                    code="coverage_mismatch",
+                    stage="load",
+                    module=module_path,
+                )
+            if tuple(module.weight.shape) != reference.shape:
+                raise TritiumError(
+                    "module conversion target geometry differs from artifact",
+                    code="coverage_mismatch",
+                    stage="load",
+                    module=module_path,
+                )
+            prior = owners.get(id(module))
+            if prior is not None and prior != reference.path:
+                raise TritiumError(
+                    "one module is bound to multiple conversion weights",
+                    code="coverage_mismatch",
+                    stage="load",
+                    module=module_path,
+                )
+            owners[id(module)] = reference.path
+            replacement = replacements.get(id(module))
+            if replacement is None:
+                replacement = AdditiveTernaryLinear(
+                    fitted.planes,
+                    module.bias,
+                ).to(device=module.weight.device)
+                replacements[id(module)] = replacement
+            modules[module_path] = replacement
+
+    root = target
+    for module_path, replacement in modules.items():
+        if not isinstance(replacement, AdditiveTernaryLinear):
+            continue
+        if module_path == "":
+            root = replacement
+            continue
+        parts = module_path.split(".")
+        parent = root
+        for part in parts[:-1]:
+            parent = parent._modules[part]
+        parent._modules[parts[-1]] = replacement
+    root.requires_grad_(False)
+    root.eval()
+    root._tritium_ptq_artifact_id = admitted.artifact_id
+    root._tritium_coverage = admitted.coverage
+    return root
+
+
 def calibrate(
     prepared: PreparedModel,
     data: Any = None,
@@ -952,5 +1066,6 @@ __all__ = [
     "convert",
     "load_activation_calibration",
     "load_module_conversion",
+    "load_quantized_module",
     "quantize",
 ]

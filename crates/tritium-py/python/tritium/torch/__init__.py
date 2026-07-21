@@ -53,6 +53,7 @@ from .ptq import (
     convert,
     load_activation_calibration,
     load_module_conversion,
+    load_quantized_module,
     quantize,
 )
 from .projection import (
@@ -105,6 +106,7 @@ __all__ = [
     "load",
     "load_activation_calibration",
     "load_module_conversion",
+    "load_quantized_module",
     "load_onnx",
     "prepare",
     "prepare_qat",

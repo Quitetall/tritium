@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -14,12 +15,36 @@ from typing import Any, Callable, Dict, Iterable, Tuple, Union
 
 import torch
 
+from .. import _tritium
 from .config import TernaryConfig
 from .coverage import CoverageReport
+from .errors import TritiumError
 from .projection import TernaryPlane
 
 Pathish = Union[str, os.PathLike[str]]
 _MANIFEST = "conversion.json"
+_PACKED_MANIFEST = "tritium.json"
+_PACKED_WEIGHTS = "weights.tsalt2"
+_PACKED_FIELDS = {
+    "schema_version",
+    "artifact_kind",
+    "artifact_id",
+    "conversion_artifact_id",
+    "source_model_digest",
+    "evidence_id",
+    "algorithm_id",
+    "recipe_id",
+    "packing",
+    "complete_model",
+    "weights",
+}
+_PACKED_WEIGHT_FIELDS = {
+    "file",
+    "package_id",
+    "serialized_bytes",
+    "resident_bytes",
+    "tensors",
+}
 _TOP_FIELDS = {
     "schema_version",
     "artifact_kind",
@@ -108,6 +133,22 @@ class ModuleQuantizationResult:
     def weight_names(self) -> Tuple[str, ...]:
         return tuple(weight.path for weight in self.weights)
 
+    def pack_native(
+        self,
+        output_dir: Pathish,
+        *,
+        packing: str = "b3",
+        max_payload_bytes: int = 8 * 1024 * 1024 * 1024,
+    ) -> "PackedModuleArtifact":
+        """Stream fitted planes into one strict seek-backed SALT V2 package."""
+
+        return pack_module_conversion(
+            self,
+            output_dir,
+            packing=packing,
+            max_payload_bytes=max_payload_bytes,
+        )
+
     def weight(self, path: str) -> FittedWeight:
         """Load and rehash one fitted weight without retaining other weights."""
 
@@ -151,6 +192,24 @@ class ModuleQuantizationResult:
             planes=tuple(planes),
             weighted_mse=reference.weighted_mse,
         )
+
+
+@dataclass(frozen=True)
+class PackedModuleArtifact:
+    artifact_dir: Path
+    artifact_id: str
+    conversion_artifact_id: str
+    source_model_digest: str
+    evidence_id: str
+    algorithm_id: str
+    recipe_id: str
+    packing: str
+    package_id: str
+    serialized_bytes: int
+    resident_bytes: int
+    tensors: int
+    complete_model: bool = False
+    schema_version: int = 1
 
 
 def _pairs_without_duplicates(pairs):
@@ -774,13 +833,169 @@ def seal_module_conversion(
     return load_module_conversion(directory)
 
 
+def load_packed_module(artifact_dir: Pathish) -> PackedModuleArtifact:
+    """Strictly reopen a generic SALT V2 weight package and its identity."""
+
+    requested = Path(artifact_dir)
+    if requested.is_symlink():
+        raise ValueError("packed module directory must not be a symlink")
+    directory = requested.resolve(strict=True)
+    if not directory.is_dir():
+        raise ValueError("packed module artifact must be an ordinary directory")
+    value = _read_json(directory / _PACKED_MANIFEST)
+    if set(value) != _PACKED_FIELDS or value["schema_version"] != 1:
+        raise ValueError("packed module manifest fields differ from schema")
+    if value["artifact_kind"] != "tritium.module-salt-v2-v1":
+        raise ValueError("unsupported packed module artifact kind")
+    if value["complete_model"] is not False:
+        raise ValueError("generic weight package must not claim a complete model")
+    for field in (
+        "artifact_id",
+        "conversion_artifact_id",
+        "source_model_digest",
+        "evidence_id",
+        "recipe_id",
+    ):
+        _validate_digest(value[field], field)
+    if not isinstance(value["algorithm_id"], str) or not value["algorithm_id"]:
+        raise ValueError("invalid packed module algorithm_id")
+    if value["packing"] not in {"d2", "b3", "s34"}:
+        raise ValueError("invalid packed module codec")
+    weights = value["weights"]
+    if not isinstance(weights, dict) or set(weights) != _PACKED_WEIGHT_FIELDS:
+        raise ValueError("packed module weight fields differ from schema")
+    if (
+        weights["file"] != _PACKED_WEIGHTS
+        or type(weights["serialized_bytes"]) is not int
+        or weights["serialized_bytes"] <= 0
+        or type(weights["resident_bytes"]) is not int
+        or weights["resident_bytes"] <= 0
+        or type(weights["tensors"]) is not int
+        or weights["tensors"] <= 0
+        or not isinstance(weights["package_id"], str)
+        or not weights["package_id"]
+    ):
+        raise ValueError("packed module weight identity or ledger is invalid")
+    expected = {_PACKED_MANIFEST, _PACKED_WEIGHTS}
+    if {child.name for child in directory.iterdir()} != expected:
+        raise ValueError("packed module directory contains unknown files")
+    observed = _tritium.verify_salt_v2_package(
+        str(directory / _PACKED_WEIGHTS),
+        weights["package_id"],
+        weights["serialized_bytes"],
+        weights["resident_bytes"],
+    )
+    if tuple(observed) != (
+        weights["package_id"],
+        value["packing"],
+        weights["serialized_bytes"],
+        weights["resident_bytes"],
+    ):
+        raise ValueError("native packed module verification receipt changed")
+    identity = dict(value)
+    artifact_id = identity.pop("artifact_id")
+    if artifact_id != _digest_bytes(_canonical(identity)):
+        raise ValueError("packed module artifact identity mismatch")
+    return PackedModuleArtifact(
+        artifact_dir=directory,
+        artifact_id=artifact_id,
+        conversion_artifact_id=value["conversion_artifact_id"],
+        source_model_digest=value["source_model_digest"],
+        evidence_id=value["evidence_id"],
+        algorithm_id=value["algorithm_id"],
+        recipe_id=value["recipe_id"],
+        packing=value["packing"],
+        package_id=weights["package_id"],
+        serialized_bytes=weights["serialized_bytes"],
+        resident_bytes=weights["resident_bytes"],
+        tensors=weights["tensors"],
+    )
+
+
+def pack_module_conversion(
+    result: ModuleQuantizationResult,
+    output_dir: Pathish,
+    *,
+    packing: str = "b3",
+    max_payload_bytes: int = 8 * 1024 * 1024 * 1024,
+) -> PackedModuleArtifact:
+    """Verify, stream, strict-reopen, and atomically publish fitted weights."""
+
+    if not isinstance(result, ModuleQuantizationResult):
+        raise TypeError("pack_module_conversion requires a ModuleQuantizationResult")
+    current = load_module_conversion(result.artifact_dir)
+    if current != result:
+        raise TritiumError(
+            "ModuleQuantizationResult differs from its verified artifact",
+            code="artifact_mismatch",
+            stage="pack",
+        )
+    if packing not in {"d2", "b3", "s34"}:
+        raise ValueError("packing must be 'd2', 'b3', or 's34'")
+    if type(max_payload_bytes) is not int or max_payload_bytes <= 0:
+        raise ValueError("max_payload_bytes must be a positive integer")
+    native = getattr(_tritium, "pack_module_conversion_salt_v2", None)
+    if native is None:
+        raise TritiumError(
+            "this wheel does not contain generic SALT V2 packing",
+            code="native_packing_unavailable",
+            stage="pack",
+        )
+    target = Path(output_dir).absolute()
+    parent = target.parent.resolve(strict=True)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"output directory already exists: {target}")
+    staging = Path(tempfile.mkdtemp(prefix=".tritium-module-stage-", dir=parent))
+    published = False
+    try:
+        receipt = native(
+            str(current.artifact_dir),
+            str(staging / _PACKED_WEIGHTS),
+            packing=packing,
+            max_payload_bytes=max_payload_bytes,
+        )
+        manifest = {
+            "schema_version": 1,
+            "artifact_kind": "tritium.module-salt-v2-v1",
+            "conversion_artifact_id": current.artifact_id,
+            "source_model_digest": current.source_model_digest,
+            "evidence_id": current.evidence_id,
+            "algorithm_id": current.algorithm_id,
+            "recipe_id": current.recipe_id,
+            "packing": receipt.packing,
+            "complete_model": False,
+            "weights": {
+                "file": _PACKED_WEIGHTS,
+                "package_id": receipt.package_id,
+                "serialized_bytes": receipt.serialized_bytes,
+                "resident_bytes": receipt.resident_bytes,
+                "tensors": receipt.tensors,
+            },
+        }
+        manifest["artifact_id"] = _digest_bytes(_canonical(manifest))
+        _atomic_write(staging / _PACKED_MANIFEST, _canonical(manifest))
+        staged = load_packed_module(staging)
+        _tritium.publish_directory_noreplace(str(staging), str(target))
+        published = True
+        reopened = load_packed_module(target)
+        if reopened.artifact_id != staged.artifact_id:
+            raise RuntimeError("published packed module identity changed")
+        return reopened
+    finally:
+        if not published and staging.exists():
+            shutil.rmtree(staging)
+
+
 __all__ = [
     "FittedPlaneRef",
     "FittedWeight",
     "FittedWeightRef",
     "ModuleQuantizationResult",
+    "PackedModuleArtifact",
     "WeightCheckpointWriter",
+    "load_packed_module",
     "load_module_conversion",
     "module_recipe_id",
+    "pack_module_conversion",
     "seal_module_conversion",
 ]

@@ -29,6 +29,7 @@
 #![allow(unreachable_pub)] // pyo3's `#[pymethods]` expansion emits `pub` items.
 
 mod hf_assets;
+mod module_package;
 mod onnx;
 mod ops;
 mod qwen;
@@ -257,6 +258,7 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<onnx::QwenOnnxModel>()?;
     m.add_class::<onnx::QwenOnnxLanguageOutput>()?;
     m.add_class::<onnx::QwenOnnxMtpOutput>()?;
+    m.add_class::<module_package::ModuleSaltV2Receipt>()?;
     m.add_function(wrap_pyfunction!(ternary_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::verify_qwen35_onnx_bundle, m)?)?;
     m.add_function(wrap_pyfunction!(onnx::stage_qwen35_onnx_bundle, m)?)?;
@@ -278,6 +280,10 @@ fn _tritium(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(salt::verify_salt_v2_package, m)?)?;
     m.add_function(wrap_pyfunction!(salt::verify_preserved_safetensors, m)?)?;
     m.add_function(wrap_pyfunction!(salt::verify_hf_asset, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        module_package::pack_module_conversion_salt_v2,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(salt::inspect_qwen36_ptq_evidence, m)?)?;
     m.add_function(wrap_pyfunction!(salt::publish_directory_noreplace, m)?)?;
     m.add(

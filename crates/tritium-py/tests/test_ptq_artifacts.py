@@ -12,6 +12,7 @@ import torch  # noqa: E402
 
 import tritium.torch.artifacts as artifacts  # noqa: E402
 import tritium.torch.ptq as ptq  # noqa: E402
+from tritium.nn import AdditiveTernaryLinear  # noqa: E402
 from tritium.torch import (  # noqa: E402
     TernaryConfig,
     TritiumError,
@@ -19,6 +20,7 @@ from tritium.torch import (  # noqa: E402
     convert,
     inspect,
     load,
+    load_quantized_module,
     prepare,
     quantize,
 )
@@ -766,6 +768,84 @@ def test_module_conversion_loader_rejects_cross_version_receipts(tmp_path):
 
     with pytest.raises(ValueError, match="receipt fields differ from schema"):
         ptq.load_module_conversion(work)
+
+
+def test_load_quantized_module_binds_compact_planes_without_dense_master(tmp_path):
+    model = torch.nn.Sequential(torch.nn.Linear(128, 2, bias=True))
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.arange(128, dtype=torch.float32).reshape(1, 128) / 128],
+        evidence_dir=tmp_path / "evidence",
+    )
+    artifact = convert(prepared, calibration, work_dir=tmp_path / "work")
+    loaded = load_quantized_module(prepared.model, artifact)
+
+    assert isinstance(loaded[0], AdditiveTernaryLinear)
+    assert loaded is not prepared.model
+    assert dict(loaded.named_parameters()) == {}
+    assert loaded[0].physical_bytes < prepared.model[0].weight.numel() * 2
+    assert all(
+        name.startswith(("0.packed_trits_", "0.scales_", "0.bias"))
+        for name in loaded.state_dict()
+    )
+    inputs = torch.randn(3, 128)
+    fitted = artifact.weight("0.weight")
+    expected = sum(
+        torch.nn.functional.linear(inputs, plane.trits.float())
+        * plane.scales.float().squeeze(-1)
+        for plane in fitted.planes
+    ) + prepared.model[0].bias
+    torch.testing.assert_close(loaded(inputs), expected)
+    assert hasattr(prepared.model[0], "weight")
+    inplace = load_quantized_module(prepared.model, artifact, inplace=True)
+    assert inplace is prepared.model
+    assert isinstance(inplace[0], AdditiveTernaryLinear)
+
+
+def test_load_quantized_module_rejects_source_drift(tmp_path):
+    model = torch.nn.Linear(3, 2, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 3)],
+        evidence_dir=tmp_path / "evidence",
+    )
+    artifact = convert(prepared, calibration, work_dir=tmp_path / "work")
+    with torch.no_grad():
+        prepared.model.weight[0, 0] += 1
+    with pytest.raises(TritiumError) as captured:
+        load_quantized_module(prepared.model, artifact)
+    assert captured.value.code == "source_changed"
+
+
+def test_load_quantized_module_rejects_linear_subclass_semantic_loss(tmp_path):
+    class ShiftedLinear(torch.nn.Linear):
+        def forward(self, value):
+            return super().forward(value) + 1
+
+    prepared = prepare(
+        ShiftedLinear(3, 2, bias=False),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 3)],
+        evidence_dir=tmp_path / "evidence",
+    )
+    artifact = convert(prepared, calibration, work_dir=tmp_path / "work")
+    with pytest.raises(TritiumError) as captured:
+        load_quantized_module(prepared.model, artifact)
+    assert captured.value.code == "coverage_mismatch"
 
 
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
