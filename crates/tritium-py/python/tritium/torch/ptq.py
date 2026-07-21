@@ -55,6 +55,7 @@ class ActivationRecord:
     module: str
     weight_aliases: Tuple[str, ...]
     features: int
+    outputs: int
     samples: int
     file: str
     digest: str
@@ -74,7 +75,7 @@ class ActivationCalibrationReceipt:
     token_stream_digest: str
     max_evidence_bytes: int
     records: Tuple[ActivationRecord, ...]
-    schema_version: int = 1
+    schema_version: int = 2
 
 
 def _hash_field(digest: "hashlib._Hash", tag: str, payload: bytes) -> None:
@@ -243,7 +244,7 @@ def load_activation_calibration(
     }
     if not isinstance(manifest, dict) or set(manifest) != fields:
         raise ValueError("calibration manifest fields do not match schema version 1")
-    if manifest["schema_version"] != 1:
+    if manifest["schema_version"] != 2:
         raise ValueError("unsupported activation calibration schema_version")
     if manifest["curvature"] != "diagonal-second-moment-f64le":
         raise ValueError("unsupported activation curvature representation")
@@ -276,6 +277,7 @@ def load_activation_calibration(
         "module",
         "weight_aliases",
         "features",
+        "outputs",
         "samples",
         "file",
         "digest",
@@ -304,6 +306,8 @@ def load_activation_calibration(
         if (
             type(item["features"]) is not int
             or item["features"] <= 0
+            or type(item["outputs"]) is not int
+            or item["outputs"] <= 0
             or type(item["samples"]) is not int
             or item["samples"] <= 0
             or type(item["bytes"]) is not int
@@ -332,6 +336,7 @@ def load_activation_calibration(
                 module=item["module"],
                 weight_aliases=tuple(aliases),
                 features=item["features"],
+                outputs=item["outputs"],
                 samples=item["samples"],
                 file=filename,
                 digest=digest,
@@ -460,7 +465,7 @@ def _collect_activations(
     record_values = []
     records = []
     try:
-        for index, (path, _, aliases) in enumerate(modules):
+        for index, (path, module, aliases) in enumerate(modules):
             payload = accumulators[path].numpy().astype("<f8", copy=False).tobytes()
             if len(payload) > max_evidence_bytes:
                 raise TritiumError(
@@ -476,6 +481,7 @@ def _collect_activations(
                 module=path,
                 weight_aliases=tuple(aliases),
                 features=accumulators[path].numel(),
+                outputs=module.out_features,
                 samples=samples[path],
                 file=filename,
                 digest=digest,
@@ -487,6 +493,7 @@ def _collect_activations(
                     "module": record.module,
                     "weight_aliases": list(record.weight_aliases),
                     "features": record.features,
+                    "outputs": record.outputs,
                     "samples": record.samples,
                     "file": record.file,
                     "digest": record.digest,
@@ -508,7 +515,7 @@ def _collect_activations(
         cache_digest = f"sha256:{activation_digest.hexdigest()}"
         stream_digest = f"sha256:{token_digest.hexdigest()}"
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "curvature": "diagonal-second-moment-f64le",
             "source_model_digest": source_digest,
             "activation_cache_digest": cache_digest,

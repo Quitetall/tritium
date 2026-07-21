@@ -1,5 +1,6 @@
 """Strict PTQ artifact and phased facade gates from plan 0047."""
 
+import hashlib
 import json
 import struct
 from pathlib import Path
@@ -369,6 +370,7 @@ def test_live_module_calibration_streams_bounded_source_bound_curvature(tmp_path
     assert receipt.records[0].module == "0"
     assert receipt.records[0].samples == 3
     assert receipt.records[0].features == 3
+    assert receipt.records[0].outputs == 2
     assert prepared.model.training is True
     values = struct.unpack("<3d", (evidence / receipt.records[0].file).read_bytes())
     assert values == pytest.approx((5.0, 5.0, 14.0))
@@ -625,6 +627,38 @@ def test_live_module_convert_resumes_missing_weight_and_rejects_tampering(tmp_pa
     plane.write_bytes(b"\x00" * plane.stat().st_size)
     with pytest.raises(ValueError, match="identity mismatch"):
         ptq.load_module_conversion(work)
+
+
+def test_live_module_convert_rejects_self_consistent_wrong_resume_geometry(tmp_path):
+    model = torch.nn.Linear(3, 2, bias=False)
+    prepared = prepare(
+        model,
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 3)],
+        evidence_dir=tmp_path / "geometry-evidence",
+    )
+    work = tmp_path / "geometry-work"
+    convert(prepared, calibration, work_dir=work)
+    (work / "conversion.json").unlink()
+    receipt_path = work / "weight-00000.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["shape"] = [1, 6]
+    for plane in receipt["planes"]:
+        scale_path = work / plane["scales_file"]
+        payload = scale_path.read_bytes()[:2]
+        scale_path.write_bytes(payload)
+        plane["scales_digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
+        plane["scales_bytes"] = 2
+        plane["scales_shape"] = [1, 1]
+        plane["group_size"] = 6
+    receipt_path.write_text(json.dumps(receipt))
+
+    with pytest.raises(ValueError, match="identity differs from calibration"):
+        convert(prepared, calibration, work_dir=work)
 
 
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):

@@ -195,6 +195,16 @@ def _digest_file(path: Path, maximum: int) -> Tuple[str, int]:
     return "sha256:" + digest.hexdigest(), metadata.st_size
 
 
+def _validate_trit_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                return
+            if any(value not in {0, 1, 255} for value in chunk):
+                raise ValueError("conversion plane contains non-ternary values")
+
+
 def _read_exact(path: Path, digest: str, byte_count: int) -> bytes:
     actual_digest, actual_bytes = _digest_file(path, byte_count)
     if actual_digest != digest or actual_bytes != byte_count:
@@ -291,6 +301,7 @@ def _load_weight_receipt(
         trits_digest, trits_bytes = _digest_file(
             directory / trits_name, maximum_bytes
         )
+        _validate_trit_file(directory / trits_name)
         scales_digest, scales_bytes = _digest_file(
             directory / scales_name, maximum_bytes
         )
@@ -488,6 +499,8 @@ def seal_module_conversion(
             if (
                 reference.path != record.weight_aliases[0]
                 or reference.aliases != record.weight_aliases
+                or reference.shape != (record.outputs, record.features)
+                or len(reference.planes) != config.planes
             ):
                 raise ValueError(
                     "resumed conversion weight identity differs from calibration"
