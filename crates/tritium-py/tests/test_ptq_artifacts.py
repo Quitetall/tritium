@@ -698,6 +698,76 @@ def test_live_module_convert_streams_deterministic_rows_under_working_ceiling(tm
     ]
 
 
+def test_live_module_convert_rejects_working_ceiling_below_one_row(tmp_path):
+    prepared = prepare(
+        torch.nn.Linear(4, 1, bias=False),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 4)],
+        evidence_dir=tmp_path / "evidence",
+    )
+    with pytest.raises(TritiumError) as captured:
+        convert(
+            prepared,
+            calibration,
+            work_dir=tmp_path / "work",
+            max_working_bytes=607,
+        )
+    assert captured.value.code == "working_set_too_small"
+    assert captured.value.details == {
+        "required_bytes": 608,
+        "max_working_bytes": 607,
+    }
+
+
+def test_module_conversion_loader_keeps_v1_artifacts_readable(tmp_path):
+    prepared = prepare(
+        torch.nn.Linear(2, 1, bias=False),
+        TernaryConfig.ptq(profile="compact-v1", target_modules=("Linear",)),
+        inplace=False,
+    )
+    calibration = calibrate(
+        prepared,
+        [torch.ones(1, 2)],
+        evidence_dir=tmp_path / "evidence",
+    )
+    work = tmp_path / "work"
+    convert(prepared, calibration, work_dir=work)
+
+    receipt_path = work / "weight-00000.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["schema_version"] = 1
+    del receipt["fit_chunk_rows"]
+    del receipt["max_working_bytes"]
+    receipt_payload = json.dumps(
+        receipt, sort_keys=True, separators=(",", ":")
+    ).encode()
+    receipt_path.write_bytes(receipt_payload)
+
+    manifest_path = work / "conversion.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["schema_version"] = 1
+    manifest["artifact_kind"] = "tritium.module-additive-ptq-v1"
+    manifest["weight_receipts"][0].update(
+        digest="sha256:" + hashlib.sha256(receipt_payload).hexdigest(),
+        bytes=len(receipt_payload),
+    )
+    identity = dict(manifest)
+    del identity["artifact_id"]
+    manifest["artifact_id"] = "sha256:" + hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+
+    reopened = ptq.load_module_conversion(work)
+    assert reopened.schema_version == 1
+    assert reopened.weights[0].fit_chunk_rows == 1
+    assert reopened.weights[0].max_working_bytes is None
+
+
 def test_quantize_composes_the_three_public_phases(monkeypatch, tmp_path):
     sentinel_prepared = object()
     sentinel_calibration = object()

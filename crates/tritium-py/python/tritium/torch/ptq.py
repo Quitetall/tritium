@@ -32,7 +32,10 @@ from .module_artifacts import (
 from .projection import TernaryPlane, TernaryProjection, validate_projection
 
 Pathish = Union[str, os.PathLike[str]]
-_FIT_BYTES_PER_COEFFICIENT = 96
+# Conservative auxiliary-tensor ledger for the row-tiled float64 fitter.
+# Source weights and framework allocator overhead are intentionally excluded.
+_FIT_FIXED_BYTES_PER_FEATURE = 24
+_FIT_BYTES_PER_COEFFICIENT = 128
 
 
 @dataclass(frozen=True)
@@ -680,7 +683,7 @@ def _fit_module(
     )
 
     def chunk_rows(record: ActivationRecord) -> int:
-        fixed_bytes = record.features * 8
+        fixed_bytes = record.features * _FIT_FIXED_BYTES_PER_FEATURE
         per_row_bytes = record.features * _FIT_BYTES_PER_COEFFICIENT
         if max_working_bytes < fixed_bytes + per_row_bytes:
             raise TritiumError(

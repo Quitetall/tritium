@@ -87,9 +87,12 @@ saves with safe serialization, automatically reloads through
   namespace. Public `convert` now fits source/recipe/coverage-bound hard
   additive planes from that evidence, including stored-scale-correct residual
   fitting. Generic conversion now checkpoints each fitted weight independently,
-  strict-reloads every digest/ledger, lazily loads one weight at a time, resumes
-  missing weights after restart and atomically seals recipe-bound state.
-  Physical allocation/packing and stronger factorized curvature remain open.
+  row-tiles the float64 fitter under an explicit auxiliary-tensor byte budget,
+  streams plane chunks directly to durable files, strict-reloads every
+  digest/ledger, lazily loads one weight at a time, resumes missing weights after
+  restart and atomically seals recipe-bound state. Schema-v2 writes retain a
+  tested strict reader for schema-v1 artifacts. Physical allocation/packing and
+  stronger factorized curvature remain open.
 - [x] Expose immutable, exact-ledger `ArtifactRef`, `QuantizationResult`, and
   `ExportReceipt` records plus atomic matrix-bundle export. `complete_model`
   remains false because vision is intentionally outside the language-plus-MTP

@@ -32,16 +32,19 @@ _TOP_FIELDS = {
     "coverage",
     "weight_receipts",
 }
-_WEIGHT_FIELDS = {
+_WEIGHT_FIELDS_V1 = {
     "schema_version",
     "recipe_id",
     "path",
     "aliases",
     "shape",
     "weighted_mse",
+    "planes",
+}
+_WEIGHT_FIELDS_V2 = {
+    *_WEIGHT_FIELDS_V1,
     "fit_chunk_rows",
     "max_working_bytes",
-    "planes",
 }
 _RECEIPT_REF_FIELDS = {"file", "digest", "bytes"}
 _PLANE_FIELDS = {
@@ -76,7 +79,7 @@ class FittedWeightRef:
     planes: Tuple[FittedPlaneRef, ...]
     weighted_mse: float
     fit_chunk_rows: int
-    max_working_bytes: int
+    max_working_bytes: int | None
 
 
 @dataclass(frozen=True, eq=False)
@@ -98,7 +101,7 @@ class ModuleQuantizationResult:
     config: TernaryConfig
     coverage: CoverageReport
     weights: Tuple[FittedWeightRef, ...]
-    schema_version: int = 1
+    schema_version: int = 2
 
     @property
     def weight_names(self) -> Tuple[str, ...]:
@@ -276,7 +279,11 @@ def _load_weight_receipt(
     if receipt_name != f"weight-{index:05d}.json":
         raise ValueError("conversion weight receipts are out of canonical order")
     value = _read_json(directory / receipt_name)
-    if set(value) != _WEIGHT_FIELDS or value["schema_version"] != 2:
+    schema_version = value.get("schema_version")
+    expected_fields = (
+        _WEIGHT_FIELDS_V1 if schema_version == 1 else _WEIGHT_FIELDS_V2
+    )
+    if schema_version not in {1, 2} or set(value) != expected_fields:
         raise ValueError("conversion weight receipt fields differ from schema")
     if value["recipe_id"] != expected_recipe_id:
         raise ValueError("conversion weight receipt belongs to another recipe")
@@ -300,13 +307,12 @@ def _load_weight_receipt(
         or weighted_mse < 0
     ):
         raise ValueError("conversion weighted_mse must be finite and nonnegative")
-    fit_chunk_rows = value["fit_chunk_rows"]
-    max_working_bytes = value["max_working_bytes"]
-    if (
-        type(fit_chunk_rows) is not int
-        or not 1 <= fit_chunk_rows <= shape[0]
-        or type(max_working_bytes) is not int
-        or max_working_bytes <= 0
+    fit_chunk_rows = value.get("fit_chunk_rows", shape[0])
+    max_working_bytes = value.get("max_working_bytes")
+    if type(fit_chunk_rows) is not int or not 1 <= fit_chunk_rows <= shape[0]:
+        raise ValueError("conversion working-set receipt is invalid")
+    if max_working_bytes is not None and (
+        type(max_working_bytes) is not int or max_working_bytes <= 0
     ):
         raise ValueError("conversion working-set receipt is invalid")
     plane_values = value["planes"]
@@ -386,9 +392,10 @@ def load_module_conversion(
     if not directory.is_dir():
         raise ValueError("module conversion must be an ordinary directory")
     value = _read_json(directory / _MANIFEST)
-    if set(value) != _TOP_FIELDS or value["schema_version"] != 2:
+    schema_version = value.get("schema_version")
+    if set(value) != _TOP_FIELDS or schema_version not in {1, 2}:
         raise ValueError("module conversion manifest fields differ from schema")
-    if value["artifact_kind"] != "tritium.module-additive-ptq-v2":
+    if value["artifact_kind"] != f"tritium.module-additive-ptq-v{schema_version}":
         raise ValueError("unsupported module conversion artifact kind")
     for field in (
         "source_model_digest",
@@ -460,6 +467,7 @@ def load_module_conversion(
         config=config,
         coverage=coverage,
         weights=weights,
+        schema_version=schema_version,
     )
 
 
@@ -472,9 +480,27 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _sync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _sync_directory(directory: Path) -> None:
+    """Persist completed renames where directory fsync is supported."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
 
 
 class WeightCheckpointWriter:
@@ -556,6 +582,7 @@ class WeightCheckpointWriter:
             stream.close()
         for temporary, final in zip(self._temporary_paths, self._final_paths):
             os.replace(temporary, final)
+        _sync_directory(self.directory)
         planes = []
         for plane_index in range(self.plane_count):
             trits_slot = plane_index * 2
