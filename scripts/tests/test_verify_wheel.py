@@ -152,6 +152,11 @@ class VerifyWheelTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WheelError, "does not match"):
             MODULE.qualify_target("linux-x86_64-cpu", "win_amd64")
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux target binding")
+    def test_target_binding_rejects_nonportable_linux_wheel(self):
+        with self.assertRaisesRegex(MODULE.WheelError, "does not match"):
+            MODULE.qualify_target("linux-x86_64-cpu", "linux_x86_64")
+
     def test_target_binding_rejects_unknown_receipt_cell(self):
         with self.assertRaisesRegex(MODULE.WheelError, "unsupported compatibility target"):
             MODULE.qualify_target("linux-aarch64-cpu", "manylinux_2_28_aarch64")

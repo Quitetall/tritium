@@ -220,8 +220,7 @@ def qualify_target(target_id: str, platform_tag: str) -> dict[str, str]:
     contracts = {
         "linux-x86_64-cpu": (
             host_os.startswith("linux") and host_arch in {"amd64", "x86_64"},
-            re.fullmatch(r"(?:manylinux|musllinux|linux).*_x86_64", platform_tag)
-            is not None,
+            re.fullmatch(r"(?:manylinux|musllinux).*_x86_64", platform_tag) is not None,
         ),
         "macos-arm64-cpu": (
             host_os == "darwin" and host_arch in {"aarch64", "arm64"},
