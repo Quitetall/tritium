@@ -301,6 +301,11 @@ fn stage_paths(inputs: &Inputs, output: &Path) -> Result<QwenOnnxBundleReceipt, 
             max_weights_bytes: inputs.max_weights_bytes,
         };
         let receipt = verify_paths(&staged)?;
+        if receipt.conversion_mode.is_none() {
+            return Err(
+                "public Qwen ONNX publication requires complete conversion ancestry".to_owned(),
+            );
+        }
         let manifest = serde_json::to_vec_pretty(&json!({
             "schema": "tritium-qwen35-onnx-bundle-v1",
             "language": {"file": LANGUAGE_FILE, "blake3": receipt.language_blake3},
@@ -343,12 +348,18 @@ fn receipt(
         weights_blake3: hex_digest(admitted.weights_blake3),
         weights_bytes: u64::try_from(verified.language.weights_bytes)
             .map_err(|_| "weights byte count exceeds u64")?,
-        language_tokens: verified.language.tokens as u64,
-        language_past_tokens: verified.language.past_tokens as u64,
-        language_layers: verified.language.layers as u64,
-        mtp_tokens: verified.mtp.tokens as u64,
-        mtp_past_tokens: verified.mtp.past_tokens as u64,
-        mtp_layers: verified.mtp.layers as u64,
+        language_tokens: u64::try_from(verified.language.tokens)
+            .map_err(|_| "language token count exceeds u64")?,
+        language_past_tokens: u64::try_from(verified.language.past_tokens)
+            .map_err(|_| "language past-token count exceeds u64")?,
+        language_layers: u64::try_from(verified.language.layers)
+            .map_err(|_| "language layer count exceeds u64")?,
+        mtp_tokens: u64::try_from(verified.mtp.tokens)
+            .map_err(|_| "MTP token count exceeds u64")?,
+        mtp_past_tokens: u64::try_from(verified.mtp.past_tokens)
+            .map_err(|_| "MTP past-token count exceeds u64")?,
+        mtp_layers: u64::try_from(verified.mtp.layers)
+            .map_err(|_| "MTP layer count exceeds u64")?,
         source_model_id: identity.source_model_id.clone(),
         tokenizer_id: identity.tokenizer_id.clone(),
         recipe_id: identity.recipe_id.clone(),
@@ -403,7 +414,7 @@ fn read_regular_bounded(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<
     let opened = file
         .metadata()
         .map_err(|error| format!("inspect opened {label} failed: {:?}", error.kind()))?;
-    if !opened.is_file() || !same_file(&before, &opened) {
+    if !opened.is_file() || opened.len() > max_bytes || !same_file(&before, &opened) {
         return Err(format!("{label} changed before open"));
     }
     let capacity =
@@ -412,8 +423,11 @@ fn read_regular_bounded(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<
     bytes
         .try_reserve_exact(capacity)
         .map_err(|_| format!("allocate {label} failed"))?;
+    let read_ceiling = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| format!("{label} byte ceiling is too large"))?;
     Read::by_ref(&mut file)
-        .take(max_bytes + 1)
+        .take(read_ceiling)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read {label} failed: {:?}", error.kind()))?;
     let after = fs::symlink_metadata(path)
@@ -421,7 +435,10 @@ fn read_regular_bounded(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<
     let final_opened = file
         .metadata()
         .map_err(|error| format!("reinspect opened {label} failed: {:?}", error.kind()))?;
-    if bytes.len() as u64 != opened.len()
+    if u64::try_from(bytes.len()).ok() != Some(opened.len())
+        || before.len() != opened.len()
+        || after.len() != opened.len()
+        || final_opened.len() != opened.len()
         || !same_file(&before, &after)
         || !same_file(&opened, &final_opened)
     {
@@ -495,8 +512,11 @@ fn rename_directory_noreplace(_: &Path, _: &Path) -> io::Result<()> {
     ))
 }
 #[cfg(windows)]
-fn rename_directory_noreplace(source: &Path, target: &Path) -> io::Result<()> {
-    fs::rename(source, target)
+fn rename_directory_noreplace(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace directory publication is unsupported on Windows",
+    ))
 }
 
 #[cfg(unix)]

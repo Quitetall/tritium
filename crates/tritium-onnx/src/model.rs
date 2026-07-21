@@ -3634,6 +3634,11 @@ fn verified_qwen35_onnx_ancestry(
             "Qwen ONNX conversion_mode must be `qat-hard`, `ptq`, or `refined`".to_owned(),
         ));
     }
+    for key in &KEYS[1..] {
+        if metadata_value(metadata, key)?.is_empty() {
+            return Err(OnnxModelError::EmptyIdentity(key));
+        }
+    }
     Ok(Some(VerifiedQwen35OnnxAncestryV1 {
         conversion_mode: conversion_mode.to_owned(),
         completion_id: metadata_value(metadata, KEYS[1])?.to_owned(),
@@ -8385,6 +8390,39 @@ struct StringStringEntryProto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_onnx_ancestry_verification_rejects_partial_or_empty_identity() {
+        let mut metadata = BTreeMap::from([
+            ("tritium.conversion.mode".to_owned(), "ptq".to_owned()),
+            (
+                "tritium.conversion.completion_id".to_owned(),
+                "completion".to_owned(),
+            ),
+            (
+                "tritium.conversion.campaign_id".to_owned(),
+                "campaign".to_owned(),
+            ),
+            (
+                "tritium.conversion.admission_id".to_owned(),
+                "admission".to_owned(),
+            ),
+            (
+                "tritium.conversion.selection_id".to_owned(),
+                "selection".to_owned(),
+            ),
+        ]);
+        assert!(verified_qwen35_onnx_ancestry(&metadata).unwrap().is_some());
+        metadata.remove("tritium.conversion.selection_id");
+        assert!(verified_qwen35_onnx_ancestry(&metadata).is_err());
+        metadata.insert("tritium.conversion.selection_id".to_owned(), String::new());
+        assert!(matches!(
+            verified_qwen35_onnx_ancestry(&metadata),
+            Err(OnnxModelError::EmptyIdentity(
+                "tritium.conversion.selection_id"
+            ))
+        ));
+    }
     use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
 
     fn unit_packed(format: TernaryFormat, rows: usize) -> Vec<u8> {
