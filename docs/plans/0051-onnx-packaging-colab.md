@@ -200,6 +200,12 @@ parity in a real CPU ONNX Runtime session and only then atomically publishes a
 canonical SHA-256-ledgered bundle. Reload verifies the complete file allowlist,
 external-data paths, graph interface and packed initializer geometry before
 session creation; dynamic batch replay and corrupt-graph rollback are gated.
+The same fallback now accepts flat Hugging Face `ModelOutput` values, preserves
+shared packed embedding/head storage and gates an alternate sequence length in
+a real tiny-Llama PTQ export; caller-declared symbolic input axes remain part of
+the graph identity. Batch dynamism is independently gated on the generic linear
+path because the tested upstream tiny-Llama export retains a batch-one
+`GatherND` specialization.
 This is a semantic generic-module fallback, not evidence of native fused custom
 operator execution, causal generation closure or Hugging Face whole-model ONNX
 support. Those remain binding below.

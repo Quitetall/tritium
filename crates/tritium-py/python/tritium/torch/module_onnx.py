@@ -9,13 +9,17 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple, Union
+from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 
 from .. import _tritium
-from ..nn import AdditiveTernaryLinear, AdditiveTernaryWeight
+from ..nn import (
+    AdditiveTernaryEmbedding,
+    AdditiveTernaryLinear,
+    AdditiveTernaryWeight,
+)
 from .errors import TritiumError
 
 Pathish = Union[str, os.PathLike[str]]
@@ -146,7 +150,7 @@ def _packed_specs(model: nn.Module):
             storage_paths.setdefault(id(module), path)
     specs = []
     for path, module in model.named_modules():
-        if not isinstance(module, AdditiveTernaryLinear):
+        if not isinstance(module, (AdditiveTernaryLinear, AdditiveTernaryEmbedding)):
             continue
         storage_path = storage_paths.get(id(module.packed_weight))
         if storage_path is None:
@@ -157,15 +161,21 @@ def _packed_specs(model: nn.Module):
                 module=path,
             )
         prefix = f"{storage_path}." if storage_path else ""
-        packed = [f"{prefix}packed_trits_{index}" for index in range(module.plane_count)]
-        scales = [f"{prefix}scales_{index}" for index in range(module.plane_count)]
+        packed_weight = module.packed_weight
+        packed = [
+            f"{prefix}packed_trits_{index}"
+            for index in range(packed_weight.plane_count)
+        ]
+        scales = [
+            f"{prefix}scales_{index}" for index in range(packed_weight.plane_count)
+        ]
         specs.append(
             {
                 "path": path,
                 "storage_path": storage_path,
-                "rows": module.out_features,
-                "columns": module.in_features,
-                "planes": module.plane_count,
+                "rows": packed_weight.out_features,
+                "columns": packed_weight.in_features,
+                "planes": packed_weight.plane_count,
                 "packed_initializers": packed,
                 "scale_initializers": scales,
             }
@@ -300,12 +310,18 @@ def _audit_graph(graph, specs, onnx) -> None:
 
 
 def _tensor_outputs(value: Any) -> Tuple[Tensor, ...]:
-    values = (value,) if isinstance(value, Tensor) else value
+    if isinstance(value, Tensor):
+        values = (value,)
+    elif callable(getattr(value, "to_tuple", None)):
+        # Hugging Face ModelOutput exposes only its populated fields this way.
+        values = value.to_tuple()
+    else:
+        values = value
     if not isinstance(values, (tuple, list)) or not values or any(
         not isinstance(item, Tensor) for item in values
     ):
         raise TritiumError(
-            "generic ONNX export requires Tensor or tuple-of-Tensor outputs",
+            "generic ONNX export requires flat Tensor outputs",
             code="unsupported_graph",
             stage="export_module_onnx",
         )
@@ -320,6 +336,7 @@ def export_module_onnx(
     input_names: Optional[Sequence[str]] = None,
     output_names: Optional[Sequence[str]] = None,
     dynamic_batch: bool = True,
+    dynamic_axes: Optional[Mapping[str, Mapping[int, str]]] = None,
     opset: int = 18,
     rtol: float = 1e-4,
     atol: float = 1e-5,
@@ -340,12 +357,44 @@ def export_module_onnx(
     if type(dynamic_batch) is not bool or type(opset) is not int or opset < 18:
         raise ValueError("generic ONNX export requires bool dynamic_batch and opset >= 18")
     names_in = tuple(input_names or (f"input_{index}" for index in range(len(inputs))))
-    if len(names_in) != len(inputs) or len(set(names_in)) != len(names_in):
+    if (
+        len(names_in) != len(inputs)
+        or len(set(names_in)) != len(names_in)
+        or any(not isinstance(name, str) or not name for name in names_in)
+    ):
         raise ValueError("input_names must be unique and match example_inputs")
+    if dynamic_axes is not None and not isinstance(dynamic_axes, Mapping):
+        raise TypeError("dynamic_axes must map input names to axis-name mappings")
+    shapes = [
+        ({0: "batch"} if dynamic_batch and value.ndim > 0 else {})
+        for value in inputs
+    ]
+    for name, axes in (dynamic_axes or {}).items():
+        if name not in names_in or not isinstance(axes, Mapping) or not axes:
+            raise ValueError("dynamic_axes contains an unknown input or empty mapping")
+        input_index = names_in.index(name)
+        for axis, dimension in axes.items():
+            if (
+                type(axis) is not int
+                or not 0 <= axis < inputs[input_index].ndim
+                or not isinstance(dimension, str)
+                or not dimension.isidentifier()
+            ):
+                raise ValueError(
+                    "dynamic_axes contains an invalid axis or dimension name"
+                )
+            prior = shapes[input_index].get(axis)
+            if prior is not None and prior != dimension:
+                raise ValueError("dynamic_axes conflicts with dynamic_batch")
+            shapes[input_index][axis] = dimension
     with torch.no_grad():
         expected = _tensor_outputs(model(*inputs))
     names_out = tuple(output_names or (f"output_{index}" for index in range(len(expected))))
-    if len(names_out) != len(expected) or len(set(names_out)) != len(names_out):
+    if (
+        len(names_out) != len(expected)
+        or len(set(names_out)) != len(names_out)
+        or any(not isinstance(name, str) or not name for name in names_out)
+    ):
         raise ValueError("output_names must be unique and match model outputs")
     specs = _packed_specs(model)
     checkpoint_digest = getattr(
@@ -364,11 +413,7 @@ def export_module_onnx(
     published = False
     try:
         graph_path = staging / _GRAPH
-        dynamic_shapes = None
-        if dynamic_batch:
-            dynamic_shapes = tuple(
-                ({0: "batch"} if value.ndim > 0 else {}) for value in inputs
-            )
+        dynamic_shapes = tuple(shapes) if any(shapes) else None
         torch.onnx.export(
             model,
             inputs,
