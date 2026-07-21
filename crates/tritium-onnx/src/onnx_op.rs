@@ -38,11 +38,12 @@ use ort::value::TensorElementType;
 use tritium_core::TernaryFormat;
 
 use crate::{
-    ATTR_CONV_KERNEL_DIM, ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_KEY_HEAD_DIM, ATTR_N_HEAD,
-    ATTR_N_KV_HEAD, ATTR_NUM_KEY_HEADS, ATTR_NUM_VALUE_HEADS, ATTR_PAST_TOKENS,
-    ATTR_VALUE_HEAD_DIM, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME, ONNX_KV_ATTENTION_OP_NAME,
-    ONNX_OP_NAME, ONNX_QWEN_DELTANET_OP_NAME, QwenDeltaNetGeometry, QwenDeltaNetInput,
-    QwenDeltaNetOutputSlot, kv_attention_kernel, ternary_embedding_kernel, ternary_mpgemm_kernel,
+    ATTR_CODEC, ATTR_CONV_KERNEL_DIM, ATTR_FORMAT, ATTR_HEAD_DIM, ATTR_K, ATTR_KEY_HEAD_DIM,
+    ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_NUM_KEY_HEADS, ATTR_NUM_VALUE_HEADS, ATTR_PAST_TOKENS,
+    ATTR_ROWS, ATTR_TERMINAL_MAP_VALUE, ATTR_VALUE_HEAD_DIM, ONNX_DOMAIN, ONNX_EMBEDDING_OP_NAME,
+    ONNX_KV_ATTENTION_OP_NAME, ONNX_OP_NAME, ONNX_QWEN_DELTANET_OP_NAME, ONNX_SALT_V2_OP_NAME,
+    QwenDeltaNetGeometry, QwenDeltaNetInput, QwenDeltaNetOutputSlot, SaltV2PackedMatrix,
+    kv_attention_kernel, salt_v2_mpgemm_kernel, ternary_embedding_kernel, ternary_mpgemm_kernel,
 };
 
 /// Map the integer `format` node attribute to a [`TernaryFormat`].
@@ -116,6 +117,158 @@ impl Operator for TritiumTernaryMpGemmOp {
         // not determine K (the last quant block is zero-padded).
         let (k, format) = kernel_config(attributes)?;
         Ok(Box::new(TritiumTernaryMpGemmKernel { k, format }))
+    }
+}
+
+/// Custom operator for descriptor-free additive SALT V2 matrix multiplication.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TritiumSaltV2MpGemmOp;
+
+impl Operator for TritiumSaltV2MpGemmOp {
+    fn name(&self) -> &str {
+        ONNX_SALT_V2_OP_NAME
+    }
+
+    fn inputs(&self) -> Vec<OperatorInput> {
+        vec![
+            OperatorInput::required(TensorElementType::Float32),
+            OperatorInput::required(TensorElementType::Uint8),
+            OperatorInput::required(TensorElementType::Float16),
+            OperatorInput::required(TensorElementType::Uint8),
+            OperatorInput::required(TensorElementType::Uint32),
+        ]
+    }
+
+    fn outputs(&self) -> Vec<OperatorOutput> {
+        vec![OperatorOutput::required(TensorElementType::Float32)]
+    }
+
+    fn min_version(&self) -> i32 {
+        2
+    }
+
+    fn max_version(&self) -> i32 {
+        2
+    }
+
+    fn create_kernel(&self, attributes: &KernelAttributes) -> ort::Result<Box<dyn Kernel>> {
+        let columns = usize_attribute(attributes, ATTR_K, false)?;
+        let rows = usize_attribute(attributes, ATTR_ROWS, false)?;
+        let codec: i64 = attributes
+            .get(ATTR_CODEC)
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing i64 attribute `codec`"))?;
+        let codec = match codec {
+            0 => tritium_format::salt_v2::SaltV2Codec::D2,
+            1 => tritium_format::salt_v2::SaltV2Codec::B3,
+            2 => tritium_format::salt_v2::SaltV2Codec::S34,
+            value => {
+                return Err(OrtError::new(format!(
+                    "tritium-onnx: unknown SALT V2 codec {value}"
+                )));
+            }
+        };
+        let terminal: i64 = attributes.get(ATTR_TERMINAL_MAP_VALUE).ok_or_else(|| {
+            OrtError::new("tritium-onnx: missing i64 attribute `terminal_map_value`")
+        })?;
+        let terminal_map_value = u32::try_from(terminal).map_err(|_| {
+            OrtError::new("tritium-onnx: terminal_map_value must fit unsigned 32 bits")
+        })?;
+        Ok(Box::new(TritiumSaltV2MpGemmKernel {
+            rows,
+            columns,
+            codec,
+            terminal_map_value,
+        }))
+    }
+}
+
+/// Per-node additive SALT V2 ORT kernel.
+#[derive(Debug, Clone, Copy)]
+pub struct TritiumSaltV2MpGemmKernel {
+    rows: usize,
+    columns: usize,
+    codec: tritium_format::salt_v2::SaltV2Codec,
+    terminal_map_value: u32,
+}
+
+impl TritiumSaltV2MpGemmKernel {
+    /// Execute one extracted ORT operand set.
+    ///
+    /// # Errors
+    /// Returns an [`ort::Error`] when shapes, arenas, metadata, or arithmetic
+    /// violate the SALT V2 contract.
+    pub fn run(
+        &self,
+        act_shape: &[i64],
+        activation: &[f32],
+        payload: &[u8],
+        scales: &[half::f16],
+        allocation_map: &[u8],
+        rank_prefixes: &[u32],
+    ) -> Result<Vec<f32>, OrtError> {
+        if act_shape.len() != 2 || usize::try_from(act_shape[1]) != Ok(self.columns) {
+            return Err(OrtError::new(format!(
+                "tritium-onnx: SALT V2 activation must be [M, {}], got {act_shape:?}",
+                self.columns
+            )));
+        }
+        let m = usize::try_from(act_shape[0])
+            .map_err(|_| OrtError::new("tritium-onnx: SALT V2 activation M must be nonnegative"))?;
+        salt_v2_mpgemm_kernel(
+            activation,
+            m,
+            SaltV2PackedMatrix {
+                rows: self.rows,
+                columns: self.columns,
+                codec: self.codec,
+                payload,
+                scales,
+                allocation_map,
+                rank_prefixes,
+                terminal_map_value: self.terminal_map_value,
+            },
+        )
+        .map_err(|error| OrtError::new(error.to_string()))
+    }
+}
+
+impl Kernel for TritiumSaltV2MpGemmKernel {
+    fn compute(&mut self, ctx: &KernelContext) -> ort::Result<()> {
+        let act = ctx
+            .input(0)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 activation"))?;
+        let payload = ctx
+            .input(1)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 payload"))?;
+        let scales = ctx
+            .input(2)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 scales"))?;
+        let allocation_map = ctx
+            .input(3)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 allocation map"))?;
+        let rank_prefixes = ctx
+            .input(4)?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 rank prefixes"))?;
+        let (shape, activation) = act.try_extract_tensor::<f32>()?;
+        let (_, payload) = payload.try_extract_tensor::<u8>()?;
+        let (_, scales) = scales.try_extract_tensor::<half::f16>()?;
+        let (_, allocation_map) = allocation_map.try_extract_tensor::<u8>()?;
+        let (_, rank_prefixes) = rank_prefixes.try_extract_tensor::<u32>()?;
+        let shape: Vec<i64> = shape.iter().copied().collect();
+        let output = self.run(
+            &shape,
+            activation,
+            payload,
+            scales,
+            allocation_map,
+            rank_prefixes,
+        )?;
+        let mut value = ctx
+            .output(0, vec![shape[0], self.rows as i64])?
+            .ok_or_else(|| OrtError::new("tritium-onnx: missing SALT V2 output"))?;
+        let (_, destination) = value.try_extract_tensor_mut::<f32>()?;
+        destination.copy_from_slice(&output);
+        Ok(())
     }
 }
 
@@ -958,6 +1111,7 @@ pub fn tritium_operator_domain() -> ort::Result<OperatorDomain> {
     OperatorDomain::new(ONNX_DOMAIN)?
         .add(TritiumTernaryMpGemmOp)?
         .add(TritiumTernaryEmbeddingOp)?
+        .add(TritiumSaltV2MpGemmOp)?
         .add(TritiumKvAttentionOp)?
         .add(TritiumQwenDeltaNetOp)
 }
@@ -969,7 +1123,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tritium_core::Trit;
-    use tritium_format::{num_blocks, pack_tq1_0_row, pack_tq2_0_row};
+    use tritium_format::{
+        num_blocks, pack_tq1_0_row, pack_tq2_0_row, salt_v2::SaltV2Codec,
+        salt_v2_package::pack_salt_v2_plane,
+    };
     use tritium_testkit::{ConformanceVector, FROZEN_COUNT, FROZEN_SEED, generate_vectors};
 
     fn block_bytes(format: TernaryFormat) -> usize {
@@ -1084,10 +1241,79 @@ mod tests {
         assert_eq!(embedding.name(), ONNX_EMBEDDING_OP_NAME);
         assert_eq!(embedding.inputs().len(), 3, "tokens, packed, scales");
         assert_eq!(embedding.outputs().len(), 1, "embedding");
+        let salt_v2 = TritiumSaltV2MpGemmOp;
+        assert_eq!(salt_v2.name(), ONNX_SALT_V2_OP_NAME);
+        assert_eq!(salt_v2.inputs().len(), 5);
+        assert_eq!(salt_v2.outputs().len(), 1);
         let attention = TritiumKvAttentionOp;
         assert_eq!(attention.name(), ONNX_KV_ATTENTION_OP_NAME);
         assert_eq!(attention.inputs().len(), 3, "q, k_cache, v_cache");
         assert_eq!(attention.outputs().len(), 1, "context");
+    }
+
+    #[test]
+    fn salt_v2_custom_op_executes_additive_packed_operand_in_real_ort() {
+        use ort::value::Tensor;
+
+        let columns = 8;
+        let rows = 1;
+        let first = [
+            Trit::NEG,
+            Trit::ZERO,
+            Trit::POS,
+            Trit::NEG,
+            Trit::ZERO,
+            Trit::POS,
+            Trit::NEG,
+            Trit::POS,
+        ];
+        let second = [
+            Trit::POS,
+            Trit::POS,
+            Trit::ZERO,
+            Trit::NEG,
+            Trit::NEG,
+            Trit::ZERO,
+            Trit::POS,
+            Trit::ZERO,
+        ];
+        let mut payload = pack_salt_v2_plane(SaltV2Codec::B3, &first).unwrap();
+        payload.extend(pack_salt_v2_plane(SaltV2Codec::B3, &second).unwrap());
+        let scales = [f16::from_f32(0.5), f16::from_f32(0.25)];
+        let activation = vec![1.0_f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0];
+        let matrix = crate::SaltV2PackedMatrix {
+            rows,
+            columns,
+            codec: SaltV2Codec::B3,
+            payload: &payload,
+            scales: &scales,
+            allocation_map: &[],
+            rank_prefixes: &[],
+            terminal_map_value: 1,
+        };
+        let expected = crate::salt_v2_mpgemm_kernel(&activation, 1, matrix).unwrap();
+        let encoded = crate::model::encode_salt_v2_mpgemm_test_graph(matrix);
+        let diagnostics = crate::diagnose_unsupported_graph(&encoded).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&encoded)
+            .unwrap();
+        let act = Tensor::from_array(([1, columns], activation.clone())).unwrap();
+        {
+            let outputs = session.run(ort::inputs![&act]).unwrap();
+            let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        let two_rows = [activation.as_slice(), activation.as_slice()].concat();
+        let expected_two = crate::salt_v2_mpgemm_kernel(&two_rows, 2, matrix).unwrap();
+        let act = Tensor::from_array(([2, columns], two_rows)).unwrap();
+        let outputs = session.run(ort::inputs![&act]).unwrap();
+        let (_, actual) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(actual, expected_two);
     }
 
     #[test]

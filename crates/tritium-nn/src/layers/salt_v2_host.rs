@@ -166,6 +166,42 @@ impl HostSaltV2Linear {
         self.plane_count
     }
 
+    /// Physical codec used by every packed plane.
+    #[must_use]
+    pub const fn codec(&self) -> SaltV2Codec {
+        self.codec
+    }
+
+    /// Descriptor-free packed payload arena.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Descriptor-free f16 group-scale arena.
+    #[must_use]
+    pub fn scales(&self) -> &[f16] {
+        &self.scales
+    }
+
+    /// Complete bytes of the two-bit plane-count map.
+    #[must_use]
+    pub fn allocation_map(&self) -> &[u8] {
+        &self.allocation_map
+    }
+
+    /// Cumulative plane ranks at 256-tile boundaries.
+    #[must_use]
+    pub fn rank_prefixes(&self) -> &[u32] {
+        &self.rank_prefixes
+    }
+
+    /// Remaining zero-padded plane-count map bits carried outside the arena.
+    #[must_use]
+    pub const fn terminal_map_value(&self) -> u32 {
+        self.terminal_map_value
+    }
+
     /// Exact requested payload, scale, map, and rank-prefix bytes.
     ///
     /// Allocator bookkeeping and this fixed-size handle are excluded. No dense

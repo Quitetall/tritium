@@ -31,7 +31,13 @@
 use half::f16;
 use tritium_core::{GemmShape, TernaryFormat, Trit, reference_mpgemm};
 use tritium_format::{
-    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks, unpack_tq1_0_row, unpack_tq2_0_row,
+    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, num_blocks,
+    salt_v2::{S34_TRITS_PER_GROUP, SaltV2Codec},
+    salt_v2_package::{
+        SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES,
+        SALT_V2_MAX_PLANES, SALT_V2_SCALE_GROUP_SIZE, unpack_salt_v2_plane_into,
+    },
+    unpack_tq1_0_row, unpack_tq2_0_row,
 };
 
 /// Stable Tritium ONNX custom-operator domain.
@@ -49,11 +55,23 @@ pub const ONNX_KV_ATTENTION_OP_NAME: &str = "TritiumKvAttention";
 /// Experimental opset-2 projected Qwen Gated DeltaNet recurrent-core node.
 pub const ONNX_QWEN_DELTANET_OP_NAME: &str = "TritiumQwenDeltaNet";
 
+/// Stable additive SALT V2 packed matrix multiplication node name.
+pub const ONNX_SALT_V2_OP_NAME: &str = "TritiumSaltV2MpGemm";
+
 /// Node-attribute name for the contraction/embedding dimension `K`.
 pub const ATTR_K: &str = "K";
 
 /// Node-attribute name for the packing format (`0` = TQ2_0, `1` = TQ1_0).
 pub const ATTR_FORMAT: &str = "format";
+
+/// Additive SALT V2 matrix output-row count attribute.
+pub const ATTR_ROWS: &str = "rows";
+
+/// Additive SALT V2 codec attribute (`0` = D2, `1` = B3, `2` = S34).
+pub const ATTR_CODEC: &str = "codec";
+
+/// Additive SALT V2 terminal partial allocation-map bits.
+pub const ATTR_TERMINAL_MAP_VALUE: &str = "terminal_map_value";
 
 /// Cache-aware attention query-head-count attribute.
 pub const ATTR_N_HEAD: &str = "n_head";
@@ -403,6 +421,13 @@ pub enum OnnxTernaryError {
         /// Flat rejected element index.
         index: usize,
     },
+    /// A SALT V2 indexed arena or its canonical metadata is malformed.
+    InvalidSaltV2(String),
+    /// An additive SALT V2 activation is NaN or infinite.
+    InvalidActivationValue {
+        /// Flat rejected activation index.
+        index: usize,
+    },
 }
 
 impl core::fmt::Display for OnnxTernaryError {
@@ -458,6 +483,13 @@ impl core::fmt::Display for OnnxTernaryError {
             OnnxTernaryError::InvalidAttentionValue { input, index } => write!(
                 f,
                 "tritium-onnx: KV attention {input}[{index}] must be finite"
+            ),
+            OnnxTernaryError::InvalidSaltV2(reason) => {
+                write!(f, "tritium-onnx: invalid SALT V2 operand: {reason}")
+            }
+            OnnxTernaryError::InvalidActivationValue { index } => write!(
+                f,
+                "tritium-onnx: SALT V2 activation[{index}] must be finite"
             ),
         }
     }
@@ -611,6 +643,284 @@ pub fn ternary_mpgemm_kernel(
     reference_mpgemm(act, &trits, scales, GemmShape { m, n, k }, &mut out)
         .map_err(|e| OnnxTernaryError::Kernel(e.to_string()))?;
     Ok(out)
+}
+
+/// One descriptor-free indexed SALT V2 matrix operand.
+///
+/// The arenas are the production runtime layout: codec payloads, f16 group-128
+/// scales, a two-bit plane-count map, and one u32 rank prefix per 256 tiles.
+/// The terminal partial map byte is carried by `terminal_map_value` and is not
+/// duplicated in `allocation_map`.
+#[derive(Debug, Clone, Copy)]
+pub struct SaltV2PackedMatrix<'a> {
+    /// Output rows.
+    pub rows: usize,
+    /// Input/contraction columns.
+    pub columns: usize,
+    /// Physical plane codec.
+    pub codec: SaltV2Codec,
+    /// Concatenated canonical plane payloads.
+    pub payload: &'a [u8],
+    /// Concatenated nonnegative finite f16 group scales.
+    pub scales: &'a [f16],
+    /// Complete bytes of the two-bit-per-tile plane-count map.
+    pub allocation_map: &'a [u8],
+    /// Cumulative plane ranks at 256-tile boundaries.
+    pub rank_prefixes: &'a [u32],
+    /// Remaining zero-padded plane-count map bits.
+    pub terminal_map_value: u32,
+}
+
+impl SaltV2PackedMatrix<'_> {
+    fn logical_coefficients(self) -> Result<usize, OnnxTernaryError> {
+        if self.rows == 0 || self.columns == 0 {
+            return Err(OnnxTernaryError::InvalidSaltV2(
+                "rows and columns must be positive".into(),
+            ));
+        }
+        self.rows
+            .checked_mul(self.columns)
+            .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 coefficient count"))
+    }
+
+    fn tile_count(self) -> Result<usize, OnnxTernaryError> {
+        Ok(self
+            .logical_coefficients()?
+            .div_ceil(SALT_V2_ALLOCATION_TILE_SIZE))
+    }
+
+    fn tile_plane_count(self, tile: usize) -> Result<usize, OnnxTernaryError> {
+        let tile_count = self.tile_count()?;
+        if tile >= tile_count {
+            return Err(OnnxTernaryError::InvalidSaltV2(
+                "tile index exceeds matrix geometry".into(),
+            ));
+        }
+        let bit = tile.checked_mul(2).ok_or(OnnxTernaryError::ShapeOverflow(
+            "SALT V2 allocation-map bit offset",
+        ))?;
+        let stored_bits = self.allocation_map.len() * u8::BITS as usize;
+        let code = if bit < stored_bits {
+            (self.allocation_map[bit / 8] >> (bit % 8)) & 0b11
+        } else {
+            ((self.terminal_map_value >> (bit - stored_bits)) & 0b11) as u8
+        };
+        let count = usize::from(code) + 1;
+        if count > SALT_V2_MAX_PLANES {
+            return Err(OnnxTernaryError::InvalidSaltV2(format!(
+                "tile {tile} encodes {count} planes"
+            )));
+        }
+        Ok(count)
+    }
+
+    fn plane_rank_before(self, tile: usize) -> Result<usize, OnnxTernaryError> {
+        let block = tile / SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES;
+        let block_start = block * SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES;
+        let mut rank =
+            if block == 0 {
+                0
+            } else {
+                usize::try_from(*self.rank_prefixes.get(block - 1).ok_or_else(|| {
+                    OnnxTernaryError::InvalidSaltV2("rank prefix is absent".into())
+                })?)
+                .map_err(|_| OnnxTernaryError::InvalidSaltV2("rank prefix exceeds usize".into()))?
+            };
+        for current in block_start..tile {
+            rank = rank
+                .checked_add(self.tile_plane_count(current)?)
+                .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 plane rank"))?;
+        }
+        Ok(rank)
+    }
+
+    fn payload_bytes(self, logical_len: usize) -> Result<usize, OnnxTernaryError> {
+        let stored = if self.codec == SaltV2Codec::S34 {
+            logical_len.div_ceil(S34_TRITS_PER_GROUP) * S34_TRITS_PER_GROUP
+        } else {
+            logical_len
+        };
+        self.codec
+            .ledger(stored)
+            .map(|ledger| ledger.physical_bytes)
+            .map_err(|error| OnnxTernaryError::InvalidSaltV2(error.to_string()))
+    }
+
+    fn validate(self) -> Result<(), OnnxTernaryError> {
+        let logical = self.logical_coefficients()?;
+        let tiles = self.tile_count()?;
+        let expected_map = tiles.checked_mul(2).ok_or(OnnxTernaryError::ShapeOverflow(
+            "SALT V2 allocation-map bit count",
+        ))? / 8;
+        let expected_ranks = tiles.saturating_sub(1) / SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES;
+        if self.allocation_map.len() != expected_map || self.rank_prefixes.len() != expected_ranks {
+            return Err(OnnxTernaryError::InvalidSaltV2(format!(
+                "metadata lengths differ from geometry: map {}/{expected_map}, ranks {}/{expected_ranks}",
+                self.allocation_map.len(),
+                self.rank_prefixes.len()
+            )));
+        }
+        let terminal_bits = (tiles * 2) % 8;
+        if terminal_bits == 0 {
+            if self.terminal_map_value != 0 {
+                return Err(OnnxTernaryError::InvalidSaltV2(
+                    "terminal allocation-map padding is nonzero".into(),
+                ));
+            }
+        } else if self.terminal_map_value >> terminal_bits != 0 {
+            return Err(OnnxTernaryError::InvalidSaltV2(
+                "terminal allocation-map padding is nonzero".into(),
+            ));
+        }
+        let mut payload_bytes = 0usize;
+        let mut scale_count = 0usize;
+        let mut planes_before = 0usize;
+        for tile in 0..tiles {
+            if tile > 0 && tile % SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES == 0 {
+                let declared =
+                    usize::try_from(self.rank_prefixes[tile / 256 - 1]).map_err(|_| {
+                        OnnxTernaryError::InvalidSaltV2("rank prefix exceeds usize".into())
+                    })?;
+                if declared != planes_before {
+                    return Err(OnnxTernaryError::InvalidSaltV2(format!(
+                        "rank prefix before tile {tile} is {declared}, expected {planes_before}"
+                    )));
+                }
+            }
+            let start = tile * SALT_V2_ALLOCATION_TILE_SIZE;
+            let len = (logical - start).min(SALT_V2_ALLOCATION_TILE_SIZE);
+            let planes = self.tile_plane_count(tile)?;
+            payload_bytes = payload_bytes
+                .checked_add(self.payload_bytes(len)?.checked_mul(planes).ok_or(
+                    OnnxTernaryError::ShapeOverflow("SALT V2 tile payload bytes"),
+                )?)
+                .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 payload bytes"))?;
+            scale_count = scale_count
+                .checked_add(
+                    len.div_ceil(SALT_V2_SCALE_GROUP_SIZE)
+                        .checked_mul(planes)
+                        .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 tile scales"))?,
+                )
+                .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 scale count"))?;
+            planes_before += planes;
+        }
+        if self.payload.len() != payload_bytes || self.scales.len() != scale_count {
+            return Err(OnnxTernaryError::InvalidSaltV2(format!(
+                "arena lengths differ from geometry: payload {}/{payload_bytes}, scales {}/{scale_count}",
+                self.payload.len(),
+                self.scales.len()
+            )));
+        }
+        if let Some((index, _)) = self
+            .scales
+            .iter()
+            .enumerate()
+            .find(|(_, scale)| !scale.is_finite() || scale.to_f32() < 0.0)
+        {
+            return Err(OnnxTernaryError::InvalidSaltV2(format!(
+                "scale {index} must be finite and nonnegative"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Execute additive SALT V2 matrix multiplication without a dense weight shadow.
+///
+/// Reduction order is row, group-128, plane, then column, matching Tritium's
+/// host and CUDA SALT V2 execution contract.
+///
+/// # Errors
+/// Returns [`OnnxTernaryError`] for malformed geometry or arenas, noncanonical
+/// codec data, non-finite operands/arithmetic, or a derived-size overflow.
+pub fn salt_v2_mpgemm_kernel(
+    activation: &[f32],
+    m: usize,
+    matrix: SaltV2PackedMatrix<'_>,
+) -> Result<Vec<f32>, OnnxTernaryError> {
+    matrix.validate()?;
+    let expected = m
+        .checked_mul(matrix.columns)
+        .ok_or(OnnxTernaryError::ShapeOverflow(
+            "SALT V2 activation element count",
+        ))?;
+    if activation.len() != expected {
+        return Err(OnnxTernaryError::ActivationLenMismatch {
+            expected,
+            got: activation.len(),
+        });
+    }
+    if let Some((index, _)) = activation
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(OnnxTernaryError::InvalidActivationValue { index });
+    }
+    let output_len = m
+        .checked_mul(matrix.rows)
+        .ok_or(OnnxTernaryError::ShapeOverflow(
+            "SALT V2 output element count",
+        ))?;
+    let mut output = vec![0.0f32; output_len];
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(SALT_V2_ALLOCATION_TILE_SIZE)
+        .map_err(|_| OnnxTernaryError::InvalidSaltV2("decode scratch allocation failed".into()))?;
+    for batch in 0..m {
+        let input = &activation[batch * matrix.columns..(batch + 1) * matrix.columns];
+        for row in 0..matrix.rows {
+            let row_start = row * matrix.columns;
+            let row_end = row_start + matrix.columns;
+            let mut coefficient = row_start;
+            let mut accumulator = 0.0f32;
+            while coefficient < row_end {
+                let tile = coefficient / SALT_V2_ALLOCATION_TILE_SIZE;
+                let tile_start = tile * SALT_V2_ALLOCATION_TILE_SIZE;
+                let local_start = coefficient - tile_start;
+                let logical_len =
+                    (matrix.logical_coefficients()? - tile_start).min(SALT_V2_ALLOCATION_TILE_SIZE);
+                let group = local_start / SALT_V2_SCALE_GROUP_SIZE;
+                let group_end = ((group + 1) * SALT_V2_SCALE_GROUP_SIZE).min(logical_len);
+                let segment_len = (group_end - local_start).min(row_end - coefficient);
+                let segment_end = coefficient + segment_len;
+                let planes = matrix.tile_plane_count(tile)?;
+                let rank = matrix.plane_rank_before(tile)?;
+                let payload_stride = matrix.payload_bytes(logical_len)?;
+                let scale_stride = logical_len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+                for plane in 0..planes {
+                    let payload_start = rank
+                        .checked_mul(matrix.payload_bytes(SALT_V2_ALLOCATION_TILE_SIZE)?)
+                        .and_then(|offset| offset.checked_add(plane * payload_stride))
+                        .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 payload offset"))?;
+                    let scale_start = rank
+                        .checked_mul(
+                            SALT_V2_ALLOCATION_TILE_SIZE.div_ceil(SALT_V2_SCALE_GROUP_SIZE),
+                        )
+                        .and_then(|offset| offset.checked_add(plane * scale_stride))
+                        .ok_or(OnnxTernaryError::ShapeOverflow("SALT V2 scale offset"))?;
+                    let packed = &matrix.payload[payload_start..payload_start + payload_stride];
+                    unpack_salt_v2_plane_into(matrix.codec, packed, logical_len, &mut decoded)
+                        .map_err(|error| OnnxTernaryError::InvalidSaltV2(error.to_string()))?;
+                    let scale = matrix.scales[scale_start + group].to_f32();
+                    let mut group_sum = 0.0f32;
+                    for current in coefficient..segment_end {
+                        let column = current - row_start;
+                        group_sum += decoded[current - tile_start].to_f32() * input[column];
+                    }
+                    accumulator += group_sum * scale;
+                    if !accumulator.is_finite() {
+                        return Err(OnnxTernaryError::InvalidSaltV2(
+                            "contraction produced a non-finite value".into(),
+                        ));
+                    }
+                }
+                coefficient = segment_end;
+            }
+            output[batch * matrix.rows + row] = accumulator;
+        }
+    }
+    Ok(output)
 }
 
 /// Gather scaled rows from a packed ternary embedding table without
@@ -801,8 +1111,9 @@ pub fn kv_attention_kernel(
 pub use onnx_op::{
     QwenDeltaNetInputs, QwenDeltaNetOutput, QwenDeltaNetTensor, TritiumKvAttentionKernel,
     TritiumKvAttentionOp, TritiumQwenDeltaNetKernel, TritiumQwenDeltaNetOp,
-    TritiumTernaryEmbeddingKernel, TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel,
-    TritiumTernaryMpGemmOp, tritium_operator_domain,
+    TritiumSaltV2MpGemmKernel, TritiumSaltV2MpGemmOp, TritiumTernaryEmbeddingKernel,
+    TritiumTernaryEmbeddingOp, TritiumTernaryMpGemmKernel, TritiumTernaryMpGemmOp,
+    tritium_operator_domain,
 };
 
 #[cfg(feature = "onnx")]
@@ -836,7 +1147,13 @@ mod model;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tritium_format::{pack_tq1_0_row, pack_tq2_0_row};
+    use tritium_format::{
+        pack_tq1_0_row, pack_tq2_0_row,
+        salt_v2::SaltV2Codec,
+        salt_v2_package::{
+            SALT_V2_ALLOCATION_TILE_SIZE, SALT_V2_SCALE_GROUP_SIZE, pack_salt_v2_plane,
+        },
+    };
     use tritium_testkit::{ConformanceVector, FROZEN_COUNT, FROZEN_SEED, generate_vectors};
 
     /// Pack a vector's `[N, K]` `i8` weights exactly as the conformance harness
@@ -882,6 +1199,83 @@ mod tests {
         generate_vectors(FROZEN_SEED, FROZEN_COUNT)
     }
 
+    struct SaltFixture {
+        payload: Vec<u8>,
+        scales: Vec<f16>,
+        allocation_map: Vec<u8>,
+        rank_prefixes: Vec<u32>,
+        terminal_map_value: u32,
+        dense: Vec<f32>,
+    }
+
+    fn salt_fixture(codec: SaltV2Codec, rows: usize, columns: usize) -> SaltFixture {
+        let logical = rows * columns;
+        let mut payload = Vec::new();
+        let mut scales = Vec::new();
+        let mut dense = vec![0.0; logical];
+        let tile_count = logical.div_ceil(SALT_V2_ALLOCATION_TILE_SIZE);
+        let mut allocation_map = vec![0u8; tile_count * 2 / 8];
+        let mut rank_prefixes = Vec::new();
+        let mut terminal_map_value = 0u32;
+        let mut planes_before = 0usize;
+        for (tile_index, start) in (0..logical)
+            .step_by(SALT_V2_ALLOCATION_TILE_SIZE)
+            .enumerate()
+        {
+            let len = (logical - start).min(SALT_V2_ALLOCATION_TILE_SIZE);
+            let plane_count = 1 + tile_index % 3;
+            if tile_index > 0 && tile_index % SALT_V2_INDEXED_RUNTIME_RANK_STRIDE_TILES == 0 {
+                rank_prefixes.push(u32::try_from(planes_before).unwrap());
+            }
+            let bit = tile_index * 2;
+            let stored_bits = allocation_map.len() * 8;
+            if bit < stored_bits {
+                allocation_map[bit / 8] |= ((plane_count - 1) as u8) << (bit % 8);
+            } else {
+                terminal_map_value |= ((plane_count - 1) as u32) << (bit - stored_bits);
+            }
+            for plane_index in 0..plane_count {
+                let trits: Vec<Trit> = (0..len)
+                    .map(|index| {
+                        if codec == SaltV2Codec::S34 {
+                            match index % 4 {
+                                0 => Trit::ZERO,
+                                1 | 2 => Trit::POS,
+                                _ => Trit::NEG,
+                            }
+                        } else {
+                            match (index + plane_index + tile_index) % 3 {
+                                0 => Trit::NEG,
+                                1 => Trit::ZERO,
+                                _ => Trit::POS,
+                            }
+                        }
+                    })
+                    .collect();
+                payload.extend(pack_salt_v2_plane(codec, &trits).unwrap());
+                let group_count = len.div_ceil(SALT_V2_SCALE_GROUP_SIZE);
+                for group in 0..group_count {
+                    let scale = f16::from_f32(0.125 * (1 + plane_index + group) as f32);
+                    scales.push(scale);
+                    let begin = group * SALT_V2_SCALE_GROUP_SIZE;
+                    let end = (begin + SALT_V2_SCALE_GROUP_SIZE).min(len);
+                    for local in begin..end {
+                        dense[start + local] += trits[local].to_f32() * scale.to_f32();
+                    }
+                }
+            }
+            planes_before += plane_count;
+        }
+        SaltFixture {
+            payload,
+            scales,
+            allocation_map,
+            rank_prefixes,
+            terminal_map_value,
+            dense,
+        }
+    }
+
     /// The always-on kernel reproduces the frozen conformance set. Because it
     /// runs the SAME `reference_mpgemm` over pack->unpack round-tripped trits, it
     /// is bit-exact; grading it exactly (rather than within a tolerance) proves
@@ -907,6 +1301,105 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, total, "every frozen vector exercised");
+    }
+
+    #[test]
+    fn salt_v2_kernel_matches_independent_additive_oracle_for_every_codec() {
+        let (m, rows, columns) = (2, 2, 300);
+        let activation: Vec<f32> = (0..m * columns)
+            .map(|index| (index as f32 % 17.0 - 8.0) * 0.0625)
+            .collect();
+        for codec in [SaltV2Codec::D2, SaltV2Codec::B3, SaltV2Codec::S34] {
+            let fixture = salt_fixture(codec, rows, columns);
+            let matrix = SaltV2PackedMatrix {
+                rows,
+                columns,
+                codec,
+                payload: &fixture.payload,
+                scales: &fixture.scales,
+                allocation_map: &fixture.allocation_map,
+                rank_prefixes: &fixture.rank_prefixes,
+                terminal_map_value: fixture.terminal_map_value,
+            };
+            let got = salt_v2_mpgemm_kernel(&activation, m, matrix).unwrap();
+            let expected: Vec<f32> = (0..m)
+                .flat_map(|batch| {
+                    let fixture = &fixture;
+                    let activation = &activation;
+                    (0..rows).map(move |row| {
+                        (0..columns).fold(0.0, |sum, column| {
+                            sum + activation[batch * columns + column]
+                                * fixture.dense[row * columns + column]
+                        })
+                    })
+                })
+                .collect();
+            for (actual, reference) in got.iter().zip(expected) {
+                assert!((actual - reference).abs() < 2.0e-5, "{codec:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn salt_v2_kernel_rejects_noncanonical_or_incomplete_arenas() {
+        let fixture = salt_fixture(SaltV2Codec::B3, 2, 300);
+        let valid = SaltV2PackedMatrix {
+            rows: 2,
+            columns: 300,
+            codec: SaltV2Codec::B3,
+            payload: &fixture.payload,
+            scales: &fixture.scales,
+            allocation_map: &fixture.allocation_map,
+            rank_prefixes: &fixture.rank_prefixes,
+            terminal_map_value: fixture.terminal_map_value,
+        };
+        assert!(salt_v2_mpgemm_kernel(&[0.0; 599], 2, valid).is_err());
+        let truncated = SaltV2PackedMatrix {
+            payload: &fixture.payload[..fixture.payload.len() - 1],
+            ..valid
+        };
+        assert!(salt_v2_mpgemm_kernel(&[0.0; 600], 2, truncated).is_err());
+        let trailing = SaltV2PackedMatrix {
+            terminal_map_value: fixture.terminal_map_value | (1 << 6),
+            ..valid
+        };
+        assert!(salt_v2_mpgemm_kernel(&[0.0; 600], 2, trailing).is_err());
+        let mut bad_scales = fixture.scales.clone();
+        bad_scales[0] = f16::NAN;
+        let nonfinite = SaltV2PackedMatrix {
+            scales: &bad_scales,
+            ..valid
+        };
+        assert!(salt_v2_mpgemm_kernel(&[0.0; 600], 2, nonfinite).is_err());
+    }
+
+    #[test]
+    fn salt_v2_kernel_crosses_compact_map_and_rank_prefix_boundary() {
+        let columns = 257 * SALT_V2_ALLOCATION_TILE_SIZE;
+        let fixture = salt_fixture(SaltV2Codec::D2, 1, columns);
+        assert_eq!(fixture.allocation_map.len(), 64);
+        assert_eq!(fixture.rank_prefixes.len(), 1);
+        let matrix = SaltV2PackedMatrix {
+            rows: 1,
+            columns,
+            codec: SaltV2Codec::D2,
+            payload: &fixture.payload,
+            scales: &fixture.scales,
+            allocation_map: &fixture.allocation_map,
+            rank_prefixes: &fixture.rank_prefixes,
+            terminal_map_value: fixture.terminal_map_value,
+        };
+        let activation = vec![1.0; columns];
+        let output = salt_v2_mpgemm_kernel(&activation, 1, matrix).unwrap();
+        assert!((output[0] - fixture.dense.iter().sum::<f32>()).abs() < 2.0e-4);
+
+        let mut bad_rank = fixture.rank_prefixes.clone();
+        bad_rank[0] += 1;
+        let corrupted = SaltV2PackedMatrix {
+            rank_prefixes: &bad_rank,
+            ..matrix
+        };
+        assert!(salt_v2_mpgemm_kernel(&activation, 1, corrupted).is_err());
     }
 
     #[test]

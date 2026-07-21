@@ -42,6 +42,7 @@ ort = { workspace = true, optional = true, features = [
     "tls-rustls",
     "copy-dylibs",
     "api-22",
+    "half",
 ] }
 
 [dev-dependencies]

@@ -20,6 +20,8 @@ const TRITIUM_OPSET: i64 = 1;
 const TENSOR_FLOAT: i32 = 1;
 const TENSOR_UINT8: i32 = 2;
 const TENSOR_INT64: i32 = 7;
+const TENSOR_FLOAT16: i32 = 10;
+const TENSOR_UINT32: i32 = 12;
 const ATTRIBUTE_INT: i32 = 2;
 const ATTRIBUTE_INTS: i32 = 7;
 const EXTERNAL_DATA: i32 = 1;
@@ -1938,7 +1940,9 @@ pub fn diagnose_unsupported_graph(
             let reason = if node.domain == ONNX_DOMAIN
                 && matches!(
                     node.op_type.as_str(),
-                    ONNX_KV_ATTENTION_OP_NAME | crate::ONNX_QWEN_DELTANET_OP_NAME
+                    ONNX_KV_ATTENTION_OP_NAME
+                        | crate::ONNX_QWEN_DELTANET_OP_NAME
+                        | crate::ONNX_SALT_V2_OP_NAME
                 )
                 && tritium_opset != Some(2)
             {
@@ -1992,7 +1996,9 @@ pub fn diagnose_unsupported_graph(
                         attribute.kind
                     ),
                 });
-            } else if attribute.name == ATTR_K && attribute.value <= 0 {
+            } else if matches!(attribute.name.as_str(), ATTR_K | crate::ATTR_ROWS)
+                && attribute.value <= 0
+            {
                 diagnostics.push(UnsupportedGraphDiagnostic {
                     kind: UnsupportedGraphItemKind::Attribute,
                     subject,
@@ -2003,6 +2009,20 @@ pub fn diagnose_unsupported_graph(
                     kind: UnsupportedGraphItemKind::Attribute,
                     subject,
                     reason: format!("unsupported format code {}", attribute.value),
+                });
+            } else if attribute.name == crate::ATTR_CODEC && !matches!(attribute.value, 0..=2) {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: format!("unsupported SALT V2 codec code {}", attribute.value),
+                });
+            } else if attribute.name == crate::ATTR_TERMINAL_MAP_VALUE
+                && u32::try_from(attribute.value).is_err()
+            {
+                diagnostics.push(UnsupportedGraphDiagnostic {
+                    kind: UnsupportedGraphItemKind::Attribute,
+                    subject,
+                    reason: "terminal_map_value must fit unsigned 32 bits".to_owned(),
                 });
             } else if matches!(
                 attribute.name.as_str(),
@@ -2081,6 +2101,39 @@ pub fn diagnose_unsupported_graph(
         }
         let supported = node_supported(node, tritium_opset, standard_opset);
         if supported {
+            if node.op_type == crate::ONNX_SALT_V2_OP_NAME {
+                let packed_slots = [
+                    ".salt_payload",
+                    ".salt_scales",
+                    ".salt_allocation_map",
+                    ".salt_rank_prefixes",
+                ];
+                if node.input.len() != packed_slots.len() + 1 || node.output.len() != 1 {
+                    diagnostics.push(UnsupportedGraphDiagnostic {
+                        kind: UnsupportedGraphItemKind::Node,
+                        subject: diagnostic_subject(&node.name, "<unnamed node>"),
+                        reason: format!(
+                            "SALT V2 mpGEMM requires five inputs and one output, got {} inputs and {} outputs",
+                            node.input.len(),
+                            node.output.len()
+                        ),
+                    });
+                } else {
+                    for (packed_slot, suffix) in packed_slots.iter().enumerate() {
+                        let slot = packed_slot + 1;
+                        if !node.input[slot].ends_with(suffix) {
+                            diagnostics.push(UnsupportedGraphDiagnostic {
+                                kind: UnsupportedGraphItemKind::Node,
+                                subject: diagnostic_subject(&node.name, "<unnamed node>"),
+                                reason: format!(
+                                    "SALT V2 input slot {slot} must bind a {} initializer",
+                                    suffix
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
             for &required in supported_attributes(node) {
                 let count = node
                     .attribute
@@ -2157,7 +2210,15 @@ pub fn diagnose_unsupported_graph(
     }
     for initializer in &graph.initializer {
         let expected = match initializer.name.as_str() {
-            name if name == "tritium.packed" || name.ends_with(".packed") => Some(TENSOR_UINT8),
+            name if name == "tritium.packed"
+                || name.ends_with(".packed")
+                || name.ends_with(".salt_payload")
+                || name.ends_with(".salt_allocation_map") =>
+            {
+                Some(TENSOR_UINT8)
+            }
+            name if name.ends_with(".salt_scales") => Some(TENSOR_FLOAT16),
+            name if name.ends_with(".salt_rank_prefixes") => Some(TENSOR_UINT32),
             name if name == "tritium.scales"
                 || name == "attention.scale"
                 || name.ends_with(".scales")
@@ -2323,6 +2384,12 @@ pub fn diagnose_unsupported_graph(
 fn supported_attributes(node: &NodeProto) -> &'static [&'static str] {
     match (node.domain.as_str(), node.op_type.as_str()) {
         (ONNX_DOMAIN, ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME) => &[ATTR_K, ATTR_FORMAT],
+        (ONNX_DOMAIN, crate::ONNX_SALT_V2_OP_NAME) => &[
+            ATTR_K,
+            crate::ATTR_ROWS,
+            crate::ATTR_CODEC,
+            crate::ATTR_TERMINAL_MAP_VALUE,
+        ],
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => {
             &[ATTR_N_HEAD, ATTR_N_KV_HEAD, ATTR_HEAD_DIM, ATTR_PAST_TOKENS]
         }
@@ -2436,6 +2503,7 @@ fn node_supported(
         (ONNX_DOMAIN, ONNX_OP_NAME | ONNX_EMBEDDING_OP_NAME) => {
             matches!(tritium_opset, Some(1 | 2))
         }
+        (ONNX_DOMAIN, crate::ONNX_SALT_V2_OP_NAME) => tritium_opset == Some(2),
         (ONNX_DOMAIN, ONNX_KV_ATTENTION_OP_NAME) => tritium_opset == Some(2),
         (ONNX_DOMAIN, crate::ONNX_QWEN_DELTANET_OP_NAME) => tritium_opset == Some(2),
         (
@@ -6455,6 +6523,96 @@ pub(crate) fn encode_qwen_deltanet_test_graph() -> Vec<u8> {
     .encode_to_vec()
 }
 
+#[cfg(all(test, feature = "onnx"))]
+pub(crate) fn encode_salt_v2_mpgemm_test_graph(matrix: crate::SaltV2PackedMatrix<'_>) -> Vec<u8> {
+    let rows = i64::try_from(matrix.rows).unwrap();
+    let columns = i64::try_from(matrix.columns).unwrap();
+    let codec = match matrix.codec {
+        tritium_format::salt_v2::SaltV2Codec::D2 => 0,
+        tritium_format::salt_v2::SaltV2Codec::B3 => 1,
+        tritium_format::salt_v2::SaltV2Codec::S34 => 2,
+        _ => panic!("test graph does not support an unknown SALT V2 codec"),
+    };
+    let scale_bytes = matrix
+        .scales
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let rank_bytes = matrix
+        .rank_prefixes
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let graph = GraphProto {
+        node: vec![NodeProto {
+            input: strings([
+                "hidden",
+                "weight.salt_payload",
+                "weight.salt_scales",
+                "weight.salt_allocation_map",
+                "weight.salt_rank_prefixes",
+            ]),
+            output: strings(["next_hidden"]),
+            name: "tritium.salt_v2_mpgemm".to_owned(),
+            op_type: crate::ONNX_SALT_V2_OP_NAME.to_owned(),
+            attribute: vec![
+                int_attribute(crate::ATTR_K, columns),
+                int_attribute(crate::ATTR_ROWS, rows),
+                int_attribute(crate::ATTR_CODEC, codec),
+                int_attribute(
+                    crate::ATTR_TERMINAL_MAP_VALUE,
+                    i64::from(matrix.terminal_map_value),
+                ),
+            ],
+            domain: ONNX_DOMAIN.to_owned(),
+        }],
+        name: "tritium.salt_v2_mpgemm.test".to_owned(),
+        initializer: vec![
+            inline_tensor(
+                "weight.salt_payload",
+                TENSOR_UINT8,
+                vec![i64::try_from(matrix.payload.len()).unwrap()],
+                matrix.payload.to_vec(),
+            ),
+            inline_tensor(
+                "weight.salt_scales",
+                TENSOR_FLOAT16,
+                vec![i64::try_from(matrix.scales.len()).unwrap()],
+                scale_bytes,
+            ),
+            inline_tensor(
+                "weight.salt_allocation_map",
+                TENSOR_UINT8,
+                vec![i64::try_from(matrix.allocation_map.len()).unwrap()],
+                matrix.allocation_map.to_vec(),
+            ),
+            inline_tensor(
+                "weight.salt_rank_prefixes",
+                TENSOR_UINT32,
+                vec![i64::try_from(matrix.rank_prefixes.len()).unwrap()],
+                rank_bytes,
+            ),
+        ],
+        input: vec![tensor_value("hidden", TENSOR_FLOAT, &[-1, columns])],
+        output: vec![tensor_value("next_hidden", TENSOR_FLOAT, &[-1, rows])],
+        value_info: Vec::new(),
+    };
+    ModelProto {
+        ir_version: ONNX_IR_VERSION,
+        producer_name: "tritium-onnx-test".to_owned(),
+        producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+        domain: String::new(),
+        model_version: 1,
+        graph: Some(graph),
+        opset_import: vec![OperatorSetIdProto {
+            domain: ONNX_DOMAIN.to_owned(),
+            version: 2,
+        }],
+        metadata_props: Vec::new(),
+    }
+    .encode_to_vec()
+}
+
 #[cfg(test)]
 pub(crate) fn encode_standard_attention_test_graph(
     query_tokens: usize,
@@ -8035,6 +8193,57 @@ mod tests {
     fn supported_kv_attention_graph_has_no_unsupported_diagnostics() {
         let encoded = encode_kv_attention_test_graph(1, 2, 2, 1, 4);
         assert!(diagnose_unsupported_graph(&encoded).unwrap().is_empty());
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn salt_v2_diagnostics_reject_opset_arity_and_slot_mutations() {
+        let payload = [1u8];
+        let scales = [f16::ONE];
+        let matrix = crate::SaltV2PackedMatrix {
+            rows: 1,
+            columns: 1,
+            codec: tritium_format::salt_v2::SaltV2Codec::B3,
+            payload: &payload,
+            scales: &scales,
+            allocation_map: &[],
+            rank_prefixes: &[],
+            terminal_map_value: 0,
+        };
+        let encoded = encode_salt_v2_mpgemm_test_graph(matrix);
+        assert!(diagnose_unsupported_graph(&encoded).unwrap().is_empty());
+
+        let mut missing = ModelProto::decode(encoded.as_slice()).unwrap();
+        missing.graph.as_mut().unwrap().node[0].input.pop();
+        let diagnostics = diagnose_unsupported_graph(&missing.encode_to_vec()).unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .reason
+                .contains("requires five inputs and one output")
+        }));
+
+        let mut reordered = ModelProto::decode(encoded.as_slice()).unwrap();
+        reordered.graph.as_mut().unwrap().node[0].input.swap(1, 3);
+        let diagnostics = diagnose_unsupported_graph(&reordered.encode_to_vec()).unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .reason
+                .contains("input slot 1 must bind a .salt_payload initializer")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .reason
+                .contains("input slot 3 must bind a .salt_allocation_map initializer")
+        }));
+
+        let mut old_opset = ModelProto::decode(encoded.as_slice()).unwrap();
+        old_opset.opset_import[0].version = 1;
+        let diagnostics = diagnose_unsupported_graph(&old_opset.encode_to_vec()).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.reason.contains("requires com.tritium opset 2"))
+        );
     }
 
     #[test]

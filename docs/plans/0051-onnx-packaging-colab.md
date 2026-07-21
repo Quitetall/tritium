@@ -146,7 +146,18 @@ Shared embedding/head ranges are stored once and referenced by both graphs;
 strict union-range admission rejects gaps, partial/unauthorized overlaps,
 identity/geometry/RMS-epsilon drift, noncanonical attention cadence and any of
 three manifest-digest mismatches. Real ORT loads both file-backed graphs from
-the shared arena and matches inline execution.
+the shared arena and matches inline execution. The ONNX domain now also has a
+real experimental opset-2 `TritiumSaltV2MpGemm` substrate over the production
+indexed SALT V2 arenas: D2, B3 and S34 payloads, f16 group-128 scales, adaptive one-to-three
+plane allocation maps and rank prefixes execute without a dense shadow. Its
+dependency-free kernel matches an independent additive oracle; malformed arena
+lengths, noncanonical map padding/ranks, codec data, scales and activations fail
+closed; a registered custom-op graph passes pre-session inspection and executes
+in an actual ORT session. `HostSaltV2Linear` exposes borrowed arena views so the
+next mapper can serialize the real PTQ/refined operands without reconstruction.
+Whole-Qwen emission still uses the single-plane matrix type and is not yet a
+truthful SALT V2 artifact exporter; migrating every language/MTP matrix and the
+shared embedding path remains the binding prerequisite for Slice 2.
 
 Upgrade `tritium-onnx` from a single reference custom op to a versioned operator
 domain plus whole-model loader:
