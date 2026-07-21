@@ -2010,6 +2010,57 @@ mod tests {
         assert_eq!(conv_shape.as_ref(), &[3, 2]);
         assert_eq!(key_shape.as_ref(), &[2, 1, hidden as i64]);
 
+        let dynamic_model = crate::encode_dynamic_qwen_causal_lm(base).unwrap();
+        let diagnostics = crate::diagnose_unsupported_graph(&dynamic_model).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let mut dynamic_session = ort::session::Session::builder()
+            .unwrap()
+            .with_operators(tritium_operator_domain().unwrap())
+            .unwrap()
+            .commit_from_memory(&dynamic_model)
+            .unwrap();
+        let token = Tensor::from_array(([2], vec![0_i64, 1])).unwrap();
+        let no_past = Tensor::from_array(((), vec![0_i64])).unwrap();
+        let conv = Tensor::from_array(([3, 2], vec![0.0_f32; 6])).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], vec![0.0_f32])).unwrap();
+        let dummy_k = Tensor::from_array(([1, 1, hidden], vec![0.0_f32; hidden])).unwrap();
+        let dummy_v = Tensor::from_array(([1, 1, hidden], vec![0.0_f32; hidden])).unwrap();
+        let dynamic_prompt = dynamic_session
+            .run(ort::inputs![
+                &token, &no_past, &conv, &recurrent, &dummy_k, &dummy_v
+            ])
+            .unwrap();
+        let (dynamic_logits_shape, dynamic_logits) =
+            dynamic_prompt[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(dynamic_logits_shape.as_ref(), &[2, 2]);
+        assert!(dynamic_logits.iter().all(|value| value.is_finite()));
+        let (_, dynamic_conv) = dynamic_prompt[1].try_extract_tensor::<f32>().unwrap();
+        let (_, dynamic_recurrent) = dynamic_prompt[2].try_extract_tensor::<f32>().unwrap();
+        let (dynamic_key_shape, dynamic_k) = dynamic_prompt[3].try_extract_tensor::<f32>().unwrap();
+        let (_, dynamic_v) = dynamic_prompt[4].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(dynamic_key_shape.as_ref(), &[2, 1, hidden as i64]);
+        let dynamic_conv = dynamic_conv.to_vec();
+        let dynamic_recurrent = dynamic_recurrent.to_vec();
+        let dynamic_k = dynamic_k.to_vec();
+        let dynamic_v = dynamic_v.to_vec();
+        drop(dynamic_prompt);
+
+        let token = Tensor::from_array(([1], vec![1_i64])).unwrap();
+        let two_past = Tensor::from_array(((), vec![2_i64])).unwrap();
+        let conv = Tensor::from_array(([3, 2], dynamic_conv)).unwrap();
+        let recurrent = Tensor::from_array(([1, 1, 1], dynamic_recurrent)).unwrap();
+        let past_k = Tensor::from_array(([2, 1, hidden], dynamic_k)).unwrap();
+        let past_v = Tensor::from_array(([2, 1, hidden], dynamic_v)).unwrap();
+        let dynamic_decode = dynamic_session
+            .run(ort::inputs![
+                &token, &two_past, &conv, &recurrent, &past_k, &past_v
+            ])
+            .unwrap();
+        let (_, dynamic_decode_logits) = dynamic_decode[0].try_extract_tensor::<f32>().unwrap();
+        assert!(dynamic_decode_logits.iter().all(|value| value.is_finite()));
+        let (dynamic_key_shape, _) = dynamic_decode[3].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(dynamic_key_shape.as_ref(), &[3, 1, hidden as i64]);
+
         let external = crate::encode_external_qwen_causal_lm(base).unwrap();
         let directory = TestDirectory::new();
         let model_path = directory.0.join("model.onnx");

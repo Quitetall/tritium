@@ -2487,6 +2487,7 @@ pub fn diagnose_unsupported_graph(
                 Some(TENSOR_FLOAT)
             }
             name if name.ends_with(".axes")
+                || name.ends_with("_axes")
                 || name.ends_with(".shape")
                 || name.ends_with("_shape")
                 || name.ends_with(".gqa_repeats")
@@ -2497,6 +2498,8 @@ pub fn diagnose_unsupported_graph(
                 || name.ends_with(".tail_start")
                 || name.ends_with(".tail_end")
                 || name.ends_with(".steps")
+                || name.ends_with("_starts")
+                || name.ends_with("_steps")
                 || name == "sequence.zero"
                 || name == "sequence.one" =>
             {
@@ -2711,6 +2714,12 @@ fn concat_role(node: &NodeProto, graph: &GraphProto) -> Option<ConcatRole> {
             label: "RoPE",
         });
     }
+    if node.name.ends_with(".duplicate_angles") {
+        return Some(ConcatRole {
+            axis: 1,
+            label: "RoPE angle duplication",
+        });
+    }
     let mtp_fusion = node.input.len() == 2
         && node.output.len() == 1
         && node
@@ -2731,9 +2740,19 @@ fn concat_role(node: &NodeProto, graph: &GraphProto) -> Option<ConcatRole> {
             label: "MTP fusion",
         });
     }
+    let cache_source_is_input = |value: &str| {
+        graph.input.iter().any(|input| input.name == value)
+            || producer(value).is_some_and(|candidate| {
+                candidate.op_type == "Slice"
+                    && candidate
+                        .input
+                        .first()
+                        .is_some_and(|source| graph.input.iter().any(|input| input.name == *source))
+            })
+    };
     let cache = node.input.len() == 2
         && node.output.len() == 1
-        && graph.input.iter().any(|input| input.name == node.input[0])
+        && cache_source_is_input(&node.input[0])
         && graph
             .output
             .iter()
@@ -3025,6 +3044,41 @@ pub fn encode_qwen_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
     validate_qwen_causal_lm(&model)?;
     build_qwen_causal_lm_graph(model, CausalGraphBuilder::counting())?;
     let (protobuf, _) = build_qwen_causal_lm_graph(model, CausalGraphBuilder::default())?;
+    let encoded = protobuf.encode_to_vec();
+    if encoded.len() > MAX_MODEL_BYTES {
+        return Err(OnnxModelError::InvalidModel(format!(
+            "protobuf exceeds {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
+}
+
+/// Encode one schema-v3 Qwen language graph with dynamic prompt/decode length.
+///
+/// The returned graph accepts symbolic `tokens`, scalar `past_tokens`, every
+/// DeltaNet state, and one capacity-backed K/V tensor for each full-attention
+/// layer. Callers use `past_tokens = 0` with a non-empty dummy K/V tensor for a
+/// prompt; the graph slices that tensor to an empty logical prefix. Decode
+/// feeds prior `present_k`/`present_v` outputs and their valid row count back
+/// into the same ONNX Runtime session.
+///
+/// `model.tokens` and `model.past_tokens` are a canonical construction marker
+/// and must be `1` and `0`; sequence lengths are not frozen into the graph.
+///
+/// # Errors
+/// [`OnnxModelError`] if the canonical marker, model geometry, schedule,
+/// packed payloads, preserved vectors, or initializer budget is invalid.
+pub fn encode_dynamic_qwen_causal_lm<'a, M: OnnxPackedMatrix<'a>>(
+    model: QwenCausalLmModel<'a, M>,
+) -> Result<Vec<u8>, OnnxModelError> {
+    if model.tokens != 1 || model.past_tokens != 0 {
+        return Err(OnnxModelError::InvalidModel(
+            "dynamic Qwen construction requires tokens=1 and past_tokens=0".to_owned(),
+        ));
+    }
+    validate_qwen_causal_lm(&model)?;
+    build_dynamic_qwen_causal_lm_graph(model, CausalGraphBuilder::counting())?;
+    let (protobuf, _) = build_dynamic_qwen_causal_lm_graph(model, CausalGraphBuilder::default())?;
     let encoded = protobuf.encode_to_vec();
     if encoded.len() > MAX_MODEL_BYTES {
         return Err(OnnxModelError::InvalidModel(format!(
@@ -4858,12 +4912,15 @@ struct CausalGraphGeometry {
     gqa_repeat: i64,
 }
 
-#[cfg(test)]
 struct DynamicSequenceGeometry {
     positions: String,
     key_positions: String,
+    #[cfg(test)]
     token_count: String,
+    #[cfg(test)]
     past_count: String,
+    past_count_vector: String,
+    #[cfg(test)]
     total_count: String,
 }
 
@@ -4877,6 +4934,7 @@ struct FullAttentionGraphContext<'a> {
     query_width: i64,
     geometry: CausalGraphGeometry,
     rotary_state: Option<&'a RotaryGraphState>,
+    dynamic_sequence: Option<&'a DynamicSequenceGeometry>,
     attention_mask: &'a str,
     epsilon: f32,
     zero_centered_norm: bool,
@@ -5366,7 +5424,6 @@ impl CausalGraphBuilder {
         ));
     }
 
-    #[cfg(test)]
     fn add_dynamic_sequence_geometry(
         &mut self,
         tokens_input: &str,
@@ -5401,6 +5458,16 @@ impl CausalGraphBuilder {
             &[&total_count],
             Vec::new(),
         );
+        let vector_axes = format!("{prefix}.vector_axes");
+        let past_count_vector = format!("{prefix}.past_count_vector");
+        self.add_i64(&vector_axes, vec![1], &[0]);
+        self.standard(
+            format!("{prefix}.past_count_vector_node"),
+            "Unsqueeze",
+            &[past_count_input, &vector_axes],
+            &[&past_count_vector],
+            Vec::new(),
+        );
         let positions = format!("{prefix}.positions");
         let key_positions = format!("{prefix}.key_positions");
         self.standard(
@@ -5420,13 +5487,16 @@ impl CausalGraphBuilder {
         DynamicSequenceGeometry {
             positions,
             key_positions,
+            #[cfg(test)]
             token_count,
+            #[cfg(test)]
             past_count: past_count_input.to_owned(),
+            past_count_vector,
+            #[cfg(test)]
             total_count,
         }
     }
 
-    #[cfg(test)]
     fn add_dynamic_causal_mask(
         &mut self,
         prefix: &str,
@@ -5485,14 +5555,14 @@ impl CausalGraphBuilder {
         mask
     }
 
-    #[cfg(test)]
     fn add_dynamic_rotary_tables(
         &mut self,
         prefix: &str,
         geometry: &DynamicSequenceGeometry,
+        head_dim: usize,
         rotary_dim: usize,
         theta: f32,
-    ) -> Result<(String, String), OnnxModelError> {
+    ) -> Result<RotaryGraphState, OnnxModelError> {
         if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) {
             return Err(OnnxModelError::InvalidModel(
                 "dynamic RoPE dimension must be positive and even".to_owned(),
@@ -5583,7 +5653,52 @@ impl CausalGraphBuilder {
             &[&sin],
             Vec::new(),
         );
-        Ok((cos, sin))
+        let half = rotary_dim / 2;
+        let first_start = format!("{prefix}.first_start");
+        let first_end = format!("{prefix}.first_end");
+        let second_start = format!("{prefix}.second_start");
+        let second_end = format!("{prefix}.second_end");
+        let tail_start = format!("{prefix}.tail_start");
+        let tail_end = format!("{prefix}.tail_end");
+        let axes = format!("{prefix}.axes");
+        let steps = format!("{prefix}.steps");
+        self.add_i64(&first_start, vec![1], &[0]);
+        self.add_i64(&first_end, vec![1], &[as_i64(half, "RoPE half dimension")?]);
+        self.add_i64(
+            &second_start,
+            vec![1],
+            &[as_i64(half, "RoPE half dimension")?],
+        );
+        self.add_i64(
+            &second_end,
+            vec![1],
+            &[as_i64(rotary_dim, "RoPE rotary dimension")?],
+        );
+        self.add_i64(
+            &tail_start,
+            vec![1],
+            &[as_i64(rotary_dim, "RoPE rotary dimension")?],
+        );
+        self.add_i64(
+            &tail_end,
+            vec![1],
+            &[as_i64(head_dim, "RoPE head dimension")?],
+        );
+        self.add_i64(&axes, vec![1], &[-1]);
+        self.add_i64(&steps, vec![1], &[1]);
+        Ok(RotaryGraphState {
+            first_start,
+            first_end,
+            second_start,
+            second_end,
+            tail_start,
+            tail_end,
+            has_tail: rotary_dim < head_dim,
+            axes,
+            steps,
+            cos,
+            sin,
+        })
     }
 
     fn add_causal_mask(
@@ -5950,7 +6065,7 @@ impl CausalGraphBuilder {
         &mut self,
         prefix: &str,
         fused: &str,
-        tokens: i64,
+        reshape_tokens: i64,
         n_head: i64,
         head_dim: i64,
         query_width: i64,
@@ -5963,8 +6078,12 @@ impl CausalGraphBuilder {
         let second_end = format!("{prefix}.second_end");
         let axes = format!("{prefix}.axes");
         let steps = format!("{prefix}.steps");
-        self.add_i64(&fused_shape, vec![4], &[tokens, n_head, 2, head_dim]);
-        self.add_i64(&flat_shape, vec![2], &[tokens, query_width]);
+        self.add_i64(
+            &fused_shape,
+            vec![4],
+            &[reshape_tokens, n_head, 2, head_dim],
+        );
+        self.add_i64(&flat_shape, vec![2], &[reshape_tokens, query_width]);
         self.add_i64(&first_start, vec![1], &[0]);
         self.add_i64(&first_end, vec![1], &[1]);
         self.add_i64(&second_start, vec![1], &[1]);
@@ -6420,6 +6539,165 @@ impl CausalGraphBuilder {
         }
     }
 
+    fn cache_and_expand_gqa_dynamic(
+        &mut self,
+        index: usize,
+        current_k: &str,
+        current_v: &str,
+        geometry: CausalGraphGeometry,
+        sequence: &DynamicSequenceGeometry,
+        inputs: &mut Vec<ValueInfoProto>,
+    ) -> CacheGraphOutputs {
+        use tensor_dimension_proto::Value::{DimParam, DimValue};
+
+        let prefix = format!("layer.{index}");
+        let past_k = format!("past_k.{index}");
+        let past_v = format!("past_v.{index}");
+        inputs.push(tensor_value_dimensions(
+            &past_k,
+            TENSOR_FLOAT,
+            vec![
+                DimParam("cache_capacity".to_owned()),
+                DimValue(geometry.n_kv_head),
+                DimValue(geometry.head_dim),
+            ],
+        ));
+        inputs.push(tensor_value_dimensions(
+            &past_v,
+            TENSOR_FLOAT,
+            vec![
+                DimParam("cache_capacity".to_owned()),
+                DimValue(geometry.n_kv_head),
+                DimValue(geometry.head_dim),
+            ],
+        ));
+        let starts = format!("{prefix}.cache_starts");
+        let axes = format!("{prefix}.cache_axes");
+        let steps = format!("{prefix}.cache_steps");
+        self.add_i64(&starts, vec![1], &[0]);
+        self.add_i64(&axes, vec![1], &[0]);
+        self.add_i64(&steps, vec![1], &[1]);
+        let sliced_k = format!("{prefix}.sliced_past_k");
+        let sliced_v = format!("{prefix}.sliced_past_v");
+        self.standard(
+            format!("{prefix}.slice_past_k"),
+            "Slice",
+            &[&past_k, &starts, &sequence.past_count_vector, &axes, &steps],
+            &[&sliced_k],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.slice_past_v"),
+            "Slice",
+            &[&past_v, &starts, &sequence.past_count_vector, &axes, &steps],
+            &[&sliced_v],
+            Vec::new(),
+        );
+        let present_k = format!("present_k.{index}");
+        let present_v = format!("present_v.{index}");
+        self.standard(
+            format!("{prefix}.key_concat"),
+            "Concat",
+            &[&sliced_k, current_k],
+            &[&present_k],
+            vec![int_attribute("axis", 0)],
+        );
+        self.standard(
+            format!("{prefix}.value_concat"),
+            "Concat",
+            &[&sliced_v, current_v],
+            &[&present_v],
+            vec![int_attribute("axis", 0)],
+        );
+        let declarations = [
+            tensor_value_dimensions(
+                &present_k,
+                TENSOR_FLOAT,
+                vec![
+                    DimParam("total_tokens".to_owned()),
+                    DimValue(geometry.n_kv_head),
+                    DimValue(geometry.head_dim),
+                ],
+            ),
+            tensor_value_dimensions(
+                &present_v,
+                TENSOR_FLOAT,
+                vec![
+                    DimParam("total_tokens".to_owned()),
+                    DimValue(geometry.n_kv_head),
+                    DimValue(geometry.head_dim),
+                ],
+            ),
+        ];
+        let grouped_shape = format!("{prefix}.grouped_kv_shape");
+        self.add_i64(
+            &grouped_shape,
+            vec![4],
+            &[0, geometry.n_kv_head, 1, geometry.head_dim],
+        );
+        let grouped_k = format!("{prefix}.grouped_k");
+        let grouped_v = format!("{prefix}.grouped_v");
+        self.standard(
+            format!("{prefix}.key_group_reshape"),
+            "Reshape",
+            &[&present_k, &grouped_shape],
+            &[&grouped_k],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.value_group_reshape"),
+            "Reshape",
+            &[&present_v, &grouped_shape],
+            &[&grouped_v],
+            Vec::new(),
+        );
+        let repeats = format!("{prefix}.gqa_repeats");
+        self.add_i64(&repeats, vec![4], &[1, 1, geometry.gqa_repeat, 1]);
+        let tiled_k = format!("{prefix}.tiled_k");
+        let tiled_v = format!("{prefix}.tiled_v");
+        self.standard(
+            format!("{prefix}.key_gqa_tile"),
+            "Tile",
+            &[&grouped_k, &repeats],
+            &[&tiled_k],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.value_gqa_tile"),
+            "Tile",
+            &[&grouped_v, &repeats],
+            &[&tiled_v],
+            Vec::new(),
+        );
+        let expanded_shape = format!("{prefix}.expanded_kv_shape");
+        self.add_i64(
+            &expanded_shape,
+            vec![3],
+            &[0, geometry.n_head, geometry.head_dim],
+        );
+        let expanded_k = format!("{prefix}.expanded_k");
+        let expanded_v = format!("{prefix}.expanded_v");
+        self.standard(
+            format!("{prefix}.key_gqa"),
+            "Reshape",
+            &[&tiled_k, &expanded_shape],
+            &[&expanded_k],
+            Vec::new(),
+        );
+        self.standard(
+            format!("{prefix}.value_gqa"),
+            "Reshape",
+            &[&tiled_v, &expanded_shape],
+            &[&expanded_v],
+            Vec::new(),
+        );
+        CacheGraphOutputs {
+            expanded_k,
+            expanded_v,
+            declarations,
+        }
+    }
+
     fn full_attention_block<'a, M: OnnxPackedMatrix<'a>>(
         &mut self,
         index: usize,
@@ -6438,11 +6716,17 @@ impl CausalGraphBuilder {
             query_width,
             geometry,
             rotary_state,
+            dynamic_sequence,
             attention_mask,
             epsilon,
             zero_centered_norm,
         } = context;
         let prefix = format!("layer.{index}");
+        let reshape_tokens = if dynamic_sequence.is_some() {
+            0
+        } else {
+            tokens
+        };
         let attention_input = format!("{prefix}.attention_input");
         self.rms_norm_with_semantics(
             &format!("{prefix}.attention_norm"),
@@ -6467,7 +6751,7 @@ impl CausalGraphBuilder {
                 let (query, gate) = self.deinterleave_query_gate(
                     &format!("{prefix}.query_gate_split"),
                     &fused,
-                    tokens,
+                    reshape_tokens,
                     n_head,
                     head_dim,
                     query_width,
@@ -6518,8 +6802,8 @@ impl CausalGraphBuilder {
         )?;
         let query_shape = format!("{prefix}.query_shape");
         let kv_shape = format!("{prefix}.kv_shape");
-        self.add_i64(&query_shape, vec![3], &[tokens, n_head, head_dim]);
-        self.add_i64(&kv_shape, vec![3], &[tokens, n_kv_head, head_dim]);
+        self.add_i64(&query_shape, vec![3], &[reshape_tokens, n_head, head_dim]);
+        self.add_i64(&kv_shape, vec![3], &[reshape_tokens, n_kv_head, head_dim]);
         let query_tokens = format!("{prefix}.query_tokens");
         let query = format!("{prefix}.query_heads");
         let current_k = format!("{prefix}.current_k");
@@ -6596,7 +6880,13 @@ impl CausalGraphBuilder {
             &[&query],
             vec![ints_attribute("perm", &[1, 0, 2])],
         );
-        let cache = self.cache_and_expand_gqa(index, &key_ready, &current_v, geometry, inputs);
+        let cache = if let Some(sequence) = dynamic_sequence {
+            self.cache_and_expand_gqa_dynamic(
+                index, &key_ready, &current_v, geometry, sequence, inputs,
+            )
+        } else {
+            self.cache_and_expand_gqa(index, &key_ready, &current_v, geometry, inputs)
+        };
         cache_outputs.extend(cache.declarations);
         let expanded_k = cache.expanded_k;
         let expanded_v = cache.expanded_v;
@@ -6671,7 +6961,7 @@ impl CausalGraphBuilder {
             vec![ints_attribute("perm", &[1, 0, 2])],
         );
         let context_shape = format!("{prefix}.context_shape");
-        self.add_i64(&context_shape, vec![2], &[tokens, query_width]);
+        self.add_i64(&context_shape, vec![2], &[reshape_tokens, query_width]);
         let context = format!("{prefix}.context");
         self.standard(
             format!("{prefix}.context_reshape"),
@@ -7137,6 +7427,7 @@ fn build_qwen35_mtp_graph<'a, M: OnnxPackedMatrix<'a>>(
             query_width,
             geometry,
             rotary_state: Some(&rotary_state),
+            dynamic_sequence: None,
             attention_mask,
             epsilon: model.rms_epsilon,
             zero_centered_norm: true,
@@ -7303,6 +7594,7 @@ fn build_qwen_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
         query_width,
         geometry,
         rotary_state: Some(&rotary_state),
+        dynamic_sequence: None,
         attention_mask,
         epsilon: model.rms_epsilon,
         zero_centered_norm: true,
@@ -7439,6 +7731,202 @@ fn build_qwen_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
     ))
 }
 
+fn build_dynamic_qwen_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
+    model: QwenCausalLmModel<'a, M>,
+    mut graph: CausalGraphBuilder,
+) -> Result<(ModelProto, Option<ExternalWeightArena>), OnnxModelError> {
+    use tensor_dimension_proto::Value::{DimParam, DimValue};
+
+    let vocab = as_i64(model.embedding.rows(), "vocabulary")?;
+    let n_head = as_i64(model.n_head, "attention head count")?;
+    let n_kv_head = as_i64(model.n_kv_head, "KV head count")?;
+    let head_dim = as_i64(model.head_dim, "head dimension")?;
+    let query_width = n_head
+        .checked_mul(head_dim)
+        .ok_or(OnnxModelError::ShapeOverflow("query width"))?;
+    let geometry = CausalGraphGeometry {
+        past_tokens: 0,
+        total_tokens: 0,
+        n_head,
+        n_kv_head,
+        head_dim,
+        gqa_repeat: as_i64(model.n_head / model.n_kv_head, "GQA repeat")?,
+    };
+    let sequence = graph.add_dynamic_sequence_geometry("tokens", "past_tokens", "sequence");
+    let attention_mask = graph.add_dynamic_causal_mask("attention.attention_mask", &sequence);
+    let rotary_state = graph.add_dynamic_rotary_tables(
+        "rope",
+        &sequence,
+        model.head_dim,
+        model.rotary.dimensions,
+        model.rotary.theta,
+    )?;
+    graph.embedding(
+        "tok_embeddings",
+        "tokens",
+        "layer.0.input",
+        "tok_embeddings",
+        model.embedding,
+    )?;
+    let mut hidden_name = "layer.0.input".to_owned();
+    let mut inputs = vec![
+        tensor_value_dimensions(
+            "tokens",
+            TENSOR_INT64,
+            vec![DimParam("query_tokens".to_owned())],
+        ),
+        tensor_value("past_tokens", TENSOR_INT64, &[]),
+    ];
+    let mut state_outputs = Vec::with_capacity(model.layers.len() * 2);
+    let full_context = FullAttentionGraphContext {
+        tokens: 0,
+        n_head,
+        n_kv_head,
+        head_dim,
+        head_dim_usize: model.head_dim,
+        query_width,
+        geometry,
+        rotary_state: Some(&rotary_state),
+        dynamic_sequence: Some(&sequence),
+        attention_mask: &attention_mask,
+        epsilon: model.rms_epsilon,
+        zero_centered_norm: true,
+    };
+    for (index, layer) in model.layers.iter().copied().enumerate() {
+        hidden_name = match layer {
+            QwenCausalLmDecoderLayer::DeltaNet(layer) => graph.delta_net_block(
+                index,
+                &hidden_name,
+                layer,
+                DeltaNetGraphContext {
+                    geometry: model.delta_geometry,
+                    state_scope: DeltaStateScope::LayerIndex(index),
+                    epsilon: model.rms_epsilon,
+                },
+                &mut inputs,
+                &mut state_outputs,
+            )?,
+            QwenCausalLmDecoderLayer::FullAttention(layer) => graph.full_attention_block(
+                index,
+                &hidden_name,
+                layer.causal(),
+                full_context,
+                &mut inputs,
+                &mut state_outputs,
+            )?,
+        };
+    }
+    let final_hidden = "final_norm.output";
+    graph.rms_norm_with_semantics(
+        "final_norm",
+        &hidden_name,
+        final_hidden,
+        model.final_norm,
+        model.rms_epsilon,
+        true,
+    );
+    if let Some(head) = model.lm_head {
+        graph.projection("lm_head", final_hidden, "logits", "lm_head", head)?;
+    } else {
+        graph.projection_reusing(
+            "lm_head",
+            final_hidden,
+            "logits",
+            "tok_embeddings",
+            model.embedding,
+        )?;
+    }
+    let mut outputs = vec![tensor_value_dimensions(
+        "logits",
+        TENSOR_FLOAT,
+        vec![DimParam("query_tokens".to_owned()), DimValue(vocab)],
+    )];
+    outputs.extend(state_outputs);
+    let schedule = model
+        .layers
+        .iter()
+        .map(|layer| match layer {
+            QwenCausalLmDecoderLayer::DeltaNet(_) => "linear_attention",
+            QwenCausalLmDecoderLayer::FullAttention(_) => "full_attention",
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let full_attention_interval = qwen_full_attention_interval(model.layers)?;
+    if let Some(error) = graph.failure {
+        return Err(error);
+    }
+    let external_weights = external_storage_result(graph.storage)?;
+    Ok((
+        ModelProto {
+            ir_version: ONNX_IR_VERSION,
+            producer_name: "tritium-onnx".to_owned(),
+            producer_version: env!("CARGO_PKG_VERSION").to_owned(),
+            domain: ONNX_DOMAIN.to_owned(),
+            model_version: 3,
+            graph: Some(GraphProto {
+                node: graph.nodes,
+                name: "tritium.qwen_causal_lm.dynamic".to_owned(),
+                initializer: graph.initializers,
+                input: inputs,
+                output: outputs,
+                value_info: Vec::new(),
+            }),
+            opset_import: vec![
+                OperatorSetIdProto {
+                    domain: String::new(),
+                    version: ONNX_OPSET,
+                },
+                OperatorSetIdProto {
+                    domain: ONNX_DOMAIN.to_owned(),
+                    version: 2,
+                },
+            ],
+            metadata_props: vec![
+                metadata("tritium.schema_version", "3"),
+                metadata("tritium.graph_kind", "qwen-causal-lm"),
+                metadata("tritium.sequence_mode", "dynamic-cache-v1"),
+                metadata("tritium.source_model_id", model.identity.source_model_id),
+                metadata("tritium.tokenizer_id", model.identity.tokenizer_id),
+                metadata("tritium.recipe_id", model.identity.recipe_id),
+                metadata("tritium.build_id", model.identity.tritium_build_id),
+                metadata("tritium.package_id", model.identity.package_id),
+                metadata(
+                    "tritium.coverage.converted_id",
+                    model.identity.converted_coverage_id,
+                ),
+                metadata(
+                    "tritium.coverage.deferred_id",
+                    model.identity.deferred_coverage_id,
+                ),
+                metadata("tritium.layers", &model.layers.len().to_string()),
+                metadata("tritium.hidden", &model.embedding.columns().to_string()),
+                metadata("tritium.vocab", &model.embedding.rows().to_string()),
+                metadata("tritium.n_head", &model.n_head.to_string()),
+                metadata("tritium.n_kv_head", &model.n_kv_head.to_string()),
+                metadata("tritium.head_dim", &model.head_dim.to_string()),
+                metadata("tritium.rotary_dim", &model.rotary.dimensions.to_string()),
+                metadata("tritium.rms_epsilon", &model.rms_epsilon.to_string()),
+                metadata(
+                    "tritium.full_attention_interval",
+                    &full_attention_interval.to_string(),
+                ),
+                metadata("tritium.layer_schedule", &schedule),
+                metadata("tritium.rms_norm_weight_semantics", "zero-centered-offset"),
+                metadata(
+                    "tritium.tied_embedding_head",
+                    if model.lm_head.is_none() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+                metadata("tritium.rope_theta", &model.rotary.theta.to_string()),
+            ],
+        },
+        external_weights,
+    ))
+}
+
 fn build_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
     model: CausalLmModel<'a, M>,
     external: bool,
@@ -7525,6 +8013,7 @@ fn build_causal_lm_graph<'a, M: OnnxPackedMatrix<'a>>(
         query_width,
         geometry,
         rotary_state: rotary_state.as_ref(),
+        dynamic_sequence: None,
         attention_mask,
         epsilon: model.rms_epsilon,
         zero_centered_norm: model.zero_centered_norm,
@@ -7822,8 +8311,8 @@ pub(crate) fn encode_dynamic_sequence_geometry_test_graph() -> Vec<u8> {
     let mut graph = CausalGraphBuilder::default();
     let geometry = graph.add_dynamic_sequence_geometry("tokens", "past_tokens", "sequence");
     let mask = graph.add_dynamic_causal_mask("causal_mask", &geometry);
-    let (cos, sin) = graph
-        .add_dynamic_rotary_tables("rope", &geometry, 4, 10_000.0)
+    let rotary = graph
+        .add_dynamic_rotary_tables("rope", &geometry, 4, 4, 10_000.0)
         .unwrap();
     assert!(graph.failure.is_none());
     ModelProto {
@@ -7860,7 +8349,7 @@ pub(crate) fn encode_dynamic_sequence_geometry_test_graph() -> Vec<u8> {
                     ],
                 ),
                 tensor_value_dimensions(
-                    &cos,
+                    &rotary.cos,
                     TENSOR_FLOAT,
                     vec![
                         DimParam("query_tokens".to_owned()),
@@ -7869,7 +8358,7 @@ pub(crate) fn encode_dynamic_sequence_geometry_test_graph() -> Vec<u8> {
                     ],
                 ),
                 tensor_value_dimensions(
-                    &sin,
+                    &rotary.sin,
                     TENSOR_FLOAT,
                     vec![
                         DimParam("query_tokens".to_owned()),
