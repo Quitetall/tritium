@@ -11718,6 +11718,36 @@ mod tests {
         );
         assert_eq!(dynamic_receipt.language.tokens, 0);
         assert_eq!(dynamic_receipt.mtp.past_tokens, 0);
+        let mut corrupted_dynamic_weights = dynamic_bundle.weights_bytes.clone();
+        corrupted_dynamic_weights[0] ^= 1;
+        assert!(matches!(
+            verify_dynamic_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    language_model_bytes: &dynamic_bundle.language_model_bytes,
+                    mtp_model_bytes: &dynamic_bundle.mtp_model_bytes,
+                    weights_bytes: &corrupted_dynamic_weights,
+                },
+                dynamic_admitted,
+            ),
+            Err(OnnxModelError::ExternalDataMismatch(reason))
+                if reason.contains("bundle weights")
+                    && reason.contains("package manifest")
+        ));
+        let mut corrupted_dynamic_language = dynamic_bundle.language_model_bytes.clone();
+        corrupted_dynamic_language[0] ^= 1;
+        assert!(matches!(
+            verify_dynamic_external_qwen35_bundle(
+                ExternalQwen35BundleFiles {
+                    language_model_bytes: &corrupted_dynamic_language,
+                    mtp_model_bytes: &dynamic_bundle.mtp_model_bytes,
+                    weights_bytes: &dynamic_bundle.weights_bytes,
+                },
+                dynamic_admitted,
+            ),
+            Err(OnnxModelError::ExternalDataMismatch(reason))
+                if reason.contains("model BLAKE3")
+                    && reason.contains("package manifest")
+        ));
         assert!(matches!(
             verify_external_qwen35_bundle(
                 ExternalQwen35BundleFiles {
